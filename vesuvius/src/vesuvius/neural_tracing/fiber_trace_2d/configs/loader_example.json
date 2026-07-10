@@ -1,5 +1,5 @@
 {
-  "batch_size": 512,
+  "batch_size": 128,
   "patch_shape_hw": [64, 64],
   "strip_z_offset_count": 1,
   "strip_z_offset_step": 2.0,
@@ -39,7 +39,7 @@
     "test_interval": 100,
     "test_control_points": 8,
     "test_start_sample_index": 0,
-    "control_points_per_step": 4,
+    "control_points_per_step": 128,
     "device": "auto",
     "tensorboard_enabled": true,
     "model_hidden_channels": 64,

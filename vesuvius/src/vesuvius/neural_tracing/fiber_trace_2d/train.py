@@ -13,7 +13,12 @@ from typing import Any
 import numpy as np
 import torch
 
-from vesuvius.neural_tracing.fiber_trace_2d.augmentation import overlay_line_coords_rgb, resolve_torch_device
+from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
+    apply_value_augmentation_batch,
+    overlay_line_coords_rgb,
+    resolve_torch_device,
+    value_only_params,
+)
 from vesuvius.neural_tracing.fiber_trace_2d.direction import (
     DirectionSupervision,
     build_direction_supervision,
@@ -155,12 +160,51 @@ def _flatten_batch(batch: FiberStrip2DBatch) -> tuple[np.ndarray, np.ndarray]:
 def _prepare_images(images_np: np.ndarray, valid_np: np.ndarray, *, device: torch.device) -> torch.Tensor:
     images = torch.as_tensor(images_np, dtype=torch.float32, device=device)
     valid = torch.as_tensor(valid_np, dtype=torch.bool, device=device).unsqueeze(1)
+    return _normalize_image_tensor(images, valid)
+
+
+def _normalize_image_tensor(images: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    if valid.ndim == 3:
+        valid = valid.unsqueeze(1)
     counts = valid.sum(dim=(2, 3), keepdim=True).clamp_min(1)
     masked = torch.where(valid, images, torch.zeros_like(images))
     mean = masked.sum(dim=(2, 3), keepdim=True) / counts
     var = torch.where(valid, (images - mean) ** 2, torch.zeros_like(images)).sum(dim=(2, 3), keepdim=True) / counts
     std = torch.sqrt(var.clamp_min(1.0e-6))
     return torch.where(valid, (images - mean) / std, torch.zeros_like(images))
+
+
+def _batch_images_to_tensors(
+    batch: FiberStrip2DBatch,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
+    images_np, valid_np = _flatten_batch(batch)
+    flat_count = int(images_np.shape[0])
+    height, width = int(images_np.shape[2]), int(images_np.shape[3])
+    flat_images = images_np.reshape(flat_count, height, width)
+    flat_valids = valid_np.reshape(flat_count, height, width)
+
+    params = tuple(batch.augmentation_params)
+    if batch.augmentation_params and len(params) != flat_count:
+        raise ValueError(
+            "batch does not carry image augmentation parameters: "
+            f"params={len(params)} expected={flat_count}"
+        )
+    if params and not all(param is None for param in params):
+        value_params = [value_only_params(param) for param in params if param is not None]
+        if len(value_params) != flat_count:
+            raise ValueError("partially missing image augmentation parameters in batch")
+        image_t, valid_t = apply_value_augmentation_batch(
+            flat_images,
+            flat_valids,
+            value_params,
+            device=device,
+        )
+    else:
+        image_t = torch.as_tensor(flat_images, dtype=torch.float32, device=device)
+        valid_t = torch.as_tensor(flat_valids, dtype=torch.bool, device=device)
+    return image_t.unsqueeze(1), valid_t, valid_np
 
 
 @dataclass(frozen=True)
@@ -184,6 +228,138 @@ class _LoadedTrainingBatch:
     batch: FiberStrip2DBatch
     profile: dict[str, float]
     load_ms: float
+
+
+@dataclass(frozen=True)
+class _PreparedTrainingBatch:
+    loaded: _LoadedTrainingBatch
+    images: torch.Tensor
+    supervision: DirectionSupervision
+    valid_np: np.ndarray
+    prep_ms: float
+    prep_gpu_ms: float = 0.0
+    prep_wait_ms: float = 0.0
+    prep_submit_ms: float = 0.0
+    stream: torch.cuda.Stream | None = None
+    start_event: torch.cuda.Event | None = None
+    end_event: torch.cuda.Event | None = None
+
+    @property
+    def batch(self) -> FiberStrip2DBatch:
+        return self.loaded.batch
+
+    @property
+    def load_ms(self) -> float:
+        return self.loaded.load_ms
+
+    @property
+    def raw_start_sample_index(self) -> int:
+        return self.loaded.raw_start_sample_index
+
+
+def _prepare_loaded_training_batch(
+    loaded: _LoadedTrainingBatch,
+    *,
+    device: torch.device,
+    stream: torch.cuda.Stream | None = None,
+) -> _PreparedTrainingBatch:
+    t0 = time.perf_counter()
+    start_event: torch.cuda.Event | None = None
+    end_event: torch.cuda.Event | None = None
+    context = torch.cuda.stream(stream) if stream is not None else None
+    if context is None:
+        images_raw, valid_t, valid_np = _batch_images_to_tensors(loaded.batch, device=device)
+        images = _normalize_image_tensor(images_raw, valid_t)
+        supervision = build_direction_supervision(loaded.batch.samples, valid_np, device=device)
+    else:
+        with context:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(stream)
+            images_raw, valid_t, valid_np = _batch_images_to_tensors(loaded.batch, device=device)
+            images = _normalize_image_tensor(images_raw, valid_t)
+            supervision = build_direction_supervision(loaded.batch.samples, valid_np, device=device)
+            end_event.record(stream)
+    prep_ms = (time.perf_counter() - t0) * 1000.0
+    if stream is None:
+        _sync_device(device)
+    return _PreparedTrainingBatch(
+        loaded=loaded,
+        images=images,
+        supervision=supervision,
+        valid_np=valid_np,
+        prep_ms=prep_ms,
+        stream=stream,
+        start_event=start_event,
+        end_event=end_event,
+    )
+
+
+def _wait_for_prepared_batch(prepared: _PreparedTrainingBatch, *, device: torch.device) -> _PreparedTrainingBatch:
+    if prepared.end_event is None:
+        return prepared
+    wait_start = time.perf_counter()
+    prepared.end_event.synchronize()
+    wait_ms = (time.perf_counter() - wait_start) * 1000.0
+    prep_gpu_ms = (
+        prepared.start_event.elapsed_time(prepared.end_event)
+        if prepared.start_event is not None
+        else 0.0
+    )
+    if prepared.stream is not None and device.type == "cuda":
+        torch.cuda.current_stream(device).wait_event(prepared.end_event)
+    return replace(prepared, prep_wait_ms=wait_ms, prep_gpu_ms=float(prep_gpu_ms))
+
+
+class _CudaPreparedBatchPipeline:
+    def __init__(
+        self,
+        load_pipeline: _TrainingBatchPipeline,
+        *,
+        device: torch.device,
+    ) -> None:
+        if device.type != "cuda":
+            raise ValueError("_CudaPreparedBatchPipeline requires a CUDA device")
+        self.load_pipeline = load_pipeline
+        self.device = device
+        self.depth = load_pipeline.depth
+        self.stream = torch.cuda.Stream(device=device)
+        self.pending: dict[int, _PreparedTrainingBatch] = {}
+        self.closed = False
+        self._submit_until_full()
+
+    def _submit_until_full(self) -> float:
+        submit_start = time.perf_counter()
+        while not self.closed and len(self.pending) < self.depth:
+            try:
+                loaded, load_wait_ms = self.load_pipeline.next()
+            except StopIteration:
+                break
+            prepared = _prepare_loaded_training_batch(
+                loaded,
+                device=self.device,
+                stream=self.stream,
+            )
+            if load_wait_ms:
+                loaded.profile["pipeline_wait"] = loaded.profile.get("pipeline_wait", 0.0) + load_wait_ms
+            self.pending[loaded.step] = prepared
+        return (time.perf_counter() - submit_start) * 1000.0
+
+    def next(self) -> _PreparedTrainingBatch:
+        if self.closed:
+            raise RuntimeError("training preparation pipeline is closed")
+        if not self.pending:
+            self._submit_until_full()
+        step = min(self.pending)
+        prepared = self.pending.pop(step)
+        prepared = _wait_for_prepared_batch(prepared, device=self.device)
+        submit_ms = self._submit_until_full()
+        return replace(prepared, prep_submit_ms=submit_ms)
+
+    def close(self) -> None:
+        self.closed = True
+        self.pending.clear()
+        self.load_pipeline.close()
 
 
 def _training_raw_start_sample_index(step: int, training: FiberStripTrainingConfig) -> int:
@@ -316,6 +492,17 @@ def _compute_batch_loss(
     return loss, outputs, supervision, metrics
 
 
+def _compute_prepared_batch_loss(
+    model: FiberStripDirectionNet,
+    prepared: _PreparedTrainingBatch,
+) -> tuple[torch.Tensor, torch.Tensor, DirectionSupervision, _DirectionMetrics]:
+    outputs = model(prepared.images)
+    loss = direction_mse_loss(outputs, prepared.supervision)
+    angle_error = direction_angle_error_degrees(outputs, prepared.supervision)
+    metrics = _DirectionMetrics(angle_mean_deg=float(angle_error.detach().mean().cpu().item()))
+    return loss, outputs, prepared.supervision, metrics
+
+
 def _sync_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -347,6 +534,10 @@ def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dic
         "loader_worker": loader_worker,
         "loader_thread_factor": loader_worker / loader_wall if loader_wall > 0.0 else 0.0,
         "pipeline_wait": _stage_ms(train_profile, "pipeline_wait"),
+        "prep": _stage_ms(train_profile, "prep"),
+        "prep_gpu": _stage_ms(train_profile, "prep_gpu"),
+        "prep_wait": _stage_ms(train_profile, "prep_wait"),
+        "prep_submit": _stage_ms(train_profile, "prep_submit"),
         "coord_gen": coord_gen,
         "descriptor": descriptor,
         "coord_cache": coord_cache,
@@ -357,6 +548,15 @@ def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dic
         "image_aug": _stage_ms(loader_profile, "value_augmentation") + _stage_ms(train_profile, "value_augmentation"),
         "fw": _stage_ms(train_profile, "fw"),
         "bw_step": _stage_ms(train_profile, "bw_step"),
+        "outside_fw_bw": (
+            loader_wall
+            + _stage_ms(train_profile, "pipeline_wait")
+            + _stage_ms(train_profile, "prep")
+            + _stage_ms(train_profile, "prep_wait")
+            + _stage_ms(train_profile, "prep_submit")
+            + _stage_ms(loader_profile, "value_augmentation")
+            + _stage_ms(train_profile, "value_augmentation")
+        ),
     }
 
 
@@ -364,12 +564,13 @@ def _print_profile_header() -> None:
     print(
         "fiber_trace_2d profile columns: "
         "batch=batch-index patches=CNN image patches "
-        "total/wall/work/wait/coord/desc/cache/source/line/coord_aug/load/img_aug/fw/bw_step=ms per patch "
+        "total/wall/work/wait/prep/prep_gpu/prep_wait/submit/outside/coord/desc/cache/source/line/coord_aug/load/img_aug/fw/bw_step=ms per patch "
         "tf=loader worker-time/wall-time",
         flush=True,
     )
     print(
         f"{'batch':>5} {'patches':>7} {'total':>9} {'wall':>9} {'work':>9} {'tf':>6} {'wait':>9} "
+        f"{'prep':>9} {'prep_gpu':>9} {'prep_wait':>9} {'submit':>9} {'outside':>9} "
         f"{'coord':>9} {'desc':>9} "
         f"{'cache':>9} {'source':>9} {'line':>9} {'coord_aug':>9} "
         f"{'load':>9} {'img_aug':>9} {'fw':>9} {'bw_step':>9}",
@@ -386,6 +587,11 @@ def _print_profile_row(batch_index: int, patch_count: int, elapsed_ms: float, st
         f"{stages.get('loader_worker', 0.0) / denom:9.2f} "
         f"{stages.get('loader_thread_factor', 0.0):6.2f} "
         f"{stages.get('pipeline_wait', 0.0) / denom:9.2f} "
+        f"{stages.get('prep', 0.0) / denom:9.2f} "
+        f"{stages.get('prep_gpu', 0.0) / denom:9.2f} "
+        f"{stages.get('prep_wait', 0.0) / denom:9.2f} "
+        f"{stages.get('prep_submit', 0.0) / denom:9.2f} "
+        f"{stages.get('outside_fw_bw', 0.0) / denom:9.2f} "
         f"{stages.get('coord_gen', 0.0) / denom:9.2f} "
         f"{stages.get('descriptor', 0.0) / denom:9.2f} "
         f"{stages.get('coord_cache', 0.0) / denom:9.2f} "
@@ -413,6 +619,11 @@ def _print_benchmark_summary(summary: _BenchmarkSummary, *, profile: bool) -> No
             "loader_wall",
             "loader_worker",
             "pipeline_wait",
+            "prep",
+            "prep_gpu",
+            "prep_wait",
+            "prep_submit",
+            "outside_fw_bw",
             "coord_gen",
             "descriptor",
             "coord_cache",
@@ -467,6 +678,11 @@ def run_benchmark(
             "loader_worker",
             "loader_thread_factor",
             "pipeline_wait",
+            "prep",
+            "prep_gpu",
+            "prep_wait",
+            "prep_submit",
+            "outside_fw_bw",
             "coord_gen",
             "descriptor",
             "coord_cache",
@@ -488,6 +704,7 @@ def run_benchmark(
     wall_start = time.perf_counter()
     use_pipeline = bool(training.pipeline_enabled and not load_only and device.type == "cuda")
     pipeline: _TrainingBatchPipeline | None = None
+    prep_pipeline: _CudaPreparedBatchPipeline | None = None
     if use_pipeline:
         pipeline = _TrainingBatchPipeline(
             loader,
@@ -498,11 +715,21 @@ def run_benchmark(
             profile_enabled=profile,
             apply_image_augmentation=False,
         )
+        prep_pipeline = _CudaPreparedBatchPipeline(pipeline, device=device)
     try:
         for batch_index in range(1, total_batches + 1):
             batch_start = time.perf_counter()
             train_profile: dict[str, float] = {}
-            if pipeline is None:
+            prepared: _PreparedTrainingBatch | None = None
+            if prep_pipeline is not None:
+                prepared = prep_pipeline.next()
+                loaded = prepared.loaded
+                train_profile["pipeline_wait"] = loaded.profile.get("pipeline_wait", 0.0)
+                train_profile["prep"] = prepared.prep_ms
+                train_profile["prep_gpu"] = prepared.prep_gpu_ms
+                train_profile["prep_wait"] = prepared.prep_wait_ms
+                train_profile["prep_submit"] = prepared.prep_submit_ms
+            elif pipeline is None:
                 loaded = _load_training_batch(
                     loader,
                     training,
@@ -516,25 +743,23 @@ def run_benchmark(
                 train_profile["pipeline_wait"] = wait_ms
             loader_profile = loaded.profile
             batch = loaded.batch
-            if not load_only:
-                batch = loader.apply_batch_image_augmentation(
-                    batch,
-                    profile=train_profile if profile else None,
-                )
-
             images_np, valid_np = _flatten_batch(batch)
             patch_count = int(images_np.shape[0])
             if not load_only:
                 assert model is not None
                 assert optimizer is not None
-                images = _prepare_images(images_np, valid_np, device=device)
-                supervision = build_direction_supervision(batch.samples, valid_np, device=device)
+                if prepared is None:
+                    prep_start = time.perf_counter()
+                    prepared = _prepare_loaded_training_batch(loaded, device=device)
+                    train_profile["prep"] = (time.perf_counter() - prep_start) * 1000.0
+                    train_profile["prep_gpu"] = prepared.prep_gpu_ms
+                    train_profile["prep_wait"] = prepared.prep_wait_ms
 
                 optimizer.zero_grad(set_to_none=True)
                 _sync_device(device)
                 fw_start = time.perf_counter()
-                outputs = model(images)
-                loss = direction_mse_loss(outputs, supervision)
+                outputs = model(prepared.images)
+                loss = direction_mse_loss(outputs, prepared.supervision)
                 _sync_device(device)
                 train_profile["fw"] = (time.perf_counter() - fw_start) * 1000.0
 
@@ -552,7 +777,9 @@ def run_benchmark(
             if profile:
                 _print_profile_row(batch_index, patch_count, batch_elapsed_ms, stages)
     finally:
-        if pipeline is not None:
+        if prep_pipeline is not None:
+            prep_pipeline.close()
+        elif pipeline is not None:
             pipeline.close()
 
     _sync_device(device)
@@ -847,6 +1074,7 @@ def run_training(
     last_test_angle_mean_deg = float("nan")
     use_pipeline = bool(training.pipeline_enabled and device.type == "cuda")
     pipeline: _TrainingBatchPipeline | None = None
+    prep_pipeline: _CudaPreparedBatchPipeline | None = None
     try:
         finite_max_step = int(training.max_steps) if finite_steps else None
         if use_pipeline:
@@ -859,11 +1087,24 @@ def run_training(
                 profile_enabled=False,
                 apply_image_augmentation=False,
             )
+            prep_pipeline = _CudaPreparedBatchPipeline(pipeline, device=device)
         step = 1
         while True:
             if finite_steps and step > training.max_steps:
                 break
-            if pipeline is None:
+            prep_ms = 0.0
+            prep_gpu_ms = 0.0
+            prep_wait_ms = 0.0
+            prep_submit_ms = 0.0
+            if prep_pipeline is not None:
+                prepared = prep_pipeline.next()
+                loaded = prepared.loaded
+                wait_ms = float(loaded.profile.get("pipeline_wait", 0.0))
+                prep_ms = float(prepared.prep_ms)
+                prep_gpu_ms = float(prepared.prep_gpu_ms)
+                prep_wait_ms = float(prepared.prep_wait_ms)
+                prep_submit_ms = float(prepared.prep_submit_ms)
+            elif pipeline is None:
                 loaded = _load_training_batch(
                     loader,
                     training,
@@ -873,15 +1114,19 @@ def run_training(
                     apply_image_augmentation=False,
                 )
                 wait_ms = 0.0
+                prepared = _prepare_loaded_training_batch(loaded, device=device)
+                prep_ms = float(prepared.prep_ms)
             else:
                 loaded, wait_ms = pipeline.next()
+                prepared = _prepare_loaded_training_batch(loaded, device=device)
+                prep_ms = float(prepared.prep_ms)
             raw_start_sample_index = loaded.raw_start_sample_index
-            batch = loader.apply_batch_image_augmentation(loaded.batch)
+            batch = loaded.batch
             load_ms = float(loaded.load_ms)
 
             model.train()
             optimizer.zero_grad(set_to_none=True)
-            loss, outputs, supervision, metrics = _compute_batch_loss(model, batch, device=device)
+            loss, outputs, supervision, metrics = _compute_prepared_batch_loss(model, prepared)
             loss.backward()
             optimizer.step()
             loss_value = float(loss.detach().cpu().item())
@@ -909,6 +1154,10 @@ def run_training(
                 writer.add_scalar("train/supervision_samples", int(supervision.target.shape[0]), step)
                 writer.add_scalar("timing/load_ms", load_ms, step)
                 writer.add_scalar("timing/pipeline_wait_ms", wait_ms, step)
+                writer.add_scalar("timing/prep_enqueue_ms", prep_ms, step)
+                writer.add_scalar("timing/prep_gpu_ms", prep_gpu_ms, step)
+                writer.add_scalar("timing/prep_wait_ms", prep_wait_ms, step)
+                writer.add_scalar("timing/prep_submit_ms", prep_submit_ms, step)
                 for key, value in _cache_scalars(batch.cache_stats).items():
                     writer.add_scalar(key, value, step)
             if writer is not None and test_result is not None:
@@ -975,12 +1224,16 @@ def run_training(
                     f"step={step} loss_direction={loss_value:.6f} "
                     f"angle_mean_deg={metrics.angle_mean_deg:.2f} "
                     f"supervision_samples={int(supervision.target.shape[0])}{test_part} "
-                    f"load_ms={load_ms:.1f} wait_ms={wait_ms:.1f}",
+                    f"load_ms={load_ms:.1f} wait_ms={wait_ms:.1f} "
+                    f"prep_ms={prep_ms:.1f} prep_gpu_ms={prep_gpu_ms:.1f} "
+                    f"prep_wait_ms={prep_wait_ms:.1f} prep_submit_ms={prep_submit_ms:.1f}",
                     flush=True,
                 )
             step += 1
     finally:
-        if pipeline is not None:
+        if prep_pipeline is not None:
+            prep_pipeline.close()
+        elif pipeline is not None:
             pipeline.close()
         if writer is not None:
             writer.flush()

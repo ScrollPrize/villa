@@ -588,6 +588,19 @@ warm batches should mostly avoid that cost.
 Images are normalized per patch over valid pixels. Invalid pixels are set to
 zero after normalization.
 
+On CUDA training runs with `training.pipeline_enabled`, the trainer keeps two
+overlap stages active:
+
+- CPU/VC3D batch loading continues through the deterministic loader pipeline.
+- Deferred image/value augmentation, image normalization, and supervision-tensor
+  construction run as CUDA preparation on a side stream. The prepared image
+  tensor stays on CUDA and the main training stream waits on the preparation
+  event immediately before forward pass.
+
+This training-only prepared-batch path avoids the runner/debug
+`apply_batch_image_augmentation()` NumPy round trip. Runner exports still use
+NumPy-returning loader APIs.
+
 Targets are built from `FiberStripSample.line_xy` and
 `FiberStripSample.control_point_xy`, which are already transformed output-pixel
 coordinates from the loader's augmentation path. The local tangent near the
@@ -619,6 +632,11 @@ The trainer logs:
 - `train/angle_error_mean_deg`;
 - `train/supervision_samples`;
 - `timing/load_ms`;
+- `timing/pipeline_wait_ms`;
+- `timing/prep_enqueue_ms`;
+- `timing/prep_gpu_ms`;
+- `timing/prep_wait_ms`;
+- `timing/prep_submit_ms`;
 - cache hit/download diagnostics where available;
 - `train/batch_direction_overlay` images showing the transformed centerline
   behind one short network-predicted direction segment at the transformed CP.
@@ -629,9 +647,9 @@ The trainer logs:
   `test/batch_direction_overlay` at test evaluation steps.
 
 Console progress prints the same loss, mean angle error in degrees,
-supervision, and load-time summary for every step whose deterministic
-control-point sample range starts before sample index 100, then return to
-`training.scalar_log_interval`.
+supervision, load-time summary, and CUDA preparation timing for every step whose
+deterministic control-point sample range starts before sample index 100, then
+return to `training.scalar_log_interval`.
 
 Snapshots are written under:
 

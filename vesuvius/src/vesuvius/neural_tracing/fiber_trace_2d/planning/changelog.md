@@ -2,6 +2,9 @@
 
 ## 2026-07-10
 
+- Added CUDA side-stream training preparation for deferred image/value
+  augmentation, normalization, and supervision tensors, plus prep/outside
+  timing diagnostics.
 - Added `--trace2cp-vis` runner inspection for CP-pair segment tracing,
   optional median-TTA scoring, normalized trace-to-target score output, and
   single-panel JPG/summary export.
