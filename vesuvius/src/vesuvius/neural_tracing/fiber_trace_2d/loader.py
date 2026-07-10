@@ -58,6 +58,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.sampling import CoordinateSampler, m
 
 
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
+_STRIP_COORD_CACHE_VERSION = "fiber_strip_2d_source_v2"
 
 
 @dataclass(frozen=True)
@@ -131,6 +132,8 @@ class _StripSource:
     center_offset: float
     source_shape_hw: tuple[int, int]
     grid: FiberStripGridTorch
+    source_line_xy: torch.Tensor
+    source_control_point_xy: torch.Tensor
 
 
 @dataclass
@@ -1050,6 +1053,20 @@ class FiberStrip2DLoader:
         height, width = (int(v) for v in shape_hw)
         return np.asarray([(float(width) - 1.0) * 0.5, (float(height) - 1.0) * 0.5], dtype=np.float32)
 
+    @staticmethod
+    def _source_line_and_cp_tensors(shape_hw: tuple[int, int], *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        height, width = (int(v) for v in shape_hw)
+        x = torch.arange(width, dtype=torch.float32, device=device)
+        y = torch.full((width,), (float(height) - 1.0) * 0.5, dtype=torch.float32, device=device)
+        return (
+            torch.stack([x, y], dim=1),
+            torch.tensor(
+                [(float(width) - 1.0) * 0.5, (float(height) - 1.0) * 0.5],
+                dtype=torch.float32,
+                device=device,
+            ),
+        )
+
     def _source_shape_hw(self, *, use_augmentation_envelope: bool | None = None) -> tuple[int, int]:
         use_envelope = self.config.augment.enabled if use_augmentation_envelope is None else bool(use_augmentation_envelope)
         if not use_envelope:
@@ -1071,7 +1088,7 @@ class FiberStrip2DLoader:
             return None
         cp_xyz = np.asarray(record.fiber.control_points_xyz[control_point_index], dtype=np.float64)
         family_key = _stable_digest(
-            "fiber_strip_2d_source_v1",
+            _STRIP_COORD_CACHE_VERSION,
             record.volume_path,
             record.volume_scale,
             f"{record.volume_spacing_base:.12g}",
@@ -1085,7 +1102,13 @@ class FiberStrip2DLoader:
         return root / family_key[:2] / f"{family_key}.npz"
 
     @staticmethod
-    def _crop_cached_grid(grid: FiberStripGridTorch, cached_shape_hw: tuple[int, int], shape_hw: tuple[int, int]) -> FiberStripGridTorch:
+    def _crop_cached_source(
+        grid: FiberStripGridTorch,
+        source_line_xy: torch.Tensor,
+        source_control_point_xy: torch.Tensor,
+        cached_shape_hw: tuple[int, int],
+        shape_hw: tuple[int, int],
+    ) -> tuple[FiberStripGridTorch, torch.Tensor, torch.Tensor]:
         cached_h, cached_w = (int(v) for v in cached_shape_hw)
         height, width = (int(v) for v in shape_hw)
         if cached_h < height or cached_w < width:
@@ -1100,7 +1123,7 @@ class FiberStrip2DLoader:
                 return None
             return value[y0:y1, x0:x1].contiguous()
 
-        return FiberStripGridTorch(
+        cropped = FiberStripGridTorch(
             coords_xyz=crop_tensor(grid.coords_xyz),
             coords_zyx=crop_tensor(grid.coords_zyx),
             valid_mask=crop_tensor(grid.valid_mask),
@@ -1108,6 +1131,11 @@ class FiberStrip2DLoader:
             offset_axis_xyz=crop_tensor(grid.offset_axis_xyz),
             offset_axis_zyx=crop_tensor(grid.offset_axis_zyx),
         )
+        line = source_line_xy[x0:x1].contiguous()
+        shift = torch.tensor([float(x0), float(y0)], dtype=line.dtype, device=line.device)
+        line = line - shift.view(1, 2)
+        cp = source_control_point_xy - shift
+        return cropped, line, cp
 
     def _load_strip_coord_cache(
         self,
@@ -1116,12 +1144,12 @@ class FiberStrip2DLoader:
         source_shape_hw: tuple[int, int],
         device: torch.device,
         center_offset: float,
-    ) -> FiberStripGridTorch | None:
+    ) -> tuple[FiberStripGridTorch, torch.Tensor, torch.Tensor] | None:
         if path is None or not path.is_file():
             return None
         try:
             with np.load(path, allow_pickle=False) as data:
-                if str(data["version"].item()) != "fiber_strip_2d_source_v1":
+                if str(data["version"].item()) != _STRIP_COORD_CACHE_VERSION:
                     return None
                 cached_shape = tuple(int(v) for v in data["source_shape_hw"].tolist())
                 if cached_shape[0] < int(source_shape_hw[0]) or cached_shape[1] < int(source_shape_hw[1]):
@@ -1141,9 +1169,21 @@ class FiberStrip2DLoader:
                     offset_axis_xyz=torch.as_tensor(np.asarray(data["offset_axis_xyz"], dtype=np.float32), device=device),
                     offset_axis_zyx=torch.as_tensor(np.asarray(data["offset_axis_zyx"], dtype=np.float32), device=device),
                 )
+                source_line_xy = torch.as_tensor(np.asarray(data["source_line_xy"], dtype=np.float32), device=device)
+                source_control_point_xy = torch.as_tensor(
+                    np.asarray(data["source_control_point_xy"], dtype=np.float32),
+                    device=device,
+                )
         except Exception:
             return None
-        return self._crop_cached_grid(grid, cached_shape, source_shape_hw)
+        grid, source_line_xy, source_control_point_xy = self._crop_cached_source(
+            grid,
+            source_line_xy,
+            source_control_point_xy,
+            cached_shape,
+            source_shape_hw,
+        )
+        return grid, source_line_xy, source_control_point_xy
 
     def _store_strip_coord_cache(
         self,
@@ -1152,6 +1192,8 @@ class FiberStrip2DLoader:
         *,
         source_shape_hw: tuple[int, int],
         center_offset: float,
+        source_line_xy: torch.Tensor,
+        source_control_point_xy: torch.Tensor,
     ) -> None:
         if path is None:
             return
@@ -1162,7 +1204,7 @@ class FiberStrip2DLoader:
             with tmp.open("wb") as handle:
                 np.savez(
                     handle,
-                    version=np.asarray("fiber_strip_2d_source_v1"),
+                    version=np.asarray(_STRIP_COORD_CACHE_VERSION),
                     source_shape_hw=np.asarray(source_shape_hw, dtype=np.int64),
                     center_offset=np.asarray(float(center_offset), dtype=np.float64),
                     coords_xyz=_as_numpy_float32(grid.coords_xyz),
@@ -1170,6 +1212,8 @@ class FiberStrip2DLoader:
                     valid_mask=_as_numpy_bool(grid.valid_mask),
                     offset_axis_xyz=_as_numpy_float32(grid.offset_axis_xyz),
                     offset_axis_zyx=_as_numpy_float32(grid.offset_axis_zyx),
+                    source_line_xy=_as_numpy_float32(source_line_xy),
+                    source_control_point_xy=_as_numpy_float32(source_control_point_xy),
                     frame_tangent_xyz=np.asarray(frame.tangent_xyz, dtype=np.float32),
                     frame_side_xyz=np.asarray(frame.side_xyz, dtype=np.float32),
                     frame_mesh_normal_xyz=np.asarray(frame.mesh_normal_xyz, dtype=np.float32),
@@ -1215,13 +1259,14 @@ class FiberStrip2DLoader:
             center_offset=float(center_offset),
         )
         with _ProfileBlock(profile, "strip_coord_cache"):
-            cached_grid = self._load_strip_coord_cache(
+            cached_source = self._load_strip_coord_cache(
                 cache_path,
                 source_shape_hw=source_shape_hw,
                 device=device,
                 center_offset=float(center_offset),
             )
-        if cached_grid is not None:
+        if cached_source is not None:
+            cached_grid, source_line_xy, source_control_point_xy = cached_source
             if debug_label is not None:
                 print(
                     f"{debug_label} strip_coord_cache hit valid={int(torch.count_nonzero(cached_grid.valid_mask).item())}",
@@ -1234,6 +1279,8 @@ class FiberStrip2DLoader:
                 center_offset=float(center_offset),
                 source_shape_hw=source_shape_hw,
                 grid=cached_grid,
+                source_line_xy=source_line_xy,
+                source_control_point_xy=source_control_point_xy,
             )
         with _ProfileBlock(profile, "line_window"):
             line_window = self._line_window_for_patch(
@@ -1266,11 +1313,14 @@ class FiberStrip2DLoader:
                 pixel_spacing_base=record.volume_spacing_base,
                 device=device,
             )
+        source_line_xy, source_control_point_xy = self._source_line_and_cp_tensors(source_shape_hw, device=device)
         self._store_strip_coord_cache(
             cache_path,
             grid,
             source_shape_hw=source_shape_hw,
             center_offset=float(center_offset),
+            source_line_xy=source_line_xy,
+            source_control_point_xy=source_control_point_xy,
         )
         if debug_label is not None:
             print(
@@ -1284,6 +1334,8 @@ class FiberStrip2DLoader:
             center_offset=float(center_offset),
             source_shape_hw=source_shape_hw,
             grid=grid,
+            source_line_xy=source_line_xy,
+            source_control_point_xy=source_control_point_xy,
         )
 
     def _offset_grid_from_source(self, source: _StripSource, offset: float) -> FiberStripGridTorch:
@@ -1306,36 +1358,29 @@ class FiberStrip2DLoader:
 
     def _line_and_cp_xy_for_params(
         self,
-        source_shape_hw: tuple[int, int],
+        source: _StripSource,
         params: FiberStripAugmentParams | None,
         *,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if params is None:
-            height, width = (int(v) for v in source_shape_hw)
-            x = torch.arange(width, dtype=torch.float32, device=device)
-            y = torch.full((width,), (float(height) - 1.0) * 0.5, dtype=torch.float32, device=device)
             return (
-                torch.stack([x, y], dim=1),
-                torch.tensor(
-                    [(float(width) - 1.0) * 0.5, (float(height) - 1.0) * 0.5],
-                    dtype=torch.float32,
-                    device=device,
-                ),
+                source.source_line_xy.to(device=device, dtype=torch.float32),
+                source.source_control_point_xy.to(device=device, dtype=torch.float32),
             )
         line_xy = transformed_centerline_coords_torch(
             self.config.patch_shape_hw,
-            source_shape_hw,
+            source.source_shape_hw,
             params,
             device=device,
         )
         control_point_xy = transformed_source_point_coords_torch(
             self.config.patch_shape_hw,
-            source_shape_hw,
+            source.source_shape_hw,
             params,
             (
-                (float(source_shape_hw[1]) - 1.0) * 0.5,
-                (float(source_shape_hw[0]) - 1.0) * 0.5,
+                (float(source.source_shape_hw[1]) - 1.0) * 0.5,
+                (float(source.source_shape_hw[0]) - 1.0) * 0.5,
             ),
             device=device,
         )
@@ -1367,7 +1412,7 @@ class FiberStrip2DLoader:
                 )
         with _ProfileBlock(profile, "line_coords", device):
             line_xy_t, control_point_xy_t = self._line_and_cp_xy_for_params(
-                source.source_shape_hw,
+                source,
                 params,
                 device=device,
             )

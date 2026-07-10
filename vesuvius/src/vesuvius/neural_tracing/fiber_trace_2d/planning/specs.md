@@ -32,6 +32,11 @@
   augmentation are applied. Training, augment-vis, runner center/line/dir
   visualizations, and prefetch all use this cache through the shared
   source-strip path.
+- Strip-coordinate cache entries include source-space line pixel coordinates
+  and source-space control-point pixel coordinates. Unaugmented patches reuse
+  those cached line/CP coordinates directly; augmented patches still compute
+  transformed output line/CP coordinates per patch because they depend on the
+  augmentation draw.
 - Strip-coordinate cache identity is based on the base-volume path, selected
   scale and pixel spacing, strip-z offset step/center, control-point 3D
   coordinate, and fiber-line identity. The requested source size is stored in
@@ -44,7 +49,7 @@
 - Strip-coordinate cache writes use unique temporary files in the cache
   directory followed by atomic rename. Corrupt or incompatible entries are
   treated as misses and regenerated through the normal Lasagna/strip-coordinate
-  path.
+  path. Cache version changes intentionally ignore previous cache files.
 - Image loading samples base-volume Zarr values from explicit coordinates.
 - Training/export coordinate sampling uses the VC3D blocking coordinate sampler: required chunks are collected and fetched/decoded before sampling, so a cold cache miss must not become an invalid output pixel.
 - Interactive/progressive VC3D `tryGetChunk` semantics are not acceptable for this loader path because they can queue I/O and return an all-invalid first sample.
@@ -100,7 +105,7 @@
 - V0 training is provided by `python -m vesuvius.neural_tracing.fiber_trace_2d.train`.
 - `train.py --prefetch` runs training-oriented chunk prefetch only and exits before model, optimizer, TensorBoard, run-directory, or snapshot setup.
 - `train.py --benchmark` runs 100 training batches and exits without test evaluation, TensorBoard, run-directory creation, or snapshot setup. It reports throughput in CNN image patches per second, where one patch is one flattened strip-z image sent through the 2D model.
-- `train.py --profile` runs the same 100-batch benchmark path with per-batch timing rows and a final average milliseconds-per-patch summary. Profiled stages are coordinate generation, coordinate augmentation, base-volume Zarr read/sampling, torch image/value augmentation, forward plus loss, and backward plus optimizer step.
+- `train.py --profile` runs the same 100-batch benchmark path with per-batch timing rows and a final average milliseconds-per-patch summary. Profiled stages are aggregate coordinate generation, descriptor lookup, strip-coordinate cache load, source geometry generation, line-coordinate generation, coordinate augmentation, base-volume Zarr read/sampling, torch image/value augmentation, forward plus loss, and backward plus optimizer step.
 - `train.py --load-only` runs the same 100-batch benchmark loader path and exits without test evaluation, TensorBoard, run-directory creation, snapshots, image/value augmentation, image normalization, supervision building, model forward, backward, or optimizer work. It still performs deterministic sample selection, CP-local source construction, coordinate augmentation, and base-volume sampling so loading bottlenecks can be isolated.
 - Training and training prefetch use the same deterministic pseudo-random CP sample-index sequence: each pass visits all configured CPs once in seeded random order and wraps at dataset end.
 - With `training.max_steps = 0`, training repeats the full training dataset indefinitely.

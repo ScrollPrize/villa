@@ -39,7 +39,9 @@ from vesuvius.neural_tracing.fiber_trace_2d.model import (
     FiberStripDirectionNet,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.train import (
+    _benchmark_stage_totals,
     _draw_predicted_cp_direction,
+    _print_profile_header,
     _select_visualization_patch_indices,
     _should_print_training_step,
     _test_loader_config_from_raw,
@@ -588,6 +590,34 @@ def test_loader_batch_profile_collects_stage_timings(tmp_path: Path) -> None:
         assert profile[key] >= 0.0
 
 
+def test_training_profile_splits_coord_cache_and_line(capsys: pytest.CaptureFixture[str]) -> None:
+    stages = _benchmark_stage_totals(
+        {
+            "descriptor": 1.0,
+            "strip_coord_cache": 2.0,
+            "line_window": 3.0,
+            "lasagna_normals": 4.0,
+            "strip_coords": 5.0,
+            "line_coords": 6.0,
+            "coord_augmentation": 7.0,
+            "volume_sample": 8.0,
+        },
+        {},
+    )
+
+    _print_profile_header()
+    output = capsys.readouterr().out
+
+    assert stages["descriptor"] == 1.0
+    assert stages["coord_cache"] == 2.0
+    assert stages["source_geom"] == 12.0
+    assert stages["line"] == 6.0
+    assert stages["coord_gen"] == 21.0
+    assert "cache" in output
+    assert "source" in output
+    assert "line" in output
+
+
 def test_loader_skips_whole_fiber_with_out_of_volume_control_point(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     bad_fiber = _write_fiber(
@@ -934,6 +964,14 @@ def test_strip_coord_cache_serves_fresh_loader_without_resampling_normals(
         _as_test_numpy(cold_source.grid.valid_mask),
         _as_test_numpy(warm_source.grid.valid_mask),
     )
+    assert np.allclose(
+        _as_test_numpy(cold_source.source_line_xy),
+        _as_test_numpy(warm_source.source_line_xy),
+    )
+    assert np.allclose(
+        _as_test_numpy(cold_source.source_control_point_xy),
+        _as_test_numpy(warm_source.source_control_point_xy),
+    )
 
 
 def _as_test_numpy(value: torch.Tensor) -> np.ndarray:
@@ -970,6 +1008,14 @@ def test_strip_coord_cache_larger_source_satisfies_smaller_request(
     assert np.allclose(
         _as_test_numpy(small_source.grid.coords_zyx),
         _as_test_numpy(large_source.grid.coords_zyx)[2:5, 2:5],
+    )
+    assert np.allclose(
+        _as_test_numpy(small_source.source_line_xy),
+        np.asarray([[0.0, 1.0], [1.0, 1.0], [2.0, 1.0]], dtype=np.float32),
+    )
+    assert np.allclose(
+        _as_test_numpy(small_source.source_control_point_xy),
+        np.asarray([1.0, 1.0], dtype=np.float32),
     )
 
 

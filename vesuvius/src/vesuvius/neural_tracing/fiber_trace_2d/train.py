@@ -198,15 +198,26 @@ def _stage_ms(profile: dict[str, float], key: str) -> float:
 
 
 def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dict[str, float]) -> dict[str, float]:
-    coord_gen = (
-        _stage_ms(loader_profile, "descriptor")
-        + _stage_ms(loader_profile, "line_window")
+    descriptor = _stage_ms(loader_profile, "descriptor")
+    coord_cache = _stage_ms(loader_profile, "strip_coord_cache")
+    source_geom = (
+        _stage_ms(loader_profile, "line_window")
         + _stage_ms(loader_profile, "lasagna_normals")
         + _stage_ms(loader_profile, "strip_coords")
-        + _stage_ms(loader_profile, "line_coords")
+    )
+    line = _stage_ms(loader_profile, "line_coords")
+    coord_gen = (
+        descriptor
+        + coord_cache
+        + source_geom
+        + line
     )
     return {
         "coord_gen": coord_gen,
+        "descriptor": descriptor,
+        "coord_cache": coord_cache,
+        "source_geom": source_geom,
+        "line": line,
         "coord_aug": _stage_ms(loader_profile, "coord_augmentation"),
         "loading": _stage_ms(loader_profile, "volume_sample"),
         "image_aug": _stage_ms(loader_profile, "value_augmentation"),
@@ -218,11 +229,13 @@ def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dic
 def _print_profile_header() -> None:
     print(
         "fiber_trace_2d profile columns: "
-        "batch=batch-index patches=CNN image patches total/coord/coord_aug/load/img_aug/fw/bw_step=ms per patch",
+        "batch=batch-index patches=CNN image patches "
+        "total/coord/desc/cache/source/line/coord_aug/load/img_aug/fw/bw_step=ms per patch",
         flush=True,
     )
     print(
-        f"{'batch':>5} {'patches':>7} {'total':>9} {'coord':>9} {'coord_aug':>9} "
+        f"{'batch':>5} {'patches':>7} {'total':>9} {'coord':>9} {'desc':>9} "
+        f"{'cache':>9} {'source':>9} {'line':>9} {'coord_aug':>9} "
         f"{'load':>9} {'img_aug':>9} {'fw':>9} {'bw_step':>9}",
         flush=True,
     )
@@ -234,6 +247,10 @@ def _print_profile_row(batch_index: int, patch_count: int, elapsed_ms: float, st
         f"{int(batch_index):5d} {int(patch_count):7d} "
         f"{elapsed_ms / denom:9.2f} "
         f"{stages.get('coord_gen', 0.0) / denom:9.2f} "
+        f"{stages.get('descriptor', 0.0) / denom:9.2f} "
+        f"{stages.get('coord_cache', 0.0) / denom:9.2f} "
+        f"{stages.get('source_geom', 0.0) / denom:9.2f} "
+        f"{stages.get('line', 0.0) / denom:9.2f} "
         f"{stages.get('coord_aug', 0.0) / denom:9.2f} "
         f"{stages.get('loading', 0.0) / denom:9.2f} "
         f"{stages.get('image_aug', 0.0) / denom:9.2f} "
@@ -252,7 +269,18 @@ def _print_benchmark_summary(summary: _BenchmarkSummary, *, profile: bool) -> No
     )
     if profile:
         print("fiber_trace_2d profile summary ms_per_patch:", flush=True)
-        for key in ("coord_gen", "coord_aug", "loading", "image_aug", "fw", "bw_step"):
+        for key in (
+            "coord_gen",
+            "descriptor",
+            "coord_cache",
+            "source_geom",
+            "line",
+            "coord_aug",
+            "loading",
+            "image_aug",
+            "fw",
+            "bw_step",
+        ):
             print(f"  {key}={summary.stage_ms_per_patch.get(key, 0.0):.3f}", flush=True)
 
 
@@ -285,7 +313,21 @@ def run_benchmark(
         model.train()
 
     sample_mode = "random"
-    stage_totals = {key: 0.0 for key in ("coord_gen", "coord_aug", "loading", "image_aug", "fw", "bw_step")}
+    stage_totals = {
+        key: 0.0
+        for key in (
+            "coord_gen",
+            "descriptor",
+            "coord_cache",
+            "source_geom",
+            "line",
+            "coord_aug",
+            "loading",
+            "image_aug",
+            "fw",
+            "bw_step",
+        )
+    }
     total_patches = 0
     total_batches = int(batches)
     if profile:

@@ -17,5 +17,3 @@
     - if not yet existing extend the coord aug process so we can move coords fw and bw thorugh the augs
     - then we use that to implement a TTA trace - it should run in the references (unagumented) space but at each step warp the point into all TTA spaces, sample the dir there, warp it back (note the fw/bw warp needs to support warping both coords and orientations!) then in the reference space we use the median dir. note we need try both ambigurous dirs from each TTA sample (and reference) and simply discard all those that go in the other direction relative to the last step (e.g. that are more than +-90 deg off from the last step).
     - lets add a separate med-tta flag that triggers this mode - it should then be visualized as a third columne vs reference only and the flock of traces
-- [ ] faster coord gen: does coord generation and augmentation use cuda? can it use cuda in some parts? can we accelerate it somehow
-- [ ] 

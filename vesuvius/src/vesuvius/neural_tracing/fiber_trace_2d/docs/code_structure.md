@@ -122,7 +122,8 @@ The important behavior is:
 - Optionally caches CP-local source strip coordinates under
   `strip_coord_cache_dir`. Cache hits skip local line-window normal sampling and
   source-grid construction; larger cached source grids are center-cropped for
-  smaller requests.
+  smaller requests. Cached entries also contain source-space line and
+  control-point pixel coordinates for unaugmented patch use.
 - Keeps source grids, strip-z offset grids, geometric coordinate augmentation,
   and transformed line/control-point coordinates as torch tensors until an
   explicit consumer needs NumPy.
@@ -203,9 +204,11 @@ The important behavior is:
   reports throughput as CNN image patches per second, where patches are the
   flattened `[control point, strip-z offset]` images sent through the model.
 - Supports `--profile` on the benchmark path. It prints per-batch rows and a
-  final milliseconds-per-patch summary for coordinate generation, coordinate
-  augmentation, base-volume sampling, torch value augmentation, forward plus
-  loss, and backward plus optimizer step. Loader-side stage timings come from
+  final milliseconds-per-patch summary for aggregate coordinate generation,
+  descriptor lookup, strip-coordinate cache load, source geometry generation,
+  line-coordinate generation, coordinate augmentation, base-volume sampling,
+  torch value augmentation, forward plus loss, and backward plus optimizer step.
+  Loader-side stage timings come from
   the shared `load_batch` / `build_strip_source` / `build_strip_patch_from_source`
   profile hooks, so profiling uses the same sampling path as normal training.
 - Supports `--load-only` on the benchmark path. It still performs deterministic
@@ -317,8 +320,13 @@ Training benchmark/profile:
   `patches_per_second` summary.
 - `--profile` implies the same 100-batch benchmark work and additionally prints
   table rows with milliseconds per CNN patch for:
-  - `coord`: descriptor lookup, CP-local line window, Lasagna normals, strip
-    coordinate grid, and transformed line/control-point coordinates;
+  - `coord`: aggregate descriptor, cache, source geometry, and line-coordinate
+    work;
+  - `desc`: deterministic sample descriptor lookup;
+  - `cache`: strip-coordinate cache lookup/load;
+  - `source`: uncached CP-local line window, Lasagna normals, and strip
+    coordinate grid generation;
+  - `line`: transformed line/control-point coordinates;
   - `coord_aug`: coordinate-space geometric augmentation;
   - `load`: base-volume Zarr/VC3D coordinate sampling;
   - `img_aug`: torch image/value augmentation;
