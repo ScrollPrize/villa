@@ -138,6 +138,13 @@ without reducing download concurrency. `prefetch_workers` controls chunk
 download workers; `prefetch_sampler_workers` controls the producer threads that
 build CP-local source strips and collect chunk dependencies.
 
+`strip_coord_cache_dir` enables a separate CP-local source-coordinate cache.
+This is not the remote Zarr chunk cache. It stores the torch-vectorized source
+strip coordinates before strip-z offsets, image sampling, and augmentations, and
+is used by training, augment-vis, line/dir visualizations, and prefetch through
+the shared loader source path. Larger cached source strips satisfy smaller
+source-size requests by center-cropping.
+
 ## Focused Test Command
 
 ```bash

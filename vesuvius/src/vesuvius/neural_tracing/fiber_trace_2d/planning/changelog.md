@@ -2,6 +2,7 @@
 
 ## 2026-07-10
 
+- Added configurable CP-local strip-coordinate caching shared by training, visualization, and prefetch source-grid construction.
 - Kept 2D fiber-strip source grids, strip-z offsets, coordinate augmentation, and line/control-point transforms torch-native until explicit VC3D/export NumPy boundaries.
 - Added opt-in `--med-tta` runner line tracing that uses per-step median directions across reference and fixed TTA direction fields.
 - Added 100-batch `train.py --benchmark`, `--profile`, and `--load-only` modes for patch-throughput, per-stage timing, and loader-only diagnostics.

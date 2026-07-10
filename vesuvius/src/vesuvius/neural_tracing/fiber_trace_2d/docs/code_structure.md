@@ -119,6 +119,10 @@ The important behavior is:
 - Builds one CP-local source strip with the torch-vectorized augment-vis path,
   then derives all configured strip-z offsets from that source using the stored
   strip offset axis.
+- Optionally caches CP-local source strip coordinates under
+  `strip_coord_cache_dir`. Cache hits skip local line-window normal sampling and
+  source-grid construction; larger cached source grids are center-cropped for
+  smaller requests.
 - Keeps source grids, strip-z offset grids, geometric coordinate augmentation,
   and transformed line/control-point coordinates as torch tensors until an
   explicit consumer needs NumPy.
@@ -247,6 +251,8 @@ Top-level keys used by `load_config`:
 - `volume_cache_dir`: optional cache directory for remote volume chunks.
 - `volume_cache_offline`: passed to the Vesuvius Zarr cache opener.
 - `volume_cache_retry_seconds`: passed to the Vesuvius Zarr cache opener.
+- `strip_coord_cache_dir`: optional disk cache for CP-local source strip
+  coordinates. It is separate from the base-volume chunk cache.
 - `augment_*`: parsed into `FiberStripAugmentConfig`.
 - `training`: optional object used by `train.py`; ignored by the loader/debug
   runner config parser.

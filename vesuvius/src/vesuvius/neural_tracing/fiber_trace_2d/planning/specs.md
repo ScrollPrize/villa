@@ -27,6 +27,24 @@
   `augment_device: "auto"` uses CUDA when available. Prefetch dependency
   generation is the exception and stays CPU-pinned.
 - The loader builds CP-local source geometry once per selected control point and reuses it across augmentation variants or strip-z offsets as appropriate.
+- When `strip_coord_cache_dir` is configured, CP-local source geometry is cached
+  before strip-z offsets, coordinate augmentation, image sampling, or value
+  augmentation are applied. Training, augment-vis, runner center/line/dir
+  visualizations, and prefetch all use this cache through the shared
+  source-strip path.
+- Strip-coordinate cache identity is based on the base-volume path, selected
+  scale and pixel spacing, strip-z offset step/center, control-point 3D
+  coordinate, and fiber-line identity. The requested source size is stored in
+  entry metadata rather than isolated into incompatible files so larger source
+  entries can satisfy smaller later requests for the same identity.
+- A strip-coordinate cache entry with height and width greater than or equal to
+  the requested source size is a hit. The loader center-crops the cached source
+  grid to the requested size. If a larger source is generated later, it
+  atomically replaces the previous smaller entry.
+- Strip-coordinate cache writes use unique temporary files in the cache
+  directory followed by atomic rename. Corrupt or incompatible entries are
+  treated as misses and regenerated through the normal Lasagna/strip-coordinate
+  path.
 - Image loading samples base-volume Zarr values from explicit coordinates.
 - Training/export coordinate sampling uses the VC3D blocking coordinate sampler: required chunks are collected and fetched/decoded before sampling, so a cold cache miss must not become an invalid output pixel.
 - Interactive/progressive VC3D `tryGetChunk` semantics are not acceptable for this loader path because they can queue I/O and return an all-invalid first sample.
@@ -35,7 +53,7 @@
 - The loader must not use the existing neural-tracing crop-loading path for image loading.
 - Training's multiple strip-z offsets are derived from one CP-local source geometry by offsetting along the strip normal/frame direction, not by rebuilding a separate coordinate-generation path.
 - Dataset and loader settings are specified in Vesuvius-style JSON.
-- Config keys include `datasets`, `batch_size`, `patch_shape_hw`, `strip_z_offset_count`, `strip_z_offset_step`, `seed`, `prefetch_workers`, `prefetch_sampler_workers`, and optional cache settings.
+- Config keys include `datasets`, `batch_size`, `patch_shape_hw`, `strip_z_offset_count`, `strip_z_offset_step`, `seed`, `prefetch_workers`, `prefetch_sampler_workers`, `volume_cache_dir`, optional `strip_coord_cache_dir`, and optional cache settings.
 - Augmentation config keys include `augment_enabled`, `augment_device`, `augment_seed`, `augment_shift_x`, `augment_shift_y`, `augment_rotation_degrees`, `augment_shear_x`, `augment_shear_y`, `augment_scale_min`, `augment_scale_max`, `augment_smooth_offset`, `augment_smooth_offset_stride`, `augment_brightness`, `augment_contrast_min`, `augment_contrast_max`, `augment_gamma_min`, `augment_gamma_max`, `augment_noise_std`, and `augment_blur_sigma`.
 - Default augmentation extrema are `+-patch_width/4` px horizontal offset, `+-patch_height/4` px vertical offset, `+-180` degree rotation, `+-1` px/px shear, `sqrt(0.5)x..sqrt(2.0)x` scale, smooth curve offset up to `+-8` px with 16 px control stride, `+-0.25` valid-range brightness offset, `0.5x..2.0x` contrast around the valid patch center, `0.5..2.0` gamma, valid-range-relative noise std up to `0.125`, and Gaussian blur sigma up to `2.0`.
 - Geometric strip augmentations operate on strip coordinates before image sampling.

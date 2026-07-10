@@ -538,6 +538,17 @@ def test_config_prefetch_sampler_workers_is_separate_from_download_workers(tmp_p
     assert parsed.prefetch_sampler_workers == 3
 
 
+def test_config_parses_strip_coord_cache_dir(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["strip_coord_cache_dir"] = "coord-cache"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    parsed = load_config(config_path)
+
+    assert parsed.strip_coord_cache_dir == str((tmp_path / "coord-cache").resolve())
+
+
 def test_config_and_loader_batch_shape(tmp_path: Path) -> None:
     config = load_config(_write_config(tmp_path, batch_size=2))
     loader = _make_loader(config)
@@ -888,6 +899,78 @@ def test_augment_center_patch_loads_one_zarr_sample(
     assert image.shape == (3, 3)
     assert valid.shape == (3, 3)
     assert sample.strip_z_offset == 0.0
+
+
+def test_strip_coord_cache_serves_fresh_loader_without_resampling_normals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["strip_coord_cache_dir"] = str(tmp_path / "coord-cache")
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    config = load_config(config_path)
+    first_loader = _make_loader(config)
+
+    cold_source = first_loader.build_strip_source(0, device=torch.device("cpu"))
+
+    cache_files = sorted((tmp_path / "coord-cache").glob("*/*.npz"))
+    assert len(cache_files) == 1
+
+    warm_loader = _make_loader(config)
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("Lasagna normals should not be sampled on strip coordinate cache hit")
+
+    monkeypatch.setattr(warm_loader, "_lasagna_normals_for_line_window", forbidden)
+
+    warm_source = warm_loader.build_strip_source(0, device=torch.device("cpu"))
+
+    assert np.allclose(
+        _as_test_numpy(cold_source.grid.coords_zyx),
+        _as_test_numpy(warm_source.grid.coords_zyx),
+    )
+    assert np.array_equal(
+        _as_test_numpy(cold_source.grid.valid_mask),
+        _as_test_numpy(warm_source.grid.valid_mask),
+    )
+
+
+def _as_test_numpy(value: torch.Tensor) -> np.ndarray:
+    return value.detach().cpu().numpy()
+
+
+def test_strip_coord_cache_larger_source_satisfies_smaller_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["strip_coord_cache_dir"] = str(tmp_path / "coord-cache")
+    raw["patch_shape_hw"] = [7, 7]
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    large_config = load_config(config_path)
+    large_loader = _make_loader(large_config)
+    large_source = large_loader.build_strip_source(0, device=torch.device("cpu"))
+    assert large_source.grid.coords_zyx.shape[:2] == (7, 7)
+
+    raw["patch_shape_hw"] = [3, 3]
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    small_config = load_config(config_path)
+    small_loader = _make_loader(small_config)
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("smaller strip source should be served from larger cached entry")
+
+    monkeypatch.setattr(small_loader, "_lasagna_normals_for_line_window", forbidden)
+
+    small_source = small_loader.build_strip_source(0, device=torch.device("cpu"))
+
+    assert small_source.grid.coords_zyx.shape[:2] == (3, 3)
+    assert np.allclose(
+        _as_test_numpy(small_source.grid.coords_zyx),
+        _as_test_numpy(large_source.grid.coords_zyx)[2:5, 2:5],
+    )
 
 
 def test_augmented_center_patch_loads_one_zarr_sample(

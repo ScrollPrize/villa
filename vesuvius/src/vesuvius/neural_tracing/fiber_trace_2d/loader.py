@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import math
 import os
@@ -72,6 +73,7 @@ class FiberStrip2DConfig:
     volume_cache_dir: str | None = None
     volume_cache_offline: bool = False
     volume_cache_retry_seconds: float = 0.0
+    strip_coord_cache_dir: str | None = None
     augment: FiberStripAugmentConfig = FiberStripAugmentConfig()
     config_dir: Path | None = None
 
@@ -110,6 +112,7 @@ class _Record:
     volume_path: str
     volume_scale: int
     volume_spacing_base: float
+    fiber_identity: str
     sampler: CoordinateSampler
     grad_mag: Any
     grad_mag_spacing_base: float
@@ -200,6 +203,7 @@ def load_config(path: str | Path) -> FiberStrip2DConfig:
     if "strip_z_offsets" in raw:
         raise ValueError("strip_z_offsets was removed; use strip_z_offset_count and strip_z_offset_step")
     cache_dir = raw.get("volume_cache_dir")
+    strip_coord_cache_dir = raw.get("strip_coord_cache_dir")
     return FiberStrip2DConfig(
         datasets=tuple(dict(entry) for entry in datasets),
         batch_size=int(raw.get("batch_size", 1)),
@@ -212,6 +216,11 @@ def load_config(path: str | Path) -> FiberStrip2DConfig:
         volume_cache_dir=None if cache_dir is None else str(cache_dir),
         volume_cache_offline=bool(raw.get("volume_cache_offline", False)),
         volume_cache_retry_seconds=float(raw.get("volume_cache_retry_seconds", 0.0)),
+        strip_coord_cache_dir=(
+            None
+            if strip_coord_cache_dir is None
+            else _resolve_path(strip_coord_cache_dir, config_path.parent)
+        ),
         augment=augment_config_from_mapping(raw),
         config_dir=config_path.parent,
     )
@@ -225,6 +234,22 @@ def _stable_seed(*parts: Any) -> int:
         digest.update(str(part).encode("utf-8"))
         digest.update(b"\0")
     return int.from_bytes(digest.digest(), "little", signed=False)
+
+
+def _stable_digest(*parts: Any, digest_size: int = 24) -> str:
+    digest = hashlib.blake2b(digest_size=digest_size)
+    for part in parts:
+        if isinstance(part, bytes):
+            payload = part
+        else:
+            payload = str(part).encode("utf-8")
+        digest.update(payload)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _round_json_array(value: np.ndarray, *, decimals: int = 6) -> str:
+    return json.dumps(np.round(np.asarray(value, dtype=np.float64), decimals).tolist(), separators=(",", ":"))
 
 
 def _resolve_fiber_paths(dataset_config: dict[str, Any], config: FiberStrip2DConfig) -> list[Path]:
@@ -676,6 +701,11 @@ class FiberStrip2DLoader:
             )
             for fiber_path in _resolve_fiber_paths(dataset_config, self.config):
                 fiber = load_vc3d_fiber(fiber_path)
+                fiber_identity = _stable_digest(
+                    "fiber",
+                    str(fiber_path),
+                    _round_json_array(np.asarray(fiber.line_points_xyz, dtype=np.float64)),
+                )
                 bad_control = _first_out_of_bounds_control_point(fiber, base_shape_zyx)
                 if bad_control is not None:
                     bad_index, bad_zyx = bad_control
@@ -694,6 +724,7 @@ class FiberStrip2DLoader:
                         volume_path=volume_path,
                         volume_scale=volume_scale,
                         volume_spacing_base=volume_spacing_base,
+                        fiber_identity=fiber_identity,
                         sampler=sampler,
                         grad_mag=grad_mag,
                         grad_mag_spacing_base=grad_mag_spacing_base,
@@ -1029,6 +1060,130 @@ class FiberStrip2DLoader:
             int(self.config.patch_shape_hw[1]) + 2 * pad.x,
         )
 
+    def _strip_coord_cache_path(
+        self,
+        record: _Record,
+        *,
+        control_point_index: int,
+        center_offset: float,
+    ) -> Path | None:
+        if self.config.strip_coord_cache_dir is None:
+            return None
+        cp_xyz = np.asarray(record.fiber.control_points_xyz[control_point_index], dtype=np.float64)
+        family_key = _stable_digest(
+            "fiber_strip_2d_source_v1",
+            record.volume_path,
+            record.volume_scale,
+            f"{record.volume_spacing_base:.12g}",
+            f"{float(center_offset):.12g}",
+            f"{float(self.config.strip_z_offset_step):.12g}",
+            record.fiber_identity,
+            control_point_index,
+            _round_json_array(cp_xyz),
+        )
+        root = Path(self.config.strip_coord_cache_dir)
+        return root / family_key[:2] / f"{family_key}.npz"
+
+    @staticmethod
+    def _crop_cached_grid(grid: FiberStripGridTorch, cached_shape_hw: tuple[int, int], shape_hw: tuple[int, int]) -> FiberStripGridTorch:
+        cached_h, cached_w = (int(v) for v in cached_shape_hw)
+        height, width = (int(v) for v in shape_hw)
+        if cached_h < height or cached_w < width:
+            raise ValueError("cached source shape is smaller than requested source shape")
+        y0 = (cached_h - height) // 2
+        x0 = (cached_w - width) // 2
+        y1 = y0 + height
+        x1 = x0 + width
+
+        def crop_tensor(value: torch.Tensor | None) -> torch.Tensor | None:
+            if value is None:
+                return None
+            return value[y0:y1, x0:x1].contiguous()
+
+        return FiberStripGridTorch(
+            coords_xyz=crop_tensor(grid.coords_xyz),
+            coords_zyx=crop_tensor(grid.coords_zyx),
+            valid_mask=crop_tensor(grid.valid_mask),
+            frame=grid.frame,
+            offset_axis_xyz=crop_tensor(grid.offset_axis_xyz),
+            offset_axis_zyx=crop_tensor(grid.offset_axis_zyx),
+        )
+
+    def _load_strip_coord_cache(
+        self,
+        path: Path | None,
+        *,
+        source_shape_hw: tuple[int, int],
+        device: torch.device,
+        center_offset: float,
+    ) -> FiberStripGridTorch | None:
+        if path is None or not path.is_file():
+            return None
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                if str(data["version"].item()) != "fiber_strip_2d_source_v1":
+                    return None
+                cached_shape = tuple(int(v) for v in data["source_shape_hw"].tolist())
+                if cached_shape[0] < int(source_shape_hw[0]) or cached_shape[1] < int(source_shape_hw[1]):
+                    return None
+                if abs(float(data["center_offset"].item()) - float(center_offset)) > 1.0e-6:
+                    return None
+                frame = FiberStripFrame(
+                    tangent_xyz=np.asarray(data["frame_tangent_xyz"], dtype=np.float32),
+                    side_xyz=np.asarray(data["frame_side_xyz"], dtype=np.float32),
+                    mesh_normal_xyz=np.asarray(data["frame_mesh_normal_xyz"], dtype=np.float32),
+                )
+                grid = FiberStripGridTorch(
+                    coords_xyz=torch.as_tensor(np.asarray(data["coords_xyz"], dtype=np.float32), device=device),
+                    coords_zyx=torch.as_tensor(np.asarray(data["coords_zyx"], dtype=np.float32), device=device),
+                    valid_mask=torch.as_tensor(np.asarray(data["valid_mask"], dtype=bool), device=device),
+                    frame=frame,
+                    offset_axis_xyz=torch.as_tensor(np.asarray(data["offset_axis_xyz"], dtype=np.float32), device=device),
+                    offset_axis_zyx=torch.as_tensor(np.asarray(data["offset_axis_zyx"], dtype=np.float32), device=device),
+                )
+        except Exception:
+            return None
+        return self._crop_cached_grid(grid, cached_shape, source_shape_hw)
+
+    def _store_strip_coord_cache(
+        self,
+        path: Path | None,
+        grid: FiberStripGridTorch,
+        *,
+        source_shape_hw: tuple[int, int],
+        center_offset: float,
+    ) -> None:
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+        frame = grid.frame
+        try:
+            with tmp.open("wb") as handle:
+                np.savez(
+                    handle,
+                    version=np.asarray("fiber_strip_2d_source_v1"),
+                    source_shape_hw=np.asarray(source_shape_hw, dtype=np.int64),
+                    center_offset=np.asarray(float(center_offset), dtype=np.float64),
+                    coords_xyz=_as_numpy_float32(grid.coords_xyz),
+                    coords_zyx=_as_numpy_float32(grid.coords_zyx),
+                    valid_mask=_as_numpy_bool(grid.valid_mask),
+                    offset_axis_xyz=_as_numpy_float32(grid.offset_axis_xyz),
+                    offset_axis_zyx=_as_numpy_float32(grid.offset_axis_zyx),
+                    frame_tangent_xyz=np.asarray(frame.tangent_xyz, dtype=np.float32),
+                    frame_side_xyz=np.asarray(frame.side_xyz, dtype=np.float32),
+                    frame_mesh_normal_xyz=np.asarray(frame.mesh_normal_xyz, dtype=np.float32),
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
     def build_strip_source(
         self,
         sample_index: int,
@@ -1054,6 +1209,32 @@ class FiberStrip2DLoader:
                 flush=True,
             )
             print(f"{debug_label} line_window start", flush=True)
+        cache_path = self._strip_coord_cache_path(
+            record,
+            control_point_index=cp_index,
+            center_offset=float(center_offset),
+        )
+        with _ProfileBlock(profile, "strip_coord_cache"):
+            cached_grid = self._load_strip_coord_cache(
+                cache_path,
+                source_shape_hw=source_shape_hw,
+                device=device,
+                center_offset=float(center_offset),
+            )
+        if cached_grid is not None:
+            if debug_label is not None:
+                print(
+                    f"{debug_label} strip_coord_cache hit valid={int(torch.count_nonzero(cached_grid.valid_mask).item())}",
+                    flush=True,
+                )
+            return _StripSource(
+                record=record,
+                record_index=record_index,
+                control_point_index=cp_index,
+                center_offset=float(center_offset),
+                source_shape_hw=source_shape_hw,
+                grid=cached_grid,
+            )
         with _ProfileBlock(profile, "line_window"):
             line_window = self._line_window_for_patch(
                 record,
@@ -1085,6 +1266,12 @@ class FiberStrip2DLoader:
                 pixel_spacing_base=record.volume_spacing_base,
                 device=device,
             )
+        self._store_strip_coord_cache(
+            cache_path,
+            grid,
+            source_shape_hw=source_shape_hw,
+            center_offset=float(center_offset),
+        )
         if debug_label is not None:
             print(
                 f"{debug_label} strip_coords done valid={int(torch.count_nonzero(grid.valid_mask).item())}",

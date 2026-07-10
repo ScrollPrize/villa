@@ -5,7 +5,7 @@
     - then add --profile which should measure timings by stage: coord gen, coord aug, loading (zarr read/sampling), image augs, fw, bw+step
     - should output summary after running the 100 batches on the time each stage takes avg pe sample
     - also output per sample the values (print table-like so its easy to read)
-- [ ] cache strip coord
+- [x] cache strip coord
     - add a separate cache (with it own config key) that caches the strip patch coords around cps
     - the cache should key by cps 3d coordiante + size-scale-step-/zarr-remote-path
     - if the patch size is changed that should still be counted as a hit if the cache entry has a >= patch size
