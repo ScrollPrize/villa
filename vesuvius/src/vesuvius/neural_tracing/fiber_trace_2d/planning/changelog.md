@@ -2,6 +2,8 @@
 
 ## 2026-07-10
 
+- Added CUDA training batch pipelining with bounded deterministic whole-batch
+  futures, deferred torch value augmentation, and profile wait timing.
 - Removed avoidable warm-path loader threading overhead by prewarming cached
   deterministic random pass orders and reusing a persistent CP worker executor
   across `load_batch` calls.

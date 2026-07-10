@@ -41,6 +41,8 @@
     "test_start_sample_index": 0,
     "control_points_per_step": 4,
     "device": "auto",
+    "pipeline_enabled": true,
+    "pipeline_depth": 2,
     "tensorboard_enabled": true,
     "model_hidden_channels": 64,
     "model_depth": 10

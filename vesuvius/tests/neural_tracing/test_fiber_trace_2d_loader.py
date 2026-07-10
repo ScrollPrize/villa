@@ -49,8 +49,10 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _print_profile_header,
     _select_visualization_patch_indices,
     _should_print_training_step,
+    _TrainingBatchPipeline,
     _test_loader_config_from_raw,
     _training_config_from_raw,
+    FiberStripTrainingConfig,
     prefetch_training,
     run_benchmark,
     run_training,
@@ -1409,6 +1411,56 @@ def test_build_sample_uses_batched_line_lookup_for_augmented_offsets(
     assert images.shape[0] == len(loader.strip_z_offsets)
     assert coords.shape[0] == len(loader.strip_z_offsets)
     assert valids.shape[0] == len(loader.strip_z_offsets)
+
+
+def test_deferred_batch_image_augmentation_matches_inline_batch(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loader = _make_loader(load_config(config_path))
+    inline = loader.load_batch(0, batch_size=1, sample_mode="flat", apply_image_augmentation=True)
+    deferred_base = loader.load_batch(0, batch_size=1, sample_mode="flat", apply_image_augmentation=False)
+    deferred = loader.apply_batch_image_augmentation(deferred_base)
+
+    assert len(deferred_base.augmentation_params) == deferred_base.images.shape[0] * deferred_base.images.shape[1]
+    np.testing.assert_allclose(deferred.images, inline.images)
+    np.testing.assert_array_equal(deferred.valid_mask, inline.valid_mask)
+
+
+def test_training_batch_pipeline_preserves_step_sample_order() -> None:
+    class FakeLoader:
+        def __init__(self) -> None:
+            self.starts: list[int] = []
+
+        def load_batch(self, start_sample_index: int, **kwargs):
+            self.starts.append(int(start_sample_index))
+            return SimpleNamespace(start=int(start_sample_index))
+
+    training = FiberStripTrainingConfig(
+        train_control_points_per_step=2,
+        max_sample_index=0,
+        pipeline_depth=3,
+    )
+    loader = FakeLoader()
+    with _TrainingBatchPipeline(
+        loader,  # type: ignore[arg-type]
+        training,
+        sample_mode="random",
+        start_step=1,
+        max_step=3,
+        profile_enabled=False,
+        apply_image_augmentation=False,
+    ) as pipeline:
+        first, _ = pipeline.next()
+        second, _ = pipeline.next()
+        third, _ = pipeline.next()
+
+    assert [first.raw_start_sample_index, second.raw_start_sample_index, third.raw_start_sample_index] == [0, 2, 4]
+    assert [first.batch.start, second.batch.start, third.batch.start] == [0, 2, 4]
+    assert loader.starts == [0, 2, 4]
 
 
 def test_identity_equivalent_augment_vis_entries_match(tmp_path: Path) -> None:

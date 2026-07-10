@@ -237,8 +237,8 @@ The important behavior is:
   final milliseconds-per-patch summary for aggregate coordinate generation,
   descriptor lookup, strip-coordinate cache load, source geometry generation,
   line-coordinate generation, coordinate augmentation, base-volume sampling,
-  torch value augmentation, forward plus loss, and backward plus optimizer step.
-  Loader-side stage timings come from
+  torch value augmentation, pipeline wait time, forward plus loss, and backward
+  plus optimizer step. Loader-side stage timings come from
   the shared `load_batch` / `build_strip_source` / `build_strip_patch_from_source`
   profile hooks, so profiling uses the same sampling path as normal training.
 - Supports `--load-only` on the benchmark path. It still performs deterministic
@@ -249,6 +249,17 @@ The important behavior is:
   model.
 - Computes direction targets from transformed line coordinates after geometric
   augmentation.
+- On CUDA training runs, uses a bounded deterministic whole-batch pipeline when
+  `training.pipeline_enabled` is true. The producer calls the same
+  `FiberStrip2DLoader.load_batch` path with image/value augmentation deferred;
+  the main thread consumes batches strictly by training step, applies the
+  existing torch value augmentation, normalizes, and runs forward/backward.
+  Coordinate generation and geometric coordinate augmentation remain on the
+  configured `augment_device`.
+- The pipeline uses one whole-batch producer because each `load_batch` already
+  parallelizes CP samples with `loader_workers` and owns one cache-trace scope.
+  `training.pipeline_depth` controls queued future batches, not concurrent
+  `load_batch` calls.
 - Logs scalars/images to TensorBoard and writes `current.pt` / `best.pt`
   snapshots under the run directory.
 - When `test_datasets` is configured, evaluates a fixed deterministic held-out
@@ -319,6 +330,10 @@ Training keys:
 - `control_points_per_step`: deterministic CP samples per step; default `4`.
 - `device`: `auto`, `cpu`, or a torch device string.
 - `tensorboard_enabled`: set false for smoke tests without TensorBoard.
+- `pipeline_enabled`: enables CUDA training batch pipelining; default `true`.
+  CPU training keeps the synchronous path.
+- `pipeline_depth`: queued whole-batch futures for the CUDA training pipeline;
+  default `2`.
 - `model_hidden_channels` and `model_depth`: V0 ResNet size knobs. Defaults
   are 64 hidden channels and 10 residual blocks.
 

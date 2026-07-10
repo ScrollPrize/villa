@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -111,6 +111,7 @@ class FiberStrip2DBatch:
     fiber_paths: tuple[str, ...]
     samples: tuple[FiberStripSample, ...]
     cache_stats: Any | None = None
+    augmentation_params: tuple[FiberStripAugmentParams | None, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1745,7 +1746,13 @@ class FiberStrip2DLoader:
         *,
         apply_image_augmentation: bool,
         profile: dict[str, float] | None = None,
-    ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[
+        list[FiberStripSample],
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        tuple[FiberStripAugmentParams | None, ...],
+    ]:
         device = resolve_torch_device(self.config.augment.device)
         source = prepared.source
         coords_zyx_np = np.asarray(prepared.coords_zyx, dtype=np.float32)
@@ -1808,16 +1815,23 @@ class FiberStrip2DLoader:
             np.stack(images, axis=0),
             coords_zyx_np,
             np.stack(valids, axis=0),
+            tuple(prepared.params_by_offset),
         )
 
-    def build_sample(
+    def _build_sample_with_params(
         self,
         sample_index: int,
         *,
         sample_mode: str = "random",
         profile: dict[str, float] | None = None,
         apply_image_augmentation: bool = True,
-    ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[
+        list[FiberStripSample],
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        tuple[FiberStripAugmentParams | None, ...],
+    ]:
         prepared = self._prepare_sample(sample_index, sample_mode=sample_mode, profile=profile)
         with _ProfileBlock(profile, "volume_sample"):
             result = prepared.source.record.sampler.sample_coord_batch(prepared.coords_zyx, prepared.valid_mask)
@@ -1834,6 +1848,69 @@ class FiberStrip2DLoader:
             apply_image_augmentation=apply_image_augmentation,
             profile=profile,
         )
+
+    def build_sample(
+        self,
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        profile: dict[str, float] | None = None,
+        apply_image_augmentation: bool = True,
+    ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
+        samples, images, coords, valids, _ = self._build_sample_with_params(
+            sample_index,
+            sample_mode=sample_mode,
+            profile=profile,
+            apply_image_augmentation=apply_image_augmentation,
+        )
+        return samples, images, coords, valids
+
+    def apply_batch_image_augmentation(
+        self,
+        batch: FiberStrip2DBatch,
+        *,
+        profile: dict[str, float] | None = None,
+    ) -> FiberStrip2DBatch:
+        if not self.config.augment.enabled:
+            return batch
+        images_np = np.asarray(batch.images, dtype=np.float32)
+        valids_np = np.asarray(batch.valid_mask, dtype=bool)
+        if images_np.ndim != 5 or images_np.shape[2] != 1:
+            raise ValueError("batch.images must have shape B,Z,1,H,W")
+        expected_valid_shape = (images_np.shape[0], images_np.shape[1], images_np.shape[3], images_np.shape[4])
+        if valids_np.shape != expected_valid_shape:
+            raise ValueError("batch.valid_mask shape must match batch.images")
+        flat_count = int(images_np.shape[0]) * int(images_np.shape[1])
+        params = tuple(batch.augmentation_params)
+        if len(params) != flat_count:
+            raise ValueError(
+                "batch does not carry image augmentation parameters: "
+                f"params={len(params)} expected={flat_count}"
+            )
+        if all(param is None for param in params):
+            return batch
+        value_params = [value_only_params(param) for param in params if param is not None]
+        if len(value_params) != flat_count:
+            raise ValueError("partially missing image augmentation parameters in batch")
+
+        flat_images = images_np.reshape(flat_count, int(images_np.shape[3]), int(images_np.shape[4]))
+        flat_valids = valids_np.reshape(flat_count, int(valids_np.shape[2]), int(valids_np.shape[3]))
+        device = resolve_torch_device(self.config.augment.device)
+        value_aug_before = 0.0 if profile is None else profile.get("value_aug_batch", 0.0)
+        with _ProfileBlock(profile, "value_aug_batch", device):
+            image_t, valid_t = apply_value_augmentation_batch(
+                flat_images,
+                flat_valids,
+                value_params,
+                device=device,
+            )
+            images = image_t.cpu().numpy().astype(np.float32).reshape(images_np.shape)
+            valids = valid_t.cpu().numpy().astype(bool).reshape(valids_np.shape)
+        if profile is not None:
+            profile["value_augmentation"] = profile.get("value_augmentation", 0.0) + (
+                profile.get("value_aug_batch", 0.0) - value_aug_before
+            )
+        return replace(batch, images=images, valid_mask=valids)
 
     def build_center_strip_patch(
         self,
@@ -1912,6 +1989,7 @@ class FiberStrip2DLoader:
         record_indices: list[int] = []
         cp_indices: list[int] = []
         fiber_paths: list[str] = []
+        augmentation_params: list[FiberStripAugmentParams | None] = []
         batch_wall_start = time.perf_counter()
 
         def report_skip(current_sample_index: int, exc: ValueError) -> None:
@@ -1932,14 +2010,20 @@ class FiberStrip2DLoader:
             int,
             int,
             dict[str, float],
-            tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray] | None,
+            tuple[
+                list[FiberStripSample],
+                np.ndarray,
+                np.ndarray,
+                np.ndarray,
+                tuple[FiberStripAugmentParams | None, ...],
+            ] | None,
             ValueError | None,
         ]:
             current_sample_index = self._bounded_sample_index(raw_sample_index, sample_index_limit)
             local_profile: dict[str, float] = {} if profile is not None else {}
             worker_start = time.perf_counter()
             try:
-                result = self.build_sample(
+                result = self._build_sample_with_params(
                     current_sample_index,
                     sample_mode=sample_mode,
                     profile=local_profile if profile is not None else None,
@@ -1971,7 +2055,13 @@ class FiberStrip2DLoader:
             def consume_result(
                 current_sample_index: int,
                 local_profile: dict[str, float],
-                result: tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray] | None,
+                result: tuple[
+                    list[FiberStripSample],
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                    tuple[FiberStripAugmentParams | None, ...],
+                ] | None,
                 skip_exc: ValueError | None,
             ) -> None:
                 if skip_exc is not None:
@@ -1986,6 +2076,7 @@ class FiberStrip2DLoader:
                     sample_images,
                     sample_coords,
                     sample_valids,
+                    sample_params,
                 ) = result
                 first = sample_records[0]
                 all_samples.extend(sample_records)
@@ -1995,6 +2086,7 @@ class FiberStrip2DLoader:
                 record_indices.append(first.record_index)
                 cp_indices.append(first.control_point_index)
                 fiber_paths.append(first.fiber_path)
+                augmentation_params.extend(sample_params)
 
             if worker_count == 1:
                 while len(images) < batch_size and attempts < max_attempts:
@@ -2018,7 +2110,13 @@ class FiberStrip2DLoader:
                     tuple[
                         int,
                         dict[str, float],
-                        tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray] | None,
+                        tuple[
+                            list[FiberStripSample],
+                            np.ndarray,
+                            np.ndarray,
+                            np.ndarray,
+                            tuple[FiberStripAugmentParams | None, ...],
+                        ] | None,
                         ValueError | None,
                     ],
                 ] = {}
@@ -2088,6 +2186,7 @@ class FiberStrip2DLoader:
             fiber_paths=tuple(fiber_paths),
             samples=tuple(all_samples),
             cache_stats=cache_stats,
+            augmentation_params=tuple(augmentation_params),
         )
 
     def chunk_requests_for_sample_index(

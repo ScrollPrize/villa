@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +47,8 @@ class FiberStripTrainingConfig:
     tensorboard_enabled: bool = True
     model_hidden_channels: int = 64
     model_depth: int = 10
+    pipeline_enabled: bool = True
+    pipeline_depth: int = 2
 
 
 def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
@@ -75,6 +78,8 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         tensorboard_enabled=bool(get("tensorboard_enabled", True)),
         model_hidden_channels=max(1, int(get("model_hidden_channels", 64))),
         model_depth=max(1, int(get("model_depth", 10))),
+        pipeline_enabled=bool(get("pipeline_enabled", True)),
+        pipeline_depth=max(1, int(get("pipeline_depth", 2))),
     )
     if config.max_steps < 0:
         raise ValueError("training.max_steps must be >= 0")
@@ -172,6 +177,129 @@ class _BenchmarkSummary:
     stage_ms_per_patch: dict[str, float]
 
 
+@dataclass(frozen=True)
+class _LoadedTrainingBatch:
+    step: int
+    raw_start_sample_index: int
+    batch: FiberStrip2DBatch
+    profile: dict[str, float]
+    load_ms: float
+
+
+def _training_raw_start_sample_index(step: int, training: FiberStripTrainingConfig) -> int:
+    return (int(step) - 1) * int(training.train_control_points_per_step)
+
+
+def _load_training_batch(
+    loader: FiberStrip2DLoader,
+    training: FiberStripTrainingConfig,
+    *,
+    step: int,
+    sample_mode: str,
+    profile_enabled: bool,
+    apply_image_augmentation: bool,
+) -> _LoadedTrainingBatch:
+    raw_start_sample_index = _training_raw_start_sample_index(step, training)
+    loader_profile: dict[str, float] = {}
+    t0 = time.perf_counter()
+    batch = loader.load_batch(
+        raw_start_sample_index,
+        batch_size=training.train_control_points_per_step,
+        sample_mode=sample_mode,
+        sample_index_limit=training.max_sample_index,
+        profile=loader_profile if profile_enabled else None,
+        apply_image_augmentation=apply_image_augmentation,
+    )
+    load_ms = (time.perf_counter() - t0) * 1000.0
+    return _LoadedTrainingBatch(
+        step=int(step),
+        raw_start_sample_index=raw_start_sample_index,
+        batch=batch,
+        profile=loader_profile,
+        load_ms=load_ms,
+    )
+
+
+class _TrainingBatchPipeline:
+    def __init__(
+        self,
+        loader: FiberStrip2DLoader,
+        training: FiberStripTrainingConfig,
+        *,
+        sample_mode: str,
+        start_step: int,
+        max_step: int | None,
+        profile_enabled: bool,
+        apply_image_augmentation: bool,
+    ) -> None:
+        self.loader = loader
+        self.training = training
+        self.sample_mode = sample_mode
+        self.next_submit_step = int(start_step)
+        self.next_consume_step = int(start_step)
+        self.max_step = None if max_step is None else int(max_step)
+        self.profile_enabled = bool(profile_enabled)
+        self.apply_image_augmentation = bool(apply_image_augmentation)
+        self.depth = max(1, int(training.pipeline_depth))
+        # One load_batch call may already fan out across loader_workers and uses
+        # shared cache tracing. Keep whole-batch prefetching ordered and single
+        # producer while allowing it to overlap with model work.
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fiber-strip-train-load")
+        self.pending: dict[int, Future[_LoadedTrainingBatch]] = {}
+        self.closed = False
+        self._submit_until_full()
+
+    def _can_submit(self) -> bool:
+        return self.max_step is None or self.next_submit_step <= self.max_step
+
+    def _submit_until_full(self) -> None:
+        while not self.closed and len(self.pending) < self.depth and self._can_submit():
+            step = self.next_submit_step
+            self.next_submit_step += 1
+            self.pending[step] = self.executor.submit(
+                _load_training_batch,
+                self.loader,
+                self.training,
+                step=step,
+                sample_mode=self.sample_mode,
+                profile_enabled=self.profile_enabled,
+                apply_image_augmentation=self.apply_image_augmentation,
+            )
+
+    def next(self) -> tuple[_LoadedTrainingBatch, float]:
+        if self.closed:
+            raise RuntimeError("training batch pipeline is closed")
+        step = self.next_consume_step
+        future = self.pending.get(step)
+        if future is None:
+            self._submit_until_full()
+            future = self.pending.get(step)
+        if future is None:
+            raise StopIteration
+        wait_start = time.perf_counter()
+        result = future.result()
+        wait_ms = (time.perf_counter() - wait_start) * 1000.0
+        del self.pending[step]
+        self.next_consume_step += 1
+        self._submit_until_full()
+        return result, wait_ms
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        for future in self.pending.values():
+            future.cancel()
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        self.pending.clear()
+
+    def __enter__(self) -> "_TrainingBatchPipeline":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+
 def _compute_batch_loss(
     model: FiberStripDirectionNet,
     batch: FiberStrip2DBatch,
@@ -218,6 +346,7 @@ def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dic
         "loader_wall": loader_wall,
         "loader_worker": loader_worker,
         "loader_thread_factor": loader_worker / loader_wall if loader_wall > 0.0 else 0.0,
+        "pipeline_wait": _stage_ms(train_profile, "pipeline_wait"),
         "coord_gen": coord_gen,
         "descriptor": descriptor,
         "coord_cache": coord_cache,
@@ -225,7 +354,7 @@ def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dic
         "line": line,
         "coord_aug": _stage_ms(loader_profile, "coord_augmentation"),
         "loading": _stage_ms(loader_profile, "volume_sample"),
-        "image_aug": _stage_ms(loader_profile, "value_augmentation"),
+        "image_aug": _stage_ms(loader_profile, "value_augmentation") + _stage_ms(train_profile, "value_augmentation"),
         "fw": _stage_ms(train_profile, "fw"),
         "bw_step": _stage_ms(train_profile, "bw_step"),
     }
@@ -235,12 +364,12 @@ def _print_profile_header() -> None:
     print(
         "fiber_trace_2d profile columns: "
         "batch=batch-index patches=CNN image patches "
-        "total/wall/work/coord/desc/cache/source/line/coord_aug/load/img_aug/fw/bw_step=ms per patch "
+        "total/wall/work/wait/coord/desc/cache/source/line/coord_aug/load/img_aug/fw/bw_step=ms per patch "
         "tf=loader worker-time/wall-time",
         flush=True,
     )
     print(
-        f"{'batch':>5} {'patches':>7} {'total':>9} {'wall':>9} {'work':>9} {'tf':>6} "
+        f"{'batch':>5} {'patches':>7} {'total':>9} {'wall':>9} {'work':>9} {'tf':>6} {'wait':>9} "
         f"{'coord':>9} {'desc':>9} "
         f"{'cache':>9} {'source':>9} {'line':>9} {'coord_aug':>9} "
         f"{'load':>9} {'img_aug':>9} {'fw':>9} {'bw_step':>9}",
@@ -256,6 +385,7 @@ def _print_profile_row(batch_index: int, patch_count: int, elapsed_ms: float, st
         f"{stages.get('loader_wall', 0.0) / denom:9.2f} "
         f"{stages.get('loader_worker', 0.0) / denom:9.2f} "
         f"{stages.get('loader_thread_factor', 0.0):6.2f} "
+        f"{stages.get('pipeline_wait', 0.0) / denom:9.2f} "
         f"{stages.get('coord_gen', 0.0) / denom:9.2f} "
         f"{stages.get('descriptor', 0.0) / denom:9.2f} "
         f"{stages.get('coord_cache', 0.0) / denom:9.2f} "
@@ -282,6 +412,7 @@ def _print_benchmark_summary(summary: _BenchmarkSummary, *, profile: bool) -> No
         for key in (
             "loader_wall",
             "loader_worker",
+            "pipeline_wait",
             "coord_gen",
             "descriptor",
             "coord_cache",
@@ -335,6 +466,7 @@ def run_benchmark(
             "loader_wall",
             "loader_worker",
             "loader_thread_factor",
+            "pipeline_wait",
             "coord_gen",
             "descriptor",
             "coord_cache",
@@ -354,49 +486,74 @@ def run_benchmark(
 
     _sync_device(device)
     wall_start = time.perf_counter()
-    for batch_index in range(1, total_batches + 1):
-        raw_start_sample_index = (batch_index - 1) * int(training.train_control_points_per_step)
-        loader_profile: dict[str, float] = {}
-        batch_start = time.perf_counter()
-        batch = loader.load_batch(
-            raw_start_sample_index,
-            batch_size=training.train_control_points_per_step,
+    use_pipeline = bool(training.pipeline_enabled and not load_only and device.type == "cuda")
+    pipeline: _TrainingBatchPipeline | None = None
+    if use_pipeline:
+        pipeline = _TrainingBatchPipeline(
+            loader,
+            training,
             sample_mode=sample_mode,
-            sample_index_limit=training.max_sample_index,
-            profile=loader_profile if profile else None,
-            apply_image_augmentation=not load_only,
+            start_step=1,
+            max_step=total_batches,
+            profile_enabled=profile,
+            apply_image_augmentation=False,
         )
+    try:
+        for batch_index in range(1, total_batches + 1):
+            batch_start = time.perf_counter()
+            train_profile: dict[str, float] = {}
+            if pipeline is None:
+                loaded = _load_training_batch(
+                    loader,
+                    training,
+                    step=batch_index,
+                    sample_mode=sample_mode,
+                    profile_enabled=profile,
+                    apply_image_augmentation=False if not load_only else False,
+                )
+            else:
+                loaded, wait_ms = pipeline.next()
+                train_profile["pipeline_wait"] = wait_ms
+            loader_profile = loaded.profile
+            batch = loaded.batch
+            if not load_only:
+                batch = loader.apply_batch_image_augmentation(
+                    batch,
+                    profile=train_profile if profile else None,
+                )
 
-        images_np, valid_np = _flatten_batch(batch)
-        patch_count = int(images_np.shape[0])
-        train_profile: dict[str, float] = {}
-        if not load_only:
-            assert model is not None
-            assert optimizer is not None
-            images = _prepare_images(images_np, valid_np, device=device)
-            supervision = build_direction_supervision(batch.samples, valid_np, device=device)
+            images_np, valid_np = _flatten_batch(batch)
+            patch_count = int(images_np.shape[0])
+            if not load_only:
+                assert model is not None
+                assert optimizer is not None
+                images = _prepare_images(images_np, valid_np, device=device)
+                supervision = build_direction_supervision(batch.samples, valid_np, device=device)
 
-            optimizer.zero_grad(set_to_none=True)
-            _sync_device(device)
-            fw_start = time.perf_counter()
-            outputs = model(images)
-            loss = direction_mse_loss(outputs, supervision)
-            _sync_device(device)
-            train_profile["fw"] = (time.perf_counter() - fw_start) * 1000.0
+                optimizer.zero_grad(set_to_none=True)
+                _sync_device(device)
+                fw_start = time.perf_counter()
+                outputs = model(images)
+                loss = direction_mse_loss(outputs, supervision)
+                _sync_device(device)
+                train_profile["fw"] = (time.perf_counter() - fw_start) * 1000.0
 
-            bw_start = time.perf_counter()
-            loss.backward()
-            optimizer.step()
-            _sync_device(device)
-            train_profile["bw_step"] = (time.perf_counter() - bw_start) * 1000.0
+                bw_start = time.perf_counter()
+                loss.backward()
+                optimizer.step()
+                _sync_device(device)
+                train_profile["bw_step"] = (time.perf_counter() - bw_start) * 1000.0
 
-        batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
-        stages = _benchmark_stage_totals(loader_profile, train_profile)
-        for key, value in stages.items():
-            stage_totals[key] += float(value)
-        total_patches += patch_count
-        if profile:
-            _print_profile_row(batch_index, patch_count, batch_elapsed_ms, stages)
+            batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+            stages = _benchmark_stage_totals(loader_profile, train_profile)
+            for key, value in stages.items():
+                stage_totals[key] += float(value)
+            total_patches += patch_count
+            if profile:
+                _print_profile_row(batch_index, patch_count, batch_elapsed_ms, stages)
+    finally:
+        if pipeline is not None:
+            pipeline.close()
 
     _sync_device(device)
     elapsed_ms = (time.perf_counter() - wall_start) * 1000.0
@@ -688,21 +845,39 @@ def run_training(
     last_angle_mean_deg = float("nan")
     last_test_loss = float("nan")
     last_test_angle_mean_deg = float("nan")
+    use_pipeline = bool(training.pipeline_enabled and device.type == "cuda")
+    pipeline: _TrainingBatchPipeline | None = None
     try:
+        finite_max_step = int(training.max_steps) if finite_steps else None
+        if use_pipeline:
+            pipeline = _TrainingBatchPipeline(
+                loader,
+                training,
+                sample_mode=sample_mode,
+                start_step=1,
+                max_step=finite_max_step,
+                profile_enabled=False,
+                apply_image_augmentation=False,
+            )
         step = 1
         while True:
             if finite_steps and step > training.max_steps:
                 break
-            raw_start_sample_index = (step - 1) * int(training.train_control_points_per_step)
-            start_sample_index = raw_start_sample_index
-            t0 = time.perf_counter()
-            batch = loader.load_batch(
-                start_sample_index,
-                batch_size=training.train_control_points_per_step,
-                sample_mode=sample_mode,
-                sample_index_limit=training.max_sample_index,
-            )
-            load_ms = (time.perf_counter() - t0) * 1000.0
+            if pipeline is None:
+                loaded = _load_training_batch(
+                    loader,
+                    training,
+                    step=step,
+                    sample_mode=sample_mode,
+                    profile_enabled=False,
+                    apply_image_augmentation=False,
+                )
+                wait_ms = 0.0
+            else:
+                loaded, wait_ms = pipeline.next()
+            raw_start_sample_index = loaded.raw_start_sample_index
+            batch = loader.apply_batch_image_augmentation(loaded.batch)
+            load_ms = float(loaded.load_ms)
 
             model.train()
             optimizer.zero_grad(set_to_none=True)
@@ -733,6 +908,7 @@ def run_training(
                 writer.add_scalar("train/angle_error_mean_deg", metrics.angle_mean_deg, step)
                 writer.add_scalar("train/supervision_samples", int(supervision.target.shape[0]), step)
                 writer.add_scalar("timing/load_ms", load_ms, step)
+                writer.add_scalar("timing/pipeline_wait_ms", wait_ms, step)
                 for key, value in _cache_scalars(batch.cache_stats).items():
                     writer.add_scalar(key, value, step)
             if writer is not None and test_result is not None:
@@ -799,11 +975,13 @@ def run_training(
                     f"step={step} loss_direction={loss_value:.6f} "
                     f"angle_mean_deg={metrics.angle_mean_deg:.2f} "
                     f"supervision_samples={int(supervision.target.shape[0])}{test_part} "
-                    f"load_ms={load_ms:.1f}",
+                    f"load_ms={load_ms:.1f} wait_ms={wait_ms:.1f}",
                     flush=True,
                 )
             step += 1
     finally:
+        if pipeline is not None:
+            pipeline.close()
         if writer is not None:
             writer.flush()
             writer.close()
