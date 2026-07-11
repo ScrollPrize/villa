@@ -216,7 +216,7 @@
         "EduceLab Data License": "the 3.24 µm and 7.91 µm DLS scans",
         "CC BY-NC 4.0": "all other data"
       },
-      "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 µm and 7.91 µm), and rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025).\n\nIt is the innermost part of a scroll, known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original. Its small size is what made such high-resolution scans practical.",
+      "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 µm and 7.91 µm), and rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025).\n\nIt is the innermost part of a scroll, known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0332/photos/PHerc0332_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0332/",
       "volume": "s3://vesuvius-challenge/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr",
