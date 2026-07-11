@@ -22,4 +22,4 @@
 - [ ] trace2cp its not a score its an error (hence we choose btest result as 0.0!) so fix this label in the vis
 - [ ] make bidir trace2cp metric in train/test loop
 - [ ] check augmentations for training: all flips and orientations should be equally likely
-- [ ] group norm: with a single sample per patch we seem to get a more global direction per patch! either remove the norm or do more batch-norm style normalization!
+- [x] group norm: with a single sample per patch we seem to get a more global direction per patch! either remove the norm or do more batch-norm style normalization!

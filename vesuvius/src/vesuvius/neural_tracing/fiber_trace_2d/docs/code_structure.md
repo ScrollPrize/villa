@@ -132,8 +132,7 @@ The important behavior is:
 
 - Defines `FiberStripDirectionNet`, the V0 2D residual CNN.
 - The default model has 10 residual blocks and 64 hidden channels.
-- The default normalization is `GroupNorm(8, 64)`; smaller explicit hidden
-  widths use the largest valid group count up to 8.
+- The default normalization is `BatchNorm2d`.
 - Consumes flattened strip patches shaped `[patch_batch, 1, height, width]`.
 - Outputs exactly two per-pixel direction channels in the Lasagna encoded
   representation.

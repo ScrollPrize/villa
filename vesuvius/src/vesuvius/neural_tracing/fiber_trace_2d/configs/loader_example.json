@@ -35,7 +35,7 @@
     "max_steps": 1000000,
     "max_sample_index": 0,
     "learning_rate": 0.001,
-    "scalar_log_interval": 1,
+    "scalar_log_interval": 100,
     "tensorboard_image_interval": 100,
     "checkpoint_interval": 100,
     "test_interval": 100,

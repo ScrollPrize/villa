@@ -13,22 +13,14 @@ class FiberStripDirectionModelConfig:
     depth: int = 10
 
 
-def _group_norm_groups(channels: int, preferred_groups: int = 8) -> int:
-    groups = min(int(preferred_groups), int(channels))
-    while groups > 1 and int(channels) % groups != 0:
-        groups -= 1
-    return groups
-
-
 class _ResidualBlock(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
-        groups = _group_norm_groups(channels)
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.norm1 = nn.GroupNorm(groups, channels)
+        self.norm1 = nn.BatchNorm2d(channels)
         self.act = nn.SiLU(inplace=True)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.norm2 = nn.GroupNorm(groups, channels)
+        self.norm2 = nn.BatchNorm2d(channels)
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         residual = image
@@ -53,10 +45,9 @@ class FiberStripDirectionNet(nn.Module):
         if cfg.depth <= 0:
             raise ValueError("depth must be > 0")
         hidden = int(cfg.hidden_channels)
-        groups = _group_norm_groups(hidden)
         self.input = nn.Sequential(
             nn.Conv2d(int(cfg.in_channels), hidden, kernel_size=3, padding=1),
-            nn.GroupNorm(groups, hidden),
+            nn.BatchNorm2d(hidden),
             nn.SiLU(inplace=True),
         )
         self.blocks = nn.Sequential(*[_ResidualBlock(hidden) for _ in range(int(cfg.depth))])

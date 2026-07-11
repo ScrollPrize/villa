@@ -49,6 +49,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _print_profile_header,
     _select_visualization_patch_indices,
     _should_print_training_step,
+    _load_training_batch,
     _TrainingBatchPipeline,
     _test_loader_config_from_raw,
     _training_config_from_raw,
@@ -546,8 +547,10 @@ def test_direction_model_defaults_to_10_block_64_channel_resnet() -> None:
     assert config.depth == 10
     assert len(model.blocks) == 10
     assert model.input[0].out_channels == 64
-    assert model.input[1].num_groups == 8
-    assert model.blocks[0].norm1.num_groups == 8
+    assert isinstance(model.input[1], torch.nn.BatchNorm2d)
+    assert model.input[1].num_features == 64
+    assert isinstance(model.blocks[0].norm1, torch.nn.BatchNorm2d)
+    assert model.blocks[0].norm1.num_features == 64
 
 
 def test_direction_model_forward_shape_and_range() -> None:
@@ -556,7 +559,8 @@ def test_direction_model_forward_shape_and_range() -> None:
 
     output = model(image)
 
-    assert model.input[1].num_groups == 4
+    assert isinstance(model.input[1], torch.nn.BatchNorm2d)
+    assert model.input[1].num_features == 4
     assert output.shape == (3, 2, 8, 9)
     assert bool(torch.all(output >= 0.0))
     assert bool(torch.all(output <= 1.0))
@@ -2724,6 +2728,32 @@ def test_training_visualization_selects_different_control_points_first() -> None
 
     assert indices[:4] == [7, 23, 39, 55]
     assert [index // 16 for index in indices[:4]] == [0, 1, 2, 3]
+
+
+def test_training_batch_keeps_full_centerline_for_visualization(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 7]
+    raw["strip_z_offset_count"] = 1
+    raw["augment_enabled"] = False
+    raw["loader_workers"] = 1
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    training = FiberStripTrainingConfig(train_control_points_per_step=1)
+
+    loaded = _load_training_batch(
+        loader,
+        training,
+        step=1,
+        sample_mode="flat",
+        profile_enabled=False,
+        apply_image_augmentation=False,
+    )
+
+    sample = loaded.batch.samples[0]
+    assert sample.line_xy.shape == (7, 2)
+    np.testing.assert_allclose(sample.line_xy[:, 0], np.arange(7, dtype=np.float32))
+    np.testing.assert_allclose(sample.line_xy[:, 1], np.full((7,), 2.0, dtype=np.float32))
 
 
 def test_one_step_training_smoke_writes_checkpoint(tmp_path: Path) -> None:

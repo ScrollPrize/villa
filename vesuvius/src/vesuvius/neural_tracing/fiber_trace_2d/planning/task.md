@@ -1,17 +1,8 @@
-# Remove Loader Serialization Bottlenecks
+# Switch Direction Model Normalization To BatchNorm
 
-The current load-only benchmark is only a slight improvement and still leaves
-CPU resources idle. Find what is serializing fiber-strip batch loading and fix
-it.
+Todo item:
 
-Requirements:
-
-- Reuse the established `--benchmark --load-only --profile` command for
-  measurements.
-- Preserve deterministic sample ordering.
-- Keep using the shared `FiberStrip2DLoader.load_batch` path and VC3D
-  coordinate sampler.
-- Identify whether the bottleneck is Python-side queueing, strip-coordinate
-  cache reads, line-coordinate transforms, VC3D sampling, or C++ cache locking.
-- Remove any avoidable serial tail in `load_batch`.
-- Report before/after throughput and CPU/thread factors.
+- GroupNorm with a single supervision sample per patch can let the model use
+  patch-global statistics in a way that behaves like a non-convolutional
+  classifier. Switch the default 2D direction model from GroupNorm to a
+  BatchNorm-style normalization.

@@ -513,7 +513,7 @@ def _load_training_batch(
         sample_index_limit=training.max_sample_index,
         profile=loader_profile if profile_enabled else None,
         apply_image_augmentation=apply_image_augmentation,
-        include_line_xy=False,
+        include_line_xy=True,
         include_coords=False,
     )
     load_ms = (time.perf_counter() - t0) * 1000.0

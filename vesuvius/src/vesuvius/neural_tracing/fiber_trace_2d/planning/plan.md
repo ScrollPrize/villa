@@ -46,9 +46,10 @@ a pretraining stage that does not require control points at all - but does benef
         - given the receptive field we do not perform this right until the edge but only where the receptive field would touch the edge
         - for now we only want to vis one of such refinment on a sample given by the passed sample idx (which shall be the same deterministic ordering as the training/prefetch - that should also be the same as augment vis sample ordering
         - vis should show the original line (which without augs is just the centerline) as well as this dir-traced line (which might be slightly off from that)
-    - tool2: segmeent refinement
-        - load whole side-strip between two consecutive cps
-        - TBD
+    - tool2: segment refinement
+        - this is already partially implemented by trace2cp metric
+        - just extent the relevant code (it MUST be shared) to give us a full cp to cp line init like this:
+            - 
 
 # V0.1 gt self-refinement
 

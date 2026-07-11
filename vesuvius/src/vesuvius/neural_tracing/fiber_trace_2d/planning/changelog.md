@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-07-11
+
+- Switched the default 2D fiber-strip direction model normalization from
+  GroupNorm to BatchNorm2d.
+
 ## 2026-07-10
 
 - Tuned the 2D fiber-strip load-only pipeline to use shared-loader whole-batch
