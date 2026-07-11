@@ -407,25 +407,6 @@ export default function ScrollDetailPage(props) {
               display={scroll.display}
             />
 
-            {/* Footer */}
-            <div className="footer">
-              {scroll._general || ""} &nbsp;·&nbsp;{" "}
-              <a
-                href="https://dl.ash2txt.org/"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                ash2txt data browser
-              </a>{" "}
-              ·{" "}
-              <a
-                href="/data"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                scrollprize.org/data
-              </a>
-            </div>
           </div>
         </div>
       </div>
