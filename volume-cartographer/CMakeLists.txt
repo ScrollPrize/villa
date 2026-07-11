@@ -404,14 +404,26 @@ endif()
 find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
-# OpenCV 5's Homebrew package can report module names in OpenCV_LIBS without
-# defining the corresponding imported targets. A bare name such as
-# `opencv_calib3d` then becomes `-lopencv_calib3d`, but its keg-only library
-# directory is not added to the link line. Normalize every module this project
-# uses to an absolute imported target when the package config omitted it.
+# OpenCV 5 split calib3d into geometry/calib/stereo/ptcloud. VC uses
+# Rodrigues (calib) and estimateAffine3D (geometry), so select both new
+# modules there while retaining the OpenCV 4 module name elsewhere.
+if(OpenCV_VERSION_MAJOR GREATER_EQUAL 5)
+    set(VC_OPENCV_CALIB_TARGETS opencv_calib opencv_geometry)
+else()
+    set(VC_OPENCV_CALIB_TARGETS opencv_calib3d)
+endif()
+
+# Homebrew's OpenCV package can occasionally report module names without
+# defining corresponding imported targets. Normalize any such module to an
+# absolute dylib path so it never degrades into a bare, unresolvable -l flag.
 if(APPLE)
     set(_vc_opencv_modules
-        core imgproc imgcodecs calib3d video videoio flann ximgproc)
+        core imgproc imgcodecs video videoio flann ximgproc)
+    if(OpenCV_VERSION_MAJOR GREATER_EQUAL 5)
+        list(APPEND _vc_opencv_modules calib geometry)
+    else()
+        list(APPEND _vc_opencv_modules calib3d)
+    endif()
     foreach(_vc_opencv_module IN LISTS _vc_opencv_modules)
         set(_vc_opencv_target "opencv_${_vc_opencv_module}")
         if(NOT TARGET ${_vc_opencv_target})

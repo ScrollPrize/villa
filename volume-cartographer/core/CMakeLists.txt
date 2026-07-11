@@ -53,7 +53,7 @@ target_link_libraries(vc_core
         opencv_core
         opencv_imgproc
         opencv_imgcodecs
-        opencv_calib3d
+        ${VC_OPENCV_CALIB_TARGETS}
         opencv_video
         nlohmann_json::nlohmann_json
         OpenMP::OpenMP_CXX
