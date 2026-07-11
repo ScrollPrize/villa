@@ -2,6 +2,10 @@
 
 ## 2026-07-10
 
+- Added `--dbg-dirs` for 2D `--dir-vis`, adding a half-image pasted-center
+  debug row to probe local direction evidence against transformed patch context.
+- Added explicit image-space flip/90-degree-rotation panels to 2D `--dir-vis`
+  and writes them as one labeled direction-overlay contact sheet.
 - Switched 2D `--dir-vis` direction overlays to 8x8 display-pixel cells with
   6-pixel anti-aliased direction segments.
 - Added real process CPU timing to the 2D fiber-trace benchmark/profile table

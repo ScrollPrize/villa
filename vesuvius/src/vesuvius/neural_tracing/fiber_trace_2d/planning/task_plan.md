@@ -1,20 +1,24 @@
-# Direction Visualization Cell Spacing Plan
+# Direction Visualization Image-Space Augmentations Plan
 
 ## Implementation
 
-- Update `_direction_field_overlay_rgb` to use a default stride of 4 source
-  pixels while retaining the 2x image scale.
-- Keep the segment-length formula tied to the display cell size so stride 4
-  yields 6-display-pixel direction segments.
-- Render the overlay on a small supersampled RGBA canvas and downsample it so
-  segment edges are anti-aliased.
-- Update the dir-vis export summary to report stride 4, 8-pixel cells, and
-  6-pixel segments.
+- Add a small dir-vis-only helper that materializes identity, flip-x, flip-y,
+  rot90, rot180, and rot270 image-space variants for the loaded center strip
+  patch and valid mask.
+- Use contiguous arrays for the variants so PyTorch can consume flipped/rotated
+  NumPy data safely.
+- Run the checkpointed direction model once per variant and draw each variant's
+  direction overlay in that variant's image coordinates.
+- Write all variant overlays into one labeled `dir_vis.jpg` contact sheet and
+  include per-variant drawn counts in `dir_vis_summary.txt`.
+- Add `--dbg-dirs` for a second debug row that keeps the normal augmented row,
+  then adds raw/no-arrow reference plus half-image-sized center-pasted
+  variants inferred and rendered separately.
 
 ## Spec Update
 
-- Document the 8x8 display-pixel cell, 6-display-pixel segment length, and
-  anti-aliased direction drawing.
+- Document the explicit dir-vis image-space augmentation variants, the debug
+  pasted-center row, and the single output image.
 
 ## Docs Updates
 
@@ -24,4 +28,4 @@
 ## Testing
 
 - Compile-check `runner.py`.
-- Run the focused dir-vis overlay test.
+- Run focused dir-vis overlay, augmentation, pasted-center, and layout tests.

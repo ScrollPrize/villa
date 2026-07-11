@@ -236,10 +236,21 @@ The important behavior is:
   traced line, and the score in a top label band above the image pixels.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
-  side-strip patch, runs the checkpointed direction model, decodes the
-  direction field, scales the patch image by 2x, and writes `dir_vis.jpg` with
-  anti-aliased 6-display-pixel direction segments drawn every fourth source
-  pixel, i.e. one segment per 8x8 display-pixel cell.
+  side-strip patch, applies pixel-perfect image-space identity/flip/90-degree
+  rotation variants, runs the checkpointed direction model for each variant,
+  nearest-neighbor scales each augmented patch image by 4x for visualization
+  only, and writes a single `dir_vis.jpg` natural-size horizontal strip with one
+  shared top label band and anti-aliased 6-display-pixel direction segments
+  drawn every second source pixel, i.e. one segment per 8x8 display-pixel cell.
+  Model inference runs on each native-resolution augmented patch before display
+  upsampling. If the loaded center patch is not square, dir-vis center-crops it
+  to the largest square before applying pixel-space flips/rotations; it does not
+  rescale the native patch before inference. The valid mask gates model
+  normalization and arrow placement, but does not black out display pixels.
+  `--dbg-dirs` adds a second row: the first cell is the raw unaugmented patch
+  without direction arrows, and the remaining cells run inference on transformed
+  patches whose center half-image region has been overwritten with the matching
+  unaugmented center crop.
 
 `train.py`
 
