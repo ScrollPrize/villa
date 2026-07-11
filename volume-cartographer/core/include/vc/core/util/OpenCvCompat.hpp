@@ -1,5 +1,11 @@
 #pragma once
 
+#include <opencv2/core/version.hpp>
+
+#if CV_VERSION_MAJOR >= 5
+#include <opencv2/geometry.hpp>
+#endif
+
 namespace vc::opencv {
 
 // OpenCV 5 removed the public cv::DistanceTypes enum while retaining the
