@@ -28,6 +28,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/OpenCvCompat.hpp"
 
 #include "vc/ui/VCCollection.hpp"
 #include <array>
@@ -732,7 +733,7 @@ void SeedingWidget::onCastRaysClicked()
         cv::threshold(sliceData, binaryImage, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
 
         cv::Mat dt;
-        cv::distanceTransform(binaryImage, dt, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+        cv::distanceTransform(binaryImage, dt, vc::opencv::distanceL2, cv::DIST_MASK_PRECISE);
 
         // --- Helper lambdas ---
         auto sampleDistAt = [&](const cv::Vec3f& p) -> float {
@@ -949,7 +950,8 @@ void SeedingWidget::computeDistanceTransform()
     cv::threshold(sliceData, binaryImage, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
     
     // Compute the distance transform
-    cv::distanceTransform(binaryImage, distanceTransform, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    cv::distanceTransform(binaryImage, distanceTransform,
+                          vc::opencv::distanceL2, cv::DIST_MASK_PRECISE);
     
     // Normalize the distance transform for visualization if needed
     cv::Mat distNormalized;
