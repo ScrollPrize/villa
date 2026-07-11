@@ -12,18 +12,12 @@
       {
         "big": "6",
         "label": "with recovered text",
-        "sub": "Greek read",
         "derive": "text"
       },
       {
         "big": "9",
-        "label": "with ink-detection results",
-        "sub": "predictions on unrolled surfaces & fragments",
+        "label": "with verified ink detection results",
         "derive": "ink"
-      },
-      {
-        "big": "~4.3 PB",
-        "label": "open research data"
       }
     ],
     "funnel": [

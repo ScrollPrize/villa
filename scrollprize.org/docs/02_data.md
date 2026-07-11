@@ -40,9 +40,6 @@ import JsonLd from '@site/src/components/JsonLd';
 
 <JsonLd data={{ "@context":"https://schema.org","@type":"Dataset","name":"Herculaneum Scrolls — X-ray CT Data Portal","description":"Open data portal aggregating synchrotron micro-CT volumes, extracted surface segments, meshes, and ML predictions of the carbonized Herculaneum scrolls and fragments.","url":"https://scrollprize.org/data","creator":{"@type":"Organization","name":"Vesuvius Challenge","url":"https://scrollprize.org/"},"measurementTechnique":"X-ray computed tomography","keywords":["Herculaneum scrolls","papyri","X-ray CT","virtual unwrapping","ink detection","machine learning"],"isAccessibleForFree":true,"license":"https://dl.ash2txt.org/LICENSE.txt","distribution":{"@type":"DataDownload","encodingFormat":"image/tiff","contentUrl":"https://scrollprize.org/data"} }} />
 
-> **Work‑in‑progress 👷‍♀️**
-> We are transitioning data hosting to a new repository. During the transition, some assets may appear in one location before the other. Both repositories follow the same organization structure.
-
 **Quick start:** [example quick data access notebook](https://github.com/ScrollPrize/open-data/blob/main/examples/get-to-know-a-dataset.ipynb)
 
 ## Overview
@@ -93,7 +90,7 @@ OME‑Zarr is the primary distribution format because it is cloud‑optimized (c
 
 ## Organization on disk
 
-Both repositories follow the same high‑level structure:
+The repository follows this high‑level structure:
 
 ```text
 {SAMPLE_ID}/
