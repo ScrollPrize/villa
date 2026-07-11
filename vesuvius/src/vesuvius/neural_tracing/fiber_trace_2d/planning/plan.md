@@ -49,8 +49,20 @@ a pretraining stage that does not require control points at all - but does benef
     - tool2: segment refinement
         - this is already partially implemented by trace2cp metric
         - just extent the relevant code (it MUST be shared) to give us a full cp to cp line init like this:
-            - 
-
+            - trace both dirs
+            - find the point with the smallest vertical distance between the two traces
+            - correct both traces linearly by warping them so their start point is unchanged and we linearly warp the line more the closer (in x) we get to that closest point
+            - at the cloest points both lines should be warped to reach the center betweent the two lines
+            - the warping should only be vertically - linearly blending between zero correction at the cps and full correction at the cloest point
+            - given the steps do not necessarily aling in pixels resample the lines before this so we have one line point per horizontal pixel
+            - then afterwards resample the new combined line so we use the configured step again (or the closest given it might not fit perfectly) - note that this step is along the line not x only
+        - trace2cp metric should actually show additional rows with:
+            - the partiall lines only going until the cloest point (both in one row)
+            - the newly constucted fused line going from cp to cp
+        - finally we re-optimize the line by minimizing the dir errors of the sampled points while at the same time applying a loss the distributes the step evenly
+            - visualize the opt result in a fourth row in trace2cp
+            
+            
 # V0.1 gt self-refinement
 
 - the augmentations gives us a bit of room to try self-refinement of the gt because the gt itself is quite errorneous

@@ -1,80 +1,79 @@
-# Merge `fiber2d-exp` Conflict Resolution Plan
+# Merge `fiber2d-tweaks` Conflict Resolution Plan
 
 ## Conflict Inventory
 
-- Code and tests auto-merged:
-  - `augmentation.py`
-  - `direction.py`
-  - `loader.py`
+- Auto-merged code/docs:
   - `runner.py`
   - `docs/code_structure.md`
   - `planning/specs.md`
-  - `test_fiber_trace_2d_loader.py`
-- Conflicted files are task-state docs:
+- Conflicted files:
   - `planning/changelog.md`
   - `planning/status.md`
   - `planning/task.md`
   - `planning/task_log.md`
   - `planning/task_plan.md`
+  - `vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 
 ## Relevant Specs To Preserve
 
-- Keep the current BatchNorm2d default for the V0 direction model.
-- Keep full transformed centerline availability for training visualizations.
-- Keep deterministic sample ordering, skip semantics, prefetch semantics, and
-  current training/pipeline/cache config keys.
-- Keep `volume_cache_memory_mib`, `volume_io_threads`, and
-  `training.pipeline_isolated_loaders` because they are still documented in
-  `specs.md` and implemented by the current branch.
-- Keep `--load-only` benchmark behavior using the configured batch pipeline
-  when requested by current specs.
-- Accept `fiber2d-exp` Trace2CP/TTA requirements:
-  - analytic Lasagna two-channel direction decoding;
-  - no image-space geometric augmentation helpers;
-  - paired concrete forward/backward geometric maps;
-  - direct reference-to-TTA map lookup instead of dense nearest scans;
-  - coordinate-sampled TTA patches;
-  - bidirectional Trace2CP scoring and optional `--vis-tta` debug outputs.
+- Preserve the current BatchNorm2d model default, full transformed training
+  centerline visualization, deterministic sample ordering, skip semantics,
+  prefetch semantics, and current training/pipeline/cache config keys.
+- Preserve the `fiber2d-exp` merge requirements: analytic Lasagna two-channel
+  decoding, concrete paired geometric maps, direct reference-to-TTA lookup,
+  coordinate-sampled TTA patches, and bidirectional Trace2CP scoring.
+- Preserve strict coordinate-only geometric augmentation for training,
+  augment-vis, line tracing, Trace2CP, labels, TTA, and all shared loader paths.
+- Accept the `fiber2d-tweaks` behavior as a narrow runner/debug exception:
+  `--dir-vis` may apply pixel-perfect image-space identity/flip/90-degree
+  rotation variants to an already sampled center patch for checkpoint
+  robustness inspection, and `--dbg-dirs` may paste the unaugmented center into
+  transformed diagnostic contexts. This exception must not be reused by
+  training, labels, augment-vis, line tracing, Trace2CP, or TTA.
 
 ## Resolution Plan
 
-- Replace stale per-task planning conflicts with this merge task state.
-- Resolve `planning/changelog.md` by keeping both durable 2026-07-11 entries:
-  BatchNorm and the `fiber2d-exp` Trace2CP/TTA/decoder entries.
-- Review auto-merged code for spec regressions before staging:
-  - `train.py` still calls `load_batch(... include_line_xy=True, include_coords=False)`.
-  - `model.py` still uses `nn.BatchNorm2d` and has no GroupNorm fallback.
-  - `loader.py` still parses and forwards `volume_cache_memory_mib` and
-    `volume_io_threads`.
-  - `train.py` still supports `pipeline_isolated_loaders`.
-  - `direction.py` uses analytic decoding and no `bins` argument.
-  - `runner.py` no longer contains image-space geometric TTA warp helpers.
-  - TTA patch builders return both `source_xy_grid` and
-    `reference_to_tta_xy_grid`.
-- If any auto-merged code contradicts `specs.md`, fix the code rather than
-  weakening the spec.
-- Stage resolved files only after conflict markers are gone and the semantic
-  checks pass.
+- Replace conflicted per-task planning docs with this merge task state.
+- Resolve `planning/changelog.md` by keeping durable entries from both sides:
+  the current loader/training/pipeline/Trace2CP history and the incoming
+  `--dir-vis` image-space diagnostic entries.
+- Resolve the test import conflict by keeping current direct-map helpers and
+  incoming dir-vis helpers, while omitting stale helpers that must not exist:
+  `_nearest_tta_point_for_reference` and `_line_trace_tta_entries`.
+- Narrow the no-image-space-geometric regression test so it still rejects
+  training/TTA image-space warp helpers but excludes the explicit
+  `_dir_vis_image_space_augmentations` diagnostic helper.
+- Clarify `planning/specs.md` and `docs/code_structure.md` with the same
+  `--dir-vis` diagnostic exception.
+- Review auto-merged code against the merged specs before staging:
+  - `runner.py` provides `--dir-vis` identity/flip/rot90/rot180/rot270 panels,
+    natural-size strip output, and `--dbg-dirs` pasted-center debug row.
+  - `runner.py` still has no `_nearest_tta_point_for_reference`,
+    `_line_trace_tta_entries`, image-space line/Trace2CP TTA warp helper, or
+    dense nearest-grid TTA lookup.
+  - `direction.py` still uses analytic decode.
+  - `model.py` still uses `BatchNorm2d`.
+  - `train.py` still requests `include_line_xy=True` for training
+    visualization.
+- Stage resolved files only after conflict markers are gone and semantic checks
+  pass.
 
 ## Spec Update
 
-- No new spec behavior is required beyond the auto-merged union currently in
-  `planning/specs.md`.
-- During resolution, keep the union of both branches' specs rather than taking
-  either side wholesale.
-- If implementation review finds a mismatch, update `planning/specs.md` only to
-  clarify the intended behavior, not to remove current requirements.
+- Add a narrow `--dir-vis` diagnostic exception to the image-space geometric
+  prohibition.
+- Keep the coordinate-only rule unchanged for training, labels, augment-vis,
+  line tracing, Trace2CP, TTA, and shared loader paths.
+- Keep incoming `--dir-vis` output semantics: one labeled `dir_vis.jpg`, native
+  model inference per variant, 4x nearest-neighbor display scaling, 8x8 display
+  cells, 6-pixel anti-aliased direction segments, and optional `--dbg-dirs`
+  second row.
 
 ## Docs Updates
 
-- Keep `docs/code_structure.md` aligned with the merged implementation:
-  - BatchNorm model documentation;
-  - analytic direction decoder;
-  - coordinate-only TTA;
-  - bidirectional Trace2CP;
-  - retained loader pipeline/cache knobs.
-- Do not preserve old task logs in `planning/task_log.md`; it should describe
-  this merge task only.
+- Update `docs/code_structure.md` to document the `--dir-vis` exception while
+  keeping the core augmentation/loader paths coordinate-only.
+- Keep `planning/task_log.md` limited to this merge task only.
 
 ## Tests
 
@@ -85,5 +84,5 @@
 
 ## Changelog Update
 
-- Keep both existing 2026-07-11 changelog entries from the merged histories.
-- Add no extra changelog line for conflict planning alone.
+- Keep existing durable changelog entries from both branches.
+- Add no extra changelog line for the merge mechanics alone.

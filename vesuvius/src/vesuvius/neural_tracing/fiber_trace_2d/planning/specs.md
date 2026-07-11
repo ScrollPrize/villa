@@ -76,11 +76,17 @@
 - Augmentation config keys include `augment_enabled`, `augment_device`, `augment_seed`, `augment_shift_x`, `augment_shift_y`, `augment_rotation_degrees`, `augment_shear_x`, `augment_shear_y`, `augment_scale_min`, `augment_scale_max`, `augment_smooth_offset`, `augment_smooth_offset_stride`, `augment_brightness`, `augment_contrast_min`, `augment_contrast_max`, `augment_gamma_min`, `augment_gamma_max`, `augment_noise_std`, and `augment_blur_sigma`.
 - Default augmentation extrema are `+-patch_width/4` px horizontal offset, `+-patch_height/4` px vertical offset, `+-180` degree rotation, `+-1` px/px shear, `sqrt(0.5)x..sqrt(2.0)x` scale, smooth curve offset up to `+-8` px with 16 px control stride, `+-0.25` valid-range brightness offset, `0.5x..2.0x` contrast around the valid patch center, `0.5..2.0` gamma, valid-range-relative noise std up to `0.125`, and Gaussian blur sigma up to `2.0`.
 - Geometric strip augmentations operate on strip coordinates before image sampling.
-- we must never do geometric augmentations as image space operations. No helper,
-  function, or API in `fiber_trace_2d` may geometrically warp, rotate, scale,
-  shear, translate, resize, or flip an already sampled image/tensor. Such
-  image-space geometric augmentation functions must not exist in this
-  subproject.
+- Training, augment-vis, line-trace, Trace2CP, labels, TTA, and all core
+  loader paths must never do geometric augmentations as image-space operations.
+  No helper, function, or API on those paths may geometrically warp, rotate,
+  scale, shear, translate, resize, or flip an already sampled image/tensor.
+  Such geometric changes must be represented as coordinate manipulation before
+  sampling/slicing the patch.
+- The only image-space geometric exception is the `--dir-vis` diagnostic probe:
+  it may apply pixel-perfect identity, flips, and 90-degree rotations to an
+  already sampled center patch to inspect checkpoint robustness. That exception
+  must not be reused for training data, labels, augment-vis, line tracing,
+  Trace2CP, or TTA.
 - Image-space operations after sampling are allowed only for value-only changes
   such as brightness, contrast, gamma, noise, and blur.
 - Geometric augmentation builds an oversized strip-coordinate source area, maps output patch pixels into that source, and samples the volume once at the final augmented coordinates to avoid edge and image reinterpolation artifacts.
@@ -263,8 +269,9 @@
 - The runner is `python -m vesuvius.neural_tracing.fiber_trace_2d.runner`.
 - Augment contact sheets are exported with `--augment-vis --export-dir <dir>`. Add `--augment-profile` to print cold and warm augment timing tables.
 - Direction-field inspection is exported with `--dir-vis --checkpoint <snapshot> --export-dir <dir>`.
-- Direction-field inspection uses the same deterministic `--sample-index` ordering as training, prefetch, augment-vis, and line-trace-vis. It loads the center side-strip patch, runs the checkpointed direction model, decodes the Lasagna ambiguous two-cos-channel output, scales the patch image by 2x, and draws short direction line segments on top.
-- Direction-field inspection draws only every second source pixel in x and y, so each drawn sample corresponds to a 4x4 display-pixel cell in the 2x visualization. It skips invalid image pixels and invalid/non-finite decoded directions, writes `dir_vis.jpg`, and writes sample/checkpoint/drawn-count metadata to `dir_vis_summary.txt`.
+- Direction-field inspection uses the same deterministic `--sample-index` ordering as training, prefetch, augment-vis, and line-trace-vis. It loads the center side-strip patch, center-crops it to the largest native square when needed, applies pixel-perfect image-space identity, flip-x, flip-y, rot90, rot180, and rot270 variants, runs the checkpointed direction model on each native-resolution variant, decodes the Lasagna ambiguous two-cos-channel output, nearest-neighbor scales each augmented patch image by 4x for visualization only, and draws short direction line segments on top.
+- Direction-field inspection draws only every second source pixel in x and y, so each drawn sample corresponds to an 8x8 display-pixel cell in the 4x visualization. It draws anti-aliased 6-display-pixel direction segments, skips invalid image pixels and invalid/non-finite decoded directions for arrow placement only, writes the augmented variants as one natural-size horizontal `dir_vis.jpg` strip with a single top label band, and writes sample/checkpoint/per-augmentation drawn-count metadata to `dir_vis_summary.txt`. The valid mask gates model normalization and arrow placement, but does not black out display pixels.
+- `--dir-vis --dbg-dirs` adds a second row to `dir_vis.jpg`. Column 1 is the raw unaugmented patch without direction arrows. The remaining columns copy the unaugmented center crop whose side is half the center-patch image side into the center of each transformed patch, run inference on those pasted variants, and render their direction overlays.
 - V0.1 patch line-tracing inspection is exported with `--line-trace-vis --checkpoint <snapshot> --export-dir <dir>`.
 - Line-tracing inspection uses the same deterministic `--sample-index` ordering as training, prefetch, and augment-vis, loads the center side-strip patch, runs the checkpointed direction model, decodes the Lasagna ambiguous two-cos-channel output, and traces from the transformed CP in both directions.
 - The line tracer bilinearly samples the decoded per-pixel direction field, flips sampled directions as needed to maintain forward/backward sign continuity, and steps in strip-pixel coordinates.

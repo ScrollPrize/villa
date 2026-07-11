@@ -1,31 +1,35 @@
-# Merge `fiber2d-exp` Task Log
+# Merge `fiber2d-tweaks` Task Log
 
-## Actions
+## Notes
 
-- Confirmed tracked worktree was clean before merge.
-- Ran `git merge --no-commit fiber2d-exp`.
-- Merge produced conflicts only in planning/changelog/status/task/task_log/task_plan.
+- Read local `AGENTS.md`.
+- Ran `git merge --no-commit fiber2d-tweaks`.
+- Conflicts were in planning task/changelog/status/log/plan files and
+  `vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`.
 - Inspected auto-merged `planning/specs.md`, `docs/code_structure.md`,
-  `loader.py`, `runner.py`, `direction.py`, and `train.py` at a high level.
-
-## Findings
-
-- `planning/specs.md` already contains the union of the important requirements:
-  BatchNorm2d model default, analytic Lasagna direction decoding,
-  coordinate-only geometric TTA, bidirectional Trace2CP, retained training
-  pipeline/cache knobs, and full training centerline visualization semantics.
-- Code auto-merge appears to preserve current BatchNorm, `include_line_xy=True`,
-  pipeline-isolated loader support, and VC3D cache/I/O config while adding the
-  `fiber2d-exp` Trace2CP/TTA changes.
-- The planning conflicts are stale completed task states from each branch, not
-  code conflicts. They should be replaced by the current merge task state.
-- Planning review against `task.md`, `plan.md`, and `specs.md` found the plan
-  covers the requested merge/inspection task, preserves the V0 direction and
-  Trace2CP/TTA goals from `plan.md`, and keeps the merged spec union instead of
-  weakening requirements. A separate sub-agent was not spawned because the
-  available multi-agent tool explicitly requires a direct user request for
-  delegation.
+  `runner.py`, and the conflicted tests.
+- Resolved the semantic conflict by documenting and testing `--dir-vis` as a
+  narrow diagnostic image-space exception while keeping training, augment-vis,
+  line tracing, Trace2CP, labels, TTA, and shared loader paths coordinate-only.
+- Resolved the test import conflict by keeping current direct-map helpers and
+  incoming dir-vis helpers, while omitting stale helpers that must not exist.
+- Per local `AGENTS.md`, reviewed the plan locally against `task.md`,
+  `task_plan.md`, `planning/specs.md`, and `planning/plan.md`. A separate
+  sub-agent was not spawned because this environment only allows multi-agent
+  tooling when explicitly requested by the user.
 
 ## Validation
 
-- Not run yet. Validation is planned after conflict resolution.
+- Conflict-marker scan over `fiber_trace_2d` sources/tests found no matches.
+- Semantic no-image-space check after excluding the explicit `--dir-vis`
+  diagnostic helper and display-only anti-alias resize found no forbidden
+  runner tokens.
+- Whitespace check:
+  `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  passed.
+- Compile check:
+  `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/augmentation.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/direction.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/model.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  passed.
+- Focused tests:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  passed: `126 passed in 7.00s`.

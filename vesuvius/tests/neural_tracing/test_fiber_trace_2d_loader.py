@@ -62,12 +62,20 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
     run_training,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.runner import (
+    _DirVisImageAugment,
     _TtaDirectionField,
     _bilinear_direction_sample,
+    _build_dir_vis_center_patch,
+    _direction_model_receptive_field_diameter,
+    _dir_vis_image_space_augmentations,
+    _dir_vis_half_image_paste_side,
     _direction_field_overlay_rgb,
     _draw_trace2cp_tta_slice,
     _export_augment_contact_sheet,
     _identity_source_xy_grid,
+    _labeled_panel_grid_rgb,
+    _labeled_panel_strip_rgb,
+    _paste_unaugmented_center_patch,
     _print_timing_table,
     _reference_point_to_tta,
     _score_trace2cp,
@@ -78,6 +86,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace_score_trace2cp_bidirectional,
     _trace_median_tta_direction_line_to_target,
     _trace_median_tta_direction_line,
+    _to_u8_display_image,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
@@ -569,7 +578,7 @@ def test_trace2cp_tta_debug_slice_draws_transformed_corner_outline() -> None:
     assert bool(np.any(body[..., 0] != body[..., 1]))
 
 
-def test_no_image_space_geometric_augmentation_helpers_exist() -> None:
+def test_no_training_or_tta_image_space_geometric_augmentation_helpers_exist() -> None:
     root = Path(runner_module.__file__).resolve().parent
     forbidden_tokens = (
         "_warp_patch_by",
@@ -587,6 +596,15 @@ def test_no_image_space_geometric_augmentation_helpers_exist() -> None:
     offenders: list[str] = []
     for path in sorted(root.rglob("*.py")):
         text = path.read_text(encoding="utf-8")
+        if path.name == "runner.py":
+            for allowed_name, end_marker in (
+                ("_direction_field_overlay_rgb", "\n@dataclass"),
+                ("_dir_vis_image_space_augmentations", "\ndef _render_dir_vis_panel"),
+            ):
+                start = text.find(f"def {allowed_name}")
+                end = text.find(end_marker, start)
+                if start >= 0 and end > start:
+                    text = text[:start] + text[end:]
         for token in forbidden_tokens:
             if token in text:
                 offenders.append(f"{path.name}:{token}")
@@ -687,12 +705,129 @@ def test_dir_vis_overlay_scales_and_strides() -> None:
     direction = np.zeros((5, 7, 2), dtype=np.float32)
     direction[:, :, 0] = 1.0
 
-    overlay, drawn = _direction_field_overlay_rgb(image, valid, direction, scale=2, stride=2)
+    overlay, drawn = _direction_field_overlay_rgb(image, valid, direction, scale=4, stride=2)
 
-    assert overlay.shape == (10, 14, 3)
+    assert overlay.shape == (20, 28, 3)
     assert drawn == 11
-    scaled = np.repeat(np.repeat(np.repeat(image[..., None], 3, axis=2), 2, axis=0), 2, axis=1)
+    scaled = np.repeat(np.repeat(np.repeat(image[..., None], 3, axis=2), 4, axis=0), 4, axis=1)
     assert not np.array_equal(overlay, scaled)
+
+
+def test_dir_vis_image_space_augmentations_are_pixel_perfect_and_contiguous() -> None:
+    image = np.arange(6, dtype=np.float32).reshape(2, 3)
+    valid = np.asarray([[True, False, True], [False, True, False]], dtype=bool)
+
+    augmentations = _dir_vis_image_space_augmentations(image, valid)
+
+    assert [augment.name for augment in augmentations] == [
+        "identity",
+        "flip_x",
+        "flip_y",
+        "rot90",
+        "rot180",
+        "rot270",
+    ]
+    by_name = {augment.name: augment for augment in augmentations}
+    assert np.array_equal(by_name["identity"].image, image)
+    assert np.array_equal(by_name["flip_x"].image, np.flip(image, axis=1))
+    assert np.array_equal(by_name["flip_y"].image, np.flip(image, axis=0))
+    assert np.array_equal(by_name["rot90"].image, np.rot90(image, k=1, axes=(0, 1)))
+    assert np.array_equal(by_name["rot180"].image, np.rot90(image, k=2, axes=(0, 1)))
+    assert np.array_equal(by_name["rot270"].image, np.rot90(image, k=3, axes=(0, 1)))
+    assert np.array_equal(by_name["rot90"].valid_mask, np.rot90(valid, k=1, axes=(0, 1)))
+    assert all(augment.image.flags.c_contiguous for augment in augmentations)
+    assert all(augment.valid_mask.flags.c_contiguous for augment in augmentations)
+
+
+def test_labeled_panel_strip_preserves_natural_panel_sizes() -> None:
+    wide = np.full((2, 5, 3), (10, 20, 30), dtype=np.uint8)
+    tall = np.full((5, 2, 3), (40, 50, 60), dtype=np.uint8)
+
+    strip = _labeled_panel_strip_rgb([wide, tall], ["wide", "tall"])
+
+    assert strip.shape[1] == wide.shape[1] + tall.shape[1]
+    label_h = strip.shape[0] - max(wide.shape[0], tall.shape[0])
+    assert label_h > 0
+    assert np.array_equal(strip[label_h : label_h + wide.shape[0], : wide.shape[1]], wide)
+    assert np.array_equal(strip[label_h : label_h + tall.shape[0], wide.shape[1] :], tall)
+
+
+def test_labeled_panel_grid_uses_one_label_band_and_no_cell_padding() -> None:
+    panels = [
+        [np.full((2, 3, 3), 10, dtype=np.uint8), np.full((2, 3, 3), 20, dtype=np.uint8)],
+        [np.full((2, 3, 3), 30, dtype=np.uint8), np.full((2, 3, 3), 40, dtype=np.uint8)],
+    ]
+
+    grid = _labeled_panel_grid_rgb(panels, ["a", "b"])
+
+    assert grid.shape[1] == 6
+    label_h = grid.shape[0] - 4
+    assert label_h > 0
+    assert np.array_equal(grid[label_h : label_h + 2, 0:3], panels[0][0])
+    assert np.array_equal(grid[label_h : label_h + 2, 3:6], panels[0][1])
+    assert np.array_equal(grid[label_h + 2 : label_h + 4, 0:3], panels[1][0])
+    assert np.array_equal(grid[label_h + 2 : label_h + 4, 3:6], panels[1][1])
+
+
+def test_dir_vis_display_image_does_not_apply_valid_mask() -> None:
+    image = np.asarray([[10.0, 20.0], [np.nan, 300.0]], dtype=np.float32)
+
+    display = _to_u8_display_image(image)
+
+    assert np.array_equal(display, np.asarray([[10, 20], [0, 255]], dtype=np.uint8))
+
+
+def test_dir_vis_pastes_unaugmented_center_patch() -> None:
+    base = np.arange(25, dtype=np.float32).reshape(5, 5)
+    target = _DirVisImageAugment(
+        name="flip_x",
+        image=np.full((5, 5), -1.0, dtype=np.float32),
+        valid_mask=np.zeros((5, 5), dtype=bool),
+    )
+    base_valid = np.ones((5, 5), dtype=bool)
+
+    pasted = _paste_unaugmented_center_patch(base, base_valid, target, paste_side=3)
+
+    expected = np.full((5, 5), -1.0, dtype=np.float32)
+    expected[1:4, 1:4] = base[1:4, 1:4]
+    assert pasted.name == "paste_flip_x"
+    assert np.array_equal(pasted.image, expected)
+    assert np.count_nonzero(pasted.valid_mask) == 9
+
+
+def test_dir_vis_debug_paste_side_uses_half_image_side() -> None:
+    assert _dir_vis_half_image_paste_side((356, 356)) == 178
+    assert _dir_vis_half_image_paste_side((5, 7)) == 3
+    with pytest.raises(ValueError, match="non-empty"):
+        _dir_vis_half_image_paste_side((0, 8))
+
+
+def test_direction_model_receptive_field_diameter_matches_conv_stack() -> None:
+    radius, diameter = _direction_model_receptive_field_diameter(FiberStripDirectionModelConfig(depth=10))
+
+    assert radius == 21
+    assert diameter == 43
+
+
+def test_dir_vis_center_patch_center_crops_to_square_without_scaling() -> None:
+    class FakeLoader:
+        def build_center_strip_patch(
+            self, sample_index: int, *, device: torch.device
+        ) -> tuple[object, np.ndarray, np.ndarray]:
+            assert sample_index == 7
+            assert device.type == "cpu"
+            return (
+                SimpleNamespace(control_point_index=5),
+                np.arange(24, dtype=np.float32).reshape(4, 6),
+                np.ones((4, 6), dtype=bool),
+            )
+
+    sample, image, valid = _build_dir_vis_center_patch(FakeLoader(), 7, device=torch.device("cpu"))
+
+    assert sample.control_point_index == 5
+    assert image.shape == (4, 4)
+    assert valid.shape == (4, 4)
+    assert np.array_equal(image, np.arange(24, dtype=np.float32).reshape(4, 6)[:, 1:5])
 
 
 def test_direction_model_defaults_to_10_block_64_channel_resnet() -> None:

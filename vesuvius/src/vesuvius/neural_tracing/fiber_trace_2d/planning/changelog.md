@@ -21,6 +21,12 @@
 - Tuned the 2D fiber-strip load-only pipeline to use shared-loader whole-batch
   futures plus bounded CP-prep workers, added optional VC3D sampler cache/I/O
   controls, and documented measured loader throughput variants.
+- Added `--dbg-dirs` for 2D `--dir-vis`, adding a half-image pasted-center
+  debug row to probe local direction evidence against transformed patch context.
+- Added explicit image-space flip/90-degree-rotation panels to 2D `--dir-vis`
+  and writes them as one labeled direction-overlay contact sheet.
+- Switched 2D `--dir-vis` direction overlays to 8x8 display-pixel cells with
+  6-pixel anti-aliased direction segments.
 - Added real process CPU timing to the 2D fiber-trace benchmark/profile table
   so loader summed-worker timing can be compared against actual CPU usage.
 - Parallelized the 2D CUDA training load+prepare path by submitting exact training steps to concurrent workers, added one-offset strip-cache and CP-tangent/no-coordinate-retention fast paths, and documented measured throughput limits.

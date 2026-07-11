@@ -80,10 +80,14 @@ The important behavior is:
 - Builds geometric augmentation maps in strip pixel coordinates. The image is
   never geometrically warped after loading; instead, output pixels map into an
   oversized source coordinate grid, and final 3D coordinates are sampled once.
-- Geometric image-space augmentation helpers are intentionally absent. Any
-  geometric change must be represented as coordinate manipulation before
+- Training, augment-vis, line tracing, Trace2CP, labels, TTA, and core loader
+  paths keep geometric image-space augmentation helpers absent. Any geometric
+  change on those paths must be represented as coordinate manipulation before
   sampling/slicing the patch. Only value-only image changes such as brightness,
-  contrast, gamma, noise, and blur run after image sampling.
+  contrast, gamma, noise, and blur run after image sampling. The runner's
+  `--dir-vis` mode is the only diagnostic exception: it applies pixel-perfect
+  image-space flips and 90-degree rotations to an already sampled center patch
+  for checkpoint robustness inspection.
 - Provides `StripAugmentTransform`, the shared paired transform for geometric
   augmentation. At construction it bakes the whole geometric stack into two
   concrete tensors: `backward_map_xy` maps output pixels to source pixels for
@@ -263,9 +267,21 @@ The important behavior is:
   score in a top label band above the image pixels.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
-  side-strip patch, runs the checkpointed direction model, decodes the
-  direction field, scales the patch image by 2x, and writes `dir_vis.jpg` with
-  short direction segments drawn every second source pixel.
+  side-strip patch, applies pixel-perfect image-space identity/flip/90-degree
+  rotation variants, runs the checkpointed direction model for each variant,
+  nearest-neighbor scales each augmented patch image by 4x for visualization
+  only, and writes a single `dir_vis.jpg` natural-size horizontal strip with one
+  shared top label band and anti-aliased 6-display-pixel direction segments
+  drawn every second source pixel, i.e. one segment per 8x8 display-pixel cell.
+  Model inference runs on each native-resolution augmented patch before display
+  upsampling. If the loaded center patch is not square, dir-vis center-crops it
+  to the largest square before applying pixel-space flips/rotations; it does not
+  rescale the native patch before inference. The valid mask gates model
+  normalization and arrow placement, but does not black out display pixels.
+  `--dbg-dirs` adds a second row: the first cell is the raw unaugmented patch
+  without direction arrows, and the remaining cells run inference on transformed
+  patches whose center half-image region has been overwritten with the matching
+  unaugmented center crop.
 
 `train.py`
 

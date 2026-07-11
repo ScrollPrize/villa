@@ -34,6 +34,14 @@ def _to_u8_image(image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
     return out
 
 
+def _to_u8_display_image(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image, dtype=np.float32)
+    out = np.zeros(arr.shape, dtype=np.uint8)
+    finite = np.isfinite(arr)
+    out[finite] = np.clip(arr[finite], 0.0, 255.0).astype(np.uint8)
+    return out
+
+
 def _write_jpg(path: Path, image_u8: np.ndarray) -> None:
     from PIL import Image
 
@@ -107,7 +115,7 @@ def _direction_field_overlay_rgb(
     valid_mask: np.ndarray,
     direction_xy: np.ndarray,
     *,
-    scale: int = 2,
+    scale: int = 4,
     stride: int = 2,
     color_rgba: tuple[int, int, int, int] = (32, 255, 255, 220),
 ) -> tuple[np.ndarray, int]:
@@ -126,7 +134,8 @@ def _direction_field_overlay_rgb(
     sample_stride = max(1, int(stride))
     scaled = np.repeat(np.repeat(base, display_scale, axis=0), display_scale, axis=1)
     pil = Image.fromarray(scaled, mode="RGB")
-    overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+    aa_scale = 4
+    overlay = Image.new("RGBA", (pil.size[0] * aa_scale, pil.size[1] * aa_scale), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, mode="RGBA")
     half_len = max(1.0, float(display_scale * sample_stride) * 0.375)
     drawn = 0
@@ -144,9 +153,131 @@ def _direction_field_overlay_rgb(
             cy = (float(y) + 0.5) * float(display_scale)
             dx = float(unit[0]) * half_len
             dy = float(unit[1]) * half_len
-            draw.line((cx - dx, cy - dy, cx + dx, cy + dy), fill=color_rgba, width=1)
+            draw.line(
+                (
+                    (cx - dx) * aa_scale,
+                    (cy - dy) * aa_scale,
+                    (cx + dx) * aa_scale,
+                    (cy + dy) * aa_scale,
+                ),
+                fill=color_rgba,
+                width=aa_scale,
+            )
             drawn += 1
+    try:
+        resample = Image.Resampling.LANCZOS
+    except AttributeError:
+        resample = Image.LANCZOS
+    overlay = overlay.resize(pil.size, resample=resample)
     return np.asarray(Image.alpha_composite(pil.convert("RGBA"), overlay).convert("RGB"), dtype=np.uint8), drawn
+
+
+@dataclass(frozen=True)
+class _DirVisImageAugment:
+    name: str
+    image: np.ndarray
+    valid_mask: np.ndarray
+
+
+@dataclass(frozen=True)
+class _DirVisPrediction:
+    augment: _DirVisImageAugment
+    direction_xy: np.ndarray
+
+
+def _dir_vis_image_space_augmentations(image: np.ndarray, valid_mask: np.ndarray) -> list[_DirVisImageAugment]:
+    arr = np.asarray(image)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if arr.shape[:2] != valid.shape:
+        raise ValueError("valid_mask must match image height/width")
+
+    transforms = [
+        ("identity", lambda value: value),
+        ("flip_x", lambda value: np.flip(value, axis=1)),
+        ("flip_y", lambda value: np.flip(value, axis=0)),
+        ("rot90", lambda value: np.rot90(value, k=1, axes=(0, 1))),
+        ("rot180", lambda value: np.rot90(value, k=2, axes=(0, 1))),
+        ("rot270", lambda value: np.rot90(value, k=3, axes=(0, 1))),
+    ]
+    return [
+        _DirVisImageAugment(
+            name=name,
+            image=np.ascontiguousarray(transform(arr)),
+            valid_mask=np.ascontiguousarray(transform(valid), dtype=bool),
+        )
+        for name, transform in transforms
+    ]
+
+
+def _render_dir_vis_panel(augment: _DirVisImageAugment, direction_xy: np.ndarray) -> tuple[np.ndarray, int]:
+    image_u8 = _to_u8_display_image(augment.image)
+    return _direction_field_overlay_rgb(
+        image_u8,
+        augment.valid_mask,
+        direction_xy,
+        scale=4,
+        stride=2,
+    )
+
+
+def _render_dir_vis_raw_panel(image: np.ndarray, *, scale: int = 4) -> np.ndarray:
+    image_u8 = _to_u8_display_image(image)
+    if image_u8.ndim == 2:
+        image_u8 = np.repeat(image_u8[..., None], 3, axis=-1)
+    display_scale = max(1, int(scale))
+    return np.repeat(np.repeat(image_u8, display_scale, axis=0), display_scale, axis=1)
+
+
+def _center_crop_2d(array: np.ndarray, side: int) -> np.ndarray:
+    arr = np.asarray(array)
+    if arr.ndim != 2:
+        raise ValueError("array must be 2D")
+    crop_side = min(max(1, int(side)), int(arr.shape[0]), int(arr.shape[1]))
+    y0 = (int(arr.shape[0]) - crop_side) // 2
+    x0 = (int(arr.shape[1]) - crop_side) // 2
+    return arr[y0 : y0 + crop_side, x0 : x0 + crop_side]
+
+
+def _paste_unaugmented_center_patch(
+    base_image: np.ndarray,
+    base_valid_mask: np.ndarray,
+    target: _DirVisImageAugment,
+    *,
+    paste_side: int,
+) -> _DirVisImageAugment:
+    image = np.asarray(target.image).copy()
+    valid = np.asarray(target.valid_mask, dtype=bool).copy()
+    base = np.asarray(base_image)
+    base_valid = np.asarray(base_valid_mask, dtype=bool)
+    if image.ndim != 2 or valid.shape != image.shape or base.ndim != 2 or base_valid.shape != base.shape:
+        raise ValueError("base and target images/masks must be matching 2D arrays")
+    patch = _center_crop_2d(base, paste_side)
+    patch_valid = _center_crop_2d(base_valid, paste_side)
+    side = int(patch.shape[0])
+    y0 = (int(image.shape[0]) - side) // 2
+    x0 = (int(image.shape[1]) - side) // 2
+    image[y0 : y0 + side, x0 : x0 + side] = patch
+    valid[y0 : y0 + side, x0 : x0 + side] = patch_valid
+    return _DirVisImageAugment(
+        name=f"paste_{target.name}",
+        image=np.ascontiguousarray(image),
+        valid_mask=np.ascontiguousarray(valid, dtype=bool),
+    )
+
+
+def _dir_vis_half_image_paste_side(image_shape_hw: tuple[int, int]) -> int:
+    if len(image_shape_hw) != 2:
+        raise ValueError("image_shape_hw must contain exactly height and width")
+    height, width = int(image_shape_hw[0]), int(image_shape_hw[1])
+    side = min(height, width)
+    if side <= 0:
+        raise ValueError(f"dir-vis image must be non-empty, got image_shape_hw=({height}, {width})")
+    return max(1, (side + 1) // 2)
+
+
+def _direction_model_receptive_field_diameter(config: FiberStripDirectionModelConfig) -> tuple[int, int]:
+    radius = 1 + 2 * max(1, int(config.depth))
+    return radius, 2 * radius + 1
 
 
 def _draw_label_band(image: np.ndarray, label: str) -> np.ndarray:
@@ -159,20 +290,22 @@ def _draw_label_band(image: np.ndarray, label: str) -> np.ndarray:
     font = ImageFont.load_default()
     probe = Image.new("RGB", (1, 1))
     draw = ImageDraw.Draw(probe, mode="RGBA")
+    pad_x = 3
+    pad_y = 2
     try:
         bbox = draw.textbbox((0, 0), text, font=font)
         text_w = int(bbox[2] - bbox[0])
         text_h = int(bbox[3] - bbox[1])
+        text_y = pad_y - int(bbox[1])
     except AttributeError:
         text_w, text_h = draw.textsize(text, font=font)
-    pad_x = 3
-    pad_y = 2
+        text_y = pad_y
     band_h = int(text_h + 2 * pad_y)
     cell = np.zeros((arr.shape[0] + band_h, arr.shape[1], 3), dtype=np.uint8)
     cell[band_h:, :, :] = arr
     pil = Image.fromarray(cell, mode="RGB")
     draw = ImageDraw.Draw(pil, mode="RGBA")
-    draw.text((pad_x, pad_y), text[: max(1, arr.shape[1])], fill=(255, 255, 255, 255), font=font)
+    draw.text((pad_x, text_y), text[: max(1, arr.shape[1])], fill=(255, 255, 255, 255), font=font)
     return np.asarray(pil, dtype=np.uint8)
 
 
@@ -199,6 +332,126 @@ def _write_contact_sheet(
         image_h, image_w = image.shape[:2]
         sheet[row * h : row * h + image_h, col * w : col * w + image_w] = image
     _write_jpg(path, sheet)
+
+
+def _labeled_panel_strip_rgb(images: list[np.ndarray], labels: list[str]) -> np.ndarray:
+    from PIL import Image, ImageDraw, ImageFont
+
+    if not images:
+        raise ValueError("images must not be empty")
+    if len(images) != len(labels):
+        raise ValueError("labels length must match images length")
+    prepared: list[np.ndarray] = []
+    for image in images:
+        arr = np.asarray(image, dtype=np.uint8)
+        if arr.ndim == 2:
+            arr = np.repeat(arr[..., None], 3, axis=-1)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise ValueError("images must be grayscale or RGB")
+        prepared.append(arr)
+
+    font = ImageFont.load_default()
+    probe = Image.new("RGB", (1, 1))
+    draw = ImageDraw.Draw(probe, mode="RGBA")
+    sample_text = max((str(label) for label in labels), key=len)
+    pad_x = 3
+    pad_y = 2
+    try:
+        bbox = draw.textbbox((0, 0), sample_text, font=font)
+        text_h = int(bbox[3] - bbox[1])
+        text_y = pad_y - int(bbox[1])
+    except AttributeError:
+        _, text_h = draw.textsize(sample_text, font=font)
+        text_y = pad_y
+    band_h = int(text_h + 2 * pad_y)
+    total_w = sum(int(image.shape[1]) for image in prepared)
+    max_h = max(int(image.shape[0]) for image in prepared)
+    sheet = np.zeros((band_h + max_h, total_w, 3), dtype=np.uint8)
+    x = 0
+    for image, label in zip(prepared, labels):
+        image_h, image_w = image.shape[:2]
+        sheet[band_h : band_h + image_h, x : x + image_w] = image
+        x += image_w
+
+    pil = Image.fromarray(sheet, mode="RGB")
+    draw = ImageDraw.Draw(pil, mode="RGBA")
+    x = 0
+    for image, label in zip(prepared, labels):
+        draw.text((x + pad_x, text_y), str(label)[: max(1, image.shape[1])], fill=(255, 255, 255, 255), font=font)
+        x += int(image.shape[1])
+    return np.asarray(pil, dtype=np.uint8)
+
+
+def _write_labeled_panel_strip(path: Path, images: list[np.ndarray], labels: list[str]) -> None:
+    _write_jpg(path, _labeled_panel_strip_rgb(images, labels))
+
+
+def _labeled_panel_grid_rgb(rows: list[list[np.ndarray]], labels: list[str]) -> np.ndarray:
+    from PIL import Image, ImageDraw, ImageFont
+
+    if not rows or any(not row for row in rows):
+        raise ValueError("rows must not be empty")
+    columns = len(rows[0])
+    if len(labels) != columns:
+        raise ValueError("labels length must match column count")
+    if any(len(row) != columns for row in rows):
+        raise ValueError("all rows must have the same column count")
+
+    prepared: list[list[np.ndarray]] = []
+    shape_hw: tuple[int, int] | None = None
+    for row in rows:
+        prepared_row: list[np.ndarray] = []
+        for image in row:
+            arr = np.asarray(image, dtype=np.uint8)
+            if arr.ndim == 2:
+                arr = np.repeat(arr[..., None], 3, axis=-1)
+            if arr.ndim != 3 or arr.shape[2] != 3:
+                raise ValueError("images must be grayscale or RGB")
+            current_shape = (int(arr.shape[0]), int(arr.shape[1]))
+            if shape_hw is None:
+                shape_hw = current_shape
+            elif current_shape != shape_hw:
+                raise ValueError("all grid panels must have the same size")
+            prepared_row.append(arr)
+        prepared.append(prepared_row)
+    assert shape_hw is not None
+    panel_h, panel_w = shape_hw
+
+    font = ImageFont.load_default()
+    probe = Image.new("RGB", (1, 1))
+    draw = ImageDraw.Draw(probe, mode="RGBA")
+    sample_text = max((str(label) for label in labels), key=len)
+    pad_x = 3
+    pad_y = 2
+    try:
+        bbox = draw.textbbox((0, 0), sample_text, font=font)
+        text_h = int(bbox[3] - bbox[1])
+        text_y = pad_y - int(bbox[1])
+    except AttributeError:
+        _, text_h = draw.textsize(sample_text, font=font)
+        text_y = pad_y
+    band_h = int(text_h + 2 * pad_y)
+    sheet = np.zeros((band_h + len(prepared) * panel_h, columns * panel_w, 3), dtype=np.uint8)
+    for row_index, row in enumerate(prepared):
+        y0 = band_h + row_index * panel_h
+        for col_index, image in enumerate(row):
+            x0 = col_index * panel_w
+            sheet[y0 : y0 + panel_h, x0 : x0 + panel_w] = image
+
+    pil = Image.fromarray(sheet, mode="RGB")
+    draw = ImageDraw.Draw(pil, mode="RGBA")
+    for col_index, label in enumerate(labels):
+        draw.text(
+            (col_index * panel_w + pad_x, text_y),
+            str(label)[: max(1, panel_w)],
+            fill=(255, 255, 255, 255),
+            font=font,
+        )
+    return np.asarray(pil, dtype=np.uint8)
+
+
+def _write_labeled_panel_grid(path: Path, rows: list[list[np.ndarray]], labels: list[str]) -> None:
+    _write_jpg(path, _labeled_panel_grid_rgb(rows, labels))
 
 
 def _inside_trace_margin(point_xy: np.ndarray, shape_hw: tuple[int, int], margin: float) -> bool:
@@ -537,6 +790,30 @@ def _load_direction_model(
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, checkpoint
+
+
+def _build_dir_vis_center_patch(
+    loader: FiberStrip2DLoader,
+    sample_index: int,
+    *,
+    device: torch.device,
+) -> tuple[object, np.ndarray, np.ndarray]:
+    sample, image, valid_mask = loader.build_center_strip_patch(sample_index, device=device)
+    image_arr = np.asarray(image, dtype=np.float32)
+    valid_arr = np.asarray(valid_mask, dtype=bool)
+    if image_arr.ndim != 2 or valid_arr.shape != image_arr.shape:
+        raise ValueError("dir-vis center patch image and valid mask must be matching 2D arrays")
+    height, width = image_arr.shape
+    side = min(int(height), int(width))
+    if side <= 0:
+        raise ValueError(f"dir-vis center patch must be non-empty, got image_shape_hw=({height}, {width})")
+    y0 = (int(height) - side) // 2
+    x0 = (int(width) - side) // 2
+    return (
+        sample,
+        np.ascontiguousarray(image_arr[y0 : y0 + side, x0 : x0 + side], dtype=np.float32),
+        np.ascontiguousarray(valid_arr[y0 : y0 + side, x0 : x0 + side], dtype=bool),
+    )
 
 
 def _predict_direction_field(
@@ -1387,22 +1664,52 @@ def _export_dir_vis(
     output_dir: str | Path,
     *,
     checkpoint_path: str | Path,
+    dbg_dirs: bool = False,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     device = resolve_torch_device(loader.config.augment.device)
-    sample, image, valid_mask = loader.build_center_strip_patch(sample_index)
+    sample, image, valid_mask = _build_dir_vis_center_patch(loader, sample_index, device=device)
     model, checkpoint = _load_direction_model(checkpoint_path, loader, device=device)
-    direction_xy = _predict_direction_field(model, image, valid_mask, device=device)
-    image_u8 = _to_u8_image(image, valid_mask)
-    overlay, drawn = _direction_field_overlay_rgb(
-        image_u8,
-        valid_mask,
-        direction_xy,
-        scale=2,
-        stride=2,
-    )
-    _write_jpg(out / "dir_vis.jpg", overlay)
+    model_config = _model_config_from_checkpoint(checkpoint, loader)
+    rf_radius_px, rf_diameter_px = _direction_model_receptive_field_diameter(model_config)
+    dbg_paste_side_px = _dir_vis_half_image_paste_side(image.shape)
+    augmented_inputs = _dir_vis_image_space_augmentations(image, valid_mask)
+    predictions: list[_DirVisPrediction] = []
+    for augment in augmented_inputs:
+        predictions.append(
+            _DirVisPrediction(
+                augment=augment,
+                direction_xy=_predict_direction_field(model, augment.image, augment.valid_mask, device=device),
+            )
+        )
+    rendered: list[tuple[str, np.ndarray, int]] = []
+    for prediction in predictions:
+        panel, drawn = _render_dir_vis_panel(prediction.augment, prediction.direction_xy)
+        rendered.append((prediction.augment.name, panel, drawn))
+    labels = [name for name, _, _ in rendered]
+    panels = [panel for _, panel, _ in rendered]
+    drawn_by_augmentation = [(name, int(drawn)) for name, _, drawn in rendered]
+    panel_rows = [panels]
+    if dbg_dirs:
+        pasted_row: list[np.ndarray] = [_render_dir_vis_raw_panel(image)]
+        for augment in augmented_inputs[1:]:
+            pasted = _paste_unaugmented_center_patch(
+                image,
+                valid_mask,
+                augment,
+                paste_side=dbg_paste_side_px,
+            )
+            direction_xy = _predict_direction_field(model, pasted.image, pasted.valid_mask, device=device)
+            panel, drawn = _render_dir_vis_panel(pasted, direction_xy)
+            pasted_row.append(panel)
+            drawn_by_augmentation.append((pasted.name, int(drawn)))
+        panel_rows.append(pasted_row)
+        _write_labeled_panel_grid(out / "dir_vis.jpg", panel_rows, labels)
+    else:
+        _write_labeled_panel_strip(out / "dir_vis.jpg", panels, labels)
+    drawn_total = sum(drawn for _, drawn in drawn_by_augmentation)
+    augmentation_names = [name for name, _ in drawn_by_augmentation]
     summary = [
         f"sample_index={sample_index}",
         f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
@@ -1411,9 +1718,27 @@ def _export_dir_vis(
         f"control_point_index={sample.control_point_index}",
         f"strip_z_offset={sample.strip_z_offset}",
         f"image_shape_hw=({int(image.shape[0])}, {int(image.shape[1])})",
-        "display_scale=2",
+        "display_scale=4",
+        "display_patch_upsampling=nearest_neighbor",
+        "model_inference_resolution=native",
+        f"model_receptive_field_radius_px={rf_radius_px}",
+        f"model_receptive_field_diameter_px={rf_diameter_px}",
+        f"dbg_dirs_paste_side_px={dbg_paste_side_px if dbg_dirs else 0}",
         "direction_stride=2",
-        f"drawn_directions={drawn}",
+        "direction_cell_px=8",
+        "direction_segment_px=6",
+        "direction_augmentations=" + ",".join(augmentation_names),
+        "direction_panels_show_augmented_images=true",
+        f"dbg_dirs={bool(dbg_dirs)}",
+        f"direction_panel_rows={len(panel_rows)}",
+        "direction_row_1=augmented_inputs_with_direction_arrows",
+        "direction_row_2=raw_patch_then_augmented_context_with_unaugmented_half_image_center"
+        if dbg_dirs
+        else "direction_row_2=none",
+        "direction_panel_layout=" + ("same_size_grid" if dbg_dirs else "natural_size_horizontal_strip"),
+        f"direction_panels_per_row={len(panels)}",
+        f"drawn_directions={drawn_total}",
+        *[f"drawn_directions_{name}={drawn}" for name, drawn in drawn_by_augmentation],
     ]
     (out / "dir_vis_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
     print(f"exported dir_vis.jpg and dir_vis_summary.txt to {out}")
@@ -1744,6 +2069,11 @@ def main() -> None:
     parser.add_argument("--med-tta", action="store_true")
     parser.add_argument("--vis-tta", action="store_true")
     parser.add_argument("--dir-vis", action="store_true")
+    parser.add_argument(
+        "--dbg-dirs",
+        action="store_true",
+        help="When used with --dir-vis, add a second row of center-pasted direction debug variants",
+    )
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--line-trace-step", type=float, default=4.0)
     parser.add_argument("--line-trace-tta-count", type=int, default=100)
@@ -1832,6 +2162,7 @@ def main() -> None:
             args.sample_index,
             args.export_dir,
             checkpoint_path=args.checkpoint,
+            dbg_dirs=bool(args.dbg_dirs),
         )
         return
 
