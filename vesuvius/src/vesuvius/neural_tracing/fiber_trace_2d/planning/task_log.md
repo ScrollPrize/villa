@@ -1,30 +1,21 @@
-# Trace2CP Metric Task Log
+# Full Test Trace2CP Evaluation Sentinel Task Log
 
-## Implementation Notes
+## Notes
 
-- Added `_Trace2CpMetricResult` and `_trace2cp_metric_from_traces` in
-  `runner.py`.
-- Public Trace2CP metric is now closest actual vertical trace gap divided by
-  horizontal CP span.
-- The no-overlap fallback uses centerline-to-valid-edge y distance divided by
-  horizontal CP span.
-- Existing center-biased closest approach remains in the refinement result as
-  a visualization/refinement diagnostic.
-- Added `_trace2cp_metric_bidirectional` for training/test evaluation so the
-  metric path does not build fused/refined visualization traces.
-- Single-pair and whole-fiber Trace2CP summaries/stdout now report
-  `metric_error` and keep `refine_score` separate.
-- Training test evaluation now computes averaged held-out CP-to-next-CP
-  `test/trace2cp_error`, logs it to TensorBoard, and selects `best.pt` by that
-  metric when `test_datasets` is configured.
+- Starting from user request to make `training.test_control_points: 0` evaluate
+  all configured test control point samples.
+- `training.test_control_points` now parses as a non-negative integer. Positive
+  values preserve the existing deterministic random test window behavior.
+- The `0` sentinel resolves to `test_loader.sample_count`, starts at sample
+  index `0`, and uses flat CP order so the evaluated segment set matches
+  whole-fiber Trace2CP visualization more directly.
+- Test loss and Trace2CP metric both use the resolved effective test selection.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  - Passed.
-- `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task_plan.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/status.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/specs.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/code_structure.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/changelog.md`
-  - Passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'trace2cp_metric or bidirectional_trace_scores_closest_approach or training_with_test_dataset_uses_test_interval_for_snapshots'`
-  - Passed: 4 passed, 136 deselected.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'test_control_points or test_interval'`
+  - Passed: 5 passed, 140 deselected in 4.17s.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  - Passed: 140 passed.
+  - Passed: 145 passed in 6.46s.
+- `git diff --check -- <touched files>`
+  - Passed.

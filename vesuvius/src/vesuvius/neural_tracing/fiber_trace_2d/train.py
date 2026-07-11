@@ -85,7 +85,7 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         tensorboard_image_interval=max(1, int(get("tensorboard_image_interval", 1000))),
         checkpoint_interval=max(1, int(get("checkpoint_interval", 1000))),
         test_interval=max(1, int(get("test_interval", get("checkpoint_interval", 1000)))),
-        test_control_points=max(1, int(get("test_control_points", get("control_points_per_step", 4)))),
+        test_control_points=int(get("test_control_points", get("control_points_per_step", 4))),
         test_start_sample_index=max(0, int(get("test_start_sample_index", 0))),
         test_trace2cp_step_px=float(get("test_trace2cp_step_px", 4.0)),
         test_trace2cp_rf_margin_px=(
@@ -107,6 +107,8 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         raise ValueError("training.max_steps must be >= 0")
     if config.max_sample_index < 0:
         raise ValueError("training.max_sample_index must be >= 0")
+    if config.test_control_points < 0:
+        raise ValueError("training.test_control_points must be >= 0")
     if not math.isfinite(config.learning_rate) or config.learning_rate <= 0.0:
         raise ValueError("training.learning_rate must be positive and finite")
     if not math.isfinite(config.test_trace2cp_step_px) or config.test_trace2cp_step_px <= 0.0:
@@ -164,13 +166,22 @@ def _json_safe(value: Any) -> Any:
 
 def _make_run_dir(config: FiberStripTrainingConfig) -> Path:
     date = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(config.run_path).expanduser() / f"{config.run_name}_{date}"
-    run_dir.mkdir(parents=True, exist_ok=False)
+    run_root = Path(config.run_path).expanduser()
+    base_name = f"{config.run_name}_{date}"
+    run_dir = run_root / base_name
+    suffix = 0
+    while True:
+        try:
+            run_dir.mkdir(parents=True, exist_ok=False)
+            break
+        except FileExistsError:
+            suffix += 1
+            run_dir = run_root / f"{base_name}_{suffix:02d}"
     (run_dir / "snapshots").mkdir(parents=True, exist_ok=True)
     return run_dir.resolve()
 
 
-def _make_summary_writer(run_dir: Path, *, enabled: bool):
+def _make_summary_writer(run_dir: Path, *, enabled: bool, purge_step: int | None = None):
     if not enabled:
         return None
     try:
@@ -180,7 +191,10 @@ def _make_summary_writer(run_dir: Path, *, enabled: bool):
             "TensorBoard logging requires the tensorboard package. "
             "Install tensorboard or set training.tensorboard_enabled=false."
         ) from exc
-    return SummaryWriter(log_dir=str(run_dir))
+    kwargs: dict[str, Any] = {}
+    if purge_step is not None:
+        kwargs["purge_step"] = int(purge_step)
+    return SummaryWriter(log_dir=str(run_dir), **kwargs)
 
 
 def _flatten_batch(batch: FiberStrip2DBatch) -> tuple[np.ndarray, np.ndarray]:
@@ -997,6 +1011,30 @@ class _Trace2CpMetricEvalResult:
     first_skip_reason: str
 
 
+@dataclass(frozen=True)
+class _ResolvedTestSelection:
+    start_sample_index: int
+    sample_count: int
+    sample_mode: str
+
+
+def _resolve_test_selection(
+    training: FiberStripTrainingConfig,
+    loader: FiberStrip2DLoader,
+) -> _ResolvedTestSelection:
+    if int(training.test_control_points) == 0:
+        return _ResolvedTestSelection(
+            start_sample_index=0,
+            sample_count=int(loader.sample_count),
+            sample_mode="flat",
+        )
+    return _ResolvedTestSelection(
+        start_sample_index=int(training.test_start_sample_index),
+        sample_count=int(training.test_control_points),
+        sample_mode="random",
+    )
+
+
 def _evaluate_fixed_batch(
     model: FiberStripDirectionNet,
     loader: FiberStrip2DLoader,
@@ -1004,11 +1042,16 @@ def _evaluate_fixed_batch(
     device: torch.device,
     start_sample_index: int,
     batch_size: int,
+    sample_mode: str,
 ) -> _EvalResult:
     was_training = model.training
     model.eval()
     with torch.no_grad():
-        batch = loader.load_batch(start_sample_index, batch_size=batch_size)
+        batch = loader.load_batch(
+            start_sample_index,
+            batch_size=batch_size,
+            sample_mode=sample_mode,
+        )
         loss, outputs, supervision, metrics = _compute_batch_loss(model, batch, device=device)
         loss_value = float(loss.detach().cpu().item())
         outputs_cpu = outputs.detach().cpu()
@@ -1032,6 +1075,7 @@ def _evaluate_trace2cp_metric_fixed_set(
     sample_count: int,
     step_px: float,
     rf_margin_px: float,
+    sample_mode: str,
 ) -> _Trace2CpMetricEvalResult:
     was_training = model.training
     model.eval()
@@ -1048,7 +1092,7 @@ def _evaluate_trace2cp_metric_fixed_set(
                     target_offset=1,
                     rf_margin_px=rf_margin_px,
                     device=device,
-                    sample_mode="random",
+                    sample_mode=sample_mode,
                 )
                 direction_xy = _predict_direction_field(model, image, valid_mask, device=device)
                 metric = _trace2cp_metric_bidirectional(
@@ -1273,13 +1317,64 @@ def _save_checkpoint(
     )
 
 
+def _torch_load_checkpoint(path: Path, *, map_location: torch.device | str):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def _resolve_resume_checkpoint(path: str | Path | None) -> Path | None:
+    if path is None:
+        return None
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise ValueError(f"--resume checkpoint does not exist: {resolved}")
+    return resolved
+
+
+def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device=device)
+
+
+def _load_training_resume_checkpoint(
+    path: Path,
+    *,
+    model: FiberStripDirectionNet,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> tuple[dict[str, Any], int]:
+    checkpoint = _torch_load_checkpoint(path, map_location=device)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"{path} is not a fiber_trace_2d training checkpoint")
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(f"{path} is missing model_state_dict")
+    if "optimizer_state_dict" not in checkpoint:
+        raise ValueError(f"{path} is missing optimizer_state_dict")
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    _move_optimizer_state_to_device(optimizer, device)
+    try:
+        step = int(checkpoint.get("step", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path} has an invalid checkpoint step") from exc
+    if step < 0:
+        raise ValueError(f"{path} has an invalid negative checkpoint step: {step}")
+    return checkpoint, step
+
+
 def run_training(
     config_path: str | Path,
     *,
     sampler_factory: SamplerFactory | None = None,
+    resume_checkpoint: str | Path | None = None,
 ) -> Path:
     raw_config = _load_raw_config(config_path)
     training = _training_config_from_raw(raw_config)
+    resume_path = _resolve_resume_checkpoint(resume_checkpoint)
     loader_config = load_config(config_path)
     _validate_training_batch_config(training, loader_config)
     loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
@@ -1299,11 +1394,29 @@ def run_training(
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate)
 
+    resume_step = 0
     run_dir = _make_run_dir(training)
+    resume_metric_name = ""
+    resume_metric_value = float("nan")
+    if resume_path is not None:
+        resume_checkpoint_data, resume_step = _load_training_resume_checkpoint(
+            resume_path,
+            model=model,
+            optimizer=optimizer,
+            device=device,
+        )
+        resume_metric_name = str(resume_checkpoint_data.get("metric_name", "loss"))
+        try:
+            resume_metric_value = float(resume_checkpoint_data.get("loss", float("nan")))
+        except (TypeError, ValueError):
+            resume_metric_value = float("nan")
+    start_step = int(resume_step) + 1
     snapshots = run_dir / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
     writer = _make_summary_writer(run_dir, enabled=training.tensorboard_enabled)
     if writer is not None:
         writer.add_text("config/json", json.dumps(_json_safe(raw_config), indent=2, sort_keys=True), 0)
+        writer.flush()
     print(f"fiber_trace_2d train run_dir={run_dir}", flush=True)
     print(
         "fiber_trace_2d train pipeline "
@@ -1314,6 +1427,14 @@ def run_training(
         f"volume_cache_memory_mib={loader_config.volume_cache_memory_mib}",
         flush=True,
     )
+    if resume_path is not None:
+        print(
+            "fiber_trace_2d train resume "
+            f"checkpoint={resume_path} checkpoint_step={resume_step} "
+            f"next_step={resume_step + 1} metric_name={resume_metric_name} "
+            f"metric_value={resume_metric_value:.8f} run_dir={run_dir}",
+            flush=True,
+        )
 
     sample_mode = "random"
     finite_steps = training.max_steps > 0
@@ -1334,12 +1455,12 @@ def run_training(
                 training,
                 device=device,
                 sample_mode=sample_mode,
-                start_step=1,
+                start_step=start_step,
                 max_step=finite_max_step,
                 profile_enabled=False,
                 apply_image_augmentation=False,
             )
-        step = 1
+        step = start_step
         while True:
             if finite_steps and step > training.max_steps:
                 break
@@ -1395,12 +1516,14 @@ def run_training(
             test_result = None
             test_trace2cp_metric = None
             if should_test:
+                test_selection = _resolve_test_selection(training, test_loader)
                 test_result = _evaluate_fixed_batch(
                     model,
                     test_loader,
                     device=device,
-                    start_sample_index=training.test_start_sample_index,
-                    batch_size=training.test_control_points,
+                    start_sample_index=test_selection.start_sample_index,
+                    batch_size=test_selection.sample_count,
+                    sample_mode=test_selection.sample_mode,
                 )
                 last_test_loss = test_result.loss
                 last_test_angle_mean_deg = test_result.angle_mean_deg
@@ -1413,14 +1536,19 @@ def run_training(
                     model,
                     test_loader,
                     device=device,
-                    start_sample_index=training.test_start_sample_index,
-                    sample_count=training.test_control_points,
+                    start_sample_index=test_selection.start_sample_index,
+                    sample_count=test_selection.sample_count,
                     step_px=training.test_trace2cp_step_px,
                     rf_margin_px=trace2cp_margin,
+                    sample_mode=test_selection.sample_mode,
                 )
                 last_test_trace2cp_error = test_trace2cp_metric.error_mean
 
-            if writer is not None and (step == 1 or step % training.scalar_log_interval == 0):
+            is_first_run_step = step == start_step
+            wrote_tensorboard = False
+            if writer is not None and (
+                is_first_run_step or step == 1 or step % training.scalar_log_interval == 0
+            ):
                 writer.add_scalar("train/loss_direction", loss_value, step)
                 writer.add_scalar("train/angle_error_mean_deg", metrics.angle_mean_deg, step)
                 writer.add_scalar("train/supervision_samples", int(supervision.target.shape[0]), step)
@@ -1433,6 +1561,7 @@ def run_training(
                 writer.add_scalar("timing/train_ms", train_ms, step)
                 for key, value in _cache_scalars(batch.cache_stats).items():
                     writer.add_scalar(key, value, step)
+                wrote_tensorboard = True
             if writer is not None and test_result is not None:
                 writer.add_scalar("test/loss_direction", test_result.loss, step)
                 writer.add_scalar("test/angle_error_mean_deg", test_result.angle_mean_deg, step)
@@ -1448,14 +1577,21 @@ def run_training(
                     writer.add_scalar("test/trace2cp_skipped_segments", test_trace2cp_metric.skipped_segments, step)
                 for key, value in _cache_scalars(test_result.batch.cache_stats).items():
                     writer.add_scalar(f"test_{key}", value, step)
-            if writer is not None and (step == 1 or step % training.tensorboard_image_interval == 0):
+                wrote_tensorboard = True
+            if writer is not None and (
+                is_first_run_step or step == 1 or step % training.tensorboard_image_interval == 0
+            ):
                 writer.add_image("train/batch_direction_overlay", _make_training_visualization(batch, outputs), step)
+                wrote_tensorboard = True
             if writer is not None and test_result is not None:
                 writer.add_image(
                     "test/batch_direction_overlay",
                     _make_training_visualization(test_result.batch, test_result.outputs),
                     step,
                 )
+                wrote_tensorboard = True
+            if writer is not None and wrote_tensorboard:
+                writer.flush()
 
             should_save_current = (
                 bool(should_test)
@@ -1635,6 +1771,11 @@ def prefetch_training(
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train V0 2D fiber-strip direction model")
     parser.add_argument("config", help="Path to fiber_trace_2d JSON config")
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Resume training from an existing checkpoint while creating a fresh timestamped run directory",
+    )
     parser.add_argument("--prefetch", action="store_true", help="Prefetch training chunks and exit without training")
     parser.add_argument(
         "--benchmark",
@@ -1694,7 +1835,10 @@ def main(argv: list[str] | None = None) -> None:
         except ValueError as exc:
             parser.error(str(exc))
         return
-    run_training(args.config)
+    try:
+        run_training(args.config, resume_checkpoint=args.resume)
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":

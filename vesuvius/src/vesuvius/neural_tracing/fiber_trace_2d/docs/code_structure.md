@@ -256,7 +256,7 @@ The important behavior is:
 - `--trace2cp-vis` loads a side-strip segment spanning both CPs, runs the same
   decoded direction-field model as line tracing, traces start-to-target and
   target-to-start on the same strip, and reports the public
-  `trace2cp_metric_error`: closest actual vertical y-gap between the opposing
+  `trace2cp_error`: closest actual vertical y-gap between the opposing
   traces divided by the horizontal start-to-target CP span. The older
   center-biased closest approach remains a `refine_score` diagnostic for the
   fused/optimized visualization rows only. Endpoint scores at the opposite CP
@@ -276,7 +276,7 @@ The important behavior is:
   `trace2cp_tta/contact_sheet.jpg`. Each image shows the sampled slice with the
   transformed base-strip corner outline and start/target CP markers.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
-  `trace2cp_metric_error`, metric raw y-gap in pixels, horizontal CP span,
+  `trace2cp_error`, metric raw y-gap in pixels, horizontal CP span,
   `refine_score`, trace mode, endpoint diagnostics, and per-direction
   scores/statuses to stdout. The summary includes the closest x position,
   fused/optimized point counts,
@@ -296,7 +296,8 @@ The important behavior is:
   display, and the long strip uses the same four rows as the single-pair
   Trace2CP view: full traces, partial closest-approach traces, fused CP-to-CP
   line, and optimized line. The summary includes requested, valid, and skipped
-  pair counts plus mean/min/max `trace2cp_metric_error`;
+  pair counts plus mean/min/max trace2cp errors. Stdout prints the public
+  whole-fiber metric on its own line as `trace2cp_error_mean=<value>`;
   `trace2cp_fiber_debug.txt` records per-pair strip CP vectors, row axes,
   frame vectors, and projected CP deltas for debugging.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
@@ -371,10 +372,16 @@ The important behavior is:
   remains ordered by training step.
 - Logs scalars/images to TensorBoard and writes `current.pt` / `best.pt`
   snapshots under the run directory.
-- When `test_datasets` is configured, evaluates a fixed deterministic held-out
-  batch at `training.test_interval`, also evaluates Trace2CP on each selected
-  held-out CP using the segment to the next CP, and uses the averaged
-  `test/trace2cp_error` for current/best snapshots.
+- When `test_datasets` is configured, evaluates a deterministic held-out test
+  set at `training.test_interval` using either the configured fixed-size
+  random window or all held-out CPs when `test_control_points` is `0`; it also
+  evaluates Trace2CP on each selected held-out CP using the segment to the next
+  CP, and uses the averaged `test/trace2cp_error` for current/best snapshots.
+- `--resume <snapshot.pt>` restores model and optimizer state, creates a fresh
+  timestamped run directory from the current config just like normal training,
+  and continues from `checkpoint_step + 1`. `training.max_steps` remains the
+  absolute target step, so increase it before resuming a completed finite run.
+  The first resumed step is logged and flushed to TensorBoard immediately.
 
 `configs/loader_example.json`
 
@@ -443,7 +450,9 @@ Training keys:
 - `test_interval`: interval for deterministic held-out evaluation and, when
   `test_datasets` is configured, current snapshot writes.
 - `test_control_points`: number of deterministic held-out CP samples per test
-  evaluation.
+  evaluation. Positive values use the deterministic random window starting at
+  `test_start_sample_index`; `0` evaluates every held-out CP sample once in
+  flat CP order starting at zero.
 - `test_start_sample_index`: deterministic held-out sample start index.
 - `control_points_per_step`: deterministic CP samples per step; default `4`.
   Training and benchmark modes require this to match top-level `batch_size`.
@@ -789,9 +798,23 @@ Snapshots are written under:
 
 With `test_datasets`, `current.pt` is written at step 1, every
 `training.test_interval`, and the final step; `best.pt` tracks the lowest
-observed averaged `test/trace2cp_error`. Without `test_datasets`, snapshots keep the train-only
+observed averaged `test/trace2cp_error` over the effective test sample count
+(`test_control_points`, or all held-out CP samples when it is `0`). Without
+`test_datasets`, snapshots keep the train-only
 behavior: `current.pt` follows `training.checkpoint_interval`, and `best.pt`
 tracks the lowest observed training loss.
+
+Resume an existing run:
+
+```bash
+PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace_2d.train config.json --resume /path/to/run/snapshots/current.pt
+```
+
+Training writes the resumed run to a new timestamped run directory from the
+current config's `training.run_path` and `training.run_name`. If that name
+collides because two runs start in the same second, a numeric suffix is added.
+The resumed run writes its own `snapshots/current.pt`, `snapshots/best.pt`, and
+TensorBoard event file.
 
 ## Prefetch
 

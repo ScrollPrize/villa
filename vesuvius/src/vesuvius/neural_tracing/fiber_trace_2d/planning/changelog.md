@@ -2,6 +2,13 @@
 
 ## 2026-07-11
 
+- Made `training.test_control_points: 0` evaluate all configured held-out CP
+  samples once in flat order, so training `test/trace2cp_error` can cover the
+  same segment set as whole-fiber Trace2CP visualization.
+- Added `--resume <snapshot.pt>` to continue fiber_trace_2d training from an
+  existing model/optimizer snapshot into a fresh timestamped run directory, and
+  made whole-fiber Trace2CP stdout print the public metric on its own
+  `trace2cp_error_mean=...` line.
 - Changed public Trace2CP reporting to `trace2cp_error`, the closest actual
   vertical trace gap divided by horizontal CP span; the center-biased score is
   now only a refinement/visual diagnostic, and test-dataset training selects

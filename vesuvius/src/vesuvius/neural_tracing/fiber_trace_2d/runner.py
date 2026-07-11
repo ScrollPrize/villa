@@ -2770,6 +2770,7 @@ def _export_trace2cp_vis(
         f"rf_margin_px={margin:.3f}",
         f"trace_mode={selected_mode}",
         f"trace_points={trace_points}",
+        f"trace2cp_error={metric.error:.8f}",
         f"trace2cp_metric_error={metric.error:.8f}",
         f"trace2cp_metric_raw_y_error_px={metric.raw_y_error_px:.6f}",
         f"trace2cp_metric_horizontal_span_px={metric.horizontal_span_px:.6f}",
@@ -2823,17 +2824,18 @@ def _export_trace2cp_vis(
         *tta_rows,
     ]
     (out / "trace2cp_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    print(f"trace2cp_error={metric.error:.8f}")
     print(
         "trace2cp "
         f"sample_index={sample_index} fiber_path={sample.fiber_path} "
         f"start_cp={sample.start_control_point_index} target_cp={sample.target_control_point_index} "
-        f"mode={selected_mode} metric_error={metric.error:.8f} "
+        f"mode={selected_mode} trace2cp_error={metric.error:.8f} "
         f"metric_raw_y_error_px={metric.raw_y_error_px:.6f} "
         f"metric_horizontal_span_px={metric.horizontal_span_px:.6f} "
         f"actual_y_error_px={selected_result.raw_y_error_px:.6f} "
         f"considered_y_error_px={selected_result.considered_y_error_px:.6f} "
         f"center_penalty={refinement.center_penalty:.6f} "
-        f"reference_metric_error={reference_metric.error:.8f} "
+        f"reference_trace2cp_error={reference_metric.error:.8f} "
         f"refine_score={selected_result.score:.8f} "
         f"reference_refine_score={base_result.score:.8f} "
         f"endpoint_score={selected_result.endpoint_score:.8f} "
@@ -2966,7 +2968,7 @@ def _export_trace2cp_fiber_vis(
             f"fiber_path={evaluation.sample.fiber_path} "
             f"start_cp={evaluation.sample.start_control_point_index} "
             f"target_cp={evaluation.sample.target_control_point_index} "
-            f"mode={evaluation.selected_mode} metric_error={evaluation.selected_result.metric.error:.8f} "
+            f"mode={evaluation.selected_mode} trace2cp_error={evaluation.selected_result.metric.error:.8f} "
             f"metric_raw_y_error_px={evaluation.selected_result.metric.raw_y_error_px:.6f} "
             f"metric_horizontal_span_px={evaluation.selected_result.metric.horizontal_span_px:.6f} "
             f"refine_score={evaluation.selected_result.score:.8f} "
@@ -2993,8 +2995,8 @@ def _export_trace2cp_fiber_vis(
     label = (
         f"trace2cp fiber pairs={len(evaluations)} mode={mode} "
         f"skipped={len(skipped_pairs)} "
-        f"metric_mean={float(np.mean(metric_errors)):.4f} "
-        f"metric_max={float(np.max(metric_errors)):.4f} "
+        f"trace2cp_error_mean={float(np.mean(metric_errors)):.4f} "
+        f"trace2cp_error_max={float(np.max(metric_errors)):.4f} "
         f"mean_metric_raw_px={float(np.mean(actual_errors)):.2f}"
     )
     overlay = _draw_trace2cp_fiber_overlay(
@@ -3006,7 +3008,7 @@ def _export_trace2cp_fiber_vis(
     (out / "trace2cp_fiber_debug.txt").write_text("\n".join(debug_rows) + "\n", encoding="utf-8")
 
     rows = [
-        "start_cp target_cp metric_error metric_raw_y_error_px metric_horizontal_span_px "
+        "start_cp target_cp trace2cp_error metric_raw_y_error_px metric_horizontal_span_px "
         "metric_max_y_error_px metric_reason refine_score actual_y_error_px considered_y_error_px "
         "center_penalty reference_metric_error reference_refine_score endpoint_score closest_x "
         "forward_reason reverse_reason"
@@ -3048,6 +3050,9 @@ def _export_trace2cp_fiber_vis(
         f"trace_mode={mode}",
         f"med_tta={bool(med_tta)}",
         f"line_trace_tta_count={max(0, int(line_trace_tta_count)) if med_tta else 0}",
+        f"trace2cp_error_mean={float(np.mean(metric_errors)):.8f}",
+        f"trace2cp_error_max={float(np.max(metric_errors)):.8f}",
+        f"trace2cp_error_min={float(np.min(metric_errors)):.8f}",
         f"trace2cp_metric_error_mean={float(np.mean(metric_errors)):.8f}",
         f"trace2cp_metric_error_max={float(np.max(metric_errors)):.8f}",
         f"trace2cp_metric_error_min={float(np.min(metric_errors)):.8f}",
@@ -3067,12 +3072,13 @@ def _export_trace2cp_fiber_vis(
         ),
     ]
     (out / "trace2cp_fiber_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    print(f"trace2cp_error_mean={float(np.mean(metric_errors)):.8f}")
     print(
         "trace2cp fiber "
         f"fiber_json={fiber_path_display} "
         f"pairs={len(evaluations)} mode={mode} "
-        f"metric_error_mean={float(np.mean(metric_errors)):.8f} "
-        f"metric_error_max={float(np.max(metric_errors)):.8f} "
+        f"trace2cp_error_mean={float(np.mean(metric_errors)):.8f} "
+        f"trace2cp_error_max={float(np.max(metric_errors)):.8f} "
         f"metric_raw_y_error_mean_px={float(np.mean(actual_errors)):.6f} "
         f"refine_score_mean={float(np.mean(refine_scores)):.8f} "
         f"skipped_pairs={len(skipped_pairs)}"

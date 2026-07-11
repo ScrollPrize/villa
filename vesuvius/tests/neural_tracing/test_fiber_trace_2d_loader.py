@@ -54,6 +54,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _should_print_training_step,
     _load_training_batch,
     _TrainingBatchPipeline,
+    _resolve_test_selection,
     _test_loader_config_from_raw,
     _training_config_from_raw,
     _validate_training_batch_config,
@@ -3233,6 +3234,28 @@ def test_training_config_parses_test_settings() -> None:
     assert config.test_start_sample_index == 11
 
 
+def test_training_config_allows_zero_test_control_points_for_full_test_set() -> None:
+    config = _training_config_from_raw({"training": {"test_control_points": 0}})
+
+    assert config.test_control_points == 0
+
+
+def test_training_config_rejects_negative_test_control_points() -> None:
+    with pytest.raises(ValueError, match="training.test_control_points must be >= 0"):
+        _training_config_from_raw({"training": {"test_control_points": -1}})
+
+
+def test_zero_test_control_points_resolves_to_full_flat_test_set() -> None:
+    training = FiberStripTrainingConfig(test_control_points=0, test_start_sample_index=19)
+    loader = SimpleNamespace(sample_count=7)
+
+    selection = _resolve_test_selection(training, loader)  # type: ignore[arg-type]
+
+    assert selection.start_sample_index == 0
+    assert selection.sample_count == 7
+    assert selection.sample_mode == "flat"
+
+
 def test_training_config_allows_zero_max_steps() -> None:
     config = _training_config_from_raw({"training": {"max_steps": 0}})
 
@@ -3498,6 +3521,41 @@ def test_one_step_training_smoke_writes_checkpoint(tmp_path: Path) -> None:
     assert (run_dir / "snapshots" / "best.pt").is_file()
 
 
+def test_training_resume_continues_existing_checkpoint(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["training"] = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "resume",
+        "max_steps": 1,
+        "control_points_per_step": 1,
+        "tensorboard_enabled": False,
+        "model_hidden_channels": 4,
+        "model_depth": 2,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    run_dir = run_training(config_path, sampler_factory=_test_sampler_factory)
+    current_path = run_dir / "snapshots" / "current.pt"
+    first_current = torch.load(current_path, map_location="cpu", weights_only=False)
+    assert first_current["step"] == 1
+
+    raw["training"]["max_steps"] = 2
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    resumed_run_dir = run_training(
+        config_path,
+        sampler_factory=_test_sampler_factory,
+        resume_checkpoint=current_path,
+    )
+
+    resumed_current_path = resumed_run_dir / "snapshots" / "current.pt"
+    resumed_current = torch.load(resumed_current_path, map_location="cpu", weights_only=False)
+    assert resumed_run_dir != run_dir
+    assert resumed_current["step"] == 2
+    assert current_path.is_file()
+
+
 def test_training_benchmark_reports_patch_throughput_without_run_dir(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
@@ -3590,3 +3648,42 @@ def test_training_with_test_dataset_uses_test_interval_for_snapshots(tmp_path: P
     assert current["step"] == 2
     assert current["metric_name"] == "test/trace2cp_error"
     assert best["metric_name"] == "test/trace2cp_error"
+
+
+def test_zero_test_control_points_runs_trace2cp_over_full_test_set(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    test_fiber = _write_fiber(
+        tmp_path / "heldout_full_fiber.json",
+        points=[[8.0, 24.0, 24.0], [18.0, 24.0, 24.0], [28.0, 24.0, 24.0]],
+    )
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["test_datasets"] = [
+        {
+            **raw["datasets"][0],
+            "fiber_paths": [str(test_fiber)],
+        }
+    ]
+    raw["training"] = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "test_full",
+        "max_steps": 1,
+        "control_points_per_step": 1,
+        "test_interval": 1,
+        "test_control_points": 0,
+        "test_start_sample_index": 99,
+        "tensorboard_enabled": False,
+        "model_hidden_channels": 4,
+        "model_depth": 2,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    run_dir = run_training(config_path, sampler_factory=_test_sampler_factory)
+    stdout = capsys.readouterr().out
+
+    current = torch.load(run_dir / "snapshots" / "current.pt", map_location="cpu", weights_only=False)
+    assert current["metric_name"] == "test/trace2cp_error"
+    assert "test_trace2cp_segments=2" in stdout
+    assert "test_trace2cp_skipped=1" in stdout

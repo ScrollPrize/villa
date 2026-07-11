@@ -1,12 +1,10 @@
-# Trace2CP Metric Status
+# Full Test Trace2CP Evaluation Sentinel Status
 
 - [x] Read local AGENTS workflow.
-- [x] Replace `planning/task.md` with the current Trace2CP metric task.
+- [x] Replace `planning/task.md` with the current user request.
 - [x] Write `planning/task_plan.md`.
-- [x] Update specs/docs/changelog for metric semantics.
-- [x] Implement lightweight Trace2CP metric helper.
-- [x] Wire runner summaries/stdout to report the metric.
-- [x] Wire training test evaluation and best snapshot selection to the metric.
+- [x] Update specs/docs/changelog for `test_control_points: 0`.
+- [x] Implement full-test sentinel behavior.
 - [x] Add/update tests.
-- [x] Run focused test command.
-- [x] Record validation and implementation notes in `planning/task_log.md`.
+- [x] Run focused tests.
+- [x] Record implementation notes and validation in `planning/task_log.md`.
