@@ -1,40 +1,28 @@
-# Trace2CP Center-Biased Metric Task Log
+# Whole-Fiber Trace2CP Visualization Task Log
 
-## Plan Review
+## Notes
 
-- `task.md`: the plan implements the requested center preference and `2x`
-  considered distance at either CP.
-- `specs.md`: the change is limited to Trace2CP metric selection/scoring and
-  keeps the existing shared tracing/TTA code path.
-- `plan.md`: pre-existing user edits remain untouched.
-
-## Implementation Notes
-
-- Added `_trace2cp_center_penalty`, using a linear multiplier from `1.0` at
-  the midpoint between CP x coordinates to `2.0` at either CP x coordinate.
-- Trace2CP closest-point selection now minimizes
-  `actual_y_gap * center_penalty`.
-- `trace2cp_score` now uses the considered center-penalized distance divided by
-  the usable vertical strip span. The actual y separation remains available as
-  `actual_y_error_px` / `raw_y_error_px` diagnostics.
-- Trace2CP visualization/summary output now reports actual gap, considered
-  gap, and center penalty.
-- Added regression tests for the center penalty and for a case where the center
-  candidate wins despite a larger actual y-gap.
-- Added a reference-only comparison column to `trace2cp_vis.jpg` when
-  `--med-tta` is active. The selected median-TTA result remains first; the
-  second column is the base/reference inference without TTA. Non-TTA Trace2CP
-  output stays single-column.
-- Added a renderer regression test for the optional reference column.
-- `planning/plan.md` and `planning/todo.md` were already modified in the
-  worktree and were not edited for this task.
+- Started from the existing single-pair Trace2CP runner path.
+- Whole-fiber mode should reuse configured loader records and reject a
+  `--fiber-json` path that is not part of the active config.
+- Added `FiberStrip2DLoader.flat_sample_indices_for_fiber_json(...)` so runner
+  code can resolve a configured fiber JSON to deterministic flat CP indices.
+- Extracted `_evaluate_trace2cp_pair(...)` so single-pair and whole-fiber
+  Trace2CP share the same segment loading, model prediction, optional
+  median-TTA, tracing, and scoring behavior.
+- Added `--trace2cp-vis --fiber-json <path>` to evaluate all in-range CP pairs
+  for `--trace2cp-target-offset` and write `trace2cp_fiber_vis.jpg` plus
+  `trace2cp_fiber_summary.txt`.
+- Added long-strip composition by translating pair-local images and trace
+  points into the selected fiber's shared arc-length x coordinate system.
+- `--fiber-json` rejects `--trace2cp-target-cp-index` because whole-fiber mode
+  already derives all targets from `--trace2cp-target-offset`.
 
 ## Validation
 
-- Passed:
-  `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-- Passed:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  (`131 passed in 6.06s`)
-- Passed:
-  `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - passed: `134 passed in 6.04s`.
+- `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - passed.

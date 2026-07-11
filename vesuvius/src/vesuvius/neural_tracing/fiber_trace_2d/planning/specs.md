@@ -299,6 +299,14 @@
   in the same fiber; `--trace2cp-target-offset` changes the relative target and
   `--trace2cp-target-cp-index` selects an absolute target CP index in the same
   fiber. The target CP must be in range and different from the start CP.
+- `--trace2cp-vis --fiber-json <path>` runs whole-fiber Trace2CP visualization
+  for a fiber JSON that is already present in the configured loader datasets.
+  It must use the configured Lasagna manifest, volume scale, cache, and
+  sampler context for that fiber; it must not introduce a separate
+  manifest-less fiber loading path. Whole-fiber mode uses all in-range CP pairs
+  for the non-zero `--trace2cp-target-offset`; the default offset `1` evaluates
+  adjacent pairs `(0,1), (1,2), ...`. It cannot be combined with
+  `--trace2cp-target-cp-index`.
 - Trace2CP loading constructs a side-strip segment that spans the start and
   target CPs plus receptive-field/visualization margin. The segment strip
   height is twice the configured patch height so traces have more vertical room
@@ -384,6 +392,14 @@
   the selected median-TTA result first, and a second reference-only inference
   column using the base direction field without TTA. It does not draw score
   text over image pixels.
+- Whole-fiber Trace2CP mode writes `trace2cp_fiber_vis.jpg` and
+  `trace2cp_fiber_summary.txt`. Each CP pair is loaded, traced, and scored with
+  the same pair-local Trace2CP path as the single-pair command. The final
+  visualization is composed afterward by translating each pair-local segment
+  image, centerline, CP markers, selected traces, and optimized line into a
+  shared arc-length x coordinate system for the selected fiber. Overlapping
+  valid pair-image pixels are averaged for display only; scores and traces are
+  still computed pair by pair.
 - Trace2CP target-column crossing takes precedence over RF-margin rejection for
   the next step in each direction. If a step crosses that direction's target
   x-column and would also enter the RF margin, the trace is considered to have

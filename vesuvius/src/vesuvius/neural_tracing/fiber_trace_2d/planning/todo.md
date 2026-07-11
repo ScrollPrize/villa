@@ -24,30 +24,8 @@
 - [ ] check augmentations for training: all flips and orientations should be equally likely
 - [ ] group norm: with a single sample per patch we seem to get a more global direction per patch! either remove the norm or do more batch-norm style normalization!
 
-
-- Not quite before. After your question I re-scanned and found one remaining legacy dense helper in augmentation.py plus a test-only pseudo-inverse helper.
-
-  Now removed:
-
-  - _nearest_output_pixels_for_source_points
-  - _transformed_source_point_coords_affine
-  - _transformed_centerline_coords_affine
-  - _reference_direction_to_source_grid_direction with np.linalg.pinv
-  - stale “invert CP” wording
-
-  So for geometric augmentation / TTA map inversion: yes, the search/bruteforce/after-the-fact inversion code is gone. The code now uses the explicitly built paired maps.
-
-  Remaining argmin hits are unrelated to augmentation-map inversion:
-
-  - pick nearest line vertex to CP for tangent estimation
-  - choose nearest strip-z offset for display/training bookkeeping
-  - choose an axis in strip geometry
-
-  Re-ran:
-  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py
-
-  Result: 115 passed in 5.69s.
-
+# ideas
+- [ ] short-strip self supervision?
 
 
 # later optimization ml experiments

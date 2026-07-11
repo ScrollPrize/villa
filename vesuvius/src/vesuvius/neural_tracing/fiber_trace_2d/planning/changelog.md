@@ -2,6 +2,8 @@
 
 ## 2026-07-11
 
+- Added `--trace2cp-vis --fiber-json <path>` to run Trace2CP over all
+  configured CP pairs for one fiber and compose a long-strip visualization.
 - Added a reference-only comparison column to `--trace2cp-vis --med-tta`
   output.
 - Added a center-bias penalty to Trace2CP closest-approach scoring so candidate

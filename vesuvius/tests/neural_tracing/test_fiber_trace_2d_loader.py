@@ -37,6 +37,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.direction import (
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace_2d.loader import (
     FiberStrip2DLoader,
+    FiberStripSegmentSample,
     ZarrChunkRequest,
     load_config,
     strip_z_offsets_from_count_step,
@@ -70,6 +71,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _dir_vis_image_space_augmentations,
     _dir_vis_half_image_paste_side,
     _direction_field_overlay_rgb,
+    _draw_trace2cp_fiber_overlay,
     _draw_trace2cp_overlay,
     _draw_trace2cp_tta_slice,
     _export_augment_contact_sheet,
@@ -82,6 +84,8 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _reference_point_to_tta,
     _score_trace2cp,
     _source_grid_direction_to_reference,
+    _Trace2CpPairEvaluation,
+    _trace2cp_fiber_pair_cp_indices,
     _trace2cp_refinement_from_traces,
     _trace2cp_center_penalty,
     _trace2cp_tta_params,
@@ -617,6 +621,88 @@ def test_trace2cp_segment_patch_uses_double_configured_height(tmp_path: Path) ->
     assert image.shape[0] == 10
     assert valid.shape[0] == 10
     assert sample.coords_zyx.shape[0] == 10
+
+
+def test_loader_maps_fiber_json_to_flat_control_point_indices(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    loader = _make_loader(load_config(config_path))
+    fiber_path = json.loads(config_path.read_text(encoding="utf-8"))["datasets"][0]["fiber_paths"][0]
+
+    assert loader.flat_sample_indices_for_fiber_json(fiber_path) == (0, 1, 2)
+
+    with pytest.raises(ValueError, match="not present"):
+        loader.flat_sample_indices_for_fiber_json(tmp_path / "missing.json")
+
+
+def test_trace2cp_fiber_pair_cp_indices_respect_offsets() -> None:
+    assert _trace2cp_fiber_pair_cp_indices(4, 1) == ((0, 1), (1, 2), (2, 3))
+    assert _trace2cp_fiber_pair_cp_indices(4, 2) == ((0, 2), (1, 3))
+    assert _trace2cp_fiber_pair_cp_indices(4, -1) == ((1, 0), (2, 1), (3, 2))
+    assert _trace2cp_fiber_pair_cp_indices(2, 3) == ()
+    with pytest.raises(ValueError, match="non-zero"):
+        _trace2cp_fiber_pair_cp_indices(4, 0)
+
+
+def _fake_trace2cp_pair_evaluation(start_cp: int, target_cp: int) -> _Trace2CpPairEvaluation:
+    image = np.full((20, 16), 64.0, dtype=np.float32)
+    valid = np.ones_like(image, dtype=bool)
+    direction = np.zeros((20, 16, 2), dtype=np.float32)
+    direction[..., 0] = 1.0
+    start_xy = np.asarray([2.0, 10.0], dtype=np.float32)
+    target_xy = np.asarray([12.0, 10.0], dtype=np.float32)
+    result = _trace_score_trace2cp_bidirectional(
+        direction,
+        start_xy,
+        target_xy,
+        valid_mask=valid,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+    sample = FiberStripSegmentSample(
+        record_index=0,
+        fiber_path="fiber.json",
+        start_control_point_index=start_cp,
+        target_control_point_index=target_cp,
+        start_control_point_xyz=np.zeros(3, dtype=np.float32),
+        target_control_point_xyz=np.ones(3, dtype=np.float32),
+        strip_z_offset=0.0,
+        coords_zyx=np.zeros((20, 16, 3), dtype=np.float32),
+        valid_mask=valid,
+        frame=None,
+        line_xy=np.asarray([[2.0, 10.0], [12.0, 10.0]], dtype=np.float32),
+        start_control_point_xy=start_xy,
+        target_control_point_xy=target_xy,
+    )
+    return _Trace2CpPairEvaluation(
+        sample_index=start_cp,
+        sample=sample,
+        image=image,
+        valid_mask=valid,
+        base_result=result,
+        selected_result=result,
+        selected_mode="base",
+        tta_count=0,
+        med_fields_count=0,
+        tta_rows=(),
+        tta_debug_entries=(),
+    )
+
+
+def test_trace2cp_fiber_overlay_composes_pair_results_into_long_strip() -> None:
+    first = _fake_trace2cp_pair_evaluation(0, 1)
+    second = _fake_trace2cp_pair_evaluation(1, 2)
+
+    drawn = _draw_trace2cp_fiber_overlay(
+        [first, second],
+        control_point_x=np.asarray([0.0, 10.0, 20.0], dtype=np.float32),
+        label="fiber",
+    )
+
+    assert drawn.ndim == 3
+    assert drawn.shape[2] == 3
+    assert drawn.shape[0] > first.image.shape[0]
+    assert drawn.shape[1] > first.image.shape[1]
+    assert bool(np.any(drawn[..., 1] != drawn[..., 0]))
 
 
 def test_trace2cp_tta_patch_samples_volume_from_augmented_coords(tmp_path: Path) -> None:

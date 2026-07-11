@@ -231,6 +231,13 @@ def _resolve_path(path: str | Path, config_dir: Path | None) -> str:
     return str((root / expanded).resolve())
 
 
+def _path_match_key(path: str | Path, config_dir: Path | None = None) -> str:
+    resolved = _resolve_path(path, config_dir)
+    if _is_remote_path(resolved):
+        return resolved
+    return str(Path(resolved).expanduser().resolve())
+
+
 def _as_hw(value: Any, *, key: str) -> tuple[int, int]:
     if isinstance(value, int):
         size = int(value)
@@ -980,6 +987,20 @@ class FiberStrip2DLoader:
     @property
     def sample_count(self) -> int:
         return self._flat_sample_count
+
+    def flat_sample_indices_for_fiber_json(self, fiber_json: str | Path) -> tuple[int, ...]:
+        query_key = _path_match_key(fiber_json, self.config.config_dir)
+        flat_offset = 0
+        for record in self.records:
+            record_path = "" if record.fiber.path is None else str(record.fiber.path)
+            record_count = int(record.fiber.control_points_xyz.shape[0])
+            if record_path and _path_match_key(record_path, None) == query_key:
+                return tuple(flat_offset + index for index in range(record_count))
+            flat_offset += record_count
+        raise ValueError(
+            "fiber_json is not present in configured datasets: "
+            f"fiber_json='{_resolve_path(fiber_json, self.config.config_dir)}'"
+        )
 
     def _build_sample_identity_keys(self) -> tuple[str, ...]:
         keys: list[str] = []

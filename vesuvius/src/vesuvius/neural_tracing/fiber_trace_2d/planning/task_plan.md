@@ -1,44 +1,45 @@
-# Trace2CP Center-Biased Metric Plan
+# Whole-Fiber Trace2CP Visualization Plan
 
 ## Implementation Plan
 
-- Add a small Trace2CP center-penalty helper in `runner.py`.
-- Apply that helper while evaluating overlap candidates in
-  `_closest_trace2cp_approach`.
-- Select the candidate with the smallest considered distance, where considered
-  distance is actual vertical gap multiplied by the center penalty.
-- Preserve actual vertical gap diagnostics separately from considered metric
-  distance.
-- Add summary/visualization fields for the penalty and considered distance.
-- Compose Trace2CP visualization columns so `--med-tta` shows the current
-  median-TTA result plus a second reference-only inference column.
-- Keep non-TTA Trace2CP visualization as a single reference-only column.
-- Add tests covering:
-  - penalty is `1x` at CP midpoint and `2x` at either CP;
-  - a centered candidate can win even when its actual gap is larger than a
-    CP-edge candidate gap;
-  - existing closest-approach behavior remains unchanged when the best
-    candidate is already centered.
+- Add a loader helper that maps a configured `fiber_json` path to the flat
+  sample indices for that fiber's control points.
+- Refactor Trace2CP pair evaluation in `runner.py` so the existing single-pair
+  export and new whole-fiber export use the same pair loading, model
+  inference, optional median-TTA, tracing, and scoring code.
+- Add `--fiber-json` to the Trace2CP runner arguments.
+- In `--trace2cp-vis --fiber-json <path>` mode:
+  - find all in-range CP pairs for the requested non-zero
+    `--trace2cp-target-offset`;
+  - evaluate each pair with `sample_mode="flat"` and explicit target CP;
+  - translate pair-local images, centerlines, CP markers, traces, fused lines,
+    and optimized lines into a shared fiber arc-length x coordinate system;
+  - write `trace2cp_fiber_vis.jpg` and `trace2cp_fiber_summary.txt`;
+  - print concise per-fiber summary stats.
+- Keep existing single-pair output filenames and behavior unchanged when
+  `--fiber-json` is omitted.
 
 ## Spec Update
 
-- Update Trace2CP score wording: public score uses center-penalized considered
-  distance, while actual y separation remains diagnostic.
-- Add that `--trace2cp-vis --med-tta` renders a reference-only comparison
-  column next to the selected median-TTA column.
+- Document `--fiber-json` whole-fiber Trace2CP mode, adjacent/in-range CP-pair
+  selection, shared arc-length visualization coordinates, output filenames, and
+  unchanged single-pair behavior.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` Trace2CP section with center-penalty
-  semantics and reference comparison column behavior.
+- Update `docs/code_structure.md` with the new runner mode and output files.
 
 ## Tests
 
+- Add unit coverage for:
+  - mapping a configured fiber JSON path to flat CP sample indices;
+  - whole-fiber CP-pair index selection;
+  - long-strip Trace2CP composition produces a valid image wider than one pair.
 - Run:
-  `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 - Run:
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 
 ## Changelog Update
 
-- Add a 2026-07-11 changelog line for the center-biased Trace2CP score.
+- Add a 2026-07-11 changelog line for whole-fiber Trace2CP visualization.

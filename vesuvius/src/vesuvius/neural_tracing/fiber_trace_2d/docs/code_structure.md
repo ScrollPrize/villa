@@ -238,6 +238,13 @@ The important behavior is:
   through the deterministic sample order, uses that CP as the start, targets
   the next CP by default, and can use `--trace2cp-target-offset` or
   `--trace2cp-target-cp-index` for other same-fiber target CPs.
+- `--trace2cp-vis --fiber-json <path>` runs the same Trace2CP path for every
+  in-range CP pair in a configured fiber. The fiber JSON must already be part
+  of the loader config, so the command keeps the same Lasagna manifest, volume
+  scale, cache, and sampler context as normal training/inspection. With the
+  default target offset `1`, pairs are adjacent CPs. This mode writes
+  `trace2cp_fiber_vis.jpg` and `trace2cp_fiber_summary.txt`; it does not write
+  the single-pair `trace2cp_vis.jpg`.
 - `--trace2cp-vis` loads a side-strip segment spanning both CPs, runs the same
   decoded direction-field model as line tracing, traces start-to-target and
   target-to-start on the same strip, and uses the center-biased closest
@@ -271,6 +278,11 @@ The important behavior is:
   closest-approach traces, the fused CP-to-CP line, and the optimized
   refinement. With `--med-tta`, that stack is rendered as the first column and
   a second column shows the reference-only/base-inference result without TTA.
+- The whole-fiber Trace2CP JPG is composed after pair scoring. Pair-local
+  images and traced points are translated into a shared fiber arc-length x
+  coordinate system, valid overlapping image pixels are averaged for display,
+  and the long strip draws the pair centerline, selected bidirectional traces,
+  optimized CP-to-CP line, CP markers, and per-pair score labels.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
   side-strip patch, applies pixel-perfect image-space identity/flip/90-degree
