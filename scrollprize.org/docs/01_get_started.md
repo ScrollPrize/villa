@@ -54,7 +54,7 @@ Get a feel for [the data](data) by looking inside a scroll that has not been ope
 Our goal is to read the entire library:
 
 <Admonition type="tip" icon="🏆" title="2027 Grand Prize">
-* Prize: \$1,000,000 to [fully unroll and read one of 23 sealed scrolls](prizes#2027-grand-prize) — deadline June 25th, 2027
+* Prize: \$1,000,000 to [fully unroll and read one of 14 sealed scrolls](prizes#2027-grand-prize) — deadline June 25th, 2027
 * Starting point: [Open Problems](2026_open_problems) (the state of the pipeline), [Data](data), [Tutorials](tutorial)
 </Admonition>
 

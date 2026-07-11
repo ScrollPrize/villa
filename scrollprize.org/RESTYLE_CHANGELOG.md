@@ -429,6 +429,13 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 **Why:** owner spotted `Full dataset (HTTP) -> data.aws.ash2txt.org/samples/...` on detail pages after C52's deprecated-link removal. Those two rows were hardcoded to the old `s3://vesuvius-challenge/` bucket and had become exact duplicates of the "HTTP"/"S3" rows above them, which already point at the same tree in the open-data bucket (verified per-scroll prefixes exist). Removed both rows (+ dead `toHttp` import). Remaining old-host references: only inside Neuroglancer viewer URLs for the not-yet-mirrored DLS volumes (kept deliberately).
 **Files:** `src/components/atlas/DataCatalog.js`.
 
+## C54 — prizes: eligible scroll list corrected to 14, full volume names
+
+**Why:** owner narrowed the 2027 Grand Prize eligible list to 14 scrolls (dropping 175A/B, 306B, 483A/B, 490A/B, 846A/B) and wants each entry to show the full volume name — timestamp, voxel size, energy — exactly as the Data Browser displays it.
+- Eligible list rebuilt programmatically from the freshly regenerated atlas index: visible text is now the scan name (e.g. `20250720091415-9.362um-1.2m-113keV`) instead of just the voxel size; each entry's existing Neuroglancer href verified to match the live volume zarr path (all 14 matched — the scan *name* timestamp differs from the zarr *path* timestamp by design: acquisition vs processing).
+- Count updated 23 → 14 in the details summary, the prizes frontmatter hook ("Fully unroll and read one of 14 sealed scrolls." — flows to the landing prize board via prizes-data), and get_started's Grand Prize line.
+**Files:** `docs/34_prizes.md`, `docs/01_get_started.md`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
