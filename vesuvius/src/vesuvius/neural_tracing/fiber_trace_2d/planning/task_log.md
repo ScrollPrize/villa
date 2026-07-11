@@ -1,30 +1,18 @@
-# Task Log
+# Combined Direction And Contrastive Embedding Tracer Task Log
 
-Current task: exclude unreachable patch edges from contrastive embedding
-negative supervision.
-
-Plan review:
-- The task is a local correction to the contrastive loss semantics.
-- The planned mask preserves positive supervision and deterministic negative
-  pairing while removing the false edge-negative signal.
-- No config migration is needed; the mask is derived from existing
-  `augment_shift_x/y` and patch shape.
-
-Implementation:
-- Added `contrastive_negative_reachable_mask(...)` and an optional
-  `negative_candidate_mask` argument to `contrastive_embedding_loss(...)`.
-- Training and benchmark contrastive calls now pass a per-run reachable mask
-  derived from patch shape and enabled `augment_shift_x/y`; if augmentation is
-  disabled, the reachable region collapses to the CP-neighborhood around the
-  center.
-- Updated specs, code docs, and changelog.
-- Added a regression test that verifies high-similarity edge pixels do not
-  contribute as negatives when outside the reachable CP-neighborhood region.
-
-Validation:
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/embedding.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py`
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'contrastive_embedding'`
-  - Result: 2 passed, 148 deselected in 2.77s.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  - Result: 150 passed in 5.58s.
-- `git diff --check` on touched files passed.
+- Planned optional Trace2CP combined direction+embedding tracer for visualization and score tuning.
+- Added runner helpers for:
+  - predicting decoded direction plus appended embedding channels from one model pass;
+  - bilinear normalized embedding sampling;
+  - symmetric angular Trace2CP candidate fans;
+  - greedy combined candidate scoring with direction, previous-step embedding, enclosing-CP embedding, and same-fiber CP-bank embedding terms.
+- Added `--trace2cp-combined` plus candidate fan and score-weight CLI knobs.
+- Single-pair and whole-fiber Trace2CP now build/use an in-memory same-fiber CP embedding bank when combined mode is enabled.
+- Combined mode keeps the existing public Trace2CP metric unchanged; it only changes the selected trace path when explicitly requested.
+- With `--med-tta --trace2cp-combined`, median TTA supplies the direction source while embedding scoring samples the reference segment patch.
+- Updated `planning/specs.md`, `docs/code_structure.md`, and `planning/changelog.md`.
+- Added synthetic tests for candidate fan generation, embedding sampling, combined direction-only scoring, embedding-dominant candidate choice, missing embedding failure, and updated Trace2CP test fixtures for the optional combined summary field.
+- Validation:
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - Result: 157 passed in 6.09s.
+  - `git diff --check` on changed code/docs returned clean.

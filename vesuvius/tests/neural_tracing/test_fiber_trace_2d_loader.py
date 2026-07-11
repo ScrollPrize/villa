@@ -70,9 +70,14 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
 )
 from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _DirVisImageAugment,
+    _Trace2CpCombinedWeights,
     _TtaDirectionField,
     _bilinear_direction_sample,
+    _bilinear_embedding_sample,
     _build_dir_vis_center_patch,
+    _trace2cp_candidate_angles_degrees,
+    _trace2cp_candidate_fan_directions,
+    _trace_combined_direction_line_to_target,
     _direction_model_receptive_field_diameter,
     _dir_vis_image_space_augmentations,
     _dir_vis_half_image_paste_side,
@@ -90,6 +95,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _paste_unaugmented_center_patch,
     _print_timing_table,
     _reference_point_to_tta,
+    _require_trace2cp_embedding_field,
     _score_trace2cp,
     _source_grid_direction_to_reference,
     _Trace2CpPairEvaluation,
@@ -551,6 +557,137 @@ def test_trace2cp_reverse_target_column_wins_over_next_rf_margin() -> None:
     assert np.isclose(line[-1, 0], 2.0)
 
 
+def test_trace2cp_candidate_angles_are_symmetric_and_configurable() -> None:
+    angles = _trace2cp_candidate_angles_degrees(25.0, 1.0)
+
+    assert angles.shape == (51,)
+    assert angles[0] == pytest.approx(-25.0)
+    assert angles[-1] == pytest.approx(25.0)
+    assert 0.0 in angles.tolist()
+
+    every_second = _trace2cp_candidate_angles_degrees(25.0, 2.0)
+    assert every_second[0] == pytest.approx(-24.0)
+    assert every_second[-1] == pytest.approx(24.0)
+    assert np.allclose(np.diff(every_second), 2.0)
+    assert 0.0 in every_second.tolist()
+
+
+def test_trace2cp_candidate_fan_rotates_around_oriented_direction() -> None:
+    angles, vectors = _trace2cp_candidate_fan_directions(
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        max_degrees=1.0,
+        step_degrees=1.0,
+    )
+
+    assert angles.tolist() == pytest.approx([-1.0, 0.0, 1.0])
+    assert vectors[1].tolist() == pytest.approx([1.0, 0.0], abs=1.0e-6)
+    assert vectors[0, 1] < 0.0
+    assert vectors[2, 1] > 0.0
+
+
+def test_bilinear_embedding_sample_normalizes_vectors() -> None:
+    embedding = np.zeros((2, 5, 5), dtype=np.float32)
+    embedding[0] = 3.0
+    embedding[1] = 4.0
+
+    sampled = _bilinear_embedding_sample(
+        embedding,
+        np.asarray([2.25, 2.5], dtype=np.float32),
+        valid_mask=np.ones((5, 5), dtype=bool),
+    )
+
+    assert sampled is not None
+    assert sampled.tolist() == pytest.approx([0.6, 0.8])
+
+
+def test_trace2cp_combined_direction_only_selects_center_candidate() -> None:
+    direction = np.zeros((9, 9, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    embedding = np.zeros((2, 9, 9), dtype=np.float32)
+    embedding[0] = 1.0
+
+    line, reason, stats = _trace_combined_direction_line_to_target(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=embedding,
+        valid_mask=np.ones((9, 9), dtype=bool),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([6.0, 4.0], dtype=np.float32),
+        start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        fiber_embeddings=np.zeros((0, 2), dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0),
+        candidate_max_degrees=25.0,
+        candidate_step_degrees=1.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason == "target_column"
+    assert np.allclose(line[:, 1], 4.0)
+    assert stats.steps == 4
+    assert stats.mean("direction") == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_trace2cp_combined_embedding_weight_can_choose_off_axis_candidate() -> None:
+    direction = np.zeros((11, 11, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    embedding = np.zeros((2, 11, 11), dtype=np.float32)
+    embedding[0, :5, :] = 1.0
+    embedding[1, 5:, :] = 1.0
+
+    line, _reason, stats = _trace_combined_direction_line_to_target(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=embedding,
+        valid_mask=np.ones((11, 11), dtype=bool),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([9.0, 4.0], dtype=np.float32),
+        start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        fiber_embeddings=np.asarray([[0.0, 1.0]], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, last=0.0, enclosing=0.0, fiber=1.0),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert line.shape[0] > 1
+    assert line[1, 1] > 4.0
+    assert stats.mean("fiber") < 1.0
+
+
+def test_trace2cp_combined_requires_embedding_channels() -> None:
+    with pytest.raises(ValueError, match="embedding channels"):
+        _require_trace2cp_embedding_field(None)
+
+
+def test_trace2cp_combined_empty_fiber_bank_fails_when_weighted() -> None:
+    direction = np.zeros((7, 7, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    embedding = np.zeros((2, 7, 7), dtype=np.float32)
+    embedding[0] = 1.0
+
+    with pytest.raises(ValueError, match="fiber CP embedding bank is empty"):
+        _trace_combined_direction_line_to_target(
+            direction_xy=direction,
+            tta_fields=None,
+            embedding_chw=embedding,
+            valid_mask=np.ones((7, 7), dtype=bool),
+            start_xy=np.asarray([2.0, 3.0], dtype=np.float32),
+            target_xy=np.asarray([5.0, 3.0], dtype=np.float32),
+            start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+            target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+            fiber_embeddings=np.zeros((0, 0), dtype=np.float32),
+            weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=1.0),
+            candidate_max_degrees=25.0,
+            candidate_step_degrees=1.0,
+            step_px=1.0,
+            rf_margin_px=1.0,
+        )
+
+
 def test_trace2cp_tta_params_drop_y_shift_and_scale() -> None:
     params = FiberStripAugmentParams(
         shift_x=3.0,
@@ -798,6 +935,7 @@ def _fake_trace2cp_pair_evaluation(
         base_result=result,
         selected_result=result,
         selected_mode="base",
+        combined_summary=None,
         tta_count=0,
         med_fields_count=0,
         tta_rows=(),

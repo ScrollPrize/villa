@@ -279,6 +279,17 @@ The important behavior is:
   the reference segment strip, using each TTA reference-to-output coordinate
   grid for point lookup and each output-to-reference grid for direction
   mapping.
+- `--trace2cp-vis --trace2cp-combined` switches the selected Trace2CP trace to
+  a greedy combined direction-plus-embedding scorer for inspection. At each
+  trace step it samples the oriented direction, evaluates an angular candidate
+  fan around that direction, and chooses the candidate with the lowest weighted
+  sum of direction disagreement, cosine distance to the previous trace-point
+  embedding, cosine distance to the two enclosing CP embeddings, and cosine
+  distance to an embedding bank built from all CPs in the same fiber. The
+  default candidate fan is `-25..+25` degrees at 1 degree spacing, and all four
+  score weights default to `1.0`. The mode requires checkpoints with appended
+  embedding channels. With `--med-tta`, median-TTA still supplies the direction
+  reference while embeddings are sampled in the reference segment patch.
 - `--trace2cp-vis --med-tta --vis-tta` writes `trace2cp_tta/reference.jpg`,
   one `trace2cp_tta/random_NNN.jpg` per generated TTA field, and
   `trace2cp_tta/contact_sheet.jpg`. Each image shows the sampled slice with the
@@ -294,6 +305,10 @@ The important behavior is:
   closest-approach traces, the fused CP-to-CP line, and the optimized
   refinement. With `--med-tta`, that stack is rendered as the first column and
   a second column shows the reference-only/base-inference result without TTA.
+  With `--trace2cp-combined`, the selected combined stack is rendered alongside
+  the reference-only/base-inference stack and the summary/stdout include
+  candidate settings, weights, embedding-bank size/skips, and mean score
+  components.
 - The whole-fiber Trace2CP JPG is composed after pair scoring. Pair-local
   images and traced points are mapped into a shared fiber arc-length x
   coordinate system using each pair's local start/target CP columns and global

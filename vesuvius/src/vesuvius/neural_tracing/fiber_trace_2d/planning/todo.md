@@ -23,14 +23,15 @@
 - [ ] make bidir trace2cp metric in train/test loop
 - [ ] check augmentations for training: all flips and orientations should be equally likely
 - [x] group norm: with a single sample per patch we seem to get a more global direction per patch! either remove the norm or do more batch-norm style normalization!
-- [x] contrastive embedding using cosine similarity
+- [ ] contrastive embedding using cosine similarity
     - change cp sampling on training so that each batch does not independet cps but N cps from the same fiber M times (N=8 for now, M adjusted to fit the batch)
     - learn very simple contrastive loss with cos similarity - 8 samples around the cp shall be the same, all otheres shall be different - given the true fiber is a small subset of the whole patch this should give us some similarity metric (with the right weights)
     - weight so the few positive samples are euqally weighted to the negative ones
     - for now just apply the loss on training and visualize by showing similatiy (between 0 and 1) all points in a patch aginst that patches cp embedding (interpolated)
     - the losses should be applied positive: all points around the cps against each other within the same fiber (across batch patches, thats what the same fiber cp sampling is there for) - and negative across against potentially all other points from all patches (with lower weight it does not matter if we exclude the relevant cps) - choose the pairs in a way that scales well with the batch size - e.g. each output px is compared against a single other px from anywhere in the batch (for negative) and for positive all postive pxs of a fiber are compared against all other postive pxs (the number is probably still very small)
     - augmentations: geometric distortions should be _independent_ across fiber patches but image augmentations should be synced!
-
+- [ ] try less shift
+    
 # ideas
 - [ ] short-strip self supervision?
 

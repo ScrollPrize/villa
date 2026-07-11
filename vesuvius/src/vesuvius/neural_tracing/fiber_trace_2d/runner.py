@@ -28,6 +28,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.model import (
     FiberStripDirectionModelConfig,
     FiberStripDirectionNet,
     direction_output,
+    embedding_output,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_line_index
 
@@ -539,6 +540,94 @@ def _bilinear_direction_sample(
     return (direction / norm).astype(np.float32)
 
 
+def _bilinear_embedding_sample(
+    embedding_chw: np.ndarray,
+    point_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+) -> np.ndarray | None:
+    field = np.asarray(embedding_chw, dtype=np.float32)
+    if field.ndim != 3:
+        raise ValueError("embedding_chw must have shape C,H,W")
+    channels, height, width = (int(v) for v in field.shape)
+    if channels <= 0:
+        raise ValueError("embedding_chw must contain at least one channel")
+    point = np.asarray(point_xy, dtype=np.float32)
+    if point.shape != (2,) or not bool(np.isfinite(point).all()):
+        return None
+    x = float(point[0])
+    y = float(point[1])
+    if x < 0.0 or y < 0.0 or x > float(width - 1) or y > float(height - 1):
+        return None
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    x1 = min(x0 + 1, width - 1)
+    y1 = min(y0 + 1, height - 1)
+    if valid_mask is not None:
+        valid = np.asarray(valid_mask, dtype=bool)
+        if valid.shape != (height, width):
+            raise ValueError("valid_mask must match embedding field shape")
+        if not (bool(valid[y0, x0]) and bool(valid[y0, x1]) and bool(valid[y1, x0]) and bool(valid[y1, x1])):
+            return None
+    tx = np.float32(x - float(x0))
+    ty = np.float32(y - float(y0))
+    top = field[:, y0, x0] * (1.0 - tx) + field[:, y0, x1] * tx
+    bottom = field[:, y1, x0] * (1.0 - tx) + field[:, y1, x1] * tx
+    embedding = top * (1.0 - ty) + bottom * ty
+    norm = float(np.linalg.norm(embedding))
+    if not np.isfinite(norm) or norm <= 1.0e-6:
+        return None
+    return (embedding / norm).astype(np.float32)
+
+
+def _embedding_cosine_loss(a: np.ndarray, b: np.ndarray) -> float:
+    lhs = np.asarray(a, dtype=np.float32).reshape(-1)
+    rhs = np.asarray(b, dtype=np.float32).reshape(-1)
+    if lhs.shape != rhs.shape or lhs.shape[0] == 0:
+        raise ValueError("embedding vectors must have the same non-empty shape")
+    if not bool(np.isfinite(lhs).all()) or not bool(np.isfinite(rhs).all()):
+        return float("inf")
+    return float(1.0 - np.clip(float(np.dot(lhs, rhs)), -1.0, 1.0))
+
+
+def _trace2cp_candidate_angles_degrees(max_degrees: float, step_degrees: float) -> np.ndarray:
+    maximum = float(max_degrees)
+    step = float(step_degrees)
+    if not np.isfinite(maximum) or maximum < 0.0:
+        raise ValueError("candidate max degrees must be finite and >= 0")
+    if not np.isfinite(step) or step <= 0.0:
+        raise ValueError("candidate step degrees must be finite and > 0")
+    count = int(np.floor(maximum / step + 1.0e-6))
+    values = (np.arange(-count, count + 1, dtype=np.float32) * np.float32(step)).astype(np.float32)
+    if values.size == 0:
+        values = np.asarray([0.0], dtype=np.float32)
+    return values[np.abs(values) <= np.float32(maximum + 1.0e-5)].astype(np.float32, copy=False)
+
+
+def _trace2cp_candidate_fan_directions(
+    oriented_direction_xy: np.ndarray,
+    *,
+    max_degrees: float,
+    step_degrees: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    direction = np.asarray(oriented_direction_xy, dtype=np.float32)
+    if direction.shape != (2,):
+        raise ValueError("oriented_direction_xy must have shape (2,)")
+    norm = float(np.linalg.norm(direction))
+    if not np.isfinite(norm) or norm <= 1.0e-6:
+        raise ValueError("oriented_direction_xy must be finite and non-zero")
+    base = (direction / norm).astype(np.float32)
+    angles = _trace2cp_candidate_angles_degrees(max_degrees, step_degrees)
+    radians = np.deg2rad(angles.astype(np.float64)).astype(np.float32)
+    cos = np.cos(radians).astype(np.float32)
+    sin = np.sin(radians).astype(np.float32)
+    x = base[0] * cos - base[1] * sin
+    y = base[0] * sin + base[1] * cos
+    vectors = np.stack([x, y], axis=1).astype(np.float32)
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True).clip(1.0e-12).astype(np.float32)
+    return angles, vectors
+
+
 def _trace_direction_line(
     direction_xy: np.ndarray,
     cp_xy: np.ndarray,
@@ -598,6 +687,67 @@ class _TtaDirectionField:
     valid_mask: np.ndarray
     source_xy_grid: np.ndarray
     reference_to_tta_xy_grid: np.ndarray
+
+
+@dataclass(frozen=True)
+class _Trace2CpPredictedFields:
+    direction_xy: np.ndarray
+    embedding_chw: np.ndarray | None
+
+
+@dataclass(frozen=True)
+class _Trace2CpCombinedWeights:
+    direction: float = 1.0
+    last: float = 1.0
+    enclosing: float = 1.0
+    fiber: float = 1.0
+
+
+@dataclass(frozen=True)
+class _Trace2CpCombinedTraceStats:
+    steps: int
+    invalid_candidates: int
+    direction_loss_sum: float
+    last_loss_sum: float
+    enclosing_loss_sum: float
+    fiber_loss_sum: float
+    total_loss_sum: float
+    reason: str
+
+    def mean(self, name: str) -> float:
+        count = max(1, int(self.steps))
+        return float(getattr(self, f"{name}_loss_sum") / count)
+
+
+@dataclass(frozen=True)
+class _Trace2CpCombinedSummary:
+    forward: _Trace2CpCombinedTraceStats
+    reverse: _Trace2CpCombinedTraceStats
+    candidate_angles_degrees: np.ndarray
+    fiber_bank_size: int
+    fiber_bank_skipped: int
+
+    @property
+    def steps(self) -> int:
+        return int(self.forward.steps) + int(self.reverse.steps)
+
+    @property
+    def invalid_candidates(self) -> int:
+        return int(self.forward.invalid_candidates) + int(self.reverse.invalid_candidates)
+
+    def mean(self, name: str) -> float:
+        steps = max(1, int(self.steps))
+        total = float(getattr(self.forward, f"{name}_loss_sum")) + float(
+            getattr(self.reverse, f"{name}_loss_sum")
+        )
+        return total / steps
+
+
+@dataclass(frozen=True)
+class _Trace2CpEmbeddingBank:
+    embeddings: np.ndarray
+    skipped: int
+    rows: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -693,6 +843,7 @@ class _Trace2CpPairEvaluation:
     base_result: _Trace2CpBidirectionalResult
     selected_result: _Trace2CpBidirectionalResult
     selected_mode: str
+    combined_summary: _Trace2CpCombinedSummary | None
     tta_count: int
     med_fields_count: int
     tta_rows: tuple[str, ...]
@@ -931,10 +1082,29 @@ def _predict_direction_field(
     *,
     device: torch.device,
 ) -> np.ndarray:
+    fields = _predict_trace2cp_fields(model, image, valid_mask, device=device)
+    return fields.direction_xy
+
+
+def _predict_trace2cp_fields(
+    model: FiberStripDirectionNet,
+    image: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    device: torch.device,
+) -> _Trace2CpPredictedFields:
     with torch.no_grad():
         input_image = _prepare_model_image(image, valid_mask, device=device)
-        encoded = direction_output(model(input_image))[0].permute(1, 2, 0)
-        return decode_lasagna_direction_xy(encoded).detach().cpu().numpy().astype(np.float32)
+        output = model(input_image)
+        encoded = direction_output(output)[0].permute(1, 2, 0)
+        direction_xy = decode_lasagna_direction_xy(encoded).detach().cpu().numpy().astype(np.float32)
+        embeddings = embedding_output(output)
+        embedding_chw: np.ndarray | None
+        if int(embeddings.shape[1]) <= 0:
+            embedding_chw = None
+        else:
+            embedding_chw = embeddings[0].detach().cpu().numpy().astype(np.float32)
+        return _Trace2CpPredictedFields(direction_xy=direction_xy, embedding_chw=embedding_chw)
 
 
 def _identity_source_xy_grid(shape_hw: tuple[int, int]) -> np.ndarray:
@@ -1126,6 +1296,216 @@ def _trace_direction_line_to_target(
         current = next_point.astype(np.float32)
         previous = sampled.astype(np.float32)
     return np.stack(points, axis=0).astype(np.float32), "max_steps"
+
+
+def _require_trace2cp_embedding_field(embedding_chw: np.ndarray | None) -> np.ndarray:
+    if embedding_chw is None:
+        raise ValueError("trace2cp combined tracing requires model embedding channels")
+    emb = np.asarray(embedding_chw, dtype=np.float32)
+    if emb.ndim != 3 or int(emb.shape[0]) <= 0:
+        raise ValueError("trace2cp combined tracing requires model embedding channels")
+    return emb
+
+
+def _sample_trace2cp_combined_direction(
+    *,
+    direction_xy: np.ndarray | None,
+    tta_fields: list[_TtaDirectionField] | None,
+    current_xy: np.ndarray,
+    previous_xy: np.ndarray,
+    valid_mask: np.ndarray | None,
+) -> np.ndarray | None:
+    if tta_fields is not None:
+        return _sample_tta_direction_in_reference(tta_fields, current_xy, previous_xy)
+    if direction_xy is None:
+        raise ValueError("direction_xy is required when tta_fields are not provided")
+    sampled = _bilinear_direction_sample(direction_xy, current_xy, valid_mask=valid_mask)
+    if sampled is None:
+        return None
+    return _orient_direction_to_previous(sampled, previous_xy)
+
+
+def _trace_combined_direction_line_to_target(
+    *,
+    direction_xy: np.ndarray | None,
+    tta_fields: list[_TtaDirectionField] | None,
+    embedding_chw: np.ndarray,
+    valid_mask: np.ndarray | None,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    start_embedding: np.ndarray,
+    target_embedding: np.ndarray,
+    fiber_embeddings: np.ndarray,
+    weights: _Trace2CpCombinedWeights,
+    candidate_max_degrees: float,
+    candidate_step_degrees: float,
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+    max_steps: int | None = None,
+) -> tuple[np.ndarray, str, _Trace2CpCombinedTraceStats]:
+    embedding = _require_trace2cp_embedding_field(embedding_chw)
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    if start.shape != (2,) or target.shape != (2,):
+        raise ValueError("start_xy and target_xy must have shape (2,)")
+    target_delta = target - start
+    target_norm = float(np.linalg.norm(target_delta))
+    if not np.isfinite(target_norm) or target_norm <= 1.0e-6:
+        raise ValueError("trace2cp start and target points must be distinct")
+
+    shape_hw = (int(embedding.shape[1]), int(embedding.shape[2]))
+    if direction_xy is not None:
+        direction = np.asarray(direction_xy, dtype=np.float32)
+        if direction.ndim != 3 or direction.shape[2] != 2:
+            raise ValueError("direction_xy must have shape H,W,2")
+        if tuple(int(v) for v in direction.shape[:2]) != shape_hw:
+            raise ValueError("direction_xy and embedding_chw spatial shapes must match")
+    if valid_mask is not None and tuple(int(v) for v in np.asarray(valid_mask).shape) != shape_hw:
+        raise ValueError("valid_mask shape must match embedding field shape")
+
+    bank = np.asarray(fiber_embeddings, dtype=np.float32)
+    if bank.size == 0:
+        bank = bank.reshape(0, int(embedding.shape[0]))
+    if bank.ndim != 2 or int(bank.shape[1]) != int(embedding.shape[0]):
+        raise ValueError("fiber_embeddings must have shape N,C matching embedding_chw")
+    if float(weights.fiber) != 0.0 and int(bank.shape[0]) == 0:
+        raise ValueError("trace2cp combined fiber weight is non-zero but the fiber CP embedding bank is empty")
+
+    start_emb = np.asarray(start_embedding, dtype=np.float32).reshape(-1)
+    target_emb = np.asarray(target_embedding, dtype=np.float32).reshape(-1)
+    if start_emb.shape[0] != int(embedding.shape[0]) or target_emb.shape[0] != int(embedding.shape[0]):
+        raise ValueError("start/target embeddings must match embedding_chw channel count")
+
+    step = max(float(step_px), 1.0e-3)
+    if max_steps is None:
+        max_steps = int(np.ceil(np.hypot(*shape_hw) / step)) + 2
+    current = start.astype(np.float32)
+    previous_direction = (target_delta / target_norm).astype(np.float32)
+    previous_embedding = start_emb.astype(np.float32)
+    points = [current.copy()]
+    target_x = float(target[0])
+
+    steps = 0
+    invalid_candidates = 0
+    direction_loss_sum = 0.0
+    last_loss_sum = 0.0
+    enclosing_loss_sum = 0.0
+    fiber_loss_sum = 0.0
+    total_loss_sum = 0.0
+
+    def finish(reason: str) -> tuple[np.ndarray, str, _Trace2CpCombinedTraceStats]:
+        return (
+            np.stack(points, axis=0).astype(np.float32),
+            reason,
+            _Trace2CpCombinedTraceStats(
+                steps=int(steps),
+                invalid_candidates=int(invalid_candidates),
+                direction_loss_sum=float(direction_loss_sum),
+                last_loss_sum=float(last_loss_sum),
+                enclosing_loss_sum=float(enclosing_loss_sum),
+                fiber_loss_sum=float(fiber_loss_sum),
+                total_loss_sum=float(total_loss_sum),
+                reason=reason,
+            ),
+        )
+
+    for _ in range(int(max_steps)):
+        if not _inside_trace_margin(current, shape_hw, rf_margin_px):
+            return finish(_trace_margin_reason(current, shape_hw, rf_margin_px))
+        oriented = _sample_trace2cp_combined_direction(
+            direction_xy=direction_xy,
+            tta_fields=tta_fields,
+            current_xy=current,
+            previous_xy=previous_direction,
+            valid_mask=valid_mask,
+        )
+        if oriented is None:
+            return finish("invalid_direction")
+        angles, candidate_vectors = _trace2cp_candidate_fan_directions(
+            oriented,
+            max_degrees=candidate_max_degrees,
+            step_degrees=candidate_step_degrees,
+        )
+        scored: list[tuple[float, float, int, np.ndarray, np.ndarray, np.ndarray, float, float, float, float]] = []
+        margin_reason: str | None = None
+        for order, (angle, candidate_unit) in enumerate(zip(angles.tolist(), candidate_vectors)):
+            next_point = current + candidate_unit.astype(np.float32) * np.float32(step)
+            previous_x = float(current[0])
+            next_x = float(next_point[0])
+            crosses_target = (previous_x - target_x) == 0.0 or (previous_x - target_x) * (next_x - target_x) <= 0.0
+            if not crosses_target and not _inside_trace_margin(next_point, shape_hw, rf_margin_px):
+                invalid_candidates += 1
+                if margin_reason is None:
+                    margin_reason = _trace_margin_reason(next_point, shape_hw, rf_margin_px)
+                continue
+            candidate_embedding = _bilinear_embedding_sample(embedding, next_point, valid_mask=valid_mask)
+            if candidate_embedding is None:
+                invalid_candidates += 1
+                continue
+            direction_loss = float(1.0 - np.clip(float(np.dot(candidate_unit, oriented)), -1.0, 1.0))
+            last_loss = _embedding_cosine_loss(candidate_embedding, previous_embedding)
+            enclosing_loss = 0.5 * (
+                _embedding_cosine_loss(candidate_embedding, start_emb)
+                + _embedding_cosine_loss(candidate_embedding, target_emb)
+            )
+            if int(bank.shape[0]) == 0:
+                fiber_loss = 0.0
+            else:
+                fiber_similarity = np.clip(bank @ candidate_embedding.reshape(-1, 1), -1.0, 1.0)
+                fiber_loss = float(np.mean(1.0 - fiber_similarity))
+            total = (
+                float(weights.direction) * direction_loss
+                + float(weights.last) * last_loss
+                + float(weights.enclosing) * enclosing_loss
+                + float(weights.fiber) * fiber_loss
+            )
+            if np.isfinite(total):
+                scored.append(
+                    (
+                        total,
+                        abs(float(angle)),
+                        int(order),
+                        next_point.astype(np.float32),
+                        candidate_unit.astype(np.float32),
+                        candidate_embedding.astype(np.float32),
+                        direction_loss,
+                        last_loss,
+                        enclosing_loss,
+                        fiber_loss,
+                    )
+                )
+            else:
+                invalid_candidates += 1
+        if not scored:
+            return finish(margin_reason or "invalid_candidate")
+        scored.sort(key=lambda row: (row[0], row[1], row[2]))
+        (
+            selected_total,
+            _selected_abs_angle,
+            _selected_order,
+            next_point,
+            selected_direction,
+            selected_embedding,
+            selected_direction_loss,
+            selected_last_loss,
+            selected_enclosing_loss,
+            selected_fiber_loss,
+        ) = scored[0]
+        points.append(next_point.astype(np.float32))
+        steps += 1
+        direction_loss_sum += float(selected_direction_loss)
+        last_loss_sum += float(selected_last_loss)
+        enclosing_loss_sum += float(selected_enclosing_loss)
+        fiber_loss_sum += float(selected_fiber_loss)
+        total_loss_sum += float(selected_total)
+        previous_x = float(current[0])
+        next_x = float(next_point[0])
+        if (previous_x - target_x) == 0.0 or (previous_x - target_x) * (next_x - target_x) <= 0.0:
+            return finish("target_column")
+        current = next_point.astype(np.float32)
+        previous_direction = selected_direction.astype(np.float32)
+        previous_embedding = selected_embedding.astype(np.float32)
+    return finish("max_steps")
 
 
 def _trace_y_at_x(trace_xy: np.ndarray, target_x: float) -> float | None:
@@ -1909,6 +2289,140 @@ def _trace_score_trace2cp_median_tta_bidirectional(
     return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse, refinement=refinement, metric=metric)
 
 
+def _trace_score_trace2cp_combined_direction(
+    *,
+    direction_xy: np.ndarray | None,
+    tta_fields: list[_TtaDirectionField] | None,
+    embedding_chw: np.ndarray,
+    valid_mask: np.ndarray | None,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    start_embedding: np.ndarray,
+    target_embedding: np.ndarray,
+    fiber_embeddings: np.ndarray,
+    weights: _Trace2CpCombinedWeights,
+    candidate_max_degrees: float,
+    candidate_step_degrees: float,
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+) -> tuple[_Trace2CpDirectionResult, _Trace2CpCombinedTraceStats]:
+    traced_line, reason, stats = _trace_combined_direction_line_to_target(
+        direction_xy=direction_xy,
+        tta_fields=tta_fields,
+        embedding_chw=embedding_chw,
+        valid_mask=valid_mask,
+        start_xy=start_xy,
+        target_xy=target_xy,
+        start_embedding=start_embedding,
+        target_embedding=target_embedding,
+        fiber_embeddings=fiber_embeddings,
+        weights=weights,
+        candidate_max_degrees=candidate_max_degrees,
+        candidate_step_degrees=candidate_step_degrees,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    result = _score_trace2cp(
+        traced_line,
+        target_xy,
+        shape_hw=(int(embedding_chw.shape[1]), int(embedding_chw.shape[2])),
+        rf_margin_px=rf_margin_px,
+        termination_reason=reason,
+    )
+    return _Trace2CpDirectionResult(trace_xy=traced_line, result=result), stats
+
+
+def _trace_score_trace2cp_combined_bidirectional(
+    *,
+    direction_xy: np.ndarray | None,
+    tta_fields: list[_TtaDirectionField] | None,
+    embedding_chw: np.ndarray,
+    valid_mask: np.ndarray | None,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    fiber_embeddings: np.ndarray,
+    weights: _Trace2CpCombinedWeights,
+    candidate_max_degrees: float,
+    candidate_step_degrees: float,
+    fiber_bank_skipped: int = 0,
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+) -> tuple[_Trace2CpBidirectionalResult, _Trace2CpCombinedSummary]:
+    embedding = _require_trace2cp_embedding_field(embedding_chw)
+    start_embedding = _bilinear_embedding_sample(embedding, start_xy, valid_mask=valid_mask)
+    target_embedding = _bilinear_embedding_sample(embedding, target_xy, valid_mask=valid_mask)
+    if start_embedding is None:
+        raise ValueError("trace2cp combined tracing could not sample start CP embedding")
+    if target_embedding is None:
+        raise ValueError("trace2cp combined tracing could not sample target CP embedding")
+    forward, forward_stats = _trace_score_trace2cp_combined_direction(
+        direction_xy=direction_xy,
+        tta_fields=tta_fields,
+        embedding_chw=embedding,
+        valid_mask=valid_mask,
+        start_xy=start_xy,
+        target_xy=target_xy,
+        start_embedding=start_embedding,
+        target_embedding=target_embedding,
+        fiber_embeddings=fiber_embeddings,
+        weights=weights,
+        candidate_max_degrees=candidate_max_degrees,
+        candidate_step_degrees=candidate_step_degrees,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    reverse, reverse_stats = _trace_score_trace2cp_combined_direction(
+        direction_xy=direction_xy,
+        tta_fields=tta_fields,
+        embedding_chw=embedding,
+        valid_mask=valid_mask,
+        start_xy=target_xy,
+        target_xy=start_xy,
+        start_embedding=target_embedding,
+        target_embedding=start_embedding,
+        fiber_embeddings=fiber_embeddings,
+        weights=weights,
+        candidate_max_degrees=candidate_max_degrees,
+        candidate_step_degrees=candidate_step_degrees,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    metric = _trace2cp_metric_from_traces(
+        forward.trace_xy,
+        reverse.trace_xy,
+        start_xy,
+        target_xy,
+        shape_hw=(int(embedding.shape[1]), int(embedding.shape[2])),
+        rf_margin_px=rf_margin_px,
+    )
+    reference_direction = direction_xy if direction_xy is not None else tta_fields[0].direction_xy if tta_fields else None
+    reference_valid = valid_mask if valid_mask is not None else tta_fields[0].valid_mask if tta_fields else None
+    if reference_direction is None:
+        raise ValueError("trace2cp combined refinement requires a reference direction field")
+    refinement = _trace2cp_refinement_from_traces(
+        forward.trace_xy,
+        reverse.trace_xy,
+        start_xy,
+        target_xy,
+        direction_xy=reference_direction,
+        valid_mask=reference_valid,
+        shape_hw=(int(embedding.shape[1]), int(embedding.shape[2])),
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    summary = _Trace2CpCombinedSummary(
+        forward=forward_stats,
+        reverse=reverse_stats,
+        candidate_angles_degrees=_trace2cp_candidate_angles_degrees(candidate_max_degrees, candidate_step_degrees),
+        fiber_bank_size=int(np.asarray(fiber_embeddings).shape[0]) if np.asarray(fiber_embeddings).ndim == 2 else 0,
+        fiber_bank_skipped=int(fiber_bank_skipped),
+    )
+    return (
+        _Trace2CpBidirectionalResult(forward=forward, reverse=reverse, refinement=refinement, metric=metric),
+        summary,
+    )
+
+
 def _export_line_trace_vis(
     loader: FiberStrip2DLoader,
     sample_index: int,
@@ -2550,6 +3064,61 @@ def _write_trace2cp_tta_debug_images(
     return tta_dir
 
 
+def _build_trace2cp_embedding_bank(
+    loader: FiberStrip2DLoader,
+    model: torch.nn.Module,
+    flat_indices: tuple[int, ...],
+    *,
+    device: torch.device,
+    rf_margin_px: float,
+) -> _Trace2CpEmbeddingBank:
+    embeddings: list[np.ndarray] = []
+    rows: list[str] = []
+    skipped = 0
+    cp_count = len(flat_indices)
+    if cp_count <= 1:
+        return _Trace2CpEmbeddingBank(
+            embeddings=np.zeros((0, 0), dtype=np.float32),
+            skipped=cp_count,
+            rows=("embedding_bank_skipped=not_enough_control_points",),
+        )
+    for cp_index, flat_index in enumerate(flat_indices):
+        target_cp = cp_index + 1 if cp_index + 1 < cp_count else cp_index - 1
+        try:
+            sample, image, valid_mask = loader.build_trace2cp_segment_patch(
+                int(flat_index),
+                target_control_point_index=int(target_cp),
+                rf_margin_px=rf_margin_px,
+                device=device,
+                sample_mode="flat",
+            )
+            fields = _predict_trace2cp_fields(model, image, valid_mask, device=device)
+            embedding = _require_trace2cp_embedding_field(fields.embedding_chw)
+            cp_embedding = _bilinear_embedding_sample(
+                embedding,
+                np.asarray(sample.start_control_point_xy, dtype=np.float32),
+                valid_mask=valid_mask,
+            )
+            if cp_embedding is None:
+                raise ValueError("could not sample CP embedding")
+            embeddings.append(cp_embedding.astype(np.float32))
+            rows.append(
+                f"embedding_bank_cp={int(cp_index)} flat_index={int(flat_index)} "
+                f"target_cp={int(target_cp)} status=ok"
+            )
+        except ValueError as exc:
+            skipped += 1
+            rows.append(
+                f"embedding_bank_cp={int(cp_index)} flat_index={int(flat_index)} "
+                f"target_cp={int(target_cp)} status=skipped reason={_trace2cp_skip_reason(exc)}"
+            )
+    if embeddings:
+        bank = np.stack(embeddings, axis=0).astype(np.float32)
+    else:
+        bank = np.zeros((0, 0), dtype=np.float32)
+    return _Trace2CpEmbeddingBank(embeddings=bank, skipped=int(skipped), rows=tuple(rows))
+
+
 def _evaluate_trace2cp_pair(
     loader: FiberStrip2DLoader,
     model: torch.nn.Module,
@@ -2563,6 +3132,11 @@ def _evaluate_trace2cp_pair(
     med_tta: bool,
     line_trace_tta_count: int,
     vis_tta: bool,
+    combined: bool = False,
+    combined_weights: _Trace2CpCombinedWeights | None = None,
+    combined_fiber_bank: _Trace2CpEmbeddingBank | None = None,
+    candidate_max_degrees: float = 25.0,
+    candidate_step_degrees: float = 1.0,
     sample_mode: str = "random",
     row_axis_alignment_line_index: int | None = None,
     row_axis_alignment_xyz: np.ndarray | None = None,
@@ -2577,7 +3151,8 @@ def _evaluate_trace2cp_pair(
         device=device,
         sample_mode=sample_mode,
     )
-    direction_xy = _predict_direction_field(model, image, valid_mask, device=device)
+    fields = _predict_trace2cp_fields(model, image, valid_mask, device=device)
+    direction_xy = fields.direction_xy
     start_xy = np.asarray(sample.start_control_point_xy, dtype=np.float32)
     target_xy = np.asarray(sample.target_control_point_xy, dtype=np.float32)
     base_result = _trace_score_trace2cp_bidirectional(
@@ -2594,6 +3169,7 @@ def _evaluate_trace2cp_pair(
     selected_mode = "base"
     med_fields_count = 0
     tta_debug_entries: list[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    med_fields: list[_TtaDirectionField] | None = None
     if med_tta:
         med_fields = [
             _TtaDirectionField(
@@ -2673,6 +3249,30 @@ def _evaluate_trace2cp_pair(
             rf_margin_px=rf_margin_px,
         )
         selected_mode = "med_tta"
+    combined_summary: _Trace2CpCombinedSummary | None = None
+    if combined:
+        weights = combined_weights or _Trace2CpCombinedWeights()
+        bank = combined_fiber_bank or _Trace2CpEmbeddingBank(
+            embeddings=np.zeros((0, 0), dtype=np.float32),
+            skipped=0,
+            rows=(),
+        )
+        selected_result, combined_summary = _trace_score_trace2cp_combined_bidirectional(
+            direction_xy=None if med_tta else direction_xy,
+            tta_fields=med_fields if med_tta else None,
+            embedding_chw=_require_trace2cp_embedding_field(fields.embedding_chw),
+            valid_mask=valid_mask,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            fiber_embeddings=bank.embeddings,
+            weights=weights,
+            candidate_max_degrees=float(candidate_max_degrees),
+            candidate_step_degrees=float(candidate_step_degrees),
+            fiber_bank_skipped=int(bank.skipped),
+            step_px=step_px,
+            rf_margin_px=rf_margin_px,
+        )
+        selected_mode = "combined_med_tta" if med_tta else "combined"
     return _Trace2CpPairEvaluation(
         sample_index=int(sample_index),
         sample=sample,
@@ -2681,6 +3281,7 @@ def _evaluate_trace2cp_pair(
         base_result=base_result,
         selected_result=selected_result,
         selected_mode=selected_mode,
+        combined_summary=combined_summary,
         tta_count=tta_count,
         med_fields_count=med_fields_count,
         tta_rows=tuple(tta_rows),
@@ -2701,6 +3302,10 @@ def _export_trace2cp_vis(
     med_tta: bool = False,
     line_trace_tta_count: int = 100,
     vis_tta: bool = False,
+    combined: bool = False,
+    combined_weights: _Trace2CpCombinedWeights | None = None,
+    candidate_max_degrees: float = 25.0,
+    candidate_step_degrees: float = 1.0,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -2709,6 +3314,17 @@ def _export_trace2cp_vis(
     configured_depth = max(1, int(_model_config_from_checkpoint(checkpoint, loader).depth))
     default_margin = configured_depth
     margin = float(default_margin if rf_margin_px is None else rf_margin_px)
+    weights = combined_weights or _Trace2CpCombinedWeights()
+    embedding_bank: _Trace2CpEmbeddingBank | None = None
+    if combined:
+        flat_indices = _trace2cp_flat_indices_for_sample(loader, sample_index, sample_mode="random")
+        embedding_bank = _build_trace2cp_embedding_bank(
+            loader,
+            model,
+            flat_indices,
+            device=device,
+            rf_margin_px=margin,
+        )
     evaluation = _evaluate_trace2cp_pair(
         loader,
         model,
@@ -2721,6 +3337,11 @@ def _export_trace2cp_vis(
         med_tta=med_tta,
         line_trace_tta_count=line_trace_tta_count,
         vis_tta=vis_tta,
+        combined=combined,
+        combined_weights=weights,
+        combined_fiber_bank=embedding_bank,
+        candidate_max_degrees=candidate_max_degrees,
+        candidate_step_degrees=candidate_step_degrees,
     )
     sample = evaluation.sample
     image = evaluation.image
@@ -2738,13 +3359,22 @@ def _export_trace2cp_vis(
         tta_debug_dir = _write_trace2cp_tta_debug_images(out, list(evaluation.tta_debug_entries))
 
     image_u8 = _to_u8_image(image, valid_mask)
+    result_label = selected_mode
+    if evaluation.combined_summary is not None:
+        result_label = (
+            f"{selected_mode} total={evaluation.combined_summary.mean('total'):.4f} "
+            f"dir={evaluation.combined_summary.mean('direction'):.4f} "
+            f"last={evaluation.combined_summary.mean('last'):.4f} "
+            f"enc={evaluation.combined_summary.mean('enclosing'):.4f} "
+            f"fib={evaluation.combined_summary.mean('fiber'):.4f}"
+        )
     overlay = _draw_trace2cp_overlay(
         image_u8,
         line_xy=sample.line_xy,
         start_xy=start_xy,
         target_xy=target_xy,
         bidirectional_result=selected_result,
-        result_label=selected_mode,
+        result_label=result_label,
         reference_result=base_result if selected_result is not base_result else None,
         reference_label="reference",
     )
@@ -2822,6 +3452,11 @@ def _export_trace2cp_vis(
         f"trace2cp_tta_debug_dir={str(tta_debug_dir) if tta_debug_dir is not None else ''}",
         f"line_trace_tta_count={tta_count}",
         f"med_tta_fields={med_fields_count}",
+        *_trace2cp_combined_summary_lines(
+            evaluation.combined_summary,
+            weights=weights,
+            bank_rows=embedding_bank.rows if embedding_bank is not None else (),
+        ),
         "tta_fields:",
         *tta_rows,
     ]
@@ -2846,6 +3481,20 @@ def _export_trace2cp_vis(
         f"forward_reached={forward.reached_target_column} reverse_reached={reverse.reached_target_column} "
         f"forward_reason={forward.reason} reverse_reason={reverse.reason}"
     )
+    if evaluation.combined_summary is not None:
+        combined_summary = evaluation.combined_summary
+        print(
+            "trace2cp combined "
+            f"trace2cp_error={metric.error:.8f} "
+            f"reference_trace2cp_error={reference_metric.error:.8f} "
+            f"candidate_count={int(combined_summary.candidate_angles_degrees.size)} "
+            f"steps={int(combined_summary.steps)} "
+            f"direction_loss={combined_summary.mean('direction'):.8f} "
+            f"last_loss={combined_summary.mean('last'):.8f} "
+            f"enclosing_loss={combined_summary.mean('enclosing'):.8f} "
+            f"fiber_loss={combined_summary.mean('fiber'):.8f} "
+            f"total_loss={combined_summary.mean('total'):.8f}"
+        )
     print(f"exported trace2cp_vis.jpg and trace2cp_summary.txt to {out}")
 
 
@@ -2862,6 +3511,19 @@ def _trace2cp_control_point_x_positions(loader: FiberStrip2DLoader, flat_indices
     return values - np.float32(float(np.nanmin(values)))
 
 
+def _trace2cp_flat_indices_for_sample(
+    loader: FiberStrip2DLoader,
+    sample_index: int,
+    *,
+    sample_mode: str,
+) -> tuple[int, ...]:
+    record, record_index, _ = loader.descriptor_for_sample_index(int(sample_index), sample_mode=sample_mode)
+    if record.fiber.path is not None:
+        return loader.flat_sample_indices_for_fiber_json(str(record.fiber.path))
+    flat_start = int(loader._record_flat_offsets[int(record_index)])
+    return tuple(flat_start + index for index in range(int(record.fiber.control_points_xyz.shape[0])))
+
+
 def _trace2cp_control_point_line_indices(loader: FiberStrip2DLoader, flat_indices: tuple[int, ...]) -> np.ndarray:
     if not flat_indices:
         raise ValueError("fiber has no control points")
@@ -2870,6 +3532,44 @@ def _trace2cp_control_point_line_indices(loader: FiberStrip2DLoader, flat_indice
         [control_point_line_index(record.fiber, cp_index) for cp_index in range(len(flat_indices))],
         dtype=np.int64,
     )
+
+
+def _trace2cp_combined_summary_lines(
+    summary: _Trace2CpCombinedSummary | None,
+    *,
+    weights: _Trace2CpCombinedWeights,
+    bank_rows: tuple[str, ...] = (),
+) -> list[str]:
+    if summary is None:
+        return ["trace2cp_combined=false"]
+    angles = np.asarray(summary.candidate_angles_degrees, dtype=np.float32)
+    angle_min = float(np.min(angles)) if angles.size else 0.0
+    angle_max = float(np.max(angles)) if angles.size else 0.0
+    angle_step = float(abs(angles[1] - angles[0])) if angles.size > 1 else 0.0
+    return [
+        "trace2cp_combined=true",
+        f"trace2cp_combined_candidate_count={int(angles.size)}",
+        f"trace2cp_combined_candidate_min_deg={angle_min:.6f}",
+        f"trace2cp_combined_candidate_max_deg={angle_max:.6f}",
+        f"trace2cp_combined_candidate_step_deg={angle_step:.6f}",
+        f"trace2cp_combined_weight_direction={float(weights.direction):.6f}",
+        f"trace2cp_combined_weight_last={float(weights.last):.6f}",
+        f"trace2cp_combined_weight_enclosing={float(weights.enclosing):.6f}",
+        f"trace2cp_combined_weight_fiber={float(weights.fiber):.6f}",
+        f"trace2cp_combined_steps={int(summary.steps)}",
+        f"trace2cp_combined_invalid_candidates={int(summary.invalid_candidates)}",
+        f"trace2cp_combined_fiber_bank_size={int(summary.fiber_bank_size)}",
+        f"trace2cp_combined_fiber_bank_skipped={int(summary.fiber_bank_skipped)}",
+        f"trace2cp_combined_direction_loss_mean={summary.mean('direction'):.8f}",
+        f"trace2cp_combined_last_loss_mean={summary.mean('last'):.8f}",
+        f"trace2cp_combined_enclosing_loss_mean={summary.mean('enclosing'):.8f}",
+        f"trace2cp_combined_fiber_loss_mean={summary.mean('fiber'):.8f}",
+        f"trace2cp_combined_total_loss_mean={summary.mean('total'):.8f}",
+        f"trace2cp_combined_forward_reason={summary.forward.reason}",
+        f"trace2cp_combined_reverse_reason={summary.reverse.reason}",
+        "trace2cp_combined_embedding_bank:",
+        *bank_rows,
+    ]
 
 
 def _export_trace2cp_fiber_vis(
@@ -2883,6 +3583,10 @@ def _export_trace2cp_fiber_vis(
     target_offset: int,
     med_tta: bool = False,
     line_trace_tta_count: int = 100,
+    combined: bool = False,
+    combined_weights: _Trace2CpCombinedWeights | None = None,
+    candidate_max_degrees: float = 25.0,
+    candidate_step_degrees: float = 1.0,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -2892,6 +3596,16 @@ def _export_trace2cp_fiber_vis(
     default_margin = configured_depth
     margin = float(default_margin if rf_margin_px is None else rf_margin_px)
     flat_indices = loader.flat_sample_indices_for_fiber_json(fiber_json)
+    weights = combined_weights or _Trace2CpCombinedWeights()
+    embedding_bank: _Trace2CpEmbeddingBank | None = None
+    if combined:
+        embedding_bank = _build_trace2cp_embedding_bank(
+            loader,
+            model,
+            flat_indices,
+            device=device,
+            rf_margin_px=margin,
+        )
     pair_indices = _trace2cp_fiber_pair_cp_indices(len(flat_indices), int(target_offset))
     if not pair_indices:
         raise ValueError(
@@ -2927,6 +3641,11 @@ def _export_trace2cp_fiber_vis(
                 med_tta=med_tta,
                 line_trace_tta_count=line_trace_tta_count,
                 vis_tta=False,
+                combined=combined,
+                combined_weights=weights,
+                combined_fiber_bank=embedding_bank,
+                candidate_max_degrees=candidate_max_degrees,
+                candidate_step_degrees=candidate_step_degrees,
                 sample_mode="flat",
                 row_axis_alignment_line_index=alignment_line_index,
                 row_axis_alignment_xyz=alignment_axis,
@@ -2993,13 +3712,18 @@ def _export_trace2cp_fiber_vis(
         [evaluation.selected_result.metric.raw_y_error_px for evaluation in evaluations], dtype=np.float64
     )
     fiber_path_display = evaluations[0].sample.fiber_path or str(fiber_json)
-    mode = "med_tta" if med_tta else "base"
+    mode = evaluations[0].selected_mode
+    combined_label = ""
+    first_combined = next((evaluation.combined_summary for evaluation in evaluations if evaluation.combined_summary is not None), None)
+    if first_combined is not None:
+        combined_label = f" combined_total={first_combined.mean('total'):.4f}"
     label = (
         f"trace2cp fiber pairs={len(evaluations)} mode={mode} "
         f"skipped={len(skipped_pairs)} "
         f"trace2cp_error_mean={float(np.mean(metric_errors)):.4f} "
         f"trace2cp_error_max={float(np.max(metric_errors)):.4f} "
         f"mean_metric_raw_px={float(np.mean(actual_errors)):.2f}"
+        f"{combined_label}"
     )
     overlay = _draw_trace2cp_fiber_overlay(
         evaluations,
@@ -3013,12 +3737,17 @@ def _export_trace2cp_fiber_vis(
         "start_cp target_cp trace2cp_error metric_raw_y_error_px metric_horizontal_span_px "
         "metric_max_y_error_px metric_reason refine_score actual_y_error_px considered_y_error_px "
         "center_penalty reference_metric_error reference_refine_score endpoint_score closest_x "
-        "forward_reason reverse_reason"
+        "combined_total_loss_mean forward_reason reverse_reason"
     ]
     for evaluation in evaluations:
         result = evaluation.selected_result
         refinement = result.refinement
         metric = result.metric
+        combined_total = (
+            evaluation.combined_summary.mean("total")
+            if evaluation.combined_summary is not None
+            else float("nan")
+        )
         rows.append(
             f"{evaluation.sample.start_control_point_index} "
             f"{evaluation.sample.target_control_point_index} "
@@ -3035,9 +3764,35 @@ def _export_trace2cp_fiber_vis(
             f"{evaluation.base_result.score:.8f} "
             f"{result.endpoint_score:.8f} "
             f"{refinement.closest_x:.6f} "
+            f"{combined_total:.8f} "
             f"{result.forward.result.reason} "
             f"{result.reverse.result.reason}"
         )
+    combined_summaries = [evaluation.combined_summary for evaluation in evaluations if evaluation.combined_summary is not None]
+    if combined_summaries:
+        combined_steps = sum(int(summary.steps) for summary in combined_summaries)
+        combined_invalid = sum(int(summary.invalid_candidates) for summary in combined_summaries)
+        combined_component_lines = [
+            "trace2cp_combined=true",
+            f"trace2cp_combined_pair_count={len(combined_summaries)}",
+            f"trace2cp_combined_steps={combined_steps}",
+            f"trace2cp_combined_invalid_candidates={combined_invalid}",
+            f"trace2cp_combined_fiber_bank_size={int(combined_summaries[0].fiber_bank_size)}",
+            f"trace2cp_combined_fiber_bank_skipped={int(combined_summaries[0].fiber_bank_skipped)}",
+        ]
+        for component in ("direction", "last", "enclosing", "fiber", "total"):
+            weighted_sum = sum(float(summary.mean(component)) * max(1, int(summary.steps)) for summary in combined_summaries)
+            denom = max(1, sum(max(1, int(summary.steps)) for summary in combined_summaries))
+            combined_component_lines.append(f"trace2cp_combined_{component}_loss_mean={weighted_sum / denom:.8f}")
+        combined_component_lines.extend(
+            _trace2cp_combined_summary_lines(
+                combined_summaries[0],
+                weights=weights,
+                bank_rows=embedding_bank.rows if embedding_bank is not None else (),
+            )
+        )
+    else:
+        combined_component_lines = ["trace2cp_combined=false"]
     summary = [
         f"fiber_json={fiber_path_display}",
         f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
@@ -3052,6 +3807,7 @@ def _export_trace2cp_fiber_vis(
         f"trace_mode={mode}",
         f"med_tta={bool(med_tta)}",
         f"line_trace_tta_count={max(0, int(line_trace_tta_count)) if med_tta else 0}",
+        *combined_component_lines,
         f"trace2cp_error_mean={float(np.mean(metric_errors)):.8f}",
         f"trace2cp_error_max={float(np.max(metric_errors)):.8f}",
         f"trace2cp_error_min={float(np.min(metric_errors)):.8f}",
@@ -3085,6 +3841,17 @@ def _export_trace2cp_fiber_vis(
         f"refine_score_mean={float(np.mean(refine_scores)):.8f} "
         f"skipped_pairs={len(skipped_pairs)}"
     )
+    if combined_summaries:
+        denom = max(1, sum(max(1, int(summary.steps)) for summary in combined_summaries))
+        total_mean = sum(float(summary.mean("total")) * max(1, int(summary.steps)) for summary in combined_summaries) / denom
+        print(
+            "trace2cp combined fiber "
+            f"trace2cp_error_mean={float(np.mean(metric_errors)):.8f} "
+            f"pairs={len(combined_summaries)} "
+            f"candidate_count={int(combined_summaries[0].candidate_angles_degrees.size)} "
+            f"fiber_bank_size={int(combined_summaries[0].fiber_bank_size)} "
+            f"total_loss_mean={total_mean:.8f}"
+        )
     print(f"exported trace2cp_fiber_vis.jpg, trace2cp_fiber_summary.txt, and trace2cp_fiber_debug.txt to {out}")
 
 
@@ -3496,6 +4263,7 @@ def main() -> None:
     )
     parser.add_argument("--line-trace-vis", action="store_true")
     parser.add_argument("--trace2cp-vis", action="store_true")
+    parser.add_argument("--trace2cp-combined", action="store_true")
     parser.add_argument("--med-tta", action="store_true")
     parser.add_argument("--vis-tta", action="store_true")
     parser.add_argument("--dir-vis", action="store_true")
@@ -3511,6 +4279,12 @@ def main() -> None:
     parser.add_argument("--line-trace-rf-margin", type=float, default=None)
     parser.add_argument("--trace2cp-target-offset", type=int, default=1)
     parser.add_argument("--trace2cp-target-cp-index", type=int, default=None)
+    parser.add_argument("--trace2cp-candidate-max-deg", type=float, default=25.0)
+    parser.add_argument("--trace2cp-candidate-step-deg", type=float, default=1.0)
+    parser.add_argument("--trace2cp-combined-direction-weight", type=float, default=1.0)
+    parser.add_argument("--trace2cp-combined-last-weight", type=float, default=1.0)
+    parser.add_argument("--trace2cp-combined-enclosing-weight", type=float, default=1.0)
+    parser.add_argument("--trace2cp-combined-fiber-weight", type=float, default=1.0)
     parser.add_argument("--fiber-json", default=None)
     args = parser.parse_args()
 
@@ -3568,6 +4342,12 @@ def main() -> None:
             raise SystemExit("--trace2cp-vis requires --export-dir")
         if args.checkpoint is None:
             raise SystemExit("--trace2cp-vis requires --checkpoint")
+        combined_weights = _Trace2CpCombinedWeights(
+            direction=float(args.trace2cp_combined_direction_weight),
+            last=float(args.trace2cp_combined_last_weight),
+            enclosing=float(args.trace2cp_combined_enclosing_weight),
+            fiber=float(args.trace2cp_combined_fiber_weight),
+        )
         if args.fiber_json is not None:
             if args.trace2cp_target_cp_index is not None:
                 raise SystemExit("--trace2cp-vis --fiber-json cannot be combined with --trace2cp-target-cp-index")
@@ -3585,6 +4365,10 @@ def main() -> None:
                 line_trace_tta_count=(
                     args.line_trace_tta_count if args.med_tta_count is None else args.med_tta_count
                 ),
+                combined=args.trace2cp_combined,
+                combined_weights=combined_weights,
+                candidate_max_degrees=args.trace2cp_candidate_max_deg,
+                candidate_step_degrees=args.trace2cp_candidate_step_deg,
             )
             return
         _export_trace2cp_vis(
@@ -3601,6 +4385,10 @@ def main() -> None:
                 args.line_trace_tta_count if args.med_tta_count is None else args.med_tta_count
             ),
             vis_tta=args.vis_tta,
+            combined=args.trace2cp_combined,
+            combined_weights=combined_weights,
+            candidate_max_degrees=args.trace2cp_candidate_max_deg,
+            candidate_step_degrees=args.trace2cp_candidate_step_deg,
         )
         return
 

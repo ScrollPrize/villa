@@ -400,6 +400,36 @@
   direction field. With `--med-tta`, it builds deterministic random geometric
   TTA direction fields using `--line-trace-tta-count`, default `100`, and
   traces both median-TTA directions in the reference segment strip.
+- Trace2CP supports an optional inspection mode enabled by
+  `--trace2cp-combined`. In this mode the selected traces are produced by a
+  greedy combined direction-plus-embedding scorer rather than by directly
+  stepping along the sampled direction. At each trace step, the tracer samples
+  the current oriented direction, builds a discrete angular fan around it, and
+  evaluates candidate next points. The default fan is `-25..+25` degrees at
+  `1` degree spacing, giving 51 candidates. `--trace2cp-candidate-max-deg` and
+  `--trace2cp-candidate-step-deg` configure the bound and spacing; coarser
+  spacing such as `2` degrees evaluates every second degree within the bound.
+- The combined Trace2CP candidate score is a weighted sum of four losses:
+  direction disagreement `1 - dot(candidate_direction, oriented_direction)`,
+  cosine distance to the previously accepted trace-point embedding, mean cosine
+  distance to the two enclosing Trace2CP CP embeddings, and mean cosine
+  distance to an embedding bank built from all CP embeddings in the same fiber.
+  `--trace2cp-combined-direction-weight`,
+  `--trace2cp-combined-last-weight`,
+  `--trace2cp-combined-enclosing-weight`, and
+  `--trace2cp-combined-fiber-weight` default to `1.0`.
+- `--trace2cp-combined` requires a checkpoint/model output with appended
+  embedding channels; it must fail clearly rather than silently falling back
+  when embeddings are absent. If a non-zero fiber-bank weight is configured and
+  no same-fiber CP embedding can be built, the command must fail clearly. CPs
+  whose local segment patch is invalid while building the bank are skipped and
+  reported in the summary.
+- Combined Trace2CP is an inspection/score-tuning path. It does not replace the
+  public `trace2cp_error` definition, the direction-only tracer, training loss,
+  or best-checkpoint selection unless explicitly enabled by the command-line
+  flag. With `--med-tta --trace2cp-combined`, median TTA supplies the direction
+  reference while candidate embeddings are sampled from the reference segment
+  patch; no embedding fields are geometrically warped after sampling.
 - Trace2CP TTA samples from the regular training geometric augmentation ranges
   but forces y-shift to zero and scale to one for long-strip target-column
   semantics. Each TTA field is built by transforming the segment coordinate

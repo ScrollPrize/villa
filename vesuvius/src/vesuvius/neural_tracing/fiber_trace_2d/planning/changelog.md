@@ -2,6 +2,9 @@
 
 ## 2026-07-11
 
+- Added optional `--trace2cp-combined` visualization mode that greedily scores
+  angular trace candidates with direction plus contrastive embedding terms,
+  including previous-step, enclosing-CP, and same-fiber CP-bank cosine losses.
 - Added optional cosine contrastive embedding training for 2D fiber strips:
   same-fiber grouped CP batches, appended embedding output channels, balanced
   positive/negative embedding loss, and TensorBoard CP-similarity maps.
