@@ -240,12 +240,13 @@ Discovering a scroll’s title tells scholars what — and whom — they have be
 <details>
 <summary>Submission criteria and requirements</summary>
 
+* **Mesh.** The submission must contain the mesh, in tifxyz format, of the surface region containing the title, already including a low-distortion isometric 2D parametrization (flattening).
 * **Image.** Submissions must be an image of the virtually unwrapped region, showing the title visibly and legibly.
   * Illustrate the ink predictions in the spatial context of the title search, similar to what is [shown here](https://scrollprize.substack.com/p/30k-first-title-prize). You **do not** have to read the title yourself — you have to produce an image of it that our team of papyrologists is able to read.
-  * Images must be generated programmatically, as direct outputs of CT data inputs, and should not contain manual annotations of characters or text. Ink model outputs of this region should not overlap with any training data used.
+  * Images must be generated programmatically from the reconstructed CT scan volume and the mesh submitted in the same package, and should not contain manual annotations of characters or text. Ink model outputs of this region should not overlap with any training data used.
   * Specify which scan the image comes from — any of Scroll 1’s published volumes qualifies, including the 2.4 µm ones.
   * Include a scale bar showing the size of 1 cm on the submission image, and the pixel and millimeter dimensions of a few representative letters.
-  * Specify the 3D position of the title within the scroll: where it sits, whether the surface faces inward or outward, and which way is "up". A 3D orientation image is the easiest way to show this — or provide the segmentation file (or the segmentation ID, if using a public segmentation).
+  * Name the image after the tifxyz mesh (from the same package) used to generate it, so it is traceable to the exact surface it was rendered from.
 * **Methodology.** A detailed technical description of how your solution works. We need to be able to reproduce your work, so please make this as easy as possible:
   * For fully automated software, consider a Docker image that we can easily run to reproduce your work, and please include system requirements.
   * For software with a human in the loop, please provide written instructions and a video explaining how to use your tool. We’ll work with you to learn how to use it, but we’d like to have a strong starting point.
