@@ -47,15 +47,16 @@ function Thumb({ href, highlight, label, videoSrc, poster, imgSrc }) {
 
 // `links`/`labels` optionally re-target and re-name each thumb (e.g. the Open
 // Problems post points them at its own section anchors with its own section
-// names, turning the strip into a visual TOC). Defaults keep the tutorial
-// destinations and labels used on the tutorial pages.
+// names, turning the strip into a visual TOC). Defaults point at CURRENT
+// destinations only — the Open Problems article for stages without a live
+// tutorial, and the live tutorials elsewhere; never at archived pages.
 export function TutorialsTop({ highlightId, links = {}, labels = {} } = {}) {
   return (
     // One row on ≥sm: thumbs shrink (min-w-0) instead of wrapping; the
     // arrows are fixed-width. Phones keep the centered wrap.
     <div className="mx-[-16px] sm:mx-0 flex flex-wrap sm:flex-nowrap items-start mb-4 text-center justify-center sm:justify-start">
       <Thumb
-        href={links.scanning || "/tutorial1"}
+        href={links.scanning || "/2026_open_problems#1-scanning-preserving-the-signal-before-algorithms-see-it"}
         label={labels.scanning || "Scanning"}
         videoSrc="/img/tutorial-thumbs/top-scanning-small.webm"
         poster="/img/tutorial-thumbs/top-scanning-small.webp"
@@ -68,7 +69,7 @@ export function TutorialsTop({ highlightId, links = {}, labels = {} } = {}) {
       </div>
 
       <Thumb
-        href={links.representation || "/tutorial2"}
+        href={links.representation || "/tutorial_VC3D"}
         label={labels.representation || "Representation"}
         videoSrc="/img/tutorial-thumbs/top-representation-small.webm"
         poster="/img/tutorial-thumbs/top-representation-small.webp"
@@ -81,7 +82,7 @@ export function TutorialsTop({ highlightId, links = {}, labels = {} } = {}) {
       </div>
 
       <Thumb
-        href={links.segmentation || "/segmentation"}
+        href={links.segmentation || "/tutorial_spiral"}
         label={labels.segmentation || "Segmentation and Flattening"}
         videoSrc="/img/tutorial-thumbs/top-segmentation-small.webm"
         poster="/img/tutorial-thumbs/top-segmentation-small.webp"

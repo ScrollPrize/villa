@@ -37,12 +37,15 @@ sidebar_label: "Spiral Fitting"
 </head>
 
 import { TutorialsTop } from '@site/src/components/TutorialsTop';
+import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
 
 <TutorialsTop highlightId={4} />
 
 *Last updated: July 9, 2026*
 
-Most of our segmentation tools work bottom-up. [GrowPatch](2026_open_problems#normal-grids-growpatch-and-local-tracing), [lasagna](2026_open_problems#lasagna-smoother-optimization-of-one-or-more-sheets), and [manual segmentation in VC3D](segmentation) all produce *patches* — pieces of papyrus surface that you grow bigger and bigger until they hit a tricky region and stall. Other tools trace individual fibers. Either way you end up with a big pile of small pieces: segments, fibers, point annotations. What we really want is the *whole scroll* — one surface covering every winding of the original papyrus sheet, from the center to the outer shell. However, gluing the pieces together directly is hard, especially where there are gaps between them. [^tracer]
+<ChatCallout prefill="Walk me through the spiral fitting tutorial" />
+
+Most of our segmentation tools work bottom-up. [GrowPatch](2026_open_problems#normal-grids-growpatch-and-local-tracing), [lasagna](2026_open_problems#lasagna-smoother-optimization-of-one-or-more-sheets), and [manual segmentation in VC3D](tutorial_VC3D) all produce *patches* — pieces of papyrus surface that you grow bigger and bigger until they hit a tricky region and stall. Other tools trace individual fibers. Either way you end up with a big pile of small pieces: segments, fibers, point annotations. What we really want is the *whole scroll* — one surface covering every winding of the original papyrus sheet, from the center to the outer shell. However, gluing the pieces together directly is hard, especially where there are gaps between them. [^tracer]
 
 That is what the spiral fit does. It takes the whole pile of partial evidence — surface patches, traced lines, winding annotations, volumetric predictions — and fits a single, globally coherent surface for the entire scroll that agrees with as much of that evidence as possible. Where the evidence is dense, the fitted surface follows it closely; where there are gaps, the spiral bridges them smoothly instead of stopping or leaving a gap.
 

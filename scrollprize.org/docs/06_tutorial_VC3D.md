@@ -29,9 +29,13 @@ title: "Volume Cartographer 3D (VC3D)"
   <meta property="twitter:image" content="https://scrollprize.org/img/social/opengraph.jpg" />
 </head>
 
+import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
+
 # Volume Cartographer 3D (VC3D)
 
 *Last updated: July 11, 2026*
+
+<ChatCallout prefill="Help me get started with VC3D" />
 
 :::info[Draft]
 

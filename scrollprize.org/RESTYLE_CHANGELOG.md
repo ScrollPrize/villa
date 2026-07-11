@@ -416,6 +416,14 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - Landing: the Virtual Unwrapping challenge box's CTA ("Chart the Path") now leads to /tutorial_VC3D — mirroring how Ink Detection's "Find a Letter" leads to /tutorial5 (its title still deep-links the article section).
 **Files:** `sidebars.js`, `docs/06_tutorial_VC3D.md`, `docs/37_2026_open_problems.md`, `src/components/Landing.js`.
 
+## C52 — tutorials: no archived links from current pages, Philodemus callouts, deprecated repo link removed
+
+- **TutorialsTop defaults** pointed at archived pages (/tutorial1, /tutorial2, /segmentation) — the strips atop Spiral Fitting and Ink Detection sent readers to ARCHIVED content. Defaults now current-only: Scanning → /2026_open_problems#1-scanning…, Representation → /tutorial_VC3D, Segmentation and Flattening → /tutorial_spiral, Ink → /tutorial5 (unchanged). Explicit `links` overrides (Open Problems' strip) unaffected.
+- **In-prose archived links retargeted** on the same pages: spiral's "manual segmentation in VC3D" and tutorial5's "segmented" now → /tutorial_VC3D. Verified zero links to archived pages remain on any current tutorial.
+- **Philodemus callouts** added to all three tutorials with page-specific prefills (VC3D: "Help me get started with VC3D"; spiral/ink: "Walk me through the … tutorial").
+- **Deprecated data repo link removed** from Data Formats (`https://data.aws.ash2txt.org/samples/`) — docs-only scope per owner: the 10 Neuroglancer viewer links whose zarr source is that host stay (those DLS volumes aren't mirrored in the open-data bucket yet; removing them would kill data access for PHerc0332/1667/Paris4's older scans).
+**Files:** `src/components/TutorialsTop.js`, `docs/{38_tutorial_spiral,07_tutorial5,06_tutorial_VC3D,02_data}.md`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

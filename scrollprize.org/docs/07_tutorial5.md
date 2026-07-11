@@ -37,10 +37,13 @@ sidebar_label: "Ink Detection"
 </head>
 
 import { TutorialsTop } from '@site/src/components/TutorialsTop';
+import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
 
 <TutorialsTop highlightId={5} />
 
-Ink detection is the last step of the pipeline: taking the flattened surface of a papyrus sheet ([segmented](/segmentation) from the 3D X-ray scan) and identifying where the ink is, so that the text can be read.
+<ChatCallout prefill="Walk me through the ink detection tutorial" />
+
+Ink detection is the last step of the pipeline: taking the flattened surface of a papyrus sheet ([segmented](/tutorial_VC3D) from the 3D X-ray scan) and identifying where the ink is, so that the text can be read.
 
 This is where one of the core difficulties of the Herculaneum Papyri comes in: the carbon ink and the carbonized papyrus have almost the same density, so in an X-ray scan the ink is nearly invisible to the naked eye. The problem is easiest to see on a *detached* fragment, where the writing is exposed and we can photograph it directly: in a color photograph the letters are faint, in 1000&nbsp;nm infrared they are crisp and legible, but in the X-ray CT scan the ink contrast almost completely disappears.
 

@@ -60,10 +60,7 @@ If you are publishing or presenting results, make sure you cite the dataset that
 
 ## Data repositories
 
-We host the dataset in **two repositories** (with the **same folder layout**):
-
-- **Open data bucket:** `s3://vesuvius-challenge-open-data/` usable with any S3‑compatible client (e.g., AWS CLI, boto3, s3fs, etc.). It's also [browsable directly](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html).
-- **(deprecated) Web-browsable samples:** https://data.aws.ash2txt.org/samples/
+We host the dataset in the **open data bucket**: `s3://vesuvius-challenge-open-data/`, usable with any S3‑compatible client (e.g., AWS CLI, boto3, s3fs, etc.). It's also [browsable directly](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html).
 
 An overview of the dataset can be found in the [Data Browser](data_browser).
 The browser is the unified sample index for both scrolls and fragments.
