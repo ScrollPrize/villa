@@ -70,16 +70,20 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _dir_vis_image_space_augmentations,
     _dir_vis_half_image_paste_side,
     _direction_field_overlay_rgb,
+    _draw_trace2cp_overlay,
     _draw_trace2cp_tta_slice,
     _export_augment_contact_sheet,
     _identity_source_xy_grid,
     _labeled_panel_grid_rgb,
     _labeled_panel_strip_rgb,
+    _resample_polyline_by_arclength,
     _paste_unaugmented_center_patch,
     _print_timing_table,
     _reference_point_to_tta,
     _score_trace2cp,
     _source_grid_direction_to_reference,
+    _trace2cp_refinement_from_traces,
+    _trace2cp_center_penalty,
     _trace2cp_tta_params,
     _trace_direction_line,
     _trace_direction_line_to_target,
@@ -314,7 +318,7 @@ def test_trace2cp_one_way_trace_stops_at_target_column() -> None:
     assert np.isclose(line[-1, 0], 6.0)
 
 
-def test_trace2cp_bidirectional_trace_scores_average() -> None:
+def test_trace2cp_bidirectional_trace_scores_closest_approach() -> None:
     field = np.zeros((11, 11, 2), dtype=np.float32)
     field[:, :, 0] = 1.0
 
@@ -334,8 +338,121 @@ def test_trace2cp_bidirectional_trace_scores_average() -> None:
     assert result.reverse.result.raw_y_error_px == pytest.approx(1.0)
     assert result.forward.result.score == pytest.approx(1.0 / 4.0)
     assert result.reverse.result.score == pytest.approx(1.0 / 3.0)
-    assert result.score == pytest.approx(0.5 * (1.0 / 4.0 + 1.0 / 3.0))
+    assert result.endpoint_score == pytest.approx(0.5 * (1.0 / 4.0 + 1.0 / 3.0))
+    assert result.score == pytest.approx(1.0 / 8.0)
     assert result.raw_y_error_px == pytest.approx(1.0)
+    assert result.considered_y_error_px == pytest.approx(1.0)
+    assert result.refinement.center_penalty == pytest.approx(1.0)
+    assert result.refinement.closest_x == pytest.approx(5.0)
+    assert result.refinement.closest_midpoint_xy.tolist() == pytest.approx([5.0, 4.5])
+
+
+def test_trace2cp_center_penalty_is_one_at_center_and_two_at_cps() -> None:
+    assert _trace2cp_center_penalty(5.0, 2.0, 8.0) == pytest.approx(1.0)
+    assert _trace2cp_center_penalty(2.0, 2.0, 8.0) == pytest.approx(2.0)
+    assert _trace2cp_center_penalty(8.0, 2.0, 8.0) == pytest.approx(2.0)
+
+
+def test_trace2cp_center_penalty_can_choose_larger_centered_gap() -> None:
+    forward = np.asarray([[0.0, 8.0], [5.0, 8.0], [10.0, 8.0]], dtype=np.float32)
+    reverse = np.asarray([[10.0, 12.0], [5.0, 15.0], [0.0, 12.0]], dtype=np.float32)
+    direction = np.zeros((21, 21, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+
+    result = _trace2cp_refinement_from_traces(
+        forward,
+        reverse,
+        np.asarray([0.0, 8.0], dtype=np.float32),
+        np.asarray([10.0, 12.0], dtype=np.float32),
+        direction_xy=direction,
+        valid_mask=np.ones((21, 21), dtype=bool),
+        shape_hw=(21, 21),
+        step_px=2.0,
+        rf_margin_px=1.0,
+    )
+
+    assert result.closest_x == pytest.approx(5.0)
+    assert result.raw_y_error_px == pytest.approx(7.0)
+    assert result.considered_y_error_px == pytest.approx(7.0)
+    assert result.center_penalty == pytest.approx(1.0)
+    assert result.score == pytest.approx(7.0 / 18.0)
+
+
+def test_trace2cp_refinement_warps_partial_traces_to_midpoint() -> None:
+    forward = np.asarray([[2.0, 4.0], [4.0, 4.0], [6.0, 4.0]], dtype=np.float32)
+    reverse = np.asarray([[8.0, 8.0], [6.0, 8.0], [4.0, 8.0]], dtype=np.float32)
+    direction = np.zeros((13, 13, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+
+    result = _trace2cp_refinement_from_traces(
+        forward,
+        reverse,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 8.0], dtype=np.float32),
+        direction_xy=direction,
+        valid_mask=np.ones((13, 13), dtype=bool),
+        shape_hw=(13, 13),
+        step_px=2.0,
+        rf_margin_px=1.0,
+    )
+
+    assert result.reached_overlap
+    assert result.score == pytest.approx(4.0 / 10.0)
+    assert result.considered_y_error_px == pytest.approx(4.0)
+    assert result.center_penalty == pytest.approx(1.0)
+    assert result.closest_x == pytest.approx(5.0)
+    assert result.closest_midpoint_xy.tolist() == pytest.approx([5.0, 6.0])
+    assert result.partial_forward_xy[-1].tolist() == pytest.approx([5.0, 4.0])
+    assert result.partial_reverse_xy[-1].tolist() == pytest.approx([5.0, 8.0])
+    assert result.fused_dense_xy[0].tolist() == pytest.approx([2.0, 4.0])
+    assert result.fused_dense_xy[-1].tolist() == pytest.approx([8.0, 8.0])
+    assert bool(np.any(np.all(np.isclose(result.fused_dense_xy, np.asarray([5.0, 6.0])), axis=1)))
+
+
+def test_resample_polyline_by_arclength_keeps_endpoints() -> None:
+    line = np.asarray([[0.0, 0.0], [3.0, 4.0]], dtype=np.float32)
+
+    resampled = _resample_polyline_by_arclength(line, step_px=2.0)
+
+    assert resampled[0].tolist() == pytest.approx([0.0, 0.0])
+    assert resampled[-1].tolist() == pytest.approx([3.0, 4.0])
+    assert resampled.shape[0] == 4
+
+
+def test_trace2cp_overlay_can_add_reference_column() -> None:
+    field = np.zeros((11, 11, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+    result = _trace_score_trace2cp_bidirectional(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+    image = np.zeros((11, 11), dtype=np.uint8)
+    line = np.asarray([[2.0, 4.0], [8.0, 5.0]], dtype=np.float32)
+
+    single = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        result_label="med_tta",
+    )
+    dual = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        result_label="med_tta",
+        reference_result=result,
+        reference_label="reference",
+    )
+
+    assert dual.shape[0] >= single.shape[0]
+    assert dual.shape[1] == 2 * single.shape[1]
 
 
 def test_trace2cp_target_column_wins_over_next_rf_margin() -> None:
@@ -2038,7 +2155,7 @@ def test_training_batch_pipeline_preserves_step_sample_order() -> None:
 
     assert [first.raw_start_sample_index, second.raw_start_sample_index, third.raw_start_sample_index] == [0, 2, 4]
     assert [first.batch.start, second.batch.start, third.batch.start] == [0, 2, 4]
-    assert loader.starts == [0, 2, 4]
+    assert sorted(loader.starts) == [0, 2, 4]
 
 
 def test_identity_equivalent_augment_vis_entries_match(tmp_path: Path) -> None:

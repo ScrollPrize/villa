@@ -240,11 +240,13 @@ The important behavior is:
   `--trace2cp-target-cp-index` for other same-fiber target CPs.
 - `--trace2cp-vis` loads a side-strip segment spanning both CPs, runs the same
   decoded direction-field model as line tracing, traces start-to-target and
-  target-to-start on the same strip, and scores each direction's y-error where
-  that trace reaches its target CP x-column. The reported `trace2cp_score` is
-  the average of the two normalized directional scores. The trace2cp segment
-  strip uses twice the configured patch height for more vertical room before
-  the RF margin.
+  target-to-start on the same strip, and uses the center-biased closest
+  vertical approach between the two opposing traces as the public
+  `trace2cp_score`. Candidate y-gaps are multiplied by a horizontal center
+  penalty that is `1x` at the midpoint between the CPs and `2x` at either CP
+  x-coordinate. Endpoint scores at the opposite CP x-columns remain summary
+  diagnostics. The trace2cp segment strip uses twice the configured patch
+  height for more vertical room before the RF margin.
 - Trace2CP uses `--med-tta` to decide whether to use TTA. Without it, the tool
   traces and scores both directions on the base direction field. With it,
   deterministic random geometric TTA direction fields are built by transforming
@@ -259,12 +261,16 @@ The important behavior is:
   `trace2cp_tta/contact_sheet.jpg`. Each image shows the sampled slice with the
   transformed base-strip corner outline and start/target CP markers.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
-  the averaged normalized `0..1` score plus averaged raw pixel error, trace
-  mode, and per-direction scores/statuses to stdout. The summary includes
-  forward/reverse raw errors, normalized scores, target x-columns, target-column
-  reach statuses, termination reasons, and trace point counts. The JPG is
-  always one strip image with the two CPs, both traced lines, and the averaged
-  score in a top label band above the image pixels.
+  the center-biased closest-approach normalized `0..1` score plus actual pixel
+  separation, considered metric distance, center penalty, trace mode, endpoint
+  diagnostics, and per-direction scores/statuses to stdout. The summary
+  includes the closest x position, fused/optimized point counts,
+  forward/reverse raw endpoint errors, normalized endpoint scores, target
+  x-columns, target-column reach statuses, termination reasons, and trace point
+  counts. The JPG is a labeled vertical stack with full traces, partial
+  closest-approach traces, the fused CP-to-CP line, and the optimized
+  refinement. With `--med-tta`, that stack is rendered as the first column and
+  a second column shows the reference-only/base-inference result without TTA.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
   side-strip patch, applies pixel-perfect image-space identity/flip/90-degree

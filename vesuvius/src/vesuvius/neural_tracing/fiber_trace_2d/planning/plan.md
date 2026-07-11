@@ -61,6 +61,7 @@ a pretraining stage that does not require control points at all - but does benef
             - the newly constucted fused line going from cp to cp
         - finally we re-optimize the line by minimizing the dir errors of the sampled points while at the same time applying a loss the distributes the step evenly
             - visualize the opt result in a fourth row in trace2cp
+        - the trace2cp metric calculation should actually be changed to be based on the min distance between the two traces instead of the distance at the cps
             
             
 # V0.1 gt self-refinement

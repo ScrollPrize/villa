@@ -2,6 +2,13 @@
 
 ## 2026-07-11
 
+- Added a reference-only comparison column to `--trace2cp-vis --med-tta`
+  output.
+- Added a center-bias penalty to Trace2CP closest-approach scoring so candidate
+  gaps at either CP x-coordinate count twice as much as gaps at the midpoint.
+- Changed Trace2CP's public score to the closest vertical approach between
+  opposing traces and added fused/optimized CP-to-CP refinement rows to the
+  visualization.
 - Switched the default 2D fiber-strip direction model normalization from
   GroupNorm to BatchNorm2d.
 - Replaced Trace2CP/line median-TTA reference-point lookup with direct sampling

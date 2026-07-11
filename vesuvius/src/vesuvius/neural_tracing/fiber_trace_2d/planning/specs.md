@@ -316,16 +316,36 @@
 - Each Trace2CP direction initializes its ambiguous-direction sign from the
   vector pointing from that direction's start CP to its target CP. The reverse
   trace therefore starts at the second CP and is seeded toward the first CP.
-- Per-direction Trace2CP scoring evaluates the traced y coordinate at that
-  direction's target CP x-column. If the trace crosses that x-column, the y
-  coordinate is linearly interpolated between bracketing trace points. The raw
-  error is `abs(trace_y_at_target_x - target_cp_y)`.
-- Per-direction Trace2CP normalized score is clamped to `0..1`; `0.0` is an
-  exact y-hit at the direction's target column, and `1.0` is a miss at the
-  usable strip edge or failure to reach the target column. The denominator is
-  the direction target CP's distance to the nearest usable vertical strip edge
-  after the receptive-field margin is excluded. The public `trace2cp_score` is
-  the arithmetic mean of the forward and reverse normalized scores.
+- Per-direction Trace2CP endpoint diagnostics still evaluate the traced y
+  coordinate at that direction's target CP x-column. If the trace crosses that
+  x-column, the y coordinate is linearly interpolated between bracketing trace
+  points. These endpoint scores remain in the summary as diagnostics, but they
+  are not the public `trace2cp_score`.
+- The public Trace2CP metric is the center-biased closest vertical approach
+  between the opposing traces. Both traces are resampled at one point per
+  horizontal pixel over their overlapping x span. The actual error at a
+  candidate x is the absolute y separation between those two resampled traces.
+  The considered metric distance is
+  `actual_error * (1 + abs(x - center_x) / half_cp_x_span)`, clipped so the
+  multiplier is `1.0` at the midpoint between CP x coordinates and `2.0` at
+  either CP x coordinate. Trace2CP chooses the candidate x with the smallest
+  considered distance; ties choose the candidate closest to the midpoint.
+- The public Trace2CP normalized score is clamped to `0..1`; `0.0` means the
+  two opposing traces meet exactly, and `1.0` means the center-penalized
+  considered distance reaches the usable vertical strip span or the traces have
+  no overlap. The denominator is the full usable vertical strip span after the
+  receptive-field margin is excluded. The actual y separation remains a
+  diagnostic field.
+- Trace2CP builds a CP-to-CP initialized segment from the two closest-approach
+  partial traces. Each CP stays fixed. Each partial trace is corrected only in
+  y, with zero correction at its CP and linearly increasing correction toward
+  the closest x position. At the closest x position both traces are warped to
+  the midpoint between their original y values. The two warped partial traces
+  are fused and resampled by arc length using `--line-trace-step`.
+- Trace2CP also runs a small deterministic refinement of the fused line that
+  reduces local direction mismatch against the sampled direction field while
+  discouraging uneven segment spacing. The refined line keeps the two CP
+  endpoints fixed.
 - Trace2CP uses `--med-tta` to determine whether TTA is used. Without
   `--med-tta`, it traces and scores both directions on the base strip
   direction field. With `--med-tta`, it builds deterministic random geometric
@@ -353,12 +373,17 @@
   base-strip corner outline and start/target CP markers.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
   a concise stdout line with sample index, fiber path, start/target CP indices,
-  trace mode, averaged normalized score, averaged raw y error in pixels, and
-  per-direction normalized scores, raw errors, target x-columns, reach statuses,
-  termination reasons, and trace point counts. The JPG is always a single strip
-  image containing the two CPs, both directional traced lines, and the averaged
-  score in a top label band; it does not add separate TTA/flock columns or draw
-  score text over image pixels.
+  trace mode, center-biased closest-approach normalized score, actual y
+  separation in pixels, considered metric distance in pixels, center penalty,
+  closest x position, endpoint diagnostic scores, per-direction raw errors,
+  target x-columns, reach statuses, termination reasons, and trace point
+  counts. The JPG is a labeled vertical stack with rows for full bidirectional
+  traces, partial traces up to the closest point, the fused CP-to-CP line, and
+  the optimized refinement. Without `--med-tta`, this stack is the
+  reference-only inference result. With `--med-tta`, the JPG has two columns:
+  the selected median-TTA result first, and a second reference-only inference
+  column using the base direction field without TTA. It does not draw score
+  text over image pixels.
 - Trace2CP target-column crossing takes precedence over RF-margin rejection for
   the next step in each direction. If a step crosses that direction's target
   x-column and would also enter the RF margin, the trace is considered to have

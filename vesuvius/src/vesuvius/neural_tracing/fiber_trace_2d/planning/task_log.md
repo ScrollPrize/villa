@@ -1,35 +1,40 @@
-# Merge `fiber2d-tweaks` Task Log
+# Trace2CP Center-Biased Metric Task Log
 
-## Notes
+## Plan Review
 
-- Read local `AGENTS.md`.
-- Ran `git merge --no-commit fiber2d-tweaks`.
-- Conflicts were in planning task/changelog/status/log/plan files and
-  `vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`.
-- Inspected auto-merged `planning/specs.md`, `docs/code_structure.md`,
-  `runner.py`, and the conflicted tests.
-- Resolved the semantic conflict by documenting and testing `--dir-vis` as a
-  narrow diagnostic image-space exception while keeping training, augment-vis,
-  line tracing, Trace2CP, labels, TTA, and shared loader paths coordinate-only.
-- Resolved the test import conflict by keeping current direct-map helpers and
-  incoming dir-vis helpers, while omitting stale helpers that must not exist.
-- Per local `AGENTS.md`, reviewed the plan locally against `task.md`,
-  `task_plan.md`, `planning/specs.md`, and `planning/plan.md`. A separate
-  sub-agent was not spawned because this environment only allows multi-agent
-  tooling when explicitly requested by the user.
+- `task.md`: the plan implements the requested center preference and `2x`
+  considered distance at either CP.
+- `specs.md`: the change is limited to Trace2CP metric selection/scoring and
+  keeps the existing shared tracing/TTA code path.
+- `plan.md`: pre-existing user edits remain untouched.
+
+## Implementation Notes
+
+- Added `_trace2cp_center_penalty`, using a linear multiplier from `1.0` at
+  the midpoint between CP x coordinates to `2.0` at either CP x coordinate.
+- Trace2CP closest-point selection now minimizes
+  `actual_y_gap * center_penalty`.
+- `trace2cp_score` now uses the considered center-penalized distance divided by
+  the usable vertical strip span. The actual y separation remains available as
+  `actual_y_error_px` / `raw_y_error_px` diagnostics.
+- Trace2CP visualization/summary output now reports actual gap, considered
+  gap, and center penalty.
+- Added regression tests for the center penalty and for a case where the center
+  candidate wins despite a larger actual y-gap.
+- Added a reference-only comparison column to `trace2cp_vis.jpg` when
+  `--med-tta` is active. The selected median-TTA result remains first; the
+  second column is the base/reference inference without TTA. Non-TTA Trace2CP
+  output stays single-column.
+- Added a renderer regression test for the optional reference column.
+- `planning/plan.md` and `planning/todo.md` were already modified in the
+  worktree and were not edited for this task.
 
 ## Validation
 
-- Conflict-marker scan over `fiber_trace_2d` sources/tests found no matches.
-- Semantic no-image-space check after excluding the explicit `--dir-vis`
-  diagnostic helper and display-only anti-alias resize found no forbidden
-  runner tokens.
-- Whitespace check:
-  `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed.
-- Compile check:
-  `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/augmentation.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/direction.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/model.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed.
-- Focused tests:
+- Passed:
+  `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+- Passed:
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: `126 passed in 7.00s`.
+  (`131 passed in 6.06s`)
+- Passed:
+  `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`

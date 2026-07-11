@@ -592,16 +592,49 @@ class _Trace2CpDirectionResult:
 
 
 @dataclass(frozen=True)
+class _Trace2CpRefinementResult:
+    score: float
+    raw_y_error_px: float
+    considered_y_error_px: float
+    center_penalty: float
+    denominator_px: float
+    closest_x: float
+    forward_y_at_closest_x: float
+    reverse_y_at_closest_x: float
+    closest_midpoint_xy: np.ndarray
+    reached_overlap: bool
+    reason: str
+    partial_forward_xy: np.ndarray
+    partial_reverse_xy: np.ndarray
+    fused_dense_xy: np.ndarray
+    fused_resampled_xy: np.ndarray
+    optimized_xy: np.ndarray
+
+
+@dataclass(frozen=True)
 class _Trace2CpBidirectionalResult:
     forward: _Trace2CpDirectionResult
     reverse: _Trace2CpDirectionResult
+    refinement: _Trace2CpRefinementResult
 
     @property
     def score(self) -> float:
-        return 0.5 * (float(self.forward.result.score) + float(self.reverse.result.score))
+        return float(self.refinement.score)
 
     @property
     def raw_y_error_px(self) -> float:
+        return float(self.refinement.raw_y_error_px)
+
+    @property
+    def considered_y_error_px(self) -> float:
+        return float(self.refinement.considered_y_error_px)
+
+    @property
+    def endpoint_score(self) -> float:
+        return 0.5 * (float(self.forward.result.score) + float(self.reverse.result.score))
+
+    @property
+    def endpoint_raw_y_error_px(self) -> float:
         return 0.5 * (
             float(self.forward.result.raw_y_error_px) + float(self.reverse.result.raw_y_error_px)
         )
@@ -1080,6 +1113,427 @@ def _score_trace2cp(
     )
 
 
+def _ordered_x_values_between(start_x: float, end_x: float) -> np.ndarray:
+    start = float(start_x)
+    end = float(end_x)
+    if not np.isfinite(start) or not np.isfinite(end):
+        return np.zeros((0,), dtype=np.float32)
+    if abs(end - start) <= 1.0e-6:
+        return np.asarray([start], dtype=np.float32)
+    lo = min(start, end)
+    hi = max(start, end)
+    columns = np.arange(np.ceil(lo), np.floor(hi) + 1.0, dtype=np.float32)
+    values = np.concatenate(
+        [
+            np.asarray([lo, hi], dtype=np.float32),
+            columns.astype(np.float32, copy=False),
+        ],
+        axis=0,
+    )
+    values = np.unique(values[(values >= lo - 1.0e-6) & (values <= hi + 1.0e-6)]).astype(np.float32)
+    if start > end:
+        values = values[::-1].copy()
+    return values
+
+
+def _resample_trace_at_x_values(trace_xy: np.ndarray, x_values: np.ndarray) -> np.ndarray:
+    trace = np.asarray(trace_xy, dtype=np.float32)
+    values = np.asarray(x_values, dtype=np.float32).reshape(-1)
+    if trace.ndim != 2 or trace.shape[1] != 2:
+        raise ValueError("trace_xy must have shape N,2")
+    points: list[list[float]] = []
+    for x in values.tolist():
+        y = _trace_y_at_x(trace, float(x))
+        if y is not None and np.isfinite(y):
+            points.append([float(x), float(y)])
+    if not points:
+        return np.zeros((0, 2), dtype=np.float32)
+    return np.asarray(points, dtype=np.float32)
+
+
+def _resample_trace_between_x(trace_xy: np.ndarray, start_x: float, end_x: float) -> np.ndarray:
+    return _resample_trace_at_x_values(trace_xy, _ordered_x_values_between(float(start_x), float(end_x)))
+
+
+def _usable_trace2cp_vertical_span(shape_hw: tuple[int, int], rf_margin_px: float) -> tuple[float, float, float]:
+    height, _ = (int(v) for v in shape_hw)
+    margin = max(0.0, float(rf_margin_px))
+    top = margin
+    bottom = float(height - 1) - margin
+    span = bottom - top
+    if not np.isfinite(span) or span <= 0.0:
+        raise ValueError(
+            "trace2cp has no usable vertical scoring span: "
+            f"height={height} rf_margin_px={margin:.3f}"
+        )
+    return top, bottom, span
+
+
+def _trace2cp_overlap_x_values(
+    forward_trace_xy: np.ndarray,
+    reverse_trace_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+) -> np.ndarray:
+    forward = np.asarray(forward_trace_xy, dtype=np.float32)
+    reverse = np.asarray(reverse_trace_xy, dtype=np.float32)
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    if forward.ndim != 2 or forward.shape[1] != 2 or reverse.ndim != 2 or reverse.shape[1] != 2:
+        raise ValueError("forward/reverse traces must have shape N,2")
+    if start.shape != (2,) or target.shape != (2,):
+        raise ValueError("start_xy and target_xy must have shape (2,)")
+    finite_forward = forward[np.isfinite(forward).all(axis=1)]
+    finite_reverse = reverse[np.isfinite(reverse).all(axis=1)]
+    if finite_forward.shape[0] == 0 or finite_reverse.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+    cp_lo = min(float(start[0]), float(target[0]))
+    cp_hi = max(float(start[0]), float(target[0]))
+    overlap_lo = max(float(np.min(finite_forward[:, 0])), float(np.min(finite_reverse[:, 0])), cp_lo)
+    overlap_hi = min(float(np.max(finite_forward[:, 0])), float(np.max(finite_reverse[:, 0])), cp_hi)
+    if overlap_hi < overlap_lo:
+        return np.zeros((0,), dtype=np.float32)
+    values = _ordered_x_values_between(overlap_lo, overlap_hi)
+    if float(start[0]) > float(target[0]):
+        values = values[::-1].copy()
+    return values
+
+
+def _trace2cp_center_penalty(x: float, start_x: float, target_x: float) -> float:
+    half_span = 0.5 * abs(float(target_x) - float(start_x))
+    if not np.isfinite(half_span) or half_span <= 1.0e-6:
+        return 1.0
+    center_x = 0.5 * (float(start_x) + float(target_x))
+    normalized = abs(float(x) - center_x) / half_span
+    return float(1.0 + np.clip(normalized, 0.0, 1.0))
+
+
+def _closest_trace2cp_approach(
+    forward_trace_xy: np.ndarray,
+    reverse_trace_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    shape_hw: tuple[int, int],
+    rf_margin_px: float,
+) -> tuple[float, float, float, float, float, float, float, np.ndarray, str, bool]:
+    _, _, denominator = _usable_trace2cp_vertical_span(shape_hw, rf_margin_px)
+    x_values = _trace2cp_overlap_x_values(forward_trace_xy, reverse_trace_xy, start_xy, target_xy)
+    if x_values.size == 0:
+        midpoint = np.asarray([np.nan, np.nan], dtype=np.float32)
+        return (
+            1.0,
+            denominator,
+            denominator,
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            midpoint,
+            "no_trace_overlap",
+            False,
+        )
+
+    forward_rows: list[tuple[float, float]] = []
+    reverse_rows: list[tuple[float, float]] = []
+    gaps: list[float] = []
+    penalties: list[float] = []
+    considered_gaps: list[float] = []
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    for x in x_values.tolist():
+        forward_y = _trace_y_at_x(forward_trace_xy, float(x))
+        reverse_y = _trace_y_at_x(reverse_trace_xy, float(x))
+        if forward_y is None or reverse_y is None:
+            continue
+        if not np.isfinite(forward_y) or not np.isfinite(reverse_y):
+            continue
+        gap = abs(float(forward_y) - float(reverse_y))
+        penalty = _trace2cp_center_penalty(float(x), float(start[0]), float(target[0]))
+        forward_rows.append((float(x), float(forward_y)))
+        reverse_rows.append((float(x), float(reverse_y)))
+        gaps.append(gap)
+        penalties.append(penalty)
+        considered_gaps.append(gap * penalty)
+    if not gaps:
+        midpoint = np.asarray([np.nan, np.nan], dtype=np.float32)
+        return (
+            1.0,
+            denominator,
+            denominator,
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            midpoint,
+            "no_trace_overlap",
+            False,
+        )
+
+    considered_arr = np.asarray(considered_gaps, dtype=np.float32)
+    min_considered = float(np.min(considered_arr))
+    midpoint_x = 0.5 * (float(start[0]) + float(target[0]))
+    candidate_indices = np.flatnonzero(np.isclose(considered_arr, min_considered, rtol=1.0e-6, atol=1.0e-6))
+    if candidate_indices.size > 1:
+        candidate_x = np.asarray([forward_rows[int(index)][0] for index in candidate_indices], dtype=np.float32)
+        closest_index = int(candidate_indices[int(np.argmin(np.abs(candidate_x - np.float32(midpoint_x))))])
+    else:
+        closest_index = int(candidate_indices[0])
+    closest_x, forward_y = forward_rows[closest_index]
+    _, reverse_y = reverse_rows[closest_index]
+    gap = float(gaps[closest_index])
+    penalty = float(penalties[closest_index])
+    considered_gap = float(considered_gaps[closest_index])
+    midpoint = np.asarray([closest_x, 0.5 * (forward_y + reverse_y)], dtype=np.float32)
+    score = float(np.clip(considered_gap / denominator, 0.0, 1.0))
+    return score, gap, considered_gap, penalty, closest_x, forward_y, reverse_y, midpoint, "closest_approach", True
+
+
+def _vertical_warp_trace_to_meet(
+    trace_xy: np.ndarray,
+    *,
+    anchor_xy: np.ndarray,
+    meet_x: float,
+    meet_y: float,
+    source_meet_y: float,
+) -> np.ndarray:
+    trace = np.asarray(trace_xy, dtype=np.float32)
+    anchor = np.asarray(anchor_xy, dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[1] != 2:
+        raise ValueError("trace_xy must have shape N,2")
+    if anchor.shape != (2,):
+        raise ValueError("anchor_xy must have shape (2,)")
+    if trace.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    warped = trace.copy()
+    denom = abs(float(meet_x) - float(anchor[0]))
+    if denom <= 1.0e-6:
+        blend = np.ones((trace.shape[0],), dtype=np.float32)
+    else:
+        blend = np.clip(np.abs(trace[:, 0] - np.float32(anchor[0])) / np.float32(denom), 0.0, 1.0)
+    warped[:, 1] = warped[:, 1] + blend * np.float32(float(meet_y) - float(source_meet_y))
+    warped[0] = anchor.astype(np.float32, copy=False)
+    warped[-1, 0] = np.float32(meet_x)
+    warped[-1, 1] = np.float32(meet_y)
+    return warped.astype(np.float32, copy=False)
+
+
+def _resample_polyline_by_arclength(line_xy: np.ndarray, *, step_px: float) -> np.ndarray:
+    line = np.asarray(line_xy, dtype=np.float32)
+    if line.ndim != 2 or line.shape[1] != 2:
+        raise ValueError("line_xy must have shape N,2")
+    finite = np.isfinite(line).all(axis=1)
+    line = line[finite]
+    if line.shape[0] <= 1:
+        return line.astype(np.float32, copy=True)
+    delta = line[1:] - line[:-1]
+    seg_len = np.linalg.norm(delta, axis=1)
+    keep = np.concatenate([[True], seg_len > 1.0e-6])
+    line = line[keep]
+    if line.shape[0] <= 1:
+        return line.astype(np.float32, copy=True)
+    delta = line[1:] - line[:-1]
+    seg_len = np.linalg.norm(delta, axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(seg_len, dtype=np.float64)]).astype(np.float64)
+    total = float(cumulative[-1])
+    if total <= 1.0e-6:
+        return line[:1].astype(np.float32, copy=True)
+    step = max(float(step_px), 1.0e-3)
+    distances = np.arange(0.0, total, step, dtype=np.float64)
+    if distances.size == 0 or abs(float(distances[-1]) - total) > 1.0e-6:
+        distances = np.concatenate([distances, np.asarray([total], dtype=np.float64)], axis=0)
+    xs = np.interp(distances, cumulative, line[:, 0].astype(np.float64))
+    ys = np.interp(distances, cumulative, line[:, 1].astype(np.float64))
+    return np.stack([xs, ys], axis=1).astype(np.float32)
+
+
+def _sample_direction_field_torch(
+    direction_xy: torch.Tensor,
+    points_xy: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if direction_xy.ndim != 3 or int(direction_xy.shape[2]) != 2:
+        raise ValueError("direction_xy must have shape H,W,2")
+    if points_xy.ndim != 2 or int(points_xy.shape[1]) != 2:
+        raise ValueError("points_xy must have shape N,2")
+    height = int(direction_xy.shape[0])
+    width = int(direction_xy.shape[1])
+    x = points_xy[:, 0]
+    y = points_xy[:, 1]
+    inside = (x >= 0.0) & (y >= 0.0) & (x <= float(width - 1)) & (y <= float(height - 1))
+    x0 = torch.floor(x).to(dtype=torch.long).clamp(0, max(0, width - 1))
+    y0 = torch.floor(y).to(dtype=torch.long).clamp(0, max(0, height - 1))
+    x1 = (x0 + 1).clamp(0, max(0, width - 1))
+    y1 = (y0 + 1).clamp(0, max(0, height - 1))
+    tx = (x - x0.to(dtype=torch.float32)).clamp(0.0, 1.0).view(-1, 1)
+    ty = (y - y0.to(dtype=torch.float32)).clamp(0.0, 1.0).view(-1, 1)
+    top = direction_xy[y0, x0] * (1.0 - tx) + direction_xy[y0, x1] * tx
+    bottom = direction_xy[y1, x0] * (1.0 - tx) + direction_xy[y1, x1] * tx
+    sampled = top * (1.0 - ty) + bottom * ty
+    raw_norm = torch.linalg.vector_norm(sampled, dim=1)
+    sampled = sampled / raw_norm.clamp_min(1.0e-12).view(-1, 1)
+    valid = inside & torch.isfinite(sampled).all(dim=1) & (raw_norm > 1.0e-6)
+    if valid_mask is not None:
+        valid = (
+            valid
+            & valid_mask[y0, x0]
+            & valid_mask[y0, x1]
+            & valid_mask[y1, x0]
+            & valid_mask[y1, x1]
+        )
+    return sampled, valid
+
+
+def _optimize_trace2cp_line(
+    initial_line_xy: np.ndarray,
+    direction_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None,
+    step_px: float,
+    iterations: int = 80,
+) -> np.ndarray:
+    line = np.asarray(initial_line_xy, dtype=np.float32)
+    field = np.asarray(direction_xy, dtype=np.float32)
+    if line.ndim != 2 or line.shape[1] != 2:
+        raise ValueError("initial_line_xy must have shape N,2")
+    if field.ndim != 3 or field.shape[2] != 2:
+        raise ValueError("direction_xy must have shape H,W,2")
+    if line.shape[0] <= 2:
+        return line.astype(np.float32, copy=True)
+
+    device = torch.device("cpu")
+    field_t = torch.as_tensor(field, dtype=torch.float32, device=device)
+    valid_t = None
+    if valid_mask is not None:
+        valid_arr = np.asarray(valid_mask, dtype=bool)
+        if valid_arr.shape != field.shape[:2]:
+            raise ValueError("valid_mask must match direction field shape")
+        valid_t = torch.as_tensor(valid_arr, dtype=torch.bool, device=device)
+    base = torch.as_tensor(line, dtype=torch.float32, device=device)
+    x_fixed = base[:, 0].detach()
+    y_initial = base[:, 1].detach()
+    y_param = torch.nn.Parameter(y_initial[1:-1].clone())
+    optimizer = torch.optim.Adam([y_param], lr=0.05)
+    target_step = max(float(step_px), 1.0e-3)
+
+    for _ in range(max(1, int(iterations))):
+        optimizer.zero_grad(set_to_none=True)
+        y = torch.cat([y_initial[:1], y_param, y_initial[-1:]], dim=0)
+        points = torch.stack([x_fixed, y], dim=1)
+        segments = points[1:] - points[:-1]
+        lengths = torch.linalg.vector_norm(segments, dim=1).clamp_min(1.0e-6)
+        segment_unit = segments / lengths.view(-1, 1)
+        midpoints = 0.5 * (points[1:] + points[:-1])
+        sampled, valid = _sample_direction_field_torch(field_t, midpoints, valid_t)
+        if not bool(valid.any()):
+            return line.astype(np.float32, copy=True)
+        direction_loss = 1.0 - torch.abs(torch.sum(segment_unit[valid] * sampled[valid], dim=1)).clamp(0.0, 1.0)
+        step_loss = ((lengths - lengths.mean().detach()) / target_step).pow(2)
+        anchor_loss = ((y - y_initial) / target_step).pow(2)
+        loss = direction_loss.mean() + 0.05 * step_loss.mean() + 0.01 * anchor_loss.mean()
+        loss.backward()
+        optimizer.step()
+
+    with torch.no_grad():
+        y = torch.cat([y_initial[:1], y_param, y_initial[-1:]], dim=0)
+        optimized = torch.stack([x_fixed, y], dim=1).detach().cpu().numpy().astype(np.float32)
+    return optimized
+
+
+def _trace2cp_refinement_from_traces(
+    forward_trace_xy: np.ndarray,
+    reverse_trace_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    direction_xy: np.ndarray,
+    valid_mask: np.ndarray | None,
+    shape_hw: tuple[int, int],
+    step_px: float,
+    rf_margin_px: float,
+) -> _Trace2CpRefinementResult:
+    score, gap, considered_gap, penalty, closest_x, forward_y, reverse_y, midpoint, reason, reached = (
+        _closest_trace2cp_approach(
+            forward_trace_xy,
+            reverse_trace_xy,
+            start_xy,
+            target_xy,
+            shape_hw=shape_hw,
+            rf_margin_px=rf_margin_px,
+        )
+    )
+    _, _, denominator = _usable_trace2cp_vertical_span(shape_hw, rf_margin_px)
+    empty = np.zeros((0, 2), dtype=np.float32)
+    if not reached:
+        return _Trace2CpRefinementResult(
+            score=score,
+            raw_y_error_px=gap,
+            considered_y_error_px=considered_gap,
+            center_penalty=penalty,
+            denominator_px=denominator,
+            closest_x=closest_x,
+            forward_y_at_closest_x=forward_y,
+            reverse_y_at_closest_x=reverse_y,
+            closest_midpoint_xy=midpoint,
+            reached_overlap=False,
+            reason=reason,
+            partial_forward_xy=empty,
+            partial_reverse_xy=empty,
+            fused_dense_xy=empty,
+            fused_resampled_xy=empty,
+            optimized_xy=empty,
+        )
+
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    partial_forward = _resample_trace_between_x(forward_trace_xy, float(start[0]), closest_x)
+    partial_reverse = _resample_trace_between_x(reverse_trace_xy, float(target[0]), closest_x)
+    warped_forward = _vertical_warp_trace_to_meet(
+        partial_forward,
+        anchor_xy=start,
+        meet_x=closest_x,
+        meet_y=float(midpoint[1]),
+        source_meet_y=forward_y,
+    )
+    warped_reverse = _vertical_warp_trace_to_meet(
+        partial_reverse,
+        anchor_xy=target,
+        meet_x=closest_x,
+        meet_y=float(midpoint[1]),
+        source_meet_y=reverse_y,
+    )
+    reverse_meet_to_target = warped_reverse[::-1].copy()
+    if warped_forward.shape[0] > 0 and reverse_meet_to_target.shape[0] > 0:
+        fused_dense = np.concatenate([warped_forward, reverse_meet_to_target[1:]], axis=0)
+    else:
+        fused_dense = np.zeros((0, 2), dtype=np.float32)
+    fused_resampled = _resample_polyline_by_arclength(fused_dense, step_px=step_px)
+    optimized = _optimize_trace2cp_line(
+        fused_resampled,
+        direction_xy,
+        valid_mask=valid_mask,
+        step_px=step_px,
+    )
+    return _Trace2CpRefinementResult(
+        score=score,
+        raw_y_error_px=gap,
+        considered_y_error_px=considered_gap,
+        center_penalty=penalty,
+        denominator_px=denominator,
+        closest_x=closest_x,
+        forward_y_at_closest_x=forward_y,
+        reverse_y_at_closest_x=reverse_y,
+        closest_midpoint_xy=midpoint,
+        reached_overlap=True,
+        reason=reason,
+        partial_forward_xy=partial_forward,
+        partial_reverse_xy=partial_reverse,
+        fused_dense_xy=fused_dense.astype(np.float32, copy=False),
+        fused_resampled_xy=fused_resampled.astype(np.float32, copy=False),
+        optimized_xy=optimized.astype(np.float32, copy=False),
+    )
+
+
 def _trace_score_trace2cp_direction(
     direction_xy: np.ndarray,
     start_xy: np.ndarray,
@@ -1132,7 +1586,18 @@ def _trace_score_trace2cp_bidirectional(
         step_px=step_px,
         rf_margin_px=rf_margin_px,
     )
-    return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse)
+    refinement = _trace2cp_refinement_from_traces(
+        forward.trace_xy,
+        reverse.trace_xy,
+        start_xy,
+        target_xy,
+        direction_xy=direction_xy,
+        valid_mask=valid_mask,
+        shape_hw=(int(direction_xy.shape[0]), int(direction_xy.shape[1])),
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse, refinement=refinement)
 
 
 def _trace_score_trace2cp_median_tta_direction(
@@ -1187,7 +1652,19 @@ def _trace_score_trace2cp_median_tta_bidirectional(
         step_px=step_px,
         rf_margin_px=rf_margin_px,
     )
-    return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse)
+    reference = fields[0]
+    refinement = _trace2cp_refinement_from_traces(
+        forward.trace_xy,
+        reverse.trace_xy,
+        start_xy,
+        target_xy,
+        direction_xy=reference.direction_xy,
+        valid_mask=reference.valid_mask,
+        shape_hw=shape_hw,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse, refinement=refinement)
 
 
 def _export_line_trace_vis(
@@ -1346,49 +1823,107 @@ def _draw_trace2cp_overlay(
     start_xy: np.ndarray,
     target_xy: np.ndarray,
     bidirectional_result: _Trace2CpBidirectionalResult,
+    result_label: str = "trace2cp",
+    reference_result: _Trace2CpBidirectionalResult | None = None,
+    reference_label: str = "reference",
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
 
-    overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.35, thickness=1)
-    overlay = _overlay_polyline_rgb(
-        overlay,
-        bidirectional_result.forward.trace_xy,
-        color_rgba=(0, 255, 0, 230),
-        thickness=1,
-    )
-    overlay = _overlay_polyline_rgb(
-        overlay,
-        bidirectional_result.reverse.trace_xy,
-        color_rgba=(255, 64, 220, 230),
-        thickness=1,
-    )
-    arr = np.asarray(overlay, dtype=np.uint8)
-    pil = Image.fromarray(arr, mode="RGB")
-    draw = ImageDraw.Draw(pil, mode="RGBA")
-    height, width = arr.shape[:2]
+    def draw_row(
+        polylines: list[tuple[np.ndarray, tuple[int, int, int, int], int]],
+        *,
+        label: str,
+        meeting_xy: np.ndarray | None = None,
+    ) -> np.ndarray:
+        overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.25, thickness=1)
+        for points_xy, color, thickness in polylines:
+            overlay = _overlay_polyline_rgb(overlay, points_xy, color_rgba=color, thickness=thickness)
+        arr = np.asarray(overlay, dtype=np.uint8)
+        pil = Image.fromarray(arr, mode="RGB")
+        draw = ImageDraw.Draw(pil, mode="RGBA")
+        height, _ = arr.shape[:2]
 
-    sx, sy = (float(v) for v in np.asarray(start_xy, dtype=np.float32))
-    tx, ty = (float(v) for v in np.asarray(target_xy, dtype=np.float32))
-    if np.isfinite([sx, sy]).all():
-        draw.line((sx, 0.0, sx, float(height - 1)), fill=(32, 255, 255, 100), width=1)
-        draw.ellipse((sx - 2.0, sy - 2.0, sx + 2.0, sy + 2.0), outline=(32, 255, 255, 255), width=1)
-    if np.isfinite([tx, ty]).all():
-        draw.line((tx, 0.0, tx, float(height - 1)), fill=(255, 220, 64, 130), width=1)
-        gap = 2.0
-        arm = 6.0
-        draw.line((tx - arm, ty, tx - gap, ty), fill=(255, 220, 64, 255), width=1)
-        draw.line((tx + gap, ty, tx + arm, ty), fill=(255, 220, 64, 255), width=1)
-        draw.line((tx, ty - arm, tx, ty - gap), fill=(255, 220, 64, 255), width=1)
-        draw.line((tx, ty + gap, tx, ty + arm), fill=(255, 220, 64, 255), width=1)
+        sx, sy = (float(v) for v in np.asarray(start_xy, dtype=np.float32))
+        tx, ty = (float(v) for v in np.asarray(target_xy, dtype=np.float32))
+        if np.isfinite([sx, sy]).all():
+            draw.line((sx, 0.0, sx, float(height - 1)), fill=(32, 255, 255, 80), width=1)
+            draw.ellipse((sx - 2.0, sy - 2.0, sx + 2.0, sy + 2.0), outline=(32, 255, 255, 255), width=1)
+        if np.isfinite([tx, ty]).all():
+            draw.line((tx, 0.0, tx, float(height - 1)), fill=(255, 220, 64, 95), width=1)
+            gap = 2.0
+            arm = 6.0
+            draw.line((tx - arm, ty, tx - gap, ty), fill=(255, 220, 64, 255), width=1)
+            draw.line((tx + gap, ty, tx + arm, ty), fill=(255, 220, 64, 255), width=1)
+            draw.line((tx, ty - arm, tx, ty - gap), fill=(255, 220, 64, 255), width=1)
+            draw.line((tx, ty + gap, tx, ty + arm), fill=(255, 220, 64, 255), width=1)
+        if meeting_xy is not None:
+            meet = np.asarray(meeting_xy, dtype=np.float32)
+            if meet.shape == (2,) and bool(np.isfinite(meet).all()):
+                mx, my = (float(v) for v in meet)
+                draw.ellipse((mx - 2.0, my - 2.0, mx + 2.0, my + 2.0), outline=(255, 255, 255, 255), width=1)
+        return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
 
-    forward = bidirectional_result.forward.result
-    reverse = bidirectional_result.reverse.result
-    label = (
-        f"score={bidirectional_result.score:.4f} "
-        f"f={forward.score:.4f} r={reverse.score:.4f} "
-        f"hit={int(forward.reached_target_column)}/{int(reverse.reached_target_column)}"
-    )
-    return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
+    def result_stack(result: _Trace2CpBidirectionalResult, label_prefix: str) -> np.ndarray:
+        refinement = result.refinement
+        rows = [
+            draw_row(
+                [
+                    (result.forward.trace_xy, (0, 255, 0, 230), 1),
+                    (result.reverse.trace_xy, (255, 64, 220, 230), 1),
+                ],
+                label=(
+                    f"{label_prefix} traces score={result.score:.4f} "
+                    f"gap={refinement.raw_y_error_px:.2f}px "
+                    f"considered={refinement.considered_y_error_px:.2f}px "
+                    f"endpoint={result.endpoint_score:.4f}"
+                ),
+                meeting_xy=refinement.closest_midpoint_xy,
+            ),
+            draw_row(
+                [
+                    (refinement.partial_forward_xy, (0, 255, 0, 230), 1),
+                    (refinement.partial_reverse_xy, (255, 64, 220, 230), 1),
+                ],
+                label=(
+                    f"{label_prefix} partial closest_x={refinement.closest_x:.2f} "
+                    f"f_y={refinement.forward_y_at_closest_x:.2f} "
+                    f"r_y={refinement.reverse_y_at_closest_x:.2f}"
+                ),
+                meeting_xy=refinement.closest_midpoint_xy,
+            ),
+            draw_row(
+                [(refinement.fused_resampled_xy, (255, 220, 64, 240), 1)],
+                label=f"{label_prefix} fused points={int(refinement.fused_resampled_xy.shape[0])}",
+                meeting_xy=refinement.closest_midpoint_xy,
+            ),
+            draw_row(
+                [(refinement.optimized_xy, (64, 224, 255, 240), 1)],
+                label=f"{label_prefix} optimized points={int(refinement.optimized_xy.shape[0])} reason={refinement.reason}",
+                meeting_xy=refinement.closest_midpoint_xy,
+            ),
+        ]
+        width = max(int(row.shape[1]) for row in rows)
+        total_h = sum(int(row.shape[0]) for row in rows)
+        stack = np.zeros((total_h, width, 3), dtype=np.uint8)
+        y0 = 0
+        for row in rows:
+            h, w = row.shape[:2]
+            stack[y0 : y0 + h, :w] = row
+            y0 += h
+        return stack
+
+    stacks = [result_stack(bidirectional_result, result_label)]
+    if reference_result is not None:
+        stacks.append(result_stack(reference_result, reference_label))
+    width = sum(int(stack.shape[1]) for stack in stacks)
+    height = max(int(stack.shape[0]) for stack in stacks)
+    combined = np.zeros((height, width, 3), dtype=np.uint8)
+    x0 = 0
+    for stack in stacks:
+        h, w = stack.shape[:2]
+        combined[:h, x0 : x0 + w] = stack
+        x0 += w
+    return combined
 
 
 def _base_corners_xy(shape_hw: tuple[int, int]) -> np.ndarray:
@@ -1495,7 +2030,7 @@ def _export_trace2cp_vis(
     direction_xy = _predict_direction_field(model, image, valid_mask, device=device)
     start_xy = np.asarray(sample.start_control_point_xy, dtype=np.float32)
     target_xy = np.asarray(sample.target_control_point_xy, dtype=np.float32)
-    selected_result = _trace_score_trace2cp_bidirectional(
+    base_result = _trace_score_trace2cp_bidirectional(
         direction_xy,
         start_xy,
         target_xy,
@@ -1503,6 +2038,7 @@ def _export_trace2cp_vis(
         step_px=step_px,
         rf_margin_px=margin,
     )
+    selected_result = base_result
     tta_rows: list[str] = []
     tta_count = max(0, int(line_trace_tta_count)) if med_tta else 0
     selected_mode = "base"
@@ -1598,10 +2134,14 @@ def _export_trace2cp_vis(
         start_xy=start_xy,
         target_xy=target_xy,
         bidirectional_result=selected_result,
+        result_label=selected_mode,
+        reference_result=base_result if selected_result is not base_result else None,
+        reference_label="reference",
     )
     _write_jpg(out / "trace2cp_vis.jpg", overlay)
     forward = selected_result.forward.result
     reverse = selected_result.reverse.result
+    refinement = selected_result.refinement
     trace_points = int(selected_result.forward.trace_xy.shape[0]) + int(
         selected_result.reverse.trace_xy.shape[0]
     )
@@ -1621,7 +2161,25 @@ def _export_trace2cp_vis(
         f"trace_mode={selected_mode}",
         f"trace_points={trace_points}",
         f"trace2cp_score={selected_result.score:.8f}",
-        f"raw_y_error_px={selected_result.raw_y_error_px:.6f}",
+        f"actual_y_error_px={selected_result.raw_y_error_px:.6f}",
+        f"considered_y_error_px={selected_result.considered_y_error_px:.6f}",
+        f"center_penalty={refinement.center_penalty:.6f}",
+        f"score_semantics=center_penalized_minimum_vertical_trace_to_trace_separation",
+        f"trace2cp_denominator_px={refinement.denominator_px:.6f}",
+        f"closest_x={refinement.closest_x:.6f}",
+        f"closest_forward_y={refinement.forward_y_at_closest_x:.6f}",
+        f"closest_reverse_y={refinement.reverse_y_at_closest_x:.6f}",
+        f"closest_midpoint_xy=({refinement.closest_midpoint_xy[0]:.6f}, {refinement.closest_midpoint_xy[1]:.6f})",
+        f"closest_reached_overlap={refinement.reached_overlap}",
+        f"closest_reason={refinement.reason}",
+        f"fused_points={int(refinement.fused_resampled_xy.shape[0])}",
+        f"optimized_points={int(refinement.optimized_xy.shape[0])}",
+        f"endpoint_trace2cp_score={selected_result.endpoint_score:.8f}",
+        f"endpoint_raw_y_error_px={selected_result.endpoint_raw_y_error_px:.6f}",
+        f"reference_trace2cp_score={base_result.score:.8f}",
+        f"reference_actual_y_error_px={base_result.raw_y_error_px:.6f}",
+        f"reference_considered_y_error_px={base_result.considered_y_error_px:.6f}",
+        f"reference_center_penalty={base_result.refinement.center_penalty:.6f}",
         f"forward_trace_points={int(selected_result.forward.trace_xy.shape[0])}",
         f"forward_trace2cp_score={forward.score:.8f}",
         f"forward_raw_y_error_px={forward.raw_y_error_px:.6f}",
@@ -1650,8 +2208,13 @@ def _export_trace2cp_vis(
         f"sample_index={sample_index} fiber_path={sample.fiber_path} "
         f"start_cp={sample.start_control_point_index} target_cp={sample.target_control_point_index} "
         f"mode={selected_mode} score={selected_result.score:.8f} "
-        f"raw_y_error_px={selected_result.raw_y_error_px:.6f} "
-        f"forward_score={forward.score:.8f} reverse_score={reverse.score:.8f} "
+        f"actual_y_error_px={selected_result.raw_y_error_px:.6f} "
+        f"considered_y_error_px={selected_result.considered_y_error_px:.6f} "
+        f"center_penalty={refinement.center_penalty:.6f} "
+        f"reference_score={base_result.score:.8f} "
+        f"endpoint_score={selected_result.endpoint_score:.8f} "
+        f"closest_x={refinement.closest_x:.6f} "
+        f"forward_endpoint_score={forward.score:.8f} reverse_endpoint_score={reverse.score:.8f} "
         f"forward_reached={forward.reached_target_column} reverse_reached={reverse.reached_target_column} "
         f"forward_reason={forward.reason} reverse_reason={reverse.reason}"
     )
