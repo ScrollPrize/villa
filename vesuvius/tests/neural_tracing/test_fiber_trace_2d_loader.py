@@ -12,6 +12,7 @@ import zarr
 
 import vesuvius.neural_tracing.fiber_trace_2d.augmentation as augment_module
 import vesuvius.neural_tracing.fiber_trace_2d.loader as loader_module
+import vesuvius.neural_tracing.fiber_trace_2d.runner as runner_module
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     FiberStripAugmentConfig,
     FiberStripAugmentParams,
@@ -29,6 +30,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
 from vesuvius.neural_tracing.fiber_trace_2d.direction import (
     build_direction_supervision,
     cp_neighborhood_yx,
+    decode_lasagna_direction_xy,
     direction_angle_error_degrees,
     encode_lasagna_direction_xy,
 )
@@ -62,14 +64,14 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _TtaDirectionField,
     _bilinear_direction_sample,
     _direction_field_overlay_rgb,
+    _draw_trace2cp_tta_slice,
     _export_augment_contact_sheet,
-    _line_trace_tta_entries,
-    _nearest_tta_point_for_reference,
+    _identity_source_xy_grid,
     _print_timing_table,
     _reference_direction_to_source_grid_direction,
+    _reference_point_to_tta,
     _score_trace2cp,
     _source_grid_direction_to_reference,
-    _transform_points_xy,
     _trace2cp_tta_params,
     _trace_direction_line,
     _trace_direction_line_to_target,
@@ -400,14 +402,13 @@ def test_trace2cp_tta_params_drop_y_shift_and_scale() -> None:
 def test_trace2cp_median_tta_trace_stops_at_target_column() -> None:
     field = np.zeros((9, 9, 2), dtype=np.float32)
     field[:, :, 0] = 1.0
-    identity = np.eye(3, dtype=np.float32)
     fields = [
         _TtaDirectionField(
             name="reference",
             direction_xy=field,
             valid_mask=np.ones((9, 9), dtype=bool),
-            matrix_ref_to_tta=identity,
-            matrix_tta_to_ref=identity,
+            source_xy_grid=_identity_source_xy_grid((9, 9)),
+            reference_to_tta_xy_grid=_identity_source_xy_grid((9, 9)),
         )
     ]
 
@@ -492,21 +493,127 @@ def test_trace2cp_segment_patch_uses_double_configured_height(tmp_path: Path) ->
     assert sample.coords_zyx.shape[0] == 10
 
 
-def test_line_trace_tta_point_transforms_round_trip() -> None:
-    loader = SimpleNamespace(
-        config=SimpleNamespace(
-            augment=SimpleNamespace(
-                shift_x=3.0,
-                shift_y=2.0,
-            )
-        )
+def test_trace2cp_tta_patch_samples_volume_from_augmented_coords(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    sample, _, _ = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
     )
-    points = np.asarray([[1.0, 2.0], [4.5, 6.25], [8.0, 3.0]], dtype=np.float32)
 
-    for _, matrix in _line_trace_tta_entries((11, 13), loader):
-        warped = _transform_points_xy(points, matrix)
-        restored = _transform_points_xy(warped, np.linalg.inv(matrix))
-        assert np.allclose(restored, points, atol=1.0e-5)
+    patch = loader.build_trace2cp_tta_patch_from_sample(
+        sample,
+        FiberStripAugmentParams(rotation_degrees=35.0),
+        rf_margin_px=0.0,
+        device=torch.device("cpu"),
+    )
+
+    coords = np.asarray(patch.sample.coords_zyx, dtype=np.float32)
+    valid = np.asarray(patch.valid_mask, dtype=bool)
+    expected = coords[..., 0] * 10000.0 + coords[..., 1] * 100.0 + coords[..., 2]
+    assert patch.image.shape == patch.valid_mask.shape
+    assert patch.source_xy_grid.shape[:2] == patch.image.shape
+    assert patch.reference_to_tta_xy_grid.shape[:2] == sample.coords_zyx.shape[:2]
+    assert bool(valid.any())
+    assert np.allclose(patch.image[valid], expected[valid], atol=1.0e-2)
+
+
+def test_trace2cp_tta_rotation_expands_canvas_and_contains_base_corners(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    sample, _, _ = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+
+    patch = loader.build_trace2cp_tta_patch_from_sample(
+        sample,
+        FiberStripAugmentParams(rotation_degrees=45.0),
+        rf_margin_px=0.0,
+        device=torch.device("cpu"),
+    )
+
+    base_h, base_w = sample.coords_zyx.shape[:2]
+    out_h, out_w = patch.image.shape
+    corners = np.asarray(patch.base_corners_xy, dtype=np.float32)
+    assert out_h > base_h or out_w > base_w
+    assert corners.shape == (4, 2)
+    assert bool(np.isfinite(corners).all())
+    assert float(corners[:, 0].min()) >= 0.0
+    assert float(corners[:, 1].min()) >= 0.0
+    assert float(corners[:, 0].max()) <= float(out_w - 1)
+    assert float(corners[:, 1].max()) <= float(out_h - 1)
+
+
+def test_trace2cp_tta_debug_slice_draws_transformed_corner_outline() -> None:
+    image = np.zeros((9, 11), dtype=np.float32)
+    valid = np.ones_like(image, dtype=bool)
+    corners = np.asarray([[1.0, 1.0], [9.0, 1.0], [9.0, 7.0], [1.0, 7.0]], dtype=np.float32)
+
+    drawn = _draw_trace2cp_tta_slice(
+        image,
+        valid,
+        base_corners_xy=corners,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 4.0], dtype=np.float32),
+        label="debug",
+    )
+
+    body = drawn[-image.shape[0] :, :, :]
+    assert drawn.shape[0] > image.shape[0]
+    assert body.shape[:2] == image.shape
+    assert bool(np.any(body[..., 0] != body[..., 1]))
+
+
+def test_no_image_space_geometric_augmentation_helpers_exist() -> None:
+    root = Path(runner_module.__file__).resolve().parent
+    forbidden_tokens = (
+        "_warp_patch_by",
+        "_line_trace_tta_entries",
+        "_trace_tta_matrix",
+        "_transform_points_xy",
+        "_transform_direction_xy",
+        "affine_grid",
+        "rot90",
+        "cv2.warp",
+        ".rotate(",
+        ".resize(",
+    )
+    grid_sample_allowed = {"augmentation.py", "loader.py"}
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden_tokens:
+            if token in text:
+                offenders.append(f"{path.name}:{token}")
+        if "grid_sample" in text and path.name not in grid_sample_allowed:
+            offenders.append(f"{path.name}:grid_sample")
+    assert offenders == []
+
+
+def test_identity_tta_source_grid_maps_points_and_directions() -> None:
+    source_xy = _identity_source_xy_grid((11, 13))
+    point = np.asarray([4.0, 6.0], dtype=np.float32)
+
+    tta_point = _reference_point_to_tta(source_xy, point)
+    assert tta_point is not None
+    assert np.allclose(tta_point, point)
+
+    tta_direction = _reference_direction_to_source_grid_direction(
+        source_xy,
+        tta_point,
+        np.asarray([1.0, 0.0], dtype=np.float32),
+    )
+    assert tta_direction is not None
+    assert np.allclose(tta_direction, [1.0, 0.0])
+
+    reference_direction = _source_grid_direction_to_reference(source_xy, tta_point, tta_direction)
+    assert reference_direction is not None
+    assert np.allclose(reference_direction, [1.0, 0.0])
 
 
 def test_line_trace_random_tta_source_grid_maps_points_and_directions() -> None:
@@ -514,8 +621,11 @@ def test_line_trace_random_tta_source_grid_maps_points_and_directions() -> None:
     yy, xx = np.indices((9, 9), dtype=np.float32)
     source_xy[..., 0] = xx - 1.0
     source_xy[..., 1] = yy
+    reference_to_tta_xy = np.zeros((9, 9, 2), dtype=np.float32)
+    reference_to_tta_xy[..., 0] = xx + 1.0
+    reference_to_tta_xy[..., 1] = yy
 
-    tta_point = _nearest_tta_point_for_reference(source_xy, np.asarray([4.0, 4.0], dtype=np.float32))
+    tta_point = _reference_point_to_tta(reference_to_tta_xy, np.asarray([4.0, 4.0], dtype=np.float32))
     assert tta_point is not None
     assert np.allclose(tta_point, [5.0, 4.0])
 
@@ -533,9 +643,6 @@ def test_line_trace_random_tta_source_grid_maps_points_and_directions() -> None:
 
 
 def test_median_tta_trace_uses_reference_space_directions() -> None:
-    identity = np.eye(3, dtype=np.float32)
-    shift = np.asarray([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
-    shifted_inverse = np.linalg.inv(shift).astype(np.float32)
     ref = np.zeros((9, 9, 2), dtype=np.float32)
     ref[:, :, 0] = 1.0
     up = np.zeros_like(ref)
@@ -543,10 +650,15 @@ def test_median_tta_trace_uses_reference_space_directions() -> None:
     shifted_opposite = np.zeros_like(ref)
     shifted_opposite[:, :, 0] = -1.0
     valid = np.ones((9, 9), dtype=bool)
+    identity_grid = _identity_source_xy_grid((9, 9))
+    shifted_grid = _identity_source_xy_grid((9, 9))
+    shifted_grid[..., 0] -= 1.0
+    shifted_reference_to_tta = _identity_source_xy_grid((9, 9))
+    shifted_reference_to_tta[..., 0] += 1.0
     fields = [
-        _TtaDirectionField("ref", ref, valid, identity, identity),
-        _TtaDirectionField("up", up, valid, identity, identity),
-        _TtaDirectionField("shifted_opposite", shifted_opposite, valid, shift, shifted_inverse),
+        _TtaDirectionField("ref", ref, valid, identity_grid, identity_grid),
+        _TtaDirectionField("up", up, valid, identity_grid, identity_grid),
+        _TtaDirectionField("shifted_opposite", shifted_opposite, valid, shifted_grid, shifted_reference_to_tta),
     ]
 
     line = _trace_median_tta_direction_line(
@@ -561,6 +673,18 @@ def test_median_tta_trace_uses_reference_space_directions() -> None:
     assert np.allclose(line[:, 1], 4.0)
     assert np.isclose(line[0, 0], 2.0)
     assert np.isclose(line[-1, 0], 6.0)
+
+
+def test_tta_reference_mapping_does_not_use_dense_nearest_scan() -> None:
+    source = Path(runner_module.__file__).read_text(encoding="utf-8")
+
+    assert "_nearest_tta_point_for_reference" not in source
+    helper = source.split("def _reference_point_to_tta", 1)[1].split(
+        "\ndef _source_grid_direction_to_reference",
+        1,
+    )[0]
+    assert "argmin" not in helper
+    assert "delta * delta" not in helper
 
 
 def test_dir_vis_overlay_scales_and_strides() -> None:
@@ -2593,6 +2717,38 @@ def test_lasagna_direction_encoding_is_forward_backward_ambiguous() -> None:
     assert torch.allclose(encoded[0], torch.tensor([1.0, 0.5 + 0.5 / math.sqrt(2.0)]))
     assert torch.allclose(encoded[2], torch.tensor([0.0, 0.5 - 0.5 / math.sqrt(2.0)]), atol=1.0e-6)
     assert torch.allclose(encoded[3], torch.tensor([0.5, 0.5 - 0.5 / math.sqrt(2.0)]), atol=1.0e-6)
+
+
+def test_lasagna_direction_decode_is_analytic_unsigned_inverse() -> None:
+    directions = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [math.sqrt(0.5), math.sqrt(0.5)],
+            [0.25, -0.75],
+            [-0.3, 0.9],
+        ],
+        dtype=torch.float32,
+    )
+    directions = directions / torch.linalg.vector_norm(directions, dim=1, keepdim=True)
+
+    decoded = decode_lasagna_direction_xy(encode_lasagna_direction_xy(directions))
+    folded_dot = torch.abs(torch.sum(decoded * directions, dim=1))
+
+    assert decoded.shape == directions.shape
+    assert torch.allclose(torch.linalg.vector_norm(decoded, dim=1), torch.ones((directions.shape[0],)), atol=1.0e-6)
+    assert torch.allclose(folded_dot, torch.ones_like(folded_dot), atol=1.0e-5)
+
+
+def test_lasagna_direction_decode_has_no_binned_candidate_lookup() -> None:
+    source = Path(augment_module.__file__).resolve().with_name("direction.py").read_text(encoding="utf-8")
+    decoder_source = source.split("def decode_lasagna_direction_xy", 1)[1].split("\ndef cp_neighborhood_yx", 1)[0]
+
+    assert "def decode_lasagna_direction_xy(encoded: torch.Tensor) -> torch.Tensor" in source
+    assert "torch.atan2" in decoder_source
+    assert "linspace" not in decoder_source
+    assert "argmin" not in decoder_source
+    assert "bins" not in decoder_source
 
 
 def test_cp_local_supervision_uses_eight_samples_and_augmented_line() -> None:

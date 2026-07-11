@@ -122,6 +122,16 @@ class FiberStripSegmentSample:
 
 
 @dataclass(frozen=True)
+class FiberStripTtaPatch:
+    sample: FiberStripSample | FiberStripSegmentSample
+    image: np.ndarray
+    valid_mask: np.ndarray
+    source_xy_grid: np.ndarray
+    reference_to_tta_xy_grid: np.ndarray
+    base_corners_xy: np.ndarray
+
+
+@dataclass(frozen=True)
 class FiberStrip2DBatch:
     images: np.ndarray
     coords_zyx: np.ndarray
@@ -2012,6 +2022,170 @@ class FiberStrip2DLoader:
         segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
         return np.concatenate([[0.0], np.cumsum(segment_lengths)])
 
+    @staticmethod
+    def _source_patch_corners_xy(source_shape_hw: tuple[int, int], *, device: torch.device) -> torch.Tensor:
+        source_height, source_width = (int(v) for v in source_shape_hw)
+        return torch.tensor(
+            [
+                [0.0, 0.0],
+                [float(source_width - 1), 0.0],
+                [float(source_width - 1), float(source_height - 1)],
+                [0.0, float(source_height - 1)],
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+
+    @staticmethod
+    def _finite_source_xy_grid(transform: Any, source_shape_hw: tuple[int, int]) -> np.ndarray:
+        source_height, source_width = (int(v) for v in source_shape_hw)
+        source_xy_t = transform.output_to_source_grid().detach()
+        inside = (
+            torch.isfinite(source_xy_t).all(dim=-1)
+            & (source_xy_t[..., 0] >= 0.0)
+            & (source_xy_t[..., 0] <= float(source_width - 1))
+            & (source_xy_t[..., 1] >= 0.0)
+            & (source_xy_t[..., 1] <= float(source_height - 1))
+        )
+        source_xy_t = torch.where(
+            inside[..., None],
+            source_xy_t,
+            torch.full_like(source_xy_t, float("nan")),
+        )
+        return _as_numpy_float32(source_xy_t)
+
+    @staticmethod
+    def _finite_reference_to_output_xy_grid(transform: Any, output_shape_hw: tuple[int, int]) -> np.ndarray:
+        output_height, output_width = (int(v) for v in output_shape_hw)
+        output_xy_t = transform.forward_map_xy.detach()
+        inside = (
+            torch.isfinite(output_xy_t).all(dim=-1)
+            & (output_xy_t[..., 0] >= 0.0)
+            & (output_xy_t[..., 0] <= float(output_width - 1))
+            & (output_xy_t[..., 1] >= 0.0)
+            & (output_xy_t[..., 1] <= float(output_height - 1))
+        )
+        output_xy_t = torch.where(
+            inside[..., None],
+            output_xy_t,
+            torch.full_like(output_xy_t, float("nan")),
+        )
+        return _as_numpy_float32(output_xy_t)
+
+    @staticmethod
+    def _filter_line_xy_t(line_xy: torch.Tensor, output_shape_hw: tuple[int, int]) -> torch.Tensor:
+        if line_xy.numel() == 0:
+            return line_xy.to(dtype=torch.float32)
+        output_height, output_width = (int(v) for v in output_shape_hw)
+        return line_xy[
+            torch.isfinite(line_xy).all(dim=1)
+            & (line_xy[:, 0] >= 0.0)
+            & (line_xy[:, 0] <= float(output_width - 1))
+            & (line_xy[:, 1] >= 0.0)
+            & (line_xy[:, 1] <= float(output_height - 1))
+        ].to(dtype=torch.float32)
+
+    def _tta_transform_for_source_shape(
+        self,
+        source_shape_hw: tuple[int, int],
+        params: FiberStripAugmentParams,
+        *,
+        rf_margin_px: float,
+        device: torch.device,
+    ) -> tuple[tuple[int, int], FiberStripAugmentParams, Any, np.ndarray]:
+        source_height, source_width = (int(v) for v in source_shape_hw)
+        if source_height <= 0 or source_width <= 0:
+            raise ValueError(f"invalid TTA source shape {source_shape_hw}")
+        corners_source = self._source_patch_corners_xy(source_shape_hw, device=device)
+        pad = max(1, int(math.ceil(max(0.0, float(rf_margin_px)))))
+        output_shape = (source_height, source_width)
+        transform = strip_augment_transform(output_shape, source_shape_hw, params, device=device)
+        corners_out = transform.source_to_output_points(corners_source)
+        for _ in range(4):
+            transform = strip_augment_transform(output_shape, source_shape_hw, params, device=device)
+            corners_out = transform.source_to_output_points(corners_source)
+            if not bool(torch.isfinite(corners_out).all().item()):
+                raise ValueError("TTA transform produced non-finite output corners")
+            min_xy = torch.min(corners_out, dim=0).values
+            max_xy = torch.max(corners_out, dim=0).values
+            grow_x = max(
+                0.0,
+                float(pad) - float(min_xy[0]),
+                float(max_xy[0]) - (float(output_shape[1] - 1) - float(pad)),
+            )
+            grow_y = max(
+                0.0,
+                float(pad) - float(min_xy[1]),
+                float(max_xy[1]) - (float(output_shape[0] - 1) - float(pad)),
+            )
+            if grow_x <= 1.0e-5 and grow_y <= 1.0e-5:
+                break
+            output_shape = (
+                int(output_shape[0]) + int(math.ceil(2.0 * grow_y)),
+                int(output_shape[1]) + int(math.ceil(2.0 * grow_x)),
+            )
+        transform = strip_augment_transform(output_shape, source_shape_hw, params, device=device)
+        corners_out = transform.source_to_output_points(corners_source)
+        if not bool(torch.isfinite(corners_out).all().item()):
+            raise ValueError("TTA transform produced non-finite final corners")
+        return output_shape, params, transform, _as_numpy_float32(corners_out)
+
+    def build_center_tta_patch_from_sample(
+        self,
+        sample: FiberStripSample,
+        params: FiberStripAugmentParams,
+        *,
+        rf_margin_px: float = 0.0,
+        device: torch.device | None = None,
+    ) -> FiberStripTtaPatch:
+        resolved_device = resolve_torch_device(self.config.augment.device) if device is None else device
+        record = self.records[int(sample.record_index)]
+        source_shape_hw = tuple(int(v) for v in np.asarray(sample.coords_zyx).shape[:2])
+        output_shape, _, transform, corners_xy = self._tta_transform_for_source_shape(
+            source_shape_hw,
+            params,
+            rf_margin_px=rf_margin_px,
+            device=resolved_device,
+        )
+        coords_t, valid_t = _resample_coord_tensors_like_augmentation(
+            torch.as_tensor(sample.coords_zyx, dtype=torch.float32, device=resolved_device),
+            torch.as_tensor(sample.valid_mask, dtype=torch.bool, device=resolved_device),
+            params,
+            output_shape_hw=output_shape,
+            device=resolved_device,
+            transform=transform,
+        )
+        coords_zyx = _as_numpy_float32(coords_t)
+        coord_valid = _as_numpy_bool(valid_t)
+        result = record.sampler.sample_coords(coords_zyx, coord_valid)
+        image = np.asarray(result.image, dtype=np.float32)
+        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        source_line = torch.as_tensor(sample.line_xy, dtype=torch.float32, device=resolved_device)
+        source_cp = torch.as_tensor(sample.control_point_xy, dtype=torch.float32, device=resolved_device).view(1, 2)
+        mapped = transform.source_to_output_points(torch.cat([source_line, source_cp], dim=0))
+        line_xy = self._filter_line_xy_t(mapped[:-1], output_shape)
+        cp_xy = mapped[-1]
+        tta_sample = FiberStripSample(
+            record_index=int(sample.record_index),
+            fiber_path=sample.fiber_path,
+            control_point_index=int(sample.control_point_index),
+            control_point_xyz=np.asarray(sample.control_point_xyz, dtype=np.float32),
+            strip_z_offset=float(sample.strip_z_offset),
+            coords_zyx=coords_zyx,
+            valid_mask=valid_mask,
+            frame=sample.frame,
+            line_xy=_as_numpy_float32(line_xy),
+            control_point_xy=_as_numpy_float32(cp_xy),
+        )
+        return FiberStripTtaPatch(
+            sample=tta_sample,
+            image=image,
+            valid_mask=valid_mask,
+            source_xy_grid=self._finite_source_xy_grid(transform, source_shape_hw),
+            reference_to_tta_xy_grid=self._finite_reference_to_output_xy_grid(transform, output_shape),
+            base_corners_xy=corners_xy,
+        )
+
     def build_trace2cp_segment_patch(
         self,
         sample_index: int,
@@ -2130,6 +2304,67 @@ class FiberStrip2DLoader:
             target_control_point_xy=target_xy.astype(np.float32, copy=False),
         )
         return sample, image, valid_mask
+
+    def build_trace2cp_tta_patch_from_sample(
+        self,
+        sample: FiberStripSegmentSample,
+        params: FiberStripAugmentParams,
+        *,
+        rf_margin_px: float = 0.0,
+        device: torch.device | None = None,
+    ) -> FiberStripTtaPatch:
+        resolved_device = resolve_torch_device(self.config.augment.device) if device is None else device
+        record = self.records[int(sample.record_index)]
+        source_shape_hw = tuple(int(v) for v in np.asarray(sample.coords_zyx).shape[:2])
+        output_shape, _, transform, corners_xy = self._tta_transform_for_source_shape(
+            source_shape_hw,
+            params,
+            rf_margin_px=rf_margin_px,
+            device=resolved_device,
+        )
+        coords_t, valid_t = _resample_coord_tensors_like_augmentation(
+            torch.as_tensor(sample.coords_zyx, dtype=torch.float32, device=resolved_device),
+            torch.as_tensor(sample.valid_mask, dtype=torch.bool, device=resolved_device),
+            params,
+            output_shape_hw=output_shape,
+            device=resolved_device,
+            transform=transform,
+        )
+        coords_zyx = _as_numpy_float32(coords_t)
+        coord_valid = _as_numpy_bool(valid_t)
+        result = record.sampler.sample_coords(coords_zyx, coord_valid)
+        image = np.asarray(result.image, dtype=np.float32)
+        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        source_line = torch.as_tensor(sample.line_xy, dtype=torch.float32, device=resolved_device)
+        start = torch.as_tensor(sample.start_control_point_xy, dtype=torch.float32, device=resolved_device).view(1, 2)
+        target = torch.as_tensor(sample.target_control_point_xy, dtype=torch.float32, device=resolved_device).view(1, 2)
+        mapped = transform.source_to_output_points(torch.cat([source_line, start, target], dim=0))
+        line_xy = self._filter_line_xy_t(mapped[:-2], output_shape)
+        start_xy = mapped[-2]
+        target_xy = mapped[-1]
+        tta_sample = FiberStripSegmentSample(
+            record_index=int(sample.record_index),
+            fiber_path=sample.fiber_path,
+            start_control_point_index=int(sample.start_control_point_index),
+            target_control_point_index=int(sample.target_control_point_index),
+            start_control_point_xyz=np.asarray(sample.start_control_point_xyz, dtype=np.float32),
+            target_control_point_xyz=np.asarray(sample.target_control_point_xyz, dtype=np.float32),
+            strip_z_offset=float(sample.strip_z_offset),
+            coords_zyx=coords_zyx,
+            valid_mask=valid_mask,
+            frame=sample.frame,
+            line_xy=_as_numpy_float32(line_xy),
+            start_control_point_xy=_as_numpy_float32(start_xy),
+            target_control_point_xy=_as_numpy_float32(target_xy),
+        )
+        return FiberStripTtaPatch(
+            sample=tta_sample,
+            image=image,
+            valid_mask=valid_mask,
+            source_xy_grid=self._finite_source_xy_grid(transform, source_shape_hw),
+            reference_to_tta_xy_grid=self._finite_reference_to_output_xy_grid(transform, output_shape),
+            base_corners_xy=corners_xy,
+        )
 
     def build_augmented_center_strip_source(
         self,

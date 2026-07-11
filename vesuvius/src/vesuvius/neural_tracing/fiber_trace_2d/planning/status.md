@@ -1,18 +1,13 @@
-# Coordinate-Space Geometric TTA Status
+# TTA Reference Mapping Performance Status
 
 - [x] Capture current user task in `planning/task.md`.
 - [x] Create focused task plan.
-- [ ] Review task plan against `planning/specs.md`, `planning/plan.md`, and
-  `planning/task.md`.
-- [ ] Delete all image-space geometric augmentation functions from
-  `fiber_trace_2d`.
-- [ ] Implement coordinate-space Trace2CP TTA sampling from oversized coord
-  strips.
-- [ ] Add `--vis-tta` debug output.
-- [ ] Add focused regression tests.
-- [ ] Update specs, docs, changelog, and task log with implementation results.
-- [ ] Compile-check changed Python.
-- [ ] Run focused fiber-trace tests.
+- [x] Review traceback and implementation locally.
+- [x] Return reference-to-TTA maps from TTA patch construction.
+- [x] Replace dense nearest-grid tracing lookup with direct map sampling.
+- [x] Add focused regression tests.
+- [x] Update specs, docs, changelog, and task log.
+- [x] Compile-check changed Python.
+- [x] Run focused fiber-trace tests.
 
-Result: planning is complete; no implementation changes have been made for this
-task yet.
+Result: complete. Focused pytest passed with 115 tests.
