@@ -335,6 +335,28 @@ class _Trace2CpResult:
     reason: str
 
 
+@dataclass(frozen=True)
+class _Trace2CpDirectionResult:
+    trace_xy: np.ndarray
+    result: _Trace2CpResult
+
+
+@dataclass(frozen=True)
+class _Trace2CpBidirectionalResult:
+    forward: _Trace2CpDirectionResult
+    reverse: _Trace2CpDirectionResult
+
+    @property
+    def score(self) -> float:
+        return 0.5 * (float(self.forward.result.score) + float(self.reverse.result.score))
+
+    @property
+    def raw_y_error_px(self) -> float:
+        return 0.5 * (
+            float(self.forward.result.raw_y_error_px) + float(self.reverse.result.raw_y_error_px)
+        )
+
+
 def _trace_tta_matrix(
     shape_hw: tuple[int, int],
     *,
@@ -963,6 +985,116 @@ def _score_trace2cp(
     )
 
 
+def _trace_score_trace2cp_direction(
+    direction_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+) -> _Trace2CpDirectionResult:
+    traced_line, reason = _trace_direction_line_to_target(
+        direction_xy,
+        start_xy,
+        target_xy,
+        valid_mask=valid_mask,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    result = _score_trace2cp(
+        traced_line,
+        target_xy,
+        shape_hw=(int(direction_xy.shape[0]), int(direction_xy.shape[1])),
+        rf_margin_px=rf_margin_px,
+        termination_reason=reason,
+    )
+    return _Trace2CpDirectionResult(trace_xy=traced_line, result=result)
+
+
+def _trace_score_trace2cp_bidirectional(
+    direction_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+) -> _Trace2CpBidirectionalResult:
+    forward = _trace_score_trace2cp_direction(
+        direction_xy,
+        start_xy,
+        target_xy,
+        valid_mask=valid_mask,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    reverse = _trace_score_trace2cp_direction(
+        direction_xy,
+        target_xy,
+        start_xy,
+        valid_mask=valid_mask,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse)
+
+
+def _trace_score_trace2cp_median_tta_direction(
+    fields: list[_TtaDirectionField],
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    shape_hw: tuple[int, int],
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+) -> _Trace2CpDirectionResult:
+    traced_line, reason = _trace_median_tta_direction_line_to_target(
+        fields,
+        start_xy,
+        target_xy,
+        shape_hw=shape_hw,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    result = _score_trace2cp(
+        traced_line,
+        target_xy,
+        shape_hw=shape_hw,
+        rf_margin_px=rf_margin_px,
+        termination_reason=reason,
+    )
+    return _Trace2CpDirectionResult(trace_xy=traced_line, result=result)
+
+
+def _trace_score_trace2cp_median_tta_bidirectional(
+    fields: list[_TtaDirectionField],
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    shape_hw: tuple[int, int],
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+) -> _Trace2CpBidirectionalResult:
+    forward = _trace_score_trace2cp_median_tta_direction(
+        fields,
+        start_xy,
+        target_xy,
+        shape_hw=shape_hw,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    reverse = _trace_score_trace2cp_median_tta_direction(
+        fields,
+        target_xy,
+        start_xy,
+        shape_hw=shape_hw,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse)
+
+
 def _export_line_trace_vis(
     loader: FiberStrip2DLoader,
     sample_index: int,
@@ -1111,15 +1243,25 @@ def _draw_trace2cp_overlay(
     image_u8: np.ndarray,
     *,
     line_xy: np.ndarray,
-    trace_xy: np.ndarray,
     start_xy: np.ndarray,
     target_xy: np.ndarray,
-    result: _Trace2CpResult,
+    bidirectional_result: _Trace2CpBidirectionalResult,
 ) -> np.ndarray:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.35, thickness=1)
-    overlay = _overlay_polyline_rgb(overlay, trace_xy, color_rgba=(0, 255, 0, 230), thickness=1)
+    overlay = _overlay_polyline_rgb(
+        overlay,
+        bidirectional_result.forward.trace_xy,
+        color_rgba=(0, 255, 0, 230),
+        thickness=1,
+    )
+    overlay = _overlay_polyline_rgb(
+        overlay,
+        bidirectional_result.reverse.trace_xy,
+        color_rgba=(255, 64, 220, 230),
+        thickness=1,
+    )
     arr = np.asarray(overlay, dtype=np.uint8)
     pil = Image.fromarray(arr, mode="RGB")
     draw = ImageDraw.Draw(pil, mode="RGBA")
@@ -1128,6 +1270,7 @@ def _draw_trace2cp_overlay(
     sx, sy = (float(v) for v in np.asarray(start_xy, dtype=np.float32))
     tx, ty = (float(v) for v in np.asarray(target_xy, dtype=np.float32))
     if np.isfinite([sx, sy]).all():
+        draw.line((sx, 0.0, sx, float(height - 1)), fill=(32, 255, 255, 100), width=1)
         draw.ellipse((sx - 2.0, sy - 2.0, sx + 2.0, sy + 2.0), outline=(32, 255, 255, 255), width=1)
     if np.isfinite([tx, ty]).all():
         draw.line((tx, 0.0, tx, float(height - 1)), fill=(255, 220, 64, 130), width=1)
@@ -1138,9 +1281,12 @@ def _draw_trace2cp_overlay(
         draw.line((tx, ty - arm, tx, ty - gap), fill=(255, 220, 64, 255), width=1)
         draw.line((tx, ty + gap, tx, ty + arm), fill=(255, 220, 64, 255), width=1)
 
+    forward = bidirectional_result.forward.result
+    reverse = bidirectional_result.reverse.result
     label = (
-        f"score={result.score:.4f} yerr={result.raw_y_error_px:.2f}px "
-        f"hit={int(result.reached_target_column)} reason={result.reason}"
+        f"score={bidirectional_result.score:.4f} "
+        f"f={forward.score:.4f} r={reverse.score:.4f} "
+        f"hit={int(forward.reached_target_column)}/{int(reverse.reached_target_column)}"
     )
     return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
 
@@ -1174,7 +1320,7 @@ def _export_trace2cp_vis(
     direction_xy = _predict_direction_field(model, image, valid_mask, device=device)
     start_xy = np.asarray(sample.start_control_point_xy, dtype=np.float32)
     target_xy = np.asarray(sample.target_control_point_xy, dtype=np.float32)
-    traced_line, reason = _trace_direction_line_to_target(
+    selected_result = _trace_score_trace2cp_bidirectional(
         direction_xy,
         start_xy,
         target_xy,
@@ -1182,18 +1328,8 @@ def _export_trace2cp_vis(
         step_px=step_px,
         rf_margin_px=margin,
     )
-    result = _score_trace2cp(
-        traced_line,
-        target_xy,
-        shape_hw=image.shape,
-        rf_margin_px=margin,
-        termination_reason=reason,
-    )
     tta_rows: list[str] = []
     tta_count = max(0, int(line_trace_tta_count)) if med_tta else 0
-    selected_trace = traced_line
-    selected_result = result
-    selected_reason = reason
     selected_mode = "base"
     med_fields_count = 0
     if med_tta:
@@ -1235,7 +1371,7 @@ def _export_trace2cp_vis(
             except (ValueError, np.linalg.LinAlgError) as exc:
                 tta_rows.append(f"{tta_name}: skipped={exc}")
         med_fields_count = len(med_fields)
-        selected_trace, selected_reason = _trace_median_tta_direction_line_to_target(
+        selected_result = _trace_score_trace2cp_median_tta_bidirectional(
             med_fields,
             start_xy,
             target_xy,
@@ -1243,25 +1379,22 @@ def _export_trace2cp_vis(
             step_px=step_px,
             rf_margin_px=margin,
         )
-        selected_result = _score_trace2cp(
-            selected_trace,
-            target_xy,
-            shape_hw=image.shape,
-            rf_margin_px=margin,
-            termination_reason=selected_reason,
-        )
         selected_mode = "med_tta"
 
     image_u8 = _to_u8_image(image, valid_mask)
     overlay = _draw_trace2cp_overlay(
         image_u8,
         line_xy=sample.line_xy,
-        trace_xy=selected_trace,
         start_xy=start_xy,
         target_xy=target_xy,
-        result=selected_result,
+        bidirectional_result=selected_result,
     )
     _write_jpg(out / "trace2cp_vis.jpg", overlay)
+    forward = selected_result.forward.result
+    reverse = selected_result.reverse.result
+    trace_points = int(selected_result.forward.trace_xy.shape[0]) + int(
+        selected_result.reverse.trace_xy.shape[0]
+    )
     summary = [
         f"sample_index={sample_index}",
         f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
@@ -1276,13 +1409,23 @@ def _export_trace2cp_vis(
         f"step_px={float(step_px):.3f}",
         f"rf_margin_px={margin:.3f}",
         f"trace_mode={selected_mode}",
-        f"trace_points={int(selected_trace.shape[0])}",
+        f"trace_points={trace_points}",
         f"trace2cp_score={selected_result.score:.8f}",
         f"raw_y_error_px={selected_result.raw_y_error_px:.6f}",
-        f"target_x={selected_result.target_x:.6f}",
-        f"trace_y_at_target_x={selected_result.trace_y_at_target_x:.6f}",
-        f"reached_target_column={selected_result.reached_target_column}",
-        f"termination_reason={selected_result.reason}",
+        f"forward_trace_points={int(selected_result.forward.trace_xy.shape[0])}",
+        f"forward_trace2cp_score={forward.score:.8f}",
+        f"forward_raw_y_error_px={forward.raw_y_error_px:.6f}",
+        f"forward_target_x={forward.target_x:.6f}",
+        f"forward_trace_y_at_target_x={forward.trace_y_at_target_x:.6f}",
+        f"forward_reached_target_column={forward.reached_target_column}",
+        f"forward_termination_reason={forward.reason}",
+        f"reverse_trace_points={int(selected_result.reverse.trace_xy.shape[0])}",
+        f"reverse_trace2cp_score={reverse.score:.8f}",
+        f"reverse_raw_y_error_px={reverse.raw_y_error_px:.6f}",
+        f"reverse_target_x={reverse.target_x:.6f}",
+        f"reverse_trace_y_at_target_x={reverse.trace_y_at_target_x:.6f}",
+        f"reverse_reached_target_column={reverse.reached_target_column}",
+        f"reverse_termination_reason={reverse.reason}",
         f"med_tta={bool(med_tta)}",
         f"line_trace_tta_count={tta_count}",
         f"med_tta_fields={med_fields_count}",
@@ -1296,8 +1439,9 @@ def _export_trace2cp_vis(
         f"start_cp={sample.start_control_point_index} target_cp={sample.target_control_point_index} "
         f"mode={selected_mode} score={selected_result.score:.8f} "
         f"raw_y_error_px={selected_result.raw_y_error_px:.6f} "
-        f"target_x={selected_result.target_x:.3f} "
-        f"reached={selected_result.reached_target_column} reason={selected_result.reason}"
+        f"forward_score={forward.score:.8f} reverse_score={reverse.score:.8f} "
+        f"forward_reached={forward.reached_target_column} reverse_reached={reverse.reached_target_column} "
+        f"forward_reason={forward.reason} reverse_reason={reverse.reason}"
     )
     print(f"exported trace2cp_vis.jpg and trace2cp_summary.txt to {out}")
 

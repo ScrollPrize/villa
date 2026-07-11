@@ -1,14 +1,7 @@
-# Load-Only Parallelism Diagnostics
+# Bidirectional Trace2CP Inspection
 
-Add load-only benchmark profiling that shows real process CPU consumption per
-batch in addition to the existing summed loader-worker timings.
-
-Requirements:
-
-- Keep the focus on `--load-only --profile` so loader parallelism can be
-  inspected without model or image-augmentation work.
-- Report per-batch wall time and process CPU time so the profiler can show
-  whether observed worker-time parallelism corresponds to actual CPU usage.
-- Preserve the existing loader profiling columns and deterministic loading
-  behavior.
-- Reuse the existing benchmark command family and keep task notes current.
+Make `--trace2cp-vis` trace a selected CP segment in both directions. When the
+segment is selected by the first CP, trace from that CP to the second CP and
+also trace backward from the second CP to the first CP on the same segment
+strip. Draw both lines in the visualization, and report the Trace2CP score as
+the average of the two directional results.

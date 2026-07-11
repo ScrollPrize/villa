@@ -73,6 +73,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_tta_params,
     _trace_direction_line,
     _trace_direction_line_to_target,
+    _trace_score_trace2cp_bidirectional,
     _trace_median_tta_direction_line_to_target,
     _trace_median_tta_direction_line,
 )
@@ -302,6 +303,30 @@ def test_trace2cp_one_way_trace_stops_at_target_column() -> None:
     assert np.isclose(line[-1, 0], 6.0)
 
 
+def test_trace2cp_bidirectional_trace_scores_average() -> None:
+    field = np.zeros((11, 11, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+
+    result = _trace_score_trace2cp_bidirectional(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert result.forward.result.reached_target_column
+    assert result.reverse.result.reached_target_column
+    assert np.all(np.diff(result.forward.trace_xy[:, 0]) > 0.0)
+    assert np.all(np.diff(result.reverse.trace_xy[:, 0]) < 0.0)
+    assert result.forward.result.raw_y_error_px == pytest.approx(1.0)
+    assert result.reverse.result.raw_y_error_px == pytest.approx(1.0)
+    assert result.forward.result.score == pytest.approx(1.0 / 4.0)
+    assert result.reverse.result.score == pytest.approx(1.0 / 3.0)
+    assert result.score == pytest.approx(0.5 * (1.0 / 4.0 + 1.0 / 3.0))
+    assert result.raw_y_error_px == pytest.approx(1.0)
+
+
 def test_trace2cp_target_column_wins_over_next_rf_margin() -> None:
     field = np.zeros((9, 9, 2), dtype=np.float32)
     field[:, :, 0] = 1.0
@@ -316,6 +341,22 @@ def test_trace2cp_target_column_wins_over_next_rf_margin() -> None:
 
     assert reason == "target_column"
     assert np.isclose(line[-1, 0], 6.0)
+
+
+def test_trace2cp_reverse_target_column_wins_over_next_rf_margin() -> None:
+    field = np.zeros((9, 9, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+
+    line, reason = _trace_direction_line_to_target(
+        field,
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        step_px=2.0,
+        rf_margin_px=3.0,
+    )
+
+    assert reason == "target_column"
+    assert np.isclose(line[-1, 0], 2.0)
 
 
 def test_trace2cp_tta_params_drop_y_shift_and_scale() -> None:

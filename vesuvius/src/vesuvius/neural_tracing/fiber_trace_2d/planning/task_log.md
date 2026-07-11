@@ -1,41 +1,43 @@
-# Load-Only Parallelism Diagnostics Log
+# Bidirectional Trace2CP Log
 
-Current task: add real process-level CPU/wall timing to load-only profile output
-so the loader's summed worker timings can be compared against actual process CPU
-usage.
+Current task: make `--trace2cp-vis` trace selected CP segments in both
+directions and report the average of the two directional Trace2CP scores.
+
+Plan review:
+
+- Independent read-only plan review found the plan consistent with
+  `task.md`, `specs.md`, and `plan.md`.
+- Review gaps addressed during implementation:
+  - specs now explicitly define bidirectional tracing instead of one traced
+    line;
+  - reverse scoring evaluates at the original start CP x-column with its own
+    denominator/status;
+  - each direction's ambiguous sign is seeded toward that direction's target;
+  - summary/stdout use explicit forward/reverse fields;
+  - tests cover bidirectional averaging and decreasing-x target-column
+    precedence over RF-margin rejection.
 
 Implementation notes:
 
-- Added per-batch `time.process_time()` deltas around the benchmark batch body.
-- Added `cpu` and `ctf` profile row columns:
-  - `cpu`: process CPU milliseconds per patch for the whole process.
-  - `ctf`: process CPU time divided by batch wall time.
-- Kept existing `work` and `tf` columns unchanged:
-  - `work`: summed per-candidate loader worker elapsed time.
-  - `tf`: `work / load_batch wall`.
+- Left `build_trace2cp_segment_patch` unchanged; one segment strip already
+  contains both CPs.
+- Added private runner helpers that trace and score a single Trace2CP direction
+  and aggregate forward/reverse results.
+- Base `--trace2cp-vis` now traces start-to-target and target-to-start on the
+  same decoded direction field.
+- `--trace2cp-vis --med-tta` now traces both directions through the same
+  reference/TTA direction-field set.
+- `trace2cp_vis.jpg` draws the original strip line, the forward trace, the
+  reverse trace, both CP columns, and an averaged-score label band.
+- `trace2cp_summary.txt` and stdout keep the averaged score and raw error, plus
+  per-direction scores, raw errors, target x-columns, reach statuses,
+  termination reasons, and trace point counts.
 
 Validation:
 
 - Compile check:
-  `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py`
+  `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
   passed.
-- Focused loader tests:
+- Focused loader/runner tests:
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: `106 passed in 4.97s`.
-- Load-only profile benchmark:
-  `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_2d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --benchmark --load-only --profile`
-  completed with `batches=100`, `patches=12800`, `elapsed_ms=86678.4`,
-  `patches_per_second=147.67`.
-- Profile summary from that run:
-  - `process_cpu=25.848 ms/patch`
-  - `loader_wall=6.760 ms/patch`
-  - `loader_worker=202.474 ms/patch`
-  - `loader_thread_factor=29.951`
-  - `process_cpu_factor=3.817`
-
-Finding:
-
-- The existing `tf` column was only a synthetic summed-worker-timer ratio. It
-  can report about 30x while the actual process consumes about 3.8 CPU cores on
-  this workload. The new `ctf` / `process_cpu_factor` columns are the numbers
-  to compare with system CPU monitors.
+  passed: `108 passed in 3.85s`.

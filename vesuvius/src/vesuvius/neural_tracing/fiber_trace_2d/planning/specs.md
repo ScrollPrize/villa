@@ -271,23 +271,28 @@
   column. It does not use the neural-tracing 3D crop loader.
 - Trace2CP samples the center strip-z image only, runs the checkpointed
   direction model, decodes the Lasagna ambiguous two-cos-channel output, and
-  traces one direction from the start CP toward the target CP. The trace uses
-  `--line-trace-step` and the line-trace receptive-field margin default
-  `model_depth`, overrideable with `--line-trace-rf-margin`.
-- Trace2CP scoring evaluates the traced y coordinate at the target CP x-column.
-  If the trace crosses that x-column, the y coordinate is linearly interpolated
-  between bracketing trace points. The raw error is
-  `abs(trace_y_at_target_x - target_cp_y)`.
-- Trace2CP normalized score is clamped to `0..1`; `0.0` is an exact y-hit at
-  the target column, and `1.0` is a miss at the usable strip edge or failure to
-  reach the target column. The denominator is the target CP's distance to the
-  nearest usable vertical strip edge after the receptive-field margin is
-  excluded.
+  traces the same selected segment in both directions: start CP to target CP,
+  and target CP back to start CP on the same segment strip. Each directional
+  trace uses `--line-trace-step` and the line-trace receptive-field margin
+  default `model_depth`, overrideable with `--line-trace-rf-margin`.
+- Each Trace2CP direction initializes its ambiguous-direction sign from the
+  vector pointing from that direction's start CP to its target CP. The reverse
+  trace therefore starts at the second CP and is seeded toward the first CP.
+- Per-direction Trace2CP scoring evaluates the traced y coordinate at that
+  direction's target CP x-column. If the trace crosses that x-column, the y
+  coordinate is linearly interpolated between bracketing trace points. The raw
+  error is `abs(trace_y_at_target_x - target_cp_y)`.
+- Per-direction Trace2CP normalized score is clamped to `0..1`; `0.0` is an
+  exact y-hit at the direction's target column, and `1.0` is a miss at the
+  usable strip edge or failure to reach the target column. The denominator is
+  the direction target CP's distance to the nearest usable vertical strip edge
+  after the receptive-field margin is excluded. The public `trace2cp_score` is
+  the arithmetic mean of the forward and reverse normalized scores.
 - Trace2CP uses `--med-tta` to determine whether TTA is used. Without
-  `--med-tta`, it traces and scores only the base strip direction field. With
-  `--med-tta`, it builds deterministic random geometric TTA direction fields
-  using `--line-trace-tta-count`, default `100`, and traces one median-TTA line
-  in the reference segment strip.
+  `--med-tta`, it traces and scores both directions on the base strip
+  direction field. With `--med-tta`, it builds deterministic random geometric
+  TTA direction fields using `--line-trace-tta-count`, default `100`, and
+  traces both median-TTA directions in the reference segment strip.
 - Trace2CP TTA samples from the regular training geometric augmentation ranges
   but forces y-shift to zero and scale to one for long-strip target-column
   semantics. The median trace is stepped in the reference segment strip by
@@ -296,15 +301,18 @@
   step, and using the normalized component-wise median direction.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
   a concise stdout line with sample index, fiber path, start/target CP indices,
-  trace mode, normalized score, raw y error in pixels, target x-column, and
-  trace status. The JPG is always a single strip image containing the two CPs,
-  one traced line, and the score in a top label band; it does not add separate
-  TTA/flock columns or draw score text over image pixels.
+  trace mode, averaged normalized score, averaged raw y error in pixels, and
+  per-direction normalized scores, raw errors, target x-columns, reach statuses,
+  termination reasons, and trace point counts. The JPG is always a single strip
+  image containing the two CPs, both directional traced lines, and the averaged
+  score in a top label band; it does not add separate TTA/flock columns or draw
+  score text over image pixels.
 - Trace2CP target-column crossing takes precedence over RF-margin rejection for
-  the next step. If a step crosses the target x-column and would also enter the
-  RF margin, the trace is considered to have reached the target column and the
-  score is computed by interpolation at the target column. RF-margin stop
-  reasons should identify whether the x margin, y margin, or both were hit.
+  the next step in each direction. If a step crosses that direction's target
+  x-column and would also enter the RF margin, the trace is considered to have
+  reached the target column and the score is computed by interpolation at the
+  target column. RF-margin stop reasons should identify whether the x margin,
+  y margin, or both were hit.
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
 - Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.

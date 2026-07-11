@@ -220,20 +220,25 @@ The important behavior is:
   the next CP by default, and can use `--trace2cp-target-offset` or
   `--trace2cp-target-cp-index` for other same-fiber target CPs.
 - `--trace2cp-vis` loads a side-strip segment spanning both CPs, runs the same
-  decoded direction-field model as line tracing, traces one direction from the
-  start CP toward the target CP, and scores the y-error where the trace reaches
-  the target CP x-column. The trace2cp segment strip uses twice the configured
-  patch height for more vertical room before the RF margin.
+  decoded direction-field model as line tracing, traces start-to-target and
+  target-to-start on the same strip, and scores each direction's y-error where
+  that trace reaches its target CP x-column. The reported `trace2cp_score` is
+  the average of the two normalized directional scores. The trace2cp segment
+  strip uses twice the configured patch height for more vertical room before
+  the RF margin.
 - Trace2CP uses `--med-tta` to decide whether to use TTA. Without it, the tool
-  traces and scores the base direction field. With it, deterministic random
-  geometric TTA direction fields are built using `--line-trace-tta-count`; the
-  TTA set uses the training geometric ranges except y-shift is forced to zero
-  and scale to one. The tool then traces one median-direction line in the
-  reference segment strip.
+  traces and scores both directions on the base direction field. With it,
+  deterministic random geometric TTA direction fields are built using
+  `--line-trace-tta-count`; the TTA set uses the training geometric ranges
+  except y-shift is forced to zero and scale to one. The tool then traces both
+  median-direction lines in the reference segment strip.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
-  the normalized `0..1` score plus raw pixel error, trace mode, and trace
-  status to stdout. The JPG is always one strip image with the two CPs, one
-  traced line, and the score in a top label band above the image pixels.
+  the averaged normalized `0..1` score plus averaged raw pixel error, trace
+  mode, and per-direction scores/statuses to stdout. The summary includes
+  forward/reverse raw errors, normalized scores, target x-columns, target-column
+  reach statuses, termination reasons, and trace point counts. The JPG is
+  always one strip image with the two CPs, both traced lines, and the averaged
+  score in a top label band above the image pixels.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
   side-strip patch, runs the checkpointed direction model, decodes the

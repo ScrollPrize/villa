@@ -1,13 +1,15 @@
-# Load-Only Parallelism Diagnostics Status
+# Bidirectional Trace2CP Status
 
 - [x] Capture current user task in `planning/task.md`.
-- [x] Create focused diagnostic task plan.
-- [x] Add real process CPU timing to benchmark profile rows and summary.
+- [x] Create focused task plan.
+- [x] Review task plan against `planning/specs.md`, `planning/plan.md`, and
+  `planning/task.md`.
+- [x] Implement bidirectional Trace2CP tracing, scoring, and visualization.
+- [x] Add focused regression tests.
+- [x] Update specs, docs, changelog, and task log.
 - [x] Compile-check changed Python.
-- [x] Run load-only profile benchmark.
-- [x] Update docs/specs and task log with results.
+- [x] Run focused fiber-trace tests.
 
-Result: load-only profile now reports both synthetic loader worker factor and
-real process CPU factor. On the 100-batch load-only profile run,
-`loader_thread_factor=29.951` but `process_cpu_factor=3.817`, matching the
-observed low system CPU utilization much better than the old table did.
+Result: `--trace2cp-vis` now traces start-to-target and target-to-start on the
+same segment strip, draws both traces, and reports `trace2cp_score` as the
+average of the two directional normalized scores.

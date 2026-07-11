@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-07-11
+
+- Made `--trace2cp-vis` trace selected CP segments in both directions, draw both
+  traces, and report the average of the forward/reverse normalized scores.
+
 ## 2026-07-10
 
 - Added real process CPU timing to the 2D fiber-trace benchmark/profile table
