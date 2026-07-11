@@ -1,28 +1,37 @@
-# Whole-Fiber Trace2CP Visualization Task Log
+# Whole-Fiber Trace2CP Normal-Alignment Task Log
 
 ## Notes
 
-- Started from the existing single-pair Trace2CP runner path.
-- Whole-fiber mode should reuse configured loader records and reject a
-  `--fiber-json` path that is not part of the active config.
-- Added `FiberStrip2DLoader.flat_sample_indices_for_fiber_json(...)` so runner
-  code can resolve a configured fiber JSON to deterministic flat CP indices.
-- Extracted `_evaluate_trace2cp_pair(...)` so single-pair and whole-fiber
-  Trace2CP share the same segment loading, model prediction, optional
-  median-TTA, tracing, and scoring behavior.
-- Added `--trace2cp-vis --fiber-json <path>` to evaluate all in-range CP pairs
-  for `--trace2cp-target-offset` and write `trace2cp_fiber_vis.jpg` plus
-  `trace2cp_fiber_summary.txt`.
-- Added long-strip composition by translating pair-local images and trace
-  points into the selected fiber's shared arc-length x coordinate system.
-- `--fiber-json` rejects `--trace2cp-target-cp-index` because whole-fiber mode
-  already derives all targets from `--trace2cp-target-offset`.
+- The visual reversal was a y-axis flip from Lasagna normal sign ambiguity, not
+  an x-order problem. Each pair-local Trace2CP segment built its side-strip row
+  axis independently, so adjacent segments could choose opposite normal signs.
+- Added signed line-window normal metadata to `FiberStripSegmentSample`.
+- Added optional Trace2CP segment row-axis alignment: if a caller supplies a
+  reference line index and row-axis vector, the segment first builds the grid,
+  checks the actual generated row axis at that line index, and rebuilds with
+  the local Lasagna normal sequence flipped when the row axis disagrees.
+- Whole-fiber Trace2CP now carries accepted CP row axes by original line index.
+  When a later pair shares a CP, it aligns its local segment to that stored row
+  axis before sampling image data.
+- Added `trace2cp_fiber_debug.txt` and matching stdout rows with per-pair
+  start/target strip CP vectors, start/target row axes, frame vectors, and 3D
+  CP deltas projected into the start frame.
+- Removed the sparse per-pixel whole-fiber image splat compositor that caused
+  display holes. The compositor now uses dense valid-mask rectangular averaging
+  over already sampled pair images.
 
 ## Validation
 
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - passed: `138 passed in 6.68s`.
 - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
   - passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  - passed: `134 passed in 6.04s`.
-- `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+- `git diff --check -- <task-touched files>`
   - passed.
+- Real command rerun with expanded local paths:
+  `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_2d.runner /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --export-dir ./ --checkpoint /home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_2d_runs/cps_only_20260711_132923/snapshots/best.pt --trace2cp-vis --fiber-json /home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_2026-06-16/test/er_20260615T190505820_000003.json`
+  - passed in `/tmp/trace2cp_debug_current`.
+  - produced `trace2cp_fiber_vis.jpg`, `trace2cp_fiber_summary.txt`, and
+    `trace2cp_fiber_debug.txt`.
+  - debug rows: `121`; aligned shared-CP row-axis dots: `120`; min
+    `alignment_dot=0.999074`; no negative shared-axis alignments.

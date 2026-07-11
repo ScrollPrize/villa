@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +29,25 @@ from vesuvius.neural_tracing.fiber_trace_2d.model import (
     FiberStripDirectionNet,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_line_index
+
+
+def _path_arg_for_config(path: str | Path) -> str:
+    path_s = str(path)
+    if path_s.startswith(("s3://", "http://", "https://")):
+        return path_s
+    return str(Path(path_s).expanduser().resolve())
+
+
+def _config_for_trace2cp_fiber_json(config, fiber_json: str | Path):
+    if len(config.datasets) != 1:
+        raise ValueError(
+            "--trace2cp-vis --fiber-json requires a config with exactly one dataset entry "
+            f"so the volume/manifest context is unambiguous; got {len(config.datasets)}"
+        )
+    dataset = dict(config.datasets[0])
+    dataset["fiber_paths"] = [_path_arg_for_config(fiber_json)]
+    dataset.pop("fiber_glob", None)
+    return replace(config, datasets=(dataset,))
 
 
 def _to_u8_image(image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
@@ -663,8 +682,16 @@ class _Trace2CpPairEvaluation:
 @dataclass(frozen=True)
 class _Trace2CpFiberPairPlacement:
     evaluation: _Trace2CpPairEvaluation
-    x_shift: float
+    x_scale: float
+    x_offset: float
     y_shift: float
+
+
+@dataclass(frozen=True)
+class _Trace2CpSkippedPair:
+    start_cp_index: int
+    target_cp_index: int
+    reason: str
 
 
 def _geometric_only_params(params: FiberStripAugmentParams) -> FiberStripAugmentParams:
@@ -1965,14 +1992,100 @@ def _trace2cp_fiber_pair_cp_indices(cp_count: int, target_offset: int) -> tuple[
     return tuple((index, index + offset) for index in range(-offset, count))
 
 
-def _translated_trace2cp_points(points_xy: np.ndarray, x_shift: float, y_shift: float) -> np.ndarray:
+def _trace2cp_skip_reason(exc: BaseException) -> str:
+    return " ".join(str(exc).split())
+
+
+def _mapped_trace2cp_points(
+    points_xy: np.ndarray,
+    *,
+    x_scale: float,
+    x_offset: float,
+    y_shift: float,
+) -> np.ndarray:
     points = np.asarray(points_xy, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] != 2:
         return np.zeros((0, 2), dtype=np.float32)
-    translated = points.copy()
-    translated[:, 0] += np.float32(x_shift)
-    translated[:, 1] += np.float32(y_shift)
-    return translated
+    mapped = points.copy()
+    mapped[:, 0] = np.float32(x_offset) + np.float32(x_scale) * mapped[:, 0]
+    mapped[:, 1] += np.float32(y_shift)
+    return mapped
+
+
+def _trace2cp_unit_or_zero(values: np.ndarray) -> np.ndarray:
+    vec = np.asarray(values, dtype=np.float32).reshape(-1)
+    if vec.shape != (3,):
+        return np.zeros(3, dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if not np.isfinite(norm) or norm <= 1.0e-12:
+        return np.zeros(3, dtype=np.float32)
+    return (vec / np.float32(norm)).astype(np.float32, copy=False)
+
+
+def _fmt_vec(values: np.ndarray, *, precision: int = 4) -> str:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    return "(" + ",".join(f"{float(v):.{precision}f}" for v in arr.tolist()) + ")"
+
+
+def _trace2cp_pair_debug_row(
+    evaluation: _Trace2CpPairEvaluation,
+    *,
+    start_line_index: int,
+    target_line_index: int,
+    alignment_line_index: int | None,
+    alignment_reference_xyz: np.ndarray | None,
+) -> str:
+    sample = evaluation.sample
+    start_xy = np.asarray(sample.start_control_point_xy, dtype=np.float32)
+    target_xy = np.asarray(sample.target_control_point_xy, dtype=np.float32)
+    dxy = target_xy - start_xy
+    start_xyz = np.asarray(sample.start_control_point_xyz, dtype=np.float32)
+    target_xyz = np.asarray(sample.target_control_point_xyz, dtype=np.float32)
+    delta_xyz = target_xyz - start_xyz
+    frame = sample.frame
+    if frame is None:
+        tangent = np.zeros(3, dtype=np.float32)
+        side = np.zeros(3, dtype=np.float32)
+        normal = np.zeros(3, dtype=np.float32)
+    else:
+        tangent = _trace2cp_unit_or_zero(np.asarray(frame.tangent_xyz, dtype=np.float32))
+        side = _trace2cp_unit_or_zero(np.asarray(frame.side_xyz, dtype=np.float32))
+        normal = _trace2cp_unit_or_zero(np.asarray(frame.mesh_normal_xyz, dtype=np.float32))
+    start_axis = _trace2cp_unit_or_zero(np.asarray(sample.start_row_axis_xyz, dtype=np.float32))
+    target_axis = _trace2cp_unit_or_zero(np.asarray(sample.target_row_axis_xyz, dtype=np.float32))
+    frame_dot_tsn = np.asarray(
+        [
+            float(np.dot(delta_xyz, tangent)),
+            float(np.dot(delta_xyz, side)),
+            float(np.dot(delta_xyz, normal)),
+        ],
+        dtype=np.float32,
+    )
+    alignment_dot = np.nan
+    if alignment_line_index is not None and alignment_reference_xyz is not None:
+        ref = _trace2cp_unit_or_zero(np.asarray(alignment_reference_xyz, dtype=np.float32))
+        if int(alignment_line_index) == int(start_line_index):
+            alignment_dot = float(np.dot(start_axis, ref))
+        elif int(alignment_line_index) == int(target_line_index):
+            alignment_dot = float(np.dot(target_axis, ref))
+    return (
+        "trace2cp fiber_pair_vectors "
+        f"start_cp={int(sample.start_control_point_index)} "
+        f"target_cp={int(sample.target_control_point_index)} "
+        f"start_line={int(start_line_index)} target_line={int(target_line_index)} "
+        f"start_xy={_fmt_vec(start_xy, precision=3)} "
+        f"target_xy={_fmt_vec(target_xy, precision=3)} "
+        f"dxy={_fmt_vec(dxy, precision=3)} "
+        f"start_axis_xyz={_fmt_vec(start_axis, precision=5)} "
+        f"target_axis_xyz={_fmt_vec(target_axis, precision=5)} "
+        f"frame_tangent_xyz={_fmt_vec(tangent, precision=5)} "
+        f"frame_side_xyz={_fmt_vec(side, precision=5)} "
+        f"frame_normal_xyz={_fmt_vec(normal, precision=5)} "
+        f"cp_delta_xyz={_fmt_vec(delta_xyz, precision=3)} "
+        f"cp_delta_dot_tsn={_fmt_vec(frame_dot_tsn, precision=3)} "
+        f"alignment_line={'' if alignment_line_index is None else int(alignment_line_index)} "
+        f"alignment_dot={alignment_dot:.6f}"
+    )
 
 
 def _draw_trace2cp_fiber_overlay(
@@ -1997,22 +2110,45 @@ def _draw_trace2cp_fiber_overlay(
     for evaluation in evaluations:
         sample = evaluation.sample
         start_cp = int(sample.start_control_point_index)
+        target_cp = int(sample.target_control_point_index)
         if start_cp < 0 or start_cp >= cp_x.shape[0]:
             raise ValueError(f"start control point {start_cp} is outside control_point_x")
+        if target_cp < 0 or target_cp >= cp_x.shape[0]:
+            raise ValueError(f"target control point {target_cp} is outside control_point_x")
         start_xy = np.asarray(sample.start_control_point_xy, dtype=np.float32)
-        if start_xy.shape != (2,) or not bool(np.isfinite(start_xy).all()):
-            raise ValueError("Trace2CP sample has invalid start_control_point_xy")
+        target_xy = np.asarray(sample.target_control_point_xy, dtype=np.float32)
+        if (
+            start_xy.shape != (2,)
+            or target_xy.shape != (2,)
+            or not bool(np.isfinite(start_xy).all())
+            or not bool(np.isfinite(target_xy).all())
+        ):
+            raise ValueError("Trace2CP sample has invalid start/target control point xy")
         image = np.asarray(evaluation.image)
         if image.ndim != 2:
             raise ValueError("Trace2CP fiber visualization expects 2D pair images")
         height, width = image.shape[:2]
-        x_shift = float(cp_x[start_cp]) - float(start_xy[0])
+        local_dx = float(target_xy[0] - start_xy[0])
+        global_dx = float(cp_x[target_cp] - cp_x[start_cp])
+        if abs(local_dx) <= 1.0e-6:
+            x_scale = 1.0
+        else:
+            x_scale = global_dx / local_dx
+        x_offset = float(cp_x[start_cp]) - x_scale * float(start_xy[0])
         y_shift = -float(start_xy[1])
-        placements.append(_Trace2CpFiberPairPlacement(evaluation=evaluation, x_shift=x_shift, y_shift=y_shift))
-        min_x = min(min_x, x_shift)
+        placements.append(
+            _Trace2CpFiberPairPlacement(
+                evaluation=evaluation,
+                x_scale=x_scale,
+                x_offset=x_offset,
+                y_shift=y_shift,
+            )
+        )
+        corner_x = x_offset + x_scale * np.asarray([0.0, float(width - 1)], dtype=np.float32)
+        min_x = min(min_x, float(np.min(corner_x)))
         min_y = min(min_y, y_shift)
-        max_x = max(max_x, x_shift + float(width))
-        max_y = max(max_y, y_shift + float(height))
+        max_x = max(max_x, float(np.max(corner_x)))
+        max_y = max(max_y, y_shift + float(height - 1))
 
     pad = 8
     global_x_shift = float(pad) - float(np.floor(min_x))
@@ -2025,37 +2161,53 @@ def _draw_trace2cp_fiber_overlay(
     for placement in placements:
         evaluation = placement.evaluation
         image_u8 = _to_u8_image(evaluation.image, evaluation.valid_mask)
-        rgb = np.repeat(image_u8[..., None], 3, axis=-1).astype(np.float32)
+        rgb = np.repeat(image_u8[..., None], 3, axis=-1).astype(np.uint8)
         valid = np.asarray(evaluation.valid_mask, dtype=bool)
-        x0 = int(round(placement.x_shift + global_x_shift))
-        y0 = int(round(placement.y_shift + global_y_shift))
-        h, w = image_u8.shape[:2]
-        dst_x0 = max(0, x0)
-        dst_y0 = max(0, y0)
-        dst_x1 = min(canvas_width, x0 + w)
-        dst_y1 = min(canvas_height, y0 + h)
-        if dst_x0 >= dst_x1 or dst_y0 >= dst_y1:
+        if not bool(valid.any()):
             continue
-        src_x0 = dst_x0 - x0
-        src_y0 = dst_y0 - y0
-        src_x1 = src_x0 + (dst_x1 - dst_x0)
-        src_y1 = src_y0 + (dst_y1 - dst_y0)
-        local_valid = valid[src_y0:src_y1, src_x0:src_x1]
-        if not bool(local_valid.any()):
+        height, width = image_u8.shape[:2]
+        x0 = global_x_shift + placement.x_offset
+        x1 = global_x_shift + placement.x_offset + placement.x_scale * float(width - 1)
+        if placement.x_scale < 0.0:
+            rgb = np.flip(rgb, axis=1)
+            valid = np.flip(valid, axis=1)
+        dst_x0 = int(round(min(x0, x1)))
+        dst_y0 = int(round(global_y_shift + placement.y_shift))
+        src_y0 = max(0, -dst_y0)
+        src_x0 = max(0, -dst_x0)
+        dst_y = max(0, dst_y0)
+        dst_x = max(0, dst_x0)
+        copy_h = min(int(rgb.shape[0]) - src_y0, canvas_height - dst_y)
+        copy_w = min(int(rgb.shape[1]) - src_x0, canvas_width - dst_x)
+        if copy_h <= 0 or copy_w <= 0:
             continue
-        local_weight = local_valid[..., None].astype(np.float32)
-        accum[dst_y0:dst_y1, dst_x0:dst_x1] += rgb[src_y0:src_y1, src_x0:src_x1] * local_weight
-        weight[dst_y0:dst_y1, dst_x0:dst_x1] += local_weight
+        valid_crop = valid[src_y0 : src_y0 + copy_h, src_x0 : src_x0 + copy_w]
+        rgb_crop = rgb[src_y0 : src_y0 + copy_h, src_x0 : src_x0 + copy_w].astype(np.float32)
+        if not bool(valid_crop.any()):
+            continue
+        target_slice = np.s_[dst_y : dst_y + copy_h, dst_x : dst_x + copy_w]
+        accum[target_slice] += rgb_crop * valid_crop[..., None].astype(np.float32)
+        weight[target_slice] += valid_crop[..., None].astype(np.float32)
 
     canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
     covered = weight[..., 0] > 0.0
     canvas[covered] = np.clip(accum[covered] / weight[covered], 0.0, 255.0).astype(np.uint8)
-    pil = Image.fromarray(canvas, mode="RGB")
-    overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay, mode="RGBA")
     font = ImageFont.load_default()
 
-    def draw_points(points_xy: np.ndarray, color: tuple[int, int, int, int], width: int = 1) -> None:
+    def map_points(points_xy: np.ndarray, placement: _Trace2CpFiberPairPlacement) -> np.ndarray:
+        return _mapped_trace2cp_points(
+            points_xy,
+            x_scale=placement.x_scale,
+            x_offset=placement.x_offset + global_x_shift,
+            y_shift=placement.y_shift + global_y_shift,
+        )
+
+    def draw_points(
+        draw: ImageDraw.ImageDraw,
+        points_xy: np.ndarray,
+        color: tuple[int, int, int, int],
+        width: int = 1,
+    ) -> None:
         coords = np.asarray(points_xy, dtype=np.float32)
         finite = coords.ndim == 2 and coords.shape[1] == 2
         if not finite:
@@ -2070,52 +2222,71 @@ def _draw_trace2cp_fiber_overlay(
         else:
             draw.line(points, fill=color, width=max(1, width), joint="curve")
 
-    for placement in placements:
+    def draw_cp_markers(draw: ImageDraw.ImageDraw, placement: _Trace2CpFiberPairPlacement) -> None:
         evaluation = placement.evaluation
-        result = evaluation.selected_result
-        x_shift = placement.x_shift + global_x_shift
-        y_shift = placement.y_shift + global_y_shift
-        draw_points(
-            _translated_trace2cp_points(evaluation.sample.line_xy, x_shift, y_shift),
-            (210, 210, 210, 95),
-            width=1,
-        )
-        draw_points(
-            _translated_trace2cp_points(result.forward.trace_xy, x_shift, y_shift),
-            (0, 255, 0, 230),
-            width=1,
-        )
-        draw_points(
-            _translated_trace2cp_points(result.reverse.trace_xy, x_shift, y_shift),
-            (255, 64, 220, 230),
-            width=1,
-        )
-        draw_points(
-            _translated_trace2cp_points(result.refinement.optimized_xy, x_shift, y_shift),
-            (64, 224, 255, 240),
-            width=1,
-        )
         for point_xy, color in (
             (evaluation.sample.start_control_point_xy, (32, 255, 255, 255)),
             (evaluation.sample.target_control_point_xy, (255, 220, 64, 255)),
         ):
-            point = _translated_trace2cp_points(np.asarray(point_xy, dtype=np.float32).reshape(1, 2), x_shift, y_shift)
+            point = map_points(np.asarray(point_xy, dtype=np.float32).reshape(1, 2), placement)
             if point.shape == (1, 2) and bool(np.isfinite(point).all()):
                 x, y = (float(v) for v in point[0])
                 draw.ellipse((x - 2.0, y - 2.0, x + 2.0, y + 2.0), outline=color, width=1)
-        midpoint_x = 0.5 * (
-            float(cp_x[int(evaluation.sample.start_control_point_index)])
-            + float(cp_x[int(evaluation.sample.target_control_point_index)])
-        ) + global_x_shift
-        draw.text(
-            (midpoint_x - 10.0, 2.0),
-            f"{evaluation.selected_result.score:.3f}",
-            fill=(255, 255, 255, 220),
-            font=font,
-        )
 
-    drawn = np.asarray(Image.alpha_composite(pil.convert("RGBA"), overlay).convert("RGB"), dtype=np.uint8)
-    return _draw_label_band(drawn, label)
+    def draw_row(row_label: str, kind: str) -> np.ndarray:
+        pil = Image.fromarray(canvas, mode="RGB")
+        overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay, mode="RGBA")
+        for placement in placements:
+            evaluation = placement.evaluation
+            result = evaluation.selected_result
+            refinement = result.refinement
+            draw_points(draw, map_points(evaluation.sample.line_xy, placement), (210, 210, 210, 95), width=1)
+            if kind == "full":
+                draw_points(draw, map_points(result.forward.trace_xy, placement), (0, 255, 0, 230), width=1)
+                draw_points(draw, map_points(result.reverse.trace_xy, placement), (255, 64, 220, 230), width=1)
+                midpoint_x = 0.5 * (
+                    float(cp_x[int(evaluation.sample.start_control_point_index)])
+                    + float(cp_x[int(evaluation.sample.target_control_point_index)])
+                ) + global_x_shift
+                draw.text(
+                    (midpoint_x - 10.0, 2.0),
+                    f"{result.score:.3f}",
+                    fill=(255, 255, 255, 220),
+                    font=font,
+                )
+            elif kind == "partial":
+                draw_points(draw, map_points(refinement.partial_forward_xy, placement), (0, 255, 0, 230), width=1)
+                draw_points(draw, map_points(refinement.partial_reverse_xy, placement), (255, 64, 220, 230), width=1)
+                point = map_points(refinement.closest_midpoint_xy.reshape(1, 2), placement)
+                if point.shape == (1, 2) and bool(np.isfinite(point).all()):
+                    x, y = (float(v) for v in point[0])
+                    draw.ellipse((x - 2.0, y - 2.0, x + 2.0, y + 2.0), outline=(255, 255, 255, 255), width=1)
+            elif kind == "fused":
+                draw_points(draw, map_points(refinement.fused_resampled_xy, placement), (255, 220, 64, 240), width=1)
+            elif kind == "optimized":
+                draw_points(draw, map_points(refinement.optimized_xy, placement), (64, 224, 255, 240), width=1)
+            else:
+                raise ValueError(f"unknown Trace2CP fiber row kind {kind!r}")
+            draw_cp_markers(draw, placement)
+        drawn = np.asarray(Image.alpha_composite(pil.convert("RGBA"), overlay).convert("RGB"), dtype=np.uint8)
+        return _draw_label_band(drawn, row_label)
+
+    rows = [
+        draw_row(f"{label} full traces", "full"),
+        draw_row("partial closest-approach traces", "partial"),
+        draw_row("fused CP-to-CP line", "fused"),
+        draw_row("optimized CP-to-CP line", "optimized"),
+    ]
+    width = max(int(row.shape[1]) for row in rows)
+    height = sum(int(row.shape[0]) for row in rows)
+    stacked = np.zeros((height, width, 3), dtype=np.uint8)
+    y0 = 0
+    for row in rows:
+        h, w = row.shape[:2]
+        stacked[y0 : y0 + h, :w] = row
+        y0 += h
+    return stacked
 
 
 def _base_corners_xy(shape_hw: tuple[int, int]) -> np.ndarray:
@@ -2205,12 +2376,16 @@ def _evaluate_trace2cp_pair(
     line_trace_tta_count: int,
     vis_tta: bool,
     sample_mode: str = "random",
+    row_axis_alignment_line_index: int | None = None,
+    row_axis_alignment_xyz: np.ndarray | None = None,
 ) -> _Trace2CpPairEvaluation:
     sample, image, valid_mask = loader.build_trace2cp_segment_patch(
         sample_index,
         target_control_point_index=target_cp_index,
         target_offset=target_offset,
         rf_margin_px=rf_margin_px,
+        row_axis_alignment_line_index=row_axis_alignment_line_index,
+        row_axis_alignment_xyz=row_axis_alignment_xyz,
         device=device,
         sample_mode=sample_mode,
     )
@@ -2481,6 +2656,16 @@ def _trace2cp_control_point_x_positions(loader: FiberStrip2DLoader, flat_indices
     return values - np.float32(float(np.nanmin(values)))
 
 
+def _trace2cp_control_point_line_indices(loader: FiberStrip2DLoader, flat_indices: tuple[int, ...]) -> np.ndarray:
+    if not flat_indices:
+        raise ValueError("fiber has no control points")
+    record, _, _ = loader.descriptor_for_sample_index(int(flat_indices[0]), sample_mode="flat")
+    return np.asarray(
+        [control_point_line_index(record.fiber, cp_index) for cp_index in range(len(flat_indices))],
+        dtype=np.int64,
+    )
+
+
 def _export_trace2cp_fiber_vis(
     loader: FiberStrip2DLoader,
     fiber_json: str | Path,
@@ -2509,22 +2694,71 @@ def _export_trace2cp_fiber_vis(
         )
 
     evaluations: list[_Trace2CpPairEvaluation] = []
+    skipped_pairs: list[_Trace2CpSkippedPair] = []
+    cp_line_indices = _trace2cp_control_point_line_indices(loader, flat_indices)
+    row_axis_refs_by_line_index: dict[int, np.ndarray] = {}
+    debug_rows: list[str] = []
     for start_cp_index, target_cp_index in pair_indices:
-        evaluation = _evaluate_trace2cp_pair(
-            loader,
-            model,
-            int(flat_indices[start_cp_index]),
-            device=device,
-            step_px=step_px,
-            rf_margin_px=margin,
-            target_offset=target_offset,
-            target_cp_index=int(target_cp_index),
-            med_tta=med_tta,
-            line_trace_tta_count=line_trace_tta_count,
-            vis_tta=False,
-            sample_mode="flat",
-        )
+        alignment_line_index: int | None = None
+        alignment_axis: np.ndarray | None = None
+        for cp_index in (int(start_cp_index), int(target_cp_index)):
+            line_index = int(cp_line_indices[cp_index])
+            existing = row_axis_refs_by_line_index.get(line_index)
+            if existing is not None:
+                alignment_line_index = line_index
+                alignment_axis = existing
+                break
+        try:
+            evaluation = _evaluate_trace2cp_pair(
+                loader,
+                model,
+                int(flat_indices[start_cp_index]),
+                device=device,
+                step_px=step_px,
+                rf_margin_px=margin,
+                target_offset=target_offset,
+                target_cp_index=int(target_cp_index),
+                med_tta=med_tta,
+                line_trace_tta_count=line_trace_tta_count,
+                vis_tta=False,
+                sample_mode="flat",
+                row_axis_alignment_line_index=alignment_line_index,
+                row_axis_alignment_xyz=alignment_axis,
+            )
+        except ValueError as exc:
+            reason = _trace2cp_skip_reason(exc)
+            skipped_pairs.append(
+                _Trace2CpSkippedPair(
+                    start_cp_index=int(start_cp_index),
+                    target_cp_index=int(target_cp_index),
+                    reason=reason,
+                )
+            )
+            print(
+                "trace2cp fiber_pair_skip "
+                f"fiber_json={fiber_json} start_cp={int(start_cp_index)} "
+                f"target_cp={int(target_cp_index)} reason={reason}",
+                flush=True,
+            )
+            continue
         evaluations.append(evaluation)
+        start_line_index = int(cp_line_indices[int(start_cp_index)])
+        target_line_index = int(cp_line_indices[int(target_cp_index)])
+        start_axis = _trace2cp_unit_or_zero(np.asarray(evaluation.sample.start_row_axis_xyz, dtype=np.float32))
+        target_axis = _trace2cp_unit_or_zero(np.asarray(evaluation.sample.target_row_axis_xyz, dtype=np.float32))
+        if bool(np.any(start_axis)):
+            row_axis_refs_by_line_index[start_line_index] = start_axis
+        if bool(np.any(target_axis)):
+            row_axis_refs_by_line_index[target_line_index] = target_axis
+        debug_row = _trace2cp_pair_debug_row(
+            evaluation,
+            start_line_index=start_line_index,
+            target_line_index=target_line_index,
+            alignment_line_index=alignment_line_index,
+            alignment_reference_xyz=alignment_axis,
+        )
+        debug_rows.append(debug_row)
+        print(debug_row, flush=True)
         print(
             "trace2cp fiber_pair "
             f"fiber_path={evaluation.sample.fiber_path} "
@@ -2534,6 +2768,13 @@ def _export_trace2cp_fiber_vis(
             f"actual_y_error_px={evaluation.selected_result.raw_y_error_px:.6f} "
             f"considered_y_error_px={evaluation.selected_result.considered_y_error_px:.6f}",
             flush=True,
+        )
+    if not evaluations:
+        first_skip = skipped_pairs[0].reason if skipped_pairs else ""
+        raise ValueError(
+            "no valid Trace2CP pairs for whole-fiber visualization: "
+            f"fiber_json='{fiber_json}' requested_pairs={len(pair_indices)} "
+            f"skipped_pairs={len(skipped_pairs)} first_skip='{first_skip}'"
         )
 
     cp_x = _trace2cp_control_point_x_positions(loader, flat_indices)
@@ -2545,6 +2786,7 @@ def _export_trace2cp_fiber_vis(
     mode = "med_tta" if med_tta else "base"
     label = (
         f"trace2cp fiber pairs={len(evaluations)} mode={mode} "
+        f"skipped={len(skipped_pairs)} "
         f"mean={float(np.mean(scores)):.4f} max={float(np.max(scores)):.4f} "
         f"mean_actual_px={float(np.mean(actual_errors)):.2f}"
     )
@@ -2554,6 +2796,7 @@ def _export_trace2cp_fiber_vis(
         label=label,
     )
     _write_jpg(out / "trace2cp_fiber_vis.jpg", overlay)
+    (out / "trace2cp_fiber_debug.txt").write_text("\n".join(debug_rows) + "\n", encoding="utf-8")
 
     rows = [
         "start_cp target_cp score actual_y_error_px considered_y_error_px center_penalty "
@@ -2581,7 +2824,9 @@ def _export_trace2cp_fiber_vis(
         f"checkpoint_step={checkpoint.get('step', 'unknown')}",
         f"target_offset={int(target_offset)}",
         f"cp_count={len(flat_indices)}",
-        f"pair_count={len(evaluations)}",
+        f"requested_pair_count={len(pair_indices)}",
+        f"valid_pair_count={len(evaluations)}",
+        f"skipped_pair_count={len(skipped_pairs)}",
         f"step_px={float(step_px):.3f}",
         f"rf_margin_px={margin:.3f}",
         f"trace_mode={mode}",
@@ -2592,17 +2837,25 @@ def _export_trace2cp_fiber_vis(
         f"score_min={float(np.min(scores)):.8f}",
         f"actual_y_error_mean_px={float(np.mean(actual_errors)):.6f}",
         f"image_shape_hw=({int(overlay.shape[0])}, {int(overlay.shape[1])})",
+        f"debug_path={out / 'trace2cp_fiber_debug.txt'}",
         "",
         *rows,
+        "",
+        "skipped_pairs:",
+        *(
+            f"{pair.start_cp_index} {pair.target_cp_index} {pair.reason}"
+            for pair in skipped_pairs
+        ),
     ]
     (out / "trace2cp_fiber_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
     print(
         "trace2cp fiber "
         f"fiber_json={fiber_path_display} "
         f"pairs={len(evaluations)} mode={mode} mean_score={float(np.mean(scores)):.8f} "
-        f"max_score={float(np.max(scores)):.8f} mean_actual_y_error_px={float(np.mean(actual_errors)):.6f}"
+        f"max_score={float(np.max(scores)):.8f} mean_actual_y_error_px={float(np.mean(actual_errors)):.6f} "
+        f"skipped_pairs={len(skipped_pairs)}"
     )
-    print(f"exported trace2cp_fiber_vis.jpg and trace2cp_fiber_summary.txt to {out}")
+    print(f"exported trace2cp_fiber_vis.jpg, trace2cp_fiber_summary.txt, and trace2cp_fiber_debug.txt to {out}")
 
 
 def _export_dir_vis(
@@ -3033,6 +3286,8 @@ def main() -> None:
 
     with _Timer() as config_timer:
         config = load_config(args.config)
+        if args.trace2cp_vis and args.fiber_json is not None:
+            config = _config_for_trace2cp_fiber_json(config, args.fiber_json)
     with _Timer() as loader_timer:
         loader = FiberStrip2DLoader(config)
     print(

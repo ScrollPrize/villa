@@ -188,7 +188,12 @@ The important behavior is:
   between two control points in the same fiber. This path resolves the start CP
   from the deterministic sample stream, validates the target CP, builds a
   Lasagna/VC3D-style side-strip segment covering both CPs plus margin, and
-  samples the center strip-z image through the normal coordinate sampler.
+  samples the center strip-z image through the normal coordinate sampler. The
+  returned segment sample carries the original line indices and signed Lasagna
+  normals used for that strip, plus the actual start/target strip row-axis
+  vectors after frame construction. Whole-fiber Trace2CP can pass a shared-CP
+  row-axis reference into this path so adjacent pair-local strips keep the same
+  vertical row orientation despite Lasagna normal sign ambiguity.
 - Computes prefetch envelopes from the same shared source geometry, asks the
   sampler for dependency-only chunk requests, deduplicates those requests, and
   fetches only chunks not already represented in the VC3D persistent cache.
@@ -239,12 +244,15 @@ The important behavior is:
   the next CP by default, and can use `--trace2cp-target-offset` or
   `--trace2cp-target-cp-index` for other same-fiber target CPs.
 - `--trace2cp-vis --fiber-json <path>` runs the same Trace2CP path for every
-  in-range CP pair in a configured fiber. The fiber JSON must already be part
-  of the loader config, so the command keeps the same Lasagna manifest, volume
-  scale, cache, and sampler context as normal training/inspection. With the
-  default target offset `1`, pairs are adjacent CPs. This mode writes
+  in-range CP pair in an explicit fiber. Before constructing the loader, the
+  runner narrows a single-dataset config to `fiber_paths=[<path>]`, so the
+  command loads only that fiber while keeping the same Lasagna manifest,
+  volume scale, cache, and sampler context as normal training/inspection. With
+  the default target offset `1`, pairs are adjacent CPs. This mode writes
   `trace2cp_fiber_vis.jpg` and `trace2cp_fiber_summary.txt`; it does not write
-  the single-pair `trace2cp_vis.jpg`.
+  the single-pair `trace2cp_vis.jpg`. Invalid pair segments, for example from
+  zero Lasagna `grad_mag` samples in the local line window, are skipped and
+  listed in the summary; the command fails only if no valid pairs remain.
 - `--trace2cp-vis` loads a side-strip segment spanning both CPs, runs the same
   decoded direction-field model as line tracing, traces start-to-target and
   target-to-start on the same strip, and uses the center-biased closest
@@ -279,10 +287,17 @@ The important behavior is:
   refinement. With `--med-tta`, that stack is rendered as the first column and
   a second column shows the reference-only/base-inference result without TTA.
 - The whole-fiber Trace2CP JPG is composed after pair scoring. Pair-local
-  images and traced points are translated into a shared fiber arc-length x
-  coordinate system, valid overlapping image pixels are averaged for display,
-  and the long strip draws the pair centerline, selected bidirectional traces,
-  optimized CP-to-CP line, CP markers, and per-pair score labels.
+  images and traced points are mapped into a shared fiber arc-length x
+  coordinate system using each pair's local start/target CP columns and global
+  start/target arc-length columns. Whole-fiber mode aligns each segment's
+  actual strip row axis against already accepted shared-CP row axes before
+  image sampling, so adjacent pair images do not randomly flip in y.
+  Valid overlapping image pixels are averaged with dense rectangular masks for
+  display, and the long strip uses the same four rows as the single-pair
+  Trace2CP view: full traces, partial closest-approach traces, fused CP-to-CP
+  line, and optimized line. The summary includes requested, valid, and skipped
+  pair counts; `trace2cp_fiber_debug.txt` records per-pair strip CP vectors,
+  row axes, frame vectors, and projected CP deltas for debugging.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
   side-strip patch, applies pixel-perfect image-space identity/flip/90-degree

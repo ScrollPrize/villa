@@ -4,9 +4,10 @@
 
 # current overview plan
 - add trace2cp metrics in training (full test fiber pairs) - minus the ones that go out of the FOV (or increase strip height?)
-- add gt refinement
+- add gt dir refinement
 - add actuall embedding similarity
 - add to vc3d?
+- gt positions refinement (from emdedding) 
 
 # general
 - work on 2d slices only (maybe 2.5D by moving a bit in z on the 2d slices?)

@@ -75,6 +75,8 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _draw_trace2cp_overlay,
     _draw_trace2cp_tta_slice,
     _export_augment_contact_sheet,
+    _export_trace2cp_fiber_vis,
+    _config_for_trace2cp_fiber_json,
     _identity_source_xy_grid,
     _labeled_panel_grid_rgb,
     _labeled_panel_strip_rgb,
@@ -623,6 +625,35 @@ def test_trace2cp_segment_patch_uses_double_configured_height(tmp_path: Path) ->
     assert sample.coords_zyx.shape[0] == 10
 
 
+def test_trace2cp_segment_patch_can_align_ambiguous_normal_sign(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+
+    reference, _, _ = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    line_index = int(reference.line_point_indices[0])
+    alignment_normal = -np.asarray(reference.line_normals_xyz[0], dtype=np.float32)
+
+    aligned, _, _ = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        row_axis_alignment_line_index=line_index,
+        row_axis_alignment_xyz=alignment_normal,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+
+    assert np.allclose(aligned.line_normals_xyz, -reference.line_normals_xyz)
+    assert np.allclose(aligned.start_row_axis_xyz, -reference.start_row_axis_xyz, atol=1.0e-5)
+    assert np.allclose(aligned.target_row_axis_xyz, -reference.target_row_axis_xyz, atol=1.0e-5)
+    assert np.allclose(aligned.coords_zyx, reference.coords_zyx[::-1], atol=1.0e-4)
+
+
 def test_loader_maps_fiber_json_to_flat_control_point_indices(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     loader = _make_loader(load_config(config_path))
@@ -634,6 +665,20 @@ def test_loader_maps_fiber_json_to_flat_control_point_indices(tmp_path: Path) ->
         loader.flat_sample_indices_for_fiber_json(tmp_path / "missing.json")
 
 
+def test_trace2cp_fiber_json_config_narrows_loader_to_explicit_fiber(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    (tmp_path / "test").mkdir()
+    requested_fiber = _write_fiber(tmp_path / "test" / "explicit_trace2cp_fiber.json")
+
+    narrowed = _config_for_trace2cp_fiber_json(load_config(config_path), requested_fiber)
+    loader = _make_loader(narrowed)
+
+    assert tuple(narrowed.datasets[0]["fiber_paths"]) == (str(requested_fiber.resolve()),)
+    assert "fiber_glob" not in narrowed.datasets[0]
+    assert loader.flat_sample_indices_for_fiber_json(requested_fiber) == (0, 1, 2)
+    assert Path(loader.records[0].fiber.path).resolve() == requested_fiber.resolve()
+
+
 def test_trace2cp_fiber_pair_cp_indices_respect_offsets() -> None:
     assert _trace2cp_fiber_pair_cp_indices(4, 1) == ((0, 1), (1, 2), (2, 3))
     assert _trace2cp_fiber_pair_cp_indices(4, 2) == ((0, 2), (1, 3))
@@ -643,13 +688,23 @@ def test_trace2cp_fiber_pair_cp_indices_respect_offsets() -> None:
         _trace2cp_fiber_pair_cp_indices(4, 0)
 
 
-def _fake_trace2cp_pair_evaluation(start_cp: int, target_cp: int) -> _Trace2CpPairEvaluation:
-    image = np.full((20, 16), 64.0, dtype=np.float32)
+def _fake_trace2cp_pair_evaluation(
+    start_cp: int,
+    target_cp: int,
+    *,
+    start_xy: np.ndarray | None = None,
+    target_xy: np.ndarray | None = None,
+    image: np.ndarray | None = None,
+) -> _Trace2CpPairEvaluation:
+    if image is None:
+        image = np.full((20, 16), 64.0, dtype=np.float32)
+    else:
+        image = np.asarray(image, dtype=np.float32)
     valid = np.ones_like(image, dtype=bool)
-    direction = np.zeros((20, 16, 2), dtype=np.float32)
+    direction = np.zeros((*image.shape, 2), dtype=np.float32)
     direction[..., 0] = 1.0
-    start_xy = np.asarray([2.0, 10.0], dtype=np.float32)
-    target_xy = np.asarray([12.0, 10.0], dtype=np.float32)
+    start_xy = np.asarray([2.0, 10.0], dtype=np.float32) if start_xy is None else np.asarray(start_xy, dtype=np.float32)
+    target_xy = np.asarray([12.0, 10.0], dtype=np.float32) if target_xy is None else np.asarray(target_xy, dtype=np.float32)
     result = _trace_score_trace2cp_bidirectional(
         direction,
         start_xy,
@@ -666,12 +721,16 @@ def _fake_trace2cp_pair_evaluation(start_cp: int, target_cp: int) -> _Trace2CpPa
         start_control_point_xyz=np.zeros(3, dtype=np.float32),
         target_control_point_xyz=np.ones(3, dtype=np.float32),
         strip_z_offset=0.0,
-        coords_zyx=np.zeros((20, 16, 3), dtype=np.float32),
+        coords_zyx=np.zeros((*image.shape, 3), dtype=np.float32),
         valid_mask=valid,
         frame=None,
-        line_xy=np.asarray([[2.0, 10.0], [12.0, 10.0]], dtype=np.float32),
+        line_xy=np.stack([start_xy, target_xy]).astype(np.float32, copy=False),
         start_control_point_xy=start_xy,
         target_control_point_xy=target_xy,
+        line_point_indices=np.asarray([start_cp, target_cp], dtype=np.int64),
+        line_normals_xyz=np.tile(np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32), (2, 1)),
+        start_row_axis_xyz=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        target_row_axis_xyz=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
     )
     return _Trace2CpPairEvaluation(
         sample_index=start_cp,
@@ -703,6 +762,93 @@ def test_trace2cp_fiber_overlay_composes_pair_results_into_long_strip() -> None:
     assert drawn.shape[0] > first.image.shape[0]
     assert drawn.shape[1] > first.image.shape[1]
     assert bool(np.any(drawn[..., 1] != drawn[..., 0]))
+
+
+def test_trace2cp_fiber_overlay_flips_reversed_pair_image_data() -> None:
+    image = np.zeros((20, 16), dtype=np.float32)
+    image[:, 12] = 240.0
+    image[:, 2] = 40.0
+    reversed_pair = _fake_trace2cp_pair_evaluation(
+        0,
+        1,
+        start_xy=np.asarray([12.0, 10.0], dtype=np.float32),
+        target_xy=np.asarray([2.0, 10.0], dtype=np.float32),
+        image=image,
+    )
+
+    drawn = _draw_trace2cp_fiber_overlay(
+        [reversed_pair],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+
+    column_mean = drawn.mean(axis=(0, 2))
+    bright_column = int(np.argmax(column_mean))
+    # Local x=12 is the pair start and should land left of local x=2, the target.
+    assert bright_column < drawn.shape[1] // 2
+    assert drawn.shape[0] >= image.shape[0] * 4
+
+
+def test_trace2cp_fiber_export_skips_invalid_pair_and_keeps_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _FakeLoader:
+        config = SimpleNamespace(augment=SimpleNamespace(device="cpu"))
+
+        def flat_sample_indices_for_fiber_json(self, fiber_json):
+            return (10, 11, 12)
+
+    def fake_evaluate(*args, **kwargs):
+        target = int(kwargs["target_cp_index"])
+        if target == 1:
+            raise ValueError("Lasagna grad_mag sample is zero\nat fiber line point")
+        return _fake_trace2cp_pair_evaluation(1, 2)
+
+    written: list[Path] = []
+
+    monkeypatch.setattr(runner_module, "_load_direction_model", lambda *args, **kwargs: (object(), {"step": 7}))
+    monkeypatch.setattr(
+        runner_module,
+        "_model_config_from_checkpoint",
+        lambda *args, **kwargs: SimpleNamespace(depth=1),
+    )
+    monkeypatch.setattr(runner_module, "_evaluate_trace2cp_pair", fake_evaluate)
+    monkeypatch.setattr(
+        runner_module,
+        "_trace2cp_control_point_x_positions",
+        lambda *args, **kwargs: np.asarray([0.0, 10.0, 20.0], dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_trace2cp_control_point_line_indices",
+        lambda *args, **kwargs: np.asarray([0, 1, 2], dtype=np.int64),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_draw_trace2cp_fiber_overlay",
+        lambda *args, **kwargs: np.zeros((8, 12, 3), dtype=np.uint8),
+    )
+    monkeypatch.setattr(runner_module, "_write_jpg", lambda path, image: written.append(Path(path)))
+
+    _export_trace2cp_fiber_vis(
+        _FakeLoader(),
+        "fiber.json",
+        tmp_path,
+        checkpoint_path=tmp_path / "checkpoint.pt",
+        step_px=1.0,
+        rf_margin_px=None,
+        target_offset=1,
+    )
+
+    summary = (tmp_path / "trace2cp_fiber_summary.txt").read_text(encoding="utf-8")
+    output = capsys.readouterr().out
+    assert written == [tmp_path / "trace2cp_fiber_vis.jpg"]
+    assert "valid_pair_count=1" in summary
+    assert "skipped_pair_count=1" in summary
+    assert "0 1 Lasagna grad_mag sample is zero at fiber line point" in summary
+    assert "trace2cp fiber_pair_skip" in output
 
 
 def test_trace2cp_tta_patch_samples_volume_from_augmented_coords(tmp_path: Path) -> None:

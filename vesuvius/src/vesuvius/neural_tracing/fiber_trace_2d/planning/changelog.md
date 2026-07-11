@@ -3,7 +3,12 @@
 ## 2026-07-11
 
 - Added `--trace2cp-vis --fiber-json <path>` to run Trace2CP over all
-  configured CP pairs for one fiber and compose a long-strip visualization.
+  configured CP pairs for one explicit fiber and compose a long-strip
+  visualization without requiring that fiber to match the configured
+  `fiber_glob`; invalid CP-pair segments are skipped and listed in the
+  summary, adjacent pair strips align actual strip row axes at shared CPs to
+  avoid random y flips, and `trace2cp_fiber_debug.txt` records per-pair strip
+  CP vectors.
 - Added a reference-only comparison column to `--trace2cp-vis --med-tta`
   output.
 - Added a center-bias penalty to Trace2CP closest-approach scoring so candidate

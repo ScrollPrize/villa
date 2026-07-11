@@ -162,6 +162,15 @@
 - Dataset entries include `fiber_paths` or `fiber_glob`, `base_volume_path`, `base_volume_scale`, and required `lasagna_manifest_path`.
 - Optional top-level `test_datasets` uses the same dataset-entry schema as `datasets`; when present it defines a separate deterministic test loader while reusing the rest of the loader configuration.
 - Strip-frame normals are sampled only through the Lasagna manifest `grad_mag`, `nx`, and `ny` channels.
+- Trace2CP segment samples carry the line-window original line indices and the
+  signed Lasagna normals used to build the segment strip, plus the actual
+  start/target strip row-axis vectors after VC3D-style frame construction.
+  Single-pair Trace2CP may choose either valid sign, but whole-fiber Trace2CP
+  must align each later pair-local row axis to any already accepted shared-CP
+  row-axis reference before sampling image data. If the initially built grid's
+  row-axis disagrees with that reference, the loader flips the local Lasagna
+  normal sequence and rebuilds the grid. This prevents adjacent segment images
+  from flipping in y solely because Lasagna normals are sign-ambiguous.
 - Normal batch loading samples control points in deterministic pseudo-random order from the configured seed.
 - The deterministic pseudo-random training order covers every configured control point exactly once per dataset pass before repeating.
 - Changing training step counts, batch size, or control points per step must only truncate or extend the consumed prefix of that deterministic sample stream; it must not reshuffle earlier samples.
@@ -300,13 +309,20 @@
   `--trace2cp-target-cp-index` selects an absolute target CP index in the same
   fiber. The target CP must be in range and different from the start CP.
 - `--trace2cp-vis --fiber-json <path>` runs whole-fiber Trace2CP visualization
-  for a fiber JSON that is already present in the configured loader datasets.
-  It must use the configured Lasagna manifest, volume scale, cache, and
-  sampler context for that fiber; it must not introduce a separate
+  for an explicit fiber JSON. In this mode the runner narrows a single-dataset
+  config to `fiber_paths=[<path>]` before constructing the loader, so it loads
+  only that fiber while reusing the configured Lasagna manifest, volume scale,
+  cache, and sampler context. It must not require the fiber to match the
+  configured dataset glob/list, and it must not introduce a separate
   manifest-less fiber loading path. Whole-fiber mode uses all in-range CP pairs
   for the non-zero `--trace2cp-target-offset`; the default offset `1` evaluates
   adjacent pairs `(0,1), (1,2), ...`. It cannot be combined with
   `--trace2cp-target-cp-index`.
+- Whole-fiber Trace2CP must continue past CP pairs whose segment cannot be
+  constructed or traced because of invalid local data such as zero
+  Lasagna `grad_mag` normal samples. Skipped pairs are reported to stdout and
+  listed in `trace2cp_fiber_summary.txt`; the command fails only if every
+  requested pair is skipped.
 - Trace2CP loading constructs a side-strip segment that spans the start and
   target CPs plus receptive-field/visualization margin. The segment strip
   height is twice the configured patch height so traces have more vertical room
@@ -393,13 +409,24 @@
   column using the base direction field without TTA. It does not draw score
   text over image pixels.
 - Whole-fiber Trace2CP mode writes `trace2cp_fiber_vis.jpg` and
-  `trace2cp_fiber_summary.txt`. Each CP pair is loaded, traced, and scored with
-  the same pair-local Trace2CP path as the single-pair command. The final
-  visualization is composed afterward by translating each pair-local segment
-  image, centerline, CP markers, selected traces, and optimized line into a
-  shared arc-length x coordinate system for the selected fiber. Overlapping
-  valid pair-image pixels are averaged for display only; scores and traces are
-  still computed pair by pair.
+  `trace2cp_fiber_summary.txt`, and `trace2cp_fiber_debug.txt`. Each CP pair
+  is loaded, traced, and scored with the same pair-local Trace2CP path as the
+  single-pair command. The final
+  visualization is composed afterward by mapping each pair-local segment image,
+  centerline, CP markers, selected traces, and optimized line into a shared
+  arc-length x coordinate system for the selected fiber. The mapping uses each
+  pair's local start/target CP image columns and the corresponding global
+  start/target CP arc-length columns. Pair-local y orientation is fixed before
+  image sampling by shared-CP row-axis alignment, not by guessing after
+  composition. The debug file and stdout include per-pair start/target CP strip
+  coordinates, strip-space CP deltas, start/target row axes, frame vectors, and
+  3D CP deltas projected into the start frame. The image layer uses dense rectangular valid-mask averaging of
+  the already sampled segment images; it must not use sparse per-pixel
+  splatting that can introduce display holes. Scores and traces are still
+  computed pair by pair. The JPG uses the same four-row Trace2CP structure as
+  single-pair output: full bidirectional traces, partial closest-approach
+  traces, fused CP-to-CP line, and optimized CP-to-CP line. Skipped-pair counts
+  and reasons are included in the summary.
 - Trace2CP target-column crossing takes precedence over RF-margin rejection for
   the next step in each direction. If a step crosses that direction's target
   x-column and would also enter the RF margin, the trace is considered to have

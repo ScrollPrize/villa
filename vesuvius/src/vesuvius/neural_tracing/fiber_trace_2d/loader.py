@@ -128,6 +128,10 @@ class FiberStripSegmentSample:
     line_xy: np.ndarray
     start_control_point_xy: np.ndarray
     target_control_point_xy: np.ndarray
+    line_point_indices: np.ndarray
+    line_normals_xyz: np.ndarray
+    start_row_axis_xyz: np.ndarray
+    target_row_axis_xyz: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -1318,6 +1322,87 @@ class FiberStrip2DLoader:
             )
         return np.stack(normals, axis=0).astype(np.float32)
 
+    @staticmethod
+    def _prealign_lasagna_normals_to_row_axis_reference(
+        sampled_normals: np.ndarray,
+        line_window: FiberStripLineWindow,
+        *,
+        row_axis_alignment_line_index: int | None,
+        row_axis_alignment_xyz: np.ndarray | None,
+    ) -> np.ndarray:
+        if row_axis_alignment_line_index is None or row_axis_alignment_xyz is None:
+            return sampled_normals
+        normals = np.asarray(sampled_normals, dtype=np.float32)
+        reference = np.asarray(row_axis_alignment_xyz, dtype=np.float64).reshape(-1)
+        if reference.shape != (3,):
+            return normals
+        reference_norm = float(np.linalg.norm(reference))
+        if not np.isfinite(reference_norm) or reference_norm <= 1.0e-12:
+            return normals
+        reference = reference / reference_norm
+        indices = np.asarray(line_window.original_line_indices, dtype=np.int64)
+        matches = np.flatnonzero(indices == int(row_axis_alignment_line_index))
+        if matches.size == 0:
+            return normals
+        local = np.asarray(normals[int(matches[0])], dtype=np.float64)
+        local_norm = float(np.linalg.norm(local))
+        if not np.isfinite(local_norm) or local_norm <= 1.0e-12:
+            return normals
+        if float(np.dot(local / local_norm, reference)) < 0.0:
+            return (-normals).astype(np.float32, copy=False)
+        return normals
+
+    @staticmethod
+    def _row_axis_at_xy(grid: FiberStripGridTorch, point_xy: np.ndarray) -> np.ndarray:
+        axes = _as_numpy_float32(grid.offset_axis_xyz)
+        point = np.asarray(point_xy, dtype=np.float32)
+        if point.shape != (2,):
+            return np.zeros(3, dtype=np.float32)
+        height, width = axes.shape[:2]
+        x = int(round(float(point[0])))
+        y = int(round(float(point[1])))
+        if x < 0 or y < 0 or x >= width or y >= height:
+            return np.zeros(3, dtype=np.float32)
+        axis = np.asarray(axes[y, x], dtype=np.float32)
+        norm = float(np.linalg.norm(axis))
+        if not np.isfinite(norm) or norm <= 1.0e-12:
+            return np.zeros(3, dtype=np.float32)
+        return (axis / np.float32(norm)).astype(np.float32, copy=False)
+
+    @classmethod
+    def _grid_row_axis_aligns_reference(
+        cls,
+        grid: FiberStripGridTorch,
+        line_window: FiberStripLineWindow,
+        *,
+        line_index: int,
+        reference_xyz: np.ndarray,
+        patch_shape_hw: tuple[int, int],
+        anchor_column_px: float,
+        pixel_spacing_base: float,
+    ) -> bool:
+        reference = np.asarray(reference_xyz, dtype=np.float64).reshape(-1)
+        if reference.shape != (3,):
+            return True
+        reference_norm = float(np.linalg.norm(reference))
+        if not np.isfinite(reference_norm) or reference_norm <= 1.0e-12:
+            return True
+        try:
+            point_xy = source_point_xy_for_line_index(
+                line_window,
+                original_line_index=int(line_index),
+                patch_shape_hw=patch_shape_hw,
+                anchor_column_px=anchor_column_px,
+                pixel_spacing_base=pixel_spacing_base,
+            )
+        except (IndexError, ValueError):
+            return True
+        axis = cls._row_axis_at_xy(grid, point_xy)
+        axis_norm = float(np.linalg.norm(axis))
+        if not np.isfinite(axis_norm) or axis_norm <= 1.0e-12:
+            return True
+        return float(np.dot(axis / axis_norm, reference / reference_norm)) >= 0.0
+
     def _unaugmented_centerline_coords(self, shape_hw: tuple[int, int]) -> np.ndarray:
         height, width = (int(v) for v in shape_hw)
         x = np.arange(width, dtype=np.float32)
@@ -2403,6 +2488,8 @@ class FiberStrip2DLoader:
         target_control_point_index: int | None = None,
         target_offset: int = 1,
         rf_margin_px: float = 0.0,
+        row_axis_alignment_line_index: int | None = None,
+        row_axis_alignment_xyz: np.ndarray | None = None,
         device: torch.device | None = None,
         sample_mode: str = "random",
     ) -> tuple[FiberStripSegmentSample, np.ndarray, np.ndarray]:
@@ -2454,21 +2541,6 @@ class FiberStrip2DLoader:
             margin_px=margin,
             pixel_spacing_base=record.volume_spacing_base,
         )
-        sampled_normals = self._lasagna_normals_for_line_window(
-            record,
-            line_window,
-            control_point_index=int(start_cp_index),
-        )
-        center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
-        grid = build_side_strip_patch_grid_tensor_from_line_window(
-            line_window,
-            patch_shape_hw=(height, width),
-            strip_z_offset=float(center_offset),
-            sampled_normals=sampled_normals,
-            pixel_spacing_base=record.volume_spacing_base,
-            anchor_column_px=start_col,
-            device=resolved_device,
-        )
         line_xy = source_line_xy_from_line_window(
             line_window,
             patch_shape_hw=(height, width),
@@ -2489,6 +2561,47 @@ class FiberStrip2DLoader:
             anchor_column_px=start_col,
             pixel_spacing_base=record.volume_spacing_base,
         )
+        sampled_normals = self._lasagna_normals_for_line_window(
+            record,
+            line_window,
+            control_point_index=int(start_cp_index),
+        )
+        sampled_normals = self._prealign_lasagna_normals_to_row_axis_reference(
+            sampled_normals,
+            line_window,
+            row_axis_alignment_line_index=row_axis_alignment_line_index,
+            row_axis_alignment_xyz=row_axis_alignment_xyz,
+        )
+        center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
+        def build_grid(normals: np.ndarray) -> FiberStripGridTorch:
+            return build_side_strip_patch_grid_tensor_from_line_window(
+                line_window,
+                patch_shape_hw=(height, width),
+                strip_z_offset=float(center_offset),
+                sampled_normals=normals,
+                pixel_spacing_base=record.volume_spacing_base,
+                anchor_column_px=start_col,
+                device=resolved_device,
+            )
+
+        grid = build_grid(sampled_normals)
+        if (
+            row_axis_alignment_line_index is not None
+            and row_axis_alignment_xyz is not None
+            and not self._grid_row_axis_aligns_reference(
+                grid,
+                line_window,
+                line_index=int(row_axis_alignment_line_index),
+                reference_xyz=row_axis_alignment_xyz,
+                patch_shape_hw=(height, width),
+                anchor_column_px=start_col,
+                pixel_spacing_base=record.volume_spacing_base,
+            )
+        ):
+            sampled_normals = (-np.asarray(sampled_normals, dtype=np.float32)).astype(np.float32, copy=False)
+            grid = build_grid(sampled_normals)
+        start_row_axis = self._row_axis_at_xy(grid, start_xy)
+        target_row_axis = self._row_axis_at_xy(grid, target_xy)
         coords_zyx = _as_numpy_float32(grid.coords_zyx)
         grid_valid = _as_numpy_bool(grid.valid_mask)
         result = record.sampler.sample_coords(coords_zyx, grid_valid)
@@ -2512,6 +2625,10 @@ class FiberStrip2DLoader:
             line_xy=line_xy,
             start_control_point_xy=start_xy.astype(np.float32, copy=False),
             target_control_point_xy=target_xy.astype(np.float32, copy=False),
+            line_point_indices=np.asarray(line_window.original_line_indices, dtype=np.int64),
+            line_normals_xyz=np.asarray(sampled_normals, dtype=np.float32),
+            start_row_axis_xyz=start_row_axis,
+            target_row_axis_xyz=target_row_axis,
         )
         return sample, image, valid_mask
 
@@ -2566,6 +2683,10 @@ class FiberStrip2DLoader:
             line_xy=_as_numpy_float32(line_xy),
             start_control_point_xy=_as_numpy_float32(start_xy),
             target_control_point_xy=_as_numpy_float32(target_xy),
+            line_point_indices=np.asarray(sample.line_point_indices, dtype=np.int64),
+            line_normals_xyz=np.asarray(sample.line_normals_xyz, dtype=np.float32),
+            start_row_axis_xyz=np.asarray(sample.start_row_axis_xyz, dtype=np.float32),
+            target_row_axis_xyz=np.asarray(sample.target_row_axis_xyz, dtype=np.float32),
         )
         return FiberStripTtaPatch(
             sample=tta_sample,
