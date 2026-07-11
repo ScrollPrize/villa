@@ -1,15 +1,18 @@
-# Bidirectional Trace2CP Status
+# Coordinate-Space Geometric TTA Status
 
 - [x] Capture current user task in `planning/task.md`.
 - [x] Create focused task plan.
-- [x] Review task plan against `planning/specs.md`, `planning/plan.md`, and
+- [ ] Review task plan against `planning/specs.md`, `planning/plan.md`, and
   `planning/task.md`.
-- [x] Implement bidirectional Trace2CP tracing, scoring, and visualization.
-- [x] Add focused regression tests.
-- [x] Update specs, docs, changelog, and task log.
-- [x] Compile-check changed Python.
-- [x] Run focused fiber-trace tests.
+- [ ] Delete all image-space geometric augmentation functions from
+  `fiber_trace_2d`.
+- [ ] Implement coordinate-space Trace2CP TTA sampling from oversized coord
+  strips.
+- [ ] Add `--vis-tta` debug output.
+- [ ] Add focused regression tests.
+- [ ] Update specs, docs, changelog, and task log with implementation results.
+- [ ] Compile-check changed Python.
+- [ ] Run focused fiber-trace tests.
 
-Result: `--trace2cp-vis` now traces start-to-target and target-to-start on the
-same segment strip, draws both traces, and reports `trace2cp_score` as the
-average of the two directional normalized scores.
+Result: planning is complete; no implementation changes have been made for this
+task yet.
