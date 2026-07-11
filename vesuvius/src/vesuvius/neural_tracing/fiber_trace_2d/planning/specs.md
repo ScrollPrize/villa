@@ -274,9 +274,11 @@
   CP-neighborhood embedding samples from the same fiber and target cosine
   similarity `1`. Negative terms compare each CP-neighborhood embedding sample
   with one deterministic valid non-CP pixel from the batch and penalize cosine
-  similarity above `training.contrastive_negative_margin`. Positive and
-  negative means are averaged equally, then multiplied by
-  `training.contrastive_weight`.
+  similarity above `training.contrastive_negative_margin`. Negative candidates
+  are restricted to the CP-neighborhood reachable rectangle implied by the
+  configured output-space `augment_shift_x/y` bounds; unreachable patch edges
+  are ignored, not supervised as negatives. Positive and negative means are
+  averaged equally, then multiplied by `training.contrastive_weight`.
 - Contrastive embedding visualization writes TensorBoard similarity maps:
   per-pixel cosine similarity against the selected patch's CP embedding is
   mapped from `[-1, 1]` to `[0, 255]` with invalid pixels black.

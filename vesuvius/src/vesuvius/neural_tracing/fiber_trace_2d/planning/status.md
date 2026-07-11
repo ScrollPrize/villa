@@ -1,12 +1,10 @@
 # Status
 
-- [x] Read todo, specs, docs, and current training/model/loader paths
-- [x] Create task.md from the todo item
-- [x] Create task_plan.md
-- [x] Review task_plan.md against task/specs/plan with no scope deviations
-- [x] Implement configurable embedding head and output slicing
-- [x] Implement grouped same-fiber contrastive batch loading
-- [x] Implement cosine contrastive loss and visualization
-- [x] Update docs/specs/changelog
-- [x] Add focused tests
-- [x] Run validation
+- [x] Read task and relevant specs/docs/code
+- [x] Write task plan
+- [x] Review task plan against current specs and task
+- [x] Implement reachable-region masking for contrastive negatives
+- [x] Update docs/spec/changelog
+- [x] Add regression test
+- [x] Run focused tests
+- [x] Record validation in task log

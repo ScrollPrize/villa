@@ -1,11 +1,11 @@
-# Contrastive Embedding With Cosine Similarity
+# Task
 
-Implement the todo item "contrastive embedding using cosine similarity":
+Fix contrastive embedding negative supervision so edge pixels that cannot host
+CP-local positive samples under the configured shift augmentation are not sampled
+as negatives.
 
-- change CP sampling for training so each contrastive batch uses `N` CPs from the same fiber repeated `M` times to fill the batch;
-- add a simple embedding head and cosine-similarity contrastive loss;
-- positive supervision compares CP-neighborhood pixels from the same fiber;
-- negative supervision compares CP-neighborhood pixels to other valid pixels from the batch with balanced positive/negative weighting;
-- keep direction supervision active;
-- visualize per-pixel embedding similarity against the patch CP embedding in TensorBoard;
-- keep geometric augmentations independent across repeated fiber patches and synchronize value/image augmentations for contrastive groups.
+The negative loss currently treats every valid non-CP pixel as an explicit
+negative. Because positives only occur in the CP-neighborhood reachable region,
+this teaches the embedding head that unreachable patch edges are always
+negative. Instead, negative candidates must also be restricted to the reachable
+CP-neighborhood region implied by the configured output-space shift range.

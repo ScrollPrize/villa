@@ -31,6 +31,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.direction import (
 from vesuvius.neural_tracing.fiber_trace_2d.embedding import (
     ContrastiveEmbeddingMetrics,
     contrastive_embedding_loss,
+    contrastive_negative_reachable_mask,
     embedding_similarity_to_cp,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.loader import FiberStrip2DBatch, FiberStrip2DLoader, SamplerFactory, load_config
@@ -170,6 +171,17 @@ def _validate_training_batch_config(training: FiberStripTrainingConfig, loader_c
             "because training loads one control-point batch per step: "
             f"control_points_per_step={control_points} batch_size={loader_batch_size}"
         )
+
+
+def _contrastive_negative_candidate_mask(loader_config: Any) -> np.ndarray:
+    shift_x = float(loader_config.augment.shift_x) if bool(loader_config.augment.enabled) else 0.0
+    shift_y = float(loader_config.augment.shift_y) if bool(loader_config.augment.enabled) else 0.0
+    return contrastive_negative_reachable_mask(
+        tuple(int(v) for v in loader_config.patch_shape_hw),
+        shift_x=shift_x,
+        shift_y=shift_y,
+        neighborhood_radius=1,
+    )
 
 
 def _load_raw_config(path: str | Path) -> dict[str, Any]:
@@ -701,6 +713,7 @@ def _compute_batch_loss(
     *,
     device: torch.device,
     training: FiberStripTrainingConfig | None = None,
+    contrastive_negative_mask: np.ndarray | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, DirectionSupervision, _DirectionMetrics]:
     images_np, valid_np = _flatten_batch(batch)
     images = _prepare_images(images_np, valid_np, device=device)
@@ -718,6 +731,7 @@ def _compute_batch_loss(
             valid_np,
             weight=training.contrastive_weight,
             negative_margin=training.contrastive_negative_margin,
+            negative_candidate_mask=contrastive_negative_mask,
         )
         loss = loss + contrastive
     angle_error = direction_angle_error_degrees(direction, supervision)
@@ -737,6 +751,7 @@ def _compute_prepared_batch_loss(
     model: FiberStripDirectionNet,
     prepared: _PreparedTrainingBatch,
     training: FiberStripTrainingConfig | None = None,
+    contrastive_negative_mask: np.ndarray | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, DirectionSupervision, _DirectionMetrics]:
     outputs = model(prepared.images)
     direction = direction_output(outputs)
@@ -751,6 +766,7 @@ def _compute_prepared_batch_loss(
             prepared.valid_np,
             weight=training.contrastive_weight,
             negative_margin=training.contrastive_negative_margin,
+            negative_candidate_mask=contrastive_negative_mask,
         )
         loss = loss + contrastive
     angle_error = direction_angle_error_degrees(direction, prepared.supervision)
@@ -926,6 +942,11 @@ def run_benchmark(
     training = _training_config_from_raw(raw_config)
     loader_config = load_config(config_path)
     _validate_training_batch_config(training, loader_config)
+    contrastive_negative_mask = (
+        _contrastive_negative_candidate_mask(loader_config)
+        if bool(training.contrastive_enabled) and float(training.contrastive_weight) > 0.0
+        else None
+    )
     loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
     device = resolve_torch_device(training.device)
     model: FiberStripDirectionNet | None = None
@@ -1053,6 +1074,7 @@ def run_benchmark(
                         prepared.valid_np,
                         weight=training.contrastive_weight,
                         negative_margin=training.contrastive_negative_margin,
+                        negative_candidate_mask=contrastive_negative_mask,
                     )
                     loss = loss + contrastive
                 _sync_device(device)
@@ -1527,6 +1549,11 @@ def run_training(
     resume_path = _resolve_resume_checkpoint(resume_checkpoint)
     loader_config = load_config(config_path)
     _validate_training_batch_config(training, loader_config)
+    contrastive_negative_mask = (
+        _contrastive_negative_candidate_mask(loader_config)
+        if bool(training.contrastive_enabled) and float(training.contrastive_weight) > 0.0
+        else None
+    )
     loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
     test_loader_config = _test_loader_config_from_raw(raw_config, loader_config)
     test_loader = (
@@ -1652,7 +1679,12 @@ def run_training(
             model.train()
             train_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
-            loss, outputs, supervision, metrics = _compute_prepared_batch_loss(model, prepared, training)
+            loss, outputs, supervision, metrics = _compute_prepared_batch_loss(
+                model,
+                prepared,
+                training,
+                contrastive_negative_mask=contrastive_negative_mask,
+            )
             loss.backward()
             optimizer.step()
             _sync_device(device)

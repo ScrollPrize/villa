@@ -35,7 +35,10 @@ from vesuvius.neural_tracing.fiber_trace_2d.direction import (
     direction_angle_error_degrees,
     encode_lasagna_direction_xy,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.embedding import contrastive_embedding_loss
+from vesuvius.neural_tracing.fiber_trace_2d.embedding import (
+    contrastive_embedding_loss,
+    contrastive_negative_reachable_mask,
+)
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace_2d.loader import (
     FiberStrip2DLoader,
@@ -3494,6 +3497,52 @@ def test_contrastive_embedding_loss_balances_positive_and_negative_terms() -> No
     assert metrics.loss == pytest.approx(1.0)
     assert metrics.positive_samples == 2
     assert metrics.negative_samples == 2
+
+
+def test_contrastive_embedding_loss_ignores_unreachable_edge_negatives() -> None:
+    output = torch.zeros((2, 4, 5, 5), dtype=torch.float32)
+    output[:, 2, :, :] = 1.0
+    reachable = contrastive_negative_reachable_mask((5, 5), shift_x=0.0, shift_y=0.0)
+    output[:, 2, reachable] = 0.0
+    output[:, 3, reachable] = 1.0
+    output[:, 2, 2, 2] = 1.0
+    output[:, 3, 2, 2] = 0.0
+    supervision = DirectionSupervision(
+        patch_indices=torch.tensor([0, 1], dtype=torch.long),
+        y=torch.tensor([2, 2], dtype=torch.long),
+        x=torch.tensor([2, 2], dtype=torch.long),
+        target=torch.zeros((2, 2), dtype=torch.float32),
+        cp_xy=torch.zeros((2, 2), dtype=torch.float32),
+        tangent_xy=torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
+    )
+    samples = (
+        SimpleNamespace(fiber_path="fiber-a", record_index=0),
+        SimpleNamespace(fiber_path="fiber-a", record_index=0),
+    )
+    valid = np.ones((2, 5, 5), dtype=bool)
+
+    _, unmasked_metrics = contrastive_embedding_loss(
+        output,
+        supervision,
+        samples,  # type: ignore[arg-type]
+        valid,
+        weight=1.0,
+        negative_margin=0.0,
+    )
+    loss, masked_metrics = contrastive_embedding_loss(
+        output,
+        supervision,
+        samples,  # type: ignore[arg-type]
+        valid,
+        weight=1.0,
+        negative_margin=0.0,
+        negative_candidate_mask=reachable,
+    )
+
+    assert unmasked_metrics.negative_loss > 0.0
+    assert float(loss.detach().item()) == pytest.approx(0.0)
+    assert masked_metrics.negative_loss == pytest.approx(0.0)
+    assert masked_metrics.negative_samples == 2
 
 
 def test_training_batch_assembly_default_patch_count_is_64(tmp_path: Path) -> None:

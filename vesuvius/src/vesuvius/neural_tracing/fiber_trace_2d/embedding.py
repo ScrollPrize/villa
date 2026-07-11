@@ -21,6 +21,33 @@ class ContrastiveEmbeddingMetrics:
     negative_samples: int
 
 
+def contrastive_negative_reachable_mask(
+    shape_hw: tuple[int, int],
+    *,
+    shift_x: float,
+    shift_y: float,
+    neighborhood_radius: int = 1,
+) -> np.ndarray:
+    height, width = (int(v) for v in shape_hw)
+    if height <= 0 or width <= 0:
+        raise ValueError(f"shape_hw must contain positive dimensions, got {shape_hw}")
+    sx = float(shift_x)
+    sy = float(shift_y)
+    if not np.isfinite(sx) or not np.isfinite(sy):
+        raise ValueError("contrastive negative reachable shift must be finite")
+    radius = max(0, int(neighborhood_radius))
+    center_x = (float(width) - 1.0) * 0.5
+    center_y = (float(height) - 1.0) * 0.5
+    x0 = max(0, int(np.floor(center_x - abs(sx) - float(radius))))
+    x1 = min(width - 1, int(np.ceil(center_x + abs(sx) + float(radius))))
+    y0 = max(0, int(np.floor(center_y - abs(sy) - float(radius))))
+    y1 = min(height - 1, int(np.ceil(center_y + abs(sy) + float(radius))))
+    mask = np.zeros((height, width), dtype=bool)
+    if x0 <= x1 and y0 <= y1:
+        mask[y0 : y1 + 1, x0 : x1 + 1] = True
+    return mask
+
+
 def _sample_fiber_ids(
     samples: Sequence[FiberStripSample],
     patch_indices: torch.Tensor,
@@ -45,6 +72,7 @@ def contrastive_embedding_loss(
     *,
     weight: float,
     negative_margin: float = 0.0,
+    negative_candidate_mask: np.ndarray | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ContrastiveEmbeddingMetrics]:
     embeddings = embedding_output(model_output)
     if int(embeddings.shape[1]) <= 0:
@@ -83,7 +111,20 @@ def contrastive_embedding_loss(
         raise ValueError("valid_mask shape must match model output spatial shape")
     cp_mask = torch.zeros_like(valid, dtype=torch.bool)
     cp_mask[patch_indices, ys, xs] = True
-    negative_flat = torch.nonzero((valid & ~cp_mask).reshape(-1), as_tuple=False).flatten()
+    candidate = valid & ~cp_mask
+    if negative_candidate_mask is not None:
+        reachable = torch.as_tensor(negative_candidate_mask, dtype=torch.bool, device=device)
+        if reachable.ndim == 2:
+            if tuple(int(v) for v in reachable.shape) != tuple(int(v) for v in valid.shape[1:]):
+                raise ValueError("2D negative_candidate_mask shape must match model output spatial shape")
+            reachable = reachable.unsqueeze(0)
+        elif reachable.ndim == 3:
+            if tuple(int(v) for v in reachable.shape) != tuple(int(v) for v in valid.shape):
+                raise ValueError("3D negative_candidate_mask shape must match valid_mask shape")
+        else:
+            raise ValueError("negative_candidate_mask must have shape H,W or N,H,W")
+        candidate = candidate & reachable
+    negative_flat = torch.nonzero(candidate.reshape(-1), as_tuple=False).flatten()
     if int(negative_flat.numel()) == 0:
         negative_loss = positive.new_tensor(0.0)
         negative_count = 0

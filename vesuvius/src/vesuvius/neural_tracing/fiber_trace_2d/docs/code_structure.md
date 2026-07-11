@@ -370,8 +370,10 @@ The important behavior is:
   uses the loader's same-fiber grouped batch path, and adds a cosine embedding
   loss. Positive terms compare CP-neighborhood embeddings from the same fiber;
   negative terms compare each positive to one deterministic valid non-CP pixel
-  from the batch. The positive and negative means are balanced before applying
-  `training.contrastive_weight`.
+  from the batch inside the CP-neighborhood reachable region derived from
+  `augment_shift_x/y`, so unreachable patch edges are ignored rather than
+  trained as always-negative. The positive and negative means are balanced
+  before applying `training.contrastive_weight`.
 - Logs `train/loss_total`, `train/loss_direction`,
   `train/loss_contrastive`, positive/negative contrastive components, and
   TensorBoard embedding-similarity images that compare every pixel in a
