@@ -1,27 +1,51 @@
-# Load-Only Parallelism Diagnostics Plan
+# Whole-Batch Loader Parallelization Plan
 
 ## Implementation
 
-- Add per-batch `time.process_time()` measurement around the benchmark batch
-  body.
-- Print process CPU milliseconds per patch and a process CPU factor
-  (`cpu_time / batch_wall_time`) in profile rows.
-- Keep the existing loader `work / wall` factor so synthetic worker timing and
-  actual process CPU usage can be compared directly.
-- Include process CPU time and factor in the profile summary.
+- Route `run_benchmark(..., load_only=True)` through `_TrainingBatchPipeline`
+  when `training.pipeline_enabled` is true.
+- Keep `_TrainingBatchPipeline` consumption ordered by step number and preserve
+  `_load_training_batch` as the only batch-construction entrypoint.
+- Keep normal pipeline workers on the shared base loader/sampler path by
+  default; set `training.pipeline_isolated_loaders=false`.
+- Keep isolated worker-local VC3D samplers available as an opt-in path, but
+  build them from shared parsed records and shared deterministic order caches
+  instead of rediscovering fibers/manifests.
+- Add optional `volume_cache_memory_mib` and `volume_io_threads` wiring to the
+  VC3D sampler factory. `volume_cache_memory_mib: null` leaves VC3D's default
+  cache behavior intact; positive values cap each VC3D sampler cache.
+- Reduce deterministic batch lookahead from `batch_size * 100` to a bounded
+  `max(batch_size * 4, batch_size + 1000)` window to avoid excessive random
+  order/cache bookkeeping.
+- Update `loader_example.json` to the measured best current shape:
+  `loader_workers=4`, `pipeline_depth=16`, `pipeline_workers=4`,
+  `pipeline_isolated_loaders=false`, `volume_cache_memory_mib=null`.
+- Ensure profile rows keep reporting `pipeline_wait`, process CPU factor, and
+  loader worker factor.
 
 ## Spec Update
 
-- Document that benchmark/profile output includes both summed loader worker
-  timing and real process CPU timing, and that only process CPU factor should be
-  used to compare against system CPU utilization.
+- Clarify that `--load-only` uses the same bounded whole-batch queue as CUDA
+  training when `training.pipeline_enabled` is true.
+- Clarify the intended defaults: queue depth 16 and 8 whole-batch loader
+  workers.
+- Document `training.pipeline_isolated_loaders`, `volume_cache_memory_mib`, and
+  `volume_io_threads`.
+- Document that the tuned example config uses 4 whole-batch workers plus 4
+  CP-prep workers because that measured faster than 8 independent whole-batch
+  workers or isolated samplers on the current Staticsheep workload.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` profiling description.
-- Keep `planning/task_log.md` limited to this diagnostic task.
+- Update `planning/local_development.md` if the benchmark command or expected
+  interpretation changes.
+- Update `docs/code_structure.md` if the profile-column meaning changes.
+- Keep `planning/task_log.md` scoped to this task.
 
 ## Testing
 
 - Compile-check `train.py`.
-- Run the load-only profile benchmark with the existing command family.
+- Run the focused loader tests.
+- Run the established load-only profile benchmark command and compare
+  throughput/process CPU factor against the previous baseline.
+- Record tested worker-shape regressions in `planning/task_log.md`.

@@ -770,6 +770,49 @@ def test_config_loader_workers_accepts_single_worker_debug_mode(tmp_path: Path) 
     assert parsed.loader_workers == 1
 
 
+def test_config_parses_vc3d_cache_budget_and_io_threads(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["volume_cache_memory_mib"] = 500
+    config["volume_io_threads"] = 3
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    parsed = load_config(config_path)
+
+    assert parsed.volume_cache_memory_mib == 500.0
+    assert parsed.volume_cache_memory_bytes == 500 * 1024 * 1024
+    assert parsed.volume_io_threads == 3
+
+
+def test_loader_clone_reuses_records_but_refreshes_samplers(tmp_path: Path) -> None:
+    created_samplers: list[_RecordingCoordinateSampler] = []
+
+    def factory(**kwargs):
+        sampler = _RecordingCoordinateSampler(
+            kwargs["array"],
+            level_spacing_base=kwargs["level_spacing_base"],
+        )
+        created_samplers.append(sampler)
+        return sampler
+
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["volume_cache_memory_mib"] = 500
+    raw["volume_io_threads"] = 2
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
+
+    clone = loader.clone()
+
+    assert len(created_samplers) == 2
+    assert clone.records[0].fiber is loader.records[0].fiber
+    assert clone.records[0].volume is loader.records[0].volume
+    assert clone.records[0].grad_mag is loader.records[0].grad_mag
+    assert clone.records[0].sampler is not loader.records[0].sampler
+    assert clone._sample_identity_keys is loader._sample_identity_keys
+    assert clone._random_pass_cache is loader._random_pass_cache
+
+
 def test_numpy_sampler_batch_loading_matches_repeated_patch_loading(tmp_path: Path) -> None:
     array = zarr.open(str(_write_zarr(tmp_path / "vol.zarr") / "0"), mode="r")
     sampler = NumpyZarrCoordinateSampler(array, level_spacing_base=1.0)

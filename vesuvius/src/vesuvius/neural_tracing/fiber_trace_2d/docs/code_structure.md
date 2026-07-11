@@ -272,7 +272,10 @@ The important behavior is:
 - Supports `--load-only` on the benchmark path. It still performs deterministic
   CP selection, CP-local source construction, coordinate augmentation, and
   base-volume sampling, but skips value/image augmentation, normalization,
-  supervision construction, model forward, backward, and optimizer work.
+  supervision construction, model forward, backward, and optimizer work. When
+  `training.pipeline_enabled` is true, load-only benchmark mode also uses the
+  bounded whole-batch queue so independent batch-load parallelism can be
+  measured without model work.
 - Flattens `[control_point_sample, strip_z_offset]` into one patch batch for the
   model.
 - Computes direction targets from transformed line coordinates after geometric
@@ -281,7 +284,8 @@ The important behavior is:
   `training.pipeline_enabled` is true. Background workers build exact training
   steps with `FiberStrip2DLoader.load_batch`, defer image/value augmentation,
   prepare tensors on side CUDA streams, and return prepared batches for strict
-  in-order forward/backward consumption.
+  in-order forward/backward consumption. Load-only benchmark mode uses the
+  same whole-batch queue without CUDA preparation.
   Coordinate generation and geometric coordinate augmentation remain on the
   configured `augment_device`.
 - `training.pipeline_depth` controls queued future batches.
@@ -299,8 +303,10 @@ The important behavior is:
 - Example local Staticsheep config using:
   - PHercParis4 78keV masked base volume through the public Vesuvius S3 path;
   - local Lasagna manifest;
-  - 128x128 strips;
-  - 16 strip-z offsets;
+  - 64x64 strips;
+  - one strip-z offset for CP-only training experiments;
+  - measured load-only tuning with 4 whole-batch workers, queue depth 16, and
+    4 CP-prep workers;
   - current augmentation extrema.
 
 ## Config Shape
@@ -328,6 +334,12 @@ Top-level keys used by `load_config`:
   `FiberStrip2DLoader.close()` to shut it down explicitly in long-lived tools or
   tests.
 - `volume_cache_dir`: optional cache directory for remote volume chunks.
+- `volume_cache_memory_mib`: optional per-VC3D-sampler decoded/hot cache budget
+  in MiB. `null` or omission leaves VC3D's default behavior intact. Use a
+  positive cap mainly when `training.pipeline_isolated_loaders` is enabled and
+  each worker creates its own VC3D sampler.
+- `volume_io_threads`: optional positive VC3D I/O thread count, forwarded to
+  the VC3D volume binding when available.
 - `volume_cache_offline`: passed to the Vesuvius Zarr cache opener.
 - `volume_cache_retry_seconds`: passed to the Vesuvius Zarr cache opener.
 - `strip_coord_cache_dir`: optional disk cache for CP-local source strip
@@ -361,12 +373,17 @@ Training keys:
   any default-shape warning.
 - `device`: `auto`, `cpu`, or a torch device string.
 - `tensorboard_enabled`: set false for smoke tests without TensorBoard.
-- `pipeline_enabled`: enables CUDA training batch pipelining; default `true`.
-  CPU training keeps the synchronous path.
-- `pipeline_depth`: queued whole-batch futures for the CUDA training pipeline;
-  default `8`.
-- `pipeline_workers`: concurrent whole-batch loader calls for the CUDA training
-  pipeline. Default `4`; `0` means use `pipeline_depth`.
+- `pipeline_enabled`: enables CUDA training batch pipelining and load-only
+  benchmark batch pipelining; default `true`. CPU training keeps the
+  synchronous path.
+- `pipeline_depth`: queued whole-batch futures for the pipeline; default `16`.
+- `pipeline_workers`: concurrent whole-batch loader calls for the pipeline.
+  Default `8`; `0` means use `pipeline_depth`.
+- `pipeline_isolated_loaders`: default `false`. The normal path shares the base
+  loader and VC3D sampler/cache across whole-batch futures. `true` gives each
+  pipeline worker a cloned loader with shared parsed records/order cache but a
+  fresh VC3D sampler; combine this with `volume_cache_memory_mib` if the clone
+  path is required.
 - `model_hidden_channels` and `model_depth`: V0 ResNet size knobs. Defaults
   are 64 hidden channels and 10 residual blocks.
 
@@ -589,6 +606,10 @@ Results are consumed by raw deterministic sample index, so changing
 The parallel path reuses one loader-owned executor across batches instead of
 creating and destroying a thread pool per training step. `loader_workers=1`
 uses a direct serial path with no futures.
+Whole-batch training and load-only benchmark pipelines can run several
+`load_batch` calls concurrently. The default path shares loaded records and the
+VC3D sampler/cache; isolated loader clones are opt-in and only duplicate the
+mutable sampler handles, not fiber or Lasagna metadata.
 In benchmark/profile output, `total` is batch wall time, `cpu` is whole-process
 CPU time measured with `time.process_time()`, and `ctf` is `cpu / total`.
 Compare `ctf` to system CPU-utilization monitors when checking whether the
@@ -617,6 +638,11 @@ overlap stages active:
 preparation work is represented by `prep_ms` and, on CUDA, `prep_gpu_ms`.
 Training prints the effective pipeline enable flag, queue depth, whole-batch
 loader worker count, and CP-level loader worker count once at startup.
+
+In load-only benchmark mode, the same whole-batch queue is used when
+`training.pipeline_enabled` is true, but workers stop after
+`FiberStrip2DLoader.load_batch`. This isolates whether independent batch loads
+can keep CPU/I/O resources busy before adding CUDA preparation or model work.
 
 This training-only prepared-batch path avoids the runner/debug
 `apply_batch_image_augmentation()` NumPy round trip. It also requests only the

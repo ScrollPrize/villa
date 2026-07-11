@@ -2,6 +2,9 @@
 
 ## 2026-07-10
 
+- Tuned the 2D fiber-strip load-only pipeline to use shared-loader whole-batch
+  futures plus bounded CP-prep workers, added optional VC3D sampler cache/I/O
+  controls, and documented measured loader throughput variants.
 - Added real process CPU timing to the 2D fiber-trace benchmark/profile table
   so loader summed-worker timing can be compared against actual CPU usage.
 - Parallelized the 2D CUDA training load+prepare path by submitting exact training steps to concurrent workers, added one-offset strip-cache and CP-tangent/no-coordinate-retention fast paths, and documented measured throughput limits.

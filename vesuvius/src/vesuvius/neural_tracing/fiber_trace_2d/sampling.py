@@ -94,6 +94,8 @@ class Vc3dCoordinateSampler(CoordinateSampler):
         *,
         level: int,
         cache_root: str | None,
+        cache_budget_bytes: int | None = None,
+        io_threads: int | None = None,
         sampling: str = "trilinear",
         blocking: bool = True,
     ) -> None:
@@ -113,6 +115,26 @@ class Vc3dCoordinateSampler(CoordinateSampler):
             self.volume = Volume.open_url(path, "" if cache_root is None else str(cache_root))
         else:
             self.volume = Volume.open(path)
+        if cache_budget_bytes is not None:
+            budget = int(cache_budget_bytes)
+            if budget <= 0:
+                raise ValueError("cache_budget_bytes must be positive when provided")
+            set_cache_budget = getattr(self.volume, "set_cache_budget", None)
+            if set_cache_budget is None:
+                raise RuntimeError(
+                    "VC3D volume binding does not expose set_cache_budget; rebuild volume-cartographer"
+                )
+            set_cache_budget(budget)
+        if io_threads is not None:
+            threads = int(io_threads)
+            if threads <= 0:
+                raise ValueError("io_threads must be positive when provided")
+            set_io_threads = getattr(self.volume, "set_io_threads", None)
+            if set_io_threads is None:
+                raise RuntimeError(
+                    "VC3D volume binding does not expose set_io_threads; rebuild volume-cartographer"
+                )
+            set_io_threads(threads)
 
     @property
     def store_identity(self) -> str:
@@ -235,6 +257,14 @@ def make_coordinate_sampler(
     level: int,
     level_spacing_base: float,
     cache_root: str | None,
+    cache_budget_bytes: int | None = None,
+    io_threads: int | None = None,
 ) -> CoordinateSampler:
     del array, level_spacing_base
-    return Vc3dCoordinateSampler(volume_path, level=level, cache_root=cache_root)
+    return Vc3dCoordinateSampler(
+        volume_path,
+        level=level,
+        cache_root=cache_root,
+        cache_budget_bytes=cache_budget_bytes,
+        io_threads=io_threads,
+    )

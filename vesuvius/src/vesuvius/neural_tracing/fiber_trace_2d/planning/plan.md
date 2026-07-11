@@ -59,6 +59,12 @@ a pretraining stage that does not require control points at all - but does benef
     - gt_mod is initialized as gt
     - at each training step we adjust gt_mod towards the inferered direction (by some small step - lets do 1 degree for now)
     - vis additionaly the gt_mod as another short line (slightly longer than model output and behind it - and diff color of course)
+    - the rotation we apply is to the whole line as a rotation (in 2d) centered on the cp
+    - per sample we store the current gt_mod rotation - so it will always be applied after loading the line and before applying the geometric augmentations
+    - dir supervision of gt and gt mod should then for both different losses by calculated from the transformed lines (after augmenations) - this should already be the case?
+    - this should also support working together with multiple per-patch cp:
+        - if strip_z_offset_count is > 1 then we avg the angle offset of each result vs gt_mod so we get a cleaner correction signal
+        - we specifically also suport strip_z_offset_step of 0.0 so we get multiple agumentations of the exact same cp without any z offset
         
 # V1 - short refinement self-supervision
 

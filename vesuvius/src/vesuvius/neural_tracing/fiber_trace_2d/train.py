@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -53,8 +54,9 @@ class FiberStripTrainingConfig:
     model_hidden_channels: int = 64
     model_depth: int = 10
     pipeline_enabled: bool = True
-    pipeline_depth: int = 8
-    pipeline_workers: int = 4
+    pipeline_depth: int = 16
+    pipeline_workers: int = 8
+    pipeline_isolated_loaders: bool = False
 
 
 def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
@@ -85,8 +87,9 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         model_hidden_channels=max(1, int(get("model_hidden_channels", 64))),
         model_depth=max(1, int(get("model_depth", 10))),
         pipeline_enabled=bool(get("pipeline_enabled", True)),
-        pipeline_depth=max(1, int(get("pipeline_depth", 8))),
-        pipeline_workers=max(0, int(get("pipeline_workers", 4))),
+        pipeline_depth=max(1, int(get("pipeline_depth", 16))),
+        pipeline_workers=max(0, int(get("pipeline_workers", 8))),
+        pipeline_isolated_loaders=bool(get("pipeline_isolated_loaders", False)),
     )
     if config.max_steps < 0:
         raise ValueError("training.max_steps must be >= 0")
@@ -243,6 +246,34 @@ class _LoadedTrainingBatch:
     load_ms: float
 
 
+class _PipelineLoaderProvider:
+    def __init__(self, loader: FiberStrip2DLoader, *, isolated: bool) -> None:
+        self.base_loader = loader
+        self.isolated = bool(isolated)
+        self.local = threading.local()
+        self.lock = threading.Lock()
+        self.clones: list[FiberStrip2DLoader] = []
+
+    def get(self) -> FiberStrip2DLoader:
+        if not self.isolated or not hasattr(self.base_loader, "clone"):
+            return self.base_loader
+        loader = getattr(self.local, "loader", None)
+        if isinstance(loader, FiberStrip2DLoader):
+            return loader
+        loader = self.base_loader.clone()
+        self.local.loader = loader
+        with self.lock:
+            self.clones.append(loader)
+        return loader
+
+    def close(self) -> None:
+        with self.lock:
+            clones = list(self.clones)
+            self.clones.clear()
+        for loader in clones:
+            loader.close()
+
+
 @dataclass(frozen=True)
 class _PreparedTrainingBatch:
     loaded: _LoadedTrainingBatch
@@ -325,7 +356,7 @@ def _wait_for_prepared_batch(prepared: _PreparedTrainingBatch, *, device: torch.
 
 
 def _load_and_prepare_training_step(
-    loader: FiberStrip2DLoader,
+    loader_provider: _PipelineLoaderProvider,
     training: FiberStripTrainingConfig,
     *,
     step: int,
@@ -336,7 +367,7 @@ def _load_and_prepare_training_step(
     stream: torch.cuda.Stream,
 ) -> _PreparedTrainingBatch:
     loaded = _load_training_batch(
-        loader,
+        loader_provider.get(),
         training,
         step=step,
         sample_mode=sample_mode,
@@ -349,6 +380,25 @@ def _load_and_prepare_training_step(
         stream=stream,
     )
     return prepared
+
+
+def _load_training_batch_from_provider(
+    loader_provider: _PipelineLoaderProvider,
+    training: FiberStripTrainingConfig,
+    *,
+    step: int,
+    sample_mode: str,
+    profile_enabled: bool,
+    apply_image_augmentation: bool,
+) -> _LoadedTrainingBatch:
+    return _load_training_batch(
+        loader_provider.get(),
+        training,
+        step=step,
+        sample_mode=sample_mode,
+        profile_enabled=profile_enabled,
+        apply_image_augmentation=apply_image_augmentation,
+    )
 
 
 class _CudaPreparedBatchPipeline:
@@ -367,6 +417,10 @@ class _CudaPreparedBatchPipeline:
         if device.type != "cuda":
             raise ValueError("_CudaPreparedBatchPipeline requires a CUDA device")
         self.loader = loader
+        self.loader_provider = _PipelineLoaderProvider(
+            loader,
+            isolated=bool(training.pipeline_isolated_loaders),
+        )
         self.training = training
         self.device = device
         self.sample_mode = sample_mode
@@ -397,7 +451,7 @@ class _CudaPreparedBatchPipeline:
             stream = self.streams[(step - 1) % len(self.streams)]
             self.pending[step] = self.executor.submit(
                 _load_and_prepare_training_step,
-                self.loader,
+                self.loader_provider,
                 self.training,
                 step=step,
                 sample_mode=self.sample_mode,
@@ -432,6 +486,7 @@ class _CudaPreparedBatchPipeline:
         for future in self.pending.values():
             future.cancel()
         self.executor.shutdown(wait=True, cancel_futures=True)
+        self.loader_provider.close()
         self.pending.clear()
 
 
@@ -484,6 +539,10 @@ class _TrainingBatchPipeline:
         apply_image_augmentation: bool,
     ) -> None:
         self.loader = loader
+        self.loader_provider = _PipelineLoaderProvider(
+            loader,
+            isolated=bool(training.pipeline_isolated_loaders),
+        )
         self.training = training
         self.sample_mode = sample_mode
         self.next_submit_step = int(start_step)
@@ -510,8 +569,8 @@ class _TrainingBatchPipeline:
             step = self.next_submit_step
             self.next_submit_step += 1
             self.pending[step] = self.executor.submit(
-                _load_training_batch,
-                self.loader,
+                _load_training_batch_from_provider,
+                self.loader_provider,
                 self.training,
                 step=step,
                 sample_mode=self.sample_mode,
@@ -544,6 +603,7 @@ class _TrainingBatchPipeline:
         for future in self.pending.values():
             future.cancel()
         self.executor.shutdown(wait=True, cancel_futures=True)
+        self.loader_provider.close()
         self.pending.clear()
 
     def __enter__(self) -> "_TrainingBatchPipeline":
@@ -788,14 +848,25 @@ def run_benchmark(
 
     _sync_device(device)
     wall_start = time.perf_counter()
-    use_pipeline = bool(training.pipeline_enabled and not load_only and device.type == "cuda")
+    use_prep_pipeline = bool(training.pipeline_enabled and not load_only and device.type == "cuda")
+    use_load_pipeline = bool(training.pipeline_enabled and load_only)
     pipeline: _TrainingBatchPipeline | None = None
     prep_pipeline: _CudaPreparedBatchPipeline | None = None
-    if use_pipeline:
+    if use_prep_pipeline:
         prep_pipeline = _CudaPreparedBatchPipeline(
             loader,
             training,
             device=device,
+            sample_mode=sample_mode,
+            start_step=1,
+            max_step=total_batches,
+            profile_enabled=profile,
+            apply_image_augmentation=False,
+        )
+    elif use_load_pipeline:
+        pipeline = _TrainingBatchPipeline(
+            loader,
+            training,
             sample_mode=sample_mode,
             start_step=1,
             max_step=total_batches,
@@ -1150,7 +1221,9 @@ def run_training(
         "fiber_trace_2d train pipeline "
         f"enabled={bool(training.pipeline_enabled and device.type == 'cuda')} "
         f"depth={int(training.pipeline_depth)} workers={int(training.pipeline_workers)} "
-        f"loader_workers={int(loader_config.loader_workers)}",
+        f"isolated_loaders={bool(training.pipeline_isolated_loaders)} "
+        f"loader_workers={int(loader_config.loader_workers)} "
+        f"volume_cache_memory_mib={loader_config.volume_cache_memory_mib}",
         flush=True,
     )
 

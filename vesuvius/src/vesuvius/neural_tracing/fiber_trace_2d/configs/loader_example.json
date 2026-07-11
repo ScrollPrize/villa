@@ -6,6 +6,7 @@
   "seed": 0,
   "prefetch_workers": 16,
   "prefetch_sampler_workers": 4,
+  "loader_workers": 4,
   "augment_enabled": true,
   "augment_seed": 0,
   "augment_device": "auto",
@@ -26,6 +27,7 @@
   "augment_noise_std": 0.125,
   "augment_blur_sigma": 2.0,
   "volume_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/vesuvius_fiber_trace_zarr_cache",
+  "volume_cache_memory_mib": null,
   "strip_coord_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/vesuvius_fiber_trace_strip_coord_cache",
   "training": {
     "run_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_2d_runs",
@@ -44,8 +46,9 @@
     "tensorboard_enabled": true,
     "model_hidden_channels": 64,
     "model_depth": 10,
-    "pipeline_depth": 8,
-    "pipeline_workers": 4
+    "pipeline_depth": 16,
+    "pipeline_workers": 4,
+    "pipeline_isolated_loaders": false
   },
   "datasets": [
     {
