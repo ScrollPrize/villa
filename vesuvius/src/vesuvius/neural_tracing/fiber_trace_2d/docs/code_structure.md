@@ -589,9 +589,13 @@ Results are consumed by raw deterministic sample index, so changing
 The parallel path reuses one loader-owned executor across batches instead of
 creating and destroying a thread pool per training step. `loader_workers=1`
 uses a direct serial path with no futures.
-In benchmark/profile output, `wall` is real `load_batch` wall time, `work` is
+In benchmark/profile output, `total` is batch wall time, `cpu` is whole-process
+CPU time measured with `time.process_time()`, and `ctf` is `cpu / total`.
+Compare `ctf` to system CPU-utilization monitors when checking whether the
+process is really using cores. `wall` is real `load_batch` wall time, `work` is
 summed per-candidate worker elapsed time, and `tf` is `work / wall`. The
-individual stage columns remain summed worker timings under parallel loading.
+individual stage columns remain summed worker timings under parallel loading,
+so `tf` can be high even when actual process CPU usage is lower.
 Cold deterministic random-order setup is included in the descriptor column;
 warm batches should mostly avoid that cost.
 

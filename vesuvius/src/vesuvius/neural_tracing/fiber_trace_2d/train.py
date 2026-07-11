@@ -641,12 +641,13 @@ def _print_profile_header() -> None:
     print(
         "fiber_trace_2d profile columns: "
         "batch=batch-index patches=CNN image patches "
-        "total/wall/work/wait/prep/prep_gpu/prep_wait/submit/outside/coord/desc/cache/source/line/coord_aug/load/img_aug/fw/bw_step=ms per patch "
-        "tf=loader worker-time/wall-time",
+        "total/cpu/wall/work/wait/prep/prep_gpu/prep_wait/submit/outside/coord/desc/cache/source/line/coord_aug/load/img_aug/fw/bw_step=ms per patch "
+        "ctf=process cpu-time/total-wall-time tf=loader worker-time/load-wall-time",
         flush=True,
     )
     print(
-        f"{'batch':>5} {'patches':>7} {'total':>9} {'wall':>9} {'work':>9} {'tf':>6} {'wait':>9} "
+        f"{'batch':>5} {'patches':>7} {'total':>9} {'cpu':>9} {'ctf':>6} "
+        f"{'wall':>9} {'work':>9} {'tf':>6} {'wait':>9} "
         f"{'prep':>9} {'prep_gpu':>9} {'prep_wait':>9} {'submit':>9} {'outside':>9} "
         f"{'coord':>9} {'desc':>9} "
         f"{'cache':>9} {'source':>9} {'line':>9} {'coord_aug':>9} "
@@ -660,6 +661,8 @@ def _print_profile_row(batch_index: int, patch_count: int, elapsed_ms: float, st
     print(
         f"{int(batch_index):5d} {int(patch_count):7d} "
         f"{elapsed_ms / denom:9.2f} "
+        f"{stages.get('process_cpu', 0.0) / denom:9.2f} "
+        f"{(stages.get('process_cpu', 0.0) / elapsed_ms if elapsed_ms > 0.0 else 0.0):6.2f} "
         f"{stages.get('loader_wall', 0.0) / denom:9.2f} "
         f"{stages.get('loader_worker', 0.0) / denom:9.2f} "
         f"{stages.get('loader_thread_factor', 0.0):6.2f} "
@@ -693,6 +696,7 @@ def _print_benchmark_summary(summary: _BenchmarkSummary, *, profile: bool) -> No
     if profile:
         print("fiber_trace_2d profile summary ms_per_patch:", flush=True)
         for key in (
+            "process_cpu",
             "loader_wall",
             "loader_worker",
             "pipeline_wait",
@@ -717,6 +721,9 @@ def _print_benchmark_summary(summary: _BenchmarkSummary, *, profile: bool) -> No
         worker = summary.stage_ms_per_patch.get("loader_worker", 0.0)
         factor = worker / wall if wall > 0.0 else 0.0
         print(f"  loader_thread_factor={factor:.3f}", flush=True)
+        process_cpu_ms = summary.stage_ms_per_patch.get("process_cpu", 0.0) * max(1, int(summary.patches))
+        process_factor = process_cpu_ms / summary.elapsed_ms if summary.elapsed_ms > 0.0 else 0.0
+        print(f"  process_cpu_factor={process_factor:.3f}", flush=True)
 
 
 def run_benchmark(
@@ -755,6 +762,7 @@ def run_benchmark(
             "loader_wall",
             "loader_worker",
             "loader_thread_factor",
+            "process_cpu",
             "pipeline_wait",
             "prep",
             "prep_gpu",
@@ -797,6 +805,7 @@ def run_benchmark(
     try:
         for batch_index in range(1, total_batches + 1):
             batch_start = time.perf_counter()
+            batch_cpu_start = time.process_time()
             train_profile: dict[str, float] = {}
             prepared: _PreparedTrainingBatch | None = None
             if prep_pipeline is not None:
@@ -848,7 +857,9 @@ def run_benchmark(
                 train_profile["bw_step"] = (time.perf_counter() - bw_start) * 1000.0
 
             batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+            batch_process_cpu_ms = (time.process_time() - batch_cpu_start) * 1000.0
             stages = _benchmark_stage_totals(loader_profile, train_profile)
+            stages["process_cpu"] = batch_process_cpu_ms
             for key, value in stages.items():
                 stage_totals[key] += float(value)
             total_patches += patch_count

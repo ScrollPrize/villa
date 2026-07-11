@@ -2,6 +2,8 @@
 
 ## 2026-07-10
 
+- Added real process CPU timing to the 2D fiber-trace benchmark/profile table
+  so loader summed-worker timing can be compared against actual CPU usage.
 - Parallelized the 2D CUDA training load+prepare path by submitting exact training steps to concurrent workers, added one-offset strip-cache and CP-tangent/no-coordinate-retention fast paths, and documented measured throughput limits.
 - Removed the 2D training default patch-count warning, added a real
   `batch_size`/`control_points_per_step` validation error, and switched

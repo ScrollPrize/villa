@@ -48,6 +48,7 @@ a pretraining stage that does not require control points at all - but does benef
         - vis should show the original line (which without augs is just the centerline) as well as this dir-traced line (which might be slightly off from that)
     - tool2: segmeent refinement
         - load whole side-strip between two consecutive cps
+        - TBD
 
 # V0.1 gt self-refinement
 
@@ -57,7 +58,7 @@ a pretraining stage that does not require control points at all - but does benef
     - use two dir losses - gt and gt_mod
     - gt_mod is initialized as gt
     - at each training step we adjust gt_mod towards the inferered direction (by some small step - lets do 1 degree for now)
-    - vis additionaly the gt_mod as another short line (sliglty longer than model output and behind it - and diff color of course)
+    - vis additionaly the gt_mod as another short line (slightly longer than model output and behind it - and diff color of course)
         
 # V1 - short refinement self-supervision
 

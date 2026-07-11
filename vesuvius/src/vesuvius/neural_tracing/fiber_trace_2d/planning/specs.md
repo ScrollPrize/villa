@@ -183,6 +183,10 @@
   `worker_time / wall_time`; stage columns such as descriptor/cache/load remain
   summed worker timings and must not be interpreted as wall time under
   parallel loading.
+- Profile rows also report whole-process CPU time for the benchmark batch. The
+  process CPU factor is `process_cpu_time / batch_wall_time`; compare this
+  value against system CPU-utilization monitors when checking whether loader
+  work is actually keeping CPU cores busy.
 - `train.py --load-only` runs the same 100-batch benchmark loader path and exits without test evaluation, TensorBoard, run-directory creation, snapshots, image/value augmentation, image normalization, supervision building, model forward, backward, or optimizer work. It still performs deterministic sample selection, CP-local source construction, coordinate augmentation, and base-volume sampling so loading bottlenecks can be isolated.
 - Training and training prefetch use the same deterministic pseudo-random CP sample-index sequence: each pass visits all configured CPs once in seeded random order and wraps at dataset end.
 - With `training.max_steps = 0`, training repeats the full training dataset indefinitely.
