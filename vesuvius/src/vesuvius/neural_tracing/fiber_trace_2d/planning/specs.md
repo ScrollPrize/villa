@@ -262,14 +262,15 @@
   It requires `training.contrastive_embedding_channels > 0` and
   `training.control_points_per_step` divisible by
   `training.contrastive_control_points_per_fiber`.
-- In contrastive mode, each training step loads a deterministic same-fiber CP
-  group: `contrastive_control_points_per_fiber` CPs from one fiber are repeated
-  to fill `control_points_per_step`. Group ordering is deterministic and covers
-  the effective CP set by shuffled fiber-local CP groups before repeating.
-- Repeated same-fiber CP patches keep independent geometric augmentation draws
-  through unique raw sample indices. Value/image augmentation draws are
-  synchronized across the repeated group so the embedding objective does not
-  treat value-only appearance jitter as identity evidence.
+- In contrastive mode, each training step loads deterministic same-fiber CP
+  groups: every group contains `contrastive_control_points_per_fiber` CPs from
+  one fiber, and consecutive groups are concatenated to fill
+  `control_points_per_step`. Group ordering is deterministic and covers the
+  effective CP set by shuffled fiber-local CP groups before repeating.
+- Same-fiber CP patches keep independent geometric augmentation draws through
+  unique raw sample indices. Value/image augmentation draws are synchronized
+  within each same-fiber group so the embedding objective does not treat
+  value-only appearance jitter as identity evidence.
 - The contrastive embedding loss uses cosine similarity. Positive terms compare
   CP-neighborhood embedding samples from the same fiber and target cosine
   similarity `1`. Negative terms compare each CP-neighborhood embedding sample
@@ -277,8 +278,13 @@
   similarity above `training.contrastive_negative_margin`. Negative candidates
   are restricted to the CP-neighborhood reachable rectangle implied by the
   configured output-space `augment_shift_x/y` bounds; unreachable patch edges
-  are ignored, not supervised as negatives. Positive and negative means are
-  averaged equally, then multiplied by `training.contrastive_weight`.
+  are ignored, not supervised as negatives. When a batch contains multiple
+  fibers, an additional negative component compares each CP-neighborhood
+  embedding sample with every other-fiber CP-neighborhood embedding sample in
+  the batch, using the same margin. Available negative components are averaged
+  together, so valid-pixel negatives and cross-fiber CP negatives split the
+  negative branch equally when both exist. Positive and aggregate negative
+  means are averaged equally, then multiplied by `training.contrastive_weight`.
 - Contrastive embedding visualization writes TensorBoard similarity maps:
   per-pixel cosine similarity against the selected patch's CP embedding is
   mapped from `[-1, 1]` to `[0, 255]` with invalid pixels black.

@@ -19,6 +19,10 @@ class ContrastiveEmbeddingMetrics:
     negative_loss: float
     positive_samples: int
     negative_samples: int
+    pixel_negative_loss: float = 0.0
+    cross_fiber_negative_loss: float = 0.0
+    pixel_negative_samples: int = 0
+    cross_fiber_negative_samples: int = 0
 
 
 def contrastive_negative_reachable_mask(
@@ -126,8 +130,8 @@ def contrastive_embedding_loss(
         candidate = candidate & reachable
     negative_flat = torch.nonzero(candidate.reshape(-1), as_tuple=False).flatten()
     if int(negative_flat.numel()) == 0:
-        negative_loss = positive.new_tensor(0.0)
-        negative_count = 0
+        pixel_negative_loss = positive.new_tensor(0.0)
+        pixel_negative_count = 0
     else:
         count = int(positive.shape[0])
         selected = negative_flat[
@@ -144,9 +148,28 @@ def contrastive_embedding_loss(
         x = rem - y * width
         negative = F.normalize(embeddings[patch, :, y, x], dim=1, eps=1.0e-12)
         negative_similarity = torch.sum(positive * negative, dim=1)
-        negative_loss = torch.square(torch.relu(negative_similarity - float(negative_margin))).mean()
-        negative_count = count
+        pixel_negative_loss = torch.square(torch.relu(negative_similarity - float(negative_margin))).mean()
+        pixel_negative_count = count
 
+    cross_mask = fiber_ids[:, None] != fiber_ids[None, :]
+    cross_fiber_negative_count = int(cross_mask.sum().detach().cpu().item())
+    if cross_fiber_negative_count == 0:
+        cross_fiber_negative_loss = positive.new_tensor(0.0)
+    else:
+        cp_similarity = positive @ positive.T
+        cross_fiber_negative_loss = torch.square(
+            torch.relu(cp_similarity[cross_mask] - float(negative_margin))
+        ).mean()
+
+    negative_components: list[torch.Tensor] = []
+    if pixel_negative_count > 0:
+        negative_components.append(pixel_negative_loss)
+    if cross_fiber_negative_count > 0:
+        negative_components.append(cross_fiber_negative_loss)
+    if not negative_components:
+        negative_loss = positive.new_tensor(0.0)
+    else:
+        negative_loss = torch.stack(negative_components).mean()
     combined = 0.5 * (positive_loss + negative_loss)
     weighted = combined * float(weight)
     metrics = ContrastiveEmbeddingMetrics(
@@ -154,7 +177,11 @@ def contrastive_embedding_loss(
         positive_loss=float(positive_loss.detach().cpu().item()),
         negative_loss=float(negative_loss.detach().cpu().item()),
         positive_samples=int(supervision.patch_indices.numel()),
-        negative_samples=int(negative_count),
+        negative_samples=int(pixel_negative_count + cross_fiber_negative_count),
+        pixel_negative_loss=float(pixel_negative_loss.detach().cpu().item()),
+        cross_fiber_negative_loss=float(cross_fiber_negative_loss.detach().cpu().item()),
+        pixel_negative_samples=int(pixel_negative_count),
+        cross_fiber_negative_samples=int(cross_fiber_negative_count),
     )
     return weighted, metrics
 

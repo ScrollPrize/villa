@@ -1,12 +1,12 @@
-# Trace2CP Similarity Debug Column Status
+# Cross-Fiber Contrastive CP Negatives Status
 
 - [x] Read subproject AGENTS workflow.
-- [x] Locate Trace2CP visualization and combined embedding scoring code.
 - [x] Replace `planning/task.md` with the current task.
 - [x] Draft `planning/task_plan.md`.
 - [x] Self-review the plan against current specs and request.
-- [x] Add similarity-debug helpers and pair-evaluation wiring.
-- [x] Render the optional Trace2CP similarity debug column.
+- [x] Extend contrastive embedding loss and metrics.
+- [x] Update contrastive grouped-batch construction.
+- [x] Wire new metrics through training logs.
 - [x] Update docs/specs/changelog.
 - [x] Add/update tests.
 - [x] Run validation.

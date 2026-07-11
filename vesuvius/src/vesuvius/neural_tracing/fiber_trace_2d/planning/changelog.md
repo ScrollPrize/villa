@@ -2,6 +2,10 @@
 
 ## 2026-07-11
 
+- Added cross-fiber CP embedding negatives to contrastive training and changed
+  contrastive batches to concatenate same-fiber CP groups; CP-vs-other-fiber-CP
+  negatives now share the aggregate negative branch with existing valid-pixel
+  negatives when multiple fibers are present.
 - Added an optional embedding-similarity debug column to single-pair
   `trace2cp_vis.jpg`, showing fixed-scale cosine maps for both CPs,
   same-fiber/global CP-bank similarity, and forward/reverse trace-last

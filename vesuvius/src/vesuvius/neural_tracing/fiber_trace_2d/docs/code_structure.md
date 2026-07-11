@@ -186,10 +186,10 @@ The important behavior is:
 - Builds one sample as all configured strip-z offsets around one control point.
 - Builds a batch by stacking deterministic samples.
 - Builds contrastive training batches by selecting deterministic shuffled
-  groups of `N` CPs from one fiber, repeating that same-fiber CP group to fill
-  the configured training batch, using independent geometric augmentation
-  seeds per repeated patch, and synchronizing value/image augmentation seeds
-  across the group.
+  groups of `N` CPs from one fiber, concatenating consecutive same-fiber groups
+  to fill the configured training batch, using independent geometric
+  augmentation seeds per patch, and synchronizing value/image augmentation
+  seeds within each group.
 - Implements `build_strip_source` / `build_strip_patch_from_source` as the
   shared path for training, runner loading, augment-vis, and prefetch.
 - Implements `build_trace2cp_segment_patch` for runner inspection of a segment
@@ -394,8 +394,11 @@ The important behavior is:
   negative terms compare each positive to one deterministic valid non-CP pixel
   from the batch inside the CP-neighborhood reachable region derived from
   `augment_shift_x/y`, so unreachable patch edges are ignored rather than
-  trained as always-negative. The positive and negative means are balanced
-  before applying `training.contrastive_weight`.
+  trained as always-negative. When multiple fibers are present in the batch,
+  each CP embedding is also contrasted against CP embeddings from other fibers.
+  The valid-pixel and cross-fiber CP negative components split the aggregate
+  negative branch equally when both are available; the positive and aggregate
+  negative means are balanced before applying `training.contrastive_weight`.
 - Logs `train/loss_total`, `train/loss_direction`,
   `train/loss_contrastive`, positive/negative contrastive components, and
   TensorBoard embedding-similarity images that compare every pixel in a
@@ -505,10 +508,12 @@ Training keys:
   after the two direction channels; must be positive when contrastive training
   is enabled.
 - `contrastive_control_points_per_fiber`: same-fiber CP group size `N`.
-  `control_points_per_step` must be divisible by this value so the group can be
-  repeated evenly to fill the batch.
+  `control_points_per_step` must be divisible by this value so the batch is an
+  exact number of same-fiber CP groups.
 - `contrastive_weight`: multiplier for the balanced cosine contrastive loss.
 - `contrastive_negative_margin`: cosine margin for negative pairs.
+  The margin applies to both valid non-CP pixel negatives and cross-fiber CP
+  embedding negatives.
 - `device`: `auto`, `cpu`, or a torch device string.
 - `tensorboard_enabled`: set false for smoke tests without TensorBoard.
 - `pipeline_enabled`: enables CUDA training batch pipelining and load-only

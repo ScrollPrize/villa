@@ -1807,10 +1807,19 @@ def test_config_and_loader_batch_shape(tmp_path: Path) -> None:
     assert batch.control_point_indices.shape == (2,)
 
 
-def test_fiber_group_batch_repeats_same_fiber_control_points(tmp_path: Path) -> None:
+def test_fiber_group_batch_concatenates_same_fiber_control_point_groups(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=4)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["strip_z_offset_count"] = 1
+    fiber_a = _write_fiber(
+        tmp_path / "fiber_a.json",
+        points=[[0.0, 20.0, 20.0], [10.0, 20.0, 20.0]],
+    )
+    fiber_b = _write_fiber(
+        tmp_path / "fiber_b.json",
+        points=[[0.0, 22.0, 22.0], [10.0, 22.0, 22.0]],
+    )
+    raw["datasets"][0]["fiber_paths"] = [str(fiber_a), str(fiber_b)]
     config_path.write_text(json.dumps(raw), encoding="utf-8")
     loader = _make_loader(load_config(config_path))
 
@@ -1822,10 +1831,8 @@ def test_fiber_group_batch_repeats_same_fiber_control_points(tmp_path: Path) -> 
     )
 
     assert batch.images.shape == (4, 1, 1, 3, 3)
-    assert len(set(batch.fiber_paths)) == 1
-    unique, counts = np.unique(batch.control_point_indices, return_counts=True)
-    assert unique.shape == (2,)
-    assert sorted(counts.tolist()) == [2, 2]
+    assert len(set(batch.fiber_paths)) == 2
+    assert sorted(batch.fiber_paths.count(path) for path in set(batch.fiber_paths)) == [2, 2]
 
 
 def test_fiber_group_batch_syncs_value_augmentation_but_not_geometry(tmp_path: Path) -> None:
@@ -1847,9 +1854,10 @@ def test_fiber_group_batch_syncs_value_augmentation_but_not_geometry(tmp_path: P
 
     params = tuple(param for param in batch.augmentation_params if param is not None)
     assert len(params) == 4
-    values = {(p.brightness, p.contrast, p.gamma, p.noise_std, p.blur_sigma, p.noise_seed) for p in params}
+    values = [(p.brightness, p.contrast, p.gamma, p.noise_std, p.blur_sigma, p.noise_seed) for p in params]
     geometry = {(p.shift_x, p.shift_y, p.rotation_degrees, p.shear_x, p.shear_y, p.scale) for p in params}
-    assert len(values) == 1
+    assert values[0] == values[1]
+    assert values[2] == values[3]
     assert len(geometry) > 1
 
 
@@ -3730,6 +3738,49 @@ def test_contrastive_embedding_loss_balances_positive_and_negative_terms() -> No
     assert metrics.loss == pytest.approx(1.0)
     assert metrics.positive_samples == 2
     assert metrics.negative_samples == 2
+
+
+def test_contrastive_embedding_loss_adds_cross_fiber_cp_negatives() -> None:
+    output = torch.zeros((4, 4, 3, 3), dtype=torch.float32)
+    output[:, 3, :, :] = 1.0
+    output[:, 2, 1, 1] = 1.0
+    output[:, 3, 1, 1] = 0.0
+    supervision = DirectionSupervision(
+        patch_indices=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        y=torch.tensor([1, 1, 1, 1], dtype=torch.long),
+        x=torch.tensor([1, 1, 1, 1], dtype=torch.long),
+        target=torch.zeros((4, 2), dtype=torch.float32),
+        cp_xy=torch.zeros((4, 2), dtype=torch.float32),
+        tangent_xy=torch.tensor(
+            [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+            dtype=torch.float32,
+        ),
+    )
+    samples = (
+        SimpleNamespace(fiber_path="fiber-a", record_index=0),
+        SimpleNamespace(fiber_path="fiber-a", record_index=0),
+        SimpleNamespace(fiber_path="fiber-b", record_index=1),
+        SimpleNamespace(fiber_path="fiber-b", record_index=1),
+    )
+    valid = np.ones((4, 3, 3), dtype=bool)
+
+    loss, metrics = contrastive_embedding_loss(
+        output,
+        supervision,
+        samples,  # type: ignore[arg-type]
+        valid,
+        weight=1.0,
+        negative_margin=0.0,
+    )
+
+    assert metrics.positive_loss == pytest.approx(0.0)
+    assert metrics.pixel_negative_loss == pytest.approx(0.0)
+    assert metrics.cross_fiber_negative_loss == pytest.approx(1.0)
+    assert metrics.negative_loss == pytest.approx(0.5)
+    assert float(loss.detach().item()) == pytest.approx(0.25)
+    assert metrics.pixel_negative_samples == 4
+    assert metrics.cross_fiber_negative_samples == 8
+    assert metrics.negative_samples == 12
 
 
 def test_contrastive_embedding_loss_ignores_unreachable_edge_negatives() -> None:

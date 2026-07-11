@@ -1,49 +1,58 @@
-# Trace2CP Similarity Debug Column Plan
+# Cross-Fiber Contrastive CP Negatives Plan
 
 ## Scope
 
-- Add embedding-similarity maps to the existing single-pair
-  `--trace2cp-vis` JPG.
-- Keep Trace2CP metric, refinement, TTA, and candidate scoring unchanged.
-- Use the existing contrastive embedding field and combined-mode CP embedding
-  bank; do not invent a replacement global embedding definition when no bank
-  exists.
+- Update contrastive embedding training only.
+- Keep direction loss, loader sampling, Trace2CP tracing, and visualization
+  semantics unchanged.
+- Do not add new config keys; use the existing
+  `training.contrastive_negative_margin` and `training.contrastive_weight`.
 
 ## Implementation
 
-1. Add Trace2CP similarity-debug data structures and helpers in `runner.py`.
-   - Compute per-pixel cosine similarity maps from the normalized embedding
-     field.
-   - Build maps for start CP, target CP, same-fiber CP bank mean similarity,
-     forward trace last sampled embedding, and reverse trace last sampled
-     embedding.
-   - Treat missing embedding channels as "no debug column".
+1. Extend `contrastive_embedding_loss`.
+   - Reuse the normalized CP embeddings already sampled for positive terms.
+   - Build a cross-fiber mask from existing per-sample fiber IDs.
+   - Penalize same-margin cosine similarity for all CP embedding pairs whose
+     fiber IDs differ.
+   - Average available negative components: existing valid non-CP pixel
+     negatives and cross-fiber CP negatives. This gives each component equal
+     weight when both exist while preserving old behavior when only one exists.
 
-2. Attach similarity debug to pair evaluation.
-   - After the selected Trace2CP result is known, build debug maps from the
-     selected forward/reverse traces.
-   - Use the existing combined fiber embedding bank for the global map when it
-     is available.
+2. Update contrastive grouped batches.
+   - Concatenate consecutive same-fiber CP groups to fill a training batch
+     instead of repeating one group across the whole batch.
+   - Advance contrastive training steps by the number of groups per batch so
+     adjacent steps do not overlap groups.
+   - Synchronize value/image augmentation within each same-fiber group.
 
-3. Render the debug column.
-   - Add one optional right-side column to `_draw_trace2cp_overlay`.
-   - Render similarity maps on a fixed cosine scale `-1..1 -> 0..255`.
-   - Overlay the fiber line, relevant trace, and CP markers for orientation.
+3. Extend metrics.
+   - Keep `negative_loss` as the aggregate negative branch used by the loss.
+   - Add component metrics for pixel negatives and cross-fiber CP negatives.
+   - Report the total negative comparison count while preserving existing
+     single-fiber behavior.
 
-4. Add tests.
-   - Verify similarity debug maps are computed with the expected cosine values.
-   - Verify `_draw_trace2cp_overlay` adds the debug column.
+4. Wire metrics through training logs.
+   - Add TensorBoard scalars for the component losses/counts when contrastive
+     training is enabled.
+   - Keep existing scalar names intact for aggregate values.
+
+5. Add tests.
+   - Existing same-fiber tests should continue to show unchanged weighting.
+   - Add a cross-fiber batch test proving the new CP-negative component is
+     present and splits the negative branch weight with pixel negatives.
+   - Update grouped-batch tests to verify multiple same-fiber groups are
+     concatenated and value augmentation is synchronized per group.
 
 ## Spec Update
 
-- Document that Trace2CP visualization includes an optional embedding-debug
-  column when embedding output is present.
-- Document that the global map uses the same-fiber CP embedding bank from
-  combined Trace2CP mode.
+- Update `planning/specs.md` contrastive section to document cross-fiber CP
+  embedding negatives and the averaged negative-branch weighting.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` runner/Trace2CP documentation.
+- Update `docs/code_structure.md` training/contrastive documentation with the
+  new negative component and metrics.
 - Update `planning/changelog.md`, `status.md`, and `task_log.md`.
 
 ## Validation

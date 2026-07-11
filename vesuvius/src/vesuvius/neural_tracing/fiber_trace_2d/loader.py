@@ -1206,28 +1206,31 @@ class FiberStrip2DLoader:
     ) -> tuple[int, ...]:
         batch_size = max(1, int(batch_size))
         group_size = max(1, int(control_points_per_group))
+        groups_per_batch = max(1, int(math.ceil(batch_size / float(group_size))))
         first_entries = self._fiber_group_entries_for_pass(
             0,
             control_points_per_group=group_size,
             sample_index_limit=sample_index_limit,
         )
         groups_per_pass = len(first_entries)
-        pass_index = math.floor(int(group_index) / groups_per_pass)
-        offset = int(group_index) % groups_per_pass
-        entries = (
-            first_entries
-            if pass_index == 0
-            else self._fiber_group_entries_for_pass(
-                pass_index,
-                control_points_per_group=group_size,
-                sample_index_limit=sample_index_limit,
+        flat: list[int] = []
+        for batch_group_offset in range(groups_per_batch):
+            current_group_index = int(group_index) + int(batch_group_offset)
+            pass_index = math.floor(current_group_index / groups_per_pass)
+            offset = current_group_index % groups_per_pass
+            entries = (
+                first_entries
+                if pass_index == 0
+                else self._fiber_group_entries_for_pass(
+                    pass_index,
+                    control_points_per_group=group_size,
+                    sample_index_limit=sample_index_limit,
+                )
             )
-        )
-        record_index, control_indices = entries[offset]
-        record_start = int(self._record_flat_offsets[record_index])
-        group_flat = [record_start + int(control_index) for control_index in control_indices]
-        repeated = [group_flat[index % len(group_flat)] for index in range(batch_size)]
-        return tuple(int(v) for v in repeated)
+            record_index, control_indices = entries[offset]
+            record_start = int(self._record_flat_offsets[record_index])
+            flat.extend(record_start + int(control_index) for control_index in control_indices)
+        return tuple(int(v) for v in flat[:batch_size])
 
     def _interpolation_cube(
         self, array: Any, point_zyx_base: np.ndarray, *, array_spacing_base: float
@@ -3165,24 +3168,26 @@ class FiberStrip2DLoader:
         batch_size = max(1, int(batch_size))
         attempts = max(batch_size * 4, batch_size + 1000)
         group_size = max(1, int(control_points_per_group))
+        groups_per_batch = max(1, int(math.ceil(batch_size / float(group_size))))
         group_span = max(1, int(math.ceil(attempts / float(batch_size))))
         flat_indices: list[int] = []
         for local_group in range(group_span):
             flat_indices.extend(
                 self.fiber_group_flat_indices_for_group(
-                    int(group_index) + local_group,
+                    int(group_index) + local_group * groups_per_batch,
                     control_points_per_group=group_size,
                     batch_size=batch_size,
                     sample_index_limit=sample_index_limit,
                 )
             )
+        augmentation_start_index = int(group_index) * group_size
         return self.load_batch(
-            int(group_index) * batch_size,
+            augmentation_start_index,
             batch_size=batch_size,
             sample_mode="flat",
             flat_indices=tuple(flat_indices),
-            augmentation_sample_start_index=int(group_index) * batch_size,
-            value_augmentation_sync_group_size=batch_size,
+            augmentation_sample_start_index=augmentation_start_index,
+            value_augmentation_sync_group_size=group_size,
             profile=profile,
             apply_image_augmentation=apply_image_augmentation,
             include_line_xy=include_line_xy,

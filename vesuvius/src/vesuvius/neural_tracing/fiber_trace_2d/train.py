@@ -304,8 +304,12 @@ class _DirectionMetrics:
     loss_contrastive: float = 0.0
     contrastive_positive_loss: float = 0.0
     contrastive_negative_loss: float = 0.0
+    contrastive_pixel_negative_loss: float = 0.0
+    contrastive_cross_fiber_negative_loss: float = 0.0
     contrastive_positive_samples: int = 0
     contrastive_negative_samples: int = 0
+    contrastive_pixel_negative_samples: int = 0
+    contrastive_cross_fiber_negative_samples: int = 0
 
 
 @dataclass(frozen=True)
@@ -572,7 +576,12 @@ class _CudaPreparedBatchPipeline:
 
 def _training_raw_start_sample_index(step: int, training: FiberStripTrainingConfig) -> int:
     if bool(training.contrastive_enabled):
-        return int(step) - 1
+        groups_per_step = max(
+            1,
+            int(training.train_control_points_per_step)
+            // int(training.contrastive_control_points_per_fiber),
+        )
+        return (int(step) - 1) * groups_per_step
     return (int(step) - 1) * int(training.train_control_points_per_step)
 
 
@@ -741,8 +750,12 @@ def _compute_batch_loss(
         loss_contrastive=contrastive_metrics.loss,
         contrastive_positive_loss=contrastive_metrics.positive_loss,
         contrastive_negative_loss=contrastive_metrics.negative_loss,
+        contrastive_pixel_negative_loss=contrastive_metrics.pixel_negative_loss,
+        contrastive_cross_fiber_negative_loss=contrastive_metrics.cross_fiber_negative_loss,
         contrastive_positive_samples=contrastive_metrics.positive_samples,
         contrastive_negative_samples=contrastive_metrics.negative_samples,
+        contrastive_pixel_negative_samples=contrastive_metrics.pixel_negative_samples,
+        contrastive_cross_fiber_negative_samples=contrastive_metrics.cross_fiber_negative_samples,
     )
     return loss, outputs, supervision, metrics
 
@@ -776,8 +789,12 @@ def _compute_prepared_batch_loss(
         loss_contrastive=contrastive_metrics.loss,
         contrastive_positive_loss=contrastive_metrics.positive_loss,
         contrastive_negative_loss=contrastive_metrics.negative_loss,
+        contrastive_pixel_negative_loss=contrastive_metrics.pixel_negative_loss,
+        contrastive_cross_fiber_negative_loss=contrastive_metrics.cross_fiber_negative_loss,
         contrastive_positive_samples=contrastive_metrics.positive_samples,
         contrastive_negative_samples=contrastive_metrics.negative_samples,
+        contrastive_pixel_negative_samples=contrastive_metrics.pixel_negative_samples,
+        contrastive_cross_fiber_negative_samples=contrastive_metrics.cross_fiber_negative_samples,
     )
     return loss, outputs, prepared.supervision, metrics
 
@@ -1747,6 +1764,16 @@ def run_training(
                         step,
                     )
                     writer.add_scalar(
+                        "train/contrastive_pixel_negative_loss",
+                        metrics.contrastive_pixel_negative_loss,
+                        step,
+                    )
+                    writer.add_scalar(
+                        "train/contrastive_cross_fiber_negative_loss",
+                        metrics.contrastive_cross_fiber_negative_loss,
+                        step,
+                    )
+                    writer.add_scalar(
                         "train/contrastive_positive_samples",
                         metrics.contrastive_positive_samples,
                         step,
@@ -1754,6 +1781,16 @@ def run_training(
                     writer.add_scalar(
                         "train/contrastive_negative_samples",
                         metrics.contrastive_negative_samples,
+                        step,
+                    )
+                    writer.add_scalar(
+                        "train/contrastive_pixel_negative_samples",
+                        metrics.contrastive_pixel_negative_samples,
+                        step,
+                    )
+                    writer.add_scalar(
+                        "train/contrastive_cross_fiber_negative_samples",
+                        metrics.contrastive_cross_fiber_negative_samples,
                         step,
                     )
                 writer.add_scalar("train/angle_error_mean_deg", metrics.angle_mean_deg, step)

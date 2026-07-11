@@ -1,16 +1,10 @@
-# Trace2CP Similarity Debug Column
+# Cross-Fiber Contrastive CP Negatives
 
-Add embedding-similarity debugging to Trace2CP visualization.
+Add an additional contrastive negative term for embedding training: each CP
+embedding in a batch should be penalized for high cosine similarity to CP
+embeddings from other fibers in the same batch.
 
-The single-pair tracer visualization should show an additional column when
-embedding outputs are available. The column should render:
-
-- similarity to the start CP embedding;
-- similarity to the target CP embedding;
-- same-fiber global CP-bank similarity when the combined Trace2CP fiber bank is
-  available;
-- similarity to the final sampled embedding of the forward directional trace;
-- similarity to the final sampled embedding of the reverse directional trace.
-
-This is a debug visualization only. It must not change Trace2CP tracing,
-metric, or refinement semantics.
+This term should use the same cosine margin as the existing non-CP pixel
+negative term. When both negative terms are available, they should split the
+negative half of the balanced contrastive objective equally, so the overall
+positive-vs-negative balance stays unchanged.

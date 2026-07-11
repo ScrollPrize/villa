@@ -33,6 +33,7 @@
 - [ ] try less shift (?)
 - [ ] we might be off in z (wrong plane in the 2d slice
     - can we additionally add uncertainty and/or optimize for maximum embedding similaity by shifting in z?
+- [ ] better tracing using dijkstra or similar
     
 # ideas
 - [ ] short-strip self supervision?
