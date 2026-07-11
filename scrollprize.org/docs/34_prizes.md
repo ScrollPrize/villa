@@ -158,6 +158,9 @@ If you have a qualifying result, submit it for consideration by sending an email
 * **Methodology.** A detailed technical description of how your solution works. We need to be able to reproduce your work, so please make this as easy as possible:
   * Please create a Docker image that we can easily run to reproduce your work, and please include system requirements.
   * Attach your code/video directly to the email, or include an easily accessible link from which we can download it.
+* **False-positive mitigation.** If there is any risk of your model producing spurious patterns — apparent letterforms that are not actually supported by the data — please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
+  * We strongly discourage submissions that use window sizes larger than 0.5x0.5 mm to generate images from machine learning models. If your submission uses larger window sizes, we may reject it and ask you to modify and resubmit.
+* **Held-out validation.** Run your method on the public input renders/volumes with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
 * **Other information.** Feel free to include any other things we should know.
 
 If you're competing as a team, please have your team leader submit your results. We will communicate with the team leader exclusively, and any prize money will be distributed according to the instructions of the team leader. You'd have to sort out within your team how to split any prizes.
@@ -199,20 +202,21 @@ These prizes bridge ink detection on fragments to the much harder problem of rea
 <details>
 <summary>Submission criteria and requirements</summary>
 
+* **Meshes.** The submission must contain the mesh(es), in tifxyz format, of the surface region containing the letters, already including a low-distortion isometric 2D parametrization (flattening).
 * **Image.** Submissions must be an image of the virtually unwrapped segment, showing at least 10 visible and legible letters within a single 4 cm² area.
-  * Submit a single static image showing the text region. Images must be generated programmatically, as direct outputs of CT data inputs, and should not contain manual annotations of characters or text. This includes annotations that were then used as training data and memorized by a machine learning ink model. Ink model outputs of this region should not overlap with any training data used.
+  * Submit a single static image showing the text region. Images must be generated programmatically from the reconstructed CT scan volume and the mesh(es) submitted in the same package, and should not contain manual annotations of characters or text. This includes annotations that were then used as training data and memorized by a machine learning ink model. Ink model outputs of this region should not overlap with any training data used.
   * Specify which scroll the image comes from. For multiple scrolls, please make multiple submissions.
   * Include a scale bar showing the size of 1 cm on the submission image, and the pixel and millimeter dimensions of a few representative letters.
-  * Specify the 3D position of the text within the scroll: where it sits, whether the surface faces inward or outward, and which way is "up". A 3D orientation image is the easiest way to show this — or provide the segmentation file (or the segmentation ID, if using a public segmentation).
+  * Name each image after the tifxyz mesh (from the same package) used to generate it, so it is traceable to the exact surface it was rendered from.
   * Annotate the rows of text. Letters in read samples run overwhelmingly parallel to the horizontal papyrus fibers — where possible, overlay your ink predictions on a fiber-visible rendering. Misaligned text or text without clear rows does not immediately disqualify a submission, but it does make it less likely that you found valid text.
 * **Methodology.** A detailed technical description of how your solution works. We need to be able to reproduce your work, so please make this as easy as possible:
   * For fully automated software, consider a Docker image that we can easily run to reproduce your work, and please include system requirements.
   * For software with a human in the loop, please provide written instructions and a video explaining how to use your tool. We’ll work with you to learn how to use it, but we’d like to have a strong starting point.
   * Please include an easily accessible link from which we can download it.
-* **Hallucination mitigation.** If there is any risk of your model hallucinating results, please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
-  * We strongly discourage submissions that use window sizes larger than 0.5x0.5 mm to generate images from machine learning models. This corresponds to 64x64 pixels for 8 µm scans. If your submission uses larger window sizes, we may reject it and ask you to modify and resubmit.
-  * In addition to hallucination mitigation, do not include overlap between training and prediction regions. This leads to the memorization of annotated labels.
-* **Held-out validation.** Run your method on the public scroll fragments with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
+* **False-positive mitigation.** If there is any risk of your model producing spurious patterns — apparent letterforms that are not actually supported by the data — please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
+  * We strongly discourage submissions that use window sizes larger than 0.5x0.5 mm to generate images from machine learning models. If your submission uses larger window sizes, we may reject it and ask you to modify and resubmit.
+  * Do not include overlap between training and prediction regions — this leads to the memorization of annotated labels.
+* **Held-out validation.** Run your method on the public input renders/volumes with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
 * **Other information.** Feel free to include any other things we should know.
 
 Your submission will be reviewed by the review teams to verify technical validity and papyrological plausibility and legibility.
@@ -251,10 +255,10 @@ Discovering a scroll’s title tells scholars what — and whom — they have be
   * For fully automated software, consider a Docker image that we can easily run to reproduce your work, and please include system requirements.
   * For software with a human in the loop, please provide written instructions and a video explaining how to use your tool. We’ll work with you to learn how to use it, but we’d like to have a strong starting point.
   * Please include an easily accessible link from which we can download it.
-* **Hallucination mitigation.** If there is any risk of your model hallucinating results, please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
+* **False-positive mitigation.** If there is any risk of your model producing spurious patterns — apparent letterforms that are not actually supported by the data — please let us know how you mitigated that risk. Tell us why you are confident that the results you are getting are real.
   * We strongly discourage submissions that use window sizes larger than 0.5x0.5 mm to generate images from machine learning models. If your submission uses larger window sizes, we may reject it and ask you to modify and resubmit.
-  * In addition to hallucination mitigation, do not include overlap between training and prediction regions. This leads to the memorization of annotated labels.
-* **Held-out validation.** Run your method on the public scroll fragments with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
+  * Do not include overlap between training and prediction regions — this leads to the memorization of annotated labels.
+* **Held-out validation.** Run your method on the public input renders/volumes with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
 * **Other information.** Feel free to include any other things we should know.
 
 Your submission will be reviewed by the review teams to verify technical validity and papyrological plausibility and legibility.
