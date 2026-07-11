@@ -117,9 +117,11 @@ jobs:
           fi
           echo "vc_tifxyz_trim OK (exit $rc)"
 
-          # GUI app: --version under the offscreen platform exercises every Qt
-          # framework plus the platform plugin lookup.
-          QT_QPA_PLATFORM=offscreen "$bin/VC3D" --version
+          # GUI app: Homebrew's macOS Qt package ships the native Cocoa
+          # platform plugin, not the offscreen plugin. --version exits without
+          # showing a window while still exercising the packaged Qt framework
+          # and native platform plugin lookup.
+          QT_QPA_PLATFORM=cocoa "$bin/VC3D" --version
           echo "VC3D --version OK"
 
       - name: Attach DMG to release
