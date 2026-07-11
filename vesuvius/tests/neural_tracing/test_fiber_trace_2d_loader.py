@@ -523,17 +523,17 @@ def test_median_tta_trace_uses_reference_space_directions() -> None:
 
 
 def test_dir_vis_overlay_scales_and_strides() -> None:
-    image = np.full((5, 7), 64, dtype=np.uint8)
-    valid = np.zeros((5, 7), dtype=bool)
-    valid[0::2, 0::2] = True
-    valid[2, 2] = False
-    direction = np.zeros((5, 7, 2), dtype=np.float32)
+    image = np.full((9, 9), 64, dtype=np.uint8)
+    valid = np.zeros((9, 9), dtype=bool)
+    valid[0::4, 0::4] = True
+    valid[4, 4] = False
+    direction = np.zeros((9, 9, 2), dtype=np.float32)
     direction[:, :, 0] = 1.0
 
-    overlay, drawn = _direction_field_overlay_rgb(image, valid, direction, scale=2, stride=2)
+    overlay, drawn = _direction_field_overlay_rgb(image, valid, direction, scale=2, stride=4)
 
-    assert overlay.shape == (10, 14, 3)
-    assert drawn == 11
+    assert overlay.shape == (18, 18, 3)
+    assert drawn == 8
     scaled = np.repeat(np.repeat(np.repeat(image[..., None], 3, axis=2), 2, axis=0), 2, axis=1)
     assert not np.array_equal(overlay, scaled)
 

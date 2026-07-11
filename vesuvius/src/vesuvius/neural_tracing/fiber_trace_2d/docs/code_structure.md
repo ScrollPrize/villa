@@ -238,7 +238,8 @@ The important behavior is:
   direction-field inspection. This mode loads the same deterministic center
   side-strip patch, runs the checkpointed direction model, decodes the
   direction field, scales the patch image by 2x, and writes `dir_vis.jpg` with
-  short direction segments drawn every second source pixel.
+  anti-aliased 6-display-pixel direction segments drawn every fourth source
+  pixel, i.e. one segment per 8x8 display-pixel cell.
 
 `train.py`
 

@@ -1,13 +1,13 @@
-# Load-Only Parallelism Diagnostics Status
+# Direction Visualization Cell Spacing Status
 
 - [x] Capture current user task in `planning/task.md`.
-- [x] Create focused diagnostic task plan.
-- [x] Add real process CPU timing to benchmark profile rows and summary.
+- [x] Create focused visualization task plan.
+- [x] Update dir-vis overlay stride/segment rendering.
+- [x] Update docs/specs and task log.
 - [x] Compile-check changed Python.
-- [x] Run load-only profile benchmark.
-- [x] Update docs/specs and task log with results.
+- [x] Run focused dir-vis overlay test.
 
-Result: load-only profile now reports both synthetic loader worker factor and
-real process CPU factor. On the 100-batch load-only profile run,
-`loader_thread_factor=29.951` but `process_cpu_factor=3.817`, matching the
-observed low system CPU utilization much better than the old table did.
+Result: `--dir-vis` now samples directions every fourth source pixel on the 2x
+display image, so direction samples occupy 8x8 display-pixel cells. The segment
+length remains proportional to cell size, yielding 6-display-pixel anti-aliased
+segments with a visible border between neighboring samples.

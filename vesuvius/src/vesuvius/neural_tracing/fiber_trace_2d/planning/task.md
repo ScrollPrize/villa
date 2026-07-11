@@ -1,14 +1,13 @@
-# Load-Only Parallelism Diagnostics
+# Direction Visualization Cell Spacing
 
-Add load-only benchmark profiling that shows real process CPU consumption per
-batch in addition to the existing summed loader-worker timings.
+Adjust the 2D fiber-trace `--dir-vis` overlay so direction samples are spaced on
+8x8 display-pixel cells instead of 4x4 cells.
 
 Requirements:
 
-- Keep the focus on `--load-only --profile` so loader parallelism can be
-  inspected without model or image-augmentation work.
-- Report per-batch wall time and process CPU time so the profiler can show
-  whether observed worker-time parallelism corresponds to actual CPU usage.
-- Preserve the existing loader profiling columns and deterministic loading
-  behavior.
-- Reuse the existing benchmark command family and keep task notes current.
+- Keep the existing 2x nearest-neighbor patch display scale.
+- Draw one direction segment every fourth source pixel so each sample owns an
+  8x8 display-pixel cell.
+- Draw 6-display-pixel segments, leaving a visible border between neighboring
+  samples.
+- Anti-alias the drawn direction segments.

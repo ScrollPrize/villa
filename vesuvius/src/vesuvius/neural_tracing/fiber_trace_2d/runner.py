@@ -110,7 +110,7 @@ def _direction_field_overlay_rgb(
     direction_xy: np.ndarray,
     *,
     scale: int = 2,
-    stride: int = 2,
+    stride: int = 4,
     color_rgba: tuple[int, int, int, int] = (32, 255, 255, 220),
 ) -> tuple[np.ndarray, int]:
     from PIL import Image, ImageDraw
@@ -128,7 +128,8 @@ def _direction_field_overlay_rgb(
     sample_stride = max(1, int(stride))
     scaled = np.repeat(np.repeat(base, display_scale, axis=0), display_scale, axis=1)
     pil = Image.fromarray(scaled, mode="RGB")
-    overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+    aa_scale = 4
+    overlay = Image.new("RGBA", (pil.size[0] * aa_scale, pil.size[1] * aa_scale), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, mode="RGBA")
     half_len = max(1.0, float(display_scale * sample_stride) * 0.375)
     drawn = 0
@@ -146,8 +147,22 @@ def _direction_field_overlay_rgb(
             cy = (float(y) + 0.5) * float(display_scale)
             dx = float(unit[0]) * half_len
             dy = float(unit[1]) * half_len
-            draw.line((cx - dx, cy - dy, cx + dx, cy + dy), fill=color_rgba, width=1)
+            draw.line(
+                (
+                    (cx - dx) * aa_scale,
+                    (cy - dy) * aa_scale,
+                    (cx + dx) * aa_scale,
+                    (cy + dy) * aa_scale,
+                ),
+                fill=color_rgba,
+                width=aa_scale,
+            )
             drawn += 1
+    try:
+        resample = Image.Resampling.LANCZOS
+    except AttributeError:
+        resample = Image.LANCZOS
+    overlay = overlay.resize(pil.size, resample=resample)
     return np.asarray(Image.alpha_composite(pil.convert("RGBA"), overlay).convert("RGB"), dtype=np.uint8), drawn
 
 
@@ -1321,7 +1336,7 @@ def _export_dir_vis(
         valid_mask,
         direction_xy,
         scale=2,
-        stride=2,
+        stride=4,
     )
     _write_jpg(out / "dir_vis.jpg", overlay)
     summary = [
@@ -1333,7 +1348,9 @@ def _export_dir_vis(
         f"strip_z_offset={sample.strip_z_offset}",
         f"image_shape_hw=({int(image.shape[0])}, {int(image.shape[1])})",
         "display_scale=2",
-        "direction_stride=2",
+        "direction_stride=4",
+        "direction_cell_px=8",
+        "direction_segment_px=6",
         f"drawn_directions={drawn}",
     ]
     (out / "dir_vis_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")

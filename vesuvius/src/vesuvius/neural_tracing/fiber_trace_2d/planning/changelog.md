@@ -2,6 +2,8 @@
 
 ## 2026-07-10
 
+- Switched 2D `--dir-vis` direction overlays to 8x8 display-pixel cells with
+  6-pixel anti-aliased direction segments.
 - Added real process CPU timing to the 2D fiber-trace benchmark/profile table
   so loader summed-worker timing can be compared against actual CPU usage.
 - Parallelized the 2D CUDA training load+prepare path by submitting exact training steps to concurrent workers, added one-offset strip-cache and CP-tangent/no-coordinate-retention fast paths, and documented measured throughput limits.

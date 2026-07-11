@@ -1,27 +1,27 @@
-# Load-Only Parallelism Diagnostics Plan
+# Direction Visualization Cell Spacing Plan
 
 ## Implementation
 
-- Add per-batch `time.process_time()` measurement around the benchmark batch
-  body.
-- Print process CPU milliseconds per patch and a process CPU factor
-  (`cpu_time / batch_wall_time`) in profile rows.
-- Keep the existing loader `work / wall` factor so synthetic worker timing and
-  actual process CPU usage can be compared directly.
-- Include process CPU time and factor in the profile summary.
+- Update `_direction_field_overlay_rgb` to use a default stride of 4 source
+  pixels while retaining the 2x image scale.
+- Keep the segment-length formula tied to the display cell size so stride 4
+  yields 6-display-pixel direction segments.
+- Render the overlay on a small supersampled RGBA canvas and downsample it so
+  segment edges are anti-aliased.
+- Update the dir-vis export summary to report stride 4, 8-pixel cells, and
+  6-pixel segments.
 
 ## Spec Update
 
-- Document that benchmark/profile output includes both summed loader worker
-  timing and real process CPU timing, and that only process CPU factor should be
-  used to compare against system CPU utilization.
+- Document the 8x8 display-pixel cell, 6-display-pixel segment length, and
+  anti-aliased direction drawing.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` profiling description.
-- Keep `planning/task_log.md` limited to this diagnostic task.
+- Update `docs/code_structure.md` dir-vis description.
+- Keep `planning/task_log.md` limited to this visualization task.
 
 ## Testing
 
-- Compile-check `train.py`.
-- Run the load-only profile benchmark with the existing command family.
+- Compile-check `runner.py`.
+- Run the focused dir-vis overlay test.

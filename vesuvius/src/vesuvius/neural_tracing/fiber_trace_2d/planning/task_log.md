@@ -1,41 +1,31 @@
-# Load-Only Parallelism Diagnostics Log
+# Direction Visualization Cell Spacing Log
 
-Current task: add real process-level CPU/wall timing to load-only profile output
-so the loader's summed worker timings can be compared against actual process CPU
-usage.
+Current task: adjust the `--dir-vis` direction overlay from 4x4 display-pixel
+cells to 8x8 display-pixel cells, with 6-display-pixel anti-aliased direction
+segments.
 
 Implementation notes:
 
-- Added per-batch `time.process_time()` deltas around the benchmark batch body.
-- Added `cpu` and `ctf` profile row columns:
-  - `cpu`: process CPU milliseconds per patch for the whole process.
-  - `ctf`: process CPU time divided by batch wall time.
-- Kept existing `work` and `tf` columns unchanged:
-  - `work`: summed per-candidate loader worker elapsed time.
-  - `tf`: `work / load_batch wall`.
+- Updated `_direction_field_overlay_rgb` to default to stride 4, while
+  `--dir-vis` still uses a 2x nearest-neighbor image scale.
+- The existing proportional segment-length formula now yields a 6-display-pixel
+  segment inside each 8x8 display-pixel cell.
+- Direction segments are drawn onto a 4x supersampled RGBA overlay and
+  downsampled before compositing, leaving the underlying image scaling
+  unchanged.
+- Updated dir-vis summary metadata, specs, and code-structure docs.
 
 Validation:
 
 - Compile check:
-  `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py`
+  `AGENTS_AGENT_MODE=1 PYTHONPATH=vesuvius/src:. python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
   passed.
-- Focused loader tests:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: `106 passed in 4.97s`.
-- Load-only profile benchmark:
-  `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_2d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --benchmark --load-only --profile`
-  completed with `batches=100`, `patches=12800`, `elapsed_ms=86678.4`,
-  `patches_per_second=147.67`.
-- Profile summary from that run:
-  - `process_cpu=25.848 ms/patch`
-  - `loader_wall=6.760 ms/patch`
-  - `loader_worker=202.474 ms/patch`
-  - `loader_thread_factor=29.951`
-  - `process_cpu_factor=3.817`
-
-Finding:
-
-- The existing `tf` column was only a synthetic summed-worker-timer ratio. It
-  can report about 30x while the actual process consumes about 3.8 CPU cores on
-  this workload. The new `ctf` / `process_cpu_factor` columns are the numbers
-  to compare with system CPU monitors.
+- Focused overlay test:
+  `AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k dir_vis_overlay_scales_and_strides`
+  passed: `1 passed, 105 deselected in 1.90s`.
+- Full fiber 2D loader/runner helper test module:
+  `AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  passed: `106 passed in 5.12s`.
+- Diff whitespace check:
+  `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  passed.
