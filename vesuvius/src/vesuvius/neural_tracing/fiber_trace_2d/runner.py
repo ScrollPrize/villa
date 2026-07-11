@@ -485,40 +485,6 @@ def _source_grid_point_to_reference(source_xy_grid: np.ndarray, point_xy: np.nda
     return (top * (1.0 - ty) + bottom * ty).astype(np.float32)
 
 
-def _reference_direction_to_source_grid_direction(
-    source_xy_grid: np.ndarray,
-    point_xy: np.ndarray,
-    reference_direction_xy: np.ndarray,
-) -> np.ndarray | None:
-    source = np.asarray(source_xy_grid, dtype=np.float32)
-    point = np.asarray(point_xy, dtype=np.float32)
-    direction = np.asarray(reference_direction_xy, dtype=np.float32)
-    if source.ndim != 3 or source.shape[2] != 2 or point.shape != (2,) or direction.shape != (2,):
-        raise ValueError("source_xy_grid must have shape H,W,2 and point/direction must have shape (2,)")
-    height, width = source.shape[:2]
-    x = int(round(float(point[0])))
-    y = int(round(float(point[1])))
-    if x < 0 or y < 0 or x >= width or y >= height:
-        return None
-    x0 = max(0, x - 1)
-    x1 = min(width - 1, x + 1)
-    y0 = max(0, y - 1)
-    y1 = min(height - 1, y + 1)
-    if x0 == x1 or y0 == y1:
-        return None
-    local = source[[y, y, y0, y1], [x0, x1, x, x]]
-    if not bool(np.isfinite(local).all()):
-        return None
-    dsource_dx = (source[y, x1] - source[y, x0]) / np.float32(x1 - x0)
-    dsource_dy = (source[y1, x] - source[y0, x]) / np.float32(y1 - y0)
-    jacobian = np.stack([dsource_dx, dsource_dy], axis=1).astype(np.float32)
-    transformed = np.linalg.pinv(jacobian).astype(np.float32) @ direction
-    norm = float(np.linalg.norm(transformed))
-    if not np.isfinite(norm) or norm <= 1.0e-6:
-        return None
-    return (transformed / norm).astype(np.float32)
-
-
 def _source_grid_points_to_reference(source_xy_grid: np.ndarray, points_xy: np.ndarray) -> np.ndarray:
     points = np.asarray(points_xy, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] != 2:
@@ -1009,7 +975,7 @@ def _export_line_trace_vis(
                 raise ValueError("could not derive transformed CP/tangent in TTA patch")
             tta_cp, tta_tangent = tta_cp_tangent
             if _reference_point_to_tta(reference_to_tta_xy_grid, cp_xy) is None:
-                raise ValueError("could not invert CP into TTA patch")
+                raise ValueError("could not map CP into TTA patch")
             tta_direction = _predict_direction_field(model, tta_image, tta_valid, device=device)
             field = _TtaDirectionField(
                 name=tta_name,

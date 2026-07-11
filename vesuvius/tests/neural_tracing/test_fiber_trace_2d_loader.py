@@ -68,7 +68,6 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _export_augment_contact_sheet,
     _identity_source_xy_grid,
     _print_timing_table,
-    _reference_direction_to_source_grid_direction,
     _reference_point_to_tta,
     _score_trace2cp,
     _source_grid_direction_to_reference,
@@ -603,15 +602,11 @@ def test_identity_tta_source_grid_maps_points_and_directions() -> None:
     assert tta_point is not None
     assert np.allclose(tta_point, point)
 
-    tta_direction = _reference_direction_to_source_grid_direction(
+    reference_direction = _source_grid_direction_to_reference(
         source_xy,
         tta_point,
         np.asarray([1.0, 0.0], dtype=np.float32),
     )
-    assert tta_direction is not None
-    assert np.allclose(tta_direction, [1.0, 0.0])
-
-    reference_direction = _source_grid_direction_to_reference(source_xy, tta_point, tta_direction)
     assert reference_direction is not None
     assert np.allclose(reference_direction, [1.0, 0.0])
 
@@ -629,15 +624,11 @@ def test_line_trace_random_tta_source_grid_maps_points_and_directions() -> None:
     assert tta_point is not None
     assert np.allclose(tta_point, [5.0, 4.0])
 
-    tta_direction = _reference_direction_to_source_grid_direction(
+    reference_direction = _source_grid_direction_to_reference(
         source_xy,
         tta_point,
         np.asarray([1.0, 0.0], dtype=np.float32),
     )
-    assert tta_direction is not None
-    assert np.allclose(tta_direction, [1.0, 0.0])
-
-    reference_direction = _source_grid_direction_to_reference(source_xy, tta_point, tta_direction)
     assert reference_direction is not None
     assert np.allclose(reference_direction, [1.0, 0.0])
 
@@ -1338,12 +1329,9 @@ def test_line_augmentation_returns_coordinates_not_mask() -> None:
     assert line.dtype == np.float32
 
 
-def test_smooth_line_and_cp_mapping_do_not_use_nearest_grid_search(monkeypatch: pytest.MonkeyPatch) -> None:
-    def forbidden(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("smooth line mapping should not use dense nearest-grid search")
+def test_smooth_line_and_cp_mapping_do_not_use_nearest_grid_search() -> None:
+    assert not hasattr(augment_module, "_nearest_output_pixels_for_source_points")
 
-    monkeypatch.setattr(augment_module, "_nearest_output_pixels_for_source_points", forbidden)
     params = FiberStripAugmentParams(smooth_offset=2.0, smooth_offset_stride=3.0, smooth_offset_seed=7)
 
     line = transformed_centerline_coords(
