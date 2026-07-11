@@ -349,8 +349,8 @@
   requested pair is skipped.
 - Trace2CP loading constructs a side-strip segment that spans the start and
   target CPs plus receptive-field/visualization margin. The segment strip
-  height is twice the configured patch height so traces have more vertical room
-  before entering the RF margin. It uses the same
+  height is four times the configured patch height so traces have more vertical
+  room before entering the RF margin. It uses the same
   Lasagna manifest normal sampling and VC3D-equivalent side-strip coordinate
   construction as CP-local patches, but anchors the start CP at an explicit
   strip x-coordinate so the target CP lies in the same image at its arc-length

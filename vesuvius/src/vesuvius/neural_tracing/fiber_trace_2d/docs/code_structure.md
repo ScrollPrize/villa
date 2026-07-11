@@ -269,7 +269,7 @@ The important behavior is:
   target CP column; the reverse trace is compared at the start CP column.
   The center-biased closest approach remains a `refine_score` diagnostic for
   the fused/optimized visualization rows only. The trace2cp segment strip uses
-  twice the configured patch height for more vertical room before the RF
+  four times the configured patch height for more vertical room before the RF
   margin.
 - Trace2CP uses `--med-tta` to decide whether to use TTA. Without it, the tool
   traces and scores both directions on the base direction field. With it,

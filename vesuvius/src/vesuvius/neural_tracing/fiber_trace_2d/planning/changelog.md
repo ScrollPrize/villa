@@ -2,6 +2,8 @@
 
 ## 2026-07-11
 
+- Increased Trace2CP segment strip height to four times the configured patch
+  height so tracing has more vertical room before RF-margin or edge stops.
 - Switched public Trace2CP `trace2cp_error` back to target-column y error per
   horizontal CP span for all trace modes while keeping closest-approach logic
   for fusion/refinement diagnostics.

@@ -1,10 +1,8 @@
-# Trace2CP Target-Column Metric
+# Trace2CP Vertical Space Doubling
 
-Switch the public Trace2CP metric back to measuring y error at the opposite
-control-point columns.
+Increase Trace2CP segment strip vertical room by another factor of two.
 
-The closest-point/intersection logic should remain the source for Trace2CP
-fusion/refinement visualization, but `trace2cp_error` should no longer be
-computed from the closest trace-to-trace intersection gap. This must apply to
-all Trace2CP modes, including direction-only, median-TTA, and combined
-direction/embedding tracing.
+The segment-strip height is currently `2 * patch_shape_hw[0]`; change it to
+`4 * patch_shape_hw[0]` for Trace2CP loading, visualization, and test
+evaluation paths. This gives the tracer more vertical space before hitting RF
+margin or strip-edge stop conditions.

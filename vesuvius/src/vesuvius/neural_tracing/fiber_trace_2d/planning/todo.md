@@ -30,7 +30,9 @@
     - for now just apply the loss on training and visualize by showing similatiy (between 0 and 1) all points in a patch aginst that patches cp embedding (interpolated)
     - the losses should be applied positive: all points around the cps against each other within the same fiber (across batch patches, thats what the same fiber cp sampling is there for) - and negative across against potentially all other points from all patches (with lower weight it does not matter if we exclude the relevant cps) - choose the pairs in a way that scales well with the batch size - e.g. each output px is compared against a single other px from anywhere in the batch (for negative) and for positive all postive pxs of a fiber are compared against all other postive pxs (the number is probably still very small)
     - augmentations: geometric distortions should be _independent_ across fiber patches but image augmentations should be synced!
-- [ ] try less shift
+- [ ] try less shift (?)
+- [ ] we might be off in z (wrong plane in the 2d slice
+    - can we additionally add uncertainty and/or optimize for maximum embedding similaity by shifting in z?
     
 # ideas
 - [ ] short-strip self supervision?

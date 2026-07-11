@@ -809,7 +809,7 @@ def test_trace2cp_loader_rejects_same_cp(tmp_path: Path) -> None:
         )
 
 
-def test_trace2cp_segment_patch_uses_double_configured_height(tmp_path: Path) -> None:
+def test_trace2cp_segment_patch_uses_quadruple_configured_height(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["patch_shape_hw"] = [5, 7]
@@ -823,9 +823,9 @@ def test_trace2cp_segment_patch_uses_double_configured_height(tmp_path: Path) ->
         sample_mode="flat",
     )
 
-    assert image.shape[0] == 10
-    assert valid.shape[0] == 10
-    assert sample.coords_zyx.shape[0] == 10
+    assert image.shape[0] == 20
+    assert valid.shape[0] == 20
+    assert sample.coords_zyx.shape[0] == 20
 
 
 def test_trace2cp_segment_patch_can_align_ambiguous_normal_sign(tmp_path: Path) -> None:
