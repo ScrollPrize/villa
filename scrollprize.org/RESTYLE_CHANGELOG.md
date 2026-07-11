@@ -407,6 +407,15 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - Four boxes, one per major section, each distilling that section's takeaway (owner-reviewed wording): §1 Scanning — compressed regions leave the scanner degraded, sub-micron whole-scroll scans impractical, limiting pipeline stage unknown scroll-by-scroll; §2 Unwrapping — no fully automatic complete trace; label quality one of the main bottlenecks; §3 Ink — the verbatim PHerc. 1667 caveat (model links kept as following prose); §4 Data scale — cloud-native or impractical; infrastructure determines what research is possible.
 **Files:** `docs/37_2026_open_problems.md`, `src/css/chrome.css`.
 
+## C50 — VC3D tutorial promoted to current
+
+**Why:** David's new draft VC3D tutorial (`06_tutorial_VC3D.md`, added in `0f344e474` under Archive) is the live guide for the project's main tool — it belongs with the current tutorials.
+- Sidebar: moved from Archive into Overview → Open Problems, first (above Spiral Fitting and Ink Detection).
+- Date stamp `*Last updated: July 11, 2026*` added to the page (site convention).
+- Open Problems: listed first under "Related tutorials → Up to date" (marked early draft); inline link added where the article introduces VC3D as the visualization tool ("A hands-on VC3D tutorial walks through…").
+- Landing: the Virtual Unwrapping challenge box's CTA ("Chart the Path") now leads to /tutorial_VC3D — mirroring how Ink Detection's "Find a Letter" leads to /tutorial5 (its title still deep-links the article section).
+**Files:** `sidebars.js`, `docs/06_tutorial_VC3D.md`, `docs/37_2026_open_problems.md`, `src/components/Landing.js`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

@@ -31,6 +31,8 @@ title: "Volume Cartographer 3D (VC3D)"
 
 # Volume Cartographer 3D (VC3D)
 
+*Last updated: July 11, 2026*
+
 :::info[Draft]
 
 This is an early draft that will eventually replace the [Volume Cartographer (Segmentation)](/tutorial_VC) tutorial. Many sections are still incomplete.
