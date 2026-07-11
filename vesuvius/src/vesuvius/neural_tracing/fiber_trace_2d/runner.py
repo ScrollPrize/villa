@@ -27,6 +27,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.loader import (
 from vesuvius.neural_tracing.fiber_trace_2d.model import (
     FiberStripDirectionModelConfig,
     FiberStripDirectionNet,
+    direction_output,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_line_index
 
@@ -879,6 +880,7 @@ def _model_config_from_checkpoint(checkpoint: dict, loader: FiberStrip2DLoader) 
         in_channels=1,
         hidden_channels=max(1, int(training.get("model_hidden_channels", 64))),
         depth=max(1, int(training.get("model_depth", 10))),
+        embedding_channels=max(0, int(training.get("contrastive_embedding_channels", 0))),
     )
 
 
@@ -931,7 +933,7 @@ def _predict_direction_field(
 ) -> np.ndarray:
     with torch.no_grad():
         input_image = _prepare_model_image(image, valid_mask, device=device)
-        encoded = model(input_image)[0].permute(1, 2, 0)
+        encoded = direction_output(model(input_image))[0].permute(1, 2, 0)
         return decode_lasagna_direction_xy(encoded).detach().cpu().numpy().astype(np.float32)
 
 

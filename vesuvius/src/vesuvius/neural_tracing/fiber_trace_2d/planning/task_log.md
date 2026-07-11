@@ -1,21 +1,23 @@
-# Full Test Trace2CP Evaluation Sentinel Task Log
+# Task Log
 
-## Notes
+Current task: contrastive embedding using cosine similarity.
 
-- Starting from user request to make `training.test_control_points: 0` evaluate
-  all configured test control point samples.
-- `training.test_control_points` now parses as a non-negative integer. Positive
-  values preserve the existing deterministic random test window behavior.
-- The `0` sentinel resolves to `test_loader.sample_count`, starts at sample
-  index `0`, and uses flat CP order so the evaluated segment set matches
-  whole-fiber Trace2CP visualization more directly.
-- Test loss and Trace2CP metric both use the resolved effective test selection.
+Plan review:
+- The plan keeps existing direction supervision active and adds embedding
+  channels only when configured, so old direction-only configs remain valid.
+- The grouped batch mode is limited to training; existing flat/random loader
+  modes remain available for tests, runner tools, and Trace2CP evaluation.
+- No spec deviations identified before implementation.
 
-## Validation
-
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'test_control_points or test_interval'`
-  - Passed: 5 passed, 140 deselected in 4.17s.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  - Passed: 145 passed in 6.46s.
-- `git diff --check -- <touched files>`
-  - Passed.
+Validation:
+- Focused tests passed:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'embedding or fiber_group or direction_model_forward_shape'`
+  -> 5 passed, 144 deselected.
+- Full focused file initially failed because two legacy tests monkeypatched
+  `_prepare_sample` with its old signature. Added a compatibility fallback for
+  normal load paths.
+- Full focused file passed:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  -> 149 passed.
+- Python compile check passed for changed fiber_trace_2d source/test modules.
+- `git diff --check` passed for touched files.

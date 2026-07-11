@@ -13,6 +13,8 @@ The important behavior is:
   augmentation;
 - train a small 2D direction model using CP-local Lasagna two-cos-channel
   direction targets;
+- optionally train a CP-local contrastive embedding head using cosine
+  similarity;
 - export JPG batches and augmentation contact sheets for inspection;
 - prefetch addressed base-volume chunks into the configured cache.
 
@@ -152,8 +154,9 @@ The important behavior is:
 - The default model has 10 residual blocks and 64 hidden channels.
 - The default normalization is `BatchNorm2d`.
 - Consumes flattened strip patches shaped `[patch_batch, 1, height, width]`.
-- Outputs exactly two per-pixel direction channels in the Lasagna encoded
-  representation.
+- Outputs two per-pixel direction channels in the Lasagna encoded
+  representation first. Configured contrastive embedding channels are appended
+  after those first two channels.
 
 `loader.py`
 
@@ -182,6 +185,11 @@ The important behavior is:
   metadata converts line and control-point coordinates at assembly/export time.
 - Builds one sample as all configured strip-z offsets around one control point.
 - Builds a batch by stacking deterministic samples.
+- Builds contrastive training batches by selecting deterministic shuffled
+  groups of `N` CPs from one fiber, repeating that same-fiber CP group to fill
+  the configured training batch, using independent geometric augmentation
+  seeds per repeated patch, and synchronizing value/image augmentation seeds
+  across the group.
 - Implements `build_strip_source` / `build_strip_patch_from_source` as the
   shared path for training, runner loading, augment-vis, and prefetch.
 - Implements `build_trace2cp_segment_patch` for runner inspection of a segment
@@ -358,6 +366,16 @@ The important behavior is:
   model.
 - Computes direction targets from transformed line coordinates after geometric
   augmentation.
+- When `training.contrastive_enabled` is true, configures an embedding head,
+  uses the loader's same-fiber grouped batch path, and adds a cosine embedding
+  loss. Positive terms compare CP-neighborhood embeddings from the same fiber;
+  negative terms compare each positive to one deterministic valid non-CP pixel
+  from the batch. The positive and negative means are balanced before applying
+  `training.contrastive_weight`.
+- Logs `train/loss_total`, `train/loss_direction`,
+  `train/loss_contrastive`, positive/negative contrastive components, and
+  TensorBoard embedding-similarity images that compare every pixel in a
+  selected patch against that patch's CP embedding.
 - On CUDA training runs, uses a bounded deterministic whole-batch pipeline when
   `training.pipeline_enabled` is true. Background workers build exact training
   steps with `FiberStrip2DLoader.load_batch`, defer image/value augmentation,
@@ -458,6 +476,15 @@ Training keys:
   Training and benchmark modes require this to match top-level `batch_size`.
   Changing `strip_z_offset_count` changes the flattened CNN patch count without
   any default-shape warning.
+- `contrastive_enabled`: enables same-fiber contrastive embedding training.
+- `contrastive_embedding_channels`: number of raw embedding channels appended
+  after the two direction channels; must be positive when contrastive training
+  is enabled.
+- `contrastive_control_points_per_fiber`: same-fiber CP group size `N`.
+  `control_points_per_step` must be divisible by this value so the group can be
+  repeated evenly to fill the batch.
+- `contrastive_weight`: multiplier for the balanced cosine contrastive loss.
+- `contrastive_negative_margin`: cosine margin for negative pairs.
 - `device`: `auto`, `cpu`, or a torch device string.
 - `tensorboard_enabled`: set false for smoke tests without TensorBoard.
 - `pipeline_enabled`: enables CUDA training batch pipelining and load-only

@@ -28,12 +28,14 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     transformed_source_point_coords,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.direction import (
+    DirectionSupervision,
     build_direction_supervision,
     cp_neighborhood_yx,
     decode_lasagna_direction_xy,
     direction_angle_error_degrees,
     encode_lasagna_direction_xy,
 )
+from vesuvius.neural_tracing.fiber_trace_2d.embedding import contrastive_embedding_loss
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace_2d.loader import (
     FiberStrip2DLoader,
@@ -1259,6 +1261,20 @@ def test_direction_model_forward_shape_and_range() -> None:
     assert bool(torch.all(output <= 1.0))
 
 
+def test_direction_model_can_append_embedding_channels() -> None:
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(hidden_channels=4, depth=2, embedding_channels=5)
+    )
+    image = torch.zeros((3, 1, 8, 9), dtype=torch.float32)
+
+    output = model(image)
+
+    assert output.shape == (3, 7, 8, 9)
+    assert bool(torch.all(output[:, :2] >= 0.0))
+    assert bool(torch.all(output[:, :2] <= 1.0))
+    assert bool(torch.isfinite(output[:, 2:]).all())
+
+
 def test_fiber_parser_reuse(tmp_path: Path) -> None:
     path = _write_fiber(tmp_path / "fiber.json")
     fiber = load_vc3d_fiber(path)
@@ -1553,6 +1569,52 @@ def test_config_and_loader_batch_shape(tmp_path: Path) -> None:
     assert not hasattr(batch, "planar_images")
     assert batch.strip_z_offsets.tolist() == [-1.0, 0.0, 1.0]
     assert batch.control_point_indices.shape == (2,)
+
+
+def test_fiber_group_batch_repeats_same_fiber_control_points(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=4)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["strip_z_offset_count"] = 1
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    batch = loader.load_fiber_group_batch(
+        0,
+        batch_size=4,
+        control_points_per_group=2,
+        include_coords=False,
+    )
+
+    assert batch.images.shape == (4, 1, 1, 3, 3)
+    assert len(set(batch.fiber_paths)) == 1
+    unique, counts = np.unique(batch.control_point_indices, return_counts=True)
+    assert unique.shape == (2,)
+    assert sorted(counts.tolist()) == [2, 2]
+
+
+def test_fiber_group_batch_syncs_value_augmentation_but_not_geometry(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=4)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["strip_z_offset_count"] = 1
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    batch = loader.load_fiber_group_batch(
+        0,
+        batch_size=4,
+        control_points_per_group=2,
+        apply_image_augmentation=False,
+        include_coords=False,
+    )
+
+    params = tuple(param for param in batch.augmentation_params if param is not None)
+    assert len(params) == 4
+    values = {(p.brightness, p.contrast, p.gamma, p.noise_std, p.blur_sigma, p.noise_seed) for p in params}
+    geometry = {(p.shift_x, p.shift_y, p.rotation_degrees, p.shear_x, p.shear_y, p.scale) for p in params}
+    assert len(values) == 1
+    assert len(geometry) > 1
 
 
 def test_loader_batch_profile_collects_stage_timings(tmp_path: Path) -> None:
@@ -3398,6 +3460,40 @@ def test_direction_angle_error_reports_degrees() -> None:
 
     assert float(perfect_error.max()) < 0.5
     assert float(perpendicular_error.min()) > 89.0
+
+
+def test_contrastive_embedding_loss_balances_positive_and_negative_terms() -> None:
+    output = torch.zeros((2, 4, 3, 3), dtype=torch.float32)
+    output[:, 2, :, :] = 1.0
+    supervision = DirectionSupervision(
+        patch_indices=torch.tensor([0, 1], dtype=torch.long),
+        y=torch.tensor([1, 1], dtype=torch.long),
+        x=torch.tensor([1, 1], dtype=torch.long),
+        target=torch.zeros((2, 2), dtype=torch.float32),
+        cp_xy=torch.zeros((2, 2), dtype=torch.float32),
+        tangent_xy=torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
+    )
+    samples = (
+        SimpleNamespace(fiber_path="fiber-a", record_index=0),
+        SimpleNamespace(fiber_path="fiber-a", record_index=0),
+    )
+    valid = np.ones((2, 3, 3), dtype=bool)
+
+    loss, metrics = contrastive_embedding_loss(
+        output,
+        supervision,
+        samples,  # type: ignore[arg-type]
+        valid,
+        weight=2.0,
+        negative_margin=0.0,
+    )
+
+    assert float(loss.detach().item()) == pytest.approx(1.0)
+    assert metrics.positive_loss == pytest.approx(0.0)
+    assert metrics.negative_loss == pytest.approx(1.0)
+    assert metrics.loss == pytest.approx(1.0)
+    assert metrics.positive_samples == 2
+    assert metrics.negative_samples == 2
 
 
 def test_training_batch_assembly_default_patch_count_is_64(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ class FiberStripDirectionModelConfig:
     in_channels: int = 1
     hidden_channels: int = 64
     depth: int = 10
+    embedding_channels: int = 0
 
 
 class _ResidualBlock(nn.Module):
@@ -33,7 +34,7 @@ class _ResidualBlock(nn.Module):
 
 
 class FiberStripDirectionNet(nn.Module):
-    """V0 2D ResNet that predicts Lasagna two-channel direction codes."""
+    """V0 2D ResNet that predicts direction codes plus optional embeddings."""
 
     def __init__(self, config: FiberStripDirectionModelConfig | None = None) -> None:
         super().__init__()
@@ -44,7 +45,10 @@ class FiberStripDirectionNet(nn.Module):
             raise ValueError("hidden_channels must be > 0")
         if cfg.depth <= 0:
             raise ValueError("depth must be > 0")
+        if cfg.embedding_channels < 0:
+            raise ValueError("embedding_channels must be >= 0")
         hidden = int(cfg.hidden_channels)
+        embedding_channels = int(cfg.embedding_channels)
         self.input = nn.Sequential(
             nn.Conv2d(int(cfg.in_channels), hidden, kernel_size=3, padding=1),
             nn.BatchNorm2d(hidden),
@@ -52,8 +56,29 @@ class FiberStripDirectionNet(nn.Module):
         )
         self.blocks = nn.Sequential(*[_ResidualBlock(hidden) for _ in range(int(cfg.depth))])
         self.output = nn.Conv2d(hidden, 2, kernel_size=1)
+        self.embedding_output = (
+            None if embedding_channels == 0 else nn.Conv2d(hidden, embedding_channels, kernel_size=1)
+        )
+        self.embedding_channels = embedding_channels
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         if image.ndim != 4:
             raise ValueError("image must have shape N,C,H,W")
-        return torch.sigmoid(self.output(self.blocks(self.input(image))))
+        features = self.blocks(self.input(image))
+        direction = torch.sigmoid(self.output(features))
+        if self.embedding_output is None:
+            return direction
+        embedding = self.embedding_output(features)
+        return torch.cat([direction, embedding], dim=1)
+
+
+def direction_output(output: torch.Tensor) -> torch.Tensor:
+    if output.ndim != 4 or int(output.shape[1]) < 2:
+        raise ValueError("model output must have shape N,C,H,W with at least two direction channels")
+    return output[:, :2]
+
+
+def embedding_output(output: torch.Tensor) -> torch.Tensor:
+    if output.ndim != 4 or int(output.shape[1]) < 2:
+        raise ValueError("model output must have shape N,C,H,W with at least two direction channels")
+    return output[:, 2:]

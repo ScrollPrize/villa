@@ -2,6 +2,9 @@
 
 ## 2026-07-11
 
+- Added optional cosine contrastive embedding training for 2D fiber strips:
+  same-fiber grouped CP batches, appended embedding output channels, balanced
+  positive/negative embedding loss, and TensorBoard CP-similarity maps.
 - Made `training.test_control_points: 0` evaluate all configured held-out CP
   samples once in flat order, so training `test/trace2cp_error` can cover the
   same segment set as whole-fiber Trace2CP visualization.

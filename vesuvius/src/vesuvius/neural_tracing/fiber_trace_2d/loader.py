@@ -796,6 +796,21 @@ def _format_seconds(seconds: float) -> str:
     return f"{int(hours)}h{int(minutes):02d}m"
 
 
+def _sync_value_augmentation_params(
+    geometric_params: FiberStripAugmentParams,
+    value_params: FiberStripAugmentParams,
+) -> FiberStripAugmentParams:
+    return replace(
+        geometric_params,
+        brightness=float(value_params.brightness),
+        contrast=float(value_params.contrast),
+        gamma=float(value_params.gamma),
+        noise_std=float(value_params.noise_std),
+        blur_sigma=float(value_params.blur_sigma),
+        noise_seed=int(value_params.noise_seed),
+    )
+
+
 SamplerFactory = Callable[..., CoordinateSampler]
 
 
@@ -821,6 +836,12 @@ class FiberStrip2DLoader:
         self._flat_sample_count = sum(record.fiber.control_points_xyz.shape[0] for record in self.records)
         if self._flat_sample_count <= 0:
             raise ValueError("no control points found in configured fibers")
+        flat_offsets: list[int] = []
+        flat_total = 0
+        for record in self.records:
+            flat_offsets.append(flat_total)
+            flat_total += int(record.fiber.control_points_xyz.shape[0])
+        self._record_flat_offsets = tuple(flat_offsets)
         self._sample_identity_keys = (
             self._build_sample_identity_keys()
             if sample_identity_keys is None
@@ -832,6 +853,8 @@ class FiberStrip2DLoader:
         self._random_pass_cache_lock = (
             threading.Lock() if random_pass_cache_lock is None else random_pass_cache_lock
         )
+        self._fiber_group_pass_cache: dict[tuple[int, int, int], tuple[tuple[int, tuple[int, ...]], ...]] = {}
+        self._fiber_group_pass_cache_lock = threading.Lock()
         self._load_batch_skipped_samples = 0
         self._loader_executor: ThreadPoolExecutor | None = None
         self._loader_executor_workers = 0
@@ -1086,6 +1109,10 @@ class FiberStrip2DLoader:
             remaining -= count
         raise IndexError(flat_index)
 
+    def _descriptor_for_flat_index(self, flat_index: int) -> tuple[_Record, int, int]:
+        record_index, control_index = self._locate_flat_index(int(flat_index))
+        return self.records[record_index], record_index, control_index
+
     def descriptor_for_sample_index(
         self, sample_index: int, *, sample_mode: str = "random"
     ) -> tuple[_Record, int, int]:
@@ -1095,8 +1122,112 @@ class FiberStrip2DLoader:
             flat = self._flat_sample_index(sample_index)
         else:
             raise ValueError("sample_mode must be 'random' or 'flat'")
-        record_index, control_index = self._locate_flat_index(flat)
-        return self.records[record_index], record_index, control_index
+        return self._descriptor_for_flat_index(flat)
+
+    def _effective_flat_sample_count(self, sample_index_limit: int | None) -> int:
+        if sample_index_limit is None or int(sample_index_limit) <= 0:
+            return int(self._flat_sample_count)
+        return max(0, min(int(sample_index_limit), int(self._flat_sample_count)))
+
+    def _fiber_group_entries_for_pass(
+        self,
+        pass_index: int,
+        *,
+        control_points_per_group: int,
+        sample_index_limit: int | None,
+    ) -> tuple[tuple[int, tuple[int, ...]], ...]:
+        group_size = max(1, int(control_points_per_group))
+        effective_count = self._effective_flat_sample_count(sample_index_limit)
+        if effective_count <= 0:
+            raise ValueError("fiber group sampling has no effective control points")
+        key = (int(pass_index), group_size, effective_count)
+        cached = self._fiber_group_pass_cache.get(key)
+        if cached is not None:
+            return cached
+        with self._fiber_group_pass_cache_lock:
+            cached = self._fiber_group_pass_cache.get(key)
+            if cached is not None:
+                return cached
+            entries: list[tuple[int, tuple[int, ...]]] = []
+            for record_index, record in enumerate(self.records):
+                record_start = int(self._record_flat_offsets[record_index])
+                record_count = int(record.fiber.control_points_xyz.shape[0])
+                allowed = max(0, min(record_count, effective_count - record_start))
+                if allowed <= 0:
+                    continue
+                cp_order = sorted(
+                    range(allowed),
+                    key=lambda control_index: (
+                        _stable_seed(
+                            self.config.seed,
+                            "fiber_group_cp",
+                            int(pass_index),
+                            record.fiber_identity,
+                            control_index,
+                        ),
+                        self._sample_identity_keys[record_start + control_index],
+                        control_index,
+                    ),
+                )
+                for start in range(0, len(cp_order), group_size):
+                    group = list(cp_order[start : start + group_size])
+                    fill = 0
+                    while len(group) < group_size:
+                        group.append(cp_order[fill % len(cp_order)])
+                        fill += 1
+                    entries.append((record_index, tuple(int(v) for v in group)))
+            if not entries:
+                raise ValueError("fiber group sampling could not build any same-fiber CP groups")
+            entries = sorted(
+                entries,
+                key=lambda item: (
+                    _stable_seed(
+                        self.config.seed,
+                        "fiber_group_order",
+                        int(pass_index),
+                        item[0],
+                        ",".join(str(v) for v in item[1]),
+                    ),
+                    item[0],
+                    item[1],
+                ),
+            )
+            cached = tuple(entries)
+            self._fiber_group_pass_cache[key] = cached
+        return cached
+
+    def fiber_group_flat_indices_for_group(
+        self,
+        group_index: int,
+        *,
+        control_points_per_group: int,
+        batch_size: int,
+        sample_index_limit: int | None = None,
+    ) -> tuple[int, ...]:
+        batch_size = max(1, int(batch_size))
+        group_size = max(1, int(control_points_per_group))
+        first_entries = self._fiber_group_entries_for_pass(
+            0,
+            control_points_per_group=group_size,
+            sample_index_limit=sample_index_limit,
+        )
+        groups_per_pass = len(first_entries)
+        pass_index = math.floor(int(group_index) / groups_per_pass)
+        offset = int(group_index) % groups_per_pass
+        entries = (
+            first_entries
+            if pass_index == 0
+            else self._fiber_group_entries_for_pass(
+                pass_index,
+                control_points_per_group=group_size,
+                sample_index_limit=sample_index_limit,
+            )
+        )
+        record_index, control_indices = entries[offset]
+        record_start = int(self._record_flat_offsets[record_index])
+        group_flat = [record_start + int(control_index) for control_index in control_indices]
+        repeated = [group_flat[index % len(group_flat)] for index in range(batch_size)]
+        return tuple(int(v) for v in repeated)
 
     def _interpolation_cube(
         self, array: Any, point_zyx_base: np.ndarray, *, array_spacing_base: float
@@ -1606,6 +1737,7 @@ class FiberStrip2DLoader:
         *,
         device: torch.device,
         sample_mode: str = "random",
+        descriptor: tuple[_Record, int, int] | None = None,
         profile: dict[str, float] | None = None,
         use_augmentation_envelope: bool | None = None,
         debug_label: str | None = None,
@@ -1613,9 +1745,12 @@ class FiberStrip2DLoader:
         if debug_label is not None:
             print(f"{debug_label} descriptor start", flush=True)
         with _ProfileBlock(profile, "descriptor"):
-            record, record_index, cp_index = self.descriptor_for_sample_index(
-                sample_index, sample_mode=sample_mode
-            )
+            if descriptor is None:
+                record, record_index, cp_index = self.descriptor_for_sample_index(
+                    sample_index, sample_mode=sample_mode
+                )
+            else:
+                record, record_index, cp_index = descriptor
             center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
             source_shape_hw = self._source_shape_hw(use_augmentation_envelope=use_augmentation_envelope)
         if debug_label is not None:
@@ -1870,17 +2005,34 @@ class FiberStrip2DLoader:
         sample_index: int,
         *,
         sample_mode: str = "random",
+        descriptor: tuple[_Record, int, int] | None = None,
+        value_augmentation_sample_index: int | None = None,
         profile: dict[str, float] | None = None,
         include_line_xy: bool = True,
     ) -> _PreparedStripSample:
         device = resolve_torch_device(self.config.augment.device)
-        source = self.build_strip_source(sample_index, device=device, sample_mode=sample_mode, profile=profile)
-        params_by_offset: list[FiberStripAugmentParams | None] = [
-            (
-                random_combined_augmentation(self.config.augment, sample_index, offset_index)
-                if self.config.augment.enabled
-                else None
+        source = self.build_strip_source(
+            sample_index,
+            device=device,
+            sample_mode=sample_mode,
+            descriptor=descriptor,
+            profile=profile,
+        )
+        def augmentation_params_for_offset(offset_index: int) -> FiberStripAugmentParams | None:
+            if not self.config.augment.enabled:
+                return None
+            geometric = random_combined_augmentation(self.config.augment, sample_index, offset_index)
+            if value_augmentation_sample_index is None:
+                return geometric
+            value = random_combined_augmentation(
+                self.config.augment,
+                int(value_augmentation_sample_index),
+                offset_index,
             )
+            return _sync_value_augmentation_params(geometric, value)
+
+        params_by_offset: list[FiberStripAugmentParams | None] = [
+            augmentation_params_for_offset(offset_index)
             for offset_index, _ in enumerate(self.strip_z_offsets)
         ]
         transforms_by_params: dict[FiberStripAugmentParams, Any] = {}
@@ -2742,12 +2894,30 @@ class FiberStrip2DLoader:
         *,
         sample_mode: str = "random",
         sample_index_limit: int | None = None,
+        flat_indices: tuple[int, ...] | list[int] | None = None,
+        augmentation_sample_start_index: int | None = None,
+        value_augmentation_sync_group_size: int | None = None,
         profile: dict[str, float] | None = None,
         apply_image_augmentation: bool = True,
         include_line_xy: bool = True,
         include_coords: bool = True,
     ) -> FiberStrip2DBatch:
         batch_size = self.config.batch_size if batch_size is None else int(batch_size)
+        flat_index_sequence = None if flat_indices is None else tuple(int(v) for v in flat_indices)
+        if flat_index_sequence is not None and not flat_index_sequence:
+            raise ValueError("flat_indices must be non-empty when provided")
+        if flat_index_sequence is not None and batch_size > len(flat_index_sequence):
+            raise ValueError("batch_size cannot exceed flat_indices length")
+        aug_start_index = (
+            int(start_sample_index)
+            if augmentation_sample_start_index is None
+            else int(augmentation_sample_start_index)
+        )
+        value_sync_size = (
+            None
+            if value_augmentation_sync_group_size is None
+            else max(1, int(value_augmentation_sync_group_size))
+        )
         begin_zarr_cache_trace()
         all_samples: list[FiberStripSample] = []
         images: list[np.ndarray] = []
@@ -2762,7 +2932,7 @@ class FiberStrip2DLoader:
         def report_skip(current_sample_index: int, exc: ValueError) -> None:
             self._load_batch_skipped_samples += 1
 
-        def build_candidate(raw_sample_index: int) -> tuple[
+        def build_candidate(raw_sample_index: int, attempt_index: int) -> tuple[
             int,
             int,
             dict[str, float],
@@ -2770,6 +2940,15 @@ class FiberStrip2DLoader:
             ValueError | None,
         ]:
             current_sample_index = self._bounded_sample_index(raw_sample_index, sample_index_limit)
+            descriptor = None
+            if flat_index_sequence is not None:
+                current_sample_index = int(flat_index_sequence[int(attempt_index)])
+                descriptor = self._descriptor_for_flat_index(current_sample_index)
+            value_augmentation_sample_index = (
+                None
+                if value_sync_size is None
+                else math.floor(int(raw_sample_index) / value_sync_size)
+            )
             local_profile: dict[str, float] = {} if profile is not None else {}
             worker_start = time.perf_counter()
             try:
@@ -2777,11 +2956,18 @@ class FiberStrip2DLoader:
                     result = self._prepare_sample(
                         current_sample_index,
                         sample_mode=sample_mode,
+                        descriptor=descriptor,
+                        value_augmentation_sample_index=value_augmentation_sample_index,
                         profile=local_profile if profile is not None else None,
                         include_line_xy=include_line_xy,
                     )
                 except TypeError as exc:
-                    if "include_line_xy" not in str(exc):
+                    message = str(exc)
+                    if (
+                        "include_line_xy" not in message
+                        and "descriptor" not in message
+                        and "value_augmentation_sample_index" not in message
+                    ):
                         raise
                     result = self._prepare_sample(
                         current_sample_index,
@@ -2799,12 +2985,16 @@ class FiberStrip2DLoader:
             return raw_sample_index, current_sample_index, local_profile, result, None
 
         try:
-            next_raw_to_submit = int(start_sample_index)
-            next_raw_to_consume = int(start_sample_index)
-            max_attempts = max(batch_size * 4, batch_size + 1000)
+            next_attempt_to_submit = 0
+            next_attempt_to_consume = 0
+            max_attempts = (
+                len(flat_index_sequence)
+                if flat_index_sequence is not None
+                else max(batch_size * 4, batch_size + 1000)
+            )
             attempts = 0
             worker_count = min(max(1, int(self.config.loader_workers)), max(1, batch_size), max_attempts)
-            if sample_mode == "random":
+            if sample_mode == "random" and flat_index_sequence is None:
                 with _ProfileBlock(profile, "random_order"):
                     self._ensure_random_pass_orders_for_indices(
                         self._bounded_sample_index(raw, sample_index_limit)
@@ -2857,8 +3047,9 @@ class FiberStrip2DLoader:
 
             if worker_count == 1:
                 while len(prepared_items) < batch_size and attempts < max_attempts:
-                    raw_sample_index = next_raw_to_submit
-                    next_raw_to_submit += 1
+                    attempt_index = next_attempt_to_submit
+                    raw_sample_index = aug_start_index + attempt_index
+                    next_attempt_to_submit += 1
                     attempts += 1
                     (
                         returned_raw,
@@ -2866,7 +3057,7 @@ class FiberStrip2DLoader:
                         local_profile,
                         result,
                         skip_exc,
-                    ) = build_candidate(raw_sample_index)
+                    ) = build_candidate(raw_sample_index, attempt_index)
                     if returned_raw != raw_sample_index:
                         raise RuntimeError("internal load_batch raw sample index mismatch")
                     consume_candidate(current_sample_index, local_profile, result, skip_exc)
@@ -2889,10 +3080,11 @@ class FiberStrip2DLoader:
                         and len(pending) + len(outcomes) < needed_candidates
                         and attempts < max_attempts
                     ):
-                        raw_sample_index = next_raw_to_submit
-                        next_raw_to_submit += 1
+                        attempt_index = next_attempt_to_submit
+                        raw_sample_index = aug_start_index + attempt_index
+                        next_attempt_to_submit += 1
                         attempts += 1
-                        future = executor.submit(build_candidate, raw_sample_index)
+                        future = executor.submit(build_candidate, raw_sample_index, attempt_index)
                         pending[future] = raw_sample_index
                     if not pending:
                         break
@@ -2914,14 +3106,14 @@ class FiberStrip2DLoader:
                             result,
                             skip_exc,
                         )
-                    while len(images) < batch_size and next_raw_to_consume in outcomes:
+                    while len(prepared_items) < batch_size and (aug_start_index + next_attempt_to_consume) in outcomes:
                         (
                             current_sample_index,
                             local_profile,
                             result,
                             skip_exc,
-                        ) = outcomes.pop(next_raw_to_consume)
-                        next_raw_to_consume += 1
+                        ) = outcomes.pop(aug_start_index + next_attempt_to_consume)
+                        next_attempt_to_consume += 1
                         consume_candidate(current_sample_index, local_profile, result, skip_exc)
                 for future in pending:
                     future.cancel()
@@ -2955,6 +3147,45 @@ class FiberStrip2DLoader:
             samples=tuple(all_samples),
             cache_stats=cache_stats,
             augmentation_params=tuple(augmentation_params),
+        )
+
+    def load_fiber_group_batch(
+        self,
+        group_index: int,
+        *,
+        batch_size: int,
+        control_points_per_group: int,
+        sample_index_limit: int | None = None,
+        profile: dict[str, float] | None = None,
+        apply_image_augmentation: bool = True,
+        include_line_xy: bool = True,
+        include_coords: bool = True,
+    ) -> FiberStrip2DBatch:
+        batch_size = max(1, int(batch_size))
+        attempts = max(batch_size * 4, batch_size + 1000)
+        group_size = max(1, int(control_points_per_group))
+        group_span = max(1, int(math.ceil(attempts / float(batch_size))))
+        flat_indices: list[int] = []
+        for local_group in range(group_span):
+            flat_indices.extend(
+                self.fiber_group_flat_indices_for_group(
+                    int(group_index) + local_group,
+                    control_points_per_group=group_size,
+                    batch_size=batch_size,
+                    sample_index_limit=sample_index_limit,
+                )
+            )
+        return self.load_batch(
+            int(group_index) * batch_size,
+            batch_size=batch_size,
+            sample_mode="flat",
+            flat_indices=tuple(flat_indices),
+            augmentation_sample_start_index=int(group_index) * batch_size,
+            value_augmentation_sync_group_size=batch_size,
+            profile=profile,
+            apply_image_augmentation=apply_image_augmentation,
+            include_line_xy=include_line_xy,
+            include_coords=include_coords,
         )
 
     def chunk_requests_for_sample_index(

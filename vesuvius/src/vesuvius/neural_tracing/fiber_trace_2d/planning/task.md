@@ -1,11 +1,11 @@
-# Full Test Trace2CP Evaluation Sentinel
+# Contrastive Embedding With Cosine Similarity
 
-User request:
+Implement the todo item "contrastive embedding using cosine similarity":
 
-- Make `training.test_control_points: 0` mean that test evaluation runs over
-  every configured held-out control point sample.
-- This should make the training test Trace2CP metric comparable to running
-  whole-fiber Trace2CP visualization on the same held-out fiber, apart from
-  small differences such as whole-fiber row-axis alignment.
-- Keep positive `test_control_points` values as the existing fixed-size
-  deterministic test subset.
+- change CP sampling for training so each contrastive batch uses `N` CPs from the same fiber repeated `M` times to fill the batch;
+- add a simple embedding head and cosine-similarity contrastive loss;
+- positive supervision compares CP-neighborhood pixels from the same fiber;
+- negative supervision compares CP-neighborhood pixels to other valid pixels from the batch with balanced positive/negative weighting;
+- keep direction supervision active;
+- visualize per-pixel embedding similarity against the patch CP embedding in TensorBoard;
+- keep geometric augmentations independent across repeated fiber patches and synchronize value/image augmentations for contrastive groups.

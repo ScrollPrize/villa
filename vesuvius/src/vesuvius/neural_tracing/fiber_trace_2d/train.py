@@ -28,10 +28,16 @@ from vesuvius.neural_tracing.fiber_trace_2d.direction import (
     direction_mse_loss,
     line_cp_and_tangent_xy,
 )
+from vesuvius.neural_tracing.fiber_trace_2d.embedding import (
+    ContrastiveEmbeddingMetrics,
+    contrastive_embedding_loss,
+    embedding_similarity_to_cp,
+)
 from vesuvius.neural_tracing.fiber_trace_2d.loader import FiberStrip2DBatch, FiberStrip2DLoader, SamplerFactory, load_config
 from vesuvius.neural_tracing.fiber_trace_2d.model import (
     FiberStripDirectionModelConfig,
     FiberStripDirectionNet,
+    direction_output,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _predict_direction_field,
@@ -59,6 +65,11 @@ class FiberStripTrainingConfig:
     tensorboard_enabled: bool = True
     model_hidden_channels: int = 64
     model_depth: int = 10
+    contrastive_enabled: bool = False
+    contrastive_embedding_channels: int = 0
+    contrastive_control_points_per_fiber: int = 8
+    contrastive_weight: float = 1.0
+    contrastive_negative_margin: float = 0.0
     pipeline_enabled: bool = True
     pipeline_depth: int = 16
     pipeline_workers: int = 8
@@ -98,6 +109,11 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         tensorboard_enabled=bool(get("tensorboard_enabled", True)),
         model_hidden_channels=max(1, int(get("model_hidden_channels", 64))),
         model_depth=max(1, int(get("model_depth", 10))),
+        contrastive_enabled=bool(get("contrastive_enabled", False)),
+        contrastive_embedding_channels=max(0, int(get("contrastive_embedding_channels", 0))),
+        contrastive_control_points_per_fiber=max(1, int(get("contrastive_control_points_per_fiber", 8))),
+        contrastive_weight=float(get("contrastive_weight", 1.0)),
+        contrastive_negative_margin=float(get("contrastive_negative_margin", 0.0)),
         pipeline_enabled=bool(get("pipeline_enabled", True)),
         pipeline_depth=max(1, int(get("pipeline_depth", 16))),
         pipeline_workers=max(0, int(get("pipeline_workers", 8))),
@@ -113,6 +129,19 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         raise ValueError("training.learning_rate must be positive and finite")
     if not math.isfinite(config.test_trace2cp_step_px) or config.test_trace2cp_step_px <= 0.0:
         raise ValueError("training.test_trace2cp_step_px must be positive and finite")
+    if config.contrastive_enabled and config.contrastive_embedding_channels <= 0:
+        raise ValueError("training.contrastive_embedding_channels must be > 0 when contrastive is enabled")
+    if config.contrastive_enabled and (
+        config.train_control_points_per_step % config.contrastive_control_points_per_fiber != 0
+    ):
+        raise ValueError(
+            "training.control_points_per_step must be divisible by "
+            "training.contrastive_control_points_per_fiber when contrastive is enabled"
+        )
+    if not math.isfinite(config.contrastive_weight) or config.contrastive_weight < 0.0:
+        raise ValueError("training.contrastive_weight must be non-negative and finite")
+    if not math.isfinite(config.contrastive_negative_margin):
+        raise ValueError("training.contrastive_negative_margin must be finite")
     if config.test_trace2cp_rf_margin_px is not None and (
         not math.isfinite(config.test_trace2cp_rf_margin_px)
         or config.test_trace2cp_rf_margin_px < 0.0
@@ -259,6 +288,12 @@ def _batch_images_to_tensors(
 @dataclass(frozen=True)
 class _DirectionMetrics:
     angle_mean_deg: float
+    loss_direction: float
+    loss_contrastive: float = 0.0
+    contrastive_positive_loss: float = 0.0
+    contrastive_negative_loss: float = 0.0
+    contrastive_positive_samples: int = 0
+    contrastive_negative_samples: int = 0
 
 
 @dataclass(frozen=True)
@@ -524,6 +559,8 @@ class _CudaPreparedBatchPipeline:
 
 
 def _training_raw_start_sample_index(step: int, training: FiberStripTrainingConfig) -> int:
+    if bool(training.contrastive_enabled):
+        return int(step) - 1
     return (int(step) - 1) * int(training.train_control_points_per_step)
 
 
@@ -539,16 +576,28 @@ def _load_training_batch(
     raw_start_sample_index = _training_raw_start_sample_index(step, training)
     loader_profile: dict[str, float] = {}
     t0 = time.perf_counter()
-    batch = loader.load_batch(
-        raw_start_sample_index,
-        batch_size=training.train_control_points_per_step,
-        sample_mode=sample_mode,
-        sample_index_limit=training.max_sample_index,
-        profile=loader_profile if profile_enabled else None,
-        apply_image_augmentation=apply_image_augmentation,
-        include_line_xy=True,
-        include_coords=False,
-    )
+    if bool(training.contrastive_enabled):
+        batch = loader.load_fiber_group_batch(
+            raw_start_sample_index,
+            batch_size=training.train_control_points_per_step,
+            control_points_per_group=training.contrastive_control_points_per_fiber,
+            sample_index_limit=training.max_sample_index,
+            profile=loader_profile if profile_enabled else None,
+            apply_image_augmentation=apply_image_augmentation,
+            include_line_xy=True,
+            include_coords=False,
+        )
+    else:
+        batch = loader.load_batch(
+            raw_start_sample_index,
+            batch_size=training.train_control_points_per_step,
+            sample_mode=sample_mode,
+            sample_index_limit=training.max_sample_index,
+            profile=loader_profile if profile_enabled else None,
+            apply_image_augmentation=apply_image_augmentation,
+            include_line_xy=True,
+            include_coords=False,
+        )
     load_ms = (time.perf_counter() - t0) * 1000.0
     return _LoadedTrainingBatch(
         step=int(step),
@@ -651,25 +700,69 @@ def _compute_batch_loss(
     batch: FiberStrip2DBatch,
     *,
     device: torch.device,
+    training: FiberStripTrainingConfig | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, DirectionSupervision, _DirectionMetrics]:
     images_np, valid_np = _flatten_batch(batch)
     images = _prepare_images(images_np, valid_np, device=device)
     supervision = build_direction_supervision(batch.samples, valid_np, device=device)
     outputs = model(images)
-    loss = direction_mse_loss(outputs, supervision)
-    angle_error = direction_angle_error_degrees(outputs, supervision)
-    metrics = _DirectionMetrics(angle_mean_deg=float(angle_error.detach().mean().cpu().item()))
+    direction = direction_output(outputs)
+    direction_loss = direction_mse_loss(direction, supervision)
+    loss = direction_loss
+    contrastive_metrics = ContrastiveEmbeddingMetrics(0.0, 0.0, 0.0, 0, 0)
+    if training is not None and bool(training.contrastive_enabled) and float(training.contrastive_weight) > 0.0:
+        contrastive, contrastive_metrics = contrastive_embedding_loss(
+            outputs,
+            supervision,
+            batch.samples,
+            valid_np,
+            weight=training.contrastive_weight,
+            negative_margin=training.contrastive_negative_margin,
+        )
+        loss = loss + contrastive
+    angle_error = direction_angle_error_degrees(direction, supervision)
+    metrics = _DirectionMetrics(
+        angle_mean_deg=float(angle_error.detach().mean().cpu().item()),
+        loss_direction=float(direction_loss.detach().cpu().item()),
+        loss_contrastive=contrastive_metrics.loss,
+        contrastive_positive_loss=contrastive_metrics.positive_loss,
+        contrastive_negative_loss=contrastive_metrics.negative_loss,
+        contrastive_positive_samples=contrastive_metrics.positive_samples,
+        contrastive_negative_samples=contrastive_metrics.negative_samples,
+    )
     return loss, outputs, supervision, metrics
 
 
 def _compute_prepared_batch_loss(
     model: FiberStripDirectionNet,
     prepared: _PreparedTrainingBatch,
+    training: FiberStripTrainingConfig | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, DirectionSupervision, _DirectionMetrics]:
     outputs = model(prepared.images)
-    loss = direction_mse_loss(outputs, prepared.supervision)
-    angle_error = direction_angle_error_degrees(outputs, prepared.supervision)
-    metrics = _DirectionMetrics(angle_mean_deg=float(angle_error.detach().mean().cpu().item()))
+    direction = direction_output(outputs)
+    direction_loss = direction_mse_loss(direction, prepared.supervision)
+    loss = direction_loss
+    contrastive_metrics = ContrastiveEmbeddingMetrics(0.0, 0.0, 0.0, 0, 0)
+    if training is not None and bool(training.contrastive_enabled) and float(training.contrastive_weight) > 0.0:
+        contrastive, contrastive_metrics = contrastive_embedding_loss(
+            outputs,
+            prepared.supervision,
+            prepared.batch.samples,
+            prepared.valid_np,
+            weight=training.contrastive_weight,
+            negative_margin=training.contrastive_negative_margin,
+        )
+        loss = loss + contrastive
+    angle_error = direction_angle_error_degrees(direction, prepared.supervision)
+    metrics = _DirectionMetrics(
+        angle_mean_deg=float(angle_error.detach().mean().cpu().item()),
+        loss_direction=float(direction_loss.detach().cpu().item()),
+        loss_contrastive=contrastive_metrics.loss,
+        contrastive_positive_loss=contrastive_metrics.positive_loss,
+        contrastive_negative_loss=contrastive_metrics.negative_loss,
+        contrastive_positive_samples=contrastive_metrics.positive_samples,
+        contrastive_negative_samples=contrastive_metrics.negative_samples,
+    )
     return loss, outputs, prepared.supervision, metrics
 
 
@@ -843,6 +936,7 @@ def run_benchmark(
                 in_channels=1,
                 hidden_channels=training.model_hidden_channels,
                 depth=training.model_depth,
+                embedding_channels=training.contrastive_embedding_channels,
             )
         ).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate)
@@ -950,7 +1044,17 @@ def run_benchmark(
                 _sync_device(device)
                 fw_start = time.perf_counter()
                 outputs = model(prepared.images)
-                loss = direction_mse_loss(outputs, prepared.supervision)
+                loss = direction_mse_loss(direction_output(outputs), prepared.supervision)
+                if bool(training.contrastive_enabled) and float(training.contrastive_weight) > 0.0:
+                    contrastive, _ = contrastive_embedding_loss(
+                        outputs,
+                        prepared.supervision,
+                        prepared.batch.samples,
+                        prepared.valid_np,
+                        weight=training.contrastive_weight,
+                        negative_margin=training.contrastive_negative_margin,
+                    )
+                    loss = loss + contrastive
                 _sync_device(device)
                 train_profile["fw"] = (time.perf_counter() - fw_start) * 1000.0
 
@@ -1273,13 +1377,59 @@ def _make_training_visualization(
             center = np.rint(cp_xy).astype(np.int64)
             y = int(np.clip(center[1], 0, flat_valid.shape[1] - 1))
             x = int(np.clip(center[0], 0, flat_valid.shape[2] - 1))
-            encoded = outputs_cpu[patch_index, :, y, x]
+            encoded = outputs_cpu[patch_index, :2, y, x]
             prediction_xy = decode_lasagna_direction_xy(encoded).cpu().numpy()
             rgb = _draw_predicted_cp_direction(
                 rgb,
                 cp_xy=cp_xy,
                 prediction_xy=prediction_xy,
             )
+        cells.append(rgb)
+    if not cells:
+        return np.zeros((3, 1, 1), dtype=np.uint8)
+    h, w = cells[0].shape[:2]
+    cols = min(4, len(cells))
+    rows = int(math.ceil(len(cells) / cols))
+    sheet = np.zeros((rows * h, cols * w, 3), dtype=np.uint8)
+    for i, cell in enumerate(cells):
+        row = i // cols
+        col = i % cols
+        sheet[row * h : (row + 1) * h, col * w : (col + 1) * w] = cell
+    return np.transpose(sheet, (2, 0, 1))
+
+
+def _similarity_to_u8(similarity: np.ndarray) -> np.ndarray:
+    arr = np.asarray(similarity, dtype=np.float32)
+    return np.clip(arr * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def _make_embedding_similarity_visualization(
+    batch: FiberStrip2DBatch,
+    outputs: torch.Tensor,
+    *,
+    max_patches: int = 8,
+) -> np.ndarray:
+    if int(outputs.shape[1]) <= 2:
+        return np.zeros((3, 1, 1), dtype=np.uint8)
+    _, flat_valid = _flatten_batch(batch)
+    cells: list[np.ndarray] = []
+    for patch_index in _select_visualization_patch_indices(batch, max_patches=max_patches):
+        if patch_index >= int(outputs.shape[0]) or patch_index >= len(batch.samples):
+            continue
+        sample = batch.samples[patch_index]
+        cp_tangent = line_cp_and_tangent_xy(sample.line_xy, getattr(sample, "control_point_xy", None))
+        if cp_tangent is None:
+            continue
+        cp_xy, _ = cp_tangent
+        similarity = embedding_similarity_to_cp(
+            outputs,
+            patch_index=patch_index,
+            cp_xy=cp_xy,
+            valid_mask=flat_valid[patch_index],
+        )
+        image_u8 = _similarity_to_u8(similarity)
+        rgb = np.repeat(image_u8[:, :, None], 3, axis=2)
+        rgb = _draw_predicted_cp_direction(rgb, cp_xy=cp_xy, prediction_xy=None)
         cells.append(rgb)
     if not cells:
         return np.zeros((3, 1, 1), dtype=np.uint8)
@@ -1390,6 +1540,7 @@ def run_training(
             in_channels=1,
             hidden_channels=training.model_hidden_channels,
             depth=training.model_depth,
+            embedding_channels=training.contrastive_embedding_channels,
         )
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate)
@@ -1501,7 +1652,7 @@ def run_training(
             model.train()
             train_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
-            loss, outputs, supervision, metrics = _compute_prepared_batch_loss(model, prepared)
+            loss, outputs, supervision, metrics = _compute_prepared_batch_loss(model, prepared, training)
             loss.backward()
             optimizer.step()
             _sync_device(device)
@@ -1549,7 +1700,30 @@ def run_training(
             if writer is not None and (
                 is_first_run_step or step == 1 or step % training.scalar_log_interval == 0
             ):
-                writer.add_scalar("train/loss_direction", loss_value, step)
+                writer.add_scalar("train/loss_total", loss_value, step)
+                writer.add_scalar("train/loss_direction", metrics.loss_direction, step)
+                if bool(training.contrastive_enabled):
+                    writer.add_scalar("train/loss_contrastive", metrics.loss_contrastive, step)
+                    writer.add_scalar(
+                        "train/contrastive_positive_loss",
+                        metrics.contrastive_positive_loss,
+                        step,
+                    )
+                    writer.add_scalar(
+                        "train/contrastive_negative_loss",
+                        metrics.contrastive_negative_loss,
+                        step,
+                    )
+                    writer.add_scalar(
+                        "train/contrastive_positive_samples",
+                        metrics.contrastive_positive_samples,
+                        step,
+                    )
+                    writer.add_scalar(
+                        "train/contrastive_negative_samples",
+                        metrics.contrastive_negative_samples,
+                        step,
+                    )
                 writer.add_scalar("train/angle_error_mean_deg", metrics.angle_mean_deg, step)
                 writer.add_scalar("train/supervision_samples", int(supervision.target.shape[0]), step)
                 writer.add_scalar("timing/load_ms", load_ms, step)
@@ -1582,6 +1756,12 @@ def run_training(
                 is_first_run_step or step == 1 or step % training.tensorboard_image_interval == 0
             ):
                 writer.add_image("train/batch_direction_overlay", _make_training_visualization(batch, outputs), step)
+                if bool(training.contrastive_enabled):
+                    writer.add_image(
+                        "train/batch_embedding_similarity",
+                        _make_embedding_similarity_visualization(batch, outputs),
+                        step,
+                    )
                 wrote_tensorboard = True
             if writer is not None and test_result is not None:
                 writer.add_image(
@@ -1589,6 +1769,12 @@ def run_training(
                     _make_training_visualization(test_result.batch, test_result.outputs),
                     step,
                 )
+                if bool(training.contrastive_enabled):
+                    writer.add_image(
+                        "test/batch_embedding_similarity",
+                        _make_embedding_similarity_visualization(test_result.batch, test_result.outputs),
+                        step,
+                    )
                 wrote_tensorboard = True
             if writer is not None and wrote_tensorboard:
                 writer.flush()
@@ -1607,7 +1793,7 @@ def run_training(
                 checkpoint_metric = (
                     "test/trace2cp_error"
                     if test_trace2cp_metric is not None
-                    else ("test/loss_direction" if test_result is not None else "train/loss_direction")
+                    else ("test/loss_direction" if test_result is not None else "train/loss_total")
                 )
                 _save_checkpoint(
                     snapshots / "current.pt",
@@ -1627,7 +1813,7 @@ def run_training(
                 metric_name = (
                     "test/trace2cp_error"
                     if test_trace2cp_metric is not None
-                    else ("test/loss_direction" if test_result is not None else "train/loss_direction")
+                    else ("test/loss_direction" if test_result is not None else "train/loss_total")
                 )
                 if metric_value < best_metric:
                     best_metric = metric_value
@@ -1668,7 +1854,9 @@ def run_training(
                     )
                 )
                 print(
-                    f"step={step} loss_direction={loss_value:.6f} "
+                    f"step={step} loss_total={loss_value:.6f} "
+                    f"loss_direction={metrics.loss_direction:.6f} "
+                    f"loss_contrastive={metrics.loss_contrastive:.6f} "
                     f"angle_mean_deg={metrics.angle_mean_deg:.2f} "
                     f"supervision_samples={int(supervision.target.shape[0])}{test_part} "
                     f"load_ms={load_ms:.1f} wait_ms={wait_ms:.1f} "
@@ -1697,7 +1885,7 @@ def run_training(
     )
     print(
         f"fiber_trace_2d train complete step={training.max_steps} "
-        f"loss_direction={last_loss:.6f} angle_mean_deg={last_angle_mean_deg:.2f}{test_complete}",
+        f"loss_total={last_loss:.6f} angle_mean_deg={last_angle_mean_deg:.2f}{test_complete}",
         flush=True,
     )
     return run_dir

@@ -1,10 +1,12 @@
-# Full Test Trace2CP Evaluation Sentinel Status
+# Status
 
-- [x] Read local AGENTS workflow.
-- [x] Replace `planning/task.md` with the current user request.
-- [x] Write `planning/task_plan.md`.
-- [x] Update specs/docs/changelog for `test_control_points: 0`.
-- [x] Implement full-test sentinel behavior.
-- [x] Add/update tests.
-- [x] Run focused tests.
-- [x] Record implementation notes and validation in `planning/task_log.md`.
+- [x] Read todo, specs, docs, and current training/model/loader paths
+- [x] Create task.md from the todo item
+- [x] Create task_plan.md
+- [x] Review task_plan.md against task/specs/plan with no scope deviations
+- [x] Implement configurable embedding head and output slicing
+- [x] Implement grouped same-fiber contrastive batch loading
+- [x] Implement cosine contrastive loss and visualization
+- [x] Update docs/specs/changelog
+- [x] Add focused tests
+- [x] Run validation
