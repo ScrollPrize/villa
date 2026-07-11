@@ -2,6 +2,10 @@
 
 ## 2026-07-11
 
+- Added an optional embedding-similarity debug column to single-pair
+  `trace2cp_vis.jpg`, showing fixed-scale cosine maps for both CPs,
+  same-fiber/global CP-bank similarity, and forward/reverse trace-last
+  embeddings when embedding outputs are available.
 - Increased Trace2CP segment strip height to four times the configured patch
   height so tracing has more vertical room before RF-margin or edge stops.
 - Switched public Trace2CP `trace2cp_error` back to target-column y error per

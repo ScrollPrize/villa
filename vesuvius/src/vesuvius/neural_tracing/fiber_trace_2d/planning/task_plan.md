@@ -1,35 +1,50 @@
-# Trace2CP Vertical Space Doubling Plan
+# Trace2CP Similarity Debug Column Plan
 
 ## Scope
 
-- Change only Trace2CP segment patch loading height.
-- Keep CP-local training patches, regular strip sampling, metric semantics,
-  TTA behavior, and tracer logic unchanged.
-- Apply to all Trace2CP users because they all call
-  `build_trace2cp_segment_patch`.
+- Add embedding-similarity maps to the existing single-pair
+  `--trace2cp-vis` JPG.
+- Keep Trace2CP metric, refinement, TTA, and candidate scoring unchanged.
+- Use the existing contrastive embedding field and combined-mode CP embedding
+  bank; do not invent a replacement global embedding definition when no bank
+  exists.
 
 ## Implementation
 
-1. Update Trace2CP segment height calculation in `loader.py`.
-   - Replace the current `2 * patch_shape_hw[0]` height with
-     `4 * patch_shape_hw[0]`.
-   - Prefer a named local multiplier so the intent is obvious.
+1. Add Trace2CP similarity-debug data structures and helpers in `runner.py`.
+   - Compute per-pixel cosine similarity maps from the normalized embedding
+     field.
+   - Build maps for start CP, target CP, same-fiber CP bank mean similarity,
+     forward trace last sampled embedding, and reverse trace last sampled
+     embedding.
+   - Treat missing embedding channels as "no debug column".
 
-2. Update tests.
-   - Rename the existing double-height regression to four-times-height.
-   - Change expected image/valid/coords heights from `10` to `20` when the
-     configured patch height is `5`.
+2. Attach similarity debug to pair evaluation.
+   - After the selected Trace2CP result is known, build debug maps from the
+     selected forward/reverse traces.
+   - Use the existing combined fiber embedding bank for the global map when it
+     is available.
+
+3. Render the debug column.
+   - Add one optional right-side column to `_draw_trace2cp_overlay`.
+   - Render similarity maps on a fixed cosine scale `-1..1 -> 0..255`.
+   - Overlay the fiber line, relevant trace, and CP markers for orientation.
+
+4. Add tests.
+   - Verify similarity debug maps are computed with the expected cosine values.
+   - Verify `_draw_trace2cp_overlay` adds the debug column.
 
 ## Spec Update
 
-- Update the Trace2CP segment loading spec from "twice configured patch
-  height" to "four times configured patch height".
+- Document that Trace2CP visualization includes an optional embedding-debug
+  column when embedding output is present.
+- Document that the global map uses the same-fiber CP embedding bank from
+  combined Trace2CP mode.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` Trace2CP description to say four times the
-  configured patch height.
-- Update changelog, status, and task log.
+- Update `docs/code_structure.md` runner/Trace2CP documentation.
+- Update `planning/changelog.md`, `status.md`, and `task_log.md`.
 
 ## Validation
 

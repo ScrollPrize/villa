@@ -590,6 +590,118 @@ def _embedding_cosine_loss(a: np.ndarray, b: np.ndarray) -> float:
     return float(1.0 - np.clip(float(np.dot(lhs, rhs)), -1.0, 1.0))
 
 
+def _normalized_embedding_field(embedding_chw: np.ndarray) -> np.ndarray:
+    field = _require_trace2cp_embedding_field(embedding_chw)
+    norm = np.linalg.norm(field, axis=0, keepdims=True)
+    finite = np.isfinite(field).all(axis=0, keepdims=True) & np.isfinite(norm) & (norm > 1.0e-6)
+    return np.where(finite, field / np.clip(norm, 1.0e-12, None), 0.0).astype(np.float32)
+
+
+def _embedding_similarity_map(
+    normalized_embedding_chw: np.ndarray,
+    reference_embedding: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None,
+    normalize_reference: bool = True,
+) -> np.ndarray:
+    field = _require_trace2cp_embedding_field(normalized_embedding_chw)
+    ref = np.asarray(reference_embedding, dtype=np.float32).reshape(-1)
+    if int(ref.shape[0]) != int(field.shape[0]):
+        raise ValueError("reference embedding channel count must match embedding field")
+    if not bool(np.isfinite(ref).all()):
+        raise ValueError("reference embedding must be finite")
+    if normalize_reference:
+        ref_norm = float(np.linalg.norm(ref))
+        if not np.isfinite(ref_norm) or ref_norm <= 1.0e-6:
+            raise ValueError("reference embedding must be non-zero")
+        ref = (ref / np.float32(ref_norm)).astype(np.float32)
+    similarity = np.sum(field * ref[:, None, None], axis=0, dtype=np.float32)
+    similarity = np.clip(similarity, -1.0, 1.0).astype(np.float32)
+    if valid_mask is not None:
+        valid = np.asarray(valid_mask, dtype=bool)
+        if valid.shape != similarity.shape:
+            raise ValueError("valid_mask must match embedding spatial shape")
+        similarity = np.where(valid, similarity, np.nan).astype(np.float32)
+    return similarity
+
+
+def _last_trace_embedding(
+    embedding_chw: np.ndarray,
+    trace_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None,
+) -> np.ndarray | None:
+    points = np.asarray(trace_xy, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("trace_xy must have shape N,2")
+    for point in points[::-1]:
+        embedding = _bilinear_embedding_sample(embedding_chw, point, valid_mask=valid_mask)
+        if embedding is not None:
+            return embedding.astype(np.float32, copy=False)
+    return None
+
+
+def _trace2cp_similarity_debug(
+    embedding_chw: np.ndarray | None,
+    valid_mask: np.ndarray,
+    *,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    forward_trace_xy: np.ndarray,
+    reverse_trace_xy: np.ndarray,
+    fiber_embeddings: np.ndarray | None = None,
+) -> _Trace2CpSimilarityDebug | None:
+    if embedding_chw is None:
+        return None
+    embedding = _require_trace2cp_embedding_field(embedding_chw)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if valid.shape != tuple(int(v) for v in embedding.shape[1:]):
+        raise ValueError("valid_mask must match embedding spatial shape")
+    start_embedding = _bilinear_embedding_sample(embedding, start_xy, valid_mask=valid)
+    target_embedding = _bilinear_embedding_sample(embedding, target_xy, valid_mask=valid)
+    if start_embedding is None or target_embedding is None:
+        return None
+
+    normalized = _normalized_embedding_field(embedding)
+    global_similarity: np.ndarray | None = None
+    global_bank_size = 0
+    if fiber_embeddings is not None:
+        bank = np.asarray(fiber_embeddings, dtype=np.float32)
+        if bank.ndim == 2 and bank.shape[0] > 0 and bank.shape[1] == embedding.shape[0]:
+            bank_norm = np.linalg.norm(bank, axis=1, keepdims=True)
+            bank_valid = np.isfinite(bank).all(axis=1, keepdims=True) & np.isfinite(bank_norm) & (bank_norm > 1.0e-6)
+            normalized_bank = np.where(bank_valid, bank / np.clip(bank_norm, 1.0e-12, None), 0.0).astype(np.float32)
+            normalized_bank = normalized_bank[bank_valid[:, 0]]
+            global_bank_size = int(normalized_bank.shape[0])
+            if global_bank_size > 0:
+                mean_reference = np.mean(normalized_bank, axis=0, dtype=np.float32)
+                global_similarity = _embedding_similarity_map(
+                    normalized,
+                    mean_reference,
+                    valid_mask=valid,
+                    normalize_reference=False,
+                )
+
+    forward_last_embedding = _last_trace_embedding(embedding, forward_trace_xy, valid_mask=valid)
+    reverse_last_embedding = _last_trace_embedding(embedding, reverse_trace_xy, valid_mask=valid)
+    return _Trace2CpSimilarityDebug(
+        start_cp_similarity=_embedding_similarity_map(normalized, start_embedding, valid_mask=valid),
+        target_cp_similarity=_embedding_similarity_map(normalized, target_embedding, valid_mask=valid),
+        global_similarity=global_similarity,
+        forward_last_similarity=(
+            None
+            if forward_last_embedding is None
+            else _embedding_similarity_map(normalized, forward_last_embedding, valid_mask=valid)
+        ),
+        reverse_last_similarity=(
+            None
+            if reverse_last_embedding is None
+            else _embedding_similarity_map(normalized, reverse_last_embedding, valid_mask=valid)
+        ),
+        global_bank_size=global_bank_size,
+    )
+
+
 def _trace2cp_candidate_angles_degrees(max_degrees: float, step_degrees: float) -> np.ndarray:
     maximum = float(max_degrees)
     step = float(step_degrees)
@@ -751,6 +863,16 @@ class _Trace2CpEmbeddingBank:
 
 
 @dataclass(frozen=True)
+class _Trace2CpSimilarityDebug:
+    start_cp_similarity: np.ndarray
+    target_cp_similarity: np.ndarray
+    global_similarity: np.ndarray | None
+    forward_last_similarity: np.ndarray | None
+    reverse_last_similarity: np.ndarray | None
+    global_bank_size: int
+
+
+@dataclass(frozen=True)
 class _Trace2CpResult:
     score: float
     raw_y_error_px: float
@@ -853,6 +975,7 @@ class _Trace2CpPairEvaluation:
     med_fields_count: int
     tta_rows: tuple[str, ...]
     tta_debug_entries: tuple[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray], ...]
+    similarity_debug: _Trace2CpSimilarityDebug | None = None
 
 
 @dataclass(frozen=True)
@@ -2575,6 +2698,118 @@ def _export_line_trace_vis(
     print(f"exported line_trace_vis.jpg and line_trace_summary.txt to {out}")
 
 
+def _similarity_map_to_u8(similarity: np.ndarray | None, valid_mask: np.ndarray) -> np.ndarray:
+    valid = np.asarray(valid_mask, dtype=bool)
+    out = np.zeros(valid.shape, dtype=np.uint8)
+    if similarity is None:
+        return out
+    values = np.asarray(similarity, dtype=np.float32)
+    if values.shape != valid.shape:
+        raise ValueError("similarity map must match valid mask shape")
+    mask = valid & np.isfinite(values)
+    out[mask] = np.clip((values[mask] + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
+    return out
+
+
+def _draw_trace2cp_similarity_panel(
+    similarity: np.ndarray | None,
+    valid_mask: np.ndarray,
+    *,
+    line_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    trace_xy: np.ndarray | None,
+    label: str,
+    trace_color: tuple[int, int, int, int] = (255, 255, 255, 220),
+) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    panel = np.repeat(_similarity_map_to_u8(similarity, valid_mask)[..., None], 3, axis=-1)
+    panel = overlay_line_coords_rgb(panel, line_xy, opacity=0.22, thickness=1)
+    if trace_xy is not None:
+        panel = _overlay_polyline_rgb(panel, trace_xy, color_rgba=trace_color, thickness=1)
+    pil = Image.fromarray(panel, mode="RGB")
+    draw = ImageDraw.Draw(pil, mode="RGBA")
+    for point_xy, color in (
+        (start_xy, (32, 255, 255, 255)),
+        (target_xy, (255, 220, 64, 255)),
+    ):
+        point = np.asarray(point_xy, dtype=np.float32)
+        if point.shape == (2,) and bool(np.isfinite(point).all()):
+            x, y = (float(v) for v in point)
+            draw.ellipse((x - 2.0, y - 2.0, x + 2.0, y + 2.0), outline=color, width=1)
+    return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
+
+
+def _draw_trace2cp_similarity_debug_column(
+    debug: _Trace2CpSimilarityDebug,
+    *,
+    valid_mask: np.ndarray,
+    line_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    bidirectional_result: _Trace2CpBidirectionalResult,
+) -> np.ndarray:
+    panels = [
+        _draw_trace2cp_similarity_panel(
+            debug.start_cp_similarity,
+            valid_mask,
+            line_xy=line_xy,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            trace_xy=None,
+            label="emb sim start_cp",
+        ),
+        _draw_trace2cp_similarity_panel(
+            debug.target_cp_similarity,
+            valid_mask,
+            line_xy=line_xy,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            trace_xy=None,
+            label="emb sim target_cp",
+        ),
+        _draw_trace2cp_similarity_panel(
+            debug.global_similarity,
+            valid_mask,
+            line_xy=line_xy,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            trace_xy=None,
+            label=f"emb sim fiber_global n={int(debug.global_bank_size)}",
+        ),
+        _draw_trace2cp_similarity_panel(
+            debug.forward_last_similarity,
+            valid_mask,
+            line_xy=line_xy,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            trace_xy=bidirectional_result.forward.trace_xy,
+            label="emb sim forward_last",
+            trace_color=(0, 255, 0, 230),
+        ),
+        _draw_trace2cp_similarity_panel(
+            debug.reverse_last_similarity,
+            valid_mask,
+            line_xy=line_xy,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            trace_xy=bidirectional_result.reverse.trace_xy,
+            label="emb sim reverse_last",
+            trace_color=(255, 64, 220, 230),
+        ),
+    ]
+    width = max(int(panel.shape[1]) for panel in panels)
+    total_h = sum(int(panel.shape[0]) for panel in panels)
+    stack = np.zeros((total_h, width, 3), dtype=np.uint8)
+    y0 = 0
+    for panel in panels:
+        h, w = panel.shape[:2]
+        stack[y0 : y0 + h, :w] = panel
+        y0 += h
+    return stack
+
+
 def _draw_trace2cp_overlay(
     image_u8: np.ndarray,
     *,
@@ -2585,6 +2820,8 @@ def _draw_trace2cp_overlay(
     result_label: str = "trace2cp",
     reference_result: _Trace2CpBidirectionalResult | None = None,
     reference_label: str = "reference",
+    similarity_debug: _Trace2CpSimilarityDebug | None = None,
+    valid_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
 
@@ -2674,6 +2911,22 @@ def _draw_trace2cp_overlay(
     stacks = [result_stack(bidirectional_result, result_label)]
     if reference_result is not None:
         stacks.append(result_stack(reference_result, reference_label))
+    if similarity_debug is not None:
+        sim_valid = (
+            np.ones(np.asarray(image_u8).shape[:2], dtype=bool)
+            if valid_mask is None
+            else np.asarray(valid_mask, dtype=bool)
+        )
+        stacks.append(
+            _draw_trace2cp_similarity_debug_column(
+                similarity_debug,
+                valid_mask=sim_valid,
+                line_xy=line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                bidirectional_result=bidirectional_result,
+            )
+        )
     width = sum(int(stack.shape[1]) for stack in stacks)
     height = max(int(stack.shape[0]) for stack in stacks)
     combined = np.zeros((height, width, 3), dtype=np.uint8)
@@ -3143,6 +3396,7 @@ def _evaluate_trace2cp_pair(
     sample_mode: str = "random",
     row_axis_alignment_line_index: int | None = None,
     row_axis_alignment_xyz: np.ndarray | None = None,
+    build_similarity_debug: bool = True,
 ) -> _Trace2CpPairEvaluation:
     sample, image, valid_mask = loader.build_trace2cp_segment_patch(
         sample_index,
@@ -3253,6 +3507,7 @@ def _evaluate_trace2cp_pair(
         )
         selected_mode = "med_tta"
     combined_summary: _Trace2CpCombinedSummary | None = None
+    debug_fiber_embeddings: np.ndarray | None = None
     if combined:
         weights = combined_weights or _Trace2CpCombinedWeights()
         bank = combined_fiber_bank or _Trace2CpEmbeddingBank(
@@ -3260,6 +3515,7 @@ def _evaluate_trace2cp_pair(
             skipped=0,
             rows=(),
         )
+        debug_fiber_embeddings = bank.embeddings
         selected_result, combined_summary = _trace_score_trace2cp_combined_bidirectional(
             direction_xy=None if med_tta else direction_xy,
             tta_fields=med_fields if med_tta else None,
@@ -3276,6 +3532,19 @@ def _evaluate_trace2cp_pair(
             rf_margin_px=rf_margin_px,
         )
         selected_mode = "combined_med_tta" if med_tta else "combined"
+    similarity_debug = (
+        _trace2cp_similarity_debug(
+            fields.embedding_chw,
+            valid_mask,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            forward_trace_xy=selected_result.forward.trace_xy,
+            reverse_trace_xy=selected_result.reverse.trace_xy,
+            fiber_embeddings=debug_fiber_embeddings,
+        )
+        if build_similarity_debug
+        else None
+    )
     return _Trace2CpPairEvaluation(
         sample_index=int(sample_index),
         sample=sample,
@@ -3289,6 +3558,7 @@ def _evaluate_trace2cp_pair(
         med_fields_count=med_fields_count,
         tta_rows=tuple(tta_rows),
         tta_debug_entries=tuple(tta_debug_entries),
+        similarity_debug=similarity_debug,
     )
 
 
@@ -3380,6 +3650,8 @@ def _export_trace2cp_vis(
         result_label=result_label,
         reference_result=base_result if selected_result is not base_result else None,
         reference_label="reference",
+        similarity_debug=evaluation.similarity_debug,
+        valid_mask=valid_mask,
     )
     _write_jpg(out / "trace2cp_vis.jpg", overlay)
     forward = selected_result.forward.result
@@ -3416,6 +3688,8 @@ def _export_trace2cp_vis(
         f"trace2cp_metric_reverse_y_at_target_x={metric.reverse_y_at_target_x:.6f}",
         f"trace2cp_metric_reached_target_columns={metric.reached_target_columns}",
         f"trace2cp_metric_reason={metric.reason}",
+        f"trace2cp_similarity_debug={evaluation.similarity_debug is not None}",
+        f"trace2cp_similarity_global_bank_size={int(evaluation.similarity_debug.global_bank_size) if evaluation.similarity_debug is not None else 0}",
         f"trace2cp_refine_score={selected_result.score:.8f}",
         f"actual_y_error_px={selected_result.raw_y_error_px:.6f}",
         f"considered_y_error_px={selected_result.considered_y_error_px:.6f}",
@@ -3655,6 +3929,7 @@ def _export_trace2cp_fiber_vis(
                 sample_mode="flat",
                 row_axis_alignment_line_index=alignment_line_index,
                 row_axis_alignment_xyz=alignment_axis,
+                build_similarity_debug=False,
             )
         except ValueError as exc:
             reason = _trace2cp_skip_reason(exc)

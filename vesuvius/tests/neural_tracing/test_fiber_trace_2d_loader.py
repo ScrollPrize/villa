@@ -82,6 +82,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _dir_vis_image_space_augmentations,
     _dir_vis_half_image_paste_side,
     _direction_field_overlay_rgb,
+    _draw_trace2cp_similarity_debug_column,
     _draw_trace2cp_fiber_overlay,
     _draw_trace2cp_overlay,
     _draw_trace2cp_tta_slice,
@@ -99,7 +100,9 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _score_trace2cp,
     _source_grid_direction_to_reference,
     _Trace2CpPairEvaluation,
+    _Trace2CpSimilarityDebug,
     _trace2cp_fiber_pair_cp_indices,
+    _trace2cp_similarity_debug,
     _trace2cp_refinement_from_traces,
     _trace2cp_center_penalty,
     _trace2cp_metric_from_traces,
@@ -531,6 +534,90 @@ def test_trace2cp_overlay_can_add_reference_column() -> None:
 
     assert dual.shape[0] >= single.shape[0]
     assert dual.shape[1] == 2 * single.shape[1]
+
+
+def test_trace2cp_similarity_debug_maps_use_cosine_scale() -> None:
+    embedding = np.zeros((2, 5, 7), dtype=np.float32)
+    embedding[0, :, :3] = 1.0
+    embedding[1, :, 3:] = 1.0
+    valid = np.ones((5, 7), dtype=bool)
+
+    debug = _trace2cp_similarity_debug(
+        embedding,
+        valid,
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([5.0, 2.0], dtype=np.float32),
+        forward_trace_xy=np.asarray([[1.0, 2.0], [2.0, 2.0]], dtype=np.float32),
+        reverse_trace_xy=np.asarray([[5.0, 2.0], [4.0, 2.0]], dtype=np.float32),
+        fiber_embeddings=np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+    )
+
+    assert debug is not None
+    assert debug.global_bank_size == 2
+    assert debug.start_cp_similarity[2, 1] == pytest.approx(1.0)
+    assert debug.start_cp_similarity[2, 5] == pytest.approx(0.0)
+    assert debug.target_cp_similarity[2, 1] == pytest.approx(0.0)
+    assert debug.target_cp_similarity[2, 5] == pytest.approx(1.0)
+    assert debug.global_similarity is not None
+    assert debug.global_similarity[2, 1] == pytest.approx(0.5)
+    assert debug.global_similarity[2, 5] == pytest.approx(0.5)
+    assert debug.forward_last_similarity is not None
+    assert debug.forward_last_similarity[2, 1] == pytest.approx(1.0)
+    assert debug.reverse_last_similarity is not None
+    assert debug.reverse_last_similarity[2, 5] == pytest.approx(1.0)
+
+
+def test_trace2cp_overlay_can_add_similarity_debug_column() -> None:
+    field = np.zeros((11, 11, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+    result = _trace_score_trace2cp_bidirectional(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+    image = np.zeros((11, 11), dtype=np.uint8)
+    valid = np.ones((11, 11), dtype=bool)
+    line = np.asarray([[2.0, 4.0], [8.0, 5.0]], dtype=np.float32)
+    similarity = np.linspace(-1.0, 1.0, 121, dtype=np.float32).reshape(11, 11)
+    debug = _Trace2CpSimilarityDebug(
+        start_cp_similarity=similarity,
+        target_cp_similarity=similarity,
+        global_similarity=similarity,
+        forward_last_similarity=similarity,
+        reverse_last_similarity=similarity,
+        global_bank_size=3,
+    )
+
+    base = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+    )
+    with_debug = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        similarity_debug=debug,
+        valid_mask=valid,
+    )
+    debug_column = _draw_trace2cp_similarity_debug_column(
+        debug,
+        valid_mask=valid,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+    )
+
+    assert with_debug.shape[1] == base.shape[1] + debug_column.shape[1]
+    assert with_debug.shape[0] >= debug_column.shape[0]
+    assert bool(np.any(with_debug[:, -debug_column.shape[1] :, :] != 0))
 
 
 def test_trace2cp_target_column_wins_over_next_rf_margin() -> None:

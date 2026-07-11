@@ -291,6 +291,12 @@ The important behavior is:
   score weights default to `1.0`. The mode requires checkpoints with appended
   embedding channels. With `--med-tta`, median-TTA still supplies the direction
   reference while embeddings are sampled in the reference segment patch.
+- When embedding channels are present, single-pair `trace2cp_vis.jpg` appends a
+  debug column of fixed-scale cosine similarity maps: start CP, target CP,
+  same-fiber CP-bank/global similarity when a combined Trace2CP bank is
+  available, forward trace final sampled embedding, and reverse trace final
+  sampled embedding. The column is for inspection only and does not affect
+  Trace2CP scoring or metrics.
 - `--trace2cp-vis --med-tta --vis-tta` writes `trace2cp_tta/reference.jpg`,
   one `trace2cp_tta/random_NNN.jpg` per generated TTA field, and
   `trace2cp_tta/contact_sheet.jpg`. Each image shows the sampled slice with the

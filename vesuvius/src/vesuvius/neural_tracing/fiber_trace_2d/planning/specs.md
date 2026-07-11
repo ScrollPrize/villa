@@ -429,6 +429,14 @@
   flag. With `--med-tta --trace2cp-combined`, median TTA supplies the direction
   reference while candidate embeddings are sampled from the reference segment
   patch; no embedding fields are geometrically warped after sampling.
+- Single-pair `trace2cp_vis.jpg` includes an additional embedding-debug column
+  when the checkpoint exposes embedding channels. The column renders cosine
+  similarity maps for the start CP embedding, target CP embedding, same-fiber
+  CP-bank mean similarity when the combined Trace2CP bank is available,
+  forward-trace final sampled embedding, and reverse-trace final sampled
+  embedding. These maps are fixed-scale cosine displays (`-1..1` mapped to
+  `0..255`) and are visualization-only; they must not affect tracing,
+  refinement, metrics, or best-checkpoint selection.
 - Trace2CP TTA samples from the regular training geometric augmentation ranges
   but forces y-shift to zero and scale to one for long-strip target-column
   semantics. Each TTA field is built by transforming the segment coordinate

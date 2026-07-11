@@ -1,8 +1,16 @@
-# Trace2CP Vertical Space Doubling
+# Trace2CP Similarity Debug Column
 
-Increase Trace2CP segment strip vertical room by another factor of two.
+Add embedding-similarity debugging to Trace2CP visualization.
 
-The segment-strip height is currently `2 * patch_shape_hw[0]`; change it to
-`4 * patch_shape_hw[0]` for Trace2CP loading, visualization, and test
-evaluation paths. This gives the tracer more vertical space before hitting RF
-margin or strip-edge stop conditions.
+The single-pair tracer visualization should show an additional column when
+embedding outputs are available. The column should render:
+
+- similarity to the start CP embedding;
+- similarity to the target CP embedding;
+- same-fiber global CP-bank similarity when the combined Trace2CP fiber bank is
+  available;
+- similarity to the final sampled embedding of the forward directional trace;
+- similarity to the final sampled embedding of the reverse directional trace.
+
+This is a debug visualization only. It must not change Trace2CP tracing,
+metric, or refinement semantics.

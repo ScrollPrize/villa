@@ -1,11 +1,12 @@
-# Trace2CP Vertical Space Doubling Status
+# Trace2CP Similarity Debug Column Status
 
 - [x] Read subproject AGENTS workflow.
-- [x] Locate current Trace2CP segment height implementation and tests.
+- [x] Locate Trace2CP visualization and combined embedding scoring code.
 - [x] Replace `planning/task.md` with the current task.
 - [x] Draft `planning/task_plan.md`.
 - [x] Self-review the plan against current specs and request.
-- [x] Update Trace2CP segment height implementation.
+- [x] Add similarity-debug helpers and pair-evaluation wiring.
+- [x] Render the optional Trace2CP similarity debug column.
 - [x] Update docs/specs/changelog.
-- [x] Update tests.
+- [x] Add/update tests.
 - [x] Run validation.
