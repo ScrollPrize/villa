@@ -85,43 +85,19 @@ if(VC_MACDEPLOYQT)
 
         # macdeployqt only deploys the cocoa platform plugin. Headless runs
         # (QT_QPA_PLATFORM=offscreen — used by the CI smoke test) need the
-        # offscreen plugin as well: copy it and point its Homebrew-absolute
-        # dependency paths at the frameworks macdeployqt just bundled.
+        # offscreen plugin as well.
         set(_offscreen "${_vc_qt_plugin_dir}/platforms/libqoffscreen.dylib")
         if(EXISTS "${_offscreen}")
             file(COPY "${_offscreen}"
                  DESTINATION "${_app}/Contents/PlugIns/platforms")
-            set(_plugin "${_app}/Contents/PlugIns/platforms/libqoffscreen.dylib")
-            execute_process(COMMAND install_name_tool -id
-                "@rpath/libqoffscreen.dylib" "${_plugin}")
-            execute_process(COMMAND otool -L "${_plugin}"
-                OUTPUT_VARIABLE _deps_out)
-            string(REPLACE "\n" ";" _dep_lines "${_deps_out}")
-            foreach(_line IN LISTS _dep_lines)
-                if(NOT _line MATCHES "^[ \t]+(/[^ ]+)")
-                    continue()
-                endif()
-                set(_dep "${CMAKE_MATCH_1}")
-                if(_dep MATCHES "^(/usr/lib|/System)")
-                    continue()
-                endif()
-                if(_dep MATCHES "/([^/]+\\.framework/.+)$")
-                    set(_new "@executable_path/../Frameworks/${CMAKE_MATCH_1}")
-                else()
-                    get_filename_component(_base "${_dep}" NAME)
-                    set(_new "@executable_path/../Frameworks/${_base}")
-                endif()
-                execute_process(COMMAND install_name_tool
-                    -change "${_dep}" "${_new}" "${_plugin}")
-            endforeach()
         else()
             message(WARNING "offscreen Qt plugin not found at ${_offscreen}")
         endif()
 
-        # Ad-hoc re-sign every Mach-O: install-name rewriting invalidated the
-        # signatures, and arm64 macOS refuses to load unsigned binaries.
-        # Mach-O detection by magic bytes (thin LE / fat BE / fat LE) — the
-        # bundle also holds plists, qt.conf, icons etc. that must be skipped.
+        # macdeployqt copies the complete non-Qt dependency closure, but does
+        # not consistently rewrite dependencies between those copied dylibs.
+        # Normalize every non-system absolute install name, including each
+        # dylib LC_ID_DYLIB, after all bundle files are in place.
         file(GLOB_RECURSE _bundle_files LIST_DIRECTORIES false
             "${_app}/Contents/Frameworks/*"
             "${_app}/Contents/PlugIns/*"
@@ -134,6 +110,63 @@ if(VC_MACDEPLOYQT)
             if(NOT _magic MATCHES "^(cffaedfe|cafebabe|bebafeca)")
                 continue()
             endif()
+            execute_process(COMMAND otool -L "${_f}"
+                RESULT_VARIABLE _otool_rc OUTPUT_VARIABLE _deps_out
+                ERROR_VARIABLE _otool_err)
+            if(NOT _otool_rc EQUAL 0)
+                message(FATAL_ERROR "otool failed for ${_f}: ${_otool_err}")
+            endif()
+            string(REPLACE "\n" ";" _dep_lines "${_deps_out}")
+            foreach(_line IN LISTS _dep_lines)
+                if(NOT _line MATCHES "^[ \t]+(/[^ ]+)")
+                    continue()
+                endif()
+                set(_dep "${CMAKE_MATCH_1}")
+                if(_dep MATCHES "^(/usr/lib|/System/)")
+                    continue()
+                endif()
+                if(_dep MATCHES "/([^/]+\\.framework/.+)$")
+                    set(_relative_dep "${CMAKE_MATCH_1}")
+                else()
+                    get_filename_component(_relative_dep "${_dep}" NAME)
+                endif()
+                if(NOT EXISTS "${_app}/Contents/Frameworks/${_relative_dep}")
+                    message(FATAL_ERROR
+                        "Bundled dependency for ${_dep} (needed by ${_f}) not found")
+                endif()
+                set(_new "@rpath/${_relative_dep}")
+                execute_process(COMMAND install_name_tool
+                    -change "${_dep}" "${_new}" "${_f}"
+                    RESULT_VARIABLE _int_rc ERROR_VARIABLE _int_err)
+                if(NOT _int_rc EQUAL 0)
+                    message(FATAL_ERROR
+                        "install_name_tool failed for ${_f}: ${_int_err}")
+                endif()
+            endforeach()
+
+            execute_process(COMMAND otool -D "${_f}"
+                RESULT_VARIABLE _id_rc OUTPUT_VARIABLE _id_out
+                ERROR_QUIET)
+            if(_id_rc EQUAL 0 AND _id_out MATCHES "\n(/[^ \n]+)")
+                set(_old_id "${CMAKE_MATCH_1}")
+                if(NOT _old_id MATCHES "^(/usr/lib|/System/)")
+                    if(_old_id MATCHES "/([^/]+\\.framework/.+)$")
+                        set(_relative_id "${CMAKE_MATCH_1}")
+                    else()
+                        get_filename_component(_relative_id "${_old_id}" NAME)
+                    endif()
+                    execute_process(COMMAND install_name_tool -id
+                        "@rpath/${_relative_id}" "${_f}"
+                        RESULT_VARIABLE _int_rc ERROR_VARIABLE _int_err)
+                    if(NOT _int_rc EQUAL 0)
+                        message(FATAL_ERROR
+                            "install_name_tool -id failed for ${_f}: ${_int_err}")
+                    endif()
+                endif()
+            endif()
+
+            # Install-name rewriting invalidates Mach-O signatures. Ad-hoc
+            # re-sign each file because arm64 macOS refuses to load it otherwise.
             execute_process(COMMAND codesign --force --sign - "${_f}"
                 RESULT_VARIABLE _cs_rc ERROR_VARIABLE _cs_err)
             if(NOT _cs_rc EQUAL 0)
