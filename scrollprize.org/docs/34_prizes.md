@@ -219,9 +219,9 @@ These prizes bridge ink detection on fragments to the much harder problem of rea
 * **Held-out validation.** Run your method on the public input renders/volumes with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
 * **Other information.** Feel free to include any other things we should know.
 
-Your submission will be reviewed by the review teams to verify technical validity and papyrological plausibility and legibility.
-Submissions remain open until the prize is won: if we discover months from now that your method was right all along, you will then win.
-Just as with the Grand Prize, please **do not** make your discovery public until winning the prize. We will work with you to announce your findings.
+* Your submission will be reviewed by the review teams to verify technical validity and papyrological plausibility and legibility.
+* Submissions remain open until the prize is won: if we discover months from now that your method was right all along, you will then win.
+* As with the Grand Prize, you **must not** make your discovery public until the prize is officially announced. We will work with you to announce your findings.
 </details>
 
 [Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSdw43FX_uPQwBTIV8pC2y0xkwZmu6GhrwxV4n3WEbqC8Xof9Q/viewform?usp=dialog)
@@ -261,9 +261,9 @@ Discovering a scroll’s title tells scholars what — and whom — they have be
 * **Held-out validation.** Run your method on the public input renders/volumes with known ground truth (using k-fold validation if you trained on them) and include the results. We may also run your method, following your instructions, on held-out data with known ground truth.
 * **Other information.** Feel free to include any other things we should know.
 
-Your submission will be reviewed by the review teams to verify technical validity and papyrological plausibility and legibility.
-Submissions remain open until the prize is won: if we discover months from now that your method was right all along, you will then win.
-Just as with the Grand Prize, please **do not** make your discovery public until winning the prize. We will work with you to announce your findings.
+* Your submission will be reviewed by the review teams to verify technical validity and papyrological plausibility and legibility.
+* Submissions remain open until the prize is won: if we discover months from now that your method was right all along, you will then win.
+* As with the Grand Prize, you **must not** make your discovery public until the prize is officially announced. We will work with you to announce your findings.
 </details>
 
 [Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSdw43FX_uPQwBTIV8pC2y0xkwZmu6GhrwxV4n3WEbqC8Xof9Q/viewform?usp=dialog)
