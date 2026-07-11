@@ -1,12 +1,11 @@
-# Combined Direction And Contrastive Embedding Tracer Status
+# Trace2CP Target-Column Metric Status
 
 - [x] Read subproject AGENTS workflow.
-- [x] Read relevant specs, broader plan, todo, and tracer/model/embedding code.
+- [x] Read relevant Trace2CP specs, plan, code, and tests.
 - [x] Replace `planning/task.md` with the current task.
 - [x] Draft `planning/task_plan.md`.
-- [x] Self-review the plan against current specs and code shape.
-- [x] Implement combined trace scorer.
-- [x] Add CLI flags and visualization/summary output.
-- [x] Update specs/docs/changelog.
-- [x] Add or update tests.
+- [x] Self-review the plan against current specs and user request.
+- [x] Update Trace2CP metric implementation.
+- [x] Update summaries/docs/specs/changelog.
+- [x] Update tests.
 - [x] Run validation.

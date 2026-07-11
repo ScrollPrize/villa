@@ -2,6 +2,9 @@
 
 ## 2026-07-11
 
+- Switched public Trace2CP `trace2cp_error` back to target-column y error per
+  horizontal CP span for all trace modes while keeping closest-approach logic
+  for fusion/refinement diagnostics.
 - Added optional `--trace2cp-combined` visualization mode that greedily scores
   angular trace candidates with direction plus contrastive embedding terms,
   including previous-step, enclosing-CP, and same-fiber CP-bank cosine losses.

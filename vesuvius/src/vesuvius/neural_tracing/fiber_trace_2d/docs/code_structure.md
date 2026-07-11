@@ -264,12 +264,13 @@ The important behavior is:
 - `--trace2cp-vis` loads a side-strip segment spanning both CPs, runs the same
   decoded direction-field model as line tracing, traces start-to-target and
   target-to-start on the same strip, and reports the public
-  `trace2cp_error`: closest actual vertical y-gap between the opposing
-  traces divided by the horizontal start-to-target CP span. The older
-  center-biased closest approach remains a `refine_score` diagnostic for the
-  fused/optimized visualization rows only. Endpoint scores at the opposite CP
-  x-columns remain summary diagnostics. The trace2cp segment strip uses twice
-  the configured patch height for more vertical room before the RF margin.
+  `trace2cp_error`: the mean y error at the opposite CP x-columns divided by
+  the horizontal start-to-target CP span. The forward trace is compared at the
+  target CP column; the reverse trace is compared at the start CP column.
+  The center-biased closest approach remains a `refine_score` diagnostic for
+  the fused/optimized visualization rows only. The trace2cp segment strip uses
+  twice the configured patch height for more vertical room before the RF
+  margin.
 - Trace2CP uses `--med-tta` to decide whether to use TTA. Without it, the tool
   traces and scores both directions on the base direction field. With it,
   deterministic random geometric TTA direction fields are built by transforming
@@ -295,10 +296,10 @@ The important behavior is:
   `trace2cp_tta/contact_sheet.jpg`. Each image shows the sampled slice with the
   transformed base-strip corner outline and start/target CP markers.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
-  `trace2cp_error`, metric raw y-gap in pixels, horizontal CP span,
+  `trace2cp_error`, target-column metric raw y error in pixels, horizontal CP span,
   `refine_score`, trace mode, endpoint diagnostics, and per-direction
-  scores/statuses to stdout. The summary includes the closest x position,
-  fused/optimized point counts,
+  scores/statuses to stdout. The summary includes metric target-column
+  interpolation values, the refinement closest x position, fused/optimized point counts,
   forward/reverse raw endpoint errors, normalized endpoint scores, target
   x-columns, target-column reach statuses, termination reasons, and trace point
   counts. The JPG is a labeled vertical stack with full traces, partial

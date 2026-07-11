@@ -369,19 +369,18 @@
   x-column, the y coordinate is linearly interpolated between bracketing trace
   points. These endpoint scores remain in the summary as diagnostics, but they
   are not the public `trace2cp_score`.
-- The public Trace2CP metric is `trace2cp_error`: the actual closest vertical
-  separation between opposing traces divided by the horizontal start-to-target
-  CP span. Both traces are resampled at one point per horizontal pixel over
-  their overlapping x span. Trace2CP chooses the candidate x with the smallest
-  actual y separation; ties choose the candidate closest to the midpoint only
-  as a deterministic tie-breaker. No center-focus penalty is applied to this
-  public metric.
-- If the two opposing traces have no usable overlap, the public metric uses the
-  default maximum y error for that segment: vertical distance from the CP
+- The public Trace2CP metric is `trace2cp_error`: the mean target-column y
+  error divided by the horizontal start-to-target CP span. The forward trace is
+  linearly interpolated where it reaches the target CP x-column and compared
+  to the target CP y. The reverse trace is linearly interpolated where it
+  reaches the start CP x-column and compared to the start CP y. The two raw y
+  errors are averaged before division by horizontal span.
+- If either trace does not reach its opposite CP x-column, that direction uses
+  the default maximum y error for the segment: vertical distance from the CP
   centerline y to the nearest usable vertical strip edge after RF-margin
-  exclusion, divided by the horizontal CP span. The same maximum y error caps
-  pathological closest-gap values. This intentionally treats exact early/late
-  edge intersection as noise for now.
+  exclusion. The same maximum y error caps pathological endpoint y errors.
+  This intentionally treats exact early/late edge intersection as noise for
+  now.
 - The previous center-biased closest-approach value remains available only as a
   refinement/visualization diagnostic named `refine_score`. It must not be used
   as the public Trace2CP metric or as the training best-checkpoint criterion.
@@ -452,7 +451,7 @@
   base-strip corner outline and start/target CP markers.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
   a concise stdout line with sample index, fiber path, start/target CP indices,
-  trace mode, public `trace2cp_error`, metric raw y separation in
+  trace mode, public `trace2cp_error`, target-column metric raw y error in
   pixels, horizontal CP span, refinement diagnostic score, endpoint diagnostic
   scores, per-direction raw errors, target x-columns, reach statuses,
   termination reasons, and trace point counts. The JPG is a labeled vertical

@@ -792,6 +792,11 @@ class _Trace2CpMetricResult:
     raw_y_error_px: float
     horizontal_span_px: float
     max_y_error_px: float
+    forward_target_x: float
+    reverse_target_x: float
+    forward_y_at_target_x: float
+    reverse_y_at_target_x: float
+    reached_target_columns: bool
     closest_x: float
     forward_y_at_closest_x: float
     reverse_y_at_closest_x: float
@@ -1800,63 +1805,61 @@ def _trace2cp_metric_from_traces(
         shape_hw=shape_hw,
         rf_margin_px=rf_margin_px,
     )
-    x_values = _trace2cp_overlap_x_values(forward_trace_xy, reverse_trace_xy, start_xy, target_xy)
-    if x_values.size == 0:
-        midpoint = _trace2cp_midpoint_xy(start_xy, target_xy)
-        return _Trace2CpMetricResult(
-            error=float(max_y_error / horizontal_span),
-            raw_y_error_px=float(max_y_error),
-            horizontal_span_px=float(horizontal_span),
-            max_y_error_px=float(max_y_error),
-            closest_x=float("nan"),
-            forward_y_at_closest_x=float("nan"),
-            reverse_y_at_closest_x=float("nan"),
-            closest_midpoint_xy=midpoint,
-            reached_overlap=False,
-            reason="no_trace_overlap",
-        )
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    forward_target_x = float(target[0])
+    reverse_target_x = float(start[0])
+    forward_y = _trace_y_at_x(forward_trace_xy, forward_target_x)
+    reverse_y = _trace_y_at_x(reverse_trace_xy, reverse_target_x)
+    forward_reached = forward_y is not None and np.isfinite(forward_y)
+    reverse_reached = reverse_y is not None and np.isfinite(reverse_y)
 
-    rows: list[tuple[float, float, float, float]] = []
-    for x in x_values.tolist():
-        forward_y = _trace_y_at_x(forward_trace_xy, float(x))
-        reverse_y = _trace_y_at_x(reverse_trace_xy, float(x))
-        if forward_y is None or reverse_y is None:
-            continue
-        if not np.isfinite(forward_y) or not np.isfinite(reverse_y):
-            continue
-        gap = abs(float(forward_y) - float(reverse_y))
-        rows.append((gap, float(x), float(forward_y), float(reverse_y)))
-    if not rows:
-        midpoint = _trace2cp_midpoint_xy(start_xy, target_xy)
-        return _Trace2CpMetricResult(
-            error=float(max_y_error / horizontal_span),
-            raw_y_error_px=float(max_y_error),
-            horizontal_span_px=float(horizontal_span),
-            max_y_error_px=float(max_y_error),
-            closest_x=float("nan"),
-            forward_y_at_closest_x=float("nan"),
-            reverse_y_at_closest_x=float("nan"),
-            closest_midpoint_xy=midpoint,
-            reached_overlap=False,
-            reason="no_trace_overlap",
-        )
+    forward_error = (
+        abs(float(forward_y) - float(target[1])) if forward_reached else float(max_y_error)
+    )
+    reverse_error = (
+        abs(float(reverse_y) - float(start[1])) if reverse_reached else float(max_y_error)
+    )
+    raw_y_error = 0.5 * (float(forward_error) + float(reverse_error))
+    metric_gap = 0.5 * (
+        min(float(forward_error), float(max_y_error))
+        + min(float(reverse_error), float(max_y_error))
+    )
+    reached_target_columns = bool(forward_reached and reverse_reached)
+    if reached_target_columns:
+        reason = "target_columns"
+    elif forward_reached or reverse_reached:
+        reason = "partial_target_columns"
+    else:
+        reason = "missing_target_columns"
 
-    midpoint_x = float(_trace2cp_midpoint_xy(start_xy, target_xy)[0])
-    rows.sort(key=lambda row: (row[0], abs(row[1] - midpoint_x)))
-    gap, closest_x, forward_y, reverse_y = rows[0]
-    metric_gap = min(float(gap), float(max_y_error))
-    midpoint = np.asarray([closest_x, 0.5 * (forward_y + reverse_y)], dtype=np.float32)
+    endpoint_mid_x = 0.5 * (float(start[0]) + float(target[0]))
+    endpoint_ys = [
+        float(y)
+        for y, reached in ((forward_y, forward_reached), (reverse_y, reverse_reached))
+        if reached
+    ]
+    if endpoint_ys:
+        endpoint_mid_y = float(np.mean(np.asarray(endpoint_ys, dtype=np.float32)))
+    else:
+        endpoint_mid_y = float(_trace2cp_midpoint_xy(start, target)[1])
+    endpoint_midpoint = np.asarray([endpoint_mid_x, endpoint_mid_y], dtype=np.float32)
     return _Trace2CpMetricResult(
         error=float(metric_gap / horizontal_span),
-        raw_y_error_px=float(gap),
+        raw_y_error_px=float(raw_y_error),
         horizontal_span_px=float(horizontal_span),
         max_y_error_px=float(max_y_error),
-        closest_x=float(closest_x),
-        forward_y_at_closest_x=float(forward_y),
-        reverse_y_at_closest_x=float(reverse_y),
-        closest_midpoint_xy=midpoint,
-        reached_overlap=True,
-        reason="closest_vertical_gap",
+        forward_target_x=float(forward_target_x),
+        reverse_target_x=float(reverse_target_x),
+        forward_y_at_target_x=float(forward_y) if forward_reached else float("nan"),
+        reverse_y_at_target_x=float(reverse_y) if reverse_reached else float("nan"),
+        reached_target_columns=reached_target_columns,
+        closest_x=float(endpoint_mid_x),
+        forward_y_at_closest_x=float(forward_y) if forward_reached else float("nan"),
+        reverse_y_at_closest_x=float(reverse_y) if reverse_reached else float("nan"),
+        closest_midpoint_xy=endpoint_midpoint,
+        reached_overlap=reached_target_columns,
+        reason=reason,
     )
 
 
@@ -3407,14 +3410,17 @@ def _export_trace2cp_vis(
         f"trace2cp_metric_raw_y_error_px={metric.raw_y_error_px:.6f}",
         f"trace2cp_metric_horizontal_span_px={metric.horizontal_span_px:.6f}",
         f"trace2cp_metric_max_y_error_px={metric.max_y_error_px:.6f}",
-        f"trace2cp_metric_closest_x={metric.closest_x:.6f}",
-        f"trace2cp_metric_reached_overlap={metric.reached_overlap}",
+        f"trace2cp_metric_forward_target_x={metric.forward_target_x:.6f}",
+        f"trace2cp_metric_reverse_target_x={metric.reverse_target_x:.6f}",
+        f"trace2cp_metric_forward_y_at_target_x={metric.forward_y_at_target_x:.6f}",
+        f"trace2cp_metric_reverse_y_at_target_x={metric.reverse_y_at_target_x:.6f}",
+        f"trace2cp_metric_reached_target_columns={metric.reached_target_columns}",
         f"trace2cp_metric_reason={metric.reason}",
         f"trace2cp_refine_score={selected_result.score:.8f}",
         f"actual_y_error_px={selected_result.raw_y_error_px:.6f}",
         f"considered_y_error_px={selected_result.considered_y_error_px:.6f}",
         f"center_penalty={refinement.center_penalty:.6f}",
-        f"metric_semantics=closest_vertical_trace_gap_per_horizontal_cp_span",
+        f"metric_semantics=target_column_y_error_per_horizontal_cp_span",
         f"refine_score_semantics=center_penalized_minimum_vertical_trace_to_trace_separation",
         f"trace2cp_denominator_px={refinement.denominator_px:.6f}",
         f"closest_x={refinement.closest_x:.6f}",

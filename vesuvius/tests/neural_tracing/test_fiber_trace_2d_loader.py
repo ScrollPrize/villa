@@ -338,7 +338,7 @@ def test_trace2cp_one_way_trace_stops_at_target_column() -> None:
     assert np.isclose(line[-1, 0], 6.0)
 
 
-def test_trace2cp_bidirectional_trace_scores_closest_approach() -> None:
+def test_trace2cp_bidirectional_trace_scores_target_columns_and_refines_closest_approach() -> None:
     field = np.zeros((11, 11, 2), dtype=np.float32)
     field[:, :, 0] = 1.0
 
@@ -368,6 +368,10 @@ def test_trace2cp_bidirectional_trace_scores_closest_approach() -> None:
     assert result.metric.error == pytest.approx(1.0 / 6.0)
     assert result.metric.raw_y_error_px == pytest.approx(1.0)
     assert result.metric.horizontal_span_px == pytest.approx(6.0)
+    assert result.metric.reached_target_columns
+    assert result.metric.reason == "target_columns"
+    assert result.metric.forward_y_at_target_x == pytest.approx(4.0)
+    assert result.metric.reverse_y_at_target_x == pytest.approx(5.0)
 
     metric_only = _trace2cp_metric_bidirectional(
         field,
@@ -379,9 +383,9 @@ def test_trace2cp_bidirectional_trace_scores_closest_approach() -> None:
     assert metric_only.error == pytest.approx(result.metric.error)
 
 
-def test_trace2cp_metric_uses_actual_closest_gap_not_center_penalty() -> None:
-    forward = np.asarray([[0.0, 8.0], [5.0, 8.0], [10.0, 8.0]], dtype=np.float32)
-    reverse = np.asarray([[10.0, 12.0], [5.0, 15.0], [0.0, 12.0]], dtype=np.float32)
+def test_trace2cp_metric_uses_target_columns_not_closest_intersection() -> None:
+    forward = np.asarray([[0.0, 8.0], [5.0, 8.0], [10.0, 20.0]], dtype=np.float32)
+    reverse = np.asarray([[10.0, 12.0], [5.0, 8.0], [0.0, 12.0]], dtype=np.float32)
 
     metric = _trace2cp_metric_from_traces(
         forward,
@@ -393,12 +397,15 @@ def test_trace2cp_metric_uses_actual_closest_gap_not_center_penalty() -> None:
     )
 
     assert metric.reached_overlap
-    assert metric.raw_y_error_px == pytest.approx(4.0)
-    assert metric.error == pytest.approx(4.0 / 10.0)
-    assert metric.closest_x == pytest.approx(0.0)
+    assert metric.reached_target_columns
+    assert metric.reason == "target_columns"
+    assert metric.forward_y_at_target_x == pytest.approx(20.0)
+    assert metric.reverse_y_at_target_x == pytest.approx(12.0)
+    assert metric.raw_y_error_px == pytest.approx(6.0)
+    assert metric.error == pytest.approx(6.0 / 10.0)
 
 
-def test_trace2cp_metric_no_overlap_uses_centerline_edge_error() -> None:
+def test_trace2cp_metric_missing_target_columns_uses_centerline_edge_error() -> None:
     forward = np.asarray([[0.0, 10.0], [2.0, 10.0]], dtype=np.float32)
     reverse = np.asarray([[10.0, 10.0], [8.0, 10.0]], dtype=np.float32)
 
@@ -412,7 +419,8 @@ def test_trace2cp_metric_no_overlap_uses_centerline_edge_error() -> None:
     )
 
     assert not metric.reached_overlap
-    assert metric.reason == "no_trace_overlap"
+    assert not metric.reached_target_columns
+    assert metric.reason == "missing_target_columns"
     assert metric.raw_y_error_px == pytest.approx(9.0)
     assert metric.error == pytest.approx(9.0 / 10.0)
 
