@@ -424,6 +424,11 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - **Deprecated data repo link removed** from Data Formats (`https://data.aws.ash2txt.org/samples/`) — docs-only scope per owner: the 10 Neuroglancer viewer links whose zarr source is that host stay (those DLS volumes aren't mirrored in the open-data bucket yet; removing them would kill data access for PHerc0332/1667/Paris4's older scans).
 **Files:** `src/components/TutorialsTop.js`, `docs/{38_tutorial_spiral,07_tutorial5,06_tutorial_VC3D,02_data}.md`.
 
+## C53 — data browser: drop old-bucket "Full dataset" rows
+
+**Why:** owner spotted `Full dataset (HTTP) -> data.aws.ash2txt.org/samples/...` on detail pages after C52's deprecated-link removal. Those two rows were hardcoded to the old `s3://vesuvius-challenge/` bucket and had become exact duplicates of the "HTTP"/"S3" rows above them, which already point at the same tree in the open-data bucket (verified per-scroll prefixes exist). Removed both rows (+ dead `toHttp` import). Remaining old-host references: only inside Neuroglancer viewer URLs for the not-yet-mirrored DLS volumes (kept deliberately).
+**Files:** `src/components/atlas/DataCatalog.js`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
