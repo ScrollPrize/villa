@@ -72,7 +72,10 @@ jobs:
         run: cmake --preset ci-windows-mingw
 
       - name: Build
-        run: cmake --build --preset ci-windows-mingw
+        run: ninja -C build/ci-windows-mingw
+
+      - name: Test
+        run: ctest --test-dir build/ci-windows-mingw --output-on-failure
 
       - name: Package (NSIS installer + ZIP)
         run: |

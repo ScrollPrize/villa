@@ -24,14 +24,14 @@ set(_vc_app_dir "VC3D.app")
 # top-level CMakeLists already drops it and the CLI tools into
 # VC3D.app/Contents/MacOS. Info.plist + icon make that tree a real
 # double-clickable bundle (and give macdeployqt its entry point).
-if(CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(VC_MACOS_MIN_VERSION "${CMAKE_OSX_DEPLOYMENT_TARGET}")
-else()
-    # No explicit deployment target: the binaries (and the Homebrew bottles
-    # they link) target the build host's macOS release.
-    execute_process(COMMAND sw_vers -productVersion
-        OUTPUT_VARIABLE _vc_host_macos OUTPUT_STRIP_TRAILING_WHITESPACE)
-    string(REGEX MATCH "^[0-9]+" VC_MACOS_MIN_VERSION "${_vc_host_macos}")
+# The bundle contains Homebrew bottles built for the host OS, whose minimum
+# version may be newer than our own compiler deployment target. Advertise the
+# build host's major version so Finder does not claim unsupported compatibility.
+execute_process(COMMAND sw_vers -productVersion
+    OUTPUT_VARIABLE _vc_host_macos OUTPUT_STRIP_TRAILING_WHITESPACE)
+string(REGEX MATCH "^[0-9]+" VC_MACOS_MIN_VERSION "${_vc_host_macos}")
+if(NOT VC_MACOS_MIN_VERSION)
+    message(FATAL_ERROR "Could not determine the macOS host version")
 endif()
 configure_file("${CMAKE_SOURCE_DIR}/cmake/MacOSBundleInfo.plist.in"
     "${CMAKE_BINARY_DIR}/Info.plist" @ONLY)

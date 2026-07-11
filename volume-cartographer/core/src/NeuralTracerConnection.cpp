@@ -9,7 +9,7 @@
 
 namespace
 {
-    utils::Json process_json_request(const utils::Json& req, int sock) {
+    utils::Json process_json_request(const utils::Json& req, vc::unixsocket::Socket sock) {
         std::string response_str;
 
 #pragma omp critical
@@ -42,7 +42,7 @@ namespace
 NeuralTracerConnection::NeuralTracerConnection(std::string const & socket_path) {
 
     sock = vc::unixsocket::connectStream(socket_path);
-    if (sock < 0) {
+    if (!vc::unixsocket::isValid(sock)) {
         throw std::runtime_error("Failed to connect to socket " + socket_path);
     }
 }

@@ -2,9 +2,7 @@
 
 // AF_UNIX stream-socket compat layer: POSIX everywhere, afunix.h on
 // Windows 10 1803+ / Windows 11. Including this header pulls in the
-// platform's socket API so call sites can keep using send()/recv()
-// directly; descriptors are plain ints on both platforms (Windows socket
-// handles fit in 32 bits).
+// platform's socket API so call sites can keep using send()/recv() directly.
 
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -25,14 +23,24 @@
 
 namespace vc::unixsocket {
 
-// Creates a SOCK_STREAM AF_UNIX socket and connects it to `path`.
-// Returns the descriptor, or -1 on failure (including a too-long path).
-// Handles WSAStartup on Windows.
-int connectStream(const std::string& path);
+#if defined(_WIN32)
+using Socket = SOCKET;
+inline constexpr Socket invalidSocket = INVALID_SOCKET;
+#else
+using Socket = int;
+inline constexpr Socket invalidSocket = -1;
+#endif
 
-void closeSocket(int sock);
+inline bool isValid(Socket sock) { return sock != invalidSocket; }
+
+// Creates a SOCK_STREAM AF_UNIX socket and connects it to `path`.
+// Returns the platform socket handle, or invalidSocket on failure.
+// Handles WSAStartup on Windows.
+Socket connectStream(const std::string& path);
+
+void closeSocket(Socket sock);
 
 // SO_RCVTIMEO with the platform's expected argument type.
-void setRecvTimeoutSeconds(int sock, int seconds);
+void setRecvTimeoutSeconds(Socket sock, int seconds);
 
 }  // namespace vc::unixsocket

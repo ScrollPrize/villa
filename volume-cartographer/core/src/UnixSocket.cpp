@@ -10,7 +10,7 @@
 
 namespace vc::unixsocket {
 
-int connectStream(const std::string& path)
+Socket connectStream(const std::string& path)
 {
 #if defined(_WIN32)
     static std::once_flag wsaOnce;
@@ -23,50 +23,50 @@ int connectStream(const std::string& path)
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     if (path.size() >= sizeof(addr.sun_path)) {
-        return -1;
+        return invalidSocket;
     }
     std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
 
 #if defined(_WIN32)
     SOCKET sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
-        return -1;
+        return invalidSocket;
     }
     if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         ::closesocket(sock);
-        return -1;
+        return invalidSocket;
     }
-    return static_cast<int>(sock);
+    return sock;
 #else
     int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) {
-        return -1;
+        return invalidSocket;
     }
     if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         ::close(sock);
-        return -1;
+        return invalidSocket;
     }
     return sock;
 #endif
 }
 
-void closeSocket(int sock)
+void closeSocket(Socket sock)
 {
-    if (sock < 0) {
+    if (!isValid(sock)) {
         return;
     }
 #if defined(_WIN32)
-    ::closesocket(static_cast<SOCKET>(sock));
+    ::closesocket(sock);
 #else
     ::close(sock);
 #endif
 }
 
-void setRecvTimeoutSeconds(int sock, int seconds)
+void setRecvTimeoutSeconds(Socket sock, int seconds)
 {
 #if defined(_WIN32)
     DWORD ms = static_cast<DWORD>(seconds) * 1000u;
-    ::setsockopt(static_cast<SOCKET>(sock), SOL_SOCKET, SO_RCVTIMEO,
+    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
                  reinterpret_cast<const char*>(&ms), sizeof(ms));
 #else
     struct timeval tv{};

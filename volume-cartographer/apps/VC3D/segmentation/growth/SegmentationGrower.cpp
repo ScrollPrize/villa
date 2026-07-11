@@ -896,8 +896,8 @@ bool uiPatchIndexMatchesSourceFolder(CState* state,
 utils::Json sendSocketJsonRequest(const QString& socketPath, const utils::Json& request)
 {
     const std::string socketStd = socketPath.toStdString();
-    int sock = vc::unixsocket::connectStream(socketStd);
-    if (sock < 0) {
+    vc::unixsocket::Socket sock = vc::unixsocket::connectStream(socketStd);
+    if (!vc::unixsocket::isValid(sock)) {
         throw std::runtime_error("Failed to connect to neural trace socket.");
     }
 
