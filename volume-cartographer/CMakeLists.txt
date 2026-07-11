@@ -404,6 +404,36 @@ endif()
 find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
+# OpenCV 5's Homebrew package can report module names in OpenCV_LIBS without
+# defining the corresponding imported targets. A bare name such as
+# `opencv_calib3d` then becomes `-lopencv_calib3d`, but its keg-only library
+# directory is not added to the link line. Normalize every module this project
+# uses to an absolute imported target when the package config omitted it.
+if(APPLE)
+    set(_vc_opencv_modules
+        core imgproc imgcodecs calib3d video videoio flann ximgproc)
+    foreach(_vc_opencv_module IN LISTS _vc_opencv_modules)
+        set(_vc_opencv_target "opencv_${_vc_opencv_module}")
+        if(NOT TARGET ${_vc_opencv_target})
+            unset(_vc_opencv_library)
+            find_library(_vc_opencv_library
+                NAMES ${_vc_opencv_target}
+                HINTS
+                    "$ENV{HOMEBREW_PREFIX}/opt/opencv/lib"
+                    "${OpenCV_DIR}/../.."
+                NO_CACHE)
+            if(NOT _vc_opencv_library)
+                message(FATAL_ERROR
+                    "OpenCV module ${_vc_opencv_target} was not provided as a target and its library was not found")
+            endif()
+            add_library(${_vc_opencv_target} SHARED IMPORTED GLOBAL)
+            set_target_properties(${_vc_opencv_target} PROPERTIES
+                IMPORTED_LOCATION "${_vc_opencv_library}"
+                INTERFACE_INCLUDE_DIRECTORIES "${OpenCV_INCLUDE_DIRS}")
+        endif()
+    endforeach()
+    unset(_vc_opencv_library)
+endif()
 find_package(nlohmann_json REQUIRED)
 find_package(CURL REQUIRED)
 find_package(TIFF REQUIRED)
