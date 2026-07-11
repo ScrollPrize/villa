@@ -20,3 +20,6 @@
 - [ ] trace2cp vis should paint both tta (if enabled) and the reference trace (no augmentations)
 - [ ] augmentations: overlay angled strips! see trace2cp_vis_3.jpg
 - [ ] trace2cp its not a score its an error (hence we choose btest result as 0.0!) so fix this label in the vis
+- [ ] make bidir trace2cp metric in train/test loop
+- [ ] check augmentations for training: all flips and orientations should be equally likely
+- [ ] group norm: with a single sample per patch we seem to get a more global direction per patch! either remove the norm or do more batch-norm style normalization!

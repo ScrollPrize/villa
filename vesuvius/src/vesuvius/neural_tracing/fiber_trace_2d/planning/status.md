@@ -1,15 +1,12 @@
-# Whole-Batch Loader Parallelization Status
+# Loader Serialization Bottleneck Status
 
-- [x] Capture current user task in `planning/task.md`.
-- [x] Create focused implementation plan.
-- [x] Enable whole-batch queueing for load-only benchmarks.
-- [x] Update pipeline defaults and tune the example config to the measured
-  16 queued / 4 whole-batch / 4 CP-worker shape.
-- [x] Update specs/docs for load-only whole-batch queue behavior.
-- [x] Avoid fully independent loader clone startup by sharing parsed records and deterministic order cache.
-- [x] Add optional VC3D sampler cache budget / I/O thread config.
-- [x] Tune example config to measured best current loader shape.
-- [x] Compile-check changed Python.
-- [x] Run focused loader tests.
-- [x] Run load-only profile benchmark and record before/after result.
-- [x] Update current-task log and changelog.
+- [x] Read task/spec/plan context.
+- [x] Establish current load-only benchmark baseline.
+- [x] Inspect Python loader and VC3D sampling/cache boundaries.
+- [x] Rule out volume-sampling finish sharding as the primary fix.
+- [x] Rule out isolated whole-batch loaders as the primary fix.
+- [ ] Move per-sample CUDA coordinate materialization out of loader workers.
+- [ ] Batch geometric coordinate materialization across the loaded batch.
+- [ ] Update specs/docs/log.
+- [ ] Run focused tests.
+- [ ] Re-run benchmark and record before/after numbers.
