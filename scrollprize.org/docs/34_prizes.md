@@ -149,7 +149,7 @@ Prizes will be awarded to any team or individual that fully digitally unrolls an
 
 If you have a qualifying result, submit it for consideration by sending an email to [grandprize@scrollprize.org](mailto:grandprize@scrollprize.org) and provide the following:
 
-* **Meshes.** The submission must contain a set of meshes in tifxyz format whose union corresponds to the totality of the scroll surface to be virtually unwrapped. Each tifxyz must already include a low-distortion isometric 2D parametrization (flattening).
+* **Meshes.** The submission must contain a set of meshes in tifxyz format whose union corresponds to the totality of the scroll surface to be virtually unwrapped. Each tifxyz must already include a low-distortion isometric 2D parametrization (flattening). At most one mesh per column of text (plus its margins) will be accepted; smaller meshes are not considered valid unless they localize regions where the papyrus is broken, or detached patches.
 * **Images.** Submissions must include images of the virtually unwrapped papyrus, showing visible and legible text.
   * Submit a single static image for each column or sequence of consecutive wraps. Images must be generated programmatically from the reconstructed CT scan volume and the corresponding mesh submitted in the same package, and should not contain manual annotations of characters or text.
   * Specify which scroll each image came from.
