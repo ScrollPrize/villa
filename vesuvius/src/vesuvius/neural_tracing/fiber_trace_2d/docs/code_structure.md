@@ -255,13 +255,13 @@ The important behavior is:
   listed in the summary; the command fails only if no valid pairs remain.
 - `--trace2cp-vis` loads a side-strip segment spanning both CPs, runs the same
   decoded direction-field model as line tracing, traces start-to-target and
-  target-to-start on the same strip, and uses the center-biased closest
-  vertical approach between the two opposing traces as the public
-  `trace2cp_score`. Candidate y-gaps are multiplied by a horizontal center
-  penalty that is `1x` at the midpoint between the CPs and `2x` at either CP
-  x-coordinate. Endpoint scores at the opposite CP x-columns remain summary
-  diagnostics. The trace2cp segment strip uses twice the configured patch
-  height for more vertical room before the RF margin.
+  target-to-start on the same strip, and reports the public
+  `trace2cp_metric_error`: closest actual vertical y-gap between the opposing
+  traces divided by the horizontal start-to-target CP span. The older
+  center-biased closest approach remains a `refine_score` diagnostic for the
+  fused/optimized visualization rows only. Endpoint scores at the opposite CP
+  x-columns remain summary diagnostics. The trace2cp segment strip uses twice
+  the configured patch height for more vertical room before the RF margin.
 - Trace2CP uses `--med-tta` to decide whether to use TTA. Without it, the tool
   traces and scores both directions on the base direction field. With it,
   deterministic random geometric TTA direction fields are built by transforming
@@ -276,10 +276,10 @@ The important behavior is:
   `trace2cp_tta/contact_sheet.jpg`. Each image shows the sampled slice with the
   transformed base-strip corner outline and start/target CP markers.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
-  the center-biased closest-approach normalized `0..1` score plus actual pixel
-  separation, considered metric distance, center penalty, trace mode, endpoint
-  diagnostics, and per-direction scores/statuses to stdout. The summary
-  includes the closest x position, fused/optimized point counts,
+  `trace2cp_metric_error`, metric raw y-gap in pixels, horizontal CP span,
+  `refine_score`, trace mode, endpoint diagnostics, and per-direction
+  scores/statuses to stdout. The summary includes the closest x position,
+  fused/optimized point counts,
   forward/reverse raw endpoint errors, normalized endpoint scores, target
   x-columns, target-column reach statuses, termination reasons, and trace point
   counts. The JPG is a labeled vertical stack with full traces, partial
@@ -296,8 +296,9 @@ The important behavior is:
   display, and the long strip uses the same four rows as the single-pair
   Trace2CP view: full traces, partial closest-approach traces, fused CP-to-CP
   line, and optimized line. The summary includes requested, valid, and skipped
-  pair counts; `trace2cp_fiber_debug.txt` records per-pair strip CP vectors,
-  row axes, frame vectors, and projected CP deltas for debugging.
+  pair counts plus mean/min/max `trace2cp_metric_error`;
+  `trace2cp_fiber_debug.txt` records per-pair strip CP vectors, row axes,
+  frame vectors, and projected CP deltas for debugging.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
   side-strip patch, applies pixel-perfect image-space identity/flip/90-degree
@@ -371,8 +372,9 @@ The important behavior is:
 - Logs scalars/images to TensorBoard and writes `current.pt` / `best.pt`
   snapshots under the run directory.
 - When `test_datasets` is configured, evaluates a fixed deterministic held-out
-  batch at `training.test_interval` and uses test loss for current/best
-  snapshots.
+  batch at `training.test_interval`, also evaluates Trace2CP on each selected
+  held-out CP using the segment to the next CP, and uses the averaged
+  `test/trace2cp_error` for current/best snapshots.
 
 `configs/loader_example.json`
 
@@ -768,8 +770,10 @@ The trainer logs:
   The contact sheet picks one center-offset representative from each loaded
   control-point sample before filling with additional strip-z offsets.
 - when `test_datasets` is configured, `test/loss_direction`,
-  `test/angle_error_mean_deg`, `test/supervision_samples`, test cache diagnostics, and
-  `test/batch_direction_overlay` at test evaluation steps.
+  `test/angle_error_mean_deg`, `test/supervision_samples`,
+  `test/trace2cp_error`, `test/trace2cp_raw_y_error_mean_px`,
+  `test/trace2cp_segments`, `test/trace2cp_skipped_segments`, test cache
+  diagnostics, and `test/batch_direction_overlay` at test evaluation steps.
 
 Console progress prints the same loss, mean angle error in degrees,
 supervision, load-time summary, and CUDA preparation timing for every step whose
@@ -785,7 +789,7 @@ Snapshots are written under:
 
 With `test_datasets`, `current.pt` is written at step 1, every
 `training.test_interval`, and the final step; `best.pt` tracks the lowest
-observed test loss. Without `test_datasets`, snapshots keep the train-only
+observed averaged `test/trace2cp_error`. Without `test_datasets`, snapshots keep the train-only
 behavior: `current.pt` follows `training.checkpoint_interval`, and `best.pt`
 tracks the lowest observed training loss.
 

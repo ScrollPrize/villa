@@ -90,6 +90,8 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_fiber_pair_cp_indices,
     _trace2cp_refinement_from_traces,
     _trace2cp_center_penalty,
+    _trace2cp_metric_from_traces,
+    _trace2cp_metric_bidirectional,
     _trace2cp_tta_params,
     _trace_direction_line,
     _trace_direction_line_to_target,
@@ -351,6 +353,56 @@ def test_trace2cp_bidirectional_trace_scores_closest_approach() -> None:
     assert result.refinement.center_penalty == pytest.approx(1.0)
     assert result.refinement.closest_x == pytest.approx(5.0)
     assert result.refinement.closest_midpoint_xy.tolist() == pytest.approx([5.0, 4.5])
+    assert result.metric.error == pytest.approx(1.0 / 6.0)
+    assert result.metric.raw_y_error_px == pytest.approx(1.0)
+    assert result.metric.horizontal_span_px == pytest.approx(6.0)
+
+    metric_only = _trace2cp_metric_bidirectional(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+    assert metric_only.error == pytest.approx(result.metric.error)
+
+
+def test_trace2cp_metric_uses_actual_closest_gap_not_center_penalty() -> None:
+    forward = np.asarray([[0.0, 8.0], [5.0, 8.0], [10.0, 8.0]], dtype=np.float32)
+    reverse = np.asarray([[10.0, 12.0], [5.0, 15.0], [0.0, 12.0]], dtype=np.float32)
+
+    metric = _trace2cp_metric_from_traces(
+        forward,
+        reverse,
+        np.asarray([0.0, 8.0], dtype=np.float32),
+        np.asarray([10.0, 12.0], dtype=np.float32),
+        shape_hw=(21, 21),
+        rf_margin_px=1.0,
+    )
+
+    assert metric.reached_overlap
+    assert metric.raw_y_error_px == pytest.approx(4.0)
+    assert metric.error == pytest.approx(4.0 / 10.0)
+    assert metric.closest_x == pytest.approx(0.0)
+
+
+def test_trace2cp_metric_no_overlap_uses_centerline_edge_error() -> None:
+    forward = np.asarray([[0.0, 10.0], [2.0, 10.0]], dtype=np.float32)
+    reverse = np.asarray([[10.0, 10.0], [8.0, 10.0]], dtype=np.float32)
+
+    metric = _trace2cp_metric_from_traces(
+        forward,
+        reverse,
+        np.asarray([0.0, 10.0], dtype=np.float32),
+        np.asarray([10.0, 10.0], dtype=np.float32),
+        shape_hw=(21, 21),
+        rf_margin_px=1.0,
+    )
+
+    assert not metric.reached_overlap
+    assert metric.reason == "no_trace_overlap"
+    assert metric.raw_y_error_px == pytest.approx(9.0)
+    assert metric.error == pytest.approx(9.0 / 10.0)
 
 
 def test_trace2cp_center_penalty_is_one_at_center_and_two_at_cps() -> None:
@@ -3536,5 +3588,5 @@ def test_training_with_test_dataset_uses_test_interval_for_snapshots(tmp_path: P
     current = torch.load(run_dir / "snapshots" / "current.pt", map_location="cpu", weights_only=False)
     best = torch.load(run_dir / "snapshots" / "best.pt", map_location="cpu", weights_only=False)
     assert current["step"] == 2
-    assert current["metric_name"] == "test/loss_direction"
-    assert best["metric_name"] == "test/loss_direction"
+    assert current["metric_name"] == "test/trace2cp_error"
+    assert best["metric_name"] == "test/trace2cp_error"

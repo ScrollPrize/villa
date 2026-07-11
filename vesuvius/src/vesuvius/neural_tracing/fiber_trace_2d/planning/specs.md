@@ -269,12 +269,12 @@
 - Each loaded strip sample carries the transformed control-point output-pixel coordinate. V0 direction supervision is limited to the eight neighboring pixels around that rounded transformed control-point location, filtered by image validity and patch bounds.
 - The V0 loss compares predicted and target encoded channels directly with MSE over those CP-local samples; raw signed `(dx,dy)` regression and `abs(dot)` losses are not the V0 training representation. Training additionally reports folded unoriented angular error in degrees over the same supervised pixels, with `0` degrees perfect and `90` degrees maximally wrong.
 - Training creates a run directory from `training.run_path` and `training.run_name` plus a date string.
-- Training config keys include `max_sample_index` for bounded deterministic-prefix reuse, `pipeline_enabled`, `pipeline_depth`, `pipeline_workers`, and `pipeline_isolated_loaders` for CUDA training load/model overlap, and `test_interval`, `test_control_points`, and `test_start_sample_index` for deterministic test evaluation when `test_datasets` is configured.
-- Test evaluation runs at step 1, every `training.test_interval`, and the final step when `test_datasets` is configured. It always loads the fixed range starting at `training.test_start_sample_index` with `training.test_control_points`, so the same held-out CP samples are compared across time.
+- Training config keys include `max_sample_index` for bounded deterministic-prefix reuse, `pipeline_enabled`, `pipeline_depth`, `pipeline_workers`, and `pipeline_isolated_loaders` for CUDA training load/model overlap, and `test_interval`, `test_control_points`, `test_start_sample_index`, `test_trace2cp_step_px`, and `test_trace2cp_rf_margin_px` for deterministic test evaluation when `test_datasets` is configured.
+- Test evaluation runs at step 1, every `training.test_interval`, and the final step when `test_datasets` is configured. It always loads the fixed range starting at `training.test_start_sample_index` with `training.test_control_points`, so the same held-out CP samples are compared across time. In addition to fixed-batch direction loss, the test path evaluates the public Trace2CP metric by tracing each selected held-out CP to its next CP segment and averaging valid `trace2cp_error` values.
 - TensorBoard logging writes the training config JSON as text, direction-loss scalars, angular-error degree scalars, timing/cache diagnostics, and batch direction overlay images at configured intervals. Batch direction overlays show the transformed fiber centerline as context and one short network-predicted direction segment at the transformed CP; they do not draw CP-neighborhood supervision boxes or extra CP markers. Overlay contact sheets select examples across loaded control-point samples first, preferring each CP's strip-z offset closest to zero before showing additional offsets. When `test_datasets` is configured, TensorBoard also logs `test/loss_direction`, `test/angle_error_mean_deg`, `test/supervision_samples`, test cache diagnostics, and a `test/batch_direction_overlay` image at test evaluation steps.
 - Console training progress prints every step covering the first 100 deterministic control-point sample indices, then falls back to `training.scalar_log_interval`.
 - Prefetch progress includes `idx=<exclusive-index>` showing the largest contiguous exclusive bounded deterministic sample index whose required chunks are cache-complete: each required chunk is a cache hit, a known/new missing marker, or a completed successful download. Dependency generation alone must not advance `idx` while downloads are still pending. Operators can use that value as `training.max_sample_index` to train on the prefetched deterministic prefix.
-- Training writes snapshots under `<run_dir>/snapshots/current.pt` and `<run_dir>/snapshots/best.pt`. With `test_datasets`, current snapshots are written at the test evaluation cadence and best is selected by lowest observed test loss. Without `test_datasets`, current snapshots use `training.checkpoint_interval` and best is selected by lowest observed training loss.
+- Training writes snapshots under `<run_dir>/snapshots/current.pt` and `<run_dir>/snapshots/best.pt`. With `test_datasets`, current snapshots are written at the test evaluation cadence and best is selected by lowest observed averaged `test/trace2cp_error`. Without `test_datasets`, current snapshots use `training.checkpoint_interval` and best is selected by lowest observed training loss.
 - The runner is `python -m vesuvius.neural_tracing.fiber_trace_2d.runner`.
 - Augment contact sheets are exported with `--augment-vis --export-dir <dir>`. Add `--augment-profile` to print cold and warm augment timing tables.
 - Direction-field inspection is exported with `--dir-vis --checkpoint <snapshot> --export-dir <dir>`.
@@ -345,21 +345,22 @@
   x-column, the y coordinate is linearly interpolated between bracketing trace
   points. These endpoint scores remain in the summary as diagnostics, but they
   are not the public `trace2cp_score`.
-- The public Trace2CP metric is the center-biased closest vertical approach
-  between the opposing traces. Both traces are resampled at one point per
-  horizontal pixel over their overlapping x span. The actual error at a
-  candidate x is the absolute y separation between those two resampled traces.
-  The considered metric distance is
-  `actual_error * (1 + abs(x - center_x) / half_cp_x_span)`, clipped so the
-  multiplier is `1.0` at the midpoint between CP x coordinates and `2.0` at
-  either CP x coordinate. Trace2CP chooses the candidate x with the smallest
-  considered distance; ties choose the candidate closest to the midpoint.
-- The public Trace2CP normalized score is clamped to `0..1`; `0.0` means the
-  two opposing traces meet exactly, and `1.0` means the center-penalized
-  considered distance reaches the usable vertical strip span or the traces have
-  no overlap. The denominator is the full usable vertical strip span after the
-  receptive-field margin is excluded. The actual y separation remains a
-  diagnostic field.
+- The public Trace2CP metric is `trace2cp_error`: the actual closest vertical
+  separation between opposing traces divided by the horizontal start-to-target
+  CP span. Both traces are resampled at one point per horizontal pixel over
+  their overlapping x span. Trace2CP chooses the candidate x with the smallest
+  actual y separation; ties choose the candidate closest to the midpoint only
+  as a deterministic tie-breaker. No center-focus penalty is applied to this
+  public metric.
+- If the two opposing traces have no usable overlap, the public metric uses the
+  default maximum y error for that segment: vertical distance from the CP
+  centerline y to the nearest usable vertical strip edge after RF-margin
+  exclusion, divided by the horizontal CP span. The same maximum y error caps
+  pathological closest-gap values. This intentionally treats exact early/late
+  edge intersection as noise for now.
+- The previous center-biased closest-approach value remains available only as a
+  refinement/visualization diagnostic named `refine_score`. It must not be used
+  as the public Trace2CP metric or as the training best-checkpoint criterion.
 - Trace2CP builds a CP-to-CP initialized segment from the two closest-approach
   partial traces. Each CP stays fixed. Each partial trace is corrected only in
   y, with zero correction at its CP and linearly increasing correction toward
@@ -397,20 +398,19 @@
   base-strip corner outline and start/target CP markers.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
   a concise stdout line with sample index, fiber path, start/target CP indices,
-  trace mode, center-biased closest-approach normalized score, actual y
-  separation in pixels, considered metric distance in pixels, center penalty,
-  closest x position, endpoint diagnostic scores, per-direction raw errors,
-  target x-columns, reach statuses, termination reasons, and trace point
-  counts. The JPG is a labeled vertical stack with rows for full bidirectional
-  traces, partial traces up to the closest point, the fused CP-to-CP line, and
-  the optimized refinement. Without `--med-tta`, this stack is the
-  reference-only inference result. With `--med-tta`, the JPG has two columns:
-  the selected median-TTA result first, and a second reference-only inference
-  column using the base direction field without TTA. It does not draw score
-  text over image pixels.
+  trace mode, public `trace2cp_metric_error`, metric raw y separation in
+  pixels, horizontal CP span, refinement diagnostic score, endpoint diagnostic
+  scores, per-direction raw errors, target x-columns, reach statuses,
+  termination reasons, and trace point counts. The JPG is a labeled vertical
+  stack with rows for full bidirectional traces, partial traces up to the
+  closest point, the fused CP-to-CP line, and the optimized refinement. Without
+  `--med-tta`, this stack is the reference-only inference result. With
+  `--med-tta`, the JPG has two columns: the selected median-TTA result first,
+  and a second reference-only inference column using the base direction field
+  without TTA. It does not draw score text over image pixels.
 - Whole-fiber Trace2CP mode writes `trace2cp_fiber_vis.jpg` and
   `trace2cp_fiber_summary.txt`, and `trace2cp_fiber_debug.txt`. Each CP pair
-  is loaded, traced, and scored with the same pair-local Trace2CP path as the
+  is loaded, traced, and measured with the same pair-local Trace2CP path as the
   single-pair command. The final
   visualization is composed afterward by mapping each pair-local segment image,
   centerline, CP markers, selected traces, and optimized line into a shared
@@ -422,11 +422,12 @@
   coordinates, strip-space CP deltas, start/target row axes, frame vectors, and
   3D CP deltas projected into the start frame. The image layer uses dense rectangular valid-mask averaging of
   the already sampled segment images; it must not use sparse per-pixel
-  splatting that can introduce display holes. Scores and traces are still
-  computed pair by pair. The JPG uses the same four-row Trace2CP structure as
+  splatting that can introduce display holes. Metric errors and traces are
+  still computed pair by pair. The JPG uses the same four-row Trace2CP structure as
   single-pair output: full bidirectional traces, partial closest-approach
   traces, fused CP-to-CP line, and optimized CP-to-CP line. Skipped-pair counts
-  and reasons are included in the summary.
+  and reasons are included in the summary. Whole-fiber metric output is the
+  average public `trace2cp_error` over all valid CP-pair segments.
 - Trace2CP target-column crossing takes precedence over RF-margin rejection for
   the next step in each direction. If a step crosses that direction's target
   x-column and would also enter the RF margin, the trace is considered to have

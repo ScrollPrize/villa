@@ -2,6 +2,10 @@
 
 ## 2026-07-11
 
+- Changed public Trace2CP reporting to `trace2cp_error`, the closest actual
+  vertical trace gap divided by horizontal CP span; the center-biased score is
+  now only a refinement/visual diagnostic, and test-dataset training selects
+  `best.pt` by averaged `test/trace2cp_error`.
 - Added `--trace2cp-vis --fiber-json <path>` to run Trace2CP over all
   configured CP pairs for one explicit fiber and compose a long-strip
   visualization without requiring that fiber to match the configured

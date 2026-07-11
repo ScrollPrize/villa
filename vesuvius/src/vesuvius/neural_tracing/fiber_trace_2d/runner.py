@@ -636,14 +636,33 @@ class _Trace2CpRefinementResult:
 
 
 @dataclass(frozen=True)
+class _Trace2CpMetricResult:
+    error: float
+    raw_y_error_px: float
+    horizontal_span_px: float
+    max_y_error_px: float
+    closest_x: float
+    forward_y_at_closest_x: float
+    reverse_y_at_closest_x: float
+    closest_midpoint_xy: np.ndarray
+    reached_overlap: bool
+    reason: str
+
+
+@dataclass(frozen=True)
 class _Trace2CpBidirectionalResult:
     forward: _Trace2CpDirectionResult
     reverse: _Trace2CpDirectionResult
     refinement: _Trace2CpRefinementResult
+    metric: _Trace2CpMetricResult
 
     @property
     def score(self) -> float:
         return float(self.refinement.score)
+
+    @property
+    def metric_error(self) -> float:
+        return float(self.metric.error)
 
     @property
     def raw_y_error_px(self) -> float:
@@ -1343,6 +1362,122 @@ def _closest_trace2cp_approach(
     return score, gap, considered_gap, penalty, closest_x, forward_y, reverse_y, midpoint, "closest_approach", True
 
 
+def _trace2cp_horizontal_span_px(start_xy: np.ndarray, target_xy: np.ndarray) -> float:
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    if start.shape != (2,) or target.shape != (2,):
+        raise ValueError("start_xy and target_xy must have shape (2,)")
+    span = abs(float(target[0]) - float(start[0]))
+    if not np.isfinite(span) or span <= 1.0e-6:
+        raise ValueError(
+            "trace2cp metric requires distinct horizontal CP positions: "
+            f"start_x={float(start[0]):.6f} target_x={float(target[0]):.6f}"
+        )
+    return span
+
+
+def _trace2cp_default_max_y_error_px(
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    shape_hw: tuple[int, int],
+    rf_margin_px: float,
+) -> float:
+    top, bottom, span = _usable_trace2cp_vertical_span(shape_hw, rf_margin_px)
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    center_y = 0.5 * (float(start[1]) + float(target[1]))
+    if not np.isfinite(center_y):
+        return span
+    center_y = float(np.clip(center_y, top, bottom))
+    edge_distance = min(center_y - top, bottom - center_y)
+    if not np.isfinite(edge_distance) or edge_distance <= 0.0:
+        return span
+    return float(edge_distance)
+
+
+def _trace2cp_midpoint_xy(start_xy: np.ndarray, target_xy: np.ndarray) -> np.ndarray:
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    return (0.5 * (start + target)).astype(np.float32, copy=False)
+
+
+def _trace2cp_metric_from_traces(
+    forward_trace_xy: np.ndarray,
+    reverse_trace_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    shape_hw: tuple[int, int],
+    rf_margin_px: float,
+) -> _Trace2CpMetricResult:
+    horizontal_span = _trace2cp_horizontal_span_px(start_xy, target_xy)
+    max_y_error = _trace2cp_default_max_y_error_px(
+        start_xy,
+        target_xy,
+        shape_hw=shape_hw,
+        rf_margin_px=rf_margin_px,
+    )
+    x_values = _trace2cp_overlap_x_values(forward_trace_xy, reverse_trace_xy, start_xy, target_xy)
+    if x_values.size == 0:
+        midpoint = _trace2cp_midpoint_xy(start_xy, target_xy)
+        return _Trace2CpMetricResult(
+            error=float(max_y_error / horizontal_span),
+            raw_y_error_px=float(max_y_error),
+            horizontal_span_px=float(horizontal_span),
+            max_y_error_px=float(max_y_error),
+            closest_x=float("nan"),
+            forward_y_at_closest_x=float("nan"),
+            reverse_y_at_closest_x=float("nan"),
+            closest_midpoint_xy=midpoint,
+            reached_overlap=False,
+            reason="no_trace_overlap",
+        )
+
+    rows: list[tuple[float, float, float, float]] = []
+    for x in x_values.tolist():
+        forward_y = _trace_y_at_x(forward_trace_xy, float(x))
+        reverse_y = _trace_y_at_x(reverse_trace_xy, float(x))
+        if forward_y is None or reverse_y is None:
+            continue
+        if not np.isfinite(forward_y) or not np.isfinite(reverse_y):
+            continue
+        gap = abs(float(forward_y) - float(reverse_y))
+        rows.append((gap, float(x), float(forward_y), float(reverse_y)))
+    if not rows:
+        midpoint = _trace2cp_midpoint_xy(start_xy, target_xy)
+        return _Trace2CpMetricResult(
+            error=float(max_y_error / horizontal_span),
+            raw_y_error_px=float(max_y_error),
+            horizontal_span_px=float(horizontal_span),
+            max_y_error_px=float(max_y_error),
+            closest_x=float("nan"),
+            forward_y_at_closest_x=float("nan"),
+            reverse_y_at_closest_x=float("nan"),
+            closest_midpoint_xy=midpoint,
+            reached_overlap=False,
+            reason="no_trace_overlap",
+        )
+
+    midpoint_x = float(_trace2cp_midpoint_xy(start_xy, target_xy)[0])
+    rows.sort(key=lambda row: (row[0], abs(row[1] - midpoint_x)))
+    gap, closest_x, forward_y, reverse_y = rows[0]
+    metric_gap = min(float(gap), float(max_y_error))
+    midpoint = np.asarray([closest_x, 0.5 * (forward_y + reverse_y)], dtype=np.float32)
+    return _Trace2CpMetricResult(
+        error=float(metric_gap / horizontal_span),
+        raw_y_error_px=float(gap),
+        horizontal_span_px=float(horizontal_span),
+        max_y_error_px=float(max_y_error),
+        closest_x=float(closest_x),
+        forward_y_at_closest_x=float(forward_y),
+        reverse_y_at_closest_x=float(reverse_y),
+        closest_midpoint_xy=midpoint,
+        reached_overlap=True,
+        reason="closest_vertical_gap",
+    )
+
+
 def _vertical_warp_trace_to_meet(
     trace_xy: np.ndarray,
     *,
@@ -1640,6 +1775,14 @@ def _trace_score_trace2cp_bidirectional(
         step_px=step_px,
         rf_margin_px=rf_margin_px,
     )
+    metric = _trace2cp_metric_from_traces(
+        forward.trace_xy,
+        reverse.trace_xy,
+        start_xy,
+        target_xy,
+        shape_hw=(int(direction_xy.shape[0]), int(direction_xy.shape[1])),
+        rf_margin_px=rf_margin_px,
+    )
     refinement = _trace2cp_refinement_from_traces(
         forward.trace_xy,
         reverse.trace_xy,
@@ -1651,7 +1794,42 @@ def _trace_score_trace2cp_bidirectional(
         step_px=step_px,
         rf_margin_px=rf_margin_px,
     )
-    return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse, refinement=refinement)
+    return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse, refinement=refinement, metric=metric)
+
+
+def _trace2cp_metric_bidirectional(
+    direction_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+) -> _Trace2CpMetricResult:
+    forward = _trace_score_trace2cp_direction(
+        direction_xy,
+        start_xy,
+        target_xy,
+        valid_mask=valid_mask,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    reverse = _trace_score_trace2cp_direction(
+        direction_xy,
+        target_xy,
+        start_xy,
+        valid_mask=valid_mask,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    return _trace2cp_metric_from_traces(
+        forward.trace_xy,
+        reverse.trace_xy,
+        start_xy,
+        target_xy,
+        shape_hw=(int(direction_xy.shape[0]), int(direction_xy.shape[1])),
+        rf_margin_px=rf_margin_px,
+    )
 
 
 def _trace_score_trace2cp_median_tta_direction(
@@ -1718,7 +1896,15 @@ def _trace_score_trace2cp_median_tta_bidirectional(
         step_px=step_px,
         rf_margin_px=rf_margin_px,
     )
-    return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse, refinement=refinement)
+    metric = _trace2cp_metric_from_traces(
+        forward.trace_xy,
+        reverse.trace_xy,
+        start_xy,
+        target_xy,
+        shape_hw=shape_hw,
+        rf_margin_px=rf_margin_px,
+    )
+    return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse, refinement=refinement, metric=metric)
 
 
 def _export_line_trace_vis(
@@ -1926,7 +2112,7 @@ def _draw_trace2cp_overlay(
                     (result.reverse.trace_xy, (255, 64, 220, 230), 1),
                 ],
                 label=(
-                    f"{label_prefix} traces score={result.score:.4f} "
+                    f"{label_prefix} traces metric={result.metric.error:.4f} "
                     f"gap={refinement.raw_y_error_px:.2f}px "
                     f"considered={refinement.considered_y_error_px:.2f}px "
                     f"endpoint={result.endpoint_score:.4f}"
@@ -2251,7 +2437,7 @@ def _draw_trace2cp_fiber_overlay(
                 ) + global_x_shift
                 draw.text(
                     (midpoint_x - 10.0, 2.0),
-                    f"{result.score:.3f}",
+                    f"{result.metric.error:.3f}",
                     fill=(255, 255, 255, 220),
                     font=font,
                 )
@@ -2564,6 +2750,8 @@ def _export_trace2cp_vis(
     forward = selected_result.forward.result
     reverse = selected_result.reverse.result
     refinement = selected_result.refinement
+    metric = selected_result.metric
+    reference_metric = base_result.metric
     trace_points = int(selected_result.forward.trace_xy.shape[0]) + int(
         selected_result.reverse.trace_xy.shape[0]
     )
@@ -2582,11 +2770,19 @@ def _export_trace2cp_vis(
         f"rf_margin_px={margin:.3f}",
         f"trace_mode={selected_mode}",
         f"trace_points={trace_points}",
-        f"trace2cp_score={selected_result.score:.8f}",
+        f"trace2cp_metric_error={metric.error:.8f}",
+        f"trace2cp_metric_raw_y_error_px={metric.raw_y_error_px:.6f}",
+        f"trace2cp_metric_horizontal_span_px={metric.horizontal_span_px:.6f}",
+        f"trace2cp_metric_max_y_error_px={metric.max_y_error_px:.6f}",
+        f"trace2cp_metric_closest_x={metric.closest_x:.6f}",
+        f"trace2cp_metric_reached_overlap={metric.reached_overlap}",
+        f"trace2cp_metric_reason={metric.reason}",
+        f"trace2cp_refine_score={selected_result.score:.8f}",
         f"actual_y_error_px={selected_result.raw_y_error_px:.6f}",
         f"considered_y_error_px={selected_result.considered_y_error_px:.6f}",
         f"center_penalty={refinement.center_penalty:.6f}",
-        f"score_semantics=center_penalized_minimum_vertical_trace_to_trace_separation",
+        f"metric_semantics=closest_vertical_trace_gap_per_horizontal_cp_span",
+        f"refine_score_semantics=center_penalized_minimum_vertical_trace_to_trace_separation",
         f"trace2cp_denominator_px={refinement.denominator_px:.6f}",
         f"closest_x={refinement.closest_x:.6f}",
         f"closest_forward_y={refinement.forward_y_at_closest_x:.6f}",
@@ -2598,7 +2794,9 @@ def _export_trace2cp_vis(
         f"optimized_points={int(refinement.optimized_xy.shape[0])}",
         f"endpoint_trace2cp_score={selected_result.endpoint_score:.8f}",
         f"endpoint_raw_y_error_px={selected_result.endpoint_raw_y_error_px:.6f}",
-        f"reference_trace2cp_score={base_result.score:.8f}",
+        f"reference_trace2cp_metric_error={reference_metric.error:.8f}",
+        f"reference_trace2cp_metric_raw_y_error_px={reference_metric.raw_y_error_px:.6f}",
+        f"reference_trace2cp_refine_score={base_result.score:.8f}",
         f"reference_actual_y_error_px={base_result.raw_y_error_px:.6f}",
         f"reference_considered_y_error_px={base_result.considered_y_error_px:.6f}",
         f"reference_center_penalty={base_result.refinement.center_penalty:.6f}",
@@ -2629,11 +2827,15 @@ def _export_trace2cp_vis(
         "trace2cp "
         f"sample_index={sample_index} fiber_path={sample.fiber_path} "
         f"start_cp={sample.start_control_point_index} target_cp={sample.target_control_point_index} "
-        f"mode={selected_mode} score={selected_result.score:.8f} "
+        f"mode={selected_mode} metric_error={metric.error:.8f} "
+        f"metric_raw_y_error_px={metric.raw_y_error_px:.6f} "
+        f"metric_horizontal_span_px={metric.horizontal_span_px:.6f} "
         f"actual_y_error_px={selected_result.raw_y_error_px:.6f} "
         f"considered_y_error_px={selected_result.considered_y_error_px:.6f} "
         f"center_penalty={refinement.center_penalty:.6f} "
-        f"reference_score={base_result.score:.8f} "
+        f"reference_metric_error={reference_metric.error:.8f} "
+        f"refine_score={selected_result.score:.8f} "
+        f"reference_refine_score={base_result.score:.8f} "
         f"endpoint_score={selected_result.endpoint_score:.8f} "
         f"closest_x={refinement.closest_x:.6f} "
         f"forward_endpoint_score={forward.score:.8f} reverse_endpoint_score={reverse.score:.8f} "
@@ -2764,7 +2966,10 @@ def _export_trace2cp_fiber_vis(
             f"fiber_path={evaluation.sample.fiber_path} "
             f"start_cp={evaluation.sample.start_control_point_index} "
             f"target_cp={evaluation.sample.target_control_point_index} "
-            f"mode={evaluation.selected_mode} score={evaluation.selected_result.score:.8f} "
+            f"mode={evaluation.selected_mode} metric_error={evaluation.selected_result.metric.error:.8f} "
+            f"metric_raw_y_error_px={evaluation.selected_result.metric.raw_y_error_px:.6f} "
+            f"metric_horizontal_span_px={evaluation.selected_result.metric.horizontal_span_px:.6f} "
+            f"refine_score={evaluation.selected_result.score:.8f} "
             f"actual_y_error_px={evaluation.selected_result.raw_y_error_px:.6f} "
             f"considered_y_error_px={evaluation.selected_result.considered_y_error_px:.6f}",
             flush=True,
@@ -2778,17 +2983,19 @@ def _export_trace2cp_fiber_vis(
         )
 
     cp_x = _trace2cp_control_point_x_positions(loader, flat_indices)
-    scores = np.asarray([evaluation.selected_result.score for evaluation in evaluations], dtype=np.float64)
+    metric_errors = np.asarray([evaluation.selected_result.metric.error for evaluation in evaluations], dtype=np.float64)
+    refine_scores = np.asarray([evaluation.selected_result.score for evaluation in evaluations], dtype=np.float64)
     actual_errors = np.asarray(
-        [evaluation.selected_result.raw_y_error_px for evaluation in evaluations], dtype=np.float64
+        [evaluation.selected_result.metric.raw_y_error_px for evaluation in evaluations], dtype=np.float64
     )
     fiber_path_display = evaluations[0].sample.fiber_path or str(fiber_json)
     mode = "med_tta" if med_tta else "base"
     label = (
         f"trace2cp fiber pairs={len(evaluations)} mode={mode} "
         f"skipped={len(skipped_pairs)} "
-        f"mean={float(np.mean(scores)):.4f} max={float(np.max(scores)):.4f} "
-        f"mean_actual_px={float(np.mean(actual_errors)):.2f}"
+        f"metric_mean={float(np.mean(metric_errors)):.4f} "
+        f"metric_max={float(np.max(metric_errors)):.4f} "
+        f"mean_metric_raw_px={float(np.mean(actual_errors)):.2f}"
     )
     overlay = _draw_trace2cp_fiber_overlay(
         evaluations,
@@ -2799,19 +3006,28 @@ def _export_trace2cp_fiber_vis(
     (out / "trace2cp_fiber_debug.txt").write_text("\n".join(debug_rows) + "\n", encoding="utf-8")
 
     rows = [
-        "start_cp target_cp score actual_y_error_px considered_y_error_px center_penalty "
-        "reference_score endpoint_score closest_x forward_reason reverse_reason"
+        "start_cp target_cp metric_error metric_raw_y_error_px metric_horizontal_span_px "
+        "metric_max_y_error_px metric_reason refine_score actual_y_error_px considered_y_error_px "
+        "center_penalty reference_metric_error reference_refine_score endpoint_score closest_x "
+        "forward_reason reverse_reason"
     ]
     for evaluation in evaluations:
         result = evaluation.selected_result
         refinement = result.refinement
+        metric = result.metric
         rows.append(
             f"{evaluation.sample.start_control_point_index} "
             f"{evaluation.sample.target_control_point_index} "
+            f"{metric.error:.8f} "
+            f"{metric.raw_y_error_px:.6f} "
+            f"{metric.horizontal_span_px:.6f} "
+            f"{metric.max_y_error_px:.6f} "
+            f"{metric.reason} "
             f"{result.score:.8f} "
             f"{result.raw_y_error_px:.6f} "
             f"{result.considered_y_error_px:.6f} "
             f"{refinement.center_penalty:.6f} "
+            f"{evaluation.base_result.metric.error:.8f} "
             f"{evaluation.base_result.score:.8f} "
             f"{result.endpoint_score:.8f} "
             f"{refinement.closest_x:.6f} "
@@ -2832,10 +3048,13 @@ def _export_trace2cp_fiber_vis(
         f"trace_mode={mode}",
         f"med_tta={bool(med_tta)}",
         f"line_trace_tta_count={max(0, int(line_trace_tta_count)) if med_tta else 0}",
-        f"score_mean={float(np.mean(scores)):.8f}",
-        f"score_max={float(np.max(scores)):.8f}",
-        f"score_min={float(np.min(scores)):.8f}",
-        f"actual_y_error_mean_px={float(np.mean(actual_errors)):.6f}",
+        f"trace2cp_metric_error_mean={float(np.mean(metric_errors)):.8f}",
+        f"trace2cp_metric_error_max={float(np.max(metric_errors)):.8f}",
+        f"trace2cp_metric_error_min={float(np.min(metric_errors)):.8f}",
+        f"trace2cp_metric_raw_y_error_mean_px={float(np.mean(actual_errors)):.6f}",
+        f"refine_score_mean={float(np.mean(refine_scores)):.8f}",
+        f"refine_score_max={float(np.max(refine_scores)):.8f}",
+        f"refine_score_min={float(np.min(refine_scores)):.8f}",
         f"image_shape_hw=({int(overlay.shape[0])}, {int(overlay.shape[1])})",
         f"debug_path={out / 'trace2cp_fiber_debug.txt'}",
         "",
@@ -2851,8 +3070,11 @@ def _export_trace2cp_fiber_vis(
     print(
         "trace2cp fiber "
         f"fiber_json={fiber_path_display} "
-        f"pairs={len(evaluations)} mode={mode} mean_score={float(np.mean(scores)):.8f} "
-        f"max_score={float(np.max(scores)):.8f} mean_actual_y_error_px={float(np.mean(actual_errors)):.6f} "
+        f"pairs={len(evaluations)} mode={mode} "
+        f"metric_error_mean={float(np.mean(metric_errors)):.8f} "
+        f"metric_error_max={float(np.max(metric_errors)):.8f} "
+        f"metric_raw_y_error_mean_px={float(np.mean(actual_errors)):.6f} "
+        f"refine_score_mean={float(np.mean(refine_scores)):.8f} "
         f"skipped_pairs={len(skipped_pairs)}"
     )
     print(f"exported trace2cp_fiber_vis.jpg, trace2cp_fiber_summary.txt, and trace2cp_fiber_debug.txt to {out}")

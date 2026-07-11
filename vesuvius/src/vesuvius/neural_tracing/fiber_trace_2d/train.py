@@ -33,6 +33,10 @@ from vesuvius.neural_tracing.fiber_trace_2d.model import (
     FiberStripDirectionModelConfig,
     FiberStripDirectionNet,
 )
+from vesuvius.neural_tracing.fiber_trace_2d.runner import (
+    _predict_direction_field,
+    _trace2cp_metric_bidirectional,
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,8 @@ class FiberStripTrainingConfig:
     test_interval: int = 1000
     test_control_points: int = 4
     test_start_sample_index: int = 0
+    test_trace2cp_step_px: float = 4.0
+    test_trace2cp_rf_margin_px: float | None = None
     train_control_points_per_step: int = 4
     device: str = "auto"
     tensorboard_enabled: bool = True
@@ -81,6 +87,12 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         test_interval=max(1, int(get("test_interval", get("checkpoint_interval", 1000)))),
         test_control_points=max(1, int(get("test_control_points", get("control_points_per_step", 4)))),
         test_start_sample_index=max(0, int(get("test_start_sample_index", 0))),
+        test_trace2cp_step_px=float(get("test_trace2cp_step_px", 4.0)),
+        test_trace2cp_rf_margin_px=(
+            None
+            if get("test_trace2cp_rf_margin_px", None) is None
+            else float(get("test_trace2cp_rf_margin_px", None))
+        ),
         train_control_points_per_step=max(1, int(get("control_points_per_step", get("control_points", 4)))),
         device=str(get("device", "auto")),
         tensorboard_enabled=bool(get("tensorboard_enabled", True)),
@@ -97,6 +109,13 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         raise ValueError("training.max_sample_index must be >= 0")
     if not math.isfinite(config.learning_rate) or config.learning_rate <= 0.0:
         raise ValueError("training.learning_rate must be positive and finite")
+    if not math.isfinite(config.test_trace2cp_step_px) or config.test_trace2cp_step_px <= 0.0:
+        raise ValueError("training.test_trace2cp_step_px must be positive and finite")
+    if config.test_trace2cp_rf_margin_px is not None and (
+        not math.isfinite(config.test_trace2cp_rf_margin_px)
+        or config.test_trace2cp_rf_margin_px < 0.0
+    ):
+        raise ValueError("training.test_trace2cp_rf_margin_px must be non-negative and finite")
     return config
 
 
@@ -969,6 +988,15 @@ class _EvalResult:
     outputs: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _Trace2CpMetricEvalResult:
+    error_mean: float
+    raw_y_error_mean_px: float
+    segments: int
+    skipped_segments: int
+    first_skip_reason: str
+
+
 def _evaluate_fixed_batch(
     model: FiberStripDirectionNet,
     loader: FiberStrip2DLoader,
@@ -992,6 +1020,66 @@ def _evaluate_fixed_batch(
         supervision_samples=int(supervision.target.shape[0]),
         batch=batch,
         outputs=outputs_cpu,
+    )
+
+
+def _evaluate_trace2cp_metric_fixed_set(
+    model: FiberStripDirectionNet,
+    loader: FiberStrip2DLoader,
+    *,
+    device: torch.device,
+    start_sample_index: int,
+    sample_count: int,
+    step_px: float,
+    rf_margin_px: float,
+) -> _Trace2CpMetricEvalResult:
+    was_training = model.training
+    model.eval()
+    errors: list[float] = []
+    raw_errors: list[float] = []
+    skipped = 0
+    first_skip = ""
+    with torch.no_grad():
+        for offset in range(max(1, int(sample_count))):
+            sample_index = int(start_sample_index) + int(offset)
+            try:
+                sample, image, valid_mask = loader.build_trace2cp_segment_patch(
+                    sample_index,
+                    target_offset=1,
+                    rf_margin_px=rf_margin_px,
+                    device=device,
+                    sample_mode="random",
+                )
+                direction_xy = _predict_direction_field(model, image, valid_mask, device=device)
+                metric = _trace2cp_metric_bidirectional(
+                    direction_xy,
+                    np.asarray(sample.start_control_point_xy, dtype=np.float32),
+                    np.asarray(sample.target_control_point_xy, dtype=np.float32),
+                    valid_mask=valid_mask,
+                    step_px=step_px,
+                    rf_margin_px=rf_margin_px,
+                )
+            except ValueError as exc:
+                skipped += 1
+                if not first_skip:
+                    first_skip = " ".join(str(exc).split())
+                continue
+            errors.append(float(metric.error))
+            raw_errors.append(float(metric.raw_y_error_px))
+    if was_training:
+        model.train()
+    if not errors:
+        raise ValueError(
+            "test Trace2CP metric found no valid CP-to-next-CP segments: "
+            f"start_sample_index={int(start_sample_index)} sample_count={int(sample_count)} "
+            f"skipped={int(skipped)} first_skip='{first_skip}'"
+        )
+    return _Trace2CpMetricEvalResult(
+        error_mean=float(np.mean(np.asarray(errors, dtype=np.float64))),
+        raw_y_error_mean_px=float(np.mean(np.asarray(raw_errors, dtype=np.float64))),
+        segments=len(errors),
+        skipped_segments=int(skipped),
+        first_skip_reason=first_skip,
     )
 
 
@@ -1234,6 +1322,7 @@ def run_training(
     last_angle_mean_deg = float("nan")
     last_test_loss = float("nan")
     last_test_angle_mean_deg = float("nan")
+    last_test_trace2cp_error = float("nan")
     use_pipeline = bool(training.pipeline_enabled and device.type == "cuda")
     pipeline: _TrainingBatchPipeline | None = None
     prep_pipeline: _CudaPreparedBatchPipeline | None = None
@@ -1304,6 +1393,7 @@ def run_training(
                 and (step == 1 or step % training.test_interval == 0 or (finite_steps and step == training.max_steps))
             )
             test_result = None
+            test_trace2cp_metric = None
             if should_test:
                 test_result = _evaluate_fixed_batch(
                     model,
@@ -1314,6 +1404,21 @@ def run_training(
                 )
                 last_test_loss = test_result.loss
                 last_test_angle_mean_deg = test_result.angle_mean_deg
+                trace2cp_margin = (
+                    float(training.model_depth)
+                    if training.test_trace2cp_rf_margin_px is None
+                    else float(training.test_trace2cp_rf_margin_px)
+                )
+                test_trace2cp_metric = _evaluate_trace2cp_metric_fixed_set(
+                    model,
+                    test_loader,
+                    device=device,
+                    start_sample_index=training.test_start_sample_index,
+                    sample_count=training.test_control_points,
+                    step_px=training.test_trace2cp_step_px,
+                    rf_margin_px=trace2cp_margin,
+                )
+                last_test_trace2cp_error = test_trace2cp_metric.error_mean
 
             if writer is not None and (step == 1 or step % training.scalar_log_interval == 0):
                 writer.add_scalar("train/loss_direction", loss_value, step)
@@ -1332,6 +1437,15 @@ def run_training(
                 writer.add_scalar("test/loss_direction", test_result.loss, step)
                 writer.add_scalar("test/angle_error_mean_deg", test_result.angle_mean_deg, step)
                 writer.add_scalar("test/supervision_samples", test_result.supervision_samples, step)
+                if test_trace2cp_metric is not None:
+                    writer.add_scalar("test/trace2cp_error", test_trace2cp_metric.error_mean, step)
+                    writer.add_scalar(
+                        "test/trace2cp_raw_y_error_mean_px",
+                        test_trace2cp_metric.raw_y_error_mean_px,
+                        step,
+                    )
+                    writer.add_scalar("test/trace2cp_segments", test_trace2cp_metric.segments, step)
+                    writer.add_scalar("test/trace2cp_skipped_segments", test_trace2cp_metric.skipped_segments, step)
                 for key, value in _cache_scalars(test_result.batch.cache_stats).items():
                     writer.add_scalar(f"test_{key}", value, step)
             if writer is not None and (step == 1 or step % training.tensorboard_image_interval == 0):
@@ -1349,8 +1463,16 @@ def run_training(
                 else (step == 1 or step % training.checkpoint_interval == 0 or (finite_steps and step == training.max_steps))
             )
             if should_save_current:
-                checkpoint_loss = test_result.loss if test_result is not None else loss_value
-                checkpoint_metric = "test/loss_direction" if test_result is not None else "train/loss_direction"
+                checkpoint_loss = (
+                    test_trace2cp_metric.error_mean
+                    if test_trace2cp_metric is not None
+                    else (test_result.loss if test_result is not None else loss_value)
+                )
+                checkpoint_metric = (
+                    "test/trace2cp_error"
+                    if test_trace2cp_metric is not None
+                    else ("test/loss_direction" if test_result is not None else "train/loss_direction")
+                )
                 _save_checkpoint(
                     snapshots / "current.pt",
                     step=step,
@@ -1361,8 +1483,16 @@ def run_training(
                     metric_name=checkpoint_metric,
                 )
             if test_loader is None or test_result is not None:
-                metric_value = test_result.loss if test_result is not None else loss_value
-                metric_name = "test/loss_direction" if test_result is not None else "train/loss_direction"
+                metric_value = (
+                    test_trace2cp_metric.error_mean
+                    if test_trace2cp_metric is not None
+                    else (test_result.loss if test_result is not None else loss_value)
+                )
+                metric_name = (
+                    "test/trace2cp_error"
+                    if test_trace2cp_metric is not None
+                    else ("test/loss_direction" if test_result is not None else "train/loss_direction")
+                )
                 if metric_value < best_metric:
                     best_metric = metric_value
                     _save_checkpoint(
@@ -1389,6 +1519,16 @@ def run_training(
                     else (
                         f" test_loss_direction={test_result.loss:.6f} "
                         f"test_angle_mean_deg={test_result.angle_mean_deg:.2f}"
+                        + (
+                            ""
+                            if test_trace2cp_metric is None
+                            else (
+                                f" test_trace2cp_error={test_trace2cp_metric.error_mean:.6f} "
+                                f"test_trace2cp_raw_y_px={test_trace2cp_metric.raw_y_error_mean_px:.3f} "
+                                f"test_trace2cp_segments={test_trace2cp_metric.segments} "
+                                f"test_trace2cp_skipped={test_trace2cp_metric.skipped_segments}"
+                            )
+                        )
                     )
                 )
                 print(
@@ -1413,7 +1553,11 @@ def run_training(
     test_complete = (
         ""
         if math.isnan(last_test_loss)
-        else f" test_loss_direction={last_test_loss:.6f} test_angle_mean_deg={last_test_angle_mean_deg:.2f}"
+        else (
+            f" test_loss_direction={last_test_loss:.6f} "
+            f"test_angle_mean_deg={last_test_angle_mean_deg:.2f} "
+            f"test_trace2cp_error={last_test_trace2cp_error:.6f}"
+        )
     )
     print(
         f"fiber_trace_2d train complete step={training.max_steps} "
