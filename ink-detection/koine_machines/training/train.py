@@ -24,6 +24,7 @@ from vesuvius.models.training.optimizers import (
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from koine_machines.models.make_model import make_model
 from koine_machines.data.ink_dataset import InkDataset
+from koine_machines.data.normal_pooled_sample import native_volume_downsample_factor
 from koine_machines.models.load_checkpoint import load_training_checkpoint_from_config, restore_training_state
 from koine_machines.evaluation.metrics.balanced_accuracy import BalancedAccuracy
 from koine_machines.evaluation.metrics.confusion import Confusion, ConfusionCounts
@@ -39,7 +40,6 @@ from koine_machines.training.deep_supervision import (
 from koine_machines.training.visualization import PreviewAccumulator, build_validation_preview_log
 from koine_machines.training.loss.losses import create_loss_from_config
 from koine_machines.training.stitching import resolve_model_and_loader_patch_sizes, run_model_forward
-from vesuvius.models.augmentation.transforms.cucim_dilate import dilate_label_batch_with_cucim
 
 
 @dataclass
@@ -72,6 +72,28 @@ def _disable_z_projection_for_normal_pooled_3d(config):
             target_info['z_projection_mode'] = 'none'
             if isinstance(target_info.get('z_projection'), dict):
                 target_info['z_projection']['mode'] = 'none'
+
+
+def _full_3d_dilation_distances_for_level(config):
+    """Dilation distances are configured in level-0 voxels (like the projection
+    half-thicknesses); convert them to voxels of the native volume level."""
+    full_3d_config = config.get('full_3d') or {}
+    label_dilation = float(full_3d_config.get('label_dilation_distance', 0.0))
+    supervision_dilation = float(full_3d_config.get('supervision_dilation_distance', 0.0))
+    if label_dilation <= 0.0 and supervision_dilation <= 0.0:
+        return label_dilation, supervision_dilation
+    factors = {
+        native_volume_downsample_factor(ds['volume_scale'])
+        for ds in config['datasets']
+    }
+    if len(factors) != 1:
+        raise ValueError(
+            "full_3d dilation distances require a single volume_scale across datasets, "
+            f"got downsample factors {sorted(factors)!r}"
+        )
+    factor = float(factors.pop())
+    return label_dilation / factor, supervision_dilation / factor
+
 
 def _build_full_3d_preview_batch(
     batch: dict,
@@ -113,6 +135,8 @@ def _build_full_3d_preview_batch(
 
 def _apply_cucim_label_dilation(batch, label_dilation_distance, supervision_dilation_distance):
     """Apply GPU-accelerated dilation to inklabels and supervision_mask via cucim."""
+    from vesuvius.models.augmentation.transforms.cucim_dilate import dilate_label_batch_with_cucim
+
     inklabels = batch['inklabels']
     supervision_mask = batch['supervision_mask']
     ones = torch.ones(inklabels.shape[0], 1, *inklabels.shape[2:], device=inklabels.device, dtype=inklabels.dtype)
@@ -286,9 +310,9 @@ def train(config_path):
     full_3d_label_dilation = 0.0
     full_3d_supervision_dilation = 0.0
     if mode in _FULL_3D_TRAINING_MODES:
-        _full_3d_config = config.get('full_3d') or {}
-        full_3d_label_dilation = float(_full_3d_config.get('label_dilation_distance', 0.0))
-        full_3d_supervision_dilation = float(_full_3d_config.get('supervision_dilation_distance', 0.0))
+        full_3d_label_dilation, full_3d_supervision_dilation = (
+            _full_3d_dilation_distances_for_level(config)
+        )
         if full_3d_label_dilation > 0.0 or full_3d_supervision_dilation > 0.0:
             ds_full_3d = dataset_config.setdefault('full_3d', {})
             ds_full_3d['label_dilation_distance'] = 0.0
@@ -533,6 +557,22 @@ def train(config_path):
         progress_bar.set_postfix(postfix, refresh=False)
         progress_bar.update(0)
 
+    def save_checkpoint(step):
+        if not accelerator.is_main_process or step % save_every != 0 or step <= 0:
+            return
+        checkpoint = {
+            'model': accelerator.get_state_dict(model),
+            'optimizer': optimizer.state_dict(),
+            'lr_scheduler': lr_scheduler.state_dict(),
+            'config': config,
+            'step': step,
+            'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
+        }
+        if ema_model is not None and ema_save_in_checkpoint:
+            checkpoint['ema_model'] = ema_model.state_dict()
+            checkpoint['ema_optimizer_step'] = optimizer_step
+        torch.save(checkpoint, f'{out_dir}/ckpt_{step:06}.pth')
+
     for step in progress_bar:
         model.train()
         if frozen_encoder is not None:
@@ -660,6 +700,7 @@ def train(config_path):
                     latest_val_loss = None
                     latest_ema_val_loss = None
                     refresh_progress_bar(train_loss)
+                save_checkpoint(step)
                 continue
             val_iterator = iter(val_dl)
             preview_batch_indices = set(random.sample(range(num_val_batches), k=min(val_preview_batches, num_val_batches)))
@@ -816,19 +857,7 @@ def train(config_path):
                 if wandb.run is not None:
                     wandb.log(log_dict, step=step)
 
-        if accelerator.is_main_process and step % save_every == 0 and step > 0:
-            checkpoint = {
-                'model': accelerator.get_state_dict(model),
-                'optimizer': optimizer.state_dict(),
-                'lr_scheduler': lr_scheduler.state_dict(),
-                'config': config,
-                'step': step,
-                'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
-            }
-            if ema_model is not None and ema_save_in_checkpoint:
-                checkpoint['ema_model'] = ema_model.state_dict()
-                checkpoint['ema_optimizer_step'] = optimizer_step
-            torch.save(checkpoint, f'{out_dir}/ckpt_{step:06}.pth')
+        save_checkpoint(step)
 
     accelerator.wait_for_everyone()
 

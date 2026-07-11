@@ -28,12 +28,17 @@ from koine_machines.data.normal_pooled_sample import (
     _build_normal_pooled_flat_metadata,
     _compute_normals_local_zyx_from_position_halo,
     _filter_support_components_by_active_supervision,
+    _maybe_select_flat_pixels_for_native_crop_via_stored_resolution,
+    native_tifxyz_pyramid_params,
+    native_volume_downsample_factor,
+    SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
     _project_flat_patch_to_native_crop,
     _pack_normal_pooled_augmentation_data,
     _project_flat_labels_and_supervision_to_native_crop,
     _project_valid_surface_mask_to_native_crop,
     _select_flat_pixels_for_native_crop,
     _restore_normal_pooled_augmentation_data,
+    read_tifxyz_on_flat_grid,
     _select_flat_pixels_for_native_crop_via_stored_resolution,
     _slice_support_halo_for_subwindow,
 )
@@ -230,138 +235,6 @@ def _exclude_validation_voxels_from_training_supervision(
     masked_supervision = np.array(supervision_patch, copy=True)
     masked_supervision[validation_patch > 0] = 0
     return masked_supervision
-
-
-def _select_flat_pixels_for_native_crop(patch_zyxs, valid_mask, crop_bbox):
-    patch_zyxs = np.asarray(patch_zyxs)
-    valid_mask = np.asarray(valid_mask, dtype=bool)
-    crop_start = np.asarray(crop_bbox[:3], dtype=np.int64)
-    crop_stop = np.asarray(crop_bbox[3:], dtype=np.int64)
-
-    finite_mask = np.isfinite(patch_zyxs).all(axis=-1)
-    within = valid_mask & finite_mask
-    within &= patch_zyxs[..., 0] >= crop_start[0]
-    within &= patch_zyxs[..., 0] < crop_stop[0]
-    within &= patch_zyxs[..., 1] >= crop_start[1]
-    within &= patch_zyxs[..., 1] < crop_stop[1]
-    within &= patch_zyxs[..., 2] >= crop_start[2]
-    within &= patch_zyxs[..., 2] < crop_stop[2]
-    if not np.any(within):
-        raise ValueError(f"crop_bbox {crop_bbox!r} does not intersect any valid flat tifxyz pixels")
-
-    # We only need the enclosing row/column span, not every matching index.
-    row_hits = np.any(within, axis=1)
-    col_hits = np.any(within, axis=0)
-    row_indices = np.flatnonzero(row_hits)
-    col_indices = np.flatnonzero(col_hits)
-    support_y0 = int(row_indices[0])
-    support_y1 = int(row_indices[-1]) + 1
-    support_x0 = int(col_indices[0])
-    support_x1 = int(col_indices[-1]) + 1
-    return (
-        (support_y0, support_y1, support_x0, support_x1),
-        patch_zyxs[support_y0:support_y1, support_x0:support_x1],
-        within[support_y0:support_y1, support_x0:support_x1],
-    )
-
-
-def _select_flat_pixels_for_native_crop_via_stored_resolution(
-    patch_tifxyz,
-    crop_bbox,
-    *,
-    coarse_native_pad=20,
-    coarse_patch_zyxs=None,
-    coarse_valid=None,
-    return_halo=False,
-):
-    coarse_native_pad = int(coarse_native_pad)
-    coarse_crop_bbox = (
-        int(crop_bbox[0]) - coarse_native_pad,
-        int(crop_bbox[1]) - coarse_native_pad,
-        int(crop_bbox[2]) - coarse_native_pad,
-        int(crop_bbox[3]) + coarse_native_pad,
-        int(crop_bbox[4]) + coarse_native_pad,
-        int(crop_bbox[5]) + coarse_native_pad,
-    )
-
-    if coarse_patch_zyxs is None:
-        coarse_patch_zyxs = np.asarray(
-            patch_tifxyz.get_zyxs(stored_resolution=True),
-            dtype=np.float32,
-        )
-    else:
-        coarse_patch_zyxs = np.asarray(coarse_patch_zyxs, dtype=np.float32)
-
-    if coarse_valid is None:
-        coarse_valid = np.isfinite(coarse_patch_zyxs).all(axis=-1)
-        coarse_valid &= (coarse_patch_zyxs >= 0).all(axis=-1)
-    else:
-        coarse_valid = np.asarray(coarse_valid, dtype=bool)
-
-    (coarse_y0, coarse_y1, coarse_x0, coarse_x1), _, _ = _select_flat_pixels_for_native_crop(
-        coarse_patch_zyxs,
-        coarse_valid,
-        coarse_crop_bbox,
-    )
-
-    stored_h, stored_w = (int(v) for v in coarse_patch_zyxs.shape[:2])
-    full_h, full_w = (int(v) for v in patch_tifxyz.full_resolution_shape)
-    if stored_h <= 0 or stored_w <= 0:
-        raise ValueError(f"stored-resolution tifxyz grid must have positive shape, got {(stored_h, stored_w)!r}")
-
-    factor_y = full_h / float(stored_h)
-    factor_x = full_w / float(stored_w)
-
-    # Expand by one stored cell before mapping back to full resolution so the
-    # exact full-res refinement can't miss intersections near a coarse edge.
-    coarse_y0 = max(0, coarse_y0 - 1)
-    coarse_y1 = min(stored_h, coarse_y1 + 1)
-    coarse_x0 = max(0, coarse_x0 - 1)
-    coarse_x1 = min(stored_w, coarse_x1 + 1)
-
-    full_y0 = max(0, int(np.floor(coarse_y0 * factor_y)))
-    full_y1 = min(full_h, int(np.ceil(coarse_y1 * factor_y)))
-    full_x0 = max(0, int(np.floor(coarse_x0 * factor_x)))
-    full_x1 = min(full_w, int(np.ceil(coarse_x1 * factor_x)))
-
-    full_x, full_y, full_z, full_valid = patch_tifxyz[full_y0:full_y1, full_x0:full_x1]
-    full_patch_zyxs = np.stack([full_z, full_y, full_x], axis=-1)
-    (local_y0, local_y1, local_x0, local_x1), support_patch_zyxs, support_valid = _select_flat_pixels_for_native_crop(
-        full_patch_zyxs,
-        full_valid,
-        crop_bbox,
-    )
-    support_bbox = (
-        full_y0 + local_y0,
-        full_y0 + local_y1,
-        full_x0 + local_x0,
-        full_x0 + local_x1,
-    )
-    if not return_halo:
-        return (
-            support_bbox,
-            support_patch_zyxs,
-            support_valid,
-        )
-
-    halo_local_y0 = max(0, local_y0 - 1)
-    halo_local_y1 = min(full_patch_zyxs.shape[0], local_y1 + 1)
-    halo_local_x0 = max(0, local_x0 - 1)
-    halo_local_x1 = min(full_patch_zyxs.shape[1], local_x1 + 1)
-    support_patch_zyxs_halo = full_patch_zyxs[halo_local_y0:halo_local_y1, halo_local_x0:halo_local_x1]
-    support_valid_halo = full_valid[halo_local_y0:halo_local_y1, halo_local_x0:halo_local_x1]
-    trim_slices = (
-        slice(local_y0 - halo_local_y0, local_y1 - halo_local_y0),
-        slice(local_x0 - halo_local_x0, local_x1 - halo_local_x0),
-    )
-    return (
-        support_bbox,
-        support_patch_zyxs,
-        support_valid,
-        support_patch_zyxs_halo,
-        support_valid_halo,
-        trim_slices,
-    )
 
 
 def _project_flat_patch_to_native_crop(flat_patch, patch_zyxs, valid_mask, crop_bbox):
@@ -851,18 +724,29 @@ def _support_normals_local_zyx(
     support_patch_zyxs_halo=None,
     support_valid_halo=None,
     trim_slices=None,
+    flat_grid_stride=1,
 ):
     if patch_tifxyz is not None and hasattr(patch_tifxyz, "get_normals"):
         if support_bbox is None:
             raise ValueError("support_bbox is required when patch_tifxyz is provided")
         support_y0, support_y1, support_x0, support_x1 = (int(v) for v in support_bbox)
+        stride = int(flat_grid_stride)
+        if stride <= 0:
+            raise ValueError(f"flat_grid_stride must be positive, got {flat_grid_stride!r}")
         nx, ny, nz = patch_tifxyz.get_normals(
-            support_y0,
-            support_y1,
-            support_x0,
-            support_x1,
+            support_y0 * stride,
+            support_y1 * stride,
+            support_x0 * stride,
+            support_x1 * stride,
         )
-        return np.stack([nz, ny, nx], axis=-1).astype(np.float32, copy=False)
+        normals = np.stack([nz, ny, nx], axis=-1)[::stride, ::stride]
+        expected_shape = (support_y1 - support_y0, support_x1 - support_x0)
+        if normals.shape[:2] != expected_shape:
+            raise ValueError(
+                "tifxyz normals did not align with the flat support grid: "
+                f"got {normals.shape[:2]!r}, expected {expected_shape!r}"
+            )
+        return normals.astype(np.float32, copy=False)
 
     if support_patch_zyxs_halo is None or support_valid_halo is None or trim_slices is None:
         raise ValueError(
@@ -873,122 +757,6 @@ def _support_normals_local_zyx(
         support_patch_zyxs_halo,
         support_valid_halo,
         trim_slices,
-    )
-
-
-def _project_valid_surface_occupancy_to_native_crop(patch_zyxs, valid_mask, crop_bbox):
-    flat_mask = np.ones(np.asarray(valid_mask).shape, dtype=np.float32)
-    surface_occupancy = _project_flat_patch_to_native_crop(flat_mask, patch_zyxs, valid_mask, crop_bbox)
-    surface_occupancy = surface_occupancy > 0
-    return surface_occupancy.astype(np.float32, copy=False)
-
-
-def _project_valid_surface_mask_to_native_crop(patch_zyxs, valid_mask, crop_bbox):
-    surface_occupancy = _project_valid_surface_occupancy_to_native_crop(
-        patch_zyxs,
-        valid_mask,
-        crop_bbox,
-    ) > 0
-    if not np.any(surface_occupancy):
-        return surface_occupancy.astype(np.float32)
-
-    max_distance_voxels = 10.0
-    distance = distance_transform_edt(~surface_occupancy)
-    surface_distance_field = np.clip(1.0 - (distance / max_distance_voxels), 0.0, 1.0)
-    return surface_distance_field.astype(np.float32, copy=False)
-
-
-def _maybe_select_flat_pixels_for_native_crop_via_stored_resolution(
-    patch_tifxyz,
-    crop_bbox,
-    *,
-    coarse_native_pad=20,
-    coarse_patch_zyxs=None,
-    coarse_valid=None,
-):
-    coarse_native_pad = int(coarse_native_pad)
-    coarse_crop_bbox = (
-        int(crop_bbox[0]) - coarse_native_pad,
-        int(crop_bbox[1]) - coarse_native_pad,
-        int(crop_bbox[2]) - coarse_native_pad,
-        int(crop_bbox[3]) + coarse_native_pad,
-        int(crop_bbox[4]) + coarse_native_pad,
-        int(crop_bbox[5]) + coarse_native_pad,
-    )
-
-    if coarse_patch_zyxs is None:
-        coarse_patch_zyxs = np.asarray(
-            patch_tifxyz.get_zyxs(stored_resolution=True),
-            dtype=np.float32,
-        )
-    else:
-        coarse_patch_zyxs = np.asarray(coarse_patch_zyxs, dtype=np.float32)
-
-    if coarse_valid is None:
-        coarse_valid = np.isfinite(coarse_patch_zyxs).all(axis=-1)
-        coarse_valid &= (coarse_patch_zyxs >= 0).all(axis=-1)
-    else:
-        coarse_valid = np.asarray(coarse_valid, dtype=bool)
-
-    coarse_start = np.asarray(coarse_crop_bbox[:3], dtype=np.float32)
-    coarse_stop = np.asarray(coarse_crop_bbox[3:], dtype=np.float32)
-    coarse_hits = coarse_valid & np.isfinite(coarse_patch_zyxs).all(axis=-1)
-    coarse_hits &= (coarse_patch_zyxs >= coarse_start).all(axis=-1)
-    coarse_hits &= (coarse_patch_zyxs < coarse_stop).all(axis=-1)
-    if not np.any(coarse_hits):
-        return None
-
-    row_indices = np.flatnonzero(np.any(coarse_hits, axis=1))
-    col_indices = np.flatnonzero(np.any(coarse_hits, axis=0))
-    coarse_y0 = int(row_indices[0])
-    coarse_y1 = int(row_indices[-1]) + 1
-    coarse_x0 = int(col_indices[0])
-    coarse_x1 = int(col_indices[-1]) + 1
-
-    stored_h, stored_w = (int(v) for v in coarse_patch_zyxs.shape[:2])
-    full_h, full_w = (int(v) for v in patch_tifxyz.full_resolution_shape)
-    if stored_h <= 0 or stored_w <= 0:
-        raise ValueError(f"stored-resolution tifxyz grid must have positive shape, got {(stored_h, stored_w)!r}")
-
-    factor_y = full_h / float(stored_h)
-    factor_x = full_w / float(stored_w)
-
-    coarse_y0 = max(0, coarse_y0 - 1)
-    coarse_y1 = min(stored_h, coarse_y1 + 1)
-    coarse_x0 = max(0, coarse_x0 - 1)
-    coarse_x1 = min(stored_w, coarse_x1 + 1)
-
-    full_y0 = max(0, int(np.floor(coarse_y0 * factor_y)))
-    full_y1 = min(full_h, int(np.ceil(coarse_y1 * factor_y)))
-    full_x0 = max(0, int(np.floor(coarse_x0 * factor_x)))
-    full_x1 = min(full_w, int(np.ceil(coarse_x1 * factor_x)))
-
-    full_x, full_y, full_z, full_valid = patch_tifxyz[full_y0:full_y1, full_x0:full_x1]
-    full_patch_zyxs = np.stack([full_z, full_y, full_x], axis=-1)
-    crop_start = np.asarray(crop_bbox[:3], dtype=np.float32)
-    crop_stop = np.asarray(crop_bbox[3:], dtype=np.float32)
-    hits = np.asarray(full_valid, dtype=bool) & np.isfinite(full_patch_zyxs).all(axis=-1)
-    hits &= (full_patch_zyxs >= crop_start).all(axis=-1)
-    hits &= (full_patch_zyxs < crop_stop).all(axis=-1)
-    if not np.any(hits):
-        return None
-
-    row_indices = np.flatnonzero(np.any(hits, axis=1))
-    col_indices = np.flatnonzero(np.any(hits, axis=0))
-    local_y0 = int(row_indices[0])
-    local_y1 = int(row_indices[-1]) + 1
-    local_x0 = int(col_indices[0])
-    local_x1 = int(col_indices[-1]) + 1
-    support_bbox = (
-        full_y0 + local_y0,
-        full_y0 + local_y1,
-        full_x0 + local_x0,
-        full_x0 + local_x1,
-    )
-    return (
-        support_bbox,
-        full_patch_zyxs[local_y0:local_y1, local_x0:local_x1],
-        hits[local_y0:local_y1, local_x0:local_x1],
     )
 
 
@@ -1460,7 +1228,7 @@ class InkDataset(Dataset):
             str(getattr(segment, "segment_relpath", None) or getattr(segment, "segment_dir", None) or getattr(segment, "segment_name", "")),
         )
 
-    def _full_3d_projection_half_thicknesses(self):
+    def _full_3d_projection_half_thicknesses(self, *, resolution=0):
         full_3d_config = (getattr(self, "config", None) or {}).get('full_3d') or {}
         default_thickness = float(
             full_3d_config.get(
@@ -1482,7 +1250,8 @@ class InkDataset(Dataset):
                 "full_3d projection half-thickness values must be >= 0, "
                 f"got label={label_thickness!r}, background={background_thickness!r}"
             )
-        return label_thickness, background_thickness
+        factor = native_volume_downsample_factor(resolution)
+        return label_thickness / float(factor), background_thickness / float(factor)
 
     def _register_segments(self, segments):
         self._segments_by_native_volume_key = {}
@@ -1505,10 +1274,24 @@ class InkDataset(Dataset):
                 yield segment
 
     def _get_cached_zarr(self, path, *, resolution):
-        cache_key = (str(path), str(resolution), str(self.vol_auth))
+        volume_cache_dir = self.config.get("volume_cache_dir")
+        volume_cache_max_gb = self.config.get("volume_cache_max_gb")
+        cache_key = (
+            str(path),
+            str(resolution),
+            str(self.vol_auth),
+            None if volume_cache_dir is None else str(volume_cache_dir),
+            None if volume_cache_max_gb is None else float(volume_cache_max_gb),
+        )
         volume = self._zarr_cache.get(cache_key)
         if volume is None:
-            volume = open_zarr(path, resolution=resolution, auth=self.vol_auth)
+            volume = open_zarr(
+                path,
+                resolution=resolution,
+                auth=self.vol_auth,
+                cache_dir=volume_cache_dir,
+                cache_max_gb=volume_cache_max_gb,
+            )
             self._zarr_cache[cache_key] = volume
         return volume
 
@@ -1670,7 +1453,7 @@ class InkDataset(Dataset):
         supervision_crop,
     ):
         label_projection_half_thickness, background_projection_half_thickness = (
-            self._full_3d_projection_half_thicknesses()
+            self._full_3d_projection_half_thicknesses(resolution=patch.segment.scale)
         )
         for segment in self._iter_other_native_segments(patch):
             if segment.segment_dir is None or segment.inklabels is None or segment.supervision_mask is None:
@@ -1681,11 +1464,17 @@ class InkDataset(Dataset):
                 segment.segment_dir,
                 patch_tifxyz=patch_tifxyz,
             )
+            flat_grid_stride, native_coordinate_scale, coarse_native_pad = (
+                native_tifxyz_pyramid_params(segment.scale)
+            )
             support_selection = _maybe_select_flat_pixels_for_native_crop_via_stored_resolution(
                 patch_tifxyz,
                 crop_bbox,
+                coarse_native_pad=coarse_native_pad,
                 coarse_patch_zyxs=coarse_patch_zyxs,
                 coarse_valid=coarse_valid,
+                native_coordinate_scale=native_coordinate_scale,
+                flat_grid_stride=flat_grid_stride,
             )
             if support_selection is None:
                 continue
@@ -1733,6 +1522,7 @@ class InkDataset(Dataset):
             support_normals_local_zyx = _support_normals_local_zyx(
                 patch_tifxyz=patch_tifxyz,
                 support_bbox=support_bbox,
+                flat_grid_stride=flat_grid_stride,
             )
             other_inklabels = self._get_cached_zarr(segment.inklabels, resolution=segment.scale)
             support_inklabels_flat_patch = _read_flat_surface_patch(
@@ -1797,9 +1587,19 @@ class InkDataset(Dataset):
                     )
                 patch_tifxyz = self._get_cached_tifxyz(patch.segment_dir)
                 coarse_patch_zyxs, coarse_valid = self._get_cached_stored_resolution_zyxs(patch.segment_dir,patch_tifxyz=patch_tifxyz)
+                flat_grid_stride, native_coordinate_scale, coarse_native_pad = (
+                    native_tifxyz_pyramid_params(patch.segment.scale)
+                )
 
-                flat_x, flat_y, flat_z, flat_valid = patch_tifxyz[y0:y1, x0:x1]
-                patch_zyxs = np.stack([flat_z, flat_y, flat_x], axis=-1)
+                patch_zyxs, flat_valid = read_tifxyz_on_flat_grid(
+                    patch_tifxyz,
+                    y0=y0,
+                    y1=y1,
+                    x0=x0,
+                    x1=x1,
+                    flat_grid_stride=flat_grid_stride,
+                    native_coordinate_scale=native_coordinate_scale,
+                )
                 try:
                     crop_bbox = compute_native_crop_bbox_from_patch_points(patch_zyxs,flat_valid,expected_shape)
                 except ValueError as exc:
@@ -1835,9 +1635,12 @@ class InkDataset(Dataset):
                     ) = _select_flat_pixels_for_native_crop_via_stored_resolution(
                         patch_tifxyz,
                         crop_bbox,
+                        coarse_native_pad=coarse_native_pad,
                         coarse_patch_zyxs=coarse_patch_zyxs,
                         coarse_valid=coarse_valid,
                         return_halo=True,
+                        native_coordinate_scale=native_coordinate_scale,
+                        flat_grid_stride=flat_grid_stride,
                     )
                     support_y0, support_y1, support_x0, support_x1 = base_support_bbox
                     support_supervision_flat_patch = _read_flat_surface_patch(supervision_mask,y0=support_y0,y1=support_y1,x0=support_x0,x1=support_x1)
@@ -1856,7 +1659,9 @@ class InkDataset(Dataset):
                     (
                         label_projection_half_thickness,
                         background_projection_half_thickness,
-                    ) = self._full_3d_projection_half_thicknesses()
+                    ) = self._full_3d_projection_half_thicknesses(
+                        resolution=patch.segment.scale,
+                    )
                     (
                         (support_y0, support_y1, support_x0, support_x1),
                         support_patch_zyxs,
@@ -1891,6 +1696,7 @@ class InkDataset(Dataset):
                             support_patch_zyxs_halo=support_patch_zyxs_halo,
                             support_valid_halo=support_valid_halo,
                             trim_slices=trim_slices,
+                            flat_grid_stride=flat_grid_stride,
                         )
 
                     support_grid_shape = tuple(int(v) for v in support_valid.shape)
@@ -1910,6 +1716,9 @@ class InkDataset(Dataset):
                                 support_patch_zyxs,
                                 support_valid,
                                 crop_bbox,
+                                max_distance_voxels=(
+                                    SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS / float(flat_grid_stride)
+                                ),
                             )
                         if self.mode == "normal_pooled_3d":
                             normal_pooled_metadata = _build_normal_pooled_flat_metadata(

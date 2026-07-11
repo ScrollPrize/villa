@@ -24,6 +24,15 @@ from numcodecs import Blosc
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
+import vesuvius.tifxyz as tifxyz
+from koine_machines.common.disk_cache import wrap_store_with_disk_cache
+from koine_machines.data.normal_pooled_sample import (
+    _maybe_select_flat_pixels_for_native_crop_via_stored_resolution,
+    _project_valid_surface_mask_to_native_crop,
+    native_tifxyz_pyramid_params,
+    native_volume_downsample_factor,
+    SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
+)
 from koine_machines.models.load_checkpoint import _load_model_state_with_ddp_compat
 from koine_machines.models.make_model import make_model
 
@@ -33,6 +42,9 @@ PUBLIC_VOLUME_SUBSTRING = "vesuvius-challenge-open-data"
 DEFAULT_LEVELS = 6
 DEFAULT_OVERLAP = 0.5
 DEFAULT_PREFETCH_FACTOR = 2
+FULL_3D_MODE = "full_3d"
+FULL_3D_SINGLE_WRAP_MODE = "full_3d_single_wrap"
+FULL_3D_MODES = {FULL_3D_MODE, FULL_3D_SINGLE_WRAP_MODE}
 ARRAY_DIMENSIONS = ["z", "y", "x"]
 AXES = [
     {"name": "z", "type": "space"},
@@ -137,6 +149,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpus", default=None, help="Comma-separated CUDA ids. Multiple ids use DataParallel.")
     parser.add_argument("--foreground-channel", type=int, default=1, help="Foreground class for C>1 softmax outputs. Default: 1.")
     parser.add_argument("--plan-only", action="store_true", help="Build and print the chunk/patch plan without loading the model or writing output.")
+    parser.add_argument("--max-target-chunks", type=int, default=None, help="Limit output to the first N target chunks after sorting by z/y/x. Useful for quick validation runs.")
+    parser.add_argument("--cache-dir", type=Path, default=None)
+    parser.add_argument("--cache-max-gb", type=float, default=None)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -154,6 +169,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--chunk-halo must be >= 0")
     if args.tta_batch_size is not None and int(args.tta_batch_size) <= 0:
         parser.error("--tta-batch-size must be positive")
+    if args.max_target_chunks is not None and int(args.max_target_chunks) <= 0:
+        parser.error("--max-target-chunks must be positive")
     args.gpu_ids = parse_gpu_ids(args.gpus)
     return args
 
@@ -208,14 +225,16 @@ def _https_s3_to_s3_url(path: str) -> str | None:
     return f"s3://{bucket}{parsed.path}"
 
 
-def _make_fsspec_store(path: str):
+def _make_fsspec_store(path: str, *, cache_dir=None, cache_max_gb=None):
     path_str = str(path).rstrip("/")
     use_anon = PUBLIC_VOLUME_SUBSTRING in path_str
     if use_anon:
         s3_path = path_str if path_str.startswith("s3://") else _https_s3_to_s3_url(path_str)
         if s3_path is not None:
-            fs = fsspec.filesystem("s3", anon=True)
-            return zarr.storage.FSStore(
+            # skip_instance_cache: fsspec's cached filesystems hold an asyncio loop
+            # that is not fork-safe; dataloader workers must build fresh instances.
+            fs = fsspec.filesystem("s3", anon=True, skip_instance_cache=True)
+            store = zarr.storage.FSStore(
                 s3_path.rstrip("/"),
                 fs=fs,
                 mode="r",
@@ -223,10 +242,13 @@ def _make_fsspec_store(path: str):
                 create=False,
                 exceptions=(KeyError, FileNotFoundError, PermissionError, OSError),
             )
+            if cache_dir is not None:
+                store = wrap_store_with_disk_cache(store, s3_path, cache_dir, cache_max_gb)
+            return store
 
     if path_str.startswith("s3://"):
-        fs = fsspec.filesystem("s3")
-        return zarr.storage.FSStore(
+        fs = fsspec.filesystem("s3", skip_instance_cache=True)
+        store = zarr.storage.FSStore(
             path_str,
             fs=fs,
             mode="r",
@@ -234,10 +256,13 @@ def _make_fsspec_store(path: str):
             create=False,
             exceptions=(KeyError, FileNotFoundError, PermissionError, OSError),
         )
+        if cache_dir is not None:
+            store = wrap_store_with_disk_cache(store, path_str, cache_dir, cache_max_gb)
+        return store
     if path_str.startswith(("http://", "https://")):
         protocol = "https" if path_str.startswith("https://") else "http"
-        fs = fsspec.filesystem(protocol)
-        return zarr.storage.FSStore(
+        fs = fsspec.filesystem(protocol, skip_instance_cache=True)
+        store = zarr.storage.FSStore(
             path_str,
             fs=fs,
             mode="r",
@@ -245,15 +270,23 @@ def _make_fsspec_store(path: str):
             create=False,
             exceptions=(KeyError, FileNotFoundError, PermissionError, OSError),
         )
+        if cache_dir is not None:
+            store = wrap_store_with_disk_cache(store, path_str, cache_dir, cache_max_gb)
+        return store
     return path_str
 
 
-def open_zarr_root(path: str | Path):
-    return zarr.open(_make_fsspec_store(str(path)), mode="r")
+def open_zarr_root(path: str | Path, *, cache_dir=None, cache_max_gb=None):
+    store = _make_fsspec_store(
+        str(path),
+        cache_dir=cache_dir,
+        cache_max_gb=cache_max_gb,
+    )
+    return zarr.open(store, mode="r")
 
 
-def open_zarr_array(path: str | Path, resolution: str):
-    root = open_zarr_root(path)
+def open_zarr_array(path: str | Path, resolution: str, *, cache_dir=None, cache_max_gb=None):
+    root = open_zarr_root(path, cache_dir=cache_dir, cache_max_gb=cache_max_gb)
     if isinstance(root, zarr.Array):
         return root
     return root[str(resolution)]
@@ -271,7 +304,11 @@ def read_volume_source(tifxyz_dir: Path) -> str:
     return source
 
 
-def read_tifxyz_points(tifxyz_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def read_tifxyz_points(
+    tifxyz_dir: Path,
+    *,
+    native_coordinate_scale=1.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     arrays = []
     for name in ("x.tif", "y.tif", "z.tif"):
         path = tifxyz_dir / name
@@ -283,6 +320,16 @@ def read_tifxyz_points(tifxyz_dir: Path) -> tuple[np.ndarray, np.ndarray, np.nda
         raise ValueError(f"x/y/z tif shapes must match, got x={x.shape} y={y.shape} z={z.shape}")
     valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
     valid &= (x >= 0.0) & (y >= 0.0) & (z >= 0.0)
+    coordinate_scale = float(native_coordinate_scale)
+    if coordinate_scale <= 0.0:
+        raise ValueError(
+            "native_coordinate_scale must be positive, "
+            f"got {native_coordinate_scale!r}"
+        )
+    if coordinate_scale != 1.0:
+        x = x * coordinate_scale
+        y = y * coordinate_scale
+        z = z * coordinate_scale
     return x, y, z, valid
 
 
@@ -513,22 +560,41 @@ def normalize_image_crop(image: np.ndarray, config: dict[str, Any]) -> np.ndarra
     return _normalize_image_crop(image, config)
 
 
+def uses_surface_mask_channel(config: dict[str, Any]) -> bool:
+    return str(config["mode"]).strip().lower() == FULL_3D_SINGLE_WRAP_MODE
+
+
 class Full3DPatchDataset(Dataset):
     def __init__(
         self,
         *,
+        tifxyz_dir: Path,
         volume_path: str,
         resolution: str,
         patches: Sequence[PatchSpec],
         patch_size_zyx: tuple[int, int, int],
         config: dict[str, Any],
+        cache_dir=None,
+        cache_max_gb=None,
     ):
+        self.tifxyz_dir = Path(tifxyz_dir)
         self.volume_path = str(volume_path)
         self.resolution = str(resolution)
         self.patches = list(patches)
         self.patch_size_zyx = tuple(int(v) for v in patch_size_zyx)
         self.config = copy.deepcopy(config)
+        self.cache_dir = None if cache_dir is None else str(cache_dir)
+        self.cache_max_gb = cache_max_gb
+        self.use_surface_mask_channel = uses_surface_mask_channel(self.config)
+        (
+            self.native_downsample_factor,
+            self.native_coordinate_scale,
+            self.coarse_native_pad,
+        ) = native_tifxyz_pyramid_params(self.resolution)
         self._array = None
+        self._tifxyz = None
+        self._coarse_patch_zyxs = None
+        self._coarse_valid = None
 
     def __len__(self) -> int:
         return len(self.patches)
@@ -536,26 +602,85 @@ class Full3DPatchDataset(Dataset):
     def __getstate__(self):
         state = dict(self.__dict__)
         state["_array"] = None
+        state["_tifxyz"] = None
+        state["_coarse_patch_zyxs"] = None
+        state["_coarse_valid"] = None
         return state
 
     def _ensure_array(self):
         if self._array is None:
-            self._array = open_zarr_array(self.volume_path, self.resolution)
+            self._array = open_zarr_array(
+                self.volume_path,
+                self.resolution,
+                cache_dir=self.cache_dir,
+                cache_max_gb=self.cache_max_gb,
+            )
         return self._array
+
+    def _ensure_tifxyz(self):
+        if self._tifxyz is None:
+            self._tifxyz = tifxyz.read_tifxyz(
+                self.tifxyz_dir,
+                load_mask=False,
+                validate=False,
+            )
+            self._tifxyz.use_full_resolution()
+        return self._tifxyz
+
+    def _ensure_stored_resolution_zyxs(self):
+        if self._coarse_patch_zyxs is None or self._coarse_valid is None:
+            patch_tifxyz = self._ensure_tifxyz()
+            coarse_patch_zyxs = np.asarray(
+                patch_tifxyz.get_zyxs(stored_resolution=True),
+                dtype=np.float32,
+            )
+            coarse_valid = np.isfinite(coarse_patch_zyxs).all(axis=-1)
+            coarse_valid &= (coarse_patch_zyxs >= 0).all(axis=-1)
+            self._coarse_patch_zyxs = coarse_patch_zyxs
+            self._coarse_valid = coarse_valid
+        return self._coarse_patch_zyxs, self._coarse_valid
+
+    def _surface_mask_for_bbox(self, bbox: tuple[int, int, int, int, int, int]) -> np.ndarray:
+        patch_tifxyz = self._ensure_tifxyz()
+        coarse_patch_zyxs, coarse_valid = self._ensure_stored_resolution_zyxs()
+        support_selection = _maybe_select_flat_pixels_for_native_crop_via_stored_resolution(
+            patch_tifxyz,
+            bbox,
+            coarse_native_pad=self.coarse_native_pad,
+            coarse_patch_zyxs=coarse_patch_zyxs,
+            coarse_valid=coarse_valid,
+            native_coordinate_scale=self.native_coordinate_scale,
+            flat_grid_stride=self.native_downsample_factor,
+        )
+        if support_selection is None:
+            return np.zeros(self.patch_size_zyx, dtype=np.float32)
+        _, support_patch_zyxs, support_valid = support_selection
+        return _project_valid_surface_mask_to_native_crop(
+            support_patch_zyxs,
+            support_valid,
+            bbox,
+            max_distance_voxels=(
+                SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS / float(self.native_downsample_factor)
+            ),
+        )
 
     def __getitem__(self, index: int):
         patch = self.patches[int(index)]
         z0, y0, x0 = int(patch.z0), int(patch.y0), int(patch.x0)
         dz, dy, dx = self.patch_size_zyx
+        bbox = (z0, y0, x0, z0 + dz, y0 + dy, x0 + dx)
         crop, valid_slices = _read_bbox_with_padding(
             self._ensure_array(),
-            (z0, y0, x0, z0 + dz, y0 + dy, x0 + dx),
+            bbox,
             fill_value=0,
         )
         crop = crop.astype(np.float32, copy=False)
         if valid_slices is not None:
             crop[valid_slices] = normalize_image_crop(crop[valid_slices], self.config)
-        image = torch.from_numpy(np.ascontiguousarray(crop)).float().unsqueeze(0)
+        channels = [crop]
+        if self.use_surface_mask_channel:
+            channels.append(self._surface_mask_for_bbox(bbox))
+        image = torch.from_numpy(np.ascontiguousarray(np.stack(channels, axis=0))).float()
         meta = torch.tensor([z0, y0, x0], dtype=torch.int64)
         return image, meta
 
@@ -581,10 +706,12 @@ def normalize_training_config_for_full3d(config: dict[str, Any]) -> dict[str, An
         normalized["model_type"] = "vesuvius_unet"
 
     mode = str(normalized.get("mode", "flat")).strip().lower()
-    if mode not in {"full_3d", "full_3d_single_wrap"}:
-        raise ValueError(f"This script expects mode='full_3d' or 'full_3d_single_wrap', got {mode!r}")
+    if mode not in FULL_3D_MODES:
+        allowed = ", ".join(repr(value) for value in sorted(FULL_3D_MODES))
+        raise ValueError(f"This script expects mode to be one of {allowed}, got {mode!r}")
 
-    if mode == "full_3d_single_wrap":
+    normalized["mode"] = mode
+    if mode == FULL_3D_SINGLE_WRAP_MODE:
         normalized["in_channels"] = 2
     else:
         normalized.setdefault("in_channels", 1)
@@ -1162,8 +1289,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         torch.set_float32_matmul_precision("high")
 
     tifxyz_dir = Path(args.tifxyz_dir)
+    native_downsample_factor = native_volume_downsample_factor(args.resolution)
+    native_coordinate_scale = 1.0 / float(native_downsample_factor)
     volume_path = read_volume_source(tifxyz_dir)
-    volume = open_zarr_array(volume_path, str(args.resolution))
+    volume = open_zarr_array(
+        volume_path,
+        str(args.resolution),
+        cache_dir=args.cache_dir,
+        cache_max_gb=args.cache_max_gb,
+    )
     array_shape = tuple(int(v) for v in volume.shape)
     chunk_shape = tuple(int(v) for v in (volume.chunks or volume.shape))
     if len(array_shape) != 3:
@@ -1171,7 +1305,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if len(chunk_shape) != 3:
         raise ValueError(f"Expected 3D zarr chunks, got chunks={chunk_shape}")
 
-    x, y, z, valid = read_tifxyz_points(tifxyz_dir)
+    x, y, z, valid = read_tifxyz_points(
+        tifxyz_dir,
+        native_coordinate_scale=native_coordinate_scale,
+    )
     occupied_chunks = tifxyz_occupied_chunks(
         x=x,
         y=y,
@@ -1180,12 +1317,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         array_shape_zyx=array_shape,
         chunk_shape_zyx=chunk_shape,
     )
+    del x, y, z, valid
     expanded_chunks = expand_chunks(
         occupied_chunks,
         radius=int(args.chunk_halo),
         grid_shape_zyx=chunk_grid_shape(array_shape, chunk_shape),
     )
     target_chunks = expanded_chunks if args.write_region == "expanded" else occupied_chunks
+    if args.max_target_chunks is not None and len(target_chunks) > int(args.max_target_chunks):
+        original_count = len(target_chunks)
+        target_chunks = set(sorted(target_chunks)[: int(args.max_target_chunks)])
+        LOGGER.info(
+            "Limited target chunks from %d to %d via --max-target-chunks.",
+            original_count,
+            len(target_chunks),
+        )
 
     if args.plan_only:
         payload = load_checkpoint_payload(args.checkpoint)
@@ -1252,11 +1398,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         overwrite=bool(args.overwrite),
     )
     dataset = Full3DPatchDataset(
+        tifxyz_dir=Path(args.tifxyz_dir),
         volume_path=volume_path,
         resolution=str(args.resolution),
         patches=patches,
         patch_size_zyx=patch_size,
         config=bundle.config,
+        cache_dir=args.cache_dir,
+        cache_max_gb=args.cache_max_gb,
     )
     effective_batch_size = int(args.batch_size) * max(1, len(args.gpu_ids))
     loader_kwargs = {
@@ -1270,6 +1419,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if int(args.num_workers) > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = int(args.prefetch_factor)
+        # Forked workers inherit non-fork-safe state (fsspec/asyncio loops,
+        # open zarr handles) and can deadlock mid-run when streaming from S3;
+        # spawn gives each worker a fresh interpreter.
+        loader_kwargs["multiprocessing_context"] = "spawn"
     loader = DataLoader(**loader_kwargs)
     weights = create_importance_map(patch_size, mode=str(args.blend_mode))
     accumulator = ChunkAccumulator3D(

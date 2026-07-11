@@ -30,7 +30,7 @@ def test_open_zarr_uses_anonymous_s3_for_public_vesuvius_bucket(monkeypatch):
         resolution=0,
     )
 
-    assert filesystem_calls == [("s3", {"anon": True})]
+    assert filesystem_calls == [("s3", {"skip_instance_cache": True, "anon": True})]
     assert zarr_open_calls[0][0].path == "s3://vesuvius-challenge-open-data/example-volume.zarr"
     assert zarr_open_calls[0][1] == {"path": "0", "mode": "r"}
 
@@ -48,7 +48,7 @@ def test_open_zarr_does_not_force_anonymous_s3_for_other_buckets(monkeypatch):
 
     common.open_zarr("s3://private-bucket/example-volume.zarr/", resolution=0)
 
-    assert filesystem_calls == [("s3", {})]
+    assert filesystem_calls == [("s3", {"skip_instance_cache": True})]
 
 
 def test_open_zarr_path_not_found_names_store_resolution_and_available_keys(monkeypatch):

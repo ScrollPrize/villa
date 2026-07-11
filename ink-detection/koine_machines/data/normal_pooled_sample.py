@@ -5,7 +5,66 @@ from scipy.ndimage import distance_transform_edt
 import torch
 
 
-def _select_flat_pixels_for_native_crop(patch_zyxs, valid_mask, crop_bbox):
+NATIVE_COARSE_PAD_LEVEL0_VOXELS = 20.0
+SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS = 10.0
+
+
+def native_volume_downsample_factor(resolution) -> int:
+    """Return the native-coordinate factor for an OME-Zarr pyramid level."""
+    try:
+        level = int(resolution)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"native volume resolution must be an integer, got {resolution!r}") from exc
+    if level < 0:
+        raise ValueError(f"native volume resolution must be >= 0, got {level!r}")
+    return 1 << level
+
+
+def native_tifxyz_pyramid_params(resolution):
+    """Return (flat_grid_stride, native_coordinate_scale, coarse_native_pad) for a pyramid level."""
+    factor = native_volume_downsample_factor(resolution)
+    coarse_native_pad = max(1, int(np.ceil(NATIVE_COARSE_PAD_LEVEL0_VOXELS / float(factor))))
+    return factor, 1.0 / float(factor), coarse_native_pad
+
+
+def read_tifxyz_on_flat_grid(
+    patch_tifxyz,
+    *,
+    y0,
+    y1,
+    x0,
+    x1,
+    flat_grid_stride=1,
+    native_coordinate_scale=1.0,
+):
+    """Read TIFF coordinates aligned to a possibly downsampled flat grid."""
+    stride = int(flat_grid_stride)
+    if stride <= 0:
+        raise ValueError(f"flat_grid_stride must be positive, got {flat_grid_stride!r}")
+    coordinate_scale = float(native_coordinate_scale)
+    if coordinate_scale <= 0.0:
+        raise ValueError(
+            "native_coordinate_scale must be positive, "
+            f"got {native_coordinate_scale!r}"
+        )
+
+    full_x, full_y, full_z, valid = patch_tifxyz[
+        slice(int(y0) * stride, int(y1) * stride, stride),
+        slice(int(x0) * stride, int(x1) * stride, stride),
+    ]
+    patch_zyxs = np.stack([full_z, full_y, full_x], axis=-1).astype(np.float32, copy=False)
+    if coordinate_scale != 1.0:
+        patch_zyxs = patch_zyxs * coordinate_scale
+    return patch_zyxs, np.asarray(valid, dtype=bool)
+
+
+def _maybe_select_flat_pixels_for_native_crop(patch_zyxs, valid_mask, crop_bbox):
+    """Enclosing (y, x) window of the valid flat pixels landing inside crop_bbox.
+
+    crop_bbox is (z0, y0, x0, z1, y1, x1) in native voxel coordinates. Returns
+    ((y0, y1, x0, x1), patch_zyxs_window, valid_window), or None when no valid
+    pixel maps inside the crop.
+    """
     patch_zyxs = np.asarray(patch_zyxs)
     valid_mask = np.asarray(valid_mask, dtype=bool)
     crop_start = np.asarray(crop_bbox[:3], dtype=np.int64)
@@ -20,12 +79,10 @@ def _select_flat_pixels_for_native_crop(patch_zyxs, valid_mask, crop_bbox):
     within &= patch_zyxs[..., 2] >= crop_start[2]
     within &= patch_zyxs[..., 2] < crop_stop[2]
     if not np.any(within):
-        raise ValueError(f"crop_bbox {crop_bbox!r} does not intersect any valid flat tifxyz pixels")
+        return None
 
-    row_hits = np.any(within, axis=1)
-    col_hits = np.any(within, axis=0)
-    row_indices = np.flatnonzero(row_hits)
-    col_indices = np.flatnonzero(col_hits)
+    row_indices = np.flatnonzero(np.any(within, axis=1))
+    col_indices = np.flatnonzero(np.any(within, axis=0))
     support_y0 = int(row_indices[0])
     support_y1 = int(row_indices[-1]) + 1
     support_x0 = int(col_indices[0])
@@ -37,17 +94,17 @@ def _select_flat_pixels_for_native_crop(patch_zyxs, valid_mask, crop_bbox):
     )
 
 
-def _select_flat_pixels_for_native_crop_via_stored_resolution(
-    patch_tifxyz,
-    crop_bbox,
-    *,
-    coarse_native_pad=20,
-    coarse_patch_zyxs=None,
-    coarse_valid=None,
-    return_halo=False,
-):
+def _select_flat_pixels_for_native_crop(patch_zyxs, valid_mask, crop_bbox):
+    """As _maybe_select_flat_pixels_for_native_crop, but raises when nothing intersects."""
+    selection = _maybe_select_flat_pixels_for_native_crop(patch_zyxs, valid_mask, crop_bbox)
+    if selection is None:
+        raise ValueError(f"crop_bbox {crop_bbox!r} does not intersect any valid flat tifxyz pixels")
+    return selection
+
+
+def _stored_resolution_coarse_crop_bbox(crop_bbox, coarse_native_pad):
     coarse_native_pad = int(coarse_native_pad)
-    coarse_crop_bbox = (
+    return (
         int(crop_bbox[0]) - coarse_native_pad,
         int(crop_bbox[1]) - coarse_native_pad,
         int(crop_bbox[2]) - coarse_native_pad,
@@ -56,6 +113,37 @@ def _select_flat_pixels_for_native_crop_via_stored_resolution(
         int(crop_bbox[5]) + coarse_native_pad,
     )
 
+
+def _stored_resolution_full_window(
+    patch_tifxyz,
+    crop_bbox,
+    *,
+    coarse_native_pad,
+    coarse_patch_zyxs,
+    coarse_valid,
+    native_coordinate_scale=1.0,
+    flat_grid_stride=1,
+):
+    """Full-resolution (y, x) window enclosing the coarse cells that intersect crop_bbox.
+
+    Locates crop_bbox at the stored (coarse) resolution, maps that span back to
+    full resolution, and reads coordinates at the requested flat-grid stride.
+    Returns (patch_zyxs_zyx, valid, y0, x0), where y0/x0 are in requested
+    flat-grid coordinates, or None when the crop intersects no valid coarse
+    pixel.
+    """
+    coarse_crop_bbox = _stored_resolution_coarse_crop_bbox(crop_bbox, coarse_native_pad)
+
+    coordinate_scale = float(native_coordinate_scale)
+    if coordinate_scale <= 0.0:
+        raise ValueError(
+            "native_coordinate_scale must be positive, "
+            f"got {native_coordinate_scale!r}"
+        )
+    stride = int(flat_grid_stride)
+    if stride <= 0:
+        raise ValueError(f"flat_grid_stride must be positive, got {flat_grid_stride!r}")
+
     if coarse_patch_zyxs is None:
         coarse_patch_zyxs = np.asarray(
             patch_tifxyz.get_zyxs(stored_resolution=True),
@@ -63,6 +151,8 @@ def _select_flat_pixels_for_native_crop_via_stored_resolution(
         )
     else:
         coarse_patch_zyxs = np.asarray(coarse_patch_zyxs, dtype=np.float32)
+    if coordinate_scale != 1.0:
+        coarse_patch_zyxs = coarse_patch_zyxs * coordinate_scale
 
     if coarse_valid is None:
         coarse_valid = np.isfinite(coarse_patch_zyxs).all(axis=-1)
@@ -70,11 +160,14 @@ def _select_flat_pixels_for_native_crop_via_stored_resolution(
     else:
         coarse_valid = np.asarray(coarse_valid, dtype=bool)
 
-    (coarse_y0, coarse_y1, coarse_x0, coarse_x1), _, _ = _select_flat_pixels_for_native_crop(
+    coarse_selection = _maybe_select_flat_pixels_for_native_crop(
         coarse_patch_zyxs,
         coarse_valid,
         coarse_crop_bbox,
     )
+    if coarse_selection is None:
+        return None
+    (coarse_y0, coarse_y1, coarse_x0, coarse_x1), _, _ = coarse_selection
 
     stored_h, stored_w = (int(v) for v in coarse_patch_zyxs.shape[:2])
     full_h, full_w = (int(v) for v in patch_tifxyz.full_resolution_shape)
@@ -96,8 +189,92 @@ def _select_flat_pixels_for_native_crop_via_stored_resolution(
     full_x0 = max(0, int(np.floor(coarse_x0 * factor_x)))
     full_x1 = min(full_w, int(np.ceil(coarse_x1 * factor_x)))
 
-    full_x, full_y, full_z, full_valid = patch_tifxyz[full_y0:full_y1, full_x0:full_x1]
-    full_patch_zyxs = np.stack([full_z, full_y, full_x], axis=-1)
+    flat_y0 = full_y0 // stride
+    flat_x0 = full_x0 // stride
+    sampled_y0 = flat_y0 * stride
+    sampled_x0 = flat_x0 * stride
+    sampled_y1 = min(full_h, int(np.ceil(full_y1 / float(stride))) * stride)
+    sampled_x1 = min(full_w, int(np.ceil(full_x1 / float(stride))) * stride)
+    full_x, full_y, full_z, full_valid = patch_tifxyz[
+        slice(sampled_y0, sampled_y1, stride),
+        slice(sampled_x0, sampled_x1, stride),
+    ]
+    full_patch_zyxs = np.stack([full_z, full_y, full_x], axis=-1).astype(np.float32, copy=False)
+    if coordinate_scale != 1.0:
+        full_patch_zyxs = full_patch_zyxs * coordinate_scale
+    return full_patch_zyxs, np.asarray(full_valid, dtype=bool), flat_y0, flat_x0
+
+
+def _maybe_select_flat_pixels_for_native_crop_via_stored_resolution(
+    patch_tifxyz,
+    crop_bbox,
+    *,
+    coarse_native_pad=20,
+    coarse_patch_zyxs=None,
+    coarse_valid=None,
+    native_coordinate_scale=1.0,
+    flat_grid_stride=1,
+):
+    """Locate crop_bbox against full-res tifxyz coordinates via the stored-resolution grid.
+
+    Returns (support_bbox_yx, support_patch_zyxs, support_valid) in full-resolution
+    rows/cols, or None when the crop intersects no valid flat pixel.
+    """
+    window = _stored_resolution_full_window(
+        patch_tifxyz,
+        crop_bbox,
+        coarse_native_pad=coarse_native_pad,
+        coarse_patch_zyxs=coarse_patch_zyxs,
+        coarse_valid=coarse_valid,
+        native_coordinate_scale=native_coordinate_scale,
+        flat_grid_stride=flat_grid_stride,
+    )
+    if window is None:
+        return None
+    full_patch_zyxs, full_valid, full_y0, full_x0 = window
+    selection = _maybe_select_flat_pixels_for_native_crop(full_patch_zyxs, full_valid, crop_bbox)
+    if selection is None:
+        return None
+    (local_y0, local_y1, local_x0, local_x1), support_patch_zyxs, support_valid = selection
+    support_bbox = (
+        full_y0 + local_y0,
+        full_y0 + local_y1,
+        full_x0 + local_x0,
+        full_x0 + local_x1,
+    )
+    return support_bbox, support_patch_zyxs, support_valid
+
+
+def _select_flat_pixels_for_native_crop_via_stored_resolution(
+    patch_tifxyz,
+    crop_bbox,
+    *,
+    coarse_native_pad=20,
+    coarse_patch_zyxs=None,
+    coarse_valid=None,
+    return_halo=False,
+    native_coordinate_scale=1.0,
+    flat_grid_stride=1,
+):
+    """Raising variant of _maybe_select_flat_pixels_for_native_crop_via_stored_resolution.
+
+    With return_halo, also returns the one-cell-dilated support window and the
+    slices that trim it back to the exact support: (support_bbox, support_patch_zyxs,
+    support_valid, support_patch_zyxs_halo, support_valid_halo, trim_slices).
+    """
+    window = _stored_resolution_full_window(
+        patch_tifxyz,
+        crop_bbox,
+        coarse_native_pad=coarse_native_pad,
+        coarse_patch_zyxs=coarse_patch_zyxs,
+        coarse_valid=coarse_valid,
+        native_coordinate_scale=native_coordinate_scale,
+        flat_grid_stride=flat_grid_stride,
+    )
+    if window is None:
+        coarse_crop_bbox = _stored_resolution_coarse_crop_bbox(crop_bbox, coarse_native_pad)
+        raise ValueError(f"crop_bbox {coarse_crop_bbox!r} does not intersect any valid flat tifxyz pixels")
+    full_patch_zyxs, full_valid, full_y0, full_x0 = window
     (local_y0, local_y1, local_x0, local_x1), support_patch_zyxs, support_valid = _select_flat_pixels_for_native_crop(
         full_patch_zyxs,
         full_valid,
@@ -171,14 +348,22 @@ def _project_flat_patch_to_native_crop(flat_patch, patch_zyxs, valid_mask, crop_
     return output
 
 
-def _project_valid_surface_mask_to_native_crop(patch_zyxs, valid_mask, crop_bbox):
+def _project_valid_surface_mask_to_native_crop(
+    patch_zyxs,
+    valid_mask,
+    crop_bbox,
+    *,
+    max_distance_voxels=10.0,
+):
     flat_mask = np.ones(np.asarray(valid_mask).shape, dtype=np.float32)
     surface_occupancy = _project_flat_patch_to_native_crop(flat_mask, patch_zyxs, valid_mask, crop_bbox)
     surface_occupancy = surface_occupancy > 0
     if not np.any(surface_occupancy):
         return surface_occupancy.astype(np.float32)
 
-    max_distance_voxels = 10.0
+    max_distance_voxels = float(max_distance_voxels)
+    if max_distance_voxels <= 0.0:
+        return surface_occupancy.astype(np.float32, copy=False)
     distance = distance_transform_edt(~surface_occupancy)
     surface_distance_field = np.clip(1.0 - (distance / max_distance_voxels), 0.0, 1.0)
     return surface_distance_field.astype(np.float32, copy=False)

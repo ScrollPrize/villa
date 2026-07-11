@@ -6,6 +6,8 @@ import fsspec
 import numpy as np
 import zarr
 
+from koine_machines.common.disk_cache import wrap_store_with_disk_cache
+
 _FLAT_PATCH_FINDING_CACHE_VERSION = "v4"
 _PUBLIC_S3_VOLUME_SUBSTRINGS = ("vesuvius-challenge-open-data",)
 
@@ -144,13 +146,15 @@ def _open_zarr_resolution(store, *, source_path, resolution):
         raise zarr.errors.PathNotFoundError(message) from exc
 
 
-def open_zarr(path, resolution, auth=None):
+def open_zarr(path, resolution, auth=None, *, cache_dir=None, cache_max_gb=None):
     path_str = str(path)
     if path_str.startswith("s3://"):
         fs_kwargs = {}
         if any(public_path in path_str for public_path in _PUBLIC_S3_VOLUME_SUBSTRINGS):
             fs_kwargs["anon"] = True
-        fs = fsspec.filesystem("s3", **fs_kwargs)
+        # skip_instance_cache: fsspec's cached filesystems hold an asyncio loop
+        # that is not fork-safe; dataloader workers must build fresh instances.
+        fs = fsspec.filesystem("s3", skip_instance_cache=True, **fs_kwargs)
         store = zarr.storage.FSStore(
             path_str.rstrip("/"),
             fs=fs,
@@ -159,6 +163,8 @@ def open_zarr(path, resolution, auth=None):
             create=False,
             exceptions=(KeyError, FileNotFoundError, PermissionError, OSError),
         )
+        if cache_dir is not None:
+            store = wrap_store_with_disk_cache(store, path_str, cache_dir, cache_max_gb)
         return _open_zarr_resolution(store, source_path=path_str, resolution=resolution)
 
     user, password = load_volume_auth(auth)
@@ -166,6 +172,7 @@ def open_zarr(path, resolution, auth=None):
     if use_https_auth:
         fs = fsspec.filesystem(
             "https",
+            skip_instance_cache=True,
             client_kwargs={"auth": aiohttp.BasicAuth(user, password)},
         )
         store = zarr.storage.FSStore(
@@ -176,6 +183,8 @@ def open_zarr(path, resolution, auth=None):
             create=False,
             exceptions=(KeyError, FileNotFoundError, PermissionError, OSError, aiohttp.ClientResponseError),
         )
+        if cache_dir is not None:
+            store = wrap_store_with_disk_cache(store, path_str, cache_dir, cache_max_gb)
         return _open_zarr_resolution(store, source_path=path_str, resolution=resolution)
     return _open_zarr_resolution(path_str, source_path=path_str, resolution=resolution)
 
