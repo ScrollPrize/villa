@@ -44,8 +44,8 @@
     "tensorboard_enabled": true,
     "model_hidden_channels": 64,
     "model_depth": 10,
-    "pipeline_depth": 16,
-    "pipeline_workers": 8
+    "pipeline_depth": 8,
+    "pipeline_workers": 4
   },
   "datasets": [
     {

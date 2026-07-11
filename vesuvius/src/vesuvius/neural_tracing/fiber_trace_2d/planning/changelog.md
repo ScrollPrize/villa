@@ -2,12 +2,15 @@
 
 ## 2026-07-10
 
+- Parallelized the 2D CUDA training load+prepare path by submitting exact training steps to concurrent workers, added one-offset strip-cache and CP-tangent/no-coordinate-retention fast paths, and documented measured throughput limits.
 - Removed the 2D training default patch-count warning, added a real
-  `batch_size`/`control_points_per_step` validation error, and batched
-  variable-sigma value-augmentation blur with grouped convolutions.
-- Increased the default CUDA training pipeline queue to 16 batches, default
-  whole-batch loader workers to 8, and added a startup print for effective
-  pipeline settings.
+  `batch_size`/`control_points_per_step` validation error, and switched
+  variable-sigma value-augmentation blur to the measured unfold-based batched
+  implementation.
+- Set the measured default CUDA training pipeline queue to 8 batches, default
+  whole-batch loader workers to 4, added a startup print for effective
+  pipeline settings, and removed invalid-sample skip reason spam from hot
+  training loads.
 - Added configurable concurrent whole-batch CUDA training loaders and moved
   CUDA preparation submission into a background preparation executor.
 - Added CUDA side-stream training preparation for deferred image/value

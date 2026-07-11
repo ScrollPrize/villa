@@ -1,47 +1,42 @@
-# Training Batch Config Validation, Prep Slowdown, And Pipeline Depth Plan
+# Training Throughput Parallelization Plan
 
 ## Implementation
 
-- Remove the hard-coded default patch-count warning from `run_training`.
-- Add a small train/benchmark validation helper that requires
-  `training.control_points_per_step` to match loader `batch_size`, because
-  training loads exactly one CP batch per step.
-- Keep non-default flattened patch counts valid:
-  `batch_size * strip_z_offset_count` may be any positive configured value.
-- Replace per-patch CUDA Gaussian blur in batched value augmentation with a
-  grouped batched blur so variable per-patch blur sigmas use two grouped
-  convolutions for the whole patch batch.
-- Increase the default CUDA training pipeline depth/worker count so normal
-  runs keep several whole-batch loaders in flight.
-- Add explicit `pipeline_depth` and `pipeline_workers` to the example config.
-- Print effective pipeline settings once at startup.
+- Re-establish a current benchmark/profile baseline using the approved command.
+- Inspect and simplify the nested pipeline/loader threading model so CP sample
+  loading can use available CPU workers without contention between outer batch
+  workers and inner sample workers.
+- Test variants by rewriting `/tmp/fiber_trace_p_d2_w1.json` only:
+  - current defaults;
+  - high loader worker count with shallow training pipeline;
+  - deeper training pipeline only if it improves wall throughput;
+  - moving CUDA prep concurrency from one stream/thread to multiple streams only
+    if measured beneficial.
+- Keep any variant only if it improves measured patches/s on the same command.
+- Add profiling counters where needed to distinguish wall time, worker time,
+  wait time, prep time, and train time.
 
 ## Spec Update
 
-- Document that top-level `batch_size` is the CP-sample count and training
-  `control_points_per_step` must match it.
-- Document that changing `strip_z_offset_count` changes the flattened CNN patch
-  count without warning.
-- Document that batched value augmentation should avoid per-patch CUDA blur
-  loops.
-- Document the updated pipeline defaults and startup print.
+- Document the measured training pipeline/loader defaults and the benchmark
+  method used to select them.
+- Document that deterministic sample ordering must not depend on worker count.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` config/training notes with the same meaning.
-- Update augmentation implementation notes for grouped batch blur.
-- Update training config docs for the loader pipeline defaults.
+- Update `planning/local_development.md` only if the benchmark workflow changes.
+- Update `docs/code_structure.md` if config defaults or pipeline behavior change.
+- Keep `planning/task_log.md` limited to this throughput task.
 
 ## Testing
 
-- Add a focused regression test for rejecting mismatched
-  `control_points_per_step` and loader `batch_size`.
-- Add a regression test that batched blur matches the single-patch path for
-  different blur sigmas.
-- Run:
+- Run focused loader tests:
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+- Run compile check for touched Python files.
+- Run the approved benchmark command after each meaningful variant:
+  `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_2d.train /tmp/fiber_trace_p_d2_w1.json --benchmark --benchmark-batches 30`
 
 ## Changelog
 
-- Add a short entry for removing the default patch-count warning, validating
-  training batch config, and batching value-augmentation blur.
+- Add a concise entry if a retained change improves throughput or changes the
+  training pipeline defaults.

@@ -100,6 +100,25 @@ The trainer writes TensorBoard events and snapshots under the configured
 `training.run_path`. Do not add `PYTHONNOUSERSITE=1` to this command in this
 checkout.
 
+## Agent Benchmark Command Reuse
+
+When comparing training performance variants as an agent, avoid changing the
+shell command shape repeatedly. Use one temporary config path and overwrite that
+JSON between runs, so the same approved command can be reused:
+
+```bash
+PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_2d.train /tmp/fiber_trace_p_d2_w1.json --benchmark --benchmark-batches 30
+```
+
+For example, write the next variant into the same temp file:
+
+```bash
+jq '.training.tensorboard_enabled=false | .training.pipeline_depth=4 | .training.pipeline_workers=2' $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json > /tmp/fiber_trace_p_d2_w1.json
+```
+
+Then rerun the exact same benchmark command above. Do not introduce a new temp
+config filename or extra CLI flags unless the user explicitly approves it.
+
 ## Fiber Trace 2D Training Prefetch Commands
 
 Prefetch the base-volume chunks needed for the first 10 configured training

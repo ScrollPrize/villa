@@ -1304,6 +1304,7 @@ class FiberStrip2DLoader:
         source_shape_hw: tuple[int, int],
         device: torch.device,
         center_offset: float,
+        require_offset_axis: bool = True,
     ) -> tuple[FiberStripGridTorch, torch.Tensor, torch.Tensor] | None:
         if path is None or not path.is_file():
             return None
@@ -1322,16 +1323,24 @@ class FiberStrip2DLoader:
                         mesh_normal_xyz=np.asarray(data["frame_mesh_normal_xyz"], dtype=np.float32),
                     )
                 coords_zyx = torch.as_tensor(np.asarray(data["coords_zyx"], dtype=np.float32), device=device)
-                offset_axis_zyx = torch.as_tensor(
-                    np.asarray(data["offset_axis_zyx"], dtype=np.float32),
-                    device=device,
+                offset_axis_zyx = (
+                    torch.as_tensor(
+                        np.asarray(data["offset_axis_zyx"], dtype=np.float32),
+                        device=device,
+                    )
+                    if bool(require_offset_axis)
+                    else None
                 )
                 grid = FiberStripGridTorch(
                     coords_xyz=coords_zyx[..., (2, 1, 0)].contiguous(),
                     coords_zyx=coords_zyx,
                     valid_mask=torch.as_tensor(np.asarray(data["valid_mask"], dtype=bool), device=device),
                     frame=frame,
-                    offset_axis_xyz=offset_axis_zyx[..., (2, 1, 0)].contiguous(),
+                    offset_axis_xyz=(
+                        None
+                        if offset_axis_zyx is None
+                        else offset_axis_zyx[..., (2, 1, 0)].contiguous()
+                    ),
                     offset_axis_zyx=offset_axis_zyx,
                 )
                 source_line_xy = torch.as_tensor(np.asarray(data["source_line_xy"], dtype=np.float32), device=device)
@@ -1427,6 +1436,10 @@ class FiberStrip2DLoader:
                 source_shape_hw=source_shape_hw,
                 device=device,
                 center_offset=float(center_offset),
+                require_offset_axis=not (
+                    len(self.strip_z_offsets) == 1
+                    and abs(float(self.strip_z_offsets[0]) - float(center_offset)) <= 1.0e-6
+                ),
             )
         if cached_source is not None:
             cached_grid, source_line_xy, source_control_point_xy = cached_source
@@ -1502,11 +1515,13 @@ class FiberStrip2DLoader:
         )
 
     def _offset_grid_from_source(self, source: _StripSource, offset: float) -> FiberStripGridTorch:
+        delta_base = (float(offset) - float(source.center_offset)) * float(source.record.volume_spacing_base)
+        if abs(float(delta_base)) <= 1.0e-6:
+            return source.grid
         axis_zyx = source.grid.offset_axis_zyx
         axis_xyz = source.grid.offset_axis_xyz
         if axis_zyx is None or axis_xyz is None:
             raise ValueError("strip source grid is missing offset-axis data")
-        delta_base = (float(offset) - float(source.center_offset)) * float(source.record.volume_spacing_base)
         delta = torch.as_tensor(delta_base, dtype=source.grid.coords_zyx.dtype, device=source.grid.coords_zyx.device)
         coords_zyx = source.grid.coords_zyx + axis_zyx.to(device=source.grid.coords_zyx.device) * delta
         coords_xyz = source.grid.coords_xyz + axis_xyz.to(device=source.grid.coords_xyz.device) * delta
@@ -1656,6 +1671,7 @@ class FiberStrip2DLoader:
         *,
         sample_mode: str = "random",
         profile: dict[str, float] | None = None,
+        include_line_xy: bool = True,
     ) -> _PreparedStripSample:
         device = resolve_torch_device(self.config.augment.device)
         source = self.build_strip_source(sample_index, device=device, sample_mode=sample_mode, profile=profile)
@@ -1681,16 +1697,25 @@ class FiberStrip2DLoader:
 
         line_and_cp_cache: dict[FiberStripAugmentParams | None, tuple[torch.Tensor, torch.Tensor]] = {}
         if not self.config.augment.enabled:
-            line_and_cp_cache[None] = (
-                source.source_line_xy.to(device=device, dtype=torch.float32),
-                source.source_control_point_xy.to(device=device, dtype=torch.float32),
-            )
+            source_cp_xy = source.source_control_point_xy.to(device=device, dtype=torch.float32)
+            if include_line_xy:
+                line_xy = source.source_line_xy.to(device=device, dtype=torch.float32)
+            else:
+                unit = torch.tensor([1.0, 0.0], dtype=torch.float32, device=device)
+                line_xy = torch.stack([source_cp_xy - unit, source_cp_xy + unit], dim=0)
+            line_and_cp_cache[None] = (line_xy, source_cp_xy)
         else:
             unique_params = [params for params in dict.fromkeys(params_by_offset) if params is not None]
             if unique_params:
-                source_line_xy = source.source_line_xy.to(device=device, dtype=torch.float32)
                 source_cp_xy = source.source_control_point_xy.to(device=device, dtype=torch.float32).view(1, 2)
-                source_points = torch.cat([source_line_xy, source_cp_xy], dim=0)
+                if include_line_xy:
+                    source_line_xy = source.source_line_xy.to(device=device, dtype=torch.float32)
+                    source_points = torch.cat([source_line_xy, source_cp_xy], dim=0)
+                    cp_point_index = int(source_points.shape[0] - 1)
+                else:
+                    unit = torch.tensor([[1.0, 0.0]], dtype=torch.float32, device=device)
+                    source_points = torch.cat([source_cp_xy - unit, source_cp_xy, source_cp_xy + unit], dim=0)
+                    cp_point_index = 1
                 point_batch = source_points.unsqueeze(0).expand(len(unique_params), -1, -1)
                 forward_maps = torch.stack([transforms_by_params[params].forward_map_xy for params in unique_params], dim=0)
                 line_lookup_before = 0.0 if profile is None else profile.get("line_lookup", 0.0)
@@ -1701,9 +1726,9 @@ class FiberStrip2DLoader:
                 with _ProfileBlock(profile, "line_filter", device):
                     for index, params in enumerate(unique_params):
                         mapped = mapped_batch[index]
-                        line_xy = mapped[:-1]
-                        cp_xy = mapped[-1]
-                        if line_xy.numel() != 0:
+                        if include_line_xy:
+                            line_xy = mapped[:cp_point_index]
+                            cp_xy = mapped[cp_point_index]
                             line_xy = line_xy[
                                 torch.isfinite(line_xy).all(dim=1)
                                 & (line_xy[:, 0] >= 0.0)
@@ -1711,6 +1736,9 @@ class FiberStrip2DLoader:
                                 & (line_xy[:, 1] >= 0.0)
                                 & (line_xy[:, 1] <= float(int(height) - 1))
                             ]
+                        else:
+                            cp_xy = mapped[cp_point_index]
+                            line_xy = torch.stack([mapped[0], mapped[2]], dim=0)
                         line_and_cp_cache[params] = (line_xy, cp_xy)
                 if profile is not None:
                     profile["line_coords"] = profile.get("line_coords", 0.0) + (
@@ -1766,6 +1794,7 @@ class FiberStrip2DLoader:
         valids_np: np.ndarray,
         *,
         apply_image_augmentation: bool,
+        include_coords: bool = True,
         profile: dict[str, float] | None = None,
     ) -> tuple[
         list[FiberStripSample],
@@ -1795,7 +1824,11 @@ class FiberStrip2DLoader:
         for offset_index, offset in enumerate(self.strip_z_offsets):
             line_xy = prepared.line_xy_by_offset[offset_index]
             control_point_xy = prepared.control_point_xy_by_offset[offset_index]
-            coords_zyx = coords_zyx_np[offset_index]
+            coords_zyx = (
+                coords_zyx_np[offset_index]
+                if include_coords
+                else np.empty((0, 0, 3), dtype=np.float32)
+            )
             image = images_np[offset_index]
             sampled_valid = valids_np[offset_index]
             sample = FiberStripSample(
@@ -1834,7 +1867,7 @@ class FiberStrip2DLoader:
         return (
             samples,
             np.stack(images, axis=0),
-            coords_zyx_np,
+            coords_zyx_np if include_coords else np.empty((len(self.strip_z_offsets), 0, 0, 3), dtype=np.float32),
             np.stack(valids, axis=0),
             tuple(prepared.params_by_offset),
         )
@@ -1846,6 +1879,8 @@ class FiberStrip2DLoader:
         sample_mode: str = "random",
         profile: dict[str, float] | None = None,
         apply_image_augmentation: bool = True,
+        include_line_xy: bool = True,
+        include_coords: bool = True,
     ) -> tuple[
         list[FiberStripSample],
         np.ndarray,
@@ -1853,7 +1888,21 @@ class FiberStrip2DLoader:
         np.ndarray,
         tuple[FiberStripAugmentParams | None, ...],
     ]:
-        prepared = self._prepare_sample(sample_index, sample_mode=sample_mode, profile=profile)
+        try:
+            prepared = self._prepare_sample(
+                sample_index,
+                sample_mode=sample_mode,
+                profile=profile,
+                include_line_xy=include_line_xy,
+            )
+        except TypeError as exc:
+            if "include_line_xy" not in str(exc):
+                raise
+            prepared = self._prepare_sample(
+                sample_index,
+                sample_mode=sample_mode,
+                profile=profile,
+            )
         with _ProfileBlock(profile, "volume_sample"):
             result = prepared.source.record.sampler.sample_coord_batch(prepared.coords_zyx, prepared.valid_mask)
             images_np = np.asarray(result.image, dtype=np.float32)
@@ -1867,6 +1916,7 @@ class FiberStrip2DLoader:
             images_np,
             valids_np,
             apply_image_augmentation=apply_image_augmentation,
+            include_coords=include_coords,
             profile=profile,
         )
 
@@ -1883,6 +1933,7 @@ class FiberStrip2DLoader:
             sample_mode=sample_mode,
             profile=profile,
             apply_image_augmentation=apply_image_augmentation,
+            include_line_xy=True,
         )
         return samples, images, coords, valids
 
@@ -2127,6 +2178,8 @@ class FiberStrip2DLoader:
         sample_index_limit: int | None = None,
         profile: dict[str, float] | None = None,
         apply_image_augmentation: bool = True,
+        include_line_xy: bool = True,
+        include_coords: bool = True,
     ) -> FiberStrip2DBatch:
         batch_size = self.config.batch_size if batch_size is None else int(batch_size)
         begin_zarr_cache_trace()
@@ -2142,17 +2195,6 @@ class FiberStrip2DLoader:
 
         def report_skip(current_sample_index: int, exc: ValueError) -> None:
             self._load_batch_skipped_samples += 1
-            if self._load_batch_skipped_samples <= 10:
-                print(
-                    "fiber_trace_2d: skipping invalid training sample "
-                    f"sample_index={current_sample_index} reason={exc}",
-                    flush=True,
-                )
-            elif self._load_batch_skipped_samples == 11:
-                print(
-                    "fiber_trace_2d: further invalid training sample skip messages suppressed",
-                    flush=True,
-                )
 
         def build_candidate(raw_sample_index: int) -> tuple[
             int,
@@ -2176,6 +2218,8 @@ class FiberStrip2DLoader:
                     sample_mode=sample_mode,
                     profile=local_profile if profile is not None else None,
                     apply_image_augmentation=apply_image_augmentation,
+                    include_line_xy=include_line_xy,
+                    include_coords=include_coords,
                 )
             except ValueError as exc:
                 if profile is not None:

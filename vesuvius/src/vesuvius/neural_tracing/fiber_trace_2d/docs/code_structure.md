@@ -278,16 +278,16 @@ The important behavior is:
 - Computes direction targets from transformed line coordinates after geometric
   augmentation.
 - On CUDA training runs, uses a bounded deterministic whole-batch pipeline when
-  `training.pipeline_enabled` is true. Whole-batch producers call the same
-  `FiberStrip2DLoader.load_batch` path with image/value augmentation deferred;
-  the trainer consumes batches strictly by training step, prepares tensors on a
-  side CUDA stream, and runs forward/backward.
+  `training.pipeline_enabled` is true. Background workers build exact training
+  steps with `FiberStrip2DLoader.load_batch`, defer image/value augmentation,
+  prepare tensors on side CUDA streams, and return prepared batches for strict
+  in-order forward/backward consumption.
   Coordinate generation and geometric coordinate augmentation remain on the
   configured `augment_device`.
 - `training.pipeline_depth` controls queued future batches.
-  `training.pipeline_workers` controls concurrent whole-batch `load_batch`
-  calls; `0` means use `pipeline_depth`. Completion may be out of order, but
-  consumption remains ordered by training step.
+  `training.pipeline_workers` controls concurrent load+prepare tasks; `0`
+  means use `pipeline_depth`. Completion may be out of order, but consumption
+  remains ordered by training step.
 - Logs scalars/images to TensorBoard and writes `current.pt` / `best.pt`
   snapshots under the run directory.
 - When `test_datasets` is configured, evaluates a fixed deterministic held-out
@@ -364,9 +364,9 @@ Training keys:
 - `pipeline_enabled`: enables CUDA training batch pipelining; default `true`.
   CPU training keeps the synchronous path.
 - `pipeline_depth`: queued whole-batch futures for the CUDA training pipeline;
-  default `16`.
+  default `8`.
 - `pipeline_workers`: concurrent whole-batch loader calls for the CUDA training
-  pipeline. Default `8`; `0` means use `pipeline_depth`.
+  pipeline. Default `4`; `0` means use `pipeline_depth`.
 - `model_hidden_channels` and `model_depth`: V0 ResNet size knobs. Defaults
   are 64 hidden channels and 10 residual blocks.
 
@@ -601,14 +601,13 @@ zero after normalization.
 On CUDA training runs with `training.pipeline_enabled`, the trainer keeps two
 overlap stages active:
 
-- CPU/VC3D batch loading continues through the deterministic loader pipeline.
-  `training.pipeline_workers` may run multiple whole-batch loads concurrently,
-  while output consumption remains ordered by training step.
-- Deferred image/value augmentation, image normalization, and supervision-tensor
-  construction are submitted by a background preparation executor and run as
-  CUDA preparation on a side stream. The prepared image tensor stays on CUDA
-  and the main training stream waits on the preparation event immediately
-  before forward pass.
+- Background load+prepare workers run deterministic whole training steps
+  concurrently. Each worker uses the loader's CP-level worker pool for patch
+  construction and then submits deferred image/value augmentation, image
+  normalization, and supervision-tensor construction on a side CUDA stream.
+- The prepared image tensor stays on CUDA. The main training stream consumes
+  prepared batches in step order and waits on each preparation event
+  immediately before the forward pass.
 
 `prep_submit_ms` measures only main-thread queue refill overhead. The actual
 preparation work is represented by `prep_ms` and, on CUDA, `prep_gpu_ms`.
@@ -616,8 +615,10 @@ Training prints the effective pipeline enable flag, queue depth, whole-batch
 loader worker count, and CP-level loader worker count once at startup.
 
 This training-only prepared-batch path avoids the runner/debug
-`apply_batch_image_augmentation()` NumPy round trip. Runner exports still use
-NumPy-returning loader APIs.
+`apply_batch_image_augmentation()` NumPy round trip. It also requests only the
+CP-local tangent line needed for direction supervision and does not retain
+post-sampling coordinate arrays in the returned training batch. Runner exports
+and debug loader APIs still keep full transformed strip lines and coordinates.
 
 Targets are built from `FiberStripSample.line_xy` and
 `FiberStripSample.control_point_xy`, which are already transformed output-pixel

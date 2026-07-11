@@ -53,8 +53,8 @@ class FiberStripTrainingConfig:
     model_hidden_channels: int = 64
     model_depth: int = 10
     pipeline_enabled: bool = True
-    pipeline_depth: int = 16
-    pipeline_workers: int = 8
+    pipeline_depth: int = 8
+    pipeline_workers: int = 4
 
 
 def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
@@ -85,8 +85,8 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         model_hidden_channels=max(1, int(get("model_hidden_channels", 64))),
         model_depth=max(1, int(get("model_depth", 10))),
         pipeline_enabled=bool(get("pipeline_enabled", True)),
-        pipeline_depth=max(1, int(get("pipeline_depth", 16))),
-        pipeline_workers=max(0, int(get("pipeline_workers", 8))),
+        pipeline_depth=max(1, int(get("pipeline_depth", 8))),
+        pipeline_workers=max(0, int(get("pipeline_workers", 4))),
     )
     if config.max_steps < 0:
         raise ValueError("training.max_steps must be >= 0")
@@ -324,55 +324,87 @@ def _wait_for_prepared_batch(prepared: _PreparedTrainingBatch, *, device: torch.
     return replace(prepared, prep_wait_ms=wait_ms, prep_gpu_ms=float(prep_gpu_ms))
 
 
-def _load_and_prepare_training_batch(
-    load_pipeline: "_TrainingBatchPipeline",
+def _load_and_prepare_training_step(
+    loader: FiberStrip2DLoader,
+    training: FiberStripTrainingConfig,
     *,
+    step: int,
+    sample_mode: str,
+    profile_enabled: bool,
+    apply_image_augmentation: bool,
     device: torch.device,
     stream: torch.cuda.Stream,
 ) -> _PreparedTrainingBatch:
-    loaded, load_wait_ms = load_pipeline.next()
+    loaded = _load_training_batch(
+        loader,
+        training,
+        step=step,
+        sample_mode=sample_mode,
+        profile_enabled=profile_enabled,
+        apply_image_augmentation=apply_image_augmentation,
+    )
     prepared = _prepare_loaded_training_batch(
         loaded,
         device=device,
         stream=stream,
     )
-    if load_wait_ms:
-        loaded.profile["pipeline_wait"] = loaded.profile.get("pipeline_wait", 0.0) + load_wait_ms
     return prepared
 
 
 class _CudaPreparedBatchPipeline:
     def __init__(
         self,
-        load_pipeline: _TrainingBatchPipeline,
+        loader: FiberStrip2DLoader,
+        training: FiberStripTrainingConfig,
         *,
         device: torch.device,
+        sample_mode: str,
+        start_step: int,
+        max_step: int | None,
+        profile_enabled: bool,
+        apply_image_augmentation: bool,
     ) -> None:
         if device.type != "cuda":
             raise ValueError("_CudaPreparedBatchPipeline requires a CUDA device")
-        self.load_pipeline = load_pipeline
+        self.loader = loader
+        self.training = training
         self.device = device
-        self.depth = load_pipeline.depth
-        self.stream = torch.cuda.Stream(device=device)
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fiber-strip-train-prep")
+        self.sample_mode = sample_mode
+        self.max_step = None if max_step is None else int(max_step)
+        self.profile_enabled = bool(profile_enabled)
+        self.apply_image_augmentation = bool(apply_image_augmentation)
+        self.depth = max(1, int(training.pipeline_depth))
+        configured_workers = int(training.pipeline_workers)
+        self.worker_count = max(1, configured_workers if configured_workers > 0 else self.depth)
+        self.streams = [torch.cuda.Stream(device=device) for _ in range(self.worker_count)]
+        self.executor = ThreadPoolExecutor(
+            max_workers=self.worker_count,
+            thread_name_prefix="fiber-strip-train-load-prep",
+        )
         self.pending: dict[int, Future[_PreparedTrainingBatch]] = {}
-        self.next_submit_step = load_pipeline.next_consume_step
-        self.next_consume_step = load_pipeline.next_consume_step
+        self.next_submit_step = int(start_step)
+        self.next_consume_step = int(start_step)
         self.closed = False
         self._submit_until_full()
 
     def _submit_until_full(self) -> float:
         submit_start = time.perf_counter()
         while not self.closed and len(self.pending) < self.depth:
-            if self.load_pipeline.max_step is not None and self.next_submit_step > self.load_pipeline.max_step:
+            if self.max_step is not None and self.next_submit_step > self.max_step:
                 break
             step = self.next_submit_step
             self.next_submit_step += 1
+            stream = self.streams[(step - 1) % len(self.streams)]
             self.pending[step] = self.executor.submit(
-                _load_and_prepare_training_batch,
-                self.load_pipeline,
+                _load_and_prepare_training_step,
+                self.loader,
+                self.training,
+                step=step,
+                sample_mode=self.sample_mode,
+                profile_enabled=self.profile_enabled,
+                apply_image_augmentation=self.apply_image_augmentation,
                 device=self.device,
-                stream=self.stream,
+                stream=stream,
             )
         return (time.perf_counter() - submit_start) * 1000.0
 
@@ -401,7 +433,6 @@ class _CudaPreparedBatchPipeline:
             future.cancel()
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.pending.clear()
-        self.load_pipeline.close()
 
 
 def _training_raw_start_sample_index(step: int, training: FiberStripTrainingConfig) -> int:
@@ -427,6 +458,8 @@ def _load_training_batch(
         sample_index_limit=training.max_sample_index,
         profile=loader_profile if profile_enabled else None,
         apply_image_augmentation=apply_image_augmentation,
+        include_line_xy=False,
+        include_coords=False,
     )
     load_ms = (time.perf_counter() - t0) * 1000.0
     return _LoadedTrainingBatch(
@@ -751,16 +784,16 @@ def run_benchmark(
     pipeline: _TrainingBatchPipeline | None = None
     prep_pipeline: _CudaPreparedBatchPipeline | None = None
     if use_pipeline:
-        pipeline = _TrainingBatchPipeline(
+        prep_pipeline = _CudaPreparedBatchPipeline(
             loader,
             training,
+            device=device,
             sample_mode=sample_mode,
             start_step=1,
             max_step=total_batches,
             profile_enabled=profile,
             apply_image_augmentation=False,
         )
-        prep_pipeline = _CudaPreparedBatchPipeline(pipeline, device=device)
     try:
         for batch_index in range(1, total_batches + 1):
             batch_start = time.perf_counter()
@@ -1123,24 +1156,26 @@ def run_training(
     try:
         finite_max_step = int(training.max_steps) if finite_steps else None
         if use_pipeline:
-            pipeline = _TrainingBatchPipeline(
+            prep_pipeline = _CudaPreparedBatchPipeline(
                 loader,
                 training,
+                device=device,
                 sample_mode=sample_mode,
                 start_step=1,
                 max_step=finite_max_step,
                 profile_enabled=False,
                 apply_image_augmentation=False,
             )
-            prep_pipeline = _CudaPreparedBatchPipeline(pipeline, device=device)
         step = 1
         while True:
             if finite_steps and step > training.max_steps:
                 break
+            step_wall_start = time.perf_counter()
             prep_ms = 0.0
             prep_gpu_ms = 0.0
             prep_wait_ms = 0.0
             prep_submit_ms = 0.0
+            train_ms = 0.0
             if prep_pipeline is not None:
                 prepared = prep_pipeline.next()
                 loaded = prepared.loaded
@@ -1170,10 +1205,13 @@ def run_training(
             load_ms = float(loaded.load_ms)
 
             model.train()
+            train_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             loss, outputs, supervision, metrics = _compute_prepared_batch_loss(model, prepared)
             loss.backward()
             optimizer.step()
+            _sync_device(device)
+            train_ms = (time.perf_counter() - train_start) * 1000.0
             loss_value = float(loss.detach().cpu().item())
             last_loss = loss_value
             last_angle_mean_deg = metrics.angle_mean_deg
@@ -1203,6 +1241,7 @@ def run_training(
                 writer.add_scalar("timing/prep_gpu_ms", prep_gpu_ms, step)
                 writer.add_scalar("timing/prep_wait_ms", prep_wait_ms, step)
                 writer.add_scalar("timing/prep_submit_ms", prep_submit_ms, step)
+                writer.add_scalar("timing/train_ms", train_ms, step)
                 for key, value in _cache_scalars(batch.cache_stats).items():
                     writer.add_scalar(key, value, step)
             if writer is not None and test_result is not None:
@@ -1257,6 +1296,9 @@ def run_training(
                 start_sample_index=raw_start_sample_index,
                 sample_count=training.train_control_points_per_step,
             ):
+                step_ms = (time.perf_counter() - step_wall_start) * 1000.0
+                if writer is not None and (step == 1 or step % training.scalar_log_interval == 0):
+                    writer.add_scalar("timing/step_ms", step_ms, step)
                 test_part = (
                     ""
                     if test_result is None
@@ -1271,7 +1313,8 @@ def run_training(
                     f"supervision_samples={int(supervision.target.shape[0])}{test_part} "
                     f"load_ms={load_ms:.1f} wait_ms={wait_ms:.1f} "
                     f"prep_ms={prep_ms:.1f} prep_gpu_ms={prep_gpu_ms:.1f} "
-                    f"prep_wait_ms={prep_wait_ms:.1f} prep_submit_ms={prep_submit_ms:.1f}",
+                    f"prep_wait_ms={prep_wait_ms:.1f} prep_submit_ms={prep_submit_ms:.1f} "
+                    f"train_ms={train_ms:.1f} step_ms={step_ms:.1f}",
                     flush=True,
                 )
             step += 1
@@ -1371,6 +1414,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Run 100 training batches without testing, TensorBoard, or snapshots, then report patch samples/s",
     )
     parser.add_argument(
+        "--benchmark-batches",
+        type=int,
+        default=100,
+        help="Number of batches for --benchmark/--profile/--load-only; default 100",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Print benchmark/training-stage timing rows and per-patch summary for the 100-batch benchmark run",
@@ -1408,7 +1457,12 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.benchmark or args.profile or args.load_only:
         try:
-            run_benchmark(args.config, batches=100, profile=bool(args.profile), load_only=bool(args.load_only))
+            run_benchmark(
+                args.config,
+                batches=int(args.benchmark_batches),
+                profile=bool(args.profile),
+                load_only=bool(args.load_only),
+            )
         except ValueError as exc:
             parser.error(str(exc))
         return

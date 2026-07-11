@@ -631,15 +631,14 @@ def _gaussian_blur_2d_batch(images: torch.Tensor, sigmas: torch.Tensor) -> torch
         kernels[~active.squeeze(1), center] = 1.0
     kernels = kernels / kernels.sum(dim=1, keepdim=True).clamp_min(1.0e-12)
 
-    grouped = images.unsqueeze(0)
-    kernel_y = kernels.view(batch, 1, -1, 1)
-    kernel_x = kernels.view(batch, 1, 1, -1)
     pad_mode_y = "reflect" if max_radius < height else "replicate"
     pad_mode_x = "reflect" if max_radius < width else "replicate"
-    padded = F.pad(grouped, (0, 0, max_radius, max_radius), mode=pad_mode_y)
-    blurred = F.conv2d(padded, kernel_y, groups=batch)
-    padded = F.pad(blurred, (max_radius, max_radius, 0, 0), mode=pad_mode_x)
-    return F.conv2d(padded, kernel_x, groups=batch)[0]
+    padded_y = F.pad(images.unsqueeze(1), (0, 0, max_radius, max_radius), mode=pad_mode_y)[:, 0]
+    windows_y = padded_y.unfold(1, 2 * max_radius + 1, 1)
+    blurred = (windows_y * kernels.view(batch, 1, 1, -1)).sum(dim=-1)
+    padded_x = F.pad(blurred.unsqueeze(1), (max_radius, max_radius, 0, 0), mode=pad_mode_x)[:, 0]
+    windows_x = padded_x.unfold(2, 2 * max_radius + 1, 1)
+    return (windows_x * kernels.view(batch, 1, 1, -1)).sum(dim=-1)
 
 
 def _apply_gamma(image: torch.Tensor, valid: torch.Tensor, gamma: float, value_range: torch.Tensor, center: torch.Tensor) -> torch.Tensor:
