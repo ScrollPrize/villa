@@ -23,6 +23,19 @@ SUPPORTED_LABEL_EXTENSIONS = {".tif", ".png", ".jpg"}
 RESERVED_IMAGE_FILENAMES = {"x.tif", "y.tif", "z.tif", "mask.tif"}
 
 
+def _read_tiff_maybe_memmap(path: Path) -> np.ndarray:
+    try:
+        return tifffile.memmap(str(path), mode="r")
+    except ValueError as exc:
+        if "memory-mappable" not in str(exc):
+            raise
+        logger.warning(
+            "TIFF is not memory-mappable; falling back to tifffile.imread: %s",
+            path,
+        )
+        return tifffile.imread(str(path))
+
+
 @dataclass
 class TifxyzInfo:
     """Lightweight metadata for a tifxyz segment without loading coordinates.
@@ -340,7 +353,7 @@ class TifxyzReader:
         if not tif_path.exists():
             raise FileNotFoundError(f"Coordinate file not found: {tif_path}")
 
-        data = tifffile.memmap(str(tif_path), mode="r")
+        data = _read_tiff_maybe_memmap(tif_path)
         if data.dtype == np.float32:
             return data
         return data.astype(np.float32)
@@ -357,7 +370,7 @@ class TifxyzReader:
         if not mask_path.exists():
             return None
 
-        return tifffile.memmap(str(mask_path), mode="r")
+        return _read_tiff_maybe_memmap(mask_path)
 
     def _read_label_shape(self, path: Path) -> Tuple[int, int]:
         """Read label shape using OpenCV."""
