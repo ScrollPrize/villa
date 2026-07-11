@@ -1,8 +1,15 @@
-# Switch Direction Model Normalization To BatchNorm
+# Merge `fiber2d-exp`
 
-Todo item:
+User request:
 
-- GroupNorm with a single supervision sample per patch can let the model use
-  patch-global statistics in a way that behaves like a non-convolutional
-  classifier. Switch the default 2D direction model from GroupNorm to a
-  BatchNorm-style normalization.
+- Merge the `fiber2d-exp` branch into the current `fiber-2d-training` branch.
+- First run the git merge, then inspect conflicts, especially spec changes.
+- Create a plan to resolve conflicts while keeping and fulfilling all relevant
+  specs.
+
+Current merge state:
+
+- `git merge --no-commit fiber2d-exp` has been run.
+- Python code and tests auto-merged.
+- Conflicts are limited to planning/changelog/status/task/task_log/task_plan
+  files.

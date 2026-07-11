@@ -1,15 +1,31 @@
-# BatchNorm Direction Model Task Log
+# Merge `fiber2d-exp` Task Log
 
-## Notes
+## Actions
 
-- Replaced all GroupNorm layers in the V0 2D direction model with
-  `nn.BatchNorm2d`.
-- Removed the now-unused GroupNorm group-count helper.
-- Kept model config keys unchanged.
+- Confirmed tracked worktree was clean before merge.
+- Ran `git merge --no-commit fiber2d-exp`.
+- Merge produced conflicts only in planning/changelog/status/task/task_log/task_plan.
+- Inspected auto-merged `planning/specs.md`, `docs/code_structure.md`,
+  `loader.py`, `runner.py`, `direction.py`, and `train.py` at a high level.
+
+## Findings
+
+- `planning/specs.md` already contains the union of the important requirements:
+  BatchNorm2d model default, analytic Lasagna direction decoding,
+  coordinate-only geometric TTA, bidirectional Trace2CP, retained training
+  pipeline/cache knobs, and full training centerline visualization semantics.
+- Code auto-merge appears to preserve current BatchNorm, `include_line_xy=True`,
+  pipeline-isolated loader support, and VC3D cache/I/O config while adding the
+  `fiber2d-exp` Trace2CP/TTA changes.
+- The planning conflicts are stale completed task states from each branch, not
+  code conflicts. They should be replaced by the current merge task state.
+- Planning review against `task.md`, `plan.md`, and `specs.md` found the plan
+  covers the requested merge/inspection task, preserves the V0 direction and
+  Trace2CP/TTA goals from `plan.md`, and keeps the merged spec union instead of
+  weakening requirements. A separate sub-agent was not spawned because the
+  available multi-agent tool explicitly requires a direct user request for
+  delegation.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/model.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: 108 tests.
+- Not run yet. Validation is planned after conflict resolution.

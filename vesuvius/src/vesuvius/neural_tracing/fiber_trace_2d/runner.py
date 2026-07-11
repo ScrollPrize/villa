@@ -7,7 +7,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     FiberStripAugmentParams,
@@ -15,7 +14,6 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     overlay_line_coords_rgb,
     random_combined_augmentation,
     resolve_torch_device,
-    source_coordinate_grid_for_output,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.direction import (
     decode_lasagna_direction_xy,
@@ -320,9 +318,8 @@ class _TtaDirectionField:
     name: str
     direction_xy: np.ndarray
     valid_mask: np.ndarray
-    matrix_ref_to_tta: np.ndarray | None = None
-    matrix_tta_to_ref: np.ndarray | None = None
-    source_xy_grid: np.ndarray | None = None
+    source_xy_grid: np.ndarray
+    reference_to_tta_xy_grid: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -335,58 +332,26 @@ class _Trace2CpResult:
     reason: str
 
 
-def _trace_tta_matrix(
-    shape_hw: tuple[int, int],
-    *,
-    flip_x: bool = False,
-    flip_y: bool = False,
-    rotation_degrees: int = 0,
-    shift_xy: tuple[float, float] = (0.0, 0.0),
-) -> np.ndarray:
-    height, width = (int(v) for v in shape_hw)
-    cx = (float(width) - 1.0) * 0.5
-    cy = (float(height) - 1.0) * 0.5
-
-    def translate(tx: float, ty: float) -> np.ndarray:
-        return np.asarray([[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]], dtype=np.float32)
-
-    center_to_origin = translate(-cx, -cy)
-    origin_to_center = translate(cx, cy)
-    flip = np.asarray(
-        [[-1.0 if flip_x else 1.0, 0.0, 0.0], [0.0, -1.0 if flip_y else 1.0, 0.0], [0.0, 0.0, 1.0]],
-        dtype=np.float32,
-    )
-    angle = np.deg2rad(float(rotation_degrees))
-    rot = np.asarray(
-        [[np.cos(angle), -np.sin(angle), 0.0], [np.sin(angle), np.cos(angle), 0.0], [0.0, 0.0, 1.0]],
-        dtype=np.float32,
-    )
-    shift = translate(float(shift_xy[0]), float(shift_xy[1]))
-    return (shift @ origin_to_center @ rot @ flip @ center_to_origin).astype(np.float32)
+@dataclass(frozen=True)
+class _Trace2CpDirectionResult:
+    trace_xy: np.ndarray
+    result: _Trace2CpResult
 
 
-def _transform_points_xy(points_xy: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    points = np.asarray(points_xy, dtype=np.float32)
-    if points.ndim == 1:
-        points = points.reshape(1, 2)
-    if points.ndim != 2 or points.shape[1] != 2:
-        raise ValueError("points_xy must have shape N,2")
-    ones = np.ones((points.shape[0], 1), dtype=np.float32)
-    homogeneous = np.concatenate([points, ones], axis=1)
-    transformed = homogeneous @ np.asarray(matrix, dtype=np.float32).T
-    return transformed[:, :2].astype(np.float32)
+@dataclass(frozen=True)
+class _Trace2CpBidirectionalResult:
+    forward: _Trace2CpDirectionResult
+    reverse: _Trace2CpDirectionResult
 
+    @property
+    def score(self) -> float:
+        return 0.5 * (float(self.forward.result.score) + float(self.reverse.result.score))
 
-def _transform_direction_xy(direction_xy: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    direction = np.asarray(direction_xy, dtype=np.float32)
-    if direction.shape != (2,):
-        raise ValueError("direction_xy must have shape (2,)")
-    linear = np.asarray(matrix, dtype=np.float32)[:2, :2]
-    transformed = linear @ direction
-    norm = float(np.linalg.norm(transformed))
-    if not np.isfinite(norm) or norm <= 1.0e-6:
-        return direction
-    return (transformed / norm).astype(np.float32)
+    @property
+    def raw_y_error_px(self) -> float:
+        return 0.5 * (
+            float(self.forward.result.raw_y_error_px) + float(self.reverse.result.raw_y_error_px)
+        )
 
 
 def _geometric_only_params(params: FiberStripAugmentParams) -> FiberStripAugmentParams:
@@ -441,23 +406,31 @@ def _orient_direction_to_previous(direction_xy: np.ndarray, previous_xy: np.ndar
     return unit.astype(np.float32)
 
 
-def _nearest_tta_point_for_reference(source_xy_grid: np.ndarray, point_xy: np.ndarray) -> np.ndarray | None:
-    source = np.asarray(source_xy_grid, dtype=np.float32)
+def _reference_point_to_tta(reference_to_tta_xy_grid: np.ndarray, point_xy: np.ndarray) -> np.ndarray | None:
+    grid = np.asarray(reference_to_tta_xy_grid, dtype=np.float32)
     point = np.asarray(point_xy, dtype=np.float32)
-    if source.ndim != 3 or source.shape[2] != 2 or point.shape != (2,):
-        raise ValueError("source_xy_grid must have shape H,W,2 and point_xy must have shape (2,)")
-    finite = np.isfinite(source).all(axis=2)
-    if not bool(finite.any()) or not bool(np.isfinite(point).all()):
+    if grid.ndim != 3 or grid.shape[2] != 2 or point.shape != (2,):
+        raise ValueError("reference_to_tta_xy_grid must have shape H,W,2 and point_xy must have shape (2,)")
+    height, width = grid.shape[:2]
+    x = float(point[0])
+    y = float(point[1])
+    if not np.isfinite(x) or not np.isfinite(y) or x < 0.0 or y < 0.0 or x > float(width - 1) or y > float(height - 1):
         return None
-    delta = source - point.reshape(1, 1, 2)
-    dist2 = np.sum(delta * delta, axis=2)
-    dist2 = np.where(finite, dist2, np.inf)
-    flat_index = int(np.argmin(dist2))
-    best = float(dist2.reshape(-1)[flat_index])
-    if not np.isfinite(best) or best > 4.0:
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    x1 = min(x0 + 1, width - 1)
+    y1 = min(y0 + 1, height - 1)
+    corners = grid[[y0, y0, y1, y1], [x0, x1, x0, x1]]
+    if not bool(np.isfinite(corners).all()):
         return None
-    y, x = np.unravel_index(flat_index, dist2.shape)
-    return np.asarray([float(x), float(y)], dtype=np.float32)
+    tx = np.float32(x - float(x0))
+    ty = np.float32(y - float(y0))
+    top = grid[y0, x0] * (1.0 - tx) + grid[y0, x1] * tx
+    bottom = grid[y1, x0] * (1.0 - tx) + grid[y1, x1] * tx
+    mapped = top * (1.0 - ty) + bottom * ty
+    if not bool(np.isfinite(mapped).all()):
+        return None
+    return mapped.astype(np.float32)
 
 
 def _source_grid_direction_to_reference(source_xy_grid: np.ndarray, point_xy: np.ndarray, direction_xy: np.ndarray) -> np.ndarray | None:
@@ -512,40 +485,6 @@ def _source_grid_point_to_reference(source_xy_grid: np.ndarray, point_xy: np.nda
     return (top * (1.0 - ty) + bottom * ty).astype(np.float32)
 
 
-def _reference_direction_to_source_grid_direction(
-    source_xy_grid: np.ndarray,
-    point_xy: np.ndarray,
-    reference_direction_xy: np.ndarray,
-) -> np.ndarray | None:
-    source = np.asarray(source_xy_grid, dtype=np.float32)
-    point = np.asarray(point_xy, dtype=np.float32)
-    direction = np.asarray(reference_direction_xy, dtype=np.float32)
-    if source.ndim != 3 or source.shape[2] != 2 or point.shape != (2,) or direction.shape != (2,):
-        raise ValueError("source_xy_grid must have shape H,W,2 and point/direction must have shape (2,)")
-    height, width = source.shape[:2]
-    x = int(round(float(point[0])))
-    y = int(round(float(point[1])))
-    if x < 0 or y < 0 or x >= width or y >= height:
-        return None
-    x0 = max(0, x - 1)
-    x1 = min(width - 1, x + 1)
-    y0 = max(0, y - 1)
-    y1 = min(height - 1, y + 1)
-    if x0 == x1 or y0 == y1:
-        return None
-    local = source[[y, y, y0, y1], [x0, x1, x, x]]
-    if not bool(np.isfinite(local).all()):
-        return None
-    dsource_dx = (source[y, x1] - source[y, x0]) / np.float32(x1 - x0)
-    dsource_dy = (source[y1, x] - source[y0, x]) / np.float32(y1 - y0)
-    jacobian = np.stack([dsource_dx, dsource_dy], axis=1).astype(np.float32)
-    transformed = np.linalg.pinv(jacobian).astype(np.float32) @ direction
-    norm = float(np.linalg.norm(transformed))
-    if not np.isfinite(norm) or norm <= 1.0e-6:
-        return None
-    return (transformed / norm).astype(np.float32)
-
-
 def _source_grid_points_to_reference(source_xy_grid: np.ndarray, points_xy: np.ndarray) -> np.ndarray:
     points = np.asarray(points_xy, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] != 2:
@@ -555,101 +494,6 @@ def _source_grid_points_to_reference(source_xy_grid: np.ndarray, points_xy: np.n
     if not finite:
         return np.zeros((0, 2), dtype=np.float32)
     return np.stack(finite, axis=0).astype(np.float32)
-
-
-def _warp_patch_by_matrix(
-    image: np.ndarray,
-    valid_mask: np.ndarray,
-    matrix_original_to_augmented: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    arr = np.asarray(image, dtype=np.float32)
-    valid = np.asarray(valid_mask, dtype=bool)
-    if arr.ndim != 2 or valid.shape != arr.shape:
-        raise ValueError("image and valid_mask must be matching 2D arrays")
-    height, width = arr.shape
-    inv = np.linalg.inv(np.asarray(matrix_original_to_augmented, dtype=np.float32))
-    yy, xx = torch.meshgrid(
-        torch.arange(height, dtype=torch.float32),
-        torch.arange(width, dtype=torch.float32),
-        indexing="ij",
-    )
-    ones = torch.ones_like(xx)
-    out = torch.stack([xx, yy, ones], dim=-1).reshape(-1, 3)
-    inv_t = torch.as_tensor(inv.T, dtype=torch.float32)
-    src = (out @ inv_t).reshape(height, width, 3)[..., :2]
-    if width > 1:
-        grid_x = src[..., 0] * (2.0 / float(width - 1)) - 1.0
-    else:
-        grid_x = torch.zeros_like(src[..., 0])
-    if height > 1:
-        grid_y = src[..., 1] * (2.0 / float(height - 1)) - 1.0
-    else:
-        grid_y = torch.zeros_like(src[..., 1])
-    grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-    image_t = torch.as_tensor(arr, dtype=torch.float32).view(1, 1, height, width)
-    valid_t = torch.as_tensor(valid.astype(np.float32), dtype=torch.float32).view(1, 1, height, width)
-    warped = F.grid_sample(image_t, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0]
-    warped_valid = F.grid_sample(valid_t, grid, mode="nearest", padding_mode="zeros", align_corners=True)[0, 0] > 0.5
-    return warped.numpy().astype(np.float32), warped_valid.numpy().astype(bool)
-
-
-def _warp_patch_by_augment_params(
-    image: np.ndarray,
-    valid_mask: np.ndarray,
-    params: FiberStripAugmentParams,
-    *,
-    device: torch.device,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    arr = np.asarray(image, dtype=np.float32)
-    valid = np.asarray(valid_mask, dtype=bool)
-    if arr.ndim != 2 or valid.shape != arr.shape:
-        raise ValueError("image and valid_mask must be matching 2D arrays")
-    height, width = arr.shape
-    source_xy = source_coordinate_grid_for_output(
-        height,
-        width,
-        height,
-        width,
-        _geometric_only_params(params),
-        device=device,
-    )
-    if width > 1:
-        grid_x = source_xy[..., 0] * (2.0 / float(width - 1)) - 1.0
-    else:
-        grid_x = torch.zeros_like(source_xy[..., 0])
-    if height > 1:
-        grid_y = source_xy[..., 1] * (2.0 / float(height - 1)) - 1.0
-    else:
-        grid_y = torch.zeros_like(source_xy[..., 1])
-    grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-    image_t = torch.as_tensor(arr, dtype=torch.float32, device=device).view(1, 1, height, width)
-    valid_t = torch.as_tensor(valid.astype(np.float32), dtype=torch.float32, device=device).view(1, 1, height, width)
-    warped = F.grid_sample(image_t, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0]
-    warped_valid = F.grid_sample(valid_t, grid, mode="nearest", padding_mode="zeros", align_corners=True)[0, 0] > 0.5
-    return (
-        warped.detach().cpu().numpy().astype(np.float32),
-        warped_valid.detach().cpu().numpy().astype(bool),
-        source_xy.detach().cpu().numpy().astype(np.float32),
-    )
-
-
-def _line_trace_tta_entries(shape_hw: tuple[int, int], loader: FiberStrip2DLoader) -> list[tuple[str, np.ndarray]]:
-    height, width = (int(v) for v in shape_hw)
-    shift_x = float(getattr(loader.config.augment, "shift_x", max(1.0, float(width) * 0.25)))
-    shift_y = float(getattr(loader.config.augment, "shift_y", max(1.0, float(height) * 0.25)))
-    variants = [
-        ("flip_h", dict(flip_x=True)),
-        ("flip_v", dict(flip_y=True)),
-        ("flip_hv", dict(flip_x=True, flip_y=True)),
-        ("rot90", dict(rotation_degrees=90)),
-        ("rot180", dict(rotation_degrees=180)),
-        ("rot270", dict(rotation_degrees=270)),
-        ("shift_x_min", dict(shift_xy=(-shift_x, 0.0))),
-        ("shift_x_max", dict(shift_xy=(shift_x, 0.0))),
-        ("shift_y_min", dict(shift_xy=(0.0, -shift_y))),
-        ("shift_y_max", dict(shift_xy=(0.0, shift_y))),
-    ]
-    return [(name, _trace_tta_matrix(shape_hw, **kwargs)) for name, kwargs in variants]
 
 
 def _prepare_model_image(image: np.ndarray, valid_mask: np.ndarray, *, device: torch.device) -> torch.Tensor:
@@ -705,7 +549,13 @@ def _predict_direction_field(
     with torch.no_grad():
         input_image = _prepare_model_image(image, valid_mask, device=device)
         encoded = model(input_image)[0].permute(1, 2, 0)
-        return decode_lasagna_direction_xy(encoded, bins=720).detach().cpu().numpy().astype(np.float32)
+        return decode_lasagna_direction_xy(encoded).detach().cpu().numpy().astype(np.float32)
+
+
+def _identity_source_xy_grid(shape_hw: tuple[int, int]) -> np.ndarray:
+    height, width = (int(v) for v in shape_hw)
+    yy, xx = np.indices((height, width), dtype=np.float32)
+    return np.stack([xx, yy], axis=-1).astype(np.float32)
 
 
 def _sample_tta_direction_in_reference(
@@ -715,25 +565,15 @@ def _sample_tta_direction_in_reference(
 ) -> np.ndarray | None:
     candidates: list[np.ndarray] = []
     for field in fields:
-        if field.source_xy_grid is not None:
-            tta_point = _nearest_tta_point_for_reference(field.source_xy_grid, point_xy)
-            if tta_point is None:
-                continue
-        elif field.matrix_ref_to_tta is not None:
-            tta_point = _transform_points_xy(point_xy, field.matrix_ref_to_tta)[0]
-        else:
-            raise ValueError(f"TTA field {field.name!r} has no point transform")
+        tta_point = _reference_point_to_tta(field.reference_to_tta_xy_grid, point_xy)
+        if tta_point is None:
+            continue
         sampled = _bilinear_direction_sample(field.direction_xy, tta_point, valid_mask=field.valid_mask)
         if sampled is None:
             continue
-        if field.source_xy_grid is not None:
-            sampled_ref = _source_grid_direction_to_reference(field.source_xy_grid, tta_point, sampled)
-            if sampled_ref is None:
-                continue
-        elif field.matrix_tta_to_ref is not None:
-            sampled_ref = _transform_direction_xy(sampled, field.matrix_tta_to_ref)
-        else:
-            raise ValueError(f"TTA field {field.name!r} has no orientation transform")
+        sampled_ref = _source_grid_direction_to_reference(field.source_xy_grid, tta_point, sampled)
+        if sampled_ref is None:
+            continue
         oriented = _orient_direction_to_previous(sampled_ref, previous_xy)
         if oriented is not None:
             candidates.append(oriented)
@@ -963,6 +803,116 @@ def _score_trace2cp(
     )
 
 
+def _trace_score_trace2cp_direction(
+    direction_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+) -> _Trace2CpDirectionResult:
+    traced_line, reason = _trace_direction_line_to_target(
+        direction_xy,
+        start_xy,
+        target_xy,
+        valid_mask=valid_mask,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    result = _score_trace2cp(
+        traced_line,
+        target_xy,
+        shape_hw=(int(direction_xy.shape[0]), int(direction_xy.shape[1])),
+        rf_margin_px=rf_margin_px,
+        termination_reason=reason,
+    )
+    return _Trace2CpDirectionResult(trace_xy=traced_line, result=result)
+
+
+def _trace_score_trace2cp_bidirectional(
+    direction_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+) -> _Trace2CpBidirectionalResult:
+    forward = _trace_score_trace2cp_direction(
+        direction_xy,
+        start_xy,
+        target_xy,
+        valid_mask=valid_mask,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    reverse = _trace_score_trace2cp_direction(
+        direction_xy,
+        target_xy,
+        start_xy,
+        valid_mask=valid_mask,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse)
+
+
+def _trace_score_trace2cp_median_tta_direction(
+    fields: list[_TtaDirectionField],
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    shape_hw: tuple[int, int],
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+) -> _Trace2CpDirectionResult:
+    traced_line, reason = _trace_median_tta_direction_line_to_target(
+        fields,
+        start_xy,
+        target_xy,
+        shape_hw=shape_hw,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    result = _score_trace2cp(
+        traced_line,
+        target_xy,
+        shape_hw=shape_hw,
+        rf_margin_px=rf_margin_px,
+        termination_reason=reason,
+    )
+    return _Trace2CpDirectionResult(trace_xy=traced_line, result=result)
+
+
+def _trace_score_trace2cp_median_tta_bidirectional(
+    fields: list[_TtaDirectionField],
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    shape_hw: tuple[int, int],
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+) -> _Trace2CpBidirectionalResult:
+    forward = _trace_score_trace2cp_median_tta_direction(
+        fields,
+        start_xy,
+        target_xy,
+        shape_hw=shape_hw,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    reverse = _trace_score_trace2cp_median_tta_direction(
+        fields,
+        target_xy,
+        start_xy,
+        shape_hw=shape_hw,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse)
+
+
 def _export_line_trace_vis(
     loader: FiberStrip2DLoader,
     sample_index: int,
@@ -1009,24 +959,30 @@ def _export_line_trace_vis(
         params = _geometric_only_params(random_combined_augmentation(loader.config.augment, sample_index, variant_index))
         tta_name = f"random_{variant_index:03d}"
         try:
-            tta_image, tta_valid, source_xy_grid = _warp_patch_by_augment_params(
-                image,
-                valid_mask,
+            tta_patch = loader.build_center_tta_patch_from_sample(
+                sample,
                 params,
+                rf_margin_px=margin,
                 device=device,
             )
-            tta_cp = _nearest_tta_point_for_reference(source_xy_grid, cp_xy)
-            if tta_cp is None:
-                raise ValueError("could not invert CP into TTA patch")
-            tta_tangent = _reference_direction_to_source_grid_direction(source_xy_grid, tta_cp, tangent_xy)
-            if tta_tangent is None:
-                raise ValueError("could not transform tangent into TTA patch")
+            tta_image = tta_patch.image
+            tta_valid = tta_patch.valid_mask
+            source_xy_grid = tta_patch.source_xy_grid
+            reference_to_tta_xy_grid = tta_patch.reference_to_tta_xy_grid
+            tta_sample = tta_patch.sample
+            tta_cp_tangent = line_cp_and_tangent_xy(tta_sample.line_xy, tta_sample.control_point_xy)
+            if tta_cp_tangent is None:
+                raise ValueError("could not derive transformed CP/tangent in TTA patch")
+            tta_cp, tta_tangent = tta_cp_tangent
+            if _reference_point_to_tta(reference_to_tta_xy_grid, cp_xy) is None:
+                raise ValueError("could not map CP into TTA patch")
             tta_direction = _predict_direction_field(model, tta_image, tta_valid, device=device)
             field = _TtaDirectionField(
                 name=tta_name,
                 direction_xy=tta_direction,
                 valid_mask=tta_valid,
                 source_xy_grid=source_xy_grid,
+                reference_to_tta_xy_grid=reference_to_tta_xy_grid,
             )
             random_tta_fields.append(field)
             tta_trace = _trace_direction_line(
@@ -1053,14 +1009,13 @@ def _export_line_trace_vis(
     med_trace: np.ndarray | None = None
     med_tta_fields_count = 0
     if med_tta:
-        identity = np.eye(3, dtype=np.float32)
         med_fields = [
             _TtaDirectionField(
                 name="reference",
                 direction_xy=direction_xy,
                 valid_mask=np.asarray(valid_mask, dtype=bool),
-                matrix_ref_to_tta=identity,
-                matrix_tta_to_ref=identity,
+                source_xy_grid=_identity_source_xy_grid(image.shape),
+                reference_to_tta_xy_grid=_identity_source_xy_grid(image.shape),
             ),
         ]
         med_fields.extend(random_tta_fields)
@@ -1111,15 +1066,25 @@ def _draw_trace2cp_overlay(
     image_u8: np.ndarray,
     *,
     line_xy: np.ndarray,
-    trace_xy: np.ndarray,
     start_xy: np.ndarray,
     target_xy: np.ndarray,
-    result: _Trace2CpResult,
+    bidirectional_result: _Trace2CpBidirectionalResult,
 ) -> np.ndarray:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.35, thickness=1)
-    overlay = _overlay_polyline_rgb(overlay, trace_xy, color_rgba=(0, 255, 0, 230), thickness=1)
+    overlay = _overlay_polyline_rgb(
+        overlay,
+        bidirectional_result.forward.trace_xy,
+        color_rgba=(0, 255, 0, 230),
+        thickness=1,
+    )
+    overlay = _overlay_polyline_rgb(
+        overlay,
+        bidirectional_result.reverse.trace_xy,
+        color_rgba=(255, 64, 220, 230),
+        thickness=1,
+    )
     arr = np.asarray(overlay, dtype=np.uint8)
     pil = Image.fromarray(arr, mode="RGB")
     draw = ImageDraw.Draw(pil, mode="RGBA")
@@ -1128,6 +1093,7 @@ def _draw_trace2cp_overlay(
     sx, sy = (float(v) for v in np.asarray(start_xy, dtype=np.float32))
     tx, ty = (float(v) for v in np.asarray(target_xy, dtype=np.float32))
     if np.isfinite([sx, sy]).all():
+        draw.line((sx, 0.0, sx, float(height - 1)), fill=(32, 255, 255, 100), width=1)
         draw.ellipse((sx - 2.0, sy - 2.0, sx + 2.0, sy + 2.0), outline=(32, 255, 255, 255), width=1)
     if np.isfinite([tx, ty]).all():
         draw.line((tx, 0.0, tx, float(height - 1)), fill=(255, 220, 64, 130), width=1)
@@ -1138,11 +1104,88 @@ def _draw_trace2cp_overlay(
         draw.line((tx, ty - arm, tx, ty - gap), fill=(255, 220, 64, 255), width=1)
         draw.line((tx, ty + gap, tx, ty + arm), fill=(255, 220, 64, 255), width=1)
 
+    forward = bidirectional_result.forward.result
+    reverse = bidirectional_result.reverse.result
     label = (
-        f"score={result.score:.4f} yerr={result.raw_y_error_px:.2f}px "
-        f"hit={int(result.reached_target_column)} reason={result.reason}"
+        f"score={bidirectional_result.score:.4f} "
+        f"f={forward.score:.4f} r={reverse.score:.4f} "
+        f"hit={int(forward.reached_target_column)}/{int(reverse.reached_target_column)}"
     )
     return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
+
+
+def _base_corners_xy(shape_hw: tuple[int, int]) -> np.ndarray:
+    height, width = (int(v) for v in shape_hw)
+    return np.asarray(
+        [
+            [0.0, 0.0],
+            [float(width - 1), 0.0],
+            [float(width - 1), float(height - 1)],
+            [0.0, float(height - 1)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _draw_trace2cp_tta_slice(
+    image: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    base_corners_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    label: str,
+) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    arr = _to_u8_image(image, valid_mask)
+    rgb = np.repeat(arr[..., None], 3, axis=-1)
+    pil = Image.fromarray(rgb, mode="RGB")
+    overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, mode="RGBA")
+    corners = np.asarray(base_corners_xy, dtype=np.float32)
+    if corners.shape == (4, 2) and bool(np.isfinite(corners).all()):
+        points = [(float(x), float(y)) for x, y in corners.tolist()]
+        draw.line(points + [points[0]], fill=(255, 220, 64, 230), width=1)
+    for point_xy, color in (
+        (start_xy, (32, 255, 255, 255)),
+        (target_xy, (255, 64, 220, 255)),
+    ):
+        point = np.asarray(point_xy, dtype=np.float32)
+        if point.shape == (2,) and bool(np.isfinite(point).all()):
+            x = float(point[0])
+            y = float(point[1])
+            draw.ellipse((x - 2.0, y - 2.0, x + 2.0, y + 2.0), outline=color, width=1)
+    return _draw_label_band(
+        np.asarray(Image.alpha_composite(pil.convert("RGBA"), overlay).convert("RGB"), dtype=np.uint8),
+        label,
+    )
+
+
+def _write_trace2cp_tta_debug_images(
+    output_dir: Path,
+    entries: list[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+) -> Path:
+    tta_dir = output_dir / "trace2cp_tta"
+    tta_dir.mkdir(parents=True, exist_ok=True)
+    debug_images: list[np.ndarray] = []
+    labels: list[str] = []
+    for name, image, valid_mask, corners_xy, start_xy, target_xy in entries:
+        label = f"{name} shape={int(image.shape[0])}x{int(image.shape[1])}"
+        drawn = _draw_trace2cp_tta_slice(
+            image,
+            valid_mask,
+            base_corners_xy=corners_xy,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            label=label,
+        )
+        _write_jpg(tta_dir / f"{name}.jpg", drawn)
+        debug_images.append(drawn)
+        labels.append(name)
+    _write_contact_sheet(tta_dir / "contact_sheet.jpg", debug_images, columns=4, labels=labels)
+    return tta_dir
+
 
 def _export_trace2cp_vis(
     loader: FiberStrip2DLoader,
@@ -1156,6 +1199,7 @@ def _export_trace2cp_vis(
     target_cp_index: int | None,
     med_tta: bool = False,
     line_trace_tta_count: int = 100,
+    vis_tta: bool = False,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -1174,7 +1218,7 @@ def _export_trace2cp_vis(
     direction_xy = _predict_direction_field(model, image, valid_mask, device=device)
     start_xy = np.asarray(sample.start_control_point_xy, dtype=np.float32)
     target_xy = np.asarray(sample.target_control_point_xy, dtype=np.float32)
-    traced_line, reason = _trace_direction_line_to_target(
+    selected_result = _trace_score_trace2cp_bidirectional(
         direction_xy,
         start_xy,
         target_xy,
@@ -1182,45 +1226,54 @@ def _export_trace2cp_vis(
         step_px=step_px,
         rf_margin_px=margin,
     )
-    result = _score_trace2cp(
-        traced_line,
-        target_xy,
-        shape_hw=image.shape,
-        rf_margin_px=margin,
-        termination_reason=reason,
-    )
     tta_rows: list[str] = []
     tta_count = max(0, int(line_trace_tta_count)) if med_tta else 0
-    selected_trace = traced_line
-    selected_result = result
-    selected_reason = reason
     selected_mode = "base"
     med_fields_count = 0
+    tta_debug_entries: list[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    tta_debug_dir: Path | None = None
     if med_tta:
-        identity = np.eye(3, dtype=np.float32)
         med_fields = [
             _TtaDirectionField(
                 name="reference",
                 direction_xy=direction_xy,
                 valid_mask=np.asarray(valid_mask, dtype=bool),
-                matrix_ref_to_tta=identity,
-                matrix_tta_to_ref=identity,
+                source_xy_grid=_identity_source_xy_grid(image.shape),
+                reference_to_tta_xy_grid=_identity_source_xy_grid(image.shape),
             ),
         ]
+        if vis_tta:
+            tta_debug_entries.append(
+                (
+                    "reference",
+                    image,
+                    valid_mask,
+                    _base_corners_xy(image.shape),
+                    start_xy,
+                    target_xy,
+                )
+            )
         for variant_index in range(tta_count):
             params = _trace2cp_tta_params(
                 random_combined_augmentation(loader.config.augment, sample_index, variant_index)
             )
             tta_name = f"random_{variant_index:03d}"
             try:
-                tta_image, tta_valid, source_xy_grid = _warp_patch_by_augment_params(
-                    image,
-                    valid_mask,
+                tta_patch = loader.build_trace2cp_tta_patch_from_sample(
+                    sample,
                     params,
+                    rf_margin_px=margin,
                     device=device,
                 )
-                tta_start = _nearest_tta_point_for_reference(source_xy_grid, start_xy)
-                tta_target = _nearest_tta_point_for_reference(source_xy_grid, target_xy)
+                tta_image = tta_patch.image
+                tta_valid = tta_patch.valid_mask
+                source_xy_grid = tta_patch.source_xy_grid
+                reference_to_tta_xy_grid = tta_patch.reference_to_tta_xy_grid
+                tta_sample = tta_patch.sample
+                tta_start_xy = np.asarray(tta_sample.start_control_point_xy, dtype=np.float32)
+                tta_target_xy = np.asarray(tta_sample.target_control_point_xy, dtype=np.float32)
+                tta_start = _reference_point_to_tta(reference_to_tta_xy_grid, start_xy)
+                tta_target = _reference_point_to_tta(reference_to_tta_xy_grid, target_xy)
                 if tta_start is None or tta_target is None:
                     raise ValueError("could not map start/target CP into TTA patch")
                 med_fields.append(
@@ -1229,13 +1282,27 @@ def _export_trace2cp_vis(
                         direction_xy=_predict_direction_field(model, tta_image, tta_valid, device=device),
                         valid_mask=tta_valid,
                         source_xy_grid=source_xy_grid,
+                        reference_to_tta_xy_grid=reference_to_tta_xy_grid,
                     )
                 )
-                tta_rows.append(f"{tta_name}: field=ok")
+                if vis_tta:
+                    tta_debug_entries.append(
+                        (
+                            tta_name,
+                            tta_image,
+                            tta_valid,
+                            tta_patch.base_corners_xy,
+                            tta_start_xy,
+                            tta_target_xy,
+                        )
+                    )
+                tta_rows.append(
+                    f"{tta_name}: field=ok shape_hw=({int(tta_image.shape[0])}, {int(tta_image.shape[1])})"
+                )
             except (ValueError, np.linalg.LinAlgError) as exc:
                 tta_rows.append(f"{tta_name}: skipped={exc}")
         med_fields_count = len(med_fields)
-        selected_trace, selected_reason = _trace_median_tta_direction_line_to_target(
+        selected_result = _trace_score_trace2cp_median_tta_bidirectional(
             med_fields,
             start_xy,
             target_xy,
@@ -1243,25 +1310,24 @@ def _export_trace2cp_vis(
             step_px=step_px,
             rf_margin_px=margin,
         )
-        selected_result = _score_trace2cp(
-            selected_trace,
-            target_xy,
-            shape_hw=image.shape,
-            rf_margin_px=margin,
-            termination_reason=selected_reason,
-        )
         selected_mode = "med_tta"
+        if vis_tta and tta_debug_entries:
+            tta_debug_dir = _write_trace2cp_tta_debug_images(out, tta_debug_entries)
 
     image_u8 = _to_u8_image(image, valid_mask)
     overlay = _draw_trace2cp_overlay(
         image_u8,
         line_xy=sample.line_xy,
-        trace_xy=selected_trace,
         start_xy=start_xy,
         target_xy=target_xy,
-        result=selected_result,
+        bidirectional_result=selected_result,
     )
     _write_jpg(out / "trace2cp_vis.jpg", overlay)
+    forward = selected_result.forward.result
+    reverse = selected_result.reverse.result
+    trace_points = int(selected_result.forward.trace_xy.shape[0]) + int(
+        selected_result.reverse.trace_xy.shape[0]
+    )
     summary = [
         f"sample_index={sample_index}",
         f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
@@ -1276,14 +1342,26 @@ def _export_trace2cp_vis(
         f"step_px={float(step_px):.3f}",
         f"rf_margin_px={margin:.3f}",
         f"trace_mode={selected_mode}",
-        f"trace_points={int(selected_trace.shape[0])}",
+        f"trace_points={trace_points}",
         f"trace2cp_score={selected_result.score:.8f}",
         f"raw_y_error_px={selected_result.raw_y_error_px:.6f}",
-        f"target_x={selected_result.target_x:.6f}",
-        f"trace_y_at_target_x={selected_result.trace_y_at_target_x:.6f}",
-        f"reached_target_column={selected_result.reached_target_column}",
-        f"termination_reason={selected_result.reason}",
+        f"forward_trace_points={int(selected_result.forward.trace_xy.shape[0])}",
+        f"forward_trace2cp_score={forward.score:.8f}",
+        f"forward_raw_y_error_px={forward.raw_y_error_px:.6f}",
+        f"forward_target_x={forward.target_x:.6f}",
+        f"forward_trace_y_at_target_x={forward.trace_y_at_target_x:.6f}",
+        f"forward_reached_target_column={forward.reached_target_column}",
+        f"forward_termination_reason={forward.reason}",
+        f"reverse_trace_points={int(selected_result.reverse.trace_xy.shape[0])}",
+        f"reverse_trace2cp_score={reverse.score:.8f}",
+        f"reverse_raw_y_error_px={reverse.raw_y_error_px:.6f}",
+        f"reverse_target_x={reverse.target_x:.6f}",
+        f"reverse_trace_y_at_target_x={reverse.trace_y_at_target_x:.6f}",
+        f"reverse_reached_target_column={reverse.reached_target_column}",
+        f"reverse_termination_reason={reverse.reason}",
         f"med_tta={bool(med_tta)}",
+        f"vis_tta={bool(vis_tta)}",
+        f"trace2cp_tta_debug_dir={str(tta_debug_dir) if tta_debug_dir is not None else ''}",
         f"line_trace_tta_count={tta_count}",
         f"med_tta_fields={med_fields_count}",
         "tta_fields:",
@@ -1296,8 +1374,9 @@ def _export_trace2cp_vis(
         f"start_cp={sample.start_control_point_index} target_cp={sample.target_control_point_index} "
         f"mode={selected_mode} score={selected_result.score:.8f} "
         f"raw_y_error_px={selected_result.raw_y_error_px:.6f} "
-        f"target_x={selected_result.target_x:.3f} "
-        f"reached={selected_result.reached_target_column} reason={selected_result.reason}"
+        f"forward_score={forward.score:.8f} reverse_score={reverse.score:.8f} "
+        f"forward_reached={forward.reached_target_column} reverse_reached={reverse.reached_target_column} "
+        f"forward_reason={forward.reason} reverse_reason={reverse.reason}"
     )
     print(f"exported trace2cp_vis.jpg and trace2cp_summary.txt to {out}")
 
@@ -1663,6 +1742,7 @@ def main() -> None:
     parser.add_argument("--line-trace-vis", action="store_true")
     parser.add_argument("--trace2cp-vis", action="store_true")
     parser.add_argument("--med-tta", action="store_true")
+    parser.add_argument("--vis-tta", action="store_true")
     parser.add_argument("--dir-vis", action="store_true")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--line-trace-step", type=float, default=4.0)
@@ -1738,6 +1818,7 @@ def main() -> None:
             line_trace_tta_count=(
                 args.line_trace_tta_count if args.med_tta_count is None else args.med_tta_count
             ),
+            vis_tta=args.vis_tta,
         )
         return
 

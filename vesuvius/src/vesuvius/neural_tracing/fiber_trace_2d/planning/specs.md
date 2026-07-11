@@ -76,6 +76,13 @@
 - Augmentation config keys include `augment_enabled`, `augment_device`, `augment_seed`, `augment_shift_x`, `augment_shift_y`, `augment_rotation_degrees`, `augment_shear_x`, `augment_shear_y`, `augment_scale_min`, `augment_scale_max`, `augment_smooth_offset`, `augment_smooth_offset_stride`, `augment_brightness`, `augment_contrast_min`, `augment_contrast_max`, `augment_gamma_min`, `augment_gamma_max`, `augment_noise_std`, and `augment_blur_sigma`.
 - Default augmentation extrema are `+-patch_width/4` px horizontal offset, `+-patch_height/4` px vertical offset, `+-180` degree rotation, `+-1` px/px shear, `sqrt(0.5)x..sqrt(2.0)x` scale, smooth curve offset up to `+-8` px with 16 px control stride, `+-0.25` valid-range brightness offset, `0.5x..2.0x` contrast around the valid patch center, `0.5..2.0` gamma, valid-range-relative noise std up to `0.125`, and Gaussian blur sigma up to `2.0`.
 - Geometric strip augmentations operate on strip coordinates before image sampling.
+- we must never do geometric augmentations as image space operations. No helper,
+  function, or API in `fiber_trace_2d` may geometrically warp, rotate, scale,
+  shear, translate, resize, or flip an already sampled image/tensor. Such
+  image-space geometric augmentation functions must not exist in this
+  subproject.
+- Image-space operations after sampling are allowed only for value-only changes
+  such as brightness, contrast, gamma, noise, and blur.
 - Geometric augmentation builds an oversized strip-coordinate source area, maps output patch pixels into that source, and samples the volume once at the final augmented coordinates to avoid edge and image reinterpolation artifacts.
 - Geometric augmentation map handling is centralized in one paired fused map
   object. In this spec, "fused map" means actual precomputed coordinate map
@@ -84,11 +91,19 @@
   output shape, augmentation parameters, and torch device. It must store:
   `backward_map_xy` for output pixel -> source pixel sampling, and
   `forward_map_xy` for source pixel -> output pixel line/control-point lookup.
+- Both geometric map directions must be built explicitly as paired concrete
+  map tensors during augmentation construction. Runtime consumers must never
+  invert one map direction into the other after the fact, including by
+  nearest-neighbor searches, brute-force distance scans, iterative solvers, or
+  analytic/formula re-evaluation. If a runner, loader, target, or visualization
+  path needs the opposite direction, it must receive and sample the prebuilt
+  opposite map.
 - Every geometric augmentation stage is baked into those map tensors at
   construction time: translation, flips, scale, shear, rotation, and smooth
   offset. No geometric augmentation may invert coordinates with rasterized
   masks, image warps, nearest-neighbor searches over the output grid,
-  brute-force distance scans, or iterative solvers.
+  brute-force distance scans, iterative solvers, or runtime analytic inverse
+  formulas.
 - Smooth offset augmentation is a direct paired vertical map in source-strip
   coordinates. The output-to-source map applies the smooth offset as
   `source_y += f(source_x)`, and the source-to-output point map applies the
@@ -229,6 +244,11 @@
 - V0 model output is exactly two per-pixel direction channels in the Lasagna ambiguous two-cos-channel encoding.
 - For strip-image tangent angle `theta`, target channels are `0.5 + 0.5*cos(2*theta)` and `0.5 + 0.5*cos(2*theta + pi/4)`.
 - Equivalent implementation formulas are `cos2theta=(dx^2-dy^2)/(dx^2+dy^2+eps)`, `sin2theta=2*dx*dy/(dx^2+dy^2+eps)`, `dir0=0.5+0.5*cos2theta`, and `dir1=0.5+0.5*(cos2theta-sin2theta)/sqrt(2)`.
+- Lasagna two-channel direction decoding must use the analytic inverse:
+  `cos2theta=2*d0-1`,
+  `sin2theta=cos2theta-sqrt(2)*(2*d1-1)`, and
+  `theta=atan2(sin2theta, cos2theta)/2`. Binned or candidate-angle lookup
+  decoders must not exist anywhere in `fiber_trace_2d`.
 - Forward/backward ambiguity comes from the double-angle encoding itself; `(dx,dy)` and `(-dx,-dy)` must encode identically.
 - Direction targets are derived from the transformed output-pixel line coordinates produced by the same augmentation path as the image. They must not be derived from unaugmented line points for augmented patches.
 - Each loaded strip sample carries the transformed control-point output-pixel coordinate. V0 direction supervision is limited to the eight neighboring pixels around that rounded transformed control-point location, filtered by image validity and patch bounds.
@@ -250,10 +270,10 @@
 - The line tracer bilinearly samples the decoded per-pixel direction field, flips sampled directions as needed to maintain forward/backward sign continuity, and steps in strip-pixel coordinates.
 - The line tracer stops when the next point would enter the configured receptive-field border margin, when the sampled direction is invalid, or when image validity around the bilinear sample is insufficient. By default the receptive-field margin is `model_depth`; `--line-trace-rf-margin` can override it for inspection.
 - The default line-trace step is `4.0` strip-image pixels and can be overridden with `--line-trace-step`.
-- Line-tracing inspection writes `line_trace_vis.jpg` as a two-column image by default: the first column is the original transformed strip line plus the unaugmented direction-traced line, and the second column is the same original patch with a flock of traces from random combined geometric test-time augmentations inverse-warped back into original patch coordinates.
+- Line-tracing inspection writes `line_trace_vis.jpg` as a two-column image by default: the first column is the original transformed strip line plus the unaugmented direction-traced line, and the second column is the same original patch with a flock of traces from random combined geometric test-time augmentations mapped back through TTA output-to-reference coordinate grids.
 - Line-trace test-time augmentations are deterministic per `sample_index` and are sampled from the regular training geometric augmentation ranges: shift, rotation, shear, scale, smooth offset, and flips. Value-only augmentations are not applied for line tracing.
 - `--line-trace-tta-count` controls the number of random geometric TTA variants and defaults to `100`. `--med-tta-count` is accepted as a compatibility alias for the same count.
-- Line-trace TTA runs the model and tracer in augmented patch coordinates, then uses the augmentation source-coordinate grid to inverse-map traced points back into original patch coordinates before drawing. It writes per-TTA trace counts to `line_trace_summary.txt`.
+- Line-trace TTA constructs augmented coordinate grids from the base patch coordinates, samples the volume at those coordinates, runs the model and tracer in augmented patch coordinates, then uses the TTA output-to-reference coordinate grid to map traced points back into original patch coordinates before drawing. It writes per-TTA trace counts to `line_trace_summary.txt`.
 - `--line-trace-vis --med-tta` adds a third `line_trace_vis.jpg` column for
   median test-time augmentation tracing. Median TTA traces in the unaugmented
   reference patch space; at each trace step it transforms the current reference
@@ -282,40 +302,62 @@
   column. It does not use the neural-tracing 3D crop loader.
 - Trace2CP samples the center strip-z image only, runs the checkpointed
   direction model, decodes the Lasagna ambiguous two-cos-channel output, and
-  traces one direction from the start CP toward the target CP. The trace uses
-  `--line-trace-step` and the line-trace receptive-field margin default
-  `model_depth`, overrideable with `--line-trace-rf-margin`.
-- Trace2CP scoring evaluates the traced y coordinate at the target CP x-column.
-  If the trace crosses that x-column, the y coordinate is linearly interpolated
-  between bracketing trace points. The raw error is
-  `abs(trace_y_at_target_x - target_cp_y)`.
-- Trace2CP normalized score is clamped to `0..1`; `0.0` is an exact y-hit at
-  the target column, and `1.0` is a miss at the usable strip edge or failure to
-  reach the target column. The denominator is the target CP's distance to the
-  nearest usable vertical strip edge after the receptive-field margin is
-  excluded.
+  traces the same selected segment in both directions: start CP to target CP,
+  and target CP back to start CP on the same segment strip. Each directional
+  trace uses `--line-trace-step` and the line-trace receptive-field margin
+  default `model_depth`, overrideable with `--line-trace-rf-margin`.
+- Each Trace2CP direction initializes its ambiguous-direction sign from the
+  vector pointing from that direction's start CP to its target CP. The reverse
+  trace therefore starts at the second CP and is seeded toward the first CP.
+- Per-direction Trace2CP scoring evaluates the traced y coordinate at that
+  direction's target CP x-column. If the trace crosses that x-column, the y
+  coordinate is linearly interpolated between bracketing trace points. The raw
+  error is `abs(trace_y_at_target_x - target_cp_y)`.
+- Per-direction Trace2CP normalized score is clamped to `0..1`; `0.0` is an
+  exact y-hit at the direction's target column, and `1.0` is a miss at the
+  usable strip edge or failure to reach the target column. The denominator is
+  the direction target CP's distance to the nearest usable vertical strip edge
+  after the receptive-field margin is excluded. The public `trace2cp_score` is
+  the arithmetic mean of the forward and reverse normalized scores.
 - Trace2CP uses `--med-tta` to determine whether TTA is used. Without
-  `--med-tta`, it traces and scores only the base strip direction field. With
-  `--med-tta`, it builds deterministic random geometric TTA direction fields
-  using `--line-trace-tta-count`, default `100`, and traces one median-TTA line
-  in the reference segment strip.
+  `--med-tta`, it traces and scores both directions on the base strip
+  direction field. With `--med-tta`, it builds deterministic random geometric
+  TTA direction fields using `--line-trace-tta-count`, default `100`, and
+  traces both median-TTA directions in the reference segment strip.
 - Trace2CP TTA samples from the regular training geometric augmentation ranges
   but forces y-shift to zero and scale to one for long-strip target-column
-  semantics. The median trace is stepped in the reference segment strip by
-  sampling the reference and TTA direction fields, mapping TTA directions back
-  to reference coordinates, resolving ambiguous signs against the previous
-  step, and using the normalized component-wise median direction.
+  semantics. Each TTA field is built by transforming the segment coordinate
+  grid first, then sampling the volume at those coordinates. It must not warp
+  the already sampled base segment image.
+- Trace2CP TTA output canvases are sized so the transformed base segment-strip
+  corner footprint fits in the TTA image. Pixels that map outside the base
+  coordinate strip or volume stay invalid/black.
+- The Trace2CP median trace is stepped in the reference segment strip by
+  sampling the reference and TTA direction fields, mapping each current
+  reference trace point into each TTA field through the prebuilt
+  reference-to-TTA map, mapping TTA directions back to reference coordinates
+  through each TTA output-to-reference coordinate grid, resolving ambiguous
+  signs against the previous step, and using the normalized component-wise
+  median direction. It must not locate reference points in TTA fields by
+  scanning the dense output-to-reference grid.
+- `--trace2cp-vis --med-tta --vis-tta` writes `trace2cp_tta/reference.jpg`,
+  one `trace2cp_tta/random_NNN.jpg` per generated TTA field, and a contact
+  sheet. Each TTA debug image shows the sampled TTA slice with the transformed
+  base-strip corner outline and start/target CP markers.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
   a concise stdout line with sample index, fiber path, start/target CP indices,
-  trace mode, normalized score, raw y error in pixels, target x-column, and
-  trace status. The JPG is always a single strip image containing the two CPs,
-  one traced line, and the score in a top label band; it does not add separate
-  TTA/flock columns or draw score text over image pixels.
+  trace mode, averaged normalized score, averaged raw y error in pixels, and
+  per-direction normalized scores, raw errors, target x-columns, reach statuses,
+  termination reasons, and trace point counts. The JPG is always a single strip
+  image containing the two CPs, both directional traced lines, and the averaged
+  score in a top label band; it does not add separate TTA/flock columns or draw
+  score text over image pixels.
 - Trace2CP target-column crossing takes precedence over RF-margin rejection for
-  the next step. If a step crosses the target x-column and would also enter the
-  RF margin, the trace is considered to have reached the target column and the
-  score is computed by interpolation at the target column. RF-margin stop
-  reasons should identify whether the x margin, y margin, or both were hit.
+  the next step in each direction. If a step crosses that direction's target
+  x-column and would also enter the RF margin, the trace is considered to have
+  reached the target column and the score is computed by interpolation at the
+  target column. RF-margin stop reasons should identify whether the x margin,
+  y margin, or both were hit.
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
 - Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.

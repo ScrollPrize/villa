@@ -679,7 +679,7 @@ def transformed_centerline_coords_torch(
     ]
     if coords.numel() == 0:
         return torch.zeros((0, 2), dtype=torch.float32, device=device)
-    # Remove adjacent duplicates from nearest-pixel inversion while preserving order.
+    # Remove adjacent duplicate output pixels while preserving source-line order.
     rounded = torch.round(coords)
     keep = torch.ones((rounded.shape[0],), dtype=torch.bool, device=device)
     keep[1:] = torch.any(rounded[1:] != rounded[:-1], dim=1)
@@ -745,136 +745,6 @@ def transformed_source_point_coords(
         .numpy()
         .astype(np.float32)
     )
-
-
-def _nearest_output_pixels_for_source_points(
-    source_flat_xy: torch.Tensor,
-    output_flat_xy: torch.Tensor,
-    target_source_xy: torch.Tensor,
-    *,
-    max_distance_sq: float = 4.0,
-    chunk_size: int = 256,
-) -> torch.Tensor:
-    kept: list[torch.Tensor] = []
-    for start in range(0, int(target_source_xy.shape[0]), int(chunk_size)):
-        target = target_source_xy[start : start + int(chunk_size)]
-        delta = source_flat_xy[:, None, :] - target[None, :, :]
-        dist2 = torch.sum(delta * delta, dim=2)
-        best_dist, best_index = torch.min(dist2, dim=0)
-        valid = best_dist <= float(max_distance_sq)
-        if bool(valid.any().item()):
-            kept.append(output_flat_xy[best_index[valid]])
-    if not kept:
-        return torch.zeros((0, 2), dtype=output_flat_xy.dtype, device=output_flat_xy.device)
-    return torch.cat(kept, dim=0)
-
-
-def _transformed_source_point_coords_affine(
-    output_shape_hw: tuple[int, int],
-    source_shape_hw: tuple[int, int],
-    params: FiberStripAugmentParams,
-    source_points_xy: torch.Tensor,
-    *,
-    device: torch.device,
-) -> torch.Tensor:
-    output_height, output_width = (int(v) for v in output_shape_hw)
-    source_height, source_width = (int(v) for v in source_shape_hw)
-    output_center_x = (float(output_width) - 1.0) * 0.5
-    output_center_y = (float(output_height) - 1.0) * 0.5
-    source_center_x = (float(source_width) - 1.0) * 0.5
-    source_center_y = (float(source_height) - 1.0) * 0.5
-
-    points = torch.as_tensor(source_points_xy, dtype=torch.float32, device=device)
-    src_x = points[:, 0]
-    src_y = points[:, 1]
-    u = src_x - source_center_x
-    v = src_y - source_center_y
-
-    angle = math.radians(float(params.rotation_degrees))
-    cos_a = math.cos(angle)
-    sin_a = math.sin(angle)
-    x_sheared = cos_a * u + sin_a * v
-    y_sheared = -sin_a * u + cos_a * v
-
-    shear_x = float(params.shear_x)
-    shear_y = float(params.shear_y)
-    det = 1.0 - shear_x * shear_y
-    if abs(det) <= 1.0e-6:
-        return torch.full((points.shape[0], 2), float("nan"), dtype=torch.float32, device=device)
-    x = (x_sheared - shear_x * y_sheared) / det
-    y = (-shear_y * x_sheared + y_sheared) / det
-
-    scale = max(float(params.scale), 1.0e-6)
-    x = x * scale
-    y = y * scale
-    if params.flip_x:
-        x = -x
-    if params.flip_y:
-        y = -y
-    coords = torch.stack(
-        [x + output_center_x + float(params.shift_x), y + output_center_y + float(params.shift_y)],
-        dim=1,
-    )
-    return coords.to(dtype=torch.float32)
-
-
-def _transformed_centerline_coords_affine(
-    output_shape_hw: tuple[int, int],
-    source_shape_hw: tuple[int, int],
-    params: FiberStripAugmentParams,
-    *,
-    device: torch.device,
-) -> torch.Tensor:
-    output_height, output_width = (int(v) for v in output_shape_hw)
-    source_height, source_width = (int(v) for v in source_shape_hw)
-    output_center_x = (float(output_width) - 1.0) * 0.5
-    output_center_y = (float(output_height) - 1.0) * 0.5
-    source_center_x = (float(source_width) - 1.0) * 0.5
-    source_center_y = (float(source_height) - 1.0) * 0.5
-
-    count = max(source_width, output_width)
-    src_x = torch.linspace(0.0, float(source_width - 1), count, device=device, dtype=torch.float32)
-    src_y = torch.full_like(src_x, source_center_y)
-    u = src_x - source_center_x
-    v = src_y - source_center_y
-
-    angle = math.radians(float(params.rotation_degrees))
-    cos_a = math.cos(angle)
-    sin_a = math.sin(angle)
-    x_sheared = cos_a * u + sin_a * v
-    y_sheared = -sin_a * u + cos_a * v
-
-    shear_x = float(params.shear_x)
-    shear_y = float(params.shear_y)
-    det = 1.0 - shear_x * shear_y
-    if abs(det) <= 1.0e-6:
-        return torch.zeros((0, 2), dtype=torch.float32, device=device)
-    x = (x_sheared - shear_x * y_sheared) / det
-    y = (-shear_y * x_sheared + y_sheared) / det
-
-    scale = max(float(params.scale), 1.0e-6)
-    x = x * scale
-    y = y * scale
-    if params.flip_x:
-        x = -x
-    if params.flip_y:
-        y = -y
-    coords = torch.stack(
-        [x + output_center_x + float(params.shift_x), y + output_center_y + float(params.shift_y)],
-        dim=1,
-    )
-    coords = coords[
-        (coords[:, 0] >= 0.0)
-        & (coords[:, 0] <= float(output_width - 1))
-        & (coords[:, 1] >= 0.0)
-        & (coords[:, 1] <= float(output_height - 1))
-    ]
-    if coords.numel() == 0:
-        return torch.zeros((0, 2), dtype=torch.float32, device=device)
-    rounded = torch.round(coords)
-    keep = torch.ones((rounded.shape[0],), dtype=torch.bool, device=device)
-    keep[1:] = torch.any(rounded[1:] != rounded[:-1], dim=1)
-    return coords[keep].to(dtype=torch.float32)
 
 
 def apply_value_augmentation(

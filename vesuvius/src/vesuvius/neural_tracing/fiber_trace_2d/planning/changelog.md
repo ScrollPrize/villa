@@ -4,6 +4,17 @@
 
 - Switched the default 2D fiber-strip direction model normalization from
   GroupNorm to BatchNorm2d.
+- Replaced Trace2CP/line median-TTA reference-point lookup with direct sampling
+  of the prebuilt reference-to-TTA map, removing dense nearest-grid scans over
+  TTA coordinate images during tracing.
+- Replaced binned Lasagna two-channel direction decoding with the analytic
+  inverse, removing the large `pixels * bins` temporary allocation in tracing
+  and visualization paths.
+- Removed image-space geometric TTA warps from `fiber_trace_2d`, switched
+  line/Trace2CP TTA to coordinate-sampled volume patches, and added
+  `--trace2cp-vis --med-tta --vis-tta` per-TTA slice debug exports.
+- Made `--trace2cp-vis` trace selected CP segments in both directions, draw both
+  traces, and report the average of the forward/reverse normalized scores.
 
 ## 2026-07-10
 

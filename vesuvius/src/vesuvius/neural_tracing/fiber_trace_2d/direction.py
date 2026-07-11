@@ -48,19 +48,19 @@ def encode_lasagna_direction_xy(direction_xy: torch.Tensor, *, eps: float = 1.0e
     return torch.stack([dir0, dir1], dim=-1)
 
 
-def decode_lasagna_direction_xy(encoded: torch.Tensor, *, bins: int = 180) -> torch.Tensor:
-    """Approximate inverse for visualization. The sign is arbitrary by design."""
+def decode_lasagna_direction_xy(encoded: torch.Tensor) -> torch.Tensor:
+    """Analytic inverse for Lasagna's ambiguous two-cos direction channels."""
 
     device = getattr(encoded, "device", None)
     encoded_t = torch.as_tensor(encoded, dtype=torch.float32, device=device)
     if encoded_t.shape[-1] != 2:
         raise ValueError("encoded must have final dimension 2")
-    theta = torch.linspace(0.0, torch.pi, int(bins), dtype=torch.float32, device=encoded_t.device)
-    unit = torch.stack([torch.cos(theta), torch.sin(theta)], dim=1)
-    table = encode_lasagna_direction_xy(unit)
-    diff = encoded_t.reshape(-1, 1, 2) - table.reshape(1, int(bins), 2)
-    best = torch.argmin(torch.sum(diff * diff, dim=2), dim=1)
-    return unit[best].reshape(*encoded_t.shape[:-1], 2)
+    d0 = encoded_t[..., 0]
+    d1 = encoded_t[..., 1]
+    cos2theta = 2.0 * d0 - 1.0
+    sin2theta = cos2theta - (2.0**0.5) * (2.0 * d1 - 1.0)
+    theta = 0.5 * torch.atan2(sin2theta, cos2theta)
+    return torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)
 
 
 def cp_neighborhood_yx(cp_xy: np.ndarray, shape_hw: tuple[int, int]) -> np.ndarray:
@@ -184,15 +184,13 @@ def direction_mse_loss(prediction: torch.Tensor, supervision: DirectionSupervisi
 def direction_angle_error_degrees(
     prediction: torch.Tensor,
     supervision: DirectionSupervision,
-    *,
-    bins: int = 720,
 ) -> torch.Tensor:
     """Folded unoriented angular error in degrees for supervised pixels."""
 
     gathered = gather_direction_predictions(prediction, supervision)
     if gathered.numel() == 0:
         raise ValueError("no valid CP-local direction supervision samples")
-    pred_xy = decode_lasagna_direction_xy(gathered, bins=bins)
+    pred_xy = decode_lasagna_direction_xy(gathered)
     target_xy = supervision.tangent_xy.to(dtype=torch.float32, device=pred_xy.device)
     pred_norm = torch.linalg.vector_norm(pred_xy, dim=1).clamp_min(1.0e-12)
     target_norm = torch.linalg.vector_norm(target_xy, dim=1).clamp_min(1.0e-12)

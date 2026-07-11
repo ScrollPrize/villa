@@ -80,12 +80,17 @@ The important behavior is:
 - Builds geometric augmentation maps in strip pixel coordinates. The image is
   never geometrically warped after loading; instead, output pixels map into an
   oversized source coordinate grid, and final 3D coordinates are sampled once.
+- Geometric image-space augmentation helpers are intentionally absent. Any
+  geometric change must be represented as coordinate manipulation before
+  sampling/slicing the patch. Only value-only image changes such as brightness,
+  contrast, gamma, noise, and blur run after image sampling.
 - Provides `StripAugmentTransform`, the shared paired transform for geometric
   augmentation. At construction it bakes the whole geometric stack into two
   concrete tensors: `backward_map_xy` maps output pixels to source pixels for
   image/coordinate sampling, and `forward_map_xy` maps source pixels to output
   pixels for line/CP lookup. Runtime point mapping samples these cached maps; it
-  does not re-run affine/smooth formulas.
+  does not re-run affine/smooth formulas or invert one direction from the
+  other.
 - Exposes torch-native transformed line/control-point coordinate helpers for
   loader internals, with NumPy wrappers kept for public/debug callers.
 - Affine shift is composed as an output-space translation after scale/flip, and
@@ -102,6 +107,14 @@ The important behavior is:
   augmentation and line/CP mapping. Line points and the CP are mapped together
   in one batched source-to-output call, and shared line/CP results can be reused
   across strip-z offsets with identical augmentation params.
+- The loader also exposes coordinate-sampled TTA builders for runner
+  inspection. They start from a base patch's `coords_zyx`, transform those
+  coordinates through the same augmentation maps, sample the volume at the
+  transformed coordinates, and return both the output-to-reference
+  `source_xy_grid` and the reference-to-output map. Median-TTA tracing uses the
+  reference-to-output map to locate a reference trace point inside a TTA field
+  in constant time, then uses `source_xy_grid` to map sampled TTA directions
+  back to the reference frame.
 - Training `build_sample` batches compatible strip-z offset coordinate
   augmentation by stacking `backward_map_xy` tensors and running dense
   coordinate/valid-mask sampling over the stack. It then sends the whole
@@ -125,8 +138,9 @@ The important behavior is:
 - Builds V0 training targets from transformed strip-line coordinates.
 - Selects only the eight neighboring pixels around the rounded transformed CP
   location, filtered by valid image samples.
-- Provides a visualization-only approximate decoder for drawing predicted
-  direction arrows.
+- Decodes predicted direction channels with Lasagna's analytic inverse:
+  recover `cos(2*theta)` and `sin(2*theta)` from the two channels, then use
+  `atan2(...)/2`. There is no binned candidate-angle lookup decoder.
 
 `model.py`
 
@@ -204,13 +218,15 @@ The important behavior is:
   `line_trace_vis.jpg` plus `line_trace_summary.txt`.
 - The line-trace JPG normally has two columns: the unaugmented trace view, then
   the original patch with a flock of traces from random combined geometric
-  training-style test-time augmentations inverse-warped back into original
-  patch coordinates. `--line-trace-tta-count` controls the TTA count and
-  defaults to 100.
+  training-style test-time augmentations mapped back through each TTA
+  output-to-reference coordinate grid. `--line-trace-tta-count` controls the
+  TTA count and defaults to 100.
 - `--line-trace-vis --med-tta` adds a third column. That trace stays in the
   original patch space and uses the same random TTA direction fields as the
   flock column. At each step it samples the reference and TTA direction fields,
-  inverse-warps TTA orientations back to the original patch frame, resolves the
+  maps the current original-patch point into each TTA field through the
+  prebuilt reference-to-output map, maps TTA orientations back to the original
+  patch frame through the output-to-reference coordinate grid, resolves the
   ambiguous direction sign against the previous step, and steps along the
   normalized median direction.
 - Provides `--trace2cp-vis --checkpoint <snapshot> --export-dir <dir>` for
@@ -219,20 +235,32 @@ The important behavior is:
   the next CP by default, and can use `--trace2cp-target-offset` or
   `--trace2cp-target-cp-index` for other same-fiber target CPs.
 - `--trace2cp-vis` loads a side-strip segment spanning both CPs, runs the same
-  decoded direction-field model as line tracing, traces one direction from the
-  start CP toward the target CP, and scores the y-error where the trace reaches
-  the target CP x-column. The trace2cp segment strip uses twice the configured
-  patch height for more vertical room before the RF margin.
+  decoded direction-field model as line tracing, traces start-to-target and
+  target-to-start on the same strip, and scores each direction's y-error where
+  that trace reaches its target CP x-column. The reported `trace2cp_score` is
+  the average of the two normalized directional scores. The trace2cp segment
+  strip uses twice the configured patch height for more vertical room before
+  the RF margin.
 - Trace2CP uses `--med-tta` to decide whether to use TTA. Without it, the tool
-  traces and scores the base direction field. With it, deterministic random
-  geometric TTA direction fields are built using `--line-trace-tta-count`; the
-  TTA set uses the training geometric ranges except y-shift is forced to zero
-  and scale to one. The tool then traces one median-direction line in the
-  reference segment strip.
+  traces and scores both directions on the base direction field. With it,
+  deterministic random geometric TTA direction fields are built by transforming
+  the segment coordinate grid and sampling the volume at those coordinates.
+  The TTA set uses the training geometric ranges except y-shift is forced to
+  zero and scale to one. The tool then traces both median-direction lines in
+  the reference segment strip, using each TTA reference-to-output coordinate
+  grid for point lookup and each output-to-reference grid for direction
+  mapping.
+- `--trace2cp-vis --med-tta --vis-tta` writes `trace2cp_tta/reference.jpg`,
+  one `trace2cp_tta/random_NNN.jpg` per generated TTA field, and
+  `trace2cp_tta/contact_sheet.jpg`. Each image shows the sampled slice with the
+  transformed base-strip corner outline and start/target CP markers.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
-  the normalized `0..1` score plus raw pixel error, trace mode, and trace
-  status to stdout. The JPG is always one strip image with the two CPs, one
-  traced line, and the score in a top label band above the image pixels.
+  the averaged normalized `0..1` score plus averaged raw pixel error, trace
+  mode, and per-direction scores/statuses to stdout. The summary includes
+  forward/reverse raw errors, normalized scores, target x-columns, target-column
+  reach statuses, termination reasons, and trace point counts. The JPG is
+  always one strip image with the two CPs, both traced lines, and the averaged
+  score in a top label band above the image pixels.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
   side-strip patch, runs the checkpointed direction model, decodes the
