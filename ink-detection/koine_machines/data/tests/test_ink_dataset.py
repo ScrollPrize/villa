@@ -9,6 +9,7 @@ from koine_machines.augmentation.translation import (
     count_points_within_crop,
     maybe_translate_normal_pooled_crop_bbox,
 )
+from koine_machines.data.normal_pooled_sample import read_tifxyz_on_flat_grid
 import koine_machines.data.ink_dataset as ink_dataset_module
 from koine_machines.data.ink_dataset import (
     InkDataset,
@@ -567,7 +568,7 @@ def test_getitem_resamples_empty_native_patch_before_using_result(monkeypatch):
     monkeypatch.setattr(
         ink_dataset_module,
         "_project_valid_surface_mask_to_native_crop",
-        lambda support_patch_zyxs, support_valid, crop_bbox: np.ones((1, 2, 2), dtype=np.float32),
+        lambda support_patch_zyxs, support_valid, crop_bbox, **kwargs: np.ones((1, 2, 2), dtype=np.float32),
     )
     monkeypatch.setattr(
         ink_dataset_module,
@@ -685,6 +686,124 @@ def test_maybe_select_flat_pixels_for_native_crop_via_stored_resolution_returns_
     )
 
     assert selected is None
+
+
+def test_level_two_tifxyz_sampling_and_support_use_the_level_two_flat_grid():
+    full_h = full_w = 16
+    rows = np.arange(full_h, dtype=np.float32)[:, None]
+    cols = np.arange(full_w, dtype=np.float32)[None, :]
+    full_patch_zyxs = np.stack(
+        [
+            np.full((full_h, full_w), 8.0, dtype=np.float32),
+            rows.repeat(full_w, axis=1),
+            cols.repeat(full_h, axis=0),
+        ],
+        axis=-1,
+    )
+    tifxyz = StubTifxyz(
+        full_patch_zyxs[::4, ::4],
+        full_zyxs=full_patch_zyxs,
+        full_resolution_shape=(full_h, full_w),
+    )
+
+    patch_zyxs, valid = read_tifxyz_on_flat_grid(
+        tifxyz,
+        y0=1,
+        y1=3,
+        x0=1,
+        x1=3,
+        flat_grid_stride=4,
+        native_coordinate_scale=0.25,
+    )
+
+    assert patch_zyxs.shape == (2, 2, 3)
+    assert valid.all()
+    np.testing.assert_array_equal(
+        patch_zyxs,
+        np.array(
+            [
+                [[2.0, 1.0, 1.0], [2.0, 1.0, 2.0]],
+                [[2.0, 2.0, 1.0], [2.0, 2.0, 2.0]],
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+    support_bbox, support_zyxs, support_valid = _select_flat_pixels_for_native_crop_via_stored_resolution(
+        tifxyz,
+        crop_bbox=(1, 1, 1, 3, 3, 3),
+        coarse_native_pad=1,
+        native_coordinate_scale=0.25,
+        flat_grid_stride=4,
+    )
+
+    assert support_bbox == (1, 3, 1, 3)
+    assert support_valid.all()
+    np.testing.assert_array_equal(support_zyxs, patch_zyxs)
+
+
+def test_full_3d_projection_thickness_scales_with_native_volume_level():
+    dataset = object.__new__(InkDataset)
+    dataset.config = {
+        "full_3d": {
+            "label_projection_half_thickness": 4.0,
+            "background_projection_half_thickness": 8.0,
+        }
+    }
+
+    assert dataset._full_3d_projection_half_thicknesses(resolution=0) == (4.0, 8.0)
+    assert dataset._full_3d_projection_half_thicknesses(resolution=2) == (1.0, 2.0)
+
+
+def test_level_two_flat_grid_handles_full_resolution_not_multiple_of_stride():
+    # 15 is not a multiple of stride 4; the strided grid must match the
+    # ceil-shaped [::2][::2] label pyramid (ceil(15/4) == 4) including the
+    # ragged last row/column.
+    full_h = full_w = 15
+    rows = np.arange(full_h, dtype=np.float32)[:, None]
+    cols = np.arange(full_w, dtype=np.float32)[None, :]
+    full_patch_zyxs = np.stack(
+        [
+            np.full((full_h, full_w), 8.0, dtype=np.float32),
+            rows.repeat(full_w, axis=1),
+            cols.repeat(full_h, axis=0),
+        ],
+        axis=-1,
+    )
+    tifxyz = StubTifxyz(
+        full_patch_zyxs[::4, ::4],
+        full_zyxs=full_patch_zyxs,
+        full_resolution_shape=(full_h, full_w),
+    )
+
+    patch_zyxs, valid = read_tifxyz_on_flat_grid(
+        tifxyz,
+        y0=0,
+        y1=4,
+        x0=0,
+        x1=4,
+        flat_grid_stride=4,
+        native_coordinate_scale=0.25,
+    )
+
+    assert patch_zyxs.shape == (4, 4, 3)
+    assert valid.all()
+    np.testing.assert_array_equal(patch_zyxs[3, 3], np.array([2.0, 3.0, 3.0], dtype=np.float32))
+
+    support_bbox, support_zyxs, support_valid = _select_flat_pixels_for_native_crop_via_stored_resolution(
+        tifxyz,
+        crop_bbox=(2, 3, 3, 3, 4, 4),
+        coarse_native_pad=1,
+        native_coordinate_scale=0.25,
+        flat_grid_stride=4,
+    )
+
+    assert support_bbox == (3, 4, 3, 4)
+    assert support_valid.all()
+    np.testing.assert_array_equal(
+        support_zyxs,
+        np.array([[[2.0, 3.0, 3.0]]], dtype=np.float32),
+    )
 
 
 def test_project_flat_patch_to_native_crop_includes_points_from_expanded_flat_support():
