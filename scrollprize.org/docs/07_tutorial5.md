@@ -41,6 +41,8 @@ import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
 
 <TutorialsTop highlightId={5} />
 
+*Last updated: July 10, 2026*
+
 <ChatCallout prefill="Walk me through the ink detection tutorial" />
 
 Ink detection is the last step of the pipeline: taking the flattened surface of a papyrus sheet ([segmented](/tutorial_VC3D) from the 3D X-ray scan) and identifying where the ink is, so that the text can be read.
@@ -290,7 +292,7 @@ Two native 3D modes exist. `full_3d` trains on the raw crops; `full_3d_single_wr
 
 #### Native 3D training
 
-Create `configs/ink_full3d.json`. It is the same shape as the 2.5D config with three changes: the mode, no z-projection (the prediction stays 3D), and the dataset entry gains a `volume_path` pointing at the original scroll volume:
+Create `configs/ink_full3d.json`. It is the same shape as the 2.5D config with a few changes: the mode, no z-projection (the prediction stays 3D), a `full_3d` block controlling the label projection, an on-disk cache for the streamed volume chunks, and a dataset entry that gains a `volume_path` pointing at the original scroll volume and trains at pyramid level 2 instead of full resolution:
 
 ```json
 {
@@ -307,11 +309,20 @@ Create `configs/ink_full3d.json`. It is the same shape as the 2.5D config with t
   "patch_overlap": 0.5,
   "patch_min_labeled_coverage": 0.05,
 
-  "batch_size": 1,
-  "num_iterations": 20000,
+  "full_3d": {
+    "label_projection_half_thickness": 8,
+    "background_projection_half_thickness": 8
+  },
+
+  "batch_size": 8,
+  "num_iterations": 2500,
   "learning_rate": 0.01,
   "mixed_precision": "fp16",
-  "dataloader_workers": 1,
+  "dataloader_workers": 16,
+  "prefetch_factor": 2,
+
+  "volume_cache_dir": "volume_cache",
+  "volume_cache_max_gb": 120,
 
   "val_every": 500,
   "save_every": 1000,
@@ -320,16 +331,17 @@ Create `configs/ink_full3d.json`. It is the same shape as the 2.5D config with t
     {
       "segments_path": "/path/to/ink-dataset/phercparis4",
       "volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/",
-      "volume_scale": "0"
+      "volume_scale": "2"
     }
   ]
 }
 ```
 
 * `volume_path` is where the 3D crops come from. The public `vesuvius-challenge-open-data` S3 bucket is read anonymously — no AWS account needed. You can also download the volume locally (or just the chunks your segments touch, with `koine_machines.preprocessing.download_required_zarr_chunks`) and point `volume_path` at the local copy instead.
-* Native 3D patches are much heavier than 2.5D surface-volume patches. The `[80, 128, 128]` patch size and batch size 1 are conservative first-run defaults; increase them only after you have confirmed your GPU has enough memory and I/O headroom.
+* `volume_scale: "2"` samples the crops from level 2 of the volume pyramid — 4× downsampled in each axis. That's enough for the tutorial; training at native resolution (`"0"`) can bring further gains, at the cost of a much longer run. Distances in the config are always given in **full-resolution voxels** regardless of `volume_scale` — the pipeline converts them to the trained level internally.
+* The `full_3d` block sets how far above and below the surface the 2D ink labels and supervision mask are projected into the crop, in full-resolution voxels (here ±8, so ±2 voxels at level 2).
+* `volume_cache_dir` enables an on-disk LRU cache (capped at `volume_cache_max_gb`) for the chunks streamed from `volume_path`: each chunk is downloaded once and re-read from local disk afterwards, which makes both re-runs and inference (which shares the cache) much faster.
 * `in_channels` is set automatically in the native 3D modes (2 for `full_3d_single_wrap`: image + wrap mask), so you don't need to change it.
-* How far above and below the surface the 2D labels are projected is controlled by an optional `"full_3d": { "projection_half_thickness": ... }` block (default 1 voxel).
 
 :::info
 If you enable native-3D label dilation (`full_3d.label_dilation_distance` or `full_3d.supervision_dilation_distance`), install cuCIM/CuPy too. Pick the build matching your CUDA major version: `uv pip install --extra-index-url https://pypi.nvidia.com "cucim-cu12==26.6.0"` for CUDA 12.x, or the corresponding `cucim-cu13` build for CUDA 13.x.
@@ -341,7 +353,7 @@ Training starts the same way:
 uv run python -m koine_machines.training.train configs/ink_full3d.json
 ```
 
-Expect a native 3D run to take several times longer than the flat run — every batch is sampled from the full-resolution scroll volume instead of a compact pre-rendered zarr.
+This run — 2,500 iterations at batch size 8 — takes about an hour on an H100 with the tutorial segment and uses about 17&nbsp;GB of VRAM. For a longer, higher-quality run, raise `num_iterations`.
 
 #### Native 3D inference
 
@@ -359,15 +371,47 @@ Then, with your native-3D checkpoint:
 ```bash
 uv run python -m koine_machines.inference.infer_full3d_tifxyz \
   /path/to/ink-dataset/phercparis4/w00_20231016151002 \
-  runs/ink_full3d/ckpt_019000.pth \
+  runs/ink_full3d/ckpt_002000.pth \
   predictions/w00_20231016151002_ink.ome.zarr \
+  --resolution 2 \
   --write-region occupied --chunk-halo 0 \
-  --batch-size 1 --overwrite
+  --batch-size 8 --num-workers 0 \
+  --cache-dir volume_cache --cache-max-gb 120 \
+  --overwrite
 ```
 
-`--write-region occupied --chunk-halo 0` restricts the output to just the chunks that actually contain surface points, which is much faster for a first run than the default (which also writes a halo of neighboring chunks). Even so, a single segment can plan hundreds of thousands of native-3D patches — add `--plan-only` to preview the chunk/patch plan first, and only launch the full command when the printed patch count fits your compute budget. For `full_3d_single_wrap` checkpoints, the script reconstructs the surface-mask input channel from the `.tifxyz` geometry automatically.
+* `--resolution 2` must match the `volume_scale` the checkpoint was trained at.
+* At `--batch-size 8`, inference uses about 6.5&nbsp;GB of VRAM.
+* `--num-workers 0` loads patches in the main process. It sounds slow, but multi-worker streaming inference can hang mid-run, and with `--cache-dir` pointed at the same cache directory as training, most chunks come straight from local disk anyway.
+* `--write-region occupied --chunk-halo 0` restricts the output to just the chunks that actually contain surface points, which is much faster than the default (which also writes a halo of neighboring chunks). Even at level 2 a single segment plans thousands of patches (hundreds of thousands at full resolution) — add `--plan-only` to preview the chunk/patch plan first, and only launch the full command when the printed patch count fits your compute budget.
+* For `full_3d_single_wrap` checkpoints, the script reconstructs the surface-mask input channel from the `.tifxyz` geometry automatically.
 
-The result is an ink prediction in scroll coordinates rather than a flattened image. To turn it into something readable across a whole scroll, the spiral fit's [`render_ink.py` step](tutorial_spiral#rendering-ink) renders the fitted windings through exactly this kind of ink-prediction volume, producing flattened strips winding by winding.
+The result is an ink prediction in scroll coordinates rather than a flattened image. To read it, render it through the segment geometry with VC3D's `vc_render_tifxyz` — the same tool that renders surface volumes from the scroll, just pointed at the prediction volume instead. You'll need a VC3D build on your `PATH`; see the [VC3D tutorial's installation instructions](tutorial_VC3D#installing-vc3d).
+
+```bash
+vc_render_tifxyz \
+  --volume predictions/w00_20231016151002_ink.ome.zarr \
+  --group-idx 0 \
+  --scale 0.4 \
+  --scale-segmentation 0.25 \
+  --segmentation /path/to/ink-dataset/phercparis4/w00_20231016151002 \
+  --num-slices 65 \
+  --slice-step 0.25 \
+  --cache-gb 16 \
+  --tif-output renders/w00_20231016151002_ink
+```
+
+This flattens the prediction into a stack of 65 slices spanning the surface, written as one TIFF per slice into the output folder. Two flags account for the prediction volume being at level 2: `--scale-segmentation 0.25` maps the segment's full-resolution `.tifxyz` coordinates into the 4×-downsampled volume, and `--slice-step 0.25` makes the 65 slices span the same 65-full-resolution-voxel band around the surface as the 2.5D surface volumes. `--scale 0.4` matches the scale in the segment's `meta.json`, so the render lines up with the segment's own images. Finally, take a maximum over the slices to get a single readable image:
+
+```bash
+uv run --with numpy --with tifffile --with imagecodecs python -c "
+import glob, numpy as np, tifffile
+stack = np.stack([tifffile.imread(p) for p in sorted(glob.glob('renders/w00_20231016151002_ink/*.tif'))])
+tifffile.imwrite('renders/w00_20231016151002_ink_max.tif', stack.max(axis=0))
+"
+```
+
+(Newer VC3D builds can do this in one pass with `--composite-collapse`, if your build has it.)
 
 ### Scaling up: the full dataset
 
