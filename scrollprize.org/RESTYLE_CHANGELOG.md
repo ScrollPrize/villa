@@ -436,6 +436,13 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - Count updated 23 → 14 in the details summary, the prizes frontmatter hook ("Fully unroll and read one of 14 sealed scrolls." — flows to the landing prize board via prizes-data), and get_started's Grand Prize line.
 **Files:** `docs/34_prizes.md`, `docs/01_get_started.md`.
 
+## C55 — prizes: GP criteria precision (owner wording)
+
+- "Valid explanation" for missing ink now defined: valid only if the Vesuvius Challenge Team acknowledges it as valid.
+- Submission package gains a leading **Meshes** requirement: complete tifxyz set covering the whole scroll surface, each with a low-distortion isometric 2D parametrization (flattening) included.
+- Images: must be generated programmatically from the reconstructed CT volume AND the corresponding submitted mesh; each image named after the tifxyz mesh it was rendered from (replaces the vaguer position-description bullet). First Letters/Title sections untouched (mesh package is GP-specific).
+**Files:** `docs/34_prizes.md`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
