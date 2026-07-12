@@ -687,81 +687,55 @@ export function Landing() {
             <div className="vc-hero__scrim" />
           </div>
           <div className="container mx-auto vc-hero__content">
-            {gpDaysLeft !== null && (
-              <a
-                className="vc-hero__countdown"
-                href="/prizes#2027-grand-prize"
-                aria-label={`${gpDaysLeft} days to the $1,000,000 Grand Prize deadline`}
-              >
-                <span className="vc-hero__countdown-label">
-                  $1,000,000 Grand Prize
-                </span>
-                <span className="vc-hero__countdown-row">
-                  <span className="vc-hero__countdown-value vc-nums">
-                    {gpDaysLeft}
-                  </span>
-                  <span className="vc-hero__countdown-unit">
-                    days
-                    <br />
-                    left
-                  </span>
-                </span>
-                <span className="vc-hero__countdown-date">
-                  deadline June 25th, 2027
-                </span>
-              </a>
-            )}
-            <Heading as="h1" id="home-hero-title" className="vc-hero__title">
-              Resurrect an ancient library from the ashes of a volcano.
-            </Heading>
-            <p className="vc-hero__tagline">Win Prizes. Make History.</p>
-            <p className="vc-hero__intro">
-              Vesuvius Challenge is a machine learning, computer vision, and
-              geometry competition that is <a href="/firstscroll">reading</a>{" "}
-              the carbonized Herculaneum scrolls without opening them.
-            </p>
-            <div className="vc-hero__row">
-              {/* The unwrap payoff: PHerc. 1667 unrolling into readable Greek.
-                  Poster = the video's final frame, so poster-only contexts
-                  (mobile, reduced-motion, data-saver) still get the reveal. */}
-              {SHOW_BREAKING && (
-                <a href="/firstscroll" className="vc-hero__reveal">
-                  <video
-                    playsInline
-                    muted
-                    preload="none"
-                    title="PHerc. 1667 virtually unwrapping into readable Greek"
-                    poster="/img/firstscroll/hero-reveal-end-960.webp"
-                    className="vc-hero__reveal-media"
-                    ref={revealVideo}
+            <div className="vc-hero__grid">
+              <div className="vc-hero__main">
+                <Heading as="h1" id="home-hero-title" className="vc-hero__title">
+                  Resurrect an ancient library from the ashes of a volcano.
+                </Heading>
+                <p className="vc-hero__tagline">Win Prizes. Make History.</p>
+                <p className="vc-hero__intro">
+                  Vesuvius Challenge is a machine learning, computer vision, and
+                  geometry competition that is <a href="/firstscroll">reading</a>{" "}
+                  the carbonized Herculaneum scrolls without opening them.
+                </p>
+                <div className="vc-hero__ctas">
+                  <a
+                    className="vc-btn-outline"
+                    href="https://discord.gg/V4fJhvtaQn"
                   >
-                    <source
-                      data-src="/img/firstscroll/hero-reveal.webm"
-                      type="video/webm"
-                    />
-                    <source
-                      data-src="/img/firstscroll/hero-reveal.mp4"
-                      type="video/mp4"
-                    />
-                  </video>
-                  <span className="vc-hero__reveal-caption">
-                    <span className="vc-hero__reveal-title">
-                      We read an entire scroll&nbsp;→
-                    </span>
-                  </span>
-                </a>
-              )}
+                    Join Discord
+                  </a>
+                  <a className="vc-btn" href="/get_started">
+                    Get Started
+                  </a>
+                </div>
+              </div>
 
-              <div className="vc-hero__ctas">
-                <a
-                  className="vc-btn-outline"
-                  href="https://discord.gg/V4fJhvtaQn"
-                >
-                  Join Discord
-                </a>
-                <a className="vc-btn" href="/get_started">
-                  Get Started
-                </a>
+              <div className="vc-hero__aside">
+                {gpDaysLeft !== null && (
+                  <a
+                    className="vc-hero__countdown"
+                    href="/prizes#2027-grand-prize"
+                    aria-label={`${gpDaysLeft} days to the $1,000,000 Grand Prize deadline`}
+                  >
+                    <span className="vc-hero__countdown-label">
+                      $1,000,000 Grand Prize
+                    </span>
+                    <span className="vc-hero__countdown-row">
+                      <span className="vc-hero__countdown-value vc-nums">
+                        {gpDaysLeft}
+                      </span>
+                      <span className="vc-hero__countdown-unit">
+                        days
+                        <br />
+                        left
+                      </span>
+                    </span>
+                    <span className="vc-hero__countdown-date">
+                      deadline June 25th, 2027
+                    </span>
+                  </a>
+                )}
               </div>
             </div>
 
@@ -812,7 +786,37 @@ export function Landing() {
             >
               News — from our Substack
             </a>
-            <LatestPosts />
+            <div className="vc-newsbar">
+              {/* The unwrap payoff: PHerc. 1667 unrolling into readable Greek.
+                  Poster = the video's final frame, so poster-only contexts
+                  (mobile, reduced-motion, data-saver) still get the reveal. */}
+              {SHOW_BREAKING && (
+                <a href="/firstscroll" className="vc-newsbar__feature">
+                  <video
+                    playsInline
+                    muted
+                    preload="none"
+                    title="PHerc. 1667 virtually unwrapping into readable Greek"
+                    poster="/img/firstscroll/hero-reveal-end-960.webp"
+                    className="vc-newsbar__media"
+                    ref={revealVideo}
+                  >
+                    <source
+                      data-src="/img/firstscroll/hero-reveal.webm"
+                      type="video/webm"
+                    />
+                    <source
+                      data-src="/img/firstscroll/hero-reveal.mp4"
+                      type="video/mp4"
+                    />
+                  </video>
+                  <span className="vc-newsbar__feature-title">
+                    We read an entire scroll&nbsp;→
+                  </span>
+                </a>
+              )}
+              <LatestPosts />
+            </div>
           </div>
         </section>
 

@@ -12,21 +12,13 @@
       },
       {
         "big": "4",
-        "label": "with recovered text",
-        "sub": "Greek read; first Latin in progress",
+        "label": "with substantial text recovered",
         "derive": "text"
       },
       {
         "big": "9",
-        "label": "with ink-detection results",
-        "sub": "predictions on unrolled surfaces & fragments",
+        "label": "with verified ink detection results",
         "derive": "ink"
-      },
-      {
-        "big": "~4.3 PB",
-        "label": "open research data",
-        "sub": "3 scans at sub-2µm, down to 1.1µm",
-        "derive": "resolution"
       }
     ],
     "funnel": [
@@ -121,7 +113,7 @@
     {
       "id": "PHercParis4",
       "type": "scroll",
-      "desc": "PHerc. Paris 4 is a rolled Herculaneum papyrus from the [Institut de France](https://www.institutdefrance.fr/en/home/), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nThis is the scroll for which we have by far the most segments, where the [first letters](https://scrollprize.org/firstletters) were discovered and the [2023 Grand Prize](https://scrollprize.org/grandprize) was claimed.",
+      "desc": "PHerc. Paris 4 is a rolled Herculaneum papyrus from the [Institut de France](https://www.institutdefrance.fr/en/home/), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 7.91 µm), and rescanned in 2026 at the [ESRF](https://www.esrf.fr) in Grenoble, France (2.4 µm, plus 45.5 µm overview scans).\n\nIt is the scroll with by far the most segments, and the first from which substantial continuous Greek text — Epicurean philosophy attributed to Philodemus — was recovered: the [first letters](https://scrollprize.org/firstletters) were discovered here, and the [2023 Grand Prize](https://scrollprize.org/grandprize) was claimed on it.",
       "legacy": "https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/",
       "n_scans": 6,
       "n_volumes": 6,
@@ -197,7 +189,7 @@
       "display": "Scroll 1",
       "label": "PHerc. Paris 4",
       "repository": "Institut de France, Paris",
-      "note": "Scroll 1. The first scroll from which substantial continuous Greek text was recovered (2023 Vesuvius Challenge Grand Prize) — Epicurean philosophy attributed to Philodemus. Rescanned at ESRF at 2.4µm in 2026.",
+      "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis4/photos/PHercParis4_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis4/",
       "content": {
@@ -1269,7 +1261,7 @@
     {
       "id": "PHerc1667",
       "type": "scroll",
-      "desc": "PHerc. 1667 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 µm and 7.91 µm), and later rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025) — the scan from which it was virtually unwrapped and read in full.\n\nIt is similar in size to PHerc. 332 (Scroll 3).",
+      "desc": "PHerc. 1667 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 µm and 7.91 µm), and rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025). From that scan it became the first Herculaneum scroll ever virtually unwrapped and read in full, end to end, without being physically opened.\n\nIt is similar in size to PHerc. 332 (Scroll 3).",
       "legacy": "https://dl.ash2txt.org/full-scrolls/Scroll4/PHerc1667.volpkg/",
       "n_scans": 3,
       "n_volumes": 3,
@@ -1322,7 +1314,7 @@
       "display": "Scroll 4",
       "label": "PHerc. 1667",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Scroll 4 — the first Herculaneum scroll virtually unwrapped and read in full, end to end, without ever being physically opened. Scanned and read at 2.4µm.",
+      "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1667/photos/PHerc1667_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1667/",
       "content": {
@@ -1634,7 +1626,7 @@
       "display": "Scroll 5",
       "label": "PHerc. 172",
       "repository": "Bodleian Library, Oxford",
-      "note": "Scroll 5. ~70% geometrically unrolled by November 2025.",
+      "note": "About 70% geometrically unrolled as of November 2025.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0172/photos/PHerc0172_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0172/",
       "content": {
@@ -2387,7 +2379,7 @@
       "display": "PHerc0139",
       "label": "PHerc. 139",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Title and author attribution recovered, identifying it as a work by the Epicurean philosopher Philodemus, specifically On Gods, Book 8. About 20% virtually unrolled.",
+      "note": "Title and author recovered — On Gods, Book 8, by the Epicurean philosopher Philodemus. About 20% virtually unrolled.",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0139/",
       "content": {
@@ -3583,7 +3575,7 @@
     {
       "id": "PHerc0332",
       "type": "scroll",
-      "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nIt is the innermost part of a scroll, known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original. Its small size enabled scanning at extremely high resolution (3.24um).",
+      "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 µm and 7.91 µm), and rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025).\n\nIt is the innermost part of a scroll, known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original.",
       "legacy": "https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/",
       "n_scans": 4,
       "n_volumes": 4,
@@ -3643,7 +3635,7 @@
       "display": "Scroll 3",
       "label": "PHerc. 332",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Scroll 3.",
+      "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0332/photos/PHerc0332_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0332/",
       "content": {
@@ -4094,7 +4086,7 @@
     {
       "id": "PHercParis3",
       "type": "scroll",
-      "desc": "",
+      "desc": "PHerc. Paris 3 is a rolled Herculaneum papyrus from the [Institut de France](https://www.institutdefrance.fr/en/home/), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK, and rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2026).",
       "legacy": null,
       "n_scans": 1,
       "n_volumes": 1,
@@ -4126,7 +4118,7 @@
       "display": "Scroll 2",
       "label": "PHerc. Paris 3",
       "repository": "Institut de France, Paris",
-      "note": "Scroll 2. Rescanned at ESRF at 2.4µm.",
+      "note": "",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis3/",
       "content": null,
