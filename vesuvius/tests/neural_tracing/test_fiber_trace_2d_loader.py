@@ -124,6 +124,9 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_metric_bidirectional,
     _trace2cp_tta_params,
     _trace2cp_refinement_from_traces_z,
+    _trace2cp_refinement_input_xyz,
+    _trace2cp_nonempty_xyz_trace_or_none,
+    _smooth_trace2cp_refinement_trace,
     _trace2cp_z_corrected_image_u8,
     _trace2cp_z_corrected_presence_u8,
     _trace2cp_z_layer_tiff_stack,
@@ -514,6 +517,67 @@ def test_trace2cp_refinement_warps_partial_traces_to_midpoint() -> None:
     assert result.fused_dense_xy[0].tolist() == pytest.approx([2.0, 4.0])
     assert result.fused_dense_xy[-1].tolist() == pytest.approx([8.0, 8.0])
     assert bool(np.any(np.all(np.isclose(result.fused_dense_xy, np.asarray([5.0, 6.0])), axis=1)))
+
+
+def test_trace2cp_refinement_trace_smoothing_is_gaussian_and_preserves_cp_anchors() -> None:
+    trace = np.asarray(
+        [
+            [0.0, 10.0, 0.0],
+            [1.0, 16.0, 3.0],
+            [2.0, 8.0, -3.0],
+            [3.0, 10.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    smoothed = _smooth_trace2cp_refinement_trace(trace, window=3)
+
+    np.testing.assert_allclose(smoothed[0], trace[0])
+    np.testing.assert_allclose(smoothed[-1], trace[-1])
+    np.testing.assert_allclose(smoothed[:, 0], trace[:, 0])
+    sigma = 0.8
+    kernel = np.exp(-0.5 * np.square(np.asarray([-1.0, 0.0, 1.0], dtype=np.float32) / sigma))
+    kernel = kernel / np.sum(kernel)
+    expected_y1 = float(np.dot(np.asarray([10.0, 16.0, 8.0], dtype=np.float32), kernel))
+    expected_z1 = float(np.dot(np.asarray([0.0, 3.0, -3.0], dtype=np.float32), kernel))
+    assert float(smoothed[1, 1]) == pytest.approx(expected_y1)
+    assert float(smoothed[1, 2]) == pytest.approx(expected_z1)
+    assert abs(float(smoothed[1, 1]) - float(trace[1, 1])) > 0.1
+    assert abs(float(smoothed[1, 2])) < abs(float(trace[1, 2]))
+
+
+def test_trace2cp_refinement_input_adds_zero_z_for_2d_fused_trace() -> None:
+    start = np.asarray([2.0, 10.0], dtype=np.float32)
+    target = np.asarray([12.0, 10.0], dtype=np.float32)
+    direction = np.zeros((24, 20, 2), dtype=np.float32)
+    direction[..., 0] = 1.0
+    result = _trace2cp_refinement_from_traces(
+        np.stack([start, target]).astype(np.float32),
+        np.stack([target, start]).astype(np.float32),
+        start,
+        target,
+        direction_xy=direction,
+        valid_mask=np.ones(direction.shape[:2], dtype=bool),
+        shape_hw=direction.shape[:2],
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    trace_xyz = _trace2cp_refinement_input_xyz(result)
+
+    assert trace_xyz.shape[1] == 3
+    np.testing.assert_allclose(trace_xyz[:, 2], 0.0)
+
+
+def test_trace2cp_empty_xyz_trace_is_not_valid_for_z_top_debug() -> None:
+    assert _trace2cp_nonempty_xyz_trace_or_none(np.zeros((0, 3), dtype=np.float32)) is None
+    assert _trace2cp_nonempty_xyz_trace_or_none(np.zeros((2, 2), dtype=np.float32)) is None
+
+    trace = np.asarray([[0.0, 1.0, 0.0], [2.0, 3.0, 1.0]], dtype=np.float32)
+    valid = _trace2cp_nonempty_xyz_trace_or_none(trace)
+
+    assert valid is not None
+    np.testing.assert_allclose(valid, trace)
 
 
 def test_resample_polyline_by_arclength_keeps_endpoints() -> None:
@@ -1700,6 +1764,88 @@ def test_trace2cp_segment_source_offsets_each_pixel_axis(tmp_path: Path) -> None
     assert shifted.strip_z_offset == pytest.approx(1.0)
     assert np.count_nonzero(grid_valid) > 0
     assert np.allclose(delta[grid_valid], expected[grid_valid], atol=1.0e-5)
+
+
+def test_trace2cp_refined_segment_source_samples_from_fused_trace(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    start = np.asarray(source.start_control_point_xy, dtype=np.float32)
+    target = np.asarray(source.target_control_point_xy, dtype=np.float32)
+    midpoint = 0.5 * (start + target)
+    midpoint[1] += np.float32(1.0)
+    trace_xyz = np.asarray(
+        [
+            [start[0], start[1], 0.0],
+            [midpoint[0], midpoint[1], 0.0],
+            [target[0], target[1], 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    refined_source = loader.build_trace2cp_refined_segment_source(
+        source,
+        trace_xyz,
+        device=torch.device("cpu"),
+    )
+    refined_sample, refined_image, refined_valid = loader.sample_trace2cp_segment_source(refined_source)
+
+    assert refined_sample.start_control_point_index == source.start_control_point_index
+    assert refined_sample.target_control_point_index == source.target_control_point_index
+    assert refined_source.source_shape_hw[0] == source.source_shape_hw[0]
+    assert refined_source.source_shape_hw[1] >= source.source_shape_hw[1]
+    assert refined_sample.start_control_point_xy[0] < refined_sample.target_control_point_xy[0]
+    assert refined_image.shape == refined_valid.shape
+    assert np.count_nonzero(refined_valid) > 0
+
+
+def test_trace2cp_refined_segment_source_preserves_bidirectional_trace_starts(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    start = np.asarray(source.start_control_point_xy, dtype=np.float32)
+    target = np.asarray(source.target_control_point_xy, dtype=np.float32)
+    midpoint = 0.5 * (start + target)
+    midpoint[1] += np.float32(1.0)
+    refined_source = loader.build_trace2cp_refined_segment_source(
+        source,
+        np.asarray(
+            [
+                [start[0], start[1], 0.0],
+                [midpoint[0], midpoint[1], 0.0],
+                [target[0], target[1], 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        device=torch.device("cpu"),
+    )
+    sample, image, valid = loader.sample_trace2cp_segment_source(refined_source)
+    direction = np.zeros((*image.shape, 2), dtype=np.float32)
+    direction[..., 0] = 1.0
+
+    result = _trace_score_trace2cp_bidirectional(
+        direction,
+        np.asarray(sample.start_control_point_xy, dtype=np.float32),
+        np.asarray(sample.target_control_point_xy, dtype=np.float32),
+        valid_mask=valid,
+        step_px=1.0,
+        rf_margin_px=0.0,
+    )
+
+    np.testing.assert_allclose(result.forward.trace_xy[0], sample.start_control_point_xy)
+    np.testing.assert_allclose(result.reverse.trace_xy[0], sample.target_control_point_xy)
+    assert float(result.forward.trace_xy[-1, 0]) > float(result.forward.trace_xy[0, 0])
+    assert float(result.reverse.trace_xy[-1, 0]) < float(result.reverse.trace_xy[0, 0])
 
 
 def test_trace2cp_traced_top_strip_samples_from_fused_trace(tmp_path: Path) -> None:

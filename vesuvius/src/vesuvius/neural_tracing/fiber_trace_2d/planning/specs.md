@@ -496,6 +496,31 @@
   reduces local direction mismatch against the sampled direction field while
   discouraging uneven segment spacing. The refined line keeps the two CP
   endpoints fixed.
+- `--trace2cp-refine-iterations N` enables iterative Trace2CP refinement after
+  the initial pass. Iteration `0` is the normal Trace2CP evaluation. Each extra
+  iteration smooths the previous selected fused CP-to-CP trace, keeps the CP
+  endpoints and x columns fixed during smoothing, converts the smoothed
+  patch-space `(x,y,z)` trace back through the previous segment source to
+  volume coordinates, builds a fresh side-strip segment from that volume-space
+  curve, and reruns the same Trace2CP scoring mode. `N=0` preserves the current
+  single-pass behavior.
+- Iterative Trace2CP refinement must resample the volume from the refined
+  curve geometry. It must not geometrically warp, bend, rotate, or otherwise
+  reuse the previous strip image as the next pass input.
+- A refined pass must be equivalent to running Trace2CP on an independent
+  line source: after converting the previous fused trace to volume-space line
+  points, the loader must build a fresh segment source with endpoint context
+  before the start CP and after the target CP. Both forward and reverse traces
+  must therefore have the same valid local neighborhood at their start points
+  as they do for an original fiber-json line.
+- `--trace2cp-refine-smooth-window` controls the finite Gaussian smoothing
+  window used between iterations and defaults to `5`. Even values are rounded
+  up to the next odd window. The smoothing keeps x columns and both CP
+  endpoints fixed.
+- Single-pair refinement outputs keep the initial pass as `trace2cp_vis.jpg`
+  and `trace2cp_summary.txt`. Extra passes write `trace2cp_vis_it1.jpg`,
+  `trace2cp_summary_it1.txt`, then `it2`, etc. If z-layer TIFF export is also
+  enabled, extra passes write `trace2cp_z_layers_it1.tif`, etc.
 - Trace2CP uses `--med-tta` to determine whether TTA is used. Without
   `--med-tta`, it traces and scores both directions on the base strip
   direction field. With `--med-tta`, it builds deterministic random geometric
@@ -712,6 +737,10 @@
   the selected median-TTA result first, and a second reference-only inference
   column using the base direction field without TTA. It does not draw score
   text over image pixels.
+- With `--trace2cp-refine-iterations`, the base `trace2cp_vis.jpg` remains the
+  initial pass for compatibility; extra pass visualizations use the `itN`
+  suffix. Each `itN` pass uses the same drawing structure and public
+  `trace2cp_error` reporting semantics as the initial pass.
 - Whole-fiber Trace2CP mode writes `trace2cp_fiber_vis.jpg` and
   `trace2cp_fiber_summary.txt`, and `trace2cp_fiber_debug.txt`. Each CP pair
   is loaded, traced, and measured with the same pair-local Trace2CP path as the
@@ -733,6 +762,10 @@
   and reasons are included in the summary. Whole-fiber metric output is the
   average public `trace2cp_error` over all valid CP-pair segments and is
   printed on its own stdout line as `trace2cp_error_mean=<value>`.
+- With `--trace2cp-refine-iterations`, whole-fiber mode writes additional
+  aggregate iteration images and summaries as `trace2cp_fiber_vis_it1.jpg` and
+  `trace2cp_fiber_summary_it1.txt`, then `it2`, etc. The unsuffixed whole-fiber
+  outputs remain the initial pass.
 - Trace2CP target-column crossing takes precedence over RF-margin rejection for
   the next step in each direction. If a step crosses that direction's target
   x-column and would also enter the RF margin, the trace is considered to have

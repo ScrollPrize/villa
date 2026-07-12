@@ -201,6 +201,63 @@ def _trace2cp_refinement_fused_xyz(refinement: _Trace2CpRefinementResult) -> np.
     return np.concatenate([xy, z_arr[:, None]], axis=1).astype(np.float32, copy=False)
 
 
+def _trace2cp_refinement_input_xyz(refinement: "_Trace2CpRefinementResult") -> np.ndarray:
+    xy = np.asarray(refinement.fused_resampled_xy, dtype=np.float32)
+    if xy.ndim != 2 or xy.shape[1] != 2 or xy.shape[0] < 2:
+        raise ValueError("Trace2CP refinement needs a non-empty fused trace")
+    z = refinement.fused_resampled_z
+    if z is None:
+        z_arr = np.zeros((int(xy.shape[0]),), dtype=np.float32)
+    else:
+        z_arr = np.asarray(z, dtype=np.float32).reshape(-1)
+        if int(z_arr.shape[0]) != int(xy.shape[0]):
+            raise ValueError("Trace2CP fused z trace length does not match fused xy trace")
+    return np.concatenate([xy, z_arr[:, None]], axis=1).astype(np.float32, copy=False)
+
+
+def _trace2cp_nonempty_xyz_trace_or_none(trace_xyz: np.ndarray | None) -> np.ndarray | None:
+    if trace_xyz is None:
+        return None
+    trace = np.asarray(trace_xyz, dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[1] != 3 or trace.shape[0] == 0:
+        return None
+    if not bool(np.isfinite(trace).all()):
+        return None
+    return trace
+
+
+def _smooth_trace2cp_refinement_trace(
+    trace_xyz: np.ndarray,
+    *,
+    window: int = 5,
+) -> np.ndarray:
+    trace = np.asarray(trace_xyz, dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[0] < 2 or trace.shape[1] != 3:
+        raise ValueError("trace_xyz must have shape [N,3] with N >= 2")
+    if not bool(np.isfinite(trace).all()):
+        raise ValueError("trace_xyz contains non-finite values")
+    width = max(1, int(window))
+    if width <= 1 or trace.shape[0] <= 2:
+        return trace.astype(np.float32, copy=True)
+    if width % 2 == 0:
+        width += 1
+    radius = width // 2
+    padded = np.pad(trace, ((radius, radius), (0, 0)), mode="edge")
+    sigma = 0.3 * ((float(width) - 1.0) * 0.5 - 1.0) + 0.8
+    offsets = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = np.exp(-0.5 * np.square(offsets / np.float32(sigma)))
+    kernel = (kernel / np.sum(kernel)).astype(np.float32, copy=False)
+    smoothed = np.empty_like(trace, dtype=np.float32)
+    for channel in range(3):
+        smoothed[:, channel] = np.convolve(padded[:, channel], kernel, mode="valid")
+    # Preserve columns and endpoints exactly; the line refinement is meant to
+    # smooth cross-strip/z deviations without moving CP anchors or target x.
+    smoothed[:, 0] = trace[:, 0]
+    smoothed[0] = trace[0]
+    smoothed[-1] = trace[-1]
+    return smoothed.astype(np.float32, copy=False)
+
+
 def _z_layer_columns_to_rgb(
     layers_by_column: np.ndarray,
     *,
@@ -1530,6 +1587,7 @@ class _Trace2CpPairEvaluation:
     med_fields_count: int
     tta_rows: tuple[str, ...]
     tta_debug_entries: tuple[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray], ...]
+    segment_source: Any | None = None
     similarity_debug: _Trace2CpSimilarityDebug | None = None
     z_search_debug: _Trace2CpZTraceDebug | None = None
     presence_debug: np.ndarray | None = None
@@ -6277,20 +6335,22 @@ def _evaluate_trace2cp_pair(
     sample_mode: str = "random",
     row_axis_alignment_line_index: int | None = None,
     row_axis_alignment_xyz: np.ndarray | None = None,
+    segment_source: Any | None = None,
     build_similarity_debug: bool = True,
     build_top_strip_debug: bool = False,
     build_z_layer_tiff_stack: bool = False,
 ) -> _Trace2CpPairEvaluation:
-    segment_source = loader.build_trace2cp_segment_source(
-        sample_index,
-        target_control_point_index=target_cp_index,
-        target_offset=target_offset,
-        rf_margin_px=rf_margin_px,
-        row_axis_alignment_line_index=row_axis_alignment_line_index,
-        row_axis_alignment_xyz=row_axis_alignment_xyz,
-        device=device,
-        sample_mode=sample_mode,
-    )
+    if segment_source is None:
+        segment_source = loader.build_trace2cp_segment_source(
+            sample_index,
+            target_control_point_index=target_cp_index,
+            target_offset=target_offset,
+            rf_margin_px=rf_margin_px,
+            row_axis_alignment_line_index=row_axis_alignment_line_index,
+            row_axis_alignment_xyz=row_axis_alignment_xyz,
+            device=device,
+            sample_mode=sample_mode,
+        )
     sample, image, valid_mask = loader.sample_trace2cp_segment_source(segment_source)
     fields = _predict_trace2cp_fields(model, image, valid_mask, device=device)
     direction_xy = fields.direction_xy
@@ -6633,10 +6693,15 @@ def _evaluate_trace2cp_pair(
                 segment_source,
                 fused_center_xyz,
             )
-        if z_search_debug is not None:
+        fused_z_trace = (
+            None
+            if z_search_debug is None
+            else _trace2cp_nonempty_xyz_trace_or_none(z_search_debug.fused_trace_xyz)
+        )
+        if fused_z_trace is not None:
             z_top_strip_image, z_top_strip_valid_mask = loader.sample_trace2cp_traced_top_strip_source(
                 segment_source,
-                z_search_debug.fused_trace_xyz,
+                fused_z_trace,
             )
     return _Trace2CpPairEvaluation(
         sample_index=int(sample_index),
@@ -6651,6 +6716,7 @@ def _evaluate_trace2cp_pair(
         med_fields_count=med_fields_count,
         tta_rows=tuple(tta_rows),
         tta_debug_entries=tuple(tta_debug_entries),
+        segment_source=segment_source,
         similarity_debug=similarity_debug,
         z_search_debug=z_search_debug,
         presence_debug=presence_debug,
@@ -6660,6 +6726,207 @@ def _evaluate_trace2cp_pair(
         traced_top_strip_valid_mask=traced_top_strip_valid_mask,
         z_top_strip_image=z_top_strip_image,
         z_top_strip_valid_mask=z_top_strip_valid_mask,
+    )
+
+
+def _evaluate_trace2cp_refinement_chain(
+    loader: FiberStrip2DLoader,
+    model: torch.nn.Module,
+    sample_index: int,
+    *,
+    device: torch.device,
+    step_px: float,
+    rf_margin_px: float,
+    target_offset: int,
+    target_cp_index: int | None,
+    med_tta: bool,
+    line_trace_tta_count: int,
+    vis_tta: bool,
+    combined: bool,
+    combined_weights: _Trace2CpCombinedWeights | None,
+    combined_fiber_bank: _Trace2CpEmbeddingBank | None,
+    combined_mode: str,
+    image_scoring: _Trace2CpImageScoringConfig | None,
+    candidate_max_degrees: float,
+    candidate_step_degrees: float,
+    z_search: _Trace2CpZSearchConfig | None,
+    sample_mode: str = "random",
+    row_axis_alignment_line_index: int | None = None,
+    row_axis_alignment_xyz: np.ndarray | None = None,
+    build_similarity_debug: bool = True,
+    build_top_strip_debug: bool = False,
+    build_z_layer_tiff_stack: bool = False,
+    refine_iterations: int = 0,
+    refine_smooth_window: int = 5,
+) -> tuple[_Trace2CpPairEvaluation, ...]:
+    initial = _evaluate_trace2cp_pair(
+        loader,
+        model,
+        sample_index,
+        device=device,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+        target_offset=target_offset,
+        target_cp_index=target_cp_index,
+        med_tta=med_tta,
+        line_trace_tta_count=line_trace_tta_count,
+        vis_tta=vis_tta,
+        combined=combined,
+        combined_weights=combined_weights,
+        combined_fiber_bank=combined_fiber_bank,
+        combined_mode=combined_mode,
+        image_scoring=image_scoring,
+        candidate_max_degrees=candidate_max_degrees,
+        candidate_step_degrees=candidate_step_degrees,
+        z_search=z_search,
+        sample_mode=sample_mode,
+        row_axis_alignment_line_index=row_axis_alignment_line_index,
+        row_axis_alignment_xyz=row_axis_alignment_xyz,
+        build_similarity_debug=build_similarity_debug,
+        build_top_strip_debug=build_top_strip_debug,
+        build_z_layer_tiff_stack=build_z_layer_tiff_stack,
+    )
+    evaluations: list[_Trace2CpPairEvaluation] = [initial]
+    for _iteration in range(max(0, int(refine_iterations))):
+        previous = evaluations[-1]
+        if previous.segment_source is None:
+            raise ValueError("Trace2CP refinement iteration requires previous segment source")
+        refined_trace = _smooth_trace2cp_refinement_trace(
+            _trace2cp_refinement_input_xyz(previous.selected_result.refinement),
+            window=refine_smooth_window,
+        )
+        refined_source = loader.build_trace2cp_refined_segment_source(
+            previous.segment_source,
+            refined_trace,
+            device=device,
+        )
+        evaluations.append(
+            _evaluate_trace2cp_pair(
+                loader,
+                model,
+                sample_index,
+                device=device,
+                step_px=step_px,
+                rf_margin_px=rf_margin_px,
+                target_offset=target_offset,
+                target_cp_index=target_cp_index,
+                med_tta=med_tta,
+                line_trace_tta_count=line_trace_tta_count,
+                vis_tta=False,
+                combined=combined,
+                combined_weights=combined_weights,
+                combined_fiber_bank=combined_fiber_bank,
+                combined_mode=combined_mode,
+                image_scoring=image_scoring,
+                candidate_max_degrees=candidate_max_degrees,
+                candidate_step_degrees=candidate_step_degrees,
+                z_search=z_search,
+                sample_mode=sample_mode,
+                segment_source=refined_source,
+                build_similarity_debug=build_similarity_debug,
+                build_top_strip_debug=build_top_strip_debug,
+                build_z_layer_tiff_stack=build_z_layer_tiff_stack,
+            )
+        )
+    return tuple(evaluations)
+
+
+def _trace2cp_evaluation_label(evaluation: _Trace2CpPairEvaluation) -> str:
+    if evaluation.combined_summary is None:
+        return evaluation.selected_mode
+    summary = evaluation.combined_summary
+    return (
+        f"{evaluation.selected_mode} total={summary.mean('total'):.4f} "
+        f"dir={summary.mean('direction'):.4f} "
+        f"last={summary.mean('last'):.4f} "
+        f"enc={summary.mean('enclosing'):.4f} "
+        f"fib={summary.mean('fiber'):.4f} "
+        f"img={summary.mean('image'):.4f} "
+        f"pres={summary.mean('presence'):.4f}"
+    )
+
+
+def _write_trace2cp_iteration_artifacts(
+    output_dir: Path,
+    *,
+    iteration: int,
+    evaluation: _Trace2CpPairEvaluation,
+    checkpoint_path: str | Path,
+    checkpoint: dict[str, Any],
+    step_px: float,
+    rf_margin_px: float,
+    export_z_layers_tif: bool,
+) -> None:
+    suffix = f"_it{int(iteration)}"
+    sample = evaluation.sample
+    selected = evaluation.selected_result
+    base = evaluation.base_result
+    metric = selected.metric
+    refinement = selected.refinement
+    image_u8 = _to_u8_image(evaluation.image, evaluation.valid_mask)
+    overlay = _draw_trace2cp_overlay(
+        image_u8,
+        line_xy=sample.line_xy,
+        start_xy=np.asarray(sample.start_control_point_xy, dtype=np.float32),
+        target_xy=np.asarray(sample.target_control_point_xy, dtype=np.float32),
+        bidirectional_result=selected,
+        result_label=_trace2cp_evaluation_label(evaluation),
+        reference_result=base if selected is not base else None,
+        reference_label="reference",
+        similarity_debug=evaluation.similarity_debug,
+        z_search_debug=evaluation.z_search_debug,
+        presence_debug=evaluation.presence_debug,
+        top_strip_image=evaluation.top_strip_image,
+        top_strip_valid_mask=evaluation.top_strip_valid_mask,
+        traced_top_strip_image=evaluation.traced_top_strip_image,
+        traced_top_strip_valid_mask=evaluation.traced_top_strip_valid_mask,
+        z_top_strip_image=evaluation.z_top_strip_image,
+        z_top_strip_valid_mask=evaluation.z_top_strip_valid_mask,
+        valid_mask=evaluation.valid_mask,
+    )
+    _write_jpg(output_dir / f"trace2cp_vis{suffix}.jpg", overlay)
+    z_layer_tif_path: Path | None = None
+    if export_z_layers_tif:
+        z_debug = evaluation.z_search_debug
+        if z_debug is None:
+            raise ValueError("--trace2cp-z-layers-tif requires an active z-search evaluation")
+        z_layer_tif_path = output_dir / f"trace2cp_z_layers{suffix}.tif"
+        _write_trace2cp_z_layers_tif(z_layer_tif_path, z_debug)
+    summary = [
+        f"iteration={int(iteration)}",
+        f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
+        f"checkpoint_step={checkpoint.get('step', 'unknown')}",
+        f"fiber_path={sample.fiber_path}",
+        f"start_control_point_index={sample.start_control_point_index}",
+        f"target_control_point_index={sample.target_control_point_index}",
+        f"image_shape_hw=({int(evaluation.image.shape[0])}, {int(evaluation.image.shape[1])})",
+        f"start_cp_xy=({float(sample.start_control_point_xy[0]):.3f}, {float(sample.start_control_point_xy[1]):.3f})",
+        f"target_cp_xy=({float(sample.target_control_point_xy[0]):.3f}, {float(sample.target_control_point_xy[1]):.3f})",
+        f"step_px={float(step_px):.3f}",
+        f"rf_margin_px={float(rf_margin_px):.3f}",
+        f"trace_mode={evaluation.selected_mode}",
+        f"trace2cp_error={metric.error:.8f}",
+        f"trace2cp_metric_error={metric.error:.8f}",
+        f"trace2cp_metric_raw_y_error_px={metric.raw_y_error_px:.6f}",
+        f"trace2cp_metric_horizontal_span_px={metric.horizontal_span_px:.6f}",
+        f"trace2cp_metric_reason={metric.reason}",
+        f"trace2cp_refine_score={selected.score:.8f}",
+        f"actual_y_error_px={selected.raw_y_error_px:.6f}",
+        f"considered_y_error_px={selected.considered_y_error_px:.6f}",
+        f"fused_points={int(refinement.fused_resampled_xy.shape[0])}",
+        f"optimized_points={int(refinement.optimized_xy.shape[0])}",
+        f"reference_trace2cp_metric_error={base.metric.error:.8f}",
+        f"trace2cp_z_layers_tif={str(z_layer_tif_path) if z_layer_tif_path is not None else ''}",
+    ]
+    (output_dir / f"trace2cp_summary{suffix}.txt").write_text(
+        "\n".join(summary) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"trace2cp_it{int(iteration)}_error={metric.error:.8f} "
+        f"metric_raw_y_error_px={metric.raw_y_error_px:.6f} "
+        f"mode={evaluation.selected_mode} "
+        f"vis={output_dir / f'trace2cp_vis{suffix}.jpg'}"
     )
 
 
@@ -6684,6 +6951,8 @@ def _export_trace2cp_vis(
     candidate_step_degrees: float = 1.0,
     z_search: _Trace2CpZSearchConfig | None = None,
     export_z_layers_tif: bool = False,
+    refine_iterations: int = 0,
+    refine_smooth_window: int = 5,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -6706,7 +6975,7 @@ def _export_trace2cp_vis(
             device=device,
             rf_margin_px=margin,
         )
-    evaluation = _evaluate_trace2cp_pair(
+    evaluations = _evaluate_trace2cp_refinement_chain(
         loader,
         model,
         sample_index,
@@ -6728,7 +6997,10 @@ def _export_trace2cp_vis(
         z_search=z_search,
         build_top_strip_debug=True,
         build_z_layer_tiff_stack=bool(export_z_layers_tif),
+        refine_iterations=int(refine_iterations),
+        refine_smooth_window=int(refine_smooth_window),
     )
+    evaluation = evaluations[0]
     sample = evaluation.sample
     image = evaluation.image
     valid_mask = evaluation.valid_mask
@@ -6745,17 +7017,7 @@ def _export_trace2cp_vis(
         tta_debug_dir = _write_trace2cp_tta_debug_images(out, list(evaluation.tta_debug_entries))
 
     image_u8 = _to_u8_image(image, valid_mask)
-    result_label = selected_mode
-    if evaluation.combined_summary is not None:
-        result_label = (
-            f"{selected_mode} total={evaluation.combined_summary.mean('total'):.4f} "
-            f"dir={evaluation.combined_summary.mean('direction'):.4f} "
-            f"last={evaluation.combined_summary.mean('last'):.4f} "
-            f"enc={evaluation.combined_summary.mean('enclosing'):.4f} "
-            f"fib={evaluation.combined_summary.mean('fiber'):.4f} "
-            f"img={evaluation.combined_summary.mean('image'):.4f} "
-            f"pres={evaluation.combined_summary.mean('presence'):.4f}"
-        )
+    result_label = _trace2cp_evaluation_label(evaluation)
     overlay = _draw_trace2cp_overlay(
         image_u8,
         line_xy=sample.line_xy,
@@ -6835,6 +7097,8 @@ def _export_trace2cp_vis(
         f"step_px={float(step_px):.3f}",
         f"rf_margin_px={margin:.3f}",
         f"trace_mode={selected_mode}",
+        f"trace2cp_refine_iterations={int(refine_iterations)}",
+        f"trace2cp_refine_smooth_window={int(refine_smooth_window)}",
         f"trace_points={trace_points}",
         f"trace2cp_error={metric.error:.8f}",
         f"trace2cp_metric_error={metric.error:.8f}",
@@ -6904,6 +7168,17 @@ def _export_trace2cp_vis(
         *tta_rows,
     ]
     (out / "trace2cp_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    for iteration, iteration_evaluation in enumerate(evaluations[1:], start=1):
+        _write_trace2cp_iteration_artifacts(
+            out,
+            iteration=iteration,
+            evaluation=iteration_evaluation,
+            checkpoint_path=checkpoint_path,
+            checkpoint=checkpoint,
+            step_px=step_px,
+            rf_margin_px=margin,
+            export_z_layers_tif=bool(export_z_layers_tif),
+        )
     print(f"trace2cp_error={metric.error:.8f}")
     print(
         "trace2cp details "
@@ -7074,6 +7349,8 @@ def _export_trace2cp_fiber_vis(
     candidate_step_degrees: float = 1.0,
     z_search: _Trace2CpZSearchConfig | None = None,
     export_z_layers_tif: bool = False,
+    refine_iterations: int = 0,
+    refine_smooth_window: int = 5,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -7104,6 +7381,7 @@ def _export_trace2cp_fiber_vis(
         )
 
     evaluations: list[_Trace2CpPairEvaluation] = []
+    evaluation_chains: list[tuple[_Trace2CpPairEvaluation, ...]] = []
     skipped_pairs: list[_Trace2CpSkippedPair] = []
     cp_line_indices = _trace2cp_control_point_line_indices(loader, flat_indices)
     row_axis_refs_by_line_index: dict[int, np.ndarray] = {}
@@ -7123,7 +7401,7 @@ def _export_trace2cp_fiber_vis(
                 alignment_axis = existing
                 break
         try:
-            evaluation = _evaluate_trace2cp_pair(
+            chain = _evaluate_trace2cp_refinement_chain(
                 loader,
                 model,
                 int(flat_indices[start_cp_index]),
@@ -7149,7 +7427,10 @@ def _export_trace2cp_fiber_vis(
                 build_similarity_debug=False,
                 build_top_strip_debug=True,
                 build_z_layer_tiff_stack=bool(export_z_layers_tif),
+                refine_iterations=int(refine_iterations),
+                refine_smooth_window=int(refine_smooth_window),
             )
+            evaluation = chain[0]
         except ValueError as exc:
             reason = _trace2cp_skip_reason(exc)
             skipped_pairs.append(
@@ -7167,6 +7448,7 @@ def _export_trace2cp_fiber_vis(
             )
             continue
         evaluations.append(evaluation)
+        evaluation_chains.append(chain)
         if export_z_layers_tif:
             z_debug = evaluation.z_search_debug
             if z_debug is None:
@@ -7256,6 +7538,64 @@ def _export_trace2cp_fiber_vis(
         label=label,
     )
     _write_jpg(out / "trace2cp_fiber_vis.jpg", overlay)
+    for iteration in range(1, max(0, int(refine_iterations)) + 1):
+        iteration_evaluations = [
+            chain[iteration] for chain in evaluation_chains if len(chain) > iteration
+        ]
+        if not iteration_evaluations:
+            continue
+        iteration_metric_errors = np.asarray(
+            [evaluation.selected_result.metric.error for evaluation in iteration_evaluations],
+            dtype=np.float64,
+        )
+        iteration_actual_errors = np.asarray(
+            [evaluation.selected_result.metric.raw_y_error_px for evaluation in iteration_evaluations],
+            dtype=np.float64,
+        )
+        iteration_mode = iteration_evaluations[0].selected_mode
+        iteration_label = (
+            f"trace2cp fiber it{iteration} pairs={len(iteration_evaluations)} "
+            f"mode={iteration_mode} "
+            f"trace2cp_error_mean={float(np.mean(iteration_metric_errors)):.4f} "
+            f"trace2cp_error_max={float(np.max(iteration_metric_errors)):.4f} "
+            f"mean_metric_raw_px={float(np.mean(iteration_actual_errors)):.2f}"
+        )
+        iteration_overlay = _draw_trace2cp_fiber_overlay(
+            iteration_evaluations,
+            control_point_x=cp_x,
+            label=iteration_label,
+        )
+        _write_jpg(out / f"trace2cp_fiber_vis_it{iteration}.jpg", iteration_overlay)
+        iteration_summary = [
+            f"iteration={iteration}",
+            f"fiber_json={fiber_path_display}",
+            f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
+            f"checkpoint_step={checkpoint.get('step', 'unknown')}",
+            f"valid_pair_count={len(iteration_evaluations)}",
+            f"trace_mode={iteration_mode}",
+            f"trace2cp_error_mean={float(np.mean(iteration_metric_errors)):.8f}",
+            f"trace2cp_error_max={float(np.max(iteration_metric_errors)):.8f}",
+            f"trace2cp_metric_raw_y_error_mean_px={float(np.mean(iteration_actual_errors)):.6f}",
+            "start_cp target_cp trace2cp_error metric_raw_y_error_px trace_mode",
+            *(
+                f"{evaluation.sample.start_control_point_index} "
+                f"{evaluation.sample.target_control_point_index} "
+                f"{evaluation.selected_result.metric.error:.8f} "
+                f"{evaluation.selected_result.metric.raw_y_error_px:.6f} "
+                f"{evaluation.selected_mode}"
+                for evaluation in iteration_evaluations
+            ),
+        ]
+        (out / f"trace2cp_fiber_summary_it{iteration}.txt").write_text(
+            "\n".join(iteration_summary) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"trace2cp_fiber_it{iteration}_error_mean={float(np.mean(iteration_metric_errors)):.8f} "
+            f"trace2cp_error_max={float(np.max(iteration_metric_errors)):.8f} "
+            f"pairs={len(iteration_evaluations)} "
+            f"vis={out / f'trace2cp_fiber_vis_it{iteration}.jpg'}"
+        )
     (out / "trace2cp_fiber_debug.txt").write_text("\n".join(debug_rows) + "\n", encoding="utf-8")
 
     rows = [
@@ -7354,6 +7694,8 @@ def _export_trace2cp_fiber_vis(
         f"step_px={float(step_px):.3f}",
         f"rf_margin_px={margin:.3f}",
         f"trace_mode={mode}",
+        f"trace2cp_refine_iterations={int(refine_iterations)}",
+        f"trace2cp_refine_smooth_window={int(refine_smooth_window)}",
         f"med_tta={bool(med_tta)}",
         f"line_trace_tta_count={max(0, int(line_trace_tta_count)) if med_tta else 0}",
         *combined_component_lines,
@@ -7864,6 +8206,8 @@ def main() -> None:
     parser.add_argument("--trace2cp-image-blur-radius", type=int, default=5)
     parser.add_argument("--trace2cp-z-step-voxels", type=float, default=1.0)
     parser.add_argument("--trace2cp-z-max-layer", type=int, default=4)
+    parser.add_argument("--trace2cp-refine-iterations", type=int, default=0)
+    parser.add_argument("--trace2cp-refine-smooth-window", type=int, default=5)
     parser.add_argument("--trace2cp-combined-direction-weight", type=float, default=1.0)
     parser.add_argument("--trace2cp-combined-last-weight", type=float, default=1.0)
     parser.add_argument("--trace2cp-combined-enclosing-weight", type=float, default=1.0)
@@ -7965,6 +8309,10 @@ def main() -> None:
             raise SystemExit("--trace2cp-z-search does not currently support --med-tta")
         if args.trace2cp_z_layers_tif and not args.trace2cp_z_search:
             raise SystemExit("--trace2cp-z-layers-tif requires --trace2cp-z-search")
+        if int(args.trace2cp_refine_iterations) < 0:
+            raise SystemExit("--trace2cp-refine-iterations must be >= 0")
+        if int(args.trace2cp_refine_smooth_window) < 1:
+            raise SystemExit("--trace2cp-refine-smooth-window must be >= 1")
         z_search = _Trace2CpZSearchConfig(
             enabled=bool(args.trace2cp_z_search),
             step_voxels=float(args.trace2cp_z_step_voxels),
@@ -7995,6 +8343,8 @@ def main() -> None:
                 candidate_step_degrees=args.trace2cp_candidate_step_deg,
                 z_search=z_search,
                 export_z_layers_tif=bool(args.trace2cp_z_layers_tif),
+                refine_iterations=int(args.trace2cp_refine_iterations),
+                refine_smooth_window=int(args.trace2cp_refine_smooth_window),
             )
             return
         _export_trace2cp_vis(
@@ -8019,6 +8369,8 @@ def main() -> None:
             candidate_step_degrees=args.trace2cp_candidate_step_deg,
             z_search=z_search,
             export_z_layers_tif=bool(args.trace2cp_z_layers_tif),
+            refine_iterations=int(args.trace2cp_refine_iterations),
+            refine_smooth_window=int(args.trace2cp_refine_smooth_window),
         )
         return
 

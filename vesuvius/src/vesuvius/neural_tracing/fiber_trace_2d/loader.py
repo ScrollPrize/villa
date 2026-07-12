@@ -3278,6 +3278,219 @@ class FiberStrip2DLoader:
             target_row_axis_xyz=target_row_axis,
         )
 
+    def build_trace2cp_refined_segment_source(
+        self,
+        source: _Trace2CpSegmentSource,
+        trace_xyz: np.ndarray,
+        *,
+        strip_z_offset: float | None = None,
+        device: torch.device | None = None,
+    ) -> _Trace2CpSegmentSource:
+        resolved_device = (
+            resolve_torch_device(self.config.augment.device) if device is None else device
+        )
+        trace = np.asarray(trace_xyz, dtype=np.float32)
+        if trace.ndim != 2 or trace.shape[0] < 2 or trace.shape[1] not in (2, 3):
+            raise ValueError("refined trace must have shape [N,2] or [N,3] with N >= 2")
+        if trace.shape[1] == 2:
+            trace = np.concatenate(
+                [trace, np.zeros((int(trace.shape[0]), 1), dtype=np.float32)],
+                axis=1,
+            )
+        if not bool(np.isfinite(trace).all()):
+            raise ValueError("refined trace contains non-finite coordinates")
+        if source.grid.offset_axis_xyz is None:
+            raise ValueError("refined Trace2CP source requires offset-axis data")
+
+        previous_start = np.asarray(source.start_control_point_xy, dtype=np.float32)
+        previous_target = np.asarray(source.target_control_point_xy, dtype=np.float32)
+        previous_height, previous_width = (int(v) for v in source.source_shape_hw)
+        target_is_right = float(previous_target[0]) >= float(previous_start[0])
+        if target_is_right:
+            before_start_margin = max(0.0, float(previous_start[0]))
+            after_target_margin = max(0.0, float(previous_width - 1) - float(previous_target[0]))
+        else:
+            before_start_margin = max(0.0, float(previous_width - 1) - float(previous_start[0]))
+            after_target_margin = max(0.0, float(previous_target[0]))
+
+        def extension_length(available: float) -> float:
+            available_f = max(0.0, float(available))
+            if available_f <= 1.0e-3:
+                return 0.0
+            preferred = max(2.0, min(8.0, available_f))
+            return max(0.0, min(preferred, available_f - 1.0e-3))
+
+        points_xy = torch.as_tensor(
+            trace[:, :2],
+            dtype=torch.float32,
+            device=source.grid.coords_xyz.device,
+        )
+        base_xyz_t, base_valid_t = _sample_grid_points_hwc(
+            source.grid.coords_xyz,
+            source.grid.valid_mask,
+            points_xy,
+        )
+        normal_xyz_t, normal_valid_t = _sample_grid_points_hwc(
+            source.grid.offset_axis_xyz,
+            source.grid.valid_mask,
+            points_xy,
+        )
+        normal_xyz_t = F.normalize(normal_xyz_t, p=2.0, dim=1, eps=1.0e-12)
+        z_offsets_t = torch.as_tensor(
+            trace[:, 2],
+            dtype=torch.float32,
+            device=source.grid.coords_xyz.device,
+        )
+        center_xyz_t = base_xyz_t + normal_xyz_t * (
+            z_offsets_t * np.float32(source.record.volume_spacing_base)
+        )[:, None]
+        valid_t = (
+            base_valid_t
+            & normal_valid_t
+            & torch.isfinite(center_xyz_t).all(dim=1)
+            & torch.isfinite(normal_xyz_t).all(dim=1)
+        )
+        valid = valid_t.detach().cpu().numpy().astype(bool, copy=False)
+        if not bool(np.all(valid)):
+            bad = np.flatnonzero(~valid)
+            first = int(bad[0]) if bad.size else -1
+            raise ValueError(
+                "refined Trace2CP trace leaves the source strip valid area: "
+                f"invalid_points={int(bad.size)} first_invalid={first}"
+            )
+        center_xyz = center_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        sampled_normals = normal_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
+
+        keep = [0]
+        for idx in range(1, int(center_xyz.shape[0])):
+            if float(np.linalg.norm(center_xyz[idx] - center_xyz[keep[-1]])) > 1.0e-4:
+                keep.append(idx)
+        if len(keep) < 2:
+            raise ValueError("refined Trace2CP trace degenerates to fewer than two volume points")
+        keep_array = np.asarray(keep, dtype=np.int64)
+        kept_start_matches = np.flatnonzero(keep_array == 0)
+        kept_target_matches = np.flatnonzero(keep_array == int(trace.shape[0]) - 1)
+        if kept_start_matches.size == 0 or kept_target_matches.size == 0:
+            raise ValueError("refined Trace2CP trace lost a CP endpoint while removing duplicate points")
+        kept_start_index = int(kept_start_matches[0])
+        kept_target_index = int(kept_target_matches[0])
+        center_xyz = center_xyz[keep_array]
+        sampled_normals = sampled_normals[keep_array]
+
+        def extrapolated_volume_endpoint(
+            anchor: np.ndarray,
+            neighbor: np.ndarray,
+            length_px: float,
+        ) -> np.ndarray | None:
+            if length_px <= 1.0e-6:
+                return None
+            tangent = np.asarray(anchor, dtype=np.float32) - np.asarray(neighbor, dtype=np.float32)
+            norm = float(np.linalg.norm(tangent))
+            if not np.isfinite(norm) or norm <= 1.0e-6:
+                return None
+            length_base = np.float32(length_px * float(source.record.volume_spacing_base))
+            return (
+                np.asarray(anchor, dtype=np.float32)
+                + tangent * np.float32(length_base / norm)
+            ).astype(np.float32)
+
+        start_extension = extrapolated_volume_endpoint(
+            center_xyz[kept_start_index],
+            center_xyz[min(int(center_xyz.shape[0]) - 1, kept_start_index + 1)],
+            extension_length(before_start_margin),
+        )
+        if start_extension is not None:
+            center_xyz = np.concatenate([start_extension[None, :], center_xyz], axis=0)
+            sampled_normals = np.concatenate(
+                [sampled_normals[kept_start_index][None, :], sampled_normals],
+                axis=0,
+            )
+            kept_start_index += 1
+            kept_target_index += 1
+
+        target_extension = extrapolated_volume_endpoint(
+            center_xyz[kept_target_index],
+            center_xyz[max(0, kept_target_index - 1)],
+            extension_length(after_target_margin),
+        )
+        if target_extension is not None:
+            center_xyz = np.concatenate([center_xyz, target_extension[None, :]], axis=0)
+            sampled_normals = np.concatenate(
+                [sampled_normals, sampled_normals[kept_target_index][None, :]],
+                axis=0,
+            )
+
+        if target_is_right:
+            ordered_points = center_xyz
+            ordered_normals = sampled_normals
+            local_start = kept_start_index
+            local_target = kept_target_index
+            anchor_column = before_start_margin
+        else:
+            ordered_points = center_xyz[::-1].copy()
+            ordered_normals = sampled_normals[::-1].copy()
+            local_start = int(center_xyz.shape[0]) - 1 - kept_start_index
+            local_target = int(center_xyz.shape[0]) - 1 - kept_target_index
+            anchor_column = 0.0
+        anchor_column = float(anchor_column)
+        cumulative = self._line_arc_lengths(ordered_points)
+        distance_px = abs(float(cumulative[int(local_target)] - cumulative[int(local_start)])) / float(
+            source.record.volume_spacing_base
+        )
+        width = max(
+            previous_width,
+            int(math.ceil(distance_px + before_start_margin + after_target_margin + 1.0)),
+        )
+        height = previous_height
+        if not target_is_right:
+            anchor_column = float(width - 1) - before_start_margin
+        original_indices = np.arange(int(ordered_points.shape[0]), dtype=np.int64)
+        line_window = FiberStripLineWindow(
+            line_points_xyz=np.asarray(ordered_points, dtype=np.float64),
+            original_line_indices=original_indices,
+            local_control_point_index=int(local_start),
+        )
+        line_xy = source_line_xy_from_line_window(
+            line_window,
+            patch_shape_hw=(height, width),
+            anchor_column_px=anchor_column,
+            pixel_spacing_base=source.record.volume_spacing_base,
+        )
+        start_xy = np.asarray(line_xy[int(local_start)], dtype=np.float32)
+        target_xy = np.asarray(line_xy[int(local_target)], dtype=np.float32)
+        center_offset = (
+            float(source.center_offset) if strip_z_offset is None else float(strip_z_offset)
+        )
+        grid = build_side_strip_patch_grid_tensor_from_line_window(
+            line_window,
+            patch_shape_hw=(height, width),
+            strip_z_offset=center_offset,
+            sampled_normals=ordered_normals,
+            pixel_spacing_base=source.record.volume_spacing_base,
+            anchor_column_px=anchor_column,
+            device=resolved_device,
+        )
+        start_row_axis = self._row_axis_at_xy(grid, start_xy)
+        target_row_axis = self._row_axis_at_xy(grid, target_xy)
+        return _Trace2CpSegmentSource(
+            record=source.record,
+            record_index=int(source.record_index),
+            start_control_point_index=int(source.start_control_point_index),
+            target_control_point_index=int(source.target_control_point_index),
+            center_offset=float(center_offset),
+            source_shape_hw=(height, width),
+            grid=grid,
+            line_window=line_window,
+            anchor_column_px=float(anchor_column),
+            line_xy=np.asarray(line_xy, dtype=np.float32),
+            start_control_point_xy=start_xy.astype(np.float32, copy=False),
+            target_control_point_xy=target_xy.astype(np.float32, copy=False),
+            line_point_indices=original_indices,
+            line_normals_xyz=np.asarray(ordered_normals, dtype=np.float32),
+            start_row_axis_xyz=start_row_axis,
+            target_row_axis_xyz=target_row_axis,
+        )
+
     def sample_trace2cp_top_strip_source(
         self,
         source: _Trace2CpSegmentSource,

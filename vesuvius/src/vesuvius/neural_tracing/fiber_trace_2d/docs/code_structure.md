@@ -226,6 +226,13 @@ The important behavior is:
   vectors after frame construction. Whole-fiber Trace2CP can pass a shared-CP
   row-axis reference into this path so adjacent pair-local strips keep the same
   vertical row orientation despite Lasagna normal sign ambiguity.
+- Implements `build_trace2cp_refined_segment_source` for iterative Trace2CP
+  refinement. It samples a prior segment source at a smoothed fused trace
+  `(x,y,z)` to recover volume-space centerline points and strip-normal axes,
+  then builds a fresh side-strip segment from those points. The synthetic line
+  keeps endpoint context on both sides of the CP pair so the next pass behaves
+  like an independent Trace2CP run on a new line source. This path samples the
+  volume again for the next pass; it does not warp the previous image.
 - Computes prefetch envelopes from the same shared source geometry, asks the
   sampler for dependency-only chunk requests, deduplicates those requests, and
   fetches only chunks not already represented in the VC3D persistent cache.
@@ -298,6 +305,15 @@ The important behavior is:
   closest approach remains a `refine_score` diagnostic for the fused/optimized
   visualization rows only. The trace2cp segment strip uses eight times the
   configured patch height for more vertical room before the RF margin.
+- `--trace2cp-refine-iterations N` runs additional Trace2CP passes after the
+  initial pass. Each pass smooths the previous selected fused trace with a
+  finite Gaussian kernel controlled by `--trace2cp-refine-smooth-window`
+  (default `5`), preserves the CP endpoints and x columns, builds a new
+  volume-sampled side strip from the smoothed trace with endpoint context
+  before/after the CP pair, and reruns the same scoring mode. Single-pair mode
+  keeps `trace2cp_vis.jpg` for pass 0 and writes `trace2cp_vis_it1.jpg`,
+  `trace2cp_summary_it1.txt`, etc. Whole-fiber mode similarly writes
+  `trace2cp_fiber_vis_it1.jpg` and `trace2cp_fiber_summary_it1.txt`.
 - Trace2CP uses `--med-tta` to decide whether to use TTA. Without it, the tool
   traces and scores both directions on the base direction field. With it,
   deterministic random geometric TTA direction fields are built by transforming

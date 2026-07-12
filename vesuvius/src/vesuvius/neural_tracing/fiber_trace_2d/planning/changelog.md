@@ -2,6 +2,15 @@
 
 ## 2026-07-12
 
+- Added opt-in iterative Trace2CP refinement with
+  `--trace2cp-refine-iterations`: extra passes smooth the previous fused trace,
+  resample a fresh volume-backed side strip from that curve, and export `itN`
+  visualizations/summaries.
+- Changed Trace2CP refinement smoothing from a moving-average kernel to a
+  finite Gaussian kernel while preserving x columns and CP endpoints exactly.
+- Fixed refined Trace2CP pass source construction so the synthetic line keeps
+  endpoint context before and after the CP pair; reverse traces in `it1+` now
+  start from the target CP with a valid local direction neighborhood.
 - Added `--trace2cp-z-layers-tif` for Trace2CP z-search runs, exporting the
   already inferred z-layer cache as non-interleaved multilayer TIFF stacks:
   sorted sampled slices first, then sorted presence maps.
