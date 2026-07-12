@@ -443,7 +443,7 @@ If you have experience with 3D annotation, active learning, or data-quality work
 
 </Admonition>
 ***
-## 3\. Ink recovery: detecting what is written
+## 3\. Ink recovery: reading the scrolls
 Once the surface is traced and flattened, the next question is: where is the ink?
 
 The phrase **ink detection** is widely used, but there are two related tasks:
@@ -451,7 +451,7 @@ The phrase **ink detection** is widely used, but there are two related tasks:
 * **Ink detection**: decide whether ink is present in a region.    
 * **Ink segmentation**: locate the ink precisely, ideally in 3D.
 
-For an ideal pipeline, ink segmentation is the cleaner target. We would like to say: these voxels correspond to ink, these do not. But usually, the ink signal is too subtle for direct voxel-level annotation. That is why the current pipeline often uses models that work on surface-conditioned renders or surface volumes.
+For an ideal pipeline, ink segmentation is the cleaner target. We would like to say: these voxels correspond to ink, these do not. But usually, the ink signal is too subtle for direct voxel-level annotation. That is why the current pipeline often uses models that work on surface-conditioned renders (also called surface volumes).
 
 A surface-conditioned render, or a surface volume, is a flattened 3D subvolume centered on a segmented sheet surface. Using the mesh’s 2D flattened coordinates, each point on the sheet is mapped back into the original CT volume. The center layer corresponds to the sheet surface, while additional layers are sampled at positive and negative voxel offsets along the local surface normal. This produces an image stack where the curved papyrus surface is represented as a flat layer, making nearby material and possible ink easier to inspect or process.
 
@@ -482,7 +482,7 @@ Working on surface-conditioned renders of the fragments’ outer sheet, the mode
   caption="How a fragment becomes a training pair: the fragment (a) is photographed in infrared (e) and CT-scanned (b); a mesh of its exposed surface (c) extracts a flattened surface volume used as the model input (d), while the aligned IR photograph provides the 2D ink labels (f, g)."
 />
 
-This design makes sense because fragment labels are 2D: the photograph tells us where ink appears on the exposed surface, but not exactly where the ink signal sits in depth inside the CT volume.
+However, fragment labels are 2D: the photograph tells us where ink appears on the exposed surface, but not exactly where the ink signal sits in depth inside the CT volume.
 
 The model is not OCR. It is not given Greek words, transcriptions, dictionaries, or language-model targets. It learns local CT texture and morphology associated with ink labels.
 
@@ -537,9 +537,9 @@ The square brackets follow classics and papyrology's standard "Leiden Convention
 
 What happens if the models don’t generalize? The right conclusion here is neither "the scan failed" nor "the model failed." At the moment, several explanations remain possible:
 
-* the scan may not preserve the relevant signal strongly enough;    
-* the surface may be slightly misplaced;    
-* the labels may not match the true location of the ink signal;    
+* the scan may not capture the relevant signal strongly enough;    
+* the surface may be slightly misplaced (suboptimally localized);    
+* the ink labels may not match the true location of the ink signal;    
 * the model architecture may not be exploiting the right features;    
 * the ink morphology or chemistry may differ across scrolls;    
 * the signal may be present but below the current pipeline's ability to use it.
@@ -565,9 +565,9 @@ Useful community contributions should therefore be cloud-native from the beginni
 But a list of good habits only matters if the infrastructure to support them exists. It does: VC3D already supports streaming volumes directly from our open data bucket at s3://vesuvius-challenge-open-data/. It's hosted for free via the AWS Open Data Program, browsable at https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html, and stored as cloud-optimized OME-Zarr so tools can read only the region they need instead of downloading full volumes.
 
 ## Future directions
-Densely labeled 3D training data is the bottleneck. The CT volumes are enormous, but trusted voxel-level labels are scarce.
+Densely labeled 3D training data is the bottleneck. The CT volumes are enormous and trusted voxel-level labels are scarce.
 
-Several future directions try to work around that bottleneck: first by learning useful 3D representations without dense labels, then by using those representations or frozen teacher models to generate better training targets, and finally by directly segmenting ink when the CT signal is strong enough.
+Several future directions try to work around that bottleneck: first by learning useful 3D representations without dense labels, then by using those representations (often via frozen teacher models) to generate better training targets, and finally by directly segmenting ink when the CT signal is strong enough.
 
 ### Self-supervised 3D representations
 A major direction is **self-supervised learning**.
@@ -582,11 +582,11 @@ This is especially attractive for our data because the volumes are enormous and 
 
 **DINO-guided segmentation targets**
 
-Labels derived from DINO embeddings in the scroll domain are usually either coarse or noisy. Still, they can be used as segmentation targets to train UNet models. The convolutional layers inside the nnUNet will learn a finer and accurate representation, and will likely be able to perform precise segmentation. 
+Labels derived from DINO embeddings in the scroll domain are usually either coarse or noisy. Still, they can be used as segmentation targets to train UNet models. The convolutional layers inside the UNet will learn a finer and accurate representation, and will likely be able to perform precise segmentation. 
 
 Sometimes, before training directly an UNet, it could be worth “reinforcing” the embedding of the feature you want to label, using a minimal amount of manual input. For instance, one can use **supervised contrastive learning:** using a small set of labels (e.g, air, fiber, and an "ignore" class) to pull same-class embeddings together and push different-class ones apart. We did it on the PHerc. Paris 4 2.4 µm scan, and the fine-tuned DINO model is shared here: [dinovol\_v2\_ps8\_supcon3class\_step362500](https://huggingface.co/scrollprize/dinovol_v2_ps8_supcon3class_step362500)
 
-We used this frozen checkpoint to guide a 2-class background/fiber segmentation model.[fiber\_dinoguided\_2class\_step010000](https://huggingface.co/scrollprize/fiber_dinoguided_2class_step010000). "DINO-guided" doesn't mean what it might sound like: DINO isn't wired into this model's own architecture or forward pass. It's used externally, as a similarity signal for building the model's own training target. The training target itself is regenerated dynamically at every step: an ordinary intensity threshold (Otsu's method, the standard way to automatically pick the cutoff that separates an image into two classes) blended with cosine similarity (how closely two embedding vectors point in the same direction) between each voxel's embedding and a reference fiber embedding.
+We used this frozen checkpoint to guide a 2-class background/fiber segmentation model.[fiber\_dinoguided\_2class\_step010000](https://huggingface.co/scrollprize/fiber_dinoguided_2class_step010000). "DINO-guided" doesn't mean what it might sound like: DINO isn't wired into this model's own architecture or forward pass. It's used externally, as a similarity signal for building the model's own training target. The training target itself is regenerated dynamically at every step. It can be blended with cosine similarity between each voxel's DINO generated embedding and a reference fiber embedding.
 
 <Figure
   variant="full"
@@ -620,7 +620,7 @@ Careful\! The 3D UNet segmentation model for ink segmentation was not only DINO 
 
 <Admonition type="tip" icon="🙋" title="How you can help">
 
-If you work in 3D deep learning — segmentation, self-supervised learning, U-Nets — this is a natural fit. When ink is visible or can be localized confidently, as in PHerc. Paris 4 above, the cleanest formulation is voxel-level ink segmentation: it could reduce the ambiguity that 2D-projected fragment labels otherwise introduce, giving the model a direct target instead of an indirect one.
+If you work in 3D deep learning — segmentation, self-supervised learning, U-Nets — this is a natural fit. When ink is visible or can be localized confidently, as in PHerc. Paris 4 above, the cleanest formulation is voxel-level ink segmentation: it could reduce the ambiguity that 2D-projected labels otherwise introduce, giving the model a direct target instead of an indirect one.
 
 </Admonition>
 ### Self-distillation without ground truth
@@ -672,15 +672,15 @@ The pipeline works, but not without a person checking its output at almost every
 | Cross-scroll generalization | Ink models may work on one scroll but not another. | Fragment training plus scroll-specific pseudo-labeling. | Multi-scroll training, better labels, stronger diagnostics. |
 | Data scale | Scroll volumes are too large for ordinary local workflows. | OME-Zarr, chunked processing, cloud storage. | Reproducible streaming pipelines and cheaper compute/storage paths. |
 
-One step forward on cross-scroll generalization came from an unusual source: an autonomous agent swarm, inspired by the open-source karpathy/autoresearch project (released March 2026\) and adapted internally for ink-detection model architectures. Running several agents continuously, the system found a configuration that nearly doubled the validation Dice score on PHerc. 1667 while training only on PHerc. 139 data — a genuine cross-scroll generalization improvement.
+One step forward on cross-scroll generalization came from an unusual source: an autonomous agent swarm, inspired by the open-source karpathy/autoresearch project (released March 2026\) and adapted internally for ink-detection model architectures. Running several agents continuously, the system found a configuration that nearly doubled the validation Dice score (computed on pseudo-labels) on PHerc. 1667 while training only on PHerc. 139 data — a genuine cross-scroll generalization improvement.
 
 ***
 ## 6\. What’s next?
-Nobody here is claiming final victory. What's changed is that the bottlenecks are now much clearer.
+We cant claim final victory. What's changed is that the bottlenecks are now much clearer.
 
 We know that a sealed Herculaneum scroll can be virtually unwrapped and read. We know that high-resolution scanning can make previously elusive ink more visible. We know that direct volumetric ink segmentation is possible in favorable cases. We know that fragment-trained models can generalize far enough to bootstrap scroll-specific reading. We know that semi-automated geometry tools can drastically accelerate tracing, even though human correction remains necessary.
 
-But the next goal is harder to name than any single breakthrough: making all of this reliable, on any scroll, without someone catching every failure by hand.
+But the next goal is harder to name than any single breakthrough: making all of this reliable, on any scroll, without someone catching every failure.
 
 Can we choose scan parameters that preserve useful signals across scrolls? Can we infer surfaces from voxels without months of correction? Can we reduce the dependence on approximate labels, and reliably tell "no ink" apart from "no ink recovered yet"? And can we make the whole workflow reproducible enough for collection-scale reading?
 
