@@ -656,6 +656,15 @@
   must not re-sample the volume and must not interpolate image values between
   z layers; columns without a trace/fused z value and columns whose rounded
   layer is missing render black and are counted in summary/debug output.
+- `--trace2cp-vis --trace2cp-z-search --trace2cp-z-layers-tif` exports the
+  already inferred z-search layer cache as TIFF debug stacks. Single-pair mode
+  writes `trace2cp_z_layers.tif`; whole-fiber mode writes one pair-local TIFF
+  per valid pair under `trace2cp_z_layers/` because segment strips can have
+  different shapes. Pages are uint8 and non-interleaved: all sampled slice
+  images first in sorted z-layer order, then all available sheet/fiber-presence
+  maps in the same sorted z-layer order. The export must use the existing
+  z-search cache, must not re-sample the volume, and must not interpolate
+  between z layers.
 - Single-pair `trace2cp_vis.jpg` includes an additional embedding-debug column
   when the checkpoint exposes embedding channels. The column renders cosine
   similarity maps for the start CP embedding, target CP embedding, same-fiber

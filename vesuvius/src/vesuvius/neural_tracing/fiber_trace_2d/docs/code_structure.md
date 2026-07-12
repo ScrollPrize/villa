@@ -385,6 +385,12 @@ The important behavior is:
   column. Columns outside the available trace/fused z path render black. This
   visualization does not re-sample the volume and does not interpolate image
   values between z layers.
+- `--trace2cp-z-layers-tif` can be added to z-search Trace2CP runs to export
+  the inferred layer cache as multilayer TIFF. Single-pair mode writes
+  `trace2cp_z_layers.tif`; whole-fiber mode writes one pair-local TIFF per
+  valid pair under `trace2cp_z_layers/`. Page order is all sampled slice images
+  in sorted z-layer order, followed by all available presence maps in the same
+  sorted z-layer order.
 - When embedding channels are present, single-pair `trace2cp_vis.jpg` appends a
   debug column of fixed-scale cosine similarity maps: start CP, target CP,
   same-fiber CP-bank/global similarity when a combined Trace2CP bank is

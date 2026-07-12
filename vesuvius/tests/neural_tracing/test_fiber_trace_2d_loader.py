@@ -126,6 +126,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_refinement_from_traces_z,
     _trace2cp_z_corrected_image_u8,
     _trace2cp_z_corrected_presence_u8,
+    _trace2cp_z_layer_tiff_stack,
     _trace2cp_image_descriptor,
     _trace2cp_image_descriptor_loss,
     _trace_combined_image_line_to_target,
@@ -1486,6 +1487,41 @@ def test_trace2cp_z_corrected_image_marks_untraced_columns_black() -> None:
     assert image[:, 1].tolist() == [200, 200]
     assert image[:, 2].tolist() == [200, 200]
     assert image[:, 3].tolist() == [0, 0]
+
+
+def test_trace2cp_z_layer_tiff_stack_orders_slices_then_presence() -> None:
+    def layer(layer_index: int, image_value: int, presence_value: float):
+        return SimpleNamespace(
+            layer=layer_index,
+            z_voxels=float(layer_index) * 2.0,
+            image=np.full((2, 2), image_value, dtype=np.float32),
+            valid_mask=np.ones((2, 2), dtype=bool),
+            fields=SimpleNamespace(
+                presence_hw=np.full((2, 2), presence_value, dtype=np.float32),
+            ),
+        )
+
+    plane_cache = SimpleNamespace(
+        z_step_voxels=2.0,
+        layers={
+            1: layer(1, 30, 0.75),
+            -1: layer(-1, 10, 0.25),
+            0: layer(0, 20, 0.50),
+        },
+    )
+
+    stack, labels = _trace2cp_z_layer_tiff_stack(plane_cache)
+
+    assert stack.shape == (6, 2, 2)
+    assert labels == (
+        "slice layer=-1 z_voxels=-2.000000",
+        "slice layer=0 z_voxels=0.000000",
+        "slice layer=1 z_voxels=2.000000",
+        "presence layer=-1 z_voxels=-2.000000",
+        "presence layer=0 z_voxels=0.000000",
+        "presence layer=1 z_voxels=2.000000",
+    )
+    assert stack[:, 0, 0].tolist() == [10, 20, 30, 63, 127, 191]
 
 
 def test_trace2cp_tta_params_drop_y_shift_and_scale() -> None:

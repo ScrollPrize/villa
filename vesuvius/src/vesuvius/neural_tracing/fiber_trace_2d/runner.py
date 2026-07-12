@@ -140,6 +140,56 @@ def _trace2cp_z_corrected_presence_u8(
     return output, missing, layers_by_column
 
 
+def _trace2cp_z_layer_tiff_stack(
+    plane_cache: "_Trace2CpZPlaneCache",
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    layers = tuple(sorted(int(layer) for layer in plane_cache.layers))
+    pages: list[np.ndarray] = []
+    labels: list[str] = []
+    for layer in layers:
+        prediction = plane_cache.layers[int(layer)]
+        page = _to_u8_image(prediction.image, prediction.valid_mask)
+        z_voxels = float(getattr(prediction, "z_voxels", float(layer) * float(plane_cache.z_step_voxels)))
+        pages.append(page)
+        labels.append(f"slice layer={int(layer)} z_voxels={z_voxels:.6f}")
+    for layer in layers:
+        prediction = plane_cache.layers[int(layer)]
+        fields = getattr(prediction, "fields", None)
+        presence = None if fields is None else getattr(fields, "presence_hw", None)
+        if presence is None:
+            continue
+        page = _presence_map_to_u8(presence, prediction.valid_mask)
+        z_voxels = float(getattr(prediction, "z_voxels", float(layer) * float(plane_cache.z_step_voxels)))
+        pages.append(page)
+        labels.append(f"presence layer={int(layer)} z_voxels={z_voxels:.6f}")
+    if not pages:
+        raise ValueError("trace2cp z-search has no inferred layers to export")
+    shape = tuple(int(v) for v in pages[0].shape)
+    for label, page in zip(labels, pages):
+        if tuple(int(v) for v in page.shape) != shape:
+            raise ValueError(
+                "trace2cp z-search layer export requires same-shaped pages: "
+                f"first_shape={shape} mismatched_page={label!r} shape={tuple(int(v) for v in page.shape)}"
+            )
+    return np.stack(pages, axis=0).astype(np.uint8, copy=False), tuple(labels)
+
+
+def _write_multilayer_tif(path: Path, stack: np.ndarray) -> None:
+    import tifffile
+
+    pages = np.asarray(stack, dtype=np.uint8)
+    if pages.ndim != 3:
+        raise ValueError(f"multilayer TIFF stack must have shape pages,H,W; got {pages.shape}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(str(path), pages, photometric="minisblack")
+
+
+def _write_trace2cp_z_layers_tif(path: Path, debug: "_Trace2CpZTraceDebug") -> None:
+    if debug.layer_tiff_stack is None:
+        raise ValueError("trace2cp z layer TIFF export was requested but no layer stack was captured")
+    _write_multilayer_tif(path, debug.layer_tiff_stack)
+
+
 def _trace2cp_refinement_fused_xyz(refinement: _Trace2CpRefinementResult) -> np.ndarray:
     xy = np.asarray(refinement.fused_resampled_xy, dtype=np.float32)
     z = refinement.fused_resampled_z
@@ -1330,6 +1380,8 @@ class _Trace2CpZTraceDebug:
     forward_presence_missing_columns: int = 0
     reverse_presence_missing_columns: int = 0
     fused_presence_missing_columns: int = 0
+    layer_tiff_stack: np.ndarray | None = None
+    layer_tiff_page_labels: tuple[str, ...] = ()
 
     @property
     def layer_min(self) -> int:
@@ -6227,6 +6279,7 @@ def _evaluate_trace2cp_pair(
     row_axis_alignment_xyz: np.ndarray | None = None,
     build_similarity_debug: bool = True,
     build_top_strip_debug: bool = False,
+    build_z_layer_tiff_stack: bool = False,
 ) -> _Trace2CpPairEvaluation:
     segment_source = loader.build_trace2cp_segment_source(
         sample_index,
@@ -6454,6 +6507,10 @@ def _evaluate_trace2cp_pair(
                 trace_xyz=fused_xyz,
                 fallback_shape_hw=image.shape,
             )
+            layer_tiff_stack: np.ndarray | None = None
+            layer_tiff_page_labels: tuple[str, ...] = ()
+            if build_z_layer_tiff_stack:
+                layer_tiff_stack, layer_tiff_page_labels = _trace2cp_z_layer_tiff_stack(plane_cache)
             z_search_debug = _Trace2CpZTraceDebug(
                 forward_trace_xyz=forward_xyz,
                 reverse_trace_xyz=reverse_xyz,
@@ -6476,6 +6533,8 @@ def _evaluate_trace2cp_pair(
                 forward_presence_missing_columns=int(forward_presence_missing),
                 reverse_presence_missing_columns=int(reverse_presence_missing),
                 fused_presence_missing_columns=int(fused_presence_missing),
+                layer_tiff_stack=layer_tiff_stack,
+                layer_tiff_page_labels=layer_tiff_page_labels,
             )
             selected_mode = {
                 "direction": "combined_direction_z",
@@ -6624,6 +6683,7 @@ def _export_trace2cp_vis(
     candidate_max_degrees: float = 25.0,
     candidate_step_degrees: float = 1.0,
     z_search: _Trace2CpZSearchConfig | None = None,
+    export_z_layers_tif: bool = False,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -6667,6 +6727,7 @@ def _export_trace2cp_vis(
         candidate_step_degrees=candidate_step_degrees,
         z_search=z_search,
         build_top_strip_debug=True,
+        build_z_layer_tiff_stack=bool(export_z_layers_tif),
     )
     sample = evaluation.sample
     image = evaluation.image
@@ -6725,6 +6786,12 @@ def _export_trace2cp_vis(
         selected_result.reverse.trace_xy.shape[0]
     )
     z_debug = evaluation.z_search_debug
+    z_layer_tif_path: Path | None = None
+    if export_z_layers_tif:
+        if z_debug is None:
+            raise ValueError("--trace2cp-z-layers-tif requires an active z-search evaluation")
+        z_layer_tif_path = out / "trace2cp_z_layers.tif"
+        _write_trace2cp_z_layers_tif(z_layer_tif_path, z_debug)
     if z_debug is None:
         z_summary_lines = ["trace2cp_z_search=false"]
     else:
@@ -6750,6 +6817,9 @@ def _export_trace2cp_vis(
             f"trace2cp_z_forward_missing_columns={int(z_debug.forward_missing_columns)}",
             f"trace2cp_z_reverse_missing_columns={int(z_debug.reverse_missing_columns)}",
             f"trace2cp_z_fused_missing_columns={int(z_debug.fused_missing_columns)}",
+            f"trace2cp_z_layers_tif={str(z_layer_tif_path) if z_layer_tif_path is not None else ''}",
+            f"trace2cp_z_layers_tif_pages={0 if z_debug.layer_tiff_stack is None else int(z_debug.layer_tiff_stack.shape[0])}",
+            f"trace2cp_z_layers_tif_page_labels={';'.join(z_debug.layer_tiff_page_labels)}",
         ]
     summary = [
         f"sample_index={sample_index}",
@@ -6885,6 +6955,12 @@ def _export_trace2cp_vis(
             f"missing_columns={int(z_debug.forward_missing_columns)}/"
             f"{int(z_debug.reverse_missing_columns)}/{int(z_debug.fused_missing_columns)}"
         )
+    if z_layer_tif_path is not None:
+        print(
+            "trace2cp z_layers_tif "
+            f"path={z_layer_tif_path} "
+            f"pages={0 if z_debug is None or z_debug.layer_tiff_stack is None else int(z_debug.layer_tiff_stack.shape[0])}"
+        )
     print(f"exported trace2cp_vis.jpg and trace2cp_summary.txt to {out}")
 
 
@@ -6997,6 +7073,7 @@ def _export_trace2cp_fiber_vis(
     candidate_max_degrees: float = 25.0,
     candidate_step_degrees: float = 1.0,
     z_search: _Trace2CpZSearchConfig | None = None,
+    export_z_layers_tif: bool = False,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -7031,6 +7108,10 @@ def _export_trace2cp_fiber_vis(
     cp_line_indices = _trace2cp_control_point_line_indices(loader, flat_indices)
     row_axis_refs_by_line_index: dict[int, np.ndarray] = {}
     debug_rows: list[str] = []
+    z_layer_tif_rows: list[str] = []
+    z_layer_tif_dir = out / "trace2cp_z_layers"
+    if export_z_layers_tif:
+        z_layer_tif_dir.mkdir(parents=True, exist_ok=True)
     for start_cp_index, target_cp_index in pair_indices:
         alignment_line_index: int | None = None
         alignment_axis: np.ndarray | None = None
@@ -7067,6 +7148,7 @@ def _export_trace2cp_fiber_vis(
                 row_axis_alignment_xyz=alignment_axis,
                 build_similarity_debug=False,
                 build_top_strip_debug=True,
+                build_z_layer_tiff_stack=bool(export_z_layers_tif),
             )
         except ValueError as exc:
             reason = _trace2cp_skip_reason(exc)
@@ -7085,6 +7167,20 @@ def _export_trace2cp_fiber_vis(
             )
             continue
         evaluations.append(evaluation)
+        if export_z_layers_tif:
+            z_debug = evaluation.z_search_debug
+            if z_debug is None:
+                raise ValueError("--trace2cp-z-layers-tif requires an active z-search evaluation")
+            tif_path = z_layer_tif_dir / (
+                f"pair_{len(evaluations) - 1:04d}_cp_"
+                f"{int(start_cp_index)}_to_{int(target_cp_index)}.tif"
+            )
+            _write_trace2cp_z_layers_tif(tif_path, z_debug)
+            z_layer_tif_rows.append(
+                f"{int(start_cp_index)} {int(target_cp_index)} {tif_path} "
+                f"pages={0 if z_debug.layer_tiff_stack is None else int(z_debug.layer_tiff_stack.shape[0])} "
+                f"labels={';'.join(z_debug.layer_tiff_page_labels)}"
+            )
         start_line_index = int(cp_line_indices[int(start_cp_index)])
         target_line_index = int(cp_line_indices[int(target_cp_index)])
         start_axis = _trace2cp_unit_or_zero(np.asarray(evaluation.sample.start_row_axis_xyz, dtype=np.float32))
@@ -7241,6 +7337,8 @@ def _export_trace2cp_fiber_vis(
             f"trace2cp_z_forward_missing_columns={sum(int(debug.forward_missing_columns) for debug in z_debugs)}",
             f"trace2cp_z_reverse_missing_columns={sum(int(debug.reverse_missing_columns) for debug in z_debugs)}",
             f"trace2cp_z_fused_missing_columns={sum(int(debug.fused_missing_columns) for debug in z_debugs)}",
+            f"trace2cp_z_layers_tif_dir={str(z_layer_tif_dir) if export_z_layers_tif else ''}",
+            f"trace2cp_z_layers_tif_count={len(z_layer_tif_rows)}",
         ]
     else:
         z_component_lines = ["trace2cp_z_search=false"]
@@ -7280,6 +7378,9 @@ def _export_trace2cp_fiber_vis(
             f"{pair.start_cp_index} {pair.target_cp_index} {pair.reason}"
             for pair in skipped_pairs
         ),
+        "",
+        "z_layer_tifs:",
+        *z_layer_tif_rows,
     ]
     (out / "trace2cp_fiber_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
     print(f"trace2cp_error_mean={float(np.mean(metric_errors)):.8f}")
@@ -7317,6 +7418,11 @@ def _export_trace2cp_fiber_vis(
             f"missing_columns={sum(int(debug.forward_missing_columns) for debug in z_debugs)}/"
             f"{sum(int(debug.reverse_missing_columns) for debug in z_debugs)}/"
             f"{sum(int(debug.fused_missing_columns) for debug in z_debugs)}"
+        )
+    if z_layer_tif_rows:
+        print(
+            "trace2cp z_layers_tif fiber "
+            f"dir={z_layer_tif_dir} files={len(z_layer_tif_rows)}"
         )
     print(f"exported trace2cp_fiber_vis.jpg, trace2cp_fiber_summary.txt, and trace2cp_fiber_debug.txt to {out}")
 
@@ -7731,6 +7837,7 @@ def main() -> None:
     parser.add_argument("--trace2cp-vis", action="store_true")
     parser.add_argument("--trace2cp-combined", action="store_true")
     parser.add_argument("--trace2cp-z-search", action="store_true")
+    parser.add_argument("--trace2cp-z-layers-tif", action="store_true")
     parser.add_argument("--med-tta", action="store_true")
     parser.add_argument("--vis-tta", action="store_true")
     parser.add_argument("--dir-vis", action="store_true")
@@ -7856,6 +7963,8 @@ def main() -> None:
             raise SystemExit("--trace2cp-z-search requires --trace2cp-combined or an enabled combined scoring term")
         if args.trace2cp_z_search and args.med_tta:
             raise SystemExit("--trace2cp-z-search does not currently support --med-tta")
+        if args.trace2cp_z_layers_tif and not args.trace2cp_z_search:
+            raise SystemExit("--trace2cp-z-layers-tif requires --trace2cp-z-search")
         z_search = _Trace2CpZSearchConfig(
             enabled=bool(args.trace2cp_z_search),
             step_voxels=float(args.trace2cp_z_step_voxels),
@@ -7885,6 +7994,7 @@ def main() -> None:
                 candidate_max_degrees=args.trace2cp_candidate_max_deg,
                 candidate_step_degrees=args.trace2cp_candidate_step_deg,
                 z_search=z_search,
+                export_z_layers_tif=bool(args.trace2cp_z_layers_tif),
             )
             return
         _export_trace2cp_vis(
@@ -7908,6 +8018,7 @@ def main() -> None:
             candidate_max_degrees=args.trace2cp_candidate_max_deg,
             candidate_step_degrees=args.trace2cp_candidate_step_deg,
             z_search=z_search,
+            export_z_layers_tif=bool(args.trace2cp_z_layers_tif),
         )
         return
 

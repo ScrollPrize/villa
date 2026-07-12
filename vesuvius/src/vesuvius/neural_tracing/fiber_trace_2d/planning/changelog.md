@@ -2,6 +2,9 @@
 
 ## 2026-07-12
 
+- Added `--trace2cp-z-layers-tif` for Trace2CP z-search runs, exporting the
+  already inferred z-layer cache as non-interleaved multilayer TIFF stacks:
+  sorted sampled slices first, then sorted presence maps.
 - Increased Trace2CP segment strip height from four to eight times the
   configured patch height, giving visualizations/traces more vertical room
   before RF-margin or edge stops.

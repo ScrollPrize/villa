@@ -1,9 +1,9 @@
-# Trace2CP Vertical Range Increase Status
+# Trace2CP Z-Search Layer TIFF Export Status
 
-- [x] Read current request and locate Trace2CP segment height multiplier.
-- [x] Replace `task.md` with the current Trace2CP vertical range task.
-- [x] Create `task_plan.md` covering implementation, docs, specs, and tests.
-- [x] Increase Trace2CP segment height multiplier.
-- [x] Update regression test expectation.
+- [x] Read local workflow and current Trace2CP z-search code.
+- [x] Replace `task.md` with the current request.
+- [x] Create `task_plan.md` covering implementation, specs, docs, and tests.
+- [x] Add z-layer TIFF stack construction and CLI export.
+- [x] Add focused stack-order test.
 - [x] Update specs, code docs, changelog, and task log.
-- [x] Run py_compile, focused pytest, and diff check.
+- [x] Run py_compile and focused pytest.

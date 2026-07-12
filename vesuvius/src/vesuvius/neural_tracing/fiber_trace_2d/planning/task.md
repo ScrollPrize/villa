@@ -1,10 +1,14 @@
-# Trace2CP Vertical Range Increase
+# Trace2CP Z-Search Layer TIFF Export
 
-Increase the vertical range used by Trace2CP segment visualization/tracing.
+Add an opt-in Trace2CP z-search debug export that writes all z layers inferred
+and used by the z-search cache as a multilayer TIFF.
 
-- The Trace2CP segment strip should provide more vertical room before traces hit
-  RF/edge margins.
-- Keep the existing segment construction, z-search behavior, metrics, and
-  normal/VC3D coordinate semantics unchanged.
-- Update regression tests and docs/specs that describe the Trace2CP segment
-  height multiplier.
+- The flag should only be valid with `--trace2cp-z-search`.
+- The TIFF layer order must be non-interleaved: first all sampled slice images
+  in sorted z-layer order, then all corresponding presence maps in the same
+  sorted z-layer order.
+- The export must use the already inferred z-search layers and must not
+  re-sample the volume.
+- Single-pair Trace2CP should write one multilayer TIFF. Whole-fiber Trace2CP
+  should write one multilayer TIFF per valid pair because pair-local segment
+  strips can have different shapes.
