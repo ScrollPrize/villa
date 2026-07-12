@@ -135,6 +135,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_image_descriptor,
     _trace2cp_image_descriptor_loss,
     _trace2cp_select_horizontal_median_direction,
+    _trace2cp_top_monotone_direction_path,
     _trace2cp_top_direction_traces,
     _load_top_direction_model_from_checkpoint,
     _trace_combined_image_line_to_target,
@@ -2499,12 +2500,84 @@ def test_trace2cp_top_model_direction_selection_medians_horizontal_candidates() 
     assert int(layer[0, 0]) == 1
 
 
+def test_trace2cp_top_monotone_direction_path_connects_center_cps() -> None:
+    direction = np.zeros((5, 19, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((5, 19), dtype=bool)
+
+    path = _trace2cp_top_monotone_direction_path(
+        direction,
+        valid,
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 2.0], dtype=np.float32),
+    )
+
+    assert path.shape == (3, 2)
+    assert path[0].tolist() == pytest.approx([1.0, 2.0])
+    assert path[1].tolist() == pytest.approx([9.0, 2.0])
+    assert path[-1].tolist() == pytest.approx([17.0, 2.0])
+    np.testing.assert_allclose(path[:, 1], 2.0)
+
+
+def test_trace2cp_top_monotone_direction_path_prefers_gradual_eight_pixel_steps() -> None:
+    direction = np.zeros((7, 17, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((7, 17), dtype=bool)
+
+    path = _trace2cp_top_monotone_direction_path(
+        direction,
+        valid,
+        start_xy=np.asarray([0.0, 1.0], dtype=np.float32),
+        target_xy=np.asarray([16.0, 3.0], dtype=np.float32),
+        max_abs_dy=8,
+    )
+
+    np.testing.assert_allclose(path, [[0.0, 1.0], [8.0, 2.0], [16.0, 3.0]])
+
+
+def test_trace2cp_top_monotone_direction_path_respects_invalid_mask() -> None:
+    direction = np.zeros((5, 19, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((5, 19), dtype=bool)
+    valid[2, 9] = False
+
+    path = _trace2cp_top_monotone_direction_path(
+        direction,
+        valid,
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 2.0], dtype=np.float32),
+    )
+
+    assert path[0].tolist() == pytest.approx([1.0, 2.0])
+    assert path[-1].tolist() == pytest.approx([17.0, 2.0])
+    assert path[1, 0] == pytest.approx(9.0)
+    assert path[1, 1] != pytest.approx(2.0)
+
+
+def test_trace2cp_top_monotone_direction_path_crosses_invalid_barrier_with_penalty() -> None:
+    direction = np.zeros((5, 19, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((5, 19), dtype=bool)
+    valid[:, 9] = False
+
+    path = _trace2cp_top_monotone_direction_path(
+        direction,
+        valid,
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 2.0], dtype=np.float32),
+    )
+
+    assert path[0].tolist() == pytest.approx([1.0, 2.0])
+    assert path[-1].tolist() == pytest.approx([17.0, 2.0])
+    assert path.shape[0] == 3
+
+
 def test_trace2cp_top_direction_traces_reach_opposite_cp_columns() -> None:
     direction = np.zeros((5, 11, 2), dtype=np.float32)
     direction[:, :, 0] = 1.0
     valid = np.ones((5, 11), dtype=bool)
 
-    forward, reverse = _trace2cp_top_direction_traces(
+    forward, reverse, forward_reason, reverse_reason = _trace2cp_top_direction_traces(
         direction,
         valid,
         start_xy=np.asarray([2.0, 0.0], dtype=np.float32),
@@ -2516,6 +2589,8 @@ def test_trace2cp_top_direction_traces_reach_opposite_cp_columns() -> None:
     assert forward[-1].tolist() == pytest.approx([8.0, 2.0])
     assert reverse[0].tolist() == pytest.approx([8.0, 2.0])
     assert reverse[-1].tolist() == pytest.approx([2.0, 2.0])
+    assert forward_reason == "target_column"
+    assert reverse_reason == "target_column"
 
 
 def test_trace2cp_top_direction_traces_handle_ambiguous_sign_seams() -> None:
@@ -2524,7 +2599,7 @@ def test_trace2cp_top_direction_traces_handle_ambiguous_sign_seams() -> None:
     direction[:, 6:, 0] = -1.0
     valid = np.ones((5, 11), dtype=bool)
 
-    forward, reverse = _trace2cp_top_direction_traces(
+    forward, reverse, forward_reason, reverse_reason = _trace2cp_top_direction_traces(
         direction,
         valid,
         start_xy=np.asarray([2.0, 0.0], dtype=np.float32),
@@ -2536,6 +2611,8 @@ def test_trace2cp_top_direction_traces_handle_ambiguous_sign_seams() -> None:
     assert reverse[-1].tolist() == pytest.approx([2.0, 2.0])
     assert np.all(np.diff(forward[:, 0]) >= 0.0)
     assert np.all(np.diff(reverse[:, 0]) <= 0.0)
+    assert forward_reason == "target_column"
+    assert reverse_reason == "target_column"
 
 
 def test_trace2cp_top_model_loader_requires_and_loads_top_state(tmp_path: Path) -> None:

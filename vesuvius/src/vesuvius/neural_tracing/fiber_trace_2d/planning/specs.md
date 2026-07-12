@@ -616,6 +616,15 @@
   top-direction field is traced from each CP along the top-strip center row
   until the opposite CP x-column, invalid direction, edge, or max-step guard,
   and those two traces are drawn with equal visual weight on the debug panel.
+  The panel also draws a monotone-x dynamic-programming path connecting the two
+  CP columns on the top-strip center row. That DP path uses fixed 8 px
+  horizontal transitions, plus the exact target column, and integrates
+  direction alignment cost `1 - abs(dot(path_tangent, fused_direction))` across
+  every pixel column crossed by each transition. The vertical transition band
+  scales with the horizontal step, and start/target rows are exact at the CPs.
+  Invalid or missing fused-direction pixels add a fixed penalty instead of
+  blocking the path, so the diagnostic path still connects the CPs while
+  preferring valid pixels where available.
   During top trace integration, ambiguous direction signs must be resolved
   before bilinear interpolation by flipping each of the four neighboring pixel
   direction samples, if needed, so it agrees with the current trace direction;

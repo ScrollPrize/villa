@@ -1657,6 +1657,7 @@ class _Trace2CpPairEvaluation:
     top_model_direction_valid_mask: np.ndarray | None = None
     top_model_direction_source: str = ""
     top_model_direction_count: int = 0
+    top_model_direction_debug: str = ""
 
 
 @dataclass(frozen=True)
@@ -5384,7 +5385,7 @@ def _trace2cp_top_direction_traces(
     start_xy: np.ndarray,
     target_xy: np.ndarray,
     step_px: float,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, str, str]:
     field = np.asarray(direction_xy, dtype=np.float32)
     valid = np.asarray(valid_mask, dtype=bool)
     if field.ndim != 3 or field.shape[2] != 2:
@@ -5415,7 +5416,137 @@ def _trace2cp_top_direction_traces(
         step_px=step_px,
         rf_margin_px=0.0,
     )
-    return forward_trace, reverse_trace
+    return forward_trace, reverse_trace, _forward_reason, _reverse_reason
+
+
+def _trace2cp_top_monotone_direction_path(
+    direction_xy: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    max_abs_dy: int = 8,
+    invalid_penalty: float = 4.0,
+    horizontal_step_px: int = 8,
+) -> np.ndarray:
+    field = np.asarray(direction_xy, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if field.ndim != 3 or field.shape[2] != 2:
+        raise ValueError("direction_xy must have shape H,W,2")
+    if valid.shape != field.shape[:2]:
+        raise ValueError("valid_mask must match direction_xy shape")
+    height, width = (int(v) for v in valid.shape)
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    if start.shape != (2,) or target.shape != (2,):
+        raise ValueError("start_xy and target_xy must have shape (2,)")
+    if not bool(np.isfinite(start).all()) or not bool(np.isfinite(target).all()):
+        return np.zeros((0, 2), dtype=np.float32)
+
+    x0 = int(round(float(start[0])))
+    y0 = int(round(float(start[1])))
+    x1 = int(round(float(target[0])))
+    y1 = int(round(float(target[1])))
+    if (
+        x0 < 0
+        or x0 >= width
+        or x1 < 0
+        or x1 >= width
+        or y0 < 0
+        or y0 >= height
+        or y1 < 0
+        or y1 >= height
+    ):
+        return np.zeros((0, 2), dtype=np.float32)
+    if x0 == x1:
+        if y0 == y1:
+            return np.asarray([start, target], dtype=np.float32)
+        return np.zeros((0, 2), dtype=np.float32)
+
+    norm = np.linalg.norm(field, axis=2)
+    field_valid = valid & np.isfinite(field).all(axis=2) & np.isfinite(norm) & (norm > 1.0e-6)
+    unit = np.where(
+        field_valid[:, :, None],
+        field / np.clip(norm[..., None], 1.0e-12, None),
+        0.0,
+    ).astype(np.float32)
+
+    x_step = 1 if x1 > x0 else -1
+    horizontal_step = max(1, int(horizontal_step_px))
+    column_values = list(range(x0, x1, x_step * horizontal_step))
+    if not column_values or column_values[-1] != x1:
+        column_values.append(x1)
+    columns = np.asarray(column_values, dtype=np.int32)
+    rows = np.arange(height, dtype=np.int32)
+    inf = np.float32(1.0e20)
+    dp_prev = np.full(height, inf, dtype=np.float32)
+    dp_prev[y0] = np.float32(0.0)
+    backptr = np.full((int(columns.shape[0]), height), -1, dtype=np.int32)
+
+    for column_index in range(1, int(columns.shape[0])):
+        prev_x = int(columns[column_index - 1])
+        x = int(columns[column_index])
+        dx = int(x - prev_x)
+        abs_dx = abs(dx)
+        if abs_dx <= 0:
+            continue
+        transition_max_abs_dy = int(
+            np.ceil(max(0, int(max_abs_dy)) * float(abs_dx) / float(horizontal_step))
+        )
+        dy_values = np.arange(-transition_max_abs_dy, transition_max_abs_dy + 1, dtype=np.int32)
+        candidates: list[np.ndarray] = []
+        previous_rows: list[np.ndarray] = []
+        for dy in dy_values.tolist():
+            prev_y = rows - int(dy)
+            inside = (prev_y >= 0) & (prev_y < height)
+            step_norm = np.float32(np.sqrt(float(dx * dx + int(dy) * int(dy))))
+            tangent_x = np.float32(float(dx) / float(step_norm))
+            tangent_y = np.float32(float(dy) / float(step_norm))
+            transition_cost = np.zeros(height, dtype=np.float32)
+            for offset in range(1, abs_dx + 1):
+                sample_x = prev_x + x_step * offset
+                alpha = np.float32(float(offset) / float(abs_dx))
+                sample_y = np.rint(prev_y.astype(np.float32) + np.float32(dy) * alpha).astype(np.int32)
+                sample_inside = inside & (sample_y >= 0) & (sample_y < height)
+                sample_cost = np.full(height, inf, dtype=np.float32)
+                if bool(sample_inside.any()):
+                    sample_direction = unit[sample_y[sample_inside], sample_x, :]
+                    sample_valid = field_valid[sample_y[sample_inside], sample_x]
+                    alignment = np.abs(sample_direction[:, 0] * tangent_x + sample_direction[:, 1] * tangent_y)
+                    sample_cost[sample_inside] = (1.0 - np.clip(alignment, 0.0, 1.0)).astype(np.float32)
+                    sample_cost[sample_inside] += np.where(
+                        sample_valid,
+                        np.float32(0.0),
+                        np.float32(max(0.0, float(invalid_penalty))),
+                    )
+                transition_cost += sample_cost
+            candidate = np.full(height, inf, dtype=np.float32)
+            usable = inside
+            if bool(usable.any()):
+                candidate[usable] = dp_prev[prev_y[usable]] + transition_cost[usable]
+            candidates.append(candidate)
+            previous_rows.append(np.where(inside, prev_y, -1).astype(np.int32))
+        candidate_stack = np.stack(candidates, axis=0)
+        previous_stack = np.stack(previous_rows, axis=0)
+        best_choice = np.argmin(candidate_stack, axis=0)
+        dp_next = candidate_stack[best_choice, rows].astype(np.float32)
+        backptr[column_index] = previous_stack[best_choice, rows]
+        dp_prev = dp_next
+
+    if not np.isfinite(float(dp_prev[y1])) or float(dp_prev[y1]) >= float(inf) * 0.5:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    path_y = np.full(int(columns.shape[0]), -1, dtype=np.int32)
+    path_y[-1] = y1
+    for column_index in range(int(columns.shape[0]) - 1, 0, -1):
+        prev_y = int(backptr[column_index, int(path_y[column_index])])
+        if prev_y < 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        path_y[column_index - 1] = prev_y
+    path = np.stack([columns.astype(np.float32), path_y.astype(np.float32)], axis=1).astype(np.float32)
+    path[0] = start
+    path[-1] = target
+    return path
 
 
 def _trace2cp_top_model_direction_overlay(
@@ -5430,7 +5561,7 @@ def _trace2cp_top_model_direction_overlay(
     step_px: float,
     device: torch.device,
     stride: int = 8,
-) -> tuple[np.ndarray, int, np.ndarray]:
+) -> tuple[np.ndarray, int, np.ndarray, str]:
     if len(layer_images) != len(layer_valid_masks):
         raise ValueError("layer image and valid-mask counts must match")
     if not layer_images:
@@ -5455,13 +5586,39 @@ def _trace2cp_top_model_direction_overlay(
         stride=max(1, int(stride)),
         color_rgba=(32, 255, 255, 235),
     )
-    forward_trace, reverse_trace = _trace2cp_top_direction_traces(
+    forward_trace, reverse_trace, forward_reason, reverse_reason = _trace2cp_top_direction_traces(
         best_direction,
         draw_valid,
         start_xy=start_xy,
         target_xy=target_xy,
         step_px=step_px,
     )
+    height = int(draw_valid.shape[0])
+    center_y = np.float32((float(height) - 1.0) * 0.5)
+    monotone_path = _trace2cp_top_monotone_direction_path(
+        best_direction,
+        draw_valid,
+        start_xy=np.asarray(
+            [float(np.asarray(start_xy, dtype=np.float32)[0]), center_y],
+            dtype=np.float32,
+        ),
+        target_xy=np.asarray(
+            [float(np.asarray(target_xy, dtype=np.float32)[0]), center_y],
+            dtype=np.float32,
+        ),
+    )
+    if monotone_path.size:
+        rounded_x = np.rint(monotone_path[:, 0]).astype(np.int32)
+        rounded_y = np.rint(monotone_path[:, 1]).astype(np.int32)
+        inside = (
+            (rounded_y >= 0)
+            & (rounded_y < int(draw_valid.shape[0]))
+            & (rounded_x >= 0)
+            & (rounded_x < int(draw_valid.shape[1]))
+        )
+        invalid_count = int(np.count_nonzero(~draw_valid[rounded_y[inside], rounded_x[inside]]))
+    else:
+        invalid_count = 0
     overlay = _overlay_polyline_rgb(
         overlay,
         forward_trace,
@@ -5474,7 +5631,19 @@ def _trace2cp_top_model_direction_overlay(
         color_rgba=(255, 64, 220, 220),
         thickness=2,
     )
-    return overlay, int(drawn), best_layer
+    overlay = _overlay_polyline_rgb(
+        overlay,
+        monotone_path,
+        color_rgba=(255, 255, 64, 245),
+        thickness=2,
+    )
+    debug = (
+        f"fwd_reason={forward_reason} fwd_points={int(forward_trace.shape[0])} "
+        f"rev_reason={reverse_reason} rev_points={int(reverse_trace.shape[0])} "
+        f"dp_step_px=8 dp_points={int(monotone_path.shape[0])} "
+        f"dp_invalid_pixels={invalid_count}"
+    )
+    return overlay, int(drawn), best_layer, debug
 
 
 def _draw_trace2cp_similarity_panel(
@@ -5599,6 +5768,7 @@ def _draw_trace2cp_overlay(
     top_model_direction_valid_mask: np.ndarray | None = None,
     top_model_direction_source: str = "",
     top_model_direction_count: int = 0,
+    top_model_direction_debug: str = "",
     valid_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
@@ -5858,6 +6028,7 @@ def _draw_trace2cp_overlay(
                     "top model directions on fused top strip "
                     f"{top_model_direction_source or 'unknown'} "
                     f"drawn={int(top_model_direction_count)}"
+                    + (f" {top_model_direction_debug}" if top_model_direction_debug else "")
                 ),
             )
         )
@@ -6989,6 +7160,7 @@ def _evaluate_trace2cp_pair(
     top_model_direction_valid_mask: np.ndarray | None = None
     top_model_direction_source = ""
     top_model_direction_count = 0
+    top_model_direction_debug = ""
     if build_top_strip_debug:
         top_strip_image, top_strip_valid_mask = loader.sample_trace2cp_top_strip_source(segment_source)
         fused_center_xyz: np.ndarray | None = None
@@ -7045,7 +7217,12 @@ def _evaluate_trace2cp_pair(
                 )
                 layer_images.append(layer_image)
                 layer_valid_masks.append(layer_valid)
-            top_model_direction_image, top_model_direction_count, _top_model_direction_best_layer = _trace2cp_top_model_direction_overlay(
+            (
+                top_model_direction_image,
+                top_model_direction_count,
+                _top_model_direction_best_layer,
+                top_model_direction_debug,
+            ) = _trace2cp_top_model_direction_overlay(
                 top_model,
                 top_direction_image,
                 top_direction_valid,
@@ -7056,7 +7233,7 @@ def _evaluate_trace2cp_pair(
                 step_px=step_px,
                 device=device,
             )
-            top_model_direction_valid_mask = np.asarray(top_direction_valid, dtype=bool)
+            top_model_direction_valid_mask = np.ones_like(np.asarray(top_direction_valid, dtype=bool), dtype=bool)
     return _Trace2CpPairEvaluation(
         sample_index=int(sample_index),
         sample=sample,
@@ -7084,6 +7261,7 @@ def _evaluate_trace2cp_pair(
         top_model_direction_valid_mask=top_model_direction_valid_mask,
         top_model_direction_source=top_model_direction_source,
         top_model_direction_count=int(top_model_direction_count),
+        top_model_direction_debug=top_model_direction_debug,
     )
 
 
@@ -7247,6 +7425,7 @@ def _write_trace2cp_iteration_artifacts(
         top_model_direction_valid_mask=evaluation.top_model_direction_valid_mask,
         top_model_direction_source=evaluation.top_model_direction_source,
         top_model_direction_count=evaluation.top_model_direction_count,
+        top_model_direction_debug=evaluation.top_model_direction_debug,
         valid_mask=evaluation.valid_mask,
     )
     _write_jpg(output_dir / f"trace2cp_vis{suffix}.jpg", overlay)
@@ -7412,6 +7591,7 @@ def _export_trace2cp_vis(
         top_model_direction_valid_mask=evaluation.top_model_direction_valid_mask,
         top_model_direction_source=evaluation.top_model_direction_source,
         top_model_direction_count=evaluation.top_model_direction_count,
+        top_model_direction_debug=evaluation.top_model_direction_debug,
         valid_mask=valid_mask,
     )
     _write_jpg(out / "trace2cp_vis.jpg", overlay)
@@ -7478,6 +7658,7 @@ def _export_trace2cp_vis(
         f"trace2cp_top_model_dir_vis={bool(top_model_dir_vis)}",
         f"trace2cp_top_model_direction_source={evaluation.top_model_direction_source}",
         f"trace2cp_top_model_direction_count={int(evaluation.top_model_direction_count)}",
+        f"trace2cp_top_model_direction_debug={evaluation.top_model_direction_debug}",
         f"trace_points={trace_points}",
         f"trace2cp_error={metric.error:.8f}",
         f"trace2cp_metric_error={metric.error:.8f}",

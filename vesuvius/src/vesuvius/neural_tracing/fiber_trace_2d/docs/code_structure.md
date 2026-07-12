@@ -376,8 +376,13 @@ The important behavior is:
   direction field, from each CP toward the other CP's x column. Those traces
   resolve ambiguous direction signs before bilinear interpolation by flipping
   each of the four neighboring pixel direction samples, if needed, to agree
-  with the current trace direction. The panel is diagnostic only and does not
-  change scoring or z-layer selection.
+  with the current trace direction. The same panel also draws a monotone-x
+  dynamic-programming path from CP column to CP column on the top-strip center
+  row. That path uses fixed 8 px horizontal transitions, integrates
+  `1 - abs(dot(path_tangent, fused_direction))` across each transition's
+  crossed pixel columns, and uses a fixed penalty, rather than a hard stop, for
+  invalid/missing fused-direction pixels. The panel is diagnostic only and does
+  not change scoring or z-layer selection.
 - `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` adds an
   experimental short z-search to the combined tracer. The loader builds one
   aligned Trace2CP segment source from the CP-to-CP line window and Lasagna

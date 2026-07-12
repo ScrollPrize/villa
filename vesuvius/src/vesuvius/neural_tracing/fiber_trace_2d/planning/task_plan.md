@@ -1,22 +1,30 @@
-# Trace2CP Top-Model Direction Debug Plan
+# Trace2CP Top-Model Monotone Path Plan
 
 ## Implementation
 
-- Replace the top-model offset-layer direction picker with a fused median:
-  normalize every decoded layer direction, keep only valid directions within
-  45 degrees of horizontal using `abs(dx) >= cos(45 degrees)`, align signs to
-  the positive horizontal direction, take the component-wise median, and
-  normalize the result.
-- Keep returning a debug layer map by selecting the contributing layer closest
-  to the fused median direction.
-- Keep top traces ambiguity-aware when bilinearly sampling the fused field.
-- Draw the forward and reverse top traces with equal stroke weight and opacity.
+- Add a NumPy dynamic-programming helper for a monotone-x top-strip path.
+- Use the top-strip center row for both CPs, matching the existing top-strip
+  visualization convention.
+- Round CP x columns to image columns, step in fixed 8 px horizontal increments
+  plus the exact target column, and allow a bounded vertical transition band
+  proportional to the horizontal step.
+- Use ambiguous direction alignment cost for each transition:
+  integrate `1 - abs(dot(normalized([dx, dy]), normalized_direction_at_pixel))`
+  over every pixel column crossed by the transition.
+- Add a fixed penalty for invalid fused direction pixels so the path can still
+  connect across gaps, while preferring valid field pixels where possible.
+- Backtrack the minimal-cost path ending at the target CP row and return it as
+  polyline coordinates.
+- Draw the DP path in the `--trace2cp-top-model-dir-vis` debug panel along
+  with the existing forward/reverse local traces.
+- Include top-trace stop reasons, point counts, DP path length, and DP invalid
+  pixel count in the single-pair trace summary/debug label.
 
 ## Spec Update
 
-- Update `--trace2cp-top-model-dir-vis` semantics from single most-horizontal
-  layer selection to aligned median fusion over horizontally plausible layers.
-- Document that the top traces remain visualization-only.
+- Document the monotone-x DP path and its direction-alignment cost.
+- Document that it is visualization-only for now and does not change Trace2CP
+  scoring or z-search.
 
 ## Docs Updates
 
@@ -25,8 +33,10 @@
 
 ## Tests
 
-- Update focused tests so top-direction fusion verifies median behavior,
-  horizontal thresholding, and sign alignment.
+- Add focused tests that a horizontal field produces a CP-to-CP center path,
+  that an 8 px step path prefers gradual corrections over one large jump, that
+  invalid pixels are avoided where possible, and that a full invalid barrier is
+  still crossed.
 - Run:
   - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`

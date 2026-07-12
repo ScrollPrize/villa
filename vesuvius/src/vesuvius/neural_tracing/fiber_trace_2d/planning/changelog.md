@@ -2,6 +2,12 @@
 
 ## 2026-07-13
 
+- Added a visualization-only monotone-x dynamic-programming CP-to-CP path over
+  the fused `--trace2cp-top-model-dir-vis` direction field, with summary debug
+  for top-trace stop reasons and a soft penalty for invalid direction pixels.
+- Updated that top-model DP path to use fixed 8 px horizontal transitions and
+  integrated direction error over each transition to reduce late vertical
+  jumps.
 - Changed `--trace2cp-top-model-dir-vis` top-direction fusion to use a
   sign-aligned median of offset-layer directions within 45 degrees of
   image-horizontal, and made the reverse top trace equally visible.

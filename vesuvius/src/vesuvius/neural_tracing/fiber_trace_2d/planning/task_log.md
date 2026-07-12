@@ -1,17 +1,19 @@
-# Trace2CP Top-Model Median Direction Fusion Task Log
+# Trace2CP Top-Model Monotone Path Task Log
 
 ## Implementation Notes
 
-- Changed the `--trace2cp-top-model-dir-vis` offset-stack direction fusion from
-  single-layer most-horizontal selection to a median over all valid layer
-  directions within 45 degrees of image-horizontal.
-- Before the median, each contributing Lasagna-ambiguous direction is normalized
-  and sign-aligned toward positive image x so opposite signs cannot cancel.
-- The returned debug layer map now records the contributing layer whose aligned
-  direction is closest to the fused median direction.
-- The visualization-only top traces still use ambiguity-aware direction
-  sampling while tracing.
-- The forward and reverse top traces now use the same stroke weight and opacity.
+- Updated the NumPy monotone-x dynamic-programming helper for the top-model
+  direction field to use fixed 8 px horizontal transitions.
+- The DP path connects the two CP x-columns on the top-strip center row and
+  integrates `1 - abs(dot(path_tangent, fused_direction))` across every pixel
+  column crossed by each transition.
+- Invalid fused-direction pixels get a fixed penalty rather than acting as hard
+  barriers, so the diagnostic path still connects the CPs across missing field
+  gaps while preferring valid pixels where possible.
+- The top-model direction debug panel now draws the DP path in addition to the
+  existing local forward/reverse traces.
+- The single-pair summary now reports top local-trace stop reasons, point
+  counts, DP path length, and DP invalid-pixel count.
 
 ## Deviations
 
@@ -21,7 +23,7 @@
 
 - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
   passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'top_model_direction_selection or top_direction_traces or bilinear_direction_sample_ambiguous'`
-  passed: 4 tests.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'top_monotone_direction_path or top_direction_traces or top_model_direction_selection'`
+  passed after fixed-step integrated-cost update: 7 tests.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: 215 tests.
+  passed after the fixed-step integrated-cost update: 219 tests.
