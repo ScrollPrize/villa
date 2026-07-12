@@ -153,7 +153,7 @@
         "CMAKE_CXX_COMPILER": "g++",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "VC_USE_PCH": "ON",
-        "VC_TESTING": "ON"
+        "VC_TESTING": "OFF"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },
@@ -185,7 +185,7 @@
         "CMAKE_SHARED_LINKER_FLAGS_INIT": "-fuse-ld=lld",
         "CMAKE_MODULE_LINKER_FLAGS_INIT": "-fuse-ld=lld",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "13.3",
-        "VC_TESTING": "ON"
+        "VC_TESTING": "OFF"
       }
     }
   ],

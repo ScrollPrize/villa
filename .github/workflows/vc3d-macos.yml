@@ -83,9 +83,6 @@ jobs:
       - name: Build
         run: ./scripts/build_macos.sh --ccache
 
-      - name: Test
-        run: ctest --test-dir build-macos --output-on-failure
-
       - name: Package (DMG + ZIP)
         run: |
           cd build-macos

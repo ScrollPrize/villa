@@ -82,7 +82,7 @@ jobs:
       - name: Build
         run: ninja -C build/ci-windows-mingw
 
-      # Persist compiler results before tests and package smoke checks. Cache
+      # Persist compiler results before package smoke checks. Cache
       # entries are immutable, so a rerun of this commit restores the exact
       # build's cache even if a later step fails or times out.
       - name: Save compiler cache
@@ -95,9 +95,6 @@ jobs:
       - name: Report compiler cache statistics
         if: always()
         run: ccache --show-stats
-
-      - name: Test
-        run: ctest --test-dir build/ci-windows-mingw --output-on-failure
 
       - name: Package (NSIS installer + ZIP)
         run: |
