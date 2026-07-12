@@ -40,6 +40,10 @@
 - [ ] for embedding similarity try best along some small z range (and short y as well)
 - [ ] also embedding - incorporate angle? (probably not needed if curr angle est are good)
 - [ ] vis both (train & test vis) the patches cp and another patches cp (same fiber) for similarity
+- [ ] Now lets do a modification that re-introduces multiple z-slices again - we see that some difficulty in the embedding is mostly caused by the sample shifting in z
+  so we enable z-steps again in the config lets do for a step of 4vx and the pos loss is now not all in-fiber cps against each other but for each pair we only require the best similarity  
+  between any of the pairs offsets to be supervised.
+
     
 # ideas
 - [ ] short-strip self supervision?

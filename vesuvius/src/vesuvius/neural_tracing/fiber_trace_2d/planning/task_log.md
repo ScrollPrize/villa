@@ -1,19 +1,21 @@
-# Trace2CP Last-Point Similarity Columns Task Log
+# Trace2CP Short Z-Search Task Log
 
-## Notes
+## Planning Notes
 
-- Added `_trace_progress_similarity_map` for forward/reverse Trace2CP
-  embedding-debug panels.
-- The helper samples the previous accepted trace point's embedding and paints
-  only the vertical column band around the newly placed point, using
-  `ceil(step_px / 2)` as the radius.
-- Unvisited columns remain `NaN`, which the existing fixed-scale visualization
-  renders as black.
-- Start CP, target CP, and same-fiber/global CP-bank similarity maps remain
-  unchanged full-image fixed-scale cosine displays.
+- Replaced the active task with the requested Trace2CP short z-search.
+- Drafted a plan that limits the first implementation to an experimental
+  `--trace2cp-z-search` extension of `--trace2cp-combined`.
+- The plan keeps direction-only Trace2CP, training loss, best-checkpoint
+  selection, and public `trace2cp_error` unchanged.
+- The plan interprets z as the existing strip offset axis, measured in
+  selected-scale voxels. The default layer step is planned as two selected-scale
+  voxels.
+- The plan applies `abs(dy) + abs(dz_voxels)` to the connection /
+  closest-approach logic, not to the public metric.
+- The z-corrected visualization reconstruction is planned as per-image-column
+  nearest-layer copy from already inferred layer images. It must not re-sample
+  the volume or interpolate image values between z layers.
 
 ## Validation
 
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: 160 tests in 7.14s.
-- `git diff --check` on touched files passed.
+- Planning-only task so far; no code tests run.
