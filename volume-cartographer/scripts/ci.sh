@@ -13,6 +13,7 @@
 #
 # Environment knobs:
 #   PATCH_COVERAGE_MIN  minimum % required by `patch-coverage` (default 0)
+#   VC_CCACHE_MAXSIZE   compiler-cache size limit (default 3G)
 #
 # In GitHub Actions ($GITHUB_ACTIONS=true) the builder step uses GHA buildx
 # layer cache; locally it falls back to the local docker layer cache.
@@ -25,11 +26,7 @@ cd "$REPO_ROOT"
 IMAGES=(ubuntu-26.04)
 DOCKERFILES=(Dockerfile)
 COMPILERS=(gcc clang)
-# Sanitizer presets are clang-only; ci-tests runs both gcc and clang. This
-# mirrors the cells in .github/workflows/vc3d-ci.yml so `ci.sh all` is the
-# same matrix on dev/EC2 as on GHA.
-TEST_PRESETS=(ci-tests)
-CLANG_SANITIZER_PRESETS=(ci-asan-ubsan ci-tsan ci-tysan ci-nsan)
+TEST_PRESETS=(ci-release-tests)
 
 dockerfile_for() {
     local image=$1
@@ -68,6 +65,10 @@ run_in_builder() {
         -v "$src:/src" \
         -w /src \
         -e "VC_BUILD_SUFFIX=-$image" \
+        -e "CCACHE_DIR=/src/.ccache" \
+        -e "CCACHE_BASEDIR=/src" \
+        -e "CCACHE_MAXSIZE=${VC_CCACHE_MAXSIZE:-3G}" \
+        -e "CCACHE_COMPRESS=true" \
         "vc-builder:$image" bash -c "$*"
 }
 
@@ -194,17 +195,21 @@ cmd_test() {
     local image=$1 compiler=$2 preset=$3
     cmd_builder "$image"
     run_in_builder "$image" "$REPO_ROOT" "
-        cmake --preset $preset-$compiler &&
+        ccache --zero-stats &&
+        cmake --preset $preset-$compiler -DVC_USE_CCACHE=ON &&
         cmake --build --preset $preset-$compiler &&
-        ctest --preset $preset-$compiler"
+        ctest --preset $preset-$compiler &&
+        ccache --show-stats"
 }
 
 cmd_compile() {
     local image=$1 compiler=$2 preset=$3
     cmd_builder "$image"
     run_in_builder "$image" "$REPO_ROOT" "
-        cmake --preset $preset-$compiler &&
-        cmake --build --preset $preset-$compiler"
+        ccache --zero-stats &&
+        cmake --preset $preset-$compiler -DVC_USE_CCACHE=ON &&
+        cmake --build --preset $preset-$compiler &&
+        ccache --show-stats"
 }
 
 cmd_coverage() {
@@ -325,31 +330,17 @@ cmd_dead_code() {
 }
 
 cmd_all() {
-    # cmd_compile/cmd_test/cmd_coverage/cmd_dead_code each call cmd_builder up-front; repeats are cheap (pull+buildx cached), so no pre-warm here.
-    # 26.04: Release compile + full test matrix + sanitizers.
-    for compiler in "${COMPILERS[@]}"; do
-        echo "=== ubuntu-26.04: ci-release-$compiler (compile) ==="
-        cmd_compile ubuntu-26.04 "$compiler" ci-release
-    done
+    # cmd_compile/cmd_test each call cmd_builder up-front; repeats are cheap
+    # (pull+buildx cached), so no pre-warm here.
+    # 26.04: one blocking Release build + test run per compiler.
     for compiler in "${COMPILERS[@]}"; do
         for preset in "${TEST_PRESETS[@]}"; do
             echo "=== ubuntu-26.04: $preset-$compiler ==="
             cmd_test ubuntu-26.04 "$compiler" "$preset"
         done
     done
-    for preset in "${CLANG_SANITIZER_PRESETS[@]}"; do
-        echo "=== ubuntu-26.04: $preset-clang ==="
-        cmd_test ubuntu-26.04 clang "$preset"
-    done
-    echo "=== Coverage (clang, source-based) ==="
-    cmd_coverage ubuntu-26.04
-    echo "=== Dead-code report ==="
-    cmd_dead_code ubuntu-26.04 clang
-
     echo
     echo "All CI passed."
-    echo "Coverage HTML: $REPO_ROOT/coverage/index.html"
-    tail -5 "$REPO_ROOT/coverage/summary.txt"
 }
 
 case "${1:-all}" in

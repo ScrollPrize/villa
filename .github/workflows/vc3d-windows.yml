@@ -32,6 +32,11 @@ jobs:
     name: Build + package (MSYS2 UCRT64)
     runs-on: windows-latest
     timeout-minutes: 150
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/volume-cartographer/.ccache/windows-mingw
+      CCACHE_BASEDIR: ${{ github.workspace }}/volume-cartographer
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPRESS: 'true'
     defaults:
       run:
         shell: msys2 {0}
@@ -49,6 +54,7 @@ jobs:
             gcc:p
             cmake:p
             ninja:p
+            ccache:p
             pkgconf:p
             qt6-base:p
             qt6-svg:p
@@ -68,11 +74,26 @@ jobs:
             blosc:p
             nsis:p
 
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: volume-cartographer/.ccache/windows-mingw
+          key: vc3d-windows-mingw-ccache-v1-${{ github.sha }}
+          restore-keys: |
+            vc3d-windows-mingw-ccache-v1-
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
+
       - name: Configure
-        run: cmake --preset ci-windows-mingw
+        run: cmake --preset ci-windows-mingw -DVC_USE_CCACHE=ON
 
       - name: Build
         run: ninja -C build/ci-windows-mingw
+
+      - name: Report compiler cache statistics
+        if: always()
+        run: ccache --show-stats
 
       - name: Test
         run: ctest --test-dir build/ci-windows-mingw --output-on-failure

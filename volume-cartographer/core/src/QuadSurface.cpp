@@ -30,6 +30,13 @@
 
 #include <stdio.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #ifdef __linux__
 // renameat2(RENAME_EXCHANGE) in save() needs the GNU prototypes.
 #ifndef _GNU_SOURCE
@@ -46,6 +53,22 @@
 
 namespace {
 
+void replaceFile(const std::filesystem::path& source,
+                 const std::filesystem::path& destination)
+{
+#ifdef _WIN32
+    if (!MoveFileExW(source.wstring().c_str(),
+                     destination.wstring().c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const std::error_code ec(static_cast<int>(GetLastError()),
+                                 std::system_category());
+        throw std::filesystem::filesystem_error(
+            "cannot replace file", source, destination, ec);
+    }
+#else
+    std::filesystem::rename(source, destination);
+#endif
+}
 
 void normalizeMaskChannel(cv::Mat& mask)
 {
@@ -1710,11 +1733,19 @@ void QuadSurface::save_meta()
         meta["scale"] = std::move(sc);
     }
 
-    std::ofstream o(path/"meta.json.tmp");
-    o << meta.dump(4) << std::endl;
+    const auto tempMetaPath = path / "meta.json.tmp";
+    const auto metaPath = path / "meta.json";
+    {
+        std::ofstream o(tempMetaPath);
+        o << meta.dump(4) << std::endl;
+        if (!o) {
+            throw std::runtime_error("failed to write metadata: " + tempMetaPath.string());
+        }
+    }
 
-    //rename to make creation atomic
-    std::filesystem::rename(path/"meta.json.tmp", path/"meta.json");
+    // Rename to make replacement atomic. Windows requires the source handle to
+    // be closed and an explicit replace-existing operation.
+    replaceFile(tempMetaPath, metaPath);
 }
 
 Rect3D QuadSurface::bbox()

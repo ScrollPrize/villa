@@ -83,6 +83,7 @@ TEST_CASE("TiffWriter rejects mismatched dtype on writeTile")
     TiffWriter w(p, 16, 16, CV_8UC1, 16, 16);
     cv::Mat wrong(16, 16, CV_16UC1, cv::Scalar(0));
     CHECK_THROWS_AS(w.writeTile(0, 0, wrong), std::runtime_error);
+    w.close();
     fs::remove_all(d);
 }
 

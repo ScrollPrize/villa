@@ -4,12 +4,13 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/build_macos.sh [--install-deps] [--build-dir DIR] [--jobs N]
+  scripts/build_macos.sh [--install-deps] [--ccache] [--build-dir DIR] [--jobs N]
 
 Build VC3D natively on macOS with Homebrew LLVM/Clang.
 
 Options:
   --install-deps   Install missing Homebrew formulae before configuring.
+  --ccache         Enable ccache (installed when combined with --install-deps).
   --build-dir DIR  Override the default build directory: build-macos
   --jobs N         Parallel build jobs. Defaults to the host CPU count.
 USAGE
@@ -26,6 +27,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$script_dir/.."
 
 install_deps=0
+use_ccache=0
 build_dir="build-macos"
 jobs="$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 
@@ -33,6 +35,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --install-deps)
       install_deps=1
+      shift
+      ;;
+    --ccache)
+      use_ccache=1
       shift
       ;;
     --build-dir)
@@ -96,6 +102,9 @@ required_formulae=(
   # dependency even though we no longer use gfortran as the compiler.
   gcc
 )
+if (( use_ccache )); then
+  required_formulae+=(ccache)
+fi
 
 missing=()
 for formula in "${required_formulae[@]}"; do
@@ -146,6 +155,10 @@ if command -v xcrun >/dev/null 2>&1; then
 fi
 
 extra_cmake_args=()
+if (( use_ccache )); then
+  extra_cmake_args+=("-DVC_USE_CCACHE=ON")
+  ccache --zero-stats
+fi
 # Eigen ships its CMake config under <prefix>/share/eigen3/cmake. Derive
 # the prefix via `brew --prefix eigen` so a Homebrew revision bump (eigen
 # 3.4.0_1 → 3.4.0_2 → 3.5.x …) doesn't rot the script.
@@ -189,3 +202,7 @@ cmake --preset macos-homebrew-llvm \
   "${extra_cmake_args[@]}"
 
 cmake --build "$build_dir" -j "$jobs"
+
+if (( use_ccache )); then
+  ccache --show-stats
+fi

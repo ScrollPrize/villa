@@ -44,11 +44,23 @@ jobs:
     env:
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      CCACHE_DIR: ${{ github.workspace }}/volume-cartographer/.ccache/macos-homebrew-llvm
+      CCACHE_BASEDIR: ${{ github.workspace }}/volume-cartographer
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPRESS: 'true'
     defaults:
       run:
         working-directory: volume-cartographer
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: volume-cartographer/.ccache/macos-homebrew-llvm
+          key: vc3d-macos-15-homebrew-llvm-ccache-v1-${{ github.sha }}
+          restore-keys: |
+            vc3d-macos-15-homebrew-llvm-ccache-v1-
 
       - name: Refresh Homebrew index
         run: brew update --quiet
@@ -57,7 +69,7 @@ jobs:
       # lld, flang, Qt, OpenCV, Ceres, ...), sets up the toolchain env, and
       # configures + builds via the macos-homebrew-llvm preset.
       - name: Build
-        run: ./scripts/build_macos.sh --install-deps
+        run: ./scripts/build_macos.sh --install-deps --ccache
 
       - name: Test
         run: ctest --test-dir build-macos --output-on-failure
