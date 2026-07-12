@@ -44,7 +44,7 @@
     "control_points_per_step": 128,
     "device": "auto",
     "tensorboard_enabled": true,
-    "model_hidden_channels": 64,
+    "model_hidden_channels": 128,
     "model_depth": 10,
     "presence_enabled": true,
     "presence_weight": 0.1,
