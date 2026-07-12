@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write  # needed to upload installer assets to releases
+  contents: read
   packages: read
 
 concurrency:
@@ -157,12 +157,27 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "VC3D --version failed (exit $($p.ExitCode))" }
           Write-Host "VC3D --version OK"
 
+  release-windows:
+    name: Attach Windows package to release
+    if: github.event_name == 'release'
+    needs: build-windows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: VC3D-windows-installer
+          path: release-assets
+
       - name: Attach installer to release
-        if: github.event_name == 'release'
-        shell: pwsh
-        working-directory: volume-cartographer/build/ci-windows-mingw
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.event.release.tag_name }}"
-          gh release upload $tag (Get-Item VC3D-*-win64.exe).FullName (Get-Item VC3D-*-win64.zip).FullName --clobber
+          gh release upload "${{ github.event.release.tag_name }}" \
+            release-assets/VC3D-*-win64.exe \
+            release-assets/VC3D-*-win64.zip \
+            --clobber

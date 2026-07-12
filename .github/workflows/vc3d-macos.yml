@@ -30,7 +30,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write  # needed to upload DMG assets to releases
+  contents: read
   packages: read
 
 concurrency:
@@ -166,11 +166,27 @@ jobs:
           QT_QPA_PLATFORM=cocoa "$bin/VC3D" --version
           echo "VC3D --version OK"
 
-      - name: Attach DMG to release
-        if: github.event_name == 'release'
-        working-directory: volume-cartographer/build-macos
+  release-macos:
+    name: Attach macOS package to release
+    if: github.event_name == 'release'
+    needs: build-macos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download app artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: VC3D-macos-app
+          path: release-assets
+
+      - name: Attach app to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ github.event.release.tag_name }}" \
-            VC3D-*-macos-*.dmg VC3D-*-macos-*.zip --clobber
+            release-assets/VC3D-*-macos-*.dmg \
+            release-assets/VC3D-*-macos-*.zip \
+            --clobber
