@@ -39,6 +39,8 @@ const sidebars = {
               id: '2026_open_problems',
               label: 'Problems in-depth',
             },
+            { type: 'doc', id: 'winding_annotations' },
+            { type: 'doc', id: 'ink_detection_problem' },
           ],
         },
         {

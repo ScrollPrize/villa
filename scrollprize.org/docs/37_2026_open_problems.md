@@ -88,7 +88,7 @@ Reading a scroll is a chain of complex problems:
     scanning: '#1-scanning-preserving-the-signal-before-algorithms-see-it',
     representation: '#2-unwrapping-turning-disconnected-voxels-into-a-surface',
     segmentation: '#2d-parameterization-and-flattening-the-easier-problem-after-the-hard-one',
-    ink: '#3-ink-recovery-detecting-what-is-written',
+    ink: '#3-ink-recovery-reading-the-scrolls',
   }}
   labels={{
     representation: 'Unwrapping',
@@ -649,11 +649,11 @@ Top row: the raw CT crop, cutting across several parallel fiber bundles; the pse
 The result is released as [fiber\_ink\_4class\_selfdistill](https://huggingface.co/scrollprize/fiber_ink_4class_selfdistill), alongside the frozen fiber teacher that helped produce it, [fiber\_selftrain\_teacher\_epoch30](https://huggingface.co/scrollprize/fiber_selftrain_teacher_epoch30). 
 
 ### Six ways you can help, recapped
-Sections [2](#2-unwrapping-turning-disconnected-voxels-into-a-surface) and [3](#3-ink-recovery-detecting-what-is-written) above introduced mesh tracing, approximate labels, fiber connectivity, and 3D ink segmentation — and along the way, six 🙋 callouts pointed out where the community can make the most difference:
+Sections [2](#2-unwrapping-turning-disconnected-voxels-into-a-surface) and [3](#3-ink-recovery-reading-the-scrolls) above introduced mesh tracing, approximate labels, fiber connectivity, and 3D ink segmentation — and along the way, six 🙋 callouts pointed out where the community can make the most difference:
 
 * **Create datasets** with labels better localized on the papyrus’ recto **or train ML models** that can better preserve the sheets’ topology (See the 🙋 callout in ["Surface prediction"](#surface-prediction), Section 2.)  
 * **If you know classical geometry, optimization, or C++:** help with automatic topology repair — building tools that catch mesh-tracing errors like holes, mergers, and sheet switches without a human checking every traced piece of surface by hand. (See the 🙋 callout in ["Meshes: adding connectivity"](#meshes-adding-connectivity), Section 2.)  
-* **If you have experience with 3D annotation, active learning, or data-quality work:** help improve surface supervision. The labels 3D models learn from are still approximate, and a smaller set of precise labels in the hardest regions may matter more than a larger set of easy ones. (See the 🙋 callout in ["Label quality: the main unwrapping bottleneck"](#label-quality-the-main-unwrapping-bottleneck), Section 2.)  
+* **If you have experience with 3D annotation, active learning, or data-quality work:** help improve surface supervision. The labels 3D models learn from are still approximate, and a smaller set of precise labels in the hardest regions may matter more than a larger set of easy ones. (See the 🙋 callout in ["Label quality: one of the main unwrapping bottlenecks"](#label-quality-one-of-the-main-unwrapping-bottlenecks), Section 2.)
 * **If you know classical computer vision or fiber/curve-following techniques:** help with conservative fiber tracing — following individual papyrus fibers reliably across long distances to give the pipeline connectivity clues it otherwise lacks. (See the 🙋 callout in ["Fibers as connectivity clues"](#fibers-as-connectivity-clues), Section 2.)  
 * Devise better **evaluation suites and loss functions to improve the global spiral fit**, or find efficient and automated ways to introduce exploitable prior information.  
 * **If you work in 3D deep learning** (segmentation, self-supervised learning, U-Nets): help with direct 3D ink segmentation, or with self-supervised representation learning that could sharpen nearly every stage of the pipeline at once. (See the 🙋 callout in ["Direct 3D ink segmentation"](#direct-3d-ink-segmentation), Section 3; self-supervised learning as a cross-cutting direction is discussed further)

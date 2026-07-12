@@ -72,13 +72,19 @@ Downloads for all operating systems are available on the [releases page](https:/
 
   - Download the windows installer .zip file from the [releases page](https://github.com/ScrollPrize/villa/releases) of the villa repository.
   - Extract the contents of the .zip file to a folder of your choice.
-  - Double click the install file, and follow the prompts.
+  - Double click the install file, click "show more details" and then "run anyway"
+  - Follow the prompts, clicking yes or next where necessary
   
   </TabItem>
   <TabItem value="linux" label="Linux">
   
-   Currently, the application must be build from source on linux. A script to do this (tested on Ubuntu 26.04) is available in the [volume-cartographer repository](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/scripts/install.sh)
-   This script must be run from the `volume-cartographer/scripts` directory.
+   Currently, the application must be built from source on linux. There is an install script at the volume-cartographer root 
+   (villa/volume-cartographer/build_from_src_debian.sh) that will handle this build for you
+    ```bash
+    cd villa/volume-cartographer
+    chmod +x build_from_src_debian.sh
+    ./build_from_src_debian.sh
+    ```
   
 </TabItem>
 
@@ -155,7 +161,21 @@ Depending on your install method or operating system, the application may be lau
   <strong>Editor note:</strong> Re "Use axis-aligned slice planes" — can we get rid of this? Also, can we hide the red axis adjuster when the pane isn't in view?
 </div>
 
-## Fibers
+## Winding Annotation
+
+VC3D can be used to create winding annotations for the spiral fit (see [the inputs section](tutorial_spiral#what-goes-in) of the spiral
+fitting document for more details on how these are used). VC3D outputs these primarily as  *patches (segmentations)* or *point collections*. 
+
+When generating data for the spiral, we can think of the inputs broadly as two types of annotations:
+- same-winding annotations (fibers, patches, kolleisis, points along surface preds, etc)
+- relative or different winding annotations (generally points which move outward radially *across* sheets rather than *along* them)
+
+A same-winding annotation is simply some set of points which say "these points are all part of the same sheet of the scroll". Conversely, a
+relative or different winding annotation is a set of points which say "these points are part of different sheets of the scroll, and they are this many windings apart"
+
+These can be generated in an infinite number of ways. VC3D has built-in tools for generating a few examples of them: 
+
+### Fibers (*same-winding*)
 
 A tool to manually add control points to a line annotation (which we often use to target fibers), with interpolation and extrapolation assistance via lasagna normals.
 
@@ -198,12 +218,8 @@ A line annotation workspace will launch, with 4 viewers:
 - A reoptimization takes place after each control point is added
 - To delete a control point, use **Ctrl + Right click → Delete control point**
 
-## Winding Annotation
 
-VC3D can be used to create winding annotations for the spiral fit (see [the inputs section](tutorial_spiral#what-goes-in) of the spiral
-fitting document for more details on how these are used). VC3D outputs these primarily as  *patches (segmentations)* or *point collections*. 
-
-## Patch Growth
+### Patches
 
 <div className="border-l-4 border-red-500 bg-red-500/10 px-3 py-2 my-3 text-sm">
   <strong>Editor note:</strong> I think we need to hide 95% of these settings and options.

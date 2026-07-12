@@ -197,6 +197,14 @@ const config = {
                   to: "/2026_open_problems",
                   label: "Problems in-depth",
                 },
+                {
+                  to: "/open_problems/winding_annotations",
+                  label: "Winding Annotations",
+                },
+                {
+                  to: "/open_problems/ink_detection",
+                  label: "Ink Detection",
+                },
               ],
             },
             {
