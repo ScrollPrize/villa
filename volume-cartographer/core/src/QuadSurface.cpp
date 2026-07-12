@@ -70,6 +70,32 @@ void replaceFile(const std::filesystem::path& source,
 #endif
 }
 
+#ifdef _WIN32
+void replaceDirectoryContents(const std::filesystem::path& source,
+                              const std::filesystem::path& destination)
+{
+    std::filesystem::create_directories(destination);
+
+    // Windows cannot reliably remove a directory while files from it are
+    // mapped by another QuadSurface. The mappings opt into FILE_SHARE_DELETE,
+    // so replace the completed files individually instead. The temporary
+    // directory already contains newly written x/y/z/meta files plus copies of
+    // every regular auxiliary file from the destination.
+    for (const auto& entry : std::filesystem::directory_iterator(source)) {
+        if (entry.is_regular_file()) {
+            replaceFile(entry.path(), destination / entry.path().filename());
+        }
+    }
+
+    std::error_code cleanupEc;
+    std::filesystem::remove_all(source, cleanupEc);
+    if (cleanupEc) {
+        Logger()->warn("could not remove completed save temp directory {}: {}",
+                       source.string(), cleanupEc.message());
+    }
+}
+#endif
+
 void normalizeMaskChannel(cv::Mat& mask)
 {
     if (mask.empty()) {
@@ -1675,6 +1701,9 @@ void QuadSurface::save(const std::filesystem::path &path_, const std::string &uu
             }
             replacedExisting = true;
         }
+#elif defined(_WIN32)
+        replaceDirectoryContents(temp_path, final_path);
+        replacedExisting = true;
 #else
         // renameat2/RENAME_EXCHANGE is Linux-only; use remove + rename fallback
         std::filesystem::remove_all(final_path);
