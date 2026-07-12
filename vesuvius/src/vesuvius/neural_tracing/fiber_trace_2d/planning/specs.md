@@ -604,10 +604,13 @@
   top-strip side-axis offset. This is visualization-only and must not change
   Trace2CP scoring.
 - `--trace2cp-top-model-dir-vis` requires a checkpoint with
-  `top_model_state_dict`, runs the jointly trained top-view model on the
-  traced fused top strip, and appends sparse top-model direction indicators to
-  the top-strip visualization. If a z-corrected fused top strip is available,
-  that image is used; otherwise the central-z fused top strip is used. This is
+  `top_model_state_dict`. It samples a fixed top-strip normal-offset stack
+  around the traced fused top strip using offsets `-4..+4` selected-scale
+  voxels in one-voxel steps, runs the jointly trained top-view model on every
+  layer, and appends sparse direction indicators chosen per pixel from the
+  valid layer whose decoded direction is most image-horizontal (`abs(dx)` is
+  maximal). If a z-corrected fused trace is available, that trace is used as
+  the stack center; otherwise the central-z fused trace is used. This is
   visualization-only and must not change Trace2CP scoring or z-search layer
   selection.
 - Embedding combined mode requires a checkpoint/model output with appended

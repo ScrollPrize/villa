@@ -5260,25 +5260,75 @@ def _draw_trace2cp_top_strip_panel(
     return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
 
 
+def _trace2cp_select_horizontal_best_direction(
+    direction_fields: list[np.ndarray],
+    valid_masks: list[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not direction_fields:
+        raise ValueError("at least one direction field is required")
+    fields = [np.asarray(field, dtype=np.float32) for field in direction_fields]
+    masks = [np.asarray(mask, dtype=bool) for mask in valid_masks]
+    shape = fields[0].shape
+    if len(shape) != 3 or shape[2] != 2:
+        raise ValueError("direction fields must have shape H,W,2")
+    shape_hw = shape[:2]
+    best = np.zeros(shape, dtype=np.float32)
+    best_valid = np.zeros(shape_hw, dtype=bool)
+    best_layer = np.full(shape_hw, -1, dtype=np.int32)
+    best_alignment = np.full(shape_hw, -np.inf, dtype=np.float32)
+    for index, (field, valid) in enumerate(zip(fields, masks, strict=True)):
+        if field.shape != shape:
+            raise ValueError("all direction fields must have matching shape")
+        if valid.shape != shape_hw:
+            raise ValueError("valid masks must match direction field shape")
+        norm = np.linalg.norm(field, axis=2)
+        candidate_valid = valid & np.isfinite(field).all(axis=2) & np.isfinite(norm) & (norm > 1.0e-6)
+        alignment = np.where(candidate_valid, np.abs(field[:, :, 0]) / np.clip(norm, 1.0e-12, None), -np.inf)
+        update = alignment > best_alignment
+        if not bool(update.any()):
+            continue
+        best[update] = field[update]
+        best_valid[update] = True
+        best_layer[update] = int(index)
+        best_alignment[update] = alignment[update]
+    return best, best_valid, best_layer
+
+
 def _trace2cp_top_model_direction_overlay(
     model: FiberStripDirectionNet,
-    image: np.ndarray,
-    valid_mask: np.ndarray,
+    base_image: np.ndarray,
+    base_valid_mask: np.ndarray,
+    layer_images: list[np.ndarray],
+    layer_valid_masks: list[np.ndarray],
     *,
     device: torch.device,
     stride: int = 8,
-) -> tuple[np.ndarray, int]:
-    image_u8 = _to_u8_image(image, valid_mask)
+) -> tuple[np.ndarray, int, np.ndarray]:
+    if len(layer_images) != len(layer_valid_masks):
+        raise ValueError("layer image and valid-mask counts must match")
+    if not layer_images:
+        raise ValueError("at least one top model layer is required")
+    direction_fields: list[np.ndarray] = []
+    for image, valid_mask in zip(layer_images, layer_valid_masks, strict=True):
+        fields = _predict_trace2cp_fields(model, image, valid_mask, device=device)
+        direction_fields.append(fields.direction_xy)
+    best_direction, best_valid, best_layer = _trace2cp_select_horizontal_best_direction(
+        direction_fields,
+        [np.asarray(mask, dtype=bool) for mask in layer_valid_masks],
+    )
+    base_valid = np.asarray(base_valid_mask, dtype=bool)
+    draw_valid = base_valid & best_valid
+    image_u8 = _to_u8_image(base_image, base_valid)
     base_rgb = np.repeat(image_u8[..., None], 3, axis=-1)
-    fields = _predict_trace2cp_fields(model, image, valid_mask, device=device)
-    return _direction_field_overlay_rgb(
+    overlay, drawn = _direction_field_overlay_rgb(
         base_rgb,
-        valid_mask,
-        fields.direction_xy,
+        draw_valid,
+        best_direction,
         scale=1,
         stride=max(1, int(stride)),
         color_rgba=(32, 255, 255, 235),
     )
+    return overlay, int(drawn), best_layer
 
 
 def _draw_trace2cp_similarity_panel(
@@ -6795,6 +6845,7 @@ def _evaluate_trace2cp_pair(
     top_model_direction_count = 0
     if build_top_strip_debug:
         top_strip_image, top_strip_valid_mask = loader.sample_trace2cp_top_strip_source(segment_source)
+        fused_center_xyz: np.ndarray | None = None
         fused_xy = np.asarray(selected_result.refinement.fused_resampled_xy, dtype=np.float32)
         if fused_xy.ndim == 2 and fused_xy.shape[1] == 2 and fused_xy.shape[0] > 0:
             fused_center_xyz = np.concatenate(
@@ -6818,22 +6869,42 @@ def _evaluate_trace2cp_pair(
         if top_model is not None:
             top_direction_image: np.ndarray | None
             top_direction_valid: np.ndarray | None
+            top_direction_trace: np.ndarray | None
             if z_top_strip_image is not None and z_top_strip_valid_mask is not None:
                 top_direction_image = z_top_strip_image
                 top_direction_valid = z_top_strip_valid_mask
-                top_model_direction_source = "z-corrected"
+                top_direction_trace = fused_z_trace
+                top_model_direction_source = "z-corrected offsets=-4..4"
             else:
                 top_direction_image = traced_top_strip_image
                 top_direction_valid = traced_top_strip_valid_mask
-                top_model_direction_source = "z=0"
-            if top_direction_image is None or top_direction_valid is None:
+                top_direction_trace = fused_center_xyz
+                top_model_direction_source = "z=0 offsets=-4..4"
+            if top_direction_image is None or top_direction_valid is None or top_direction_trace is None:
                 raise ValueError(
                     "--trace2cp-top-model-dir-vis requires a traced fused top strip"
                 )
-            top_model_direction_image, top_model_direction_count = _trace2cp_top_model_direction_overlay(
+            layer_images: list[np.ndarray] = []
+            layer_valid_masks: list[np.ndarray] = []
+            for offset in range(-4, 5):
+                if int(offset) == 0:
+                    layer_images.append(np.asarray(top_direction_image, dtype=np.float32))
+                    layer_valid_masks.append(np.asarray(top_direction_valid, dtype=bool))
+                    continue
+                layer_trace = np.asarray(top_direction_trace, dtype=np.float32).copy()
+                layer_trace[:, 2] += np.float32(offset)
+                layer_image, layer_valid = loader.sample_trace2cp_traced_top_strip_source(
+                    segment_source,
+                    layer_trace,
+                )
+                layer_images.append(layer_image)
+                layer_valid_masks.append(layer_valid)
+            top_model_direction_image, top_model_direction_count, _top_model_direction_best_layer = _trace2cp_top_model_direction_overlay(
                 top_model,
                 top_direction_image,
                 top_direction_valid,
+                layer_images,
+                layer_valid_masks,
                 device=device,
             )
             top_model_direction_valid_mask = np.asarray(top_direction_valid, dtype=bool)

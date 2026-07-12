@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-13
+
+- Updated `--trace2cp-top-model-dir-vis` to infer a `-4..+4` selected-voxel
+  top-strip offset stack and display the per-pixel direction from the layer
+  most aligned with image-horizontal.
+
 ## 2026-07-12
 
 - Added `--trace2cp-top-model-dir-vis` to append top-view model direction

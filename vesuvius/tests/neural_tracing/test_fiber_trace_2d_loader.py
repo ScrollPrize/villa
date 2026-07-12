@@ -133,6 +133,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_z_layer_tiff_stack,
     _trace2cp_image_descriptor,
     _trace2cp_image_descriptor_loss,
+    _trace2cp_select_horizontal_best_direction,
     _load_top_direction_model_from_checkpoint,
     _trace_combined_image_line_to_target,
     _trace_combined_image_line_to_target_z,
@@ -2444,6 +2445,28 @@ def test_trace2cp_top_strip_panel_accepts_rgb_direction_overlay() -> None:
     assert panel.shape[1] == 9
     assert panel.shape[2] == 3
     assert panel.shape[0] > image.shape[0]
+
+
+def test_trace2cp_top_model_direction_selection_chooses_most_horizontal() -> None:
+    vertical = np.zeros((2, 3, 2), dtype=np.float32)
+    vertical[:, :, 1] = 1.0
+    horizontal = np.zeros((2, 3, 2), dtype=np.float32)
+    horizontal[:, :, 0] = -1.0
+    diagonal = np.full((2, 3, 2), np.float32(1.0 / np.sqrt(2.0)), dtype=np.float32)
+    valid = np.ones((2, 3), dtype=bool)
+    valid_horizontal = valid.copy()
+    valid_horizontal[0, 0] = False
+
+    selected, selected_valid, layer = _trace2cp_select_horizontal_best_direction(
+        [vertical, horizontal, diagonal],
+        [valid, valid_horizontal, valid],
+    )
+
+    assert bool(selected_valid.all())
+    np.testing.assert_allclose(selected[1, 1], horizontal[1, 1])
+    assert int(layer[1, 1]) == 1
+    np.testing.assert_allclose(selected[0, 0], diagonal[0, 0])
+    assert int(layer[0, 0]) == 2
 
 
 def test_trace2cp_top_model_loader_requires_and_loads_top_state(tmp_path: Path) -> None:

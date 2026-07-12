@@ -367,9 +367,12 @@ The important behavior is:
   uses the fused trace's per-column selected z offset along the strip normal.
 - `--trace2cp-top-model-dir-vis` loads the checkpoint's top-view model and
   appends sparse predicted direction indicators over the traced fused top strip.
-  It uses the z-corrected fused top strip when z-search produced one, otherwise
-  the central-z fused top strip. The panel is diagnostic only and does not
-  change scoring or z-layer selection.
+  It samples top-strip offsets `-4..+4` selected-scale voxels around the
+  z-corrected fused trace when available, otherwise around the central-z fused
+  trace. Each offset layer is inferred by the top model, and each displayed
+  direction comes from the valid layer whose decoded direction is most
+  image-horizontal. The panel is diagnostic only and does not change scoring or
+  z-layer selection.
 - `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` adds an
   experimental short z-search to the combined tracer. The loader builds one
   aligned Trace2CP segment source from the CP-to-CP line window and Lasagna
