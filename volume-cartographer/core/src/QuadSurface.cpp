@@ -81,10 +81,22 @@ void replaceDirectoryContents(const std::filesystem::path& source,
     // so replace the completed files individually instead. The temporary
     // directory already contains newly written x/y/z/meta files plus copies of
     // every regular auxiliary file from the destination.
+    std::vector<std::filesystem::path> files;
     for (const auto& entry : std::filesystem::directory_iterator(source)) {
         if (entry.is_regular_file()) {
-            replaceFile(entry.path(), destination / entry.path().filename());
+            files.push_back(entry.path());
         }
+    }
+    // Do not mutate a directory while iterating it: directory_iterator may
+    // otherwise skip entries on Windows. Publish metadata last so readers do
+    // not observe it before the corresponding data files are replaced.
+    std::sort(files.begin(), files.end(), [](const auto& lhs, const auto& rhs) {
+        const bool lhsMeta = lhs.filename() == "meta.json";
+        const bool rhsMeta = rhs.filename() == "meta.json";
+        return lhsMeta != rhsMeta ? !lhsMeta : lhs.filename() < rhs.filename();
+    });
+    for (const auto& file : files) {
+        replaceFile(file, destination / file.filename());
     }
 
     std::error_code cleanupEc;
