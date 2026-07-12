@@ -1,18 +1,10 @@
-# Trace2CP Iterative Fused-Trace Refinement
+# Trace2CP Top-Model Direction Debug
 
-Add an opt-in two-pass/multi-pass Trace2CP fiber tracing mode.
-
-- When enabled, the runner takes the final fused fiber trace from the previous
-  pass, smooths it, and uses that curve as the line input for another Trace2CP
-  pass.
-- The mode must support multiple refinement iterations, not only a hard-coded
-  second pass.
-- Iteration visualizations and summaries after the initial pass are written
-  with iteration-specific names such as `it1`.
-- The next-pass image data must be sampled from the volume using the refined
-  curve geometry; it must not be an image-space warp of the previous strip.
-- Refined passes must behave like normal Trace2CP runs on an independent line:
-  both directions need valid endpoint context, including reverse tracing from
-  the target CP.
-- Refine smoothing must use a Gaussian blur over trace points, not a box or
-  moving-average blur.
+- Add an opt-in Trace2CP runner argument that loads the jointly trained
+  top-view model from the checkpoint.
+- For now, use it as a diagnostic visualization rather than changing scoring:
+  run the top model on the traced top-strip rendering.
+- If z-search produced a z-corrected fused top strip, use that image;
+  otherwise use the fused traced top strip at the central z layer.
+- Append an additional top-strip panel/row with sparse top-model direction
+  line indicators over the chosen top rendering.

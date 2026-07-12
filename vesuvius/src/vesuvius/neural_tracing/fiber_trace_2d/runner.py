@@ -1597,6 +1597,10 @@ class _Trace2CpPairEvaluation:
     traced_top_strip_valid_mask: np.ndarray | None = None
     z_top_strip_image: np.ndarray | None = None
     z_top_strip_valid_mask: np.ndarray | None = None
+    top_model_direction_image: np.ndarray | None = None
+    top_model_direction_valid_mask: np.ndarray | None = None
+    top_model_direction_source: str = ""
+    top_model_direction_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1785,6 +1789,20 @@ def _model_config_from_checkpoint(checkpoint: dict, loader: FiberStrip2DLoader) 
     )
 
 
+def _top_model_config_from_checkpoint(checkpoint: dict) -> FiberStripDirectionModelConfig:
+    raw_config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+    training = raw_config.get("training", {}) if isinstance(raw_config, dict) else {}
+    if not isinstance(training, dict):
+        training = {}
+    return FiberStripDirectionModelConfig(
+        in_channels=1,
+        hidden_channels=max(1, int(training.get("model_hidden_channels", 64))),
+        depth=max(1, int(training.get("model_depth", 10))),
+        presence_channels=1,
+        embedding_channels=0,
+    )
+
+
 def _load_direction_model(
     checkpoint_path: str | Path,
     loader: FiberStrip2DLoader,
@@ -1799,6 +1817,23 @@ def _load_direction_model(
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, checkpoint
+
+
+def _load_top_direction_model_from_checkpoint(
+    checkpoint: dict,
+    checkpoint_path: str | Path,
+    *,
+    device: torch.device,
+) -> FiberStripDirectionNet:
+    path = Path(checkpoint_path).expanduser().resolve()
+    if not isinstance(checkpoint, dict) or "top_model_state_dict" not in checkpoint:
+        raise ValueError(
+            f"{path} is missing top_model_state_dict required by --trace2cp-top-model-dir-vis"
+        )
+    model = FiberStripDirectionNet(_top_model_config_from_checkpoint(checkpoint)).to(device)
+    model.load_state_dict(checkpoint["top_model_state_dict"])
+    model.eval()
+    return model
 
 
 def _build_dir_vis_center_patch(
@@ -5193,8 +5228,18 @@ def _draw_trace2cp_top_strip_panel(
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
 
-    image_u8 = _to_u8_image(image, valid_mask)
-    panel = np.repeat(image_u8[..., None], 3, axis=-1)
+    valid = np.asarray(valid_mask, dtype=bool)
+    arr = np.asarray(image)
+    if arr.ndim == 2:
+        image_u8 = _to_u8_image(arr, valid)
+        panel = np.repeat(image_u8[..., None], 3, axis=-1)
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        if valid.shape != arr.shape[:2]:
+            raise ValueError("valid_mask must match RGB top strip image shape")
+        panel = np.clip(arr, 0, 255).astype(np.uint8, copy=True)
+        panel[~valid] = 0
+    else:
+        raise ValueError("top strip image must be H,W or H,W,3")
     height = int(panel.shape[0])
     center_y = (float(height) - 1.0) * 0.5
     line_xy_top = np.asarray(line_xy, dtype=np.float32).copy()
@@ -5213,6 +5258,27 @@ def _draw_trace2cp_top_strip_panel(
             y = center_y
             draw.ellipse((x - 2.0, y - 2.0, x + 2.0, y + 2.0), outline=color, width=1)
     return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
+
+
+def _trace2cp_top_model_direction_overlay(
+    model: FiberStripDirectionNet,
+    image: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    device: torch.device,
+    stride: int = 8,
+) -> tuple[np.ndarray, int]:
+    image_u8 = _to_u8_image(image, valid_mask)
+    base_rgb = np.repeat(image_u8[..., None], 3, axis=-1)
+    fields = _predict_trace2cp_fields(model, image, valid_mask, device=device)
+    return _direction_field_overlay_rgb(
+        base_rgb,
+        valid_mask,
+        fields.direction_xy,
+        scale=1,
+        stride=max(1, int(stride)),
+        color_rgba=(32, 255, 255, 235),
+    )
 
 
 def _draw_trace2cp_similarity_panel(
@@ -5333,6 +5399,10 @@ def _draw_trace2cp_overlay(
     traced_top_strip_valid_mask: np.ndarray | None = None,
     z_top_strip_image: np.ndarray | None = None,
     z_top_strip_valid_mask: np.ndarray | None = None,
+    top_model_direction_image: np.ndarray | None = None,
+    top_model_direction_valid_mask: np.ndarray | None = None,
+    top_model_direction_source: str = "",
+    top_model_direction_count: int = 0,
     valid_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
@@ -5578,6 +5648,21 @@ def _draw_trace2cp_overlay(
                 start_xy=start_xy,
                 target_xy=target_xy,
                 label="traced fused top strip z-corrected",
+            )
+        )
+    if top_model_direction_image is not None and top_model_direction_valid_mask is not None:
+        top_panels.append(
+            _draw_trace2cp_top_strip_panel(
+                top_model_direction_image,
+                top_model_direction_valid_mask,
+                line_xy=line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                label=(
+                    "top model directions on fused top strip "
+                    f"{top_model_direction_source or 'unknown'} "
+                    f"drawn={int(top_model_direction_count)}"
+                ),
             )
         )
     if top_panels:
@@ -5930,13 +6015,23 @@ def _draw_trace2cp_fiber_overlay(
         top_weight = np.zeros((top_canvas_height, canvas_width, 1), dtype=np.float32)
         for placement in available:
             evaluation = placement.evaluation
-            image = np.asarray(getattr(evaluation, image_attr), dtype=np.float32)
+            image = np.asarray(getattr(evaluation, image_attr))
             valid = np.asarray(getattr(evaluation, valid_attr), dtype=bool)
-            if image.ndim != 2 or valid.shape != image.shape or not bool(valid.any()):
+            if image.ndim == 2:
+                if valid.shape != image.shape:
+                    continue
+                image_u8 = _to_u8_image(image.astype(np.float32), valid)
+                rgb = np.repeat(image_u8[..., None], 3, axis=-1).astype(np.uint8)
+            elif image.ndim == 3 and image.shape[2] == 3:
+                if valid.shape != image.shape[:2]:
+                    continue
+                rgb = np.clip(image, 0, 255).astype(np.uint8, copy=True)
+                rgb[~valid] = 0
+            else:
                 continue
-            image_u8 = _to_u8_image(image, valid)
-            rgb = np.repeat(image_u8[..., None], 3, axis=-1).astype(np.uint8)
-            _height, width = image_u8.shape[:2]
+            if not bool(valid.any()):
+                continue
+            _height, width = rgb.shape[:2]
             x0 = global_x_shift + placement.x_offset
             x1 = global_x_shift + placement.x_offset + placement.x_scale * float(width - 1)
             if placement.x_scale < 0.0:
@@ -5978,6 +6073,10 @@ def _draw_trace2cp_fiber_overlay(
     z_top_strip_canvas = compose_top_strip_canvas(
         image_attr="z_top_strip_image",
         valid_attr="z_top_strip_valid_mask",
+    )
+    top_model_direction_canvas = compose_top_strip_canvas(
+        image_attr="top_model_direction_image",
+        valid_attr="top_model_direction_valid_mask",
     )
     font = ImageFont.load_default()
 
@@ -6133,6 +6232,14 @@ def _draw_trace2cp_fiber_overlay(
                 "traced fused top strip z-corrected",
                 z_top_strip_canvas,
                 image_attr="z_top_strip_image",
+            )
+        )
+    if top_model_direction_canvas is not None:
+        rows.append(
+            draw_top_strip_row(
+                "top model directions on fused top strip",
+                top_model_direction_canvas,
+                image_attr="top_model_direction_image",
             )
         )
     if presence_canvas is not None:
@@ -6339,6 +6446,7 @@ def _evaluate_trace2cp_pair(
     build_similarity_debug: bool = True,
     build_top_strip_debug: bool = False,
     build_z_layer_tiff_stack: bool = False,
+    top_model: torch.nn.Module | None = None,
 ) -> _Trace2CpPairEvaluation:
     if segment_source is None:
         segment_source = loader.build_trace2cp_segment_source(
@@ -6681,6 +6789,10 @@ def _evaluate_trace2cp_pair(
     traced_top_strip_valid_mask: np.ndarray | None = None
     z_top_strip_image: np.ndarray | None = None
     z_top_strip_valid_mask: np.ndarray | None = None
+    top_model_direction_image: np.ndarray | None = None
+    top_model_direction_valid_mask: np.ndarray | None = None
+    top_model_direction_source = ""
+    top_model_direction_count = 0
     if build_top_strip_debug:
         top_strip_image, top_strip_valid_mask = loader.sample_trace2cp_top_strip_source(segment_source)
         fused_xy = np.asarray(selected_result.refinement.fused_resampled_xy, dtype=np.float32)
@@ -6703,6 +6815,28 @@ def _evaluate_trace2cp_pair(
                 segment_source,
                 fused_z_trace,
             )
+        if top_model is not None:
+            top_direction_image: np.ndarray | None
+            top_direction_valid: np.ndarray | None
+            if z_top_strip_image is not None and z_top_strip_valid_mask is not None:
+                top_direction_image = z_top_strip_image
+                top_direction_valid = z_top_strip_valid_mask
+                top_model_direction_source = "z-corrected"
+            else:
+                top_direction_image = traced_top_strip_image
+                top_direction_valid = traced_top_strip_valid_mask
+                top_model_direction_source = "z=0"
+            if top_direction_image is None or top_direction_valid is None:
+                raise ValueError(
+                    "--trace2cp-top-model-dir-vis requires a traced fused top strip"
+                )
+            top_model_direction_image, top_model_direction_count = _trace2cp_top_model_direction_overlay(
+                top_model,
+                top_direction_image,
+                top_direction_valid,
+                device=device,
+            )
+            top_model_direction_valid_mask = np.asarray(top_direction_valid, dtype=bool)
     return _Trace2CpPairEvaluation(
         sample_index=int(sample_index),
         sample=sample,
@@ -6726,6 +6860,10 @@ def _evaluate_trace2cp_pair(
         traced_top_strip_valid_mask=traced_top_strip_valid_mask,
         z_top_strip_image=z_top_strip_image,
         z_top_strip_valid_mask=z_top_strip_valid_mask,
+        top_model_direction_image=top_model_direction_image,
+        top_model_direction_valid_mask=top_model_direction_valid_mask,
+        top_model_direction_source=top_model_direction_source,
+        top_model_direction_count=int(top_model_direction_count),
     )
 
 
@@ -6758,6 +6896,7 @@ def _evaluate_trace2cp_refinement_chain(
     build_z_layer_tiff_stack: bool = False,
     refine_iterations: int = 0,
     refine_smooth_window: int = 5,
+    top_model: torch.nn.Module | None = None,
 ) -> tuple[_Trace2CpPairEvaluation, ...]:
     initial = _evaluate_trace2cp_pair(
         loader,
@@ -6785,6 +6924,7 @@ def _evaluate_trace2cp_refinement_chain(
         build_similarity_debug=build_similarity_debug,
         build_top_strip_debug=build_top_strip_debug,
         build_z_layer_tiff_stack=build_z_layer_tiff_stack,
+        top_model=top_model,
     )
     evaluations: list[_Trace2CpPairEvaluation] = [initial]
     for _iteration in range(max(0, int(refine_iterations))):
@@ -6826,6 +6966,7 @@ def _evaluate_trace2cp_refinement_chain(
                 build_similarity_debug=build_similarity_debug,
                 build_top_strip_debug=build_top_strip_debug,
                 build_z_layer_tiff_stack=build_z_layer_tiff_stack,
+                top_model=top_model,
             )
         )
     return tuple(evaluations)
@@ -6882,6 +7023,10 @@ def _write_trace2cp_iteration_artifacts(
         traced_top_strip_valid_mask=evaluation.traced_top_strip_valid_mask,
         z_top_strip_image=evaluation.z_top_strip_image,
         z_top_strip_valid_mask=evaluation.z_top_strip_valid_mask,
+        top_model_direction_image=evaluation.top_model_direction_image,
+        top_model_direction_valid_mask=evaluation.top_model_direction_valid_mask,
+        top_model_direction_source=evaluation.top_model_direction_source,
+        top_model_direction_count=evaluation.top_model_direction_count,
         valid_mask=evaluation.valid_mask,
     )
     _write_jpg(output_dir / f"trace2cp_vis{suffix}.jpg", overlay)
@@ -6953,11 +7098,17 @@ def _export_trace2cp_vis(
     export_z_layers_tif: bool = False,
     refine_iterations: int = 0,
     refine_smooth_window: int = 5,
+    top_model_dir_vis: bool = False,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     device = resolve_torch_device(loader.config.augment.device)
     model, checkpoint = _load_direction_model(checkpoint_path, loader, device=device)
+    top_model = (
+        _load_top_direction_model_from_checkpoint(checkpoint, checkpoint_path, device=device)
+        if bool(top_model_dir_vis)
+        else None
+    )
     configured_depth = max(1, int(_model_config_from_checkpoint(checkpoint, loader).depth))
     default_margin = configured_depth
     margin = float(default_margin if rf_margin_px is None else rf_margin_px)
@@ -6999,6 +7150,7 @@ def _export_trace2cp_vis(
         build_z_layer_tiff_stack=bool(export_z_layers_tif),
         refine_iterations=int(refine_iterations),
         refine_smooth_window=int(refine_smooth_window),
+        top_model=top_model,
     )
     evaluation = evaluations[0]
     sample = evaluation.sample
@@ -7036,6 +7188,10 @@ def _export_trace2cp_vis(
         traced_top_strip_valid_mask=evaluation.traced_top_strip_valid_mask,
         z_top_strip_image=evaluation.z_top_strip_image,
         z_top_strip_valid_mask=evaluation.z_top_strip_valid_mask,
+        top_model_direction_image=evaluation.top_model_direction_image,
+        top_model_direction_valid_mask=evaluation.top_model_direction_valid_mask,
+        top_model_direction_source=evaluation.top_model_direction_source,
+        top_model_direction_count=evaluation.top_model_direction_count,
         valid_mask=valid_mask,
     )
     _write_jpg(out / "trace2cp_vis.jpg", overlay)
@@ -7099,6 +7255,9 @@ def _export_trace2cp_vis(
         f"trace_mode={selected_mode}",
         f"trace2cp_refine_iterations={int(refine_iterations)}",
         f"trace2cp_refine_smooth_window={int(refine_smooth_window)}",
+        f"trace2cp_top_model_dir_vis={bool(top_model_dir_vis)}",
+        f"trace2cp_top_model_direction_source={evaluation.top_model_direction_source}",
+        f"trace2cp_top_model_direction_count={int(evaluation.top_model_direction_count)}",
         f"trace_points={trace_points}",
         f"trace2cp_error={metric.error:.8f}",
         f"trace2cp_metric_error={metric.error:.8f}",
@@ -7351,11 +7510,17 @@ def _export_trace2cp_fiber_vis(
     export_z_layers_tif: bool = False,
     refine_iterations: int = 0,
     refine_smooth_window: int = 5,
+    top_model_dir_vis: bool = False,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     device = resolve_torch_device(loader.config.augment.device)
     model, checkpoint = _load_direction_model(checkpoint_path, loader, device=device)
+    top_model = (
+        _load_top_direction_model_from_checkpoint(checkpoint, checkpoint_path, device=device)
+        if bool(top_model_dir_vis)
+        else None
+    )
     configured_depth = max(1, int(_model_config_from_checkpoint(checkpoint, loader).depth))
     default_margin = configured_depth
     margin = float(default_margin if rf_margin_px is None else rf_margin_px)
@@ -7429,6 +7594,7 @@ def _export_trace2cp_fiber_vis(
                 build_z_layer_tiff_stack=bool(export_z_layers_tif),
                 refine_iterations=int(refine_iterations),
                 refine_smooth_window=int(refine_smooth_window),
+                top_model=top_model,
             )
             evaluation = chain[0]
         except ValueError as exc:
@@ -7696,6 +7862,8 @@ def _export_trace2cp_fiber_vis(
         f"trace_mode={mode}",
         f"trace2cp_refine_iterations={int(refine_iterations)}",
         f"trace2cp_refine_smooth_window={int(refine_smooth_window)}",
+        f"trace2cp_top_model_dir_vis={bool(top_model_dir_vis)}",
+        f"trace2cp_top_model_direction_pairs={sum(1 for evaluation in evaluations if evaluation.top_model_direction_image is not None)}",
         f"med_tta={bool(med_tta)}",
         f"line_trace_tta_count={max(0, int(line_trace_tta_count)) if med_tta else 0}",
         *combined_component_lines,
@@ -8180,6 +8348,7 @@ def main() -> None:
     parser.add_argument("--trace2cp-combined", action="store_true")
     parser.add_argument("--trace2cp-z-search", action="store_true")
     parser.add_argument("--trace2cp-z-layers-tif", action="store_true")
+    parser.add_argument("--trace2cp-top-model-dir-vis", action="store_true")
     parser.add_argument("--med-tta", action="store_true")
     parser.add_argument("--vis-tta", action="store_true")
     parser.add_argument("--dir-vis", action="store_true")
@@ -8345,6 +8514,7 @@ def main() -> None:
                 export_z_layers_tif=bool(args.trace2cp_z_layers_tif),
                 refine_iterations=int(args.trace2cp_refine_iterations),
                 refine_smooth_window=int(args.trace2cp_refine_smooth_window),
+                top_model_dir_vis=bool(args.trace2cp_top_model_dir_vis),
             )
             return
         _export_trace2cp_vis(
@@ -8371,6 +8541,7 @@ def main() -> None:
             export_z_layers_tif=bool(args.trace2cp_z_layers_tif),
             refine_iterations=int(args.trace2cp_refine_iterations),
             refine_smooth_window=int(args.trace2cp_refine_smooth_window),
+            top_model_dir_vis=bool(args.trace2cp_top_model_dir_vis),
         )
         return
 

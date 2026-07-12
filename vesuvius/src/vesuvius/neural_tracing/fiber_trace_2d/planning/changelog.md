@@ -2,6 +2,8 @@
 
 ## 2026-07-12
 
+- Added `--trace2cp-top-model-dir-vis` to append top-view model direction
+  indicators over the traced fused top strip in Trace2CP visualizations.
 - Added opt-in iterative Trace2CP refinement with
   `--trace2cp-refine-iterations`: extra passes smooth the previous fused trace,
   resample a fresh volume-backed side strip from that curve, and export `itN`

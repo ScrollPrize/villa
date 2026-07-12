@@ -603,6 +603,13 @@
   trace's selected-scale `z_voxels` value as a normal/mesh offset before the
   top-strip side-axis offset. This is visualization-only and must not change
   Trace2CP scoring.
+- `--trace2cp-top-model-dir-vis` requires a checkpoint with
+  `top_model_state_dict`, runs the jointly trained top-view model on the
+  traced fused top strip, and appends sparse top-model direction indicators to
+  the top-strip visualization. If a z-corrected fused top strip is available,
+  that image is used; otherwise the central-z fused top strip is used. This is
+  visualization-only and must not change Trace2CP scoring or z-search layer
+  selection.
 - Embedding combined mode requires a checkpoint/model output with appended
   embedding channels; it must fail clearly rather than silently falling back
   when embeddings are absent. If a non-zero fiber-bank weight is configured and

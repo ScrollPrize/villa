@@ -96,6 +96,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _dir_vis_image_space_augmentations,
     _dir_vis_half_image_paste_side,
     _direction_field_overlay_rgb,
+    _draw_trace2cp_top_strip_panel,
     _draw_trace2cp_similarity_debug_column,
     _draw_trace2cp_fiber_overlay,
     _draw_trace2cp_overlay,
@@ -132,6 +133,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_z_layer_tiff_stack,
     _trace2cp_image_descriptor,
     _trace2cp_image_descriptor_loss,
+    _load_top_direction_model_from_checkpoint,
     _trace_combined_image_line_to_target,
     _trace_combined_image_line_to_target_z,
     _raise_trace2cp_max_steps,
@@ -2421,6 +2423,52 @@ def test_dir_vis_overlay_scales_and_strides() -> None:
     assert drawn == 11
     scaled = np.repeat(np.repeat(np.repeat(image[..., None], 3, axis=2), 4, axis=0), 4, axis=1)
     assert not np.array_equal(overlay, scaled)
+
+
+def test_trace2cp_top_strip_panel_accepts_rgb_direction_overlay() -> None:
+    image = np.zeros((5, 9, 3), dtype=np.uint8)
+    image[:, :, 1] = 64
+    valid = np.ones((5, 9), dtype=bool)
+    line_xy = np.asarray([[0.0, 1.0], [4.0, 2.0], [8.0, 3.0]], dtype=np.float32)
+
+    panel = _draw_trace2cp_top_strip_panel(
+        image,
+        valid,
+        line_xy=line_xy,
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([7.0, 2.0], dtype=np.float32),
+        label="rgb top",
+    )
+
+    assert panel.ndim == 3
+    assert panel.shape[1] == 9
+    assert panel.shape[2] == 3
+    assert panel.shape[0] > image.shape[0]
+
+
+def test_trace2cp_top_model_loader_requires_and_loads_top_state(tmp_path: Path) -> None:
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(hidden_channels=4, depth=2, presence_channels=1)
+    )
+    checkpoint = {
+        "config": {"training": {"model_hidden_channels": 4, "model_depth": 2}},
+        "top_model_state_dict": model.state_dict(),
+    }
+
+    loaded = _load_top_direction_model_from_checkpoint(
+        checkpoint,
+        tmp_path / "checkpoint.pt",
+        device=torch.device("cpu"),
+    )
+
+    assert isinstance(loaded, FiberStripDirectionNet)
+    assert loaded.presence_channels == 1
+    with pytest.raises(ValueError, match="top_model_state_dict"):
+        _load_top_direction_model_from_checkpoint(
+            {"config": checkpoint["config"]},
+            tmp_path / "missing.pt",
+            device=torch.device("cpu"),
+        )
 
 
 def test_dir_vis_image_space_augmentations_are_pixel_perfect_and_contiguous() -> None:
