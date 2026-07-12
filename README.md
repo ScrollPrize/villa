@@ -31,6 +31,7 @@ Originally developed by [Julian Schilliger](https://github.com/schillij95).
 ### [ink-detection](ink-detection/)
 The ink detection machine learning model used to win the Vesuvius Challenge 2023 Grand Prize.  
 Originally developed by [Youssef Nader](https://github.com/younader) and [Luke Farritor](https://github.com/lukeboi).
+Generalizing ink detection reliably across scrolls with far less per-scroll labeling remains an open problem.
 
 ---
 
@@ -41,13 +42,12 @@ A semi-automatic segmentation pipeline to extract papyrus sheets from CT scans o
 As of September 2025, it is the approach used by the Vesuvius Challenge team.
 Developed by [Hendrik Schilling](https://github.com/hendrikschilling) and [Sean Johnson](https://github.com/bruniss) as a fork of [Volume Cartographer](https://github.com/educelab/volume-cartographer).
 
-### [spiral fitting](https://github.com/pmh47/spiral-fitting)
-A fully automatic unwrapping pipeline that fits a spiral to the CT scan.
-Originally developed by [Paul Henderson](https://github.com/pmh47).
+### [lasagna](lasagna/)
+A PyTorch-based optimization framework for growing and refining papyrus surface meshes, offered as an alternative to VC3D's GrowPatch. It can jointly optimize several stacked sheets so they stay consistent with each other, and also drives fiber tracing.
 
-### [thaumato-anakalyptor](thaumato-anakalyptor/)
-A semi-automatic segmentation pipeline to extract papyrus sheets from CT scans of ancient scrolls.  
-Originally developed by [Julian Schilliger](https://github.com/schillij95).
+### [spiral fitting](volume-cartographer/scripts/spiral)
+A fully automatic unwrapping pipeline that fits a single, globally coherent spiral to an entire scroll by deforming an ideal spiral to match traced patches, fiber skeletons, and winding annotations.
+Originally developed by [Paul Henderson](https://github.com/pmh47).
 
 ---
 
@@ -55,6 +55,14 @@ Originally developed by [Julian Schilliger](https://github.com/schillij95).
 
 ### [scrollprize.org](scrollprize.org/)
 Source for the [Vesuvius Challenge website](https://scrollprize.org).
+
+---
+
+## Deprecated
+
+### [thaumato-anakalyptor](deprecated/thaumato-anakalyptor/)
+A semi-automatic segmentation pipeline to extract papyrus sheets from CT scans of ancient scrolls.  
+Originally developed by [Julian Schilliger](https://github.com/schillij95). Superseded by [VC3D](volume-cartographer) and [lasagna](lasagna/).
 
 [licence-badge]: https://img.shields.io/github/license/ScrollPrize/villa?color=blue
 [licence-url]: https://github.com/ScrollPrize/villa/blob/main/LICENSE
