@@ -2643,6 +2643,7 @@ class FiberStrip2DLoader:
         target_control_point_index: int | None = None,
         target_offset: int = 1,
         rf_margin_px: float = 0.0,
+        strip_z_offset: float | None = None,
         row_axis_alignment_line_index: int | None = None,
         row_axis_alignment_xyz: np.ndarray | None = None,
         device: torch.device | None = None,
@@ -2728,7 +2729,11 @@ class FiberStrip2DLoader:
             row_axis_alignment_line_index=row_axis_alignment_line_index,
             row_axis_alignment_xyz=row_axis_alignment_xyz,
         )
-        center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
+        center_offset = (
+            min(self.strip_z_offsets, key=lambda value: abs(float(value)))
+            if strip_z_offset is None
+            else float(strip_z_offset)
+        )
         def build_grid(normals: np.ndarray) -> FiberStripGridTorch:
             return build_side_strip_patch_grid_tensor_from_line_window(
                 line_window,

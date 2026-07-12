@@ -71,6 +71,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
 from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _DirVisImageAugment,
     _Trace2CpCombinedWeights,
+    _Trace2CpPredictedFields,
     _TtaDirectionField,
     _bilinear_direction_sample,
     _bilinear_embedding_sample,
@@ -105,11 +106,15 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_similarity_debug,
     _trace2cp_refinement_from_traces,
     _trace2cp_center_penalty,
+    _closest_trace2cp_approach_z,
     _trace2cp_metric_from_traces,
     _trace2cp_metric_bidirectional,
     _trace2cp_tta_params,
+    _trace2cp_refinement_from_traces_z,
+    _trace2cp_z_corrected_image_u8,
     _trace_direction_line,
     _trace_direction_line_to_target,
+    _trace_combined_direction_line_to_target_z,
     _trace_score_trace2cp_bidirectional,
     _trace_median_tta_direction_line_to_target,
     _trace_median_tta_direction_line,
@@ -789,6 +794,140 @@ def test_trace2cp_combined_empty_fiber_bank_fails_when_weighted() -> None:
         )
 
 
+def test_trace2cp_z_search_can_choose_embedding_layer() -> None:
+    direction = np.zeros((7, 9, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((7, 9), dtype=bool)
+
+    center_embedding = np.zeros((2, 7, 9), dtype=np.float32)
+    center_embedding[1] = 1.0
+    matching_embedding = np.zeros((2, 7, 9), dtype=np.float32)
+    matching_embedding[0] = 1.0
+
+    class FakePlaneCache:
+        z_step_voxels = 2.0
+        max_layer = 1
+
+        def __init__(self) -> None:
+            self.layers = {
+                -1: SimpleNamespace(
+                    fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=center_embedding),
+                    valid_mask=valid,
+                ),
+                0: SimpleNamespace(
+                    fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=center_embedding),
+                    valid_mask=valid,
+                ),
+                1: SimpleNamespace(
+                    fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=matching_embedding),
+                    valid_mask=valid,
+                ),
+            }
+
+        def get(self, layer: int):
+            return self.layers[int(layer)]
+
+        def ensure_neighbors(self, layer: int) -> None:
+            assert abs(int(layer)) <= self.max_layer
+
+    line, reason, stats = _trace_combined_direction_line_to_target_z(
+        plane_cache=FakePlaneCache(),
+        start_xy=np.asarray([2.0, 3.0], dtype=np.float32),
+        target_xy=np.asarray([6.0, 3.0], dtype=np.float32),
+        start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        fiber_embeddings=np.zeros((0, 2), dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, last=1.0, enclosing=1.0, fiber=0.0),
+        candidate_max_degrees=0.0,
+        candidate_step_degrees=1.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason == "target_column"
+    assert stats.steps > 0
+    assert line[1, 2] == pytest.approx(2.0)
+
+
+def test_trace2cp_z_closest_approach_includes_z_distance() -> None:
+    forward = np.asarray([[0.0, 10.0, 2.0], [10.0, 10.0, 2.0]], dtype=np.float32)
+    reverse = np.asarray([[0.0, 10.0, -2.0], [10.0, 10.0, -2.0]], dtype=np.float32)
+
+    result = _closest_trace2cp_approach_z(
+        forward,
+        reverse,
+        np.asarray([0.0, 10.0], dtype=np.float32),
+        np.asarray([10.0, 10.0], dtype=np.float32),
+        shape_hw=(31, 11),
+        rf_margin_px=0.0,
+    )
+
+    score, gap, considered_gap, penalty, closest_x, forward_y, reverse_y, forward_z, reverse_z, midpoint, midpoint_z, reason, reached = result
+    assert reached
+    assert reason == "closest_approach_z"
+    assert gap == pytest.approx(4.0)
+    assert considered_gap == pytest.approx(4.0)
+    assert penalty == pytest.approx(1.0)
+    assert score == pytest.approx(4.0 / 30.0)
+    assert closest_x == pytest.approx(5.0)
+    assert forward_y == pytest.approx(10.0)
+    assert reverse_y == pytest.approx(10.0)
+    assert forward_z == pytest.approx(2.0)
+    assert reverse_z == pytest.approx(-2.0)
+    assert midpoint.tolist() == pytest.approx([5.0, 10.0])
+    assert midpoint_z == pytest.approx(0.0)
+
+
+def test_trace2cp_z_refinement_keeps_cp_z_zero_and_fuses_fractional_z() -> None:
+    forward = np.asarray([[0.0, 10.0, 0.0], [5.0, 10.0, 2.0]], dtype=np.float32)
+    reverse = np.asarray([[10.0, 10.0, 0.0], [5.0, 10.0, -2.0]], dtype=np.float32)
+
+    result = _trace2cp_refinement_from_traces_z(
+        forward,
+        reverse,
+        np.asarray([0.0, 10.0], dtype=np.float32),
+        np.asarray([10.0, 10.0], dtype=np.float32),
+        shape_hw=(31, 11),
+        step_px=1.0,
+        rf_margin_px=0.0,
+    )
+
+    assert result.reached_overlap
+    assert result.raw_y_error_px == pytest.approx(4.0)
+    assert result.closest_forward_z_voxels == pytest.approx(2.0)
+    assert result.closest_reverse_z_voxels == pytest.approx(-2.0)
+    assert result.closest_midpoint_z_voxels == pytest.approx(0.0)
+    assert result.fused_resampled_z is not None
+    assert result.fused_resampled_z[0] == pytest.approx(0.0)
+    assert result.fused_resampled_z[-1] == pytest.approx(0.0)
+    assert np.max(np.abs(result.fused_resampled_z)) < 2.0
+
+
+def test_trace2cp_z_corrected_image_copies_nearest_inferred_layer_columns() -> None:
+    def layer(value: int):
+        return SimpleNamespace(
+            image=np.full((2, 3), value, dtype=np.float32),
+            valid_mask=np.ones((2, 3), dtype=bool),
+        )
+
+    plane_cache = SimpleNamespace(
+        z_step_voxels=2.0,
+        layers={-1: layer(10), 0: layer(20), 1: layer(30)},
+    )
+    trace = np.asarray([[0.0, 0.0, -2.0], [1.0, 0.0, 0.0], [2.0, 0.0, 2.0]], dtype=np.float32)
+
+    image, missing = _trace2cp_z_corrected_image_u8(
+        plane_cache=plane_cache,
+        trace_xyz=trace,
+        fallback_shape_hw=(2, 3),
+    )
+
+    assert missing == 0
+    assert image[:, 0].tolist() == [10, 10]
+    assert image[:, 1].tolist() == [20, 20]
+    assert image[:, 2].tolist() == [30, 30]
+
+
 def test_trace2cp_tta_params_drop_y_shift_and_scale() -> None:
     params = FiberStripAugmentParams(
         shift_x=3.0,
@@ -919,6 +1058,29 @@ def test_trace2cp_segment_patch_uses_quadruple_configured_height(tmp_path: Path)
     assert image.shape[0] == 20
     assert valid.shape[0] == 20
     assert sample.coords_zyx.shape[0] == 20
+
+
+def test_trace2cp_segment_patch_accepts_explicit_selected_scale_z_offset(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+
+    center, _, _ = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+    )
+    shifted, _, _ = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        strip_z_offset=2.0,
+        sample_mode="flat",
+    )
+
+    assert center.strip_z_offset == pytest.approx(0.0)
+    assert shifted.strip_z_offset == pytest.approx(2.0)
+    assert shifted.coords_zyx.shape == center.coords_zyx.shape
+    assert not np.allclose(shifted.coords_zyx, center.coords_zyx)
 
 
 def test_trace2cp_segment_patch_can_align_ambiguous_normal_sign(tmp_path: Path) -> None:

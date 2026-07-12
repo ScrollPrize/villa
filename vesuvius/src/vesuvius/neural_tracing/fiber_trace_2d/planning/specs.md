@@ -440,6 +440,48 @@
   flag. With `--med-tta --trace2cp-combined`, median TTA supplies the direction
   reference while candidate embeddings are sampled from the reference segment
   patch; no embedding fields are geometrically warped after sampling.
+- `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` enables an
+  experimental short z-search inspection mode. It requires combined tracing
+  and embedding channels, and it is intentionally not combined with `--med-tta`
+  in the first implementation. Existing Trace2CP commands without
+  `--trace2cp-z-search` keep the center strip-z image-only behavior.
+- Trace2CP z-search samples additional segment-strip planes by passing
+  explicit selected-scale strip offsets into the same
+  `build_trace2cp_segment_patch` coordinate path. The default
+  `--trace2cp-z-step-voxels 2.0` means layer `k` is offset by
+  `k * 2.0` selected-scale voxels along the segment strip offset axis, not by
+  warping an already sampled image. `--trace2cp-z-max-layer` bounds lazy
+  expansion and defaults to `4`.
+- Z-search starts with inferred layers `-1, 0, +1`. At each trace step it
+  ensures the current layer and its immediate neighbors are inferred, bounded
+  by `--trace2cp-z-max-layer`. Inference is deterministic and stores each
+  layer's sampled image, valid mask, decoded direction field, and embedding
+  field.
+- Z-search keeps the existing 2D angular candidate fan. For each angular
+  candidate it also evaluates candidate z layers `current-1`, `current`, and
+  `current+1`, using the candidate layer's direction/embedding fields and
+  ignoring out-of-plane direction-angle effects for now. The selected trace
+  point carries `x`, `y`, and selected-scale `z_voxels`.
+- Z-search uses the existing combined score terms and weights. Start/target CP
+  embeddings and same-fiber CP-bank embeddings remain center-layer
+  embeddings, so the bank stays comparable with non-z combined tracing.
+- Z-search closest-approach/fusion uses
+  `abs(forward_y - reverse_y) + abs(forward_z_voxels - reverse_z_voxels)`,
+  with the existing center-distance magnification. The fused CP-to-CP line
+  linearly corrects both y and z toward the closest-approach midpoint while
+  keeping both CP z values fixed at zero. The first implementation skips the
+  y-only optimized refinement step for z-search and passes through the fused
+  line as the optimized row.
+- Z-search does not change the public `trace2cp_error`, training test metric,
+  or best-checkpoint selection. Those remain target-column y error per
+  horizontal CP span.
+- Single-pair z-search visualization adds a z-corrected column. It contains
+  separate forward and reverse views because each trace direction can choose a
+  different z layer per x column. Each z-corrected image is assembled
+  column-by-column by rounding the trace z value to the nearest already
+  inferred layer and copying that layer's sampled image column. It must not
+  re-sample the volume and must not interpolate image values between z layers;
+  missing layers render black and are counted in summary/debug output.
 - Single-pair `trace2cp_vis.jpg` includes an additional embedding-debug column
   when the checkpoint exposes embedding channels. The column renders cosine
   similarity maps for the start CP embedding, target CP embedding, same-fiber

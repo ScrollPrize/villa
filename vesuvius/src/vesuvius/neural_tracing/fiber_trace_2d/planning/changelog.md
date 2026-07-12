@@ -2,6 +2,10 @@
 
 ## 2026-07-12
 
+- Added experimental `--trace2cp-z-search` for combined Trace2CP inspection:
+  lazy center/neighbor strip-offset plane inference, z-aware combined
+  candidate scoring, y+z closest-approach fusion, and single-pair
+  forward/reverse z-corrected visualization columns.
 - Changed the Trace2CP embedding-debug forward/reverse last-similarity panels
   to paint per-trace-step column bands from the previous accepted point's
   embedding instead of showing one full-image map against the final trace
