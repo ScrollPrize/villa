@@ -60,6 +60,45 @@ TEST_CASE("save(path, uuid, force_overwrite=true): atomic-exchange replaces exis
     fs::remove_all(root);
 }
 
+TEST_CASE("load rolls back an interrupted multi-file save generation")
+{
+    auto root = tmpDir("rollback");
+    auto segDir = root / "seg";
+    auto replacementDir = root / "replacement";
+
+    {
+        QuadSurface original(grid(8, 8, /*z=*/1.f), cv::Vec2f(1.f, 1.f));
+        original.save(segDir.string(), "uuid-old", false);
+        QuadSurface replacement(grid(8, 8, /*z=*/99.f), cv::Vec2f(1.f, 1.f));
+        replacement.save(replacementDir.string(), "uuid-new", false);
+    }
+
+    // Reproduce the durable state left when Windows stops after publishing
+    // only part of a generation: complete originals in the rollback journal,
+    // its ready marker, and a mixture in the live directory.
+    const auto rollbackDir = segDir / ".vc-save-rollback";
+    fs::create_directories(rollbackDir);
+    for (const auto* name : {"x.tif", "y.tif", "z.tif", "meta.json"}) {
+        fs::copy_file(segDir / name, rollbackDir / name);
+    }
+    {
+        std::ofstream ready(rollbackDir / ".ready");
+        ready << "ready\n";
+    }
+    fs::copy_file(replacementDir / "x.tif", segDir / "x.tif",
+                  fs::copy_options::overwrite_existing);
+    fs::copy_file(replacementDir / "meta.json", segDir / "meta.json",
+                  fs::copy_options::overwrite_existing);
+
+    QuadSurface recovered(segDir);
+    CHECK(recovered.meta["uuid"].get_string() == "uuid-old");
+    recovered.ensureLoaded();
+    CHECK(recovered.rawPointsPtr()->at<cv::Vec3f>(0, 0)[2] == doctest::Approx(1.f));
+    CHECK_FALSE(fs::exists(rollbackDir));
+
+    fs::remove_all(root);
+}
+
 TEST_CASE("saveChannel: writes only the channel tif, no snapshot, round-trips")
 {
     auto root = tmpDir("savechannel");

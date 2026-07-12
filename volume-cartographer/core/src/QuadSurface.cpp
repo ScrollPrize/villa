@@ -27,6 +27,8 @@
 #include <iomanip>
 #include <chrono>
 #include <atomic>
+#include <exception>
+#include <set>
 
 #include <stdio.h>
 
@@ -70,11 +72,95 @@ void replaceFile(const std::filesystem::path& source,
 #endif
 }
 
+constexpr auto kSaveRollbackDir = ".vc-save-rollback";
+constexpr auto kSaveRollbackReady = ".ready";
+
+void recoverIncompleteSave(const std::filesystem::path& destination)
+{
+    const auto rollback = destination / kSaveRollbackDir;
+    if (!std::filesystem::exists(rollback)) {
+        return;
+    }
+
+    const auto ready = rollback / kSaveRollbackReady;
+    if (!std::filesystem::exists(ready)) {
+        // Publication never began, or it committed and only cleanup was
+        // interrupted. In either case the destination is already coherent.
+        std::filesystem::remove_all(rollback);
+        return;
+    }
+
+    std::vector<std::filesystem::path> backups;
+    std::set<std::filesystem::path> originalNames;
+    for (const auto& entry : std::filesystem::directory_iterator(rollback)) {
+        if (entry.is_regular_file() && entry.path().filename() != kSaveRollbackReady) {
+            backups.push_back(entry.path());
+            originalNames.insert(entry.path().filename());
+        }
+    }
+
+    // Remove files introduced by the interrupted generation before restoring
+    // every original. Keep the backups intact until recovery is complete so a
+    // second interruption can safely retry the same recovery.
+    for (const auto& entry : std::filesystem::directory_iterator(destination)) {
+        if (entry.is_regular_file() && !originalNames.contains(entry.path().filename())) {
+            std::filesystem::remove(entry.path());
+        }
+    }
+
+    const auto restoreDir = rollback / ".restore";
+    std::filesystem::create_directories(restoreDir);
+    for (const auto& backup : backups) {
+        const auto staged = restoreDir / backup.filename();
+        std::filesystem::copy_file(
+            backup, staged, std::filesystem::copy_options::overwrite_existing);
+        replaceFile(staged, destination / backup.filename());
+    }
+    std::filesystem::remove_all(rollback);
+}
+
 #ifdef _WIN32
+void createRollbackBackup(const std::filesystem::path& original,
+                          const std::filesystem::path& backup)
+{
+    // A same-volume hard link preserves the old file object when the live name
+    // is replaced, without copying multi-gigabyte TIFFs on every autosave.
+    // Fall back to a copy on filesystems that do not support hard links.
+    if (::CreateHardLinkW(backup.wstring().c_str(), original.wstring().c_str(), nullptr)) {
+        return;
+    }
+    std::filesystem::copy_file(
+        original, backup, std::filesystem::copy_options::overwrite_existing);
+}
+
 void replaceDirectoryContents(const std::filesystem::path& source,
                               const std::filesystem::path& destination)
 {
     std::filesystem::create_directories(destination);
+
+    // If a previous process stopped during publication, restore its complete
+    // prior generation before beginning another save.
+    recoverIncompleteSave(destination);
+
+    const auto rollback = destination / kSaveRollbackDir;
+    std::filesystem::create_directories(rollback);
+    for (const auto& entry : std::filesystem::directory_iterator(destination)) {
+        if (entry.is_regular_file()) {
+            createRollbackBackup(entry.path(), rollback / entry.path().filename());
+        }
+    }
+
+    // This marker is created only after every original file is durable in the
+    // rollback directory. Its presence means publication may have begun.
+    const auto ready = rollback / kSaveRollbackReady;
+    {
+        std::ofstream marker(ready, std::ios::binary);
+        marker << "ready\n";
+        if (!marker) {
+            throw std::runtime_error("failed to prepare save rollback journal: " +
+                                     ready.string());
+        }
+    }
 
     // Windows cannot reliably remove a directory while files from it are
     // mapped by another QuadSurface. The mappings opt into FILE_SHARE_DELETE,
@@ -95,11 +181,32 @@ void replaceDirectoryContents(const std::filesystem::path& source,
         const bool rhsMeta = rhs.filename() == "meta.json";
         return lhsMeta != rhsMeta ? !lhsMeta : lhs.filename() < rhs.filename();
     });
-    for (const auto& file : files) {
-        replaceFile(file, destination / file.filename());
+    try {
+        for (const auto& file : files) {
+            replaceFile(file, destination / file.filename());
+        }
+
+        // Removing the marker commits the complete new generation. If cleanup
+        // is interrupted after this point, recovery keeps the new files.
+        std::filesystem::remove(ready);
+    } catch (...) {
+        const auto error = std::current_exception();
+        try {
+            recoverIncompleteSave(destination);
+        } catch (const std::exception& recoveryError) {
+            Logger()->error("failed to roll back interrupted save for {}: {}",
+                            destination.string(), recoveryError.what());
+        }
+        std::rethrow_exception(error);
     }
 
     std::error_code cleanupEc;
+    std::filesystem::remove_all(rollback, cleanupEc);
+    if (cleanupEc) {
+        Logger()->warn("could not remove save rollback directory {}: {}",
+                       rollback.string(), cleanupEc.message());
+    }
+    cleanupEc.clear();
     std::filesystem::remove_all(source, cleanupEc);
     if (cleanupEc) {
         Logger()->warn("could not remove completed save temp directory {}: {}",
@@ -466,6 +573,7 @@ static Rect3D rect_from_json(const utils::Json &json)
 
 QuadSurface::QuadSurface(const std::filesystem::path &path_)
 {
+    recoverIncompleteSave(path_);
     path = path_;
     id = path_.filename().string();
     auto metaPath = path_ / "meta.json";
@@ -487,6 +595,7 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
 
 QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &json)
 {
+    recoverIncompleteSave(path_);
     path = path_;
     id = path_.filename().string();
     meta = json;
@@ -1715,7 +1824,12 @@ void QuadSurface::save(const std::filesystem::path &path_, const std::string &uu
             replacedExisting = true;
         }
 #elif defined(_WIN32)
-        replaceDirectoryContents(temp_path, final_path);
+        try {
+            replaceDirectoryContents(temp_path, final_path);
+        } catch (...) {
+            path = original_path;
+            throw;
+        }
         replacedExisting = true;
 #else
         // renameat2/RENAME_EXCHANGE is Linux-only; use remove + rename fallback
@@ -1810,6 +1924,8 @@ Rect3D QuadSurface::bbox()
 
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &path, int flags)
 {
+    recoverIncompleteSave(path);
+
     auto read_band_into = [](const std::filesystem::path& fpath,
                              cv::Mat_<cv::Vec3f>& points,
                              int channel,

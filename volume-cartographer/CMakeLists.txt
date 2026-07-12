@@ -162,12 +162,17 @@ if(VC_BUILD_PYTHON)
 endif()
 
 # Portable shippable defaults; VC_MARCH_NATIVE=ON (set by dev-* presets) opts
-# into host tuning. armv8.2-a floor avoids SVE so Apple M1-M3 + Qualcomm Oryon
-# work alongside Graviton.
+# into host tuning. Windows installers use the general x86-64 baseline so they
+# run on all supported amd64 CPUs; Linux retains the existing x86-64-v3 floor.
+# armv8.2-a avoids SVE so Apple M1-M3 + Qualcomm Oryon work alongside Graviton.
 if(VC_MARCH_NATIVE)
     add_compile_options(-pipe -march=native)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-    add_compile_options(-pipe -march=x86-64-v3)
+    if(WIN32)
+        add_compile_options(-pipe -march=x86-64)
+    else()
+        add_compile_options(-pipe -march=x86-64-v3)
+    endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     add_compile_options(-pipe -march=armv8.2-a)
 else()

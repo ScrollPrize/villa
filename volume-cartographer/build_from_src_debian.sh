@@ -126,7 +126,6 @@ if [[ ":$PATH:" != *":$prefix/bin:"* ]]; then
     echo "VC3D installed successfully, but $prefix/bin is not currently on PATH." >&2
     echo "Add this line to your shell profile:" >&2
     echo "  export PATH=\"$prefix/bin:\$PATH\"" >&2
-    exit 1
 fi
 
 hash -r

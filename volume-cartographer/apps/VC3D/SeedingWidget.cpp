@@ -1286,10 +1286,13 @@ void SeedingWidget::onRunSegmentationClicked()
                       << QString::number(point.p[0])
                       << QString::number(point.p[1])
                       << QString::number(point.p[2]);
-#if defined(Q_OS_UNIX)
+#if defined(Q_OS_LINUX)
         // Background priority so batch growth doesn't starve the UI.
         process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3"
                                              << executablePath << toolArgs);
+#elif defined(Q_OS_UNIX)
+        // ionice is Linux-specific; macOS still provides nice.
+        process->start("nice", QStringList() << "-n" << "19" << executablePath << toolArgs);
 #else
         process->start(executablePath, toolArgs);
 #endif
@@ -2264,10 +2267,13 @@ void SeedingWidget::onExpandSeedsClicked()
                       << QString::fromStdString(volumePath.string())
                       << QString::fromStdString(pathsDir.string())
                       << QString::fromStdString(expandJsonPath.string());
-#if defined(Q_OS_UNIX)
+#if defined(Q_OS_LINUX)
         // Background priority so batch growth doesn't starve the UI.
         process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3"
                                              << executablePath << toolArgs);
+#elif defined(Q_OS_UNIX)
+        // ionice is Linux-specific; macOS still provides nice.
+        process->start("nice", QStringList() << "-n" << "19" << executablePath << toolArgs);
 #else
         process->start(executablePath, toolArgs);
 #endif
