@@ -1,58 +1,41 @@
-# Cross-Fiber Contrastive CP Negatives Plan
+# Contrastive Similarity-Mean Sparsity Loss Plan
 
 ## Scope
 
 - Update contrastive embedding training only.
-- Keep direction loss, loader sampling, Trace2CP tracing, and visualization
+- Keep loader sampling, direction loss, Trace2CP tracing, and visualization
   semantics unchanged.
-- Do not add new config keys; use the existing
-  `training.contrastive_negative_margin` and `training.contrastive_weight`.
+- Do not add a new config key; the requested target is fixed at `0.1`.
 
 ## Implementation
 
 1. Extend `contrastive_embedding_loss`.
-   - Reuse the normalized CP embeddings already sampled for positive terms.
-   - Build a cross-fiber mask from existing per-sample fiber IDs.
-   - Penalize same-margin cosine similarity for all CP embedding pairs whose
-     fiber IDs differ.
-   - Average available negative components: existing valid non-CP pixel
-     negatives and cross-fiber CP negatives. This gives each component equal
-     weight when both exist while preserving old behavior when only one exists.
+   - Reuse normalized embedding fields and CP embeddings.
+   - For each supervised CP sample, compute the per-pixel cosine similarity to
+     that CP embedding, mapped to normalized `0..1` space.
+   - Average that normalized similarity over valid pixels in the same patch.
+   - Add an MSE term against target `0.1`, averaged across supervised CPs.
+   - Keep the existing positive/negative pair balance intact, then add this
+     sparsity term under the same `contrastive_weight`.
 
-2. Update contrastive grouped batches.
-   - Concatenate consecutive same-fiber CP groups to fill a training batch
-     instead of repeating one group across the whole batch.
-   - Advance contrastive training steps by the number of groups per batch so
-     adjacent steps do not overlap groups.
-   - Synchronize value/image augmentation within each same-fiber group.
+2. Extend metrics and logging.
+   - Add similarity-mean loss, observed mean value, target, and sample count to
+     `ContrastiveEmbeddingMetrics`.
+   - Thread these metrics through training and TensorBoard scalars.
 
-3. Extend metrics.
-   - Keep `negative_loss` as the aggregate negative branch used by the loss.
-   - Add component metrics for pixel negatives and cross-fiber CP negatives.
-   - Report the total negative comparison count while preserving existing
-     single-fiber behavior.
-
-4. Wire metrics through training logs.
-   - Add TensorBoard scalars for the component losses/counts when contrastive
-     training is enabled.
-   - Keep existing scalar names intact for aggregate values.
-
-5. Add tests.
-   - Existing same-fiber tests should continue to show unchanged weighting.
-   - Add a cross-fiber batch test proving the new CP-negative component is
-     present and splits the negative branch weight with pixel negatives.
-   - Update grouped-batch tests to verify multiple same-fiber groups are
-     concatenated and value augmentation is synchronized per group.
+3. Add/update tests.
+   - Update existing contrastive loss tests for the additional sparsity term.
+   - Add focused assertions for the observed normalized similarity mean and
+     target loss.
 
 ## Spec Update
 
-- Update `planning/specs.md` contrastive section to document cross-fiber CP
-  embedding negatives and the averaged negative-branch weighting.
+- Document the fixed `0.1` normalized similarity-image mean target and how it
+  is combined with the contrastive pair loss.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` training/contrastive documentation with the
-  new negative component and metrics.
+- Update `docs/code_structure.md` contrastive training description.
 - Update `planning/changelog.md`, `status.md`, and `task_log.md`.
 
 ## Validation

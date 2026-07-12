@@ -1,10 +1,10 @@
-# Cross-Fiber Contrastive CP Negatives
+# Contrastive Similarity-Mean Sparsity Loss
 
-Add an additional contrastive negative term for embedding training: each CP
-embedding in a batch should be penalized for high cosine similarity to CP
-embeddings from other fibers in the same batch.
+Add another contrastive embedding loss term: for each supervised CP embedding,
+the average normalized embedding-similarity image against that CP embedding
+should be `0.1`.
 
-This term should use the same cosine margin as the existing non-CP pixel
-negative term. When both negative terms are available, they should split the
-negative half of the balanced contrastive objective equally, so the overall
-positive-vs-negative balance stays unchanged.
+The normalized similarity image is the same `0..1` space used by TensorBoard
+embedding-similarity visualization: `0.5 + 0.5 * cosine_similarity`.
+This should push CP-similar embeddings toward a small sparse region instead of
+allowing broad high-similarity areas.

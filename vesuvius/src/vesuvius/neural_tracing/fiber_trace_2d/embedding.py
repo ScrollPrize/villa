@@ -12,6 +12,9 @@ from vesuvius.neural_tracing.fiber_trace_2d.loader import FiberStripSample
 from vesuvius.neural_tracing.fiber_trace_2d.model import embedding_output
 
 
+CONTRASTIVE_SIMILARITY_MEAN_TARGET = 0.1
+
+
 @dataclass(frozen=True)
 class ContrastiveEmbeddingMetrics:
     loss: float
@@ -23,6 +26,10 @@ class ContrastiveEmbeddingMetrics:
     cross_fiber_negative_loss: float = 0.0
     pixel_negative_samples: int = 0
     cross_fiber_negative_samples: int = 0
+    similarity_mean_loss: float = 0.0
+    similarity_mean_value: float = 0.0
+    similarity_mean_target: float = CONTRASTIVE_SIMILARITY_MEAN_TARGET
+    similarity_mean_samples: int = 0
 
 
 def contrastive_negative_reachable_mask(
@@ -66,6 +73,30 @@ def _sample_fiber_ids(
         value = ids.setdefault(key, len(ids))
         rows.append(value)
     return torch.as_tensor(rows, dtype=torch.long, device=device)
+
+
+def _similarity_mean_loss(
+    embeddings: torch.Tensor,
+    positive: torch.Tensor,
+    patch_indices: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    target: float,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    patch_embeddings = F.normalize(embeddings[patch_indices], dim=1, eps=1.0e-12)
+    similarity = torch.sum(patch_embeddings * positive[:, :, None, None], dim=1)
+    similarity01 = (0.5 + 0.5 * similarity).clamp(0.0, 1.0)
+    valid_for_cp = valid[patch_indices].to(dtype=similarity01.dtype)
+    counts = valid_for_cp.flatten(1).sum(dim=1)
+    has_valid = counts > 0.0
+    if not bool(has_valid.any().detach().cpu().item()):
+        return positive.new_tensor(0.0), positive.new_tensor(0.0), 0
+    means = (
+        (similarity01 * valid_for_cp).flatten(1).sum(dim=1)[has_valid]
+        / counts[has_valid].clamp_min(1.0)
+    )
+    target_t = means.new_tensor(float(target))
+    return torch.square(means - target_t).mean(), means.mean(), int(means.numel())
 
 
 def contrastive_embedding_loss(
@@ -170,7 +201,14 @@ def contrastive_embedding_loss(
         negative_loss = positive.new_tensor(0.0)
     else:
         negative_loss = torch.stack(negative_components).mean()
-    combined = 0.5 * (positive_loss + negative_loss)
+    similarity_mean_loss, similarity_mean_value, similarity_mean_count = _similarity_mean_loss(
+        embeddings,
+        positive,
+        patch_indices,
+        valid,
+        target=CONTRASTIVE_SIMILARITY_MEAN_TARGET,
+    )
+    combined = 0.5 * (positive_loss + negative_loss) + similarity_mean_loss
     weighted = combined * float(weight)
     metrics = ContrastiveEmbeddingMetrics(
         loss=float(weighted.detach().cpu().item()),
@@ -182,6 +220,10 @@ def contrastive_embedding_loss(
         cross_fiber_negative_loss=float(cross_fiber_negative_loss.detach().cpu().item()),
         pixel_negative_samples=int(pixel_negative_count),
         cross_fiber_negative_samples=int(cross_fiber_negative_count),
+        similarity_mean_loss=float(similarity_mean_loss.detach().cpu().item()),
+        similarity_mean_value=float(similarity_mean_value.detach().cpu().item()),
+        similarity_mean_target=CONTRASTIVE_SIMILARITY_MEAN_TARGET,
+        similarity_mean_samples=int(similarity_mean_count),
     )
     return weighted, metrics
 

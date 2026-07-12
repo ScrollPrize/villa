@@ -3732,12 +3732,16 @@ def test_contrastive_embedding_loss_balances_positive_and_negative_terms() -> No
         negative_margin=0.0,
     )
 
-    assert float(loss.detach().item()) == pytest.approx(1.0)
+    assert float(loss.detach().item()) == pytest.approx(2.62)
     assert metrics.positive_loss == pytest.approx(0.0)
     assert metrics.negative_loss == pytest.approx(1.0)
-    assert metrics.loss == pytest.approx(1.0)
+    assert metrics.similarity_mean_value == pytest.approx(1.0)
+    assert metrics.similarity_mean_loss == pytest.approx(0.81)
+    assert metrics.similarity_mean_target == pytest.approx(0.1)
+    assert metrics.loss == pytest.approx(2.62)
     assert metrics.positive_samples == 2
     assert metrics.negative_samples == 2
+    assert metrics.similarity_mean_samples == 2
 
 
 def test_contrastive_embedding_loss_adds_cross_fiber_cp_negatives() -> None:
@@ -3777,7 +3781,9 @@ def test_contrastive_embedding_loss_adds_cross_fiber_cp_negatives() -> None:
     assert metrics.pixel_negative_loss == pytest.approx(0.0)
     assert metrics.cross_fiber_negative_loss == pytest.approx(1.0)
     assert metrics.negative_loss == pytest.approx(0.5)
-    assert float(loss.detach().item()) == pytest.approx(0.25)
+    assert metrics.similarity_mean_value == pytest.approx(5.0 / 9.0)
+    assert metrics.similarity_mean_loss == pytest.approx((5.0 / 9.0 - 0.1) ** 2)
+    assert float(loss.detach().item()) == pytest.approx(0.25 + (5.0 / 9.0 - 0.1) ** 2)
     assert metrics.pixel_negative_samples == 4
     assert metrics.cross_fiber_negative_samples == 8
     assert metrics.negative_samples == 12
@@ -3824,8 +3830,10 @@ def test_contrastive_embedding_loss_ignores_unreachable_edge_negatives() -> None
     )
 
     assert unmasked_metrics.negative_loss > 0.0
-    assert float(loss.detach().item()) == pytest.approx(0.0)
+    assert float(loss.detach().item()) == pytest.approx((21.0 / 25.0 - 0.1) ** 2)
     assert masked_metrics.negative_loss == pytest.approx(0.0)
+    assert masked_metrics.similarity_mean_value == pytest.approx(21.0 / 25.0)
+    assert masked_metrics.similarity_mean_loss == pytest.approx((21.0 / 25.0 - 0.1) ** 2)
     assert masked_metrics.negative_samples == 2
 
 

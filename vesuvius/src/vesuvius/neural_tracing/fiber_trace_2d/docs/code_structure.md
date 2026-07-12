@@ -398,7 +398,11 @@ The important behavior is:
   each CP embedding is also contrasted against CP embeddings from other fibers.
   The valid-pixel and cross-fiber CP negative components split the aggregate
   negative branch equally when both are available; the positive and aggregate
-  negative means are balanced before applying `training.contrastive_weight`.
+  negative means are balanced. A similarity-image sparsity term also compares
+  the valid-pixel mean of each CP's normalized `0..1` embedding-similarity map
+  against fixed target `0.1`, encouraging only a small region to remain similar
+  to the CP embedding. The balanced pair loss plus this sparsity term are
+  multiplied by `training.contrastive_weight`.
 - Logs `train/loss_total`, `train/loss_direction`,
   `train/loss_contrastive`, positive/negative contrastive components, and
   TensorBoard embedding-similarity images that compare every pixel in a

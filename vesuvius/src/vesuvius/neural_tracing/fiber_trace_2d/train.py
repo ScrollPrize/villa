@@ -310,6 +310,10 @@ class _DirectionMetrics:
     contrastive_negative_samples: int = 0
     contrastive_pixel_negative_samples: int = 0
     contrastive_cross_fiber_negative_samples: int = 0
+    contrastive_similarity_mean_loss: float = 0.0
+    contrastive_similarity_mean_value: float = 0.0
+    contrastive_similarity_mean_target: float = 0.0
+    contrastive_similarity_mean_samples: int = 0
 
 
 @dataclass(frozen=True)
@@ -756,6 +760,10 @@ def _compute_batch_loss(
         contrastive_negative_samples=contrastive_metrics.negative_samples,
         contrastive_pixel_negative_samples=contrastive_metrics.pixel_negative_samples,
         contrastive_cross_fiber_negative_samples=contrastive_metrics.cross_fiber_negative_samples,
+        contrastive_similarity_mean_loss=contrastive_metrics.similarity_mean_loss,
+        contrastive_similarity_mean_value=contrastive_metrics.similarity_mean_value,
+        contrastive_similarity_mean_target=contrastive_metrics.similarity_mean_target,
+        contrastive_similarity_mean_samples=contrastive_metrics.similarity_mean_samples,
     )
     return loss, outputs, supervision, metrics
 
@@ -795,6 +803,10 @@ def _compute_prepared_batch_loss(
         contrastive_negative_samples=contrastive_metrics.negative_samples,
         contrastive_pixel_negative_samples=contrastive_metrics.pixel_negative_samples,
         contrastive_cross_fiber_negative_samples=contrastive_metrics.cross_fiber_negative_samples,
+        contrastive_similarity_mean_loss=contrastive_metrics.similarity_mean_loss,
+        contrastive_similarity_mean_value=contrastive_metrics.similarity_mean_value,
+        contrastive_similarity_mean_target=contrastive_metrics.similarity_mean_target,
+        contrastive_similarity_mean_samples=contrastive_metrics.similarity_mean_samples,
     )
     return loss, outputs, prepared.supervision, metrics
 
@@ -1774,6 +1786,21 @@ def run_training(
                         step,
                     )
                     writer.add_scalar(
+                        "train/contrastive_similarity_mean_loss",
+                        metrics.contrastive_similarity_mean_loss,
+                        step,
+                    )
+                    writer.add_scalar(
+                        "train/contrastive_similarity_mean_value",
+                        metrics.contrastive_similarity_mean_value,
+                        step,
+                    )
+                    writer.add_scalar(
+                        "train/contrastive_similarity_mean_target",
+                        metrics.contrastive_similarity_mean_target,
+                        step,
+                    )
+                    writer.add_scalar(
                         "train/contrastive_positive_samples",
                         metrics.contrastive_positive_samples,
                         step,
@@ -1791,6 +1818,11 @@ def run_training(
                     writer.add_scalar(
                         "train/contrastive_cross_fiber_negative_samples",
                         metrics.contrastive_cross_fiber_negative_samples,
+                        step,
+                    )
+                    writer.add_scalar(
+                        "train/contrastive_similarity_mean_samples",
+                        metrics.contrastive_similarity_mean_samples,
                         step,
                     )
                 writer.add_scalar("train/angle_error_mean_deg", metrics.angle_mean_deg, step)

@@ -2,6 +2,9 @@
 
 ## 2026-07-11
 
+- Added a contrastive embedding sparsity term that trains each CP's normalized
+  valid-pixel similarity-image mean toward `0.1`, encouraging CP-similar
+  embeddings to occupy fewer pixels.
 - Added cross-fiber CP embedding negatives to contrastive training and changed
   contrastive batches to concatenate same-fiber CP groups; CP-vs-other-fiber-CP
   negatives now share the aggregate negative branch with existing valid-pixel
