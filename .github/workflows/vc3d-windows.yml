@@ -127,8 +127,13 @@ jobs:
           # Console CLI tool: loads the vc_core/OpenCV/Ceres DLL closure.
           # No-args prints usage and exits 1; anything else means load failure.
           & "$bin\vc_tifxyz_trim.exe"
-          if ($LASTEXITCODE -notin 0,1) { throw "vc_tifxyz_trim failed to start (exit $LASTEXITCODE)" }
-          Write-Host "vc_tifxyz_trim OK (exit $LASTEXITCODE)"
+          $trimExitCode = $LASTEXITCODE
+          if ($trimExitCode -notin 0,1) { throw "vc_tifxyz_trim failed to start (exit $trimExitCode)" }
+          Write-Host "vc_tifxyz_trim OK (exit $trimExitCode)"
+          # Start-Process below does not update $LASTEXITCODE. Clear the
+          # accepted usage exit so the Actions pwsh wrapper does not fail the
+          # step with this stale value after all smoke checks have passed.
+          $global:LASTEXITCODE = 0
           # A deployed Windows Qt application uses platforms/qwindows.dll.
           # Check it explicitly, then force that native backend so this probes
           # the same platform plugin users will load. Do not force Qt's
