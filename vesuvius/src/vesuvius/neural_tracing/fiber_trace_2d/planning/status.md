@@ -8,10 +8,10 @@
 - [x] Update `planning/task.md`.
 - [x] Update `planning/task_plan.md`.
 - [x] Review plan against current specs and task request.
-- [ ] Await user review of plan.
-- [ ] Implement model output slicing and optional presence head.
-- [ ] Implement presence loss, metrics, logging, and visualization.
-- [ ] Implement z-selected same-fiber embedding positive supervision.
-- [ ] Update specs/docs/changelog/task log.
-- [ ] Add focused tests.
-- [ ] Run validation.
+- [x] User approved implementation.
+- [x] Implement model output slicing and optional presence head.
+- [x] Implement presence loss, metrics, logging, and visualization.
+- [x] Implement z-selected same-fiber embedding positive supervision.
+- [x] Update specs/docs/changelog/task log.
+- [x] Add focused tests.
+- [x] Run validation.

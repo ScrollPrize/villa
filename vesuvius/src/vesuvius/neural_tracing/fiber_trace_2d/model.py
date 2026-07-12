@@ -11,6 +11,7 @@ class FiberStripDirectionModelConfig:
     in_channels: int = 1
     hidden_channels: int = 64
     depth: int = 10
+    presence_channels: int = 0
     embedding_channels: int = 0
 
 
@@ -45,9 +46,14 @@ class FiberStripDirectionNet(nn.Module):
             raise ValueError("hidden_channels must be > 0")
         if cfg.depth <= 0:
             raise ValueError("depth must be > 0")
+        if cfg.presence_channels < 0:
+            raise ValueError("presence_channels must be >= 0")
+        if cfg.presence_channels > 1:
+            raise ValueError("presence_channels must be 0 or 1")
         if cfg.embedding_channels < 0:
             raise ValueError("embedding_channels must be >= 0")
         hidden = int(cfg.hidden_channels)
+        presence_channels = int(cfg.presence_channels)
         embedding_channels = int(cfg.embedding_channels)
         self.input = nn.Sequential(
             nn.Conv2d(int(cfg.in_channels), hidden, kernel_size=3, padding=1),
@@ -56,9 +62,13 @@ class FiberStripDirectionNet(nn.Module):
         )
         self.blocks = nn.Sequential(*[_ResidualBlock(hidden) for _ in range(int(cfg.depth))])
         self.output = nn.Conv2d(hidden, 2, kernel_size=1)
+        self.presence_output = (
+            None if presence_channels == 0 else nn.Conv2d(hidden, presence_channels, kernel_size=1)
+        )
         self.embedding_output = (
             None if embedding_channels == 0 else nn.Conv2d(hidden, embedding_channels, kernel_size=1)
         )
+        self.presence_channels = presence_channels
         self.embedding_channels = embedding_channels
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
@@ -66,10 +76,13 @@ class FiberStripDirectionNet(nn.Module):
             raise ValueError("image must have shape N,C,H,W")
         features = self.blocks(self.input(image))
         direction = torch.sigmoid(self.output(features))
+        outputs = [direction]
+        if self.presence_output is not None:
+            outputs.append(torch.sigmoid(self.presence_output(features)))
         if self.embedding_output is None:
-            return direction
-        embedding = self.embedding_output(features)
-        return torch.cat([direction, embedding], dim=1)
+            return torch.cat(outputs, dim=1)
+        outputs.append(self.embedding_output(features))
+        return torch.cat(outputs, dim=1)
 
 
 def direction_output(output: torch.Tensor) -> torch.Tensor:
@@ -78,7 +91,30 @@ def direction_output(output: torch.Tensor) -> torch.Tensor:
     return output[:, :2]
 
 
-def embedding_output(output: torch.Tensor) -> torch.Tensor:
+def presence_output(output: torch.Tensor, *, presence_channels: int = 1) -> torch.Tensor:
     if output.ndim != 4 or int(output.shape[1]) < 2:
         raise ValueError("model output must have shape N,C,H,W with at least two direction channels")
-    return output[:, 2:]
+    channels = int(presence_channels)
+    if channels < 0:
+        raise ValueError("presence_channels must be >= 0")
+    if channels > 1:
+        raise ValueError("presence_channels must be 0 or 1")
+    if channels == 0:
+        return output[:, 2:2]
+    if int(output.shape[1]) < 3:
+        raise ValueError("model output does not contain a presence channel")
+    return output[:, 2:3]
+
+
+def embedding_output(output: torch.Tensor, *, presence_channels: int = 0) -> torch.Tensor:
+    if output.ndim != 4 or int(output.shape[1]) < 2:
+        raise ValueError("model output must have shape N,C,H,W with at least two direction channels")
+    channels = int(presence_channels)
+    if channels < 0:
+        raise ValueError("presence_channels must be >= 0")
+    if channels > 1:
+        raise ValueError("presence_channels must be 0 or 1")
+    start = 2 + channels
+    if int(output.shape[1]) < start:
+        raise ValueError("model output has fewer channels than the requested output layout")
+    return output[:, start:]

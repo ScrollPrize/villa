@@ -13,6 +13,8 @@ The important behavior is:
   augmentation;
 - train a small 2D direction model using CP-local Lasagna two-cos-channel
   direction targets;
+- optionally train a sheet/fiber-presence head from transformed CP pixels and
+  reachable non-CP pixels;
 - optionally train a CP-local contrastive embedding head using cosine
   similarity;
 - export JPG batches and augmentation contact sheets for inspection;
@@ -155,8 +157,9 @@ The important behavior is:
 - The default normalization is `BatchNorm2d`.
 - Consumes flattened strip patches shaped `[patch_batch, 1, height, width]`.
 - Outputs two per-pixel direction channels in the Lasagna encoded
-  representation first. Configured contrastive embedding channels are appended
-  after those first two channels.
+  representation first. If enabled, one sigmoid sheet/fiber-presence channel
+  follows. Configured contrastive embedding channels are appended after
+  direction and any presence channel.
 
 `loader.py`
 
@@ -438,22 +441,30 @@ The important behavior is:
   model.
 - Computes direction targets from transformed line coordinates after geometric
   augmentation.
+- When `training.presence_enabled` is true, configures a one-channel
+  sheet/fiber-presence head and adds a balanced BCE loss: the rounded
+  transformed CP pixel in each strip patch is positive, valid reachable non-CP
+  pixels are negative, and unreachable shift-margin edges are ignored.
 - When `training.contrastive_enabled` is true, configures an embedding head,
   uses the loader's same-fiber grouped batch path, and adds a cosine embedding
-  loss. Positive terms compare CP-neighborhood embeddings from the same fiber;
-  negative terms compare each positive to one deterministic valid non-CP pixel
-  from the batch inside the CP-neighborhood reachable region derived from
-  `augment_shift_x/y`, so unreachable patch edges are ignored rather than
-  trained as always-negative. CP embeddings from other fibers are not used as
-  contrastive negatives. The positive and valid-pixel negative means are
-  balanced. A similarity-image sparsity term also compares
+  loss. Positive terms operate on rounded transformed CP pixels: for each
+  anchor CP sample/strip-z offset, only other CPs from the same fiber are
+  considered, across their loaded strip-z offsets, and the already most-similar
+  candidate is trained toward cosine similarity `1`. Negative terms compare
+  each positive to one deterministic valid non-CP pixel from the batch inside
+  the CP-neighborhood reachable region derived from `augment_shift_x/y`, so
+  unreachable patch edges are ignored rather than trained as always-negative.
+  CP embeddings from other fibers are not used as contrastive negatives. The
+  positive and valid-pixel negative means are balanced. A similarity-image
+  sparsity term also compares
   the valid-pixel mean of each CP's normalized `0..1` embedding-similarity map
   over the same shift-reachable CP area against fixed target `0.1`, encouraging
   only a small reachable region to remain similar to the CP embedding. The
   balanced pair loss plus this sparsity term are multiplied by
   `training.contrastive_weight`.
 - Logs `train/loss_total`, `train/loss_direction`,
-  `train/loss_contrastive`, positive/negative contrastive components, and
+  optional presence loss/components, `train/loss_contrastive`,
+  positive/negative contrastive components, TensorBoard presence maps, and
   TensorBoard embedding-similarity images that compare every pixel in a
   selected patch against that patch's CP embedding.
 - On CUDA training runs, uses a bounded deterministic whole-batch pipeline when

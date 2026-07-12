@@ -255,9 +255,17 @@
 - A training step samples `training.control_points_per_step` deterministic control-point samples and every configured strip-z offset. The default is four control points and 16 strip-z offsets, giving 64 2D strip patches.
 - If a deterministic training sample is invalid because its CP-local Lasagna normal window is invalid, batch loading skips it and continues with following deterministic sample indices until the requested number of control-point samples is loaded. If too many consecutive samples are invalid, batch loading fails with a clear error.
 - Training flattens control-point and strip-z dimensions into a patch batch before the 2D model forward pass.
-- The default V0 direction model is a 10-block residual CNN with 64 hidden channels. It uses a 3x3 input projection, constant-width residual blocks, BatchNorm2d normalization, a final 1x1 direction projection, and an optional 1x1 embedding projection.
-- V0 model output always starts with exactly two per-pixel direction channels in the Lasagna ambiguous two-cos-channel encoding. When `training.contrastive_embedding_channels > 0`, raw embedding channels are appended after those first two direction channels. Direction consumers must explicitly slice the first two channels.
+- The default V0 direction model is a 10-block residual CNN with 64 hidden channels. It uses a 3x3 input projection, constant-width residual blocks, BatchNorm2d normalization, a final 1x1 direction projection, an optional 1x1 sheet/fiber-presence projection, and an optional 1x1 embedding projection.
+- V0 model output always starts with exactly two per-pixel direction channels in the Lasagna ambiguous two-cos-channel encoding. When `training.presence_enabled` is true, one sigmoid sheet/fiber-presence channel follows the direction channels. When `training.contrastive_embedding_channels > 0`, raw embedding channels are appended after direction and any presence channel. Consumers must use explicit output-slicing helpers instead of hard-coded embedding offsets.
 - For strip-image tangent angle `theta`, target channels are `0.5 + 0.5*cos(2*theta)` and `0.5 + 0.5*cos(2*theta + pi/4)`.
+- Sheet/fiber presence training is enabled by `training.presence_enabled`.
+  It supervises each loaded strip patch's rounded transformed CP pixel as
+  presence `1`. Valid non-CP pixels inside the same shift-reachable
+  CP-neighborhood rectangle used for contrastive negatives are supervised as
+  presence `0`; unreachable patch edges are ignored so the network does not
+  learn that CPs can never occur there. The positive-pixel BCE mean and the
+  negative-pixel BCE mean have equal aggregate weight, and the combined loss is
+  multiplied by `training.presence_weight`.
 - Contrastive embedding training is enabled by `training.contrastive_enabled`.
   It requires `training.contrastive_embedding_channels > 0` and
   `training.control_points_per_step` divisible by
@@ -271,16 +279,20 @@
   unique raw sample indices. Value/image augmentation draws are synchronized
   within each same-fiber group so the embedding objective does not treat
   value-only appearance jitter as identity evidence.
-- The contrastive embedding loss uses cosine similarity. Positive terms compare
-  CP-neighborhood embedding samples from the same fiber and target cosine
-  similarity `1`. Negative terms compare each CP-neighborhood embedding sample
-  with one deterministic valid non-CP pixel from the batch and penalize cosine
-  similarity above `training.contrastive_negative_margin`. Negative candidates
-  are restricted to the CP-neighborhood reachable rectangle implied by the
-  configured output-space `augment_shift_x/y` bounds; unreachable patch edges
-  are ignored, not supervised as negatives. CP-neighborhood embeddings from
-  other fibers are not used as negative samples. Positive and negative means
-  are averaged equally, then multiplied by `training.contrastive_weight`.
+- The contrastive embedding loss uses cosine similarity on each loaded strip
+  patch's rounded transformed CP pixel. Positive terms are z-search-aware:
+  for every anchor CP sample/strip-z offset, candidates are only other CP
+  samples from the same fiber, across their loaded strip-z offsets. The
+  already most-similar candidate is selected and trained toward cosine
+  similarity `1`; same-CP offsets are not used as positives. Negative terms
+  compare each CP embedding sample with one deterministic valid non-CP pixel
+  from the batch and penalize cosine similarity above
+  `training.contrastive_negative_margin`. Negative candidates are restricted to
+  the CP-neighborhood reachable rectangle implied by the configured
+  output-space `augment_shift_x/y` bounds; unreachable patch edges are ignored,
+  not supervised as negatives. CP embeddings from other fibers are not used as
+  negative samples. Positive and negative means are averaged equally, then
+  multiplied by `training.contrastive_weight`.
 - Contrastive embedding training also includes a similarity-image sparsity
   term. For each supervised CP embedding, the embedding similarity image
   against that CP is computed in normalized visualization space
@@ -290,7 +302,9 @@
   positive/negative pair loss before applying `training.contrastive_weight`, so
   CP-similar embeddings are encouraged to stay spatially sparse without using
   unreachable patch edges as evidence.
-- Contrastive embedding visualization writes TensorBoard similarity maps:
+- Presence visualization writes TensorBoard presence-probability maps when the
+  presence head is enabled. Contrastive embedding visualization writes
+  TensorBoard similarity maps:
   per-pixel cosine similarity against the selected patch's CP embedding is
   mapped from `[-1, 1]` to `[0, 255]` with invalid pixels black.
 - Equivalent implementation formulas are `cos2theta=(dx^2-dy^2)/(dx^2+dy^2+eps)`, `sin2theta=2*dx*dy/(dx^2+dy^2+eps)`, `dir0=0.5+0.5*cos2theta`, and `dir1=0.5+0.5*(cos2theta-sin2theta)/sqrt(2)`.

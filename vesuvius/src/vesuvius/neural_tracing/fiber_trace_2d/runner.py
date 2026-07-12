@@ -1575,6 +1575,7 @@ def _model_config_from_checkpoint(checkpoint: dict, loader: FiberStrip2DLoader) 
         in_channels=1,
         hidden_channels=max(1, int(training.get("model_hidden_channels", 64))),
         depth=max(1, int(training.get("model_depth", 10))),
+        presence_channels=1 if bool(training.get("presence_enabled", False)) else 0,
         embedding_channels=max(0, int(training.get("contrastive_embedding_channels", 0))),
     )
 
@@ -1642,7 +1643,7 @@ def _predict_trace2cp_fields(
         output = model(input_image)
         encoded = direction_output(output)[0].permute(1, 2, 0)
         direction_xy = decode_lasagna_direction_xy(encoded).detach().cpu().numpy().astype(np.float32)
-        embeddings = embedding_output(output)
+        embeddings = embedding_output(output, presence_channels=int(getattr(model, "presence_channels", 0)))
         embedding_chw: np.ndarray | None
         if int(embeddings.shape[1]) <= 0:
             embedding_chw = None

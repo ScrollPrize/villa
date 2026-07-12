@@ -38,6 +38,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.direction import (
 from vesuvius.neural_tracing.fiber_trace_2d.embedding import (
     contrastive_embedding_loss,
     contrastive_negative_reachable_mask,
+    presence_loss,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace_2d.loader import (
@@ -50,6 +51,9 @@ from vesuvius.neural_tracing.fiber_trace_2d.loader import (
 from vesuvius.neural_tracing.fiber_trace_2d.model import (
     FiberStripDirectionModelConfig,
     FiberStripDirectionNet,
+    direction_output,
+    embedding_output,
+    presence_output,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _benchmark_stage_totals,
@@ -2083,6 +2087,30 @@ def test_direction_model_can_append_embedding_channels() -> None:
     assert bool(torch.all(output[:, :2] >= 0.0))
     assert bool(torch.all(output[:, :2] <= 1.0))
     assert bool(torch.isfinite(output[:, 2:]).all())
+
+
+def test_direction_model_can_append_presence_before_embedding_channels() -> None:
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(
+            hidden_channels=4,
+            depth=2,
+            presence_channels=1,
+            embedding_channels=5,
+        )
+    )
+    image = torch.zeros((3, 1, 8, 9), dtype=torch.float32)
+
+    output = model(image)
+
+    assert output.shape == (3, 8, 8, 9)
+    assert direction_output(output).shape == (3, 2, 8, 9)
+    assert presence_output(output, presence_channels=1).shape == (3, 1, 8, 9)
+    assert embedding_output(output, presence_channels=1).shape == (3, 5, 8, 9)
+    assert bool(torch.all(direction_output(output) >= 0.0))
+    assert bool(torch.all(direction_output(output) <= 1.0))
+    assert bool(torch.all(presence_output(output, presence_channels=1) >= 0.0))
+    assert bool(torch.all(presence_output(output, presence_channels=1) <= 1.0))
+    assert bool(torch.isfinite(embedding_output(output, presence_channels=1)).all())
 
 
 def test_fiber_parser_reuse(tmp_path: Path) -> None:
@@ -4316,6 +4344,89 @@ def test_contrastive_embedding_loss_balances_positive_and_negative_terms() -> No
     assert metrics.positive_samples == 2
     assert metrics.negative_samples == 2
     assert metrics.similarity_mean_samples == 2
+
+
+def test_presence_loss_balances_cp_and_reachable_non_cp_pixels() -> None:
+    output = torch.zeros((1, 3, 5, 5), dtype=torch.float32)
+    reachable = contrastive_negative_reachable_mask((5, 5), shift_x=0.0, shift_y=0.0)
+    output[:, 2, :, :] = 0.99
+    output[:, 2, reachable] = 0.25
+    output[:, 2, 2, 2] = 0.8
+    supervision = DirectionSupervision(
+        patch_indices=torch.tensor([0], dtype=torch.long),
+        y=torch.tensor([2], dtype=torch.long),
+        x=torch.tensor([2], dtype=torch.long),
+        target=torch.zeros((1, 2), dtype=torch.float32),
+        cp_xy=torch.tensor([[2.0, 2.0]], dtype=torch.float32),
+        tangent_xy=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+    )
+    samples = (
+        SimpleNamespace(
+            fiber_path="fiber-a",
+            record_index=0,
+            control_point_index=7,
+            control_point_xy=np.asarray([2.0, 2.0], dtype=np.float32),
+            line_xy=np.asarray([[1.0, 2.0], [2.0, 2.0], [3.0, 2.0]], dtype=np.float32),
+        ),
+    )
+    valid = np.ones((1, 5, 5), dtype=bool)
+
+    loss, metrics = presence_loss(
+        output,
+        supervision,
+        samples,  # type: ignore[arg-type]
+        valid,
+        weight=2.0,
+        negative_candidate_mask=reachable,
+        presence_channels=1,
+    )
+
+    expected_positive = -math.log(0.8)
+    expected_negative = -math.log(0.75)
+    assert float(loss.detach().item()) == pytest.approx(expected_positive + expected_negative)
+    assert metrics.loss == pytest.approx(expected_positive + expected_negative)
+    assert metrics.positive_loss == pytest.approx(expected_positive)
+    assert metrics.negative_loss == pytest.approx(expected_negative)
+    assert metrics.positive_samples == 1
+    assert metrics.negative_samples == 8
+
+
+def test_contrastive_embedding_loss_selects_best_other_cp_offset_only() -> None:
+    output = torch.zeros((4, 4, 3, 3), dtype=torch.float32)
+    output[0, 2:4, 1, 1] = torch.tensor([1.0, 0.0])
+    output[1, 2:4, 1, 1] = torch.tensor([1.0, 0.0])
+    output[2, 2:4, 1, 1] = torch.tensor([0.0, 1.0])
+    output[3, 2:4, 1, 1] = torch.tensor([0.6, 0.8])
+    supervision = DirectionSupervision(
+        patch_indices=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        y=torch.tensor([1, 1, 1, 1], dtype=torch.long),
+        x=torch.tensor([1, 1, 1, 1], dtype=torch.long),
+        target=torch.zeros((4, 2), dtype=torch.float32),
+        cp_xy=torch.zeros((4, 2), dtype=torch.float32),
+        tangent_xy=torch.tensor(
+            [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+            dtype=torch.float32,
+        ),
+    )
+    samples = (
+        SimpleNamespace(fiber_path="fiber-a", record_index=0, control_point_index=0),
+        SimpleNamespace(fiber_path="fiber-a", record_index=0, control_point_index=0),
+        SimpleNamespace(fiber_path="fiber-a", record_index=0, control_point_index=1),
+        SimpleNamespace(fiber_path="fiber-a", record_index=0, control_point_index=2),
+    )
+    valid = np.ones((4, 3, 3), dtype=bool)
+
+    _, metrics = contrastive_embedding_loss(
+        output,
+        supervision,
+        samples,  # type: ignore[arg-type]
+        valid,
+        weight=1.0,
+        negative_margin=0.0,
+    )
+
+    assert metrics.positive_loss == pytest.approx(0.3)
+    assert metrics.positive_samples == 4
 
 
 def test_contrastive_embedding_loss_ignores_cross_fiber_cp_negatives() -> None:

@@ -30,9 +30,11 @@ from vesuvius.neural_tracing.fiber_trace_2d.direction import (
 )
 from vesuvius.neural_tracing.fiber_trace_2d.embedding import (
     ContrastiveEmbeddingMetrics,
+    PresenceMetrics,
     contrastive_embedding_loss,
     contrastive_negative_reachable_mask,
     embedding_similarity_to_cp,
+    presence_loss,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.loader import FiberStrip2DBatch, FiberStrip2DLoader, SamplerFactory, load_config
 from vesuvius.neural_tracing.fiber_trace_2d.model import (
@@ -66,6 +68,8 @@ class FiberStripTrainingConfig:
     tensorboard_enabled: bool = True
     model_hidden_channels: int = 64
     model_depth: int = 10
+    presence_enabled: bool = False
+    presence_weight: float = 1.0
     contrastive_enabled: bool = False
     contrastive_embedding_channels: int = 0
     contrastive_control_points_per_fiber: int = 8
@@ -110,6 +114,8 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         tensorboard_enabled=bool(get("tensorboard_enabled", True)),
         model_hidden_channels=max(1, int(get("model_hidden_channels", 64))),
         model_depth=max(1, int(get("model_depth", 10))),
+        presence_enabled=bool(get("presence_enabled", False)),
+        presence_weight=float(get("presence_weight", 1.0)),
         contrastive_enabled=bool(get("contrastive_enabled", False)),
         contrastive_embedding_channels=max(0, int(get("contrastive_embedding_channels", 0))),
         contrastive_control_points_per_fiber=max(1, int(get("contrastive_control_points_per_fiber", 8))),
@@ -132,6 +138,8 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         raise ValueError("training.test_trace2cp_step_px must be positive and finite")
     if config.contrastive_enabled and config.contrastive_embedding_channels <= 0:
         raise ValueError("training.contrastive_embedding_channels must be > 0 when contrastive is enabled")
+    if not math.isfinite(config.presence_weight) or config.presence_weight < 0.0:
+        raise ValueError("training.presence_weight must be non-negative and finite")
     if config.contrastive_enabled and (
         config.train_control_points_per_step % config.contrastive_control_points_per_fiber != 0
     ):
@@ -182,6 +190,10 @@ def _contrastive_negative_candidate_mask(loader_config: Any) -> np.ndarray:
         shift_y=shift_y,
         neighborhood_radius=1,
     )
+
+
+def _presence_channel_count(training: FiberStripTrainingConfig | None) -> int:
+    return 1 if training is not None and bool(training.presence_enabled) else 0
 
 
 def _load_raw_config(path: str | Path) -> dict[str, Any]:
@@ -301,6 +313,11 @@ def _batch_images_to_tensors(
 class _DirectionMetrics:
     angle_mean_deg: float
     loss_direction: float
+    loss_presence: float = 0.0
+    presence_positive_loss: float = 0.0
+    presence_negative_loss: float = 0.0
+    presence_positive_samples: int = 0
+    presence_negative_samples: int = 0
     loss_contrastive: float = 0.0
     contrastive_positive_loss: float = 0.0
     contrastive_negative_loss: float = 0.0
@@ -733,6 +750,19 @@ def _compute_batch_loss(
     direction = direction_output(outputs)
     direction_loss = direction_mse_loss(direction, supervision)
     loss = direction_loss
+    presence_metrics = PresenceMetrics(0.0, 0.0, 0.0, 0, 0)
+    presence_channels = _presence_channel_count(training)
+    if training is not None and bool(training.presence_enabled) and float(training.presence_weight) > 0.0:
+        presence, presence_metrics = presence_loss(
+            outputs,
+            supervision,
+            batch.samples,
+            valid_np,
+            weight=training.presence_weight,
+            negative_candidate_mask=contrastive_negative_mask,
+            presence_channels=presence_channels,
+        )
+        loss = loss + presence
     contrastive_metrics = ContrastiveEmbeddingMetrics(0.0, 0.0, 0.0, 0, 0)
     if training is not None and bool(training.contrastive_enabled) and float(training.contrastive_weight) > 0.0:
         contrastive, contrastive_metrics = contrastive_embedding_loss(
@@ -743,12 +773,18 @@ def _compute_batch_loss(
             weight=training.contrastive_weight,
             negative_margin=training.contrastive_negative_margin,
             negative_candidate_mask=contrastive_negative_mask,
+            presence_channels=presence_channels,
         )
         loss = loss + contrastive
     angle_error = direction_angle_error_degrees(direction, supervision)
     metrics = _DirectionMetrics(
         angle_mean_deg=float(angle_error.detach().mean().cpu().item()),
         loss_direction=float(direction_loss.detach().cpu().item()),
+        loss_presence=presence_metrics.loss,
+        presence_positive_loss=presence_metrics.positive_loss,
+        presence_negative_loss=presence_metrics.negative_loss,
+        presence_positive_samples=presence_metrics.positive_samples,
+        presence_negative_samples=presence_metrics.negative_samples,
         loss_contrastive=contrastive_metrics.loss,
         contrastive_positive_loss=contrastive_metrics.positive_loss,
         contrastive_negative_loss=contrastive_metrics.negative_loss,
@@ -774,6 +810,19 @@ def _compute_prepared_batch_loss(
     direction = direction_output(outputs)
     direction_loss = direction_mse_loss(direction, prepared.supervision)
     loss = direction_loss
+    presence_metrics = PresenceMetrics(0.0, 0.0, 0.0, 0, 0)
+    presence_channels = _presence_channel_count(training)
+    if training is not None and bool(training.presence_enabled) and float(training.presence_weight) > 0.0:
+        presence, presence_metrics = presence_loss(
+            outputs,
+            prepared.supervision,
+            prepared.batch.samples,
+            prepared.valid_np,
+            weight=training.presence_weight,
+            negative_candidate_mask=contrastive_negative_mask,
+            presence_channels=presence_channels,
+        )
+        loss = loss + presence
     contrastive_metrics = ContrastiveEmbeddingMetrics(0.0, 0.0, 0.0, 0, 0)
     if training is not None and bool(training.contrastive_enabled) and float(training.contrastive_weight) > 0.0:
         contrastive, contrastive_metrics = contrastive_embedding_loss(
@@ -784,12 +833,18 @@ def _compute_prepared_batch_loss(
             weight=training.contrastive_weight,
             negative_margin=training.contrastive_negative_margin,
             negative_candidate_mask=contrastive_negative_mask,
+            presence_channels=presence_channels,
         )
         loss = loss + contrastive
     angle_error = direction_angle_error_degrees(direction, prepared.supervision)
     metrics = _DirectionMetrics(
         angle_mean_deg=float(angle_error.detach().mean().cpu().item()),
         loss_direction=float(direction_loss.detach().cpu().item()),
+        loss_presence=presence_metrics.loss,
+        presence_positive_loss=presence_metrics.positive_loss,
+        presence_negative_loss=presence_metrics.negative_loss,
+        presence_positive_samples=presence_metrics.positive_samples,
+        presence_negative_samples=presence_metrics.negative_samples,
         loss_contrastive=contrastive_metrics.loss,
         contrastive_positive_loss=contrastive_metrics.positive_loss,
         contrastive_negative_loss=contrastive_metrics.negative_loss,
@@ -967,7 +1022,10 @@ def run_benchmark(
     _validate_training_batch_config(training, loader_config)
     contrastive_negative_mask = (
         _contrastive_negative_candidate_mask(loader_config)
-        if bool(training.contrastive_enabled) and float(training.contrastive_weight) > 0.0
+        if (
+            (bool(training.contrastive_enabled) and float(training.contrastive_weight) > 0.0)
+            or (bool(training.presence_enabled) and float(training.presence_weight) > 0.0)
+        )
         else None
     )
     loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
@@ -980,6 +1038,7 @@ def run_benchmark(
                 in_channels=1,
                 hidden_channels=training.model_hidden_channels,
                 depth=training.model_depth,
+                presence_channels=_presence_channel_count(training),
                 embedding_channels=training.contrastive_embedding_channels,
             )
         ).to(device)
@@ -1089,6 +1148,18 @@ def run_benchmark(
                 fw_start = time.perf_counter()
                 outputs = model(prepared.images)
                 loss = direction_mse_loss(direction_output(outputs), prepared.supervision)
+                presence_channels = _presence_channel_count(training)
+                if bool(training.presence_enabled) and float(training.presence_weight) > 0.0:
+                    presence, _ = presence_loss(
+                        outputs,
+                        prepared.supervision,
+                        prepared.batch.samples,
+                        prepared.valid_np,
+                        weight=training.presence_weight,
+                        negative_candidate_mask=contrastive_negative_mask,
+                        presence_channels=presence_channels,
+                    )
+                    loss = loss + presence
                 if bool(training.contrastive_enabled) and float(training.contrastive_weight) > 0.0:
                     contrastive, _ = contrastive_embedding_loss(
                         outputs,
@@ -1098,6 +1169,7 @@ def run_benchmark(
                         weight=training.contrastive_weight,
                         negative_margin=training.contrastive_negative_margin,
                         negative_candidate_mask=contrastive_negative_mask,
+                        presence_channels=presence_channels,
                     )
                     loss = loss + contrastive
                 _sync_device(device)
@@ -1453,8 +1525,9 @@ def _make_embedding_similarity_visualization(
     outputs: torch.Tensor,
     *,
     max_patches: int = 8,
+    presence_channels: int = 0,
 ) -> np.ndarray:
-    if int(outputs.shape[1]) <= 2:
+    if int(outputs.shape[1]) <= 2 + int(presence_channels):
         return np.zeros((3, 1, 1), dtype=np.uint8)
     _, flat_valid = _flatten_batch(batch)
     cells: list[np.ndarray] = []
@@ -1471,10 +1544,48 @@ def _make_embedding_similarity_visualization(
             patch_index=patch_index,
             cp_xy=cp_xy,
             valid_mask=flat_valid[patch_index],
+            presence_channels=presence_channels,
         )
         image_u8 = _similarity_to_u8(similarity)
         rgb = np.repeat(image_u8[:, :, None], 3, axis=2)
         rgb = _draw_predicted_cp_direction(rgb, cp_xy=cp_xy, prediction_xy=None)
+        cells.append(rgb)
+    if not cells:
+        return np.zeros((3, 1, 1), dtype=np.uint8)
+    h, w = cells[0].shape[:2]
+    cols = min(4, len(cells))
+    rows = int(math.ceil(len(cells) / cols))
+    sheet = np.zeros((rows * h, cols * w, 3), dtype=np.uint8)
+    for i, cell in enumerate(cells):
+        row = i // cols
+        col = i % cols
+        sheet[row * h : (row + 1) * h, col * w : (col + 1) * w] = cell
+    return np.transpose(sheet, (2, 0, 1))
+
+
+def _make_presence_visualization(
+    batch: FiberStrip2DBatch,
+    outputs: torch.Tensor,
+    *,
+    max_patches: int = 8,
+    presence_channels: int = 1,
+) -> np.ndarray:
+    if int(presence_channels) <= 0 or int(outputs.shape[1]) < 3:
+        return np.zeros((3, 1, 1), dtype=np.uint8)
+    _, flat_valid = _flatten_batch(batch)
+    presence = outputs.detach().cpu()[:, 2, :, :].numpy().astype(np.float32)
+    cells: list[np.ndarray] = []
+    for patch_index in _select_visualization_patch_indices(batch, max_patches=max_patches):
+        if patch_index >= int(presence.shape[0]) or patch_index >= len(batch.samples):
+            continue
+        values = np.where(flat_valid[patch_index], presence[patch_index], 0.0)
+        image_u8 = np.clip(values * 255.0, 0.0, 255.0).astype(np.uint8)
+        rgb = np.repeat(image_u8[:, :, None], 3, axis=2)
+        sample = batch.samples[patch_index]
+        cp_tangent = line_cp_and_tangent_xy(sample.line_xy, getattr(sample, "control_point_xy", None))
+        if cp_tangent is not None:
+            cp_xy, _ = cp_tangent
+            rgb = _draw_predicted_cp_direction(rgb, cp_xy=cp_xy, prediction_xy=None)
         cells.append(rgb)
     if not cells:
         return np.zeros((3, 1, 1), dtype=np.uint8)
@@ -1574,7 +1685,10 @@ def run_training(
     _validate_training_batch_config(training, loader_config)
     contrastive_negative_mask = (
         _contrastive_negative_candidate_mask(loader_config)
-        if bool(training.contrastive_enabled) and float(training.contrastive_weight) > 0.0
+        if (
+            (bool(training.contrastive_enabled) and float(training.contrastive_weight) > 0.0)
+            or (bool(training.presence_enabled) and float(training.presence_weight) > 0.0)
+        )
         else None
     )
     loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
@@ -1590,6 +1704,7 @@ def run_training(
             in_channels=1,
             hidden_channels=training.model_hidden_channels,
             depth=training.model_depth,
+            presence_channels=_presence_channel_count(training),
             embedding_channels=training.contrastive_embedding_channels,
         )
     ).to(device)
@@ -1757,6 +1872,12 @@ def run_training(
             ):
                 writer.add_scalar("train/loss_total", loss_value, step)
                 writer.add_scalar("train/loss_direction", metrics.loss_direction, step)
+                if bool(training.presence_enabled):
+                    writer.add_scalar("train/loss_presence", metrics.loss_presence, step)
+                    writer.add_scalar("train/presence_positive_loss", metrics.presence_positive_loss, step)
+                    writer.add_scalar("train/presence_negative_loss", metrics.presence_negative_loss, step)
+                    writer.add_scalar("train/presence_positive_samples", metrics.presence_positive_samples, step)
+                    writer.add_scalar("train/presence_negative_samples", metrics.presence_negative_samples, step)
                 if bool(training.contrastive_enabled):
                     writer.add_scalar("train/loss_contrastive", metrics.loss_contrastive, step)
                     writer.add_scalar(
@@ -1841,10 +1962,24 @@ def run_training(
                 is_first_run_step or step == 1 or step % training.tensorboard_image_interval == 0
             ):
                 writer.add_image("train/batch_direction_overlay", _make_training_visualization(batch, outputs), step)
+                if bool(training.presence_enabled):
+                    writer.add_image(
+                        "train/batch_presence",
+                        _make_presence_visualization(
+                            batch,
+                            outputs,
+                            presence_channels=_presence_channel_count(training),
+                        ),
+                        step,
+                    )
                 if bool(training.contrastive_enabled):
                     writer.add_image(
                         "train/batch_embedding_similarity",
-                        _make_embedding_similarity_visualization(batch, outputs),
+                        _make_embedding_similarity_visualization(
+                            batch,
+                            outputs,
+                            presence_channels=_presence_channel_count(training),
+                        ),
                         step,
                     )
                 wrote_tensorboard = True
@@ -1854,10 +1989,24 @@ def run_training(
                     _make_training_visualization(test_result.batch, test_result.outputs),
                     step,
                 )
+                if bool(training.presence_enabled):
+                    writer.add_image(
+                        "test/batch_presence",
+                        _make_presence_visualization(
+                            test_result.batch,
+                            test_result.outputs,
+                            presence_channels=_presence_channel_count(training),
+                        ),
+                        step,
+                    )
                 if bool(training.contrastive_enabled):
                     writer.add_image(
                         "test/batch_embedding_similarity",
-                        _make_embedding_similarity_visualization(test_result.batch, test_result.outputs),
+                        _make_embedding_similarity_visualization(
+                            test_result.batch,
+                            test_result.outputs,
+                            presence_channels=_presence_channel_count(training),
+                        ),
                         step,
                     )
                 wrote_tensorboard = True
@@ -1941,6 +2090,7 @@ def run_training(
                 print(
                     f"step={step} loss_total={loss_value:.6f} "
                     f"loss_direction={metrics.loss_direction:.6f} "
+                    f"loss_presence={metrics.loss_presence:.6f} "
                     f"loss_contrastive={metrics.loss_contrastive:.6f} "
                     f"angle_mean_deg={metrics.angle_mean_deg:.2f} "
                     f"supervision_samples={int(supervision.target.shape[0])}{test_part} "

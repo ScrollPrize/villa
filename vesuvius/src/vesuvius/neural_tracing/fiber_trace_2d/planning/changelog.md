@@ -2,6 +2,14 @@
 
 ## 2026-07-12
 
+- Added optional sheet/fiber presence training for 2D fiber strips: model
+  outputs can now include one sigmoid presence channel after the two direction
+  channels, trained with balanced CP-positive and reachable non-CP negative BCE
+  while ignoring unreachable shift-margin edges.
+- Changed contrastive embedding positives to be z-search-aware CP matches:
+  each anchor CP sample/strip-z offset now trains only against the already
+  most-similar other CP from the same fiber across loaded offsets, instead of
+  all same-fiber CP-neighborhood pairs.
 - Fixed Trace2CP target-directed traces stopping short under the old diagonal
   step budget: target-column crossings now append an exact interpolated point,
   `max_steps` exhaustion raises visibly instead of being scored, and
