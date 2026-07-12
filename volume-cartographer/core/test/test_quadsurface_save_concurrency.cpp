@@ -105,8 +105,7 @@ TEST_CASE("concurrent saveChannel + saveOverwrite on same dir does not crash or 
     a.join();
     b.join();
     CHECK(done == 2);
-    INFO(errorMessage);
-    CHECK_FALSE(failed);
+    CHECK_MESSAGE(!failed.load(), errorMessage);
 
     // Surface remains loadable + intact after the contention.
     QuadSurface reloaded(seg);

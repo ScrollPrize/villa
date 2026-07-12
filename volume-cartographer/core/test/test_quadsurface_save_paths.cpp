@@ -85,6 +85,13 @@ TEST_CASE("saveChannel: writes only the channel tif, no snapshot, round-trips")
     qs.saveChannel("approval");
 
     CHECK(fs::exists(segDir / "approval.tif"));
+
+    // Replacing an existing channel file needs an explicit replace operation
+    // on Windows; std::filesystem::rename alone leaves the first save in place.
+    approval(2, 3) = cv::Vec3b(255, 0, 0);
+    qs.setChannel("approval", approval);
+    qs.saveChannel("approval");
+
     // No backups/ directory: saveChannel must not snapshot the segment.
     CHECK_FALSE(fs::exists(pathsDir / "backups"));
     CHECK_FALSE(fs::exists(volpkg / "backups"));
@@ -94,7 +101,7 @@ TEST_CASE("saveChannel: writes only the channel tif, no snapshot, round-trips")
     QuadSurface reloaded(segDir);
     cv::Mat got = reloaded.channel("approval", SURF_CHANNEL_NORESIZE);
     REQUIRE(got.channels() == 3);
-    CHECK(got.at<cv::Vec3b>(2, 3) == cv::Vec3b(0, 255, 0));
+    CHECK(got.at<cv::Vec3b>(2, 3) == cv::Vec3b(255, 0, 0));
     CHECK(got.at<cv::Vec3b>(0, 0) == cv::Vec3b(0, 0, 0));
 
     fs::remove_all(root);

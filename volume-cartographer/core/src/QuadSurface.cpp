@@ -1413,13 +1413,14 @@ void QuadSurface::saveChannel(const std::string& name)
     const std::string tmpStem = "." + name + ".tmp" + std::to_string(vc::memmap::pid())
         + "_" + std::to_string(tmpCounter.fetch_add(1, std::memory_order_relaxed));
     writeChannelFile(path, tmpStem, it->second);
-    std::error_code ec;
-    std::filesystem::rename(path / (tmpStem + ".tif"), path / (name + ".tif"), ec);
-    if (ec) {
+    const auto tmpPath = path / (tmpStem + ".tif");
+    try {
+        replaceFile(tmpPath, path / (name + ".tif"));
+    } catch (const std::filesystem::filesystem_error& error) {
         Logger()->warn("saveChannel: rename {}.tif -> {}.tif failed: {}",
-                       tmpStem, name, ec.message());
+                       tmpStem, name, error.code().message());
         std::error_code rmEc;
-        std::filesystem::remove(path / (tmpStem + ".tif"), rmEc);
+        std::filesystem::remove(tmpPath, rmEc);
     }
 }
 

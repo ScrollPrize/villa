@@ -550,10 +550,10 @@ int main(int argc, char** argv)
     state.setVpkg(vpkg);
     require(panel._atlasCombo->count() == 1,
             "Atlas combo should refresh when the state's volume package changes");
-    const QString selectedAtlasDir = QDir::cleanPath(
-        QDir::fromNativeSeparators(panel._atlasCombo->currentData().toString()));
-    const QString expectedAtlasDir = QDir::cleanPath(
-        QDir::fromNativeSeparators(volpkgRoot + QStringLiteral("/atlases/fiber_atlas")));
+    const QString selectedAtlasDir = QFileInfo(
+        panel._atlasCombo->currentData().toString()).canonicalFilePath();
+    const QString expectedAtlasDir = QFileInfo(
+        volpkgRoot + QStringLiteral("/atlases/fiber_atlas")).canonicalFilePath();
     require(selectedAtlasDir == expectedAtlasDir,
             "Atlas combo should select the discovered atlas directory");
     require(panel._compactAtlasCombo->count() == panel._atlasCombo->count(),
