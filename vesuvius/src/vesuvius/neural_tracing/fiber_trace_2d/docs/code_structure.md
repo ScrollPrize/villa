@@ -400,9 +400,10 @@ The important behavior is:
   negative branch equally when both are available; the positive and aggregate
   negative means are balanced. A similarity-image sparsity term also compares
   the valid-pixel mean of each CP's normalized `0..1` embedding-similarity map
-  against fixed target `0.1`, encouraging only a small region to remain similar
-  to the CP embedding. The balanced pair loss plus this sparsity term are
-  multiplied by `training.contrastive_weight`.
+  over the same shift-reachable CP area against fixed target `0.1`, encouraging
+  only a small reachable region to remain similar to the CP embedding. The
+  balanced pair loss plus this sparsity term are multiplied by
+  `training.contrastive_weight`.
 - Logs `train/loss_total`, `train/loss_direction`,
   `train/loss_contrastive`, positive/negative contrastive components, and
   TensorBoard embedding-similarity images that compare every pixel in a

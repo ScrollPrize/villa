@@ -286,12 +286,14 @@
   negative branch equally when both exist. Positive and aggregate negative
   means are averaged equally, then multiplied by `training.contrastive_weight`.
 - Contrastive embedding training also includes a similarity-image sparsity
-  term. For each supervised CP embedding, the full valid-pixel embedding
-  similarity image against that CP is computed in normalized visualization
-  space `0.5 + 0.5 * cosine_similarity`; its valid-pixel mean is trained
+  term. For each supervised CP embedding, the embedding similarity image
+  against that CP is computed in normalized visualization space
+  `0.5 + 0.5 * cosine_similarity`; its valid-pixel mean over the same
+  shift-reachable CP area used for contrastive pixel negatives is trained
   toward the fixed target `0.1` with MSE. This term is added to the balanced
   positive/negative pair loss before applying `training.contrastive_weight`, so
-  CP-similar embeddings are encouraged to stay spatially sparse.
+  CP-similar embeddings are encouraged to stay spatially sparse without using
+  unreachable patch edges as evidence.
 - Contrastive embedding visualization writes TensorBoard similarity maps:
   per-pixel cosine similarity against the selected patch's CP embedding is
   mapped from `[-1, 1]` to `[0, 255]` with invalid pixels black.

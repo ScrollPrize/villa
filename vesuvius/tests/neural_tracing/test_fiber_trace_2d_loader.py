@@ -3830,10 +3830,11 @@ def test_contrastive_embedding_loss_ignores_unreachable_edge_negatives() -> None
     )
 
     assert unmasked_metrics.negative_loss > 0.0
-    assert float(loss.detach().item()) == pytest.approx((21.0 / 25.0 - 0.1) ** 2)
+    assert unmasked_metrics.similarity_mean_value == pytest.approx(21.0 / 25.0)
+    assert float(loss.detach().item()) == pytest.approx((5.0 / 9.0 - 0.1) ** 2)
     assert masked_metrics.negative_loss == pytest.approx(0.0)
-    assert masked_metrics.similarity_mean_value == pytest.approx(21.0 / 25.0)
-    assert masked_metrics.similarity_mean_loss == pytest.approx((21.0 / 25.0 - 0.1) ** 2)
+    assert masked_metrics.similarity_mean_value == pytest.approx(5.0 / 9.0)
+    assert masked_metrics.similarity_mean_loss == pytest.approx((5.0 / 9.0 - 0.1) ** 2)
     assert masked_metrics.negative_samples == 2
 
 

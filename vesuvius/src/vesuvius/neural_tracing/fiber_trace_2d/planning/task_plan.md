@@ -1,37 +1,32 @@
-# Contrastive Similarity-Mean Sparsity Loss Plan
+# Reachable-Area Contrastive Similarity-Mean Sparsity Loss Plan
 
 ## Scope
 
 - Update contrastive embedding training only.
 - Keep loader sampling, direction loss, Trace2CP tracing, and visualization
   semantics unchanged.
-- Do not add a new config key; the requested target is fixed at `0.1`.
+- Do not add a new config key; reuse the existing reachable mask derived from
+  configured shift augmentation.
 
 ## Implementation
 
-1. Extend `contrastive_embedding_loss`.
-   - Reuse normalized embedding fields and CP embeddings.
-   - For each supervised CP sample, compute the per-pixel cosine similarity to
-     that CP embedding, mapped to normalized `0..1` space.
-   - Average that normalized similarity over valid pixels in the same patch.
-   - Add an MSE term against target `0.1`, averaged across supervised CPs.
-   - Keep the existing positive/negative pair balance intact, then add this
-     sparsity term under the same `contrastive_weight`.
+1. Update `contrastive_embedding_loss`.
+   - Reuse the already validated `negative_candidate_mask` reachable rectangle.
+   - Pass `valid & reachable` into the similarity-mean sparsity term when a
+     reachable mask is configured.
+   - Keep the previous valid-only behavior when no reachable mask is supplied.
 
-2. Extend metrics and logging.
-   - Add similarity-mean loss, observed mean value, target, and sample count to
-     `ContrastiveEmbeddingMetrics`.
-   - Thread these metrics through training and TensorBoard scalars.
+2. Update tests.
+   - Extend the existing edge-handling regression so the masked
+     similarity-mean value ignores unreachable edges.
 
-3. Add/update tests.
-   - Update existing contrastive loss tests for the additional sparsity term.
-   - Add focused assertions for the observed normalized similarity mean and
-     target loss.
+3. Update docs.
+   - Clarify that the similarity-mean sparsity term averages over valid
+     reachable CP positions, not the whole patch, when shift bounds are known.
 
 ## Spec Update
 
-- Document the fixed `0.1` normalized similarity-image mean target and how it
-  is combined with the contrastive pair loss.
+- Document reachable-mask gating for the similarity-mean sparsity term.
 
 ## Docs Updates
 

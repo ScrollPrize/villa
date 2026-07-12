@@ -1,11 +1,10 @@
-# Contrastive Similarity-Mean Sparsity Loss Status
+# Reachable-Area Contrastive Similarity-Mean Sparsity Loss Status
 
 - [x] Read subproject AGENTS workflow.
-- [x] Replace `planning/task.md` with the current task.
-- [x] Draft `planning/task_plan.md`.
+- [x] Update `planning/task.md` with the current refinement.
+- [x] Update `planning/task_plan.md`.
 - [x] Self-review the plan against current specs and request.
-- [x] Extend contrastive embedding loss and metrics.
-- [x] Wire new metrics through training logs.
+- [x] Gate similarity-mean loss by reachable CP area.
 - [x] Update docs/specs/changelog.
 - [x] Add/update tests.
 - [x] Run validation.

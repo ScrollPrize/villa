@@ -147,6 +147,7 @@ def contrastive_embedding_loss(
     cp_mask = torch.zeros_like(valid, dtype=torch.bool)
     cp_mask[patch_indices, ys, xs] = True
     candidate = valid & ~cp_mask
+    similarity_mean_mask = valid
     if negative_candidate_mask is not None:
         reachable = torch.as_tensor(negative_candidate_mask, dtype=torch.bool, device=device)
         if reachable.ndim == 2:
@@ -159,6 +160,7 @@ def contrastive_embedding_loss(
         else:
             raise ValueError("negative_candidate_mask must have shape H,W or N,H,W")
         candidate = candidate & reachable
+        similarity_mean_mask = valid & reachable
     negative_flat = torch.nonzero(candidate.reshape(-1), as_tuple=False).flatten()
     if int(negative_flat.numel()) == 0:
         pixel_negative_loss = positive.new_tensor(0.0)
@@ -205,7 +207,7 @@ def contrastive_embedding_loss(
         embeddings,
         positive,
         patch_indices,
-        valid,
+        similarity_mean_mask,
         target=CONTRASTIVE_SIMILARITY_MEAN_TARGET,
     )
     combined = 0.5 * (positive_loss + negative_loss) + similarity_mean_loss
