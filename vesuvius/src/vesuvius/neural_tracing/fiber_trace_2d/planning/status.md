@@ -1,14 +1,9 @@
-# Trace2CP Short Z-Search Status
+# Regular Combined Trace2CP Candidate-Point Direction Scoring Status
 
-- [x] Read subproject AGENTS workflow.
-- [x] Replace `planning/task.md` with the current z-search request.
-- [x] Draft `planning/task_plan.md`.
-- [x] Review plan against current Trace2CP, augmentation, and z-offset specs.
-- [x] User approved implementation after plan review.
-- [x] Implement loader/runner z-plane sampling.
-- [x] Implement lazy z-plane prediction cache.
-- [x] Implement z-aware combined candidate tracing.
-- [x] Implement z-aware closest/fused connection handling.
-- [x] Implement forward/backward z-corrected visualization.
+- [x] Read current task request.
+- [x] Update `planning/task.md`.
+- [x] Update `planning/task_plan.md`.
+- [x] Implement non-z combined candidate-point direction scoring.
+- [x] Add focused regression.
 - [x] Update specs/docs/changelog.
-- [x] Add and run tests.
+- [x] Run validation tests.

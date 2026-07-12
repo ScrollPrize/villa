@@ -286,35 +286,46 @@ The important behavior is:
   fan around that direction, and chooses the candidate with the lowest weighted
   sum of direction disagreement, cosine distance to the previous trace-point
   embedding, cosine distance to the two enclosing CP embeddings, and cosine
-  distance to an embedding bank built from all CPs in the same fiber. The
-  default candidate fan is `-25..+25` degrees at 1 degree spacing, and all four
-  score weights default to `1.0`. The mode requires checkpoints with appended
-  embedding channels. With `--med-tta`, median-TTA still supplies the direction
-  reference while embeddings are sampled in the reference segment patch.
+  distance to an embedding bank built from all CPs in the same fiber. Direction
+  disagreement averages candidate-step agreement with the current oriented
+  direction and candidate-step agreement with the predicted direction sampled
+  at the candidate point. The default candidate fan is `-25..+25` degrees at
+  1 degree spacing, and all four score weights default to `1.0`. The mode
+  requires checkpoints with appended embedding channels. With `--med-tta`,
+  median-TTA still supplies the direction reference while embeddings are
+  sampled in the reference segment patch.
 - `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` adds an
-  experimental short z-search to the combined tracer. The runner keeps a lazy
-  prediction cache of segment-strip planes at selected-scale offsets along the
-  existing strip offset axis. Layer `k` uses
-  `k * --trace2cp-z-step-voxels` selected-scale voxels, with a bounded default
-  range controlled by `--trace2cp-z-max-layer`. Each layer is sampled through
-  `build_trace2cp_segment_patch`, so z-search still uses explicit volume
-  coordinates and never warps an already sampled image.
+  experimental short z-search to the combined tracer. The loader builds one
+  aligned Trace2CP segment source from the CP-to-CP line window and Lasagna
+  normals, including the per-pixel strip offset axis. The runner keeps a lazy
+  prediction cache of layers derived from that source: layer `k` adds
+  `offset_axis_zyx * (k * --trace2cp-z-step-voxels * volume_spacing_base)` to
+  the center coordinates before sampling the volume. The default z step is
+  `1.0` selected-scale voxel, with a bounded range controlled by
+  `--trace2cp-z-max-layer`. Z-search never warps an already sampled image and
+  never rebuilds unrelated planes for lazy z layers.
 - In z-search mode the angular fan is unchanged, but every angular candidate
   is scored in neighbor z layers `current-1`, `current`, and `current+1`.
-  Direction, previous-step embedding, enclosing-CP embedding, and same-fiber
-  CP-bank terms use the candidate layer's predicted fields; CP and CP-bank
-  embeddings are still sampled from the center layer. The public
-  `trace2cp_error` remains the target-column y error per horizontal span.
+  The fan source is the currently accepted z layer, so a layer switch changes
+  the direction field used by the next step. The direction term averages the
+  current-point direction disagreement and candidate-point direction
+  disagreement sampled at the candidate xy in the candidate layer. Previous-step
+  embedding, enclosing-CP embedding, and same-fiber CP-bank terms use the
+  candidate layer's predicted fields; CP and CP-bank embeddings are still
+  sampled from the center layer. The public `trace2cp_error` remains the
+  target-column y error per horizontal span.
 - Z-search fusion computes closest approach with
   `abs(dy) + abs(dz_voxels)` and linearly corrects both y and z toward the
   closest-approach midpoint, while both CP z coordinates stay fixed at zero.
   The first z-search implementation skips the y-only optimized-refinement
   solve and uses the fused line for that row.
-- Single-pair z-search visualization appends a z column with separate forward
-  and reverse z-corrected views. These images are reconstructed per column by
-  rounding the trace z value to the nearest already inferred layer and copying
-  that layer's sampled image column. This visualization does not re-sample the
-  volume and does not interpolate image values between z layers.
+- Single-pair z-search visualization appends a z column with separate forward,
+  reverse, and fused z-corrected views plus a fused z-layer map row. These
+  images are reconstructed per column by rounding the trace/fused z value to
+  the nearest already inferred layer and copying that layer's sampled image
+  column. Columns outside the available trace/fused z path render black. This
+  visualization does not re-sample the volume and does not interpolate image
+  values between z layers.
 - When embedding channels are present, single-pair `trace2cp_vis.jpg` appends a
   debug column of fixed-scale cosine similarity maps: start CP, target CP,
   same-fiber CP-bank/global similarity when a combined Trace2CP bank is

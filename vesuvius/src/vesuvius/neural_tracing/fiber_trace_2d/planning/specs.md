@@ -420,10 +420,14 @@
   `--trace2cp-candidate-step-deg` configure the bound and spacing; coarser
   spacing such as `2` degrees evaluates every second degree within the bound.
 - The combined Trace2CP candidate score is a weighted sum of four losses:
-  direction disagreement `1 - dot(candidate_direction, oriented_direction)`,
-  cosine distance to the previously accepted trace-point embedding, mean cosine
-  distance to the two enclosing Trace2CP CP embeddings, and mean cosine
-  distance to an embedding bank built from all CP embeddings in the same fiber.
+  direction disagreement, cosine distance to the previously accepted
+  trace-point embedding, mean cosine distance to the two enclosing Trace2CP CP
+  embeddings, and mean cosine distance to an embedding bank built from all CP
+  embeddings in the same fiber. The direction disagreement is the average of
+  the candidate step disagreement with the current oriented direction and the
+  candidate step disagreement with the predicted direction sampled at the
+  candidate point. Candidates whose candidate-point direction cannot be sampled
+  are invalid.
   `--trace2cp-combined-direction-weight`,
   `--trace2cp-combined-last-weight`,
   `--trace2cp-combined-enclosing-weight`, and
@@ -445,23 +449,34 @@
   and embedding channels, and it is intentionally not combined with `--med-tta`
   in the first implementation. Existing Trace2CP commands without
   `--trace2cp-z-search` keep the center strip-z image-only behavior.
-- Trace2CP z-search samples additional segment-strip planes by passing
-  explicit selected-scale strip offsets into the same
-  `build_trace2cp_segment_patch` coordinate path. The default
-  `--trace2cp-z-step-voxels 2.0` means layer `k` is offset by
-  `k * 2.0` selected-scale voxels along the segment strip offset axis, not by
-  warping an already sampled image. `--trace2cp-z-max-layer` bounds lazy
-  expansion and defaults to `4`.
+- Trace2CP z-search derives additional segment-strip planes from one accepted
+  center segment source. The center source is built once from the CP-to-CP
+  line window and Lasagna normals, including the row-axis sign alignment used
+  for whole-fiber Trace2CP. Layer `k` is sampled by adding
+  `grid.offset_axis_zyx[y,x] * (k * --trace2cp-z-step-voxels *
+  volume_spacing_base)` to every center coordinate before volume sampling.
+  This matches VC3D shift-scroll semantics: every strip pixel is offset by its
+  own generated strip normal/offset axis. It must not use a global normal, a
+  row-coordinate approximation, an image-space shift, or an unrelated rebuilt
+  plane. The default `--trace2cp-z-step-voxels 1.0` means layer `k` is offset
+  by `k` selected-scale voxels along the segment strip offset axis.
+  `--trace2cp-z-max-layer` bounds lazy expansion and defaults to `4`.
 - Z-search starts with inferred layers `-1, 0, +1`. At each trace step it
   ensures the current layer and its immediate neighbors are inferred, bounded
   by `--trace2cp-z-max-layer`. Inference is deterministic and stores each
   layer's sampled image, valid mask, decoded direction field, and embedding
   field.
-- Z-search keeps the existing 2D angular candidate fan. For each angular
-  candidate it also evaluates candidate z layers `current-1`, `current`, and
-  `current+1`, using the candidate layer's direction/embedding fields and
-  ignoring out-of-plane direction-angle effects for now. The selected trace
-  point carries `x`, `y`, and selected-scale `z_voxels`.
+- Z-search keeps the existing 2D angular candidate fan. The fan is sampled
+  from the currently accepted z layer; after a layer switch, the next step's
+  fan must use that newly accepted layer. For each angular candidate it also
+  evaluates candidate z layers `current-1`, `current`, and `current+1`, using
+  the candidate layer's direction/embedding fields and ignoring out-of-plane
+  direction-angle effects for now. The direction term is the average of
+  disagreement with the last/current oriented direction and disagreement with
+  the candidate-point direction sampled at the candidate xy in the candidate
+  layer. Candidates whose candidate-point direction cannot be sampled are
+  invalid. The selected trace point carries `x`, `y`, and selected-scale
+  `z_voxels`.
 - Z-search uses the existing combined score terms and weights. Start/target CP
   embeddings and same-fiber CP-bank embeddings remain center-layer
   embeddings, so the bank stays comparable with non-z combined tracing.
@@ -477,11 +492,14 @@
   horizontal CP span.
 - Single-pair z-search visualization adds a z-corrected column. It contains
   separate forward and reverse views because each trace direction can choose a
-  different z layer per x column. Each z-corrected image is assembled
-  column-by-column by rounding the trace z value to the nearest already
-  inferred layer and copying that layer's sampled image column. It must not
-  re-sample the volume and must not interpolate image values between z layers;
-  missing layers render black and are counted in summary/debug output.
+  different z layer per x column. It also contains a fused z-corrected view and
+  a fused z-layer map row so the selected layer per output column is visible
+  even when neighboring sampled planes look similar. Each z-corrected image is
+  assembled column-by-column by rounding the trace/fused z value to the nearest
+  already inferred layer and copying that layer's sampled image column. It
+  must not re-sample the volume and must not interpolate image values between
+  z layers; columns without a trace/fused z value and columns whose rounded
+  layer is missing render black and are counted in summary/debug output.
 - Single-pair `trace2cp_vis.jpg` includes an additional embedding-debug column
   when the checkpoint exposes embedding channels. The column renders cosine
   similarity maps for the start CP embedding, target CP embedding, same-fiber

@@ -764,6 +764,37 @@ def test_trace2cp_combined_embedding_weight_can_choose_off_axis_candidate() -> N
     assert stats.mean("fiber") < 1.0
 
 
+def test_trace2cp_combined_candidate_point_direction_can_choose_off_axis() -> None:
+    direction = np.zeros((7, 9, 2), dtype=np.float32)
+    direction[:, :, 0] = np.float32(1.0 / math.sqrt(2.0))
+    direction[:, :, 1] = np.float32(1.0 / math.sqrt(2.0))
+    direction[3, 2] = np.asarray([1.0, 0.0], dtype=np.float32)
+    direction[3, 3] = np.asarray([0.0, 1.0], dtype=np.float32)
+    embedding = np.zeros((2, 7, 9), dtype=np.float32)
+    embedding[0] = 1.0
+
+    line, reason, stats = _trace_combined_direction_line_to_target(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=embedding,
+        valid_mask=np.ones((7, 9), dtype=bool),
+        start_xy=np.asarray([2.0, 3.0], dtype=np.float32),
+        target_xy=np.asarray([6.0, 3.0], dtype=np.float32),
+        start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        fiber_embeddings=np.zeros((0, 2), dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason in {"target_column", "max_steps", "top", "bottom", "left", "right"}
+    assert stats.steps > 0
+    assert line[1, 1] > 3.0
+
+
 def test_trace2cp_combined_requires_embedding_channels() -> None:
     with pytest.raises(ValueError, match="embedding channels"):
         _require_trace2cp_embedding_field(None)
@@ -797,6 +828,9 @@ def test_trace2cp_combined_empty_fiber_bank_fails_when_weighted() -> None:
 def test_trace2cp_z_search_can_choose_embedding_layer() -> None:
     direction = np.zeros((7, 9, 2), dtype=np.float32)
     direction[:, :, 0] = 1.0
+    layer_direction = direction.copy()
+    layer_direction[:, :, 0] = np.float32(1.0 / math.sqrt(2.0))
+    layer_direction[:, :, 1] = np.float32(1.0 / math.sqrt(2.0))
     valid = np.ones((7, 9), dtype=bool)
 
     center_embedding = np.zeros((2, 7, 9), dtype=np.float32)
@@ -805,7 +839,7 @@ def test_trace2cp_z_search_can_choose_embedding_layer() -> None:
     matching_embedding[0] = 1.0
 
     class FakePlaneCache:
-        z_step_voxels = 2.0
+        z_step_voxels = 1.0
         max_layer = 1
 
         def __init__(self) -> None:
@@ -819,21 +853,24 @@ def test_trace2cp_z_search_can_choose_embedding_layer() -> None:
                     valid_mask=valid,
                 ),
                 1: SimpleNamespace(
-                    fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=matching_embedding),
+                    fields=_Trace2CpPredictedFields(direction_xy=layer_direction, embedding_chw=matching_embedding),
                     valid_mask=valid,
                 ),
             }
+            self.requested_layers: list[int] = []
 
         def get(self, layer: int):
+            self.requested_layers.append(int(layer))
             return self.layers[int(layer)]
 
         def ensure_neighbors(self, layer: int) -> None:
             assert abs(int(layer)) <= self.max_layer
 
+    cache = FakePlaneCache()
     line, reason, stats = _trace_combined_direction_line_to_target_z(
-        plane_cache=FakePlaneCache(),
+        plane_cache=cache,
         start_xy=np.asarray([2.0, 3.0], dtype=np.float32),
-        target_xy=np.asarray([6.0, 3.0], dtype=np.float32),
+        target_xy=np.asarray([4.0, 3.0], dtype=np.float32),
         start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
         target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
         fiber_embeddings=np.zeros((0, 2), dtype=np.float32),
@@ -846,7 +883,126 @@ def test_trace2cp_z_search_can_choose_embedding_layer() -> None:
 
     assert reason == "target_column"
     assert stats.steps > 0
-    assert line[1, 2] == pytest.approx(2.0)
+    assert line[1, 2] == pytest.approx(1.0)
+    assert line.shape[0] >= 3
+    assert line[2, 1] > line[1, 1]
+    assert 1 in cache.requested_layers
+
+
+def test_trace2cp_z_search_candidate_point_direction_can_choose_off_axis() -> None:
+    direction = np.zeros((7, 9, 2), dtype=np.float32)
+    direction[:, :, 0] = np.float32(1.0 / math.sqrt(2.0))
+    direction[:, :, 1] = np.float32(1.0 / math.sqrt(2.0))
+    direction[3, 2] = np.asarray([1.0, 0.0], dtype=np.float32)
+    direction[3, 3] = np.asarray([0.0, 1.0], dtype=np.float32)
+    embedding = np.zeros((2, 7, 9), dtype=np.float32)
+    embedding[0] = 1.0
+    valid = np.ones((7, 9), dtype=bool)
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 0
+
+        def get(self, layer: int):
+            assert int(layer) == 0
+            return SimpleNamespace(
+                fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=embedding),
+                valid_mask=valid,
+            )
+
+        def ensure_neighbors(self, layer: int) -> None:
+            assert int(layer) == 0
+
+    line, reason, stats = _trace_combined_direction_line_to_target_z(
+        plane_cache=FakePlaneCache(),
+        start_xy=np.asarray([2.0, 3.0], dtype=np.float32),
+        target_xy=np.asarray([6.0, 3.0], dtype=np.float32),
+        start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        fiber_embeddings=np.zeros((0, 2), dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason in {"target_column", "max_steps", "top", "bottom", "left", "right"}
+    assert stats.steps > 0
+    assert line[1, 1] > 3.0
+
+
+def test_trace2cp_z_plane_cache_reuses_segment_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    def make_sample(offset: float) -> FiberStripSegmentSample:
+        return FiberStripSegmentSample(
+            record_index=0,
+            fiber_path="fiber.json",
+            start_control_point_index=0,
+            target_control_point_index=1,
+            start_control_point_xyz=np.zeros(3, dtype=np.float32),
+            target_control_point_xyz=np.ones(3, dtype=np.float32),
+            strip_z_offset=float(offset),
+            coords_zyx=np.zeros((3, 3, 3), dtype=np.float32),
+            valid_mask=np.ones((3, 3), dtype=bool),
+            frame=SimpleNamespace(),
+            line_xy=np.zeros((3, 2), dtype=np.float32),
+            start_control_point_xy=np.asarray([0.0, 1.0], dtype=np.float32),
+            target_control_point_xy=np.asarray([2.0, 1.0], dtype=np.float32),
+            line_point_indices=np.arange(3, dtype=np.int64),
+            line_normals_xyz=np.zeros((3, 3), dtype=np.float32),
+            start_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            target_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        )
+
+    class FakeLoader:
+        def __init__(self) -> None:
+            self.sampled_offsets: list[float] = []
+
+        def sample_trace2cp_segment_source(self, source, *, strip_z_offset: float | None = None):
+            self.sampled_offsets.append(float(strip_z_offset))
+            return make_sample(float(strip_z_offset)), np.ones((3, 3), dtype=np.float32), np.ones((3, 3), dtype=bool)
+
+        def build_trace2cp_segment_patch(self, *args, **kwargs):
+            raise AssertionError("z-plane cache must not rebuild trace2cp segment patches")
+
+    def fake_predict(model, image, valid_mask, *, device):
+        direction = np.zeros((3, 3, 2), dtype=np.float32)
+        direction[:, :, 0] = 1.0
+        embedding = np.zeros((2, 3, 3), dtype=np.float32)
+        embedding[0] = 1.0
+        return _Trace2CpPredictedFields(direction_xy=direction, embedding_chw=embedding)
+
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict)
+    loader = FakeLoader()
+    center_layer = runner_module._Trace2CpZLayerPrediction(
+        layer=0,
+        z_voxels=0.0,
+        sample=make_sample(0.0),
+        image=np.ones((3, 3), dtype=np.float32),
+        valid_mask=np.ones((3, 3), dtype=bool),
+        fields=fake_predict(None, None, None, device=torch.device("cpu")),
+    )
+    source = object()
+    cache = runner_module._Trace2CpZPlaneCache(
+        loader=loader,
+        model=torch.nn.Identity(),
+        sample_index=123,
+        target_cp_index=1,
+        target_offset=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        row_axis_alignment_line_index=None,
+        row_axis_alignment_xyz=None,
+        device=torch.device("cpu"),
+        segment_source=source,
+        center_layer=center_layer,
+        z_step_voxels=1.0,
+        max_layer=2,
+    )
+
+    assert cache.get(1).sample.strip_z_offset == pytest.approx(1.0)
+    assert cache.get(-2).sample.strip_z_offset == pytest.approx(-2.0)
+    assert loader.sampled_offsets == [1.0, -2.0]
 
 
 def test_trace2cp_z_closest_approach_includes_z_distance() -> None:
@@ -916,16 +1072,43 @@ def test_trace2cp_z_corrected_image_copies_nearest_inferred_layer_columns() -> N
     )
     trace = np.asarray([[0.0, 0.0, -2.0], [1.0, 0.0, 0.0], [2.0, 0.0, 2.0]], dtype=np.float32)
 
-    image, missing = _trace2cp_z_corrected_image_u8(
+    image, missing, layer_columns = _trace2cp_z_corrected_image_u8(
         plane_cache=plane_cache,
         trace_xyz=trace,
         fallback_shape_hw=(2, 3),
     )
 
     assert missing == 0
+    assert layer_columns.tolist() == [-1, 0, 1]
     assert image[:, 0].tolist() == [10, 10]
     assert image[:, 1].tolist() == [20, 20]
     assert image[:, 2].tolist() == [30, 30]
+
+
+def test_trace2cp_z_corrected_image_marks_untraced_columns_black() -> None:
+    plane_cache = SimpleNamespace(
+        z_step_voxels=2.0,
+        layers={
+            0: SimpleNamespace(
+                image=np.full((2, 4), 200, dtype=np.float32),
+                valid_mask=np.ones((2, 4), dtype=bool),
+            )
+        },
+    )
+    trace = np.asarray([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float32)
+
+    image, missing, layer_columns = _trace2cp_z_corrected_image_u8(
+        plane_cache=plane_cache,
+        trace_xyz=trace,
+        fallback_shape_hw=(2, 4),
+    )
+
+    assert missing == 2
+    assert layer_columns.tolist() == [-10000, 0, 0, -10000]
+    assert image[:, 0].tolist() == [0, 0]
+    assert image[:, 1].tolist() == [200, 200]
+    assert image[:, 2].tolist() == [200, 200]
+    assert image[:, 3].tolist() == [0, 0]
 
 
 def test_trace2cp_tta_params_drop_y_shift_and_scale() -> None:
@@ -1081,6 +1264,29 @@ def test_trace2cp_segment_patch_accepts_explicit_selected_scale_z_offset(tmp_pat
     assert shifted.strip_z_offset == pytest.approx(2.0)
     assert shifted.coords_zyx.shape == center.coords_zyx.shape
     assert not np.allclose(shifted.coords_zyx, center.coords_zyx)
+
+
+def test_trace2cp_segment_source_offsets_each_pixel_axis(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+
+    center, _, _ = loader.sample_trace2cp_segment_source(source)
+    shifted, _, _ = loader.sample_trace2cp_segment_source(source, strip_z_offset=1.0)
+
+    axis_zyx = source.grid.offset_axis_zyx.detach().cpu().numpy().astype(np.float32)
+    expected = axis_zyx * np.float32(source.record.volume_spacing_base)
+    grid_valid = source.grid.valid_mask.detach().cpu().numpy().astype(bool)
+    delta = shifted.coords_zyx - center.coords_zyx
+
+    assert shifted.strip_z_offset == pytest.approx(1.0)
+    assert np.count_nonzero(grid_valid) > 0
+    assert np.allclose(delta[grid_valid], expected[grid_valid], atol=1.0e-5)
 
 
 def test_trace2cp_segment_patch_can_align_ambiguous_normal_sign(tmp_path: Path) -> None:

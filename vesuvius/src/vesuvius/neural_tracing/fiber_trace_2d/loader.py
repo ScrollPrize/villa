@@ -189,6 +189,24 @@ class _StripSource:
 
 
 @dataclass(frozen=True)
+class _Trace2CpSegmentSource:
+    record: _Record
+    record_index: int
+    start_control_point_index: int
+    target_control_point_index: int
+    center_offset: float
+    source_shape_hw: tuple[int, int]
+    grid: FiberStripGridTorch
+    line_xy: np.ndarray
+    start_control_point_xy: np.ndarray
+    target_control_point_xy: np.ndarray
+    line_point_indices: np.ndarray
+    line_normals_xyz: np.ndarray
+    start_row_axis_xyz: np.ndarray
+    target_row_axis_xyz: np.ndarray
+
+
+@dataclass(frozen=True)
 class _PreparedStripSample:
     source: _StripSource
     params_by_offset: list[FiberStripAugmentParams | None]
@@ -1852,7 +1870,11 @@ class FiberStrip2DLoader:
             source_control_point_xy=source_control_point_xy,
         )
 
-    def _offset_grid_from_source(self, source: _StripSource, offset: float) -> FiberStripGridTorch:
+    def _offset_grid_from_source(
+        self,
+        source: _StripSource | _Trace2CpSegmentSource,
+        offset: float,
+    ) -> FiberStripGridTorch:
         delta_base = (float(offset) - float(source.center_offset)) * float(source.record.volume_spacing_base)
         if abs(float(delta_base)) <= 1.0e-6:
             return source.grid
@@ -2636,7 +2658,7 @@ class FiberStrip2DLoader:
             base_corners_xy=corners_xy,
         )
 
-    def build_trace2cp_segment_patch(
+    def build_trace2cp_segment_source(
         self,
         sample_index: int,
         *,
@@ -2648,7 +2670,7 @@ class FiberStrip2DLoader:
         row_axis_alignment_xyz: np.ndarray | None = None,
         device: torch.device | None = None,
         sample_mode: str = "random",
-    ) -> tuple[FiberStripSegmentSample, np.ndarray, np.ndarray]:
+    ) -> _Trace2CpSegmentSource:
         resolved_device = resolve_torch_device(self.config.augment.device) if device is None else device
         record, record_index, start_cp_index = self.descriptor_for_sample_index(
             sample_index,
@@ -2763,27 +2785,15 @@ class FiberStrip2DLoader:
             grid = build_grid(sampled_normals)
         start_row_axis = self._row_axis_at_xy(grid, start_xy)
         target_row_axis = self._row_axis_at_xy(grid, target_xy)
-        coords_zyx = _as_numpy_float32(grid.coords_zyx)
-        grid_valid = _as_numpy_bool(grid.valid_mask)
-        result = record.sampler.sample_coords(coords_zyx, grid_valid)
-        image = np.asarray(result.image, dtype=np.float32)
-        valid_mask = np.asarray(result.valid_mask, dtype=bool)
-        sample = FiberStripSegmentSample(
-            record_index=record_index,
-            fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
+        return _Trace2CpSegmentSource(
+            record=record,
+            record_index=int(record_index),
             start_control_point_index=int(start_cp_index),
-            target_control_point_index=target_cp_index,
-            start_control_point_xyz=np.asarray(
-                record.fiber.control_points_xyz[int(start_cp_index)], dtype=np.float32
-            ),
-            target_control_point_xyz=np.asarray(
-                record.fiber.control_points_xyz[target_cp_index], dtype=np.float32
-            ),
-            strip_z_offset=float(center_offset),
-            coords_zyx=coords_zyx,
-            valid_mask=valid_mask,
-            frame=grid.frame,
-            line_xy=line_xy,
+            target_control_point_index=int(target_cp_index),
+            center_offset=float(center_offset),
+            source_shape_hw=(height, width),
+            grid=grid,
+            line_xy=np.asarray(line_xy, dtype=np.float32),
             start_control_point_xy=start_xy.astype(np.float32, copy=False),
             target_control_point_xy=target_xy.astype(np.float32, copy=False),
             line_point_indices=np.asarray(line_window.original_line_indices, dtype=np.int64),
@@ -2791,7 +2801,69 @@ class FiberStrip2DLoader:
             start_row_axis_xyz=start_row_axis,
             target_row_axis_xyz=target_row_axis,
         )
+
+    def sample_trace2cp_segment_source(
+        self,
+        source: _Trace2CpSegmentSource,
+        *,
+        strip_z_offset: float | None = None,
+    ) -> tuple[FiberStripSegmentSample, np.ndarray, np.ndarray]:
+        offset = float(source.center_offset) if strip_z_offset is None else float(strip_z_offset)
+        grid = self._offset_grid_from_source(source, offset)
+        coords_zyx = _as_numpy_float32(grid.coords_zyx)
+        grid_valid = _as_numpy_bool(grid.valid_mask)
+        result = source.record.sampler.sample_coords(coords_zyx, grid_valid)
+        image = np.asarray(result.image, dtype=np.float32)
+        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        sample = FiberStripSegmentSample(
+            record_index=int(source.record_index),
+            fiber_path=str(source.record.fiber.path) if source.record.fiber.path is not None else "",
+            start_control_point_index=int(source.start_control_point_index),
+            target_control_point_index=int(source.target_control_point_index),
+            start_control_point_xyz=np.asarray(
+                source.record.fiber.control_points_xyz[int(source.start_control_point_index)], dtype=np.float32
+            ),
+            target_control_point_xyz=np.asarray(
+                source.record.fiber.control_points_xyz[int(source.target_control_point_index)], dtype=np.float32
+            ),
+            strip_z_offset=offset,
+            coords_zyx=coords_zyx,
+            valid_mask=valid_mask,
+            frame=grid.frame,
+            line_xy=np.asarray(source.line_xy, dtype=np.float32),
+            start_control_point_xy=np.asarray(source.start_control_point_xy, dtype=np.float32),
+            target_control_point_xy=np.asarray(source.target_control_point_xy, dtype=np.float32),
+            line_point_indices=np.asarray(source.line_point_indices, dtype=np.int64),
+            line_normals_xyz=np.asarray(source.line_normals_xyz, dtype=np.float32),
+            start_row_axis_xyz=np.asarray(source.start_row_axis_xyz, dtype=np.float32),
+            target_row_axis_xyz=np.asarray(source.target_row_axis_xyz, dtype=np.float32),
+        )
         return sample, image, valid_mask
+
+    def build_trace2cp_segment_patch(
+        self,
+        sample_index: int,
+        *,
+        target_control_point_index: int | None = None,
+        target_offset: int = 1,
+        rf_margin_px: float = 0.0,
+        strip_z_offset: float | None = None,
+        row_axis_alignment_line_index: int | None = None,
+        row_axis_alignment_xyz: np.ndarray | None = None,
+        device: torch.device | None = None,
+        sample_mode: str = "random",
+    ) -> tuple[FiberStripSegmentSample, np.ndarray, np.ndarray]:
+        source = self.build_trace2cp_segment_source(
+            sample_index,
+            target_control_point_index=target_control_point_index,
+            target_offset=target_offset,
+            rf_margin_px=rf_margin_px,
+            row_axis_alignment_line_index=row_axis_alignment_line_index,
+            row_axis_alignment_xyz=row_axis_alignment_xyz,
+            device=device,
+            sample_mode=sample_mode,
+        )
+        return self.sample_trace2cp_segment_source(source, strip_z_offset=strip_z_offset)
 
     def build_trace2cp_tta_patch_from_sample(
         self,

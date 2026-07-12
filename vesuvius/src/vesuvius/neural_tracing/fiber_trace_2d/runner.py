@@ -5,6 +5,7 @@ import math
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -66,21 +67,26 @@ def _trace2cp_z_corrected_image_u8(
     plane_cache: _Trace2CpZPlaneCache,
     trace_xyz: np.ndarray,
     fallback_shape_hw: tuple[int, int],
-) -> tuple[np.ndarray, int]:
+) -> tuple[np.ndarray, int, np.ndarray]:
     height, width = (int(v) for v in fallback_shape_hw)
     output = np.zeros((height, width), dtype=np.uint8)
+    layers_by_column = np.full((width,), -10_000, dtype=np.int32)
     missing = 0
     trace = np.asarray(trace_xyz, dtype=np.float32)
     if trace.ndim != 2 or trace.shape[1] != 3 or trace.shape[0] == 0:
-        return output, width
+        return output, width, layers_by_column
     layer_images = {
         int(layer): _to_u8_image(prediction.image, prediction.valid_mask)
         for layer, prediction in plane_cache.layers.items()
     }
     for x in range(width):
         point = _trace_xyz_at_x(trace, float(x))
-        z_voxels = 0.0 if point is None or not bool(np.isfinite(point).all()) else float(point[2])
+        if point is None or not bool(np.isfinite(point).all()):
+            missing += 1
+            continue
+        z_voxels = float(point[2])
         layer = int(round(z_voxels / float(plane_cache.z_step_voxels)))
+        layers_by_column[x] = layer
         image_u8 = layer_images.get(layer)
         if image_u8 is None:
             missing += 1
@@ -89,7 +95,41 @@ def _trace2cp_z_corrected_image_u8(
             missing += 1
             continue
         output[:, x] = image_u8[:, x]
-    return output, missing
+    return output, missing, layers_by_column
+
+
+def _trace2cp_refinement_fused_xyz(refinement: _Trace2CpRefinementResult) -> np.ndarray:
+    xy = np.asarray(refinement.fused_resampled_xy, dtype=np.float32)
+    z = refinement.fused_resampled_z
+    if xy.ndim != 2 or xy.shape[1] != 2 or xy.shape[0] == 0 or z is None:
+        return np.zeros((0, 3), dtype=np.float32)
+    z_arr = np.asarray(z, dtype=np.float32).reshape(-1)
+    if int(z_arr.shape[0]) != int(xy.shape[0]):
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.concatenate([xy, z_arr[:, None]], axis=1).astype(np.float32, copy=False)
+
+
+def _z_layer_columns_to_rgb(
+    layers_by_column: np.ndarray,
+    *,
+    height: int,
+    max_layer: int,
+) -> np.ndarray:
+    layers = np.asarray(layers_by_column, dtype=np.int32).reshape(-1)
+    width = int(layers.shape[0])
+    out = np.zeros((max(1, int(height)), width, 3), dtype=np.uint8)
+    bound = max(1, int(max_layer))
+    valid = layers > -9999
+    if not bool(np.any(valid)):
+        return out
+    normalized = np.clip(layers.astype(np.float32) / float(bound), -1.0, 1.0)
+    red = np.clip(normalized, 0.0, 1.0)
+    blue = np.clip(-normalized, 0.0, 1.0)
+    green = 1.0 - np.abs(normalized)
+    colors = np.stack([red, green, blue], axis=1)
+    colors = (colors * 255.0).clip(0.0, 255.0).astype(np.uint8)
+    out[:, valid, :] = colors[valid][None, :, :]
+    return out
 
 
 def _to_u8_display_image(image: np.ndarray) -> np.ndarray:
@@ -937,10 +977,16 @@ class _Trace2CpZSearchConfig:
 class _Trace2CpZTraceDebug:
     forward_trace_xyz: np.ndarray
     reverse_trace_xyz: np.ndarray
+    fused_trace_xyz: np.ndarray
     forward_z_image: np.ndarray
     reverse_z_image: np.ndarray
+    fused_z_image: np.ndarray
     forward_missing_columns: int
     reverse_missing_columns: int
+    fused_missing_columns: int
+    forward_layer_columns: np.ndarray
+    reverse_layer_columns: np.ndarray
+    fused_layer_columns: np.ndarray
     layers: tuple[int, ...]
     z_step_voxels: float
     max_layer: int
@@ -1367,6 +1413,7 @@ class _Trace2CpZPlaneCache:
         row_axis_alignment_line_index: int | None,
         row_axis_alignment_xyz: np.ndarray | None,
         device: torch.device,
+        segment_source: Any,
         center_layer: _Trace2CpZLayerPrediction,
         z_step_voxels: float,
         max_layer: int,
@@ -1391,6 +1438,7 @@ class _Trace2CpZPlaneCache:
             else np.asarray(row_axis_alignment_xyz, dtype=np.float32).copy()
         )
         self.device = device
+        self.segment_source = segment_source
         self.z_step_voxels = step
         self.max_layer = bound
         self.center_offset = float(center_layer.sample.strip_z_offset)
@@ -1409,16 +1457,9 @@ class _Trace2CpZPlaneCache:
         if existing is not None:
             return existing
         offset = self.center_offset + float(layer_i) * self.z_step_voxels
-        sample, image, valid_mask = self.loader.build_trace2cp_segment_patch(
-            self.sample_index,
-            target_control_point_index=self.target_cp_index,
-            target_offset=self.target_offset,
-            rf_margin_px=self.rf_margin_px,
+        sample, image, valid_mask = self.loader.sample_trace2cp_segment_source(
+            self.segment_source,
             strip_z_offset=offset,
-            row_axis_alignment_line_index=self.row_axis_alignment_line_index,
-            row_axis_alignment_xyz=self.row_axis_alignment_xyz,
-            device=self.device,
-            sample_mode=self.sample_mode,
         )
         fields = _predict_trace2cp_fields(self.model, image, valid_mask, device=self.device)
         prediction = _Trace2CpZLayerPrediction(
@@ -1777,7 +1818,23 @@ def _trace_combined_direction_line_to_target(
             if candidate_embedding is None:
                 invalid_candidates += 1
                 continue
-            direction_loss = float(1.0 - np.clip(float(np.dot(candidate_unit, oriented)), -1.0, 1.0))
+            candidate_oriented = _sample_trace2cp_combined_direction(
+                direction_xy=direction_xy,
+                tta_fields=tta_fields,
+                current_xy=next_point,
+                previous_xy=candidate_unit,
+                valid_mask=valid_mask,
+            )
+            if candidate_oriented is None:
+                invalid_candidates += 1
+                continue
+            current_direction_loss = float(
+                1.0 - np.clip(float(np.dot(candidate_unit, oriented)), -1.0, 1.0)
+            )
+            candidate_direction_loss = float(
+                1.0 - np.clip(float(np.dot(candidate_unit, candidate_oriented)), -1.0, 1.0)
+            )
+            direction_loss = 0.5 * (current_direction_loss + candidate_direction_loss)
             last_loss = _embedding_cosine_loss(candidate_embedding, previous_embedding)
             enclosing_loss = 0.5 * (
                 _embedding_cosine_loss(candidate_embedding, start_emb)
@@ -1981,7 +2038,23 @@ def _trace_combined_direction_line_to_target_z(
                 if candidate_embedding is None:
                     invalid_candidates += 1
                     continue
-                direction_loss = float(1.0 - np.clip(float(np.dot(candidate_unit, oriented)), -1.0, 1.0))
+                candidate_oriented = _sample_trace2cp_combined_direction(
+                    direction_xy=candidate_prediction.fields.direction_xy,
+                    tta_fields=None,
+                    current_xy=next_point,
+                    previous_xy=candidate_unit,
+                    valid_mask=candidate_prediction.valid_mask,
+                )
+                if candidate_oriented is None:
+                    invalid_candidates += 1
+                    continue
+                current_direction_loss = float(
+                    1.0 - np.clip(float(np.dot(candidate_unit, oriented)), -1.0, 1.0)
+                )
+                candidate_direction_loss = float(
+                    1.0 - np.clip(float(np.dot(candidate_unit, candidate_oriented)), -1.0, 1.0)
+                )
+                direction_loss = 0.5 * (current_direction_loss + candidate_direction_loss)
                 last_loss = _embedding_cosine_loss(candidate_embedding, previous_embedding)
                 enclosing_loss = 0.5 * (
                     _embedding_cosine_loss(candidate_embedding, start_emb)
@@ -3757,6 +3830,14 @@ def _draw_trace2cp_overlay(
         return stack
 
     def z_stack(debug: _Trace2CpZTraceDebug) -> np.ndarray:
+        def layer_counts_text(layers_by_column: np.ndarray) -> str:
+            layers = np.asarray(layers_by_column, dtype=np.int32).reshape(-1)
+            valid_layers = layers[layers > -9999]
+            if valid_layers.size == 0:
+                return "layers=none"
+            values, counts = np.unique(valid_layers, return_counts=True)
+            return "layers=" + ",".join(f"{int(v)}:{int(c)}" for v, c in zip(values.tolist(), counts.tolist()))
+
         def draw_z_row(
             image: np.ndarray,
             trace_xy: np.ndarray,
@@ -3770,6 +3851,12 @@ def _draw_trace2cp_overlay(
 
         f_min, f_max, f_mean_abs = debug.z_stats(debug.forward_trace_xyz)
         r_min, r_max, r_mean_abs = debug.z_stats(debug.reverse_trace_xyz)
+        fused_min, fused_max, fused_mean_abs = debug.z_stats(debug.fused_trace_xyz)
+        layer_map = _z_layer_columns_to_rgb(
+            debug.fused_layer_columns,
+            height=int(debug.fused_z_image.shape[0]),
+            max_layer=int(debug.max_layer),
+        )
         rows = [
             draw_z_row(
                 debug.forward_z_image,
@@ -3777,7 +3864,8 @@ def _draw_trace2cp_overlay(
                 label=(
                     f"z forward layers={debug.layer_min}..{debug.layer_max} "
                     f"z={f_min:.1f}..{f_max:.1f} mean_abs={f_mean_abs:.1f} "
-                    f"missing_cols={debug.forward_missing_columns}"
+                    f"missing_cols={debug.forward_missing_columns} "
+                    f"{layer_counts_text(debug.forward_layer_columns)}"
                 ),
                 color=(0, 255, 0, 230),
             ),
@@ -3787,9 +3875,28 @@ def _draw_trace2cp_overlay(
                 label=(
                     f"z reverse layers={debug.layer_min}..{debug.layer_max} "
                     f"z={r_min:.1f}..{r_max:.1f} mean_abs={r_mean_abs:.1f} "
-                    f"missing_cols={debug.reverse_missing_columns}"
+                    f"missing_cols={debug.reverse_missing_columns} "
+                    f"{layer_counts_text(debug.reverse_layer_columns)}"
                 ),
                 color=(255, 64, 220, 230),
+            ),
+            draw_z_row(
+                debug.fused_z_image,
+                debug.fused_trace_xyz[:, :2],
+                label=(
+                    f"z fused corrected z={fused_min:.1f}..{fused_max:.1f} "
+                    f"mean_abs={fused_mean_abs:.1f} missing_cols={debug.fused_missing_columns} "
+                    f"{layer_counts_text(debug.fused_layer_columns)}"
+                ),
+                color=(255, 220, 64, 230),
+            ),
+            _draw_label_band(
+                layer_map,
+                label=(
+                    "z fused layer map "
+                    "blue=negative green=center red=positive "
+                    f"{layer_counts_text(debug.fused_layer_columns)}"
+                ),
             ),
         ]
         width = max(int(row.shape[1]) for row in rows)
@@ -4295,7 +4402,7 @@ def _evaluate_trace2cp_pair(
     row_axis_alignment_xyz: np.ndarray | None = None,
     build_similarity_debug: bool = True,
 ) -> _Trace2CpPairEvaluation:
-    sample, image, valid_mask = loader.build_trace2cp_segment_patch(
+    segment_source = loader.build_trace2cp_segment_source(
         sample_index,
         target_control_point_index=target_cp_index,
         target_offset=target_offset,
@@ -4305,6 +4412,7 @@ def _evaluate_trace2cp_pair(
         device=device,
         sample_mode=sample_mode,
     )
+    sample, image, valid_mask = loader.sample_trace2cp_segment_source(segment_source)
     fields = _predict_trace2cp_fields(model, image, valid_mask, device=device)
     direction_xy = fields.direction_xy
     start_xy = np.asarray(sample.start_control_point_xy, dtype=np.float32)
@@ -4437,6 +4545,7 @@ def _evaluate_trace2cp_pair(
                 row_axis_alignment_line_index=row_axis_alignment_line_index,
                 row_axis_alignment_xyz=row_axis_alignment_xyz,
                 device=device,
+                segment_source=segment_source,
                 center_layer=center_prediction,
                 z_step_voxels=float(z_config.step_voxels),
                 max_layer=int(z_config.max_layer),
@@ -4453,23 +4562,35 @@ def _evaluate_trace2cp_pair(
                 step_px=step_px,
                 rf_margin_px=rf_margin_px,
             )
-            forward_z_image, forward_missing = _trace2cp_z_corrected_image_u8(
+            forward_z_image, forward_missing, forward_layer_columns = _trace2cp_z_corrected_image_u8(
                 plane_cache=plane_cache,
                 trace_xyz=forward_xyz,
                 fallback_shape_hw=image.shape,
             )
-            reverse_z_image, reverse_missing = _trace2cp_z_corrected_image_u8(
+            reverse_z_image, reverse_missing, reverse_layer_columns = _trace2cp_z_corrected_image_u8(
                 plane_cache=plane_cache,
                 trace_xyz=reverse_xyz,
+                fallback_shape_hw=image.shape,
+            )
+            fused_xyz = _trace2cp_refinement_fused_xyz(selected_result.refinement)
+            fused_z_image, fused_missing, fused_layer_columns = _trace2cp_z_corrected_image_u8(
+                plane_cache=plane_cache,
+                trace_xyz=fused_xyz,
                 fallback_shape_hw=image.shape,
             )
             z_search_debug = _Trace2CpZTraceDebug(
                 forward_trace_xyz=forward_xyz,
                 reverse_trace_xyz=reverse_xyz,
+                fused_trace_xyz=fused_xyz,
                 forward_z_image=forward_z_image,
                 reverse_z_image=reverse_z_image,
+                fused_z_image=fused_z_image,
                 forward_missing_columns=int(forward_missing),
                 reverse_missing_columns=int(reverse_missing),
+                fused_missing_columns=int(fused_missing),
+                forward_layer_columns=forward_layer_columns,
+                reverse_layer_columns=reverse_layer_columns,
+                fused_layer_columns=fused_layer_columns,
                 layers=plane_cache.layer_indices(),
                 z_step_voxels=float(z_config.step_voxels),
                 max_layer=int(z_config.max_layer),
@@ -4633,6 +4754,7 @@ def _export_trace2cp_vis(
     else:
         f_min, f_max, f_mean_abs = z_debug.z_stats(z_debug.forward_trace_xyz)
         r_min, r_max, r_mean_abs = z_debug.z_stats(z_debug.reverse_trace_xyz)
+        fused_min, fused_max, fused_mean_abs = z_debug.z_stats(z_debug.fused_trace_xyz)
         z_summary_lines = [
             "trace2cp_z_search=true",
             f"trace2cp_z_step_voxels={float(z_debug.z_step_voxels):.6f}",
@@ -4646,8 +4768,12 @@ def _export_trace2cp_vis(
             f"trace2cp_z_reverse_min_voxels={r_min:.6f}",
             f"trace2cp_z_reverse_max_voxels={r_max:.6f}",
             f"trace2cp_z_reverse_mean_abs_voxels={r_mean_abs:.6f}",
+            f"trace2cp_z_fused_min_voxels={fused_min:.6f}",
+            f"trace2cp_z_fused_max_voxels={fused_max:.6f}",
+            f"trace2cp_z_fused_mean_abs_voxels={fused_mean_abs:.6f}",
             f"trace2cp_z_forward_missing_columns={int(z_debug.forward_missing_columns)}",
             f"trace2cp_z_reverse_missing_columns={int(z_debug.reverse_missing_columns)}",
+            f"trace2cp_z_fused_missing_columns={int(z_debug.fused_missing_columns)}",
         ]
     summary = [
         f"sample_index={sample_index}",
@@ -4766,13 +4892,16 @@ def _export_trace2cp_vis(
     if z_debug is not None:
         f_min, f_max, f_mean_abs = z_debug.z_stats(z_debug.forward_trace_xyz)
         r_min, r_max, r_mean_abs = z_debug.z_stats(z_debug.reverse_trace_xyz)
+        fused_min, fused_max, fused_mean_abs = z_debug.z_stats(z_debug.fused_trace_xyz)
         print(
             "trace2cp z_search "
             f"enabled=true z_step_voxels={float(z_debug.z_step_voxels):.3f} "
             f"layers={int(z_debug.layer_min)}..{int(z_debug.layer_max)} "
             f"forward_z={f_min:.3f}..{f_max:.3f} mean_abs={f_mean_abs:.3f} "
             f"reverse_z={r_min:.3f}..{r_max:.3f} mean_abs={r_mean_abs:.3f} "
-            f"missing_columns={int(z_debug.forward_missing_columns)}/{int(z_debug.reverse_missing_columns)}"
+            f"fused_z={fused_min:.3f}..{fused_max:.3f} mean_abs={fused_mean_abs:.3f} "
+            f"missing_columns={int(z_debug.forward_missing_columns)}/"
+            f"{int(z_debug.reverse_missing_columns)}/{int(z_debug.fused_missing_columns)}"
         )
     print(f"exported trace2cp_vis.jpg and trace2cp_summary.txt to {out}")
 
@@ -5085,6 +5214,7 @@ def _export_trace2cp_fiber_vis(
     if z_debugs:
         z_forward_mean_abs = float(np.mean([debug.z_stats(debug.forward_trace_xyz)[2] for debug in z_debugs]))
         z_reverse_mean_abs = float(np.mean([debug.z_stats(debug.reverse_trace_xyz)[2] for debug in z_debugs]))
+        z_fused_mean_abs = float(np.mean([debug.z_stats(debug.fused_trace_xyz)[2] for debug in z_debugs]))
         z_component_lines = [
             "trace2cp_z_search=true",
             f"trace2cp_z_pair_count={len(z_debugs)}",
@@ -5094,8 +5224,10 @@ def _export_trace2cp_fiber_vis(
             f"trace2cp_z_layer_max={max(debug.layer_max for debug in z_debugs)}",
             f"trace2cp_z_forward_mean_abs_voxels={z_forward_mean_abs:.6f}",
             f"trace2cp_z_reverse_mean_abs_voxels={z_reverse_mean_abs:.6f}",
+            f"trace2cp_z_fused_mean_abs_voxels={z_fused_mean_abs:.6f}",
             f"trace2cp_z_forward_missing_columns={sum(int(debug.forward_missing_columns) for debug in z_debugs)}",
             f"trace2cp_z_reverse_missing_columns={sum(int(debug.reverse_missing_columns) for debug in z_debugs)}",
+            f"trace2cp_z_fused_missing_columns={sum(int(debug.fused_missing_columns) for debug in z_debugs)}",
         ]
     else:
         z_component_lines = ["trace2cp_z_search=false"]
@@ -5166,7 +5298,8 @@ def _export_trace2cp_fiber_vis(
             f"z_step_voxels={float(z_debugs[0].z_step_voxels):.3f} "
             f"layers={min(debug.layer_min for debug in z_debugs)}..{max(debug.layer_max for debug in z_debugs)} "
             f"missing_columns={sum(int(debug.forward_missing_columns) for debug in z_debugs)}/"
-            f"{sum(int(debug.reverse_missing_columns) for debug in z_debugs)}"
+            f"{sum(int(debug.reverse_missing_columns) for debug in z_debugs)}/"
+            f"{sum(int(debug.fused_missing_columns) for debug in z_debugs)}"
         )
     print(f"exported trace2cp_fiber_vis.jpg, trace2cp_fiber_summary.txt, and trace2cp_fiber_debug.txt to {out}")
 
@@ -5598,7 +5731,7 @@ def main() -> None:
     parser.add_argument("--trace2cp-target-cp-index", type=int, default=None)
     parser.add_argument("--trace2cp-candidate-max-deg", type=float, default=25.0)
     parser.add_argument("--trace2cp-candidate-step-deg", type=float, default=1.0)
-    parser.add_argument("--trace2cp-z-step-voxels", type=float, default=2.0)
+    parser.add_argument("--trace2cp-z-step-voxels", type=float, default=1.0)
     parser.add_argument("--trace2cp-z-max-layer", type=int, default=4)
     parser.add_argument("--trace2cp-combined-direction-weight", type=float, default=1.0)
     parser.add_argument("--trace2cp-combined-last-weight", type=float, default=1.0)

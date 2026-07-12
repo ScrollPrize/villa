@@ -2,10 +2,18 @@
 
 ## 2026-07-12
 
+- Changed regular non-z combined Trace2CP direction scoring to match z-search:
+  candidates now average current-point direction agreement and candidate-point
+  direction agreement before applying the existing embedding terms.
+- Refined experimental Trace2CP z-search so lazy layers are derived from one
+  center segment source by per-pixel strip offset axes, changed the z-step
+  default to one selected-scale voxel, and made candidate scoring use both the
+  current-point and candidate-point direction fields.
 - Added experimental `--trace2cp-z-search` for combined Trace2CP inspection:
   lazy center/neighbor strip-offset plane inference, z-aware combined
   candidate scoring, y+z closest-approach fusion, and single-pair
-  forward/reverse z-corrected visualization columns.
+  forward/reverse/fused z-corrected visualization columns plus a fused z-layer
+  map row.
 - Changed the Trace2CP embedding-debug forward/reverse last-similarity panels
   to paint per-trace-step column bands from the previous accepted point's
   embedding instead of showing one full-image map against the final trace
