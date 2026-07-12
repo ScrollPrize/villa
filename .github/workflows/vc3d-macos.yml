@@ -3,8 +3,8 @@ name: VC3D macOS App
 # Builds VC3D natively on macOS (Apple Silicon) with the Homebrew LLVM
 # toolchain and produces a self-contained VC3D.app — full dylib closure and
 # Qt plugins bundled via macdeployqt, everything ad-hoc signed — wrapped in a
-# drag-and-drop DMG (+ ZIP) by CPack. On published releases both are attached
-# to the GitHub release.
+# drag-and-drop DMG by CPack, with a ZIP derived from that deployed bundle. On
+# published releases both are attached to the GitHub release.
 #
 # No Developer ID signing / notarization: downloads are Gatekeeper-quarantined,
 # so the first launch is right-click -> Open (or
@@ -86,7 +86,28 @@ jobs:
       - name: Package (DMG + ZIP)
         run: |
           cd build-macos
-          cpack -V
+          cpack -V -G DragNDrop
+
+          # CPack stages and installs once per generator. Derive the ZIP from
+          # the completed DMG so macdeployqt and install-name rewriting run
+          # only once while both artifacts contain the exact same app bundle.
+          shopt -s nullglob
+          dmgs=(VC3D-*-macos-*.dmg)
+          if [[ ${#dmgs[@]} -ne 1 ]]; then
+            echo "::error::expected exactly one packaged DMG, found ${#dmgs[@]}"
+            exit 1
+          fi
+          dmg="${dmgs[0]}"
+          zip="${dmg%.dmg}.zip"
+          mountpoint="$RUNNER_TEMP/vc3d-package"
+          mkdir -p "$mountpoint"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mountpoint"
+          trap 'hdiutil detach "$mountpoint"' EXIT
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$mountpoint/VC3D.app" "$zip"
+          hdiutil detach "$mountpoint"
+          trap - EXIT
+
           ls -la VC3D-*-macos-*.dmg VC3D-*-macos-*.zip
 
       - name: Upload app artifact

@@ -3,7 +3,7 @@
 # Produces a self-contained VC3D.app (Contents/MacOS holds VC3D plus the vc_*
 # CLI tools, Contents/Frameworks the full dylib closure resolved out of the
 # Homebrew prefix, Contents/PlugIns the Qt plugins), then wraps it in a
-# drag-and-drop DMG + ZIP via CPack:
+# drag-and-drop DMG via CPack (CI derives its ZIP from that deployed DMG):
 #
 #   cmake --build <build>            # as usual
 #   cpack --config <build>/CPackConfig.cmake
@@ -77,7 +77,11 @@ if(VC_MACDEPLOYQT)
         endforeach()
         message(STATUS "Running macdeployqt: ${_vc_macdeployqt}")
         execute_process(
-            COMMAND "${_vc_macdeployqt}" "${_app}" -always-overwrite ${_exe_args}
+            # The bundle is freshly staged, so overwriting existing deployed
+            # frameworks only repeats work shared by the many CLI executables.
+            # Signing here would also be wasted: the install-name normalization
+            # below invalidates those signatures and signs the finished files.
+            COMMAND "${_vc_macdeployqt}" "${_app}" -no-codesign ${_exe_args}
             RESULT_VARIABLE _mdq_rc)
         if(NOT _mdq_rc EQUAL 0)
             message(FATAL_ERROR "macdeployqt failed (rc=${_mdq_rc})")
@@ -117,6 +121,7 @@ if(VC_MACDEPLOYQT)
                 message(FATAL_ERROR "otool failed for ${_f}: ${_otool_err}")
             endif()
             string(REPLACE "\n" ";" _dep_lines "${_deps_out}")
+            set(_install_name_args "")
             foreach(_line IN LISTS _dep_lines)
                 if(NOT _line MATCHES "^[ \t]+(/[^ ]+)")
                     continue()
@@ -135,13 +140,7 @@ if(VC_MACDEPLOYQT)
                         "Bundled dependency for ${_dep} (needed by ${_f}) not found")
                 endif()
                 set(_new "@rpath/${_relative_dep}")
-                execute_process(COMMAND install_name_tool
-                    -change "${_dep}" "${_new}" "${_f}"
-                    RESULT_VARIABLE _int_rc ERROR_VARIABLE _int_err)
-                if(NOT _int_rc EQUAL 0)
-                    message(FATAL_ERROR
-                        "install_name_tool failed for ${_f}: ${_int_err}")
-                endif()
+                list(APPEND _install_name_args -change "${_dep}" "${_new}")
             endforeach()
 
             execute_process(COMMAND otool -D "${_f}"
@@ -155,13 +154,20 @@ if(VC_MACDEPLOYQT)
                     else()
                         get_filename_component(_relative_id "${_old_id}" NAME)
                     endif()
-                    execute_process(COMMAND install_name_tool -id
-                        "@rpath/${_relative_id}" "${_f}"
+                    list(APPEND _install_name_args
+                        -id "@rpath/${_relative_id}")
+                endif()
+            endif()
+
+            # install_name_tool rewrites the Mach-O for every invocation.
+            # Apply all dependency and ID changes in one pass per file.
+            if(_install_name_args)
+                execute_process(COMMAND install_name_tool
+                    ${_install_name_args} "${_f}"
                         RESULT_VARIABLE _int_rc ERROR_VARIABLE _int_err)
-                    if(NOT _int_rc EQUAL 0)
-                        message(FATAL_ERROR
-                            "install_name_tool -id failed for ${_f}: ${_int_err}")
-                    endif()
+                if(NOT _int_rc EQUAL 0)
+                    message(FATAL_ERROR
+                        "install_name_tool failed for ${_f}: ${_int_err}")
                 endif()
             endif()
 
@@ -185,7 +191,7 @@ else()
     message(WARNING "macdeployqt not found — the installed VC3D.app will not be self-contained")
 endif()
 
-# ---- DMG + ZIP -------------------------------------------------------------
+# ---- DMG (CI derives ZIP without redeploying) -------------------------------
 set(CPACK_PACKAGE_NAME "VC3D")
 set(CPACK_PACKAGE_VENDOR "Vesuvius Challenge")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "VC3D — Volume Cartographer 3D")
@@ -194,7 +200,9 @@ set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_PACKAGE_FILE_NAME "VC3D-${VC_VERSION_STRING}-macos-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
 # DragNDrop puts VC3D.app + an /Applications symlink in the DMG.
-set(CPACK_GENERATOR "DragNDrop;ZIP")
+# Deploy the app once for the DMG. CI derives the ZIP from that finished DMG;
+# listing both generators here would rerun every install-time deployment hook.
+set(CPACK_GENERATOR "DragNDrop")
 set(CPACK_DMG_VOLUME_NAME "VC3D")
 
 # Single vc_runtime component, packaged monolithically.
