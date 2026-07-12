@@ -164,6 +164,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
   
 - [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
     - [GPU-accelerated MLS projection for ScrollFiesta](https://github.com/pscamillo/scrollfiesta_public/blob/cuda-mls/BENCHMARKS.md) by pscamillo — OpenMP + CUDA FP32 acceleration, byte-identical, ~6x throughput.
+- [vesuvius-sheet-tools](https://github.com/IyanDopico/vesuvius-sheet-tools) by Iyan Dopico: CPU-friendly tools that clean the official surface predictions (removing out-of-mask false positives and noise components) and split the surface mask into individual sheet instances via distance-transform watershed with a calibrated over-segmentation merge. Streams directly from the open S3 bucket; validated on Scroll 3 (PHerc0332) and PHerc1218.
       
 ### 📦 Materials
 
