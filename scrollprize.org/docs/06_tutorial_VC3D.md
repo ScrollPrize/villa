@@ -30,6 +30,8 @@ title: "Volume Cartographer 3D (VC3D)"
 </head>
 
 import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
 
 # Volume Cartographer 3D (VC3D)
 
@@ -50,16 +52,46 @@ VC3D is updated frequently. Follow along in Discord for the latest changes.
 :::
 
 ## Installing VC3D
+Downloads for all operating systems are available on the [releases page](https://github.com/ScrollPrize/villa/releases) of the villa repository.
 
-<div className="border-l-4 border-red-500 bg-red-500/10 px-3 py-2 my-3 text-sm">
-  <strong>Editor note:</strong> Section to be written — install/build instructions for VC3D.
-</div>
+
+<Tabs groupId="operating-systems">
+  <TabItem value="mac-apple-silicon" label="Mac (Apple Silicon)">
+
+  - Download the macos .dmg file from the [releases page](https://github.com/ScrollPrize/villa/releases) of the villa repository.
+  - Double click the .dmg file, and drag/drop it into applications (**you may have to right click the dmg and click 'open'.**)
+
+</TabItem>
+  <TabItem value="windows" label="Windows">
+
+  - Download the windows installer .zip file from the [releases page](https://github.com/ScrollPrize/villa/releases) of the villa repository.
+  - Extract the contents of the .zip file to a folder of your choice.
+  - Double click the install file, and follow the prompts.
+  
+  </TabItem>
+  <TabItem value="linux" label="Linux">
+  
+   Currently, the application must be build from source on linux. A script to do this (tested on Ubuntu 26.04) is available in the [volume-cartographer repository](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/scripts/install.sh)
+   This script must be run from the `volume-cartographer/scripts` directory.
+  
+</TabItem>
+
+<TabItem value="docker" label="Docker">
+  Prebuild docker containers are hosted on the GitHub container registry. To use them, run the following command:
+  ```bash
+  docker pull ghcr.io/scrollprize/villa/volume-cartographer:stable
+  ```
+
+  </TabItem>
+</Tabs>
+
 
 ## Launching the GUI
 
-<div className="border-l-4 border-red-500 bg-red-500/10 px-3 py-2 my-3 text-sm">
-  <strong>Editor note:</strong> Section to be written — how to launch VC3D.
-</div>
+Depending on your install method or operating system, the application may be launched in different ways.
+- **Mac:** Open the application from the Applications folder
+- **Windows:** Open the application from the Start menu
+- **Linux:** Navigate to the build folder and run the VC3D app. example: `cd build/bin && ./vc3d`
 
 ## Data
 
@@ -160,11 +192,10 @@ A line annotation workspace will launch, with 4 viewers:
 - A reoptimization takes place after each control point is added
 - To delete a control point, use **Ctrl + Right click → Delete control point**
 
-## Manual multi-winding annotation
+## Winding Annotation
 
-<div className="border-l-4 border-red-500 bg-red-500/10 px-3 py-2 my-3 text-sm">
-  <strong>Editor note:</strong> Section to be written — manual multi-winding annotation.
-</div>
+VC3D can be used to create winding annotations for the spiral fit (see [the inputs section](tutorial_spiral#what-goes-in) of the spiral
+fitting document for more details on how these are used). VC3D outputs these primarily as  *patches (segmentations)* or *point collections*. 
 
 ## Patch Growth
 
