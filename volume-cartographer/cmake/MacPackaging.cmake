@@ -164,7 +164,7 @@ if(VC_MACDEPLOYQT)
             if(_install_name_args)
                 execute_process(COMMAND install_name_tool
                     ${_install_name_args} "${_f}"
-                        RESULT_VARIABLE _int_rc ERROR_VARIABLE _int_err)
+                    RESULT_VARIABLE _int_rc ERROR_VARIABLE _int_err)
                 if(NOT _int_rc EQUAL 0)
                     message(FATAL_ERROR
                         "install_name_tool failed for ${_f}: ${_int_err}")

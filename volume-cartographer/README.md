@@ -21,7 +21,19 @@ Due to a complex set of dependencies, it is *highly* recommended to use the dock
 docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
 
-If you want to install vc3d from source, the easiest path is to look at the [Dockerfile](Dockerfile) (and the shared [scripts/install_build_deps.sh](scripts/install_build_deps.sh) it uses) and adapt for your environment.
+To install VC3D and all command-line tools from source on a recent Debian-family
+Linux distribution using APT:
+
+```bash
+./build_from_src_debian.sh
+```
+
+The script installs build dependencies from system packages, builds VC3D and
+flatboi, and installs the runtime under `/usr/local` so commands such as
+`VC3D` and `vc_grow_seg_from_seed` are available from the terminal. The
+distribution must provide CMake 3.28 or newer; Ubuntu 24.04+ and Debian 13+
+meet that requirement. Set `JOBS`, `BUILD_DIR`, or `PREFIX` to override the
+corresponding defaults.
 
 #### Windows
 
