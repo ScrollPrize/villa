@@ -194,6 +194,19 @@ auto main(int argc, char* argv[]) -> int
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));
     QApplication::setApplicationVersion(QString::fromStdString(ProjectInfo::VersionString()));
+
+    // Handle this before constructing the main window. QCommandLineParser's
+    // built-in version option normally exits from process(), but keeping the
+    // probe explicit makes the packaged GUI-subsystem executable a reliable
+    // non-interactive smoke test on Windows.
+    if (hasCliFlag(argc, argv, "--version")) {
+        std::cout << QApplication::applicationName().toStdString() << ' '
+                  << QApplication::applicationVersion().toStdString() << std::endl;
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(0);
+    }
+
     std::cout << "VC3D commit: " << ProjectInfo::RepositoryHash() << std::endl;
     std::cout << "creating remote volume cache at "
               << vc3d::remoteCachePath().toStdString() << std::endl;

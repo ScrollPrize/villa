@@ -75,7 +75,8 @@ jobs:
             nsis:p
 
       - name: Restore compiler cache
-        uses: actions/cache@v4
+        id: compiler-cache
+        uses: actions/cache/restore@v4
         with:
           path: volume-cartographer/.ccache/windows-mingw
           key: vc3d-windows-mingw-ccache-v1-${{ github.sha }}
@@ -90,6 +91,16 @@ jobs:
 
       - name: Build
         run: ninja -C build/ci-windows-mingw
+
+      # Persist compiler results before tests and package smoke checks. Cache
+      # entries are immutable, so a rerun of this commit restores the exact
+      # build's cache even if a later step fails or times out.
+      - name: Save compiler cache
+        if: always() && steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: volume-cartographer/.ccache/windows-mingw
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
 
       - name: Report compiler cache statistics
         if: always()
@@ -133,9 +144,17 @@ jobs:
           Write-Host "vc_tifxyz_trim OK (exit $LASTEXITCODE)"
           # GUI app: --version under the offscreen platform exercises every Qt
           # DLL plus the platform plugin lookup. GUI-subsystem exe, so wait via
-          # Start-Process and check the exit code.
+          # Start-Process and check the exit code. Bound the process itself so
+          # a GUI-loop regression fails promptly instead of consuming the
+          # entire job-step timeout.
           $env:QT_QPA_PLATFORM = "offscreen"
-          $p = Start-Process -FilePath $exe.FullName -ArgumentList "--version" -Wait -PassThru -NoNewWindow
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList "--version" -PassThru -NoNewWindow
+          try {
+            Wait-Process -Id $p.Id -Timeout 60 -ErrorAction Stop
+          } catch {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw "VC3D --version did not exit within 60 seconds"
+          }
           if ($p.ExitCode -ne 0) { throw "VC3D --version failed (exit $($p.ExitCode))" }
           Write-Host "VC3D --version OK"
 

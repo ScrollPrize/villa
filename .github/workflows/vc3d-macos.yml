@@ -62,6 +62,17 @@ jobs:
           restore-keys: |
             vc3d-macos-15-homebrew-llvm-ccache-v1-
 
+      - name: Restore Homebrew downloads
+        id: homebrew-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew/downloads
+            ~/Library/Caches/Homebrew/api
+          key: vc3d-brew-macos-15-${{ hashFiles('volume-cartographer/scripts/build_macos.sh') }}
+          restore-keys: |
+            vc3d-brew-macos-15-
+
       - name: Refresh Homebrew index
         run: brew update --quiet
 
@@ -70,6 +81,15 @@ jobs:
       # configures + builds via the macos-homebrew-llvm preset.
       - name: Build
         run: ./scripts/build_macos.sh --install-deps --ccache
+
+      - name: Save Homebrew downloads
+        if: always() && steps.homebrew-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew/downloads
+            ~/Library/Caches/Homebrew/api
+          key: ${{ steps.homebrew-cache.outputs.cache-primary-key }}
 
       - name: Test
         run: ctest --test-dir build-macos --output-on-failure
