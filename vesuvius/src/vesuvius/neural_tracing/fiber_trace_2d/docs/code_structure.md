@@ -294,9 +294,12 @@ The important behavior is:
 - When embedding channels are present, single-pair `trace2cp_vis.jpg` appends a
   debug column of fixed-scale cosine similarity maps: start CP, target CP,
   same-fiber CP-bank/global similarity when a combined Trace2CP bank is
-  available, forward trace final sampled embedding, and reverse trace final
-  sampled embedding. The column is for inspection only and does not affect
-  Trace2CP scoring or metrics.
+  available, forward trace-progress last-point columns, and reverse
+  trace-progress last-point columns. The forward/reverse panels paint the
+  column band around each newly placed trace point using the previous accepted
+  trace point's embedding; the band radius is `ceil(step_px / 2)`, and
+  unvisited columns render black. The column is for inspection only and does
+  not affect Trace2CP scoring or metrics.
 - `--trace2cp-vis --med-tta --vis-tta` writes `trace2cp_tta/reference.jpg`,
   one `trace2cp_tta/random_NNN.jpg` per generated TTA field, and
   `trace2cp_tta/contact_sheet.jpg`. Each image shows the sampled slice with the
@@ -394,11 +397,9 @@ The important behavior is:
   negative terms compare each positive to one deterministic valid non-CP pixel
   from the batch inside the CP-neighborhood reachable region derived from
   `augment_shift_x/y`, so unreachable patch edges are ignored rather than
-  trained as always-negative. When multiple fibers are present in the batch,
-  each CP embedding is also contrasted against CP embeddings from other fibers.
-  The valid-pixel and cross-fiber CP negative components split the aggregate
-  negative branch equally when both are available; the positive and aggregate
-  negative means are balanced. A similarity-image sparsity term also compares
+  trained as always-negative. CP embeddings from other fibers are not used as
+  contrastive negatives. The positive and valid-pixel negative means are
+  balanced. A similarity-image sparsity term also compares
   the valid-pixel mean of each CP's normalized `0..1` embedding-similarity map
   over the same shift-reachable CP area against fixed target `0.1`, encouraging
   only a small reachable region to remain similar to the CP embedding. The
@@ -517,8 +518,7 @@ Training keys:
   exact number of same-fiber CP groups.
 - `contrastive_weight`: multiplier for the balanced cosine contrastive loss.
 - `contrastive_negative_margin`: cosine margin for negative pairs.
-  The margin applies to both valid non-CP pixel negatives and cross-fiber CP
-  embedding negatives.
+  The margin applies to valid non-CP pixel negatives.
 - `device`: `auto`, `cpu`, or a torch device string.
 - `tensorboard_enabled`: set false for smoke tests without TensorBoard.
 - `pipeline_enabled`: enables CUDA training batch pipelining and load-only

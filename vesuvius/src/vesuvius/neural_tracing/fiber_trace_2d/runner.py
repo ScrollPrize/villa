@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -625,20 +626,48 @@ def _embedding_similarity_map(
     return similarity
 
 
-def _last_trace_embedding(
-    embedding_chw: np.ndarray,
+def _trace_progress_similarity_map(
+    normalized_embedding_chw: np.ndarray,
     trace_xy: np.ndarray,
     *,
-    valid_mask: np.ndarray | None,
+    valid_mask: np.ndarray,
+    step_px: float,
 ) -> np.ndarray | None:
+    field = _require_trace2cp_embedding_field(normalized_embedding_chw)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if valid.shape != tuple(int(v) for v in field.shape[1:]):
+        raise ValueError("valid_mask must match embedding spatial shape")
     points = np.asarray(trace_xy, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] != 2:
         raise ValueError("trace_xy must have shape N,2")
-    for point in points[::-1]:
-        embedding = _bilinear_embedding_sample(embedding_chw, point, valid_mask=valid_mask)
-        if embedding is not None:
-            return embedding.astype(np.float32, copy=False)
-    return None
+    height = int(field.shape[1])
+    width = int(field.shape[2])
+    radius = max(1, int(math.ceil(max(float(step_px), 1.0e-3) * 0.5)))
+    painted = np.full((height, width), np.nan, dtype=np.float32)
+    wrote = False
+    for index in range(1, int(points.shape[0])):
+        point = points[index]
+        previous_point = points[index - 1]
+        if (
+            point.shape != (2,)
+            or previous_point.shape != (2,)
+            or not bool(np.isfinite(point).all())
+            or not bool(np.isfinite(previous_point).all())
+        ):
+            continue
+        reference = _bilinear_embedding_sample(field, previous_point, valid_mask=valid)
+        if reference is None:
+            continue
+        center_x = int(round(float(point[0])))
+        if center_x < 0 or center_x >= width:
+            continue
+        x0 = max(0, center_x - radius)
+        x1 = min(width, center_x + radius + 1)
+        band = np.sum(field[:, :, x0:x1] * reference[:, None, None], axis=0, dtype=np.float32)
+        band = np.clip(band, -1.0, 1.0).astype(np.float32)
+        painted[:, x0:x1] = np.where(valid[:, x0:x1], band, np.nan).astype(np.float32)
+        wrote = True
+    return painted if wrote else None
 
 
 def _trace2cp_similarity_debug(
@@ -649,6 +678,7 @@ def _trace2cp_similarity_debug(
     target_xy: np.ndarray,
     forward_trace_xy: np.ndarray,
     reverse_trace_xy: np.ndarray,
+    step_px: float = 1.0,
     fiber_embeddings: np.ndarray | None = None,
 ) -> _Trace2CpSimilarityDebug | None:
     if embedding_chw is None:
@@ -682,21 +712,21 @@ def _trace2cp_similarity_debug(
                     normalize_reference=False,
                 )
 
-    forward_last_embedding = _last_trace_embedding(embedding, forward_trace_xy, valid_mask=valid)
-    reverse_last_embedding = _last_trace_embedding(embedding, reverse_trace_xy, valid_mask=valid)
     return _Trace2CpSimilarityDebug(
         start_cp_similarity=_embedding_similarity_map(normalized, start_embedding, valid_mask=valid),
         target_cp_similarity=_embedding_similarity_map(normalized, target_embedding, valid_mask=valid),
         global_similarity=global_similarity,
-        forward_last_similarity=(
-            None
-            if forward_last_embedding is None
-            else _embedding_similarity_map(normalized, forward_last_embedding, valid_mask=valid)
+        forward_last_similarity=_trace_progress_similarity_map(
+            normalized,
+            forward_trace_xy,
+            valid_mask=valid,
+            step_px=step_px,
         ),
-        reverse_last_similarity=(
-            None
-            if reverse_last_embedding is None
-            else _embedding_similarity_map(normalized, reverse_last_embedding, valid_mask=valid)
+        reverse_last_similarity=_trace_progress_similarity_map(
+            normalized,
+            reverse_trace_xy,
+            valid_mask=valid,
+            step_px=step_px,
         ),
         global_bank_size=global_bank_size,
     )
@@ -3540,6 +3570,7 @@ def _evaluate_trace2cp_pair(
             target_xy=target_xy,
             forward_trace_xy=selected_result.forward.trace_xy,
             reverse_trace_xy=selected_result.reverse.trace_xy,
+            step_px=step_px,
             fiber_embeddings=debug_fiber_embeddings,
         )
         if build_similarity_debug

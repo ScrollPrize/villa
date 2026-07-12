@@ -1,40 +1,50 @@
-# Reachable-Area Contrastive Similarity-Mean Sparsity Loss Plan
+# Trace2CP Last-Point Similarity Columns Plan
 
 ## Scope
 
-- Update contrastive embedding training only.
-- Keep loader sampling, direction loss, Trace2CP tracing, and visualization
-  semantics unchanged.
-- Do not add a new config key; reuse the existing reachable mask derived from
-  configured shift augmentation.
+- Change only the single-pair Trace2CP embedding-debug visualization.
+- Keep Trace2CP tracing, refinement, public metrics, best-checkpoint selection,
+  CP/global similarity panels, and training losses unchanged.
 
 ## Implementation
 
-1. Update `contrastive_embedding_loss`.
-   - Reuse the already validated `negative_candidate_mask` reachable rectangle.
-   - Pass `valid & reachable` into the similarity-mean sparsity term when a
-     reachable mask is configured.
-   - Keep the previous valid-only behavior when no reachable mask is supplied.
+1. Add a trace-progress similarity map helper in `runner.py`.
+   - Validate the normalized embedding field and valid mask.
+   - Iterate trace points in placement order.
+   - For each newly placed point, sample the previous accepted point's
+     embedding.
+   - Compute cosine similarity for the vertical column band around the newly
+     placed point.
+   - Paint only that band, leaving unvisited columns as `NaN`.
 
-2. Update tests.
-   - Extend the existing edge-handling regression so the masked
-     similarity-mean value ignores unreachable edges.
+2. Use the configured Trace2CP step length.
+   - Pass `step_px` from `_evaluate_trace2cp_pair` into
+     `_trace2cp_similarity_debug`.
+   - Use `ceil(step_px / 2)` as the column-band radius.
 
-3. Update docs.
-   - Clarify that the similarity-mean sparsity term averages over valid
-     reachable CP positions, not the whole patch, when shift bounds are known.
+3. Preserve existing debug panels.
+   - Start CP, target CP, and same-fiber/global CP-bank maps remain full-image
+     fixed-scale cosine maps.
+   - Forward and reverse trace panels keep their overlays, but their similarity
+     image becomes the column-band trace-progress map.
 
 ## Spec Update
 
-- Document reachable-mask gating for the similarity-mean sparsity term.
+- Update Trace2CP visualization specs so forward/reverse last-similarity maps
+  are described as trace-step column-band maps, not full-image maps against the
+  final trace embedding.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` contrastive training description.
+- Update `docs/code_structure.md` with the same concise behavior description.
 - Update `planning/changelog.md`, `status.md`, and `task_log.md`.
 
 ## Validation
 
+- Extend the existing Trace2CP similarity-debug regression to prove that:
+  - early trace columns are painted from early trace-point embeddings;
+  - later trace columns are painted from later trace-point embeddings;
+  - unvisited columns remain unpainted.
 - Run:
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 - Run `git diff --check` on touched files.

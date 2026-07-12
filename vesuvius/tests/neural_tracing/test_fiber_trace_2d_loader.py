@@ -547,8 +547,9 @@ def test_trace2cp_similarity_debug_maps_use_cosine_scale() -> None:
         valid,
         start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
         target_xy=np.asarray([5.0, 2.0], dtype=np.float32),
-        forward_trace_xy=np.asarray([[1.0, 2.0], [2.0, 2.0]], dtype=np.float32),
-        reverse_trace_xy=np.asarray([[5.0, 2.0], [4.0, 2.0]], dtype=np.float32),
+        forward_trace_xy=np.asarray([[1.0, 2.0], [4.0, 2.0], [5.0, 2.0]], dtype=np.float32),
+        reverse_trace_xy=np.asarray([[5.0, 2.0], [1.0, 2.0], [2.0, 2.0]], dtype=np.float32),
+        step_px=2.0,
         fiber_embeddings=np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
     )
 
@@ -562,9 +563,14 @@ def test_trace2cp_similarity_debug_maps_use_cosine_scale() -> None:
     assert debug.global_similarity[2, 1] == pytest.approx(0.5)
     assert debug.global_similarity[2, 5] == pytest.approx(0.5)
     assert debug.forward_last_similarity is not None
-    assert debug.forward_last_similarity[2, 1] == pytest.approx(1.0)
+    assert np.isnan(debug.forward_last_similarity[2, 1])
+    assert debug.forward_last_similarity[2, 3] == pytest.approx(0.0)
+    assert debug.forward_last_similarity[2, 5] == pytest.approx(1.0)
     assert debug.reverse_last_similarity is not None
-    assert debug.reverse_last_similarity[2, 5] == pytest.approx(1.0)
+    assert debug.reverse_last_similarity[2, 0] == pytest.approx(0.0)
+    assert debug.reverse_last_similarity[2, 2] == pytest.approx(1.0)
+    assert debug.reverse_last_similarity[2, 3] == pytest.approx(0.0)
+    assert np.isnan(debug.reverse_last_similarity[2, 5])
 
 
 def test_trace2cp_overlay_can_add_similarity_debug_column() -> None:
@@ -3744,7 +3750,7 @@ def test_contrastive_embedding_loss_balances_positive_and_negative_terms() -> No
     assert metrics.similarity_mean_samples == 2
 
 
-def test_contrastive_embedding_loss_adds_cross_fiber_cp_negatives() -> None:
+def test_contrastive_embedding_loss_ignores_cross_fiber_cp_negatives() -> None:
     output = torch.zeros((4, 4, 3, 3), dtype=torch.float32)
     output[:, 3, :, :] = 1.0
     output[:, 2, 1, 1] = 1.0
@@ -3779,14 +3785,12 @@ def test_contrastive_embedding_loss_adds_cross_fiber_cp_negatives() -> None:
 
     assert metrics.positive_loss == pytest.approx(0.0)
     assert metrics.pixel_negative_loss == pytest.approx(0.0)
-    assert metrics.cross_fiber_negative_loss == pytest.approx(1.0)
-    assert metrics.negative_loss == pytest.approx(0.5)
+    assert metrics.negative_loss == pytest.approx(0.0)
     assert metrics.similarity_mean_value == pytest.approx(5.0 / 9.0)
     assert metrics.similarity_mean_loss == pytest.approx((5.0 / 9.0 - 0.1) ** 2)
-    assert float(loss.detach().item()) == pytest.approx(0.25 + (5.0 / 9.0 - 0.1) ** 2)
+    assert float(loss.detach().item()) == pytest.approx((5.0 / 9.0 - 0.1) ** 2)
     assert metrics.pixel_negative_samples == 4
-    assert metrics.cross_fiber_negative_samples == 8
-    assert metrics.negative_samples == 12
+    assert metrics.negative_samples == 4
 
 
 def test_contrastive_embedding_loss_ignores_unreachable_edge_negatives() -> None:

@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-07-12
+
+- Changed the Trace2CP embedding-debug forward/reverse last-similarity panels
+  to paint per-trace-step column bands from the previous accepted point's
+  embedding instead of showing one full-image map against the final trace
+  embedding.
+- Removed the cross-fiber CP negative component from contrastive embedding
+  training; negatives are again only deterministic valid non-CP pixels, while
+  same-fiber positives and the reachable-area similarity-mean sparsity term
+  remain active.
+
 ## 2026-07-11
 
 - Added a contrastive embedding sparsity term that trains each CP's normalized

@@ -36,7 +36,10 @@
 - [ ] better tracing using dijkstra or similar
 - [ ] do a separate sheet/fiber recognition target
     - [ ] force embeeding similarity to be different to that?
-- [ ] lets try disabling skew and scale loss (maybe throws off embedding?)
+- [x] lets try disabling skew and scale loss (maybe throws off embedding?)
+- [ ] for embedding similarity try best along some small z range (and short y as well)
+- [ ] also embedding - incorporate angle? (probably not needed if curr angle est are good)
+- [ ] vis both (train & test vis) the patches cp and another patches cp (same fiber) for similarity
     
 # ideas
 - [ ] short-strip self supervision?

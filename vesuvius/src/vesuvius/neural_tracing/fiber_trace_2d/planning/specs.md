@@ -278,13 +278,9 @@
   similarity above `training.contrastive_negative_margin`. Negative candidates
   are restricted to the CP-neighborhood reachable rectangle implied by the
   configured output-space `augment_shift_x/y` bounds; unreachable patch edges
-  are ignored, not supervised as negatives. When a batch contains multiple
-  fibers, an additional negative component compares each CP-neighborhood
-  embedding sample with every other-fiber CP-neighborhood embedding sample in
-  the batch, using the same margin. Available negative components are averaged
-  together, so valid-pixel negatives and cross-fiber CP negatives split the
-  negative branch equally when both exist. Positive and aggregate negative
-  means are averaged equally, then multiplied by `training.contrastive_weight`.
+  are ignored, not supervised as negatives. CP-neighborhood embeddings from
+  other fibers are not used as negative samples. Positive and negative means
+  are averaged equally, then multiplied by `training.contrastive_weight`.
 - Contrastive embedding training also includes a similarity-image sparsity
   term. For each supervised CP embedding, the embedding similarity image
   against that CP is computed in normalized visualization space
@@ -448,8 +444,12 @@
   when the checkpoint exposes embedding channels. The column renders cosine
   similarity maps for the start CP embedding, target CP embedding, same-fiber
   CP-bank mean similarity when the combined Trace2CP bank is available,
-  forward-trace final sampled embedding, and reverse-trace final sampled
-  embedding. These maps are fixed-scale cosine displays (`-1..1` mapped to
+  forward trace-progress last-point columns, and reverse trace-progress
+  last-point columns. For the forward/reverse panels, each newly placed trace
+  point paints the vertical column band around itself using the previous
+  accepted trace point's embedding as the similarity reference; the band radius
+  is `ceil(step_px / 2)`, and small overwrites are allowed.
+  These maps are fixed-scale cosine displays (`-1..1` mapped to
   `0..255`) and are visualization-only; they must not affect tracing,
   refinement, metrics, or best-checkpoint selection.
 - Trace2CP TTA samples from the regular training geometric augmentation ranges
