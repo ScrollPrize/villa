@@ -30,7 +30,7 @@ const sidebars = {
         { type: 'doc', id: 'prizes' },
         {
           type: 'category',
-          label: 'Open Problems',
+          label: 'Tutorials',
           collapsible: true,
           collapsed: true,
           link: { type: 'doc', id: '2026_open_problems' },
