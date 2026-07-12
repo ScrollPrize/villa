@@ -287,23 +287,33 @@ The important behavior is:
   grid for point lookup and each output-to-reference grid for direction
   mapping.
 - `--trace2cp-vis --trace2cp-combined` switches the selected Trace2CP trace to
-  a greedy combined scorer for inspection. At each trace step it samples the
+  a greedy candidate scorer for inspection. At each trace step it samples the
   oriented direction, evaluates an angular candidate fan around that direction,
   and chooses the candidate with the lowest weighted score. The default
-  candidate fan is `-25..+25` degrees at 1 degree spacing. The default
-  `--trace2cp-combined-mode embedding` scores direction disagreement plus
+  candidate fan is `-25..+25` degrees at 1 degree spacing.
+  `--trace2cp-combined-mode direction` is the default: it scores direction
+  disagreement only and does not require embedding channels.
+  `--trace2cp-combined-mode embedding` or `--trace2cp-use-embedding` adds
   cosine-distance terms to the previous trace-point embedding, the two
   enclosing CP embeddings, and a same-fiber CP embedding bank; it requires a
   checkpoint with appended embedding channels. `--trace2cp-combined-mode image`
-  is an experimental alternative that does not require embeddings. It samples
-  oriented local descriptors from the already loaded segment image, compares
-  each candidate descriptor to the start CP, target CP, and previous trace
-  point, and adds the mean descriptor MSE to the direction term. The descriptor
-  defaults to `8 x 16` pixels across/along the fiber, uses a Gaussian blur only
-  along the fiber axis with radius `5`, and applies a centered spatial Gaussian
-  weight during MSE comparison. With `--med-tta`, median-TTA still supplies the
-  direction reference while embedding/image comparisons are sampled in the
-  reference segment patch.
+  or `--trace2cp-use-image` is an experimental alternative that does not
+  require embeddings. It samples oriented local descriptors from the already
+  loaded segment image, compares each candidate descriptor to the start CP,
+  target CP, and previous trace point, and adds the mean descriptor MSE to the
+  direction term. The descriptor defaults to `8 x 16` pixels across/along the
+  fiber, uses a Gaussian blur only along the fiber axis with radius `5`, and
+  applies a centered spatial Gaussian weight during MSE comparison.
+  `--trace2cp-use-presence` can be combined with direction, embedding, or image
+  mode; it samples the sigmoid sheet/fiber-presence probability at each
+  candidate point and adds `1 - presence` weighted by
+  `--trace2cp-combined-presence-weight`. With `--med-tta`, median-TTA still
+  supplies the direction reference while embedding/image/presence comparisons
+  are sampled in the reference segment patch. When presence scoring is active,
+  `trace2cp_vis.jpg` appends a fixed-scale presence column and whole-fiber
+  `trace2cp_fiber_vis.jpg` appends a fixed-scale presence row: `0` is black,
+  `1` is white, invalid pixels are black, and the fiber line, CPs, and selected
+  traces are overlaid.
 - `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` adds an
   experimental short z-search to the combined tracer. The loader builds one
   aligned Trace2CP segment source from the CP-to-CP line window and Lasagna
@@ -325,8 +335,9 @@ The important behavior is:
   are still sampled from the center layer. In image mode, candidate descriptors
   are sampled from the candidate z layer image/mask, the previous descriptor is
   carried from the accepted current layer, and start/target descriptors stay on
-  the center layer. The public `trace2cp_error` remains the target-column y
-  error per horizontal span.
+  the center layer. With `--trace2cp-use-presence`, candidate presence is
+  sampled from the candidate z layer. The public `trace2cp_error` remains the
+  target-column y error per horizontal span.
 - Z-search fusion computes closest approach with
   `abs(dy) + abs(dz_voxels)` and linearly corrects both y and z toward the
   closest-approach midpoint, while both CP z coordinates stay fixed at zero.
@@ -353,8 +364,8 @@ The important behavior is:
   `trace2cp_tta/contact_sheet.jpg`. Each image shows the sampled slice with the
   transformed base-strip corner outline and start/target CP markers.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
-  a first stdout line whose first key is the selected public metric,
-  `trace2cp_error=...`. A second `trace2cp details ...` line carries
+  the selected public metric as a standalone first stdout line:
+  `trace2cp_error=<value>`. A second `trace2cp details ...` line carries
   diagnostics such as target-column raw y error in pixels, horizontal CP span,
   `refine_score`, trace mode, endpoint diagnostics, and per-direction
   scores/statuses. The summary includes metric target-column interpolation

@@ -434,19 +434,23 @@
   TTA direction fields using `--line-trace-tta-count`, default `100`, and
   traces both median-TTA directions in the reference segment strip.
 - Trace2CP supports an optional inspection mode enabled by
-  `--trace2cp-combined`. In this mode the selected traces are produced by a
-  greedy combined direction-plus-embedding scorer rather than by directly
-  stepping along the sampled direction. At each trace step, the tracer samples
-  the current oriented direction, builds a discrete angular fan around it, and
-  evaluates candidate next points. The default fan is `-25..+25` degrees at
-  `1` degree spacing, giving 51 candidates. `--trace2cp-candidate-max-deg` and
-  `--trace2cp-candidate-step-deg` configure the bound and spacing; coarser
-  spacing such as `2` degrees evaluates every second degree within the bound.
-- `--trace2cp-combined-mode embedding` is the default combined scorer. Its
-  candidate score is a weighted sum of four losses: direction disagreement,
-  cosine distance to the previously accepted trace-point embedding, mean
-  cosine distance to the two enclosing Trace2CP CP embeddings, and mean cosine
-  distance to an embedding bank built from all CP embeddings in the same fiber.
+  `--trace2cp-combined` or by any combined-score opt-in flag. In this mode the
+  selected traces are produced by a greedy candidate scorer rather than by
+  directly stepping along the sampled direction. At each trace step, the tracer
+  samples the current oriented direction, builds a discrete angular fan around
+  it, and evaluates candidate next points. The default fan is `-25..+25`
+  degrees at `1` degree spacing, giving 51 candidates.
+  `--trace2cp-candidate-max-deg` and `--trace2cp-candidate-step-deg` configure
+  the bound and spacing; coarser spacing such as `2` degrees evaluates every
+  second degree within the bound.
+- `--trace2cp-combined-mode direction` is the default combined scorer. Its
+  candidate score is direction disagreement only, unless additional score terms
+  are enabled.
+- `--trace2cp-combined-mode embedding` or `--trace2cp-use-embedding` enables
+  embedding similarity. Its embedding score terms are cosine distance to the
+  previously accepted trace-point embedding, mean cosine distance to the two
+  enclosing Trace2CP CP embeddings, and mean cosine distance to an embedding
+  bank built from all CP embeddings in the same fiber.
   The direction disagreement is the average of the candidate step disagreement
   with the current oriented direction and the candidate step disagreement with
   the predicted direction sampled at the candidate point. Candidates whose
@@ -454,8 +458,10 @@
   `--trace2cp-combined-direction-weight`,
   `--trace2cp-combined-last-weight`,
   `--trace2cp-combined-enclosing-weight`, and
-  `--trace2cp-combined-fiber-weight` default to `1.0`.
-- `--trace2cp-combined-mode image` is an experimental alternative scorer that
+  `--trace2cp-combined-fiber-weight` default to `1.0`, but the last,
+  enclosing, and fiber weights are used only in embedding mode.
+- `--trace2cp-combined-mode image` or `--trace2cp-use-image` enables an
+  experimental image-similarity scorer that
   does not require embedding channels. For every candidate it samples a local
   image descriptor from the already loaded Trace2CP segment image, not from a
   display image and not by re-reading the volume. The descriptor is an
@@ -471,6 +477,18 @@
   point. The total image-mode candidate score is
   `direction_weight * direction_loss + image_weight * image_loss`, where
   `--trace2cp-combined-image-weight` defaults to `1.0`.
+- `--trace2cp-use-presence` enables an orthogonal sheet/fiber-presence score
+  term for any combined mode. It samples the sigmoid presence probability at
+  the candidate point using the same bilinear/valid-mask rules as other
+  Trace2CP fields and adds
+  `trace2cp_combined_presence_weight * (1 - presence_probability)` to the
+  candidate score. This requires a checkpoint/model output with a presence
+  channel and fails clearly if the channel is absent. Visualization appends
+  fixed-scale presence debug output when presence scoring is active: single-pair
+  `trace2cp_vis.jpg` gets a presence column, whole-fiber
+  `trace2cp_fiber_vis.jpg` gets a presence row, `0` renders black, `1` renders
+  white, invalid pixels are black, and the fiber line, CPs, and selected traces
+  are overlaid.
 - Embedding combined mode requires a checkpoint/model output with appended
   embedding channels; it must fail clearly rather than silently falling back
   when embeddings are absent. If a non-zero fiber-bank weight is configured and
@@ -527,7 +545,8 @@
   remain center-layer embeddings, so the bank stays comparable with non-z
   combined tracing. In image mode, start/target CP descriptors remain
   center-layer descriptors while candidate and previous descriptors follow the
-  selected candidate/current z layers.
+  selected candidate/current z layers. When presence scoring is enabled, the
+  candidate presence probability is sampled from the candidate z layer.
 - Z-search closest-approach/fusion uses
   `abs(forward_y - reverse_y) + abs(forward_z_voxels - reverse_z_voxels)`,
   with the existing center-distance magnification. The fused CP-to-CP line

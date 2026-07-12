@@ -2,6 +2,10 @@
 
 ## 2026-07-12
 
+- Changed combined Trace2CP CLI/scoring so candidate fan tracing defaults to
+  direction-only, embedding and image similarity are explicit opt-in modes, and
+  `--trace2cp-use-presence` can add sheet/fiber presence maximization to any
+  combined mode.
 - Added optional sheet/fiber presence training for 2D fiber strips: model
   outputs can now include one sigmoid presence channel after the two direction
   channels, trained with balanced CP-positive and reachable non-CP negative BCE

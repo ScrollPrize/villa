@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -644,6 +645,43 @@ def test_trace2cp_overlay_can_add_similarity_debug_column() -> None:
     assert bool(np.any(with_debug[:, -debug_column.shape[1] :, :] != 0))
 
 
+def test_trace2cp_overlay_can_add_presence_column() -> None:
+    field = np.zeros((11, 11, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+    result = _trace_score_trace2cp_bidirectional(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+    image = np.zeros((11, 11), dtype=np.uint8)
+    valid = np.ones((11, 11), dtype=bool)
+    line = np.asarray([[2.0, 4.0], [8.0, 5.0]], dtype=np.float32)
+    presence = np.linspace(0.0, 1.0, 121, dtype=np.float32).reshape(11, 11)
+
+    base = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+    )
+    with_presence = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        presence_debug=presence,
+        valid_mask=valid,
+    )
+
+    assert with_presence.shape[1] > base.shape[1]
+    assert with_presence.shape[0] >= base.shape[0]
+    assert bool(np.any(with_presence[:, -image.shape[1] :, :] != 0))
+
+
 def test_trace2cp_target_column_wins_over_next_rf_margin() -> None:
     field = np.zeros((9, 9, 2), dtype=np.float32)
     field[:, :, 0] = 1.0
@@ -763,6 +801,32 @@ def test_trace2cp_combined_direction_only_selects_center_candidate() -> None:
     assert stats.mean("direction") == pytest.approx(0.0, abs=1.0e-6)
 
 
+def test_trace2cp_combined_direction_only_does_not_require_embeddings() -> None:
+    direction = np.zeros((9, 9, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+
+    line, reason, stats = _trace_combined_direction_line_to_target(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=None,
+        valid_mask=np.ones((9, 9), dtype=bool),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([6.0, 4.0], dtype=np.float32),
+        start_embedding=None,
+        target_embedding=None,
+        fiber_embeddings=None,
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0),
+        candidate_max_degrees=25.0,
+        candidate_step_degrees=1.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason == "target_column"
+    assert np.allclose(line[:, 1], 4.0)
+    assert stats.mean("direction") == pytest.approx(0.0, abs=1.0e-6)
+
+
 def test_trace2cp_combined_embedding_weight_can_choose_off_axis_candidate() -> None:
     direction = np.zeros((11, 11, 2), dtype=np.float32)
     direction[:, :, 0] = 1.0
@@ -790,6 +854,41 @@ def test_trace2cp_combined_embedding_weight_can_choose_off_axis_candidate() -> N
     assert line.shape[0] > 1
     assert line[1, 1] > 4.0
     assert stats.mean("fiber") < 1.0
+
+
+def test_trace2cp_combined_presence_weight_can_choose_off_axis_candidate() -> None:
+    direction = np.zeros((11, 11, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    presence = np.zeros((11, 11), dtype=np.float32)
+    presence[5:, :] = 1.0
+
+    line, _reason, stats = _trace_combined_direction_line_to_target(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=None,
+        presence_hw=presence,
+        valid_mask=np.ones((11, 11), dtype=bool),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([9.0, 4.0], dtype=np.float32),
+        start_embedding=None,
+        target_embedding=None,
+        fiber_embeddings=None,
+        weights=_Trace2CpCombinedWeights(
+            direction=0.0,
+            last=0.0,
+            enclosing=0.0,
+            fiber=0.0,
+            presence=1.0,
+        ),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert line.shape[0] > 1
+    assert line[1, 1] > 4.0
+    assert stats.mean("presence") < 1.0
 
 
 def test_trace2cp_combined_candidate_point_direction_can_choose_off_axis() -> None:
@@ -1631,6 +1730,27 @@ def test_trace2cp_fiber_overlay_composes_pair_results_into_long_strip() -> None:
     assert drawn.shape[0] > first.image.shape[0]
     assert drawn.shape[1] > first.image.shape[1]
     assert bool(np.any(drawn[..., 1] != drawn[..., 0]))
+
+
+def test_trace2cp_fiber_overlay_can_add_presence_row() -> None:
+    first = _fake_trace2cp_pair_evaluation(0, 1)
+    presence = np.linspace(0.0, 1.0, first.image.size, dtype=np.float32).reshape(first.image.shape)
+    first_with_presence = replace(first, presence_debug=presence)
+
+    base = _draw_trace2cp_fiber_overlay(
+        [first],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+    drawn = _draw_trace2cp_fiber_overlay(
+        [first_with_presence],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+
+    assert drawn.shape[0] > base.shape[0]
+    assert drawn.shape[1] == base.shape[1]
+    assert bool(np.any(drawn[-first.image.shape[0] :, :, :] != 0))
 
 
 def test_trace2cp_fiber_overlay_flips_reversed_pair_image_data() -> None:
