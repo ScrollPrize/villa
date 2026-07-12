@@ -12,7 +12,8 @@ This repository contains the source code for Vesuvius Challenge: scroll tools, l
 ## Libraries for Accessing Scrolls
 
 ### [vesuvius](vesuvius/)
-A Python library for accessing CT scans of ancient scrolls.
+A Python library for accessing CT scans of ancient scrolls, and for training and running the ML models used throughout the pipeline (e.g. surface prediction).  
+Model checkpoints are released on [Hugging Face](https://huggingface.co/scrollprize), and training runs are tracked on [Weights & Biases](https://wandb.ai/vesuvius-challenge/projects).
 
 ---
 
