@@ -107,13 +107,13 @@ What it does not contain is information about mappings to different physical obj
 
 To reconstruct a scroll, the first step then is to find efficient and descriptive “representations” of this scan volume which capture the important properties — such as where individual papyrus sheets are — that allow us to unwrap it and read it.
 
-That is why the pipeline is difficult. We are not "enhancing an image." We are reconstructing geometry and extracting text from a damaged carbonized object whose internal structure and connectivity is not given to us.
+That is why the pipeline is difficult. We are reconstructing geometry and extracting text from a damaged carbonized object whose internal structure and connectivity is not given to us.
 
 ***
-## 1\. Scanning: preserving the signal before algorithms see it
-The scrolls are scanned using **synchrotron X-ray micro-computed tomography**, or X-ray micro-CT. The primary difference between a medical CT and the type used to image the scrolls is that we require a significantly higher resolution. To achieve this, we must use a very high power source. The source we use is known as a synchrotron – a type of particle accelerator – which takes electrons and fires them at very high speeds, generating a beam of X-rays, which is shot through the scroll. As the beam moves through the scroll it is differently affected by the materials composing it, which have different densities and properties. Some materials absorb the beam more, some less, and these differences are measured at the detector. This is known as **attenuation contrast**, and can reveal fine details when materials differ in absorbency (e.g. papyrus vs air) The challenge is that the AD 79 eruption of Vesuvius carbonized these scrolls — papyrus and ink alike. Unfortunately for us, carbon ink on carbonized papyrus (both rich in the same element, carbon) provides very little of attenuation contrast, so ink is often not simply "bright" or "dark" in the raw scan.
+## 1\. Scanning: capturing the signal
+The scrolls are scanned using **synchrotron X-ray micro-computed tomography**, or X-ray micro-CT. The primary difference between a medical CT and the type used to image the scrolls is that we require a significantly higher resolution. To achieve this, we must use a very high power source. The source we use is known as a synchrotron – a type of particle accelerator – which takes electrons and fires them at very high speeds, generating a beam of X-rays, which is shot through the scroll. As the beam moves through the scroll it is differently affected by the materials composing it, which have different densities and properties. Some materials absorb the beam more, some less, and these differences are measured at the detector. This is known as **attenuation contrast**, and can reveal fine details when materials differ in absorbency (e.g. papyrus vs air). The eruption of Vesuvius carbonized these scrolls — papyrus and ink alike. Unfortunately for us, carbon ink on carbonized papyrus (both rich in the same element, carbon) provides very little of attenuation contrast, so ink is often not simply "bright" or "dark" in the raw scan.
 
-There is, however, still a signal to be found. Ink may affect the scan in more subtle ways. Texture, morphology, density, and phase effects. Frequently, in some combination of all of them. Teasing out these subtle differences is difficult, and is the primary reason we scan at such high resolutions, and why we continue to invest time and money into ensuring our scans are as good as we can reasonably achieve. 
+There is, however, still a signal to be found. Ink may affect the scan in more subtle ways. Texture, morphology, and phase shifts (derived from the refractive index). Frequently, in some combination of all of them. Teasing out these subtle differences is difficult, and is the primary reason we scan at such high resolutions, and why we continue to invest research time into ensuring our scans are as good as we can reasonably achieve. 
 
 <Figure
   variant="full"
@@ -126,9 +126,9 @@ There is, however, still a signal to be found. Ink may affect the scan in more s
 The subtle differences that distinguish ink from papyrus must be teased out of data like this.
 
 ### The compressed-region problem
-For as long as we’ve been working on these scans, it’s been apparent that some regions of a scroll look worse than the resolution used to scan them would suggest. These patches come out blurred, foggy, "compressed" — papyrus layers that should be cleanly separable become hard to tell apart. When panning through layers, the sheets could almost be seen “behind” this fog. Recent scanning experiments conducted at very high resolutions have finally given us an answer to the question of why these areas exist. 
+For as long as we’ve been working on these scans, it’s been apparent that some regions of a scroll look worse than the resolution used to scan them would suggest. These crops come out blurred, foggy, "compressed" — papyrus layers that should be cleanly separable become hard to tell apart. When panning through layers, the sheets could almost be seen “behind” this fog. Recent scanning experiments conducted at very high resolutions (0.55 µm detector pixel size) have finally given us an answer to the question of why these areas exist. 
 
-The working explanation starts at the fiber level. Carbonized papyrus fibers contain small internal cavities and tubular structures, and when many of them pack together densely, these microscopic structures disturb the X-ray beam enough to create a haze-like degradation. The likely culprit is the carbon itself: carbonized fibers are probably close to graphite, and graphite is a strong decoherer — a material that scrambles the X-ray wavefront rather than passing it through cleanly. The effect is worst in the most densely packed regions, where many fibers contribute to the haze at once.
+The explanation starts at the fiber level. Carbonized papyrus fibers contain small internal cavities and tubular structures, and when many of them pack together densely, these microscopic structures disturb the X-ray beam enough to deviate it a little bit. This effect results into a local haze-like degradation in the scan. The likely culprit is the carbon itself: carbonized fibers are probably close to graphite, and graphite is a strong decoherer — a material that scrambles the X-ray wavefront rather than passing it through cleanly. The effect is worst in the most densely packed regions, where many fibers contribute to the haze at once.
 
 <Figure
   variant="pair"
@@ -154,48 +154,49 @@ The working explanation starts at the fiber level. Carbonized papyrus fibers con
 
  The difficulty of unwrapping scrolls begins here. Blur the boundaries in the scan, and every downstream step gets harder: surface localization (finding the writing surface within the volume) turns noisier, mesh tracing turns less stable, and ink recovery may miss information it needs.
 
-The point isn't that these regions are impossible, but that scan quality is local. A scan can hold excellent regions and nearly-impossible-to-unwrap ones in the very same volume.
+The main point is that scan quality is local. A scan can hold excellent regions and nearly-impossible-to-unwrap ones in the very same volume.
 
 ### Three coupled scan parameters
 Scanning is controlled by several parameters, but three are especially important:
 
 | Parameter | Meaning | Why it matters |
 | :---- | :---- | :---- |
-| **Voxel size** | The physical size represented by each voxel in the reconstructed 3D volume. | Smaller voxels can preserve finer structures, but increase scan time, reconstruction cost, and data size. |
-| **X-ray energy** | The energy of the X-rays used for imaging. | Energy affects penetration, contrast, phase behavior, and how strongly the sample perturbs the beam. |
-| **Sample–detector distance** | The distance between the scroll and the detector after X-rays pass through the object. | This controls how phase effects develop before detection. |
+| **Voxel size** | The physical size represented by each voxel in the reconstructed 3D volume. | Smaller voxels can preserve finer structures, but increase scan time, reconstruction hardships, and data size. |
+| **X-ray energy** | The energy of the X-rays used for imaging. | Energy affects penetration, contrast, phase behavior. |
+| **Sample–detector distance** | The distance between the scroll and the detector after X-rays pass through the object. | This controls how phase shifts develop fringes before detection. |
 
 To understand why the third parameter matters, we must explain **phase contrast**.
 
-X-rays behave like waves. Passing through a material doesn't just absorb them; it also shifts their phase. As the wave-front travels away from the sample and towards the detector, it interferes with itself, generating interference fringes at the detector corresponding to the position where the accumulation of shift in phase started or ended: interface boundaries. The fringes act as a natural “edge enhancement”, and this effect is known as phase contrast. In objects with very little attenuation contrast – like carbonized scrolls – this can be especially useful. A computational step called **phase retrieval** can turn those phase-contrast fringes into a higher-contrast reconstruction; the [Paganin algorithm](https://pubmed.ncbi.nlm.nih.gov/12000561/) is one commonly used method for it.
+X-rays behave like waves. Passing through a material doesn't just absorb them; it also shifts their phase. Different shifts can be induced by different refractive indices of materials in the sample. As the wave-front travels away from the sample and towards the detector, it interferes with itself, generating interference fringes at the detector corresponding to the position where the accumulation of shift in phase started or ended: interface boundaries. The fringes act as a natural “edge enhancement”, and this effect is known as phase contrast. In objects with very little attenuation contrast – like our scrolls – this can be especially useful. A computational step called **phase retrieval** can turn those phase contrast fringes into a higher-contrast reconstruction; the [Paganin algorithm](https://pubmed.ncbi.nlm.nih.gov/12000561/) is one commonly used method for it.
 
-But more phase contrast isn't always better. Push propagation distance too far and the same effect can turn against you, blurring the volume and reducing clarity rather than contributing to it. 
+But more phase contrast isn't always better. Push sample-to-detector propagation distance (a knob that usually is tuned to optimize phase contrast) too far and the same effect can turn against you, blurring the volume and reducing clarity rather than contributing to it. 
 
-The scanning problem is therefore a balance:
+The scanning problem is a balance:
 
 * enough phase contribution to reveal useful structure;    
-* not so much that the scan becomes dominated by haze or fringes;    
+* not so much that the scan becomes dominated by haze or decohesion;    
 * enough X-ray energy to penetrate the object and separate layers;    
-* not so much that useful contrast disappears;    
+* not so much that useful absorption contrast disappears;    
 * and voxels small enough to resolve the structures that matter, without shrinking so far that scanning a full scroll stops being practical.
 
-For recent full-scroll scans (ESRF/BM18), a practical regime has been around **2.4 µm isotropic voxels**, **22 cm propagation distance**, and **about 78 keV average incident energy**. This isn't a universal recipe. Scrolls which are very large or very small may benefit from some tweaks, but we’ve found that this recipe works well in the samples we have scanned to date. 
+For recent full-scroll scans (ESRF/BM18), a practical regime has been around **2.4 µm isotropic voxels**, **22 cm propagation distance**, and **about 78 keV average incident energy**. This isn't a universal recipe. Scrolls which are very large or very small may benefit from some tweaks, but we’ve found that this recipe works well in the samples we have scanned to date. We scanned many samples with a lower resolution configuration which seemed to be "optimal" (but not as good as the first): around **9 µm isotropic voxels**, **1.2 m propagation distance**, and **about 110 keV average incident energy**.
 
 ### Why resolution helps, but does not solve everything
 The most reliable direction so far has been to reduce voxel size. Smaller voxels help in several ways:
 
-* they preserve finer papyrus structure;    
+* they preserve finer papyrus structure;
+* they are less affected by the beam decohesion (haze);    
 * they reduce ambiguity between adjacent layers;    
-* they make surface tracing easier;    
-* they may preserve more of the ink-related morphology.
-
+* they may preserve more of the ink-related morphology;
+* they induce cleaner absorption and phase contrast.
+  
 Given these benefits, it seems fair to ask “why not just scan everything at the highest possible resolution?” 
 
-The curse of dimensionality is why. Perhaps counterintuitively (for those not familiar with 3D volumes),  If voxel size is halved in each dimension, you might think the number of voxels  is simply doubled,  but in actuality it is eight times the voxel count for the same physical volume\! As an example, moving from 8 µm to 2 µm is not a 4× data increase; it is roughly a 64× increase. Moving toward 1 µm for a whole scroll becomes a data, scan-time, motion, and beamline problem.
+The curse of dimensionality is why. Perhaps counterintuitively (for those not familiar with 3D volumes) if voxel size is halved in each dimension, you might think the number of voxels is simply doubled, but in actuality it is eight times the voxel count for the same physical volume\! As an example, moving from 8 µm to 2 µm is not a 4× data increase; it is roughly a 64× increase. Moving toward 1 µm for a whole scroll becomes a data, scan-time, motion, and beamline problem.
 
 Small regions can be scanned at higher resolution. Full scrolls cannot yet be scanned everywhere at sub-micron resolution in a practical production workflow.
 
-Current failures have to be read carefully. Ink not recovered from a scroll doesn't necessarily mean the signal isn't there. It may be absent, or it may be present but not yet exploitable by the current surface placement, labels, model architecture, phase retrieval, or training data. Right now **we do not always know which part of the pipeline is limiting us** and the limiting factor is to be assessed on a scroll-by-scroll basis.
+Current failures have to be read carefully. Ink not recovered from a scroll doesn't necessarily mean the signal isn't there. It may be absent, or it may be present but not yet exploitable by the current surface placement, labels, model architecture, or training data. Right now **we do not always know which part of the pipeline is limiting us** and the limiting factor is to be assessed on a scroll-by-scroll basis.
 
 <Admonition type="danger" icon="⚠️" title="Open problem" className="vc-problem">
 
@@ -205,12 +206,12 @@ Some regions leave the scanner already degraded: densely compressed papyrus scat
 
 ***
 ## 2\. Unwrapping: turning disconnected voxels into a surface
-After scanning, we have voxels, packed together into a *volume* – a large 3D cuboid. The volume does not tell us which voxels belong to the same sheet. It does not tell us where one wrap — one full revolution of the papyrus around the roll — ends and another begins. It does not provide a graph of connectivity. And it does not tell us whether two distant points are part of the same papyrus layer. (This post uses "wrap," "winding," "sheet," and "layer" more or less interchangeably for the same idea: one continuous turn of the papyrus as it spirals from the outside of the roll toward the center.)
+After scanning, we have voxels, packed together into a *volume* – a large 3D cuboid. The volume is a sort of 3D photo: it does not tell us which voxels belong to the same sheet. It does not tell us where one wrap — one full revolution of the papyrus around the roll — ends and another begins. It does not provide a graph of connectivity. And it does not tell us whether two distant points are part of the same papyrus layer. (This post uses "wrap," "winding," "sheet," and "layer" more or less interchangeably for the same idea: one continuous turn of the papyrus as it spirals from the outside of the roll toward the center.)
 
 So the first step in unwrapping a scroll is **surface localization** – finding the writing surface inside a 3D voxel volume.
 
 ### Surface prediction
-A common starting point for  surface localization is **semantic segmentation**: assigning a class label to every voxel — either it’s the recto surface of the papyrus, or the “background”. However, a model trained this way doesn't hand back a finished scroll surface. It outputs a dense 3D prediction that later steps can use as geometric cues.
+A common starting point for surface localization is **semantic segmentation**: assigning a class label to every voxel — either it’s the recto surface of the papyrus, or the “background”. However, a model trained this way doesn't hand back a finished scroll surface. It outputs a dense 3D prediction that later steps can use as geometric cues.
 
 In papyrus terminology, two sides of a sheet are often distinguished. The **recto** is the written surface, its fibers running horizontally, and it's always rolled facing inward, toward the center of the scroll. The **verso** is the back of the papyrus, where the fibers run vertically instead.
 
@@ -235,9 +236,9 @@ Create datasets with labels better localized on the papyrus’ recto or train ML
 
 </Admonition>
 
-Surface predictions are useful, but they are not usable as the final geometry for unwrapping. Dense predictions often contain holes, local deviations, false positives, or accidental mergers between nearby layers. In a normal 2D image segmentation task, a small local error may be tolerable. Here, a small local error can send a traced mesh onto the wrong wrap entirely, with no easy way to recover.
+Surface predictions are useful, but they are not usable as the final geometry for unwrapping. Dense predictions often contain holes, local deviations, false positives, or accidental mergers between nearby layers. In a normal image/volume segmentation task, a small local error may be tolerable. Here, a small local error can send a traced mesh onto the wrong wrap entirely, with no easy way to recover.
 
-That is why the final surface is represented explicitly as a **mesh**.
+Finally, to virtually unwrap the localized surface, we need to represent it explicitly as a **mesh**.
 
 ### Meshes: adding connectivity
 The purpose of the meshing step is to determine the geometrical connectivity of the scroll.  It supplies the necessary information we cannot recover from the voxel grid alone: the ability to say "this point is next to that point, on the same surface."
@@ -254,11 +255,11 @@ The areas we most often see this type of problem are:
 * **compressed regions**, where the image itself gives weak or ambiguous evidence;    
 * **damaged regions**, where the physical papyrus is torn, folded, or missing.
 
-These are not abstract errors. They determine whether a flattened rendering shows a coherent writing surface or a geometrically corrupted one. The community has since built automatic tools that specifically target this failure list:
+These errors determine whether a flattened rendering shows a coherent writing surface or a corrupted one. The community has since built automatic tools that specifically target this failure list:
 
 <Admonition type="tip" icon="🙋" title="How you can help">
 
-If you know classical geometry, optimization, or C++, this is one of the highest-leverage places to contribute. Many errors in the surface predictions can be fixed during or mitigated during the meshing step with either subsequent optimization or post-processing algorithms. Community contributions building alternative, scalable meshing algorithms that attack the current failure modes are encouraged (e.g. [github.com/Hob3rMallow/scrollfiesta\_public](https://github.com/Hob3rMallow/scrollfiesta_public))
+If you know geometry processing, optimization algorithms, or C++, this is one of the highest-leverage places to contribute. Many errors in the surface predictions can be fixed during or mitigated during the meshing step with either subsequent optimization or post-processing algorithms. Community contributions building alternative, scalable meshing algorithms that attack the current failure modes are encouraged (e.g. [github.com/Hob3rMallow/scrollfiesta\_public](https://github.com/Hob3rMallow/scrollfiesta_public))
 
 </Admonition>
 ### Surface mesh representations
@@ -298,7 +299,7 @@ To trace a surface [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-
 
 VC3D needs local orientation information to trace surfaces well. A **normal** is simply a vector perpendicular to a surface — for a papyrus sheet, that means it points straight "out of" the sheet. Stack a coarse 3D field of these local orientations together and you get a **normal grid**, which helps guide mesh growth. A dedicated tool, [vc\_gen\_normalgrids](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_gen_normalgrids.cpp), generates, converts, and builds resolution pyramids of these normal grids from the CT volume.
 
-The workflow can then use routines such as **GrowPatch**. A GrowPatch-style routine starts from a seed point or an existing patch and extends a local mesh along the predicted surface. Recall the trail discussed in the [previous section](#meshes-adding-connectivity). GrowPatch attempts to follow this trail, iteratively. Mathematically, this means never optimizing for just one thing: the routine attempts to follow the predicted papyrus surface, keep the local geometry smooth, hold mesh spacing to something reasonable, follow whatever local orientation evidence is available, and resist the pull of a nearby sheet it could easily jump onto instead.
+The workflow can then use routines such as **GrowPatch**. A GrowPatch-style routine starts from a seed point or an existing patch and extends a local mesh along the predicted surface. Recall the trail discussed in the [previous section](#meshes-adding-connectivity). GrowPatch attempts to follow this trail, iteratively. Mathematically, this means optimizing concurrently for a combination of objectives: to follow the predicted papyrus surface, keep the local geometry smooth, hold mesh spacing to something reasonable, follow whatever local orientation evidence is available, and resist the pull of a nearby sheet it could easily jump onto instead.
 
 <Figure
   variant="full"
@@ -310,19 +311,19 @@ The workflow can then use routines such as **GrowPatch**. A GrowPatch-style rout
 
 This works well when the prediction is clean and the layers are separable. But it fails when the prediction topology does not match the real papyrus topology (e.g. because some predicted sheets incorrectly merge in the surface prediction volume). In practice, automatic growth still needs human inspection and correction.
 
-The current system is therefore best described as **semi-automated**, rather than fully automatic unwrapping.
+The current system is therefore best described as **semi-automated**.
 
 ### Copy Out/In: exploiting neighboring wraps
 Once one wrap has been traced well, nearby wraps further in or out may have similar local curvature. The Copy Out/In workflow exploits that fact. It uses an existing mesh as a geometric reference and tries to transfer or offset the tracing to a neighboring layer, implemented in [vc\_grow\_seg\_from\_seed.cpp](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_grow_seg_from_seed.cpp) and [GrowPatch.cpp](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/core/src/GrowPatch.cpp).
 
-This is powerful because scrolls are locally structured. Adjacent wraps often resemble each other. But it is also risky: if the source mesh contains a local error, that error can propagate. So Copy Out/In is useful as an acceleration tool, not as an unchecked replacement for validation.
+This is powerful because adjacent wraps often resemble each other. But it is also risky: if the source mesh contains a local error, that error can propagate. So Copy Out/In is useful as an acceleration tool, not as an unchecked replacement for validation.
 
 A "neural" learnt version of the copy out/in also exists, implemented in [infer\_rowcol\_triplet\_wraps.py](https://github.com/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/neural_tracing/inference/infer_rowcol_triplet_wraps.py) and released as the [copy\_displacement\_latest](https://huggingface.co/scrollprize/copy_displacement_latest) checkpoint on Hugging Face (trained on 2.4 µm data downscaled once → 4.8 µm).
 
 This method is exposed in the VC3D interface through a dedicated Neural Tracer panel. A baseline checkpoint, [ps256\_copy\_baseline](https://huggingface.co/scrollprize/ps256_copy_baseline), is also available for comparison against the actively used copy\_displacement\_latest, and the panel itself is implemented in [SegmentationNeuralTracerPanel.cpp](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/VC3D/segmentation/panels/SegmentationNeuralTracerPanel.cpp).
 
 ### Lasagna: smoother optimization of one or more sheets
-The **lasagna** is an alternative to GrowPatch and copy out/in. It provides a cleaner and more flexible optimization framework for solving the same problem of creating surface meshes semi-automatically. It can better fit complex, curved regions of the scroll, at the expense of being somewhat more computationally expensive.
+The **lasagna** is an alternative to GrowPatch and copy out/in. It provides a more flexible optimization framework for solving the same problem of creating surface meshes semi-automatically. It can better fit complex, curved regions of the scroll, at the expense of being somewhat more computationally intensive.
 
 The lasagna can (optionally) optimize several stacked sheets at the same time, so they are all consistent with each other; as such it can be used similarly to GrowPatch followed by copy out/in. Other modes include making local corrections so a 'draft' surface is moved closer to the true surface while keeping certain points fixed. In all cases, surfaces (represented as a stack of non-intersecting quad-meshes — quad-faced grids of vertices, more on why below) are iteratively adjusted to agree with prediction volumes as closely as possible, and also with user-provided 'correction points' that define locations known to be on the papyrus surface.
 
@@ -334,15 +335,15 @@ The lasagna can (optionally) optimize several stacked sheets at the same time, s
   caption="VC3D workspace showing semi-global optimization of multiple adjacent mesh layers linked together (the lasagna's multi-sheet joint optimization), across four synchronized views, with “true”/“false” annotations marking a correction in progress."
 />
 
-The lasagna needs richer prediction volumes than a plain recto surface prediction can offer: a dense normal volume predicted by a U-Net, and a surface density (called 'gradient magnitude') volume that represents how closely spaced the papyrus windings are. The second one works like this: a second U-Net predicts a **fractional winding position** field for every voxel — essentially "how much further out in the scroll do we get, moving from one side of this voxel to the other point, expressed as a fraction of one full winding." That field is built from distance transforms to sheet skeletons, then normalized into a monotone field via iterative weighted averaging. Gradient magnitude is just the spatial gradient of that field: how fast winding position changes as you move through space. Integrate it along a short strip between two points and you get the number of windings crossed to go from one to the other — which is why it doubles as a proxy for winding spacing. High gradient magnitude means sheets are packed tightly together locally; low means they're far apart.
+The lasagna needs richer prediction volumes than a plain recto surface prediction can offer: a dense normal volume predicted by a U-Net, and a surface density (called 'gradient magnitude') volume that represents how closely spaced the papyrus windings are. The second one works like this: a second U-Net predicts a **fractional winding position** field for every voxel — essentially "how much further out in the scroll do we get, moving from one side of this voxel to the other point, expressed as a fraction of one full winding." That field is built from distance transforms to sheet skeletons, then normalized into a monotone field via iterative weighted averaging. Gradient magnitude tells how fast winding position changes as you move through space. Integrate this along a short strip between two points and you get the number of windings crossed to go from one to the other — which is why it doubles as a proxy for winding spacing. High gradient magnitude means sheets are packed tightly together locally; low means they're far apart.
 
-Technically, the lasagna can do a global optimization of the entire local surface (or surfaces) via gradient-based optimization ([Adam](https://arxiv.org/abs/1412.6980)), implemented using PyTorch. Note that this is a different sense of "gradient" from the gradient-magnitude volume above: this is the gradient of a loss function with respect to the surface's own coordinates, computed during optimization, not a measure of image edge strength. GrowPatch, by contrast, uses [Ceres](http://ceres-solver.org) — a classical nonlinear least-squares solver of the kind widely used in robotics and computer vision — inside an iterative growth loop that adds quads progressively and repeatedly re-optimizes an outer fringe.
+Technically, the lasagna can do a global optimization of the entire local surface (or surfaces), implemented using PyTorch. GrowPatch, by contrast, uses [Ceres](http://ceres-solver.org) — a classical nonlinear least-squares solver of the kind widely used in robotics and computer vision — inside an iterative growth loop that adds quads progressively and repeatedly re-optimizes an outer fringe.
 
 The predicted volumes (normals, etc.) that are used as input to the main lasagna surface optimization can also be used to trace fibers, i.e. to semi-automatically follow the lines of papyrus fibers through the 3D volume, given sparse human-specified keypoints.
 
 The full lasagna codebase lives at [github.com/ScrollPrize/villa/tree/main/lasagna](https://github.com/ScrollPrize/villa/tree/main/lasagna).
 
-### 2D Parameterization and Flattening: the easier problem after the hard one
+### 2D Parameterization and Flattening
 Flattening takes each point on the 3D mesh and assigns it a 2D coordinate. The same trick as making a flat map from a curved globe, but in our case we are aiming to preserve local distances as much as possible: we are looking for a transformation from 3D \-\> 2D which is isometric. 
 
 <Figure
@@ -355,11 +356,12 @@ Flattening takes each point on the 3D mesh and assigns it a 2D coordinate. The s
 VC3D's current production flattening tool is [flatboi](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/libs/flatboi/flatboi.cpp), which uses **[SLIM](https://igl.ethz.ch/projects/slim/) (Scalable Locally Injective Mappings)**, minimizing the Symmetric Dirichlet Energy (which is small the lower the isometric distortion induced by the map).
 
 ### Fibers as connectivity clues
-Papyrus is made of fibers. These fibers are not just texture; they carry geometric information.
+Papyrus is made of fibers. These fibers carry geometric information.
 
-If you recall from the flattening step, to get a mapping from 3D space to 2D space, we can map our 3D points in rows and columns in the correct order (preserving distances) – in the parameterized space these rows and columns “axes” are usually called U and V. Conveniently, a papyrus sheet has these axis “physically” defined\! Within each sheet are vascular bundles oriented vertically or horizontally and each one – if perfectly segmented –  could be used directly as an individual row or column. Amazing\! The papyrus sheet itself is providing a direct way to parametrize its surface\! 
+If you recall from the flattening step, to get a mapping from 3D space to 2D space, we can map our 3D points in rows and columns in the correct order (preserving distances) – in the parameterized space these rows and columns “axes” are usually called U and V. Conveniently, a papyrus sheet has these axis “physically” defined\! Within each sheet are vascular bundles oriented vertically or horizontally and each one – if perfectly segmented –  could be used directly as an individual row or column. Amazing\! The papyrus sheet itself is providing a direct way to parametrize its surface\!
 
 If we can manage to trace the fibers, we can directly obtain oriented axes in the papyrus. This information can not only help us to flatten the segmented sheets, but also to segment the surface itself\!
+Unfortunately, if you recall the Scanning section, beam decohesion on fibers is also what makes the volume blurrier. So fibers can be both a blessing and a curse.
 
 <Figure
   variant="full"
@@ -378,15 +380,13 @@ These annotations were voxelized and used to train a semantic segmentation model
 
 Since we rescanned some of the old scrolls with the new protocol at ESRF, it can be important to match both labels and predictions.
 
-**Cross-frame training** is the key: training on two volumes that live in different coordinate frames at once, bridged by an explicit geometric transform. A new dataset class, CrossFrameZarrDataset ([cross\_frame\_dataset.py](https://github.com/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/models/datasets/cross_frame_dataset.py)), does so using a transform.json sidecar file that records the affine transform — a combination of rotation, scaling, and translation — between the old annotation's frame and the new scan's.
-
-For every training crop, the dataset finds foreground patches using the old annotation's own voxel coordinates, then resamples the matching region of the new, high-resolution scan through the inverse of that transform to line up with it — the new scan bends to meet the old label, not the other way around.
+With **cross-frame training** we can work with volumes that live in different coordinate frames at once, bridged by an affine transform — a combination of rotation, scaling, and translation. A new dataset class, CrossFrameZarrDataset ([cross\_frame\_dataset.py](https://github.com/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/models/datasets/cross_frame_dataset.py)), does so using a transform.json sidecar file that records the map between the old annotation's frame and the new scan's.
 
 The main problem is obtaining, either through direct tracing or through semantic/instance segmentation, a way to identify and separate long fibers with the right connectivity. The same problem is shared in **connectomics** — the field that reconstructs a brain's wiring diagram by tracing individual axons and dendrites through teravoxel-scale 3D electron-microscopy volumes.
 
 <Admonition type="tip" icon="🙋" title="How you can help">
 
-If you know classical computer vision or fiber/curve-following techniques, conservative fiber tracing is exactly this kind of problem. The goal should be reliable connections — a tracer that confidently follows fewer fibers correctly is more useful than one that follows more fibers with a higher error rate.
+If you know classical computer vision or point tracking techniques, robust fiber tracing is exactly this kind of problem. The goal should be reliable connections — a tracer that confidently follows fewer fibers correctly is more useful than one that follows more fibers with a higher error rate.
 
 </Admonition>
 ### Spiral fit: a global prior
@@ -414,7 +414,7 @@ A global prior can organize and regularize geometry, allowing a single consisten
 Devise better evaluation suites and loss functions to fit the spiral. Increase its expressivity and reduce the number of needed annotations. Most importantly, relative winding number annotations seem to have a great impact on the spiral fit. Automating these procedures will boost scalability by a great extent\!
 
 </Admonition>
-### Label quality: the main unwrapping bottleneck
+### Label quality: one of the main unwrapping bottlenecks
 Machine learning needs labels. For surface models, those labels often come from human-generated meshes or annotations — enormously valuable, but approximate. They may wiggle. They may drift slightly off the true surface. They may avoid the most ambiguous regions. This is also valid for manually or semi-automatically traced fibers. They may represent the best usable tracing rather than exact truth.
 
 This creates a subtle problem: the model isn't always learning the physical feature itself. It's learning from an imperfect representation of that feature.
@@ -443,7 +443,7 @@ If you have experience with 3D annotation, active learning, or data-quality work
 
 </Admonition>
 ***
-## 3\. Ink recovery: detecting what is written
+## 3\. Ink recovery: reading the scrolls
 Once the surface is traced and flattened, the next question is: where is the ink?
 
 The phrase **ink detection** is widely used, but there are two related tasks:
@@ -451,7 +451,7 @@ The phrase **ink detection** is widely used, but there are two related tasks:
 * **Ink detection**: decide whether ink is present in a region.    
 * **Ink segmentation**: locate the ink precisely, ideally in 3D.
 
-For an ideal pipeline, ink segmentation is the cleaner target. We would like to say: these voxels correspond to ink, these do not. But usually, the ink signal is too subtle for direct voxel-level annotation. That is why the current pipeline often uses models that work on surface-conditioned renders or surface volumes.
+For an ideal pipeline, ink segmentation is the cleaner target. We would like to say: these voxels correspond to ink, these do not. But usually, the ink signal is too subtle for direct voxel-level annotation. That is why the current pipeline often uses models that work on surface-conditioned renders (also called surface volumes).
 
 A surface-conditioned render, or a surface volume, is a flattened 3D subvolume centered on a segmented sheet surface. Using the mesh’s 2D flattened coordinates, each point on the sheet is mapped back into the original CT volume. The center layer corresponds to the sheet surface, while additional layers are sampled at positive and negative voxel offsets along the local surface normal. This produces an image stack where the curved papyrus surface is represented as a flat layer, making nearby material and possible ink easier to inspect or process.
 
@@ -482,7 +482,7 @@ Working on surface-conditioned renders of the fragments’ outer sheet, the mode
   caption="How a fragment becomes a training pair: the fragment (a) is photographed in infrared (e) and CT-scanned (b); a mesh of its exposed surface (c) extracts a flattened surface volume used as the model input (d), while the aligned IR photograph provides the 2D ink labels (f, g)."
 />
 
-This design makes sense because fragment labels are 2D: the photograph tells us where ink appears on the exposed surface, but not exactly where the ink signal sits in depth inside the CT volume.
+However, fragment labels are 2D: the photograph tells us where ink appears on the exposed surface, but not exactly where the ink signal sits in depth inside the CT volume.
 
 The model is not OCR. It is not given Greek words, transcriptions, dictionaries, or language-model targets. It learns local CT texture and morphology associated with ink labels.
 
@@ -537,9 +537,9 @@ The square brackets follow classics and papyrology's standard "Leiden Convention
 
 What happens if the models don’t generalize? The right conclusion here is neither "the scan failed" nor "the model failed." At the moment, several explanations remain possible:
 
-* the scan may not preserve the relevant signal strongly enough;    
-* the surface may be slightly misplaced;    
-* the labels may not match the true location of the ink signal;    
+* the scan may not capture the relevant signal strongly enough;    
+* the surface may be slightly misplaced (suboptimally localized);    
+* the ink labels may not match the true location of the ink signal;    
 * the model architecture may not be exploiting the right features;    
 * the ink morphology or chemistry may differ across scrolls;    
 * the signal may be present but below the current pipeline's ability to use it.
@@ -565,9 +565,9 @@ Useful community contributions should therefore be cloud-native from the beginni
 But a list of good habits only matters if the infrastructure to support them exists. It does: VC3D already supports streaming volumes directly from our open data bucket at s3://vesuvius-challenge-open-data/. It's hosted for free via the AWS Open Data Program, browsable at https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html, and stored as cloud-optimized OME-Zarr so tools can read only the region they need instead of downloading full volumes.
 
 ## Future directions
-Densely labeled 3D training data is the bottleneck. The CT volumes are enormous, but trusted voxel-level labels are scarce.
+Densely labeled 3D training data is the bottleneck. The CT volumes are enormous and trusted voxel-level labels are scarce.
 
-Several future directions try to work around that bottleneck: first by learning useful 3D representations without dense labels, then by using those representations or frozen teacher models to generate better training targets, and finally by directly segmenting ink when the CT signal is strong enough.
+Several future directions try to work around that bottleneck: first by learning useful 3D representations without dense labels, then by using those representations (often via frozen teacher models) to generate better training targets, and finally by directly segmenting ink when the CT signal is strong enough.
 
 ### Self-supervised 3D representations
 A major direction is **self-supervised learning**.
@@ -582,11 +582,11 @@ This is especially attractive for our data because the volumes are enormous and 
 
 **DINO-guided segmentation targets**
 
-Labels derived from DINO embeddings in the scroll domain are usually either coarse or noisy. Still, they can be used as segmentation targets to train UNet models. The convolutional layers inside the nnUNet will learn a finer and accurate representation, and will likely be able to perform precise segmentation. 
+Labels derived from DINO embeddings in the scroll domain are usually either coarse or noisy. Still, they can be used as segmentation targets to train UNet models. The convolutional layers inside the UNet will learn a finer and accurate representation, and will likely be able to perform precise segmentation. 
 
 Sometimes, before training directly an UNet, it could be worth “reinforcing” the embedding of the feature you want to label, using a minimal amount of manual input. For instance, one can use **supervised contrastive learning:** using a small set of labels (e.g, air, fiber, and an "ignore" class) to pull same-class embeddings together and push different-class ones apart. We did it on the PHerc. Paris 4 2.4 µm scan, and the fine-tuned DINO model is shared here: [dinovol\_v2\_ps8\_supcon3class\_step362500](https://huggingface.co/scrollprize/dinovol_v2_ps8_supcon3class_step362500)
 
-We used this frozen checkpoint to guide a 2-class background/fiber segmentation model.[fiber\_dinoguided\_2class\_step010000](https://huggingface.co/scrollprize/fiber_dinoguided_2class_step010000). "DINO-guided" doesn't mean what it might sound like: DINO isn't wired into this model's own architecture or forward pass. It's used externally, as a similarity signal for building the model's own training target. The training target itself is regenerated dynamically at every step: an ordinary intensity threshold (Otsu's method, the standard way to automatically pick the cutoff that separates an image into two classes) blended with cosine similarity (how closely two embedding vectors point in the same direction) between each voxel's embedding and a reference fiber embedding.
+We used this frozen checkpoint to guide a 2-class background/fiber segmentation model.[fiber\_dinoguided\_2class\_step010000](https://huggingface.co/scrollprize/fiber_dinoguided_2class_step010000). "DINO-guided" doesn't mean what it might sound like: DINO isn't wired into this model's own architecture or forward pass. It's used externally, as a similarity signal for building the model's own training target. The training target itself is regenerated dynamically at every step. It can be blended with cosine similarity between each voxel's DINO generated embedding and a reference fiber embedding.
 
 <Figure
   variant="full"
@@ -620,7 +620,7 @@ Careful\! The 3D UNet segmentation model for ink segmentation was not only DINO 
 
 <Admonition type="tip" icon="🙋" title="How you can help">
 
-If you work in 3D deep learning — segmentation, self-supervised learning, U-Nets — this is a natural fit. When ink is visible or can be localized confidently, as in PHerc. Paris 4 above, the cleanest formulation is voxel-level ink segmentation: it could reduce the ambiguity that 2D-projected fragment labels otherwise introduce, giving the model a direct target instead of an indirect one.
+If you work in 3D deep learning — segmentation, self-supervised learning, U-Nets — this is a natural fit. When ink is visible or can be localized confidently, as in PHerc. Paris 4 above, the cleanest formulation is voxel-level ink segmentation: it could reduce the ambiguity that 2D-projected labels otherwise introduce, giving the model a direct target instead of an indirect one.
 
 </Admonition>
 ### Self-distillation without ground truth
@@ -672,15 +672,15 @@ The pipeline works, but not without a person checking its output at almost every
 | Cross-scroll generalization | Ink models may work on one scroll but not another. | Fragment training plus scroll-specific pseudo-labeling. | Multi-scroll training, better labels, stronger diagnostics. |
 | Data scale | Scroll volumes are too large for ordinary local workflows. | OME-Zarr, chunked processing, cloud storage. | Reproducible streaming pipelines and cheaper compute/storage paths. |
 
-One step forward on cross-scroll generalization came from an unusual source: an autonomous agent swarm, inspired by the open-source karpathy/autoresearch project (released March 2026\) and adapted internally for ink-detection model architectures. Running several agents continuously, the system found a configuration that nearly doubled the validation Dice score on PHerc. 1667 while training only on PHerc. 139 data — a genuine cross-scroll generalization improvement.
+One step forward on cross-scroll generalization came from an unusual source: an autonomous agent swarm, inspired by the open-source karpathy/autoresearch project (released March 2026\) and adapted internally for ink-detection model architectures. Running several agents continuously, the system found a configuration that nearly doubled the validation Dice score (computed on pseudo-labels) on PHerc. 1667 while training only on PHerc. 139 data — a genuine cross-scroll generalization improvement.
 
 ***
 ## 6\. What’s next?
-Nobody here is claiming final victory. What's changed is that the bottlenecks are now much clearer.
+We cant claim final victory. What's changed is that the bottlenecks are now much clearer.
 
 We know that a sealed Herculaneum scroll can be virtually unwrapped and read. We know that high-resolution scanning can make previously elusive ink more visible. We know that direct volumetric ink segmentation is possible in favorable cases. We know that fragment-trained models can generalize far enough to bootstrap scroll-specific reading. We know that semi-automated geometry tools can drastically accelerate tracing, even though human correction remains necessary.
 
-But the next goal is harder to name than any single breakthrough: making all of this reliable, on any scroll, without someone catching every failure by hand.
+But the next goal is harder to name than any single breakthrough: making all of this reliable, on any scroll, without someone catching every failure.
 
 Can we choose scan parameters that preserve useful signals across scrolls? Can we infer surfaces from voxels without months of correction? Can we reduce the dependence on approximate labels, and reliably tell "no ink" apart from "no ink recovered yet"? And can we make the whole workflow reproducible enough for collection-scale reading?
 
