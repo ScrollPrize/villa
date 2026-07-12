@@ -200,6 +200,18 @@
 - VC3D also writes persistent-cache `.empty` markers as zero-byte files and reads them by existence.
 - Prefetch performs global chunk deduplication by store identity and chunk key before network work.
 - Prefetch runs parallel dependency producers plus bounded chunk download workers; download worker count is controlled by `prefetch_workers` without an additional hard-coded cap, and dependency/sampler producer count is controlled by `prefetch_sampler_workers`.
+- During prefetch, PyTorch CPU intra-op threads are temporarily forced to `1`
+  while dependency producers run, then restored. This prevents each producer
+  from fanning out over the full machine and makes `prefetch_sampler_workers`
+  the practical CPU-side source/dependency generation limit.
+- Prefetch may generate dependency requests with parallel producers, but producer
+  results are consumed in raw deterministic sample-index order before chunks are
+  classified or enqueued for download.
+- Prefetch schedules not-yet-submitted chunk downloads by the earliest raw
+  deterministic sample index that requested the chunk. This keeps downloads as
+  close as practical to `idx` order and avoids burying earlier-sample chunks
+  behind a large later-sample executor backlog. Transfers already active are
+  not cancelled or restarted for reprioritization.
 - Prefetch reports sample/dependency progress only while dependency generation is incomplete; once all requested samples have been processed or skipped, live progress reports only download progress. The live progress includes unique chunks, cache hits, known-missing chunks, downloaded chunks, queued download futures, configured transfer worker count, configured sampler/dependency producer count, skipped samples, errors, and MiB/s. The download denominator is the number of chunks that were not cache hits or pre-existing `.empty` markers and therefore needed fetch/missing resolution. While dependency generation is incomplete, download ETA extrapolates from observed chunks per sample and observed cache-hit/known-missing/download-needed ratios.
 - Prefetch reports skipped invalid samples separately from download errors and includes the first skip reason.
 - If prefetch hits a fatal producer error, queued producer/download futures are cancelled so shutdown does not wait on a large stale download backlog.

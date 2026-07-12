@@ -2,6 +2,12 @@
 
 ## 2026-07-12
 
+- Changed `fiber_trace_2d` prefetch scheduling so missing chunk downloads that
+  are not yet active are prioritized by the earliest raw deterministic sample
+  index that needs them, helping the reported cached-prefix `idx` advance
+  sooner during top-view-inclusive prefetch; prefetch also temporarily caps
+  PyTorch CPU intra-op generation fanout so `prefetch_sampler_workers` is the
+  practical source/dependency generation limit.
 - Added optional joint top-view training for `fiber_trace_2d`: a second
   direction model consumes VC3D-style top-strip slices and trains a sigmoid
   distance-transform channel along the CP normal line, with TensorBoard

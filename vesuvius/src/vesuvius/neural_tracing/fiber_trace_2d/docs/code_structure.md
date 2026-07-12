@@ -570,7 +570,9 @@ Top-level keys used by `load_config`:
   allowed and are not clamped by the loader.
 - `prefetch_sampler_workers`: dependency/sampler producer-worker count for
   prefetch. This limits CPU-side CP-local source generation separately from
-  download concurrency.
+  download concurrency. During prefetch, PyTorch CPU intra-op threads are
+  temporarily forced to `1` and restored afterwards, so producer workers do not
+  each expand over the full machine.
 - `loader_workers`: CP-sample worker count for `load_batch`. The default is
   the logical CPU count. Set `loader_workers: 1` for serial debugging. Parallel
   workers evaluate candidates concurrently, but accepted batch output remains
@@ -1006,15 +1008,24 @@ by prefetch.
 
 - builds the shared CP-local source once per deterministic sample index;
 - derives each configured strip-z offset from that source;
+- temporarily caps PyTorch CPU intra-op fanout during dependency generation so
+  `prefetch_sampler_workers` is the effective generation concurrency limit;
 - sends the source-envelope coordinates to `chunk_requests_for_coords`, which
   maps them to dependency-only base-volume chunk metadata;
 - deduplicates globally by `(store_identity, key)`;
+- may run dependency producers in parallel, but consumes their completed
+  results in raw deterministic sample-index order before classifying chunks;
 - treats existing VC3D persistent-cache data files as hits;
 - treats existing `<cache>/level_<level>/<iz>/<iy>/<ix>.empty` files as
   known-missing hits;
 - fetches only still-missing direct-source chunks with bounded Python workers,
   writes data through unique temp files followed by atomic rename, and writes
   zero-byte `.empty` markers for definitive missing chunks;
+- keeps not-yet-submitted downloads in a priority queue keyed by the earliest
+  raw deterministic sample index that needs each chunk. This prevents later
+  dependency producers from flooding the download executor ahead of chunks that
+  would advance the reported `idx` prefix. Already-active transfers are allowed
+  to finish instead of being cancelled for reprioritization;
 - prints sample/dependency progress only while dependency generation is still
   running, then switches to download-only progress. The live line includes
   unique chunks, cache hits, known-missing chunks, downloaded chunks, queued

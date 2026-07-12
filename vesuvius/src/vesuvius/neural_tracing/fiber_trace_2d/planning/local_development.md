@@ -155,7 +155,9 @@ cache-complete prefix.
 Use `prefetch_sampler_workers` to limit CPU-side dependency/source generation
 without reducing download concurrency. `prefetch_workers` controls chunk
 download workers; `prefetch_sampler_workers` controls the producer threads that
-build CP-local source strips and collect chunk dependencies.
+build CP-local source strips and collect chunk dependencies. Prefetch
+temporarily forces PyTorch CPU intra-op threads to `1` and restores the previous
+value afterward, so each producer does not fan out over the full machine.
 
 `strip_coord_cache_dir` enables a separate CP-local source-coordinate cache.
 This is not the remote Zarr chunk cache. It stores the torch-vectorized source

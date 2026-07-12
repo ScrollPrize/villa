@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import math
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -4078,6 +4079,102 @@ def test_prefetch_sampler_workers_limits_dependency_producers(
 
     assert summary["workers"] == 8
     assert summary["producer_workers"] == 2
+
+
+def test_prefetch_limits_and_restores_torch_cpu_threads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["prefetch_sampler_workers"] = 4
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    thread_state = {"value": 32}
+    calls: list[int] = []
+
+    def get_num_threads() -> int:
+        return int(thread_state["value"])
+
+    def set_num_threads(value: int) -> None:
+        thread_state["value"] = int(value)
+        calls.append(int(value))
+
+    monkeypatch.setattr(loader_module.torch, "get_num_threads", get_num_threads)
+    monkeypatch.setattr(loader_module.torch, "set_num_threads", set_num_threads)
+    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", lambda coords, valid: [])
+
+    summary = loader.prefetch(0, 1, workers=1)
+
+    assert calls == [1, 32]
+    assert thread_state["value"] == 32
+    assert summary["producer_workers"] == 1
+
+
+def test_prefetch_prioritizes_pending_downloads_by_earliest_sample(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["prefetch_sampler_workers"] = 2
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    class Store:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+            self.calls: list[str] = []
+
+    store = Store(tmp_path / "cache")
+    store.root.mkdir(parents=True)
+    sample_one_requests_seen = threading.Event()
+
+    def downloader(request: ZarrChunkRequest) -> bytes:
+        store.calls.append(request.key)
+        return request.key.encode("utf-8")
+
+    def request(key: str) -> ZarrChunkRequest:
+        return ZarrChunkRequest(
+            store=store,
+            store_identity="priority",
+            key=key,
+            cache_path=store.root / f"{key}.bin",
+            empty_path=store.root / f"{key}.empty",
+            remote_url=f"https://example.invalid/{key}",
+            cache_payload_format="source_bytes",
+            downloader=downloader,
+        )
+
+    class Sampler:
+        def chunk_requests_for_coords(self, coords, valid):
+            del valid
+            sample_index = int(coords[0, 0, 0])
+            if sample_index == 0:
+                return [request("sample_0")]
+            sample_one_requests_seen.set()
+            return [request("sample_1_active"), request("sample_1_pending")]
+
+    sampler = Sampler()
+
+    def build_strip_source(sample_index: int, **kwargs):
+        del kwargs
+        if int(sample_index) == 0:
+            sample_one_requests_seen.wait(timeout=2.0)
+        return SimpleNamespace(sample_index=int(sample_index), record=SimpleNamespace(sampler=sampler))
+
+    def prefetch_envelope_coords_from_source(source, offset_index):
+        del offset_index
+        coords = np.asarray([[[float(source.sample_index), 0.0, 0.0]]], dtype=np.float32)
+        valid = np.ones((1, 1), dtype=bool)
+        return coords, valid
+
+    monkeypatch.setattr(loader, "build_strip_source", build_strip_source)
+    monkeypatch.setattr(loader, "_prefetch_envelope_coords_from_source", prefetch_envelope_coords_from_source)
+
+    summary = loader.prefetch(0, 2, workers=1)
+
+    assert store.calls == ["sample_0", "sample_1_active", "sample_1_pending"]
+    assert summary["downloaded"] == 3
+    assert summary["max_exclusive_sample_index"] == 2
 
 
 def test_prefetch_skips_invalid_sample_construction(
