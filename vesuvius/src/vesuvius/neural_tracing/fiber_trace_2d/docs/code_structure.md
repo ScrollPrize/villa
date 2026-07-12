@@ -370,9 +370,14 @@ The important behavior is:
   It samples top-strip offsets `-4..+4` selected-scale voxels around the
   z-corrected fused trace when available, otherwise around the central-z fused
   trace. Each offset layer is inferred by the top model, and each displayed
-  direction comes from the valid layer whose decoded direction is most
-  image-horizontal. The panel is diagnostic only and does not change scoring or
-  z-layer selection.
+  direction is the normalized median of valid layer directions within
+  45 degrees of image-horizontal after aligning the Lasagna-ambiguous signs.
+  The panel also draws two equally weighted top traces through that fused
+  direction field, from each CP toward the other CP's x column. Those traces
+  resolve ambiguous direction signs before bilinear interpolation by flipping
+  each of the four neighboring pixel direction samples, if needed, to agree
+  with the current trace direction. The panel is diagnostic only and does not
+  change scoring or z-layer selection.
 - `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` adds an
   experimental short z-search to the combined tracer. The loader builds one
   aligned Trace2CP segment source from the CP-to-CP line window and Lasagna

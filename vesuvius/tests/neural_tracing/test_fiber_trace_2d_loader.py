@@ -86,6 +86,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _Trace2CpResult,
     _TtaDirectionField,
     _bilinear_direction_sample,
+    _bilinear_direction_sample_ambiguous,
     _bilinear_embedding_sample,
     _build_dir_vis_center_patch,
     _trace2cp_candidate_angles_degrees,
@@ -133,7 +134,8 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_z_layer_tiff_stack,
     _trace2cp_image_descriptor,
     _trace2cp_image_descriptor_loss,
-    _trace2cp_select_horizontal_best_direction,
+    _trace2cp_select_horizontal_median_direction,
+    _trace2cp_top_direction_traces,
     _load_top_direction_model_from_checkpoint,
     _trace_combined_image_line_to_target,
     _trace_combined_image_line_to_target_z,
@@ -287,6 +289,25 @@ def test_line_trace_bilinear_direction_sample_normalizes() -> None:
 
     assert sampled is not None
     assert np.allclose(sampled, [1.0, 0.0])
+
+
+def test_line_trace_bilinear_direction_sample_ambiguous_aligns_neighbor_samples_before_interpolation() -> None:
+    field = np.zeros((2, 2, 2), dtype=np.float32)
+    field[0, 0, 0] = 1.0
+    field[0, 1, 0] = -1.0
+    field[1, 0, 0] = 1.0
+    field[1, 1, 0] = -1.0
+
+    plain = _bilinear_direction_sample(field, np.asarray([0.5, 0.5], dtype=np.float32))
+    aligned = _bilinear_direction_sample_ambiguous(
+        field,
+        np.asarray([0.5, 0.5], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+    )
+
+    assert plain is None
+    assert aligned is not None
+    np.testing.assert_allclose(aligned, [1.0, 0.0])
 
 
 def test_line_trace_horizontal_stops_at_margin() -> None:
@@ -2447,26 +2468,74 @@ def test_trace2cp_top_strip_panel_accepts_rgb_direction_overlay() -> None:
     assert panel.shape[0] > image.shape[0]
 
 
-def test_trace2cp_top_model_direction_selection_chooses_most_horizontal() -> None:
-    vertical = np.zeros((2, 3, 2), dtype=np.float32)
-    vertical[:, :, 1] = 1.0
+def test_trace2cp_top_model_direction_selection_medians_horizontal_candidates() -> None:
+    angle30 = np.deg2rad(30.0)
+    angle60 = np.deg2rad(60.0)
+    positive30 = np.zeros((2, 3, 2), dtype=np.float32)
+    positive30[:, :, 0] = np.cos(angle30)
+    positive30[:, :, 1] = np.sin(angle30)
+    negative30 = -positive30
     horizontal = np.zeros((2, 3, 2), dtype=np.float32)
-    horizontal[:, :, 0] = -1.0
-    diagonal = np.full((2, 3, 2), np.float32(1.0 / np.sqrt(2.0)), dtype=np.float32)
+    horizontal[:, :, 0] = 1.0
+    too_steep = np.zeros((2, 3, 2), dtype=np.float32)
+    too_steep[:, :, 0] = np.cos(angle60)
+    too_steep[:, :, 1] = np.sin(angle60)
     valid = np.ones((2, 3), dtype=bool)
-    valid_horizontal = valid.copy()
-    valid_horizontal[0, 0] = False
+    valid_positive = valid.copy()
+    valid_positive[0, 0] = False
+    valid_negative = valid.copy()
+    valid_negative[0, 0] = False
+    expected = np.asarray([np.cos(angle30), np.sin(angle30)], dtype=np.float32)
 
-    selected, selected_valid, layer = _trace2cp_select_horizontal_best_direction(
-        [vertical, horizontal, diagonal],
-        [valid, valid_horizontal, valid],
+    selected, selected_valid, layer = _trace2cp_select_horizontal_median_direction(
+        [too_steep, horizontal, negative30, positive30],
+        [valid, valid, valid_negative, valid_positive],
     )
 
     assert bool(selected_valid.all())
-    np.testing.assert_allclose(selected[1, 1], horizontal[1, 1])
-    assert int(layer[1, 1]) == 1
-    np.testing.assert_allclose(selected[0, 0], diagonal[0, 0])
-    assert int(layer[0, 0]) == 2
+    np.testing.assert_allclose(selected[1, 1], expected, atol=1.0e-6)
+    assert int(layer[1, 1]) in (2, 3)
+    np.testing.assert_allclose(selected[0, 0], horizontal[0, 0], atol=1.0e-6)
+    assert int(layer[0, 0]) == 1
+
+
+def test_trace2cp_top_direction_traces_reach_opposite_cp_columns() -> None:
+    direction = np.zeros((5, 11, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((5, 11), dtype=bool)
+
+    forward, reverse = _trace2cp_top_direction_traces(
+        direction,
+        valid,
+        start_xy=np.asarray([2.0, 0.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 4.0], dtype=np.float32),
+        step_px=2.0,
+    )
+
+    assert forward[0].tolist() == pytest.approx([2.0, 2.0])
+    assert forward[-1].tolist() == pytest.approx([8.0, 2.0])
+    assert reverse[0].tolist() == pytest.approx([8.0, 2.0])
+    assert reverse[-1].tolist() == pytest.approx([2.0, 2.0])
+
+
+def test_trace2cp_top_direction_traces_handle_ambiguous_sign_seams() -> None:
+    direction = np.zeros((5, 11, 2), dtype=np.float32)
+    direction[:, :6, 0] = 1.0
+    direction[:, 6:, 0] = -1.0
+    valid = np.ones((5, 11), dtype=bool)
+
+    forward, reverse = _trace2cp_top_direction_traces(
+        direction,
+        valid,
+        start_xy=np.asarray([2.0, 0.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 4.0], dtype=np.float32),
+        step_px=1.0,
+    )
+
+    assert forward[-1].tolist() == pytest.approx([8.0, 2.0])
+    assert reverse[-1].tolist() == pytest.approx([2.0, 2.0])
+    assert np.all(np.diff(forward[:, 0]) >= 0.0)
+    assert np.all(np.diff(reverse[:, 0]) <= 0.0)
 
 
 def test_trace2cp_top_model_loader_requires_and_loads_top_state(tmp_path: Path) -> None:

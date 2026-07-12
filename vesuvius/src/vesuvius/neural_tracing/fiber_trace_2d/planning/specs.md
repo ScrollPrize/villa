@@ -607,12 +607,21 @@
   `top_model_state_dict`. It samples a fixed top-strip normal-offset stack
   around the traced fused top strip using offsets `-4..+4` selected-scale
   voxels in one-voxel steps, runs the jointly trained top-view model on every
-  layer, and appends sparse direction indicators chosen per pixel from the
-  valid layer whose decoded direction is most image-horizontal (`abs(dx)` is
-  maximal). If a z-corrected fused trace is available, that trace is used as
-  the stack center; otherwise the central-z fused trace is used. This is
-  visualization-only and must not change Trace2CP scoring or z-search layer
-  selection.
+  layer, and appends sparse direction indicators from an aligned median
+  direction field. Per pixel, only valid layer directions within 45 degrees of
+  image-horizontal are considered; each Lasagna-ambiguous direction is
+  normalized and sign-aligned before taking the median so opposite signs cannot
+  cancel. If a z-corrected fused trace is available, that trace is used as the
+  stack center; otherwise the central-z fused trace is used. The same fused
+  top-direction field is traced from each CP along the top-strip center row
+  until the opposite CP x-column, invalid direction, edge, or max-step guard,
+  and those two traces are drawn with equal visual weight on the debug panel.
+  During top trace integration, ambiguous direction signs must be resolved
+  before bilinear interpolation by flipping each of the four neighboring pixel
+  direction samples, if needed, so it agrees with the current trace direction;
+  otherwise opposite signs from the Lasagna two-cos encoding can cancel or
+  flip the sampled direction. This is visualization-only and must not change
+  Trace2CP scoring or z-search layer selection.
 - Embedding combined mode requires a checkpoint/model output with appended
   embedding channels; it must fail clearly rather than silently falling back
   when embeddings are absent. If a non-zero fiber-bank weight is configured and

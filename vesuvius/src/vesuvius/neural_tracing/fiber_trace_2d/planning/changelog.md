@@ -2,9 +2,12 @@
 
 ## 2026-07-13
 
+- Changed `--trace2cp-top-model-dir-vis` top-direction fusion to use a
+  sign-aligned median of offset-layer directions within 45 degrees of
+  image-horizontal, and made the reverse top trace equally visible.
 - Updated `--trace2cp-top-model-dir-vis` to infer a `-4..+4` selected-voxel
-  top-strip offset stack and display the per-pixel direction from the layer
-  most aligned with image-horizontal.
+  top-strip offset stack and add two visualization-only top traces through the
+  fused top-direction field.
 
 ## 2026-07-12
 

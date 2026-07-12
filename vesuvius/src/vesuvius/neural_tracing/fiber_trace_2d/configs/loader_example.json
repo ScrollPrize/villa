@@ -33,7 +33,7 @@
     "run_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_2d_runs",
     "run_name": "top",
     "max_steps": 1000000,
-    "max_sample_index": 7400,
+    "max_sample_index": 0,
     "learning_rate": 0.001,
     "scalar_log_interval": 100,
     "tensorboard_image_interval": 100,

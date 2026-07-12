@@ -761,6 +761,57 @@ def _bilinear_direction_sample(
     return (direction / norm).astype(np.float32)
 
 
+def _bilinear_direction_sample_ambiguous(
+    direction_xy: np.ndarray,
+    point_xy: np.ndarray,
+    reference_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+) -> np.ndarray | None:
+    field = np.asarray(direction_xy, dtype=np.float32)
+    if field.ndim != 3 or field.shape[2] != 2:
+        raise ValueError("direction_xy must have shape H,W,2")
+    reference = np.asarray(reference_xy, dtype=np.float32)
+    reference_norm = float(np.linalg.norm(reference))
+    if reference.shape != (2,) or not np.isfinite(reference_norm) or reference_norm <= 1.0e-6:
+        return _bilinear_direction_sample(field, point_xy, valid_mask=valid_mask)
+    reference_unit = (reference / np.float32(reference_norm)).astype(np.float32)
+    point = np.asarray(point_xy, dtype=np.float32)
+    if point.shape != (2,) or not bool(np.isfinite(point).all()):
+        return None
+    height, width = int(field.shape[0]), int(field.shape[1])
+    x = float(point[0])
+    y = float(point[1])
+    if x < 0.0 or y < 0.0 or x > float(width - 1) or y > float(height - 1):
+        return None
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    x1 = min(x0 + 1, width - 1)
+    y1 = min(y0 + 1, height - 1)
+    if valid_mask is not None:
+        valid = np.asarray(valid_mask, dtype=bool)
+        if valid.shape != (height, width):
+            raise ValueError("valid_mask must match direction field shape")
+        if not (bool(valid[y0, x0]) and bool(valid[y0, x1]) and bool(valid[y1, x0]) and bool(valid[y1, x1])):
+            return None
+
+    def oriented(y_index: int, x_index: int) -> np.ndarray:
+        value = field[y_index, x_index].astype(np.float32, copy=True)
+        if float(np.dot(value, reference_unit)) < 0.0:
+            value = -value
+        return value
+
+    tx = np.float32(x - float(x0))
+    ty = np.float32(y - float(y0))
+    top = oriented(y0, x0) * (1.0 - tx) + oriented(y0, x1) * tx
+    bottom = oriented(y1, x0) * (1.0 - tx) + oriented(y1, x1) * tx
+    direction = top * (1.0 - ty) + bottom * ty
+    norm = float(np.linalg.norm(direction))
+    if not np.isfinite(norm) or norm <= 1.0e-6:
+        return None
+    return (direction / norm).astype(np.float32)
+
+
 def _bilinear_embedding_sample(
     embedding_chw: np.ndarray,
     point_xy: np.ndarray,
@@ -1296,7 +1347,12 @@ def _trace_direction_line(
         for _ in range(int(max_steps)):
             if not _inside_trace_margin(current, shape_hw, rf_margin_px):
                 break
-            sampled = _bilinear_direction_sample(field, current, valid_mask=valid_mask)
+            sampled = _bilinear_direction_sample_ambiguous(
+                field,
+                current,
+                previous,
+                valid_mask=valid_mask,
+            )
             if sampled is None:
                 break
             if float(np.dot(sampled, previous)) < 0.0:
@@ -2155,7 +2211,12 @@ def _trace_direction_line_to_target(
             return np.stack(points, axis=0).astype(np.float32), _trace_margin_reason(
                 current, shape_hw, rf_margin_px
             )
-        sampled = _bilinear_direction_sample(field, current, valid_mask=valid_mask)
+        sampled = _bilinear_direction_sample_ambiguous(
+            field,
+            current,
+            previous,
+            valid_mask=valid_mask,
+        )
         if sampled is None:
             return np.stack(points, axis=0).astype(np.float32), "invalid_direction"
         if float(np.dot(sampled, previous)) < 0.0:
@@ -5260,7 +5321,7 @@ def _draw_trace2cp_top_strip_panel(
     return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
 
 
-def _trace2cp_select_horizontal_best_direction(
+def _trace2cp_select_horizontal_median_direction(
     direction_fields: list[np.ndarray],
     valid_masks: list[np.ndarray],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -5272,26 +5333,89 @@ def _trace2cp_select_horizontal_best_direction(
     if len(shape) != 3 or shape[2] != 2:
         raise ValueError("direction fields must have shape H,W,2")
     shape_hw = shape[:2]
-    best = np.zeros(shape, dtype=np.float32)
-    best_valid = np.zeros(shape_hw, dtype=bool)
-    best_layer = np.full(shape_hw, -1, dtype=np.int32)
-    best_alignment = np.full(shape_hw, -np.inf, dtype=np.float32)
-    for index, (field, valid) in enumerate(zip(fields, masks, strict=True)):
+    units: list[np.ndarray] = []
+    valid_layers: list[np.ndarray] = []
+    min_horizontal_alignment = np.float32(np.cos(np.deg2rad(45.0)))
+    for field, valid in zip(fields, masks, strict=True):
         if field.shape != shape:
             raise ValueError("all direction fields must have matching shape")
         if valid.shape != shape_hw:
             raise ValueError("valid masks must match direction field shape")
         norm = np.linalg.norm(field, axis=2)
         candidate_valid = valid & np.isfinite(field).all(axis=2) & np.isfinite(norm) & (norm > 1.0e-6)
-        alignment = np.where(candidate_valid, np.abs(field[:, :, 0]) / np.clip(norm, 1.0e-12, None), -np.inf)
-        update = alignment > best_alignment
-        if not bool(update.any()):
-            continue
-        best[update] = field[update]
-        best_valid[update] = True
-        best_layer[update] = int(index)
-        best_alignment[update] = alignment[update]
-    return best, best_valid, best_layer
+        unit = field / np.clip(norm[..., None], 1.0e-12, None)
+        horizontal_valid = candidate_valid & (np.abs(unit[:, :, 0]) >= min_horizontal_alignment)
+        # The direction head is unoriented. Align all candidate layer directions
+        # to +x before taking the median so opposite signs cannot cancel.
+        unit = np.where(unit[:, :, 0:1] < 0.0, -unit, unit).astype(np.float32)
+        units.append(unit)
+        valid_layers.append(horizontal_valid)
+    unit_stack = np.stack(units, axis=0).astype(np.float32)
+    valid_stack = np.stack(valid_layers, axis=0).astype(bool)
+    valid_count = valid_stack.sum(axis=0)
+    fused_valid = valid_count > 0
+
+    def median_component(component: int) -> np.ndarray:
+        values = np.where(valid_stack, unit_stack[:, :, :, component], np.inf)
+        sorted_values = np.sort(values, axis=0)
+        lower_index = np.clip((valid_count - 1) // 2, 0, len(units) - 1)
+        upper_index = np.clip(valid_count // 2, 0, len(units) - 1)
+        lower = np.take_along_axis(sorted_values, lower_index[None, :, :], axis=0)[0]
+        upper = np.take_along_axis(sorted_values, upper_index[None, :, :], axis=0)[0]
+        return ((lower + upper) * 0.5).astype(np.float32)
+
+    fused = np.stack([median_component(0), median_component(1)], axis=2).astype(np.float32)
+    fused[~fused_valid] = 0.0
+    fused_norm = np.linalg.norm(fused, axis=2)
+    fused_valid &= np.isfinite(fused).all(axis=2) & np.isfinite(fused_norm) & (fused_norm > 1.0e-6)
+    fused = np.where(fused_valid[:, :, None], fused / np.clip(fused_norm[..., None], 1.0e-12, None), 0.0)
+
+    alignment_to_fused = np.sum(unit_stack * fused[None, :, :, :], axis=3)
+    alignment_to_fused = np.where(valid_stack & fused_valid[None, :, :], alignment_to_fused, -np.inf)
+    fused_layer = np.argmax(alignment_to_fused, axis=0).astype(np.int32)
+    fused_layer[~fused_valid] = -1
+    return fused.astype(np.float32), fused_valid.astype(bool), fused_layer
+
+
+def _trace2cp_top_direction_traces(
+    direction_xy: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    step_px: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    field = np.asarray(direction_xy, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if field.ndim != 3 or field.shape[2] != 2:
+        raise ValueError("direction_xy must have shape H,W,2")
+    if valid.shape != field.shape[:2]:
+        raise ValueError("valid_mask must match direction_xy shape")
+    height = int(valid.shape[0])
+    center_y = np.float32((float(height) - 1.0) * 0.5)
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    if start.shape != (2,) or target.shape != (2,):
+        raise ValueError("start_xy and target_xy must have shape (2,)")
+    top_start = np.asarray([start[0], center_y], dtype=np.float32)
+    top_target = np.asarray([target[0], center_y], dtype=np.float32)
+    forward_trace, _forward_reason = _trace_direction_line_to_target(
+        field,
+        top_start,
+        top_target,
+        valid_mask=None,
+        step_px=step_px,
+        rf_margin_px=0.0,
+    )
+    reverse_trace, _reverse_reason = _trace_direction_line_to_target(
+        field,
+        top_target,
+        top_start,
+        valid_mask=None,
+        step_px=step_px,
+        rf_margin_px=0.0,
+    )
+    return forward_trace, reverse_trace
 
 
 def _trace2cp_top_model_direction_overlay(
@@ -5301,6 +5425,9 @@ def _trace2cp_top_model_direction_overlay(
     layer_images: list[np.ndarray],
     layer_valid_masks: list[np.ndarray],
     *,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    step_px: float,
     device: torch.device,
     stride: int = 8,
 ) -> tuple[np.ndarray, int, np.ndarray]:
@@ -5312,7 +5439,7 @@ def _trace2cp_top_model_direction_overlay(
     for image, valid_mask in zip(layer_images, layer_valid_masks, strict=True):
         fields = _predict_trace2cp_fields(model, image, valid_mask, device=device)
         direction_fields.append(fields.direction_xy)
-    best_direction, best_valid, best_layer = _trace2cp_select_horizontal_best_direction(
+    best_direction, best_valid, best_layer = _trace2cp_select_horizontal_median_direction(
         direction_fields,
         [np.asarray(mask, dtype=bool) for mask in layer_valid_masks],
     )
@@ -5327,6 +5454,25 @@ def _trace2cp_top_model_direction_overlay(
         scale=1,
         stride=max(1, int(stride)),
         color_rgba=(32, 255, 255, 235),
+    )
+    forward_trace, reverse_trace = _trace2cp_top_direction_traces(
+        best_direction,
+        draw_valid,
+        start_xy=start_xy,
+        target_xy=target_xy,
+        step_px=step_px,
+    )
+    overlay = _overlay_polyline_rgb(
+        overlay,
+        forward_trace,
+        color_rgba=(0, 255, 0, 220),
+        thickness=2,
+    )
+    overlay = _overlay_polyline_rgb(
+        overlay,
+        reverse_trace,
+        color_rgba=(255, 64, 220, 220),
+        thickness=2,
     )
     return overlay, int(drawn), best_layer
 
@@ -6905,6 +7051,9 @@ def _evaluate_trace2cp_pair(
                 top_direction_valid,
                 layer_images,
                 layer_valid_masks,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                step_px=step_px,
                 device=device,
             )
             top_model_direction_valid_mask = np.asarray(top_direction_valid, dtype=bool)

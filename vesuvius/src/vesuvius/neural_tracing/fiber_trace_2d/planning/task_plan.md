@@ -2,28 +2,21 @@
 
 ## Implementation
 
-- Add `--trace2cp-top-model-dir-vis` to the runner.
-- Extend checkpoint loading with a top-view model loader that requires
-  `top_model_state_dict` and instantiates the same V0 architecture with one
-  scalar output channel for the top distance-transform head.
-- Thread the optional top model through single-pair and whole-fiber Trace2CP
-  evaluation chains.
-- During top-strip debug construction, choose the z-corrected fused trace when
-  available, otherwise the fused trace at z=0.
-- Build a top-strip offset stack from that trace using offsets `-4..+4`
-  selected-scale voxels in one-voxel steps.
-- Run the top model on each offset layer, decode its two direction channels,
-  and choose the per-pixel direction from the valid layer with the largest
-  horizontal alignment `abs(dx)`.
-- Render sparse unoriented direction line segments from that selected direction
-  field over the center top-strip image.
-- Append the rendered panel to the existing top-strip column/rows.
+- Replace the top-model offset-layer direction picker with a fused median:
+  normalize every decoded layer direction, keep only valid directions within
+  45 degrees of horizontal using `abs(dx) >= cos(45 degrees)`, align signs to
+  the positive horizontal direction, take the component-wise median, and
+  normalize the result.
+- Keep returning a debug layer map by selecting the contributing layer closest
+  to the fused median direction.
+- Keep top traces ambiguity-aware when bilinearly sampling the fused field.
+- Draw the forward and reverse top traces with equal stroke weight and opacity.
 
 ## Spec Update
 
-- Document that `--trace2cp-top-model-dir-vis` searches fixed top-strip normal
-  offsets for the most-horizontal top-model direction and is visualization-only;
-  it does not alter Trace2CP scoring or z-search selection yet.
+- Update `--trace2cp-top-model-dir-vis` semantics from single most-horizontal
+  layer selection to aligned median fusion over horizontally plausible layers.
+- Document that the top traces remain visualization-only.
 
 ## Docs Updates
 
@@ -32,9 +25,8 @@
 
 ## Tests
 
-- Add focused tests for top-model checkpoint loading failure/success where
-  practical, RGB top-strip panel handling, and horizontal-best direction
-  selection across offset layers.
+- Update focused tests so top-direction fusion verifies median behavior,
+  horizontal thresholding, and sign alignment.
 - Run:
   - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
