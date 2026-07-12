@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: write  # needed to upload installer assets to releases
+  packages: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -39,40 +40,29 @@ jobs:
       CCACHE_COMPRESS: 'true'
     defaults:
       run:
-        shell: msys2 {0}
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
         working-directory: volume-cartographer
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up MSYS2 (UCRT64)
-        uses: msys2/setup-msys2@v2
+      - uses: actions/checkout@v4
         with:
-          msystem: UCRT64
-          update: true
-          install: git
-          pacboy: >-
-            gcc:p
-            cmake:p
-            ninja:p
-            ccache:p
-            pkgconf:p
-            qt6-base:p
-            qt6-svg:p
-            opencv:p
-            ceres-solver:p
-            cgal:p
-            gmp:p
-            mpfr:p
-            boost:p
-            eigen3:p
-            nlohmann-json:p
-            curl:p
-            libtiff:p
-            zlib:p
-            zstd:p
-            lz4:p
-            blosc:p
-            nsis:p
+          repository: ScrollPrize/vc3d-deps
+          ref: d84dfa0745dd2debbcec2126117878b241ffdb7f
+          path: vc3d-deps
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Restore prebuilt MSYS2 dependencies
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          $env:GHCR_TOKEN | oras login ghcr.io -u '${{ github.actor }}' --password-stdin
+          oras pull ghcr.io/scrollprize/vc3d-deps/windows:sha-d84dfa0745dd2debbcec2126117878b241ffdb7f -o $env:RUNNER_TEMP
+          & "$env:GITHUB_WORKSPACE\vc3d-deps\windows\restore.ps1" `
+            -Archive "$env:RUNNER_TEMP\vc3d-windows-ucrt64.7z"
 
       - name: Restore compiler cache
         id: compiler-cache

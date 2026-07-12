@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  packages: read
   pull-requests: read
 
 concurrency:
@@ -19,7 +20,6 @@ jobs:
     timeout-minutes: 5
     outputs:
       vc: ${{ steps.filter.outputs.vc }}
-      dockerfile: ${{ steps.filter.outputs.dockerfile }}
     steps:
       - uses: actions/checkout@v4
       - id: filter
@@ -29,11 +29,6 @@ jobs:
             vc:
               - 'volume-cartographer/**'
               - '.github/workflows/vc3d-ci.yml'
-            dockerfile:
-              - 'volume-cartographer/Dockerfile'
-              - 'volume-cartographer/.dockerignore'
-              - 'volume-cartographer/scripts/ci.sh'
-              - 'volume-cartographer/scripts/install_build_deps.sh'
 
   skip:
     name: Skip (no volume-cartographer changes)
@@ -50,6 +45,11 @@ jobs:
     if: needs.changes.outputs.vc == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     continue-on-error: ${{ matrix.blocking != true }}
     strategy:
       fail-fast: false
@@ -60,8 +60,10 @@ jobs:
           - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-release-tests, action: test, blocking: true }
           - { image: "ubuntu-26.04", compiler: clang, preset: ci-release-tests, action: test, blocking: true }
     env:
-      VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
-      VC_CCACHE_MAXSIZE: 3G
+      CCACHE_DIR: ${{ github.workspace }}/volume-cartographer/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}/volume-cartographer
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPRESS: 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Restore compiler cache
@@ -71,11 +73,15 @@ jobs:
           key: vc3d-${{ matrix.image }}-${{ matrix.compiler }}-${{ matrix.preset }}-ccache-v1-${{ github.sha }}
           restore-keys: |
             vc3d-${{ matrix.image }}-${{ matrix.compiler }}-${{ matrix.preset }}-ccache-v1-
-      - uses: docker/setup-buildx-action@v3
-      - name: Pull or build builder image
-        run: volume-cartographer/scripts/ci.sh builder ${{ matrix.image }}
       - name: ${{ matrix.action }}
-        run: volume-cartographer/scripts/ci.sh ${{ matrix.action }} ${{ matrix.image }} ${{ matrix.compiler }} ${{ matrix.preset }}
+        working-directory: volume-cartographer
+        run: |
+          preset="${{ matrix.preset }}-${{ matrix.compiler }}"
+          ccache --zero-stats
+          cmake --preset "$preset" -DVC_USE_CCACHE=ON
+          ninja -C "build/$preset"
+          ctest --preset "$preset"
+          ccache --show-stats
 
   # macOS compile is a hard gate (parity with the Ubuntu Release cells).
   # Smoke + toolchain-verifier run in a separate job that is non-blocking for
@@ -87,6 +93,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
       CCACHE_DIR: ${{ github.workspace }}/volume-cartographer/.ccache/macos-homebrew-llvm
       CCACHE_BASEDIR: ${{ github.workspace }}/volume-cartographer
       CCACHE_MAXSIZE: 3G
@@ -98,6 +106,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/checkout@v4
+        with:
+          repository: ScrollPrize/vc3d-deps
+          ref: b21145c78af694a0fc574249a3f7ae6f037f8bea
+          path: vc3d-deps
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Restore prebuilt Homebrew dependencies
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | oras login ghcr.io -u '${{ github.actor }}' --password-stdin
+          oras pull ghcr.io/scrollprize/vc3d-deps/macos:sha-b21145c78af694a0fc574249a3f7ae6f037f8bea -o "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/vc3d-deps/macos/restore.sh" \
+            "$RUNNER_TEMP/vc3d-macos-15-arm64.tar.zst"
+
       - name: Restore compiler cache
         uses: actions/cache@v4
         with:
@@ -106,24 +131,8 @@ jobs:
           restore-keys: |
             vc3d-${{ matrix.os }}-homebrew-llvm-ccache-v1-
 
-      # Cache the Homebrew downloads (bottle tarballs + API index). The
-      # install of qt/opencv/ceres/llvm/etc. is the dominant cost — caching
-      # downloads keeps the second run under ~10 min.
-      - name: Cache Homebrew downloads
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/Library/Caches/Homebrew/downloads
-            ~/Library/Caches/Homebrew/api
-          key: brew-${{ matrix.os }}-${{ hashFiles('volume-cartographer/scripts/build_macos.sh') }}
-          restore-keys: |
-            brew-${{ matrix.os }}-
-
-      - name: brew update
-        run: brew update
-
-      - name: Configure + build (installs Homebrew deps as needed)
-        run: volume-cartographer/scripts/build_macos.sh --install-deps --ccache
+      - name: Configure + build
+        run: volume-cartographer/scripts/build_macos.sh --ccache
 
   ci:
     name: CI

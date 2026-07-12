@@ -83,6 +83,11 @@ jobs:
     needs: [changes]
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     permissions:
       security-events: write
       contents: read
@@ -97,10 +102,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # history-aware queries if needed
-
-      - name: Install build deps
-        if: needs.changes.outputs.vc == 'true'
-        run: sudo bash volume-cartographer/scripts/install_build_deps.sh
 
       - name: Initialize CodeQL
         if: needs.changes.outputs.vc == 'true'
@@ -124,7 +125,7 @@ jobs:
       - name: Build (fast)
         if: needs.changes.outputs.vc == 'true'
         working-directory: ./volume-cartographer
-        run: cmake --build build --parallel
+        run: ninja -C build
 
       - name: Analyze
         if: needs.changes.outputs.vc == 'true'
