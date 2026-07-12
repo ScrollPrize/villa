@@ -1706,21 +1706,36 @@ class FiberStrip2DLoader:
         *,
         control_point_index: int,
         center_offset: float,
+        view: str = "side",
     ) -> Path | None:
         if self.config.strip_coord_cache_dir is None:
             return None
         cp_xyz = np.asarray(record.fiber.control_points_xyz[control_point_index], dtype=np.float64)
-        family_key = _stable_digest(
-            _STRIP_COORD_CACHE_KEY_VERSION,
-            record.volume_path,
-            record.volume_scale,
-            f"{record.volume_spacing_base:.12g}",
-            f"{float(center_offset):.12g}",
-            f"{float(self.config.strip_z_offset_step):.12g}",
-            record.fiber_identity,
-            control_point_index,
-            _round_json_array(cp_xyz),
-        )
+        view_key = str(view)
+        if view_key == "side":
+            family_key = _stable_digest(
+                _STRIP_COORD_CACHE_KEY_VERSION,
+                record.volume_path,
+                record.volume_scale,
+                f"{record.volume_spacing_base:.12g}",
+                f"{float(center_offset):.12g}",
+                f"{float(self.config.strip_z_offset_step):.12g}",
+                record.fiber_identity,
+                control_point_index,
+                _round_json_array(cp_xyz),
+            )
+        else:
+            family_key = _stable_digest(
+                _STRIP_COORD_CACHE_KEY_VERSION,
+                f"view:{view_key}",
+                record.volume_path,
+                record.volume_scale,
+                f"{record.volume_spacing_base:.12g}",
+                f"{float(center_offset):.12g}",
+                record.fiber_identity,
+                control_point_index,
+                _round_json_array(cp_xyz),
+            )
         root = Path(self.config.strip_coord_cache_dir)
         return root / family_key[:2] / f"{family_key}.npz"
 
@@ -1991,7 +2006,7 @@ class FiberStrip2DLoader:
         profile: dict[str, float] | None = None,
         use_augmentation_envelope: bool | None = None,
     ) -> _StripSource:
-        with _ProfileBlock(profile, "top_descriptor"):
+        with _ProfileBlock(profile, "descriptor"):
             if descriptor is None:
                 record, record_index, cp_index = self.descriptor_for_sample_index(
                     sample_index, sample_mode=sample_mode
@@ -1999,19 +2014,45 @@ class FiberStrip2DLoader:
             else:
                 record, record_index, cp_index = descriptor
             source_shape_hw = self._source_shape_hw(use_augmentation_envelope=use_augmentation_envelope)
-        with _ProfileBlock(profile, "top_line_window"):
+        cache_path = self._strip_coord_cache_path(
+            record,
+            control_point_index=cp_index,
+            center_offset=0.0,
+            view="top",
+        )
+        with _ProfileBlock(profile, "strip_coord_cache"):
+            cached_source = self._load_strip_coord_cache(
+                cache_path,
+                source_shape_hw=source_shape_hw,
+                device=device,
+                center_offset=0.0,
+                require_offset_axis=True,
+            )
+        if cached_source is not None:
+            cached_grid, source_line_xy, source_control_point_xy = cached_source
+            return _StripSource(
+                record=record,
+                record_index=record_index,
+                control_point_index=cp_index,
+                center_offset=0.0,
+                source_shape_hw=source_shape_hw,
+                grid=cached_grid,
+                source_line_xy=source_line_xy,
+                source_control_point_xy=source_control_point_xy,
+            )
+        with _ProfileBlock(profile, "line_window"):
             line_window = self._line_window_for_patch(
                 record,
                 control_point_index=cp_index,
                 patch_shape_hw=source_shape_hw,
             )
-        with _ProfileBlock(profile, "top_lasagna_normals"):
+        with _ProfileBlock(profile, "lasagna_normals"):
             sampled_normals = self._lasagna_normals_for_line_window(
                 record,
                 line_window,
                 control_point_index=cp_index,
             )
-        with _ProfileBlock(profile, "top_strip_coords", device):
+        with _ProfileBlock(profile, "strip_coords", device):
             grid = build_top_strip_patch_grid_tensor_from_line_window(
                 line_window,
                 patch_shape_hw=source_shape_hw,
@@ -2020,6 +2061,14 @@ class FiberStrip2DLoader:
                 device=device,
             )
         source_line_xy, source_control_point_xy = self._source_line_and_cp_tensors(source_shape_hw, device=device)
+        self._store_strip_coord_cache(
+            cache_path,
+            grid,
+            source_shape_hw=source_shape_hw,
+            center_offset=0.0,
+            source_line_xy=source_line_xy,
+            source_control_point_xy=source_control_point_xy,
+        )
         return _StripSource(
             record=record,
             record_index=record_index,
@@ -2346,44 +2395,48 @@ class FiberStrip2DLoader:
             profile=profile,
         )
         grid = source.grid
-        coords_zyx_t = grid.coords_zyx
-        valid_mask_t = grid.valid_mask
-        augment_transform = None
+
+        transform = None
         if params is not None:
-            augment_transform = strip_augment_transform(
-                self.config.patch_shape_hw,
-                source.source_shape_hw,
-                params,
-                device=device,
-            )
-            with _ProfileBlock(profile, "top_coord_augmentation", device):
-                coords_zyx_t, valid_mask_t = _resample_coord_tensors_like_augmentation(
+            with _ProfileBlock(profile, "map_build", device):
+                transform = strip_augment_transform(
+                    self.config.patch_shape_hw,
+                    source.source_shape_hw,
+                    params,
+                    device=device,
+                )
+
+        side_cp_xy = torch.as_tensor(side_sample.control_point_xy, dtype=torch.float32, device=device)
+        if include_line_xy:
+            line_xy_t = torch.as_tensor(side_sample.line_xy, dtype=torch.float32, device=device)
+            control_point_xy_t = side_cp_xy
+        else:
+            unit = torch.tensor([1.0, 0.0], dtype=torch.float32, device=device)
+            line_xy_t = torch.stack([side_cp_xy - unit, side_cp_xy + unit], dim=0)
+            control_point_xy_t = side_cp_xy
+
+        coords_zyx_t = grid.coords_zyx.to(device=device, dtype=torch.float32).unsqueeze(0)
+        valid_mask_t = grid.valid_mask.to(device=device, dtype=torch.bool).unsqueeze(0)
+        if params is not None:
+            assert transform is not None
+            coord_aug_before = 0.0 if profile is None else profile.get("coord_aug_batch", 0.0)
+            with _ProfileBlock(profile, "coord_aug_batch", device):
+                coords_zyx_t, valid_mask_t = _resample_coord_tensor_batch_like_augmentation(
                     coords_zyx_t,
                     valid_mask_t,
-                    params,
-                    output_shape_hw=self.config.patch_shape_hw,
-                    device=device,
-                    transform=augment_transform,
+                    transform.backward_map_xy.unsqueeze(0),
                 )
-        with _ProfileBlock(profile, "top_line_coords", device):
-            if include_line_xy:
-                line_xy_t, control_point_xy_t = self._line_and_cp_xy_for_params(
-                    source,
-                    params,
-                    device=device,
-                    transform=augment_transform,
+            if profile is not None:
+                profile["coord_augmentation"] = profile.get("coord_augmentation", 0.0) + (
+                    profile.get("coord_aug_batch", 0.0) - coord_aug_before
                 )
-            else:
-                source_cp_xy = source.source_control_point_xy.to(device=device, dtype=torch.float32)
-                unit = torch.tensor([1.0, 0.0], dtype=torch.float32, device=device)
-                line_xy_t = torch.stack([source_cp_xy - unit, source_cp_xy + unit], dim=0)
-                control_point_xy_t = source_cp_xy
+
         return _PreparedTopStripSample(
             source=source,
             params=params,
             grid=grid,
-            coords_zyx=_as_numpy_float32(coords_zyx_t),
-            valid_mask=_as_numpy_bool(valid_mask_t),
+            coords_zyx=_as_numpy_float32(coords_zyx_t[0]),
+            valid_mask=_as_numpy_bool(valid_mask_t[0]),
             line_xy=_as_numpy_float32(line_xy_t),
             control_point_xy=_as_numpy_float32(control_point_xy_t),
         )
@@ -2466,7 +2519,7 @@ class FiberStrip2DLoader:
                 include_line_xy=include_line_xy,
             )
             if profile is not None:
-                local_profile["top_load_batch_worker"] = (time.perf_counter() - worker_start) * 1000.0
+                local_profile["load_batch_worker"] = (time.perf_counter() - worker_start) * 1000.0
             return item_index, local_profile, prepared
 
         begin_zarr_cache_trace()
@@ -2514,7 +2567,7 @@ class FiberStrip2DLoader:
                     ],
                     axis=0,
                 )
-                with _ProfileBlock(profile, "top_volume_sample"):
+                with _ProfileBlock(profile, "volume_sample"):
                     result = samplers[key].sample_coord_batch(coords, valid)
                 images = np.asarray(result.image, dtype=np.float32)
                 valids = np.asarray(result.valid_mask, dtype=bool)
@@ -2531,8 +2584,8 @@ class FiberStrip2DLoader:
                 if profile is not None:
                     for stat_key, value in result.stats.items():
                         if isinstance(value, (int, float)):
-                            profile[f"top_volume_stat_{stat_key}"] = (
-                                profile.get(f"top_volume_stat_{stat_key}", 0.0) + float(value)
+                            profile[f"volume_stat_{stat_key}"] = (
+                                profile.get(f"volume_stat_{stat_key}", 0.0) + float(value)
                             )
                 for local_offset, item_index in enumerate(item_indices):
                     images_by_item[item_index] = images[local_offset]
@@ -2567,7 +2620,7 @@ class FiberStrip2DLoader:
         finally:
             cache_stats = end_zarr_cache_trace()
             if profile is not None:
-                profile["top_load_batch_wall"] = profile.get("top_load_batch_wall", 0.0) + (
+                profile["load_batch_wall"] = profile.get("load_batch_wall", 0.0) + (
                     time.perf_counter() - top_wall_start
                 ) * 1000.0
         return FiberStrip2DBatch(

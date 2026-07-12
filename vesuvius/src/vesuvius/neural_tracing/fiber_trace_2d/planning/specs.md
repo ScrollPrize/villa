@@ -42,6 +42,10 @@
   coordinate, and fiber-line identity. The requested source size is stored in
   entry metadata rather than isolated into incompatible files so larger source
   entries can satisfy smaller later requests for the same identity.
+- Top-view source-coordinate cache entries use the same cache payload and
+  larger-entry cropping semantics as side-view entries, but a separate
+  view-specific identity. Existing side-view cache keys remain stable and must
+  not be invalidated by adding top-view cache support.
 - A strip-coordinate cache entry with height and width greater than or equal to
   the requested source size is a hit. The loader center-crops the cached source
   grid to the requested size. If a larger source is generated later, it
@@ -344,6 +348,17 @@
   with the VC3D-style `lineSurface`/top-strip coordinate construction already
   used by Trace2CP visualization: columns follow the fiber line and rows follow
   the side/cross-fiber axis derived from Lasagna normals.
+- Top-view training uses the same cached, vectorized, batched loader mechanics
+  as side-view training. The only source-coordinate difference is the grid
+  builder: top view uses the top-strip builder, side view uses the side-strip
+  builder. Top-view coordinate augmentation stacks maps and tensors through the
+  same batched coordinate-resampling helper, and top-view image loading is
+  grouped through `CoordinateSampler.sample_coord_batch`.
+- Because a top patch and its center side-strip patch use the same source/output
+  pixel frame and the same geometric augmentation parameters, the transformed
+  fiber line and CP pixel coordinates are identical. Top-view batch loading
+  must reuse the already computed side-sample line/CP coordinates instead of
+  running a second line-coordinate lookup for the top patch.
 - Top-view direction supervision uses the transformed top-strip line tangent
   and the same Lasagna ambiguous two-channel MSE objective as side strips.
   Top-view distance-transform supervision uses only the rounded normal

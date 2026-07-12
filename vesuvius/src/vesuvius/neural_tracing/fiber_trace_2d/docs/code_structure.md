@@ -181,7 +181,14 @@ The important behavior is:
 - Can derive one top-view patch per loaded CP sample with
   `load_top_batch_for_batch`. That path uses the same VC3D-style top-strip
   `lineSurface` coordinate construction as Trace2CP visualization and reuses
-  the CP sample's deterministic geometric/value augmentation parameters.
+  the CP sample's deterministic geometric/value augmentation parameters. Its
+  source geometry uses separate top-view entries in `strip_coord_cache_dir`
+  with the same payload/cropping semantics as side-view source caches. Runtime
+  preparation mirrors the side-view path: batched augmentation maps, batched
+  coordinate resampling, and grouped `CoordinateSampler.sample_coord_batch`
+  calls. The transformed line and CP pixel coordinates are reused from the
+  center side-strip sample because those pixel-frame coordinates are identical
+  for the same augmentation.
 - Optionally caches CP-local source strip coordinates under
   `strip_coord_cache_dir`. Cache hits skip local line-window normal sampling and
   source-grid construction; larger cached source grids are center-cropped for

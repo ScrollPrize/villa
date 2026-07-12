@@ -3476,6 +3476,49 @@ def test_strip_coord_cache_larger_source_satisfies_smaller_request(
     )
 
 
+def test_top_strip_coord_cache_serves_fresh_loader_without_resampling_normals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["strip_coord_cache_dir"] = str(tmp_path / "coord-cache")
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    config = load_config(config_path)
+    first_loader = _make_loader(config)
+
+    cold_source = first_loader.build_top_strip_source(0, device=torch.device("cpu"))
+
+    cache_files = sorted((tmp_path / "coord-cache").glob("*/*.npz"))
+    assert len(cache_files) == 1
+
+    warm_loader = _make_loader(config)
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("Lasagna normals should not be sampled on top coordinate cache hit")
+
+    monkeypatch.setattr(warm_loader, "_lasagna_normals_for_line_window", forbidden)
+
+    warm_source = warm_loader.build_top_strip_source(0, device=torch.device("cpu"))
+
+    assert np.allclose(
+        _as_test_numpy(cold_source.grid.coords_zyx),
+        _as_test_numpy(warm_source.grid.coords_zyx),
+    )
+    assert np.array_equal(
+        _as_test_numpy(cold_source.grid.valid_mask),
+        _as_test_numpy(warm_source.grid.valid_mask),
+    )
+    assert np.allclose(
+        _as_test_numpy(cold_source.source_line_xy),
+        _as_test_numpy(warm_source.source_line_xy),
+    )
+    assert np.allclose(
+        _as_test_numpy(cold_source.source_control_point_xy),
+        _as_test_numpy(warm_source.source_control_point_xy),
+    )
+
+
 def test_augmented_center_patch_loads_one_zarr_sample(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4514,6 +4557,38 @@ def test_load_top_batch_for_batch_returns_one_patch_per_control_point(tmp_path: 
     for sample in top_batch.samples:
         assert np.asarray(sample.line_xy).shape[1] == 2
         np.testing.assert_allclose(sample.control_point_xy, np.asarray([1.0, 1.0], dtype=np.float32))
+
+
+def test_load_top_batch_for_batch_uses_grouped_coordinate_batch_sampling(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["strip_z_offset_count"] = 1
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    samplers: list[_RecordingCoordinateSampler] = []
+
+    def factory(**kwargs):
+        sampler = _RecordingCoordinateSampler(
+            kwargs["array"],
+            level_spacing_base=kwargs["level_spacing_base"],
+        )
+        samplers.append(sampler)
+        return sampler
+
+    loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
+    side_batch = loader.load_batch(0, batch_size=2, sample_mode="flat")
+    sampler = samplers[0]
+    side_call_count = len(sampler.sample_coord_batch_calls)
+    side_low_level_call_count = len(sampler.sample_coords_calls)
+
+    top_batch = loader.load_top_batch_for_batch(side_batch)
+
+    assert top_batch.images.shape == (2, 1, 1, 3, 3)
+    assert len(sampler.sample_coord_batch_calls) == side_call_count + 1
+    assert len(sampler.sample_coords_calls) == side_low_level_call_count + 1
+    top_coords, top_valid = sampler.sample_coord_batch_calls[-1]
+    assert top_coords.shape == (2, 3, 3, 3)
+    assert top_valid.shape == (2, 3, 3)
 
 
 def test_training_load_does_not_call_numpy_strip_builder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

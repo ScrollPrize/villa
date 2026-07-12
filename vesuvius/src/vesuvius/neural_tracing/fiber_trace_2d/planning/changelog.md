@@ -2,6 +2,11 @@
 
 ## 2026-07-12
 
+- Refactored top-view batch loading to match side-view loader accelerations:
+  top source grids now use separate strip-coordinate cache entries, top coord
+  augmentation uses the same batched map/tensor path, top images are grouped
+  through `sample_coord_batch`, and top patches reuse the already transformed
+  side-sample line/CP pixel coordinates.
 - Changed `fiber_trace_2d` prefetch scheduling so missing chunk downloads that
   are not yet active are prioritized by the earliest raw deterministic sample
   index that needs them, helping the reported cached-prefix `idx` advance
