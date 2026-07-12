@@ -136,6 +136,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_image_descriptor_loss,
     _trace2cp_select_horizontal_median_direction,
     _trace2cp_top_monotone_direction_path,
+    _trace2cp_top_monotone_direction_path_z,
     _trace2cp_top_direction_traces,
     _load_top_direction_model_from_checkpoint,
     _trace_combined_image_line_to_target,
@@ -2570,6 +2571,41 @@ def test_trace2cp_top_monotone_direction_path_crosses_invalid_barrier_with_penal
     assert path[0].tolist() == pytest.approx([1.0, 2.0])
     assert path[-1].tolist() == pytest.approx([17.0, 2.0])
     assert path.shape[0] == 3
+
+
+def test_trace2cp_top_monotone_direction_path_z_stays_center_when_layers_match() -> None:
+    direction = np.zeros((5, 19, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((5, 19), dtype=bool)
+
+    path, layers = _trace2cp_top_monotone_direction_path_z(
+        [direction, direction, direction],
+        [valid, valid, valid],
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 2.0], dtype=np.float32),
+    )
+
+    assert path.shape == (3, 2)
+    np.testing.assert_array_equal(layers, np.asarray([1, 1, 1], dtype=np.int32))
+
+
+def test_trace2cp_top_monotone_direction_path_z_uses_better_direction_layer() -> None:
+    vertical = np.zeros((5, 19, 2), dtype=np.float32)
+    vertical[:, :, 1] = 1.0
+    horizontal = np.zeros((5, 19, 2), dtype=np.float32)
+    horizontal[:, :, 0] = 1.0
+    valid = np.ones((5, 19), dtype=bool)
+
+    path, layers = _trace2cp_top_monotone_direction_path_z(
+        [vertical, vertical, horizontal],
+        [valid, valid, valid],
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 2.0], dtype=np.float32),
+        z_transition_penalty=0.1,
+    )
+
+    assert path.shape == (3, 2)
+    np.testing.assert_array_equal(layers, np.asarray([1, 2, 1], dtype=np.int32))
 
 
 def test_trace2cp_top_direction_traces_reach_opposite_cp_columns() -> None:

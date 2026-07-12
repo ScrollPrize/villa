@@ -617,12 +617,15 @@
   until the opposite CP x-column, invalid direction, edge, or max-step guard,
   and those two traces are drawn with equal visual weight on the debug panel.
   The panel also draws a monotone-x dynamic-programming path connecting the two
-  CP columns on the top-strip center row. That DP path uses fixed 8 px
-  horizontal transitions, plus the exact target column, and integrates
-  direction alignment cost `1 - abs(dot(path_tangent, fused_direction))` across
-  every pixel column crossed by each transition. The vertical transition band
-  scales with the horizontal step, and start/target rows are exact at the CPs.
-  Invalid or missing fused-direction pixels add a fixed penalty instead of
+  CP columns on the top-strip center row. That DP path's state is
+  `(top_offset_layer, y)`, so it may transition between neighboring top-offset
+  layers with a fixed z-transition penalty. It uses fixed 8 px horizontal
+  transitions, plus the exact target column, and integrates direction alignment
+  cost `1 - abs(dot(path_tangent, layer_direction))` across every pixel column
+  crossed by each transition, using the direction field from the path's current
+  interpolated z layer. The vertical transition band scales with the horizontal
+  step, and start/target rows and layers are exact at the CPs. Invalid or
+  missing direction pixels in the selected layer add a fixed penalty instead of
   blocking the path, so the diagnostic path still connects the CPs while
   preferring valid pixels where available.
   During top trace integration, ambiguous direction signs must be resolved

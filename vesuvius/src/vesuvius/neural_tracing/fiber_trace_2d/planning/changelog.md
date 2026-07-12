@@ -2,6 +2,9 @@
 
 ## 2026-07-13
 
+- Changed the `--trace2cp-top-model-dir-vis` yellow DP path to use
+  `(top_offset_layer, y)` state over raw per-layer top-model directions, with a
+  small z-transition penalty and layer-range debug output.
 - Added a visualization-only monotone-x dynamic-programming CP-to-CP path over
   the fused `--trace2cp-top-model-dir-vis` direction field, with summary debug
   for top-trace stop reasons and a soft penalty for invalid direction pixels.

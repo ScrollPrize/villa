@@ -5419,29 +5419,39 @@ def _trace2cp_top_direction_traces(
     return forward_trace, reverse_trace, _forward_reason, _reverse_reason
 
 
-def _trace2cp_top_monotone_direction_path(
-    direction_xy: np.ndarray,
-    valid_mask: np.ndarray,
+def _trace2cp_top_monotone_direction_path_z(
+    direction_fields: list[np.ndarray],
+    valid_masks: list[np.ndarray],
     *,
     start_xy: np.ndarray,
     target_xy: np.ndarray,
     max_abs_dy: int = 8,
+    max_abs_dz: int = 1,
     invalid_penalty: float = 4.0,
+    z_transition_penalty: float = 0.25,
     horizontal_step_px: int = 8,
-) -> np.ndarray:
-    field = np.asarray(direction_xy, dtype=np.float32)
-    valid = np.asarray(valid_mask, dtype=bool)
-    if field.ndim != 3 or field.shape[2] != 2:
-        raise ValueError("direction_xy must have shape H,W,2")
-    if valid.shape != field.shape[:2]:
-        raise ValueError("valid_mask must match direction_xy shape")
-    height, width = (int(v) for v in valid.shape)
+) -> tuple[np.ndarray, np.ndarray]:
+    if not direction_fields:
+        raise ValueError("at least one direction field is required")
+    if len(direction_fields) != len(valid_masks):
+        raise ValueError("direction field and valid-mask counts must match")
+    fields = [np.asarray(field, dtype=np.float32) for field in direction_fields]
+    masks = [np.asarray(mask, dtype=bool) for mask in valid_masks]
+    shape = fields[0].shape
+    if len(shape) != 3 or shape[2] != 2:
+        raise ValueError("direction fields must have shape H,W,2")
+    height, width = (int(shape[0]), int(shape[1]))
+    for field, mask in zip(fields, masks, strict=True):
+        if field.shape != shape:
+            raise ValueError("all direction fields must have matching shape")
+        if mask.shape != (height, width):
+            raise ValueError("valid masks must match direction field shape")
     start = np.asarray(start_xy, dtype=np.float32)
     target = np.asarray(target_xy, dtype=np.float32)
     if start.shape != (2,) or target.shape != (2,):
         raise ValueError("start_xy and target_xy must have shape (2,)")
     if not bool(np.isfinite(start).all()) or not bool(np.isfinite(target).all()):
-        return np.zeros((0, 2), dtype=np.float32)
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.int32)
 
     x0 = int(round(float(start[0])))
     y0 = int(round(float(start[1])))
@@ -5457,20 +5467,28 @@ def _trace2cp_top_monotone_direction_path(
         or y1 < 0
         or y1 >= height
     ):
-        return np.zeros((0, 2), dtype=np.float32)
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.int32)
     if x0 == x1:
         if y0 == y1:
-            return np.asarray([start, target], dtype=np.float32)
-        return np.zeros((0, 2), dtype=np.float32)
+            center_layer = len(fields) // 2
+            return (
+                np.asarray([start, target], dtype=np.float32),
+                np.asarray([center_layer, center_layer], dtype=np.int32),
+            )
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.int32)
 
-    norm = np.linalg.norm(field, axis=2)
-    field_valid = valid & np.isfinite(field).all(axis=2) & np.isfinite(norm) & (norm > 1.0e-6)
+    field_stack = np.stack(fields, axis=0).astype(np.float32)
+    mask_stack = np.stack(masks, axis=0).astype(bool)
+    norm = np.linalg.norm(field_stack, axis=3)
+    field_valid = mask_stack & np.isfinite(field_stack).all(axis=3) & np.isfinite(norm) & (norm > 1.0e-6)
     unit = np.where(
-        field_valid[:, :, None],
-        field / np.clip(norm[..., None], 1.0e-12, None),
+        field_valid[:, :, :, None],
+        field_stack / np.clip(norm[..., None], 1.0e-12, None),
         0.0,
     ).astype(np.float32)
 
+    layer_count = int(field_stack.shape[0])
+    center_layer = layer_count // 2
     x_step = 1 if x1 > x0 else -1
     horizontal_step = max(1, int(horizontal_step_px))
     column_values = list(range(x0, x1, x_step * horizontal_step))
@@ -5479,9 +5497,10 @@ def _trace2cp_top_monotone_direction_path(
     columns = np.asarray(column_values, dtype=np.int32)
     rows = np.arange(height, dtype=np.int32)
     inf = np.float32(1.0e20)
-    dp_prev = np.full(height, inf, dtype=np.float32)
-    dp_prev[y0] = np.float32(0.0)
-    backptr = np.full((int(columns.shape[0]), height), -1, dtype=np.int32)
+    dp_prev = np.full((layer_count, height), inf, dtype=np.float32)
+    dp_prev[center_layer, y0] = np.float32(0.0)
+    backptr_y = np.full((int(columns.shape[0]), layer_count, height), -1, dtype=np.int32)
+    backptr_layer = np.full((int(columns.shape[0]), layer_count, height), -1, dtype=np.int32)
 
     for column_index in range(1, int(columns.shape[0])):
         prev_x = int(columns[column_index - 1])
@@ -5494,58 +5513,95 @@ def _trace2cp_top_monotone_direction_path(
             np.ceil(max(0, int(max_abs_dy)) * float(abs_dx) / float(horizontal_step))
         )
         dy_values = np.arange(-transition_max_abs_dy, transition_max_abs_dy + 1, dtype=np.int32)
-        candidates: list[np.ndarray] = []
-        previous_rows: list[np.ndarray] = []
-        for dy in dy_values.tolist():
-            prev_y = rows - int(dy)
-            inside = (prev_y >= 0) & (prev_y < height)
-            step_norm = np.float32(np.sqrt(float(dx * dx + int(dy) * int(dy))))
-            tangent_x = np.float32(float(dx) / float(step_norm))
-            tangent_y = np.float32(float(dy) / float(step_norm))
-            transition_cost = np.zeros(height, dtype=np.float32)
-            for offset in range(1, abs_dx + 1):
-                sample_x = prev_x + x_step * offset
-                alpha = np.float32(float(offset) / float(abs_dx))
-                sample_y = np.rint(prev_y.astype(np.float32) + np.float32(dy) * alpha).astype(np.int32)
-                sample_inside = inside & (sample_y >= 0) & (sample_y < height)
-                sample_cost = np.full(height, inf, dtype=np.float32)
-                if bool(sample_inside.any()):
-                    sample_direction = unit[sample_y[sample_inside], sample_x, :]
-                    sample_valid = field_valid[sample_y[sample_inside], sample_x]
-                    alignment = np.abs(sample_direction[:, 0] * tangent_x + sample_direction[:, 1] * tangent_y)
-                    sample_cost[sample_inside] = (1.0 - np.clip(alignment, 0.0, 1.0)).astype(np.float32)
-                    sample_cost[sample_inside] += np.where(
-                        sample_valid,
-                        np.float32(0.0),
-                        np.float32(max(0.0, float(invalid_penalty))),
-                    )
-                transition_cost += sample_cost
-            candidate = np.full(height, inf, dtype=np.float32)
-            usable = inside
-            if bool(usable.any()):
-                candidate[usable] = dp_prev[prev_y[usable]] + transition_cost[usable]
-            candidates.append(candidate)
-            previous_rows.append(np.where(inside, prev_y, -1).astype(np.int32))
-        candidate_stack = np.stack(candidates, axis=0)
-        previous_stack = np.stack(previous_rows, axis=0)
-        best_choice = np.argmin(candidate_stack, axis=0)
-        dp_next = candidate_stack[best_choice, rows].astype(np.float32)
-        backptr[column_index] = previous_stack[best_choice, rows]
+        dp_next = np.full((layer_count, height), inf, dtype=np.float32)
+        for current_layer in range(layer_count):
+            prev_layer_min = max(0, current_layer - max(0, int(max_abs_dz)))
+            prev_layer_max = min(layer_count - 1, current_layer + max(0, int(max_abs_dz)))
+            for previous_layer in range(prev_layer_min, prev_layer_max + 1):
+                dz = int(current_layer - previous_layer)
+                layer_cost = np.float32(max(0.0, float(z_transition_penalty)) * abs(dz))
+                for dy in dy_values.tolist():
+                    prev_y = rows - int(dy)
+                    inside = (prev_y >= 0) & (prev_y < height)
+                    step_norm = np.float32(np.sqrt(float(dx * dx + int(dy) * int(dy))))
+                    tangent_x = np.float32(float(dx) / float(step_norm))
+                    tangent_y = np.float32(float(dy) / float(step_norm))
+                    transition_cost = np.full(height, layer_cost, dtype=np.float32)
+                    for offset in range(1, abs_dx + 1):
+                        sample_x = prev_x + x_step * offset
+                        alpha = np.float32(float(offset) / float(abs_dx))
+                        sample_y = np.rint(prev_y.astype(np.float32) + np.float32(dy) * alpha).astype(np.int32)
+                        sample_layer = int(round(float(previous_layer) + float(dz) * float(alpha)))
+                        sample_layer = min(max(sample_layer, 0), layer_count - 1)
+                        sample_inside = inside & (sample_y >= 0) & (sample_y < height)
+                        sample_cost = np.full(height, inf, dtype=np.float32)
+                        if bool(sample_inside.any()):
+                            sample_direction = unit[sample_layer, sample_y[sample_inside], sample_x, :]
+                            sample_valid = field_valid[sample_layer, sample_y[sample_inside], sample_x]
+                            alignment = np.abs(
+                                sample_direction[:, 0] * tangent_x + sample_direction[:, 1] * tangent_y
+                            )
+                            sample_cost[sample_inside] = (1.0 - np.clip(alignment, 0.0, 1.0)).astype(np.float32)
+                            sample_cost[sample_inside] += np.where(
+                                sample_valid,
+                                np.float32(0.0),
+                                np.float32(max(0.0, float(invalid_penalty))),
+                            )
+                        transition_cost += sample_cost
+                    candidate = np.full(height, inf, dtype=np.float32)
+                    usable = inside
+                    if bool(usable.any()):
+                        candidate[usable] = dp_prev[previous_layer, prev_y[usable]] + transition_cost[usable]
+                    update = candidate < dp_next[current_layer]
+                    if bool(update.any()):
+                        dp_next[current_layer, update] = candidate[update]
+                        backptr_y[column_index, current_layer, update] = prev_y[update]
+                        backptr_layer[column_index, current_layer, update] = previous_layer
         dp_prev = dp_next
 
-    if not np.isfinite(float(dp_prev[y1])) or float(dp_prev[y1]) >= float(inf) * 0.5:
-        return np.zeros((0, 2), dtype=np.float32)
+    if not np.isfinite(float(dp_prev[center_layer, y1])) or float(dp_prev[center_layer, y1]) >= float(inf) * 0.5:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.int32)
 
     path_y = np.full(int(columns.shape[0]), -1, dtype=np.int32)
+    path_layer = np.full(int(columns.shape[0]), -1, dtype=np.int32)
     path_y[-1] = y1
+    path_layer[-1] = center_layer
     for column_index in range(int(columns.shape[0]) - 1, 0, -1):
-        prev_y = int(backptr[column_index, int(path_y[column_index])])
-        if prev_y < 0:
-            return np.zeros((0, 2), dtype=np.float32)
+        current_layer = int(path_layer[column_index])
+        current_y = int(path_y[column_index])
+        prev_y = int(backptr_y[column_index, current_layer, current_y])
+        prev_layer = int(backptr_layer[column_index, current_layer, current_y])
+        if prev_y < 0 or prev_layer < 0:
+            return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.int32)
         path_y[column_index - 1] = prev_y
+        path_layer[column_index - 1] = prev_layer
     path = np.stack([columns.astype(np.float32), path_y.astype(np.float32)], axis=1).astype(np.float32)
     path[0] = start
     path[-1] = target
+    return path, path_layer.astype(np.int32)
+
+
+def _trace2cp_top_monotone_direction_path(
+    direction_xy: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    max_abs_dy: int = 8,
+    invalid_penalty: float = 4.0,
+    horizontal_step_px: int = 8,
+) -> np.ndarray:
+    path, _layers = _trace2cp_top_monotone_direction_path_z(
+        [direction_xy],
+        [valid_mask],
+        start_xy=start_xy,
+        target_xy=target_xy,
+        max_abs_dy=max_abs_dy,
+        max_abs_dz=0,
+        invalid_penalty=invalid_penalty,
+        z_transition_penalty=0.0,
+        horizontal_step_px=horizontal_step_px,
+    )
     return path
 
 
@@ -5595,9 +5651,9 @@ def _trace2cp_top_model_direction_overlay(
     )
     height = int(draw_valid.shape[0])
     center_y = np.float32((float(height) - 1.0) * 0.5)
-    monotone_path = _trace2cp_top_monotone_direction_path(
-        best_direction,
-        draw_valid,
+    monotone_path, monotone_layers = _trace2cp_top_monotone_direction_path_z(
+        direction_fields,
+        [np.asarray(mask, dtype=bool) for mask in layer_valid_masks],
         start_xy=np.asarray(
             [float(np.asarray(start_xy, dtype=np.float32)[0]), center_y],
             dtype=np.float32,
@@ -5610,15 +5666,29 @@ def _trace2cp_top_model_direction_overlay(
     if monotone_path.size:
         rounded_x = np.rint(monotone_path[:, 0]).astype(np.int32)
         rounded_y = np.rint(monotone_path[:, 1]).astype(np.int32)
+        rounded_layer = np.asarray(monotone_layers, dtype=np.int32)
         inside = (
             (rounded_y >= 0)
             & (rounded_y < int(draw_valid.shape[0]))
             & (rounded_x >= 0)
             & (rounded_x < int(draw_valid.shape[1]))
+            & (rounded_layer >= 0)
+            & (rounded_layer < len(layer_valid_masks))
         )
-        invalid_count = int(np.count_nonzero(~draw_valid[rounded_y[inside], rounded_x[inside]]))
+        valid_stack = np.stack([np.asarray(mask, dtype=bool) for mask in layer_valid_masks], axis=0)
+        invalid_count = int(
+            np.count_nonzero(~valid_stack[rounded_layer[inside], rounded_y[inside], rounded_x[inside]])
+        )
+        center_layer = len(layer_valid_masks) // 2
+        layer_offsets = rounded_layer - int(center_layer)
+        layer_min = int(layer_offsets.min())
+        layer_max = int(layer_offsets.max())
+        layer_changes = int(np.count_nonzero(np.diff(rounded_layer) != 0))
     else:
         invalid_count = 0
+        layer_min = 0
+        layer_max = 0
+        layer_changes = 0
     overlay = _overlay_polyline_rgb(
         overlay,
         forward_trace,
@@ -5641,7 +5711,8 @@ def _trace2cp_top_model_direction_overlay(
         f"fwd_reason={forward_reason} fwd_points={int(forward_trace.shape[0])} "
         f"rev_reason={reverse_reason} rev_points={int(reverse_trace.shape[0])} "
         f"dp_step_px=8 dp_points={int(monotone_path.shape[0])} "
-        f"dp_invalid_pixels={invalid_count}"
+        f"dp_invalid_pixels={invalid_count} "
+        f"dp_layer_range={layer_min}..{layer_max} dp_layer_changes={layer_changes}"
     )
     return overlay, int(drawn), best_layer, debug
 
