@@ -23,8 +23,7 @@ Tools to build/manage scroll datasets and cloud infrastructure.
 
 ### [ink-detection](ink-detection/)
 Training and inference tools for Vesuvius Challenge ink detection models, built on the model that won the 2023 Grand Prize.  
-Originally developed by [Youssef Nader](https://github.com/younader) and [Luke Farritor](https://github.com/lukeboi).
-Generalizing ink detection reliably across scrolls with far less per-scroll labeling remains an open problem.
+Originally developed by [Youssef Nader](https://github.com/younader) and [Luke Farritor](https://github.com/lukeboi), extended by the Vesuvius Challenge team.
 
 ---
 
