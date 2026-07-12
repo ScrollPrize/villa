@@ -70,6 +70,10 @@ vc_add_test(NAME test_appendmask_render)
 vc_add_test(NAME test_chunked_plane_sampler_fallback)
 
 vc_add_test(NAME test_volume_chunk_errors)
+if(WIN32)
+    set_tests_properties(test_volume_chunk_errors PROPERTIES
+        ENVIRONMENT "OMP_NUM_THREADS=1")
+endif()
 
 vc_add_test(NAME test_segmentation_autosave_state
     LIBS doctest::doctest
