@@ -32,7 +32,7 @@ const sidebars = {
           type: 'category',
           label: 'Open Problems',
           collapsible: true,
-          collapsed: true,
+          collapsed: false,
           items: [
             {
               type: 'doc',
@@ -45,14 +45,7 @@ const sidebars = {
           type: 'category',
           label: 'Tutorials',
           collapsible: true,
-          collapsed: true,
-          link: {
-            type: 'generated-index',
-            slug: '/tutorials',
-            title: 'Tutorials',
-            description:
-              'Hands-on guides for scanning, virtually unwrapping, and reading the Herculaneum scrolls.',
-          },
+          collapsed: false,
           items: [
             { type: 'doc', id: 'tutorial_VC3D' },
             { type: 'doc', id: 'tutorial_spiral' },

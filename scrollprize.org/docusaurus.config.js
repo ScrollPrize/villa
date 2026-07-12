@@ -199,7 +199,25 @@ const config = {
                 },
               ],
             },
-            { to: "/tutorials", label: "Tutorials", position: "left" },
+            {
+              type: "dropdown",
+              label: "Tutorials",
+              position: "left",
+              items: [
+                {
+                  to: "/tutorial_VC3D",
+                  label: "Volume Cartographer 3D",
+                },
+                {
+                  to: "/tutorial_spiral",
+                  label: "Spiral Fitting",
+                },
+                {
+                  to: "/tutorial5",
+                  label: "Ink Detection",
+                },
+              ],
+            },
             { to: "/data_browser", label: "Data", position: "left" },
             { to: "/winners", label: "Milestones", position: "left" },
             {
