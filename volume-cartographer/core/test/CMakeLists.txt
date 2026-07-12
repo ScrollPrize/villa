@@ -81,6 +81,7 @@ vc_add_test(NAME test_segmentation_intersection_invalidation
 
 qt6_wrap_cpp(ink_detection_overlay_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.hpp)
 qt6_wrap_cpp(viewer_overlay_base_ink_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
+qt6_wrap_cpp(viewer_manager_overlay_test_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/ViewerManager.hpp)
 qt6_wrap_cpp(cstate_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
 qt6_wrap_cpp(vccollection_ink_detection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 vc_add_test(NAME test_ink_detection_overlay
@@ -97,6 +98,7 @@ vc_add_test(NAME test_ink_detection_overlay
             test_viewer_manager_stub.cpp
             ${ink_detection_overlay_moc}
             ${viewer_overlay_base_ink_moc}
+            ${viewer_manager_overlay_test_moc}
             ${cstate_ink_detection_moc}
             ${vccollection_ink_detection_moc}
     LIBS doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
@@ -104,7 +106,6 @@ vc_add_test(NAME test_ink_detection_overlay
     DEFS VC_TESTING)
 
 qt6_wrap_cpp(viewer_overlay_base_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
-qt6_wrap_cpp(viewer_manager_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/ViewerManager.hpp)
 vc_add_test(NAME test_viewer_overlay_surface_primitives
     SOURCES test_viewer_overlay_surface_primitives.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
@@ -115,7 +116,7 @@ vc_add_test(NAME test_viewer_overlay_surface_primitives
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
             test_viewer_manager_stub.cpp
             ${viewer_overlay_base_surface_primitives_moc}
-            ${viewer_manager_overlay_surface_primitives_moc}
+            ${viewer_manager_overlay_test_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core vc_atlas
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
