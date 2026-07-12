@@ -1,7 +1,7 @@
 ---
 id: 2026_open_problems
 title: "Open Problems: Why Reading Every Herculaneum Scroll Is Still a Challenge"
-sidebar_label: "Tutorials"
+sidebar_label: "Problems in-depth"
 ---
 
 <head>

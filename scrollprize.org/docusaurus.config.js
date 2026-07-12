@@ -188,7 +188,18 @@ const config = {
           },
           items: [
             { to: "/prizes", label: "Prizes", position: "left" },
-            { to: "/2026_open_problems", label: "Tutorials", position: "left" },
+            {
+              type: "dropdown",
+              label: "Open Problems",
+              position: "left",
+              items: [
+                {
+                  to: "/2026_open_problems",
+                  label: "Problems in-depth",
+                },
+              ],
+            },
+            { to: "/tutorials", label: "Tutorials", position: "left" },
             { to: "/data_browser", label: "Data", position: "left" },
             { to: "/winners", label: "Milestones", position: "left" },
             {

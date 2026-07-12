@@ -30,10 +30,29 @@ const sidebars = {
         { type: 'doc', id: 'prizes' },
         {
           type: 'category',
+          label: 'Open Problems',
+          collapsible: true,
+          collapsed: true,
+          items: [
+            {
+              type: 'doc',
+              id: '2026_open_problems',
+              label: 'Problems in-depth',
+            },
+          ],
+        },
+        {
+          type: 'category',
           label: 'Tutorials',
           collapsible: true,
           collapsed: true,
-          link: { type: 'doc', id: '2026_open_problems' },
+          link: {
+            type: 'generated-index',
+            slug: '/tutorials',
+            title: 'Tutorials',
+            description:
+              'Hands-on guides for scanning, virtually unwrapping, and reading the Herculaneum scrolls.',
+          },
           items: [
             { type: 'doc', id: 'tutorial_VC3D' },
             { type: 'doc', id: 'tutorial_spiral' },
