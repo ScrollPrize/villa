@@ -31,6 +31,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     FiberStripGridTorch,
     FiberStripLineWindow,
     build_side_strip_patch_grid_tensor_from_line_window,
+    build_top_strip_patch_grid_tensor_from_line_window,
     control_point_line_index,
     side_strip_segment_line_window,
     side_strip_line_window,
@@ -197,6 +198,8 @@ class _Trace2CpSegmentSource:
     center_offset: float
     source_shape_hw: tuple[int, int]
     grid: FiberStripGridTorch
+    line_window: FiberStripLineWindow
+    anchor_column_px: float
     line_xy: np.ndarray
     start_control_point_xy: np.ndarray
     target_control_point_xy: np.ndarray
@@ -267,6 +270,102 @@ def _as_hw(value: Any, *, key: str) -> tuple[int, int]:
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         raise ValueError(f"{key} must be an int or length-2 sequence")
     return int(value[0]), int(value[1])
+
+
+def _trace_xyz_at_x_for_top_strip(trace_xyz: np.ndarray, target_x: float) -> np.ndarray | None:
+    trace = np.asarray(trace_xyz, dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[1] != 3 or trace.shape[0] == 0:
+        raise ValueError("trace_xyz must have shape N,3")
+    x_target = float(target_x)
+    for p0, p1 in zip(trace[:-1], trace[1:]):
+        x0 = float(p0[0])
+        x1 = float(p1[0])
+        if (x0 - x_target) == 0.0:
+            return p0.astype(np.float32, copy=True)
+        if (x0 - x_target) * (x1 - x_target) <= 0.0 and x0 != x1:
+            alpha = np.float32((x_target - x0) / (x1 - x0))
+            return (p0 + alpha * (p1 - p0)).astype(np.float32, copy=False)
+    if float(trace[-1, 0]) == x_target:
+        return trace[-1].astype(np.float32, copy=True)
+    return None
+
+
+def _trace_columns_xyz_for_top_strip(trace_xyz: np.ndarray, width: int) -> tuple[np.ndarray, np.ndarray]:
+    columns = np.full((int(width), 3), np.nan, dtype=np.float32)
+    valid = np.zeros((int(width),), dtype=bool)
+    for x in range(int(width)):
+        point = _trace_xyz_at_x_for_top_strip(trace_xyz, float(x))
+        if point is None or not bool(np.isfinite(point).all()):
+            continue
+        columns[x] = point
+        valid[x] = True
+    return columns, valid
+
+
+def _unit_vector_or_zero(vector: np.ndarray) -> np.ndarray:
+    vec = np.asarray(vector, dtype=np.float32).reshape(-1)
+    if vec.shape != (3,) or not bool(np.isfinite(vec).all()):
+        return np.zeros(3, dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if not np.isfinite(norm) or norm <= 1.0e-12:
+        return np.zeros(3, dtype=np.float32)
+    return (vec / np.float32(norm)).astype(np.float32, copy=False)
+
+
+def _sample_grid_points_hwc(
+    values_hwc: torch.Tensor,
+    valid_hw: torch.Tensor,
+    points_xy: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    values = torch.as_tensor(values_hwc, dtype=torch.float32)
+    valid = torch.as_tensor(valid_hw, dtype=torch.bool, device=values.device)
+    points = torch.as_tensor(points_xy, dtype=torch.float32, device=values.device)
+    if values.ndim != 3:
+        raise ValueError("values_hwc must have shape H,W,C")
+    if valid.shape != values.shape[:2]:
+        raise ValueError("valid_hw shape must match values_hwc")
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("points_xy must have shape N,2")
+    height, width, _channels = (int(v) for v in values.shape)
+    x = points[:, 0]
+    y = points[:, 1]
+    in_bounds = (
+        torch.isfinite(points).all(dim=1)
+        & (x >= 0.0)
+        & (x <= float(width - 1))
+        & (y >= 0.0)
+        & (y <= float(height - 1))
+    )
+    if width > 1:
+        grid_x = x * (2.0 / float(width - 1)) - 1.0
+    else:
+        grid_x = torch.zeros_like(x)
+    if height > 1:
+        grid_y = y * (2.0 / float(height - 1)) - 1.0
+    else:
+        grid_y = torch.zeros_like(y)
+    grid_x = torch.where(in_bounds, grid_x, torch.zeros_like(grid_x))
+    grid_y = torch.where(in_bounds, grid_y, torch.zeros_like(grid_y))
+    grid = torch.stack([grid_x, grid_y], dim=-1).view(1, int(points.shape[0]), 1, 2)
+    sampled = F.grid_sample(
+        values.permute(2, 0, 1).unsqueeze(0),
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )[0, :, :, 0].permute(1, 0)
+    sampled_valid = (
+        F.grid_sample(
+            valid.to(dtype=torch.float32).view(1, 1, height, width),
+            grid,
+            mode="nearest",
+            padding_mode="zeros",
+            align_corners=True,
+        )[0, 0, :, 0]
+        > 0.5
+    ) & in_bounds
+    sampled = torch.where(sampled_valid[:, None], sampled, torch.zeros_like(sampled))
+    return sampled, sampled_valid
 
 
 def strip_z_offsets_from_count_step(count: int, step: float) -> tuple[float, ...]:
@@ -2793,6 +2892,8 @@ class FiberStrip2DLoader:
             center_offset=float(center_offset),
             source_shape_hw=(height, width),
             grid=grid,
+            line_window=line_window,
+            anchor_column_px=float(start_col),
             line_xy=np.asarray(line_xy, dtype=np.float32),
             start_control_point_xy=start_xy.astype(np.float32, copy=False),
             target_control_point_xy=target_xy.astype(np.float32, copy=False),
@@ -2801,6 +2902,100 @@ class FiberStrip2DLoader:
             start_row_axis_xyz=start_row_axis,
             target_row_axis_xyz=target_row_axis,
         )
+
+    def sample_trace2cp_top_strip_source(
+        self,
+        source: _Trace2CpSegmentSource,
+        *,
+        normal_offsets_by_column: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        grid = build_top_strip_patch_grid_tensor_from_line_window(
+            source.line_window,
+            patch_shape_hw=source.source_shape_hw,
+            sampled_normals=np.asarray(source.line_normals_xyz, dtype=np.float32),
+            pixel_spacing_base=source.record.volume_spacing_base,
+            anchor_column_px=float(source.anchor_column_px),
+            normal_offsets_by_column=normal_offsets_by_column,
+            device=source.grid.coords_zyx.device,
+        )
+        coords_zyx = _as_numpy_float32(grid.coords_zyx)
+        grid_valid = _as_numpy_bool(grid.valid_mask)
+        result = source.record.sampler.sample_coords(coords_zyx, grid_valid)
+        image = np.asarray(result.image, dtype=np.float32)
+        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        return image, valid_mask
+
+    def sample_trace2cp_traced_top_strip_source(
+        self,
+        source: _Trace2CpSegmentSource,
+        trace_xyz: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        height, width = (int(v) for v in source.source_shape_hw)
+        columns_xyz, columns_valid = _trace_columns_xyz_for_top_strip(trace_xyz, width)
+        if source.grid.offset_axis_xyz is None:
+            raise ValueError("trace2cp traced top strip requires source offset-axis data")
+        device = source.grid.coords_xyz.device
+        points_xy = torch.as_tensor(columns_xyz[:, :2], dtype=torch.float32, device=device)
+        base_xyz_t, base_valid_t = _sample_grid_points_hwc(
+            source.grid.coords_xyz,
+            source.grid.valid_mask,
+            points_xy,
+        )
+        normal_xyz_t, normal_valid_t = _sample_grid_points_hwc(
+            source.grid.offset_axis_xyz,
+            source.grid.valid_mask,
+            points_xy,
+        )
+        columns_valid_t = torch.as_tensor(columns_valid, dtype=torch.bool, device=device)
+        z_offsets_t = torch.as_tensor(columns_xyz[:, 2], dtype=torch.float32, device=device)
+        normal_xyz_t = F.normalize(normal_xyz_t, p=2.0, dim=1, eps=1.0e-12)
+        base_xyz_t = base_xyz_t + normal_xyz_t * (z_offsets_t * np.float32(source.record.volume_spacing_base))[:, None]
+        base_xyz = base_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        normal_xyz = normal_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        valid_columns = (
+            columns_valid_t & base_valid_t & normal_valid_t & torch.isfinite(base_xyz_t).all(dim=1)
+        ).detach().cpu().numpy().astype(bool, copy=False)
+
+        side_axes = np.zeros((width, 3), dtype=np.float32)
+        for col in range(width):
+            if not bool(valid_columns[col]):
+                continue
+            prev_col = col - 1
+            while prev_col >= 0 and not bool(valid_columns[prev_col]):
+                prev_col -= 1
+            next_col = col + 1
+            while next_col < width and not bool(valid_columns[next_col]):
+                next_col += 1
+            if prev_col >= 0 and next_col < width:
+                tangent = base_xyz[next_col] - base_xyz[prev_col]
+            elif next_col < width:
+                tangent = base_xyz[next_col] - base_xyz[col]
+            elif prev_col >= 0:
+                tangent = base_xyz[col] - base_xyz[prev_col]
+            else:
+                continue
+            tangent = _unit_vector_or_zero(tangent)
+            normal = _unit_vector_or_zero(normal_xyz[col])
+            side = _unit_vector_or_zero(np.cross(normal, tangent))
+            if not bool(np.any(side)):
+                valid_columns[col] = False
+                continue
+            side_axes[col] = side
+
+        row_offsets = (
+            np.arange(height, dtype=np.float32) - np.float32((float(height) - 1.0) * 0.5)
+        ) * np.float32(source.record.volume_spacing_base)
+        coords_xyz = base_xyz[None, :, :] + row_offsets[:, None, None] * side_axes[None, :, :]
+        grid_valid = (
+            valid_columns[None, :]
+            & np.isfinite(coords_xyz).all(axis=2)
+            & np.isfinite(side_axes).all(axis=1)[None, :]
+        )
+        coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32, copy=False)
+        result = source.record.sampler.sample_coords(coords_zyx, grid_valid)
+        image = np.asarray(result.image, dtype=np.float32)
+        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        return image, valid_mask
 
     def sample_trace2cp_segment_source(
         self,

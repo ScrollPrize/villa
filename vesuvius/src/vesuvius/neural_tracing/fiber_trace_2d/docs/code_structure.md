@@ -317,6 +317,17 @@ The important behavior is:
   forward/reverse/fused z-corrected presence maps, built column-by-column from
   the same selected z layers as the z-corrected image; whole-fiber presence
   uses the fused z-corrected presence when available.
+- Trace2CP visualizations also include VC3D-style top-strip output sampled
+  from volume coordinates, not warped from the side-strip image. Single-pair
+  `trace2cp_vis.jpg` appends a debug column and whole-fiber
+  `trace2cp_fiber_vis.jpg` appends stitched rows. The first top strip is the
+  original/init comparison from the segment line window and Lasagna/VC3D frames.
+  The second top strip is reconstructed from the traced fused line projected to
+  the central z slice: each output column samples the segment coordinate grid
+  and normal/offset axis at the fused trace position, derives a side axis from
+  traced tangent and normal, then samples rows through the volume. If z-search
+  is active, both modes also include a traced fused z-corrected top strip that
+  uses the fused trace's per-column selected z offset along the strip normal.
 - `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` adds an
   experimental short z-search to the combined tracer. The loader builds one
   aligned Trace2CP segment source from the CP-to-CP line window and Lasagna
@@ -392,9 +403,12 @@ The important behavior is:
   Valid overlapping image pixels are averaged with dense rectangular masks for
   display, and the long strip uses the same four rows as the single-pair
   Trace2CP view: full traces, partial closest-approach traces, fused CP-to-CP
-  line, and optimized line. The summary includes requested, valid, and skipped
-  pair counts plus mean/min/max trace2cp errors. Stdout prints the public
-  whole-fiber metric on its own line as `trace2cp_error_mean=<value>`;
+  line, and optimized line. It then appends the original/init top strip, the
+  traced fused top strip projected to central z, and with z-search also appends
+  the traced fused z-corrected top strip. The summary includes requested,
+  valid, and skipped pair counts plus mean/min/max trace2cp errors.
+  Stdout prints the public whole-fiber metric on its own line as
+  `trace2cp_error_mean=<value>`;
   `trace2cp_fiber_debug.txt` records per-pair strip CP vectors, row axes,
   frame vectors, and projected CP deltas for debugging.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for

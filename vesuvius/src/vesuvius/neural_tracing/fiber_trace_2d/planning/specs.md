@@ -493,6 +493,23 @@
   column-by-column from the same trace z layers as the z-corrected image.
   Whole-fiber presence visualization must use the fused z-corrected presence
   when it is available.
+- Trace2CP visualization also appends VC3D-style top-strip output sampled from
+  volume coordinates, not warped from rendered side-strip pixels. Single-pair
+  `trace2cp_vis.jpg` gets a top-strip debug column. Whole-fiber
+  `trace2cp_fiber_vis.jpg` gets top-strip rows stitched into the same global CP
+  x-coordinate system as the side-strip rows. The original/init comparison top
+  strip uses the same pair-local line window and Lasagna/VC3D frame
+  construction as the side-strip segment, but rows are offset along
+  `frame.side` as in VC3D `lineSurface`. Visualizations must also include a
+  traced fused top strip projected to the central z slice: for each output
+  column, interpolate the fused trace, sample the segment coordinate grid and
+  Lasagna normal/offset axis at that traced side-strip point, derive the
+  top-strip side axis from traced tangent and normal, then sample rows along
+  that side axis with zero z offset. When z-search is active, the visualization
+  additionally appends a traced fused z-corrected top strip using the fused
+  trace's selected-scale `z_voxels` value as a normal/mesh offset before the
+  top-strip side-axis offset. This is visualization-only and must not change
+  Trace2CP scoring.
 - Embedding combined mode requires a checkpoint/model output with appended
   embedding channels; it must fail clearly rather than silently falling back
   when embeddings are absent. If a non-zero fiber-bank weight is configured and

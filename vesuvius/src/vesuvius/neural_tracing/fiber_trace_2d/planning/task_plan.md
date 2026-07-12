@@ -1,53 +1,51 @@
-# Trace2CP Metric Stdout And Presence Visualization Plan
+# Trace2CP Traced Top Strip Visualization Plan
 
 ## Scope
 
-- Keep Trace2CP scoring and metric definitions unchanged.
-- Change only Trace2CP stdout formatting and presence visualization.
-- Do not change whole-fiber visualization or training metrics.
+- Add top-strip panels to single-pair `trace2cp_vis.jpg`.
+- Keep the original/init top strip for comparison.
+- Add traced-line top-strip sampling for both single-pair and whole-fiber
+  Trace2CP visualization.
+- Do not change scoring, tracing, z-search candidate selection, metrics, or
+  training.
 
 ## Implementation
 
-- Split single-pair Trace2CP stdout:
-  - first line exactly `trace2cp_error=<value>`;
-  - second `trace2cp details ...` line contains raw y error, horizontal span,
-    target-column status, and other diagnostics.
-- Add fixed-scale presence visualization:
-  - derive `presence_hw` from the model presence output already used by
-    `--trace2cp-use-presence`;
-  - render `0..1` probability as black-to-white with invalid pixels black;
-  - overlay fiber line, start/target CPs, and selected forward/reverse traces;
-  - append this panel as a column in single-pair `trace2cp_vis.jpg` and as a
-    row in whole-fiber `trace2cp_fiber_vis.jpg` only when presence scoring is
-    active.
-- Add z-search corrected presence visualization:
-  - reconstruct forward, reverse, and fused presence maps column-by-column from
-    the selected trace z layer, using the same mechanism as the z-corrected
-    image;
-  - show those maps in the z debug column;
-  - use fused z-corrected presence for the whole-fiber presence row when it is
-    available.
+- Request top-strip debug sampling from `_evaluate_trace2cp_pair` in
+  single-pair export.
+- Add traced top-strip sampling in the loader:
+  - interpolate the fused trace at each output column;
+  - sample the center 3D point and Lasagna normal/offset axis from the segment
+    coordinate grid at that traced side-strip point;
+  - derive the top-strip side axis from traced tangent and normal;
+  - sample rows along that side axis;
+  - for the non-z version, force the trace z offset to zero;
+  - for z-search, use the fused trace's selected z offsets.
+- Extend `_draw_trace2cp_overlay` to accept optional original, traced z=0, and
+  traced z-corrected top-strip images/valid masks.
+- Render the top strips as an additional debug column:
+  - original/init `original top strip VC3D lineSurface`;
+  - traced `traced fused top strip z=0`;
+  - optional `traced fused top strip z-corrected`;
+  - draw the fiber centerline and start/target CP markers at the top-strip
+    center row.
+- Update whole-fiber overlay to stitch the original, traced z=0, and optional
+  traced z-corrected top-strip rows.
 
 ## Spec Update
 
-- Clarify that single-pair stdout emits `trace2cp_error=<value>` as a
-  standalone line.
-- Clarify that presence scoring enables a presence map debug column/row in
-  Trace2CP visualizations.
-- Clarify that z-search presence visualization is z-corrected from the selected
-  per-column trace layer, not the center-layer map.
+- Clarify that both single-pair and whole-fiber Trace2CP visualizations include
+  original/init top-strip comparison and traced fused top-strip output.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` Trace2CP runner docs.
-- Update `planning/status.md` and `planning/task_log.md`; add a changelog line
-  only if this becomes more than a small formatting/visualization tweak.
+- Update `docs/code_structure.md`.
+- Update `planning/status.md`, `planning/task_log.md`, and changelog if useful.
 
 ## Tests
 
-- Add/adjust focused unit coverage for single-pair and whole-fiber presence
-  visualization.
-- Add focused unit coverage for z-corrected presence column selection.
+- Add focused unit coverage that `_draw_trace2cp_overlay` appends a top-strip
+  column, and includes the z-corrected panel when provided.
 - Run:
-  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
+  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`

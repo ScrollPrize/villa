@@ -2,6 +2,9 @@
 
 ## 2026-07-12
 
+- Added Trace2CP top-strip visualization sampled as VC3D `lineSurface`,
+  including original/init comparison, traced fused central-z output, and fused
+  z-corrected output when z-search is active.
 - Changed combined Trace2CP CLI/scoring so candidate fan tracing defaults to
   direction-only, embedding and image similarity are explicit opt-in modes, and
   `--trace2cp-use-presence` can add sheet/fiber presence maximization to any

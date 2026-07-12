@@ -1481,6 +1481,12 @@ class _Trace2CpPairEvaluation:
     similarity_debug: _Trace2CpSimilarityDebug | None = None
     z_search_debug: _Trace2CpZTraceDebug | None = None
     presence_debug: np.ndarray | None = None
+    top_strip_image: np.ndarray | None = None
+    top_strip_valid_mask: np.ndarray | None = None
+    traced_top_strip_image: np.ndarray | None = None
+    traced_top_strip_valid_mask: np.ndarray | None = None
+    z_top_strip_image: np.ndarray | None = None
+    z_top_strip_valid_mask: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -5066,6 +5072,39 @@ def _draw_trace2cp_presence_panel(
     return _draw_label_band(np.asarray(pil, dtype=np.uint8), "presence 0..1")
 
 
+def _draw_trace2cp_top_strip_panel(
+    image: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    line_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    label: str,
+) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    image_u8 = _to_u8_image(image, valid_mask)
+    panel = np.repeat(image_u8[..., None], 3, axis=-1)
+    height = int(panel.shape[0])
+    center_y = (float(height) - 1.0) * 0.5
+    line_xy_top = np.asarray(line_xy, dtype=np.float32).copy()
+    if line_xy_top.ndim == 2 and line_xy_top.shape[1] == 2:
+        line_xy_top[:, 1] = np.float32(center_y)
+        panel = overlay_line_coords_rgb(panel, line_xy_top, opacity=0.25, thickness=1)
+    pil = Image.fromarray(panel, mode="RGB")
+    draw = ImageDraw.Draw(pil, mode="RGBA")
+    for point_xy, color in (
+        (start_xy, (32, 255, 255, 255)),
+        (target_xy, (255, 220, 64, 255)),
+    ):
+        point = np.asarray(point_xy, dtype=np.float32)
+        if point.shape == (2,) and bool(np.isfinite(point).all()):
+            x = float(point[0])
+            y = center_y
+            draw.ellipse((x - 2.0, y - 2.0, x + 2.0, y + 2.0), outline=color, width=1)
+    return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
+
+
 def _draw_trace2cp_similarity_panel(
     similarity: np.ndarray | None,
     valid_mask: np.ndarray,
@@ -5178,6 +5217,12 @@ def _draw_trace2cp_overlay(
     similarity_debug: _Trace2CpSimilarityDebug | None = None,
     z_search_debug: _Trace2CpZTraceDebug | None = None,
     presence_debug: np.ndarray | None = None,
+    top_strip_image: np.ndarray | None = None,
+    top_strip_valid_mask: np.ndarray | None = None,
+    traced_top_strip_image: np.ndarray | None = None,
+    traced_top_strip_valid_mask: np.ndarray | None = None,
+    z_top_strip_image: np.ndarray | None = None,
+    z_top_strip_valid_mask: np.ndarray | None = None,
     valid_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
@@ -5391,6 +5436,50 @@ def _draw_trace2cp_overlay(
         stacks.append(result_stack(reference_result, reference_label))
     if z_search_debug is not None:
         stacks.append(z_stack(z_search_debug))
+    top_panels: list[np.ndarray] = []
+    if top_strip_image is not None and top_strip_valid_mask is not None:
+        top_panels.append(
+            _draw_trace2cp_top_strip_panel(
+                top_strip_image,
+                top_strip_valid_mask,
+                line_xy=line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                label="original top strip VC3D lineSurface",
+            )
+        )
+    if traced_top_strip_image is not None and traced_top_strip_valid_mask is not None:
+        top_panels.append(
+            _draw_trace2cp_top_strip_panel(
+                traced_top_strip_image,
+                traced_top_strip_valid_mask,
+                line_xy=line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                label="traced fused top strip z=0",
+            )
+        )
+    if z_top_strip_image is not None and z_top_strip_valid_mask is not None:
+        top_panels.append(
+            _draw_trace2cp_top_strip_panel(
+                z_top_strip_image,
+                z_top_strip_valid_mask,
+                line_xy=line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                label="traced fused top strip z-corrected",
+            )
+        )
+    if top_panels:
+        top_width = max(int(panel.shape[1]) for panel in top_panels)
+        top_height = sum(int(panel.shape[0]) for panel in top_panels)
+        top_stack = np.zeros((top_height, top_width, 3), dtype=np.uint8)
+        y0 = 0
+        for panel in top_panels:
+            h, w = panel.shape[:2]
+            top_stack[y0 : y0 + h, :w] = panel
+            y0 += h
+        stacks.append(top_stack)
     if presence_debug is not None:
         presence_valid = (
             np.ones(np.asarray(image_u8).shape[:2], dtype=bool)
@@ -5712,7 +5801,74 @@ def _draw_trace2cp_fiber_overlay(
         ).astype(np.uint8)
         return presence_canvas
 
+    def compose_top_strip_canvas(*, image_attr: str, valid_attr: str) -> np.ndarray | None:
+        available = [
+            placement
+            for placement in placements
+            if getattr(placement.evaluation, image_attr) is not None
+            and getattr(placement.evaluation, valid_attr) is not None
+        ]
+        if not available:
+            return None
+        content_height = max(
+            int(np.asarray(getattr(placement.evaluation, image_attr)).shape[0])
+            for placement in available
+        )
+        top_pad = 8
+        top_canvas_height = max(1, content_height + 2 * top_pad)
+        top_accum = np.zeros((top_canvas_height, canvas_width, 3), dtype=np.float32)
+        top_weight = np.zeros((top_canvas_height, canvas_width, 1), dtype=np.float32)
+        for placement in available:
+            evaluation = placement.evaluation
+            image = np.asarray(getattr(evaluation, image_attr), dtype=np.float32)
+            valid = np.asarray(getattr(evaluation, valid_attr), dtype=bool)
+            if image.ndim != 2 or valid.shape != image.shape or not bool(valid.any()):
+                continue
+            image_u8 = _to_u8_image(image, valid)
+            rgb = np.repeat(image_u8[..., None], 3, axis=-1).astype(np.uint8)
+            _height, width = image_u8.shape[:2]
+            x0 = global_x_shift + placement.x_offset
+            x1 = global_x_shift + placement.x_offset + placement.x_scale * float(width - 1)
+            if placement.x_scale < 0.0:
+                rgb = np.flip(rgb, axis=1)
+                valid = np.flip(valid, axis=1)
+            dst_x0 = int(round(min(x0, x1)))
+            dst_y0 = int(top_pad)
+            src_y0 = max(0, -dst_y0)
+            src_x0 = max(0, -dst_x0)
+            dst_y = max(0, dst_y0)
+            dst_x = max(0, dst_x0)
+            copy_h = min(int(rgb.shape[0]) - src_y0, top_canvas_height - dst_y)
+            copy_w = min(int(rgb.shape[1]) - src_x0, canvas_width - dst_x)
+            if copy_h <= 0 or copy_w <= 0:
+                continue
+            valid_crop = valid[src_y0 : src_y0 + copy_h, src_x0 : src_x0 + copy_w]
+            rgb_crop = rgb[src_y0 : src_y0 + copy_h, src_x0 : src_x0 + copy_w].astype(np.float32)
+            if not bool(valid_crop.any()):
+                continue
+            target_slice = np.s_[dst_y : dst_y + copy_h, dst_x : dst_x + copy_w]
+            top_accum[target_slice] += rgb_crop * valid_crop[..., None].astype(np.float32)
+            top_weight[target_slice] += valid_crop[..., None].astype(np.float32)
+        top_canvas = np.zeros((top_canvas_height, canvas_width, 3), dtype=np.uint8)
+        covered = top_weight[..., 0] > 0.0
+        if not bool(covered.any()):
+            return None
+        top_canvas[covered] = np.clip(top_accum[covered] / top_weight[covered], 0.0, 255.0).astype(np.uint8)
+        return top_canvas
+
     presence_canvas = compose_presence_canvas()
+    top_strip_canvas = compose_top_strip_canvas(
+        image_attr="top_strip_image",
+        valid_attr="top_strip_valid_mask",
+    )
+    traced_top_strip_canvas = compose_top_strip_canvas(
+        image_attr="traced_top_strip_image",
+        valid_attr="traced_top_strip_valid_mask",
+    )
+    z_top_strip_canvas = compose_top_strip_canvas(
+        image_attr="z_top_strip_image",
+        valid_attr="z_top_strip_valid_mask",
+    )
     font = ImageFont.load_default()
 
     def map_points(points_xy: np.ndarray, placement: _Trace2CpFiberPairPlacement) -> np.ndarray:
@@ -5753,6 +5909,51 @@ def _draw_trace2cp_fiber_overlay(
             if point.shape == (1, 2) and bool(np.isfinite(point).all()):
                 x, y = (float(v) for v in point[0])
                 draw.ellipse((x - 2.0, y - 2.0, x + 2.0, y + 2.0), outline=color, width=1)
+
+    def draw_top_strip_row(row_label: str, row_canvas: np.ndarray, *, image_attr: str) -> np.ndarray:
+        pil = Image.fromarray(row_canvas, mode="RGB")
+        overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay, mode="RGBA")
+        for placement in placements:
+            evaluation = placement.evaluation
+            image = getattr(evaluation, image_attr)
+            if image is None:
+                continue
+            local_height = int(np.asarray(image).shape[0])
+            local_center_y = (float(local_height) - 1.0) * 0.5
+            top_y_shift = 8.0
+            line_xy_top = np.asarray(evaluation.sample.line_xy, dtype=np.float32).copy()
+            if line_xy_top.ndim == 2 and line_xy_top.shape[1] == 2:
+                line_xy_top[:, 1] = np.float32(local_center_y)
+                draw_points(
+                    draw,
+                    _mapped_trace2cp_points(
+                        line_xy_top,
+                        x_scale=placement.x_scale,
+                        x_offset=placement.x_offset + global_x_shift,
+                        y_shift=top_y_shift,
+                    ),
+                    (210, 210, 210, 95),
+                    width=1,
+                )
+            for point_xy, color in (
+                (evaluation.sample.start_control_point_xy, (32, 255, 255, 255)),
+                (evaluation.sample.target_control_point_xy, (255, 220, 64, 255)),
+            ):
+                point = np.asarray(point_xy, dtype=np.float32).reshape(1, 2).copy()
+                if point.shape == (1, 2):
+                    point[:, 1] = np.float32(local_center_y)
+                    mapped = _mapped_trace2cp_points(
+                        point,
+                        x_scale=placement.x_scale,
+                        x_offset=placement.x_offset + global_x_shift,
+                        y_shift=top_y_shift,
+                    )
+                    if mapped.shape == (1, 2) and bool(np.isfinite(mapped).all()):
+                        x, y = (float(v) for v in mapped[0])
+                        draw.ellipse((x - 2.0, y - 2.0, x + 2.0, y + 2.0), outline=color, width=1)
+        drawn = np.asarray(Image.alpha_composite(pil.convert("RGBA"), overlay).convert("RGB"), dtype=np.uint8)
+        return _draw_label_band(drawn, row_label)
 
     def draw_row(row_label: str, kind: str, *, base_canvas: np.ndarray | None = None) -> np.ndarray:
         row_canvas = canvas if base_canvas is None else base_canvas
@@ -5800,6 +6001,30 @@ def _draw_trace2cp_fiber_overlay(
         draw_row("fused CP-to-CP line", "fused"),
         draw_row("optimized CP-to-CP line", "optimized"),
     ]
+    if top_strip_canvas is not None:
+        rows.append(
+            draw_top_strip_row(
+                "original top strip VC3D lineSurface",
+                top_strip_canvas,
+                image_attr="top_strip_image",
+            )
+        )
+    if traced_top_strip_canvas is not None:
+        rows.append(
+            draw_top_strip_row(
+                "traced fused top strip z=0",
+                traced_top_strip_canvas,
+                image_attr="traced_top_strip_image",
+            )
+        )
+    if z_top_strip_canvas is not None:
+        rows.append(
+            draw_top_strip_row(
+                "traced fused top strip z-corrected",
+                z_top_strip_canvas,
+                image_attr="z_top_strip_image",
+            )
+        )
     if presence_canvas is not None:
         rows.append(draw_row("presence 0..1 full traces", "full", base_canvas=presence_canvas))
     width = max(int(row.shape[1]) for row in rows)
@@ -6001,6 +6226,7 @@ def _evaluate_trace2cp_pair(
     row_axis_alignment_line_index: int | None = None,
     row_axis_alignment_xyz: np.ndarray | None = None,
     build_similarity_debug: bool = True,
+    build_top_strip_debug: bool = False,
 ) -> _Trace2CpPairEvaluation:
     segment_source = loader.build_trace2cp_segment_source(
         sample_index,
@@ -6330,6 +6556,29 @@ def _evaluate_trace2cp_pair(
         if build_similarity_debug
         else None
     )
+    top_strip_image: np.ndarray | None = None
+    top_strip_valid_mask: np.ndarray | None = None
+    traced_top_strip_image: np.ndarray | None = None
+    traced_top_strip_valid_mask: np.ndarray | None = None
+    z_top_strip_image: np.ndarray | None = None
+    z_top_strip_valid_mask: np.ndarray | None = None
+    if build_top_strip_debug:
+        top_strip_image, top_strip_valid_mask = loader.sample_trace2cp_top_strip_source(segment_source)
+        fused_xy = np.asarray(selected_result.refinement.fused_resampled_xy, dtype=np.float32)
+        if fused_xy.ndim == 2 and fused_xy.shape[1] == 2 and fused_xy.shape[0] > 0:
+            fused_center_xyz = np.concatenate(
+                [fused_xy, np.zeros((int(fused_xy.shape[0]), 1), dtype=np.float32)],
+                axis=1,
+            )
+            traced_top_strip_image, traced_top_strip_valid_mask = loader.sample_trace2cp_traced_top_strip_source(
+                segment_source,
+                fused_center_xyz,
+            )
+        if z_search_debug is not None:
+            z_top_strip_image, z_top_strip_valid_mask = loader.sample_trace2cp_traced_top_strip_source(
+                segment_source,
+                z_search_debug.fused_trace_xyz,
+            )
     return _Trace2CpPairEvaluation(
         sample_index=int(sample_index),
         sample=sample,
@@ -6346,6 +6595,12 @@ def _evaluate_trace2cp_pair(
         similarity_debug=similarity_debug,
         z_search_debug=z_search_debug,
         presence_debug=presence_debug,
+        top_strip_image=top_strip_image,
+        top_strip_valid_mask=top_strip_valid_mask,
+        traced_top_strip_image=traced_top_strip_image,
+        traced_top_strip_valid_mask=traced_top_strip_valid_mask,
+        z_top_strip_image=z_top_strip_image,
+        z_top_strip_valid_mask=z_top_strip_valid_mask,
     )
 
 
@@ -6411,6 +6666,7 @@ def _export_trace2cp_vis(
         candidate_max_degrees=candidate_max_degrees,
         candidate_step_degrees=candidate_step_degrees,
         z_search=z_search,
+        build_top_strip_debug=True,
     )
     sample = evaluation.sample
     image = evaluation.image
@@ -6451,6 +6707,12 @@ def _export_trace2cp_vis(
         similarity_debug=evaluation.similarity_debug,
         z_search_debug=evaluation.z_search_debug,
         presence_debug=evaluation.presence_debug,
+        top_strip_image=evaluation.top_strip_image,
+        top_strip_valid_mask=evaluation.top_strip_valid_mask,
+        traced_top_strip_image=evaluation.traced_top_strip_image,
+        traced_top_strip_valid_mask=evaluation.traced_top_strip_valid_mask,
+        z_top_strip_image=evaluation.z_top_strip_image,
+        z_top_strip_valid_mask=evaluation.z_top_strip_valid_mask,
         valid_mask=valid_mask,
     )
     _write_jpg(out / "trace2cp_vis.jpg", overlay)
@@ -6804,6 +7066,7 @@ def _export_trace2cp_fiber_vis(
                 row_axis_alignment_line_index=alignment_line_index,
                 row_axis_alignment_xyz=alignment_axis,
                 build_similarity_debug=False,
+                build_top_strip_debug=True,
             )
         except ValueError as exc:
             reason = _trace2cp_skip_reason(exc)

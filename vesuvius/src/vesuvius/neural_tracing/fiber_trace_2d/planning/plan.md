@@ -2,7 +2,18 @@
 
 2d slice based fiber refinement/interpolation between long distance controlpoints in the 3d volume
 
-# current overview plan
+# curr
+- given embedding does not reall work
+    - but dir and presence do -> use those for the 2d tracing
+- add 2d top-view/fiber direction training (same supervisions & and augmentations as other side)
+- then step all jointly
+- if we cont 2d
+    - try cross fiber slices for embedding
+    - try top for embedding
+    - top fiber dt (with condition?)
+- probably better - switch to 3d
+
+# prev
 - try the looser embedding (only some points in a fiber shall look similar)
 - learn fiber/sheet presence (thats anyways what embedding regressed to)
 
@@ -20,6 +31,7 @@
 - data is streamed+cached from s3 (compare the existing fiber tracer code vesuvius/src/vesuvius/neural_tracing/fiber_trace/)
 
 # various details
+- idea: within fibers we see sub-fibers at sd 1 (4um) - is this reliable? could be used to do 2d alignment within fiber!
 
 ## trace2cp error
 - load the strip between two cps (with some margin to spare

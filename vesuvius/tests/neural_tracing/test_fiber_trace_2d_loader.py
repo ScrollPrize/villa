@@ -141,6 +141,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     build_side_strip_patch_grid_from_line_window,
     build_side_strip_patch_grid_from_line_window_torch,
     build_side_strip_patch_grid_tensor_from_line_window,
+    build_top_strip_patch_grid_tensor_from_line_window,
     control_point_line_index,
     side_strip_segment_line_window,
     side_strip_line_window,
@@ -681,6 +682,76 @@ def test_trace2cp_overlay_can_add_presence_column() -> None:
     assert with_presence.shape[1] > base.shape[1]
     assert with_presence.shape[0] >= base.shape[0]
     assert bool(np.any(with_presence[:, -image.shape[1] :, :] != 0))
+
+
+def test_trace2cp_overlay_can_add_top_strip_column() -> None:
+    field = np.zeros((11, 11, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+    result = _trace_score_trace2cp_bidirectional(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+    image = np.zeros((11, 11), dtype=np.uint8)
+    line = np.asarray([[2.0, 4.0], [8.0, 5.0]], dtype=np.float32)
+    top = np.full((11, 11), 96.0, dtype=np.float32)
+    traced_top = np.full((11, 11), 144.0, dtype=np.float32)
+    z_top = np.full((11, 11), 192.0, dtype=np.float32)
+    valid = np.ones((11, 11), dtype=bool)
+
+    base = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+    )
+    with_top = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        top_strip_image=top,
+        top_strip_valid_mask=valid,
+    )
+    with_traced_top = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        top_strip_image=top,
+        top_strip_valid_mask=valid,
+        traced_top_strip_image=traced_top,
+        traced_top_strip_valid_mask=valid,
+    )
+    with_z_top = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        top_strip_image=top,
+        top_strip_valid_mask=valid,
+        traced_top_strip_image=traced_top,
+        traced_top_strip_valid_mask=valid,
+        z_top_strip_image=z_top,
+        z_top_strip_valid_mask=valid,
+    )
+
+    assert with_top.shape[1] == base.shape[1] + image.shape[1]
+    assert with_top.shape[0] >= base.shape[0]
+    assert with_traced_top.shape[1] == with_top.shape[1]
+    assert with_traced_top.shape[0] >= with_top.shape[0]
+    assert with_z_top.shape[1] == with_traced_top.shape[1]
+    assert with_z_top.shape[0] >= with_traced_top.shape[0]
+    assert bool(np.any(with_z_top[:, -image.shape[1] :, :] != 0))
+    assert float(np.mean(with_z_top[:, -image.shape[1] :, :])) > float(
+        np.mean(with_top[:, -image.shape[1] :, :])
+    )
 
 
 def test_trace2cp_target_column_wins_over_next_rf_margin() -> None:
@@ -1591,6 +1662,39 @@ def test_trace2cp_segment_source_offsets_each_pixel_axis(tmp_path: Path) -> None
     assert np.allclose(delta[grid_valid], expected[grid_valid], atol=1.0e-5)
 
 
+def test_trace2cp_traced_top_strip_samples_from_fused_trace(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    trace_xyz = np.column_stack(
+        [
+            np.asarray(source.line_xy[:, 0], dtype=np.float32),
+            np.asarray(source.line_xy[:, 1], dtype=np.float32),
+            np.zeros((int(source.line_xy.shape[0]),), dtype=np.float32),
+        ]
+    )
+    z_trace_xyz = trace_xyz.copy()
+    z_trace_xyz[:, 2] = np.float32(1.0)
+
+    image, valid = loader.sample_trace2cp_traced_top_strip_source(source, trace_xyz)
+    z_image, z_valid = loader.sample_trace2cp_traced_top_strip_source(source, z_trace_xyz)
+
+    assert image.shape == source.source_shape_hw
+    assert valid.shape == source.source_shape_hw
+    assert z_image.shape == source.source_shape_hw
+    assert z_valid.shape == source.source_shape_hw
+    assert bool(valid.any())
+    assert bool(z_valid.any())
+    overlap = valid & z_valid
+    assert bool(overlap.any())
+    assert not np.allclose(image[overlap], z_image[overlap])
+
+
 def test_trace2cp_segment_patch_can_align_ambiguous_normal_sign(tmp_path: Path) -> None:
     loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
 
@@ -1781,6 +1885,58 @@ def test_trace2cp_fiber_overlay_can_add_presence_row() -> None:
     assert drawn.shape[0] > base.shape[0]
     assert drawn.shape[1] == base.shape[1]
     assert bool(np.any(drawn[-first.image.shape[0] :, :, :] != 0))
+
+
+def test_trace2cp_fiber_overlay_adds_top_strip_rows() -> None:
+    first = _fake_trace2cp_pair_evaluation(0, 1)
+    top_image = np.full_like(first.image, 96.0, dtype=np.float32)
+    traced_top_image = np.full_like(first.image, 144.0, dtype=np.float32)
+    z_top_image = np.full_like(first.image, 192.0, dtype=np.float32)
+    top_valid = np.ones_like(first.image, dtype=bool)
+    with_top = replace(
+        first,
+        top_strip_image=top_image,
+        top_strip_valid_mask=top_valid,
+    )
+    with_traced_top = replace(
+        with_top,
+        traced_top_strip_image=traced_top_image,
+        traced_top_strip_valid_mask=top_valid,
+    )
+    with_z_top = replace(
+        with_traced_top,
+        z_top_strip_image=z_top_image,
+        z_top_strip_valid_mask=top_valid,
+    )
+
+    base = _draw_trace2cp_fiber_overlay(
+        [first],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+    drawn_top = _draw_trace2cp_fiber_overlay(
+        [with_top],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+    drawn_traced_top = _draw_trace2cp_fiber_overlay(
+        [with_traced_top],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+    drawn_z_top = _draw_trace2cp_fiber_overlay(
+        [with_z_top],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+
+    assert drawn_top.shape[0] > base.shape[0]
+    assert drawn_top.shape[1] == base.shape[1]
+    assert drawn_traced_top.shape[0] > drawn_top.shape[0]
+    assert drawn_traced_top.shape[1] == base.shape[1]
+    assert drawn_z_top.shape[0] > drawn_traced_top.shape[0]
+    assert drawn_z_top.shape[1] == base.shape[1]
+    assert bool(np.any(drawn_z_top[-first.image.shape[0] :, :, :] != 0))
 
 
 def test_trace2cp_fiber_overlay_flips_reversed_pair_image_data() -> None:
@@ -2283,6 +2439,41 @@ def test_side_strip_grid_matches_vc3d_simple_line_boundaries(tmp_path: Path) -> 
     assert np.allclose(grid.coords_xyz[0, 1], [10.0, 20.0, 19.0])
     assert np.allclose(grid.coords_xyz[1, 1], [10.0, 20.0, 20.0])
     assert np.allclose(grid.coords_xyz[2, 1], [10.0, 20.0, 21.0])
+    assert np.all(grid.valid_mask)
+
+
+def test_top_strip_grid_uses_vc3d_line_surface_side_axis(tmp_path: Path) -> None:
+    fiber = load_vc3d_fiber(_write_fiber(tmp_path / "fiber.json"))
+    window = side_strip_line_window(
+        fiber,
+        control_point_index=1,
+        patch_shape_hw=(3, 3),
+        interpolation_point_margin=0,
+    )
+    normals = np.repeat(
+        np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+        window.line_points_xyz.shape[0],
+        axis=0,
+    )
+
+    grid = build_top_strip_patch_grid_tensor_from_line_window(
+        window,
+        patch_shape_hw=(3, 3),
+        sampled_normals=normals,
+        device=torch.device("cpu"),
+    ).to_numpy()
+    z_grid = build_top_strip_patch_grid_tensor_from_line_window(
+        window,
+        patch_shape_hw=(3, 3),
+        sampled_normals=normals,
+        normal_offsets_by_column=np.asarray([0.0, 1.0, 2.0], dtype=np.float32),
+        device=torch.device("cpu"),
+    ).to_numpy()
+
+    assert np.allclose(grid.coords_xyz[0, 1], [10.0, 19.0, 20.0])
+    assert np.allclose(grid.coords_xyz[1, 1], [10.0, 20.0, 20.0])
+    assert np.allclose(grid.coords_xyz[2, 1], [10.0, 21.0, 20.0])
+    assert np.allclose(z_grid.coords_xyz[:, :, 2], [[20.0, 21.0, 22.0]] * 3)
     assert np.all(grid.valid_mask)
 
 
