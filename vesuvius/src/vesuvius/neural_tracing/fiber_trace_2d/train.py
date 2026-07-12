@@ -41,6 +41,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.model import (
     FiberStripDirectionModelConfig,
     FiberStripDirectionNet,
     direction_output,
+    presence_output,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _predict_direction_field,
@@ -70,6 +71,10 @@ class FiberStripTrainingConfig:
     model_depth: int = 10
     presence_enabled: bool = False
     presence_weight: float = 1.0
+    top_view_enabled: bool = False
+    top_view_direction_weight: float = 1.0
+    top_view_dt_weight: float = 1.0
+    top_view_dt_radius_px: float = 30.0
     contrastive_enabled: bool = False
     contrastive_embedding_channels: int = 0
     contrastive_control_points_per_fiber: int = 8
@@ -116,6 +121,10 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         model_depth=max(1, int(get("model_depth", 10))),
         presence_enabled=bool(get("presence_enabled", False)),
         presence_weight=float(get("presence_weight", 1.0)),
+        top_view_enabled=bool(get("top_view_enabled", False)),
+        top_view_direction_weight=float(get("top_view_direction_weight", 1.0)),
+        top_view_dt_weight=float(get("top_view_dt_weight", 1.0)),
+        top_view_dt_radius_px=float(get("top_view_dt_radius_px", 30.0)),
         contrastive_enabled=bool(get("contrastive_enabled", False)),
         contrastive_embedding_channels=max(0, int(get("contrastive_embedding_channels", 0))),
         contrastive_control_points_per_fiber=max(1, int(get("contrastive_control_points_per_fiber", 8))),
@@ -140,6 +149,12 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         raise ValueError("training.contrastive_embedding_channels must be > 0 when contrastive is enabled")
     if not math.isfinite(config.presence_weight) or config.presence_weight < 0.0:
         raise ValueError("training.presence_weight must be non-negative and finite")
+    if not math.isfinite(config.top_view_direction_weight) or config.top_view_direction_weight < 0.0:
+        raise ValueError("training.top_view_direction_weight must be non-negative and finite")
+    if not math.isfinite(config.top_view_dt_weight) or config.top_view_dt_weight < 0.0:
+        raise ValueError("training.top_view_dt_weight must be non-negative and finite")
+    if not math.isfinite(config.top_view_dt_radius_px) or config.top_view_dt_radius_px <= 0.0:
+        raise ValueError("training.top_view_dt_radius_px must be positive and finite")
     if config.contrastive_enabled and (
         config.train_control_points_per_step % config.contrastive_control_points_per_fiber != 0
     ):
@@ -200,6 +215,10 @@ def _embedding_channel_count(training: FiberStripTrainingConfig | None) -> int:
     if training is None or not bool(training.contrastive_enabled):
         return 0
     return max(0, int(training.contrastive_embedding_channels))
+
+
+def _top_view_scalar_channel_count(training: FiberStripTrainingConfig | None) -> int:
+    return 1 if training is not None and bool(training.top_view_enabled) else 0
 
 
 def _load_raw_config(path: str | Path) -> dict[str, Any]:
@@ -316,6 +335,107 @@ def _batch_images_to_tensors(
 
 
 @dataclass(frozen=True)
+class TopDistanceTransformSupervision:
+    patch_indices: torch.Tensor
+    y: torch.Tensor
+    x: torch.Tensor
+    target: torch.Tensor
+    cp_xy: torch.Tensor
+    normal_xy: torch.Tensor
+
+
+def build_top_distance_transform_supervision(
+    samples: tuple[Any, ...] | list[Any],
+    valid_mask: np.ndarray | torch.Tensor,
+    *,
+    radius_px: float,
+    device: torch.device,
+) -> TopDistanceTransformSupervision:
+    valid_np = np.asarray(valid_mask, dtype=bool)
+    if valid_np.ndim != 3:
+        raise ValueError("top DT valid_mask must have shape N,H,W")
+    if len(samples) != int(valid_np.shape[0]):
+        raise ValueError("samples length must match top DT valid-mask patch count")
+    radius = float(radius_px)
+    if not math.isfinite(radius) or radius <= 0.0:
+        raise ValueError("top DT radius must be positive and finite")
+    height, width = int(valid_np.shape[1]), int(valid_np.shape[2])
+    max_steps = int(math.ceil(math.hypot(float(height), float(width)))) + 2
+    patch_rows: list[int] = []
+    y_rows: list[int] = []
+    x_rows: list[int] = []
+    targets: list[float] = []
+    cp_rows: list[np.ndarray] = []
+    normal_rows: list[np.ndarray] = []
+    for patch_index, sample in enumerate(samples):
+        cp_and_tangent = line_cp_and_tangent_xy(
+            sample.line_xy,
+            getattr(sample, "control_point_xy", None),
+        )
+        if cp_and_tangent is None:
+            continue
+        cp_xy, tangent_xy = cp_and_tangent
+        normal_xy = np.asarray([-float(tangent_xy[1]), float(tangent_xy[0])], dtype=np.float32)
+        norm = float(np.linalg.norm(normal_xy))
+        if not np.isfinite(norm) or norm <= 1.0e-6:
+            continue
+        normal_xy = (normal_xy / np.float32(norm)).astype(np.float32, copy=False)
+        seen: set[tuple[int, int]] = set()
+        for step in range(-max_steps, max_steps + 1):
+            xy = np.asarray(cp_xy, dtype=np.float32) + normal_xy * np.float32(step)
+            rounded = np.rint(xy).astype(np.int64)
+            x = int(rounded[0])
+            y = int(rounded[1])
+            if not (0 <= y < height and 0 <= x < width):
+                continue
+            key = (y, x)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not bool(valid_np[patch_index, y, x]):
+                continue
+            delta = np.asarray([float(x), float(y)], dtype=np.float32) - np.asarray(cp_xy, dtype=np.float32)
+            distance = abs(float(np.dot(delta, normal_xy)))
+            target = max(0.0, 1.0 - distance / radius)
+            patch_rows.append(int(patch_index))
+            y_rows.append(y)
+            x_rows.append(x)
+            targets.append(float(target))
+            cp_rows.append(np.asarray(cp_xy, dtype=np.float32))
+            normal_rows.append(normal_xy.astype(np.float32))
+    if not patch_rows:
+        empty_i = torch.zeros((0,), dtype=torch.long, device=device)
+        return TopDistanceTransformSupervision(
+            patch_indices=empty_i,
+            y=empty_i,
+            x=empty_i,
+            target=torch.zeros((0,), dtype=torch.float32, device=device),
+            cp_xy=torch.zeros((0, 2), dtype=torch.float32, device=device),
+            normal_xy=torch.zeros((0, 2), dtype=torch.float32, device=device),
+        )
+    return TopDistanceTransformSupervision(
+        patch_indices=torch.as_tensor(patch_rows, dtype=torch.long, device=device),
+        y=torch.as_tensor(y_rows, dtype=torch.long, device=device),
+        x=torch.as_tensor(x_rows, dtype=torch.long, device=device),
+        target=torch.as_tensor(targets, dtype=torch.float32, device=device),
+        cp_xy=torch.as_tensor(np.stack(cp_rows, axis=0), dtype=torch.float32, device=device),
+        normal_xy=torch.as_tensor(np.stack(normal_rows, axis=0), dtype=torch.float32, device=device),
+    )
+
+
+def top_distance_transform_mse_loss(
+    prediction: torch.Tensor,
+    supervision: TopDistanceTransformSupervision,
+) -> torch.Tensor:
+    if prediction.ndim != 4 or int(prediction.shape[1]) != 1:
+        raise ValueError("top DT prediction must have shape N,1,H,W")
+    if int(supervision.patch_indices.numel()) == 0:
+        raise ValueError("top DT loss requires at least one valid supervised pixel")
+    gathered = prediction[supervision.patch_indices, 0, supervision.y, supervision.x]
+    return torch.nn.functional.mse_loss(gathered, supervision.target)
+
+
+@dataclass(frozen=True)
 class _DirectionMetrics:
     angle_mean_deg: float
     loss_direction: float
@@ -335,6 +455,11 @@ class _DirectionMetrics:
     contrastive_similarity_mean_value: float = 0.0
     contrastive_similarity_mean_target: float = 0.0
     contrastive_similarity_mean_samples: int = 0
+    top_loss_direction: float = 0.0
+    top_loss_dt: float = 0.0
+    top_angle_mean_deg: float = 0.0
+    top_direction_samples: int = 0
+    top_dt_samples: int = 0
 
 
 @dataclass(frozen=True)
@@ -351,6 +476,7 @@ class _LoadedTrainingBatch:
     step: int
     raw_start_sample_index: int
     batch: FiberStrip2DBatch
+    top_batch: FiberStrip2DBatch | None
     profile: dict[str, float]
     load_ms: float
 
@@ -390,6 +516,10 @@ class _PreparedTrainingBatch:
     supervision: DirectionSupervision
     valid_np: np.ndarray
     prep_ms: float
+    top_images: torch.Tensor | None = None
+    top_supervision: DirectionSupervision | None = None
+    top_dt_supervision: TopDistanceTransformSupervision | None = None
+    top_valid_np: np.ndarray | None = None
     prep_gpu_ms: float = 0.0
     prep_wait_ms: float = 0.0
     prep_submit_ms: float = 0.0
@@ -400,6 +530,10 @@ class _PreparedTrainingBatch:
     @property
     def batch(self) -> FiberStrip2DBatch:
         return self.loaded.batch
+
+    @property
+    def top_batch(self) -> FiberStrip2DBatch | None:
+        return self.loaded.top_batch
 
     @property
     def load_ms(self) -> float:
@@ -415,15 +549,37 @@ def _prepare_loaded_training_batch(
     *,
     device: torch.device,
     stream: torch.cuda.Stream | None = None,
+    top_dt_radius_px: float = 30.0,
 ) -> _PreparedTrainingBatch:
     t0 = time.perf_counter()
     start_event: torch.cuda.Event | None = None
     end_event: torch.cuda.Event | None = None
+
+    def prepare_top() -> tuple[
+        torch.Tensor | None,
+        DirectionSupervision | None,
+        TopDistanceTransformSupervision | None,
+        np.ndarray | None,
+    ]:
+        if loaded.top_batch is None:
+            return None, None, None, None
+        top_images_raw, top_valid_t, top_valid_np = _batch_images_to_tensors(loaded.top_batch, device=device)
+        top_images = _normalize_image_tensor(top_images_raw, top_valid_t)
+        top_supervision = build_direction_supervision(loaded.top_batch.samples, top_valid_np, device=device)
+        top_dt_supervision = build_top_distance_transform_supervision(
+            loaded.top_batch.samples,
+            top_valid_np,
+            radius_px=top_dt_radius_px,
+            device=device,
+        )
+        return top_images, top_supervision, top_dt_supervision, top_valid_np
+
     context = torch.cuda.stream(stream) if stream is not None else None
     if context is None:
         images_raw, valid_t, valid_np = _batch_images_to_tensors(loaded.batch, device=device)
         images = _normalize_image_tensor(images_raw, valid_t)
         supervision = build_direction_supervision(loaded.batch.samples, valid_np, device=device)
+        top_images, top_supervision, top_dt_supervision, top_valid_np = prepare_top()
     else:
         with context:
             start_event = torch.cuda.Event(enable_timing=True)
@@ -432,6 +588,7 @@ def _prepare_loaded_training_batch(
             images_raw, valid_t, valid_np = _batch_images_to_tensors(loaded.batch, device=device)
             images = _normalize_image_tensor(images_raw, valid_t)
             supervision = build_direction_supervision(loaded.batch.samples, valid_np, device=device)
+            top_images, top_supervision, top_dt_supervision, top_valid_np = prepare_top()
             end_event.record(stream)
     prep_ms = (time.perf_counter() - t0) * 1000.0
     if stream is None:
@@ -441,6 +598,10 @@ def _prepare_loaded_training_batch(
         images=images,
         supervision=supervision,
         valid_np=valid_np,
+        top_images=top_images,
+        top_supervision=top_supervision,
+        top_dt_supervision=top_dt_supervision,
+        top_valid_np=top_valid_np,
         prep_ms=prep_ms,
         stream=stream,
         start_event=start_event,
@@ -487,6 +648,7 @@ def _load_and_prepare_training_step(
         loaded,
         device=device,
         stream=stream,
+        top_dt_radius_px=training.top_view_dt_radius_px,
     )
     return prepared
 
@@ -633,6 +795,16 @@ def _load_training_batch(
             include_line_xy=True,
             include_coords=False,
         )
+        top_batch = (
+            loader.load_top_batch_for_batch(
+                batch,
+                profile=loader_profile if profile_enabled else None,
+                include_line_xy=True,
+                include_coords=False,
+            )
+            if bool(training.top_view_enabled)
+            else None
+        )
     else:
         batch = loader.load_batch(
             raw_start_sample_index,
@@ -644,11 +816,22 @@ def _load_training_batch(
             include_line_xy=True,
             include_coords=False,
         )
+        top_batch = (
+            loader.load_top_batch_for_batch(
+                batch,
+                profile=loader_profile if profile_enabled else None,
+                include_line_xy=True,
+                include_coords=False,
+            )
+            if bool(training.top_view_enabled)
+            else None
+        )
     load_ms = (time.perf_counter() - t0) * 1000.0
     return _LoadedTrainingBatch(
         step=int(step),
         raw_start_sample_index=raw_start_sample_index,
         batch=batch,
+        top_batch=top_batch,
         profile=loader_profile,
         load_ms=load_ms,
     )
@@ -811,7 +994,8 @@ def _compute_prepared_batch_loss(
     prepared: _PreparedTrainingBatch,
     training: FiberStripTrainingConfig | None = None,
     contrastive_negative_mask: np.ndarray | torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, DirectionSupervision, _DirectionMetrics]:
+    top_model: FiberStripDirectionNet | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, DirectionSupervision, _DirectionMetrics]:
     outputs = model(prepared.images)
     direction = direction_output(outputs)
     direction_loss = direction_mse_loss(direction, prepared.supervision)
@@ -843,6 +1027,32 @@ def _compute_prepared_batch_loss(
         )
         loss = loss + contrastive
     angle_error = direction_angle_error_degrees(direction, prepared.supervision)
+    top_outputs: torch.Tensor | None = None
+    top_loss_direction_value = 0.0
+    top_loss_dt_value = 0.0
+    top_angle_mean_deg = 0.0
+    top_direction_samples = 0
+    top_dt_samples = 0
+    if training is not None and bool(training.top_view_enabled):
+        if top_model is None:
+            raise ValueError("top_view_enabled training requires a top_model")
+        if prepared.top_images is None or prepared.top_supervision is None or prepared.top_dt_supervision is None:
+            raise ValueError("top_view_enabled training requires prepared top-view tensors")
+        top_outputs = top_model(prepared.top_images)
+        top_direction = direction_output(top_outputs)
+        top_direction_loss = direction_mse_loss(top_direction, prepared.top_supervision)
+        top_dt_prediction = presence_output(top_outputs, presence_channels=1)
+        top_dt_loss = top_distance_transform_mse_loss(top_dt_prediction, prepared.top_dt_supervision)
+        if float(training.top_view_direction_weight) > 0.0:
+            loss = loss + top_direction_loss * float(training.top_view_direction_weight)
+        if float(training.top_view_dt_weight) > 0.0:
+            loss = loss + top_dt_loss * float(training.top_view_dt_weight)
+        top_angle = direction_angle_error_degrees(top_direction, prepared.top_supervision)
+        top_loss_direction_value = float(top_direction_loss.detach().cpu().item())
+        top_loss_dt_value = float(top_dt_loss.detach().cpu().item())
+        top_angle_mean_deg = float(top_angle.detach().mean().cpu().item())
+        top_direction_samples = int(prepared.top_supervision.target.shape[0])
+        top_dt_samples = int(prepared.top_dt_supervision.target.shape[0])
     metrics = _DirectionMetrics(
         angle_mean_deg=float(angle_error.detach().mean().cpu().item()),
         loss_direction=float(direction_loss.detach().cpu().item()),
@@ -862,8 +1072,13 @@ def _compute_prepared_batch_loss(
         contrastive_similarity_mean_value=contrastive_metrics.similarity_mean_value,
         contrastive_similarity_mean_target=contrastive_metrics.similarity_mean_target,
         contrastive_similarity_mean_samples=contrastive_metrics.similarity_mean_samples,
+        top_loss_direction=top_loss_direction_value,
+        top_loss_dt=top_loss_dt_value,
+        top_angle_mean_deg=top_angle_mean_deg,
+        top_direction_samples=top_direction_samples,
+        top_dt_samples=top_dt_samples,
     )
-    return loss, outputs, prepared.supervision, metrics
+    return loss, outputs, top_outputs, prepared.supervision, metrics
 
 
 def _sync_device(device: torch.device) -> None:
@@ -1037,6 +1252,7 @@ def run_benchmark(
     loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
     device = resolve_torch_device(training.device)
     model: FiberStripDirectionNet | None = None
+    top_model: FiberStripDirectionNet | None = None
     optimizer: torch.optim.Optimizer | None = None
     if not load_only:
         model = FiberStripDirectionNet(
@@ -1048,8 +1264,22 @@ def run_benchmark(
                 embedding_channels=_embedding_channel_count(training),
             )
         ).to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate)
+        parameters: list[torch.nn.Parameter] = list(model.parameters())
+        if bool(training.top_view_enabled):
+            top_model = FiberStripDirectionNet(
+                FiberStripDirectionModelConfig(
+                    in_channels=1,
+                    hidden_channels=training.model_hidden_channels,
+                    depth=training.model_depth,
+                    presence_channels=_top_view_scalar_channel_count(training),
+                    embedding_channels=0,
+                )
+            ).to(device)
+            parameters.extend(top_model.parameters())
+        optimizer = torch.optim.AdamW(parameters, lr=training.learning_rate)
         model.train()
+        if top_model is not None:
+            top_model.train()
 
     sample_mode = "random"
     stage_totals = {
@@ -1144,7 +1374,11 @@ def run_benchmark(
                 assert optimizer is not None
                 if prepared is None:
                     prep_start = time.perf_counter()
-                    prepared = _prepare_loaded_training_batch(loaded, device=device)
+                    prepared = _prepare_loaded_training_batch(
+                        loaded,
+                        device=device,
+                        top_dt_radius_px=training.top_view_dt_radius_px,
+                    )
                     train_profile["prep"] = (time.perf_counter() - prep_start) * 1000.0
                     train_profile["prep_gpu"] = prepared.prep_gpu_ms
                     train_profile["prep_wait"] = prepared.prep_wait_ms
@@ -1178,6 +1412,25 @@ def run_benchmark(
                         presence_channels=presence_channels,
                     )
                     loss = loss + contrastive
+                if bool(training.top_view_enabled):
+                    if top_model is None:
+                        raise ValueError("top_view_enabled benchmark requires a top model")
+                    if prepared.top_images is None or prepared.top_supervision is None or prepared.top_dt_supervision is None:
+                        raise ValueError("top_view_enabled benchmark requires prepared top-view tensors")
+                    top_outputs = top_model(prepared.top_images)
+                    top_direction_loss = direction_mse_loss(
+                        direction_output(top_outputs),
+                        prepared.top_supervision,
+                    )
+                    top_dt_loss = top_distance_transform_mse_loss(
+                        presence_output(top_outputs, presence_channels=1),
+                        prepared.top_dt_supervision,
+                    )
+                    loss = (
+                        loss
+                        + top_direction_loss * float(training.top_view_direction_weight)
+                        + top_dt_loss * float(training.top_view_dt_weight)
+                    )
                 _sync_device(device)
                 train_profile["fw"] = (time.perf_counter() - fw_start) * 1000.0
 
@@ -1227,6 +1480,13 @@ class _EvalResult:
     supervision_samples: int
     batch: FiberStrip2DBatch
     outputs: torch.Tensor
+    top_batch: FiberStrip2DBatch | None = None
+    top_outputs: torch.Tensor | None = None
+    top_loss_direction: float = 0.0
+    top_loss_dt: float = 0.0
+    top_angle_mean_deg: float = 0.0
+    top_direction_samples: int = 0
+    top_dt_samples: int = 0
 
 
 @dataclass(frozen=True)
@@ -1270,9 +1530,14 @@ def _evaluate_fixed_batch(
     start_sample_index: int,
     batch_size: int,
     sample_mode: str,
+    training: FiberStripTrainingConfig | None = None,
+    top_model: FiberStripDirectionNet | None = None,
 ) -> _EvalResult:
     was_training = model.training
+    top_was_training = False if top_model is None else top_model.training
     model.eval()
+    if top_model is not None:
+        top_model.eval()
     with torch.no_grad():
         batch = loader.load_batch(
             start_sample_index,
@@ -1282,14 +1547,60 @@ def _evaluate_fixed_batch(
         loss, outputs, supervision, metrics = _compute_batch_loss(model, batch, device=device)
         loss_value = float(loss.detach().cpu().item())
         outputs_cpu = outputs.detach().cpu()
+        top_batch = None
+        top_outputs_cpu = None
+        top_loss_direction = 0.0
+        top_loss_dt = 0.0
+        top_angle_mean_deg = 0.0
+        top_direction_samples = 0
+        top_dt_samples = 0
+        if training is not None and bool(training.top_view_enabled):
+            if top_model is None:
+                raise ValueError("top_view_enabled test evaluation requires a top model")
+            top_batch = loader.load_top_batch_for_batch(
+                batch,
+                include_line_xy=True,
+                include_coords=False,
+            )
+            top_images_np, top_valid_np = _flatten_batch(top_batch)
+            top_images = _prepare_images(top_images_np, top_valid_np, device=device)
+            top_supervision = build_direction_supervision(top_batch.samples, top_valid_np, device=device)
+            top_dt_supervision = build_top_distance_transform_supervision(
+                top_batch.samples,
+                top_valid_np,
+                radius_px=training.top_view_dt_radius_px,
+                device=device,
+            )
+            top_outputs = top_model(top_images)
+            top_direction_loss_t = direction_mse_loss(direction_output(top_outputs), top_supervision)
+            top_dt_loss_t = top_distance_transform_mse_loss(
+                presence_output(top_outputs, presence_channels=1),
+                top_dt_supervision,
+            )
+            top_angle = direction_angle_error_degrees(direction_output(top_outputs), top_supervision)
+            top_outputs_cpu = top_outputs.detach().cpu()
+            top_loss_direction = float(top_direction_loss_t.detach().cpu().item())
+            top_loss_dt = float(top_dt_loss_t.detach().cpu().item())
+            top_angle_mean_deg = float(top_angle.detach().mean().cpu().item())
+            top_direction_samples = int(top_supervision.target.shape[0])
+            top_dt_samples = int(top_dt_supervision.target.shape[0])
     if was_training:
         model.train()
+    if top_model is not None and top_was_training:
+        top_model.train()
     return _EvalResult(
         loss=loss_value,
         angle_mean_deg=metrics.angle_mean_deg,
         supervision_samples=int(supervision.target.shape[0]),
         batch=batch,
         outputs=outputs_cpu,
+        top_batch=top_batch,
+        top_outputs=top_outputs_cpu,
+        top_loss_direction=top_loss_direction,
+        top_loss_dt=top_loss_dt,
+        top_angle_mean_deg=top_angle_mean_deg,
+        top_direction_samples=top_direction_samples,
+        top_dt_samples=top_dt_samples,
     )
 
 
@@ -1611,20 +1922,24 @@ def _save_checkpoint(
     *,
     step: int,
     model: FiberStripDirectionNet,
+    top_model: FiberStripDirectionNet | None = None,
     optimizer: torch.optim.Optimizer,
     loss: float,
     raw_config: dict[str, Any],
     metric_name: str = "loss",
 ) -> None:
+    payload = {
+        "step": int(step),
+        "loss": float(loss),
+        "metric_name": str(metric_name),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "config": _json_safe(raw_config),
+    }
+    if top_model is not None:
+        payload["top_model_state_dict"] = top_model.state_dict()
     torch.save(
-        {
-            "step": int(step),
-            "loss": float(loss),
-            "metric_name": str(metric_name),
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": _json_safe(raw_config),
-        },
+        payload,
         path,
     )
 
@@ -1656,6 +1971,7 @@ def _load_training_resume_checkpoint(
     path: Path,
     *,
     model: FiberStripDirectionNet,
+    top_model: FiberStripDirectionNet | None = None,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
 ) -> tuple[dict[str, Any], int]:
@@ -1667,6 +1983,10 @@ def _load_training_resume_checkpoint(
     if "optimizer_state_dict" not in checkpoint:
         raise ValueError(f"{path} is missing optimizer_state_dict")
     model.load_state_dict(checkpoint["model_state_dict"])
+    if top_model is not None:
+        if "top_model_state_dict" not in checkpoint:
+            raise ValueError(f"{path} is missing top_model_state_dict required by top_view_enabled training")
+        top_model.load_state_dict(checkpoint["top_model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     _move_optimizer_state_to_device(optimizer, device)
     try:
@@ -1714,7 +2034,23 @@ def run_training(
             embedding_channels=_embedding_channel_count(training),
         )
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate)
+    top_model = (
+        FiberStripDirectionNet(
+            FiberStripDirectionModelConfig(
+                in_channels=1,
+                hidden_channels=training.model_hidden_channels,
+                depth=training.model_depth,
+                presence_channels=_top_view_scalar_channel_count(training),
+                embedding_channels=0,
+            )
+        ).to(device)
+        if bool(training.top_view_enabled)
+        else None
+    )
+    optimizer_parameters: list[torch.nn.Parameter] = list(model.parameters())
+    if top_model is not None:
+        optimizer_parameters.extend(top_model.parameters())
+    optimizer = torch.optim.AdamW(optimizer_parameters, lr=training.learning_rate)
 
     resume_step = 0
     run_dir = _make_run_dir(training)
@@ -1724,6 +2060,7 @@ def run_training(
         resume_checkpoint_data, resume_step = _load_training_resume_checkpoint(
             resume_path,
             model=model,
+            top_model=top_model,
             optimizer=optimizer,
             device=device,
         )
@@ -1810,24 +2147,35 @@ def run_training(
                     apply_image_augmentation=False,
                 )
                 wait_ms = 0.0
-                prepared = _prepare_loaded_training_batch(loaded, device=device)
+                prepared = _prepare_loaded_training_batch(
+                    loaded,
+                    device=device,
+                    top_dt_radius_px=training.top_view_dt_radius_px,
+                )
                 prep_ms = float(prepared.prep_ms)
             else:
                 loaded, wait_ms = pipeline.next()
-                prepared = _prepare_loaded_training_batch(loaded, device=device)
+                prepared = _prepare_loaded_training_batch(
+                    loaded,
+                    device=device,
+                    top_dt_radius_px=training.top_view_dt_radius_px,
+                )
                 prep_ms = float(prepared.prep_ms)
             raw_start_sample_index = loaded.raw_start_sample_index
             batch = loaded.batch
             load_ms = float(loaded.load_ms)
 
             model.train()
+            if top_model is not None:
+                top_model.train()
             train_start = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
-            loss, outputs, supervision, metrics = _compute_prepared_batch_loss(
+            loss, outputs, top_outputs, supervision, metrics = _compute_prepared_batch_loss(
                 model,
                 prepared,
                 training,
                 contrastive_negative_mask=contrastive_negative_mask,
+                top_model=top_model,
             )
             loss.backward()
             optimizer.step()
@@ -1851,6 +2199,8 @@ def run_training(
                     start_sample_index=test_selection.start_sample_index,
                     batch_size=test_selection.sample_count,
                     sample_mode=test_selection.sample_mode,
+                    training=training,
+                    top_model=top_model,
                 )
                 last_test_loss = test_result.loss
                 last_test_angle_mean_deg = test_result.angle_mean_deg
@@ -1938,6 +2288,12 @@ def run_training(
                     )
                 writer.add_scalar("train/angle_error_mean_deg", metrics.angle_mean_deg, step)
                 writer.add_scalar("train/supervision_samples", int(supervision.target.shape[0]), step)
+                if bool(training.top_view_enabled):
+                    writer.add_scalar("train/top_loss_direction", metrics.top_loss_direction, step)
+                    writer.add_scalar("train/top_loss_dt", metrics.top_loss_dt, step)
+                    writer.add_scalar("train/top_angle_error_mean_deg", metrics.top_angle_mean_deg, step)
+                    writer.add_scalar("train/top_direction_samples", metrics.top_direction_samples, step)
+                    writer.add_scalar("train/top_dt_samples", metrics.top_dt_samples, step)
                 writer.add_scalar("timing/load_ms", load_ms, step)
                 writer.add_scalar("timing/pipeline_wait_ms", wait_ms, step)
                 writer.add_scalar("timing/prep_enqueue_ms", prep_ms, step)
@@ -1952,6 +2308,12 @@ def run_training(
                 writer.add_scalar("test/loss_direction", test_result.loss, step)
                 writer.add_scalar("test/angle_error_mean_deg", test_result.angle_mean_deg, step)
                 writer.add_scalar("test/supervision_samples", test_result.supervision_samples, step)
+                if bool(training.top_view_enabled):
+                    writer.add_scalar("test/top_loss_direction", test_result.top_loss_direction, step)
+                    writer.add_scalar("test/top_loss_dt", test_result.top_loss_dt, step)
+                    writer.add_scalar("test/top_angle_error_mean_deg", test_result.top_angle_mean_deg, step)
+                    writer.add_scalar("test/top_direction_samples", test_result.top_direction_samples, step)
+                    writer.add_scalar("test/top_dt_samples", test_result.top_dt_samples, step)
                 if test_trace2cp_metric is not None:
                     writer.add_scalar("test/trace2cp_error", test_trace2cp_metric.error_mean, step)
                     writer.add_scalar(
@@ -1988,6 +2350,21 @@ def run_training(
                         ),
                         step,
                     )
+                if bool(training.top_view_enabled) and prepared.top_batch is not None and top_outputs is not None:
+                    writer.add_image(
+                        "train/top_batch_direction_overlay",
+                        _make_training_visualization(prepared.top_batch, top_outputs),
+                        step,
+                    )
+                    writer.add_image(
+                        "train/top_batch_distance_transform",
+                        _make_presence_visualization(
+                            prepared.top_batch,
+                            top_outputs,
+                            presence_channels=1,
+                        ),
+                        step,
+                    )
                 wrote_tensorboard = True
             if writer is not None and test_result is not None:
                 writer.add_image(
@@ -2015,6 +2392,25 @@ def run_training(
                         ),
                         step,
                     )
+                if (
+                    bool(training.top_view_enabled)
+                    and test_result.top_batch is not None
+                    and test_result.top_outputs is not None
+                ):
+                    writer.add_image(
+                        "test/top_batch_direction_overlay",
+                        _make_training_visualization(test_result.top_batch, test_result.top_outputs),
+                        step,
+                    )
+                    writer.add_image(
+                        "test/top_batch_distance_transform",
+                        _make_presence_visualization(
+                            test_result.top_batch,
+                            test_result.top_outputs,
+                            presence_channels=1,
+                        ),
+                        step,
+                    )
                 wrote_tensorboard = True
             if writer is not None and wrote_tensorboard:
                 writer.flush()
@@ -2039,6 +2435,7 @@ def run_training(
                     snapshots / "current.pt",
                     step=step,
                     model=model,
+                    top_model=top_model,
                     optimizer=optimizer,
                     loss=checkpoint_loss,
                     raw_config=raw_config,
@@ -2061,6 +2458,7 @@ def run_training(
                         snapshots / "best.pt",
                         step=step,
                         model=model,
+                        top_model=top_model,
                         optimizer=optimizer,
                         loss=metric_value,
                         raw_config=raw_config,
@@ -2083,6 +2481,15 @@ def run_training(
                         f"test_angle_mean_deg={test_result.angle_mean_deg:.2f}"
                         + (
                             ""
+                            if not bool(training.top_view_enabled)
+                            else (
+                                f" test_top_loss_direction={test_result.top_loss_direction:.6f} "
+                                f"test_top_loss_dt={test_result.top_loss_dt:.6f} "
+                                f"test_top_angle_mean_deg={test_result.top_angle_mean_deg:.2f}"
+                            )
+                        )
+                        + (
+                            ""
                             if test_trace2cp_metric is None
                             else (
                                 f" test_trace2cp_error={test_trace2cp_metric.error_mean:.6f} "
@@ -2093,13 +2500,23 @@ def run_training(
                         )
                     )
                 )
+                top_part = (
+                    ""
+                    if not bool(training.top_view_enabled)
+                    else (
+                        f" top_loss_direction={metrics.top_loss_direction:.6f} "
+                        f"top_loss_dt={metrics.top_loss_dt:.6f} "
+                        f"top_angle_mean_deg={metrics.top_angle_mean_deg:.2f} "
+                        f"top_dt_samples={metrics.top_dt_samples}"
+                    )
+                )
                 print(
                     f"step={step} loss_total={loss_value:.6f} "
                     f"loss_direction={metrics.loss_direction:.6f} "
                     f"loss_presence={metrics.loss_presence:.6f} "
                     f"loss_contrastive={metrics.loss_contrastive:.6f} "
                     f"angle_mean_deg={metrics.angle_mean_deg:.2f} "
-                    f"supervision_samples={int(supervision.target.shape[0])}{test_part} "
+                    f"supervision_samples={int(supervision.target.shape[0])}{top_part}{test_part} "
                     f"load_ms={load_ms:.1f} wait_ms={wait_ms:.1f} "
                     f"prep_ms={prep_ms:.1f} prep_gpu_ms={prep_gpu_ms:.1f} "
                     f"prep_wait_ms={prep_wait_ms:.1f} prep_submit_ms={prep_submit_ms:.1f} "
@@ -2176,6 +2593,7 @@ def prefetch_training(
         sample_count,
         sample_mode=sample_mode,
         sample_index_limit=training.max_sample_index,
+        include_top_view=bool(training.top_view_enabled),
     )
     if prefetch_full_dataset:
         test_loader_config = _test_loader_config_from_raw(raw_config, loader_config)
@@ -2186,7 +2604,12 @@ def prefetch_training(
                 f"sample_mode={sample_mode} start_sample_index=0 samples={int(test_loader.sample_count)}",
                 flush=True,
             )
-            test_summary = test_loader.prefetch(0, int(test_loader.sample_count), sample_mode=sample_mode)
+            test_summary = test_loader.prefetch(
+                0,
+                int(test_loader.sample_count),
+                sample_mode=sample_mode,
+                include_top_view=bool(training.top_view_enabled),
+            )
             summary = _merge_prefetch_summaries(summary, test_summary)
     print(
         "fiber_trace_2d prefetch complete "

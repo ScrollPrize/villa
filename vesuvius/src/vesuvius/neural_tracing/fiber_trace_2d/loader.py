@@ -220,6 +220,17 @@ class _PreparedStripSample:
     control_point_xy_by_offset: list[np.ndarray]
 
 
+@dataclass(frozen=True)
+class _PreparedTopStripSample:
+    source: _StripSource
+    params: FiberStripAugmentParams | None
+    grid: FiberStripGridTorch
+    coords_zyx: np.ndarray
+    valid_mask: np.ndarray
+    line_xy: np.ndarray
+    control_point_xy: np.ndarray
+
+
 @dataclass
 class _PrefetchCounters:
     samples_done: int = 0
@@ -1969,6 +1980,56 @@ class FiberStrip2DLoader:
             source_control_point_xy=source_control_point_xy,
         )
 
+    def build_top_strip_source(
+        self,
+        sample_index: int,
+        *,
+        device: torch.device,
+        sample_mode: str = "random",
+        descriptor: tuple[_Record, int, int] | None = None,
+        profile: dict[str, float] | None = None,
+        use_augmentation_envelope: bool | None = None,
+    ) -> _StripSource:
+        with _ProfileBlock(profile, "top_descriptor"):
+            if descriptor is None:
+                record, record_index, cp_index = self.descriptor_for_sample_index(
+                    sample_index, sample_mode=sample_mode
+                )
+            else:
+                record, record_index, cp_index = descriptor
+            source_shape_hw = self._source_shape_hw(use_augmentation_envelope=use_augmentation_envelope)
+        with _ProfileBlock(profile, "top_line_window"):
+            line_window = self._line_window_for_patch(
+                record,
+                control_point_index=cp_index,
+                patch_shape_hw=source_shape_hw,
+            )
+        with _ProfileBlock(profile, "top_lasagna_normals"):
+            sampled_normals = self._lasagna_normals_for_line_window(
+                record,
+                line_window,
+                control_point_index=cp_index,
+            )
+        with _ProfileBlock(profile, "top_strip_coords", device):
+            grid = build_top_strip_patch_grid_tensor_from_line_window(
+                line_window,
+                patch_shape_hw=source_shape_hw,
+                sampled_normals=sampled_normals,
+                pixel_spacing_base=record.volume_spacing_base,
+                device=device,
+            )
+        source_line_xy, source_control_point_xy = self._source_line_and_cp_tensors(source_shape_hw, device=device)
+        return _StripSource(
+            record=record,
+            record_index=record_index,
+            control_point_index=cp_index,
+            center_offset=0.0,
+            source_shape_hw=source_shape_hw,
+            grid=grid,
+            source_line_xy=source_line_xy,
+            source_control_point_xy=source_control_point_xy,
+        )
+
     def _offset_grid_from_source(
         self,
         source: _StripSource | _Trace2CpSegmentSource,
@@ -2261,6 +2322,264 @@ class FiberStrip2DLoader:
             valid_mask=valid_mask_np,
             line_xy_by_offset=line_xy_by_offset,
             control_point_xy_by_offset=control_point_xy_by_offset,
+        )
+
+    def _prepare_top_sample_from_side_sample(
+        self,
+        side_sample: FiberStripSample,
+        params: FiberStripAugmentParams | None,
+        *,
+        device: torch.device,
+        profile: dict[str, float] | None = None,
+        include_line_xy: bool = True,
+    ) -> _PreparedTopStripSample:
+        record_index = int(side_sample.record_index)
+        cp_index = int(side_sample.control_point_index)
+        if record_index < 0 or record_index >= len(self.records):
+            raise IndexError(f"record_index {record_index} out of range for {len(self.records)} records")
+        record = self.records[record_index]
+        source = self.build_top_strip_source(
+            0,
+            device=device,
+            descriptor=(record, record_index, cp_index),
+            profile=profile,
+        )
+        grid = source.grid
+        coords_zyx_t = grid.coords_zyx
+        valid_mask_t = grid.valid_mask
+        augment_transform = None
+        if params is not None:
+            augment_transform = strip_augment_transform(
+                self.config.patch_shape_hw,
+                source.source_shape_hw,
+                params,
+                device=device,
+            )
+            with _ProfileBlock(profile, "top_coord_augmentation", device):
+                coords_zyx_t, valid_mask_t = _resample_coord_tensors_like_augmentation(
+                    coords_zyx_t,
+                    valid_mask_t,
+                    params,
+                    output_shape_hw=self.config.patch_shape_hw,
+                    device=device,
+                    transform=augment_transform,
+                )
+        with _ProfileBlock(profile, "top_line_coords", device):
+            if include_line_xy:
+                line_xy_t, control_point_xy_t = self._line_and_cp_xy_for_params(
+                    source,
+                    params,
+                    device=device,
+                    transform=augment_transform,
+                )
+            else:
+                source_cp_xy = source.source_control_point_xy.to(device=device, dtype=torch.float32)
+                unit = torch.tensor([1.0, 0.0], dtype=torch.float32, device=device)
+                line_xy_t = torch.stack([source_cp_xy - unit, source_cp_xy + unit], dim=0)
+                control_point_xy_t = source_cp_xy
+        return _PreparedTopStripSample(
+            source=source,
+            params=params,
+            grid=grid,
+            coords_zyx=_as_numpy_float32(coords_zyx_t),
+            valid_mask=_as_numpy_bool(valid_mask_t),
+            line_xy=_as_numpy_float32(line_xy_t),
+            control_point_xy=_as_numpy_float32(control_point_xy_t),
+        )
+
+    def _finish_prepared_top_sample(
+        self,
+        prepared: _PreparedTopStripSample,
+        image_np: np.ndarray,
+        valid_np: np.ndarray,
+        *,
+        include_coords: bool,
+    ) -> tuple[FiberStripSample, np.ndarray, np.ndarray, np.ndarray]:
+        source = prepared.source
+        image = np.asarray(image_np, dtype=np.float32)
+        valid = np.asarray(valid_np, dtype=bool)
+        sample = FiberStripSample(
+            record_index=source.record_index,
+            fiber_path=str(source.record.fiber.path) if source.record.fiber.path is not None else "",
+            control_point_index=source.control_point_index,
+            control_point_xyz=np.asarray(
+                source.record.fiber.control_points_xyz[source.control_point_index], dtype=np.float32
+            ),
+            strip_z_offset=0.0,
+            coords_zyx=(
+                np.asarray(prepared.coords_zyx, dtype=np.float32)
+                if include_coords
+                else np.empty((0, 0, 3), dtype=np.float32)
+            ),
+            valid_mask=valid,
+            frame=prepared.grid.frame,
+            line_xy=np.asarray(prepared.line_xy, dtype=np.float32),
+            control_point_xy=np.asarray(prepared.control_point_xy, dtype=np.float32),
+        )
+        coords = (
+            np.asarray(prepared.coords_zyx, dtype=np.float32)
+            if include_coords
+            else np.empty((0, 0, 3), dtype=np.float32)
+        )
+        return sample, image, coords, valid
+
+    def load_top_batch_for_batch(
+        self,
+        batch: FiberStrip2DBatch,
+        *,
+        profile: dict[str, float] | None = None,
+        include_line_xy: bool = True,
+        include_coords: bool = True,
+    ) -> FiberStrip2DBatch:
+        images_np = np.asarray(batch.images)
+        if images_np.ndim != 5 or images_np.shape[2] != 1:
+            raise ValueError("batch.images must have shape B,Z,1,H,W")
+        control_point_count = int(images_np.shape[0])
+        offset_count = int(images_np.shape[1])
+        if len(batch.samples) != control_point_count * offset_count:
+            raise ValueError("batch.samples length does not match batch image shape")
+        if control_point_count <= 0 or offset_count <= 0:
+            raise ValueError("batch must contain at least one control point and offset")
+        center_offset_index = int(np.argmin(np.abs(np.asarray(batch.strip_z_offsets, dtype=np.float32)[:offset_count])))
+        params = tuple(batch.augmentation_params)
+        if params and len(params) != control_point_count * offset_count:
+            raise ValueError("batch augmentation_params length does not match batch image shape")
+        selected_samples: list[FiberStripSample] = []
+        selected_params: list[FiberStripAugmentParams | None] = []
+        for cp_row in range(control_point_count):
+            flat_index = cp_row * offset_count + center_offset_index
+            selected_samples.append(batch.samples[flat_index])
+            selected_params.append(params[flat_index] if params else None)
+
+        device = resolve_torch_device(self.config.augment.device)
+        worker_count = min(max(1, int(self.config.loader_workers)), max(1, control_point_count))
+
+        def build_one(item_index: int) -> tuple[int, dict[str, float], _PreparedTopStripSample]:
+            local_profile: dict[str, float] = {} if profile is not None else {}
+            worker_start = time.perf_counter()
+            prepared = self._prepare_top_sample_from_side_sample(
+                selected_samples[item_index],
+                selected_params[item_index],
+                device=device,
+                profile=local_profile if profile is not None else None,
+                include_line_xy=include_line_xy,
+            )
+            if profile is not None:
+                local_profile["top_load_batch_worker"] = (time.perf_counter() - worker_start) * 1000.0
+            return item_index, local_profile, prepared
+
+        begin_zarr_cache_trace()
+        top_wall_start = time.perf_counter()
+        try:
+            prepared_items: list[tuple[_PreparedTopStripSample, dict[str, float]]] = []
+            if worker_count == 1:
+                for item_index in range(control_point_count):
+                    returned_index, local_profile, prepared = build_one(item_index)
+                    if returned_index != item_index:
+                        raise RuntimeError("internal top batch ordering mismatch")
+                    prepared_items.append((prepared, local_profile))
+            else:
+                executor = self._get_loader_executor(worker_count)
+                futures = [executor.submit(build_one, item_index) for item_index in range(control_point_count)]
+                ordered: list[tuple[_PreparedTopStripSample, dict[str, float]] | None] = [None] * control_point_count
+                for future in futures:
+                    item_index, local_profile, prepared = future.result()
+                    ordered[int(item_index)] = (prepared, local_profile)
+                prepared_items = [item for item in ordered if item is not None]
+            if len(prepared_items) != control_point_count:
+                raise RuntimeError("internal top batch preparation count mismatch")
+
+            images_by_item: list[np.ndarray | None] = [None] * control_point_count
+            valids_by_item: list[np.ndarray | None] = [None] * control_point_count
+            groups: dict[int, list[int]] = {}
+            samplers: dict[int, CoordinateSampler] = {}
+            for item_index, (prepared, _) in enumerate(prepared_items):
+                sampler = prepared.source.record.sampler
+                key = id(sampler)
+                groups.setdefault(key, []).append(item_index)
+                samplers[key] = sampler
+            for key, item_indices in groups.items():
+                coords = np.stack(
+                    [
+                        np.asarray(prepared_items[item_index][0].coords_zyx, dtype=np.float32)
+                        for item_index in item_indices
+                    ],
+                    axis=0,
+                )
+                valid = np.stack(
+                    [
+                        np.asarray(prepared_items[item_index][0].valid_mask, dtype=bool)
+                        for item_index in item_indices
+                    ],
+                    axis=0,
+                )
+                with _ProfileBlock(profile, "top_volume_sample"):
+                    result = samplers[key].sample_coord_batch(coords, valid)
+                images = np.asarray(result.image, dtype=np.float32)
+                valids = np.asarray(result.valid_mask, dtype=bool)
+                if images.shape != valid.shape:
+                    raise ValueError(
+                        "top batched coordinate sampler returned incompatible image shape: "
+                        f"shape={images.shape} expected={valid.shape}"
+                    )
+                if valids.shape != valid.shape:
+                    raise ValueError(
+                        "top batched coordinate sampler returned incompatible valid-mask shape: "
+                        f"shape={valids.shape} expected={valid.shape}"
+                    )
+                if profile is not None:
+                    for stat_key, value in result.stats.items():
+                        if isinstance(value, (int, float)):
+                            profile[f"top_volume_stat_{stat_key}"] = (
+                                profile.get(f"top_volume_stat_{stat_key}", 0.0) + float(value)
+                            )
+                for local_offset, item_index in enumerate(item_indices):
+                    images_by_item[item_index] = images[local_offset]
+                    valids_by_item[item_index] = valids[local_offset]
+
+            samples: list[FiberStripSample] = []
+            images: list[np.ndarray] = []
+            coords: list[np.ndarray] = []
+            valids: list[np.ndarray] = []
+            record_indices: list[int] = []
+            cp_indices: list[int] = []
+            fiber_paths: list[str] = []
+            for item_index, (prepared, local_profile) in enumerate(prepared_items):
+                image = images_by_item[item_index]
+                valid = valids_by_item[item_index]
+                if image is None or valid is None:
+                    raise RuntimeError("internal missing top sampled image")
+                sample, sample_image, sample_coords, sample_valid = self._finish_prepared_top_sample(
+                    prepared,
+                    image,
+                    valid,
+                    include_coords=include_coords,
+                )
+                _merge_profile(profile, local_profile)
+                samples.append(sample)
+                images.append(sample_image)
+                coords.append(sample_coords)
+                valids.append(sample_valid)
+                record_indices.append(sample.record_index)
+                cp_indices.append(sample.control_point_index)
+                fiber_paths.append(sample.fiber_path)
+        finally:
+            cache_stats = end_zarr_cache_trace()
+            if profile is not None:
+                profile["top_load_batch_wall"] = profile.get("top_load_batch_wall", 0.0) + (
+                    time.perf_counter() - top_wall_start
+                ) * 1000.0
+        return FiberStrip2DBatch(
+            images=np.stack(images, axis=0)[:, None, None, :, :],
+            coords_zyx=np.stack(coords, axis=0)[:, None, :, :, :],
+            valid_mask=np.stack(valids, axis=0)[:, None, :, :],
+            strip_z_offsets=np.asarray([0.0], dtype=np.float32),
+            control_point_indices=np.asarray(cp_indices, dtype=np.int32),
+            record_indices=np.asarray(record_indices, dtype=np.int32),
+            fiber_paths=tuple(fiber_paths),
+            samples=tuple(samples),
+            cache_stats=cache_stats,
+            augmentation_params=tuple(selected_params),
         )
 
     def _finish_prepared_sample(
@@ -3467,7 +3786,12 @@ class FiberStrip2DLoader:
         )
 
     def chunk_requests_for_sample_index(
-        self, sample_index: int, *, sample_mode: str = "random", sample_index_limit: int | None = None
+        self,
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        sample_index_limit: int | None = None,
+        include_top_view: bool = False,
     ) -> list[ZarrChunkRequest]:
         device = resolve_torch_device(self.config.augment.device)
         bounded_sample_index = self._bounded_sample_index(sample_index, sample_index_limit)
@@ -3476,6 +3800,16 @@ class FiberStrip2DLoader:
         for offset_index, _ in enumerate(self.strip_z_offsets):
             coords_zyx, valid_mask = self._prefetch_envelope_coords_from_source(source, offset_index)
             requests.extend(source.record.sampler.chunk_requests_for_coords(coords_zyx, valid_mask))
+        if include_top_view:
+            top_source = self.build_top_strip_source(
+                bounded_sample_index,
+                device=device,
+                sample_mode=sample_mode,
+                use_augmentation_envelope=True,
+            )
+            coords_zyx = _as_numpy_float32(top_source.grid.coords_zyx)
+            valid_mask = _as_numpy_bool(top_source.grid.valid_mask)
+            requests.extend(top_source.record.sampler.chunk_requests_for_coords(coords_zyx, valid_mask))
         return requests
 
     def chunk_requests_for_samples(
@@ -3485,6 +3819,7 @@ class FiberStrip2DLoader:
         *,
         sample_mode: str = "random",
         sample_index_limit: int | None = None,
+        include_top_view: bool = False,
     ) -> list[ZarrChunkRequest]:
         unique: dict[tuple[str, str], ZarrChunkRequest] = {}
         for sample_index in range(int(start_sample_index), int(start_sample_index) + int(sample_count)):
@@ -3492,6 +3827,7 @@ class FiberStrip2DLoader:
                 sample_index,
                 sample_mode=sample_mode,
                 sample_index_limit=sample_index_limit,
+                include_top_view=include_top_view,
             ):
                 unique[(request.store_identity, request.key)] = request
         return list(unique.values())
@@ -3504,6 +3840,7 @@ class FiberStrip2DLoader:
         workers: int | None = None,
         sample_mode: str = "random",
         sample_index_limit: int | None = None,
+        include_top_view: bool = False,
     ) -> dict[str, Any]:
         total_samples = int(sample_count)
         total_patches = total_samples * len(self.strip_z_offsets)
@@ -3527,6 +3864,7 @@ class FiberStrip2DLoader:
             f"samples={total_samples} patches={total_patches} "
             f"workers={worker_count} sampler_workers={producer_count} "
             f"sample_mode={sample_mode} sample_index_limit={int(sample_index_limit or 0)} "
+            f"include_top_view={bool(include_top_view)} "
             "mode=dependency_chunks",
             flush=True,
         )
@@ -3605,6 +3943,17 @@ class FiberStrip2DLoader:
                 coords_zyx, valid_mask = self._prefetch_envelope_coords_from_source(source, offset_index)
                 valid_pixels += int(np.count_nonzero(valid_mask))
                 requests.extend(source.record.sampler.chunk_requests_for_coords(coords_zyx, valid_mask))
+            if include_top_view:
+                top_source = self.build_top_strip_source(
+                    bounded_sample_index,
+                    device=torch.device("cpu"),
+                    sample_mode=sample_mode,
+                    use_augmentation_envelope=True,
+                )
+                top_coords_zyx = _as_numpy_float32(top_source.grid.coords_zyx)
+                top_valid_mask = _as_numpy_bool(top_source.grid.valid_mask)
+                valid_pixels += int(np.count_nonzero(top_valid_mask))
+                requests.extend(top_source.record.sampler.chunk_requests_for_coords(top_coords_zyx, top_valid_mask))
             return bounded_sample_index, valid_pixels, requests
 
         def classify_or_submit(

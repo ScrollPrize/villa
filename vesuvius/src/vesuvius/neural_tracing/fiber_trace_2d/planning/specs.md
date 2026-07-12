@@ -260,6 +260,11 @@
   `training.presence_enabled` is true. Contrastive embedding training is
   disabled by default and must be explicitly enabled.
 - V0 model output always starts with exactly two per-pixel direction channels in the Lasagna ambiguous two-cos-channel encoding. When `training.presence_enabled` is true, one sigmoid sheet/fiber-presence channel follows the direction channels. When `training.contrastive_enabled` is true and `training.contrastive_embedding_channels > 0`, raw embedding channels are appended after direction and any presence channel. A disabled contrastive config must instantiate no embedding head, even if a stale positive `contrastive_embedding_channels` value is present. Consumers must use explicit output-slicing helpers instead of hard-coded embedding offsets.
+- When `training.top_view_enabled` is true, training jointly instantiates a
+  second V0 model for top-view strip slices. This top-view model outputs the
+  same two Lasagna ambiguous direction channels plus one sigmoid scalar channel
+  interpreted as a fiber-center distance transform, not sheet/fiber presence.
+  The side model output layout is unchanged.
 - For strip-image tangent angle `theta`, target channels are `0.5 + 0.5*cos(2*theta)` and `0.5 + 0.5*cos(2*theta + pi/4)`.
 - Sheet/fiber presence training is enabled by `training.presence_enabled`.
   It supervises each loaded strip patch's rounded transformed CP pixel as
@@ -321,12 +326,31 @@
 - Direction targets are derived from the transformed output-pixel line coordinates produced by the same augmentation path as the image. They must not be derived from unaugmented line points for augmented patches.
 - Each loaded strip sample carries the transformed control-point output-pixel coordinate. V0 direction supervision is limited to the eight neighboring pixels around that rounded transformed control-point location, filtered by image validity and patch bounds.
 - The V0 loss compares predicted and target encoded channels directly with MSE over those CP-local samples; raw signed `(dx,dy)` regression and `abs(dot)` losses are not the V0 training representation. Training additionally reports folded unoriented angular error in degrees over the same supervised pixels, with `0` degrees perfect and `90` degrees maximally wrong.
+- Top-view training loads one top-strip patch per loaded CP sample, using the
+  same deterministic CP ordering and the same geometric/value augmentation
+  parameters as that CP's center side-strip sample. The top strip is sampled
+  with the VC3D-style `lineSurface`/top-strip coordinate construction already
+  used by Trace2CP visualization: columns follow the fiber line and rows follow
+  the side/cross-fiber axis derived from Lasagna normals.
+- Top-view direction supervision uses the transformed top-strip line tangent
+  and the same Lasagna ambiguous two-channel MSE objective as side strips.
+  Top-view distance-transform supervision uses only the rounded normal
+  cross-section through the transformed CP. Its target is `1.0` at the CP,
+  falls linearly to `0.0` at `training.top_view_dt_radius_px` pixels
+  (default `30.0`), and remains explicitly supervised as `0.0` for valid
+  rounded-line pixels beyond that radius. The top direction and DT losses are
+  multiplied by `training.top_view_direction_weight` and
+  `training.top_view_dt_weight`.
 - Training creates a run directory from `training.run_path` and `training.run_name` plus a date string. Passing `--resume <snapshot.pt>` creates and names a fresh run directory the same way, restores model and optimizer state from the snapshot, starts from `checkpoint_step + 1`, and keeps `training.max_steps` as the absolute target step. To continue past a finished run, increase `training.max_steps` before resuming. If two runs start in the same second, a numeric suffix is added to avoid a run-directory collision.
 - Training config keys include `max_sample_index` for bounded deterministic-prefix reuse, `pipeline_enabled`, `pipeline_depth`, `pipeline_workers`, and `pipeline_isolated_loaders` for CUDA training load/model overlap, and `test_interval`, `test_control_points`, `test_start_sample_index`, `test_trace2cp_step_px`, and `test_trace2cp_rf_margin_px` for deterministic test evaluation when `test_datasets` is configured.
 - Test evaluation runs at step 1, every `training.test_interval`, and the final step when `test_datasets` is configured. Positive `training.test_control_points` values load the fixed deterministic random range starting at `training.test_start_sample_index`, so the same held-out CP samples are compared across time. `training.test_control_points: 0` is the full-test sentinel: it evaluates every configured held-out CP sample once in flat CP order starting at zero, ignoring `training.test_start_sample_index`, so whole-fiber test metrics can be compared directly against `--trace2cp-vis --fiber-json` on the same held-out fiber apart from pair-alignment details. In addition to fixed-batch direction loss, the test path evaluates the public Trace2CP metric by tracing each selected held-out CP to its next CP segment and averaging valid `trace2cp_error` values.
 - TensorBoard logging writes the training config JSON as text, direction-loss scalars, angular-error degree scalars, timing/cache diagnostics, and batch direction overlay images at configured intervals. Batch direction overlays show the transformed fiber centerline as context and one short network-predicted direction segment at the transformed CP; they do not draw CP-neighborhood supervision boxes or extra CP markers. Overlay contact sheets select examples across loaded control-point samples first, preferring each CP's strip-z offset closest to zero before showing additional offsets. When `test_datasets` is configured, TensorBoard also logs `test/loss_direction`, `test/angle_error_mean_deg`, `test/supervision_samples`, test cache diagnostics, and a `test/batch_direction_overlay` image at test evaluation steps.
+- When top-view training is enabled, TensorBoard also logs top-view
+  direction/angle/DT scalars and writes top-view image summaries: a GT-line
+  plus predicted-direction overlay and a fixed `0..1` DT scalar map for train
+  and test batches.
 - Console training progress prints every step covering the first 100 deterministic control-point sample indices, then falls back to `training.scalar_log_interval`.
-- Prefetch progress includes `idx=<exclusive-index>` showing the largest contiguous exclusive bounded deterministic sample index whose required chunks are cache-complete: each required chunk is a cache hit, a known/new missing marker, or a completed successful download. Dependency generation alone must not advance `idx` while downloads are still pending. Operators can use that value as `training.max_sample_index` to train on the prefetched deterministic prefix.
+- Prefetch progress includes `idx=<exclusive-index>` showing the largest contiguous exclusive bounded deterministic sample index whose required chunks are cache-complete: each required chunk is a cache hit, a known/new missing marker, or a completed successful download. Dependency generation alone must not advance `idx` while downloads are still pending. Operators can use that value as `training.max_sample_index` to train on the prefetched deterministic prefix. When `training.top_view_enabled` is true, prefetch dependency generation includes the top-view strip envelope in addition to all side-strip z-offset envelopes.
 - Training writes snapshots under `<run_dir>/snapshots/current.pt` and `<run_dir>/snapshots/best.pt`. With `test_datasets`, current snapshots are written at the test evaluation cadence and best is selected by lowest observed averaged `test/trace2cp_error`. Without `test_datasets`, current snapshots use `training.checkpoint_interval` and best is selected by lowest observed training loss. A resumed run writes its own fresh `current.pt` and `best.pt` under the newly created resumed run directory.
 - The runner is `python -m vesuvius.neural_tracing.fiber_trace_2d.runner`.
 - Augment contact sheets are exported with `--augment-vis --export-dir <dir>`. Add `--augment-profile` to print cold and warm augment timing tables.

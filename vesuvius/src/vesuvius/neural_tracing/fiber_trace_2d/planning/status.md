@@ -1,11 +1,11 @@
-# Default Training Without Embedding Loss Status
+# Joint Top-View Direction And Distance-Transform Model Status
 
-- [x] Read current user request.
-- [x] Read local `fiber_trace_2d` agent workflow.
-- [x] Update `planning/task.md`.
-- [x] Update `planning/task_plan.md`.
-- [x] Add effective embedding-channel handling in training.
-- [x] Update standard example config.
-- [x] Update specs and code-structure docs.
-- [x] Add focused regression tests.
-- [x] Run validation.
+- [x] Read current task and local AGENTS workflow.
+- [x] Replace `task.md` with the current top-view auxiliary-model task.
+- [x] Create `task_plan.md` covering implementation, specs, docs, and tests.
+- [x] Implement top-view batch loading and prefetch dependencies.
+- [x] Implement top-view model/loss/metrics/checkpoint/TensorBoard integration.
+- [x] Update example config.
+- [x] Add focused tests.
+- [x] Update specs, code docs, changelog, and task log.
+- [x] Run py_compile and focused pytest.

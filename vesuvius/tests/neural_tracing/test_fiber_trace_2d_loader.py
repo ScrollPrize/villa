@@ -66,10 +66,12 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _TrainingBatchPipeline,
     _resolve_test_selection,
     _embedding_channel_count,
+    _top_view_scalar_channel_count,
     _test_loader_config_from_raw,
     _training_config_from_raw,
     _validate_training_batch_config,
     FiberStripTrainingConfig,
+    build_top_distance_transform_supervision,
     prefetch_training,
     run_benchmark,
     run_training,
@@ -3674,8 +3676,44 @@ def test_standard_example_training_disables_contrastive_embedding_by_default() -
     training = _training_config_from_raw(raw)
 
     assert training.presence_enabled is True
+    assert training.top_view_enabled is True
     assert training.contrastive_enabled is False
     assert _embedding_channel_count(training) == 0
+
+
+def test_top_view_scalar_channel_count_is_configured_only_when_enabled() -> None:
+    assert _top_view_scalar_channel_count(FiberStripTrainingConfig(top_view_enabled=False)) == 0
+    assert _top_view_scalar_channel_count(FiberStripTrainingConfig(top_view_enabled=True)) == 1
+
+
+def test_top_distance_transform_supervision_samples_full_normal_line() -> None:
+    sample = SimpleNamespace(
+        line_xy=np.asarray([[1.0, 3.0], [3.0, 3.0], [5.0, 3.0]], dtype=np.float32),
+        control_point_xy=np.asarray([3.0, 3.0], dtype=np.float32),
+    )
+    valid = np.ones((1, 7, 7), dtype=bool)
+
+    supervision = build_top_distance_transform_supervision(
+        [sample],
+        valid,
+        radius_px=2.0,
+        device=torch.device("cpu"),
+    )
+
+    rows = {
+        (int(y), int(x)): float(target)
+        for y, x, target in zip(
+            supervision.y.cpu().numpy().tolist(),
+            supervision.x.cpu().numpy().tolist(),
+            supervision.target.cpu().numpy().tolist(),
+            strict=True,
+        )
+    }
+    assert rows[(3, 3)] == pytest.approx(1.0)
+    assert rows[(2, 3)] == pytest.approx(0.5)
+    assert rows[(1, 3)] == pytest.approx(0.0)
+    assert rows[(0, 3)] == pytest.approx(0.0)
+    assert rows[(6, 3)] == pytest.approx(0.0)
 
 
 def test_disabled_contrastive_ignores_stale_embedding_channels() -> None:
@@ -3720,6 +3758,24 @@ def test_enabled_contrastive_uses_configured_embedding_channels() -> None:
 
     assert output.shape == (1, 19, 3, 3)
     assert embedding_output(output, presence_channels=1).shape[1] == 16
+
+
+def test_top_view_enabled_model_has_direction_plus_dt_channels() -> None:
+    training = FiberStripTrainingConfig(top_view_enabled=True)
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(
+            in_channels=1,
+            hidden_channels=4,
+            depth=1,
+            presence_channels=_top_view_scalar_channel_count(training),
+            embedding_channels=0,
+        )
+    )
+
+    output = model(torch.zeros((1, 1, 5, 5), dtype=torch.float32))
+
+    assert direction_output(output).shape == (1, 2, 5, 5)
+    assert presence_output(output, presence_channels=1).shape == (1, 1, 5, 5)
 
 
 def test_training_batch_pipeline_preserves_step_sample_order() -> None:
@@ -4312,6 +4368,57 @@ def test_prefetch_envelope_covers_augmented_loading_dependencies(tmp_path: Path)
         assert load_keys <= prefetch_keys
 
 
+def test_prefetch_requests_can_include_top_view_dependencies(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["strip_z_offset_count"] = 2
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    samplers: list[_RecordingCoordinateSampler] = []
+
+    def factory(**kwargs):
+        sampler = _RecordingCoordinateSampler(
+            kwargs["array"],
+            level_spacing_base=kwargs["level_spacing_base"],
+        )
+        samplers.append(sampler)
+        return sampler
+
+    loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
+
+    side_requests = loader.chunk_requests_for_sample_index(0)
+    side_call_count = len(samplers[0].chunk_request_calls)
+    top_requests = loader.chunk_requests_for_sample_index(0, include_top_view=True)
+
+    assert side_requests
+    assert top_requests
+    assert side_call_count == 2
+    assert len(samplers[0].chunk_request_calls) == 5
+    top_coords, top_valid = samplers[0].chunk_request_calls[-1]
+    assert top_coords.ndim == 3
+    assert top_coords.shape[-1] == 3
+    assert top_coords.shape[:2] == top_valid.shape
+    assert top_coords.shape[0] >= 3
+    assert top_coords.shape[1] >= 3
+
+
+def test_load_top_batch_for_batch_returns_one_patch_per_control_point(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    loader = _make_loader(load_config(config_path))
+    side_batch = loader.load_batch(0, batch_size=2, sample_mode="flat")
+
+    top_batch = loader.load_top_batch_for_batch(side_batch)
+
+    assert top_batch.images.shape == (2, 1, 1, 3, 3)
+    assert top_batch.valid_mask.shape == (2, 1, 3, 3)
+    assert len(top_batch.samples) == 2
+    assert top_batch.control_point_indices.tolist() == side_batch.control_point_indices.tolist()
+    assert tuple(float(v) for v in top_batch.strip_z_offsets.tolist()) == (0.0,)
+    for sample in top_batch.samples:
+        assert np.asarray(sample.line_xy).shape[1] == 2
+        np.testing.assert_allclose(sample.control_point_xy, np.asarray([1.0, 1.0], dtype=np.float32))
+
+
 def test_training_load_does_not_call_numpy_strip_builder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import vesuvius.neural_tracing.fiber_trace_2d.loader as loader_module
     import vesuvius.neural_tracing.fiber_trace_2d.strip_geometry as strip_geometry_module
@@ -4354,8 +4461,9 @@ def test_training_prefetch_maps_steps_to_sample_count(
         workers=None,
         sample_mode="random",
         sample_index_limit=None,
+        include_top_view=False,
     ):
-        del self, workers
+        del self, workers, include_top_view
         calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(sample_index_limit or 0)))
         return {
             "generated": 11,
@@ -4418,8 +4526,9 @@ def test_training_prefetch_respects_max_sample_index_limit(
         workers=None,
         sample_mode="random",
         sample_index_limit=None,
+        include_top_view=False,
     ):
-        del self, workers
+        del self, workers, include_top_view
         calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(sample_index_limit or 0)))
         return {"generated": 0, "missing": 0, "downloaded": 0, "bytes": 0, "errors": 0, "workers": 1}
 
@@ -4428,6 +4537,41 @@ def test_training_prefetch_respects_max_sample_index_limit(
     prefetch_training(config_path, prefetch_steps=0, sampler_factory=_test_sampler_factory)
 
     assert calls == [(0, 2, "random", 2)]
+
+
+def test_training_prefetch_forwards_top_view_dependency_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["training"] = {
+        "max_steps": 1,
+        "control_points_per_step": 1,
+        "top_view_enabled": True,
+        "tensorboard_enabled": False,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    calls: list[bool] = []
+
+    def fake_prefetch(
+        self,
+        start_sample_index,
+        sample_count,
+        *,
+        workers=None,
+        sample_mode="random",
+        sample_index_limit=None,
+        include_top_view=False,
+    ):
+        del self, start_sample_index, sample_count, workers, sample_mode, sample_index_limit
+        calls.append(bool(include_top_view))
+        return {"generated": 0, "missing": 0, "downloaded": 0, "bytes": 0, "errors": 0, "workers": 1}
+
+    monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
+
+    prefetch_training(config_path, prefetch_steps=1, sampler_factory=_test_sampler_factory)
+
+    assert calls == [True]
 
 
 def test_training_prefetch_max_steps_zero_prefetches_dataset_once(
@@ -4451,8 +4595,9 @@ def test_training_prefetch_max_steps_zero_prefetches_dataset_once(
         workers=None,
         sample_mode="random",
         sample_index_limit=None,
+        include_top_view=False,
     ):
-        del workers
+        del workers, include_top_view
         calls.append((int(start_sample_index), int(sample_count), str(sample_mode)))
         return {
             "generated": 3,
@@ -4502,8 +4647,9 @@ def test_training_prefetch_max_steps_zero_prefetches_test_datasets(
         workers=None,
         sample_mode="random",
         sample_index_limit=None,
+        include_top_view=False,
     ):
-        del workers
+        del workers, include_top_view
         calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(self.sample_count)))
         return {
             "generated": int(sample_count),

@@ -15,6 +15,8 @@ The important behavior is:
   direction targets;
 - optionally train a sheet/fiber-presence head from transformed CP pixels and
   reachable non-CP pixels;
+- optionally train a second top-view direction plus distance-transform model
+  from VC3D-style top-strip slices;
 - optionally train a CP-local contrastive embedding head using cosine
   similarity;
 - export JPG batches and augmentation contact sheets for inspection;
@@ -161,6 +163,9 @@ The important behavior is:
   follows. Contrastive embedding channels are appended after direction and any
   presence channel only when contrastive training/inference is explicitly
   configured with embedding channels.
+- The same network class is also reused for the optional top-view auxiliary
+  model. In that layout the scalar sigmoid head is interpreted as a
+  fiber-center distance transform rather than side-strip presence.
 
 `loader.py`
 
@@ -173,6 +178,10 @@ The important behavior is:
 - Builds one CP-local source strip with the torch-vectorized augment-vis path,
   then derives all configured strip-z offsets from that source using the stored
   strip offset axis.
+- Can derive one top-view patch per loaded CP sample with
+  `load_top_batch_for_batch`. That path uses the same VC3D-style top-strip
+  `lineSurface` coordinate construction as Trace2CP visualization and reuses
+  the CP sample's deterministic geometric/value augmentation parameters.
 - Optionally caches CP-local source strip coordinates under
   `strip_coord_cache_dir`. Cache hits skip local line-window normal sampling and
   source-grid construction; larger cached source grids are center-cropped for
@@ -477,6 +486,13 @@ The important behavior is:
 - Standard training uses direction supervision plus the optional sheet/fiber
   presence head. The standard example config enables presence and leaves
   contrastive embedding disabled.
+- When `training.top_view_enabled` is true, training jointly builds one
+  top-view patch per CP sample and trains a second model. The top model's
+  direction loss uses the same transformed-line tangent target as side strips.
+  Its scalar head is trained as a distance transform along the rounded
+  cross-fiber line through the transformed CP: `1.0` at the CP, linearly down
+  to `0.0` at `training.top_view_dt_radius_px`, and explicit zero targets
+  beyond that radius.
 - When `training.contrastive_enabled` is true, configures an embedding head,
   uses the loader's same-fiber grouped batch path, and adds a cosine embedding
   loss. Positive terms operate on rounded transformed CP pixels: for each
@@ -499,6 +515,9 @@ The important behavior is:
   embedding is enabled, `train/loss_contrastive`, positive/negative
   contrastive components, and TensorBoard embedding-similarity images that
   compare every pixel in a selected patch against that patch's CP embedding.
+- When top-view training is enabled, logs top-view direction/angle/DT scalars
+  and TensorBoard images for the top-view line plus predicted direction and the
+  top-view DT scalar map.
 - On CUDA training runs, uses a bounded deterministic whole-batch pipeline when
   `training.pipeline_enabled` is true. Background workers build exact training
   steps with `FiberStrip2DLoader.load_batch`, defer image/value augmentation,
@@ -612,6 +631,13 @@ Training keys:
 - `contrastive_weight`: multiplier for the balanced cosine contrastive loss.
 - `contrastive_negative_margin`: cosine margin for negative pairs.
   The margin applies to valid non-CP pixel negatives.
+- `top_view_enabled`: enables the jointly trained top-view auxiliary model.
+  The top model uses one top-strip patch per loaded CP sample and outputs
+  direction plus a DT scalar channel.
+- `top_view_direction_weight`: multiplier for the top-view direction MSE.
+- `top_view_dt_weight`: multiplier for the top-view distance-transform MSE.
+- `top_view_dt_radius_px`: pixel distance where the top-view DT target reaches
+  zero; default `30.0`.
 - `device`: `auto`, `cpu`, or a torch device string.
 - `tensorboard_enabled`: set false for smoke tests without TensorBoard.
 - `pipeline_enabled`: enables CUDA training batch pipelining and load-only

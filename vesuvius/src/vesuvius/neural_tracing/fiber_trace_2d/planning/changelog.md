@@ -2,6 +2,10 @@
 
 ## 2026-07-12
 
+- Added optional joint top-view training for `fiber_trace_2d`: a second
+  direction model consumes VC3D-style top-strip slices and trains a sigmoid
+  distance-transform channel along the CP normal line, with TensorBoard
+  overlays/maps and prefetch dependency inclusion.
 - Changed standard `fiber_trace_2d` training to direction plus sheet/fiber
   presence only: contrastive embedding is now explicit opt-in, and disabled
   contrastive configs instantiate no embedding head.
