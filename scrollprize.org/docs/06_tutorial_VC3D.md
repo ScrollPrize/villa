@@ -35,7 +35,7 @@ import TabItem from '@theme/TabItem';
 
 # Volume Cartographer 3D (VC3D)
 
-*Last updated: July 11, 2026*
+*Last updated: July 12, 2026*
 
 <ChatCallout prefill="Help me get started with VC3D" />
 
@@ -60,6 +60,12 @@ Downloads for all operating systems are available on the [releases page](https:/
 
   - Download the macos .dmg file from the [releases page](https://github.com/ScrollPrize/villa/releases) of the villa repository.
   - Double click the .dmg file, and drag/drop it into applications (**you may have to right click the dmg and click 'open'.**)
+
+  <div className="mb-4 max-w-[760px]">
+    <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/vc3d/macos-install-poster.webp">
+      <source src="/img/tutorials/vc3d/macos-install.webm" type="video/webm"/>
+    </video>
+  </div>
 
 </TabItem>
   <TabItem value="windows" label="Windows">
