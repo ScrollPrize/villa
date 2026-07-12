@@ -14,9 +14,6 @@ This repository contains the source code for Vesuvius Challenge: scroll tools, l
 ### [vesuvius](vesuvius/)
 A Python library for accessing CT scans of ancient scrolls.
 
-### [vesuvius-c](vesuvius-c/)
-A single-header C library for accessing CT scans of ancient scrolls.
-
 ---
 
 ## Dataset & Rendering Tools
@@ -24,12 +21,8 @@ A single-header C library for accessing CT scans of ancient scrolls.
 ### [foundation](foundation/)
 Tools to build/manage scroll datasets and cloud infrastructure.
 
-### [crackle-viewer](crackle-viewer)
-A GUI tool to inspect and label ink on virtually unwrapped segments of ancient scrolls.  
-Originally developed by [Julian Schilliger](https://github.com/schillij95).
-
 ### [ink-detection](ink-detection/)
-The ink detection machine learning model used to win the Vesuvius Challenge 2023 Grand Prize.  
+Training and inference tools for Vesuvius Challenge ink detection models, built on the model that won the 2023 Grand Prize.  
 Originally developed by [Youssef Nader](https://github.com/younader) and [Luke Farritor](https://github.com/lukeboi).
 Generalizing ink detection reliably across scrolls with far less per-scroll labeling remains an open problem.
 
@@ -63,6 +56,13 @@ Source for the [Vesuvius Challenge website](https://scrollprize.org).
 ### [thaumato-anakalyptor](deprecated/thaumato-anakalyptor/)
 A semi-automatic segmentation pipeline to extract papyrus sheets from CT scans of ancient scrolls.  
 Originally developed by [Julian Schilliger](https://github.com/schillij95). Superseded by [VC3D](volume-cartographer) and [lasagna](lasagna/).
+
+### [vesuvius-c](deprecated/vesuvius-c/)
+A single-header C library for accessing CT scans of ancient scrolls.
+
+### [crackle-viewer](deprecated/crackle-viewer/)
+A GUI tool to inspect and label ink on virtually unwrapped segments of ancient scrolls.  
+Originally developed by [Julian Schilliger](https://github.com/schillij95).
 
 [licence-badge]: https://img.shields.io/github/license/ScrollPrize/villa?color=blue
 [licence-url]: https://github.com/ScrollPrize/villa/blob/main/LICENSE
