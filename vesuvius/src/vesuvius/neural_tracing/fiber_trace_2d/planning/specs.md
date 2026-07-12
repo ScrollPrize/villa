@@ -386,12 +386,21 @@
   to the target CP y. The reverse trace is linearly interpolated where it
   reaches the start CP x-column and compared to the start CP y. The two raw y
   errors are averaged before division by horizontal span.
-- If either trace does not reach its opposite CP x-column, that direction uses
-  the default maximum y error for the segment: vertical distance from the CP
-  centerline y to the nearest usable vertical strip edge after RF-margin
-  exclusion. The same maximum y error caps pathological endpoint y errors.
-  This intentionally treats exact early/late edge intersection as noise for
-  now.
+- Target-directed Trace2CP traces must normally stop by reaching the opposite
+  CP x-column. When a step crosses that column, the returned trace must append
+  an exact linearly interpolated point at the target column before terminating
+  with reason `target_column`.
+- If a trace explicitly stops before the opposite CP x-column because it hits
+  the RF margin, invalid sampled data, or an invalid predicted direction, that
+  direction uses the default maximum y error for the segment: vertical distance
+  from the CP centerline y to the nearest usable vertical strip edge after
+  RF-margin exclusion. The same maximum y error caps pathological endpoint y
+  errors. This intentionally treats exact early/late edge intersection as noise
+  for now.
+- If a target-directed Trace2CP trace terminates by exhausting `max_steps`, that
+  is an internal budget failure and must raise a visible error. It must not be
+  scored through the missing-target-column maximum-y fallback, because that can
+  hide traces that stop far before the opposite CP column.
 - The previous center-biased closest-approach value remains available only as a
   refinement/visualization diagnostic named `refine_score`. It must not be used
   as the public Trace2CP metric or as the training best-checkpoint criterion.
@@ -419,36 +428,58 @@
   `1` degree spacing, giving 51 candidates. `--trace2cp-candidate-max-deg` and
   `--trace2cp-candidate-step-deg` configure the bound and spacing; coarser
   spacing such as `2` degrees evaluates every second degree within the bound.
-- The combined Trace2CP candidate score is a weighted sum of four losses:
-  direction disagreement, cosine distance to the previously accepted
-  trace-point embedding, mean cosine distance to the two enclosing Trace2CP CP
-  embeddings, and mean cosine distance to an embedding bank built from all CP
-  embeddings in the same fiber. The direction disagreement is the average of
-  the candidate step disagreement with the current oriented direction and the
-  candidate step disagreement with the predicted direction sampled at the
-  candidate point. Candidates whose candidate-point direction cannot be sampled
-  are invalid.
+- `--trace2cp-combined-mode embedding` is the default combined scorer. Its
+  candidate score is a weighted sum of four losses: direction disagreement,
+  cosine distance to the previously accepted trace-point embedding, mean
+  cosine distance to the two enclosing Trace2CP CP embeddings, and mean cosine
+  distance to an embedding bank built from all CP embeddings in the same fiber.
+  The direction disagreement is the average of the candidate step disagreement
+  with the current oriented direction and the candidate step disagreement with
+  the predicted direction sampled at the candidate point. Candidates whose
+  candidate-point direction cannot be sampled are invalid.
   `--trace2cp-combined-direction-weight`,
   `--trace2cp-combined-last-weight`,
   `--trace2cp-combined-enclosing-weight`, and
   `--trace2cp-combined-fiber-weight` default to `1.0`.
-- `--trace2cp-combined` requires a checkpoint/model output with appended
+- `--trace2cp-combined-mode image` is an experimental alternative scorer that
+  does not require embedding channels. For every candidate it samples a local
+  image descriptor from the already loaded Trace2CP segment image, not from a
+  display image and not by re-reading the volume. The descriptor is an
+  oriented rectangle of `--trace2cp-image-patch-across` by
+  `--trace2cp-image-patch-along` pixels, default `8 x 16`, with the along axis
+  aligned to the local fiber/candidate direction. It is blurred only along the
+  along/fiber axis by a normalized Gaussian with
+  `--trace2cp-image-blur-radius`, default `5`, then compared by center-weighted
+  MSE using a spatial Gaussian centered on the descriptor footprint. Direction
+  sign ambiguity is handled by also comparing the reference descriptor flipped
+  along the fiber axis and taking the lower loss. The image term is the mean
+  descriptor loss to the start CP, target CP, and previous accepted trace
+  point. The total image-mode candidate score is
+  `direction_weight * direction_loss + image_weight * image_loss`, where
+  `--trace2cp-combined-image-weight` defaults to `1.0`.
+- Embedding combined mode requires a checkpoint/model output with appended
   embedding channels; it must fail clearly rather than silently falling back
   when embeddings are absent. If a non-zero fiber-bank weight is configured and
   no same-fiber CP embedding can be built, the command must fail clearly. CPs
   whose local segment patch is invalid while building the bank are skipped and
-  reported in the summary.
+  reported in the summary. Image combined mode must not build or require the
+  embedding bank.
 - Combined Trace2CP is an inspection/score-tuning path. It does not replace the
   public `trace2cp_error` definition, the direction-only tracer, training loss,
   or best-checkpoint selection unless explicitly enabled by the command-line
   flag. With `--med-tta --trace2cp-combined`, median TTA supplies the direction
-  reference while candidate embeddings are sampled from the reference segment
-  patch; no embedding fields are geometrically warped after sampling.
+  reference while candidate embeddings or image descriptors are sampled from
+  the reference segment patch; no embedding fields are geometrically warped
+  after sampling.
 - `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` enables an
   experimental short z-search inspection mode. It requires combined tracing
-  and embedding channels, and it is intentionally not combined with `--med-tta`
-  in the first implementation. Existing Trace2CP commands without
-  `--trace2cp-z-search` keep the center strip-z image-only behavior.
+  and is intentionally not combined with `--med-tta` in the first
+  implementation. In embedding mode it requires embedding channels. In image
+  mode it samples candidate descriptors from the candidate z layer image/mask,
+  keeps start/target CP descriptors from the center layer, and carries the
+  previously accepted descriptor from the previously accepted z layer. Existing
+  Trace2CP commands without `--trace2cp-z-search` keep the center strip-z
+  image-only behavior.
 - Trace2CP z-search derives additional segment-strip planes from one accepted
   center segment source. The center source is built once from the CP-to-CP
   line window and Lasagna normals, including the row-axis sign alignment used
@@ -477,9 +508,12 @@
   layer. Candidates whose candidate-point direction cannot be sampled are
   invalid. The selected trace point carries `x`, `y`, and selected-scale
   `z_voxels`.
-- Z-search uses the existing combined score terms and weights. Start/target CP
-  embeddings and same-fiber CP-bank embeddings remain center-layer
-  embeddings, so the bank stays comparable with non-z combined tracing.
+- Z-search uses the selected combined mode's score terms and weights. In
+  embedding mode, start/target CP embeddings and same-fiber CP-bank embeddings
+  remain center-layer embeddings, so the bank stays comparable with non-z
+  combined tracing. In image mode, start/target CP descriptors remain
+  center-layer descriptors while candidate and previous descriptors follow the
+  selected candidate/current z layers.
 - Z-search closest-approach/fusion uses
   `abs(forward_y - reverse_y) + abs(forward_z_voxels - reverse_z_voxels)`,
   with the existing center-distance magnification. The fused CP-to-CP line
@@ -533,17 +567,20 @@
   sheet. Each TTA debug image shows the sampled TTA slice with the transformed
   base-strip corner outline and start/target CP markers.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
-  a concise stdout line with sample index, fiber path, start/target CP indices,
-  trace mode, public `trace2cp_error`, target-column metric raw y error in
-  pixels, horizontal CP span, refinement diagnostic score, endpoint diagnostic
-  scores, per-direction raw errors, target x-columns, reach statuses,
-  termination reasons, and trace point counts. The JPG is a labeled vertical
-  stack with rows for full bidirectional traces, partial traces up to the
-  closest point, the fused CP-to-CP line, and the optimized refinement. Without
-  `--med-tta`, this stack is the reference-only inference result. With
-  `--med-tta`, the JPG has two columns: the selected median-TTA result first,
-  and a second reference-only inference column using the base direction field
-  without TTA. It does not draw score text over image pixels.
+  a dedicated public-metric stdout line beginning with `trace2cp_error=...`.
+  Additional stdout lines are diagnostics and must not duplicate the selected
+  public metric label. The summary includes sample index, fiber path,
+  start/target CP indices, trace mode, public `trace2cp_error`,
+  target-column metric raw y error in pixels, horizontal CP span, refinement
+  diagnostic score, endpoint diagnostic scores, per-direction raw errors,
+  target x-columns, reach statuses, termination reasons, and trace point
+  counts. The JPG is a labeled vertical stack with rows for full bidirectional
+  traces, partial traces up to the closest point, the fused CP-to-CP line, and
+  the optimized refinement. Without `--med-tta`, this stack is the
+  reference-only inference result. With `--med-tta`, the JPG has two columns:
+  the selected median-TTA result first, and a second reference-only inference
+  column using the base direction field without TTA. It does not draw score
+  text over image pixels.
 - Whole-fiber Trace2CP mode writes `trace2cp_fiber_vis.jpg` and
   `trace2cp_fiber_summary.txt`, and `trace2cp_fiber_debug.txt`. Each CP pair
   is loaded, traced, and measured with the same pair-local Trace2CP path as the
@@ -568,9 +605,11 @@
 - Trace2CP target-column crossing takes precedence over RF-margin rejection for
   the next step in each direction. If a step crosses that direction's target
   x-column and would also enter the RF margin, the trace is considered to have
-  reached the target column and the score is computed by interpolation at the
-  target column. RF-margin stop reasons should identify whether the x margin,
-  y margin, or both were hit.
+  reached the target column, an exact interpolated target-column point is
+  appended to the trace, and the score is computed at that point. RF-margin
+  stop reasons should identify whether the x margin, y margin, or both were
+  hit. `max_steps` exhaustion is not a valid scored stop reason for
+  target-directed Trace2CP traces and must raise instead.
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
 - Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.

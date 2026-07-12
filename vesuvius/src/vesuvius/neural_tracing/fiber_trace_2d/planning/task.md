@@ -1,13 +1,17 @@
-# Regular Combined Trace2CP Candidate-Point Direction Scoring
+# Fiber Presence Head And Z-Selected Embedding Supervision
 
-Make regular non-z `--trace2cp-combined` tracing evaluate the direction term
-the same way as z-search: average agreement with the current/last point's
-oriented direction and agreement with the predicted direction sampled at the
-candidate point.
+Plan two training changes:
 
-Requested behavior:
+- Add an explicit sheet/fiber presence output head. Supervise all transformed
+  control-point pixels as positive `1.0`, and all other reachable valid pixels
+  as negative `0.0`. Balance the positive and negative terms to equal overall
+  weight. Ignore unreachable edge pixels for the negative term using the same
+  shift-reachable region used by contrastive negatives.
+- Modify embedding training according to the z-search training todo: when
+  multiple strip-z offsets are enabled, do not supervise all same-fiber CP
+  offsets as mutually positive. For each CP, choose the already closest/best
+  matching other CP plus z-offset in the same fiber group and supervise only
+  that positive pair.
 
-- For each non-z combined candidate, sample the candidate point direction.
-- Mark candidates invalid if candidate-point direction sampling fails.
-- Keep embedding terms and weights unchanged.
-- Preserve z-search behavior.
+Keep the existing direction output and Lasagna ambiguous two-channel direction
+encoding unchanged.

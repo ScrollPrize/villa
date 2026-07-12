@@ -2,6 +2,15 @@
 
 ## 2026-07-12
 
+- Fixed Trace2CP target-directed traces stopping short under the old diagonal
+  step budget: target-column crossings now append an exact interpolated point,
+  `max_steps` exhaustion raises visibly instead of being scored, and
+  single-pair stdout prints the selected public `trace2cp_error` once on its
+  own line.
+- Added experimental `--trace2cp-combined-mode image` for Trace2CP
+  visualization: candidate scoring can now compare oriented, fiber-axis blurred
+  image descriptors against the start CP, target CP, and previous trace point,
+  including z-search support without requiring embedding channels.
 - Changed regular non-z combined Trace2CP direction scoring to match z-search:
   candidates now average current-point direction agreement and candidate-point
   direction agreement before applying the existing embedding terms.

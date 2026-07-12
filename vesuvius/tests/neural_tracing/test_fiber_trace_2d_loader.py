@@ -70,14 +70,18 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
 )
 from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _DirVisImageAugment,
+    _Trace2CpImageScoringConfig,
     _Trace2CpCombinedWeights,
+    _Trace2CpDirectionResult,
     _Trace2CpPredictedFields,
+    _Trace2CpResult,
     _TtaDirectionField,
     _bilinear_direction_sample,
     _bilinear_embedding_sample,
     _build_dir_vis_center_patch,
     _trace2cp_candidate_angles_degrees,
     _trace2cp_candidate_fan_directions,
+    _trace2cp_target_trace_max_steps,
     _trace_combined_direction_line_to_target,
     _direction_model_receptive_field_diameter,
     _dir_vis_image_space_augmentations,
@@ -112,6 +116,11 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_tta_params,
     _trace2cp_refinement_from_traces_z,
     _trace2cp_z_corrected_image_u8,
+    _trace2cp_image_descriptor,
+    _trace2cp_image_descriptor_loss,
+    _trace_combined_image_line_to_target,
+    _trace_combined_image_line_to_target_z,
+    _raise_trace2cp_max_steps,
     _trace_direction_line,
     _trace_direction_line_to_target,
     _trace_combined_direction_line_to_target_z,
@@ -663,6 +672,21 @@ def test_trace2cp_reverse_target_column_wins_over_next_rf_margin() -> None:
     assert np.isclose(line[-1, 0], 2.0)
 
 
+def test_trace2cp_target_trace_budget_has_curved_trace_slack() -> None:
+    shape_hw = (256, 2048)
+    step_px = 4.0
+    old_diagonal_budget = int(np.ceil(np.hypot(*shape_hw) / step_px)) + 2
+
+    budget = _trace2cp_target_trace_max_steps(
+        shape_hw,
+        np.asarray([32.0, 128.0], dtype=np.float32),
+        np.asarray([1980.0, 128.0], dtype=np.float32),
+        step_px,
+    )
+
+    assert budget > old_diagonal_budget * 4
+
+
 def test_trace2cp_candidate_angles_are_symmetric_and_configurable() -> None:
     angles = _trace2cp_candidate_angles_degrees(25.0, 1.0)
 
@@ -823,6 +847,151 @@ def test_trace2cp_combined_empty_fiber_bank_fails_when_weighted() -> None:
             step_px=1.0,
             rf_margin_px=1.0,
         )
+
+
+def test_trace2cp_image_descriptor_matches_identical_patch_better_than_shifted_patch() -> None:
+    y, x = np.mgrid[0:17, 0:17].astype(np.float32)
+    image = x * 7.0 + y * 11.0
+    valid = np.ones_like(image, dtype=bool)
+    config = _Trace2CpImageScoringConfig(patch_along=7, patch_across=5, blur_radius=1)
+
+    center = _trace2cp_image_descriptor(
+        image,
+        valid,
+        np.asarray([8.0, 8.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        config,
+    )
+    same = _trace2cp_image_descriptor(
+        image,
+        valid,
+        np.asarray([8.0, 8.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        config,
+    )
+    shifted = _trace2cp_image_descriptor(
+        image,
+        valid,
+        np.asarray([10.0, 8.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        config,
+    )
+
+    assert center is not None
+    assert same is not None
+    assert shifted is not None
+    assert _trace2cp_image_descriptor_loss(center, same) == pytest.approx(0.0, abs=1.0e-8)
+    assert _trace2cp_image_descriptor_loss(center, shifted) > 0.0
+
+
+def test_trace2cp_image_descriptor_direction_sign_is_horizontal_flip_equivalent() -> None:
+    y, x = np.mgrid[0:17, 0:17].astype(np.float32)
+    image = x * 13.0 + y * 3.0
+    valid = np.ones_like(image, dtype=bool)
+    config = _Trace2CpImageScoringConfig(patch_along=7, patch_across=5, blur_radius=0)
+
+    forward = _trace2cp_image_descriptor(
+        image,
+        valid,
+        np.asarray([8.0, 8.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        config,
+    )
+    reverse = _trace2cp_image_descriptor(
+        image,
+        valid,
+        np.asarray([8.0, 8.0], dtype=np.float32),
+        np.asarray([-1.0, 0.0], dtype=np.float32),
+        config,
+    )
+
+    assert forward is not None
+    assert reverse is not None
+    assert _trace2cp_image_descriptor_loss(forward, reverse) == pytest.approx(0.0, abs=1.0e-8)
+
+
+def test_trace2cp_image_combined_can_choose_off_axis_candidate_without_embeddings() -> None:
+    direction = np.zeros((17, 17, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    image = np.zeros((17, 17), dtype=np.float32)
+    # Make the straight-ahead first candidate locally unlike the CP descriptors.
+    image[8, 6] = 255.0
+    valid = np.ones((17, 17), dtype=bool)
+
+    line, reason, stats = _trace_combined_image_line_to_target(
+        direction_xy=direction,
+        tta_fields=None,
+        image_hw=image,
+        valid_mask=valid,
+        start_xy=np.asarray([2.0, 8.0], dtype=np.float32),
+        target_xy=np.asarray([14.0, 8.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, image=1.0),
+        image_config=_Trace2CpImageScoringConfig(patch_along=3, patch_across=3, blur_radius=0),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        step_px=4.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason in {"target_column", "max_steps", "top", "bottom", "left", "right", "invalid_candidate"}
+    assert stats.steps > 0
+    assert stats.mean("image") >= 0.0
+    assert abs(float(line[1, 1]) - 8.0) > 1.0
+
+
+def test_trace2cp_image_z_search_can_choose_image_layer_without_embeddings() -> None:
+    direction = np.zeros((9, 13, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((9, 13), dtype=bool)
+    center_image = np.zeros((9, 13), dtype=np.float32)
+    bad_image = center_image.copy()
+    bad_image[4, 5] = 255.0
+    matching_image = center_image.copy()
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 1
+
+        def __init__(self) -> None:
+            self.layers = {
+                -1: SimpleNamespace(
+                    image=bad_image,
+                    valid_mask=valid,
+                    fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=None),
+                ),
+                0: SimpleNamespace(
+                    image=bad_image,
+                    valid_mask=valid,
+                    fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=None),
+                ),
+                1: SimpleNamespace(
+                    image=matching_image,
+                    valid_mask=valid,
+                    fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=None),
+                ),
+            }
+
+        def get(self, layer: int):
+            return self.layers[int(layer)]
+
+        def ensure_neighbors(self, layer: int) -> None:
+            assert abs(int(layer)) <= self.max_layer
+
+    line, reason, stats = _trace_combined_image_line_to_target_z(
+        plane_cache=FakePlaneCache(),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([10.0, 4.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, image=1.0),
+        image_config=_Trace2CpImageScoringConfig(patch_along=3, patch_across=3, blur_radius=0),
+        candidate_max_degrees=0.0,
+        candidate_step_degrees=1.0,
+        step_px=3.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason == "target_column"
+    assert stats.steps > 0
+    assert line[1, 2] == pytest.approx(1.0)
 
 
 def test_trace2cp_z_search_can_choose_embedding_layer() -> None:
@@ -1410,6 +1579,37 @@ def _fake_trace2cp_pair_evaluation(
         tta_rows=(),
         tta_debug_entries=(),
     )
+
+
+def test_trace2cp_max_steps_is_loud_error() -> None:
+    evaluation = _fake_trace2cp_pair_evaluation(0, 1)
+    bad_forward = _Trace2CpDirectionResult(
+        trace_xy=evaluation.selected_result.forward.trace_xy,
+        result=_Trace2CpResult(
+            score=1.0,
+            raw_y_error_px=9.0,
+            trace_y_at_target_x=float("nan"),
+            target_x=float(evaluation.sample.target_control_point_xy[0]),
+            reached_target_column=False,
+            reason="max_steps",
+        ),
+    )
+    bad_result = runner_module._Trace2CpBidirectionalResult(
+        forward=bad_forward,
+        reverse=evaluation.selected_result.reverse,
+        refinement=evaluation.selected_result.refinement,
+        metric=evaluation.selected_result.metric,
+    )
+
+    with pytest.raises(ValueError, match="exhausted max_steps"):
+        _raise_trace2cp_max_steps(
+            bad_result,
+            mode="combined_image",
+            sample=evaluation.sample,
+            image_shape_hw=evaluation.image.shape,
+            step_px=4.0,
+            rf_margin_px=8.0,
+        )
 
 
 def test_trace2cp_fiber_overlay_composes_pair_results_into_long_strip() -> None:

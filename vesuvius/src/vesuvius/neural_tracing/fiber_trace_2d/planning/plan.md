@@ -3,6 +3,10 @@
 2d slice based fiber refinement/interpolation between long distance controlpoints in the 3d volume
 
 # current overview plan
+- try the looser embedding (only some points in a fiber shall look similar)
+- learn fiber/sheet presence (thats anyways what embedding regressed to)
+
+# previous
 - add trace2cp metrics in training (full test fiber pairs) - minus the ones that go out of the FOV (or increase strip height?)
 - add gt dir refinement
 - add actuall embedding similarity
