@@ -65,6 +65,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _load_training_batch,
     _TrainingBatchPipeline,
     _resolve_test_selection,
+    _embedding_channel_count,
     _test_loader_config_from_raw,
     _training_config_from_raw,
     _validate_training_batch_config,
@@ -3657,6 +3658,68 @@ def test_training_rejects_batch_size_control_point_mismatch(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="control_points_per_step.*batch_size"):
         _validate_training_batch_config(training, loader_config)
+
+
+def test_standard_example_training_disables_contrastive_embedding_by_default() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "vesuvius"
+        / "neural_tracing"
+        / "fiber_trace_2d"
+        / "configs"
+        / "loader_example.json"
+    )
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    training = _training_config_from_raw(raw)
+
+    assert training.presence_enabled is True
+    assert training.contrastive_enabled is False
+    assert _embedding_channel_count(training) == 0
+
+
+def test_disabled_contrastive_ignores_stale_embedding_channels() -> None:
+    training = FiberStripTrainingConfig(
+        presence_enabled=True,
+        contrastive_enabled=False,
+        contrastive_embedding_channels=16,
+    )
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(
+            in_channels=1,
+            hidden_channels=4,
+            depth=1,
+            presence_channels=1,
+            embedding_channels=_embedding_channel_count(training),
+        )
+    )
+
+    output = model(torch.zeros((1, 1, 3, 3), dtype=torch.float32))
+
+    assert output.shape == (1, 3, 3, 3)
+    assert embedding_output(output, presence_channels=1).shape[1] == 0
+
+
+def test_enabled_contrastive_uses_configured_embedding_channels() -> None:
+    training = FiberStripTrainingConfig(
+        presence_enabled=True,
+        contrastive_enabled=True,
+        contrastive_embedding_channels=16,
+    )
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(
+            in_channels=1,
+            hidden_channels=4,
+            depth=1,
+            presence_channels=1,
+            embedding_channels=_embedding_channel_count(training),
+        )
+    )
+
+    output = model(torch.zeros((1, 1, 3, 3), dtype=torch.float32))
+
+    assert output.shape == (1, 19, 3, 3)
+    assert embedding_output(output, presence_channels=1).shape[1] == 16
 
 
 def test_training_batch_pipeline_preserves_step_sample_order() -> None:

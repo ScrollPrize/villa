@@ -12,6 +12,7 @@
     - try top for embedding
     - top fiber dt (with condition?)
 - probably better - switch to 3d
+    - or 2.5d - several slices from the top view seem informative ...
 
 # prev
 - try the looser embedding (only some points in a fiber shall look similar)

@@ -158,8 +158,9 @@ The important behavior is:
 - Consumes flattened strip patches shaped `[patch_batch, 1, height, width]`.
 - Outputs two per-pixel direction channels in the Lasagna encoded
   representation first. If enabled, one sigmoid sheet/fiber-presence channel
-  follows. Configured contrastive embedding channels are appended after
-  direction and any presence channel.
+  follows. Contrastive embedding channels are appended after direction and any
+  presence channel only when contrastive training/inference is explicitly
+  configured with embedding channels.
 
 `loader.py`
 
@@ -473,6 +474,9 @@ The important behavior is:
   sheet/fiber-presence head and adds a balanced BCE loss: the rounded
   transformed CP pixel in each strip patch is positive, valid reachable non-CP
   pixels are negative, and unreachable shift-margin edges are ignored.
+- Standard training uses direction supervision plus the optional sheet/fiber
+  presence head. The standard example config enables presence and leaves
+  contrastive embedding disabled.
 - When `training.contrastive_enabled` is true, configures an embedding head,
   uses the loader's same-fiber grouped batch path, and adds a cosine embedding
   loss. Positive terms operate on rounded transformed CP pixels: for each
@@ -490,11 +494,11 @@ The important behavior is:
   only a small reachable region to remain similar to the CP embedding. The
   balanced pair loss plus this sparsity term are multiplied by
   `training.contrastive_weight`.
-- Logs `train/loss_total`, `train/loss_direction`,
-  optional presence loss/components, `train/loss_contrastive`,
-  positive/negative contrastive components, TensorBoard presence maps, and
-  TensorBoard embedding-similarity images that compare every pixel in a
-  selected patch against that patch's CP embedding.
+- Logs `train/loss_total`, `train/loss_direction`, optional presence
+  loss/components, TensorBoard presence maps, and, only when contrastive
+  embedding is enabled, `train/loss_contrastive`, positive/negative
+  contrastive components, and TensorBoard embedding-similarity images that
+  compare every pixel in a selected patch against that patch's CP embedding.
 - On CUDA training runs, uses a bounded deterministic whole-batch pipeline when
   `training.pipeline_enabled` is true. Background workers build exact training
   steps with `FiberStrip2DLoader.load_batch`, defer image/value augmentation,
@@ -595,10 +599,13 @@ Training keys:
   Training and benchmark modes require this to match top-level `batch_size`.
   Changing `strip_z_offset_count` changes the flattened CNN patch count without
   any default-shape warning.
-- `contrastive_enabled`: enables same-fiber contrastive embedding training.
+- `contrastive_enabled`: explicitly enables experimental same-fiber
+  contrastive embedding training. It defaults to false; standard training does
+  not create an embedding head or loss.
 - `contrastive_embedding_channels`: number of raw embedding channels appended
-  after the two direction channels; must be positive when contrastive training
-  is enabled.
+  after the two direction channels and optional presence channel; must be
+  positive when contrastive training is enabled. A positive value is ignored
+  while `contrastive_enabled` is false.
 - `contrastive_control_points_per_fiber`: same-fiber CP group size `N`.
   `control_points_per_step` must be divisible by this value so the batch is an
   exact number of same-fiber CP groups.

@@ -255,8 +255,11 @@
 - A training step samples `training.control_points_per_step` deterministic control-point samples and every configured strip-z offset. The default is four control points and 16 strip-z offsets, giving 64 2D strip patches.
 - If a deterministic training sample is invalid because its CP-local Lasagna normal window is invalid, batch loading skips it and continues with following deterministic sample indices until the requested number of control-point samples is loaded. If too many consecutive samples are invalid, batch loading fails with a clear error.
 - Training flattens control-point and strip-z dimensions into a patch batch before the 2D model forward pass.
-- The default V0 direction model is a 10-block residual CNN with 64 hidden channels. It uses a 3x3 input projection, constant-width residual blocks, BatchNorm2d normalization, a final 1x1 direction projection, an optional 1x1 sheet/fiber-presence projection, and an optional 1x1 embedding projection.
-- V0 model output always starts with exactly two per-pixel direction channels in the Lasagna ambiguous two-cos-channel encoding. When `training.presence_enabled` is true, one sigmoid sheet/fiber-presence channel follows the direction channels. When `training.contrastive_embedding_channels > 0`, raw embedding channels are appended after direction and any presence channel. Consumers must use explicit output-slicing helpers instead of hard-coded embedding offsets.
+- The default V0 direction model is a 10-block residual CNN with 64 hidden channels. It uses a 3x3 input projection, constant-width residual blocks, BatchNorm2d normalization, a final 1x1 direction projection, an optional 1x1 sheet/fiber-presence projection, and an optional 1x1 embedding projection for explicit contrastive experiments.
+- Standard training uses direction supervision plus sheet/fiber presence when
+  `training.presence_enabled` is true. Contrastive embedding training is
+  disabled by default and must be explicitly enabled.
+- V0 model output always starts with exactly two per-pixel direction channels in the Lasagna ambiguous two-cos-channel encoding. When `training.presence_enabled` is true, one sigmoid sheet/fiber-presence channel follows the direction channels. When `training.contrastive_enabled` is true and `training.contrastive_embedding_channels > 0`, raw embedding channels are appended after direction and any presence channel. A disabled contrastive config must instantiate no embedding head, even if a stale positive `contrastive_embedding_channels` value is present. Consumers must use explicit output-slicing helpers instead of hard-coded embedding offsets.
 - For strip-image tangent angle `theta`, target channels are `0.5 + 0.5*cos(2*theta)` and `0.5 + 0.5*cos(2*theta + pi/4)`.
 - Sheet/fiber presence training is enabled by `training.presence_enabled`.
   It supervises each loaded strip patch's rounded transformed CP pixel as
@@ -266,7 +269,8 @@
   learn that CPs can never occur there. The positive-pixel BCE mean and the
   negative-pixel BCE mean have equal aggregate weight, and the combined loss is
   multiplied by `training.presence_weight`.
-- Contrastive embedding training is enabled by `training.contrastive_enabled`.
+- Contrastive embedding training is experimental opt-in, enabled by
+  `training.contrastive_enabled`.
   It requires `training.contrastive_embedding_channels > 0` and
   `training.control_points_per_step` divisible by
   `training.contrastive_control_points_per_fiber`.

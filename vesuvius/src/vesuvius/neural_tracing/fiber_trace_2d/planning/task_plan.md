@@ -1,51 +1,43 @@
-# Trace2CP Traced Top Strip Visualization Plan
+# Default Training Without Embedding Loss Plan
 
 ## Scope
 
-- Add top-strip panels to single-pair `trace2cp_vis.jpg`.
-- Keep the original/init top strip for comparison.
-- Add traced-line top-strip sampling for both single-pair and whole-fiber
-  Trace2CP visualization.
-- Do not change scoring, tracing, z-search candidate selection, metrics, or
-  training.
+- Change the standard training path so default/example runs optimize direction
+  plus presence only.
+- Preserve explicit contrastive embedding support for experiments.
+- Avoid changing Trace2CP embedding inspection flags or existing embedding loss
+  implementation.
 
 ## Implementation
 
-- Request top-strip debug sampling from `_evaluate_trace2cp_pair` in
-  single-pair export.
-- Add traced top-strip sampling in the loader:
-  - interpolate the fused trace at each output column;
-  - sample the center 3D point and Lasagna normal/offset axis from the segment
-    coordinate grid at that traced side-strip point;
-  - derive the top-strip side axis from traced tangent and normal;
-  - sample rows along that side axis;
-  - for the non-z version, force the trace z offset to zero;
-  - for z-search, use the fused trace's selected z offsets.
-- Extend `_draw_trace2cp_overlay` to accept optional original, traced z=0, and
-  traced z-corrected top-strip images/valid masks.
-- Render the top strips as an additional debug column:
-  - original/init `original top strip VC3D lineSurface`;
-  - traced `traced fused top strip z=0`;
-  - optional `traced fused top strip z-corrected`;
-  - draw the fiber centerline and start/target CP markers at the top-strip
-    center row.
-- Update whole-fiber overlay to stitch the original, traced z=0, and optional
-  traced z-corrected top-strip rows.
+- Add an effective training helper that returns embedding channels only when
+  `training.contrastive_enabled` is true.
+- Use that helper when constructing training and benchmark models, so a disabled
+  contrastive config cannot create an unused embedding head.
+- Update `configs/loader_example.json` to remove the contrastive opt-in keys
+  from the standard example run.
+- Keep validation requiring `contrastive_embedding_channels > 0` when
+  `contrastive_enabled` is true.
+- Add focused tests for:
+  - default training config has contrastive disabled and no embedding channels;
+  - disabled contrastive with a stale positive channel count builds a
+    direction+presence model only;
+  - enabled contrastive still uses the configured embedding channel count.
 
 ## Spec Update
 
-- Clarify that both single-pair and whole-fiber Trace2CP visualizations include
-  original/init top-strip comparison and traced fused top-strip output.
+- State that standard training is direction plus presence; contrastive
+  embedding is experimental explicit opt-in.
+- Clarify that embedding channels are appended only for effective contrastive
+  training, not merely because a stale channel count exists.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md`.
-- Update `planning/status.md`, `planning/task_log.md`, and changelog if useful.
+- Update `docs/code_structure.md` training/config sections.
+- Update `planning/status.md`, `planning/task_log.md`, and changelog.
 
 ## Tests
 
-- Add focused unit coverage that `_draw_trace2cp_overlay` appends a top-strip
-  column, and includes the z-corrected panel when provided.
 - Run:
-  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
+  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py`
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`

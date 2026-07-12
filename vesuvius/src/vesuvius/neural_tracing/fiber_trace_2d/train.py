@@ -196,6 +196,12 @@ def _presence_channel_count(training: FiberStripTrainingConfig | None) -> int:
     return 1 if training is not None and bool(training.presence_enabled) else 0
 
 
+def _embedding_channel_count(training: FiberStripTrainingConfig | None) -> int:
+    if training is None or not bool(training.contrastive_enabled):
+        return 0
+    return max(0, int(training.contrastive_embedding_channels))
+
+
 def _load_raw_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as handle:
@@ -1039,7 +1045,7 @@ def run_benchmark(
                 hidden_channels=training.model_hidden_channels,
                 depth=training.model_depth,
                 presence_channels=_presence_channel_count(training),
-                embedding_channels=training.contrastive_embedding_channels,
+                embedding_channels=_embedding_channel_count(training),
             )
         ).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate)
@@ -1705,7 +1711,7 @@ def run_training(
             hidden_channels=training.model_hidden_channels,
             depth=training.model_depth,
             presence_channels=_presence_channel_count(training),
-            embedding_channels=training.contrastive_embedding_channels,
+            embedding_channels=_embedding_channel_count(training),
         )
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate)

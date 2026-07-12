@@ -1,12 +1,16 @@
-# Trace2CP Traced Top Strip Visualization
+# Default Training Without Embedding Loss
 
-Correct Trace2CP top-strip visualization so the comparison output includes both
-the original/init strip and strips reconstructed from the traced fused line.
+Standard `fiber_trace_2d` training should use direction and sheet/fiber
+presence supervision only. The contrastive embedding head and loss must remain
+supported, but they should be explicit opt-in rather than part of the default
+example training configuration.
 
-- Single-pair Trace2CP should show the VC3D-style top strip sampled from the
-  same segment source as an original/init comparison.
-- Single-pair and whole-fiber Trace2CP should also show a VC3D-style top strip
-  constructed from the fused traced line projected onto the central z slice.
-- When z-search is active, single-pair and whole-fiber Trace2CP should also
-  show the fused z-corrected top strip constructed from the fused traced line.
-- Do not change Trace2CP scoring, tracing, metrics, or training behavior.
+- Disable contrastive embedding in the standard example config.
+- Make disabled contrastive training instantiate no embedding head, even if a
+  stale embedding-channel value is present in a config.
+- Keep explicit contrastive opt-in support unchanged: when
+  `training.contrastive_enabled` is true, a positive
+  `training.contrastive_embedding_channels` is still required and the existing
+  same-fiber grouped sampling/loss/logging path remains active.
+- Update specs/docs to state the default training objective is direction plus
+  optional presence, with contrastive embedding as experimental opt-in.

@@ -2,6 +2,9 @@
 
 ## 2026-07-12
 
+- Changed standard `fiber_trace_2d` training to direction plus sheet/fiber
+  presence only: contrastive embedding is now explicit opt-in, and disabled
+  contrastive configs instantiate no embedding head.
 - Added Trace2CP top-strip visualization sampled as VC3D `lineSurface`,
   including original/init comparison, traced fused central-z output, and fused
   z-corrected output when z-search is active.
