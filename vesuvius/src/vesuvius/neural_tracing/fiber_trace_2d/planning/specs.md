@@ -236,7 +236,7 @@
 - `train.py --load-only` runs the same 100-batch benchmark loader path and exits without test evaluation, TensorBoard, run-directory creation, snapshots, image/value augmentation, image normalization, supervision building, model forward, backward, or optimizer work. It still performs deterministic sample selection, CP-local source construction, coordinate augmentation, and base-volume sampling so loading bottlenecks can be isolated. When `training.pipeline_enabled` is true, load-only benchmarks use the bounded whole-batch queue so loader parallelism can be measured without model work.
 - Training and training prefetch use the same deterministic pseudo-random CP sample-index sequence: each pass visits all configured CPs once in seeded random order and wraps at dataset end.
 - With `training.max_steps = 0`, training repeats the full training dataset indefinitely.
-- `training.max_sample_index` is an optional positive exclusive deterministic sample-index limit. The default `0` means no limit. When positive, training wraps every global sample position with `sample_index % training.max_sample_index`, so long runs reuse that deterministic prefix independently of `training.max_steps`.
+- `training.max_sample_index` is an optional positive exclusive deterministic sample-index limit. The default `0` means no limit. When positive, training wraps every global sample position with `sample_index % training.max_sample_index`, so long runs reuse that deterministic CP/data prefix independently of `training.max_steps`. The limit does not bound augmentation seeding: geometric and value/image augmentation draws are keyed by the unbounded training stream index so repeated use of the same bounded CP sample gets fresh deterministic augmentation parameters instead of replaying the same transform.
 - Explicit positive `--prefetch-steps N` overrides `training.max_steps` and prefetches exactly `N * training.control_points_per_step` CP samples from the deterministic random training stream.
 - Explicit `--prefetch-steps 0` overrides `training.max_steps` and prefetches every configured training-dataset CP once, independent of `control_points_per_step`; if `training.max_sample_index` is positive it prefetches that bounded deterministic prefix instead. When `test_datasets` is configured, it also prefetches every held-out test CP once.
 - If `--prefetch-steps` is omitted, prefetch uses `training.max_steps`; if that configured value is `0`, omitted prefetch also means every configured training/test CP once.
@@ -377,7 +377,20 @@
   plus predicted-direction overlay and a fixed `0..1` DT scalar map for train
   and test batches.
 - Console training progress prints every step covering the first 100 deterministic control-point sample indices, then falls back to `training.scalar_log_interval`.
-- Prefetch progress includes `idx=<exclusive-index>` showing the largest contiguous exclusive bounded deterministic sample index whose required chunks are cache-complete: each required chunk is a cache hit, a known/new missing marker, or a completed successful download. Dependency generation alone must not advance `idx` while downloads are still pending. Operators can use that value as `training.max_sample_index` to train on the prefetched deterministic prefix. When `training.top_view_enabled` is true, prefetch dependency generation includes the top-view strip envelope in addition to all side-strip z-offset envelopes.
+- Prefetch progress includes `idx=<exclusive-index>` showing the largest
+  contiguous exclusive deterministic training-stream prefix whose required
+  chunks are cache-complete. This index is counted through the seeded shuffled
+  CP stream used by training, before mapping a stream position to its original
+  flat fiber/CP id. Operators can use that value as
+  `training.max_sample_index` to train on the same prefetched random-prefix
+  stream. A stream sample is cache-complete only after every dependency request
+  for that sample has been classified and each required chunk is a cache hit, a
+  known/new missing marker, or a completed successful download. Dependency
+  generation alone must not advance `idx` while downloads are still pending.
+  When `training.top_view_enabled` is true, prefetch dependency generation
+  includes the top-view strip envelope in addition to all side-strip z-offset
+  envelopes, and both views must be complete before that sample can advance the
+  prefix.
 - Training writes snapshots under `<run_dir>/snapshots/current.pt` and `<run_dir>/snapshots/best.pt`. With `test_datasets`, current snapshots are written at the test evaluation cadence and best is selected by lowest observed averaged `test/trace2cp_error`. Without `test_datasets`, current snapshots use `training.checkpoint_interval` and best is selected by lowest observed training loss. A resumed run writes its own fresh `current.pt` and `best.pt` under the newly created resumed run directory.
 - The runner is `python -m vesuvius.neural_tracing.fiber_trace_2d.runner`.
 - Augment contact sheets are exported with `--augment-vis --export-dir <dir>`. Add `--augment-profile` to print cold and warm augment timing tables.
@@ -429,7 +442,7 @@
   requested pair is skipped.
 - Trace2CP loading constructs a side-strip segment that spans the start and
   target CPs plus receptive-field/visualization margin. The segment strip
-  height is four times the configured patch height so traces have more vertical
+  height is eight times the configured patch height so traces have more vertical
   room before entering the RF margin. It uses the same
   Lasagna manifest normal sampling and VC3D-equivalent side-strip coordinate
   construction as CP-local patches, but anchors the start CP at an explicit

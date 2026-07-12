@@ -147,10 +147,17 @@ random augmentation draw. Lasagna manifest channels are not prefetched.
 Set `training.max_sample_index` to a positive exclusive sample-index count to
 run many training steps over a bounded deterministic prefix. The default `0`
 means no limit. Prefetch progress prints `idx=<exclusive-index>` for the
-largest contiguous deterministic prefix whose required chunks are already in
-the cache or represented by missing markers. After stopping a long prefetch, use
-that `idx` value as `training.max_sample_index` to train only on the
-cache-complete prefix.
+largest contiguous deterministic shuffled training-stream prefix whose required
+chunks are already in the cache or represented by missing markers. This is not
+the original flat fiber/CP id; it counts through the same seeded random order
+that training uses. After stopping a long prefetch, use that `idx` value as
+`training.max_sample_index` to train only on the cache-complete random-prefix
+stream.
+
+The bounded prefix controls which CP/data samples are loaded. Training
+augmentations are still keyed by the unbounded deterministic training stream
+index, so repeated passes over a bounded prefix keep producing fresh
+deterministic geometric and value/image augmentation draws.
 
 Use `prefetch_sampler_workers` to limit CPU-side dependency/source generation
 without reducing download concurrency. `prefetch_workers` controls chunk

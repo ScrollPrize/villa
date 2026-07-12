@@ -1601,7 +1601,7 @@ def test_trace2cp_loader_rejects_same_cp(tmp_path: Path) -> None:
         )
 
 
-def test_trace2cp_segment_patch_uses_quadruple_configured_height(tmp_path: Path) -> None:
+def test_trace2cp_segment_patch_uses_eight_times_configured_height(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["patch_shape_hw"] = [5, 7]
@@ -1615,9 +1615,9 @@ def test_trace2cp_segment_patch_uses_quadruple_configured_height(tmp_path: Path)
         sample_mode="flat",
     )
 
-    assert image.shape[0] == 20
-    assert valid.shape[0] == 20
-    assert sample.coords_zyx.shape[0] == 20
+    assert image.shape[0] == 40
+    assert valid.shape[0] == 40
+    assert sample.coords_zyx.shape[0] == 40
 
 
 def test_trace2cp_segment_patch_accepts_explicit_selected_scale_z_offset(tmp_path: Path) -> None:
@@ -4107,6 +4107,60 @@ def test_prefetch_idx_requires_cache_complete_prefix(
     assert "idx=1" not in output
 
 
+def test_prefetch_idx_waits_for_all_requests_in_stream_sample(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["prefetch_sampler_workers"] = 1
+    raw["strip_z_offset_count"] = 1
+    raw["volume_cache_retry_seconds"] = 0.001
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    class Store:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+    store = Store(tmp_path / "cache")
+    store.root.mkdir(parents=True)
+    (store.root / "hit_0.bin").write_bytes(b"cached")
+    (store.root / "hit_1.bin").write_bytes(b"cached")
+    call_count = 0
+
+    def failing_downloader(request: ZarrChunkRequest) -> bytes:
+        del request
+        raise RuntimeError("network failed")
+
+    def request(key: str) -> ZarrChunkRequest:
+        return ZarrChunkRequest(
+            store=store,
+            store_identity="idx-close-test",
+            key=key,
+            cache_path=store.root / f"{key}.bin",
+            empty_path=store.root / f"{key}.empty",
+            remote_url=f"https://example.invalid/{key}",
+            cache_payload_format="source_bytes",
+            downloader=failing_downloader,
+        )
+
+    def fake_chunk_requests(coords, valid):
+        nonlocal call_count
+        del coords, valid
+        call_count += 1
+        if call_count == 1:
+            return [request("hit_0"), request("error")]
+        return [request("hit_1")]
+
+    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", fake_chunk_requests)
+
+    summary = loader.prefetch(0, 2, workers=1)
+
+    assert summary["errors"] == 1
+    assert summary["cache_hits"] == 2
+    assert summary["max_exclusive_sample_index"] == 0
+
+
 def test_prefetch_sampler_workers_limits_dependency_producers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4285,9 +4339,10 @@ def test_load_batch_wraps_through_sample_index_limit(tmp_path: Path, monkeypatch
         *,
         sample_mode: str = "random",
         profile=None,
+        **kwargs,
     ):
         attempted.append(int(sample_index))
-        return original_prepare_sample(sample_index, sample_mode=sample_mode, profile=profile)
+        return original_prepare_sample(sample_index, sample_mode=sample_mode, profile=profile, **kwargs)
 
     monkeypatch.setattr(loader, "_prepare_sample", prepare_sample)
 
@@ -4295,6 +4350,36 @@ def test_load_batch_wraps_through_sample_index_limit(tmp_path: Path, monkeypatch
 
     assert attempted == [1, 0, 1, 0]
     assert batch.images.shape == (4, len(loader.strip_z_offsets), 1, 3, 3)
+
+
+def test_bounded_sample_reuse_advances_augmentation_seed(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    raw["strip_z_offset_count"] = 1
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    first = loader.load_batch(
+        0,
+        batch_size=1,
+        sample_index_limit=1,
+        apply_image_augmentation=False,
+        include_coords=False,
+    )
+    second = loader.load_batch(
+        1,
+        batch_size=1,
+        sample_index_limit=1,
+        apply_image_augmentation=False,
+        include_coords=False,
+    )
+
+    assert first.control_point_indices.tolist() == second.control_point_indices.tolist()
+    assert first.augmentation_params[0] is not None
+    assert second.augmentation_params[0] is not None
+    assert first.augmentation_params[0] != second.augmentation_params[0]
 
 
 def test_parallel_load_batch_preserves_output_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4310,10 +4395,11 @@ def test_parallel_load_batch_preserves_output_order(tmp_path: Path, monkeypatch:
         *,
         sample_mode: str = "random",
         profile=None,
+        **kwargs,
     ):
         if int(sample_index) == 0:
             loader_module.time.sleep(0.02)
-        return original_prepare_sample(sample_index, sample_mode=sample_mode, profile=profile)
+        return original_prepare_sample(sample_index, sample_mode=sample_mode, profile=profile, **kwargs)
 
     monkeypatch.setattr(loader, "_prepare_sample", prepare_sample)
 

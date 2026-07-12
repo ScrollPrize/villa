@@ -1,17 +1,10 @@
-# Top-View Loader Performance Parity
+# Trace2CP Vertical Range Increase
 
-Top-view training became much slower after adding the additional slice. Fix the
-top-view data path so it follows the same infrastructure and accelerations as
-the side-view path.
+Increase the vertical range used by Trace2CP segment visualization/tracing.
 
-- Reuse the same source-cache mechanism for top-view CP-local source geometry,
-  without invalidating existing side-view cache entries.
-- Repeat the side-view vectorization and batching pattern for top-view samples:
-  batched augmentation-map construction, batched line/control-point lookup,
-  batched coordinate augmentation, and grouped `sample_coord_batch` calls.
-- The only intended difference from the side-view path is the source coordinate
-  generation function: top view uses the top-strip grid builder, side view uses
-  the side-strip grid builder.
-- Keep deterministic sample order and current top-view labels/loss semantics.
-- Make profiling attribute top-view work to the normal aggregate stages so
-  top-view load time is visible instead of hidden in `outside`.
+- The Trace2CP segment strip should provide more vertical room before traces hit
+  RF/edge margins.
+- Keep the existing segment construction, z-search behavior, metrics, and
+  normal/VC3D coordinate semantics unchanged.
+- Update regression tests and docs/specs that describe the Trace2CP segment
+  height multiplier.

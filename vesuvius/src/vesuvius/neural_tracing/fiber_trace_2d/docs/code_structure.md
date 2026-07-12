@@ -205,6 +205,10 @@ The important behavior is:
   metadata converts line and control-point coordinates at assembly/export time.
 - Builds one sample as all configured strip-z offsets around one control point.
 - Builds a batch by stacking deterministic samples.
+- Uses the bounded sample index only for CP/data selection; when training wraps
+  a bounded `max_sample_index` prefix, augmentation parameters are seeded by
+  the unbounded raw training stream index so repeated CPs do not replay the
+  same transform.
 - Builds contrastive training batches by selecting deterministic shuffled
   groups of `N` CPs from one fiber, concatenating consecutive same-fiber groups
   to fill the configured training batch, using independent geometric
@@ -292,7 +296,7 @@ The important behavior is:
   target-directed trace exhausts `max_steps`, the runner raises a visible error
   instead of scoring a missing target-column fallback. The center-biased
   closest approach remains a `refine_score` diagnostic for the fused/optimized
-  visualization rows only. The trace2cp segment strip uses four times the
+  visualization rows only. The trace2cp segment strip uses eight times the
   configured patch height for more vertical room before the RF margin.
 - Trace2CP uses `--med-tta` to decide whether to use TTA. Without it, the tool
   traces and scores both directions on the base direction field. With it,
@@ -611,7 +615,9 @@ Training keys:
 - `max_sample_index`: optional exclusive deterministic sample-index limit;
   `0` means unlimited. Positive values make training wrap global sample
   positions through that deterministic prefix, so many steps can reuse a
-  prefetched subset.
+  prefetched subset. Augmentation seeds still use the unbounded training stream
+  position, so the subset is deterministic but its augmentations keep changing
+  across repeats.
 - `learning_rate`: AdamW learning rate.
 - `scalar_log_interval`: TensorBoard scalar/console interval.
 - `tensorboard_image_interval`: TensorBoard batch-image interval.

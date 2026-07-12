@@ -2241,6 +2241,7 @@ class FiberStrip2DLoader:
         *,
         sample_mode: str = "random",
         descriptor: tuple[_Record, int, int] | None = None,
+        augmentation_sample_index: int | None = None,
         value_augmentation_sample_index: int | None = None,
         profile: dict[str, float] | None = None,
         include_line_xy: bool = True,
@@ -2253,10 +2254,11 @@ class FiberStrip2DLoader:
             descriptor=descriptor,
             profile=profile,
         )
+        augment_index = int(sample_index) if augmentation_sample_index is None else int(augmentation_sample_index)
         def augmentation_params_for_offset(offset_index: int) -> FiberStripAugmentParams | None:
             if not self.config.augment.enabled:
                 return None
-            geometric = random_combined_augmentation(self.config.augment, sample_index, offset_index)
+            geometric = random_combined_augmentation(self.config.augment, augment_index, offset_index)
             if value_augmentation_sample_index is None:
                 return geometric
             value = random_combined_augmentation(
@@ -3173,7 +3175,7 @@ class FiberStrip2DLoader:
             int(self.config.patch_shape_hw[1]),
             int(math.ceil(distance_px + 2.0 * margin + 1.0)),
         )
-        trace2cp_height_multiplier = 4
+        trace2cp_height_multiplier = 8
         height = int(self.config.patch_shape_hw[0]) * trace2cp_height_multiplier
         if height <= 0 or width <= 0:
             raise ValueError(f"invalid trace2cp segment shape {(height, width)}")
@@ -3606,6 +3608,7 @@ class FiberStrip2DLoader:
                         current_sample_index,
                         sample_mode=sample_mode,
                         descriptor=descriptor,
+                        augmentation_sample_index=raw_sample_index,
                         value_augmentation_sample_index=value_augmentation_sample_index,
                         profile=local_profile if profile is not None else None,
                         include_line_xy=include_line_xy,
@@ -3615,6 +3618,7 @@ class FiberStrip2DLoader:
                     if (
                         "include_line_xy" not in message
                         and "descriptor" not in message
+                        and "augmentation_sample_index" not in message
                         and "value_augmentation_sample_index" not in message
                     ):
                         raise
@@ -3909,7 +3913,7 @@ class FiberStrip2DLoader:
         completed_chunks: set[tuple[str, str]] = set()
         chunk_waiters: dict[tuple[str, str], set[int]] = {}
         sample_pending: dict[int, set[tuple[str, str]]] = {}
-        sample_bounded_index: dict[int, int] = {}
+        sample_requests_closed: set[int] = set()
         complete_raw_samples: set[int] = set()
         next_safe_raw_sample = start_sample
         start = time.perf_counter()
@@ -4048,21 +4052,26 @@ class FiberStrip2DLoader:
         def advance_safe_prefix() -> None:
             nonlocal next_safe_raw_sample
             while next_safe_raw_sample < end_sample and next_safe_raw_sample in complete_raw_samples:
-                bounded_index = sample_bounded_index.get(
-                    next_safe_raw_sample,
-                    self._bounded_sample_index(next_safe_raw_sample, sample_index_limit),
-                )
+                # This is the exclusive deterministic training-stream prefix.
+                # The raw stream position is intentionally reported before the
+                # seeded random CP permutation maps it to a flat fiber/CP id.
                 counters.max_exclusive_sample_index = max(
                     counters.max_exclusive_sample_index,
-                    int(bounded_index) + 1,
+                    int(next_safe_raw_sample) + 1,
                 )
                 next_safe_raw_sample += 1
 
         def mark_sample_complete(raw_sample_index: int) -> None:
+            if raw_sample_index not in sample_requests_closed:
+                return
             if sample_pending.get(raw_sample_index):
                 return
             complete_raw_samples.add(raw_sample_index)
             advance_safe_prefix()
+
+        def close_sample_requests(raw_sample_index: int) -> None:
+            sample_requests_closed.add(raw_sample_index)
+            mark_sample_complete(raw_sample_index)
 
         def mark_chunk_complete(identity: tuple[str, str]) -> None:
             if identity in completed_chunks:
@@ -4158,24 +4167,22 @@ class FiberStrip2DLoader:
                     if status == "error":
                         exc = payload
                         counters.samples_done += 1
-                        bounded_index = self._bounded_sample_index(sample_index_for_error, sample_index_limit)
-                        sample_bounded_index[sample_index_for_error] = bounded_index
                         counters.samples_skipped += 1
                         if not counters.first_sample_skip:
                             counters.first_sample_skip = f"sample={sample_index_for_error}: {exc}"
-                        mark_sample_complete(sample_index_for_error)
+                        sample_pending.setdefault(sample_index_for_error, set())
+                        close_sample_requests(sample_index_for_error)
                         submit_producers()
                         continue
 
-                    bounded_sample_index, sample_valid_pixels, requests = payload
+                    _bounded_sample_index, sample_valid_pixels, requests = payload
                     counters.samples_done += 1
-                    sample_bounded_index[sample_index_for_error] = int(bounded_sample_index)
                     sample_pending.setdefault(sample_index_for_error, set())
                     counters.patches_done += len(self.strip_z_offsets)
                     counters.valid_pixels += int(sample_valid_pixels)
                     for request in requests:
                         classify_or_submit(request, sample_index_for_error, download_queue, queued_downloads)
-                    mark_sample_complete(sample_index_for_error)
+                    close_sample_requests(sample_index_for_error)
                     submit_downloads()
                     submit_producers()
 

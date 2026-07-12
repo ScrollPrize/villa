@@ -2,6 +2,17 @@
 
 ## 2026-07-12
 
+- Increased Trace2CP segment strip height from four to eight times the
+  configured patch height, giving visualizations/traces more vertical room
+  before RF-margin or edge stops.
+- Changed training augmentation seeding so bounded-prefix runs still select CPs
+  through `training.max_sample_index`, but geometric and value/image
+  augmentations are seeded by the unbounded deterministic training stream index
+  and therefore do not repeat when the bounded CP prefix wraps.
+- Fixed `fiber_trace_2d` prefetch `idx` accounting so it advances only after
+  all side/top dependency requests for a deterministic shuffled-stream sample
+  are classified and resolved; docs now clarify that `idx` is the same random
+  stream prefix consumed by `training.max_sample_index`, not a flat CP id.
 - Refactored top-view batch loading to match side-view loader accelerations:
   top source grids now use separate strip-coordinate cache entries, top coord
   augmentation uses the same batched map/tensor path, top images are grouped
