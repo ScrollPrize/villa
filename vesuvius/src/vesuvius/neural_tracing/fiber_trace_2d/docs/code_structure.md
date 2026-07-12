@@ -313,7 +313,10 @@ The important behavior is:
   `trace2cp_vis.jpg` appends a fixed-scale presence column and whole-fiber
   `trace2cp_fiber_vis.jpg` appends a fixed-scale presence row: `0` is black,
   `1` is white, invalid pixels are black, and the fiber line, CPs, and selected
-  traces are overlaid.
+  traces are overlaid. With z-search, the z debug column also shows
+  forward/reverse/fused z-corrected presence maps, built column-by-column from
+  the same selected z layers as the z-corrected image; whole-fiber presence
+  uses the fused z-corrected presence when available.
 - `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` adds an
   experimental short z-search to the combined tracer. The loader builds one
   aligned Trace2CP segment source from the CP-to-CP line window and Lasagna

@@ -20,6 +20,13 @@
   - append this panel as a column in single-pair `trace2cp_vis.jpg` and as a
     row in whole-fiber `trace2cp_fiber_vis.jpg` only when presence scoring is
     active.
+- Add z-search corrected presence visualization:
+  - reconstruct forward, reverse, and fused presence maps column-by-column from
+    the selected trace z layer, using the same mechanism as the z-corrected
+    image;
+  - show those maps in the z debug column;
+  - use fused z-corrected presence for the whole-fiber presence row when it is
+    available.
 
 ## Spec Update
 
@@ -27,6 +34,8 @@
   standalone line.
 - Clarify that presence scoring enables a presence map debug column/row in
   Trace2CP visualizations.
+- Clarify that z-search presence visualization is z-corrected from the selected
+  per-column trace layer, not the center-layer map.
 
 ## Docs Updates
 
@@ -38,6 +47,7 @@
 
 - Add/adjust focused unit coverage for single-pair and whole-fiber presence
   visualization.
+- Add focused unit coverage for z-corrected presence column selection.
 - Run:
   - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`

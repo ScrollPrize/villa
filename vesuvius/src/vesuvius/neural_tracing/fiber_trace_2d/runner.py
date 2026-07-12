@@ -99,6 +99,47 @@ def _trace2cp_z_corrected_image_u8(
     return output, missing, layers_by_column
 
 
+def _trace2cp_z_corrected_presence_u8(
+    *,
+    plane_cache: _Trace2CpZPlaneCache,
+    trace_xyz: np.ndarray,
+    fallback_shape_hw: tuple[int, int],
+) -> tuple[np.ndarray | None, int, np.ndarray]:
+    height, width = (int(v) for v in fallback_shape_hw)
+    output = np.zeros((height, width), dtype=np.uint8)
+    layers_by_column = np.full((width,), -10_000, dtype=np.int32)
+    missing = 0
+    trace = np.asarray(trace_xyz, dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[1] != 3 or trace.shape[0] == 0:
+        return None, width, layers_by_column
+    layer_presence: dict[int, np.ndarray] = {}
+    for layer, prediction in plane_cache.layers.items():
+        fields = getattr(prediction, "fields", None)
+        presence = None if fields is None else getattr(fields, "presence_hw", None)
+        if presence is None:
+            continue
+        layer_presence[int(layer)] = _presence_map_to_u8(presence, prediction.valid_mask)
+    if not layer_presence:
+        return None, width, layers_by_column
+    for x in range(width):
+        point = _trace_xyz_at_x(trace, float(x))
+        if point is None or not bool(np.isfinite(point).all()):
+            missing += 1
+            continue
+        z_voxels = float(point[2])
+        layer = int(round(z_voxels / float(plane_cache.z_step_voxels)))
+        layers_by_column[x] = layer
+        presence_u8 = layer_presence.get(layer)
+        if presence_u8 is None:
+            missing += 1
+            continue
+        if presence_u8.shape != output.shape:
+            missing += 1
+            continue
+        output[:, x] = presence_u8[:, x]
+    return output, missing, layers_by_column
+
+
 def _trace2cp_refinement_fused_xyz(refinement: _Trace2CpRefinementResult) -> np.ndarray:
     xy = np.asarray(refinement.fused_resampled_xy, dtype=np.float32)
     z = refinement.fused_resampled_z
@@ -1283,6 +1324,12 @@ class _Trace2CpZTraceDebug:
     layers: tuple[int, ...]
     z_step_voxels: float
     max_layer: int
+    forward_z_presence: np.ndarray | None = None
+    reverse_z_presence: np.ndarray | None = None
+    fused_z_presence: np.ndarray | None = None
+    forward_presence_missing_columns: int = 0
+    reverse_presence_missing_columns: int = 0
+    fused_presence_missing_columns: int = 0
 
     @property
     def layer_min(self) -> int:
@@ -5279,6 +5326,47 @@ def _draw_trace2cp_overlay(
                 ),
                 color=(255, 220, 64, 230),
             ),
+        ]
+        if debug.forward_z_presence is not None:
+            rows.append(
+                draw_z_row(
+                    debug.forward_z_presence,
+                    debug.forward_trace_xyz[:, :2],
+                    label=(
+                        "z forward presence 0..1 "
+                        f"missing_cols={debug.forward_presence_missing_columns} "
+                        f"{layer_counts_text(debug.forward_layer_columns)}"
+                    ),
+                    color=(0, 255, 0, 230),
+                )
+            )
+        if debug.reverse_z_presence is not None:
+            rows.append(
+                draw_z_row(
+                    debug.reverse_z_presence,
+                    debug.reverse_trace_xyz[:, :2],
+                    label=(
+                        "z reverse presence 0..1 "
+                        f"missing_cols={debug.reverse_presence_missing_columns} "
+                        f"{layer_counts_text(debug.reverse_layer_columns)}"
+                    ),
+                    color=(255, 64, 220, 230),
+                )
+            )
+        if debug.fused_z_presence is not None:
+            rows.append(
+                draw_z_row(
+                    debug.fused_z_presence,
+                    debug.fused_trace_xyz[:, :2],
+                    label=(
+                        "z fused presence 0..1 "
+                        f"missing_cols={debug.fused_presence_missing_columns} "
+                        f"{layer_counts_text(debug.fused_layer_columns)}"
+                    ),
+                    color=(255, 220, 64, 230),
+                )
+            )
+        rows.append(
             _draw_label_band(
                 layer_map,
                 label=(
@@ -5286,8 +5374,8 @@ def _draw_trace2cp_overlay(
                     "blue=negative green=center red=positive "
                     f"{layer_counts_text(debug.fused_layer_columns)}"
                 ),
-            ),
-        ]
+            )
+        )
         width = max(int(row.shape[1]) for row in rows)
         total_h = sum(int(row.shape[0]) for row in rows)
         stack = np.zeros((total_h, width, 3), dtype=np.uint8)
@@ -5560,19 +5648,35 @@ def _draw_trace2cp_fiber_overlay(
     canvas[covered] = np.clip(accum[covered] / weight[covered], 0.0, 255.0).astype(np.uint8)
 
     def compose_presence_canvas() -> np.ndarray | None:
-        if not any(placement.evaluation.presence_debug is not None for placement in placements):
+        if not any(
+            placement.evaluation.presence_debug is not None
+            or (
+                placement.evaluation.z_search_debug is not None
+                and placement.evaluation.z_search_debug.fused_z_presence is not None
+            )
+            for placement in placements
+        ):
             return None
         presence_accum = np.zeros((canvas_height, canvas_width, 3), dtype=np.float32)
         presence_weight = np.zeros((canvas_height, canvas_width, 1), dtype=np.float32)
         for placement in placements:
             evaluation = placement.evaluation
+            z_presence = (
+                None
+                if evaluation.z_search_debug is None
+                else evaluation.z_search_debug.fused_z_presence
+            )
             presence = evaluation.presence_debug
-            if presence is None:
+            if z_presence is None and presence is None:
                 continue
             valid = np.asarray(evaluation.valid_mask, dtype=bool)
             if not bool(valid.any()):
                 continue
-            presence_u8 = _presence_map_to_u8(presence, valid)
+            presence_u8 = (
+                np.asarray(z_presence, dtype=np.uint8)
+                if z_presence is not None
+                else _presence_map_to_u8(presence, valid)
+            )
             rgb = np.repeat(presence_u8[..., None], 3, axis=-1).astype(np.uint8)
             _height, width = presence_u8.shape[:2]
             x0 = global_x_shift + placement.x_offset
@@ -6109,6 +6213,21 @@ def _evaluate_trace2cp_pair(
                 trace_xyz=fused_xyz,
                 fallback_shape_hw=image.shape,
             )
+            forward_z_presence, forward_presence_missing, _forward_presence_layer_columns = _trace2cp_z_corrected_presence_u8(
+                plane_cache=plane_cache,
+                trace_xyz=forward_xyz,
+                fallback_shape_hw=image.shape,
+            )
+            reverse_z_presence, reverse_presence_missing, _reverse_presence_layer_columns = _trace2cp_z_corrected_presence_u8(
+                plane_cache=plane_cache,
+                trace_xyz=reverse_xyz,
+                fallback_shape_hw=image.shape,
+            )
+            fused_z_presence, fused_presence_missing, _fused_presence_layer_columns = _trace2cp_z_corrected_presence_u8(
+                plane_cache=plane_cache,
+                trace_xyz=fused_xyz,
+                fallback_shape_hw=image.shape,
+            )
             z_search_debug = _Trace2CpZTraceDebug(
                 forward_trace_xyz=forward_xyz,
                 reverse_trace_xyz=reverse_xyz,
@@ -6125,6 +6244,12 @@ def _evaluate_trace2cp_pair(
                 layers=plane_cache.layer_indices(),
                 z_step_voxels=float(z_config.step_voxels),
                 max_layer=int(z_config.max_layer),
+                forward_z_presence=forward_z_presence,
+                reverse_z_presence=reverse_z_presence,
+                fused_z_presence=fused_z_presence,
+                forward_presence_missing_columns=int(forward_presence_missing),
+                reverse_presence_missing_columns=int(reverse_presence_missing),
+                fused_presence_missing_columns=int(fused_presence_missing),
             )
             selected_mode = {
                 "direction": "combined_direction_z",

@@ -121,6 +121,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_tta_params,
     _trace2cp_refinement_from_traces_z,
     _trace2cp_z_corrected_image_u8,
+    _trace2cp_z_corrected_presence_u8,
     _trace2cp_image_descriptor,
     _trace2cp_image_descriptor_loss,
     _trace_combined_image_line_to_target,
@@ -1355,6 +1356,35 @@ def test_trace2cp_z_corrected_image_copies_nearest_inferred_layer_columns() -> N
     assert image[:, 0].tolist() == [10, 10]
     assert image[:, 1].tolist() == [20, 20]
     assert image[:, 2].tolist() == [30, 30]
+
+
+def test_trace2cp_z_corrected_presence_copies_nearest_inferred_layer_columns() -> None:
+    def layer(value: float):
+        return SimpleNamespace(
+            valid_mask=np.ones((2, 3), dtype=bool),
+            fields=SimpleNamespace(
+                presence_hw=np.full((2, 3), value, dtype=np.float32),
+            ),
+        )
+
+    plane_cache = SimpleNamespace(
+        z_step_voxels=2.0,
+        layers={-1: layer(0.1), 0: layer(0.5), 1: layer(0.9)},
+    )
+    trace = np.asarray([[0.0, 0.0, -2.0], [1.0, 0.0, 0.0], [2.0, 0.0, 2.0]], dtype=np.float32)
+
+    presence, missing, layer_columns = _trace2cp_z_corrected_presence_u8(
+        plane_cache=plane_cache,
+        trace_xyz=trace,
+        fallback_shape_hw=(2, 3),
+    )
+
+    assert presence is not None
+    assert missing == 0
+    assert layer_columns.tolist() == [-1, 0, 1]
+    assert presence[:, 0].tolist() == [25, 25]
+    assert presence[:, 1].tolist() == [127, 127]
+    assert presence[:, 2].tolist() == [229, 229]
 
 
 def test_trace2cp_z_corrected_image_marks_untraced_columns_black() -> None:

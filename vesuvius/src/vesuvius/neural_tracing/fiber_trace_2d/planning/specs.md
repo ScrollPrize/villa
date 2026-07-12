@@ -488,7 +488,11 @@
   `trace2cp_vis.jpg` gets a presence column, whole-fiber
   `trace2cp_fiber_vis.jpg` gets a presence row, `0` renders black, `1` renders
   white, invalid pixels are black, and the fiber line, CPs, and selected traces
-  are overlaid.
+  are overlaid. When z-search is enabled, the z debug visualization must also
+  show forward, reverse, and fused z-corrected presence maps selected
+  column-by-column from the same trace z layers as the z-corrected image.
+  Whole-fiber presence visualization must use the fused z-corrected presence
+  when it is available.
 - Embedding combined mode requires a checkpoint/model output with appended
   embedding channels; it must fail clearly rather than silently falling back
   when embeddings are absent. If a non-zero fiber-bank weight is configured and

@@ -6,3 +6,5 @@ Small Trace2CP runner fixes:
   diagnostics moved to the following details line.
 - When `--trace2cp-use-presence` is active, include the sheet/fiber presence
   probability map in Trace2CP visualizations.
+- When z-search is active, show z-corrected presence maps selected from the
+  same per-column trace z layers as the z-corrected image.
