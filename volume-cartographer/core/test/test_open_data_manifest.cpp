@@ -774,6 +774,15 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
     std::filesystem::remove_all(cacheRoot);
 }
 
+TEST_CASE("OpenDataSegmentCache places GrowPatch output under the sample patches folder")
+{
+    const std::filesystem::path cacheRoot = "/home/test/.VC3D/remote_cache";
+    CHECK(openDataPatchesRoot(cacheRoot, "PHerc0175A") ==
+          cacheRoot / "open_data" / "segments" / "PHerc0175A" / "patches");
+    CHECK(openDataPatchesRoot(cacheRoot, "Sample With Spaces") ==
+          cacheRoot / "open_data" / "segments" / "Sample_With_Spaces" / "patches");
+}
+
 TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
 {
     OpenDataSample sample;

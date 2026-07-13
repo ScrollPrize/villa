@@ -1407,6 +1407,14 @@ std::filesystem::path openDataEditableSegmentRoot(
            safePathComponent(sampleId.empty() ? "sample" : sampleId);
 }
 
+std::filesystem::path openDataPatchesRoot(
+    const std::filesystem::path& remoteCacheRoot,
+    const std::string& sampleId)
+{
+    return remoteCacheRoot / "open_data" / "segments" /
+           safePathComponent(sampleId.empty() ? "sample" : sampleId) / "patches";
+}
+
 OpenDataSegmentCacheState cacheStateForSegment(
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSample& sample,

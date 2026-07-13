@@ -2,6 +2,8 @@
 #include "CState.hpp"
 #include "SurfacePanelController.hpp"
 #include "VCSettings.hpp"
+#include "OpenDataNormalGrids.hpp"
+#include "OpenDataSegmentCache.hpp"
 
 #include <functional>
 #include <algorithm>
@@ -246,69 +248,30 @@ QString segmentsEntryLocationForPath(const QString& outputDir, const QString& vo
     return QString::fromStdString(outputAbs.string());
 }
 
-bool entryHasTag(const vc::project::Entry& entry, const std::string& tag)
+std::optional<QString> openDataPatchesRootForVolume(const VolumePkg& pkg,
+                                                     const QString& loadedVolumeId)
 {
-    return std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end();
-}
+    if (loadedVolumeId.isEmpty() || !pkg.hasRemoteCacheRoot()) {
+        return std::nullopt;
+    }
 
-QString catalogVolumeIdForLoadedVolume(const VolumePkg& pkg, const QString& loadedVolumeId)
-{
-    constexpr std::string_view prefix = "vc-open-data-volume-id:";
     const auto tags = pkg.volumeTags(loadedVolumeId.toStdString());
     for (const auto& tag : tags) {
-        if (tag.rfind(prefix, 0) == 0) {
-            return QString::fromStdString(tag.substr(prefix.size()));
+        if (tag.rfind(vc3d::opendata::kOpenDataSampleIdTagPrefix, 0) == 0) {
+            const auto path = vc3d::opendata::openDataPatchesRoot(
+                pkg.remoteCacheRootOrEmpty(),
+                tag.substr(vc3d::opendata::kOpenDataSampleIdTagPrefix.size()));
+            return QString::fromStdString(path.string());
         }
     }
-    return loadedVolumeId;
-}
-
-std::optional<std::pair<QString, QString>> openDataSegmentRootsForVolume(const VolumePkg& pkg,
-                                                                         const QString& loadedVolumeId)
-{
-    if (loadedVolumeId.isEmpty()) {
-        return std::nullopt;
-    }
-
-    const QString catalogVolumeId = catalogVolumeIdForLoadedVolume(pkg, loadedVolumeId);
-    const std::string targetTag = "vc-open-data-target-volume-id:" + catalogVolumeId.toStdString();
-    const std::string sourceTag = "vc-open-data-source-volume-id:" + catalogVolumeId.toStdString();
-
-    const vc::project::Entry* fallbackEntry = nullptr;
-    const vc::project::Entry* matchingEntry = nullptr;
-    for (const auto& entry : pkg.segmentEntries()) {
-        if (!entryHasTag(entry, "open-data") || vc::project::isLocationRemote(entry.location)) {
-            continue;
-        }
-        if (entryHasTag(entry, targetTag)) {
-            matchingEntry = &entry;
-            break;
-        }
-        if (!matchingEntry && entryHasTag(entry, sourceTag)) {
-            matchingEntry = &entry;
-        } else if (!fallbackEntry) {
-            fallbackEntry = &entry;
-        }
-    }
-
-    const auto* entry = matchingEntry ? matchingEntry : fallbackEntry;
-    if (!entry) {
-        return std::nullopt;
-    }
-
-    const std::filesystem::path volumeRoot =
-        vc::project::resolveLocalPath(entry->location, pkg.path().parent_path()).lexically_normal();
-    const std::filesystem::path sampleRoot = volumeRoot.parent_path();
-    return std::make_pair(QString::fromStdString(sampleRoot.string()),
-                          QString::fromStdString(volumeRoot.string()));
+    return std::nullopt;
 }
 
 bool selectGrowPatchSeedParams(QWidget* parent,
                                const QString& volpkgRoot,
                                const QVector<VolumeSelector::VolumeOption>& volumeOptions,
                                const QStringList& outputDirChoices,
-                               const QHash<QString, QString>& openDataSampleRootsByVolumeId,
-                               const QHash<QString, QString>& openDataVolumeRootsByVolumeId,
+                               const QHash<QString, QString>& openDataOutputRootsByVolumeId,
                                QString* selectedVolumeId,
                                QString* selectedVolumePath,
                                int* iterations,
@@ -365,20 +328,21 @@ bool selectGrowPatchSeedParams(QWidget* parent,
         }
     });
 
-    auto selectedOpenDataSampleRoot = [&]() -> QString {
-        return openDataSampleRootsByVolumeId.value(volumeCombo->currentData().toString());
-    };
-    auto selectedOpenDataVolumeRoot = [&]() -> QString {
-        return openDataVolumeRootsByVolumeId.value(volumeCombo->currentData().toString());
+    auto selectedOpenDataOutputRoot = [&]() -> std::optional<QString> {
+        const QString volumeId = volumeCombo->currentData().toString();
+        const auto it = openDataOutputRootsByVolumeId.constFind(volumeId);
+        if (it == openDataOutputRootsByVolumeId.cend()) {
+            return std::nullopt;
+        }
+        return it.value();
     };
 
-    QObject::connect(volumeCombo, &QComboBox::currentIndexChanged, &dlg, [=, &selectedOpenDataVolumeRoot](int) {
+    QObject::connect(volumeCombo, &QComboBox::currentIndexChanged, &dlg, [=, &selectedOpenDataOutputRoot](int) {
         if (outputCombo->property("vc_user_edited").toBool()) {
             return;
         }
-        const QString preferredOutput = selectedOpenDataVolumeRoot();
-        if (!preferredOutput.isEmpty()) {
-            outputCombo->setCurrentText(preferredOutput);
+        if (const auto preferredOutput = selectedOpenDataOutputRoot()) {
+            outputCombo->setCurrentText(*preferredOutput);
         }
     });
 
@@ -397,8 +361,13 @@ bool selectGrowPatchSeedParams(QWidget* parent,
     layout->addWidget(buttons);
 
     QObject::connect(browseButton, &QToolButton::clicked, &dlg, [&]() {
-        QString startDir = selectedOpenDataSampleRoot();
-        if (startDir.isEmpty()) {
+        QString startDir;
+        if (const auto openDataOutputRoot = selectedOpenDataOutputRoot()) {
+            startDir = *openDataOutputRoot;
+            // Catalog segment directories are immutable. Ensure the writable
+            // sample patches directory exists so QFileDialog opens there.
+            QDir().mkpath(startDir);
+        } else {
             startDir = outputCombo->currentText().trimmed().isEmpty()
                 ? volpkgRoot
                 : outputCombo->currentText().trimmed();
@@ -2545,12 +2514,10 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
         return;
     }
 
-    QHash<QString, QString> openDataSampleRootsByVolumeId;
-    QHash<QString, QString> openDataVolumeRootsByVolumeId;
+    QHash<QString, QString> openDataPatchesRootsByVolumeId;
     for (const auto& option : volumeOptions) {
-        if (auto roots = openDataSegmentRootsForVolume(*_state->vpkg(), option.id)) {
-            openDataSampleRootsByVolumeId.insert(option.id, roots->first);
-            openDataVolumeRootsByVolumeId.insert(option.id, roots->second);
+        if (const auto patchesRoot = openDataPatchesRootForVolume(*_state->vpkg(), option.id)) {
+            openDataPatchesRootsByVolumeId.insert(option.id, *patchesRoot);
         }
     }
 
@@ -2584,9 +2551,9 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
     };
 
     const auto outputSegmentsPath = _state->vpkg()->outputSegmentsPath();
-    if (const QString openDataOutput = openDataVolumeRootsByVolumeId.value(selectedVolumeId);
-        !openDataOutput.isEmpty()) {
-        appendChoice(openDataOutput);
+    if (const auto it = openDataPatchesRootsByVolumeId.constFind(selectedVolumeId);
+        it != openDataPatchesRootsByVolumeId.cend()) {
+        appendChoice(it.value());
     }
     if (!outputSegmentsPath.empty()) {
         appendChoice(QString::fromStdString(outputSegmentsPath.string()));
@@ -2606,8 +2573,7 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
                                    volpkgRoot,
                                    volumeOptions,
                                    outputChoices,
-                                   openDataSampleRootsByVolumeId,
-                                   openDataVolumeRootsByVolumeId,
+                                   openDataPatchesRootsByVolumeId,
                                    &selectedVolumeId,
                                    &selectedVolumePath,
                                    &iterations,

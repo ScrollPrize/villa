@@ -84,6 +84,10 @@ struct OpenDataInkDetectionEntry {
     const std::filesystem::path& remoteCacheRoot,
     const std::string& sampleId);
 
+[[nodiscard]] std::filesystem::path openDataPatchesRoot(
+    const std::filesystem::path& remoteCacheRoot,
+    const std::string& sampleId);
+
 [[nodiscard]] OpenDataSegmentCacheState cacheStateForSegment(
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSample& sample,
