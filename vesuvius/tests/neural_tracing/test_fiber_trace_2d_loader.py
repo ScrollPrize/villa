@@ -1935,7 +1935,7 @@ def test_trace2cp_pair_builds_presence_z_pillar_panels(monkeypatch: pytest.Monke
         def sample_trace2cp_top_strip_source(self, _source):
             return np.zeros((5, shape[1]), dtype=np.float32), np.ones((5, shape[1]), dtype=bool)
 
-        def sample_trace2cp_traced_top_strip_source(self, _source, _trace_xyz):
+        def sample_trace2cp_traced_top_strip_source(self, _source, _trace_xyz, *, top_offsets_by_column=None):
             return np.zeros((5, shape[1]), dtype=np.float32), np.ones((5, shape[1]), dtype=bool)
 
     def fake_predict(_model, _image, _valid_mask, *, device):
@@ -2510,6 +2510,28 @@ def test_trace2cp_traced_top_strip_samples_from_fused_trace(tmp_path: Path) -> N
     overlap = valid & z_valid
     assert bool(overlap.any())
     assert not np.allclose(image[overlap], z_image[overlap])
+
+    coords, coord_valid = loader.trace2cp_traced_top_strip_coords_xyz(source, trace_xyz)
+    shifted, shifted_valid = loader.trace2cp_traced_top_strip_coords_xyz(
+        source,
+        trace_xyz,
+        top_offsets_by_column=np.ones((int(source.source_shape_hw[1]),), dtype=np.float32),
+    )
+    center_row = int(source.source_shape_hw[0]) // 2
+    assert center_row + 1 < int(source.source_shape_hw[0])
+    shifted_overlap = shifted_valid[center_row] & coord_valid[center_row + 1]
+    assert bool(shifted_overlap.any())
+    np.testing.assert_allclose(
+        shifted[center_row, shifted_overlap],
+        coords[center_row + 1, shifted_overlap],
+        atol=1.0e-4,
+    )
+    with pytest.raises(ValueError, match="top_offsets_by_column length"):
+        loader.trace2cp_traced_top_strip_coords_xyz(
+            source,
+            trace_xyz,
+            top_offsets_by_column=np.zeros((2,), dtype=np.float32),
+        )
 
 
 def test_trace2cp_segment_patch_can_align_ambiguous_normal_sign(tmp_path: Path) -> None:
@@ -3123,6 +3145,75 @@ def test_trace2cp_top_model_direction_selection_medians_horizontal_candidates() 
     assert int(layer[1, 1]) in (2, 3)
     np.testing.assert_allclose(selected[0, 0], horizontal[0, 0], atol=1.0e-6)
     assert int(layer[0, 0]) == 1
+
+
+def test_trace2cp_top_model_direction_overlay_returns_dp_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_predict(_model, image, valid_mask, *, device):
+        _ = device
+        shape = tuple(int(v) for v in np.asarray(image).shape)
+        direction = np.zeros((*shape, 2), dtype=np.float32)
+        direction[..., 0] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=direction,
+            embedding_chw=None,
+            presence_hw=np.ones(shape, dtype=np.float32),
+        )
+
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict)
+    images = [np.full((9, 13), float(index), dtype=np.float32) for index in range(3)]
+    valids = [np.ones((9, 13), dtype=bool) for _ in images]
+
+    overlay, drawn, best_layer, debug, path_debug = runner_module._trace2cp_top_model_direction_overlay(
+        object(),
+        images[1],
+        valids[1],
+        images,
+        valids,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([10.0, 4.0], dtype=np.float32),
+        step_px=1.0,
+        device=torch.device("cpu"),
+    )
+
+    assert overlay.shape == (9, 13, 3)
+    assert drawn > 0
+    assert best_layer.shape == (9, 13)
+    assert "dp_points=" in debug
+    assert path_debug is not None
+    assert path_debug.path_xy.ndim == 2
+    assert path_debug.path_xy.shape[1] == 2
+    assert path_debug.layer_offsets.shape[0] == path_debug.path_xy.shape[0]
+    assert bool(np.isfinite(path_debug.path_xy).all())
+    assert bool(np.isfinite(path_debug.layer_offsets).all())
+
+
+def test_trace2cp_top_model_optimized_trace_uses_row_and_layer_offsets() -> None:
+    reference = np.asarray(
+        [
+            [0.0, 5.0, 1.0],
+            [10.0, 5.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    path = np.asarray(
+        [
+            [0.0, 4.0],
+            [10.0, 7.0],
+        ],
+        dtype=np.float32,
+    )
+    layers = np.asarray([2.0, -1.0], dtype=np.float32)
+
+    optimized = runner_module._trace2cp_top_model_optimized_trace_xyz(
+        reference,
+        path,
+        layers,
+        center_y=4.0,
+    )
+
+    np.testing.assert_allclose(optimized[:, 0], path[:, 0])
+    np.testing.assert_allclose(optimized[:, 1], reference[:, 1])
+    np.testing.assert_allclose(optimized[:, 2], [3.0, 3.0])
 
 
 def test_trace2cp_weighted_median_top_direction_aligns_ambiguous_signs() -> None:

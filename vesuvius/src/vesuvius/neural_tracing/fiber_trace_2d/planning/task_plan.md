@@ -1,43 +1,41 @@
-# Trace2CP Direction-Aligned Side Presence Blur Plan
+# Trace2CP Top-Direction DP Optimized-Line Diagnostics Plan
 
 ## Implementation
 
-- Replace the axis-aligned x/z side-presence blur with a direction-aligned
-  anisotropic blur over `[z_layer, y, x]` stacks.
-- Keep radius 21 over side-z. Use radius 5 along the local predicted side
-  direction in side-image x/y, and a small radius 1 across that direction.
-- Use the local side direction field for the output pixel/layer, normalize it,
-  and use a symmetric kernel so the Lasagna direction sign ambiguity does not
-  affect the blur.
-- Keep valid-mask weighted normalization so invalid pixels do not contribute.
-- Implement the blur in batched PyTorch. The z pass can remain separable; the
-  x/y pass should use vectorized `grid_sample` over layer chunks, not per-pixel
-  Python loops.
-- Add `--trace2cp-presence-blur`; keep it disabled by default. When disabled,
-  z-search presence scoring/display must use raw per-layer presence.
-- Preserve the existing `_Trace2CpZPlaneCache.blurred_presence_for_layer(s)`
-  API and all existing z-search scoring/display call sites.
-- Leave non-z Trace2CP presence scoring unchanged because there is no side-z
-  stack to blur.
+- Add a small debug payload for the top-model DP path containing the optimized
+  top-strip path, selected z-layer offsets, and the derived xyz trace.
+- Change `_trace2cp_top_model_direction_overlay` to return that payload in
+  addition to the existing overlay image/count/debug text.
+- Extend traced top-strip sampling to accept an optional column-wise top-row
+  offset so the resliced image follows the optimized top path rather than only
+  drawing the path over the reference slice.
+- In Trace2CP pair evaluation, when top-dir visualization is enabled:
+  - reconstruct the optimized top strip from the optimized top path and z
+    offsets;
+  - reconstruct the optimized side slice from the optimized side-z offsets via
+    the existing z-corrected side-slice helper;
+  - reconstruct optimized top and side presence views with the same path/offsets.
+- Append the optimized panels below the current top-direction/path panel in
+  single-pair and fiber visualizations.
 
 ## Spec Update
 
-- Update the Trace2CP z-search presence blur spec from axis-aligned x/z blur to
-  opt-in direction-aligned anisotropic x/y plus side-z blur.
+- Document that top-dir visualization reports the DP optimized line with both
+  top-path and side-z-offset derived panels.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` Trace2CP/runner notes with the new cache-level
-  direction-aligned presence blur behavior.
+- Update `docs/code_structure.md` Trace2CP runner notes for the extra
+  optimized-line diagnostics.
 
 ## Testing
 
-- Add focused unit tests for the weighted direction-aligned blur helper and for
-  `_Trace2CpZPlaneCache.blurred_presence_for_layer()`, including default-off
-  raw-presence behavior.
-- Run the focused fiber_trace_2d loader test suite:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`.
+- Add a focused unit test for traced top-strip column offsets.
+- Add a focused unit test for the top-model direction overlay returning a
+  finite optimized xyz debug path.
+- Run:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 
 ## Changelog
 
-- Add a short 2026-07-14 entry for direction-aligned side-presence blurring.
+- Add a 2026-07-14 changelog entry for top-dir optimized-line diagnostics.

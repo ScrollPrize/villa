@@ -1968,6 +1968,13 @@ class _Trace2CpSimilarityDebug:
 
 
 @dataclass(frozen=True)
+class _Trace2CpTopModelDirectionPathDebug:
+    path_xy: np.ndarray
+    layer_offsets: np.ndarray
+    center_y: float
+
+
+@dataclass(frozen=True)
 class _Trace2CpResult:
     score: float
     raw_y_error_px: float
@@ -2099,6 +2106,18 @@ class _Trace2CpPairEvaluation:
     top_model_direction_source: str = ""
     top_model_direction_count: int = 0
     top_model_direction_debug: str = ""
+    top_model_optimized_trace_xyz: np.ndarray | None = None
+    top_model_optimized_top_offsets_by_column: np.ndarray | None = None
+    top_model_optimized_layer_columns: np.ndarray | None = None
+    top_model_optimized_top_strip_image: np.ndarray | None = None
+    top_model_optimized_top_strip_valid_mask: np.ndarray | None = None
+    top_model_optimized_side_image: np.ndarray | None = None
+    top_model_optimized_side_valid_mask: np.ndarray | None = None
+    top_model_optimized_top_presence_image: np.ndarray | None = None
+    top_model_optimized_top_presence_valid_mask: np.ndarray | None = None
+    top_model_optimized_side_presence_image: np.ndarray | None = None
+    top_model_optimized_side_presence_valid_mask: np.ndarray | None = None
+    top_model_optimized_debug: str = ""
     timing_rows: tuple[_Trace2CpTimingRow, ...] = ()
 
 
@@ -6830,6 +6849,8 @@ def _draw_trace2cp_top_strip_panel(
     start_xy: np.ndarray,
     target_xy: np.ndarray,
     label: str,
+    trace_xy: np.ndarray | None = None,
+    trace_color: tuple[int, int, int, int] = (255, 220, 64, 230),
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
 
@@ -6851,6 +6872,13 @@ def _draw_trace2cp_top_strip_panel(
     if line_xy_top.ndim == 2 and line_xy_top.shape[1] == 2:
         line_xy_top[:, 1] = np.float32(center_y)
         panel = overlay_line_coords_rgb(panel, line_xy_top, opacity=0.25, thickness=1)
+    if trace_xy is not None:
+        panel = _overlay_polyline_rgb(
+            panel,
+            np.asarray(trace_xy, dtype=np.float32),
+            color_rgba=trace_color,
+            thickness=1,
+        )
     pil = Image.fromarray(panel, mode="RGB")
     draw = ImageDraw.Draw(pil, mode="RGBA")
     for point_xy, color in (
@@ -6861,6 +6889,52 @@ def _draw_trace2cp_top_strip_panel(
         if point.shape == (2,) and bool(np.isfinite(point).all()):
             x = float(point[0])
             y = center_y
+            draw.ellipse((x - 2.0, y - 2.0, x + 2.0, y + 2.0), outline=color, width=1)
+    return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
+
+
+def _draw_trace2cp_side_debug_panel(
+    image: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    line_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    trace_xy: np.ndarray | None,
+    label: str,
+    trace_color: tuple[int, int, int, int] = (255, 220, 64, 230),
+) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    valid = np.asarray(valid_mask, dtype=bool)
+    arr = np.asarray(image)
+    if arr.ndim == 2:
+        image_u8 = _to_u8_image(arr, valid)
+        panel = np.repeat(image_u8[..., None], 3, axis=-1)
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        if valid.shape != arr.shape[:2]:
+            raise ValueError("valid_mask must match RGB side debug image shape")
+        panel = np.clip(arr, 0, 255).astype(np.uint8, copy=True)
+        panel[~valid] = 0
+    else:
+        raise ValueError("side debug image must be H,W or H,W,3")
+    panel = overlay_line_coords_rgb(panel, line_xy, opacity=0.25, thickness=1)
+    if trace_xy is not None:
+        panel = _overlay_polyline_rgb(
+            panel,
+            np.asarray(trace_xy, dtype=np.float32),
+            color_rgba=trace_color,
+            thickness=1,
+        )
+    pil = Image.fromarray(panel, mode="RGB")
+    draw = ImageDraw.Draw(pil, mode="RGBA")
+    for point_xy, color in (
+        (start_xy, (32, 255, 255, 255)),
+        (target_xy, (255, 220, 64, 255)),
+    ):
+        point = np.asarray(point_xy, dtype=np.float32)
+        if point.shape == (2,) and bool(np.isfinite(point).all()):
+            x, y = (float(v) for v in point)
             draw.ellipse((x - 2.0, y - 2.0, x + 2.0, y + 2.0), outline=color, width=1)
     return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
 
@@ -7226,6 +7300,70 @@ def _trace2cp_top_direction_traces(
         rf_margin_px=0.0,
     )
     return forward_trace, reverse_trace, _forward_reason, _reverse_reason
+
+
+def _trace2cp_top_offsets_by_column(
+    path_xy: np.ndarray,
+    *,
+    width: int,
+    center_y: float,
+) -> np.ndarray:
+    width_i = int(width)
+    offsets = np.full((width_i,), np.nan, dtype=np.float32)
+    path = np.asarray(path_xy, dtype=np.float32)
+    if path.ndim != 2 or path.shape[1] != 2 or path.shape[0] == 0:
+        return offsets
+    for x in range(width_i):
+        y = _trace_y_at_x(path, float(x))
+        if y is not None and np.isfinite(y):
+            offsets[x] = np.float32(float(y) - float(center_y))
+    return offsets
+
+
+def _trace2cp_top_model_optimized_trace_xyz(
+    reference_trace_xyz: np.ndarray,
+    path_xy: np.ndarray,
+    layer_offsets: np.ndarray,
+    *,
+    center_y: float,
+) -> np.ndarray:
+    reference = np.asarray(reference_trace_xyz, dtype=np.float32)
+    path = np.asarray(path_xy, dtype=np.float32)
+    offsets = np.asarray(layer_offsets, dtype=np.float32).reshape(-1)
+    if reference.ndim != 2 or reference.shape[1] != 3:
+        raise ValueError("reference_trace_xyz must have shape N,3")
+    if path.ndim != 2 or path.shape[1] != 2:
+        raise ValueError("top DP path must have shape N,2")
+    if int(offsets.shape[0]) != int(path.shape[0]):
+        raise ValueError("top DP layer offsets must match path length")
+    points: list[np.ndarray] = []
+    for point_xy, offset in zip(path, offsets, strict=True):
+        if not bool(np.isfinite(point_xy).all()) or not np.isfinite(float(offset)):
+            continue
+        base = _trace_xyz_at_x(reference, float(point_xy[0]))
+        if base is None or not bool(np.isfinite(base).all()):
+            continue
+        side_offset = float(offset) + (float(point_xy[1]) - float(center_y))
+        points.append(
+            np.asarray(
+                [float(point_xy[0]), float(base[1]), float(base[2]) + side_offset],
+                dtype=np.float32,
+            )
+        )
+    if len(points) < 2:
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.stack(points, axis=0).astype(np.float32, copy=False)
+
+
+def _trace2cp_valid_mask_from_layer_columns(
+    layer_columns: np.ndarray,
+    shape_hw: tuple[int, int],
+) -> np.ndarray:
+    height, width = (int(v) for v in shape_hw)
+    columns = np.asarray(layer_columns, dtype=np.int32).reshape(-1)
+    if int(columns.shape[0]) != width:
+        return np.ones((height, width), dtype=bool)
+    return np.broadcast_to((columns > -9999)[None, :], (height, width)).copy()
 
 
 def _trace2cp_top_monotone_direction_path_z_torch(
@@ -8216,7 +8354,7 @@ def _trace2cp_top_model_direction_overlay(
     step_px: float,
     device: torch.device,
     stride: int = 8,
-) -> tuple[np.ndarray, int, np.ndarray, str]:
+) -> tuple[np.ndarray, int, np.ndarray, str, _Trace2CpTopModelDirectionPathDebug | None]:
     if len(layer_images) != len(layer_valid_masks):
         raise ValueError("layer image and valid-mask counts must match")
     if not layer_images:
@@ -8286,11 +8424,17 @@ def _trace2cp_top_model_direction_overlay(
         layer_min = int(layer_offsets.min())
         layer_max = int(layer_offsets.max())
         layer_changes = int(np.count_nonzero(np.diff(rounded_layer) != 0))
+        path_debug = _Trace2CpTopModelDirectionPathDebug(
+            path_xy=np.asarray(monotone_path, dtype=np.float32).copy(),
+            layer_offsets=layer_offsets.astype(np.float32, copy=True),
+            center_y=float(center_y),
+        )
     else:
         invalid_count = 0
         layer_min = 0
         layer_max = 0
         layer_changes = 0
+        path_debug = None
     overlay = _overlay_polyline_rgb(
         overlay,
         forward_trace,
@@ -8318,7 +8462,7 @@ def _trace2cp_top_model_direction_overlay(
         f"dp_smooth_dy={_TRACE2CP_DP_DY_SMOOTH_PENALTY:g} "
         f"dp_smooth_dz={_TRACE2CP_DP_DZ_SMOOTH_PENALTY:g}"
     )
-    return overlay, int(drawn), best_layer, debug
+    return overlay, int(drawn), best_layer, debug, path_debug
 
 
 def _draw_trace2cp_similarity_panel(
@@ -8450,6 +8594,17 @@ def _draw_trace2cp_overlay(
     top_model_direction_source: str = "",
     top_model_direction_count: int = 0,
     top_model_direction_debug: str = "",
+    top_model_optimized_trace_xyz: np.ndarray | None = None,
+    top_model_optimized_top_offsets_by_column: np.ndarray | None = None,
+    top_model_optimized_top_strip_image: np.ndarray | None = None,
+    top_model_optimized_top_strip_valid_mask: np.ndarray | None = None,
+    top_model_optimized_side_image: np.ndarray | None = None,
+    top_model_optimized_side_valid_mask: np.ndarray | None = None,
+    top_model_optimized_top_presence_image: np.ndarray | None = None,
+    top_model_optimized_top_presence_valid_mask: np.ndarray | None = None,
+    top_model_optimized_side_presence_image: np.ndarray | None = None,
+    top_model_optimized_side_presence_valid_mask: np.ndarray | None = None,
+    top_model_optimized_debug: str = "",
     valid_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
@@ -8744,6 +8899,75 @@ def _draw_trace2cp_overlay(
                     f"drawn={int(top_model_direction_count)}"
                     + (f" {top_model_direction_debug}" if top_model_direction_debug else "")
                 ),
+            )
+        )
+    optimized_top_trace_xy: np.ndarray | None = None
+    optimized_side_trace_xy: np.ndarray | None = None
+    if top_model_optimized_trace_xyz is not None:
+        optimized_xyz = np.asarray(top_model_optimized_trace_xyz, dtype=np.float32)
+        if optimized_xyz.ndim == 2 and optimized_xyz.shape[1] == 3 and optimized_xyz.shape[0] > 0:
+            optimized_side_trace_xy = optimized_xyz[:, :2]
+    if top_model_optimized_top_strip_image is not None:
+        top_shape = np.asarray(top_model_optimized_top_strip_image).shape
+        if len(top_shape) >= 2 and int(top_shape[1]) > 0:
+            center_y = np.float32((float(top_shape[0]) - 1.0) * 0.5)
+            optimized_top_trace_xy = np.asarray(
+                [[0.0, float(center_y)], [float(int(top_shape[1]) - 1), float(center_y)]],
+                dtype=np.float32,
+            )
+    if top_model_optimized_top_strip_image is not None and top_model_optimized_top_strip_valid_mask is not None:
+        top_panels.append(
+            _draw_trace2cp_top_strip_panel(
+                top_model_optimized_top_strip_image,
+                top_model_optimized_top_strip_valid_mask,
+                line_xy=line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                trace_xy=optimized_top_trace_xy,
+                trace_color=(255, 255, 64, 245),
+                label=(
+                    "top-dir DP optimized top strip "
+                    + (top_model_optimized_debug if top_model_optimized_debug else "")
+                ).strip(),
+            )
+        )
+    if top_model_optimized_side_image is not None and top_model_optimized_side_valid_mask is not None:
+        top_panels.append(
+            _draw_trace2cp_side_debug_panel(
+                top_model_optimized_side_image,
+                top_model_optimized_side_valid_mask,
+                line_xy=line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                trace_xy=optimized_side_trace_xy,
+                trace_color=(255, 255, 64, 245),
+                label="top-dir DP optimized side slice from selected z offsets",
+            )
+        )
+    if top_model_optimized_top_presence_image is not None and top_model_optimized_top_presence_valid_mask is not None:
+        top_panels.append(
+            _draw_trace2cp_top_strip_panel(
+                top_model_optimized_top_presence_image,
+                top_model_optimized_top_presence_valid_mask,
+                line_xy=line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                trace_xy=optimized_top_trace_xy,
+                trace_color=(255, 255, 64, 245),
+                label="top-dir DP optimized top presence z-pillar 0..1",
+            )
+        )
+    if top_model_optimized_side_presence_image is not None and top_model_optimized_side_presence_valid_mask is not None:
+        top_panels.append(
+            _draw_trace2cp_side_debug_panel(
+                top_model_optimized_side_presence_image,
+                top_model_optimized_side_presence_valid_mask,
+                line_xy=line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                trace_xy=optimized_side_trace_xy,
+                trace_color=(255, 255, 64, 245),
+                label="top-dir DP optimized side presence from selected z offsets 0..1",
             )
         )
     if top_panels:
@@ -9171,6 +9395,22 @@ def _draw_trace2cp_fiber_overlay(
         image_attr="top_model_direction_image",
         valid_attr="top_model_direction_valid_mask",
     )
+    top_model_optimized_top_strip_canvas = compose_top_strip_canvas(
+        image_attr="top_model_optimized_top_strip_image",
+        valid_attr="top_model_optimized_top_strip_valid_mask",
+    )
+    top_model_optimized_side_canvas = compose_top_strip_canvas(
+        image_attr="top_model_optimized_side_image",
+        valid_attr="top_model_optimized_side_valid_mask",
+    )
+    top_model_optimized_top_presence_canvas = compose_top_strip_canvas(
+        image_attr="top_model_optimized_top_presence_image",
+        valid_attr="top_model_optimized_top_presence_valid_mask",
+    )
+    top_model_optimized_side_presence_canvas = compose_top_strip_canvas(
+        image_attr="top_model_optimized_side_presence_image",
+        valid_attr="top_model_optimized_side_presence_valid_mask",
+    )
     font = ImageFont.load_default()
 
     def map_points(points_xy: np.ndarray, placement: _Trace2CpFiberPairPlacement) -> np.ndarray:
@@ -9357,6 +9597,38 @@ def _draw_trace2cp_fiber_overlay(
                 "top model directions on fused top strip",
                 top_model_direction_canvas,
                 image_attr="top_model_direction_image",
+            )
+        )
+    if top_model_optimized_top_strip_canvas is not None:
+        rows.append(
+            draw_top_strip_row(
+                "top-dir DP optimized top strip",
+                top_model_optimized_top_strip_canvas,
+                image_attr="top_model_optimized_top_strip_image",
+            )
+        )
+    if top_model_optimized_side_canvas is not None:
+        rows.append(
+            draw_top_strip_row(
+                "top-dir DP optimized side slice from selected z offsets",
+                top_model_optimized_side_canvas,
+                image_attr="top_model_optimized_side_image",
+            )
+        )
+    if top_model_optimized_top_presence_canvas is not None:
+        rows.append(
+            draw_top_strip_row(
+                "top-dir DP optimized top presence z-pillar 0..1",
+                top_model_optimized_top_presence_canvas,
+                image_attr="top_model_optimized_top_presence_image",
+            )
+        )
+    if top_model_optimized_side_presence_canvas is not None:
+        rows.append(
+            draw_top_strip_row(
+                "top-dir DP optimized side presence from selected z offsets 0..1",
+                top_model_optimized_side_presence_canvas,
+                image_attr="top_model_optimized_side_presence_image",
             )
         )
     if presence_canvas is not None:
@@ -9904,6 +10176,18 @@ def _evaluate_trace2cp_pair(
     top_model_direction_source = ""
     top_model_direction_count = 0
     top_model_direction_debug = ""
+    top_model_optimized_trace_xyz: np.ndarray | None = None
+    top_model_optimized_top_offsets_by_column: np.ndarray | None = None
+    top_model_optimized_layer_columns: np.ndarray | None = None
+    top_model_optimized_top_strip_image: np.ndarray | None = None
+    top_model_optimized_top_strip_valid_mask: np.ndarray | None = None
+    top_model_optimized_side_image: np.ndarray | None = None
+    top_model_optimized_side_valid_mask: np.ndarray | None = None
+    top_model_optimized_top_presence_image: np.ndarray | None = None
+    top_model_optimized_top_presence_valid_mask: np.ndarray | None = None
+    top_model_optimized_side_presence_image: np.ndarray | None = None
+    top_model_optimized_side_presence_valid_mask: np.ndarray | None = None
+    top_model_optimized_debug = ""
     if build_top_strip_debug:
         with _Timer() as top_original_timer:
             top_strip_image, top_strip_valid_mask = loader.sample_trace2cp_top_strip_source(segment_source)
@@ -10001,6 +10285,7 @@ def _evaluate_trace2cp_pair(
                     top_model_direction_count,
                     _top_model_direction_best_layer,
                     top_model_direction_debug,
+                    top_model_path_debug,
                 ) = _trace2cp_top_model_direction_overlay(
                     top_model,
                     top_direction_image,
@@ -10014,6 +10299,111 @@ def _evaluate_trace2cp_pair(
                 )
             _append_trace2cp_timing(timing_rows, "top_model_infer_trace", top_infer_timer.elapsed_ms)
             top_model_direction_valid_mask = np.ones_like(np.asarray(top_direction_valid, dtype=bool), dtype=bool)
+            if top_model_path_debug is not None:
+                with _Timer() as top_optimized_timer:
+                    optimized_trace_xyz = _trace2cp_top_model_optimized_trace_xyz(
+                        np.asarray(top_direction_trace, dtype=np.float32),
+                        top_model_path_debug.path_xy,
+                        top_model_path_debug.layer_offsets,
+                        center_y=float(top_model_path_debug.center_y),
+                    )
+                    if optimized_trace_xyz.size:
+                        top_model_optimized_trace_xyz = optimized_trace_xyz
+                        top_model_optimized_top_offsets_by_column = _trace2cp_top_offsets_by_column(
+                            top_model_path_debug.path_xy,
+                            width=int(top_direction_image.shape[1]),
+                            center_y=float(top_model_path_debug.center_y),
+                        )
+                        (
+                            top_model_optimized_top_strip_image,
+                            top_model_optimized_top_strip_valid_mask,
+                        ) = loader.sample_trace2cp_traced_top_strip_source(
+                            segment_source,
+                            optimized_trace_xyz,
+                        )
+                        if z_plane_cache is None:
+                            top_center_prediction = _Trace2CpZLayerPrediction(
+                                layer=0,
+                                z_voxels=0.0,
+                                sample=sample,
+                                image=np.asarray(image, dtype=np.float32),
+                                valid_mask=np.asarray(valid_mask, dtype=bool),
+                                fields=fields,
+                            )
+                            top_max_layer = max(
+                                1,
+                                int(np.ceil(np.max(np.abs(top_model_path_debug.layer_offsets)).item()))
+                                if top_model_path_debug.layer_offsets.size
+                                else 1,
+                            )
+                            z_plane_cache = _Trace2CpZPlaneCache(
+                                loader=loader,
+                                model=model,
+                                sample_index=sample_index,
+                                target_cp_index=target_cp_index,
+                                target_offset=target_offset,
+                                rf_margin_px=rf_margin_px,
+                                sample_mode=sample_mode,
+                                row_axis_alignment_line_index=row_axis_alignment_line_index,
+                                row_axis_alignment_xyz=row_axis_alignment_xyz,
+                                device=device,
+                                segment_source=segment_source,
+                                center_layer=top_center_prediction,
+                                z_step_voxels=1.0,
+                                max_layer=top_max_layer,
+                                presence_blur_enabled=False,
+                            )
+                        (
+                            top_model_optimized_side_image,
+                            top_model_side_missing,
+                            top_model_optimized_layer_columns,
+                        ) = _trace2cp_z_corrected_image_u8(
+                            plane_cache=z_plane_cache,
+                            trace_xyz=optimized_trace_xyz,
+                            fallback_shape_hw=image.shape,
+                        )
+                        top_model_optimized_side_valid_mask = _trace2cp_valid_mask_from_layer_columns(
+                            top_model_optimized_layer_columns,
+                            tuple(int(v) for v in image.shape),
+                        )
+                        (
+                            top_model_optimized_side_presence_image,
+                            top_model_side_presence_missing,
+                            _top_model_presence_layer_columns,
+                        ) = _trace2cp_z_corrected_presence_u8(
+                            plane_cache=z_plane_cache,
+                            trace_xyz=optimized_trace_xyz,
+                            fallback_shape_hw=image.shape,
+                        )
+                        if top_model_optimized_side_presence_image is not None:
+                            top_model_optimized_side_presence_valid_mask = top_model_optimized_side_valid_mask.copy()
+                        (
+                            top_model_optimized_top_presence_image,
+                            top_model_optimized_top_presence_valid_mask,
+                        ) = _side_presence_z_pillar_image(
+                            z_plane_cache,
+                            optimized_trace_xyz,
+                            width=int(image.shape[1]),
+                        )
+                        finite_top_offsets = top_model_optimized_top_offsets_by_column[
+                            np.isfinite(top_model_optimized_top_offsets_by_column)
+                        ]
+                        if finite_top_offsets.size:
+                            top_offset_text = (
+                                f"{float(np.min(finite_top_offsets)):.1f}.."
+                                f"{float(np.max(finite_top_offsets)):.1f}"
+                            )
+                        else:
+                            top_offset_text = "none"
+                        top_model_optimized_debug = (
+                            f"optimized_points={int(optimized_trace_xyz.shape[0])} "
+                            f"top_row_offset={top_offset_text} "
+                            f"side_z={float(np.nanmin(optimized_trace_xyz[:, 2])):.1f}.."
+                            f"{float(np.nanmax(optimized_trace_xyz[:, 2])):.1f} "
+                            f"side_missing_cols={int(top_model_side_missing)} "
+                            f"presence_missing_cols={int(top_model_side_presence_missing)}"
+                        )
+                _append_trace2cp_timing(timing_rows, "top_model_optimized_debug", top_optimized_timer.elapsed_ms)
     return _Trace2CpPairEvaluation(
         sample_index=int(sample_index),
         sample=sample,
@@ -10048,6 +10438,18 @@ def _evaluate_trace2cp_pair(
         top_model_direction_source=top_model_direction_source,
         top_model_direction_count=int(top_model_direction_count),
         top_model_direction_debug=top_model_direction_debug,
+        top_model_optimized_trace_xyz=top_model_optimized_trace_xyz,
+        top_model_optimized_top_offsets_by_column=top_model_optimized_top_offsets_by_column,
+        top_model_optimized_layer_columns=top_model_optimized_layer_columns,
+        top_model_optimized_top_strip_image=top_model_optimized_top_strip_image,
+        top_model_optimized_top_strip_valid_mask=top_model_optimized_top_strip_valid_mask,
+        top_model_optimized_side_image=top_model_optimized_side_image,
+        top_model_optimized_side_valid_mask=top_model_optimized_side_valid_mask,
+        top_model_optimized_top_presence_image=top_model_optimized_top_presence_image,
+        top_model_optimized_top_presence_valid_mask=top_model_optimized_top_presence_valid_mask,
+        top_model_optimized_side_presence_image=top_model_optimized_side_presence_image,
+        top_model_optimized_side_presence_valid_mask=top_model_optimized_side_presence_valid_mask,
+        top_model_optimized_debug=top_model_optimized_debug,
         timing_rows=tuple(timing_rows),
     )
 
@@ -10222,6 +10624,17 @@ def _write_trace2cp_iteration_artifacts(
         top_model_direction_source=evaluation.top_model_direction_source,
         top_model_direction_count=evaluation.top_model_direction_count,
         top_model_direction_debug=evaluation.top_model_direction_debug,
+        top_model_optimized_trace_xyz=evaluation.top_model_optimized_trace_xyz,
+        top_model_optimized_top_offsets_by_column=evaluation.top_model_optimized_top_offsets_by_column,
+        top_model_optimized_top_strip_image=evaluation.top_model_optimized_top_strip_image,
+        top_model_optimized_top_strip_valid_mask=evaluation.top_model_optimized_top_strip_valid_mask,
+        top_model_optimized_side_image=evaluation.top_model_optimized_side_image,
+        top_model_optimized_side_valid_mask=evaluation.top_model_optimized_side_valid_mask,
+        top_model_optimized_top_presence_image=evaluation.top_model_optimized_top_presence_image,
+        top_model_optimized_top_presence_valid_mask=evaluation.top_model_optimized_top_presence_valid_mask,
+        top_model_optimized_side_presence_image=evaluation.top_model_optimized_side_presence_image,
+        top_model_optimized_side_presence_valid_mask=evaluation.top_model_optimized_side_presence_valid_mask,
+        top_model_optimized_debug=evaluation.top_model_optimized_debug,
         valid_mask=evaluation.valid_mask,
     )
     _write_jpg(output_dir / f"trace2cp_vis{suffix}.jpg", overlay)
@@ -10733,6 +11146,17 @@ def _export_trace2cp_vis(
             top_model_direction_source=evaluation.top_model_direction_source,
             top_model_direction_count=evaluation.top_model_direction_count,
             top_model_direction_debug=evaluation.top_model_direction_debug,
+            top_model_optimized_trace_xyz=evaluation.top_model_optimized_trace_xyz,
+            top_model_optimized_top_offsets_by_column=evaluation.top_model_optimized_top_offsets_by_column,
+            top_model_optimized_top_strip_image=evaluation.top_model_optimized_top_strip_image,
+            top_model_optimized_top_strip_valid_mask=evaluation.top_model_optimized_top_strip_valid_mask,
+            top_model_optimized_side_image=evaluation.top_model_optimized_side_image,
+            top_model_optimized_side_valid_mask=evaluation.top_model_optimized_side_valid_mask,
+            top_model_optimized_top_presence_image=evaluation.top_model_optimized_top_presence_image,
+            top_model_optimized_top_presence_valid_mask=evaluation.top_model_optimized_top_presence_valid_mask,
+            top_model_optimized_side_presence_image=evaluation.top_model_optimized_side_presence_image,
+            top_model_optimized_side_presence_valid_mask=evaluation.top_model_optimized_side_presence_valid_mask,
+            top_model_optimized_debug=evaluation.top_model_optimized_debug,
             valid_mask=valid_mask,
         )
     _append_trace2cp_timing(timing_rows, "draw_overlay", overlay_timer.elapsed_ms)

@@ -677,6 +677,16 @@
   missing direction pixels in the selected layer add a fixed penalty instead of
   blocking the path, so the diagnostic path still connects the CPs while
   preferring valid pixels where available.
+  The visualization also appends optimized-line diagnostics derived from that
+  DP path: a top strip resliced around the DP top-row path and selected
+  top-offset layers, a side slice reconstructed column-wise from the same
+  optimized side displacement, and matching top z-pillar plus side-column
+  presence panels when side-model presence is available. The optimized side
+  displacement is the sum of the selected top-offset layer and the DP
+  top-row offset from the old center row. In the optimized top-strip panel,
+  the optimized path is the slice center and is drawn as a straight centerline,
+  not as the pre-reslice curved path. These panels use the optimized line only
+  for visualization and do not feed back into Trace2CP scoring.
   During top trace integration, ambiguous direction signs must be resolved
   before bilinear interpolation by flipping each of the four neighboring pixel
   direction samples, if needed, so it agrees with the current trace direction;

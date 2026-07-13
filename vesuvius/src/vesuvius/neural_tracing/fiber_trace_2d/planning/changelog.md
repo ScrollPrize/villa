@@ -2,6 +2,12 @@
 
 ## 2026-07-14
 
+- Extended `--trace2cp-top-model-dir-vis` with optimized-line diagnostics from
+  the yellow top-DP path: optimized top strip, side slice, and matching
+  top/side presence panels.
+- Corrected those top-dir DP diagnostics so the DP row offset is folded into
+  the side-z optimized line and the optimized top-strip panel draws that line
+  as the straight slice center.
 - Changed Trace2CP z-search side-presence smoothing from axis-aligned x/z blur
   to a direction-aligned anisotropic x/y blur plus side-z smoothing, weighted by
   valid pixels and symmetric under direction sign ambiguity.

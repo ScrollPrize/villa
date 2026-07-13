@@ -3615,8 +3615,14 @@ class FiberStrip2DLoader:
         self,
         source: _Trace2CpSegmentSource,
         trace_xyz: np.ndarray,
+        *,
+        top_offsets_by_column: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        coords_xyz, grid_valid = self.trace2cp_traced_top_strip_coords_xyz(source, trace_xyz)
+        coords_xyz, grid_valid = self.trace2cp_traced_top_strip_coords_xyz(
+            source,
+            trace_xyz,
+            top_offsets_by_column=top_offsets_by_column,
+        )
         coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32, copy=False)
         result = source.record.sampler.sample_coords(coords_zyx, grid_valid)
         image = np.asarray(result.image, dtype=np.float32)
@@ -3627,9 +3633,20 @@ class FiberStrip2DLoader:
         self,
         source: _Trace2CpSegmentSource,
         trace_xyz: np.ndarray,
+        *,
+        top_offsets_by_column: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         height, width = (int(v) for v in source.source_shape_hw)
         columns_xyz, columns_valid = _trace_columns_xyz_for_top_strip(trace_xyz, width)
+        if top_offsets_by_column is None:
+            top_offsets = np.zeros((width,), dtype=np.float32)
+        else:
+            top_offsets = np.asarray(top_offsets_by_column, dtype=np.float32).reshape(-1)
+            if int(top_offsets.shape[0]) != width:
+                raise ValueError(
+                    "top_offsets_by_column length must match trace2cp strip width: "
+                    f"got {int(top_offsets.shape[0])}, expected {width}"
+                )
         if source.grid.offset_axis_xyz is None or source.grid.side_axis_xyz is None:
             raise ValueError("trace2cp traced top strip requires source row-axis and side-axis data")
         device = source.grid.coords_xyz.device
@@ -3662,6 +3679,7 @@ class FiberStrip2DLoader:
             columns_valid_t & base_valid_t & normal_valid_t & torch.isfinite(base_xyz_t).all(dim=1)
             & side_z_valid_t
         ).detach().cpu().numpy().astype(bool, copy=False)
+        valid_columns &= np.isfinite(top_offsets)
 
         side_axes = np.zeros((width, 3), dtype=np.float32)
         for col in range(width):
@@ -3690,9 +3708,11 @@ class FiberStrip2DLoader:
             side_axes[col] = side
 
         row_offsets = (
-            np.arange(height, dtype=np.float32) - np.float32((float(height) - 1.0) * 0.5)
+            np.arange(height, dtype=np.float32)[:, None]
+            - np.float32((float(height) - 1.0) * 0.5)
+            + top_offsets[None, :]
         ) * np.float32(source.record.volume_spacing_base)
-        coords_xyz = base_xyz[None, :, :] + row_offsets[:, None, None] * side_axes[None, :, :]
+        coords_xyz = base_xyz[None, :, :] + row_offsets[:, :, None] * side_axes[None, :, :]
         grid_valid = (
             valid_columns[None, :]
             & np.isfinite(coords_xyz).all(axis=2)

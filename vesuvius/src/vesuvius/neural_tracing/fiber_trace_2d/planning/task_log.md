@@ -1,34 +1,23 @@
-# Trace2CP Direction-Aligned Side Presence Blur Task Log
+# Trace2CP Top-Direction DP Optimized-Line Diagnostics Log
 
-## Goal
+## Implementation Notes
 
-Replace the axis-aligned Trace2CP z-search side-presence blur with a
-direction-aligned anisotropic blur implemented in batched PyTorch. The blur
-uses side-z radius 21, local-direction radius 5, and a small perpendicular
-radius 1.
-
-## Notes
-
-- Current z-search presence call sites already route through
-  `_Trace2CpZPlaneCache.blurred_presence_for_layer(s)`, so the implementation
-  should stay inside that cache/helper path.
-- Implemented `_trace2cp_blur_presence_stack_directional()` as a weighted
-  PyTorch blur. It smooths along side-z first, then applies a symmetric
-  direction-aligned x/y gather with `grid_sample` over bounded layer chunks.
-- The direction-aligned kernel uses radius 5 along the local side direction and
-  radius 1 across it. Since offsets are symmetric, `dir` and `-dir` produce the
-  same blur.
-- `_Trace2CpZPlaneCache` now gathers direction fields with the presence/valid
-  stack and keeps the existing `blurred_presence_for_layer(s)` API.
-- Added `--trace2cp-presence-blur` and made the cache return raw per-layer
-  presence unless that flag is enabled.
+- Extended traced top-strip sampling with optional per-column top-row offsets.
+- `_trace2cp_top_model_direction_overlay` now returns the yellow top-DP path
+  and selected top-offset layers as debug data.
+- Trace2CP pair evaluation reconstructs optimized top strip, optimized
+  side-z slice, top z-pillar presence, and side-column presence panels from
+  the top-DP optimized line.
+- The optimized line now folds both top-DP components into side displacement:
+  selected top-offset layer plus the DP row offset from the old top-strip
+  center. The optimized top-strip panel draws the new centerline as straight
+  rather than re-drawing the pre-reslice curved DP path.
+- Single-pair overlays and whole-fiber rows append these panels below the
+  existing top-model direction visualization.
+- Specs, code docs, and changelog were updated.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
-  passed.
-- Initial focused pytest run failed only because the repository guard test
-  forbade any `grid_sample` text in `runner.py`; updated that guard to exempt
-  only the new presence-blur helper block, not runner globally.
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: 254 tests.
+  - Result: `256 passed in 10.71s`

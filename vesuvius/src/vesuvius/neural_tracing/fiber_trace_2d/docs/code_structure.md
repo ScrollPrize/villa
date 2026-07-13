@@ -412,8 +412,13 @@ The important behavior is:
   crossed pixel columns using fractional row/z interpolation from the direction
   field. It uses no absolute-y row bias by default, and uses a fixed penalty,
   rather than a hard stop, for invalid/missing direction
-  pixels. The panel is diagnostic only and does not change scoring or z-layer
-  selection.
+  pixels. The visualization also appends diagnostics derived from the DP
+  optimized line: an optimized top strip resliced around the DP top-row path
+  and selected top-offset layers, a side slice reconstructed from the combined
+  top-row plus selected-layer side displacement, and top z-pillar/side-column
+  presence panels when side-model presence exists. The optimized top-strip
+  panel draws the optimized line as the straight slice center. These panels
+  are diagnostic only and do not change scoring or z-layer selection.
 - `--trace2cp-side-top-z-experiment` adds a separate single-pair diagnostic
   path. It is exclusive: when this flag is set, the command writes only
   `trace2cp_side_top_z_experiment.jpg`,
