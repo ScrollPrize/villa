@@ -1,10 +1,10 @@
-# Trace2CP DP Local-Angle Semantics Status
+# Trace2CP Regular Trace With Side-View Z Experiment Status
 
-- [x] Read current side/top Trace2CP DP implementation and docs.
-- [x] Replace current task/task_plan with this DP semantics update.
-- [x] Remove candidate-angle-derived vertical move cap.
-- [x] Set side DP transition step to 4 px.
-- [x] Reduce DP smoothness penalties.
-- [x] Add steep-local-direction regression test.
-- [x] Update specs, docs, changelog, and task log.
-- [x] Run focused validation.
+- [x] Read fiber_trace_2d AGENTS workflow.
+- [x] Read current Trace2CP task/todo/spec/plan context.
+- [x] Replace active task with the regular-plus-top-z Trace2CP experiment.
+- [x] Create implementation plan with spec, docs, tests, and changelog notes.
+- [ ] Implement opt-in experimental tracer.
+- [ ] Update specs and docs.
+- [ ] Add focused tests.
+- [ ] Run validation.

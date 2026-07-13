@@ -38,8 +38,8 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_
 
 _TRACE2CP_SIDE_DP_HORIZONTAL_STEP_PX = 4
 _TRACE2CP_SIDE_DP_MAX_ABS_DY_PER_DX = 4.0
-_TRACE2CP_DP_DY_SMOOTH_PENALTY = 0.005
-_TRACE2CP_DP_DZ_SMOOTH_PENALTY = 0.01
+_TRACE2CP_DP_DY_SMOOTH_PENALTY = 0.0
+_TRACE2CP_DP_DZ_SMOOTH_PENALTY = 0.0
 
 
 def _path_arg_for_config(path: str | Path) -> str:
@@ -5513,21 +5513,54 @@ def _trace2cp_top_monotone_direction_path_z_torch(
                 for offset in range(1, abs_dx + 1):
                     sample_x = int(prev_x + x_step * offset)
                     alpha = float(offset) / float(abs_dx)
-                    sample_y = torch.round(prev_y.float() + dy_chunk.view(chunk_len, 1, 1).float() * alpha).long()
-                    sample_layer = torch.round(
+                    sample_y_f = (
+                        prev_y.float() + dy_chunk.view(chunk_len, 1, 1).float() * alpha
+                    ).expand(chunk_len, layer_count, height)
+                    sample_layer_f = (
                         prev_layer.float() + dz_chunk.view(chunk_len, 1, 1).float() * alpha
-                    ).long()
+                    ).expand(chunk_len, layer_count, height)
                     sample_inside = (
                         valid_prev
-                        & (sample_y >= 0)
-                        & (sample_y < height)
-                        & (sample_layer >= 0)
-                        & (sample_layer < layer_count)
+                        & (sample_y_f >= 0.0)
+                        & (sample_y_f <= float(height - 1))
+                        & (sample_layer_f >= 0.0)
+                        & (sample_layer_f <= float(layer_count - 1))
                     )
-                    sample_y_idx = sample_y.clamp(0, height - 1).expand(chunk_len, layer_count, height)
-                    sample_layer_idx = sample_layer.clamp(0, layer_count - 1).expand(chunk_len, layer_count, height)
-                    sample_direction = unit_t[sample_layer_idx, sample_y_idx, sample_x, :]
-                    sample_valid = valid_t[sample_layer_idx, sample_y_idx, sample_x]
+                    sample_y0 = torch.floor(sample_y_f).long().clamp(0, height - 1)
+                    sample_y1 = (sample_y0 + 1).clamp(0, height - 1)
+                    sample_layer0 = torch.floor(sample_layer_f).long().clamp(0, layer_count - 1)
+                    sample_layer1 = (sample_layer0 + 1).clamp(0, layer_count - 1)
+                    wy = torch.clamp(sample_y_f - sample_y0.float(), 0.0, 1.0)
+                    wz = torch.clamp(sample_layer_f - sample_layer0.float(), 0.0, 1.0)
+
+                    d00 = unit_t[sample_layer0, sample_y0, sample_x, :]
+                    d01 = unit_t[sample_layer0, sample_y1, sample_x, :]
+                    d10 = unit_t[sample_layer1, sample_y0, sample_x, :]
+                    d11 = unit_t[sample_layer1, sample_y1, sample_x, :]
+
+                    def _orient_to_tangent(values: torch.Tensor) -> torch.Tensor:
+                        dot = values[..., 0] * tangent_x + values[..., 1] * tangent_y
+                        return torch.where(dot[..., None] < 0.0, -values, values)
+
+                    d00 = _orient_to_tangent(d00)
+                    d01 = _orient_to_tangent(d01)
+                    d10 = _orient_to_tangent(d10)
+                    d11 = _orient_to_tangent(d11)
+                    wy_e = wy[..., None]
+                    wz_e = wz[..., None]
+                    layer0_direction = d00 * (1.0 - wy_e) + d01 * wy_e
+                    layer1_direction = d10 * (1.0 - wy_e) + d11 * wy_e
+                    sample_direction = layer0_direction * (1.0 - wz_e) + layer1_direction * wz_e
+                    sample_norm = torch.linalg.vector_norm(sample_direction, dim=-1)
+                    sample_direction = sample_direction / sample_norm.clamp_min(1.0e-12)[..., None]
+                    sample_valid = (
+                        valid_t[sample_layer0, sample_y0, sample_x]
+                        & valid_t[sample_layer0, sample_y1, sample_x]
+                        & valid_t[sample_layer1, sample_y0, sample_x]
+                        & valid_t[sample_layer1, sample_y1, sample_x]
+                        & torch.isfinite(sample_norm)
+                        & (sample_norm > 1.0e-6)
+                    )
                     alignment = torch.abs(
                         sample_direction[..., 0] * tangent_x + sample_direction[..., 1] * tangent_y
                     )
@@ -5540,8 +5573,20 @@ def _trace2cp_top_monotone_direction_path_z_torch(
                         )
                     sample_cost = float(direction_weight) * direction_cost
                     if presence_t is not None and float(presence_weight) != 0.0:
-                        sample_presence = presence_t[sample_layer_idx, sample_y_idx, sample_x]
-                        presence_valid = torch.isfinite(sample_presence)
+                        p00 = presence_t[sample_layer0, sample_y0, sample_x]
+                        p01 = presence_t[sample_layer0, sample_y1, sample_x]
+                        p10 = presence_t[sample_layer1, sample_y0, sample_x]
+                        p11 = presence_t[sample_layer1, sample_y1, sample_x]
+                        layer0_presence = p00 * (1.0 - wy) + p01 * wy
+                        layer1_presence = p10 * (1.0 - wy) + p11 * wy
+                        sample_presence = layer0_presence * (1.0 - wz) + layer1_presence * wz
+                        presence_valid = (
+                            torch.isfinite(p00)
+                            & torch.isfinite(p01)
+                            & torch.isfinite(p10)
+                            & torch.isfinite(p11)
+                            & torch.isfinite(sample_presence)
+                        )
                         sample_cost = sample_cost + float(presence_weight) * (
                             1.0 - torch.clamp(sample_presence, 0.0, 1.0)
                         )
@@ -5833,14 +5878,57 @@ def _trace2cp_top_monotone_direction_path_z(
                 for offset in range(1, abs_dx + 1):
                     sample_x = prev_x + x_step * offset
                     alpha = np.float32(float(offset) / float(abs_dx))
-                    sample_y = np.rint(prev_y.astype(np.float32) + np.float32(dy) * alpha).astype(np.int32)
-                    sample_layer = int(round(float(previous_layer) + float(dz) * float(alpha)))
-                    sample_layer = min(max(sample_layer, 0), layer_count - 1)
-                    sample_inside = inside & (sample_y >= 0) & (sample_y < height)
+                    sample_y_f = prev_y.astype(np.float32) + np.float32(dy) * alpha
+                    sample_layer_f = np.float32(float(previous_layer) + float(dz) * float(alpha))
+                    sample_inside = (
+                        inside
+                        & (sample_y_f >= np.float32(0.0))
+                        & (sample_y_f <= np.float32(height - 1))
+                        & (sample_layer_f >= np.float32(0.0))
+                        & (sample_layer_f <= np.float32(layer_count - 1))
+                    )
                     sample_cost = np.full(height, inf, dtype=np.float32)
                     if bool(sample_inside.any()):
-                        sample_direction = unit[sample_layer, sample_y[sample_inside], sample_x, :]
-                        sample_valid = field_valid[sample_layer, sample_y[sample_inside], sample_x]
+                        sample_rows = np.flatnonzero(sample_inside)
+                        sample_y0 = np.floor(sample_y_f[sample_rows]).astype(np.int32)
+                        sample_y0 = np.clip(sample_y0, 0, height - 1)
+                        sample_y1 = np.clip(sample_y0 + 1, 0, height - 1)
+                        layer0 = int(np.clip(int(np.floor(float(sample_layer_f))), 0, layer_count - 1))
+                        layer1 = min(layer0 + 1, layer_count - 1)
+                        wy = np.clip(
+                            sample_y_f[sample_rows] - sample_y0.astype(np.float32),
+                            0.0,
+                            1.0,
+                        ).astype(np.float32)
+                        wz = np.float32(np.clip(float(sample_layer_f) - float(layer0), 0.0, 1.0))
+
+                        d00 = unit[layer0, sample_y0, sample_x, :]
+                        d01 = unit[layer0, sample_y1, sample_x, :]
+                        d10 = unit[layer1, sample_y0, sample_x, :]
+                        d11 = unit[layer1, sample_y1, sample_x, :]
+
+                        def orient_to_tangent(values: np.ndarray) -> np.ndarray:
+                            dot = values[:, 0] * tangent_x + values[:, 1] * tangent_y
+                            return np.where(dot[:, None] < 0.0, -values, values).astype(np.float32)
+
+                        d00 = orient_to_tangent(d00)
+                        d01 = orient_to_tangent(d01)
+                        d10 = orient_to_tangent(d10)
+                        d11 = orient_to_tangent(d11)
+                        wy_e = wy[:, None]
+                        layer0_direction = d00 * (1.0 - wy_e) + d01 * wy_e
+                        layer1_direction = d10 * (1.0 - wy_e) + d11 * wy_e
+                        sample_direction = layer0_direction * (1.0 - wz) + layer1_direction * wz
+                        sample_norm = np.linalg.norm(sample_direction, axis=1)
+                        sample_valid = (
+                            field_valid[layer0, sample_y0, sample_x]
+                            & field_valid[layer0, sample_y1, sample_x]
+                            & field_valid[layer1, sample_y0, sample_x]
+                            & field_valid[layer1, sample_y1, sample_x]
+                            & np.isfinite(sample_norm)
+                            & (sample_norm > 1.0e-6)
+                        )
+                        sample_direction = sample_direction / np.clip(sample_norm[:, None], 1.0e-12, None)
                         alignment = np.abs(sample_direction[:, 0] * tangent_x + sample_direction[:, 1] * tangent_y)
                         clipped_alignment = np.clip(alignment, 0.0, 1.0)
                         direction_cost = (1.0 - clipped_alignment).astype(np.float32)
@@ -5850,16 +5938,26 @@ def _trace2cp_top_monotone_direction_path_z(
                                 np.float32(min_direction_alignment) - clipped_alignment,
                             )
                             direction_cost += angle_penalty_scale * excess.astype(np.float32)
-                        sample_cost[sample_inside] = np.float32(float(direction_weight)) * direction_cost
+                        sample_cost[sample_rows] = np.float32(float(direction_weight)) * direction_cost
                         if presence_stack is not None:
-                            sample_presence = presence_stack[sample_layer, sample_y[sample_inside], sample_x]
-                            presence_valid = np.isfinite(sample_presence)
-                            presence_cost = (1.0 - np.clip(sample_presence, 0.0, 1.0)).astype(np.float32)
-                            sample_cost[sample_inside] += (
-                                np.float32(float(presence_weight)) * presence_cost
+                            p00 = presence_stack[layer0, sample_y0, sample_x]
+                            p01 = presence_stack[layer0, sample_y1, sample_x]
+                            p10 = presence_stack[layer1, sample_y0, sample_x]
+                            p11 = presence_stack[layer1, sample_y1, sample_x]
+                            layer0_presence = p00 * (1.0 - wy) + p01 * wy
+                            layer1_presence = p10 * (1.0 - wy) + p11 * wy
+                            sample_presence = layer0_presence * (1.0 - wz) + layer1_presence * wz
+                            presence_valid = (
+                                np.isfinite(p00)
+                                & np.isfinite(p01)
+                                & np.isfinite(p10)
+                                & np.isfinite(p11)
+                                & np.isfinite(sample_presence)
                             )
+                            presence_cost = (1.0 - np.clip(sample_presence, 0.0, 1.0)).astype(np.float32)
+                            sample_cost[sample_rows] += np.float32(float(presence_weight)) * presence_cost
                             sample_valid = sample_valid & presence_valid
-                        sample_cost[sample_inside] += np.where(
+                        sample_cost[sample_rows] += np.where(
                             sample_valid,
                             np.float32(0.0),
                             np.float32(max(0.0, float(invalid_penalty))),

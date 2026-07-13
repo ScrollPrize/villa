@@ -559,8 +559,12 @@
   fixed 4 px horizontal transitions, plus the exact target column, and
   integrates direction alignment cost
   `direction_weight * (1 - abs(dot(path_tangent, layer_direction)))` across
-  every crossed pixel column. Invalid or missing direction pixels add a fixed
-  penalty instead of breaking the path.
+  every crossed pixel column. Transition samples use fractional bilinear
+  interpolation in strip row and z-layer coordinates, not rounded nearest
+  lookup. Because decoded Lasagna directions are sign-ambiguous, all
+  interpolated direction-vector corners are sign-aligned to the candidate
+  transition tangent before blending. Invalid or missing direction pixels add a
+  fixed penalty instead of breaking the path.
 - The side-strip DP still uses `--line-trace-step` only for resampling the
   selected fused output trace and for the public trace visualization density.
   It must not use `--line-trace-step` as the DP transition length.
@@ -570,9 +574,9 @@
   `--line-trace-candidate-max-degrees` receive extra cost. This setting must
   not cap global horizontal slope or vertical moves, because valid local fiber
   directions can be steeper than 45 degrees.
-- The default side/top DP second-order smoothness penalties are
-  `0.005 * (dy - prev_dy)^2` and `0.01 * (dz - prev_dz)^2`. Smoothing should
-  discourage jitter without forcing an overly straight path.
+- The default side/top DP second-order smoothness penalties are zero. Optional
+  non-zero smoothing should discourage jitter without forcing an overly
+  straight path.
 - `--trace2cp-combined-mode direction` is the only active combined mode.
   `--trace2cp-combined-mode embedding`, `--trace2cp-use-embedding`,
   `--trace2cp-combined-mode image`, and `--trace2cp-use-image` are removed from
@@ -629,15 +633,14 @@
   `(top_offset_layer, y, prev_dy, prev_dz)`, so it may transition between
   neighboring top-offset layers with a fixed z-transition penalty of
   `0.1 * abs(delta_layer)` while also preferring smooth step sequences. The
-  default second-order penalties are `0.005 * (dy - prev_dy)^2` and
-  `0.01 * (dz - prev_dz)^2`; the first transition has no smoothing cost because
-  no previous step exists. There is no default absolute-y row penalty because
-  that would bias the path toward a row rather than smoothing its slope. It uses
-  fixed 8 px horizontal transitions, plus the exact target column, and
-  integrates direction alignment
+  default second-order penalties are zero; the first transition has no
+  smoothing cost because no previous step exists. There is no default
+  absolute-y row penalty because that would bias the path toward a row rather
+  than smoothing its slope. It uses fixed 8 px horizontal transitions, plus the
+  exact target column, and integrates direction alignment
   cost `1 - abs(dot(path_tangent, layer_direction))` across every pixel column
-  crossed by each transition, using the direction field from the path's current
-  interpolated z layer. The vertical transition band scales with the horizontal
+  crossed by each transition, using fractional row/z interpolation from the
+  direction field. The vertical transition band scales with the horizontal
   step, and start/target rows and layers are exact at the CPs. Invalid or
   missing direction pixels in the selected layer add a fixed penalty instead of
   blocking the path, so the diagnostic path still connects the CPs while

@@ -332,8 +332,11 @@ The important behavior is:
   length. The existing candidate-angle limit is applied only as a local angular
   excess penalty against the sampled direction field; it must not cap global
   horizontal slope because valid local fibers can be steeper than 45 degrees.
-  This combined path is an inspection/refinement path; the non-combined
-  reference tracer remains the public target-column Trace2CP metric.
+  Transition scoring samples fractional row/z positions with bilinear
+  interpolation and sign-aligns ambiguous direction-vector corners to the
+  transition tangent before blending. This combined path is an
+  inspection/refinement path; the non-combined reference tracer remains the
+  public target-column Trace2CP metric.
   `--trace2cp-combined-mode direction` is the only active combined mode.
   `--trace2cp-use-presence` adds `1 - sigmoid_presence` at sampled DP pixels,
   weighted by `--trace2cp-combined-presence-weight`. Embedding and image
@@ -373,12 +376,11 @@ The important behavior is:
   row. That path uses `(top_offset_layer, y, prev_dy, prev_dz)` state, can move
   between neighboring top-offset layers with a `0.1 * abs(delta_layer)`
   transition penalty, adds second-order smoothness penalties
-  `0.005 * (dy - prev_dy)^2` and `0.01 * (dz - prev_dz)^2`, uses fixed
-  8 px horizontal transitions, and integrates
+  that default to zero, uses fixed 8 px horizontal transitions, and integrates
   `1 - abs(dot(path_tangent, layer_direction))` across each transition's
-  crossed pixel columns using the direction field from the selected layer. It
-  uses no absolute-y row bias by default, and uses a fixed penalty, rather than
-  a hard stop, for invalid/missing direction
+  crossed pixel columns using fractional row/z interpolation from the direction
+  field. It uses no absolute-y row bias by default, and uses a fixed penalty,
+  rather than a hard stop, for invalid/missing direction
   pixels. The panel is diagnostic only and does not change scoring or z-layer
   selection.
 - `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` runs the same
