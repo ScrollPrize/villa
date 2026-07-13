@@ -85,7 +85,7 @@ class Inputs:
     surface_volume_zarr: str = ""  # Path to pre-created surface volume zarr
     chunk_size: int = 1024  # Chunk size for zarr array creation (SURFACE_VOLUME_CHUNK_SIZE)
     use_zarr_compression: bool = False  # Enable/disable zarr compression
-    model_type: str = "timesformer"  # "timesformer", "resnet3d-50", or "resnet3d-152-3d-decoder"
+    model_type: str = "timesformer"  # "timesformer", "resnet3d-50", "resnet3d-152", or "resnet3d-152-3d-decoder"
     tile_size: int = 64  # Tile size for sliding window inference (size will be set to same value)
     stride: int = 16  # Stride for sliding window
     batch_size: int = 256  # Batch size for inference
@@ -710,13 +710,16 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
     logger.info(f"Using {CFG.in_chans} input channels (layers [{inputs.start_layer}, {inputs.end_layer}))")
     logger.info(f"Inference config: tile_size={CFG.tile_size}, size={CFG.size}, stride={CFG.stride}, batch_size={CFG.batch_size}, prefetch_factor={CFG.prefetch_factor}")
 
+    requested_resnet_depth = None
+
     # Import model-specific module based on model_type
     if inputs.model_type == "timesformer":
         from model_timesformer import load_model
         logger.info(f"Using TimeSformer model")
-    elif inputs.model_type == "resnet3d-50":
+    elif inputs.model_type in ("resnet3d-50", "resnet3d-152"):
         from model_resnet3d import load_model
-        logger.info(f"Using ResNet3D-50 model")
+        requested_resnet_depth = int(inputs.model_type.rsplit("-", 1)[1])
+        logger.info(f"Using ResNet3D-{requested_resnet_depth} model")
     elif inputs.model_type == "resnet3d-152-3d-decoder":
         from model_resnet3d_3d_decoder import load_model
         logger.info("Using ResNet3D-152 3D decoder model")
@@ -770,7 +773,15 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
 
     # Load model with dynamic number of frames
     with scoped_timer(profiler, "model_load_seconds", cuda_sync=device.type == "cuda"):
-        model = load_model(weight_path, device, num_frames=CFG.in_chans)
+        if requested_resnet_depth is None:
+            model = load_model(weight_path, device, num_frames=CFG.in_chans)
+        else:
+            model = load_model(
+                weight_path,
+                device,
+                num_frames=CFG.in_chans,
+                model_depth=requested_resnet_depth,
+            )
 
     # -------- Performance toggles ------------------------------------------------
     # TF32 on Ampere+ gives fast GEMMs with tiny accuracy impact for this task.
