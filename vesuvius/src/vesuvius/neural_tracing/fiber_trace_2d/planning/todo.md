@@ -37,11 +37,9 @@
 - [ ] do a separate sheet/fiber recognition target
     - [ ] force embeeding similarity to be different to that?
 - [x] lets try disabling skew and scale loss (maybe throws off embedding?)
-- [ ] for embedding similarity try best along some small z range (and short y as well)
-- [ ] also embedding - incorporate angle? (probably not needed if curr angle est are good)
-- [ ] vis both (train & test vis) the patches cp and another patches cp (same fiber) for similarity
-- [ ] z-smoothness termin in side-view dp seems to have no effect?
-- [ ] for side-dp - lets adjust presence loss to more significantly penalize values close to zero
+- [x] for embedding similarity try best along some small z range (and short y as well)
+- [ ] integrate presence in side-z along x,z axis gaussian
+
 
 ## z-search training
 - [ ] Now lets do a modification that re-introduces multiple z-slices again int the training - we see that some difficulty in the embedding is mostly caused by the sample shifting in z

@@ -2,6 +2,10 @@
 
 ## 2026-07-13
 
+- Re-enabled the side-view Trace2CP joint-DP dz smoothness default
+  (`0.5 * (dz_current - dz_previous)^2`) after the zero-smoothness test.
+- Set side-view Trace2CP joint-DP dz smoothness default to `0.0` for testing,
+  keeping the z-transition penalty at `0.0`.
 - Changed Trace2CP z-search with sub-voxel `--trace2cp-z-step-voxels` to infer
   side-z model layers only at integer selected-scale voxel offsets, then
   interpolate direction and sheet/fiber-presence fields for intermediate
