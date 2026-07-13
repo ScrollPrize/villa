@@ -1,4 +1,5 @@
 name: VC3D Windows Installer
+run-name: VC3D Windows ${{ github.event_name }} ${{ inputs.request_id || github.sha }}
 
 # Compiles VC3D natively on Windows under MSYS2/UCRT64 for PRs. Main, release,
 # and manual runs also produce and smoke-test a self-contained NSIS installer
@@ -13,12 +14,18 @@ on:
       - '.github/workflows/vc3d-windows.yml'
   push:
     branches: [main]
-    paths:
-      - 'volume-cartographer/**'
-      - '.github/workflows/vc3d-windows.yml'
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Commit to package (defaults to the selected workflow ref)
+        required: false
+        type: string
+      request_id:
+        description: Optional caller correlation ID
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -45,6 +52,8 @@ jobs:
         working-directory: volume-cartographer
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.sha }}
 
       - uses: actions/checkout@v4
         with:
