@@ -1631,21 +1631,23 @@ std::vector<OpenDataInkDetectionEntry> cachedInkDetectionsForSegmentDirectory(
 
 std::filesystem::path defaultEditableCopyPathForCatalogSegment(
     const std::filesystem::path& catalogSegmentDir,
-    const std::filesystem::path& remoteCacheRoot)
+    const std::filesystem::path& activeSegmentsRoot)
 {
-    std::string sampleId = "sample";
-    if (const auto origin = readCatalogOrigin(catalogSegmentDir)) {
-        const auto it = origin->find("sample_id");
-        if (it != origin->end() && it->is_string() && !it->get<std::string>().empty()) {
-            sampleId = it->get<std::string>();
-        }
+    const auto currentSegmentsRoot = activeSegmentsRoot.empty()
+        ? catalogSegmentDir.parent_path()
+        : activeSegmentsRoot;
+    auto editableRootName = currentSegmentsRoot.filename().string();
+    if (editableRootName.empty()) {
+        editableRootName = "segments";
     }
+    editableRootName += "_editable";
+
     auto baseName = catalogSegmentDir.filename().string();
     if (baseName.empty()) {
         baseName = "segment";
     }
-    return openDataEditableSegmentRoot(remoteCacheRoot, sampleId) /
-           (safePathComponent(baseName) + "-edit");
+    return currentSegmentsRoot.parent_path() / editableRootName /
+           baseName;
 }
 
 void copyCatalogSegmentToEditableDirectory(

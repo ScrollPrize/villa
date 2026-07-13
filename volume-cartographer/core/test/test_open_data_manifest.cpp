@@ -783,6 +783,33 @@ TEST_CASE("OpenDataSegmentCache places GrowPatch output under the sample patches
           cacheRoot / "open_data" / "segments" / "Sample_With_Spaces" / "patches");
 }
 
+TEST_CASE("OpenDataSegmentCache names editable copies after the current segments folder")
+{
+    const std::filesystem::path cacheRoot = "/home/test/.VC3D/remote_cache";
+    const auto currentSegmentsFolder = cacheRoot / "open_data" / "segments" /
+                                       "PHerc0175A" / "volume-1";
+    const auto editableSegmentsFolder = currentSegmentsFolder.parent_path() /
+                                        "volume-1_editable";
+
+    CHECK(defaultEditableCopyPathForCatalogSegment(
+              currentSegmentsFolder / "segment-42", currentSegmentsFolder) ==
+          editableSegmentsFolder / "segment-42");
+    CHECK(defaultEditableCopyPathForCatalogSegment(
+              currentSegmentsFolder / "segment-99", currentSegmentsFolder) ==
+          editableSegmentsFolder / "segment-99");
+
+    const auto spacedFolder = currentSegmentsFolder.parent_path() / "source surfaces";
+    CHECK(defaultEditableCopyPathForCatalogSegment(
+              spacedFolder / "surface 7", spacedFolder) ==
+          spacedFolder.parent_path() / "source surfaces_editable" / "surface 7");
+
+    const auto catalogOverlay = currentSegmentsFolder.parent_path() /
+                                "catalog-overlay" / "segment-100";
+    CHECK(defaultEditableCopyPathForCatalogSegment(
+              catalogOverlay, currentSegmentsFolder) ==
+          editableSegmentsFolder / "segment-100");
+}
+
 TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
 {
     OpenDataSample sample;

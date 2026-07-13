@@ -101,7 +101,7 @@ struct OpenDataInkDetectionEntry {
 
 [[nodiscard]] std::filesystem::path defaultEditableCopyPathForCatalogSegment(
     const std::filesystem::path& catalogSegmentDir,
-    const std::filesystem::path& remoteCacheRoot);
+    const std::filesystem::path& activeSegmentsRoot);
 
 void copyCatalogSegmentToEditableDirectory(
     const std::filesystem::path& catalogSegmentDir,

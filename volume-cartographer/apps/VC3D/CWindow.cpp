@@ -7509,6 +7509,8 @@ void CWindow::CreateWidgets(void)
 
     connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
             this, &CWindow::onSegmentationEditingModeChanged);
+    connect(_segmentationModule.get(), &SegmentationModule::segmentationFolderChanged,
+            this, &CWindow::refreshSegmentationDirectoryDropdown);
     connect(_segmentationModule.get(), &SegmentationModule::statusMessageRequested,
             this, &CWindow::onShowStatusMessage);
     connect(_segmentationModule.get(), &SegmentationModule::stopToolsRequested,
