@@ -1,6 +1,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <fstream>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -137,6 +139,10 @@ bool isDirectRemoteZarrLocation(std::string location)
     return location.size() >= suffix.size()
         && location.compare(location.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
+
+constexpr const char* kDirectRemoteZarrRequired =
+    "remote Zarr volume locations must point directly to a .zarr root; "
+    "collection listing is not supported";
 
 std::string tagValueWithPrefix(const std::vector<std::string>& tags, std::string_view prefix)
 {
@@ -1219,38 +1225,75 @@ void VolumePkg::resolveAll()
         std::shared_ptr<Volume> volume;
         std::string error;
     };
-    std::vector<std::future<RemoteVolumeResult>> remoteLoads(volumes_.size());
+
+    std::vector<std::size_t> remoteIndices;
+    remoteIndices.reserve(volumes_.size());
     for (std::size_t i = 0; i < volumes_.size(); ++i) {
-        const auto& entry = volumes_[i];
-        if (!vc::project::isLocationRemote(entry.location)) continue;
-        const auto remoteCacheRoot = opts_.remoteCacheRoot;
-        remoteLoads[i] = std::async(
-            std::launch::async,
-            [entry, remoteCacheRoot]() -> RemoteVolumeResult {
-                try {
-                    if (!isDirectRemoteZarrLocation(entry.location)) {
-                        return {nullptr,
-                                "remote listing is not supported in this branch"};
-                    }
-                    return {
-                        Volume::NewFromUrl(
-                            entry.location, remoteCacheRoot, {},
-                            metadataFromVolumeEntryTags(entry.tags)),
-                        {}};
-                } catch (const std::exception& ex) {
-                    return {nullptr, ex.what()};
-                } catch (...) {
-                    return {nullptr, "unknown remote volume error"};
-                }
-            });
+        if (vc::project::isLocationRemote(volumes_[i].location)) {
+            remoteIndices.push_back(i);
+        }
     }
+
+    std::vector<RemoteVolumeResult> remoteResults(volumes_.size());
+    if (!remoteIndices.empty()) {
+        const auto remoteCacheRoot = opts_.remoteCacheRoot;
+        auto loadRemote = [this, &remoteResults, remoteCacheRoot](std::size_t i) {
+            const auto& entry = volumes_[i];
+            try {
+                if (!isDirectRemoteZarrLocation(entry.location)) {
+                    remoteResults[i] = {nullptr, kDirectRemoteZarrRequired};
+                    return;
+                }
+                remoteResults[i] = {
+                    Volume::NewFromUrl(
+                        entry.location, remoteCacheRoot, {},
+                        metadataFromVolumeEntryTags(entry.tags)),
+                    {}};
+            } catch (const std::exception& ex) {
+                remoteResults[i] = {nullptr, ex.what()};
+            } catch (...) {
+                remoteResults[i] = {nullptr, "unknown remote volume error"};
+            }
+        };
+
+        std::atomic<std::size_t> next{0};
+        auto worker = [&]() {
+            for (;;) {
+                const auto index = next.fetch_add(1, std::memory_order_relaxed);
+                if (index >= remoteIndices.size()) return;
+                loadRemote(remoteIndices[index]);
+            }
+        };
+
+        const auto hardware = std::thread::hardware_concurrency();
+        const std::size_t workerCount = std::min<std::size_t>(
+            remoteIndices.size(),
+            std::max<std::size_t>(
+                1, std::min<std::size_t>(hardware == 0 ? 4 : hardware, 8)));
+        std::vector<std::future<void>> workers;
+        workers.reserve(workerCount - 1);
+        for (std::size_t i = 1; i < workerCount; ++i) {
+            try {
+                workers.emplace_back(std::async(std::launch::async, worker));
+            } catch (const std::system_error& ex) {
+                Logger()->warn(
+                    "Could not start all remote volume workers; continuing "
+                    "with {} worker(s): {}",
+                    workers.size() + 1, ex.what());
+                break;
+            }
+        }
+        worker();
+        for (auto& future : workers) future.get();
+    }
+
     for (std::size_t i = 0; i < volumes_.size(); ++i) {
         const auto& entry = volumes_[i];
-        if (!remoteLoads[i].valid()) {
+        if (!vc::project::isLocationRemote(entry.location)) {
             resolveVolumeEntry(entry);
             continue;
         }
-        auto resolved = remoteLoads[i].get();
+        auto resolved = std::move(remoteResults[i]);
         if (!resolved.volume) {
             if (opts_.failOnRemoteError) {
                 throw std::runtime_error(
@@ -1307,7 +1350,8 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
     if (vc::project::isLocationRemote(e.location)) {
         try {
             if (!isDirectRemoteZarrLocation(e.location)) {
-                Logger()->warn("Skipping remote volume collection '{}': remote listing is not supported in this branch", e.location);
+                Logger()->warn("Skipping remote volume location '{}': {}",
+                               e.location, kDirectRemoteZarrRequired);
                 return;
             }
             auto v = Volume::NewFromUrl(

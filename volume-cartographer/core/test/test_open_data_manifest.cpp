@@ -6,13 +6,13 @@
 #include "OpenDataSampleProject.hpp"
 #include "OpenDataSegmentCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/MemMap.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <utility>
-#include <unistd.h>
 
 using namespace vc3d::opendata;
 
@@ -22,7 +22,8 @@ struct TestAutosaveRoot {
     TestAutosaveRoot()
         : previous(VolumePkg::autosaveRoot())
         , root(std::filesystem::temp_directory_path() /
-               ("vc_open_data_manifest_autosave_" + std::to_string(getpid())))
+               ("vc_open_data_manifest_autosave_" +
+                std::to_string(vc::memmap::pid())))
     {
         std::filesystem::remove_all(root);
         VolumePkg::setAutosaveRoot(root);
@@ -335,7 +336,7 @@ TEST_CASE("OpenDataSegmentCache prepares lazy source and generated placeholders"
     });
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-        ("vc_open_data_lazy_placeholder_test_" + std::to_string(getpid()));
+        ("vc_open_data_lazy_placeholder_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
     const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
     VolumePkg::setAutosaveRoot(cacheRoot / "autosave");
@@ -384,7 +385,7 @@ TEST_CASE("OpenDataSegmentCache prepares lazy source and generated placeholders"
 TEST_CASE("VolumePkg aggregate open-data folders deduplicate segment lineage")
 {
     const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_aggregate_dedupe_test_" + std::to_string(getpid()));
+        ("vc_open_data_aggregate_dedupe_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(root);
     const auto published = root / "vol1" / "published-L0" / "published";
     const auto generated =
@@ -788,7 +789,7 @@ TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
 TEST_CASE("OpenDataSegmentCache discovers cached ink detection overlays")
 {
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_ink_detection_test_" + std::to_string(getpid()));
+                           ("vc_open_data_ink_detection_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
     const auto segmentDir = cacheRoot / "segment";
     writeFile(segmentDir / "catalog-origin.json",
@@ -827,7 +828,7 @@ TEST_CASE("OpenDataSegmentCache reports local freshness against the live manifes
     REQUIRE(tifxyz != nullptr);
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_cache_state_test_" + std::to_string(getpid()));
+                           ("vc_open_data_cache_state_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
     const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, segment);
 
@@ -870,7 +871,7 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     const auto& sample = *manifest.findSample("PHerc0139");
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_sample_project_test_" + std::to_string(getpid()));
+                           ("vc_open_data_sample_project_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
 
     const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
@@ -960,7 +961,7 @@ TEST_CASE("OpenDataSegmentCache does not auto-associate transformed artifacts wi
     const auto& sample = *manifest.findSample("PHerc0139");
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_transformed_segment_test_" + std::to_string(getpid()));
+                           ("vc_open_data_transformed_segment_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
 
     const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
@@ -1023,7 +1024,7 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
     });
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_volume_transform_test_" + std::to_string(getpid()));
+                           ("vc_open_data_volume_transform_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
 
     const auto sourceDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
@@ -1135,7 +1136,7 @@ TEST_CASE("OpenDataSegmentCache prefers published source and target representati
     CHECK(representations[1].coordinateVolumeId == "vol2");
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-        ("vc_open_data_published_precedence_test_" + std::to_string(getpid()));
+        ("vc_open_data_published_precedence_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
@@ -1196,7 +1197,7 @@ TEST_CASE("OpenDataSegmentCache places GrowPatch output under the sample patches
 TEST_CASE("OpenDataSegmentCache counts manually created sample segments")
 {
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_manual_segment_count_test_" + std::to_string(getpid()));
+                           ("vc_open_data_manual_segment_count_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
 
     const auto sampleRoot = cacheRoot / "open_data" / "segments" / "PHerc0175A";
@@ -1248,7 +1249,7 @@ TEST_CASE("OpenDataSegmentCache editable copy is selectable from its new folder"
 {
     const auto testRoot = std::filesystem::temp_directory_path() /
                           ("vc_open_data_editable_selection_test_" +
-                           std::to_string(getpid()));
+                           std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(testRoot);
 
     const auto sourceRoot = testRoot / "catalog-segments";
@@ -1290,7 +1291,7 @@ TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
     sample.id = "Sample With Spaces";
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_cached_project_test_" + std::to_string(getpid()));
+                           ("vc_open_data_cached_project_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
 
     OpenDataSampleProjectResult firstResult;
@@ -1321,7 +1322,7 @@ TEST_CASE("OpenDataSampleProject reuses cached project and attaches existing cac
     auto sample = *manifest.findSample("PHerc0139");
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_cached_project_segments_test_" + std::to_string(getpid()));
+                           ("vc_open_data_cached_project_segments_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
 
     const auto segmentDir = openDataSegmentCacheDirectory(
