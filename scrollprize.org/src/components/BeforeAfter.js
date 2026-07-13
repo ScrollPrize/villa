@@ -5,6 +5,10 @@ const BeforeAfter = ({
   afterImage,
   altBefore = "Before",
   altAfter = "After",
+  beforeLabel,
+  afterLabel,
+  heightClass = "h-80",
+  accentHandle = false,
 }) => {
   const [sliderPosition, setSliderPosition] = useState(50);
   const containerRef = useRef(null);
@@ -43,7 +47,7 @@ const BeforeAfter = ({
   return (
     <div
       ref={containerRef}
-      className="h-80 rounded-lg border border-solid border-line relative inline-block overflow-hidden cursor-col-resize w-full max-w-4xl select-none"
+      className={`${heightClass} rounded-lg border border-solid border-line relative inline-block overflow-hidden cursor-col-resize w-full max-w-4xl select-none`}
       onMouseDown={handleMouseDown}
       onTouchStart={handleMouseDown}
       style={{
@@ -69,12 +73,31 @@ const BeforeAfter = ({
         }}
       />
 
+      {beforeLabel && (
+        <div className="absolute top-2 left-2 rounded px-2 py-0.5 text-xs text-dim bg-bg border border-solid border-line pointer-events-none">
+          {beforeLabel}
+        </div>
+      )}
+      {afterLabel && (
+        <div className="absolute top-2 right-2 rounded px-2 py-0.5 text-xs text-dim bg-bg border border-solid border-line pointer-events-none">
+          {afterLabel}
+        </div>
+      )}
+
       {/* 2px ember divider + 24px round handle with hairline ring (spec §3) */}
       <div
         className="absolute top-0 bottom-0 w-0.5 bg-accent"
         style={{ left: `${sliderPosition}%`, cursor: "col-resize" }}
       >
-        <div className="absolute top-1/2 -translate-y-1/2 left-1/2 -translate-x-1/2 w-6 h-6 bg-bg border border-solid border-line rounded-full"></div>
+        <div
+          className={`absolute top-1/2 -translate-y-1/2 left-1/2 -translate-x-1/2 w-6 h-6 border-solid rounded-full ${
+            accentHandle ? "bg-accent border-2 border-accent" : "bg-bg border border-line"
+          }`}
+        >
+          {accentHandle && (
+            <div className="absolute inset-0.5 rounded-full border-2 border-solid border-bg"></div>
+          )}
+        </div>
       </div>
     </div>
   );
