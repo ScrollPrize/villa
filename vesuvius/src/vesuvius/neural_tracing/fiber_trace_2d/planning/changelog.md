@@ -5,6 +5,10 @@
 - Restored regular stepwise combined Trace2CP and stepwise z-search as the
   defaults, added explicit `--trace2cp-dp` routing for the monotone-DP backend,
   and made `--trace2cp-side-top-z-experiment` an exclusive export mode.
+- Changed Trace2CP DP direction alignment to an angle-space penalty where the
+  existing candidate max angle is the excess knee.
+- Changed side/joint Trace2CP DP z regularization to use dz smoothness instead
+  of a per-step z transition penalty.
 - Added throttled progress-bar output for the forward/backward
   `--trace2cp-side-top-z-experiment` traces.
 - Kept side/top-z per-step top-direction overlays in

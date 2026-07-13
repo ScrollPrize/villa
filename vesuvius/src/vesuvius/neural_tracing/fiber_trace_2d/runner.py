@@ -38,8 +38,11 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_
 
 _TRACE2CP_SIDE_DP_HORIZONTAL_STEP_PX = 4
 _TRACE2CP_SIDE_DP_MAX_ABS_DY_PER_DX = 4.0
+_TRACE2CP_SIDE_DP_Z_TRANSITION_PENALTY = 0.0
+_TRACE2CP_SIDE_DP_DZ_SMOOTH_PENALTY = 0.05
 _TRACE2CP_DP_DY_SMOOTH_PENALTY = 0.0
 _TRACE2CP_DP_DZ_SMOOTH_PENALTY = 0.0
+_TRACE2CP_DP_ANGLE_BASE_DEGREES = 10.0
 
 
 def _path_arg_for_config(path: str | Path) -> str:
@@ -67,6 +70,39 @@ def _to_u8_image(image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
     out = np.zeros(arr.shape, dtype=np.uint8)
     out[valid] = np.clip(arr[valid], 0.0, 255.0).astype(np.uint8)
     return out
+
+
+def _trace2cp_dp_direction_angle_penalty_np(
+    alignment: np.ndarray,
+    *,
+    excess_knee_degrees: float | None,
+) -> np.ndarray:
+    clipped = np.clip(np.asarray(alignment, dtype=np.float32), 0.0, 1.0)
+    theta = (np.arccos(clipped) * np.float32(180.0 / math.pi)).astype(np.float32)
+    base = (theta / np.float32(_TRACE2CP_DP_ANGLE_BASE_DEGREES)) ** np.float32(2.0)
+    if excess_knee_degrees is None:
+        return base.astype(np.float32)
+    knee = float(excess_knee_degrees)
+    if not np.isfinite(knee) or knee <= 1.0e-6:
+        return base.astype(np.float32)
+    excess = np.maximum(theta - np.float32(knee), np.float32(0.0))
+    return (base * (np.float32(1.0) + excess / np.float32(knee))).astype(np.float32)
+
+
+def _trace2cp_dp_direction_angle_penalty_torch(
+    alignment: torch.Tensor,
+    *,
+    excess_knee_degrees: float | None,
+) -> torch.Tensor:
+    clipped = torch.clamp(alignment.to(dtype=torch.float32), 0.0, 1.0)
+    theta = torch.acos(clipped) * float(180.0 / math.pi)
+    base = (theta / float(_TRACE2CP_DP_ANGLE_BASE_DEGREES)).square()
+    if excess_knee_degrees is None:
+        return base
+    knee = float(excess_knee_degrees)
+    if not np.isfinite(knee) or knee <= 1.0e-6:
+        return base
+    return base * (1.0 + torch.clamp(theta - knee, min=0.0) / knee)
 
 
 def _trace2cp_z_corrected_image_u8(
@@ -6622,8 +6658,7 @@ def _trace2cp_top_monotone_direction_path_z_torch(
     dy_smooth_penalty: float,
     dz_smooth_penalty: float,
     horizontal_step: int,
-    min_direction_alignment: float | None,
-    angle_penalty_scale: float,
+    angle_excess_knee_degrees: float | None,
     device: torch.device,
     move_chunk_size: int = 16,
     progress_label: str | None = None,
@@ -6773,12 +6808,10 @@ def _trace2cp_top_monotone_direction_path_z_torch(
                         sample_direction[..., 0] * tangent_x + sample_direction[..., 1] * tangent_y
                     )
                     clipped_alignment = torch.clamp(alignment, 0.0, 1.0)
-                    direction_cost = 1.0 - clipped_alignment
-                    if min_direction_alignment is not None and float(angle_penalty_scale) > 0.0:
-                        direction_cost = direction_cost + float(angle_penalty_scale) * torch.clamp(
-                            float(min_direction_alignment) - clipped_alignment,
-                            min=0.0,
-                        )
+                    direction_cost = _trace2cp_dp_direction_angle_penalty_torch(
+                        clipped_alignment,
+                        excess_knee_degrees=angle_excess_knee_degrees,
+                    )
                     sample_cost = float(direction_weight) * direction_cost
                     if presence_t is not None and float(presence_weight) != 0.0:
                         p00 = presence_t[sample_layer0, sample_y0, sample_x]
@@ -6905,7 +6938,6 @@ def _trace2cp_top_monotone_direction_path_z(
     dz_smooth_penalty: float = _TRACE2CP_DP_DZ_SMOOTH_PENALTY,
     horizontal_step_px: int = 8,
     max_direction_angle_degrees: float | None = None,
-    angle_excess_penalty: float = 4.0,
     progress_label: str | None = None,
     progress_interval_s: float = 2.0,
     torch_device: torch.device | None = None,
@@ -6993,15 +7025,11 @@ def _trace2cp_top_monotone_direction_path_z(
     rows = np.arange(height, dtype=np.int32)
     max_dy = max(0, int(max_abs_dy))
     max_dz = max(0, int(max_abs_dz))
-    if max_direction_angle_degrees is None:
-        min_direction_alignment: float | None = None
-    else:
+    angle_excess_knee_degrees: float | None = None
+    if max_direction_angle_degrees is not None:
         angle_limit = float(max_direction_angle_degrees)
-        if not np.isfinite(angle_limit) or angle_limit >= 90.0:
-            min_direction_alignment = None
-        else:
-            min_direction_alignment = float(np.cos(np.deg2rad(max(0.0, angle_limit))))
-    angle_penalty_scale = np.float32(max(0.0, float(angle_excess_penalty)))
+        if np.isfinite(angle_limit) and angle_limit > 1.0e-6:
+            angle_excess_knee_degrees = angle_limit
     move_pairs = [(dy, dz) for dz in range(-max_dz, max_dz + 1) for dy in range(-max_dy, max_dy + 1)]
     move_dy = np.asarray([dy for dy, _dz in move_pairs], dtype=np.int32)
     move_dz = np.asarray([dz for _dy, dz in move_pairs], dtype=np.int32)
@@ -7031,8 +7059,7 @@ def _trace2cp_top_monotone_direction_path_z(
             dy_smooth_penalty=dy_smooth_penalty,
             dz_smooth_penalty=dz_smooth_penalty,
             horizontal_step=horizontal_step,
-            min_direction_alignment=min_direction_alignment,
-            angle_penalty_scale=float(angle_penalty_scale),
+            angle_excess_knee_degrees=angle_excess_knee_degrees,
             device=torch_device,
             move_chunk_size=torch_move_chunk_size,
             progress_label=progress_label,
@@ -7139,13 +7166,10 @@ def _trace2cp_top_monotone_direction_path_z(
                         sample_direction = sample_direction / np.clip(sample_norm[:, None], 1.0e-12, None)
                         alignment = np.abs(sample_direction[:, 0] * tangent_x + sample_direction[:, 1] * tangent_y)
                         clipped_alignment = np.clip(alignment, 0.0, 1.0)
-                        direction_cost = (1.0 - clipped_alignment).astype(np.float32)
-                        if min_direction_alignment is not None and angle_penalty_scale > 0.0:
-                            excess = np.maximum(
-                                np.float32(0.0),
-                                np.float32(min_direction_alignment) - clipped_alignment,
-                            )
-                            direction_cost += angle_penalty_scale * excess.astype(np.float32)
+                        direction_cost = _trace2cp_dp_direction_angle_penalty_np(
+                            clipped_alignment,
+                            excess_knee_degrees=angle_excess_knee_degrees,
+                        )
                         sample_cost[sample_rows] = np.float32(float(direction_weight)) * direction_cost
                         if presence_stack is not None:
                             p00 = presence_stack[layer0, sample_y0, sample_x]
@@ -7533,12 +7557,11 @@ def _trace_score_trace2cp_joint_dp_bidirectional(
         max_abs_dy=int(dy_limit),
         max_abs_dz=int(max_abs_dz),
         invalid_penalty=4.0,
-        z_transition_penalty=0.1,
+        z_transition_penalty=_TRACE2CP_SIDE_DP_Z_TRANSITION_PENALTY,
         dy_smooth_penalty=_TRACE2CP_DP_DY_SMOOTH_PENALTY,
-        dz_smooth_penalty=_TRACE2CP_DP_DZ_SMOOTH_PENALTY,
+        dz_smooth_penalty=_TRACE2CP_SIDE_DP_DZ_SMOOTH_PENALTY,
         horizontal_step_px=step,
         max_direction_angle_degrees=max_direction_angle_degrees,
-        angle_excess_penalty=4.0,
         progress_label=progress_label,
         torch_device=torch_device,
     )

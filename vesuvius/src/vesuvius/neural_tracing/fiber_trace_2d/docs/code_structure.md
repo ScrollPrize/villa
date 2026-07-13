@@ -328,18 +328,21 @@ The important behavior is:
   at both the current/last point and candidate point, plus optional presence.
   The monotone-x DP backend is still available for experiments, but only when
   `--trace2cp-dp` is also supplied. In DP mode, the state is
-  `(side_z_layer, y, prev_dy, prev_dz)` and integrates
-  `1 - abs(dot(path_tangent, direction))` across crossed pixel columns. Side DP
-  uses fixed 4 px horizontal transitions, plus the exact target column.
-  `--line-trace-step` controls output resampling density, not DP transition
-  length. The existing candidate-angle limit is applied only as a local angular
-  excess penalty against the sampled direction field; it must not cap global
-  horizontal slope because valid local fibers can be steeper than 45 degrees.
+  `(side_z_layer, y, prev_dy, prev_dz)`. Side DP uses fixed 4 px horizontal
+  transitions, plus the exact target column. `--line-trace-step` controls
+  output resampling density, not DP transition length. Direction scoring is
+  angle-space: `theta = degrees(acos(abs(dot(path_tangent, direction))))`,
+  then `(theta / 10)^2 * (1 + max(theta - knee, 0) / knee)`. The existing
+  candidate-angle setting provides the knee, defaulting to 25 degrees; it must
+  not cap global horizontal slope because valid local fibers can be steeper
+  than 45 degrees.
   Transition scoring samples fractional row/z positions with bilinear
   interpolation and sign-aligns ambiguous direction-vector corners to the
-  transition tangent before blending. This combined path is an
-  inspection/refinement path; the non-combined reference tracer remains the
-  public target-column Trace2CP metric.
+  transition tangent before blending. Side DP uses no default per-step z
+  movement penalty; it uses dz smoothness (`0.05 * (dz_current - dz_previous)^2`)
+  to discourage abrupt z-step changes while allowing steady z motion. This
+  combined path is an inspection/refinement path; the non-combined reference
+  tracer remains the public target-column Trace2CP metric.
   `--trace2cp-combined-mode direction` is the only active combined mode.
   `--trace2cp-use-presence` adds `1 - sigmoid_presence` at sampled DP pixels,
   weighted by `--trace2cp-combined-presence-weight`. Embedding and image
@@ -489,8 +492,8 @@ The important behavior is:
   column is computed with tensor operations over all layers/rows and move
   chunks. Direct helper calls without a torch device still use the NumPy
   fallback. Side-z DP also caps the inferred layer stack to the center-anchored
-  reachable range. The candidate-angle setting is a local direction excess
-  penalty, not a global side-DP move-lattice cap.
+  reachable range. The candidate-angle setting is the angle-space penalty knee,
+  not a global side-DP move-lattice cap.
 - The whole-fiber Trace2CP JPG is composed after pair scoring. Pair-local
   images and traced points are mapped into a shared fiber arc-length x
   coordinate system using each pair's local start/target CP columns and global

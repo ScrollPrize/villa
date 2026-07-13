@@ -97,6 +97,8 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _bilinear_embedding_sample,
     _build_dir_vis_center_patch,
     _trace2cp_candidate_angles_degrees,
+    _trace2cp_dp_direction_angle_penalty_np,
+    _trace2cp_dp_direction_angle_penalty_torch,
     _trace2cp_candidate_fan_directions,
     _trace2cp_target_trace_max_steps,
     _trace_combined_direction_line_to_target,
@@ -3314,6 +3316,35 @@ def test_trace2cp_top_monotone_direction_path_z_torch_matches_numpy() -> None:
     np.testing.assert_array_equal(torch_layers, numpy_layers)
 
 
+def test_trace2cp_dp_direction_angle_penalty_uses_angle_space_scale() -> None:
+    angles = np.asarray([0.0, 10.0, 20.0, 25.0, 45.0], dtype=np.float32)
+    alignment = np.cos(np.deg2rad(angles)).astype(np.float32)
+
+    penalty = _trace2cp_dp_direction_angle_penalty_np(
+        alignment,
+        excess_knee_degrees=25.0,
+    )
+    torch_penalty = _trace2cp_dp_direction_angle_penalty_torch(
+        torch.as_tensor(alignment),
+        excess_knee_degrees=25.0,
+    ).cpu().numpy()
+
+    np.testing.assert_allclose(
+        penalty,
+        torch_penalty,
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    )
+    np.testing.assert_allclose(
+        penalty[:4],
+        np.asarray([0.0, 1.0, 4.0, 6.25], dtype=np.float32),
+        rtol=1.0e-4,
+        atol=1.0e-4,
+    )
+    assert float(penalty[4]) == pytest.approx(36.45, rel=1.0e-3)
+    assert float(penalty[4] / penalty[2]) == pytest.approx(9.1125, rel=1.0e-3)
+
+
 def test_trace2cp_joint_dp_candidate_angle_does_not_cap_global_slope() -> None:
     direction = np.zeros((41, 17, 2), dtype=np.float32)
     steep = np.asarray([4.0, -5.0], dtype=np.float32)
@@ -3472,6 +3503,42 @@ def test_trace2cp_explicit_dp_uses_dp_backend(monkeypatch: pytest.MonkeyPatch) -
     assert calls == ["dp"]
     assert summary.steps == 2
     assert result.metric.reached_target_columns
+
+
+def test_trace2cp_joint_dp_uses_z_smoothness_without_z_step_penalty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, float] = {}
+
+    def fake_path_z(*_args, **kwargs):
+        captured["z_transition_penalty"] = float(kwargs["z_transition_penalty"])
+        captured["dz_smooth_penalty"] = float(kwargs["dz_smooth_penalty"])
+        return (
+            np.asarray([[2.0, 4.0], [18.0, 4.0]], dtype=np.float32),
+            np.asarray([0, 0], dtype=np.int32),
+        )
+
+    monkeypatch.setattr(runner_module, "_trace2cp_top_monotone_direction_path_z", fake_path_z)
+    direction = np.zeros((9, 21, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((9, 21), dtype=bool)
+
+    _trace_score_trace2cp_joint_dp_bidirectional(
+        direction_fields=[direction],
+        valid_masks=[valid],
+        presence_fields=None,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([18.0, 4.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0),
+        step_px=4.0,
+        rf_margin_px=0.0,
+        max_abs_dz=1,
+        horizontal_step_px=4,
+        max_direction_angle_degrees=25.0,
+    )
+
+    assert captured["z_transition_penalty"] == pytest.approx(0.0)
+    assert captured["dz_smooth_penalty"] == pytest.approx(0.05)
 
 
 def test_trace2cp_z_search_defaults_to_stepwise_not_dp(monkeypatch: pytest.MonkeyPatch) -> None:

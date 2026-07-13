@@ -1,40 +1,22 @@
-# Trace2CP DP Routing And Side/Top Experiment Exclusivity Task Log
+# Trace2CP Side-DP Z Smoothness Task Log
 
-- Corrected the Trace2CP routing contract: DP remains available, but only when
-  `--trace2cp-dp` is explicitly passed.
-- Restored default combined Trace2CP to the regular stepwise candidate-fan
-  tracer.
-- Restored default `--trace2cp-z-search` to the older stepwise z-search tracer
-  rather than the side-z DP backend.
-- Added `--trace2cp-dp` CLI validation and propagation for single-pair and
-  whole-fiber Trace2CP.
-- Made `--trace2cp-side-top-z-experiment` exclusive in single-pair mode: it now
-  builds only the segment source, center side prediction, original top strip,
-  side/top-z experiment outputs, and its summary/debug directories. It does not
-  run `_evaluate_trace2cp_refinement_chain`, write `trace2cp_vis.jpg`, or write
-  `trace2cp_summary.txt`.
-- Added focused tests covering default stepwise combined routing, explicit DP
-  combined routing, default stepwise z-search routing, explicit z-DP routing,
-  and exclusive side/top-z experiment export behavior.
-- Added throttled `trace2cp side_top_z progress` rows for side/top-z experiment
-  forward/backward traces. Rows include a bar, step count, top-patch and invalid
-  counts, current z, elapsed time, ETA, and final reason.
-- Added a focused progress regression test.
-- Removed the compact experiment JPG top-direction ticks again; the
-  forward/backward traced top-strip rows stay compact and tick-free.
-- Added an extracted-slice overlay regression test proving
-  `_draw_trace2cp_side_top_z_top_slice_direction_overlay` draws the estimated
-  direction line used for `trace2cp_side_top_z_top_overlays/`.
-- Updated `planning/specs.md`, `docs/code_structure.md`, `planning/task.md`,
-  and `planning/task_plan.md` for the corrected semantics.
+- Confirmed side/joint Trace2CP DP previously passed `z_transition_penalty=0.1`
+  and `dz_smooth_penalty=0.0` into the monotone DP helper.
+- Added side-DP-specific constants:
+  - `_TRACE2CP_SIDE_DP_Z_TRANSITION_PENALTY = 0.0`
+  - `_TRACE2CP_SIDE_DP_DZ_SMOOTH_PENALTY = 0.05`
+- Updated `_trace_score_trace2cp_joint_dp_bidirectional` to pass those
+  constants, so side-DP no longer penalizes total z movement and only penalizes
+  abrupt changes in z step.
+- Left the lower generic DP helper defaults unchanged so top-model DP
+  diagnostic behavior is not changed by this side-DP task.
+- Added a wrapper-level regression test proving side/joint DP passes zero
+  `z_transition_penalty` and nonzero `dz_smooth_penalty`.
+- Updated `planning/specs.md`, `docs/code_structure.md`,
+  `planning/task.md`, `planning/task_plan.md`, `planning/status.md`, and
+  `planning/changelog.md`.
 - Validation:
-  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-    passed.
-  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'combined_defaults_to_stepwise or explicit_dp_uses_dp_backend or z_search_defaults_to_stepwise or z_search_explicit_dp or side_top_z_experiment_export_is_exclusive'`
-    passed: 5 passed, 235 deselected.
-  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'side_top_z_experiment_progress_prints_bar or side_top_z_experiment_scores_candidate_side_direction or side_top_z_experiment_export_is_exclusive'`
-    passed: 3 passed, 238 deselected.
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'joint_dp_uses_z_smoothness_without_z_step_penalty or explicit_dp_uses_dp_backend or z_search_explicit_dp_uses_dp_backend or top_monotone_direction_path_z_torch_matches_numpy'`
+    passed: 4 passed, 240 deselected.
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-    passed: 241 passed.
-  - `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/code_structure.md`
-    passed.
+    passed: 244 passed.

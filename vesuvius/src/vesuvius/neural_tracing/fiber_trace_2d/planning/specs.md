@@ -559,26 +559,31 @@
   supplied.
 - The side-strip DP state is `(side_z_layer, y, prev_dy, prev_dz)`. It uses
   fixed 4 px horizontal transitions, plus the exact target column, and
-  integrates direction alignment cost
-  `direction_weight * (1 - abs(dot(path_tangent, layer_direction)))` across
-  every crossed pixel column. Transition samples use fractional bilinear
+  integrates angle-space direction alignment cost across every crossed pixel
+  column. The sampled alignment is frame-ambiguous:
+  `theta = degrees(acos(abs(dot(path_tangent, layer_direction))))`, and the
+  cost is
+  `(theta / 10)^2 * (1 + max(theta - knee, 0) / knee)` before applying
+  `direction_weight`. Transition samples use fractional bilinear
   interpolation in strip row and z-layer coordinates, not rounded nearest
   lookup. Because decoded Lasagna directions are sign-ambiguous, all
   interpolated direction-vector corners are sign-aligned to the candidate
   transition tangent before blending. Invalid or missing direction pixels add a
-  fixed penalty instead of breaking the path.
+  fixed penalty instead of breaking the path. Side-strip DP does not apply a
+  default per-step z movement penalty; its default z regularization is
+  second-order dz smoothness, currently `0.05 * (dz_current - dz_previous)^2`,
+  so steady z motion is allowed while abrupt z-step changes are discouraged.
 - The side-strip DP still uses `--line-trace-step` only for resampling the
   selected fused output trace and for the public trace visualization density.
   It must not use `--line-trace-step` as the DP transition length.
-- The side-strip DP must apply the existing Trace2CP candidate-angle setting
-  only as a local angular excess penalty against the sampled direction field:
-  path tangents whose frame-ambiguous direction agreement falls outside
-  `--line-trace-candidate-max-degrees` receive extra cost. This setting must
-  not cap global horizontal slope or vertical moves, because valid local fiber
-  directions can be steeper than 45 degrees.
-- The default side/top DP second-order smoothness penalties are zero. Optional
-  non-zero smoothing should discourage jitter without forcing an overly
-  straight path.
+- The side-strip DP uses the existing Trace2CP candidate-angle setting as the
+  local angle-excess knee in that penalty. With the default 25 degree knee,
+  10 degrees costs roughly 1, 20 degrees roughly 4, and 45 degrees roughly
+  36. This setting must not cap global horizontal slope or vertical moves,
+  because valid local fiber directions can be steeper than 45 degrees.
+- The default side-strip DP dy smoothness penalty is zero. The default
+  side-strip DP dz smoothness penalty is nonzero as described above and should
+  discourage lateral/z jitter without penalizing total z travel.
 - `--trace2cp-combined-mode direction` is the only active combined mode.
   `--trace2cp-combined-mode embedding`, `--trace2cp-use-embedding`,
   `--trace2cp-combined-mode image`, and `--trace2cp-use-image` are removed from
@@ -731,9 +736,10 @@
   are sampled from the selected side-strip z layer.
 - With explicit `--trace2cp-dp`, z-search infers the bounded reachable layer
   stack for the pair before running the side DP. The DP may transition between
-  neighboring z layers with the configured z cost and smoothness terms. DP
-  output is already a fused CP-to-CP path, so the optimized visualization row
-  uses that joint path directly.
+  neighboring z layers without an absolute z movement penalty, while its
+  default dz smoothness term discourages abrupt z-step changes. DP output is
+  already a fused CP-to-CP path, so the optimized visualization row uses that
+  joint path directly.
 - Z-search does not change the public `trace2cp_error`, training test metric,
   or best-checkpoint selection. Those remain target-column y error per
   horizontal CP span.
