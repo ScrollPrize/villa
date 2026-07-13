@@ -5,6 +5,7 @@ const BeforeAfter = ({
   afterImage,
   altBefore = "Before",
   altAfter = "After",
+  className = "",
 }) => {
   const [sliderPosition, setSliderPosition] = useState(50);
   const containerRef = useRef(null);
@@ -43,7 +44,7 @@ const BeforeAfter = ({
   return (
     <div
       ref={containerRef}
-      className="h-80 rounded-lg border border-solid border-line relative inline-block overflow-hidden cursor-col-resize w-full max-w-4xl select-none"
+      className={`${className || "h-80"} rounded-lg border border-solid border-line relative inline-block overflow-hidden cursor-col-resize w-full max-w-4xl select-none`}
       onMouseDown={handleMouseDown}
       onTouchStart={handleMouseDown}
       style={{

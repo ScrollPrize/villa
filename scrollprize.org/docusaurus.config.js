@@ -189,28 +189,10 @@ const config = {
           },
           items: [
             { to: "/prizes", label: "Prizes", position: "left" },
+            { to: "/2026_open_problems", label: "Problems", position: "left" },
             {
               type: "dropdown",
-              label: "Open Problems",
-              position: "left",
-              items: [
-                {
-                  to: "/2026_open_problems",
-                  label: "Problems in-depth",
-                },
-                {
-                  to: "/open_problems/winding_annotations",
-                  label: "Winding Annotations",
-                },
-                {
-                  to: "/open_problems/ink_detection",
-                  label: "Ink Detection",
-                },
-              ],
-            },
-            {
-              type: "dropdown",
-              label: "Tutorials",
+              label: "Tutorials & In-depth",
               position: "left",
               items: [
                 {
@@ -220,6 +202,10 @@ const config = {
                 {
                   to: "/tutorial_spiral",
                   label: "Spiral Fitting",
+                },
+                {
+                  to: "/open_problems/winding_annotations",
+                  label: "Winding Annotations",
                 },
                 {
                   to: "/tutorial5",
@@ -412,6 +398,13 @@ const config = {
           {
             to: "/unwrapping",
             from: "/open_problem_rep",
+          },
+          // The open_problems/ink_detection page was retired (superseded by
+          // the Ink recovery section of Problems in-depth + the ink
+          // tutorial) — keep the URL alive.
+          {
+            to: "/tutorial5",
+            from: "/open_problems/ink_detection",
           },
           // Pages retired in the C6 fix round — keep the URLs alive.
           {

@@ -12,7 +12,7 @@ prizes:
     amount: 1000000
     cadence: "Deadline June 25th, 2027"
     href: "/prizes#2027-grand-prize"
-    hook: "Fully unroll and read one of 14 sealed scrolls."
+    hook: "Fully unroll and make readable one of 13 sealed scrolls."
     featured: true
     tiers:
       - name: "1st"
@@ -98,27 +98,26 @@ Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us m
 
 ## 2027 Grand Prize {#2027-grand-prize}
 
-**<span className="vc-money">\$800,000</span> to the first team or individual to fully unroll and read a scroll from the set below.** We also have prizes for **second place (<span className="vc-money">\$100,000</span>)**, **third place (<span className="vc-money">\$50,000</span>)**, and **fourth place (<span className="vc-money">\$50,000</span>)** — <span className="vc-money">\$1,000,000</span> in total. Prizes are awarded according to the rules listed below.
+**<span className="vc-money">\$800,000</span> to the first team or individual to fully unroll and make readable a scroll from the set below.** We also have prizes for **second place (<span className="vc-money">\$100,000</span>)**, **third place (<span className="vc-money">\$50,000</span>)**, and **fourth place (<span className="vc-money">\$50,000</span>)** — <span className="vc-money">\$1,000,000</span> in total. Prizes are awarded according to the rules listed below.
 
 Prizes will be awarded to any team or individual that fully digitally unrolls and makes readable (according to the conditions and requirements specified below) one of the eligible CT scans of carbonized scrolls from Herculaneum:
 
 <details>
-<summary>Eligible scroll volumes (14)</summary>
+<summary>Eligible scroll volumes (13)</summary>
 
 1. [PHerc. 125](/data_browser/PHerc0125) — [20250720091415-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0125/volumes/20250821151825-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22125_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
 2. [PHerc. 191](/data_browser/PHerc0191) — [20250720024445-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0191/volumes/20250821151635-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22191_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
 3. [PHerc. 211](/data_browser/PHerc0211) — [20250720140115-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0211/volumes/20250821151803-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22211_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
 4. [PHerc. 257](/data_browser/PHerc0257) — [20250720113058-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0257/volumes/20250821151750-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22257_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
 5. [PHerc. 268](/data_browser/PHerc0268) — [20250511054932-8.640um-1.2m-116keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0268/volumes/20251110183117-8.640um-1.2m-116keV-masked.zarr%22%2C%22name%22%3A%22268_8.64um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-6. [PHerc. 343](/data_browser/PHerc0343) — [20250509220833-8.640um-1.2m-116keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0343/volumes/20250521140437-8.640um-1.2m-116keV-masked.zarr%22%2C%22name%22%3A%22343_8.64um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-7. [PHerc. 358](/data_browser/PHerc0358) — [20250719150703-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0358/volumes/20250821151737-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22358_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-8. [PHerc. 800](/data_browser/PHerc0800) — [20250510225703-8.640um-1.2m-116keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr%22%2C%22name%22%3A%22800_8.64um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-9. [PHerc. 813](/data_browser/PHerc0813) — [20250720160015-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0813/volumes/20250821151723-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22813_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-10. [PHerc. 826](/data_browser/PHerc0826) — [20250720174915-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0826/volumes/20250821151701-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22826_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-11. [PHerc. 1203](/data_browser/PHerc1203) — [20250720004030-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1203/volumes/20250820131727-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%221203_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-12. [PHerc. 1218](/data_browser/PHerc1218) — [20250510170249-8.640um-1.2m-116keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1218/volumes/20250521120456-8.640um-1.2m-116keV-masked.zarr%22%2C%22name%22%3A%221218_8.64um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-13. [PHerc. 1447](/data_browser/PHerc1447) — [20250509011039-8.640um-1.2m-116keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr%22%2C%22name%22%3A%221447_8.64um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
-14. [PHerc. 1545](/data_browser/PHerc1545) — [20250720045926-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1545/volumes/20250821151648-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%221545_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
+6. [PHerc. 358](/data_browser/PHerc0358) — [20250719150703-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0358/volumes/20250821151737-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22358_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
+7. [PHerc. 800](/data_browser/PHerc0800) — [20250510225703-8.640um-1.2m-116keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr%22%2C%22name%22%3A%22800_8.64um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
+8. [PHerc. 813](/data_browser/PHerc0813) — [20250720160015-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0813/volumes/20250821151723-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22813_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
+9. [PHerc. 826](/data_browser/PHerc0826) — [20250720174915-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0826/volumes/20250821151701-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%22826_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
+10. [PHerc. 1203](/data_browser/PHerc1203) — [20250720004030-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1203/volumes/20250820131727-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%221203_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
+11. [PHerc. 1218](/data_browser/PHerc1218) — [20250510170249-8.640um-1.2m-116keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1218/volumes/20250521120456-8.640um-1.2m-116keV-masked.zarr%22%2C%22name%22%3A%221218_8.64um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
+12. [PHerc. 1447](/data_browser/PHerc1447) — [20250509011039-8.640um-1.2m-116keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr%22%2C%22name%22%3A%221447_8.64um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
+13. [PHerc. 1545](/data_browser/PHerc1545) — [20250720045926-9.362um-1.2m-113keV](https://neuroglancer-demo.appspot.com/#!%7B%22layers%22%3A%5B%7B%22type%22%3A%22image%22%2C%22source%22%3A%22zarr2%3A//https%3A//vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc1545/volumes/20250821151648-9.362um-1.2m-113keV-masked.zarr%22%2C%22name%22%3A%221545_9.362um%22%2C%22shader%22%3A%22%23uicontrol%20invlerp%20normalized%5Cnvoid%20main%28%29%20%7B%20emitGrayscale%28normalized%28%29%29%3B%20%7D%22%7D%5D%2C%22layout%22%3A%224panel%22%7D)
 </details>
 
 **Deadline: June 25th, 2027 (11:59pm Pacific)**
@@ -133,7 +132,7 @@ Prizes will be awarded to any team or individual that fully digitally unrolls an
 * 100% of the papyrus recto surface unrolled. If the scroll possesses flakes or detached patches, they should also be segmented and unrolled either in a single or in a sequence of separate tifxyz meshes. It is permissible to skip disconnected outer patches if they constitute less than 10% of the total scroll surface.
 * Ink detection or renders with ink should be produced from or on top of the flattened images. Columns of text should be visible everywhere. Verify that at least 70% of each counted column's preserved characters are legible. Legible characters only count as legible when identified on a letter-by-letter basis without papyrological interpolation. If text is not displayed, that area will be counted as "non legible" unless an explanation for the lack of ink is provided — an explanation is valid only if the Vesuvius Challenge Team acknowledges it as valid.
 * No overlap between training and prediction regions. Overlap leads to the memorization of annotated labels — ink model outputs should not overlap with any training data used.
-* In case multiple eligible submissions are concurrently evaluated, a ranking will be determined counting the number of legible characters in the submitted images, abiding by the legibility criteria defined before.
+* In case multiple eligible submissions are concurrently evaluated, a ranking will be determined counting the number of legible lines in the submitted images, abiding by the legibility criteria defined before.
 * You may use any information or resource that is publicly available (published scholarship, other scrolls' data, segments, or models, third-party pretrained models, etc.), provided that use is permitted by that resource's own license or terms. Data derived from higher resolution scans of the submitted scroll volume cannot be used.
 
 **Compute and data conditions**
@@ -149,12 +148,13 @@ Prizes will be awarded to any team or individual that fully digitally unrolls an
 
 If you have a qualifying result, submit it for consideration by sending an email to [grandprize@scrollprize.org](mailto:grandprize@scrollprize.org) and provide the following:
 
-* **Meshes.** The submission must contain a set of meshes in tifxyz format whose union corresponds to the totality of the scroll surface to be virtually unwrapped. Each tifxyz must already include a low-distortion isometric 2D parametrization (flattening). At most one mesh per full column of text (plus its margins) will be accepted; smaller meshes are not considered valid unless they localize regions where the papyrus is broken, or detached patches.
+* **Meshes.** The submission must contain a set of meshes in tifxyz format whose union corresponds to the totality of the scroll surface to be virtually unwrapped. Each tifxyz must already include a low-distortion isometric 2D parametrization (flattening). At most one mesh per full column of text (plus its margins) will be accepted; smaller meshes are not considered valid unless they localize regions where the papyrus is broken, or detached patches. Name each mesh with a sequential column number (e.g. `column_01.tifxyz`, `column_02.tifxyz`, ...) following the order of the windings, so every mesh is identifiable by its column.
 * **Images.** Submissions must include images of the virtually unwrapped papyrus, showing visible and legible text.
   * Submit a single static image for each column or sequence of consecutive wraps. Images must be generated programmatically from the reconstructed CT scan volume and the corresponding mesh submitted in the same package, and should not contain manual annotations of characters or text.
   * Specify which scroll each image came from.
-  * Name each image after the tifxyz mesh (from the same package) used to generate it, so every image is traceable to the exact surface it was rendered from.
+  * Name each image after the tifxyz mesh (from the same package) used to generate it — carrying the same sequential column number — so every image is traceable to the exact surface it was rendered from.
   * Include scale bars showing the size of 1cm on each submission image.
+  * Also include a single banner image spanning the full unrolled scroll, showing ink detection results across all columns, with each column's number overlaid on it — so the whole submission can be checked against the numbered meshes and images at a glance.
 * **Methodology.** A detailed technical description of how your solution works. We need to be able to reproduce your work, so please make this as easy as possible:
   * Please create a Docker image that we can easily run to reproduce your work, and please include system requirements.
   * Attach your code/video directly to the email, or include an easily accessible link from which we can download it.
@@ -175,7 +175,7 @@ All submissions will be assessed by the Review Team, which consists of a Technic
 * We will acknowledge having received your submission within a week. Depending on the difficulty of verifying your methodology, it might take longer until we are able to make our final assessment.
 * In case there are multiple teams that submit qualifying results, the team that submitted first will win (independent of how long our assessment takes).
 
-**2. Papyrological assessment.** Once we are reasonably confident that your solution is technically valid and appears to meet the qualifications, we will share your results with the Papyrology Team, who will judge if the text is legitimate and meets the required legibility standards.
+**2. Papyrological assessment.** Once we are reasonably confident that your solution is technically valid and appears to meet the qualifications, we will share your results with the Papyrology Team, who will judge if the text is legitimate and meets the required legibility standards. Each submitted column is distributed to one or more papyrologists, who independently attribute a legibility score to it; a column counts toward the legibility thresholds above only once it is scored as legible.
 
 **Additional terms**
 
@@ -186,6 +186,8 @@ All submissions will be assessed by the Review Team, which consists of a Technic
 * The general [Terms and Conditions](#terms-and-conditions) at the bottom of this page also apply.
 
 </details>
+
+[Submission Form](https://forms.gle/wvNK7DkNKuRKjHJdA)
 
 ***
 
@@ -208,7 +210,7 @@ These prizes bridge ink detection on fragments to the much harder problem of rea
   * Specify which scroll the image comes from. For multiple scrolls, please make multiple submissions.
   * Include a scale bar showing the size of 1 cm on the submission image, and the pixel and millimeter dimensions of a few representative letters.
   * Name each image after the tifxyz mesh (from the same package) used to generate it, so it is traceable to the exact surface it was rendered from.
-  * Annotate the rows of text. Letters in read samples run overwhelmingly parallel to the horizontal papyrus fibers — where possible, overlay your ink predictions on a fiber-visible rendering. Misaligned text or text without clear rows does not immediately disqualify a submission, but it does make it less likely that you found valid text.
+  * Annotate the rows of text. Usually, letters in read samples run overwhelmingly parallel to the horizontal papyrus fibers — where possible, overlay your ink predictions on a fiber-visible rendering. Annotate rows without obscuring the visible text — e.g. by drawing a horizontal baseline through each row or a rectangle around it, rather than overwriting the letters themselves. Misaligned text or text without clear rows does not immediately disqualify a submission, but it does make it less likely that you found valid text.
 * **Methodology.** A detailed technical description of how your solution works. We need to be able to reproduce your work, so please make this as easy as possible:
   * For fully automated software, consider a Docker image that we can easily run to reproduce your work, and please include system requirements.
   * For software with a human in the loop, please provide written instructions and a video explaining how to use your tool. We’ll work with you to learn how to use it, but we’d like to have a strong starting point.
@@ -220,11 +222,10 @@ These prizes bridge ink detection on fragments to the much harder problem of rea
 * **Other information.** Feel free to include any other things we should know.
 
 * Your submission will be reviewed by the review teams to verify technical validity and papyrological plausibility and legibility.
-* Submissions remain open until the prize is won: if we discover months from now that your method was right all along, you will then win.
 * As with the Grand Prize, you **must not** make your discovery public until the prize is officially announced. We will work with you to announce your findings.
 </details>
 
-[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSdw43FX_uPQwBTIV8pC2y0xkwZmu6GhrwxV4n3WEbqC8Xof9Q/viewform?usp=dialog)
+[Submission Form](https://forms.gle/TM5ao8GwC2mDrdLk9)
 
 ***
 
@@ -238,7 +239,7 @@ Discovering a scroll’s title tells scholars what — and whom — they have be
 
 <div className="mb-4">
   <img src="/img/data/title_example.webp" className="w-[50%]"/>
-  <figcaption className="mt-[-6px]">Visible Title in a Scroll Fragment.</figcaption>
+  <figcaption className="mt-[-6px]">Visible Title in a Physically Opened Papyrus (PHerc. 1050).</figcaption>
 </div>
 
 <details>
@@ -266,7 +267,7 @@ Discovering a scroll’s title tells scholars what — and whom — they have be
 * As with the Grand Prize, you **must not** make your discovery public until the prize is officially announced. We will work with you to announce your findings.
 </details>
 
-[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLSdw43FX_uPQwBTIV8pC2y0xkwZmu6GhrwxV4n3WEbqC8Xof9Q/viewform?usp=dialog)
+[Submission Form](https://forms.gle/4zeVPPBtNdSCAQa88)
 
 ***
 
@@ -318,7 +319,7 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
    * Designed for modular integration
 </details>
 
-[Submission Form](https://forms.gle/Sy6mW5cfJS2U7E9F7)
+[Submission Form](https://forms.gle/xoF5C3QsYutKP97x7)
 
 ***
 

@@ -69,7 +69,7 @@ This is where one of the core difficulties of the Herculaneum Papyri comes in: t
 
 So why scan with X-rays at all? Because visible and infrared light can't see inside a *rolled* scroll — they don't penetrate the papyrus. X-ray CT does: it images the interior of an intact scroll at high resolution, but, as the fragment above shows, at the cost of the visible ink contrast. Ink detection exists to win that contrast back computationally.
 
-Not all of that contrast is lost, though. What does the surviving signal look like? In PHerc. Paris 4 in particular, ink can sit as a thin layer on the papyrus surface, and on the flattened surface volume it often shows up as a **crackle** — a texture like cracked mud, raised slightly above the papyrus.
+Not all of that contrast is lost, though. What does the surviving signal look like? In PHerc. Paris 4 in particular, ink can sit as a thin layer on the papyrus surface, and on the flattened surface volume it often shows up as a **crackle** — a texture like cracked mud, raised slightly above the papyrus. Crackle is one of several surface-morphology cues that can betray ink; on other scrolls the signal is more subtle and heterogeneous, and may instead depend on fine texture, local roughness, deposits, or deformation.
 
 <figure>
   <a href="/img/tutorials/ink-signal-volumetric.webp" target="_blank"><img src="/img/tutorials/ink-signal-volumetric.webp" /></a>

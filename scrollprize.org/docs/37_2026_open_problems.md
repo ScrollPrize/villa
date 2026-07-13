@@ -1,7 +1,7 @@
 ---
 id: 2026_open_problems
 title: "Open Problems: Why Reading Every Herculaneum Scroll Is Still a Challenge"
-sidebar_label: "Problems in-depth"
+sidebar_label: "Open Problems"
 ---
 
 <head>
@@ -411,7 +411,7 @@ A global prior can organize and regularize geometry, allowing a single consisten
 
 <Admonition type="tip" icon="🙋" title="How you can help">
 
-Devise better evaluation suites and loss functions to fit the spiral. Increase its expressivity and reduce the number of needed annotations. Most importantly, relative winding number annotations seem to have a great impact on the spiral fit. Automating these procedures will boost scalability by a great extent\!
+Devise better evaluation suites and loss functions to fit the spiral. Increase its expressivity and reduce the number of needed annotations. Most importantly, relative [winding number annotations](/open_problems/winding_annotations) seem to have a great impact on the spiral fit. Automating these procedures will boost scalability by a great extent\!
 
 </Admonition>
 ### Label quality: one of the main unwrapping bottlenecks

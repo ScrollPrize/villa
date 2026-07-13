@@ -110,7 +110,7 @@ export function GetStarted() {
             <a href="/prizes#first-letters-prizes">
               First Letters: up to $500,000
             </a>
-            <a href="/2026_open_problems#3-ink-recovery-detecting-what-is-written">
+            <a href="/2026_open_problems#3-ink-recovery-reading-the-scrolls">
               The open problem
             </a>
           </nav>

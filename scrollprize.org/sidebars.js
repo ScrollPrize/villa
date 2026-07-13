@@ -28,31 +28,18 @@ const sidebars = {
       items: [
         { type: 'doc', id: 'get_started' },
         { type: 'doc', id: 'prizes' },
+        { type: 'doc', id: '2026_open_problems', label: 'Open Problems' },
       ],
     },
     {
       type: 'category',
-      label: 'Open Problems',
-      collapsible: true,
-      collapsed: false,
-      items: [
-        {
-          type: 'doc',
-          id: '2026_open_problems',
-          label: 'Problems in-depth',
-        },
-        { type: 'doc', id: 'winding_annotations' },
-        { type: 'doc', id: 'ink_detection_problem' },
-      ],
-    },
-    {
-      type: 'category',
-      label: 'Tutorials',
+      label: 'Tutorials & In-depth',
       collapsible: true,
       collapsed: false,
       items: [
         { type: 'doc', id: 'tutorial_VC3D' },
         { type: 'doc', id: 'tutorial_spiral' },
+        { type: 'doc', id: 'winding_annotations' },
         { type: 'doc', id: 'tutorial5' },
       ],
     },

@@ -610,7 +610,7 @@ export function Landing() {
         </title>
         <meta
           name="description"
-          content="Vesuvius Challenge uses machine learning and computer vision to read the carbonized Herculaneum scrolls buried by Vesuvius in 79 AD. Over $1,800,500 awarded."
+          content={`Vesuvius Challenge uses machine learning and computer vision to read the carbonized Herculaneum scrolls buried by Vesuvius in 79 AD. Over ${usd.format(awardedTotal)} awarded.`}
         />
         <link rel="canonical" href={canonicalUrl} />
         {/* Preload the LCP poster image */}
@@ -637,7 +637,7 @@ export function Landing() {
         />
         <meta
           property="og:description"
-          content="Vesuvius Challenge uses machine learning and computer vision to read the carbonized Herculaneum scrolls buried by Vesuvius in 79 AD. Over $1,800,500 awarded."
+          content={`Vesuvius Challenge uses machine learning and computer vision to read the carbonized Herculaneum scrolls buried by Vesuvius in 79 AD. Over ${usd.format(awardedTotal)} awarded.`}
         />
         <meta
           property="og:image"
@@ -652,7 +652,7 @@ export function Landing() {
         />
         <meta
           name="twitter:description"
-          content="Vesuvius Challenge uses machine learning and computer vision to read the carbonized Herculaneum scrolls buried by Vesuvius in 79 AD. Over $1,800,500 awarded."
+          content={`Vesuvius Challenge uses machine learning and computer vision to read the carbonized Herculaneum scrolls buried by Vesuvius in 79 AD. Over ${usd.format(awardedTotal)} awarded.`}
         />
         <meta
           name="twitter:image"
@@ -699,14 +699,14 @@ export function Landing() {
                   the carbonized Herculaneum scrolls without opening them.
                 </p>
                 <div className="vc-hero__ctas">
+                  <a className="vc-btn" href="/get_started">
+                    Get Started
+                  </a>
                   <a
                     className="vc-btn-outline"
                     href="https://discord.gg/V4fJhvtaQn"
                   >
                     Join Discord
-                  </a>
-                  <a className="vc-btn" href="/get_started">
-                    Get Started
                   </a>
                 </div>
               </div>
@@ -835,7 +835,7 @@ export function Landing() {
                 title="Virtual Unwrapping"
                 titleHref="/2026_open_problems#2-unwrapping-turning-disconnected-voxels-into-a-surface"
                 linkText="Current Path"
-                href="/open_problems/winding_annotations"
+                href="/tutorial_spiral"
                 bounty={
                   (grandPrize2027 || progressPrizes) && {
                     href: (grandPrize2027 || progressPrizes).href,
@@ -877,7 +877,7 @@ export function Landing() {
                 }
               >
                 <p>
-                  A CT scan yields voxels, not pages: the writing surface
+                  A CT scan yields voxels, not columns: the writing surface
                   must be segmented, meshed, and flattened. The pipeline
                   fails where adjacent sheets are densely packed, or tear.
                   Tracing remains semi-automated. Fully automating it is an
@@ -887,7 +887,7 @@ export function Landing() {
 
               <ChallengeBox
                 title="Ink Detection"
-                titleHref="/2026_open_problems#3-ink-recovery-detecting-what-is-written"
+                titleHref="/2026_open_problems#3-ink-recovery-reading-the-scrolls"
                 linkText="Find a Letter"
                 href="/tutorial5"
                 bounty={
@@ -1018,18 +1018,15 @@ export function Landing() {
                     read end to end. The challenge now moves onto its next
                     stage: reading multiple entire scrolls.
                   </p>
-                  <a
-                    href="/firstscroll"
-                    className="vc-media vc-banner-1667"
-                    aria-label="The unwrapped writing surface of PHerc. 1667 — read the announcement"
-                  >
-                    <img
-                      src="/img/firstscroll/banner-strip.webp"
-                      alt="The unwrapped writing surface of PHerc. 1667, showing columns of ancient Greek text"
-                      loading="lazy"
-                      decoding="async"
+                  <div className="vc-media">
+                    <BeforeAfter
+                      beforeImage="/img/firstscroll/hero-reveal-start-960-crop.webp"
+                      afterImage="/img/firstscroll/hero-reveal-end-960-crop.webp"
+                      altBefore="PHerc. 1667 as a sealed CT scan, before virtual unwrapping"
+                      altAfter="The unwrapped writing surface of PHerc. 1667, showing columns of ancient Greek text"
+                      className="aspect-[20/7] h-auto"
                     />
-                  </a>
+                  </div>
                   <a href="/prizes" className="vc-cta">
                     See all open prizes
                   </a>

@@ -101,8 +101,9 @@ Most are by Philodemus. This is a list of English translations we have found so 
 #### Academic papers
 
 * For the current end-to-end technical overview of the pipeline — and where you can help — see [Open Problems: Why Reading Every Herculaneum Scroll Is Still a Challenge](2026_open_problems).
+* 2026: [Complete virtual unwrapping and reading of a rolled Herculaneum papyrus](https://arxiv.org/abs/2606.29085) — the paper behind the first fully sealed scroll (PHerc. 1667) read end to end.
 * Data papers:
-  * 2019: [EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT](https://arxiv.org/abs/2304.02084)
+  * 2023: [EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT](https://arxiv.org/abs/2304.02084)
   * 2023: [EduceLab Herculaneum Scroll Data (2023) Info Sheet](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing)
 * [Hard-Hearted Scrolls: A Noninvasive Method for Reading the Herculaneum Papyri](https://uknowledge.uky.edu/cs_etds/138/) (Stephen Parsons’ PhD dissertation)
 * [From invisibility to readability: Recovering the ink of Herculaneum](https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0215775&type=printable)
@@ -439,12 +440,6 @@ There's a region in Scroll 2 where the scroll center appears to have drifted/squ
 Assuming consistent handedness, a counterclockwise spiral suggests the released half of Scroll 2 is the bottom half of the scroll: Slice 0 is in the middle and Slice 14000+ is the bottom.
 
 The direction of a given line of writing in Scroll 2 would be counterclockwise around the TIF cross-sections, with the bottom of the letters on higher-numbered images and the top of the letters on lower-numbered images.
-
-#### Scrolls 3, 4, 5
-
-Scrolls 3, 4, and 5 appear to be oriented like Scroll 2, with counterclockwise spirals. However, a change in scanning convention flipped the ordering of the tif stack. When viewing Scroll 3, 4, or 5 TIF cross-sections from the scan, the image number decreases from the screen toward the viewer’s eye. Therefore, the direction of a given line of writing should be counterclockwise around the TIF cross-sections. The bottom of the letters should be on the lower-numbered images, and the top of the letters should be on the higher-numbered images.
-
-Note: This flip in the scanning convention must be accounted for in any rendering pipelines.
 
 ### What happened to the people when Mount Vesuvius erupted? 😢
 
