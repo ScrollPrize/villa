@@ -100,6 +100,9 @@ These annotations do not need to form a dense surface or cover the entire scroll
 A surface patch traces a locally connected area of a single winding. It can be created manually or by a segmentation method, then used as same-winding evidence by the spiral fit. An interesting avenue would be
 identifying methods to automatically crop "good" regions of the spiral fit, and using these as surface patch inputs to a subsequent run. 
 
+The patch in this image is cropped from a large trace which had sheet switches, 
+but still contained many large areas which were high quality.
+
 <figure className="mb-6 max-w-[680px] mx-auto">
   <a href="/img/open-problems/winding-annotations/surface-patches.webp" target="_blank">
     <img src="/img/open-problems/winding-annotations/surface-patches.webp" alt="A local papyrus surface patch rendered from CT data" className="w-[100%]" />
