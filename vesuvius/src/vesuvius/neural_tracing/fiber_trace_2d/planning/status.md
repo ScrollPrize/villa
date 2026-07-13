@@ -5,8 +5,8 @@
 - [x] Write task definition.
 - [x] Write implementation plan.
 - [x] Include spec/docs/testing plan.
-- [ ] Review plan against existing specs before implementation.
-- [ ] Implement explicit side z-axis handling.
-- [ ] Update specs/docs/changelog/task log.
-- [ ] Add/update tests.
-- [ ] Run focused/full validation.
+- [x] Review plan against existing specs before implementation.
+- [x] Implement explicit side z-axis handling.
+- [x] Update specs/docs/changelog/task log.
+- [x] Add/update tests.
+- [x] Run focused validation.

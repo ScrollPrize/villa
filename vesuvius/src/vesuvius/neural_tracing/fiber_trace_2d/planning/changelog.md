@@ -2,6 +2,10 @@
 
 ## 2026-07-13
 
+- Corrected Trace2CP side z-search to offset layers along the side-strip
+  out-of-plane frame side axis instead of the side-strip image-y/Lasagna row
+  normal axis, covering stepwise z-search, DP z-search, side/top-z
+  diagnostics, and z-corrected top/debug exports.
 - Added opt-in single-pair `--trace2cp-obj` export for vertex-colored OBJ
   surfaces under `trace2cp_obj/`, using the same Trace2CP side/top/z-corrected
   coordinate grids as the JPG/TIFF debug outputs.

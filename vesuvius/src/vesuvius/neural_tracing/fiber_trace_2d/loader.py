@@ -1768,6 +1768,8 @@ class FiberStrip2DLoader:
             frame=grid.frame,
             offset_axis_xyz=crop_tensor(grid.offset_axis_xyz),
             offset_axis_zyx=crop_tensor(grid.offset_axis_zyx),
+            side_axis_xyz=crop_tensor(grid.side_axis_xyz),
+            side_axis_zyx=crop_tensor(grid.side_axis_zyx),
         )
         line = source_line_xy[x0:x1].contiguous()
         shift = torch.tensor([float(x0), float(y0)], dtype=line.dtype, device=line.device)
@@ -1809,6 +1811,17 @@ class FiberStrip2DLoader:
                     if bool(require_offset_axis)
                     else None
                 )
+                side_axis_zyx_np = (
+                    np.asarray(data["side_axis_zyx"], dtype=np.float32)
+                    if "side_axis_zyx" in data
+                    else None
+                )
+                side_axis_zyx = (
+                    torch.as_tensor(side_axis_zyx_np, dtype=torch.float32, device=device)
+                    if side_axis_zyx_np is not None
+                    and side_axis_zyx_np.shape == tuple(coords_zyx.shape)
+                    else None
+                )
                 grid = FiberStripGridTorch(
                     coords_xyz=coords_zyx[..., (2, 1, 0)].contiguous(),
                     coords_zyx=coords_zyx,
@@ -1820,6 +1833,12 @@ class FiberStrip2DLoader:
                         else offset_axis_zyx[..., (2, 1, 0)].contiguous()
                     ),
                     offset_axis_zyx=offset_axis_zyx,
+                    side_axis_xyz=(
+                        None
+                        if side_axis_zyx is None
+                        else side_axis_zyx[..., (2, 1, 0)].contiguous()
+                    ),
+                    side_axis_zyx=side_axis_zyx,
                 )
                 source_line_xy = torch.as_tensor(np.asarray(data["source_line_xy"], dtype=np.float32), device=device)
                 source_control_point_xy = torch.as_tensor(
@@ -1854,20 +1873,22 @@ class FiberStrip2DLoader:
         frame = grid.frame
         try:
             with tmp.open("wb") as handle:
-                np.savez(
-                    handle,
-                    version=np.asarray(_STRIP_COORD_CACHE_VERSION),
-                    source_shape_hw=np.asarray(source_shape_hw, dtype=np.int64),
-                    center_offset=np.asarray(float(center_offset), dtype=np.float64),
-                    coords_zyx=_as_numpy_float32(grid.coords_zyx),
-                    valid_mask=_as_numpy_bool(grid.valid_mask),
-                    offset_axis_zyx=_as_numpy_float32(grid.offset_axis_zyx),
-                    source_line_xy=_as_numpy_float32(source_line_xy),
-                    source_control_point_xy=_as_numpy_float32(source_control_point_xy),
-                    frame_tangent_xyz=np.asarray(frame.tangent_xyz, dtype=np.float32),
-                    frame_side_xyz=np.asarray(frame.side_xyz, dtype=np.float32),
-                    frame_mesh_normal_xyz=np.asarray(frame.mesh_normal_xyz, dtype=np.float32),
-                )
+                payload = {
+                    "version": np.asarray(_STRIP_COORD_CACHE_VERSION),
+                    "source_shape_hw": np.asarray(source_shape_hw, dtype=np.int64),
+                    "center_offset": np.asarray(float(center_offset), dtype=np.float64),
+                    "coords_zyx": _as_numpy_float32(grid.coords_zyx),
+                    "valid_mask": _as_numpy_bool(grid.valid_mask),
+                    "offset_axis_zyx": _as_numpy_float32(grid.offset_axis_zyx),
+                    "source_line_xy": _as_numpy_float32(source_line_xy),
+                    "source_control_point_xy": _as_numpy_float32(source_control_point_xy),
+                    "frame_tangent_xyz": np.asarray(frame.tangent_xyz, dtype=np.float32),
+                    "frame_side_xyz": np.asarray(frame.side_xyz, dtype=np.float32),
+                    "frame_mesh_normal_xyz": np.asarray(frame.mesh_normal_xyz, dtype=np.float32),
+                }
+                if grid.side_axis_zyx is not None:
+                    payload["side_axis_zyx"] = _as_numpy_float32(grid.side_axis_zyx)
+                np.savez(handle, **payload)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, path)
@@ -2102,6 +2123,39 @@ class FiberStrip2DLoader:
             frame=source.grid.frame,
             offset_axis_xyz=axis_xyz,
             offset_axis_zyx=axis_zyx,
+            side_axis_xyz=source.grid.side_axis_xyz,
+            side_axis_zyx=source.grid.side_axis_zyx,
+        )
+
+    def _trace2cp_side_z_grid_from_source(
+        self,
+        source: _Trace2CpSegmentSource,
+        side_z_offset_voxels: float,
+    ) -> FiberStripGridTorch:
+        delta_base = float(side_z_offset_voxels) * float(source.record.volume_spacing_base)
+        side_axis_zyx = source.grid.side_axis_zyx
+        side_axis_xyz = source.grid.side_axis_xyz
+        if side_axis_zyx is None or side_axis_xyz is None:
+            raise ValueError("Trace2CP side z-layer source is missing side-axis data")
+        if abs(float(delta_base)) <= 1.0e-6:
+            return source.grid
+        delta = torch.as_tensor(
+            delta_base,
+            dtype=source.grid.coords_zyx.dtype,
+            device=source.grid.coords_zyx.device,
+        )
+        coords_zyx = source.grid.coords_zyx + side_axis_zyx.to(device=source.grid.coords_zyx.device) * delta
+        coords_xyz = source.grid.coords_xyz + side_axis_xyz.to(device=source.grid.coords_xyz.device) * delta
+        valid_mask = source.grid.valid_mask & torch.isfinite(coords_zyx).all(dim=-1)
+        return FiberStripGridTorch(
+            coords_xyz=coords_xyz,
+            coords_zyx=coords_zyx,
+            valid_mask=valid_mask,
+            frame=source.grid.frame,
+            offset_axis_xyz=source.grid.offset_axis_xyz,
+            offset_axis_zyx=source.grid.offset_axis_zyx,
+            side_axis_xyz=side_axis_xyz,
+            side_axis_zyx=side_axis_zyx,
         )
 
     def _line_and_cp_xy_for_params(
@@ -3299,8 +3353,8 @@ class FiberStrip2DLoader:
             )
         if not bool(np.isfinite(trace).all()):
             raise ValueError("refined trace contains non-finite coordinates")
-        if source.grid.offset_axis_xyz is None:
-            raise ValueError("refined Trace2CP source requires offset-axis data")
+        if source.grid.offset_axis_xyz is None or source.grid.side_axis_xyz is None:
+            raise ValueError("refined Trace2CP source requires row-axis and side-axis data")
 
         previous_start = np.asarray(source.start_control_point_xy, dtype=np.float32)
         previous_target = np.asarray(source.target_control_point_xy, dtype=np.float32)
@@ -3330,25 +3384,33 @@ class FiberStrip2DLoader:
             source.grid.valid_mask,
             points_xy,
         )
-        normal_xyz_t, normal_valid_t = _sample_grid_points_hwc(
+        row_axis_xyz_t, row_axis_valid_t = _sample_grid_points_hwc(
             source.grid.offset_axis_xyz,
             source.grid.valid_mask,
             points_xy,
         )
-        normal_xyz_t = F.normalize(normal_xyz_t, p=2.0, dim=1, eps=1.0e-12)
+        side_axis_xyz_t, side_axis_valid_t = _sample_grid_points_hwc(
+            source.grid.side_axis_xyz,
+            source.grid.valid_mask,
+            points_xy,
+        )
+        row_axis_xyz_t = F.normalize(row_axis_xyz_t, p=2.0, dim=1, eps=1.0e-12)
+        side_axis_xyz_t = F.normalize(side_axis_xyz_t, p=2.0, dim=1, eps=1.0e-12)
         z_offsets_t = torch.as_tensor(
             trace[:, 2],
             dtype=torch.float32,
             device=source.grid.coords_xyz.device,
         )
-        center_xyz_t = base_xyz_t + normal_xyz_t * (
+        center_xyz_t = base_xyz_t + side_axis_xyz_t * (
             z_offsets_t * np.float32(source.record.volume_spacing_base)
         )[:, None]
         valid_t = (
             base_valid_t
-            & normal_valid_t
+            & row_axis_valid_t
+            & side_axis_valid_t
             & torch.isfinite(center_xyz_t).all(dim=1)
-            & torch.isfinite(normal_xyz_t).all(dim=1)
+            & torch.isfinite(row_axis_xyz_t).all(dim=1)
+            & torch.isfinite(side_axis_xyz_t).all(dim=1)
         )
         valid = valid_t.detach().cpu().numpy().astype(bool, copy=False)
         if not bool(np.all(valid)):
@@ -3359,7 +3421,7 @@ class FiberStrip2DLoader:
                 f"invalid_points={int(bad.size)} first_invalid={first}"
             )
         center_xyz = center_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
-        sampled_normals = normal_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        sampled_normals = row_axis_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
 
         keep = [0]
         for idx in range(1, int(center_xyz.shape[0])):
@@ -3519,6 +3581,17 @@ class FiberStrip2DLoader:
         grid_valid = _as_numpy_bool(grid.valid_mask)
         return coords_xyz, grid_valid
 
+    def trace2cp_segment_side_z_coords_xyz(
+        self,
+        source: _Trace2CpSegmentSource,
+        *,
+        side_z_offset_voxels: float = 0.0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        grid = self._trace2cp_side_z_grid_from_source(source, float(side_z_offset_voxels))
+        coords_xyz = _as_numpy_float32(grid.coords_xyz)
+        grid_valid = _as_numpy_bool(grid.valid_mask)
+        return coords_xyz, grid_valid
+
     def trace2cp_top_strip_coords_xyz(
         self,
         source: _Trace2CpSegmentSource,
@@ -3557,8 +3630,8 @@ class FiberStrip2DLoader:
     ) -> tuple[np.ndarray, np.ndarray]:
         height, width = (int(v) for v in source.source_shape_hw)
         columns_xyz, columns_valid = _trace_columns_xyz_for_top_strip(trace_xyz, width)
-        if source.grid.offset_axis_xyz is None:
-            raise ValueError("trace2cp traced top strip requires source offset-axis data")
+        if source.grid.offset_axis_xyz is None or source.grid.side_axis_xyz is None:
+            raise ValueError("trace2cp traced top strip requires source row-axis and side-axis data")
         device = source.grid.coords_xyz.device
         points_xy = torch.as_tensor(columns_xyz[:, :2], dtype=torch.float32, device=device)
         base_xyz_t, base_valid_t = _sample_grid_points_hwc(
@@ -3571,14 +3644,23 @@ class FiberStrip2DLoader:
             source.grid.valid_mask,
             points_xy,
         )
+        side_z_axis_t, side_z_valid_t = _sample_grid_points_hwc(
+            source.grid.side_axis_xyz,
+            source.grid.valid_mask,
+            points_xy,
+        )
         columns_valid_t = torch.as_tensor(columns_valid, dtype=torch.bool, device=device)
         z_offsets_t = torch.as_tensor(columns_xyz[:, 2], dtype=torch.float32, device=device)
         normal_xyz_t = F.normalize(normal_xyz_t, p=2.0, dim=1, eps=1.0e-12)
-        base_xyz_t = base_xyz_t + normal_xyz_t * (z_offsets_t * np.float32(source.record.volume_spacing_base))[:, None]
+        side_z_axis_t = F.normalize(side_z_axis_t, p=2.0, dim=1, eps=1.0e-12)
+        base_xyz_t = base_xyz_t + side_z_axis_t * (
+            z_offsets_t * np.float32(source.record.volume_spacing_base)
+        )[:, None]
         base_xyz = base_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
         normal_xyz = normal_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
         valid_columns = (
             columns_valid_t & base_valid_t & normal_valid_t & torch.isfinite(base_xyz_t).all(dim=1)
+            & side_z_valid_t
         ).detach().cpu().numpy().astype(bool, copy=False)
 
         side_axes = np.zeros((width, 3), dtype=np.float32)
@@ -3643,6 +3725,43 @@ class FiberStrip2DLoader:
                 source.record.fiber.control_points_xyz[int(source.target_control_point_index)], dtype=np.float32
             ),
             strip_z_offset=offset,
+            coords_zyx=coords_zyx,
+            valid_mask=valid_mask,
+            frame=grid.frame,
+            line_xy=np.asarray(source.line_xy, dtype=np.float32),
+            start_control_point_xy=np.asarray(source.start_control_point_xy, dtype=np.float32),
+            target_control_point_xy=np.asarray(source.target_control_point_xy, dtype=np.float32),
+            line_point_indices=np.asarray(source.line_point_indices, dtype=np.int64),
+            line_normals_xyz=np.asarray(source.line_normals_xyz, dtype=np.float32),
+            start_row_axis_xyz=np.asarray(source.start_row_axis_xyz, dtype=np.float32),
+            target_row_axis_xyz=np.asarray(source.target_row_axis_xyz, dtype=np.float32),
+        )
+        return sample, image, valid_mask
+
+    def sample_trace2cp_segment_side_z_source(
+        self,
+        source: _Trace2CpSegmentSource,
+        *,
+        side_z_offset_voxels: float = 0.0,
+    ) -> tuple[FiberStripSegmentSample, np.ndarray, np.ndarray]:
+        grid = self._trace2cp_side_z_grid_from_source(source, float(side_z_offset_voxels))
+        coords_zyx = _as_numpy_float32(grid.coords_zyx)
+        grid_valid = _as_numpy_bool(grid.valid_mask)
+        result = source.record.sampler.sample_coords(coords_zyx, grid_valid)
+        image = np.asarray(result.image, dtype=np.float32)
+        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        sample = FiberStripSegmentSample(
+            record_index=int(source.record_index),
+            fiber_path=str(source.record.fiber.path) if source.record.fiber.path is not None else "",
+            start_control_point_index=int(source.start_control_point_index),
+            target_control_point_index=int(source.target_control_point_index),
+            start_control_point_xyz=np.asarray(
+                source.record.fiber.control_points_xyz[int(source.start_control_point_index)], dtype=np.float32
+            ),
+            target_control_point_xyz=np.asarray(
+                source.record.fiber.control_points_xyz[int(source.target_control_point_index)], dtype=np.float32
+            ),
+            strip_z_offset=float(source.center_offset),
             coords_zyx=coords_zyx,
             valid_mask=valid_mask,
             frame=grid.frame,

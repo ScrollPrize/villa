@@ -362,10 +362,11 @@ The important behavior is:
   original/init comparison from the segment line window and Lasagna/VC3D frames.
   The second top strip is reconstructed from the traced fused line projected to
   the central z slice: each output column samples the segment coordinate grid
-  and normal/offset axis at the fused trace position, derives a side axis from
-  traced tangent and normal, then samples rows through the volume. If z-search
-  is active, both modes also include a traced fused z-corrected top strip that
-  uses the fused trace's per-column selected z offset along the strip normal.
+  and Lasagna row-normal axis at the fused trace position, derives a side axis
+  from traced tangent and row normal, then samples rows through the volume. If
+  z-search is active, both modes also include a traced fused z-corrected top
+  strip that uses the fused trace's per-column selected z offset along the
+  side-strip out-of-plane side-z axis.
   With z-search and a side presence head, the same top-strip section appends
   side-presence z-pillar rows. Each column samples the inferred side-slice
   presence stack across z layers at the relevant trace y coordinate, so a
@@ -445,9 +446,10 @@ The important behavior is:
   candidate-fan step may choose the current or neighboring z layer. Adding
   `--trace2cp-dp` switches the z-search to the experimental monotone DP over a
   bounded z-layer stack. The loader builds one aligned Trace2CP segment source
-  from the CP-to-CP line window and Lasagna normals, including the per-pixel
-  strip offset axis. Layer `k` adds
-  `offset_axis_zyx * (k * --trace2cp-z-step-voxels * volume_spacing_base)` to
+  from the CP-to-CP line window and Lasagna normals. In that side strip, image
+  x follows the fiber tangent, image y follows the Lasagna row-normal axis, and
+  z-search layers move along the out-of-plane frame side axis. Layer `k` adds
+  `side_axis_zyx * (k * --trace2cp-z-step-voxels * volume_spacing_base)` to
   the center coordinates before sampling the volume. The default z step is
   `1.0` selected-scale voxel, with a bounded range controlled by
   `--trace2cp-z-max-layer`. Z-search never warps an already sampled image and

@@ -85,6 +85,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _Trace2CpDirectionResult,
     _Trace2CpPredictedFields,
     _Trace2CpResult,
+    _Trace2CpSideTopZSourceArrays,
     _Trace2CpSideTopZExperiment,
     _Trace2CpSideTopZLineResult,
     _Trace2CpSideTopZTopSliceDebug,
@@ -109,6 +110,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _draw_trace2cp_top_strip_panel,
     _draw_trace2cp_side_top_z_compact_overlay,
     _draw_trace2cp_side_top_z_top_slice_direction_overlay,
+    _trace2cp_side_top_z_axes_at_point,
     _draw_trace2cp_similarity_debug_column,
     _draw_trace2cp_fiber_overlay,
     _draw_trace2cp_overlay,
@@ -1576,9 +1578,9 @@ def test_trace2cp_z_plane_cache_reuses_segment_source(monkeypatch: pytest.Monkey
         def __init__(self) -> None:
             self.sampled_offsets: list[float] = []
 
-        def sample_trace2cp_segment_source(self, source, *, strip_z_offset: float | None = None):
-            self.sampled_offsets.append(float(strip_z_offset))
-            return make_sample(float(strip_z_offset)), np.ones((3, 3), dtype=np.float32), np.ones((3, 3), dtype=bool)
+        def sample_trace2cp_segment_side_z_source(self, source, *, side_z_offset_voxels: float = 0.0):
+            self.sampled_offsets.append(float(side_z_offset_voxels))
+            return make_sample(0.0), np.ones((3, 3), dtype=np.float32), np.ones((3, 3), dtype=bool)
 
         def build_trace2cp_segment_patch(self, *args, **kwargs):
             raise AssertionError("z-plane cache must not rebuild trace2cp segment patches")
@@ -1618,8 +1620,8 @@ def test_trace2cp_z_plane_cache_reuses_segment_source(monkeypatch: pytest.Monkey
         max_layer=2,
     )
 
-    assert cache.get(1).sample.strip_z_offset == pytest.approx(1.0)
-    assert cache.get(-2).sample.strip_z_offset == pytest.approx(-2.0)
+    assert cache.get(1).z_voxels == pytest.approx(1.0)
+    assert cache.get(-2).z_voxels == pytest.approx(-2.0)
     assert loader.sampled_offsets == [1.0, -2.0]
 
 
@@ -1969,6 +1971,41 @@ def test_trace2cp_segment_source_offsets_each_pixel_axis(tmp_path: Path) -> None
     assert shifted.strip_z_offset == pytest.approx(1.0)
     assert np.count_nonzero(grid_valid) > 0
     assert np.allclose(delta[grid_valid], expected[grid_valid], atol=1.0e-5)
+
+
+def test_trace2cp_segment_side_z_offsets_use_out_of_plane_axis(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    assert source.grid.side_axis_zyx is not None
+
+    center_coords, center_valid = loader.trace2cp_segment_side_z_coords_xyz(
+        source,
+        side_z_offset_voxels=0.0,
+    )
+    shifted_coords, shifted_valid = loader.trace2cp_segment_side_z_coords_xyz(
+        source,
+        side_z_offset_voxels=1.0,
+    )
+    row_axis_xyz = source.grid.offset_axis_xyz.detach().cpu().numpy().astype(np.float32)
+    side_axis_xyz = source.grid.side_axis_xyz.detach().cpu().numpy().astype(np.float32)
+    expected = side_axis_xyz * np.float32(source.record.volume_spacing_base)
+    delta = shifted_coords - center_coords
+    grid_valid = (
+        center_valid
+        & shifted_valid
+        & source.grid.valid_mask.detach().cpu().numpy().astype(bool)
+    )
+
+    assert np.count_nonzero(grid_valid) > 0
+    assert np.allclose(delta[grid_valid], expected[grid_valid], atol=1.0e-5)
+    row_side_dot = np.sum(row_axis_xyz[grid_valid] * side_axis_xyz[grid_valid], axis=1)
+    assert np.max(np.abs(row_side_dot)) < 1.0e-4
 
 
 def test_trace2cp_refined_segment_source_samples_from_fused_trace(tmp_path: Path) -> None:
@@ -2716,6 +2753,43 @@ def test_trace2cp_weighted_median_top_direction_aligns_ambiguous_signs() -> None
 
     assert selected is not None
     np.testing.assert_allclose(selected, expected, atol=1.0e-6)
+
+
+def test_trace2cp_side_top_z_axes_offset_along_side_z_not_row_axis() -> None:
+    height, width = 5, 5
+    yy, xx = np.meshgrid(
+        np.arange(height, dtype=np.float32),
+        np.arange(width, dtype=np.float32),
+        indexing="ij",
+    )
+    coords = np.stack([xx, yy, np.zeros_like(xx)], axis=2).astype(np.float32)
+    arrays = _Trace2CpSideTopZSourceArrays(
+        coords_xyz=coords,
+        valid_mask=np.ones((height, width), dtype=bool),
+        row_axis_xyz=np.broadcast_to(
+            np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            (height, width, 3),
+        ).copy(),
+        side_z_axis_xyz=np.broadcast_to(
+            np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+            (height, width, 3),
+        ).copy(),
+        volume_spacing_base=2.0,
+    )
+
+    axes = _trace2cp_side_top_z_axes_at_point(
+        arrays,
+        np.asarray([2.0, 2.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        z_offset_voxels=3.0,
+    )
+
+    assert axes is not None
+    center_xyz, tangent_xyz, side_z_axis_xyz, row_axis_xyz = axes
+    np.testing.assert_allclose(center_xyz, [2.0, 2.0, -6.0], atol=1.0e-6)
+    np.testing.assert_allclose(tangent_xyz, [1.0, 0.0, 0.0], atol=1.0e-6)
+    np.testing.assert_allclose(side_z_axis_xyz, [0.0, 0.0, -1.0], atol=1.0e-6)
+    np.testing.assert_allclose(row_axis_xyz, [0.0, 1.0, 0.0], atol=1.0e-6)
 
 
 def test_trace2cp_side_top_z_experiment_scores_candidate_side_direction(monkeypatch: pytest.MonkeyPatch) -> None:

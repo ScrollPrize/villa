@@ -199,15 +199,13 @@ def _trace2cp_z_corrected_surface_coords_xyz(
         )
     coords = np.full((height, width, 3), np.nan, dtype=np.float32)
     valid = np.zeros((height, width), dtype=bool)
-    center_offset = float(getattr(segment_source, "center_offset"))
     for layer in sorted(int(v) for v in np.unique(layers) if int(v) > -9999):
         layer_cols = layers == int(layer)
         if not bool(np.any(layer_cols)):
             continue
-        layer_offset = center_offset + float(layer) * float(z_step_voxels)
-        layer_coords, layer_valid = loader.trace2cp_segment_coords_xyz(
+        layer_coords, layer_valid = loader.trace2cp_segment_side_z_coords_xyz(
             segment_source,
-            strip_z_offset=layer_offset,
+            side_z_offset_voxels=float(layer) * float(z_step_voxels),
         )
         layer_coords = np.asarray(layer_coords, dtype=np.float32)
         layer_valid = np.asarray(layer_valid, dtype=bool)
@@ -1732,7 +1730,8 @@ class _Trace2CpZTraceDebug:
 class _Trace2CpSideTopZSourceArrays:
     coords_xyz: np.ndarray
     valid_mask: np.ndarray
-    offset_axis_xyz: np.ndarray
+    row_axis_xyz: np.ndarray
+    side_z_axis_xyz: np.ndarray
     volume_spacing_base: float
 
 
@@ -2334,10 +2333,10 @@ class _Trace2CpZPlaneCache:
         existing = self.layers.get(layer_i)
         if existing is not None:
             return existing
-        offset = self.center_offset + float(layer_i) * self.z_step_voxels
-        sample, image, valid_mask = self.loader.sample_trace2cp_segment_source(
+        side_z_offset_voxels = float(layer_i) * self.z_step_voxels
+        sample, image, valid_mask = self.loader.sample_trace2cp_segment_side_z_source(
             self.segment_source,
-            strip_z_offset=offset,
+            side_z_offset_voxels=side_z_offset_voxels,
         )
         fields = _predict_trace2cp_fields(self.model, image, valid_mask, device=self.device)
         prediction = _Trace2CpZLayerPrediction(
@@ -2448,12 +2447,13 @@ def _trace2cp_weighted_median_top_direction(
 
 def _trace2cp_side_top_z_source_arrays(segment_source: Any) -> _Trace2CpSideTopZSourceArrays:
     grid = segment_source.grid
-    if getattr(grid, "offset_axis_xyz", None) is None:
-        raise ValueError("Trace2CP side/top-z experiment requires source offset-axis data")
+    if getattr(grid, "offset_axis_xyz", None) is None or getattr(grid, "side_axis_xyz", None) is None:
+        raise ValueError("Trace2CP side/top-z experiment requires source row-axis and side-axis data")
     return _Trace2CpSideTopZSourceArrays(
         coords_xyz=np.asarray(grid.coords_xyz.detach().cpu().numpy(), dtype=np.float32),
         valid_mask=np.asarray(grid.valid_mask.detach().cpu().numpy(), dtype=bool),
-        offset_axis_xyz=np.asarray(grid.offset_axis_xyz.detach().cpu().numpy(), dtype=np.float32),
+        row_axis_xyz=np.asarray(grid.offset_axis_xyz.detach().cpu().numpy(), dtype=np.float32),
+        side_z_axis_xyz=np.asarray(grid.side_axis_xyz.detach().cpu().numpy(), dtype=np.float32),
         volume_spacing_base=float(segment_source.record.volume_spacing_base),
     )
 
@@ -2470,11 +2470,13 @@ def _trace2cp_side_top_z_axes_at_point(
     if point.shape != (2,) or side_dir.shape != (2,):
         raise ValueError("point_xy and side_direction_xy must have shape (2,)")
     base_xyz = _bilinear_vector_sample_hwc(arrays.coords_xyz, point, valid_mask=arrays.valid_mask)
-    normal_xyz = _bilinear_vector_sample_hwc(arrays.offset_axis_xyz, point, valid_mask=arrays.valid_mask)
-    if base_xyz is None or normal_xyz is None:
+    row_axis_xyz = _bilinear_vector_sample_hwc(arrays.row_axis_xyz, point, valid_mask=arrays.valid_mask)
+    side_z_axis_xyz = _bilinear_vector_sample_hwc(arrays.side_z_axis_xyz, point, valid_mask=arrays.valid_mask)
+    if base_xyz is None or row_axis_xyz is None or side_z_axis_xyz is None:
         return None
-    normal = _unit_vector_or_none(normal_xyz)
-    if normal is None:
+    row_axis = _unit_vector_or_none(row_axis_xyz)
+    side_z_axis = _unit_vector_or_none(side_z_axis_xyz)
+    if row_axis is None or side_z_axis is None:
         return None
     left = _bilinear_vector_sample_hwc(
         arrays.coords_xyz,
@@ -2499,29 +2501,40 @@ def _trace2cp_side_top_z_axes_at_point(
             valid_mask=arrays.valid_mask,
         )
         if up is not None and down is not None:
-            tangent = _unit_vector_or_none(np.cross(normal, down - up))
+            tangent = _unit_vector_or_none(np.cross(row_axis, down - up))
     if tangent is None:
         return None
-    tangent = _unit_vector_or_none(tangent - normal * np.float32(float(np.dot(tangent, normal))))
+    tangent = _unit_vector_or_none(tangent - row_axis * np.float32(float(np.dot(tangent, row_axis))))
     if tangent is None:
         return None
-    side_axis = _unit_vector_or_none(np.cross(normal, tangent))
-    if side_axis is None:
+    if float(np.dot(side_z_axis, np.cross(row_axis, tangent))) < 0.0:
+        side_z_axis = -side_z_axis
+    side_z_axis = _unit_vector_or_none(
+        side_z_axis
+        - tangent * np.float32(float(np.dot(side_z_axis, tangent)))
+        - row_axis * np.float32(float(np.dot(side_z_axis, row_axis)))
+    )
+    if side_z_axis is None:
         return None
     corrected_tangent = _unit_vector_or_none(
-        tangent * np.float32(float(side_dir[0])) + normal * np.float32(float(side_dir[1]))
+        tangent * np.float32(float(side_dir[0])) + row_axis * np.float32(float(side_dir[1]))
     )
     if corrected_tangent is None:
         corrected_tangent = tangent
     corrected_tangent = _unit_vector_or_none(
-        corrected_tangent - side_axis * np.float32(float(np.dot(corrected_tangent, side_axis)))
+        corrected_tangent - side_z_axis * np.float32(float(np.dot(corrected_tangent, side_z_axis)))
     )
     if corrected_tangent is None:
         corrected_tangent = tangent
-    center_xyz = np.asarray(base_xyz, dtype=np.float32) + normal * np.float32(
+    center_xyz = np.asarray(base_xyz, dtype=np.float32) + side_z_axis * np.float32(
         float(z_offset_voxels) * float(arrays.volume_spacing_base)
     )
-    return center_xyz.astype(np.float32), corrected_tangent.astype(np.float32), side_axis.astype(np.float32), normal.astype(np.float32)
+    return (
+        center_xyz.astype(np.float32),
+        corrected_tangent.astype(np.float32),
+        side_z_axis.astype(np.float32),
+        row_axis.astype(np.float32),
+    )
 
 
 def _sample_trace2cp_local_top_patch(

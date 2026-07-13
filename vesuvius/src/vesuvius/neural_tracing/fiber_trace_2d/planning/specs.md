@@ -615,13 +615,13 @@
   `frame.side` as in VC3D `lineSurface`. Visualizations must also include a
   traced fused top strip projected to the central z slice: for each output
   column, interpolate the fused trace, sample the segment coordinate grid and
-  Lasagna normal/offset axis at that traced side-strip point, derive the
-  top-strip side axis from traced tangent and normal, then sample rows along
-  that side axis with zero z offset. When z-search is active, the visualization
-  additionally appends a traced fused z-corrected top strip using the fused
-  trace's selected-scale `z_voxels` value as a normal/mesh offset before the
-  top-strip side-axis offset. This is visualization-only and must not change
-  Trace2CP scoring.
+  Lasagna row-normal axis at that traced side-strip point, derive the
+  top-strip side axis from traced tangent and row normal, then sample rows
+  along that side axis with zero side-z offset. When z-search is active, the
+  visualization additionally appends a traced fused z-corrected top strip using
+  the fused trace's selected-scale `z_voxels` value as an out-of-plane side-z
+  offset before the top-strip side-axis offset. This is visualization-only and
+  must not change Trace2CP scoring.
 - When z-search is active and the side model exposes a sheet/fiber-presence
   head, Trace2CP top-strip visualization also appends fixed-scale side-presence
   z-pillar rows below the regular top-strip slices. For each output column `x`,
@@ -632,7 +632,7 @@
   line. For the z-search fused line, each column is shifted by that column's
   selected z value (`round(z_voxels / z_step_voxels)`), so the center row
   represents relative z=0 at the layer actually used by the trace. These rows
-  are side-stack projections rather than true top-strip surface predictions;
+  are side-z-stack projections rather than true top-strip surface predictions;
   if the side presence field is broad or similar across shifted layers they
   can resemble a narrow side-presence slice. They are visualization-only, do
   not use the optional top-view model, and must not affect Trace2CP scoring,
@@ -734,14 +734,17 @@
 - Trace2CP z-search derives additional segment-strip planes from one accepted
   center segment source. The center source is built once from the CP-to-CP
   line window and Lasagna normals, including the row-axis sign alignment used
-  for whole-fiber Trace2CP. Layer `k` is sampled by adding
-  `grid.offset_axis_zyx[y,x] * (k * --trace2cp-z-step-voxels *
+  for whole-fiber Trace2CP. Side-strip axes are explicit: image x follows the
+  fiber tangent/arc direction, image y follows the Lasagna mesh-normal row
+  axis, and z-search layers move along the remaining out-of-plane side axis
+  aligned with the VC3D frame side direction, approximately
+  `mesh_normal x tangent`. Layer `k` is sampled by adding
+  `side_axis_zyx[y,x] * (k * --trace2cp-z-step-voxels *
   volume_spacing_base)` to every center coordinate before volume sampling.
-  This matches VC3D shift-scroll semantics: every strip pixel is offset by its
-  own generated strip normal/offset axis. It must not use a global normal, a
+  It must not use the side-strip image-y/row axis, a global normal, a
   row-coordinate approximation, an image-space shift, or an unrelated rebuilt
   plane. The default `--trace2cp-z-step-voxels 1.0` means layer `k` is offset
-  by `k` selected-scale voxels along the segment strip offset axis.
+  by `k` selected-scale voxels along the segment strip side-z axis.
   `--trace2cp-z-max-layer` bounds lazy expansion and defaults to `4`.
 - Default z-search lazily samples side-strip layers as the stepwise candidate
   tracer requests the current and neighboring z layers. Inference is
