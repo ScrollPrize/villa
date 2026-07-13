@@ -126,6 +126,7 @@ const config = {
   clientModules: [
     require.resolve("./src/clientModules/imageZoom.js"),
     require.resolve("./src/clientModules/gtagSafeStub.js"),
+    require.resolve("./src/clientModules/anchorScrollFix.js"),
   ],
   markdown: {
     mermaid: true,

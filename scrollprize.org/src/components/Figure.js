@@ -62,13 +62,22 @@ function renderCaption(text, keyPrefix) {
 function FigImage({ src, alt, enlarge, maxHeight }) {
   const dims = DIMS[src] || null;
   // Portraits get a height cap so they don't tower over the prose; an explicit
-  // maxHeight prop wins. The cap travels as a CSS custom property so the
-  // stylesheet can tighten it to 80vh on phones.
+  // maxHeight prop wins.
   const cap =
     maxHeight != null ? maxHeight : dims && dims[1] > dims[0] ? 640 : null;
   const className = [!enlarge && "zoomable", cap && "vc-fig__img--capped"]
     .filter(Boolean)
     .join(" ");
+  // Express the height cap as an explicit *display width* (the width at which
+  // the image's height equals the cap). A definite width — not width:auto — is
+  // what lets the browser reserve the correct height BEFORE a loading="lazy"
+  // image decodes: width:auto collapses an unloaded lazy image to ~2px, so the
+  // real height only appeared on load, shoving everything below down by
+  // ~400px and leaving #anchor links parked above their target. CSS caps it
+  // with max-width:100% so it still shrinks in narrow columns / on phones,
+  // height:auto keeping the ratio (and staying under the cap). This is the same
+  // reservation mechanism the uncapped images already use.
+  const capWidth = cap && dims ? Math.round((dims[0] * cap) / dims[1]) : null;
   const img = (
     <img
       src={src}
@@ -78,7 +87,7 @@ function FigImage({ src, alt, enlarge, maxHeight }) {
       loading="lazy"
       decoding="async"
       className={className || undefined}
-      style={cap ? { "--vc-fig-maxh": `${cap}px` } : undefined}
+      style={capWidth ? { width: `${capWidth}px` } : undefined}
     />
   );
   if (!enlarge) return img;

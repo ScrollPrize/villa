@@ -577,11 +577,14 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 /* Height-capped images (portraits auto-cap at 640px; Figure's maxHeight prop
-   overrides): natural width, centered in the figure. */
+   overrides). Figure.js sets a definite pixel `width` (the width at which the
+   image reaches the cap height); we only need to let it shrink and keep ratio.
+   NB: do NOT use width:auto here — an unloaded loading="lazy" image with
+   width:auto collapses to ~2px, which caused ~400px of post-load layout shift
+   and made #anchor links land above their target. */
 .vc-fig img.vc-fig__img--capped {
-  width: auto;
-  max-height: var(--vc-fig-maxh, 640px);
-  object-fit: contain;
+  max-width: 100%;
+  height: auto;
   margin-left: auto;
   margin-right: auto;
 }
@@ -633,9 +636,6 @@ h1, h2, h3, h4, h5, h6 {
   }
   .vc-fig--card img {
     border-radius: 4px; /* plate keeps its inner radius */
-  }
-  .vc-fig img.vc-fig__img--capped {
-    max-height: min(var(--vc-fig-maxh, 640px), 80vh);
   }
 }
 
