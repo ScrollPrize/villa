@@ -1,31 +1,28 @@
-# Trace2CP Timing Rows Task Log
+# Torch-Vectorized Trace2CP DP Backend Task Log
 
-- Started from the side-strip DP Trace2CP implementation.
-- Goal: print one compact timing table per Trace2CP command, aggregated by
-  stage for whole-fiber runs.
-- Added timing row collection for Trace2CP source construction/sampling,
-  inference, reference tracing, optional TTA, combined DP/z-DP, z-debug
-  reconstruction, top-strip/top-model debug work, overlay rendering, and file
-  output.
-- Single-pair Trace2CP prints `trace2cp timings`; whole-fiber Trace2CP prints
-  `trace2cp fiber timings` aggregated across valid pair evaluations.
-- Investigated the choppy side-DP traces. The side DP was using short
-  `--line-trace-step` values as its horizontal transition length, so integer
-  y-state transitions quantized the visual slopes. Changed side DP to use a
-  fixed 32 px horizontal transition while keeping `--line-trace-step` for
-  output resampling.
-- The combined DP now applies the existing candidate-angle max as an angular
-  excess penalty, so the global DP path better matches the baseline direct
-  candidate tracer's local angle cone.
-- Added opt-in DP progress output to the shared monotone helper. Trace2CP CLI
-  side DP, z-side DP, and top-model DP call sites pass labels; direct helper
-  tests/calls stay quiet by default. Progress rows include solved columns,
-  elapsed seconds, and `eta_s`; start/done/failed rows provide lifecycle
-  markers.
+- Started from the shared monotone Trace2CP DP helper used by side combined
+  tracing, z-search tracing, and top-model diagnostic tracing.
+- Goal: replace the slow Python loops inside each DP column with torch tensor
+  work while preserving the sequential column recurrence and existing fallback
+  behavior.
+- Added `_trace2cp_top_monotone_direction_path_z_torch`, which keeps active DP
+  costs on the torch device and CPU-stores backpointers. It vectorizes each
+  DP column over move chunks, all z layers, all rows, all previous moves, and
+  all sampled transition columns.
+- CLI side combined DP, side z-search DP, and top-model diagnostic DP now pass
+  their existing torch device into the shared helper. Direct helper calls with
+  no device still use the NumPy/Python backend.
+- Added effective pruning before the torch work:
+  - side-z only infers/optimizes z layers reachable by a center-anchored path
+    for the current horizontal transition count;
+  - side DP derives a hard vertical move cap from the candidate-angle limit.
+- Local synthetic CPU comparison command:
+  `PYTHONPATH=vesuvius/src:. python -c '<synthetic 9-layer 96x321 DP benchmark>'`
+  measured fallback NumPy/Python at `10.6454s`; torch CPU with chunk 16 at
+  `0.8672s` in the chunk sweep, about `12.3x` faster on this small case.
 - Validation:
   - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
-  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'trace2cp_timing or trace2cp_joint_dp or trace2cp_top_monotone or trace2cp_combined or trace2cp_z_search'`
-    passed: 20 passed, 206 deselected.
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'trace2cp_top_monotone_direction_path_z_torch_matches_numpy or trace2cp_top_monotone_direction_path_z_progress_prints_eta or trace2cp_joint_dp or trace2cp_combined or trace2cp_z_search'`
+    passed: 13 passed, 214 deselected.
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-    passed: 226 passed.
-  - `git diff --check -- <touched files>` passed.
+    passed: 227 passed.

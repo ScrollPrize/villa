@@ -533,6 +533,16 @@
   `trace2cp dp failed`. Progress rows include the DP label, solved columns,
   elapsed seconds, and `eta_s` on progress rows. The low-level DP helper is
   quiet by default for unit tests and internal direct calls.
+- Trace2CP CLI side, side-z, and top-model DP solves use a torch-vectorized
+  backend on the active model device. The backend keeps the DP column
+  recurrence sequential but vectorizes per-column work across z layers, rows,
+  sampled transition columns, and move chunks. The existing NumPy/Python DP
+  remains the fallback when no torch device is supplied.
+- Side-z DP must not infer or optimize unreachable z layers. Since the path is
+  anchored at the center layer at both CP columns and transitions can move only
+  one z layer per DP column, the effective layer bound is capped by the number
+  of horizontal transitions. Side DP also caps the vertical move lattice from
+  the configured candidate-angle limit before constructing moves.
 - Trace2CP uses `--med-tta` to determine whether TTA is used. Without
   `--med-tta`, it traces and scores both directions on the base strip
   direction field. With `--med-tta`, it builds deterministic random geometric

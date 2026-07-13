@@ -2661,6 +2661,40 @@ def test_trace2cp_top_monotone_direction_path_z_stays_center_when_layers_match()
     np.testing.assert_array_equal(layers, np.asarray([1, 1, 1], dtype=np.int32))
 
 
+def test_trace2cp_top_monotone_direction_path_z_torch_matches_numpy() -> None:
+    base = np.zeros((7, 21, 2), dtype=np.float32)
+    base[:, :, 0] = 1.0
+    angled = base.copy()
+    angled[:, 9:15, 0] = np.float32(4.0 / math.sqrt(17.0))
+    angled[:, 9:15, 1] = np.float32(1.0 / math.sqrt(17.0))
+    valid = np.ones((7, 21), dtype=bool)
+    presence = np.zeros((7, 21), dtype=np.float32)
+    presence[4, :] = 1.0
+    kwargs = dict(
+        direction_fields=[angled, base, angled],
+        valid_masks=[valid, valid, valid],
+        presence_fields=[presence, presence, presence],
+        start_xy=np.asarray([1.0, 3.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 3.0], dtype=np.float32),
+        direction_weight=1.0,
+        presence_weight=0.2,
+        max_abs_dy=3,
+        max_abs_dz=1,
+        horizontal_step_px=4,
+        max_direction_angle_degrees=45.0,
+    )
+
+    numpy_path, numpy_layers = _trace2cp_top_monotone_direction_path_z(**kwargs)
+    torch_path, torch_layers = _trace2cp_top_monotone_direction_path_z(
+        **kwargs,
+        torch_device=torch.device("cpu"),
+        torch_move_chunk_size=2,
+    )
+
+    np.testing.assert_array_equal(torch_path, numpy_path)
+    np.testing.assert_array_equal(torch_layers, numpy_layers)
+
+
 def test_trace2cp_top_monotone_direction_path_z_progress_prints_eta(capsys) -> None:
     direction = np.zeros((5, 19, 2), dtype=np.float32)
     direction[:, :, 0] = 1.0

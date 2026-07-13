@@ -4714,6 +4714,7 @@ def _trace_score_trace2cp_combined_bidirectional(
     fiber_bank_skipped: int = 0,
     step_px: float = 1.0,
     rf_margin_px: float = 5.0,
+    torch_device: torch.device | None = None,
 ) -> tuple[_Trace2CpBidirectionalResult, _Trace2CpCombinedSummary]:
     if any(float(value) != 0.0 for value in (weights.last, weights.enclosing, weights.fiber, weights.image)):
         raise ValueError("Trace2CP DP combined tracing supports direction and presence terms only")
@@ -4744,6 +4745,7 @@ def _trace_score_trace2cp_combined_bidirectional(
         candidate_angles_degrees=_trace2cp_candidate_angles_degrees(candidate_max_degrees, candidate_step_degrees),
         progress_label="side "
         f"cp={float(np.asarray(start_xy, dtype=np.float32)[0]):.1f}->{float(np.asarray(target_xy, dtype=np.float32)[0]):.1f}",
+        torch_device=torch_device,
     )
     return result, summary
 
@@ -4893,7 +4895,18 @@ def _trace_score_trace2cp_combined_z_bidirectional(
     shape_hw = tuple(int(v) for v in np.asarray(center.fields.direction_xy).shape[:2])
     if any(float(value) != 0.0 for value in (weights.last, weights.enclosing, weights.fiber, weights.image)):
         raise ValueError("Trace2CP z DP combined tracing supports direction and presence terms only")
-    layers = tuple(range(-int(plane_cache.max_layer), int(plane_cache.max_layer) + 1))
+    x0 = int(round(float(np.asarray(start_xy, dtype=np.float32)[0])))
+    x1 = int(round(float(np.asarray(target_xy, dtype=np.float32)[0])))
+    if x0 == x1:
+        transition_count = 1
+    else:
+        x_step = 1 if x1 > x0 else -1
+        column_values = list(range(x0, x1, x_step * _TRACE2CP_SIDE_DP_HORIZONTAL_STEP_PX))
+        if not column_values or column_values[-1] != x1:
+            column_values.append(x1)
+        transition_count = max(1, len(column_values) - 1)
+    effective_max_layer = min(int(plane_cache.max_layer), max(1, int(transition_count) // 2))
+    layers = tuple(range(-effective_max_layer, effective_max_layer + 1))
     with _Timer() as layer_timer:
         predictions = [plane_cache.get(layer) for layer in layers]
     if timing_rows is not None:
@@ -4921,8 +4934,9 @@ def _trace_score_trace2cp_combined_z_bidirectional(
             max_direction_angle_degrees=float(candidate_max_degrees),
             candidate_angles_degrees=_trace2cp_candidate_angles_degrees(candidate_max_degrees, candidate_step_degrees),
             progress_label="side_z "
-            f"layers={-int(plane_cache.max_layer)}..{int(plane_cache.max_layer)} "
+            f"layers={-int(effective_max_layer)}..{int(effective_max_layer)} "
             f"cp={float(np.asarray(start_xy, dtype=np.float32)[0]):.1f}->{float(np.asarray(target_xy, dtype=np.float32)[0]):.1f}",
+            torch_device=plane_cache.device,
         )
     if timing_rows is not None:
         _append_trace2cp_timing(timing_rows, "trace_combined_z_dp", dp_timer.elapsed_ms)
@@ -5377,6 +5391,247 @@ def _trace2cp_top_direction_traces(
     return forward_trace, reverse_trace, _forward_reason, _reverse_reason
 
 
+def _trace2cp_top_monotone_direction_path_z_torch(
+    *,
+    unit: np.ndarray,
+    field_valid: np.ndarray,
+    presence_stack: np.ndarray | None,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    columns: np.ndarray,
+    move_dy: np.ndarray,
+    move_dz: np.ndarray,
+    zero_move_index: int,
+    center_layer: int,
+    direction_weight: float,
+    presence_weight: float,
+    max_abs_dy: int,
+    invalid_penalty: float,
+    z_transition_penalty: float,
+    dy_smooth_penalty: float,
+    dz_smooth_penalty: float,
+    horizontal_step: int,
+    min_direction_alignment: float | None,
+    angle_penalty_scale: float,
+    device: torch.device,
+    move_chunk_size: int = 16,
+    progress_label: str | None = None,
+    progress_interval_s: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    layer_count, height, _width, _channels = (int(v) for v in unit.shape)
+    move_count = int(move_dy.shape[0])
+    column_count = int(columns.shape[0])
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    y0 = int(round(float(start[1])))
+    y1 = int(round(float(target[1])))
+    if column_count < 2:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+
+    progress_enabled = progress_label is not None and column_count > 1
+    progress_name = "" if progress_label is None else str(progress_label).replace("\n", " ")
+    progress_total = max(1, column_count - 1)
+    progress_start_s = time.perf_counter()
+    progress_last_s = progress_start_s
+    progress_interval = max(0.1, float(progress_interval_s))
+    if progress_enabled:
+        print(
+            "trace2cp dp start "
+            f"label={progress_name!r} backend=torch columns={progress_total} layers={layer_count} "
+            f"height={height} moves={move_count} hstep={horizontal_step} device={device}",
+            flush=True,
+        )
+
+    with torch.inference_mode():
+        unit_t = torch.as_tensor(np.asarray(unit, dtype=np.float32), dtype=torch.float32, device=device)
+        valid_t = torch.as_tensor(np.asarray(field_valid, dtype=bool), dtype=torch.bool, device=device)
+        presence_t = (
+            None
+            if presence_stack is None
+            else torch.as_tensor(np.asarray(presence_stack, dtype=np.float32), dtype=torch.float32, device=device)
+        )
+        columns_i = np.asarray(columns, dtype=np.int32)
+        rows_t = torch.arange(height, dtype=torch.long, device=device)
+        layers_t = torch.arange(layer_count, dtype=torch.long, device=device)
+        move_dy_t = torch.as_tensor(np.asarray(move_dy, dtype=np.int64), dtype=torch.long, device=device)
+        move_dz_t = torch.as_tensor(np.asarray(move_dz, dtype=np.int64), dtype=torch.long, device=device)
+        smooth_cost = (
+            torch.as_tensor(max(0.0, float(dy_smooth_penalty)), dtype=torch.float32, device=device)
+            * (move_dy_t[:, None].float() - move_dy_t[None, :].float()).square()
+            + torch.as_tensor(max(0.0, float(dz_smooth_penalty)), dtype=torch.float32, device=device)
+            * (move_dz_t[:, None].float() - move_dz_t[None, :].float()).square()
+        )
+        inf_value = 1.0e20
+        inf_t = torch.tensor(inf_value, dtype=torch.float32, device=device)
+        dp_prev = torch.full((layer_count, height, move_count), inf_value, dtype=torch.float32, device=device)
+        dp_prev[int(center_layer), int(y0), int(zero_move_index)] = 0.0
+        backptr_move = np.full((column_count, layer_count, height, move_count), -1, dtype=np.int16)
+        chunk_size = max(1, int(move_chunk_size))
+
+        for column_index in range(1, column_count):
+            prev_x = int(columns_i[column_index - 1])
+            x = int(columns_i[column_index])
+            dx = int(x - prev_x)
+            abs_dx = abs(dx)
+            if abs_dx <= 0:
+                continue
+            x_step = 1 if dx > 0 else -1
+            transition_max_abs_dy = int(np.ceil(max(0, int(max_abs_dy)) * float(abs_dx) / float(horizontal_step)))
+            dp_next = torch.full_like(dp_prev, inf_value)
+
+            for move_start in range(0, move_count, chunk_size):
+                move_stop = min(move_count, move_start + chunk_size)
+                dy_chunk = move_dy_t[move_start:move_stop]
+                dz_chunk = move_dz_t[move_start:move_stop]
+                chunk_len = int(move_stop - move_start)
+                valid_move = (dy_chunk.abs() <= int(transition_max_abs_dy)).view(chunk_len, 1, 1)
+
+                prev_layer = layers_t.view(1, layer_count, 1) - dz_chunk.view(chunk_len, 1, 1)
+                prev_y = rows_t.view(1, 1, height) - dy_chunk.view(chunk_len, 1, 1)
+                valid_prev = (
+                    valid_move
+                    & (prev_layer >= 0)
+                    & (prev_layer < layer_count)
+                    & (prev_y >= 0)
+                    & (prev_y < height)
+                )
+                prev_layer_idx = prev_layer.clamp(0, layer_count - 1).expand(chunk_len, layer_count, height)
+                prev_y_idx = prev_y.clamp(0, height - 1).expand(chunk_len, layer_count, height)
+
+                layer_cost = (
+                    torch.as_tensor(max(0.0, float(z_transition_penalty)), dtype=torch.float32, device=device)
+                    * dz_chunk.abs().float()
+                ).view(chunk_len, 1, 1)
+                step_norm = torch.sqrt((float(dx * dx) + dy_chunk.float().square()).clamp_min(1.0e-12))
+                tangent_x = (float(dx) / step_norm).view(chunk_len, 1, 1)
+                tangent_y = (dy_chunk.float() / step_norm).view(chunk_len, 1, 1)
+                transition_cost = layer_cost.expand(chunk_len, layer_count, height).clone()
+
+                for offset in range(1, abs_dx + 1):
+                    sample_x = int(prev_x + x_step * offset)
+                    alpha = float(offset) / float(abs_dx)
+                    sample_y = torch.round(prev_y.float() + dy_chunk.view(chunk_len, 1, 1).float() * alpha).long()
+                    sample_layer = torch.round(
+                        prev_layer.float() + dz_chunk.view(chunk_len, 1, 1).float() * alpha
+                    ).long()
+                    sample_inside = (
+                        valid_prev
+                        & (sample_y >= 0)
+                        & (sample_y < height)
+                        & (sample_layer >= 0)
+                        & (sample_layer < layer_count)
+                    )
+                    sample_y_idx = sample_y.clamp(0, height - 1).expand(chunk_len, layer_count, height)
+                    sample_layer_idx = sample_layer.clamp(0, layer_count - 1).expand(chunk_len, layer_count, height)
+                    sample_direction = unit_t[sample_layer_idx, sample_y_idx, sample_x, :]
+                    sample_valid = valid_t[sample_layer_idx, sample_y_idx, sample_x]
+                    alignment = torch.abs(
+                        sample_direction[..., 0] * tangent_x + sample_direction[..., 1] * tangent_y
+                    )
+                    clipped_alignment = torch.clamp(alignment, 0.0, 1.0)
+                    direction_cost = 1.0 - clipped_alignment
+                    if min_direction_alignment is not None and float(angle_penalty_scale) > 0.0:
+                        direction_cost = direction_cost + float(angle_penalty_scale) * torch.clamp(
+                            float(min_direction_alignment) - clipped_alignment,
+                            min=0.0,
+                        )
+                    sample_cost = float(direction_weight) * direction_cost
+                    if presence_t is not None and float(presence_weight) != 0.0:
+                        sample_presence = presence_t[sample_layer_idx, sample_y_idx, sample_x]
+                        presence_valid = torch.isfinite(sample_presence)
+                        sample_cost = sample_cost + float(presence_weight) * (
+                            1.0 - torch.clamp(sample_presence, 0.0, 1.0)
+                        )
+                        sample_valid = sample_valid & presence_valid
+                    sample_cost = sample_cost + torch.where(
+                        sample_valid,
+                        torch.zeros((), dtype=torch.float32, device=device),
+                        torch.as_tensor(max(0.0, float(invalid_penalty)), dtype=torch.float32, device=device),
+                    )
+                    transition_cost = transition_cost + torch.where(sample_inside, sample_cost, inf_t)
+
+                previous_cost = dp_prev[prev_layer_idx, prev_y_idx, :]
+                previous_cost = torch.where(valid_prev[..., None], previous_cost, inf_t)
+                if column_index == 1:
+                    move_cost = previous_cost
+                else:
+                    move_cost = previous_cost + smooth_cost[move_start:move_stop, :].view(chunk_len, 1, 1, move_count)
+                best_values, best_prev = torch.min(move_cost, dim=-1)
+                candidate = best_values + transition_cost
+                candidate = torch.where(valid_prev, candidate, inf_t)
+                dp_next[:, :, move_start:move_stop] = candidate.permute(1, 2, 0)
+                backptr_move[column_index, :, :, move_start:move_stop] = (
+                    best_prev.permute(1, 2, 0).to(dtype=torch.int16).cpu().numpy()
+                )
+            dp_prev = dp_next
+
+            if progress_enabled:
+                now_s = time.perf_counter()
+                if column_index >= progress_total or (now_s - progress_last_s) >= progress_interval:
+                    elapsed_s = max(0.0, now_s - progress_start_s)
+                    rate = float(column_index) / max(elapsed_s, 1.0e-9)
+                    eta_s = (float(progress_total - column_index) / rate) if rate > 0.0 else float("inf")
+                    eta_text = "inf" if not np.isfinite(eta_s) else f"{eta_s:.1f}"
+                    print(
+                        "trace2cp dp progress "
+                        f"label={progress_name!r} backend=torch columns={column_index}/{progress_total} "
+                        f"elapsed_s={elapsed_s:.1f} eta_s={eta_text}",
+                        flush=True,
+                    )
+                    progress_last_s = now_s
+
+        final_moves = dp_prev[int(center_layer), int(y1), :]
+        final_move_index = int(torch.argmin(final_moves).detach().cpu().item())
+        final_value = float(final_moves[final_move_index].detach().cpu().item())
+        if not np.isfinite(final_value) or final_value >= inf_value * 0.5:
+            if progress_enabled:
+                print(
+                    "trace2cp dp failed "
+                    f"label={progress_name!r} backend=torch columns={progress_total} "
+                    f"elapsed_s={time.perf_counter() - progress_start_s:.1f}",
+                    flush=True,
+                )
+            return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+
+    path_y = np.full(column_count, -1, dtype=np.int32)
+    path_layer = np.full(column_count, -1, dtype=np.int32)
+    path_y[-1] = int(y1)
+    path_layer[-1] = int(center_layer)
+    current_move_index = int(final_move_index)
+    for column_index in range(column_count - 1, 0, -1):
+        current_layer = int(path_layer[column_index])
+        current_y = int(path_y[column_index])
+        current_dy = int(move_dy[current_move_index])
+        current_dz = int(move_dz[current_move_index])
+        prev_y = current_y - current_dy
+        prev_layer = current_layer - current_dz
+        prev_move_index = int(backptr_move[column_index, current_layer, current_y, current_move_index])
+        if prev_y < 0 or prev_y >= height or prev_layer < 0 or prev_layer >= layer_count or prev_move_index < 0:
+            if progress_enabled:
+                print(
+                    "trace2cp dp failed "
+                    f"label={progress_name!r} backend=torch columns={progress_total} "
+                    f"elapsed_s={time.perf_counter() - progress_start_s:.1f}",
+                    flush=True,
+                )
+            return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+        path_y[column_index - 1] = prev_y
+        path_layer[column_index - 1] = prev_layer
+        current_move_index = prev_move_index
+
+    path = np.stack([columns.astype(np.float32), path_y.astype(np.float32)], axis=1).astype(np.float32)
+    path[0] = start
+    path[-1] = target
+    if progress_enabled:
+        print(
+            "trace2cp dp done "
+            f"label={progress_name!r} backend=torch columns={progress_total} "
+            f"elapsed_s={time.perf_counter() - progress_start_s:.1f}",
+            flush=True,
+        )
+    return path, path_layer.astype(np.int32)
+
+
 def _trace2cp_top_monotone_direction_path_z(
     direction_fields: list[np.ndarray],
     valid_masks: list[np.ndarray],
@@ -5397,6 +5652,8 @@ def _trace2cp_top_monotone_direction_path_z(
     angle_excess_penalty: float = 4.0,
     progress_label: str | None = None,
     progress_interval_s: float = 2.0,
+    torch_device: torch.device | None = None,
+    torch_move_chunk_size: int = 16,
 ) -> tuple[np.ndarray, np.ndarray]:
     if not direction_fields:
         raise ValueError("at least one direction field is required")
@@ -5498,6 +5755,33 @@ def _trace2cp_top_monotone_direction_path_z(
         np.float32(max(0.0, float(dy_smooth_penalty))) * (move_dy[:, None] - move_dy[None, :]) ** 2
         + np.float32(max(0.0, float(dz_smooth_penalty))) * (move_dz[:, None] - move_dz[None, :]) ** 2
     ).astype(np.float32)
+    if torch_device is not None:
+        return _trace2cp_top_monotone_direction_path_z_torch(
+            unit=unit,
+            field_valid=field_valid,
+            presence_stack=presence_stack,
+            start_xy=start,
+            target_xy=target,
+            columns=columns,
+            move_dy=move_dy,
+            move_dz=move_dz,
+            zero_move_index=zero_move_index,
+            center_layer=center_layer,
+            direction_weight=direction_weight,
+            presence_weight=presence_weight,
+            max_abs_dy=max_abs_dy,
+            invalid_penalty=invalid_penalty,
+            z_transition_penalty=z_transition_penalty,
+            dy_smooth_penalty=dy_smooth_penalty,
+            dz_smooth_penalty=dz_smooth_penalty,
+            horizontal_step=horizontal_step,
+            min_direction_alignment=min_direction_alignment,
+            angle_penalty_scale=float(angle_penalty_scale),
+            device=torch_device,
+            move_chunk_size=torch_move_chunk_size,
+            progress_label=progress_label,
+            progress_interval_s=progress_interval_s,
+        )
     inf = np.float32(1.0e20)
     dp_prev = np.full((layer_count, height, move_count), inf, dtype=np.float32)
     dp_prev[center_layer, y0, zero_move_index] = np.float32(0.0)
@@ -5912,6 +6196,7 @@ def _trace_score_trace2cp_joint_dp_bidirectional(
     max_direction_angle_degrees: float | None = None,
     candidate_angles_degrees: np.ndarray | None = None,
     progress_label: str | None = None,
+    torch_device: torch.device | None = None,
 ) -> tuple[_Trace2CpBidirectionalResult, _Trace2CpCombinedSummary, np.ndarray]:
     if not direction_fields:
         raise ValueError("joint Trace2CP DP requires at least one direction field")
@@ -5922,6 +6207,11 @@ def _trace_score_trace2cp_joint_dp_bidirectional(
     dy_limit = max_abs_dy
     if dy_limit is None:
         dy_limit = max(1, int(round(max(float(step_px), float(step)))))
+    if max_direction_angle_degrees is not None:
+        angle_limit = float(max_direction_angle_degrees)
+        if np.isfinite(angle_limit) and angle_limit < 90.0:
+            angle_dy_limit = int(np.ceil(np.tan(np.deg2rad(max(0.0, angle_limit))) * float(step)))
+            dy_limit = min(int(dy_limit), max(0, angle_dy_limit))
     path, layer_indices = _trace2cp_top_monotone_direction_path_z(
         direction_fields,
         valid_masks,
@@ -5940,6 +6230,7 @@ def _trace_score_trace2cp_joint_dp_bidirectional(
         max_direction_angle_degrees=max_direction_angle_degrees,
         angle_excess_penalty=4.0,
         progress_label=progress_label,
+        torch_device=torch_device,
     )
     if path.size == 0:
         raise ValueError("joint Trace2CP DP could not connect the two CPs")
@@ -6049,6 +6340,7 @@ def _trace2cp_top_model_direction_overlay(
         ),
         progress_label="top_model "
         f"layers={len(direction_fields)} cp={float(np.asarray(start_xy, dtype=np.float32)[0]):.1f}->{float(np.asarray(target_xy, dtype=np.float32)[0]):.1f}",
+        torch_device=device,
     )
     if monotone_path.size:
         rounded_x = np.rint(monotone_path[:, 0]).astype(np.int32)
@@ -7538,6 +7830,7 @@ def _evaluate_trace2cp_pair(
                     fiber_bank_skipped=0,
                     step_px=step_px,
                     rf_margin_px=rf_margin_px,
+                    torch_device=device,
                 )
             _append_trace2cp_timing(timing_rows, "trace_combined_dp", combined_trace_timer.elapsed_ms)
             selected_mode = "combined_direction_med_tta" if med_tta else "combined_direction"

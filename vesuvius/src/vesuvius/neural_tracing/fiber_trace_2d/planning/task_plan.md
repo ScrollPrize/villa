@@ -1,52 +1,43 @@
-# Trace2CP Timing Rows Plan
+# Torch-Vectorized Trace2CP DP Backend Plan
 
 ## Implementation
 
-- Add a small timing-row dataclass and helper functions for recording,
-  aggregating, and printing Trace2CP stage timings.
-- Record timings inside `_evaluate_trace2cp_pair` for:
-  - segment source construction and sampling,
-  - center model inference,
-  - reference/base tracing,
-  - optional TTA field build/inference and median-TTA tracing,
-  - combined DP or z-DP tracing,
-  - z-corrected debug image/presence reconstruction and layer TIFF assembly,
-  - similarity debug and top-strip/top-model debug stages.
-- Add export-level rows for overlay/write/summary generation where useful.
-- Print one compact table per Trace2CP command. For whole-fiber mode, aggregate
-  all pair timings into stage rows with count, total, mean, and max.
-- Update side-strip joint DP tracing so it no longer inherits the short
-  `--line-trace-step` as its DP transition length. Use a fixed longer
-  transition for finer effective angular resolution while preserving
-  `--line-trace-step` for output resampling.
-- Pass the existing candidate-angle limit into the side DP and penalize
-  direction alignments outside that cone so combined tracing is closer to the
-  old direct candidate tracer.
-- Add opt-in progress output inside the shared monotone DP helper. CLI
-  Trace2CP side/z/top DP call sites should pass labels; tests and internal
-  direct helper calls remain quiet by default.
-- Include elapsed time and ETA in throttled progress rows.
+- Add a torch backend for `_trace2cp_top_monotone_direction_path_z`.
+- Keep the existing NumPy/Python DP as fallback when no torch device is passed.
+- Reuse the existing input validation and preprocessing where practical:
+  direction fields, valid masks, presence fields, candidate-angle penalty,
+  move grids, columns, and progress labels.
+- Implement the torch backend as a sequential loop over DP columns, with each
+  column vectorized over:
+  - current move chunks,
+  - all z layers,
+  - all image rows,
+  - all previous moves,
+  - all sampled pixel columns along a transition.
+- Store backpointers in CPU NumPy arrays to avoid keeping the large
+  backpointer tensor on GPU, while keeping active DP cost tensors on the torch
+  device.
+- Route Trace2CP CLI side/z/top DP calls through the torch backend using the
+  existing model/device.
+- Preserve progress output and final timing rows.
 
 ## Spec Update
 
-- Document that Trace2CP commands print timing rows by stage.
-- Document the side-strip DP transition length and candidate-angle penalty.
-- Document Trace2CP DP progress rows with ETA.
+- Document that Trace2CP CLI DP runs use a torch-vectorized backend when a
+  torch device is available, falling back to the NumPy/Python backend for
+  direct calls.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` Trace2CP runner section with the timing table
-  behavior.
-- Update the Trace2CP combined tracing notes with the side-DP angle/transition
-  behavior.
-- Update the Trace2CP docs with DP progress behavior.
+- Update `docs/code_structure.md` Trace2CP section to describe the torch
+  backend and the remaining sequential column recurrence.
 
 ## Tests
 
-- Add lightweight unit coverage for the timing aggregation helper.
-- Add lightweight unit coverage for DP progress ETA output.
-- Run focused Trace2CP tests and the full fiber_trace_2d loader test file.
+- Add a parity test comparing torch and NumPy DP outputs on a small deterministic
+  problem.
+- Run focused Trace2CP tests and the full `test_fiber_trace_2d_loader.py`.
 
 ## Changelog
 
-- Add a dated changelog entry for Trace2CP timing rows.
+- Add a dated changelog entry for the torch-vectorized Trace2CP DP backend.

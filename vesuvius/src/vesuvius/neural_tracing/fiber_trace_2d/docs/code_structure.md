@@ -441,6 +441,13 @@ The important behavior is:
   rendering, and file-output stages. Slow Trace2CP DP solves also emit
   time-throttled `trace2cp dp ...` progress rows while running; progress rows
   include solved columns, elapsed seconds, and `eta_s`.
+  CLI side, side-z, and top-model DP calls use a torch-vectorized backend on
+  the active model device. The column recurrence remains sequential, but each
+  column is computed with tensor operations over all layers/rows and move
+  chunks. Direct helper calls without a torch device still use the NumPy
+  fallback. Side-z DP also caps the inferred layer stack to the center-anchored
+  reachable range, and side DP caps the move lattice from the configured
+  candidate-angle limit.
 - The whole-fiber Trace2CP JPG is composed after pair scoring. Pair-local
   images and traced points are mapped into a shared fiber arc-length x
   coordinate system using each pair's local start/target CP columns and global
