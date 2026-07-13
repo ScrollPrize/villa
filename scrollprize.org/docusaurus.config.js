@@ -158,6 +158,7 @@ const config = {
             require.resolve("./src/css/custom.css"),
             require.resolve("./src/css/chrome.css"),
             require.resolve("./src/css/landing.css"),
+            require.resolve("./src/css/getstarted.css"),
             require.resolve("./src/css/imageZoom.css"),
             require.resolve("./src/css/chat.css"),
           ],

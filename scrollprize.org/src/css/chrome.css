@@ -232,6 +232,12 @@ h1, h2, h3, h4, h5, h6 {
   color: #fff;
   text-decoration: none;
 }
+/* A CTA pointing at the page you're on is noise: hide it on /get_started
+   itself (Docusaurus marks the current page's navbar item as active). */
+.navbar .vc-navbar-cta.navbar__link--active,
+.menu__link.vc-navbar-cta.menu__link--active {
+  display: none;
+}
 /* Same item inside the mobile drawer menu. */
 .menu__link.vc-navbar-cta,
 .menu__link.vc-navbar-cta:hover {
@@ -712,7 +718,7 @@ h1, h2, h3, h4, h5, h6 {
    ========================================================================== */
 html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
   .markdown
-  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(:has(img, video)) {
+  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(.vc-stat):not(:has(img, video)) {
   color: var(--vc-text);
   text-decoration: underline;
   text-decoration-color: var(--vc-accent-underline);
@@ -721,7 +727,7 @@ html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
 }
 html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
   .markdown
-  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(:has(img, video)):hover {
+  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(.vc-stat):not(:has(img, video)):hover {
   color: var(--vc-accent);
   text-decoration-color: var(--vc-accent);
 }

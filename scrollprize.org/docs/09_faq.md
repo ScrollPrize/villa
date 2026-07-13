@@ -58,7 +58,7 @@ Join us to win prizes and be a part of history!
 
 ### What dates do I need to know?
 
-The [2027 Grand Prize](prizes#2027-grand-prize), [First Letters](prizes#first-letters-prizes), and [PHerc. Paris 4's Title](prizes#first-title-prize) prizes all close on **June 25th, 2027 (11:59pm Pacific)**. [Progress Prizes](prizes#progress-prizes) are awarded every month — including \$20,000 guaranteed for the best submission. See [Open Prizes](prizes) for everything in one place, and [join the community](get_started#1-join-the-community) to stay tuned!
+The [2027 Grand Prize](prizes#2027-grand-prize), [First Letters](prizes#first-letters-prizes), and [PHerc. Paris 4's Title](prizes#first-title-prize) prizes all close on **June 25th, 2027 (11:59pm Pacific)**. [Progress Prizes](prizes#progress-prizes) are awarded every month — including \$20,000 guaranteed for the best submission. See [Open Prizes](prizes) for everything in one place, and [join the community](get_started) to stay tuned!
 
 ### What's the historical background of Herculaneum and the scrolls?
 
@@ -180,7 +180,7 @@ This depends on the jurisdiction you live in, but generally yes, you do have to 
 * Any publications and presentations must cite the dataset(s) used. See the <a href="/data#how-to-cite">How to Cite</a> section on the data page for the correct citation for EduceLab-Scrolls data versus newer Vesuvius Challenge scan releases.
 * You won’t publish any revelation of hidden text (or associated code) without the written approval of Vesuvius Challenge.
 
-We very much encourage researchers and students to work on this! Be sure to reach out to us [on Discord or by email](/get_started#1-join-the-community).
+We very much encourage researchers and students to work on this! Be sure to reach out to us [on Discord or by email](/get_started).
 
 ### I have some ideas but need help. Who can I ask?
 
