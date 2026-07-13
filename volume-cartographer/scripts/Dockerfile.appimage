@@ -20,9 +20,10 @@ FROM ${BUILDER_IMAGE} AS build
 ARG DEBIAN_FRONTEND=noninteractive
 
 # patchelf: rewrites RPATHs during bundling. file/desktop-file-utils: used by
-# linuxdeploy for ELF/desktop validation.
+# linuxdeploy for ELF/desktop validation. zstd: compresses the debug-symbols
+# companion (build_appimage.sh falls back to gzip without it).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends patchelf file desktop-file-utils \
+ && apt-get install -y --no-install-recommends patchelf file desktop-file-utils zstd \
  && rm -rf /var/lib/apt/lists/*
 
 COPY . /src

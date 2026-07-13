@@ -7,9 +7,18 @@
 #      not the app, so Qt can't derive the plugin dir from qt.conf — we set
 #      QT_PLUGIN_PATH explicitly. (Harmless in non-bundled mode too.)
 #   2. Dispatch to the right executable. VC3D ships the GUI plus ~35 CLI tools
-#      in one AppImage. Symlink the .AppImage to a tool name
-#      (e.g. `ln -s VC3D-x86_64.AppImage vc_obj2tifxyz`) to run that tool;
-#      otherwise the GUI (VC3D) launches.
+#      in one AppImage, used as a multitool: the first argument selects the tool.
+#        a. subcommand — the first argument names a tool:
+#               ./VC3D-x86_64.AppImage vc_obj2tifxyz in.obj out/
+#               ./VC3D-x86_64.AppImage VC3D            # launch the GUI
+#           Nicer via a short `vc` symlink:
+#               ln -s VC3D-x86_64.AppImage vc && vc vc_obj2tifxyz in.obj out/
+#        b. argv0 — symlink the .AppImage to a tool name and run that symlink:
+#               ln -s VC3D-x86_64.AppImage vc_obj2tifxyz && ./vc_obj2tifxyz ...
+#        c. `list` prints the bundled executables; `help` prints usage.
+#      With no tool selected: a bare desktop/double-click launch (no terminal)
+#      opens the GUI, while an interactive terminal prints usage — so the CLI
+#      feels like a multitool without breaking the desktop entry.
 #   3. If glibc was bundled (scripts/build_appimage.sh, default), launch through
 #      the bundled loader so the host's glibc is never used — this is what lets
 #      the AppImage run on distros older than the build machine. If not bundled,
@@ -21,12 +30,50 @@ LIBDIR="$HERE/usr/lib"
 
 export QT_PLUGIN_PATH="$HERE/usr/plugins${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
 
-BIN=VC3D
-if [ -n "${ARGV0:-}" ]; then
-    cand="$(basename "$ARGV0")"
-    if [ "$cand" != "AppRun" ] && [ -x "$HERE/usr/bin/$cand" ]; then
-        BIN="$cand"
-    fi
+invoked="$(basename "${ARGV0:-$0}")"
+
+list_tools() { find "$HERE/usr/bin" -maxdepth 1 -type f -executable -printf '%f\n' | sort; }
+usage() {
+    cat <<EOF
+Volume Cartographer (VC3D) — GUI + command-line toolkit in one AppImage.
+
+Usage:
+  $invoked VC3D [args...]     launch the GUI
+  $invoked <tool> [args...]   run a bundled command-line tool
+  $invoked list               list the bundled tools
+  $invoked help               show this help
+
+Each tool can also be run by symlinking the AppImage to its name, e.g.
+  ln -s $invoked vc_obj2tifxyz && ./vc_obj2tifxyz ...
+EOF
+}
+
+BIN=""
+if [ "$invoked" != "AppRun" ] && [ "$invoked" != "vc" ] && [ -x "$HERE/usr/bin/$invoked" ]; then
+    # (b) argv0 names a bundled tool.
+    BIN="$invoked"
+else
+    case "${1:-}" in
+        list|--list|--list-tools)
+            list_tools; exit 0 ;;
+        help|-h|--help)
+            usage; exit 0 ;;
+        "")
+            # No tool selected. Desktop/double-click (no controlling terminal)
+            # opens the GUI; an interactive terminal gets usage.
+            if [ -t 0 ] || [ -t 1 ]; then usage; exit 0; else BIN=VC3D; fi ;;
+        *)
+            # Any other first argument — including a bare option like
+            # --cache-size — must name a bundled tool. Passing options to the
+            # GUI requires an explicit tool: `<cmd> VC3D --cache-size ...`.
+            if [ -x "$HERE/usr/bin/$1" ]; then
+                # (a) first argument names a bundled tool.
+                BIN="$1"; shift
+            else
+                echo "$invoked: unknown tool '$1' — run '$invoked list', or pass options explicitly, e.g. '$invoked VC3D $*'" >&2
+                exit 2
+            fi ;;
+    esac
 fi
 
 LOADER="$LIBDIR/ld-linux-x86-64.so.2"

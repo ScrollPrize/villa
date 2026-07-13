@@ -56,13 +56,33 @@ runs on hosts whose glibc is at least as new as the build machine's).
 
 ## Running
 
-```bash
-./VC3D-x86_64.AppImage             # launches the GUI
+The AppImage is a multitool: the first argument selects the GUI (`VC3D`) or any
+bundled CLI tool.
 
-# Run any bundled CLI tool by symlinking the AppImage to its name:
-ln -s VC3D-x86_64.AppImage vc_obj2tifxyz
-./vc_obj2tifxyz in.obj out/        # runs the vc_obj2tifxyz binary
+```bash
+./VC3D-x86_64.AppImage VC3D                   # launch the GUI
+./VC3D-x86_64.AppImage VC3D --cache-size 20   # GUI with options
+./VC3D-x86_64.AppImage vc_obj2tifxyz in.obj out/   # run a CLI tool
+./VC3D-x86_64.AppImage list                   # list the bundled tools
+./VC3D-x86_64.AppImage help                   # usage
 ```
+
+A short `vc` symlink makes it ergonomic; each tool can also be a symlink of its
+own:
+
+```bash
+ln -s VC3D-x86_64.AppImage vc
+./vc vc_obj2tifxyz in.obj out/
+./vc VC3D                                     # GUI
+
+ln -s VC3D-x86_64.AppImage vc_obj2tifxyz      # named-link dispatch
+./vc_obj2tifxyz in.obj out/
+```
+
+Selection is explicit: a bare option (`./VC3D-x86_64.AppImage --cache-size 20`)
+is rejected — pass it through a tool (`... VC3D --cache-size 20`). Running the
+AppImage with no arguments shows this usage in a terminal, and launches the GUI
+when double-clicked from a desktop (no terminal attached).
 
 On systems without FUSE, prefix with `APPIMAGE_EXTRACT_AND_RUN=1` or install
 `libfuse2`.
