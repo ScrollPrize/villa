@@ -948,3 +948,21 @@ def test_translate_normal_pooled_crop_bbox_ignores_label_only_points():
     )
 
     assert translated == (0, 0, 40, 20, 20, 100)
+
+
+def test_translate_normal_pooled_crop_bbox_ignores_supervision_outside_ragged_tifxyz_edge():
+    crop_bbox = (0, 0, 0, 20, 20, 60)
+    patch_zyxs = np.array([[[5, 5, 5], [5, 5, 15]]], dtype=np.float32)
+    valid_mask = np.array([[True, True]])
+    supervision_flat_patch = np.array([[0, 0, 1]], dtype=np.uint8)
+    rng = StubRng(random_values=[0.0])
+
+    translated = maybe_translate_normal_pooled_crop_bbox(
+        crop_bbox,
+        patch_zyxs,
+        valid_mask,
+        supervision_flat_patch,
+        rng=rng,
+    )
+
+    assert translated == crop_bbox
