@@ -90,11 +90,6 @@ Reading a scroll is a chain of complex problems:
     segmentation: '#2d-parameterization-and-flattening-the-easier-problem-after-the-hard-one',
     ink: '#3-ink-recovery-reading-the-scrolls',
   }}
-  labels={{
-    representation: 'Unwrapping',
-    segmentation: 'Flattening',
-    ink: 'Ink recovery',
-  }}
 />
 
 <ChatCallout prefill="Give me a quick tour of the open problems on this page" />
