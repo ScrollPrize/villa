@@ -48,6 +48,19 @@ struct OpenDataSegmentCacheReconcileResult {
     std::vector<std::string> messages;
 };
 
+struct OpenDataSegmentMaterializationResult {
+    bool success = false;
+    bool alreadyMaterialized = false;
+    int materializedSegments = 0;
+    int failedSegments = 0;
+    std::string message;
+};
+
+using OpenDataSegmentMaterializationProgress =
+    std::function<void(int completed, int total,
+                       const std::filesystem::path& segmentDir,
+                       const std::string& status)>;
+
 struct OpenDataInkDetectionEntry {
     std::string label;
     std::string sampleId;
@@ -142,6 +155,20 @@ classifyOpenDataSegmentRepresentations(const OpenDataSample& sample,
 
 [[nodiscard]] bool isOpenDataCatalogSegmentDirectory(
     const std::filesystem::path& segmentDir);
+
+// Open-data placeholders contain complete display metadata and a persisted
+// materialization recipe, but defer x/y/z TIFF download or generation until
+// the surface is activated.
+[[nodiscard]] bool isOpenDataSegmentPlaceholder(
+    const std::filesystem::path& segmentDir);
+
+[[nodiscard]] OpenDataSegmentMaterializationResult materializeOpenDataSegment(
+    const std::filesystem::path& segmentDir);
+
+[[nodiscard]] OpenDataSegmentMaterializationResult
+materializeOpenDataSegmentFolder(
+    const std::filesystem::path& segmentsRoot,
+    const OpenDataSegmentMaterializationProgress& progressCallback = {});
 
 [[nodiscard]] std::vector<OpenDataInkDetectionEntry> cachedInkDetectionsForSegmentDirectory(
     const std::filesystem::path& segmentDir);

@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -431,6 +432,15 @@ std::shared_ptr<VolumePkg> VolumePkg::newEmpty()
     return std::shared_ptr<VolumePkg>(new VolumePkg());
 }
 
+std::shared_ptr<VolumePkg> VolumePkg::newEmpty(
+    const vc::project::LoadOptions& opts)
+{
+    auto pkg = std::shared_ptr<VolumePkg>(new VolumePkg());
+    pkg->opts_ = opts;
+    pkg->remoteCacheRoot_ = opts.remoteCacheRoot;
+    return pkg;
+}
+
 std::shared_ptr<VolumePkg> VolumePkg::load(const fs::path& jsonFile,
                                            const vc::project::LoadOptions& opts)
 {
@@ -783,7 +793,7 @@ bool VolumePkg::removeEntry(const std::string& location)
     if (eraseFrom(normalGrids_)) removed = true;
     if (removed) {
         if (outputSegments_ && *outputSegments_ == location) outputSegments_.reset();
-        resolveAll();
+        if (!opts_.deferResolution) resolveAll();
         persistProjectState();
     }
     return removed;
@@ -1205,7 +1215,61 @@ void VolumePkg::resolveAll()
         segmentationTagsByID_.clear();
     }
     resolvedNormalGridPaths_.clear();
-    for (const auto& e : volumes_) resolveVolumeEntry(e);
+    struct RemoteVolumeResult {
+        std::shared_ptr<Volume> volume;
+        std::string error;
+    };
+    std::vector<std::future<RemoteVolumeResult>> remoteLoads(volumes_.size());
+    for (std::size_t i = 0; i < volumes_.size(); ++i) {
+        const auto& entry = volumes_[i];
+        if (!vc::project::isLocationRemote(entry.location)) continue;
+        const auto remoteCacheRoot = opts_.remoteCacheRoot;
+        remoteLoads[i] = std::async(
+            std::launch::async,
+            [entry, remoteCacheRoot]() -> RemoteVolumeResult {
+                try {
+                    if (!isDirectRemoteZarrLocation(entry.location)) {
+                        return {nullptr,
+                                "remote listing is not supported in this branch"};
+                    }
+                    return {
+                        Volume::NewFromUrl(
+                            entry.location, remoteCacheRoot, {},
+                            metadataFromVolumeEntryTags(entry.tags)),
+                        {}};
+                } catch (const std::exception& ex) {
+                    return {nullptr, ex.what()};
+                } catch (...) {
+                    return {nullptr, "unknown remote volume error"};
+                }
+            });
+    }
+    for (std::size_t i = 0; i < volumes_.size(); ++i) {
+        const auto& entry = volumes_[i];
+        if (!remoteLoads[i].valid()) {
+            resolveVolumeEntry(entry);
+            continue;
+        }
+        auto resolved = remoteLoads[i].get();
+        if (!resolved.volume) {
+            if (opts_.failOnRemoteError) {
+                throw std::runtime_error(
+                    "Failed to load remote zarr volume '" + entry.location +
+                    "': " + resolved.error);
+            }
+            Logger()->warn("Failed to load remote zarr volume '{}': {}",
+                           entry.location, resolved.error);
+            continue;
+        }
+        const auto id = resolved.volume->id();
+        if (loadedVolumes_.count(id) > 0) {
+            Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping",
+                           id, entry.location);
+            continue;
+        }
+        loadedVolumes_.emplace(id, std::move(resolved.volume));
+        if (!entry.tags.empty()) volumeTagsByID_[id] = entry.tags;
+    }
 
     const vc::project::Entry* selectedSegments = nullptr;
     if (loadFirstSegmentationDir_ && !loadFirstSegmentationDir_->empty()) {
@@ -1367,7 +1431,70 @@ void VolumePkg::resolveSegmentsEntry(const vc::project::Entry& e)
             Logger()->warn("Failed to load segment '{}': {}", sp.string(), ex.what());
         }
     };
-    if (isSegmentDir(path)) {
+    const bool aggregateOpenDataView =
+        std::find(e.tags.begin(), e.tags.end(),
+                  "vc-open-data-segment-aggregate") != e.tags.end();
+    if (aggregateOpenDataView && !isSegmentDir(path)) {
+        struct Candidate {
+            fs::path path;
+            int rank = 0;
+        };
+        std::vector<fs::path> candidatePaths;
+        for (const auto& child : immediateSubdirs(path)) {
+            if (isSegmentDir(child)) {
+                candidatePaths.push_back(child);
+                continue;
+            }
+            for (const auto& grandchild : immediateSubdirs(child)) {
+                if (isSegmentDir(grandchild)) {
+                    candidatePaths.push_back(grandchild);
+                }
+            }
+        }
+        std::sort(candidatePaths.begin(), candidatePaths.end());
+
+        std::map<std::string, Candidate> byLineage;
+        for (const auto& candidatePath : candidatePaths) {
+            try {
+                const auto originPath = candidatePath / "catalog-origin.json";
+                if (fs::is_regular_file(originPath)) {
+                    const auto origin = utils::Json::parse_file(originPath);
+                    if (origin.value("cache_state", std::string{}) ==
+                        "orphaned") {
+                        continue;
+                    }
+                }
+                auto candidate = Segmentation::New(candidatePath);
+                const auto& metadata = candidate->metadata();
+                std::string lineage = metadata.value(
+                    "vc_open_data_catalog_segment_lineage_id",
+                    std::string{});
+                if (lineage.empty()) {
+                    lineage = metadata.value(
+                        "vc_open_data_segment_long_id", std::string{});
+                }
+                if (lineage.empty()) lineage = candidate->id();
+
+                const auto representation = metadata.value(
+                    "vc_open_data_representation", std::string{});
+                int rank = 20;
+                if (representation == "published-transformed") rank = 30;
+                if (representation == "generated-native-transform") rank = 10;
+                auto [it, inserted] = byLineage.emplace(
+                    lineage, Candidate{candidatePath, rank});
+                if (!inserted && rank > it->second.rank) {
+                    it->second = Candidate{candidatePath, rank};
+                }
+            } catch (const std::exception& ex) {
+                Logger()->warn("Failed to inspect aggregate segment '{}': {}",
+                               candidatePath.string(), ex.what());
+            }
+        }
+        for (const auto& [lineage, candidate] : byLineage) {
+            (void)lineage;
+            loadOne(candidate.path);
+        }
+    } else if (isSegmentDir(path)) {
         loadOne(path);
     } else {
         for (const auto& child : immediateSubdirs(path)) {

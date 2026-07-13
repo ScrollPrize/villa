@@ -1422,13 +1422,19 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
             }
         },
         forceRefresh);
+    const auto materialized = materializeOpenDataSegment(
+        openDataCanonicalSegmentCacheDirectory(
+            remoteRoot, oneSegmentSample,
+            oneSegmentSample.segments.front()));
 
     QCoreApplication::processEvents();
     refreshSelectedSampleCacheStatus();
     QString message = tr("Cached %1 of %2 selected tifxyz segment(s).")
-                          .arg(result.cachedTifxyzSegments)
+                          .arg(materialized.success ? 1 : 0)
                           .arg(result.supportedTifxyzSegments);
-    if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
+    if (!materialized.success) {
+        message += tr(" %1").arg(qstr(materialized.message));
+    } else if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
         message += tr(" %1").arg(qstr(result.messages.front()));
     }
     setStatus(message);
@@ -1483,12 +1489,27 @@ void OpenDataCatalogWindow::syncSelectedSampleCache()
         },
         forceRefresh);
 
+    int materializedRepresentations = 0;
+    int failedRepresentations = 0;
+    std::string materializationError;
+    for (const auto& entry : pkg->segmentEntries()) {
+        const auto materialized = materializeOpenDataSegmentFolder(entry.location);
+        materializedRepresentations += materialized.materializedSegments;
+        failedRepresentations += materialized.failedSegments;
+        if (materializationError.empty() && !materialized.message.empty()) {
+            materializationError = materialized.message;
+        }
+    }
+
     QCoreApplication::processEvents();
     refreshSelectedSampleCacheStatus();
-    QString message = tr("Synced %1 of %2 tifxyz segment(s).")
-                          .arg(result.cachedTifxyzSegments)
-                          .arg(result.supportedTifxyzSegments);
-    if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
+    QString message = tr("Created or fetched %1 segment representation(s).")
+                          .arg(materializedRepresentations);
+    if (failedRepresentations > 0) {
+        message += tr(" %1 failed: %2")
+                       .arg(failedRepresentations)
+                       .arg(qstr(materializationError));
+    } else if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
         message += tr(" %1").arg(qstr(result.messages.front()));
     }
     setStatus(message);

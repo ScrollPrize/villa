@@ -288,6 +288,106 @@ TEST_CASE("OpenDataSegmentCache selects one canonical source and published targe
         }));
 }
 
+TEST_CASE("OpenDataSegmentCache prepares lazy source and generated placeholders")
+{
+    auto manifest = parseOpenDataManifest(kFixture);
+    auto sample = *manifest.findSample("PHerc0139");
+    OpenDataVolume targetVolume;
+    targetVolume.id = "vol2";
+    sample.volumes.push_back(targetVolume);
+    sample.properties["properties"]["volume_transforms"] = nlohmann::json::array({
+        {
+            {"from_volume_id", "vol1"},
+            {"transforms", nlohmann::json::array({
+                {
+                    {"to_volume_id", "vol2"},
+                    {"matrix", nlohmann::json::array({
+                        nlohmann::json::array({1.0, 0.0, 0.0, 10.0}),
+                        nlohmann::json::array({0.0, 1.0, 0.0, 20.0}),
+                        nlohmann::json::array({0.0, 0.0, 1.0, 30.0})
+                    })}
+                }
+            })}
+        }
+    });
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+        ("vc_open_data_lazy_placeholder_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+    const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
+    VolumePkg::setAutosaveRoot(cacheRoot / "autosave");
+    auto pkg = VolumePkg::newEmpty();
+
+    const auto result = reconcileOpenDataSampleSegments(
+        *pkg, sample, cacheRoot, {}, false);
+    const auto sourceDir = openDataCanonicalSegmentCacheDirectory(
+        cacheRoot, sample, sample.segments.front());
+    const auto generatedDir = openDataTransformedSegmentCacheDirectory(
+        cacheRoot, sample, sample.segments.front(), "vol2");
+
+    CHECK(result.cachedTifxyzSegments == 0);
+    CHECK(result.transformedTifxyzSegments == 0);
+    CHECK(result.attachedSegmentEntries == 2);
+    CHECK(isOpenDataSegmentPlaceholder(sourceDir));
+    CHECK(isOpenDataSegmentPlaceholder(generatedDir));
+    CHECK(std::filesystem::is_regular_file(sourceDir / "meta.json"));
+    CHECK_FALSE(std::filesystem::exists(sourceDir / "x.tif"));
+    CHECK_FALSE(std::filesystem::exists(generatedDir / "x.tif"));
+    CHECK(pkg->segmentEntries().size() == 2);
+    CHECK(pkg->segmentationIDs().size() == 1);
+    std::set<std::string> folderNames;
+    for (const auto& entry : pkg->segmentEntries()) {
+        folderNames.insert(
+            std::filesystem::path(entry.location).filename().string());
+        CHECK(std::find(entry.tags.begin(), entry.tags.end(),
+                        "vc-open-data-segment-aggregate") !=
+              entry.tags.end());
+    }
+    CHECK(folderNames == std::set<std::string>{"vol1", "vol2"});
+
+    pkg.reset();
+    VolumePkg::setAutosaveRoot(previousAutosaveRoot);
+    std::filesystem::remove_all(cacheRoot);
+}
+
+TEST_CASE("VolumePkg aggregate open-data folders deduplicate segment lineage")
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_open_data_aggregate_dedupe_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(root);
+    const auto published = root / "vol1" / "published-L0" / "published";
+    const auto generated =
+        root / "vol1" / "generated-from-source-L0" / "generated";
+    writeFile(published / "meta.json", nlohmann::json{
+        {"type", "seg"},
+        {"uuid", "published-id"},
+        {"format", "tifxyz"},
+        {"vc_open_data_catalog_segment_lineage_id", "same-lineage"},
+        {"vc_open_data_representation", "published-transformed"}
+    }.dump());
+    writeFile(generated / "meta.json", nlohmann::json{
+        {"type", "seg"},
+        {"uuid", "generated-id"},
+        {"format", "tifxyz"},
+        {"vc_open_data_catalog_segment_lineage_id", "same-lineage"},
+        {"vc_open_data_representation", "generated-native-transform"}
+    }.dump());
+
+    const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
+    VolumePkg::setAutosaveRoot(root / "autosave");
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addSegmentsEntry(
+        (root / "vol1").string(),
+        {"open-data", "immutable", "vc-open-data-segment-aggregate"}));
+    const auto ids = pkg->segmentationIDs();
+    REQUIRE(ids.size() == 1);
+    CHECK(ids.front() == "published-id");
+
+    pkg.reset();
+    VolumePkg::setAutosaveRoot(previousAutosaveRoot);
+    std::filesystem::remove_all(root);
+}
+
 TEST_CASE("OpenDataManifest parses samples and computes summary counts")
 {
     const auto manifest = parseOpenDataManifest(kFixture, "fixture://metadata.json");
@@ -425,8 +525,6 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
     REQUIRE(volumeFromScan->pixelSizeUm.has_value());
     CHECK(*volumeFromScan->pixelSizeUm == doctest::Approx(2.403));
 
-    const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
-    VolumePkg::setAutosaveRoot(cacheRoot / "autosave");
     auto pkg = VolumePkg::newEmpty();
     const auto result = attachOpenDataSampleVolumes(*pkg, *sample);
     CHECK(result.supportedVolumes == 2);
@@ -758,17 +856,20 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     CHECK(pkg->hasSegmentations());
     const auto ids = pkg->segmentationIDs();
     REQUIRE(ids.size() == 1);
-    CHECK(ids.front().rfind(
-              "PHerc0139-20260311000000-derived-native-L0-", 0) == 0);
+    const auto representations = classifyOpenDataSegmentRepresentations(
+        sample, sample.segments.front());
+    REQUIRE(representations.size() == 1);
+    CHECK(ids.front() == representations.front().representationId);
     REQUIRE(!progressEvents.empty());
-    CHECK(progressEvents.back().status == "finished");
+    CHECK(progressEvents.back().status == "placeholders-finished");
     CHECK(progressEvents.back().completedFiles == 0);
-    CHECK(progressEvents.back().totalFiles == 6);
+    CHECK(progressEvents.back().totalFiles == 0);
     CHECK(progressEvents.back().completedSegments == 1);
     std::ifstream metaIn(segmentDir / "meta.json", std::ios::binary);
     REQUIRE(metaIn.good());
     const auto meta = nlohmann::json::parse(metaIn);
-    CHECK(meta.at("uuid").get<std::string>() == "PHerc0139-20260311000000");
+    CHECK(meta.at("uuid").get<std::string>() ==
+          representations.front().representationId);
     CHECK(meta.at("vc_open_data_segment_id").get<std::string>() == "20260311000000");
     CHECK(meta.at("vc_open_data_segment_long_id").get<std::string>() == "PHerc0139-20260311000000");
     CHECK(meta.at("vc_open_data_original_volume_id").get<std::string>() == "vol1");
@@ -893,8 +994,9 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
     attachOpenDataSampleSegments(*pkg, sample, cacheRoot, result);
 
     CHECK(result.cachedTifxyzSegments == 1);
-    CHECK(result.transformedTifxyzSegments == 1);
+    CHECK(result.transformedTifxyzSegments == 0);
     REQUIRE(std::filesystem::is_regular_file(transformedDir / "meta.json"));
+    CHECK(isOpenDataSegmentPlaceholder(transformedDir));
     REQUIRE(pkg->segmentEntries().size() == 2);
     CHECK(std::any_of(pkg->segmentEntries().begin(),
                       pkg->segmentEntries().end(),
@@ -903,6 +1005,15 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
                                            entry.tags.end(),
                                            "vc-open-data-target-volume-id:vol2") != entry.tags.end();
                       }));
+
+    const auto materialized =
+        materializeOpenDataSegmentFolder(transformedDir.parent_path());
+    REQUIRE(materialized.success);
+    CHECK(materialized.materializedSegments == 1);
+    CHECK_FALSE(isOpenDataSegmentPlaceholder(transformedDir));
+    const auto alreadyMaterialized = materializeOpenDataSegment(transformedDir);
+    REQUIRE(alreadyMaterialized.success);
+    CHECK(alreadyMaterialized.alreadyMaterialized);
 
     std::ifstream metaIn(transformedDir / "meta.json", std::ios::binary);
     REQUIRE(metaIn.good());
@@ -985,6 +1096,8 @@ TEST_CASE("OpenDataSegmentCache prefers published source and target representati
     const auto generatedDir = openDataTransformedSegmentCacheDirectory(
         cacheRoot, sample, sample.segments.front(), "vol2");
 
+    const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
+    VolumePkg::setAutosaveRoot(cacheRoot / "autosave");
     auto pkg = VolumePkg::newEmpty();
     const auto result = reconcileOpenDataSampleSegments(
         *pkg, sample, cacheRoot, {}, false);
@@ -1226,7 +1339,7 @@ TEST_CASE("OpenDataSampleProject reuses cached project and attaches existing cac
     CHECK(secondResult.cachedTifxyzSegments == 1);
     CHECK(secondResult.transformedTifxyzSegments == 1);
     CHECK(secondResult.attachedSegmentEntries == 1);
-    CHECK(secondProgressEvents.empty());
+    CHECK_FALSE(secondProgressEvents.empty());
     REQUIRE(second->segmentEntries().size() == 2);
     CHECK(std::any_of(second->segmentEntries().begin(),
                       second->segmentEntries().end(),
@@ -1238,7 +1351,7 @@ TEST_CASE("OpenDataSampleProject reuses cached project and attaches existing cac
     CHECK(std::any_of(secondResult.messages.begin(),
                       secondResult.messages.end(),
                       [](const std::string& message) {
-                          return message.find("Reused cached sample project segment entries") != std::string::npos;
+                          return message.find("Loaded cached sample project") != std::string::npos;
                       }));
 
     std::filesystem::remove_all(cacheRoot);

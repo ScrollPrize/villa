@@ -185,6 +185,11 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_mergePatchAct, &QAction::triggered,
             this, &MenuActionController::mergePatchFromMenuRequested);
 
+    _materializeOpenDataFolderAct = new QAction(
+        QObject::tr("Create/Fetch All Segments for Current Folder"), this);
+    connect(_materializeOpenDataFolderAct, &QAction::triggered, this,
+            &MenuActionController::materializeCurrentOpenDataSegmentFolder);
+
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
     _fileMenu->addAction(_newProjectAct);
@@ -222,6 +227,8 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     _actionsMenu = new QMenu(QObject::tr("&Actions"), qWindow);
     _actionsMenu->addAction(_drawBBoxAct);
+    _actionsMenu->addSeparator();
+    _actionsMenu->addAction(_materializeOpenDataFolderAct);
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_mergeTifxyzAct);
     _actionsMenu->addAction(_mergePatchAct);
@@ -543,7 +550,21 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
                     const QString file = QString::fromStdString(progress.fileName);
                     const QString status = QString::fromStdString(progress.status);
                     const bool transforming = status.startsWith(QStringLiteral("transform-"));
-                    QString label = transforming
+                    const bool preparing = status.startsWith(
+                        QStringLiteral("placeholder"));
+                    const bool resolvingVolumes =
+                        status == QStringLiteral("resolving-volumes");
+                    const bool projectReady =
+                        status == QStringLiteral("project-ready");
+                    QString label = resolvingVolumes
+                        ? QObject::tr("Opening remote volumes in parallel...")
+                        : projectReady
+                        ? QObject::tr("Open-data project is ready.")
+                        : preparing
+                        ? QObject::tr("Preparing segment metadata: %1/%2 representations.")
+                              .arg(progress.completedSegments)
+                              .arg(progress.totalSegments)
+                        : transforming
                         ? QObject::tr("Transforming segments with %1 worker(s): %2/%3 transforms.")
                               .arg(progress.totalWorkers)
                               .arg(totalDone)
@@ -554,19 +575,36 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
                               .arg(progress.totalSegments)
                               .arg(progress.completedFiles)
                               .arg(progress.totalFiles);
-                    if (!segment.isEmpty() && !file.isEmpty()) {
+                    if (!resolvingVolumes && !projectReady &&
+                        !segment.isEmpty() && !file.isEmpty()) {
                         label += transforming
                             ? QObject::tr("\n%1 -> %2").arg(segment, file)
                             : QObject::tr("\n%1: %2").arg(segment, file);
-                    } else if (!segment.isEmpty()) {
+                    } else if (!resolvingVolumes && !projectReady &&
+                               !segment.isEmpty()) {
                         label += QObject::tr("\n%1").arg(segment);
                     }
                     if (progress.failedSegments > 0) {
                         label += QObject::tr("\nFailures: %1").arg(progress.failedSegments);
                     }
-                    progressDialog->setMaximum(std::max(progress.totalFiles, 1));
-                    progressDialog->setValue(std::min(progress.completedFiles,
-                                                      std::max(progress.totalFiles, 1)));
+                    if (resolvingVolumes) {
+                        progressDialog->setRange(0, 0);
+                    } else if (projectReady) {
+                        progressDialog->setRange(0, 1);
+                        progressDialog->setValue(1);
+                    } else if (preparing) {
+                        progressDialog->setRange(
+                            0, std::max(progress.totalSegments, 1));
+                        progressDialog->setValue(std::min(
+                            progress.completedSegments,
+                            std::max(progress.totalSegments, 1)));
+                    } else {
+                        progressDialog->setMaximum(
+                            std::max(progress.totalFiles, 1));
+                        progressDialog->setValue(std::min(
+                            progress.completedFiles,
+                            std::max(progress.totalFiles, 1)));
+                    }
                     progressDialog->setLabelText(label);
                 },
                 Qt::QueuedConnection);
@@ -1491,6 +1529,14 @@ void MenuActionController::beginRotateSurfaceTransform()
     if (_window->statusBar()) {
         _window->showStatusBarMessage(QObject::tr("Surface rotation active"), 3000);
     }
+}
+
+void MenuActionController::materializeCurrentOpenDataSegmentFolder()
+{
+    if (!_window || !_window->_surfacePanel) {
+        return;
+    }
+    _window->_surfacePanel->materializeCurrentOpenDataFolder();
 }
 
 void MenuActionController::newProject()

@@ -309,39 +309,6 @@ bool isNonEmptyFile(const std::filesystem::path& path)
            !ec;
 }
 
-int openDataSegmentEntryCount(const VolumePkg& pkg,
-                              const std::filesystem::path& remoteCacheRoot,
-                              const OpenDataSample& sample)
-{
-    if (remoteCacheRoot.empty() || sample.tifxyzSegmentCount() == 0) {
-        return 0;
-    }
-
-    const auto sampleSegmentsRoot = remoteCacheRoot / "open_data" / "segments" /
-                                    safePathComponent(sample.id.empty() ? "sample" : sample.id);
-    const auto sampleSegmentsRootString = sampleSegmentsRoot.string();
-    const auto sampleSegmentsPrefix =
-        sampleSegmentsRootString + std::string(1, std::filesystem::path::preferred_separator);
-    int count = 0;
-    for (const auto& entry : pkg.segmentEntries()) {
-        std::error_code ec;
-        if (!std::filesystem::is_directory(entry.location, ec) || ec) {
-            continue;
-        }
-        const bool openDataSegmentEntry =
-            std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end() &&
-            std::any_of(entry.tags.begin(), entry.tags.end(), [](const std::string& tag) {
-                return tag.rfind("vc-open-data-source-volume-id:", 0) == 0 ||
-                       tag.rfind("vc-open-data-target-volume-id:", 0) == 0;
-            });
-        if (openDataSegmentEntry &&
-            entry.location.rfind(sampleSegmentsPrefix, 0) == 0) {
-            ++count;
-        }
-    }
-    return count;
-}
-
 } // namespace
 
 std::shared_ptr<VolumePkg> createOpenDataSampleProject(
@@ -352,7 +319,6 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
 {
     auto result = OpenDataSampleProjectResult{};
     std::shared_ptr<VolumePkg> pkg;
-    bool loadedCachedProject = false;
     const auto cachedProjectPath = remoteCacheRoot.empty()
         ? std::filesystem::path{}
         : sampleProjectCachePath(remoteCacheRoot, sample);
@@ -365,7 +331,6 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
             pkg = VolumePkg::load(
                 cachedProjectPath,
                 opts);
-            loadedCachedProject = true;
             result.messages.push_back("Loaded cached sample project: " +
                                       cachedProjectPath.string());
         } catch (const std::exception& e) {
@@ -378,7 +343,10 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     }
 
     if (!pkg) {
-        pkg = VolumePkg::newEmpty();
+        vc::project::LoadOptions opts;
+        opts.remoteCacheRoot = remoteCacheRoot;
+        opts.deferResolution = true;
+        pkg = VolumePkg::newEmpty(opts);
     }
     pkg->setName(sample.id.empty() ? "Open Data Sample" : sample.id);
     if (!remoteCacheRoot.empty()) {
@@ -402,28 +370,28 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
                                       " streaming normal grid store(s).");
         }
     }
-    if (loadedCachedProject &&
-        openDataSegmentEntryCount(*pkg, remoteCacheRoot, sample) > 0) {
-        const auto cacheAttachResult =
-            attachExistingOpenDataSegmentCaches(*pkg, sample, remoteCacheRoot);
-        result.supportedTifxyzSegments += cacheAttachResult.supportedTifxyzSegments;
-        result.cachedTifxyzSegments += cacheAttachResult.cachedTifxyzSegments;
-        result.attachedSegmentEntries += cacheAttachResult.attachedSegmentEntries;
-        result.skippedTifxyzSegments += cacheAttachResult.skippedTifxyzSegments;
-        result.failedTifxyzSegments += cacheAttachResult.failedTifxyzSegments;
-        result.transformedTifxyzSegments += cacheAttachResult.transformedTifxyzSegments;
-        result.failedTransformedTifxyzSegments += cacheAttachResult.failedTransformedTifxyzSegments;
-        result.messages.insert(result.messages.end(),
-                               cacheAttachResult.messages.begin(),
-                               cacheAttachResult.messages.end());
-        result.messages.push_back("Reused cached sample project segment entries.");
-    } else {
-        attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result, progressCallback);
-    }
+    // Reconcile against the current manifest on every open. This is metadata-
+    // only for lazy segments and also removes stale layout entries from older
+    // cached projects.
+    attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result,
+                                 progressCallback);
     // Catalog loads remain unresolved until volume tags, normal-grid paths,
     // and every segment representation/cache entry have been reconciled.
-    if (loadedCachedProject) {
+    if (pkg->entryResolutionDeferred()) {
+        if (progressCallback) {
+            OpenDataSampleDownloadProgress progress;
+            progress.totalSegments = static_cast<int>(sample.volumes.size());
+            progress.status = "resolving-volumes";
+            try { progressCallback(progress); } catch (...) {}
+        }
         pkg->resolveDeferredEntries();
+        if (progressCallback) {
+            OpenDataSampleDownloadProgress progress;
+            progress.totalSegments = static_cast<int>(sample.volumes.size());
+            progress.completedSegments = progress.totalSegments;
+            progress.status = "project-ready";
+            try { progressCallback(progress); } catch (...) {}
+        }
         const std::string sampleTag =
             std::string(kOpenDataSampleIdTagPrefix) + sample.id;
         for (const auto& entry : pkg->volumeEntries()) {
@@ -434,7 +402,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
             }
             ++result.failedVolumes;
             result.messages.push_back(
-                "Cached catalog volume failed remote open/base-level validation: " +
+                "Catalog volume failed remote open/base-level validation: " +
                 entry.location + ".");
         }
     }

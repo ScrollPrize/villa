@@ -734,6 +734,10 @@ bool isAvailableOpenDataSegmentsEntry(const VolumePkg& pkg,
     if (!std::filesystem::is_directory(path, ec) || ec) {
         return false;
     }
+    if (std::find(entry.tags.begin(), entry.tags.end(),
+                  "vc-open-data-segment-aggregate") != entry.tags.end()) {
+        return true;
+    }
     return vc::project::validateLocation(
         vc::project::Category::Segments,
         path.string()).empty();
