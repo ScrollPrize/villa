@@ -2380,7 +2380,7 @@
       "label": "PHerc. 139",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "Title and author recovered — On Gods, Book 8, by the Epicurean philosopher Philodemus. About 20% virtually unrolled.",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0139/photos/PHerc0139_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0139/",
       "content": {
         "work": "Philodemus, On Gods (Περὶ θεῶν), Book 8",
@@ -2956,7 +2956,7 @@
       "label": "PHerc. 814",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0814/photos/PHerc0814_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0814/",
       "content": null,
       "progress": {
@@ -3415,7 +3415,7 @@
       "label": "PHerc. 841",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0841/photos/PHerc0841_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0841/",
       "content": null,
       "progress": {
@@ -3839,7 +3839,7 @@
       "label": "PHerc. MANBp",
       "repository": "Museo Archeologico Nazionale di Napoli",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercMANBp/photos/PHercMANBp_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMANBp/",
       "content": null,
       "progress": {
@@ -3934,7 +3934,7 @@
       "label": "PHerc. 846A",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0846A/photos/PHerc0846A_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0846A/",
       "content": null,
       "progress": {
@@ -4032,7 +4032,7 @@
       "label": "PHerc. MAN 5",
       "repository": "Museo Archeologico Nazionale di Napoli",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercMAN5/photos/PHercMAN5_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMAN5/",
       "content": null,
       "progress": {
@@ -4119,7 +4119,7 @@
       "label": "PHerc. Paris 3",
       "repository": "Institut de France, Paris",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis3/photos/PHercParis3_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis3/",
       "content": null,
       "progress": {
@@ -4196,7 +4196,7 @@
       "label": "PHerc. MANB",
       "repository": "Museo Archeologico Nazionale di Napoli",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercMANB/photos/PHercMANB_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMANB/",
       "content": null,
       "progress": {
@@ -4283,7 +4283,7 @@
       "label": "PHerc. 1299",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1299/photos/PHerc1299_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1299/",
       "content": null,
       "progress": {
@@ -4476,7 +4476,7 @@
       "label": "PHerc. 175A",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0175A/photos/PHerc0175A_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0175A/",
       "content": null,
       "progress": {
@@ -4563,7 +4563,7 @@
       "label": "PHerc. 343",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0343/photos/PHerc0343_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0343/",
       "content": null,
       "progress": {
@@ -5868,7 +5868,7 @@
       "label": "PHerc. 846B",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0846B/photos/PHerc0846B_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0846B/",
       "content": null,
       "progress": {
