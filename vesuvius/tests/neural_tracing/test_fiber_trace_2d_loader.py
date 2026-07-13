@@ -141,6 +141,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _load_top_direction_model_from_checkpoint,
     _trace_combined_image_line_to_target,
     _trace_combined_image_line_to_target_z,
+    _trace_score_trace2cp_joint_dp_bidirectional,
     _raise_trace2cp_max_steps,
     _trace_direction_line,
     _trace_direction_line_to_target,
@@ -1056,6 +1057,62 @@ def test_trace2cp_combined_presence_weight_can_choose_off_axis_candidate() -> No
     assert line.shape[0] > 1
     assert line[1, 1] > 4.0
     assert stats.mean("presence") < 1.0
+
+
+def test_trace2cp_joint_dp_presence_can_choose_off_axis_path() -> None:
+    direction = np.zeros((17, 17, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((17, 17), dtype=bool)
+    presence = np.zeros((17, 17), dtype=np.float32)
+    presence[9, :] = 1.0
+
+    result, summary, path_xyz = _trace_score_trace2cp_joint_dp_bidirectional(
+        direction_fields=[direction],
+        valid_masks=[valid],
+        presence_fields=[presence],
+        start_xy=np.asarray([2.0, 8.0], dtype=np.float32),
+        target_xy=np.asarray([14.0, 8.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, presence=1.0),
+        step_px=4.0,
+        rf_margin_px=1.0,
+        horizontal_step_px=4,
+    )
+
+    assert result.forward.result.reason == "joint_dp"
+    assert result.reverse.result.reason == "joint_dp"
+    assert result.forward.trace_xy[0].tolist() == pytest.approx([2.0, 8.0])
+    assert result.forward.trace_xy[-1].tolist() == pytest.approx([14.0, 8.0])
+    assert float(np.max(result.forward.trace_xy[:, 1])) > 8.0
+    assert summary.mean("presence") < 1.0
+    assert np.allclose(path_xyz[:, 2], 0.0)
+
+
+def test_trace2cp_joint_dp_can_choose_non_center_z_layer() -> None:
+    direction = np.zeros((17, 17, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((17, 17), dtype=bool)
+    center_presence = np.zeros((17, 17), dtype=np.float32)
+    matching_presence = np.ones((17, 17), dtype=np.float32)
+
+    result, summary, path_xyz = _trace_score_trace2cp_joint_dp_bidirectional(
+        direction_fields=[direction, direction, direction],
+        valid_masks=[valid, valid, valid],
+        presence_fields=[center_presence, center_presence, matching_presence],
+        start_xy=np.asarray([2.0, 8.0], dtype=np.float32),
+        target_xy=np.asarray([14.0, 8.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, presence=1.0),
+        step_px=4.0,
+        rf_margin_px=1.0,
+        z_step_voxels=1.0,
+        max_abs_dz=1,
+        horizontal_step_px=4,
+    )
+
+    assert result.forward.trace_xy[0].tolist() == pytest.approx([2.0, 8.0])
+    assert result.forward.trace_xy[-1].tolist() == pytest.approx([14.0, 8.0])
+    assert float(np.max(path_xyz[:, 2])) > 0.0
+    assert summary.mean("presence") < 1.0
+    assert result.refinement.fused_resampled_z is not None
 
 
 def test_trace2cp_combined_candidate_point_direction_can_choose_off_axis() -> None:
@@ -2606,6 +2663,41 @@ def test_trace2cp_top_monotone_direction_path_z_uses_better_direction_layer() ->
 
     assert path.shape == (3, 2)
     np.testing.assert_array_equal(layers, np.asarray([1, 2, 1], dtype=np.int32))
+
+
+def test_trace2cp_top_monotone_direction_path_smooths_abrupt_y_steps() -> None:
+    direction = np.zeros((9, 25, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    for segment_index, dy in enumerate((2, -2, 2)):
+        x_start = segment_index * 8 + 1
+        x_stop = min((segment_index + 1) * 8 + 1, direction.shape[1])
+        vector = np.asarray([8.0, float(dy)], dtype=np.float32)
+        vector /= np.linalg.norm(vector)
+        direction[:, x_start:x_stop, :] = vector
+    valid = np.ones((9, 25), dtype=bool)
+
+    unsmoothed, _unsmoothed_layers = _trace2cp_top_monotone_direction_path_z(
+        [direction],
+        [valid],
+        start_xy=np.asarray([0.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([24.0, 4.0], dtype=np.float32),
+        dy_smooth_penalty=0.0,
+        dz_smooth_penalty=0.0,
+    )
+    smoothed, _smoothed_layers = _trace2cp_top_monotone_direction_path_z(
+        [direction],
+        [valid],
+        start_xy=np.asarray([0.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([24.0, 4.0], dtype=np.float32),
+        dy_smooth_penalty=1.0,
+        dz_smooth_penalty=0.0,
+    )
+
+    unsmoothed_steps = np.diff(unsmoothed[:, 1])
+    smoothed_steps = np.diff(smoothed[:, 1])
+    unsmoothed_roughness = np.sum(np.diff(unsmoothed_steps) ** 2)
+    smoothed_roughness = np.sum(np.diff(smoothed_steps) ** 2)
+    assert smoothed_roughness < unsmoothed_roughness
 
 
 def test_trace2cp_top_direction_traces_reach_opposite_cp_columns() -> None:

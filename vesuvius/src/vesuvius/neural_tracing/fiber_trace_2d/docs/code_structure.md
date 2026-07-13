@@ -323,37 +323,24 @@ The important behavior is:
   the reference segment strip, using each TTA reference-to-output coordinate
   grid for point lookup and each output-to-reference grid for direction
   mapping.
-- `--trace2cp-vis --trace2cp-combined` switches the selected Trace2CP trace to
-  a greedy candidate scorer for inspection. At each trace step it samples the
-  oriented direction, evaluates an angular candidate fan around that direction,
-  and chooses the candidate with the lowest weighted score. The default
-  candidate fan is `-25..+25` degrees at 1 degree spacing.
-  `--trace2cp-combined-mode direction` is the default: it scores direction
-  disagreement only and does not require embedding channels.
-  `--trace2cp-combined-mode embedding` or `--trace2cp-use-embedding` adds
-  cosine-distance terms to the previous trace-point embedding, the two
-  enclosing CP embeddings, and a same-fiber CP embedding bank; it requires a
-  checkpoint with appended embedding channels. `--trace2cp-combined-mode image`
-  or `--trace2cp-use-image` is an experimental alternative that does not
-  require embeddings. It samples oriented local descriptors from the already
-  loaded segment image, compares each candidate descriptor to the start CP,
-  target CP, and previous trace point, and adds the mean descriptor MSE to the
-  direction term. The descriptor defaults to `8 x 16` pixels across/along the
-  fiber, uses a Gaussian blur only along the fiber axis with radius `5`, and
-  applies a centered spatial Gaussian weight during MSE comparison.
-  `--trace2cp-use-presence` can be combined with direction, embedding, or image
-  mode; it samples the sigmoid sheet/fiber-presence probability at each
-  candidate point and adds `1 - presence` weighted by
-  `--trace2cp-combined-presence-weight`. With `--med-tta`, median-TTA still
-  supplies the direction reference while embedding/image/presence comparisons
-  are sampled in the reference segment patch. When presence scoring is active,
-  `trace2cp_vis.jpg` appends a fixed-scale presence column and whole-fiber
-  `trace2cp_fiber_vis.jpg` appends a fixed-scale presence row: `0` is black,
-  `1` is white, invalid pixels are black, and the fiber line, CPs, and selected
-  traces are overlaid. With z-search, the z debug column also shows
-  forward/reverse/fused z-corrected presence maps, built column-by-column from
-  the same selected z layers as the z-corrected image; whole-fiber presence
-  uses the fused z-corrected presence when available.
+- `--trace2cp-vis --trace2cp-combined` switches the selected Trace2CP output to
+  a joint monotone-x dynamic-programming path from the start CP to the target
+  CP. The DP state is `(side_z_layer, y, prev_dy, prev_dz)` and integrates
+  `1 - abs(dot(path_tangent, direction))` across crossed pixel columns. This
+  combined path is an inspection/refinement path; the non-combined reference
+  tracer remains the public target-column Trace2CP metric.
+  `--trace2cp-combined-mode direction` is the only active combined mode.
+  `--trace2cp-use-presence` adds `1 - sigmoid_presence` at sampled DP pixels,
+  weighted by `--trace2cp-combined-presence-weight`. Embedding and image
+  similarity modes are no longer active tracer modes and now fail clearly if
+  requested.
+  When presence scoring is active, `trace2cp_vis.jpg` appends a fixed-scale
+  presence column and whole-fiber `trace2cp_fiber_vis.jpg` appends a fixed-scale
+  presence row: `0` is black, `1` is white, invalid pixels are black, and the
+  fiber line, CPs, and selected traces are overlaid. With z-search, the z debug
+  column also shows forward/reverse/fused z-corrected presence maps, built
+  column-by-column from the same selected z layers as the z-corrected image;
+  whole-fiber presence uses the fused z-corrected presence when available.
 - Trace2CP visualizations also include VC3D-style top-strip output sampled
   from volume coordinates, not warped from the side-strip image. Single-pair
   `trace2cp_vis.jpg` appends a debug column and whole-fiber
@@ -378,43 +365,27 @@ The important behavior is:
   each of the four neighboring pixel direction samples, if needed, to agree
   with the current trace direction. The same panel also draws a monotone-x
   dynamic-programming path from CP column to CP column on the top-strip center
-  row. That path uses `(top_offset_layer, y)` state, can move between
-  neighboring top-offset layers with a fixed z-transition penalty, uses fixed
+  row. That path uses `(top_offset_layer, y, prev_dy, prev_dz)` state, can move
+  between neighboring top-offset layers with a `0.1 * abs(delta_layer)`
+  transition penalty, adds second-order smoothness penalties
+  `0.05 * (dy - prev_dy)^2` and `0.1 * (dz - prev_dz)^2`, uses fixed
   8 px horizontal transitions, and integrates
   `1 - abs(dot(path_tangent, layer_direction))` across each transition's
   crossed pixel columns using the direction field from the selected layer. It
-  uses a fixed penalty, rather than a hard stop, for invalid/missing direction
+  uses no absolute-y row bias by default, and uses a fixed penalty, rather than
+  a hard stop, for invalid/missing direction
   pixels. The panel is diagnostic only and does not change scoring or z-layer
   selection.
-- `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` adds an
-  experimental short z-search to the combined tracer. The loader builds one
-  aligned Trace2CP segment source from the CP-to-CP line window and Lasagna
-  normals, including the per-pixel strip offset axis. The runner keeps a lazy
-  prediction cache of layers derived from that source: layer `k` adds
+- `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` runs the same
+  monotone DP over a bounded stack of side-strip z layers. The loader builds
+  one aligned Trace2CP segment source from the CP-to-CP line window and Lasagna
+  normals, including the per-pixel strip offset axis. Layer `k` adds
   `offset_axis_zyx * (k * --trace2cp-z-step-voxels * volume_spacing_base)` to
   the center coordinates before sampling the volume. The default z step is
   `1.0` selected-scale voxel, with a bounded range controlled by
   `--trace2cp-z-max-layer`. Z-search never warps an already sampled image and
-  never rebuilds unrelated planes for lazy z layers.
-- In z-search mode the angular fan is unchanged, but every angular candidate
-  is scored in neighbor z layers `current-1`, `current`, and `current+1`.
-  The fan source is the currently accepted z layer, so a layer switch changes
-  the direction field used by the next step. The direction term averages the
-  current-point direction disagreement and candidate-point direction
-  disagreement sampled at the candidate xy in the candidate layer. In embedding
-  mode, previous-step embedding, enclosing-CP embedding, and same-fiber CP-bank
-  terms use the candidate layer's predicted fields; CP and CP-bank embeddings
-  are still sampled from the center layer. In image mode, candidate descriptors
-  are sampled from the candidate z layer image/mask, the previous descriptor is
-  carried from the accepted current layer, and start/target descriptors stay on
-  the center layer. With `--trace2cp-use-presence`, candidate presence is
-  sampled from the candidate z layer. The public `trace2cp_error` remains the
-  target-column y error per horizontal span.
-- Z-search fusion computes closest approach with
-  `abs(dy) + abs(dz_voxels)` and linearly corrects both y and z toward the
-  closest-approach midpoint, while both CP z coordinates stay fixed at zero.
-  The first z-search implementation skips the y-only optimized-refinement
-  solve and uses the fused line for that row.
+  never rebuilds unrelated planes. Direction and optional presence costs are
+  sampled from the DP-selected z layer at each transition.
 - Single-pair z-search visualization appends a z column with separate forward,
   reverse, and fused z-corrected views plus a fused z-layer map row. These
   images are reconstructed per column by rounding the trace/fused z value to

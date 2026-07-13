@@ -2,6 +2,11 @@
 
 ## 2026-07-13
 
+- Replaced active Trace2CP combined tracing with a joint side-strip monotone DP
+  path over direction plus optional presence, including z-layer DP search.
+- Added second-order `dy/dz` smoothness to the visualization-only
+  `--trace2cp-top-model-dir-vis` yellow DP path, with debug labels for the
+  smoothing weights.
 - Changed the `--trace2cp-top-model-dir-vis` yellow DP path to use
   `(top_offset_layer, y)` state over raw per-layer top-model directions, with a
   small z-transition penalty and layer-range debug output.
