@@ -58,8 +58,8 @@ export function TutorialsTop({ highlightId, links = {}, labels = {} } = {}) {
       <Thumb
         href={links.scanning || "/2026_open_problems#1-scanning-preserving-the-signal-before-algorithms-see-it"}
         label={labels.scanning || "Scanning"}
-        videoSrc="/img/tutorial-thumbs/top-scanning-small.webm"
-        poster="/img/tutorial-thumbs/top-scanning-small.webp"
+        videoSrc="/img/tutorial-thumbs/top-scanning-small.webm?v=4"
+        poster="/img/tutorial-thumbs/top-scanning-small.webp?v=4"
         highlight={highlightId == 2}
       />
 
@@ -70,9 +70,9 @@ export function TutorialsTop({ highlightId, links = {}, labels = {} } = {}) {
 
       <Thumb
         href={links.representation || "/tutorial_VC3D"}
-        label={labels.representation || "Representation"}
-        videoSrc="/img/tutorial-thumbs/top-representation-small.webm"
-        poster="/img/tutorial-thumbs/top-representation-small.webp"
+        label={labels.representation || "Unwrapping"}
+        videoSrc="/img/tutorial-thumbs/top-representation-small.webm?v=4"
+        poster="/img/tutorial-thumbs/top-representation-small.webp?v=4"
         highlight={highlightId == 3}
       />
 
@@ -83,9 +83,9 @@ export function TutorialsTop({ highlightId, links = {}, labels = {} } = {}) {
 
       <Thumb
         href={links.segmentation || "/tutorial_spiral"}
-        label={labels.segmentation || "Segmentation and Flattening"}
-        videoSrc="/img/tutorial-thumbs/top-segmentation-small.webm"
-        poster="/img/tutorial-thumbs/top-segmentation-small.webp"
+        label={labels.segmentation || "Flattening"}
+        videoSrc="/img/tutorial-thumbs/top-segmentation-small.webm?v=4"
+        poster="/img/tutorial-thumbs/top-segmentation-small.webp?v=4"
         highlight={highlightId == 4}
       />
 
@@ -96,7 +96,7 @@ export function TutorialsTop({ highlightId, links = {}, labels = {} } = {}) {
 
       <Thumb
         href={links.ink || "/tutorial5"}
-        label={labels.ink || "Ink Detection"}
+        label={labels.ink || "Ink Recovery"}
         videoSrc="/img/tutorial-thumbs/top-prediction-small.webm"
         poster="/img/tutorial-thumbs/top-prediction-small.webp"
         highlight={highlightId == 5}

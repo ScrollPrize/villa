@@ -198,7 +198,7 @@ const config = {
               items: [
                 {
                   to: "/tutorial_VC3D",
-                  label: "Volume Cartographer 3D",
+                  label: "Virtual Unwrapping",
                 },
                 {
                   to: "/tutorial_spiral",
@@ -206,7 +206,7 @@ const config = {
                 },
                 {
                   to: "/open_problems/winding_annotations",
-                  label: "Winding Annotations",
+                  label: "Winding Constraints",
                 },
                 {
                   to: "/tutorial5",

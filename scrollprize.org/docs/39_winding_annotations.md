@@ -1,8 +1,8 @@
 ---
 id: winding_annotations
 slug: /open_problems/winding_annotations
-title: "In-depth: Winding Annotations"
-sidebar_label: "Winding Annotations"
+title: "In-depth: Winding Constraints"
+sidebar_label: "Winding Constraints"
 ---
 
 <head>
@@ -10,21 +10,21 @@ sidebar_label: "Winding Annotations"
 
   <meta
     name="description"
-    content="An introduction to winding annotations: the sparse, high-accuracy geometric constraints used to fit a globally coherent spiral through a Herculaneum scroll."
+    content="An introduction to winding constraints: sparse, high-accuracy geometric evidence used to fit a globally coherent spiral through a Herculaneum scroll."
   />
   <meta property="og:type" content="article" />
   <meta property="og:url" content="https://scrollprize.org/open_problems/winding_annotations" />
-  <meta property="og:title" content="In-depth: Winding Annotations | Vesuvius Challenge" />
+  <meta property="og:title" content="In-depth: Winding Constraints | Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="What winding annotations are, how the spiral fit uses them, and why accuracy matters more than dataset size."
+    content="What winding constraints are, how the spiral fit uses them, and why accuracy matters more than dataset size."
   />
   <meta property="og:image" content="https://scrollprize.org/img/social/opengraph.jpg" />
   <meta property="twitter:card" content="summary_large_image" />
-  <meta property="twitter:title" content="In-depth: Winding Annotations | Vesuvius Challenge" />
+  <meta property="twitter:title" content="In-depth: Winding Constraints | Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="What winding annotations are, how the spiral fit uses them, and why accuracy matters more than dataset size."
+    content="What winding constraints are, how the spiral fit uses them, and why accuracy matters more than dataset size."
   />
   <meta property="twitter:image" content="https://scrollprize.org/img/social/opengraph.jpg" />
 </head>
@@ -33,9 +33,9 @@ import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
 
 *Last updated: July 12, 2026*
 
-<ChatCallout prefill="Explain winding annotations and how I could help create them" />
+<ChatCallout prefill="Explain winding constraints and how I could help create them" />
 
-Winding annotations are sparse geometric constraints: points, lines, fibers, or surface patches whose relationship to the scroll's windings is known. The [spiral fit](/tutorial_spiral) combines these constraints with other evidence and deforms an ideal spiral into a single, globally coherent model of the damaged scroll.
+Winding constraints are sparse geometric evidence: points, lines, fibers, or surface patches whose relationship to the scroll's windings is known. The [spiral fit](/tutorial_spiral) combines these constraints with other evidence and deforms an ideal spiral into a single, globally coherent model of the damaged scroll.
 
 <div className="flex flex-wrap mb-4">
   <div className="w-[41%] mr-[3%] mb-2">
@@ -49,24 +49,24 @@ Winding annotations are sparse geometric constraints: points, lines, fibers, or 
 </div>
 
 
-## Why we are focusing on winding annotations
-Given our recent work on PHercParis4, and the flexibility/sparsity afforded by the spiral fit,  **we believe that the fastest way to unroll scrolls at scale is to develop methods for creating winding annotations 
+## Why we are focusing on winding constraints
+Given our recent work on PHercParis4, and the flexibility/sparsity afforded by the spiral fit,  **we believe that the fastest way to unroll scrolls at scale is to develop methods for creating winding constraints
 that are precise and fast enough to use at scale** 
 
-We think that the spiral fit is flexible enough to unroll most scrolls given sufficient winding annotations. We don't know the exact minimum area of winding
-annotations necessary for a given scroll ahead of time, but we know it is certainly *much less than full wrap segmentation*. 
+We think that the spiral fit is flexible enough to unroll most scrolls given sufficient winding constraints. We don't know the exact minimum amount of winding
+evidence necessary for a given scroll ahead of time, but we know it is certainly *much less than full wrap segmentation*.
 
 It's important to emphasize here how much this changes the goal of anyone who wishes to unroll scrolls at scale. Rather than focusing on methods which produce large multi-winding segmentations (often by combining patches, using a "bottom up" style approach), 
 and eventually must handle a more global idea of a fit if they wish to address inevitable surface prediction mistakes/sheet skips/etc -- often an extremely difficult task when starting from these bottom-up methods -- we now
-can focus on methods which prioritize local, accurate annotations, leaving the more global understanding to the spiral fit.
+can focus on methods which prioritize local, accurate constraints, leaving the more global understanding to the spiral fit.
 
 There is no required annotation tool or generation method. Winding constraints can be drawn manually, inferred from fibers or meshes, produced by classical computer vision, proposed by a learned model, transferred from another representation, or generated by a new method we have not yet tried.
 
-An ideal winding annotation generator should be:
+An ideal winding constraint generator should be:
 - **Accurate (or have some way to measure its confidence/accuracy)**
 - **Fast enough to process entire scroll volumes in a reasonable amount of time**
 - **Easy to verify**
-- **Easy to integrate within the spiral fit**
+- **General enough to integrate into "global fitters", like the spiral fit**
 
 <figure className="mb-6">
   <div className="flex flex-wrap gap-4 items-start">
@@ -74,31 +74,31 @@ An ideal winding annotation generator should be:
       <img
         src="/img/open-problems/sparse-patch-annotations-1.webp"
         alt="Many small, colored surface-patch annotations distributed across a scroll-volume slice"
-        className="w-[100%]"
+        className="w-[100%] rotate-180"
       />
     </a>
     <a href="/img/open-problems/sparse-patch-annotations-2.webp" target="_blank" className="flex-1 min-w-[280px]">
       <img
         src="/img/open-problems/sparse-patch-annotations-2.webp"
         alt="A sparse set of colored local surface-patch annotations in a scroll-volume region"
-        className="w-[100%]"
+        className="w-[100%] rotate-180"
       />
     </a>
   </div>
   <figcaption className="mt-2">Sparse surface-patch annotations shown across two regions. The uncolored areas are the spiral's interpolated fit.</figcaption>
 </figure>
 
-## Types of winding annotations currently used by the spiral fit
+## Types of winding constraints currently used by the spiral fit
 
-Winding annotations are best classified by the information they provide, not by the tool that made them or the feature they follow.
+The spiral fit currently consumes annotations that encode three kinds of winding constraint. The constraints are best classified by the information they provide, not by the tool that made them or the feature they follow.
 
-- **Same-winding annotations** say that a collection of points lies on the same wrap of the papyrus sheet. A traced fiber, a line following the surface, or a verified surface patch can all provide this constraint.
-- **Relative-winding annotations** say how many complete wraps separate observations—for example, that one point lies exactly one winding outward from another. A multi-winding line can provide several such relationships at once.
-- **Absolute-winding annotations** assign an observation to a numbered winding. These anchor the solution's global numbering when that number is known.
+- **Same-winding constraints** say that a collection of points lies on the same wrap of the papyrus sheet. A traced fiber, a line following the surface, or a verified surface patch can all provide this constraint.
+- **Relative-winding constraints** say how many complete wraps separate observations—for example, that one point lies exactly one winding outward from another. A multi-winding line can provide several such relationships at once.
+- **Absolute-winding constraints** assign an observation to a numbered winding. These anchor the solution's global numbering when that number is known.
 
-These annotations do not need to form a dense surface or cover the entire scroll. They tell the optimizer how disconnected pieces of local evidence relate to the scroll's global rolled structure.
+These constraints do not need to form a dense surface or cover the entire scroll. They tell the optimizer how disconnected pieces of local evidence relate to the scroll's global rolled structure.
 
-## Some examples of winding annotations, and some promising areas to work on
+## Some examples of winding constraints, and some promising areas to work on
 
 ### Things we have used
 
@@ -191,7 +191,7 @@ A visible papyrus fiber can provide a natural path along one winding. Fiber anno
 
 ### Things we have not tried
 
-While we have used a few different types of winding annotations, there are **many** more things left to try. Here are some ideas we have thought about but have not yet had the time to implement:
+While we have used a few different types of winding constraints, there are **many** more things left to try. Here are some ideas we have thought about but have not yet had the time to implement:
 
 #### Drawn paths
 
@@ -207,7 +207,7 @@ very quickly, and likely learnable or doable with other classical computer visio
 
 #### Ink as same-winding evidence
 
-Easily identifiable correct letters, rows, or columns are a natural fit for same-winding annotations (and are likely the most easily verified). 
+Easily identifiable correct letters, rows, or columns are a natural source of same-winding constraints (and are likely the most easily verified).
 
 <figure className="mb-6">
   <div className="grid grid-cols-1 md:grid-cols-[minmax(0,2.6fr)_minmax(0,1fr)] gap-4 items-stretch">
@@ -218,7 +218,7 @@ Easily identifiable correct letters, rows, or columns are a natural fit for same
       <img src="/img/open-problems/winding-annotations/more-ink-as-same-wrap.webp" alt="Lines and individual letters highlighted as possible same-winding evidence" className="w-[100%] h-[100%] object-cover" />
     </a>
   </div>
-  <figcaption className="mt-2">Ink used same-winding annotation, from individual letters to complete lines.</figcaption>
+  <figcaption className="mt-2">Ink used as a same-winding constraint, from individual letters to complete lines.</figcaption>
 </figure>
 
 #### Intercolumnar gaps
@@ -234,7 +234,7 @@ The blank vertical spaces between columns of text can form long, recognizable pa
 
 #### Kolleisis
 
-Kolleiseis -- the joins where papyrus sheets were pasted together -- could be used as relatively large, full height same-winding annotations. They stand out well in the CT scan, and should be a good candidate for 
+Kolleiseis -- the joins where papyrus sheets were pasted together -- could be used as relatively large, full height same-winding constraints. They stand out well in the CT scan, and should be a good candidate for
 a deep learning model to excel at.
 
 <figure className="mb-6">

@@ -3,6 +3,8 @@ title: "Tutorial: Ink Detection"
 sidebar_label: "Ink Detection"
 ---
 
+import BeforeAfter from '@site/src/components/BeforeAfter';
+
 <head>
   <html data-theme="dark" />
 
@@ -107,7 +109,7 @@ Because the labels come from model predictions, the process is designed to avoid
 * The model only sees small local patches — smaller than a full letter — so it cannot learn to "draw" plausible letterforms.
 * Labeling is conservative: only regions where strokes are clearly and repeatably visible get labeled.
 * **Validation regions** are held out, so you can measure whether the model generalizes.
-* Final readings are always reviewed by papyrologists — machine output is never treated as a substitute for reading.
+* Final readings are always reviewed by papyrologists. Machine output is never treated as a substitute for reading.
 
 Now let's train a model. The rest of this tutorial is hands-on: you will set up the training pipeline, download a labeled dataset, train an ink detection model, and run inference on a scroll segment. It is written for Linux (Windows users are advised to use WSL2) and assumes an NVIDIA GPU with a working CUDA installation.
 
@@ -152,7 +154,7 @@ Here is what that looks like on a crop of the tutorial segment. First, the ink l
   <figcaption className="mt-0">A crop of the tutorial segment's surface volume with its ink labels overlaid in red</figcaption>
 </figure>
 
-The supervision mask covers those strokes *plus* the clean papyrus around them — those background pixels are the negative examples, and they matter just as much as the ink:
+The supervision mask covers those strokes *plus* the clean papyrus around them. Those background pixels are the negative examples, and they matter just as much as the ink:
 
 <figure>
   <a href="/img/tutorials/ink-supervision-overlay-w00.webp" target="_blank"><img src="/img/tutorials/ink-supervision-overlay-w00.webp" /></a>
@@ -182,7 +184,7 @@ uv run python -c "import torch; print(torch.__version__, '| cuda:', torch.cuda.i
 
 ### Training
 
-Training runs are configured with a single JSON file. Create `configs/ink_tutorial.json` (the `configs` folder doesn't exist yet — create it too), pointing `segments_path` at the folder containing your downloaded segments:
+Training runs are configured with a single JSON file. Create `configs/ink_tutorial.json` (the `configs` folder doesn't exist yet; create it too), pointing `segments_path` at the folder containing your downloaded segments:
 
 ```json
 {
@@ -219,7 +221,7 @@ Training runs are configured with a single JSON file. Create `configs/ink_tutori
 
 The important options:
 
-* `mode: "flat"` trains directly on the pre-rendered surface volume zarrs — this is the standard **2.5D** setup: the model takes a 3D patch of the surface volume as input and predicts a 2D ink image as output. Nothing is rendered on the fly. (The pipeline also has native 3D modes — `full_3d`, `full_3d_single_wrap` — which instead sample patches on the fly from the original scroll volume using the `.tifxyz` coordinates; they get [their own section](#native-3d-training-and-inference) below.)
+* `mode: "flat"` trains directly on the pre-rendered surface volume zarrs. This is the standard **2.5D** setup: the model takes a 3D patch of the surface volume as input and predicts a 2D ink image as output. Nothing is rendered on the fly. (The pipeline also has native 3D modes — `full_3d`, `full_3d_single_wrap` — which instead sample patches on the fly from the original scroll volume using the `.tifxyz` coordinates; they get [their own section](#native-3d-training-and-inference) below.)
 * `z_projection_mode: "max"` is what makes it 2.5D — the network processes the patch in 3D, then the ink head collapses the depth axis with a max-projection to produce the 2D prediction. (`mean`, `logsumexp`, and `learned_mlp` are alternative projections to experiment with.)
 * `patch_size` is the `[z, y, x]` size of the patches sampled around the surface: 64 slices deep, 256×256 pixels across. Each dimension must be divisible by the network's pooling factors — the trainer prints the required factors and adjusts or complains if they don't match.
 * `patch_overlap: 0.5` means training patches are sampled with a half-patch stride across each segment.
@@ -236,7 +238,7 @@ uv run python -m koine_machines.training.train configs/ink_tutorial.json
 The trainer discovers your segments, finds all training patches inside the supervision masks (excluding the validation regions), and starts training. Patch discovery can take a while on large datasets; the result is cached as a JSON file in `out_dir`, keyed by patch size, overlap, and label version, so re-runs with the same settings skip it. With this config, the full 20,000-iteration run takes about an hour and a half on a single H100. While it runs you will see the loss printed to the console, and in `runs/ink_tutorial/` you will find:
 
 * `ckpt_001000.pth`, `ckpt_002000.pth`, ... — checkpoints, saved every `save_every` iterations.
-* `train_previews/` (and `val_previews/`, when there is a validation set) — periodic image previews of the model's predictions next to the labels. Watching the previews sharpen from noise into letter strokes is the most satisfying part of the process.
+* `train_previews/` (and `val_previews/`, when there is a validation set) — periodic image previews of the model's predictions next to the labels. Watching the previews go from noise to letter strokes is the most satisfying part of the process.
 
 If your dataset includes segments with validation masks, the model is also evaluated on those held-out regions at each validation step, reporting balanced accuracy — how well it detects ink in areas it was never trained on. If training loss keeps dropping while validation accuracy stalls, the model is starting to overfit your labels. (The tutorial segment has no validation mask, so this first run reports training loss only.) You can stop training at any time with `ctrl+c` and use the most recently saved checkpoint.
 
@@ -255,7 +257,7 @@ To run your trained model on the same segment and produce an ink prediction imag
 ```bash
 uv run python -m koine_machines.inference.infer \
   /path/to/ink-dataset/phercparis4/w00_20231016151002/w00_20231016151002.zarr \
-  runs/ink_tutorial/ckpt_019000.pth \
+  runs/ink_tutorial/ckpt_020000.pth \
   predictions/w00_20231016151002.tif \
   --batch-size 4
 ```
@@ -309,7 +311,7 @@ Create `configs/ink_full3d.json`. It is the same shape as the 2.5D config with a
   },
 
   "batch_size": 8,
-  "num_iterations": 15000,
+  "num_iterations": 20000,
   "learning_rate": 0.01,
   "mixed_precision": "fp16",
   "dataloader_workers": 8,
@@ -343,7 +345,11 @@ Training starts the same way:
 uv run python -m koine_machines.training.train configs/ink_full3d.json
 ```
 
-This run — 15,000 iterations at batch size 8 — takes about six hours on an H100 with the tutorial segment and uses about 17&nbsp;GB of VRAM.
+This run — 20,000 iterations at batch size 8 — takes about eight hours on an H100 with the tutorial segment and uses about 17&nbsp;GB of VRAM.
+
+:::tip
+You don't have to wait eight hours to see results. Checkpoints land in the run folder every `save_every` iterations, so while training continues you can run the inference command below on an intermediate checkpoint, say `ckpt_005000.pth`, and watch the predictions improve from checkpoint to checkpoint.
+:::
 
 #### Native 3D inference
 
@@ -361,7 +367,7 @@ Then, with your native-3D checkpoint:
 ```bash
 uv run python -m koine_machines.inference.infer_full3d_tifxyz \
   /path/to/ink-dataset/phercparis4/w00_20231016151002 \
-  runs/ink_full3d/ckpt_015000.pth \
+  runs/ink_full3d/ckpt_020000.pth \
   predictions/w00_20231016151002_ink.ome.zarr \
   --resolution 2 \
   --write-region occupied --chunk-halo 0 \
@@ -376,7 +382,16 @@ uv run python -m koine_machines.inference.infer_full3d_tifxyz \
 * `--write-region occupied --chunk-halo 0` restricts the output to just the chunks that actually contain surface points, which is much faster than the default (which also writes a halo of neighboring chunks). Even at level 2 a single segment plans thousands of patches (hundreds of thousands at full resolution) — add `--plan-only` to preview the chunk/patch plan first, and only launch the full command when the printed patch count fits your compute budget.
 * For `full_3d_single_wrap` checkpoints, the script reconstructs the surface-mask input channel from the `.tifxyz` geometry automatically.
 
-The result is an ink prediction in scroll coordinates rather than a flattened image. To read it, render it through the segment geometry with VC3D's `vc_render_tifxyz` — the same tool that renders surface volumes from the scroll, just pointed at the prediction volume instead. You'll need a VC3D build on your `PATH`; see the [VC3D tutorial's installation instructions](tutorial_VC3D#installing-vc3d).
+The result is an ink prediction in scroll coordinates rather than a flattened image:
+
+<figure>
+  <video autoPlay playsInline loop muted className="block w-[100%] max-w-[480px] mx-auto" poster="/img/tutorials/ink-3d-prediction-w00.webp">
+    <source src="/img/tutorials/ink-3d-prediction-w00.webm" type="video/webm"/>
+  </video>
+  <figcaption className="mt-0">Slicing through the prediction volume for the tutorial segment. The predicted ink follows the segment's wrap through the scroll.</figcaption>
+</figure>
+
+To read it, render it through the segment geometry with VC3D's `vc_render_tifxyz` — the same tool that renders surface volumes from the scroll, just pointed at the prediction volume instead. You'll need a VC3D build on your `PATH`; see the [VC3D tutorial's installation instructions](tutorial_VC3D#installing-vc3d).
 
 ```bash
 vc_render_tifxyz \
@@ -401,6 +416,21 @@ tifffile.imwrite('renders/w00_20231016151002_ink_max.tif', stack.max(axis=0))
 "
 ```
 
+The model trained on a single segment, so the interesting test is a segment it has never seen. Here are the same two checkpoints rendered this way on the central region of `w05_4424`, elsewhere in the scroll:
+
+<figure>
+  <BeforeAfter
+    beforeImage="/img/tutorials/ink-3d-w05-15k.webp"
+    afterImage="/img/tutorials/ink-3d-w05-19k.webp"
+    beforeLabel="15,000 iterations"
+    afterLabel="19,000 iterations"
+    heightClass="aspect-[2/1]"
+  />
+  <figcaption className="mt-0">Predictions on a segment the model never trained on. Drag to compare the two checkpoints. Letters are starting to show, and the predictions have mostly converged, with the later checkpoint just slightly cleaner. This is still far from a good read.</figcaption>
+</figure>
+
+The run above is a starting point. For better results, give the trainer more segments and train longer; the next section covers where to get them.
+
 ### Scaling up: the full dataset
 
 Everything above ran on one segment; scaling up is mostly a matter of downloading more. Sync a whole scroll (or several) into the same folder:
@@ -416,7 +446,7 @@ For inference across many segments, use folder mode — it runs the checkpoint o
 ```bash
 uv run python -m koine_machines.inference.infer \
   --folder /path/to/ink-dataset/phercparis4 \
-  --checkpoint-path runs/ink_tutorial/ckpt_019000.pth \
+  --checkpoint-path runs/ink_tutorial/ckpt_020000.pth \
   --batch-size 4
 ```
 
@@ -427,7 +457,7 @@ A first model trained on a small dataset will reveal some letters clearly, other
 1. **Run inference** on your training segments (and new, unlabeled ones).
 2. **Inspect the predictions.** Look for regions where letter strokes are clearly visible.
 3. **Extend the labels.** In those regions, paint the visible strokes white in the ink label image, and extend the supervision mask to cover the region — both the strokes *and* the clean background around them, since the background pixels are the negative examples the model learns from.
-4. **Retrain** on the enlarged labels, starting fresh or from your last checkpoint (add `"checkpoint": "runs/ink_tutorial/ckpt_019000.pth"` and `"weights_only": true` to the config).
+4. **Retrain** on the enlarged labels, starting fresh or from your last checkpoint (add `"checkpoint": "runs/ink_tutorial/ckpt_020000.pth"` and `"weights_only": true` to the config).
 5. **Repeat.**
 
 Labels are ordinary image files, so you can edit them in any image editor that handles large images (e.g. GIMP or Photoshop). If you edit or create labels as TIFF/PNG files, convert them to the `.zarr` format the trainer expects with:
@@ -436,7 +466,7 @@ Labels are ordinary image files, so you can edit them in any image editor that h
 uv run python -m koine_machines.preprocessing.create_label_zarrs /path/to/ink-dataset/phercparis4
 ```
 
-The figure below shows this loop in action on PHerc. 1667: with each iteration the labels (row a) grow from a handful of strokes to dense coverage, the model's predictions (row b) sharpen, and — crucially — the reading improves even on a held-out region that was never labeled (row c).
+The figure below shows this loop in action on PHerc. 1667: with each iteration the labels (row a) grow from a handful of strokes to dense coverage, the model's predictions (row b) get cleaner, and the reading improves even on a held-out region that was never labeled (row c).
 
 <figure>
   <a href="/img/tutorials/ink-iterative-labeling.webp" target="_blank"><img src="/img/tutorials/ink-iterative-labeling.webp" /></a>
