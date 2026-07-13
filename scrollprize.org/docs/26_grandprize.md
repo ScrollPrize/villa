@@ -447,7 +447,8 @@ The potential of tens of thousands of scrolls, still buried, waiting to be disco
 Read more detail about what comes next in our [Master Plan](master_plan).
 
 <div className="mb-4">
-  <img src="/img/landing/rocio-espin-pinar-villa-papyri-small.webp" className="w-[100%] max-w-[600px]" alt="Artist's reconstruction of the Villa of the Papyri by Rocio Espin Pinar."/>
+  <img src="/img/landing/rocio-espin-pinar-villa-papyri-small.webp" className="w-[100%] max-w-[600px]" alt="Artist's reconstruction of the Villa of the Papyri by Rocío Espín Pinar."/>
+  <figcaption className="mt-[-6px]">Artist's reconstruction of the Villa of the Papyri by <a href="https://www.artstation.com/rocioespin">Rocío Espín Pinar</a>.</figcaption>
 </div>
 
 ## Thank you

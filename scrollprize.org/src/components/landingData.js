@@ -342,7 +342,7 @@ export const sponsors = [
   {
     name: "Chet Corcos",
     amount: 10000,
-    href: "https://chetcorcos.com",
+    href: "https://chetcorcos.notion.site",
     image: "/img/landing/Chet Corcos.webp",
   },
   {
