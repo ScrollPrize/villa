@@ -11,7 +11,9 @@ NORMAL_POOLED_TRANSLATION_MAX_ATTEMPTS = 24
 
 def _collect_constrained_native_points(flat_patch, patch_zyxs, valid_mask):
     constrained_mask = np.zeros(np.asarray(valid_mask).shape, dtype=bool)
-    constrained_mask |= np.asarray(flat_patch) != 0
+    flat_patch = np.asarray(flat_patch)
+    overlap = tuple(slice(0, min(a, b)) for a, b in zip(constrained_mask.shape, flat_patch.shape))
+    constrained_mask[overlap] = flat_patch[overlap] != 0
     if not np.any(constrained_mask):
         return np.empty((0, 3), dtype=np.int64)
 
