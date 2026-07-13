@@ -24,8 +24,9 @@ Usage:
     get_ink_coverage.py /path/to/<run>/meshes/<...>/ink
     get_ink_coverage.py /path/to/ink --output /somewhere/ink_metric --gpus 0,1,2
 
-The nnU-Net model, and the nnUNet_raw/preprocessed/results layout it lives in, are under
-DEFAULT_BASE_PATH below (created by the setup step).
+The nnU-Net model is pulled from HuggingFace (DEFAULT_MODEL below, cached locally by
+huggingface_hub on first use); pass --model to use another HF repo id or a local
+nnU-Net model folder instead.
 """
 
 import os
@@ -43,25 +44,38 @@ import numpy as np
 from PIL import Image
 
 # ---------------------------------------------------------------------------
-# Base path holding the nnU-Net raw/preprocessed/results layout and the model.
-# Override the model/output with CLI flags.
+# The model: a HuggingFace repo id (downloaded to the HF cache on first use) or a
+# local nnU-Net model folder. Override with --model.
 # ---------------------------------------------------------------------------
-DEFAULT_BASE_PATH = '/ephemeral/paul/spiral/ink-coverage-nnunet'
-DEFAULT_MODEL = os.path.join(
-    DEFAULT_BASE_PATH, 'nnUNet_results', 'Dataset001_Ink',
-    'nnUNetTrainer_250epochs__nnUNetPlans__2d',
-)
+DEFAULT_MODEL = 'scrollprize/ink-coverage-32um'
 DEFAULT_CHECKPOINT = 'checkpoint_final.pth'
 
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp')
 
 
 def set_nnunet_env():
-    """nnU-Net insists on these three env vars at import time; point them at our base
-    path. setdefault so an explicit outer environment still wins."""
-    os.environ.setdefault('nnUNet_raw', os.path.join(DEFAULT_BASE_PATH, 'nnUNet_raw'))
-    os.environ.setdefault('nnUNet_preprocessed', os.path.join(DEFAULT_BASE_PATH, 'nnUNet_preprocessed'))
-    os.environ.setdefault('nnUNet_results', os.path.join(DEFAULT_BASE_PATH, 'nnUNet_results'))
+    """nnU-Net insists on these three env vars at import time even though predicting
+    from an explicit model folder never reads them; point them at a scratch location.
+    setdefault so an explicit outer environment still wins."""
+    base = os.path.join(os.path.expanduser('~'), '.cache', 'ink-coverage-nnunet')
+    for key in ('nnUNet_raw', 'nnUNet_preprocessed', 'nnUNet_results'):
+        os.environ.setdefault(key, os.path.join(base, key))
+
+
+def resolve_model(model):
+    """Return a local nnU-Net model folder for `model`: either an existing local
+    directory, or a HuggingFace repo id (e.g. 'scrollprize/ink-coverage-32um') whose
+    snapshot is downloaded to the HF cache on first use."""
+    if os.path.isdir(model):
+        return model
+    from huggingface_hub import snapshot_download
+    local = snapshot_download(repo_id=model)
+    # The model folder (plans.json + dataset.json + fold_*/) is normally the repo
+    # root, but tolerate it being nested one or more levels down.
+    for root, _dirs, files in sorted(os.walk(local)):
+        if 'plans.json' in files and 'dataset.json' in files:
+            return root
+    raise SystemExit(f'no nnU-Net model (plans.json + dataset.json) found in {model} ({local})')
 
 
 # ===========================================================================
@@ -180,7 +194,8 @@ def run_main(argv):
     ap.add_argument('ink_dir', help="folder of ink strip images (render_ink's ink/ output)")
     ap.add_argument('--output', default=None,
                     help='output folder (default: <ink_dir>/../ink_metric)')
-    ap.add_argument('--model', default=DEFAULT_MODEL, help='nnU-Net model folder')
+    ap.add_argument('--model', default=DEFAULT_MODEL,
+                    help='HuggingFace repo id or local nnU-Net model folder')
     ap.add_argument('--checkpoint', default=DEFAULT_CHECKPOINT,
                     help='checkpoint_final.pth (default) or checkpoint_best.pth')
     ap.add_argument('--folds', default=None,
@@ -217,14 +232,15 @@ def run_main(argv):
     for d in (pred_dir, in_dir):
         os.makedirs(d, exist_ok=True)
 
-    folds = [int(x) for x in args.folds.split(',')] if args.folds else detect_folds(args.model)
+    model_dir = resolve_model(args.model)
+    folds = [int(x) for x in args.folds.split(',')] if args.folds else detect_folds(model_dir)
     if not folds:
-        ap.error(f'no folds found in {args.model}')
+        ap.error(f'no folds found in {model_dir}')
     gpus = [g.strip() for g in args.gpus.split(',')] if args.gpus else detect_gpus()
 
     print(f'ink_dir : {ink_dir}')
     print(f'strips  : {len(strips)}')
-    print(f'model   : {args.model}')
+    print(f'model   : {args.model}' + (f' ({model_dir})' if model_dir != args.model else ''))
     print(f'folds   : {folds}   gpus: {gpus}   checkpoint: {args.checkpoint}')
     print(f'output  : {out_dir}')
 
@@ -257,7 +273,7 @@ def run_main(argv):
         for k in ('nnUNet_raw', 'nnUNet_preprocessed', 'nnUNet_results'):
             env[k] = os.environ[k]
         cmd = [sys.executable, os.path.abspath(__file__), '__worker__',
-               '--fold', str(fold), '--model', args.model, '--checkpoint', args.checkpoint,
+               '--fold', str(fold), '--model', model_dir, '--checkpoint', args.checkpoint,
                '--input', in_dir, '--output', fold_out[fold], '--step', str(args.step),
                '--procs', str(args.procs)]
         if args.no_tta:
