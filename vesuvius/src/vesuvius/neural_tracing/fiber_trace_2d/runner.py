@@ -9540,6 +9540,33 @@ def _evaluate_trace2cp_pair(
                     fused_z_trace,
                 )
             _append_trace2cp_timing(timing_rows, "top_strip_z_traced", top_z_timer.elapsed_ms)
+        if z_plane_cache is not None and z_plane_cache.get(0).fields.presence_hw is not None:
+            with _Timer() as presence_pillar_timer:
+                width = int(image.shape[1])
+                top_strip_presence_image, top_strip_presence_valid_mask = _side_presence_z_pillar_image(
+                    z_plane_cache,
+                    np.asarray(sample.line_xy, dtype=np.float32),
+                    width=width,
+                )
+                if fused_center_xyz is not None:
+                    (
+                        traced_top_strip_presence_image,
+                        traced_top_strip_presence_valid_mask,
+                    ) = _side_presence_z_pillar_image(
+                        z_plane_cache,
+                        fused_center_xyz,
+                        width=width,
+                    )
+                if fused_z_trace is not None:
+                    (
+                        z_top_strip_presence_image,
+                        z_top_strip_presence_valid_mask,
+                    ) = _side_presence_z_pillar_image(
+                        z_plane_cache,
+                        fused_z_trace,
+                        width=width,
+                    )
+            _append_trace2cp_timing(timing_rows, "top_strip_presence_z_pillars", presence_pillar_timer.elapsed_ms)
         if top_model is not None:
             top_direction_image: np.ndarray | None
             top_direction_valid: np.ndarray | None

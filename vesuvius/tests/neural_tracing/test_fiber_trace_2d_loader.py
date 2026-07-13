@@ -1625,6 +1625,119 @@ def test_trace2cp_z_plane_cache_reuses_segment_source(monkeypatch: pytest.Monkey
     assert loader.sampled_offsets == [1.0, -2.0]
 
 
+def test_trace2cp_pair_builds_presence_z_pillar_panels(monkeypatch: pytest.MonkeyPatch) -> None:
+    shape = (9, 21)
+    valid = np.ones(shape, dtype=bool)
+    sample = FiberStripSegmentSample(
+        record_index=0,
+        fiber_path="fiber.json",
+        start_control_point_index=0,
+        target_control_point_index=1,
+        start_control_point_xyz=np.zeros(3, dtype=np.float32),
+        target_control_point_xyz=np.ones(3, dtype=np.float32),
+        strip_z_offset=0.0,
+        coords_zyx=np.zeros((shape[0], shape[1], 3), dtype=np.float32),
+        valid_mask=valid,
+        frame=SimpleNamespace(),
+        line_xy=np.asarray([[2.0, 4.0], [10.0, 4.0], [18.0, 4.0]], dtype=np.float32),
+        start_control_point_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_control_point_xy=np.asarray([18.0, 4.0], dtype=np.float32),
+        line_point_indices=np.arange(3, dtype=np.int64),
+        line_normals_xyz=np.zeros((3, 3), dtype=np.float32),
+        start_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        target_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+    )
+
+    class FakeLoader:
+        def sample_trace2cp_segment_source(self, _source):
+            return sample, np.zeros(shape, dtype=np.float32), valid
+
+        def sample_trace2cp_segment_side_z_source(self, _source, *, side_z_offset_voxels: float = 0.0):
+            image = np.full(shape, float(side_z_offset_voxels), dtype=np.float32)
+            return sample, image, valid
+
+        def sample_trace2cp_top_strip_source(self, _source):
+            return np.zeros((5, shape[1]), dtype=np.float32), np.ones((5, shape[1]), dtype=bool)
+
+        def sample_trace2cp_traced_top_strip_source(self, _source, _trace_xyz):
+            return np.zeros((5, shape[1]), dtype=np.float32), np.ones((5, shape[1]), dtype=bool)
+
+    def fake_predict(_model, _image, _valid_mask, *, device):
+        direction = np.zeros((shape[0], shape[1], 2), dtype=np.float32)
+        direction[:, :, 0] = 1.0
+        embedding = np.zeros((2, shape[0], shape[1]), dtype=np.float32)
+        presence = np.full(shape, 0.5, dtype=np.float32)
+        return _Trace2CpPredictedFields(
+            direction_xy=direction,
+            embedding_chw=embedding,
+            presence_hw=presence,
+        )
+
+    def fake_combined_z(**_kwargs):
+        result = _trace2cp_test_bidirectional_result()
+        summary = runner_module._Trace2CpCombinedSummary(
+            forward=_trace2cp_test_stats(),
+            reverse=_trace2cp_test_stats(),
+            candidate_angles_degrees=np.asarray([0.0], dtype=np.float32),
+            fiber_bank_size=0,
+            fiber_bank_skipped=0,
+        )
+        forward_xyz = np.concatenate(
+            [result.forward.trace_xy, np.zeros((int(result.forward.trace_xy.shape[0]), 1), dtype=np.float32)],
+            axis=1,
+        )
+        reverse_xyz = np.concatenate(
+            [result.reverse.trace_xy, np.zeros((int(result.reverse.trace_xy.shape[0]), 1), dtype=np.float32)],
+            axis=1,
+        )
+        return result, summary, forward_xyz, reverse_xyz
+
+    def fake_fused_xyz(_refinement):
+        return np.asarray(
+            [[2.0, 4.0, 0.0], [10.0, 4.0, 0.0], [18.0, 4.0, 0.0]],
+            dtype=np.float32,
+        )
+
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict)
+    monkeypatch.setattr(runner_module, "_trace_score_trace2cp_combined_z_bidirectional", fake_combined_z)
+    monkeypatch.setattr(runner_module, "_trace2cp_refinement_fused_xyz", fake_fused_xyz)
+
+    evaluation = runner_module._evaluate_trace2cp_pair(
+        FakeLoader(),
+        torch.nn.Identity(),
+        0,
+        device=torch.device("cpu"),
+        step_px=4.0,
+        rf_margin_px=0.0,
+        target_offset=1,
+        target_cp_index=None,
+        med_tta=False,
+        line_trace_tta_count=0,
+        vis_tta=False,
+        combined=True,
+        combined_weights=_Trace2CpCombinedWeights(direction=1.0, presence=1.0),
+        combined_fiber_bank=None,
+        combined_mode="direction",
+        image_scoring=None,
+        candidate_max_degrees=0.0,
+        candidate_step_degrees=1.0,
+        z_search=runner_module._Trace2CpZSearchConfig(enabled=True, step_voxels=1.0, max_layer=1),
+        trace2cp_dp=False,
+        sample_mode="flat",
+        segment_source=SimpleNamespace(),
+        build_similarity_debug=False,
+        build_top_strip_debug=True,
+    )
+
+    assert evaluation.top_strip_presence_image is not None
+    assert evaluation.traced_top_strip_presence_image is not None
+    assert evaluation.z_top_strip_presence_image is not None
+    assert evaluation.top_strip_presence_image.shape == (3, shape[1])
+    assert bool(np.asarray(evaluation.top_strip_presence_valid_mask, dtype=bool).any())
+    assert bool(np.asarray(evaluation.traced_top_strip_presence_valid_mask, dtype=bool).any())
+    assert bool(np.asarray(evaluation.z_top_strip_presence_valid_mask, dtype=bool).any())
+
+
 def test_trace2cp_z_closest_approach_includes_z_distance() -> None:
     forward = np.asarray([[0.0, 10.0, 2.0], [10.0, 10.0, 2.0]], dtype=np.float32)
     reverse = np.asarray([[0.0, 10.0, -2.0], [10.0, 10.0, -2.0]], dtype=np.float32)
