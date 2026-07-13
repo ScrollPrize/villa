@@ -69,18 +69,18 @@ This is where one of the core difficulties of the Herculaneum Papyri comes in: t
 
 So why scan with X-rays at all? Because visible and infrared light can't see inside a *rolled* scroll — they don't penetrate the papyrus. X-ray CT does: it images the interior of an intact scroll at high resolution, but, as the fragment above shows, at the cost of the visible ink contrast. Ink detection exists to win that contrast back computationally.
 
-Not all of that contrast is lost, though. What does the surviving signal look like? In PHerc. Paris 4 in particular, ink can sit as a thin layer on the papyrus surface, and on the flattened surface volume it often shows up as a **crackle** — a texture like cracked mud, where the ink lies proud of the surface.
+Not all of that contrast is lost, though. What does the surviving signal look like? In PHerc. Paris 4 in particular, ink can sit as a thin layer on the papyrus surface, and on the flattened surface volume it often shows up as a **crackle** — a texture like cracked mud, raised slightly above the papyrus.
 
 <figure>
   <a href="/img/tutorials/ink-signal-volumetric.webp" target="_blank"><img src="/img/tutorials/ink-signal-volumetric.webp" /></a>
   <figcaption className="mt-0">The ink signal in the data: (a) a slice through the CT volume, (b) the same region with the ink segmented in red, and (c) a flattened surface volume where the crackle texture and the letter π are visible directly. Source: <a href="https://arxiv.org/abs/2606.29085">the PHerc. 1667 paper</a>.</figcaption>
 </figure>
 
-This crackle is what first revealed [letters inside an intact scroll](/firstletters), spotted by eye in raw surface volumes; a model learns to recognize the same signal, and picks up fainter variants a human would miss. Several scrolls are still waiting for theirs, and each is worth \$50,000 in the open [First Letters Prizes](/prizes#first-letters-prizes). Finding them takes this combination of a searching eye and a model's predictions. By the end of this tutorial you'll have both — and maybe you'll be the first person to read those words in 2,000 years.
+This crackle is what first revealed [letters inside an intact scroll](/firstletters), spotted by eye in raw surface volumes; a model learns to recognize the same signal, and picks up fainter variants a human would miss. Several scrolls are still waiting for their first letters, and each is worth \$50,000 in the open [First Letters Prizes](/prizes#first-letters-prizes). Finding them takes a searching eye and a model's predictions. By the end of this tutorial you'll have both — and maybe you'll be the first person to read those words in 2,000 years.
 
 ### How ink detection works
 
-An ink detection model is not reading letters, it is doing signal recovery. The model looks at a small local patch of the surface volume (the stack of slices sampled around the papyrus surface) and predicts, for each pixel, the probability that there is ink at that location. Stitching these predictions together produces an image of the segment where the writing becomes visible to a human reader.
+An ink detection model does signal recovery, not reading. The model looks at a small local patch of the surface volume (the stack of slices sampled around the papyrus surface) and predicts, for each pixel, the probability that there is ink at that location. Stitching these predictions together produces an image of the segment where the writing becomes visible to a human reader.
 
 We train the model by picking a pixel in a binary label image, sampling a subvolume around the same coordinates from the surface volume, and backpropagating the known label to update the model weights:
 
@@ -106,7 +106,7 @@ Because the labels come from model predictions, the process is designed to avoid
 
 * The model only sees small local patches — smaller than a full letter — so it cannot learn to "draw" plausible letterforms.
 * Labeling is conservative: only regions where strokes are clearly and repeatably visible get labeled.
-* **Validation regions** are held out and never labeled from predictions, so you can measure whether the model generalizes.
+* **Validation regions** are held out, so you can measure whether the model generalizes.
 * Final readings are always reviewed by papyrologists — machine output is never treated as a substitute for reading.
 
 Now let's train a model. The rest of this tutorial is hands-on: you will set up the training pipeline, download a labeled dataset, train an ink detection model, and run inference on a scroll segment. It is written for Linux (Windows users are advised to use WSL2) and assumes an NVIDIA GPU with a working CUDA installation.
@@ -152,7 +152,7 @@ Here is what that looks like on a crop of the tutorial segment. First, the ink l
   <figcaption className="mt-0">A crop of the tutorial segment's surface volume with its ink labels overlaid in red</figcaption>
 </figure>
 
-The supervision mask covers those strokes *plus* the clean papyrus around them, the background pixels are the negative examples, and they matter just as much as the ink:
+The supervision mask covers those strokes *plus* the clean papyrus around them — those background pixels are the negative examples, and they matter just as much as the ink:
 
 <figure>
   <a href="/img/tutorials/ink-supervision-overlay-w00.webp" target="_blank"><img src="/img/tutorials/ink-supervision-overlay-w00.webp" /></a>
@@ -173,10 +173,6 @@ cd villa/ink-detection
 git checkout merge-ink-pipelines
 uv sync
 ```
-
-:::info
-The pipeline described here currently lives on the `merge-ink-pipelines` branch: run `git checkout merge-ink-pipelines` after cloning.
-:::
 
 `uv sync` creates a virtual environment and installs the exact locked dependencies (PyTorch, zarr, and friends). Verify that PyTorch sees your GPU:
 
@@ -229,6 +225,7 @@ The important options:
 * `patch_overlap: 0.5` means training patches are sampled with a half-patch stride across each segment.
 * `patch_min_labeled_coverage: 0.05` skips training patches whose ink labels cover less than 5% of the patch, so training focuses on labeled regions.
 * `val_every` controls how often validation metrics are computed on the validation-mask regions, and `save_every` how often checkpoints are written.
+* `segments_path` points at the *folder of segments*, not a single segment — the trainer picks up every valid segment it finds there, so the same config keeps working as you add more. One segment is enough for a real first model.
 
 Then start training:
 
@@ -236,12 +233,10 @@ Then start training:
 uv run python -m koine_machines.training.train configs/ink_tutorial.json
 ```
 
-The trainer discovers your segments, finds all training patches inside the supervision masks (excluding the validation regions), and starts training. Patch discovery can take a while on large datasets; the result is cached as a JSON file in `out_dir`, keyed by patch size, overlap, and label version, so re-runs with the same settings skip it. While it runs you will see the loss printed to the console, and in `runs/ink_tutorial/` you will find:
+The trainer discovers your segments, finds all training patches inside the supervision masks (excluding the validation regions), and starts training. Patch discovery can take a while on large datasets; the result is cached as a JSON file in `out_dir`, keyed by patch size, overlap, and label version, so re-runs with the same settings skip it. With this config, the full 20,000-iteration run takes about an hour and a half on a single H100. While it runs you will see the loss printed to the console, and in `runs/ink_tutorial/` you will find:
 
 * `ckpt_001000.pth`, `ckpt_002000.pth`, ... — checkpoints, saved every `save_every` iterations.
 * `train_previews/` (and `val_previews/`, when there is a validation set) — periodic image previews of the model's predictions next to the labels. Watching the previews sharpen from noise into letter strokes is the most satisfying part of the process.
-
-Note that `segments_path` points at the *folder of segments*, not a single segment — the trainer picks up every valid segment it finds there, so the same config keeps working as you add more. One segment is enough for a real first model.
 
 If your dataset includes segments with validation masks, the model is also evaluated on those held-out regions at each validation step, reporting balanced accuracy — how well it detects ink in areas it was never trained on. If training loss keeps dropping while validation accuracy stalls, the model is starting to overfit your labels. (The tutorial segment has no validation mask, so this first run reports training loss only.) You can stop training at any time with `ctrl+c` and use the most recently saved checkpoint.
 
@@ -301,7 +296,6 @@ Create `configs/ink_full3d.json`. It is the same shape as the 2.5D config with a
 
   "mode": "full_3d_single_wrap",
   "model_type": "vesuvius_unet",
-  "in_channels": 1,
   "model_config": { "autoconfigure": true },
   "targets": { "ink": { "out_channels": 1, "activation": "none" } },
 
@@ -310,15 +304,15 @@ Create `configs/ink_full3d.json`. It is the same shape as the 2.5D config with a
   "patch_min_labeled_coverage": 0.05,
 
   "full_3d": {
-    "label_projection_half_thickness": 8,
-    "background_projection_half_thickness": 8
+    "label_projection_half_thickness": 16,
+    "background_projection_half_thickness": 16
   },
 
   "batch_size": 8,
-  "num_iterations": 2500,
+  "num_iterations": 15000,
   "learning_rate": 0.01,
   "mixed_precision": "fp16",
-  "dataloader_workers": 16,
+  "dataloader_workers": 8,
   "prefetch_factor": 2,
 
   "volume_cache_dir": "volume_cache",
@@ -339,13 +333,9 @@ Create `configs/ink_full3d.json`. It is the same shape as the 2.5D config with a
 
 * `volume_path` is where the 3D crops come from. The public `vesuvius-challenge-open-data` S3 bucket is read anonymously — no AWS account needed. You can also download the volume locally (or just the chunks your segments touch, with `koine_machines.preprocessing.download_required_zarr_chunks`) and point `volume_path` at the local copy instead.
 * `volume_scale: "2"` samples the crops from level 2 of the volume pyramid — 4× downsampled in each axis. That's enough for the tutorial; training at native resolution (`"0"`) can bring further gains, at the cost of a much longer run. Distances in the config are always given in **full-resolution voxels** regardless of `volume_scale` — the pipeline converts them to the trained level internally.
-* The `full_3d` block sets how far above and below the surface the 2D ink labels and supervision mask are projected into the crop, in full-resolution voxels (here ±8, so ±2 voxels at level 2).
+* The `full_3d` block sets how far above and below the surface the 2D ink labels and supervision mask are projected into the crop, in full-resolution voxels (here ±16, so ±4 voxels at level 2).
 * `volume_cache_dir` enables an on-disk LRU cache (capped at `volume_cache_max_gb`) for the chunks streamed from `volume_path`: each chunk is downloaded once and re-read from local disk afterwards, which makes both re-runs and inference (which shares the cache) much faster.
-* `in_channels` is set automatically in the native 3D modes (2 for `full_3d_single_wrap`: image + wrap mask), so you don't need to change it.
-
-:::info
-If you enable native-3D label dilation (`full_3d.label_dilation_distance` or `full_3d.supervision_dilation_distance`), install cuCIM/CuPy too. Pick the build matching your CUDA major version: `uv pip install --extra-index-url https://pypi.nvidia.com "cucim-cu12==26.6.0"` for CUDA 12.x, or the corresponding `cucim-cu13` build for CUDA 13.x.
-:::
+* There is no `in_channels` — the native 3D modes set it automatically before model construction. `full_3d_single_wrap` uses two input channels (the volume image and the reconstructed surface mask), as does `normal_pooled_3d`; plain `full_3d` uses one.
 
 Training starts the same way:
 
@@ -353,7 +343,7 @@ Training starts the same way:
 uv run python -m koine_machines.training.train configs/ink_full3d.json
 ```
 
-This run — 2,500 iterations at batch size 8 — takes about an hour on an H100 with the tutorial segment and uses about 17&nbsp;GB of VRAM. For a longer, higher-quality run, raise `num_iterations`.
+This run — 15,000 iterations at batch size 8 — takes about six hours on an H100 with the tutorial segment and uses about 17&nbsp;GB of VRAM.
 
 #### Native 3D inference
 
@@ -371,18 +361,18 @@ Then, with your native-3D checkpoint:
 ```bash
 uv run python -m koine_machines.inference.infer_full3d_tifxyz \
   /path/to/ink-dataset/phercparis4/w00_20231016151002 \
-  runs/ink_full3d/ckpt_002000.pth \
+  runs/ink_full3d/ckpt_015000.pth \
   predictions/w00_20231016151002_ink.ome.zarr \
   --resolution 2 \
   --write-region occupied --chunk-halo 0 \
-  --batch-size 8 --num-workers 0 \
+  --batch-size 8 --num-workers 8 \
   --cache-dir volume_cache --cache-max-gb 120 \
   --overwrite
 ```
 
 * `--resolution 2` must match the `volume_scale` the checkpoint was trained at.
 * At `--batch-size 8`, inference uses about 6.5&nbsp;GB of VRAM.
-* `--num-workers 0` loads patches in the main process. It sounds slow, but multi-worker streaming inference can hang mid-run, and with `--cache-dir` pointed at the same cache directory as training, most chunks come straight from local disk anyway.
+* `--num-workers 8` prepares patches in parallel worker processes, keeping the GPU supplied.
 * `--write-region occupied --chunk-halo 0` restricts the output to just the chunks that actually contain surface points, which is much faster than the default (which also writes a halo of neighboring chunks). Even at level 2 a single segment plans thousands of patches (hundreds of thousands at full resolution) — add `--plan-only` to preview the chunk/patch plan first, and only launch the full command when the printed patch count fits your compute budget.
 * For `full_3d_single_wrap` checkpoints, the script reconstructs the surface-mask input channel from the `.tifxyz` geometry automatically.
 
@@ -392,16 +382,16 @@ The result is an ink prediction in scroll coordinates rather than a flattened im
 vc_render_tifxyz \
   --volume predictions/w00_20231016151002_ink.ome.zarr \
   --group-idx 0 \
-  --scale 0.4 \
+  --scale 1 \
   --scale-segmentation 0.25 \
   --segmentation /path/to/ink-dataset/phercparis4/w00_20231016151002 \
-  --num-slices 65 \
-  --slice-step 0.25 \
+  --num-slices 16 \
+  --slice-step 0.5 \
   --cache-gb 16 \
   --tif-output renders/w00_20231016151002_ink
 ```
 
-This flattens the prediction into a stack of 65 slices spanning the surface, written as one TIFF per slice into the output folder. Two flags account for the prediction volume being at level 2: `--scale-segmentation 0.25` maps the segment's full-resolution `.tifxyz` coordinates into the 4×-downsampled volume, and `--slice-step 0.25` makes the 65 slices span the same 65-full-resolution-voxel band around the surface as the 2.5D surface volumes. `--scale 0.4` matches the scale in the segment's `meta.json`, so the render lines up with the segment's own images. Finally, take a maximum over the slices to get a single readable image:
+This flattens the prediction into a stack of 16 slices spanning the surface, written as one TIFF per slice into the output folder. `--scale-segmentation 0.25` maps the segment's full-resolution `.tifxyz` coordinates into the 4×-downsampled level-2 prediction volume. At that level, `--slice-step 0.5` samples a focused band around the surface without accumulating as much papyrus texture as a wider step; use `--slice-step 1` if you need to search farther along the normal. `--scale 1` preserves the flat grid's output resolution. Finally, take a maximum over the slices to get a single readable image:
 
 ```bash
 uv run --with numpy --with tifffile --with imagecodecs python -c "
@@ -410,8 +400,6 @@ stack = np.stack([tifffile.imread(p) for p in sorted(glob.glob('renders/w00_2023
 tifffile.imwrite('renders/w00_20231016151002_ink_max.tif', stack.max(axis=0))
 "
 ```
-
-(Newer VC3D builds can do this in one pass with `--composite-collapse`, if your build has it.)
 
 ### Scaling up: the full dataset
 
