@@ -39,12 +39,6 @@ import TabItem from '@theme/TabItem';
 
 <ChatCallout prefill="Help me get started with VC3D" />
 
-:::info[Draft]
-
-This is an early draft that will eventually replace the [Volume Cartographer (Segmentation)](/tutorial_VC) tutorial. Many sections are still incomplete.
-
-:::
-
 :::note
 
 VC3D is updated frequently. Follow along in Discord for the latest changes.
@@ -105,60 +99,66 @@ Depending on your install method or operating system, the application may be lau
 - **Windows:** Open the application from the Start menu
 - **Linux:** Navigate to the build folder and run the VC3D app. example: `cd build/bin && ./vc3d`
 
-## Data
+## Using VC3D
+VC3D is intended as a viewer of scroll data and to assist in the virtual unwrapping of scrolls, so the fastest way to get familiar with it is to unwrap some part of scroll. Let's start
+with PHerc1447. This scroll (as of July 13, 2026) has public surfaces, so let's make one. You should see the open data catalog window in the VC3D gui when you launch it, and from here
+we can select our sample:
 
+*if the data catalog is not visible, you can reopen it*
 - **File → Open Data Catalog…**
 
 <div className="mb-4 max-w-[760px]">
-  <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/vc3d/data-catalog-poster.webp">
-    <source src="/img/tutorials/vc3d/data-catalog.webm" type="video/webm"/>
+  <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/vc3d/open_data_catalog-poster.webp">
+    <source src="/img/tutorials/vc3d/open_data_catalog.webm" type="video/webm"/>
   </video>
 </div>
 
-- Select a scroll → **Open Sample**
-- Wait for any available segments to download
+- Select PHerc1447 and either double click or press  → **Open Sample**
 
-## Data Viewing and Navigation
+After a brief wait to download any necessary data, you should see the scroll data in the xy and yz planes (the two viewers to the right) and a large blank window to the left.
 
-- Use the **View** menu to customize the bottom access bar
+General navigation tips:
+- You can zoom in and out in any viewer by using the mouse wheel.
+- Use right click to pan the view, and either `ctrl+click` or `R` to move the focus point. When the focus point is moved, the other planes will all align with it, so you are seeing the scroll data from different planes/orientations.
+- You can rotate the yz plane either by dragging the green handle in the yz view or by pressing the mousewheel in and dragging the mouse
+- you can slice through the planes by holding shift and moving the mousewheel up or down
+- you can increase the sensitivity of any navigation actions by changing the settings in viewer controls -> navigation
+
+PHerc1447 has recto surface predictions available from the open data catalog, and these should pre-populate in your overlay selector. Let's take a look at this volume with the surface predictions overlaid:
 
 <div className="mb-4 max-w-[760px]">
-  <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/vc3d/view-tab-poster.webp">
-    <source src="/img/tutorials/vc3d/view-tab.webm" type="video/webm"/>
+  <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/vc3d/navigate_and_open_overlay-poster.webp">
+    <source src="/img/tutorials/vc3d/navigate_and_open_overlay.webm" type="video/webm"/>
   </video>
 </div>
 
-## Volume Package
+Now that we've got all our necessary data, we can create our first segmentation. Let's find a place on the volume we would like to see unwrapped, and use `ctrl+right click` to bring up the volume actions menu.
+From here, click `Create Segment (GrowPatch)`, and a dialog box will pop up. From the volume selector, ensure that the volume containing "surface" is selected, set your growth iterations to 35, and check that
+the output path is to the desired location (by default, this will go to your open data catalog folder in a "patches" folder for the selected volume, you do not need to change this).
 
-<div className="mb-4">
-  <img src="/img/tutorials/vc3d/volume-package.webp" className="w-[35%] rounded-xl"/>
+You should see another dialog box pop up, and it will show the progress of the current segmentation growth. After a brief wait, it should say "Successful". Click `OK` and then click on volume package, and you should see your segment.
+Click on it to show it in the flattened view.
+
+This segment, while currently small, can be used already either for ink detection, as an input to the spiral fit, for training data, or for any other purpose. Any segment created by VC3D, regardless of how big, is in this same format.
+
+<div className="mb-4 max-w-[760px]">
+  <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/vc3d/grow_from_seed-poster.webp">
+    <source src="/img/tutorials/vc3d/grow_from_seed.webm" type="video/webm"/>
+  </video>
 </div>
 
-- Select the segmentation directory that corresponds to your target volume
-- Select the target volume
-- Use the filter to reduce the active segments
-  - Note: this helps improve GUI responsiveness if there are many segments
-- Select any segment to view
+Growth tips:
+- the more iterations you have selected, the longer it will take to complete. The growth becomes increasingly long as it gets larger due to the edges being longer.
+- Try and select an area that is on the surface predictions to get better results
 
-<div className="border-l-4 border-red-500 bg-red-500/10 px-3 py-2 my-3 text-sm">
-  <strong>Editor note:</strong> Unselecting segmentation directories seems to break VC3D — at least in testing with PHerc0814. Confirm before publishing.
-</div>
+If we want to make our segment larger, we can do this easily with the built-in segmentation tools. Click on `Segmentation` and `Enable Editing`. You can then use either the growth button or keybinds to grow in a desired direction.
+- `1` to grow left, `2` to grow up, `3` to grow down, `4` to grow right, `5` to grow in all directions
+- The `steps` spinbox in the segmentation tool can be used to increase or decrease the number of steps to take in each direction (a step being roughly 20 voxels)
 
-## Viewer Controls
-
-<div className="mb-4">
-  <img src="/img/tutorials/vc3d/viewer-controls.webp" className="w-[55%] rounded-xl"/>
-</div>
-
-- **Focus point** — hover the mouse in 3D; the keybinds **Ctrl + Left click** or **r** move the focus point to those coordinates
-- **Intersection thickness** — adjust segment line thickness in the 3D volume windows
-- **Volume window** — manually threshold/window the volume data
-- **Use axis-aligned slice planes**
-- **Show axis overlays in XY view** — toggles visibility of the YZ axis plane adjustment tool
-- **Max displayed resolution** — increase if streaming is slow
-
-<div className="border-l-4 border-red-500 bg-red-500/10 px-3 py-2 my-3 text-sm">
-  <strong>Editor note:</strong> Re "Use axis-aligned slice planes" — can we get rid of this? Also, can we hide the red axis adjuster when the pane isn't in view?
+<div className="mb-4 max-w-[760px]">
+  <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/vc3d/growth_directions-poster.webp">
+    <source src="/img/tutorials/vc3d/growth_directions.webm" type="video/webm"/>
+  </video>
 </div>
 
 ## Winding Annotation
@@ -169,6 +169,8 @@ fitting document for more details on how these are used). VC3D outputs these pri
 When generating data for the spiral, we can think of the inputs broadly as two types of annotations:
 - same-winding annotations (fibers, patches, kolleisis, points along surface preds, etc)
 - relative or different winding annotations (generally points which move outward radially *across* sheets rather than *along* them)
+
+If you've been following along with this guide, you've already created a same-winding annotation in the form of a patch (see the previous section).
 
 A same-winding annotation is simply some set of points which say "these points are all part of the same sheet of the scroll". Conversely, a
 relative or different winding annotation is a set of points which say "these points are part of different sheets of the scroll, and they are this many windings apart"
@@ -218,24 +220,52 @@ A line annotation workspace will launch, with 4 viewers:
 - A reoptimization takes place after each control point is added
 - To delete a control point, use **Ctrl + Right click → Delete control point**
 
+### Manually created Point Collections (*relative or same-winding*)
+You can manually place points by enabling annotation and using `shift+click` in any of the volume views. Using this method, you can create either a relative or same-winding annotations easily. If
+you have a patch already loaded, these annotations can be even more influential in a later fit. You can think of them as extensions of the patch itself, and they can be used as edges in a patch graph if you
+want to connect sparse patches.
 
-### Patches
-
-<div className="border-l-4 border-red-500 bg-red-500/10 px-3 py-2 my-3 text-sm">
-  <strong>Editor note:</strong> I think we need to hide 95% of these settings and options.
-</div>
+*same winding*
+place points along the surface of the scroll, beginning partially inside a patch and extending outward
 
 <div className="mb-4 max-w-[760px]">
-  <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/vc3d/seg-panel-poster.webp">
-    <source src="/img/tutorials/vc3d/seg-panel.webm" type="video/webm"/>
+  <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/vc3d/manual_same_wind-poster.webp">
+    <source src="/img/tutorials/vc3d/manual_same_wind.webm" type="video/webm"/>
   </video>
 </div>
 
-## Tracer
+*relative winding*
+place points outward radially, indicating the winding offset between points
 
-<div className="border-l-4 border-red-500 bg-red-500/10 px-3 py-2 my-3 text-sm">
-  <strong>Editor note:</strong> Do we want or expect people to want to run tracer?
+<div className="mb-4 max-w-[760px]">
+  <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/vc3d/manual_rel_wind-poster.webp">
+    <source src="/img/tutorials/vc3d/manual_rel_wind.webm" type="video/webm"/>
+  </video>
 </div>
 
-- Input: surface predictions
-- Seeding, Expansion, Tracing
+### Same-winding using the wrap annotation tool
+You can use the same-wrap annotation tool to quickly create same-winding annotations along surface predictions. Each tool uses `shift+click` (or `shift+click+drag` for the manual tool) to place tentative points, which
+are then "commited" to point collections with `shift+e`
+
+<div className="mb-4 max-w-[760px]">
+  <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/vc3d/same-wrap-annotation-tool-poster.webp">
+    <source src="/img/tutorials/vc3d/same-wrap-annotation-tool.webm" type="video/webm"/>
+  </video>
+</div>
+
+## Viewer Controls
+
+<div className="mb-4">
+  <img src="/img/tutorials/vc3d/viewer-controls.webp" className="w-[55%] rounded-xl"/>
+</div>
+
+- **Focus point** — hover the mouse in 3D; the keybinds **Ctrl + Left click** or **r** move the focus point to those coordinates
+- **Intersection thickness** — adjust segment line thickness in the 3D volume windows
+- **Volume window** — manually threshold/window the volume data
+- **Use axis-aligned slice planes**
+- **Show axis overlays in XY view** — toggles visibility of the YZ axis plane adjustment tool
+- **Max displayed resolution** — increase if streaming is slow
+
+<div className="border-l-4 border-red-500 bg-red-500/10 px-3 py-2 my-3 text-sm">
+  <strong>Editor note:</strong> Re "Use axis-aligned slice planes" — can we get rid of this? Also, can we hide the red axis adjuster when the pane isn't in view?
+</div>

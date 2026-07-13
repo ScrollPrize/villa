@@ -53,7 +53,7 @@ Winding annotations are sparse geometric constraints: points, lines, fibers, or 
 Given our recent work on PHercParis4, and the flexibility/sparsity afforded by the spiral fit,  **we believe that the fastest way to unroll scrolls at scale is to develop methods for creating winding annotations 
 that are precise and fast enough to use at scale** 
 
-We think that the spiral fit is flexible enough to unroll any scroll given sufficient winding annotations. We don't know the exact minimum area of winding
+We think that the spiral fit is flexible enough to unroll most scrolls given sufficient winding annotations. We don't know the exact minimum area of winding
 annotations necessary for a given scroll ahead of time, but we know it is certainly *much less than full wrap segmentation*. 
 
 It's important to emphasize here how much this changes the goal of anyone who wishes to unroll scrolls at scale. Rather than focusing on methods which produce large multi-winding segmentations (often by combining patches, using a "bottom up" style approach), 
@@ -66,7 +66,7 @@ An ideal winding annotation generator should be:
 - **Accurate (or have some way to measure its confidence/accuracy)**
 - **Fast enough to process entire scroll volumes in a reasonable amount of time**
 - **Easy to verify**
-- **Easy to integrate within the spiral fit**
+- **General enough to integrate into "global fitters", like the spiral fit**
 
 <figure className="mb-6">
   <div className="flex flex-wrap gap-4 items-start">
