@@ -3,12 +3,13 @@
 ## 2026-07-13
 
 - Added a torch-vectorized Trace2CP monotone-DP backend for CLI side/z/top
-  solves, with side-z reachable-layer pruning and candidate-angle-derived
-  vertical move pruning.
+  solves, with side-z reachable-layer pruning.
+- Changed side-strip Trace2CP joint DP to use fixed 4 px transitions, removed
+  candidate-angle-derived vertical move pruning, and lowered default
+  second-order smoothing penalties so steep local fibers are not over-smoothed.
 - Added Trace2CP stage timing tables for single-pair and whole-fiber
   visualization commands, and changed side-strip joint DP tracing to use a
-  fixed 32 px transition plus candidate-angle excess penalties to reduce
-  coarse horizontal/diagonal artifacts.
+  local candidate-angle excess penalty rather than a global slope cap.
 - Added time-throttled `trace2cp dp ...` progress rows with ETA for slow
   Trace2CP side/z/top dynamic-programming solves.
 - Replaced active Trace2CP combined tracing with a joint side-strip monotone DP

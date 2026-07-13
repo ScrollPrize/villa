@@ -1,12 +1,11 @@
-# Torch-Vectorized Trace2CP DP Backend
+# Trace2CP DP Local-Angle Semantics
 
-- Implement a torch-vectorized backend for the Trace2CP monotone DP optimizer.
-- Vectorize as much of the per-column work as possible over layers, rows,
-  moves, and sampled transition columns; keep only the DP column recurrence
-  sequential.
-- Prefer parallel tensor work over dynamic Python loops, including processing
-  all z layers together.
-- Keep the existing NumPy/Python implementation as a fallback for direct tests
-  and non-torch calls.
-- Preserve current side/z/top Trace2CP semantics, progress output, and final
-  timing rows.
+- Remove the side Trace2CP DP's candidate-angle-derived vertical move cap.
+- Candidate angle limits must be relative to the local sampled/predicted
+  direction field, not relative to global horizontal slope.
+- Keep only a broad compute search band for DP vertical moves, independent of
+  the candidate angle setting, so steep local fiber directions above 45 degrees
+  can be represented.
+- Set the side DP horizontal transition step to 4 px.
+- Reduce the default second-order DP smoothness penalties so the path is less
+  over-smoothed.

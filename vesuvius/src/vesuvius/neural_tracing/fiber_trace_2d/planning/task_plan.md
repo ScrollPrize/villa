@@ -1,43 +1,33 @@
-# Torch-Vectorized Trace2CP DP Backend Plan
+# Trace2CP DP Local-Angle Semantics Plan
 
 ## Implementation
 
-- Add a torch backend for `_trace2cp_top_monotone_direction_path_z`.
-- Keep the existing NumPy/Python DP as fallback when no torch device is passed.
-- Reuse the existing input validation and preprocessing where practical:
-  direction fields, valid masks, presence fields, candidate-angle penalty,
-  move grids, columns, and progress labels.
-- Implement the torch backend as a sequential loop over DP columns, with each
-  column vectorized over:
-  - current move chunks,
-  - all z layers,
-  - all image rows,
-  - all previous moves,
-  - all sampled pixel columns along a transition.
-- Store backpointers in CPU NumPy arrays to avoid keeping the large
-  backpointer tensor on GPU, while keeping active DP cost tensors on the torch
-  device.
-- Route Trace2CP CLI side/z/top DP calls through the torch backend using the
-  existing model/device.
-- Preserve progress output and final timing rows.
+- Change the side Trace2CP DP transition step constant from 32 px to 4 px.
+- Remove the code that converts `max_direction_angle_degrees` into a hard
+  vertical move cap.
+- Keep a separate broad DP compute search band, independent of candidate angle,
+  to avoid unbounded DP states while still allowing steep local fiber slopes.
+- Reduce shared DP second-order smoothing defaults by 10x:
+  `dy=0.005`, `dz=0.01`.
+- Keep candidate angle as a local direction-field angular excess penalty only.
 
 ## Spec Update
 
-- Document that Trace2CP CLI DP runs use a torch-vectorized backend when a
-  torch device is available, falling back to the NumPy/Python backend for
-  direct calls.
+- Update specs to state that side DP candidate angle is local to the sampled
+  direction field and must not cap global horizontal slope.
+- Document the 4 px side DP transition step and reduced smoothing defaults.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` Trace2CP section to describe the torch
-  backend and the remaining sequential column recurrence.
+- Update `docs/code_structure.md` Trace2CP section with the revised DP
+  transition step and local-angle semantics.
 
 ## Tests
 
-- Add a parity test comparing torch and NumPy DP outputs on a small deterministic
-  problem.
-- Run focused Trace2CP tests and the full `test_fiber_trace_2d_loader.py`.
+- Add a regression test where a steep local direction path connects despite a
+  small candidate-angle setting.
+- Run focused Trace2CP DP tests and py-compile the runner.
 
 ## Changelog
 
-- Add a dated changelog entry for the torch-vectorized Trace2CP DP backend.
+- Add a dated note for the Trace2CP DP local-angle/smoothing adjustment.

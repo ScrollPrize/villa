@@ -541,8 +541,9 @@
 - Side-z DP must not infer or optimize unreachable z layers. Since the path is
   anchored at the center layer at both CP columns and transitions can move only
   one z layer per DP column, the effective layer bound is capped by the number
-  of horizontal transitions. Side DP also caps the vertical move lattice from
-  the configured candidate-angle limit before constructing moves.
+  of horizontal transitions. The side DP vertical move lattice may use a broad
+  compute search band, but that band must be independent of the configured
+  candidate-angle limit.
 - Trace2CP uses `--med-tta` to determine whether TTA is used. Without
   `--med-tta`, it traces and scores both directions on the base strip
   direction field. With `--med-tta`, it builds deterministic random geometric
@@ -555,21 +556,23 @@
   path and its reverse. The non-combined reference tracer remains the public
   target-column `trace2cp_error` path.
 - The side-strip DP state is `(side_z_layer, y, prev_dy, prev_dz)`. It uses
-  fixed 32 px horizontal transitions, plus the exact target column, and
+  fixed 4 px horizontal transitions, plus the exact target column, and
   integrates direction alignment cost
   `direction_weight * (1 - abs(dot(path_tangent, layer_direction)))` across
   every crossed pixel column. Invalid or missing direction pixels add a fixed
   penalty instead of breaking the path.
 - The side-strip DP still uses `--line-trace-step` only for resampling the
   selected fused output trace and for the public trace visualization density.
-  It must not use short `--line-trace-step` values as the DP transition length,
-  because integer row states would otherwise quantize the path into mostly
-  horizontal/diagonal steps.
-- The side-strip DP must apply the existing Trace2CP candidate-angle setting as
-  an angular excess penalty: path tangents whose frame-ambiguous direction
-  agreement falls outside `--line-trace-candidate-max-degrees` receive extra
-  cost, keeping the global DP objective closer to the baseline direct
-  candidate tracer.
+  It must not use `--line-trace-step` as the DP transition length.
+- The side-strip DP must apply the existing Trace2CP candidate-angle setting
+  only as a local angular excess penalty against the sampled direction field:
+  path tangents whose frame-ambiguous direction agreement falls outside
+  `--line-trace-candidate-max-degrees` receive extra cost. This setting must
+  not cap global horizontal slope or vertical moves, because valid local fiber
+  directions can be steeper than 45 degrees.
+- The default side/top DP second-order smoothness penalties are
+  `0.005 * (dy - prev_dy)^2` and `0.01 * (dz - prev_dz)^2`. Smoothing should
+  discourage jitter without forcing an overly straight path.
 - `--trace2cp-combined-mode direction` is the only active combined mode.
   `--trace2cp-combined-mode embedding`, `--trace2cp-use-embedding`,
   `--trace2cp-combined-mode image`, and `--trace2cp-use-image` are removed from
@@ -626,8 +629,8 @@
   `(top_offset_layer, y, prev_dy, prev_dz)`, so it may transition between
   neighboring top-offset layers with a fixed z-transition penalty of
   `0.1 * abs(delta_layer)` while also preferring smooth step sequences. The
-  default second-order penalties are `0.05 * (dy - prev_dy)^2` and
-  `0.1 * (dz - prev_dz)^2`; the first transition has no smoothing cost because
+  default second-order penalties are `0.005 * (dy - prev_dy)^2` and
+  `0.01 * (dz - prev_dz)^2`; the first transition has no smoothing cost because
   no previous step exists. There is no default absolute-y row penalty because
   that would bias the path toward a row rather than smoothing its slope. It uses
   fixed 8 px horizontal transitions, plus the exact target column, and

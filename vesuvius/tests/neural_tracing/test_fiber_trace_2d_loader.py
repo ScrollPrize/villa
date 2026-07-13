@@ -2695,6 +2695,33 @@ def test_trace2cp_top_monotone_direction_path_z_torch_matches_numpy() -> None:
     np.testing.assert_array_equal(torch_layers, numpy_layers)
 
 
+def test_trace2cp_joint_dp_candidate_angle_does_not_cap_global_slope() -> None:
+    direction = np.zeros((41, 17, 2), dtype=np.float32)
+    steep = np.asarray([4.0, -5.0], dtype=np.float32)
+    steep /= np.linalg.norm(steep)
+    direction[:, :, :] = steep
+    valid = np.ones((41, 17), dtype=bool)
+
+    result, _summary, path_xyz = _trace_score_trace2cp_joint_dp_bidirectional(
+        direction_fields=[direction],
+        valid_masks=[valid],
+        presence_fields=None,
+        start_xy=np.asarray([0.0, 30.0], dtype=np.float32),
+        target_xy=np.asarray([16.0, 10.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0),
+        step_px=4.0,
+        rf_margin_px=0.0,
+        horizontal_step_px=4,
+        max_direction_angle_degrees=25.0,
+        candidate_angles_degrees=_trace2cp_candidate_angles_degrees(25.0, 1.0),
+    )
+
+    assert result.metric.reached_target_columns
+    np.testing.assert_allclose(path_xyz[0, :2], np.asarray([0.0, 30.0], dtype=np.float32))
+    np.testing.assert_allclose(path_xyz[-1, :2], np.asarray([16.0, 10.0], dtype=np.float32))
+    assert float(np.max(np.abs(np.diff(path_xyz[:, 1])))) > 4.0
+
+
 def test_trace2cp_top_monotone_direction_path_z_progress_prints_eta(capsys) -> None:
     direction = np.zeros((5, 19, 2), dtype=np.float32)
     direction[:, :, 0] = 1.0

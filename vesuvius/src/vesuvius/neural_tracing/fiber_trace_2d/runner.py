@@ -36,7 +36,10 @@ from vesuvius.neural_tracing.fiber_trace_2d.model import (
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_line_index
 
 
-_TRACE2CP_SIDE_DP_HORIZONTAL_STEP_PX = 32
+_TRACE2CP_SIDE_DP_HORIZONTAL_STEP_PX = 4
+_TRACE2CP_SIDE_DP_MAX_ABS_DY_PER_DX = 4.0
+_TRACE2CP_DP_DY_SMOOTH_PENALTY = 0.005
+_TRACE2CP_DP_DZ_SMOOTH_PENALTY = 0.01
 
 
 def _path_arg_for_config(path: str | Path) -> str:
@@ -5645,8 +5648,8 @@ def _trace2cp_top_monotone_direction_path_z(
     max_abs_dz: int = 1,
     invalid_penalty: float = 4.0,
     z_transition_penalty: float = 0.1,
-    dy_smooth_penalty: float = 0.05,
-    dz_smooth_penalty: float = 0.1,
+    dy_smooth_penalty: float = _TRACE2CP_DP_DY_SMOOTH_PENALTY,
+    dz_smooth_penalty: float = _TRACE2CP_DP_DZ_SMOOTH_PENALTY,
     horizontal_step_px: int = 8,
     max_direction_angle_degrees: float | None = None,
     angle_excess_penalty: float = 4.0,
@@ -6206,12 +6209,13 @@ def _trace_score_trace2cp_joint_dp_bidirectional(
     step = max(1, int(round(float(horizontal_step_px))))
     dy_limit = max_abs_dy
     if dy_limit is None:
-        dy_limit = max(1, int(round(max(float(step_px), float(step)))))
-    if max_direction_angle_degrees is not None:
-        angle_limit = float(max_direction_angle_degrees)
-        if np.isfinite(angle_limit) and angle_limit < 90.0:
-            angle_dy_limit = int(np.ceil(np.tan(np.deg2rad(max(0.0, angle_limit))) * float(step)))
-            dy_limit = min(int(dy_limit), max(0, angle_dy_limit))
+        dy_limit = max(
+            1,
+            min(
+                shape_hw[0] - 1,
+                int(round(max(float(step_px), float(step) * _TRACE2CP_SIDE_DP_MAX_ABS_DY_PER_DX))),
+            ),
+        )
     path, layer_indices = _trace2cp_top_monotone_direction_path_z(
         direction_fields,
         valid_masks,
@@ -6224,8 +6228,8 @@ def _trace_score_trace2cp_joint_dp_bidirectional(
         max_abs_dz=int(max_abs_dz),
         invalid_penalty=4.0,
         z_transition_penalty=0.1,
-        dy_smooth_penalty=0.05,
-        dz_smooth_penalty=0.1,
+        dy_smooth_penalty=_TRACE2CP_DP_DY_SMOOTH_PENALTY,
+        dz_smooth_penalty=_TRACE2CP_DP_DZ_SMOOTH_PENALTY,
         horizontal_step_px=step,
         max_direction_angle_degrees=max_direction_angle_degrees,
         angle_excess_penalty=4.0,
@@ -6392,7 +6396,8 @@ def _trace2cp_top_model_direction_overlay(
         f"dp_step_px=8 dp_points={int(monotone_path.shape[0])} "
         f"dp_invalid_pixels={invalid_count} "
         f"dp_layer_range={layer_min}..{layer_max} dp_layer_changes={layer_changes} "
-        f"dp_smooth_dy=0.05 dp_smooth_dz=0.1"
+        f"dp_smooth_dy={_TRACE2CP_DP_DY_SMOOTH_PENALTY:g} "
+        f"dp_smooth_dz={_TRACE2CP_DP_DZ_SMOOTH_PENALTY:g}"
     )
     return overlay, int(drawn), best_layer, debug
 
