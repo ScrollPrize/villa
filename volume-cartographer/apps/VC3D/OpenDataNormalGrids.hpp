@@ -29,9 +29,14 @@ struct OpenDataNormalGridsInfo {
     std::string sampleId;
     std::string volumeId;
     std::string url;
+    int sourceCoordinateLevel = 0;
+    bool levelWasExplicit = false;
 };
 
 [[nodiscard]] const OpenDataArtifact* normalGridsArtifact(const OpenDataVolume& volume);
+[[nodiscard]] std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
+    const std::string& sampleId,
+    const OpenDataVolume& volume);
 [[nodiscard]] std::string normalGridsArtifactUrl(const OpenDataVolume& volume);
 
 // Recover the pairing from a loaded volume's project tags. Returns nullopt when
@@ -43,7 +48,9 @@ struct OpenDataNormalGridsInfo {
 [[nodiscard]] std::filesystem::path normalGridsCacheDir(
     const std::filesystem::path& remoteCacheRoot,
     const std::string& sampleId,
-    const std::string& volumeId);
+    const std::string& volumeId,
+    int sourceCoordinateLevel = 0,
+    std::string_view artifactUrl = {});
 
 // True when the directory looks like a complete normal-grid store
 // (metadata.json plus xy/, xz/, yz/).

@@ -2,8 +2,10 @@
 
 #include "OpenDataManifest.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -56,6 +58,41 @@ struct OpenDataInkDetectionEntry {
     std::filesystem::path localPath;
 };
 
+enum class OpenDataSegmentRepresentationKind {
+    Authored,
+    DerivedNative,
+    PublishedTransformed
+};
+
+struct OpenDataSegmentRepresentation {
+    const OpenDataArtifact* artifact = nullptr;
+    OpenDataSegmentRepresentationKind kind =
+        OpenDataSegmentRepresentationKind::Authored;
+    std::string coordinateVolumeId;
+    int sourceCoordinateLevel = 0;
+    std::string coordinateSpace;
+    std::string representationId;
+};
+
+// Classify every coordinate-bearing tifxyz artifact. Authored artifacts keep
+// their manifest coordinate level and, for nonzero levels, also produce a
+// separate derived-native representation. Published transformed artifacts are
+// retained for their explicit target_volume at L0.
+[[nodiscard]] std::vector<OpenDataSegmentRepresentation>
+classifyOpenDataSegmentRepresentations(const OpenDataSample& sample,
+                                       const OpenDataSegment& segment);
+
+[[nodiscard]] std::filesystem::path openDataSegmentRepresentationCacheRoot(
+    const std::filesystem::path& remoteCacheRoot,
+    const OpenDataSample& sample,
+    const OpenDataSegmentRepresentation& representation);
+
+[[nodiscard]] std::filesystem::path openDataSegmentRepresentationCacheDirectory(
+    const std::filesystem::path& remoteCacheRoot,
+    const OpenDataSample& sample,
+    const OpenDataSegment& segment,
+    const OpenDataSegmentRepresentation& representation);
+
 [[nodiscard]] const char* cacheStateName(OpenDataSegmentCacheState state) noexcept;
 
 [[nodiscard]] std::filesystem::path openDataSegmentCacheRoot(
@@ -84,6 +121,14 @@ struct OpenDataInkDetectionEntry {
     const std::filesystem::path& remoteCacheRoot,
     const std::string& sampleId);
 
+[[nodiscard]] std::filesystem::path openDataPatchesRoot(
+    const std::filesystem::path& remoteCacheRoot,
+    const std::string& sampleId);
+
+[[nodiscard]] std::size_t manualOpenDataSegmentCount(
+    const std::filesystem::path& remoteCacheRoot,
+    const std::string& sampleId);
+
 [[nodiscard]] OpenDataSegmentCacheState cacheStateForSegment(
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSample& sample,
@@ -97,7 +142,7 @@ struct OpenDataInkDetectionEntry {
 
 [[nodiscard]] std::filesystem::path defaultEditableCopyPathForCatalogSegment(
     const std::filesystem::path& catalogSegmentDir,
-    const std::filesystem::path& remoteCacheRoot);
+    const std::filesystem::path& activeSegmentsRoot);
 
 void copyCatalogSegmentToEditableDirectory(
     const std::filesystem::path& catalogSegmentDir,

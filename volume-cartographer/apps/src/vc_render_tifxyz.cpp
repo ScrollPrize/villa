@@ -1327,28 +1327,8 @@ int main(int argc, char *argv[])
         printMat4x4(affineTransform.matrix, "Final composed affine:");
     }
 
-    // Try to read voxelsize from meta.json to set TIFF DPI.
-    // meta.json stores the level-0 voxel size; renders at --group-idx > 0
-    // come from a 2^group_idx-downsampled pyramid, so each output pixel
-    // covers (voxelsize / ds_scale) µm. Account for that so the DPI tag
-    // matches the actual pixel grid.
+    // Resolved below from the same CLI/metadata value used for OME-Zarr.
     float tifDpi = 0.f;
-    {
-        auto metaPath = vol_path / "meta.json";
-        if (std::filesystem::exists(metaPath)) {
-            try {
-                auto meta = Json::parse_file(metaPath);
-                if (meta.contains("voxelsize")) {
-                    const double vs = meta["voxelsize"].get_double();
-                    const double vsLevel = ds_scale > 0
-                                               ? vs / double(ds_scale)
-                                               : vs;
-                    tifDpi = voxelSizeToDpi(vsLevel);
-                }
-            } catch (...) {
-            }
-        }
-    }
 
     // --- Open source volume ---
     const int cacheLevel = group_idx;
@@ -1415,22 +1395,48 @@ int main(int argc, char *argv[])
     // --- Resolve voxel size for OME-Zarr metadata ---
     const std::string voxel_unit = parsed["voxel-unit"].as<std::string>();
     double base_voxel_size = 1.0;
+    bool hasPhysicalVoxelSize = false;
+    bool voxelSizeFromCli = false;
     if (parsed.count("voxel-size")) {
         base_voxel_size = parsed["voxel-size"].as<double>();
         if (!std::isfinite(base_voxel_size) || base_voxel_size <= 0.0) {
             logPrintf(stderr, "Error: --voxel-size must be a positive finite number\n");
             return EXIT_FAILURE;
         }
+        hasPhysicalVoxelSize = true;
+        voxelSizeFromCli = true;
         logPrintf(stdout, "Voxel size (from CLI): %g %s\n", base_voxel_size, voxel_unit.c_str());
     } else if (auto mv = readVolumeVoxelSize(vol_path); mv.has_value()) {
         if (std::isfinite(*mv) && *mv > 0.0) {
             base_voxel_size = *mv;
+            hasPhysicalVoxelSize = true;
             logPrintf(stdout, "Voxel size (from volume metadata): %g %s\n", base_voxel_size, voxel_unit.c_str());
         } else {
             logPrintf(stderr, "Warning: ignoring invalid metadata voxelsize; using default 1.0\n");
         }
     } else {
         logPrintf(stdout, "Voxel size: 1.0 (no metadata found; override with --voxel-size)\n");
+    }
+    if (hasPhysicalVoxelSize) {
+        double voxelSizeUm = base_voxel_size;
+        if (voxelSizeFromCli) {
+            if (voxel_unit == "nanometer" || voxel_unit == "nanometre" || voxel_unit == "nm")
+                voxelSizeUm *= 0.001;
+            else if (voxel_unit == "millimeter" || voxel_unit == "millimetre" || voxel_unit == "mm")
+                voxelSizeUm *= 1000.0;
+            else if (voxel_unit == "meter" || voxel_unit == "metre" || voxel_unit == "m")
+                voxelSizeUm *= 1000000.0;
+            else if (voxel_unit != "micrometer" && voxel_unit != "micrometre" &&
+                     voxel_unit != "um" && voxel_unit != "µm") {
+                logPrintf(stderr, "Error: unsupported --voxel-unit for TIFF resolution: %s\n",
+                          voxel_unit.c_str());
+                return EXIT_FAILURE;
+            }
+        }
+        const double voxelSizeAtRenderLevelUm = ds_scale > 0
+            ? voxelSizeUm / double(ds_scale)
+            : voxelSizeUm;
+        tifDpi = voxelSizeToDpi(voxelSizeAtRenderLevelUm);
     }
 
     int rotQuadGlobal = -1;

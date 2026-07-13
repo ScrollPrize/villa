@@ -1,5 +1,7 @@
 #include "OpenDataManifest.hpp"
 
+#include "vc/core/util/RemoteUrl.hpp"
+
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
@@ -325,8 +327,27 @@ std::vector<OpenDataArtifact> parseArtifacts(const nlohmann::json& ownerJson)
         }
         OpenDataArtifact artifact;
         artifact.raw = itemJson;
+        artifact.parameters = objectOrEmpty(itemJson, "parameters");
         artifact.properties = objectOrEmpty(itemJson, "properties");
         artifact.type = stringValue(itemJson, {"type"}).value_or("");
+        if (const auto levelIt = artifact.parameters.find("level");
+            levelIt != artifact.parameters.end()) {
+            artifact.levelParameterPresent = true;
+            if (levelIt->is_number_unsigned()) {
+                const auto value = levelIt->get<unsigned long long>();
+                if (value <= 5)
+                    artifact.sourceCoordinateLevel = static_cast<int>(value);
+            } else if (levelIt->is_number_integer()) {
+                const auto value = levelIt->get<long long>();
+                if (value >= 0 && value <= 5)
+                    artifact.sourceCoordinateLevel = static_cast<int>(value);
+            }
+        }
+        if (const auto targetIt = artifact.parameters.find("target_volume");
+            targetIt != artifact.parameters.end() && targetIt->is_string() &&
+            !targetIt->get_ref<const std::string&>().empty()) {
+            artifact.targetVolumeId = targetIt->get<std::string>();
+        }
         if (const auto it = itemJson.find("origins"); it != itemJson.end()) {
             artifact.origins = parseOrigins(*it);
         }
@@ -639,6 +660,8 @@ std::string joinOpenDataUrl(std::string root, std::string path)
         startsWith(path, "http://") || startsWith(path, "https://")) {
         return path;
     }
+    if (startsWith(root, "http://") || startsWith(root, "https://"))
+        return vc::joinRemoteUrlPath(root, path);
     while (!root.empty() && root.back() == '/') {
         root.pop_back();
     }

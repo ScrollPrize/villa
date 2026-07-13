@@ -832,7 +832,7 @@ void SettingsDialog::redownloadExistingCache()
     std::shared_ptr<vc::render::ChunkCache> source;
     try {
         auto freshVolume = Volume::NewFromUrl(
-            _currentVolume->remoteUrl(), {}, _currentVolume->remoteAuth());
+            _currentVolume->remoteLocator(), {}, _currentVolume->remoteAuth());
         vc::render::ChunkCache::Options options;
         options.maxConcurrentReads = workerCount;
         options.compressPersistentCache = false;

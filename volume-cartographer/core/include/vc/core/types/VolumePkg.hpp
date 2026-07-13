@@ -29,6 +29,7 @@ enum class Category { Volumes, Segments, NormalGrids };
 struct LoadOptions {
     std::filesystem::path remoteCacheRoot;
     bool failOnRemoteError = false;
+    bool deferResolution = false;
 };
 
 bool isLocationRemote(const std::string& location);
@@ -70,6 +71,24 @@ public:
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
     bool mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags);
+    // Replace singleton keyed tags and merge ordinary tags in one operation,
+    // refreshing a loaded remote volume at most once.
+    bool reconcileVolumeEntryTags(
+        const std::string& location,
+        const std::vector<std::string>& tags,
+        const std::vector<std::string>& singletonPrefixes);
+    bool reconcileSegmentsEntryTags(
+        const std::string& location,
+        const std::vector<std::string>& tags,
+        const std::vector<std::string>& singletonPrefixes);
+    bool reconcileNormalGridEntryTags(
+        const std::string& location,
+        const std::vector<std::string>& tags,
+        const std::vector<std::string>& singletonPrefixes);
+    bool relocateSegmentsEntry(const std::string& oldLocation,
+                               const std::string& newLocation);
+    bool relocateNormalGridEntry(const std::string& oldLocation,
+                                 const std::string& newLocation);
     bool addSegmentsEntry(const std::string& location, std::vector<std::string> tags = {});
     bool addNormalGridEntry(const std::string& location, std::vector<std::string> tags = {});
     bool removeEntry(const std::string& location);
@@ -88,8 +107,12 @@ public:
     [[nodiscard]] bool hasVolume(const std::string& id) const;
     [[nodiscard]] std::size_t numberOfVolumes() const;
     [[nodiscard]] std::vector<std::string> volumeIDs() const;
-    std::shared_ptr<Volume> volume();
-    std::shared_ptr<Volume> volume(const std::string& id);
+    [[nodiscard]] bool entryResolutionDeferred() const noexcept {
+        return opts_.deferResolution;
+    }
+    [[nodiscard]] bool hasLoadedVolumeEntry(const std::string& location) const;
+    std::shared_ptr<Volume> volume() const;
+    std::shared_ptr<Volume> volume(const std::string& id) const;
     bool addVolume(const std::shared_ptr<Volume>& volume);
     bool addSingleVolume(const std::string& volumeDirName);
     bool removeSingleVolume(const std::string& volumeIdOrDirName);
@@ -121,6 +144,8 @@ public:
     [[nodiscard]] bool hasRemoteCacheRoot() const;
     [[nodiscard]] std::string remoteCacheRootOrEmpty() const;
     void setRemoteCacheRoot(const std::filesystem::path& dir);
+    // Completes a deferred load. Ordinary load() callers remain eager.
+    void resolveDeferredEntries();
 
     [[nodiscard]] std::string getVolpkgDirectory() const;
     [[nodiscard]] std::string getSegmentationDirectory() const;

@@ -17,7 +17,8 @@
 namespace vc3d::opendata {
 namespace {
 
-constexpr const char* kMarkerVersion = "vc3d_open_data_prefill_v1";
+constexpr const char* kMarkerVersion = "vc3d_open_data_prefill_v2";
+constexpr const char* kLegacyMarkerVersion = "vc3d_open_data_prefill_v1";
 constexpr std::size_t kProgressIntervalChunks = 32;
 
 std::size_t chunkCountForGrid(const std::array<int, 3>& grid)
@@ -31,8 +32,10 @@ OpenDataVolumePrefillMarkerInfo markerInfoForVolume(const Volume& volume, int le
 {
     OpenDataVolumePrefillMarkerInfo info;
     info.remoteUrl = volume.remoteUrl();
+    info.remoteLocator = volume.remoteLocator();
     info.volumeId = volume.id();
     info.level = level;
+    info.physicalLevel = volume.baseScaleLevel() + level;
     info.shape = volume.levelShape(level);
     info.chunkShape = volume.chunkShape(level);
     info.chunkGridShape = volume.chunkGridShape(level);
@@ -45,8 +48,11 @@ nlohmann::json markerJsonForInfo(const OpenDataVolumePrefillMarkerInfo& info)
     return nlohmann::json{
         {"version", kMarkerVersion},
         {"remote_url", info.remoteUrl},
+        {"remote_locator", info.remoteLocator},
         {"volume_id", info.volumeId},
-        {"level", info.level},
+        {"level", info.level}, // retained for readers of the v1 logical field
+        {"logical_level", info.level},
+        {"physical_level", info.physicalLevel},
         {"shape", info.shape},
         {"chunk_shape", info.chunkShape},
         {"chunk_grid_shape", info.chunkGridShape},
@@ -70,12 +76,32 @@ bool markerMatchesJson(const nlohmann::json& marker,
     if (!marker.is_object()) {
         return false;
     }
+    if (marker.value("version", std::string{}) == kLegacyMarkerVersion &&
+        info.level == info.physicalLevel && info.remoteLocator == info.remoteUrl) {
+        for (const char* key : {
+                 "remote_url", "volume_id", "level", "shape", "chunk_shape",
+                 "chunk_grid_shape", "chunk_count"}) {
+            const auto found = marker.find(key);
+            if (found == marker.end())
+                return false;
+        }
+        return marker.at("remote_url") == info.remoteUrl &&
+               marker.at("volume_id") == info.volumeId &&
+               marker.at("level") == info.level &&
+               marker.at("shape") == info.shape &&
+               marker.at("chunk_shape") == info.chunkShape &&
+               marker.at("chunk_grid_shape") == info.chunkGridShape &&
+               marker.at("chunk_count") == info.totalChunks;
+    }
     const auto expected = markerJsonForInfo(info);
     for (const char* key : {
              "version",
              "remote_url",
+             "remote_locator",
              "volume_id",
              "level",
+             "logical_level",
+             "physical_level",
              "shape",
              "chunk_shape",
              "chunk_grid_shape",
@@ -229,6 +255,7 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
     }
 
     result.volumeId = volume->id();
+    result.physicalLevel = volume->baseScaleLevel() + level;
     result.cacheDir = volume->remotePersistentCachePath();
 
     if (!volume->isRemote()) {

@@ -669,7 +669,11 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
 
 void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume)
 {
-    if (!volume || !volume->isRemote() || !volume->hasScaleLevel(vc3d::opendata::kOpenDataVolumePrefillLevel)) {
+    const int logicalPrefillLevel = volume
+        ? vc3d::opendata::kOpenDataVolumePrefillLevel - volume->baseScaleLevel()
+        : -1;
+    if (!volume || !volume->isRemote() || logicalPrefillLevel < 0 ||
+        !volume->hasScaleLevel(logicalPrefillLevel)) {
         return;
     }
     if (volume->remotePersistentCachePath().empty()) {
@@ -678,11 +682,12 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
     if (vc3d::opendata::openDataVolumePrefillMarkerMatches(
             volume->remotePersistentCachePath(),
             *volume,
-            vc3d::opendata::kOpenDataVolumePrefillLevel)) {
+            logicalPrefillLevel)) {
         Logger()->info(
-            "Open-data volume {} level {} already prefetched",
+            "Open-data volume {} physical level {} (logical {}) already prefetched",
             volume->id(),
-            vc3d::opendata::kOpenDataVolumePrefillLevel);
+            vc3d::opendata::kOpenDataVolumePrefillLevel,
+            logicalPrefillLevel);
         return;
     }
 
@@ -695,9 +700,10 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
     const QString volumeId = QString::fromStdString(volume->id());
     if (_window) {
         _window->showStatusBarMessage(
-            QObject::tr("Caching remote volume %1 level /%2 in background...")
+            QObject::tr("Caching remote volume %1 physical /%2 (logical /%3) in background...")
                 .arg(volumeId)
-                .arg(vc3d::opendata::kOpenDataVolumePrefillLevel),
+                .arg(vc3d::opendata::kOpenDataVolumePrefillLevel)
+                .arg(logicalPrefillLevel),
             7000);
     }
 
@@ -741,8 +747,9 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
                 switch (result.status) {
                 case Status::Completed:
                     _window->showStatusBarMessage(
-                        QObject::tr("Cached remote volume %1 level /%2: %3 chunks.")
+                        QObject::tr("Cached remote volume %1 physical /%2 (logical /%3): %4 chunks.")
                             .arg(QString::fromStdString(result.volumeId))
+                            .arg(result.physicalLevel)
                             .arg(result.level)
                             .arg(result.totalChunks),
                         7000);
@@ -785,10 +792,10 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
                 }
             });
 
-    watcher->setFuture(QtConcurrent::run([volume, cancelFlag]() {
+    watcher->setFuture(QtConcurrent::run([volume, cancelFlag, logicalPrefillLevel]() {
         return vc3d::opendata::prefillOpenDataVolumeLevel(
             volume,
-            vc3d::opendata::kOpenDataVolumePrefillLevel,
+            logicalPrefillLevel,
             cancelFlag.get());
     }));
 }
@@ -820,14 +827,14 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
     }
 
     *authOut = {};
-    auto resolved = vc::resolveRemoteUrl(url.trimmed().toStdString());
-    if (!resolved.useAwsSigv4) {
+    const auto spec = vc::parseRemoteVolumeSpec(url.trimmed().toStdString());
+    if (!spec.useAwsSigv4) {
         return true;
     }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     *authOut = vc::loadAwsCredentials();
-    if (authOut->region.empty()) authOut->region = resolved.awsRegion;
+    if (authOut->region.empty()) authOut->region = spec.awsRegion;
 
     if (authOut->access_key.empty() || authOut->secret_key.empty()) {
         const auto savedAccess = settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
@@ -940,12 +947,18 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
         return;
     }
 
-    auto resolved = vc::resolveRemoteUrl(url.trimmed().toStdString());
-    std::string trimmed = resolved.httpsUrl;
-    while (!trimmed.empty() && trimmed.back() == '/') {
-        trimmed.pop_back();
+    vc::RemoteVolumeSpec spec;
+    try {
+        spec = vc::parseRemoteVolumeSpec(url.trimmed().toStdString());
+    } catch (const std::exception& e) {
+        QMessageBox::warning(_window, QObject::tr("Invalid Remote Zarr"),
+                             QString::fromUtf8(e.what()));
+        return;
     }
-    const bool looksLikeZarr = trimmed.size() >= 5 && trimmed.substr(trimmed.size() - 5) == ".zarr";
+    const auto query = spec.sourceUrl.find('?');
+    const auto sourcePath = spec.sourceUrl.substr(0, query);
+    const bool looksLikeZarr = sourcePath.size() >= 5 &&
+                               sourcePath.substr(sourcePath.size() - 5) == ".zarr";
     if (!looksLikeZarr) {
         QMessageBox::warning(_window,
                              QObject::tr("Expected Remote Zarr"),
@@ -966,7 +979,9 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
     if (cacheDir.isEmpty()) {
         return;
     }
-    updateRecentRemoteList(url);
+    const QString persistedLocator = QString::fromStdString(
+        spec.hasBaseScaleSelector ? spec.portableLocator : url.trimmed().toStdString());
+    updateRecentRemoteList(persistedLocator);
     if (_attachRemoteZarrAct) {
         _attachRemoteZarrAct->setEnabled(false);
     }
@@ -976,7 +991,7 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
 
     auto* watcher = new QFutureWatcher<std::shared_ptr<Volume>>(this);
     connect(watcher, &QFutureWatcher<std::shared_ptr<Volume>>::finished, this,
-            [this, watcher, url]() {
+            [this, watcher, persistedLocator]() {
                 watcher->deleteLater();
                 if (_attachRemoteZarrAct) {
                     _attachRemoteZarrAct->setEnabled(true);
@@ -1008,7 +1023,7 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
 
                         // VolumePkg::addVolumeEntry persists to the volpkg
                         // JSON automatically via persistProjectState().
-                        _window->_state->vpkg()->addVolumeEntry(url.trimmed().toStdString());
+                        _window->_state->vpkg()->addVolumeEntry(persistedLocator.toStdString());
 
                         if (_window->statusBar()) {
                             _window->showStatusBarMessage(
@@ -1049,8 +1064,8 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
                             .arg(errorMsg),
                         QMessageBox::Yes | QMessageBox::No);
                     if (reply == QMessageBox::Yes) {
-                        QTimer::singleShot(0, this, [this, url]() {
-                            attachRemoteZarrUrl(url);
+                        QTimer::singleShot(0, this, [this, persistedLocator]() {
+                            attachRemoteZarrUrl(persistedLocator);
                         });
                         return;
                     }
@@ -1062,8 +1077,8 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
                     QObject::tr("Failed to attach remote zarr:\n%1").arg(errorMsg));
             });
 
-    auto future = QtConcurrent::run([url, auth, cacheDir]() -> std::shared_ptr<Volume> {
-        return Volume::NewFromUrl(url.toStdString(), cacheDir.toStdString(), auth);
+    auto future = QtConcurrent::run([persistedLocator, auth, cacheDir]() -> std::shared_ptr<Volume> {
+        return Volume::NewFromUrl(persistedLocator.toStdString(), cacheDir.toStdString(), auth);
     });
     watcher->setFuture(future);
 }

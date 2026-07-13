@@ -1,5 +1,7 @@
 #include "SegmentationGrower.hpp"
 
+#include "OpenDataCoordinateIdentity.hpp"
+
 #include "../../NeuralTraceServiceManager.hpp"
 #include "../SegmentationModule.hpp"
 #include "../SegmentationWidget.hpp"
@@ -2260,6 +2262,9 @@ void SegmentationGrower::onFutureFinished()
             const std::string newSegmentId = makeUniqueSegmentId(segmentsDir, baseId);
             const std::filesystem::path newSegmentPath = segmentsDir / newSegmentId;
             try {
+                vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+                    *surface, *request.volumeContext.package,
+                    request.volumeContext.activeVolumeId);
                 surface->save(newSegmentPath.string(), newSegmentId, false);
             } catch (const std::exception& ex) {
                 showStatus(tr("Failed to save displacement copy result: %1").arg(ex.what()), kStatusLong);
@@ -2360,6 +2365,9 @@ void SegmentationGrower::onFutureFinished()
         const std::filesystem::path newSegmentPath = segmentsDir / newSegmentId;
 
         try {
+            vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+                *result.surface, *request.volumeContext.package,
+                request.volumeContext.activeVolumeId);
             result.surface->save(newSegmentPath.string(), newSegmentId, false);
         } catch (const std::exception& ex) {
             showStatus(tr("Failed to save dense displacement result: %1").arg(ex.what()), kStatusLong);

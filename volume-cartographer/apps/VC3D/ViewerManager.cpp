@@ -15,6 +15,7 @@
 #include "CState.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Logging.hpp"
 
 #include <QMdiArea>
@@ -29,6 +30,7 @@
 #include <exception>
 #include <iostream>
 #include <optional>
+#include <string_view>
 #include <unordered_set>
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
@@ -40,6 +42,16 @@ Q_LOGGING_CATEGORY(lcViewerManager, "vc.viewer.manager")
 #define VC3D_DEBUG_QCINFO(category) if (!DebugLoggingEnabled()) {} else qCInfo(category)
 
 namespace {
+
+std::string coordinateSpaceTag(const VolumePkg& pkg, const std::string& volumeId)
+{
+    constexpr std::string_view prefix = "vc-open-data-coordinate-space:";
+    for (const auto& tag : pkg.volumeTags(volumeId)) {
+        if (tag.rfind(prefix, 0) == 0)
+            return tag.substr(prefix.size());
+    }
+    return {};
+}
 
 QString compactViewerLabel(const std::string& surfaceName, const QString& title)
 {
@@ -379,11 +391,33 @@ void ViewerManager::setHighlightedSurfaceIds(const std::vector<std::string>& ids
 
 void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId)
 {
+    if (volume && _state && _state->vpkg()) {
+        const auto baseSpace = coordinateSpaceTag(
+            *_state->vpkg(), _state->currentVolumeId());
+        const auto overlaySpace = coordinateSpaceTag(*_state->vpkg(), volumeId);
+        if ((!baseSpace.empty() || !overlaySpace.empty()) &&
+            (baseSpace.empty() || baseSpace != overlaySpace)) {
+            Logger()->warn(
+                "Rejected volume overlay '{}' because its explicit coordinate space does not match '{}'.",
+                volumeId, _state->currentVolumeId());
+            volume.reset();
+        }
+    }
     _overlayVolume = std::move(volume);
-    _overlayVolumeId = volumeId;
+    _overlayVolumeId = _overlayVolume ? volumeId : std::string{};
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayVolume(_overlayVolume); });
 
     emit overlayVolumeAvailabilityChanged(static_cast<bool>(_overlayVolume));
+}
+
+std::shared_ptr<Volume> ViewerManager::currentVolume() const
+{
+    return _state ? _state->currentVolume() : nullptr;
+}
+
+std::string ViewerManager::currentVolumeId() const
+{
+    return _state ? _state->currentVolumeId() : std::string{};
 }
 
 void ViewerManager::setOverlayOpacity(float opacity)
