@@ -1,5 +1,9 @@
 set(CMAKE_AUTORCC ON)
 
+option(VC_BUILD_MCP_SERVER "Build the experimental standalone VC MCP server" OFF)
+set(VC_MCP_CONTAINER_DIGEST "unverified" CACHE STRING
+    "Pinned VC worker OCI digest advertised by the MCP server")
+
 set(CHUNK_CACHE_SIZE_GB "10" CACHE STRING "size of the chunk cache in gigabytes")
 add_definitions(-DCHUNK_CACHE_SIZE_GB=${CHUNK_CACHE_SIZE_GB})
 
@@ -267,6 +271,10 @@ target_link_libraries(VC3D
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
     Blosc::blosc
 )
+
+if(VC_BUILD_MCP_SERVER)
+    add_subdirectory(mcp)
+endif()
 
 if(VC_USE_PCH)
     # VC3D gets its own PCH = vc_core's common headers + the heavy Qt umbrella

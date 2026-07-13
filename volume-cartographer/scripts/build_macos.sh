@@ -146,6 +146,16 @@ if command -v xcrun >/dev/null 2>&1; then
 fi
 
 extra_cmake_args=()
+# Homebrew flang may ship a target config that names the current macOS major
+# SDK (for example MacOSX26.sdk) even when the installed CLT only provides an
+# older compatible SDK. Pass the SDK selected by xcrun explicitly; the later
+# command-line flag overrides flang's stale config-file default.
+if [[ -n "${SDKROOT:-}" ]]; then
+  extra_cmake_args+=(
+    "-DCMAKE_OSX_SYSROOT=$SDKROOT"
+    "-DCMAKE_Fortran_FLAGS=-isysroot $SDKROOT"
+  )
+fi
 # Eigen ships its CMake config under <prefix>/share/eigen3/cmake. Derive
 # the prefix via `brew --prefix eigen` so a Homebrew revision bump (eigen
 # 3.4.0_1 → 3.4.0_2 → 3.5.x …) doesn't rot the script.

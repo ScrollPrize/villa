@@ -1,0 +1,9 @@
+# Controlled local/remote Zarr ROI staging dependencies.
+# Install into the same interpreter configured by VC_MCP_NNUNET_PYTHON.
+numpy>=2.0,<3
+pillow>=11,<13
+scipy>=1.14,<2
+tifffile>=2025.1
+zarr>=3.1,<4
+fsspec>=2025.1
+s3fs>=2025.1

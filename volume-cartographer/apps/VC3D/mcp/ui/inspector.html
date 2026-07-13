@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vellum Lens</title>
+  <script type="module" src="/src/inspector.ts"></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="mast">
+      <div class="mark" aria-hidden="true"><span></span><span></span><span></span></div>
+      <div><p class="eyebrow">Volume Cartographer · MCP App</p><h1>Vellum Lens</h1></div>
+      <div id="status" class="status">waiting for tool result</div>
+    </header>
+
+    <section id="prediction-view" class="view hidden">
+      <div class="hero-grid">
+        <article class="plate">
+          <p class="plate-label">Prediction volume</p>
+          <h2 id="volume-name">—</h2>
+          <div class="metrics">
+            <div><span>Shape · ZYX</span><strong id="shape">—</strong></div>
+            <div><span>Chunk</span><strong id="chunks">—</strong></div>
+            <div><span>Signal</span><strong id="dtype">—</strong></div>
+            <div><span>Space</span><strong id="space">—</strong></div>
+          </div>
+        </article>
+        <aside class="coordinate-card">
+          <div class="axis axis-x">X</div><div class="axis axis-y">Y</div><div class="axis axis-z">Z</div>
+          <p>Storage reads <b>Z · Y · X</b><br/>VC speaks <b>X · Y · Z</b></p>
+        </aside>
+      </div>
+
+      <form id="candidate-form" class="workbench">
+        <div class="section-title"><span>01</span><div><h3>Candidate field</h3><p>Bounded search · maximum eight chunks</p></div></div>
+        <label class="wide">Surface prediction URI<input id="prediction-uri" required /></label>
+        <label class="wide">Ink prediction URI <em>optional</em><input id="ink-uri" /></label>
+        <div class="field-row three">
+          <label>Center X<input id="cx" type="number" required /></label>
+          <label>Center Y<input id="cy" type="number" required /></label>
+          <label>Center Z<input id="cz" type="number" required /></label>
+        </div>
+        <div class="field-row three">
+          <label>Radius X<input id="rx" type="number" value="80" min="1" max="192" /></label>
+          <label>Radius Y<input id="ry" type="number" value="80" min="1" max="192" /></label>
+          <label>Radius Z<input id="rz" type="number" value="80" min="1" max="192" /></label>
+        </div>
+        <div class="field-row four">
+          <label>Surface ≥<input id="surface-threshold" type="number" value="128" min="0" max="255" /></label>
+          <label>Ink ≥<input id="ink-threshold" type="number" value="0" min="0" max="255" /></label>
+          <label>Ink weight<input id="ink-weight" type="number" value="0.5" min="0" max="1" step="0.05" /></label>
+          <label>Separation<input id="separation" type="number" value="24" min="8" max="256" /></label>
+        </div>
+        <button class="primary" type="submit"><span>Scan bounded region</span><i>→</i></button>
+      </form>
+
+      <section id="candidate-section" class="results hidden">
+        <div class="section-title"><span>02</span><div><h3>Seed candidates</h3><p id="candidate-summary">—</p></div></div>
+        <div class="candidate-layout">
+          <div id="candidate-map" class="candidate-map"><div class="crosshair h"></div><div class="crosshair v"></div></div>
+          <div id="candidate-list" class="candidate-list"></div>
+        </div>
+        <pre id="seed-payload" class="payload">Select a candidate</pre>
+        <button id="copy-seed" class="secondary" type="button">Copy grow request seed</button>
+      </section>
+    </section>
+
+    <section id="surface-view" class="view hidden">
+      <div class="section-title"><span>Σ</span><div><h3>Surface result</h3><p id="surface-job">—</p></div></div>
+      <div class="surface-grid">
+        <figure class="preview-frame"><img id="surface-preview" alt="Generation map"/><figcaption>Generation topology</figcaption></figure>
+        <article class="plate"><p class="plate-label">Geometry</p><div id="surface-metrics" class="metrics vertical"></div></article>
+      </div>
+    </section>
+
+    <section id="segmentation-view" class="view hidden">
+      <div class="section-title"><span>Ψ</span><div><h3>Volumetric segmentation</h3><p id="segmentation-job">—</p></div></div>
+      <div id="segmentation-progress" class="segmentation-progress"><span></span><b>queued</b></div>
+      <div class="segmentation-grid">
+        <figure class="preview-frame"><img id="probability-preview" alt="Surface probability projection"/><figcaption>Maximum surface probability</figcaption></figure>
+        <figure class="preview-frame"><img id="mask-preview" alt="Segmentation mask projection"/><figcaption>Thresholded surface mask</figcaption></figure>
+      </div>
+      <article class="plate"><p class="plate-label">Inference manifest</p><div id="segmentation-metrics" class="metrics"></div></article>
+    </section>
+
+    <section id="registered-view" class="view hidden">
+      <div class="section-title"><span>⌖</span><div><h3>Registered surface evidence</h3><p id="registered-job">TIFXYZ → canonical Zarr · CT registered in UV</p></div></div>
+      <div class="evidence-ribbon"><span>MEASUREMENT</span><p>This view preserves coordinates and coverage. It does not certify geometry or writing.</p></div>
+      <div class="registered-grid">
+        <figure class="preview-frame evidence-primary"><img id="registered-intensity" alt="Registered CT intensity"/><figcaption>Raw CT intensity · registered UV grid</figcaption></figure>
+        <figure class="preview-frame"><img id="registered-depth" alt="Surface depth"/><figcaption>Surface Z coordinate</figcaption></figure>
+        <figure class="preview-frame"><img id="registered-coverage" alt="Registration coverage"/><figcaption>Valid sampled coverage</figcaption></figure>
+      </div>
+      <article class="plate evidence-ledger"><p class="plate-label">Coordinate ledger</p><div id="registered-metrics" class="metrics"></div></article>
+    </section>
+
+    <section id="geometry-view" class="view hidden">
+      <div class="section-title"><span>△</span><div><h3>Surface geometry diagnostics</h3><p id="geometry-job">local regular-grid measurements</p></div></div>
+      <div class="evidence-ribbon"><span>NOT A VERDICT</span><p>Local folds, stretch, and normal changes can expose defects; a clean map does not prove the correct papyrus layer.</p></div>
+      <div class="evidence-triptych">
+        <figure class="preview-frame"><img id="geometry-stretch" alt="Surface stretch map"/><figcaption>Log edge-length distortion</figcaption></figure>
+        <figure class="preview-frame"><img id="geometry-normal" alt="Normal change map"/><figcaption>Neighbor normal change · degrees</figcaption></figure>
+        <figure class="preview-frame"><img id="geometry-fold" alt="Fold and degeneracy map"/><figcaption>Local fold / degenerate cells</figcaption></figure>
+      </div>
+      <article class="plate evidence-ledger"><p class="plate-label">Geometry ledger</p><div id="geometry-metrics" class="metrics"></div></article>
+    </section>
+
+    <section id="alignment-view" class="view hidden">
+      <div class="section-title"><span>∿</span><div><h3>CT normal-profile alignment</h3><p id="alignment-job">raw-volume evidence along surface normals</p></div></div>
+      <div class="evidence-ribbon"><span>EVIDENCE ONLY</span><p>A strong boundary gradient supports sheet alignment but cannot identify the correct layer by itself.</p></div>
+      <div class="evidence-triptych">
+        <figure class="preview-frame"><img id="alignment-gradient" alt="Peak CT gradient map"/><figcaption>Peak normal-profile gradient</figcaption></figure>
+        <figure class="preview-frame"><img id="alignment-offset" alt="Peak offset map"/><figcaption>Peak gradient offset · voxels</figcaption></figure>
+        <figure class="preview-frame"><img id="alignment-confidence" alt="Alignment confidence map"/><figcaption>Peak / profile-range evidence</figcaption></figure>
+      </div>
+      <article class="plate evidence-ledger"><p class="plate-label">Alignment ledger</p><div id="alignment-metrics" class="metrics"></div></article>
+    </section>
+
+    <section id="grid-view" class="view hidden">
+      <div class="section-title"><span>▦</span><div><h3>Structural grid coherence</h3><p id="grid-job">cycle-gated physical periodicity</p></div></div>
+      <div class="evidence-ribbon"><span>TEXT-LIKENESS</span><p>Periodicity can come from writing, fibers, rendering, or model artifacts. This is not an ink probability.</p></div>
+      <div class="grid-evidence-layout"><figure class="preview-frame"><img id="grid-coherence" alt="Grid coherence map"/><figcaption>Windowed cycle-gated coherence</figcaption></figure><article class="plate"><p class="plate-label">Detected signature</p><div id="grid-metrics" class="metrics vertical"></div></article></div>
+    </section>
+
+    <section id="comparison-view" class="view hidden">
+      <div class="section-title"><span>⇄</span><div><h3>Registered structural comparison</h3><p id="comparison-job">agreement · divergence · review priority</p></div></div>
+      <div class="evidence-ribbon"><span>NOT CONSENSUS TRUTH</span><p>Agreement may be correlated error. Divergence identifies where to review, not which input is correct.</p></div>
+      <div class="evidence-triptych"><figure class="preview-frame"><img id="comparison-agreement" alt="Structural agreement"/><figcaption>Agreement</figcaption></figure><figure class="preview-frame"><img id="comparison-divergence" alt="Structural divergence"/><figcaption>Divergence · A red / B blue</figcaption></figure><figure class="preview-frame"><img id="comparison-priority" alt="Review priority"/><figcaption>Review priority</figcaption></figure></div>
+      <article class="plate evidence-ledger"><p class="plate-label">Comparison ledger</p><div id="comparison-metrics" class="metrics"></div></article>
+    </section>
+
+    <section id="fold-view" class="view hidden">
+      <div class="section-title"><span>≋</span><div><h3>Epoch-fold structure</h3><p id="fold-job">period search with permutation null</p></div></div>
+      <div class="evidence-ribbon"><span>DETECTS · CANNOT READ</span><p>The horizontal signal is averaged into a one-dimensional phase profile. The same full search is applied to every null trial.</p></div>
+      <div class="segmentation-grid"><figure class="preview-frame"><img id="fold-profile" alt="Folded phase profile"/><figcaption>Folded line-phase profile</figcaption></figure><figure class="preview-frame"><img id="fold-search" alt="Period search"/><figcaption>Period-search statistic</figcaption></figure></div>
+      <article class="plate evidence-ledger"><p class="plate-label">Detection ledger</p><div id="fold-metrics" class="metrics"></div></article>
+    </section>
+
+    <section id="stability-view" class="view hidden">
+      <div class="section-title"><span>≈</span><div><h3>Perturbation stability</h3><p id="stability-job">robustness across supplied runs</p></div></div>
+      <div class="evidence-ribbon"><span>CONDITIONAL ROBUSTNESS</span><p>Stability is measured only against the supplied perturbations and cannot establish the correct papyrus layer.</p></div>
+      <div class="evidence-triptych"><figure class="preview-frame"><img id="stability-displacement" alt="Maximum displacement"/><figcaption>Maximum physical displacement · mm</figcaption></figure><figure class="preview-frame"><img id="stability-angle" alt="Maximum normal angle"/><figcaption>Maximum normal-angle change</figcaption></figure><figure class="preview-frame"><img id="stability-local" alt="Minimum local stability"/><figcaption>Minimum local stability</figcaption></figure></div>
+      <article class="plate evidence-ledger"><p class="plate-label">Stability ledger</p><div id="stability-metrics" class="metrics"></div></article>
+    </section>
+
+    <section id="ranking-view" class="view hidden">
+      <div class="section-title"><span>≜</span><div><h3>Transparent evidence ranking</h3><p id="ranking-job">explicit components · explicit weights</p></div></div>
+      <div class="evidence-ribbon"><span>HEURISTIC RANKING</span><p>The aggregate is a review-priority heuristic, not a calibrated probability. Every formula and component remains in the manifest.</p></div>
+      <div class="grid-evidence-layout"><figure class="preview-frame"><img id="ranking-preview" alt="Candidate evidence ranking"/><figcaption>Candidate order and combined heuristic score</figcaption></figure><article class="plate"><p class="plate-label">Ranking summary</p><div id="ranking-metrics" class="metrics vertical"></div></article></div>
+      <div id="ranking-candidates" class="files"></div>
+    </section>
+
+    <section id="review-view" class="view hidden">
+      <div class="section-title"><span>☷</span><div><h3>Immutable review queue</h3><p id="review-job">prioritized evidence for human assessment</p></div></div>
+      <div class="evidence-ribbon"><span>HUMAN REVIEW</span><p>Submitting creates a new assessment artifact. The source queue is never modified.</p></div>
+      <div class="grid-evidence-layout"><figure class="preview-frame"><img id="review-preview" alt="Review queue priorities"/><figcaption>Priority order</figcaption></figure><article class="plate"><p class="plate-label">Assessment identity</p><label>Reviewer ID<input id="reviewer-id" value="reviewer" maxlength="64" pattern="[A-Za-z0-9._-]+"/></label><button id="submit-assessment" class="primary" type="button"><span>Create assessment artifact</span><i>→</i></button></article></div>
+      <div id="review-items" class="review-items"></div>
+    </section>
+
+    <section id="assessment-view" class="view hidden">
+      <div class="section-title"><span>✓</span><div><h3>Reviewer assessment artifact</h3><p id="assessment-job">immutable decisions and provenance</p></div></div>
+      <div class="grid-evidence-layout"><figure class="preview-frame"><img id="assessment-preview" alt="Assessment summary"/><figcaption>Decision distribution</figcaption></figure><article class="plate"><p class="plate-label">Assessment ledger</p><div id="assessment-metrics" class="metrics vertical"></div></article></div>
+      <div id="assessment-records" class="files"></div>
+    </section>
+
+    <section id="evaluation-view" class="view hidden">
+      <div class="section-title"><span>∴</span><div><h3>Reviewer-label evaluation</h3><p id="evaluation-job">ranking metrics · calibration · agreement</p></div></div>
+      <div class="evidence-ribbon"><span>SUPPLIED LABELS</span><p>Metrics describe agreement with the supplied reviewers, not objective papyrological truth.</p></div>
+      <div class="grid-evidence-layout"><figure class="preview-frame"><img id="evaluation-preview" alt="Evaluation summary"/><figcaption>Ranking and agreement metrics</figcaption></figure><article class="plate"><p class="plate-label">Evaluation ledger</p><div id="evaluation-metrics" class="metrics vertical"></div></article></div>
+      <div id="evaluation-bins" class="files"></div>
+    </section>
+
+    <section id="artifact-view" class="view hidden">
+      <div class="section-title"><span>#</span><div><h3>Manifest & artifacts</h3><p id="artifact-job">—</p></div></div>
+      <div id="manifest" class="manifest"></div>
+      <div id="files" class="files"></div>
+    </section>
+
+    <section id="empty-view" class="empty-view">
+      <div class="scanline"></div><p>Invoke <code>vc_inspect_prediction</code>, <code>surface_render_registered_roi</code>,<br/><code>volume_run_segmentation</code>, or <code>vc_inspect_artifacts</code>.</p>
+    </section>
+  </main>
+</body>
+</html>

@@ -375,6 +375,12 @@ endif()
 find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
+# OpenCV 5 renamed calib3d to calib. Preserve the target name used throughout
+# VC while retaining OpenCV 4 compatibility.
+if(OpenCV_VERSION_MAJOR GREATER_EQUAL 5 AND TARGET opencv_calib AND NOT TARGET opencv_calib3d)
+    add_library(opencv_calib3d INTERFACE)
+    target_link_libraries(opencv_calib3d INTERFACE opencv_calib)
+endif()
 find_package(nlohmann_json REQUIRED)
 find_package(CURL REQUIRED)
 find_package(TIFF REQUIRED)
@@ -505,6 +511,12 @@ if(NOT VC_LIBBACKTRACE)
 endif()
 
 # ---- Subdirectories ---------------------------------------------------------
+# Testing must be enabled before test-bearing subdirectories are configured so
+# their CTestTestfile.cmake files are reachable from the root test manifest.
+if(VC_TESTING)
+    enable_testing()
+endif()
+
 include_directories(core/include)
 
 add_subdirectory(libs/OpenABF)

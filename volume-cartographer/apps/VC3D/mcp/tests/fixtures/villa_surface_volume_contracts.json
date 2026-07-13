@@ -1,0 +1,24 @@
+{
+  "canonical_source_layers": 65,
+  "canonical_offsets_voxels": [-32, 32],
+  "profiles": {
+    "villa-timesformer-26": {
+      "channels": 26,
+      "source_layer_range": [17, 43],
+      "offsets_voxels": [-15, 10],
+      "provenance": "ink-detection/train_timesformer_og.py read_image_mask defaults"
+    },
+    "villa-resnet152-62": {
+      "channels": 62,
+      "source_layer_range": [1, 63],
+      "offsets_voxels": [-31, 30],
+      "provenance": "ink-detection/train_resnet3d_3d_decoder.py and metadata.json"
+    }
+  },
+  "array_contract": {
+    "axes": ["height", "width", "channels"],
+    "dtype": "uint8",
+    "zarr_chunks": ["spatial", "spatial", 1],
+    "provenance": "ink-detection/optimized_inference/processing.py create_surface_volume_zarr"
+  }
+}
