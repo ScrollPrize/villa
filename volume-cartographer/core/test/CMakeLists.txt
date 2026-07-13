@@ -7,7 +7,7 @@ set_target_properties(doctest::doctest PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES
         "${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/doctest_compat")
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Test Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Gui Test Widgets)
 
 # Dedicated PCH carrier for the test suite. Keep this STATIC and separate from
 # production targets so tests can add test-only headers without bloating the

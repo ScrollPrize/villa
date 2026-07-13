@@ -11,6 +11,7 @@
 #include "vc/core/types/VcDataset.hpp"
 
 #include <array>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <set>
@@ -103,9 +104,30 @@ public:
     };
     ~Chunked3d()
     {
+        // _cache_dir selects the storage strategy for every entry: an empty
+        // path uses malloc, while a configured cache stores shared mappings.
+        // Release the backing memory before removing transient cache files;
+        // Windows cannot delete a file while this process still maps it.
+        if (_cache_dir.empty()) {
+            for (const auto& [id, chunk] : _chunks) {
+                (void)id;
+                std::free(chunk);
+            }
+        }
+        else {
+            constexpr std::size_t chunkElements =
+                static_cast<std::size_t>(C::CHUNK_SIZE) * C::CHUNK_SIZE * C::CHUNK_SIZE;
+            constexpr std::size_t chunkBytes = chunkElements * sizeof(T);
+            for (const auto& [id, chunk] : _chunks) {
+                (void)id;
+                vc::memmap::unmapRW(chunk, chunkBytes);
+            }
+        }
+        _chunks.clear();
+
         if (!_persistent) {
-            // Best effort: on Windows files with live mappings can't be
-            // deleted, and a throwing remove_all would terminate() here.
+            // Best effort in a noexcept destructor. Mapping cleanup above
+            // makes the normal Windows removal path succeed.
             std::error_code ec;
             std::filesystem::remove_all(_cache_dir, ec);
         }

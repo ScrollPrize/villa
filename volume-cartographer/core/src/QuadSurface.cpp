@@ -29,6 +29,7 @@
 #include <atomic>
 #include <exception>
 #include <set>
+#include <unordered_map>
 
 #include <stdio.h>
 
@@ -75,8 +76,27 @@ void replaceFile(const std::filesystem::path& source,
 constexpr auto kSaveRollbackDir = ".vc-save-rollback";
 constexpr auto kSaveRollbackReady = ".ready";
 
+std::recursive_mutex& surfaceDirWriteMutex(const std::filesystem::path& dir)
+{
+    // Keyed by normalized dir string so separate QuadSurface objects pointing
+    // at the same segment dir share one lock. Recursive because saveOverwrite
+    // holds it across nested saveSnapshot()/save() calls, and Windows
+    // publication performs recovery while the save lock is already held.
+    static std::mutex mapMutex;
+    static std::unordered_map<std::string, std::recursive_mutex> locks;
+    const std::string key = dir.lexically_normal().string();
+    std::lock_guard<std::mutex> guard(mapMutex);
+    return locks[key];
+}
+
 void recoverIncompleteSave(const std::filesystem::path& destination)
 {
+    // Loading and publication must be mutually exclusive. In particular, a
+    // loader must not mistake an active Windows rollback journal for one left
+    // by an interrupted process and restore it while files are being replaced.
+    std::lock_guard<std::recursive_mutex> dirLock(
+        surfaceDirWriteMutex(destination));
+
     const auto rollback = destination / kSaveRollbackDir;
     if (!std::filesystem::exists(rollback)) {
         return;
@@ -1407,14 +1427,7 @@ void QuadSurface::save(const std::filesystem::path &path_, bool force_overwrite)
 
 std::recursive_mutex& QuadSurface::dirWriteMutex(const std::filesystem::path& dir)
 {
-    // Keyed by normalized dir string so separate QuadSurface objects pointing at
-    // the same segment dir share one lock. Grows by one entry per distinct dir
-    // touched this session (tiny, never pruned); a mutex guards the map itself.
-    static std::mutex mapMutex;
-    static std::unordered_map<std::string, std::recursive_mutex> locks;
-    const std::string key = dir.lexically_normal().string();
-    std::lock_guard<std::mutex> g(mapMutex);
-    return locks[key];
+    return surfaceDirWriteMutex(dir);
 }
 
 void QuadSurface::saveOverwrite()
