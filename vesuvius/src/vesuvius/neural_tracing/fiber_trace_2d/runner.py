@@ -39,7 +39,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_
 _TRACE2CP_SIDE_DP_HORIZONTAL_STEP_PX = 4
 _TRACE2CP_SIDE_DP_MAX_ABS_DY_PER_DX = 4.0
 _TRACE2CP_SIDE_DP_Z_TRANSITION_PENALTY = 0.0
-_TRACE2CP_SIDE_DP_DZ_SMOOTH_PENALTY = 0.05
+_TRACE2CP_SIDE_DP_DZ_SMOOTH_PENALTY = 0.5
 _TRACE2CP_DP_DY_SMOOTH_PENALTY = 0.0
 _TRACE2CP_DP_DZ_SMOOTH_PENALTY = 0.0
 _TRACE2CP_DP_ANGLE_BASE_DEGREES = 10.0
@@ -1794,6 +1794,12 @@ class _Trace2CpPairEvaluation:
     traced_top_strip_valid_mask: np.ndarray | None = None
     z_top_strip_image: np.ndarray | None = None
     z_top_strip_valid_mask: np.ndarray | None = None
+    top_strip_presence_image: np.ndarray | None = None
+    top_strip_presence_valid_mask: np.ndarray | None = None
+    traced_top_strip_presence_image: np.ndarray | None = None
+    traced_top_strip_presence_valid_mask: np.ndarray | None = None
+    z_top_strip_presence_image: np.ndarray | None = None
+    z_top_strip_presence_valid_mask: np.ndarray | None = None
     top_model_direction_image: np.ndarray | None = None
     top_model_direction_valid_mask: np.ndarray | None = None
     top_model_direction_source: str = ""
@@ -6341,6 +6347,52 @@ def _draw_trace2cp_top_strip_panel(
     return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
 
 
+def _project_side_presence_to_top_strip(
+    presence_hw: np.ndarray | None,
+    presence_valid_mask: np.ndarray | None,
+    top_valid_mask: np.ndarray,
+    trace_xy: np.ndarray,
+) -> np.ndarray | None:
+    if presence_hw is None:
+        return None
+    presence = np.asarray(presence_hw, dtype=np.float32)
+    if presence.ndim != 2:
+        raise ValueError("presence_hw must have shape H,W")
+    valid = None if presence_valid_mask is None else np.asarray(presence_valid_mask, dtype=bool)
+    if valid is not None and valid.shape != presence.shape:
+        raise ValueError("presence_valid_mask must match presence shape")
+    top_valid = np.asarray(top_valid_mask, dtype=bool)
+    if top_valid.ndim != 2:
+        raise ValueError("top_valid_mask must have shape H,W")
+    trace = np.asarray(trace_xy, dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[1] != 2 or trace.shape[0] == 0:
+        return None
+
+    height, width = (int(v) for v in top_valid.shape)
+    center_y = (float(height) - 1.0) * 0.5
+    output = np.zeros((height, width), dtype=np.uint8)
+    wrote_pixel = False
+    for x in range(width):
+        y = _trace_y_at_x(trace, float(x))
+        if y is None or not np.isfinite(y):
+            continue
+        valid_rows = np.flatnonzero(top_valid[:, x])
+        for row in valid_rows.tolist():
+            side_y = float(y) + (float(row) - center_y)
+            value = _bilinear_scalar_sample(
+                presence,
+                np.asarray([float(x), side_y], dtype=np.float32),
+                valid_mask=valid,
+            )
+            if value is None:
+                continue
+            output[int(row), x] = np.uint8(np.clip(float(value) * 255.0, 0.0, 255.0))
+            wrote_pixel = True
+    if not wrote_pixel:
+        return None
+    return output
+
+
 def _draw_trace2cp_side_top_z_compact_overlay(
     *,
     line_xy: np.ndarray,
@@ -7849,6 +7901,12 @@ def _draw_trace2cp_overlay(
     traced_top_strip_valid_mask: np.ndarray | None = None,
     z_top_strip_image: np.ndarray | None = None,
     z_top_strip_valid_mask: np.ndarray | None = None,
+    top_strip_presence_image: np.ndarray | None = None,
+    top_strip_presence_valid_mask: np.ndarray | None = None,
+    traced_top_strip_presence_image: np.ndarray | None = None,
+    traced_top_strip_presence_valid_mask: np.ndarray | None = None,
+    z_top_strip_presence_image: np.ndarray | None = None,
+    z_top_strip_presence_valid_mask: np.ndarray | None = None,
     top_model_direction_image: np.ndarray | None = None,
     top_model_direction_valid_mask: np.ndarray | None = None,
     top_model_direction_source: str = "",
@@ -8099,6 +8157,39 @@ def _draw_trace2cp_overlay(
                 start_xy=start_xy,
                 target_xy=target_xy,
                 label="traced fused top strip z-corrected",
+            )
+        )
+    if top_strip_presence_image is not None and top_strip_presence_valid_mask is not None:
+        top_panels.append(
+            _draw_trace2cp_top_strip_panel(
+                top_strip_presence_image,
+                top_strip_presence_valid_mask,
+                line_xy=line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                label="projected side presence on original top strip 0..1",
+            )
+        )
+    if traced_top_strip_presence_image is not None and traced_top_strip_presence_valid_mask is not None:
+        top_panels.append(
+            _draw_trace2cp_top_strip_panel(
+                traced_top_strip_presence_image,
+                traced_top_strip_presence_valid_mask,
+                line_xy=line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                label="projected side presence on traced top strip z=0 0..1",
+            )
+        )
+    if z_top_strip_presence_image is not None and z_top_strip_presence_valid_mask is not None:
+        top_panels.append(
+            _draw_trace2cp_top_strip_panel(
+                z_top_strip_presence_image,
+                z_top_strip_presence_valid_mask,
+                line_xy=line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                label="projected side presence on traced top strip z-corrected 0..1",
             )
         )
     if top_model_direction_image is not None and top_model_direction_valid_mask is not None:
@@ -8526,6 +8617,18 @@ def _draw_trace2cp_fiber_overlay(
         image_attr="z_top_strip_image",
         valid_attr="z_top_strip_valid_mask",
     )
+    top_strip_presence_canvas = compose_top_strip_canvas(
+        image_attr="top_strip_presence_image",
+        valid_attr="top_strip_presence_valid_mask",
+    )
+    traced_top_strip_presence_canvas = compose_top_strip_canvas(
+        image_attr="traced_top_strip_presence_image",
+        valid_attr="traced_top_strip_presence_valid_mask",
+    )
+    z_top_strip_presence_canvas = compose_top_strip_canvas(
+        image_attr="z_top_strip_presence_image",
+        valid_attr="z_top_strip_presence_valid_mask",
+    )
     top_model_direction_canvas = compose_top_strip_canvas(
         image_attr="top_model_direction_image",
         valid_attr="top_model_direction_valid_mask",
@@ -8684,6 +8787,30 @@ def _draw_trace2cp_fiber_overlay(
                 "traced fused top strip z-corrected",
                 z_top_strip_canvas,
                 image_attr="z_top_strip_image",
+            )
+        )
+    if top_strip_presence_canvas is not None:
+        rows.append(
+            draw_top_strip_row(
+                "projected side presence on original top strip 0..1",
+                top_strip_presence_canvas,
+                image_attr="top_strip_presence_image",
+            )
+        )
+    if traced_top_strip_presence_canvas is not None:
+        rows.append(
+            draw_top_strip_row(
+                "projected side presence on traced top strip z=0 0..1",
+                traced_top_strip_presence_canvas,
+                image_attr="traced_top_strip_presence_image",
+            )
+        )
+    if z_top_strip_presence_canvas is not None:
+        rows.append(
+            draw_top_strip_row(
+                "projected side presence on traced top strip z-corrected 0..1",
+                z_top_strip_presence_canvas,
+                image_attr="z_top_strip_presence_image",
             )
         )
     if top_model_direction_canvas is not None:
@@ -9223,6 +9350,12 @@ def _evaluate_trace2cp_pair(
     traced_top_strip_valid_mask: np.ndarray | None = None
     z_top_strip_image: np.ndarray | None = None
     z_top_strip_valid_mask: np.ndarray | None = None
+    top_strip_presence_image: np.ndarray | None = None
+    top_strip_presence_valid_mask: np.ndarray | None = None
+    traced_top_strip_presence_image: np.ndarray | None = None
+    traced_top_strip_presence_valid_mask: np.ndarray | None = None
+    z_top_strip_presence_image: np.ndarray | None = None
+    z_top_strip_presence_valid_mask: np.ndarray | None = None
     top_model_direction_image: np.ndarray | None = None
     top_model_direction_valid_mask: np.ndarray | None = None
     top_model_direction_source = ""
@@ -9232,6 +9365,18 @@ def _evaluate_trace2cp_pair(
         with _Timer() as top_original_timer:
             top_strip_image, top_strip_valid_mask = loader.sample_trace2cp_top_strip_source(segment_source)
         _append_trace2cp_timing(timing_rows, "top_strip_original", top_original_timer.elapsed_ms)
+        if fields.presence_hw is not None:
+            top_strip_presence_image = _project_side_presence_to_top_strip(
+                fields.presence_hw,
+                valid_mask,
+                top_strip_valid_mask,
+                sample.line_xy,
+            )
+            top_strip_presence_valid_mask = (
+                None
+                if top_strip_presence_image is None
+                else np.asarray(top_strip_valid_mask, dtype=bool)
+            )
         fused_center_xyz: np.ndarray | None = None
         fused_xy = np.asarray(selected_result.refinement.fused_resampled_xy, dtype=np.float32)
         if fused_xy.ndim == 2 and fused_xy.shape[1] == 2 and fused_xy.shape[0] > 0:
@@ -9245,6 +9390,18 @@ def _evaluate_trace2cp_pair(
                     fused_center_xyz,
                 )
             _append_trace2cp_timing(timing_rows, "top_strip_traced", top_traced_timer.elapsed_ms)
+            if fields.presence_hw is not None:
+                traced_top_strip_presence_image = _project_side_presence_to_top_strip(
+                    fields.presence_hw,
+                    valid_mask,
+                    traced_top_strip_valid_mask,
+                    fused_xy,
+                )
+                traced_top_strip_presence_valid_mask = (
+                    None
+                    if traced_top_strip_presence_image is None
+                    else np.asarray(traced_top_strip_valid_mask, dtype=bool)
+                )
         fused_z_trace = (
             None
             if z_search_debug is None
@@ -9257,6 +9414,25 @@ def _evaluate_trace2cp_pair(
                     fused_z_trace,
                 )
             _append_trace2cp_timing(timing_rows, "top_strip_z_traced", top_z_timer.elapsed_ms)
+            z_presence_source: np.ndarray | None = None
+            z_presence_valid: np.ndarray | None = None
+            if z_search_debug is not None and z_search_debug.fused_z_presence is not None:
+                z_presence_source = np.asarray(z_search_debug.fused_z_presence, dtype=np.float32) / 255.0
+            elif fields.presence_hw is not None:
+                z_presence_source = fields.presence_hw
+                z_presence_valid = np.asarray(valid_mask, dtype=bool)
+            if z_presence_source is not None:
+                z_top_strip_presence_image = _project_side_presence_to_top_strip(
+                    z_presence_source,
+                    z_presence_valid,
+                    z_top_strip_valid_mask,
+                    fused_z_trace[:, :2],
+                )
+                z_top_strip_presence_valid_mask = (
+                    None
+                    if z_top_strip_presence_image is None
+                    else np.asarray(z_top_strip_valid_mask, dtype=bool)
+                )
         if top_model is not None:
             top_direction_image: np.ndarray | None
             top_direction_valid: np.ndarray | None
@@ -9334,6 +9510,12 @@ def _evaluate_trace2cp_pair(
         traced_top_strip_valid_mask=traced_top_strip_valid_mask,
         z_top_strip_image=z_top_strip_image,
         z_top_strip_valid_mask=z_top_strip_valid_mask,
+        top_strip_presence_image=top_strip_presence_image,
+        top_strip_presence_valid_mask=top_strip_presence_valid_mask,
+        traced_top_strip_presence_image=traced_top_strip_presence_image,
+        traced_top_strip_presence_valid_mask=traced_top_strip_presence_valid_mask,
+        z_top_strip_presence_image=z_top_strip_presence_image,
+        z_top_strip_presence_valid_mask=z_top_strip_presence_valid_mask,
         top_model_direction_image=top_model_direction_image,
         top_model_direction_valid_mask=top_model_direction_valid_mask,
         top_model_direction_source=top_model_direction_source,
@@ -9502,6 +9684,12 @@ def _write_trace2cp_iteration_artifacts(
         traced_top_strip_valid_mask=evaluation.traced_top_strip_valid_mask,
         z_top_strip_image=evaluation.z_top_strip_image,
         z_top_strip_valid_mask=evaluation.z_top_strip_valid_mask,
+        top_strip_presence_image=evaluation.top_strip_presence_image,
+        top_strip_presence_valid_mask=evaluation.top_strip_presence_valid_mask,
+        traced_top_strip_presence_image=evaluation.traced_top_strip_presence_image,
+        traced_top_strip_presence_valid_mask=evaluation.traced_top_strip_presence_valid_mask,
+        z_top_strip_presence_image=evaluation.z_top_strip_presence_image,
+        z_top_strip_presence_valid_mask=evaluation.z_top_strip_presence_valid_mask,
         top_model_direction_image=evaluation.top_model_direction_image,
         top_model_direction_valid_mask=evaluation.top_model_direction_valid_mask,
         top_model_direction_source=evaluation.top_model_direction_source,
@@ -9845,6 +10033,12 @@ def _export_trace2cp_vis(
             traced_top_strip_valid_mask=evaluation.traced_top_strip_valid_mask,
             z_top_strip_image=evaluation.z_top_strip_image,
             z_top_strip_valid_mask=evaluation.z_top_strip_valid_mask,
+            top_strip_presence_image=evaluation.top_strip_presence_image,
+            top_strip_presence_valid_mask=evaluation.top_strip_presence_valid_mask,
+            traced_top_strip_presence_image=evaluation.traced_top_strip_presence_image,
+            traced_top_strip_presence_valid_mask=evaluation.traced_top_strip_presence_valid_mask,
+            z_top_strip_presence_image=evaluation.z_top_strip_presence_image,
+            z_top_strip_presence_valid_mask=evaluation.z_top_strip_presence_valid_mask,
             top_model_direction_image=evaluation.top_model_direction_image,
             top_model_direction_valid_mask=evaluation.top_model_direction_valid_mask,
             top_model_direction_source=evaluation.top_model_direction_source,

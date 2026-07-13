@@ -113,6 +113,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _draw_trace2cp_fiber_overlay,
     _draw_trace2cp_overlay,
     _draw_trace2cp_tta_slice,
+    _project_side_presence_to_top_strip,
     _export_augment_contact_sheet,
     _export_trace2cp_fiber_vis,
     _config_for_trace2cp_fiber_json,
@@ -826,6 +827,7 @@ def test_trace2cp_overlay_can_add_top_strip_column() -> None:
     top = np.full((11, 11), 96.0, dtype=np.float32)
     traced_top = np.full((11, 11), 144.0, dtype=np.float32)
     z_top = np.full((11, 11), 192.0, dtype=np.float32)
+    top_presence = np.full((11, 11), 220, dtype=np.uint8)
     valid = np.ones((11, 11), dtype=bool)
 
     base = _draw_trace2cp_overlay(
@@ -868,6 +870,25 @@ def test_trace2cp_overlay_can_add_top_strip_column() -> None:
         z_top_strip_image=z_top,
         z_top_strip_valid_mask=valid,
     )
+    with_top_presence = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        top_strip_image=top,
+        top_strip_valid_mask=valid,
+        traced_top_strip_image=traced_top,
+        traced_top_strip_valid_mask=valid,
+        z_top_strip_image=z_top,
+        z_top_strip_valid_mask=valid,
+        top_strip_presence_image=top_presence,
+        top_strip_presence_valid_mask=valid,
+        traced_top_strip_presence_image=top_presence,
+        traced_top_strip_presence_valid_mask=valid,
+        z_top_strip_presence_image=top_presence,
+        z_top_strip_presence_valid_mask=valid,
+    )
 
     assert with_top.shape[1] == base.shape[1] + image.shape[1]
     assert with_top.shape[0] >= base.shape[0]
@@ -875,10 +896,25 @@ def test_trace2cp_overlay_can_add_top_strip_column() -> None:
     assert with_traced_top.shape[0] >= with_top.shape[0]
     assert with_z_top.shape[1] == with_traced_top.shape[1]
     assert with_z_top.shape[0] >= with_traced_top.shape[0]
+    assert with_top_presence.shape[1] == with_z_top.shape[1]
+    assert with_top_presence.shape[0] > with_z_top.shape[0]
     assert bool(np.any(with_z_top[:, -image.shape[1] :, :] != 0))
+    assert bool(np.any(with_top_presence[:, -image.shape[1] :, :] != 0))
     assert float(np.mean(with_z_top[:, -image.shape[1] :, :])) > float(
         np.mean(with_top[:, -image.shape[1] :, :])
     )
+
+
+def test_project_side_presence_to_top_strip_samples_side_rows() -> None:
+    presence = np.tile(np.arange(7, dtype=np.float32).reshape(7, 1), (1, 7)) / 6.0
+    valid = np.ones((7, 7), dtype=bool)
+    trace = np.asarray([[0.0, 3.0], [6.0, 3.0]], dtype=np.float32)
+
+    projected = _project_side_presence_to_top_strip(presence, valid, valid, trace)
+
+    assert projected is not None
+    assert int(projected[0, 3]) < int(projected[3, 3]) < int(projected[6, 3])
+    assert len(set(int(v) for v in projected[:, 3].tolist())) > 1
 
 
 def test_trace2cp_target_column_wins_over_next_rf_margin() -> None:
@@ -2192,6 +2228,7 @@ def test_trace2cp_fiber_overlay_adds_top_strip_rows() -> None:
     top_image = np.full_like(first.image, 96.0, dtype=np.float32)
     traced_top_image = np.full_like(first.image, 144.0, dtype=np.float32)
     z_top_image = np.full_like(first.image, 192.0, dtype=np.float32)
+    top_presence = np.full_like(first.image, 220, dtype=np.uint8)
     top_valid = np.ones_like(first.image, dtype=bool)
     with_top = replace(
         first,
@@ -2207,6 +2244,15 @@ def test_trace2cp_fiber_overlay_adds_top_strip_rows() -> None:
         with_traced_top,
         z_top_strip_image=z_top_image,
         z_top_strip_valid_mask=top_valid,
+    )
+    with_top_presence = replace(
+        with_z_top,
+        top_strip_presence_image=top_presence,
+        top_strip_presence_valid_mask=top_valid,
+        traced_top_strip_presence_image=top_presence,
+        traced_top_strip_presence_valid_mask=top_valid,
+        z_top_strip_presence_image=top_presence,
+        z_top_strip_presence_valid_mask=top_valid,
     )
 
     base = _draw_trace2cp_fiber_overlay(
@@ -2229,6 +2275,11 @@ def test_trace2cp_fiber_overlay_adds_top_strip_rows() -> None:
         control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
         label="fiber",
     )
+    drawn_top_presence = _draw_trace2cp_fiber_overlay(
+        [with_top_presence],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
 
     assert drawn_top.shape[0] > base.shape[0]
     assert drawn_top.shape[1] == base.shape[1]
@@ -2236,7 +2287,10 @@ def test_trace2cp_fiber_overlay_adds_top_strip_rows() -> None:
     assert drawn_traced_top.shape[1] == base.shape[1]
     assert drawn_z_top.shape[0] > drawn_traced_top.shape[0]
     assert drawn_z_top.shape[1] == base.shape[1]
+    assert drawn_top_presence.shape[0] > drawn_z_top.shape[0]
+    assert drawn_top_presence.shape[1] == base.shape[1]
     assert bool(np.any(drawn_z_top[-first.image.shape[0] :, :, :] != 0))
+    assert bool(np.any(drawn_top_presence[-first.image.shape[0] :, :, :] != 0))
 
 
 def test_trace2cp_fiber_overlay_flips_reversed_pair_image_data() -> None:
@@ -3538,7 +3592,7 @@ def test_trace2cp_joint_dp_uses_z_smoothness_without_z_step_penalty(
     )
 
     assert captured["z_transition_penalty"] == pytest.approx(0.0)
-    assert captured["dz_smooth_penalty"] == pytest.approx(0.05)
+    assert captured["dz_smooth_penalty"] == pytest.approx(0.5)
 
 
 def test_trace2cp_z_search_defaults_to_stepwise_not_dp(monkeypatch: pytest.MonkeyPatch) -> None:

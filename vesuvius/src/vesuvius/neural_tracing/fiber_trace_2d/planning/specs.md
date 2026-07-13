@@ -571,7 +571,7 @@
   transition tangent before blending. Invalid or missing direction pixels add a
   fixed penalty instead of breaking the path. Side-strip DP does not apply a
   default per-step z movement penalty; its default z regularization is
-  second-order dz smoothness, currently `0.05 * (dz_current - dz_previous)^2`,
+  second-order dz smoothness, currently `0.5 * (dz_current - dz_previous)^2`,
   so steady z motion is allowed while abrupt z-step changes are discouraged.
 - The side-strip DP still uses `--line-trace-step` only for resampling the
   selected fused output trace and for the public trace visualization density.
@@ -622,6 +622,17 @@
   trace's selected-scale `z_voxels` value as a normal/mesh offset before the
   top-strip side-axis offset. This is visualization-only and must not change
   Trace2CP scoring.
+- When the side model exposes a sheet/fiber-presence head, Trace2CP
+  top-strip visualization also appends fixed-scale projected side-presence rows
+  below the regular top-strip slices: original/init, traced central-z, and
+  traced z-corrected when z-search is active. These rows sample the side-strip
+  presence map at each top-strip pixel's corresponding side-strip coordinate:
+  the top column gives `x`, and the row samples around the relevant side trace
+  as `trace_y(x) + top_row_offset`. The z-corrected row uses the already
+  z-selected side-presence image assembled from inferred side slices, so it
+  varies with the same per-column z layer as the z-corrected side image. These
+  rows are visualization-only, do not use the optional top-view model, and must
+  not affect Trace2CP scoring, z-search, or training.
 - `--trace2cp-top-model-dir-vis` requires a checkpoint with
   `top_model_state_dict`. It samples a fixed top-strip normal-offset stack
   around the traced fused top strip using offsets `-4..+4` selected-scale
