@@ -3053,6 +3053,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                     showStatusBarMessage(message, timeout);
                 }
             });
+    connect(_state, &CState::volumeChanged, _volumeOverlay.get(),
+            [this](const std::shared_ptr<Volume>&, const std::string&) {
+                if (_volumeOverlay) {
+                    _volumeOverlay->refreshForCurrentVolume();
+                }
+            });
     _viewerManager->setVolumeOverlay(_volumeOverlay.get());
 
     if (_statusDockPanelHost) {

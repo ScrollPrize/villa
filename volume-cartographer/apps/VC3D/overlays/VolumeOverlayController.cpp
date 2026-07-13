@@ -303,6 +303,13 @@ void VolumeOverlayController::refreshVolumeOptions()
     }
 }
 
+void VolumeOverlayController::refreshForCurrentVolume()
+{
+    refreshVolumeOptions();
+    applyOverlayVolume();
+    updateUiEnabled();
+}
+
 void VolumeOverlayController::toggleVisibility()
 {
     if (_overlayVisible) {
