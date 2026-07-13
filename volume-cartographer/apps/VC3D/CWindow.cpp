@@ -7609,7 +7609,22 @@ void CWindow::CreateWidgets(void)
     connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
             this, &CWindow::onSegmentationEditingModeChanged);
     connect(_segmentationModule.get(), &SegmentationModule::segmentationFolderChanged,
-            this, &CWindow::refreshSegmentationDirectoryDropdown);
+            this, [this](const QString& surfaceId) {
+                refreshSegmentationDirectoryDropdown();
+                if (!_state || !_state->vpkg() || !_surfacePanel) {
+                    return;
+                }
+
+                _surfacePanel->setVolumePkg(_state->vpkg());
+                _surfacePanel->resetTagUi();
+                _surfacePanel->loadSurfaces(true);
+                _surfacePanel->refreshPointSetFilterOptions();
+
+                if (!restoreActiveSurfaceAfterSurfaceReload(surfaceId.toStdString())) {
+                    clearSurfaceSelection();
+                    _state->setSurface("segmentation", nullptr, true);
+                }
+            });
     connect(_segmentationModule.get(), &SegmentationModule::statusMessageRequested,
             this, &CWindow::onShowStatusMessage);
     connect(_segmentationModule.get(), &SegmentationModule::stopToolsRequested,

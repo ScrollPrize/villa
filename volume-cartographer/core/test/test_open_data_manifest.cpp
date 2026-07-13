@@ -950,6 +950,46 @@ TEST_CASE("OpenDataSegmentCache names editable copies after the current segments
           editableSegmentsFolder / "segment-100");
 }
 
+TEST_CASE("OpenDataSegmentCache editable copy is selectable from its new folder")
+{
+    const auto testRoot = std::filesystem::temp_directory_path() /
+                          ("vc_open_data_editable_selection_test_" +
+                           std::to_string(getpid()));
+    std::filesystem::remove_all(testRoot);
+
+    const auto sourceRoot = testRoot / "catalog-segments";
+    const auto sourceSegment = sourceRoot / "20241113070770";
+    const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
+                                "segments" / "20241113070770";
+    copyFixtureFile(fixtureSegment / "meta.json", sourceSegment / "meta.json");
+    copyFixtureFile(fixtureSegment / "x.tif", sourceSegment / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", sourceSegment / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", sourceSegment / "z.tif");
+    writeFile(sourceSegment / "catalog-origin.json", "{}");
+
+    const auto editableSegment =
+        defaultEditableCopyPathForCatalogSegment(sourceSegment, sourceRoot);
+    const auto editableRoot = editableSegment.parent_path();
+    copyCatalogSegmentToEditableDirectory(sourceSegment, editableSegment);
+
+    const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
+    VolumePkg::setAutosaveRoot(testRoot / "autosave");
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addSegmentsEntry(sourceRoot.string(), {"open-data", "immutable"}));
+    REQUIRE(pkg->addSegmentsEntry(editableRoot.string(), {"open-data-editable"}));
+    pkg->setOutputSegments(editableRoot.string());
+
+    CHECK(pkg->outputSegmentsPath() == editableRoot);
+    CHECK_FALSE(std::filesystem::exists(editableSegment / "catalog-origin.json"));
+    const auto surface = pkg->loadSurface("20241113070770");
+    REQUIRE(surface);
+    CHECK(surface->path == editableSegment);
+
+    pkg.reset();
+    VolumePkg::setAutosaveRoot(previousAutosaveRoot);
+    std::filesystem::remove_all(testRoot);
+}
+
 TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
 {
     OpenDataSample sample;

@@ -110,10 +110,10 @@ std::optional<std::pair<int, int>> segmentationSceneToGrid(VolumeViewerBase* vie
 
 bool ensureEditableOpenDataSegmentTarget(CState* state,
                                          SegmentationWidget* widget,
-                                         bool* folderChanged)
+                                         std::string* editableSurfaceId)
 {
-    if (folderChanged) {
-        *folderChanged = false;
+    if (editableSurfaceId) {
+        editableSurfaceId->clear();
     }
     if (!state || !state->vpkg()) {
         return true;
@@ -180,8 +180,8 @@ bool ensureEditableOpenDataSegmentTarget(CState* state,
             *editableSurface, *pkg, state->currentVolumeId());
         editableSurface->save_meta();
         state->setSurface("segmentation", editableSurface, false, false);
-        if (folderChanged) {
-            *folderChanged = true;
+        if (editableSurfaceId) {
+            *editableSurfaceId = segmentId;
         }
         return true;
     } catch (const std::exception& e) {
@@ -663,13 +663,15 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (_editingEnabled == enabled) {
         return;
     }
-    bool folderChanged = false;
+    std::string editableSurfaceId;
     if (enabled) {
-        if (!ensureEditableOpenDataSegmentTarget(_state, _widget, &folderChanged)) {
+        if (!ensureEditableOpenDataSegmentTarget(
+                _state, _widget, &editableSurfaceId)) {
             return;
         }
-        if (folderChanged) {
-            emit segmentationFolderChanged();
+        if (!editableSurfaceId.empty()) {
+            emit segmentationFolderChanged(
+                QString::fromStdString(editableSurfaceId));
         }
     }
     _editingEnabled = enabled;
