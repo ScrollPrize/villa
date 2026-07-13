@@ -659,7 +659,13 @@ static std::vector<bool> build_occupancy_mask(
 // ============================================================================
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    // setlinebuf is POSIX-only; unbuffered is the closest Windows can do
+    // (its _IOLBF means fully buffered, not line buffered).
+    setvbuf(stdout, nullptr, _IONBF, 0);
+#else
     setlinebuf(stdout);
+#endif
     if (argc < 3) {
         std::cerr << "Usage: vc_zarr_recompress <input> <output> [options]\n"
                   << "\n"

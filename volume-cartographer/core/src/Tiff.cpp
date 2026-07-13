@@ -12,7 +12,33 @@
 
 #include <opencv2/imgcodecs.hpp>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
+
+void replaceFile(const std::filesystem::path& source,
+                 const std::filesystem::path& destination)
+{
+#if defined(_WIN32)
+    if (!::MoveFileExW(source.c_str(), destination.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const std::error_code ec(static_cast<int>(::GetLastError()),
+                                 std::system_category());
+        throw std::filesystem::filesystem_error(
+            "cannot replace TIFF", source, destination, ec);
+    }
+#else
+    std::filesystem::rename(source, destination);
+#endif
+}
 
 // Get TIFF parameters for a given OpenCV type
 struct TiffParams {
@@ -313,7 +339,7 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
     size_t failures = 0;
     for (auto& [finalPath, partFiles] : groups) {
         std::sort(partFiles.begin(), partFiles.end());
-        TIFF* first = TIFFOpen(partFiles[0].c_str(), "r");
+        TIFF* first = TIFFOpen(partFiles[0].string().c_str(), "r");
         if (!first) { std::cerr << "Cannot open " << partFiles[0] << "\n"; failures++; continue; }
         uint32_t w, h, tw, th; uint16_t bps, spp, sf, comp;
         TIFFGetField(first, TIFFTAG_IMAGEWIDTH, &w);
@@ -330,7 +356,7 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
                       TIFFGetField(first, TIFFTAG_YRESOLUTION, &yRes);
         TIFFClose(first);
 
-        TIFF* out = TIFFOpen(finalPath.c_str(), "w");
+        TIFF* out = TIFFOpen(finalPath.string().c_str(), "w");
         if (!out) { std::cerr << "Cannot create " << finalPath << "\n"; failures++; continue; }
         TIFFSetField(out, TIFFTAG_IMAGEWIDTH, w); TIFFSetField(out, TIFFTAG_IMAGELENGTH, h);
         TIFFSetField(out, TIFFTAG_TILEWIDTH, tw); TIFFSetField(out, TIFFTAG_TILELENGTH, th);
@@ -351,7 +377,7 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
             for (uint32_t tx = 0; tx < tilesX; tx++) {
                 bool found = false;
                 for (auto& pf : partFiles) {
-                    TIFF* pt = TIFFOpen(pf.c_str(), "r");
+                    TIFF* pt = TIFFOpen(pf.string().c_str(), "r");
                     if (!pt) continue;
                     tmsize_t r = TIFFReadEncodedTile(pt, TIFFComputeTile(pt, tx*tw, ty*th, 0, 0), buf.data(), tileBytes);
                     TIFFClose(pt);
@@ -402,11 +428,10 @@ void atomicImwriteMulti(const std::filesystem::path& outPath,
                                  tmpPath.string());
     }
 
-    std::filesystem::rename(tmpPath, outPath, ec);
-    if (ec) {
-        std::filesystem::remove(tmpPath);
-        throw std::runtime_error("atomicImwriteMulti: rename " + tmpPath.string() +
-                                 " -> " + outPath.string() + " failed: " +
-                                 ec.message());
+    try {
+        replaceFile(tmpPath, outPath);
+    } catch (...) {
+        std::filesystem::remove(tmpPath, ec);
+        throw;
     }
 }

@@ -21,9 +21,39 @@ Due to a complex set of dependencies, it is *highly* recommended to use the dock
 docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
 
-If you want to install vc3d from source, the easiest path is to look at the [Dockerfile](Dockerfile) (and the shared [scripts/install_build_deps.sh](scripts/install_build_deps.sh) it uses) and adapt for your environment. Building from source presently requires a *nix like environment for atomic rename support. If you are on Windows, either use the docker image or WSL. 
+To install VC3D and all command-line tools from source on a recent Debian-family
+Linux distribution using APT:
 
-On macOS, use the Homebrew LLVM build helper:
+```bash
+./build_from_src_debian.sh
+```
+
+The script installs build dependencies from system packages, builds VC3D and
+flatboi, and installs the runtime under `/usr/local` so commands such as
+`VC3D` and `vc_grow_seg_from_seed` are available from the terminal. The
+distribution must provide CMake 3.28 or newer; Ubuntu 24.04+ and Debian 13+
+meet that requirement. Set `JOBS`, `BUILD_DIR`, or `PREFIX` to override the
+corresponding defaults.
+
+#### Windows
+
+A self-contained Windows 10/11 installer (`VC3D-<version>-win64.exe`, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases) — download, run, and launch VC3D from the Start menu. A portable `.zip` of the same tree is published alongside it.
+
+To build natively from source on Windows, use an [MSYS2](https://www.msys2.org/) UCRT64 shell (see [.github/workflows/vc3d-windows.yml](../.github/workflows/vc3d-windows.yml) for the package list), then:
+
+```bash
+cmake --preset ci-windows-mingw
+cmake --build --preset ci-windows-mingw
+cpack --config build/ci-windows-mingw/CPackConfig.cmake
+```
+
+Note: the flatboi SLIM flattening tool (PaStiX-based) is not available on Windows; Docker or WSL still covers that workflow.
+
+#### macOS
+
+A self-contained `VC3D.app` for Apple Silicon (`VC3D-<version>-macos-arm64.dmg`, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases) — drag it to Applications. The app is not notarized, so the first launch is right-click → Open (or `xattr -dr com.apple.quarantine /Applications/VC3D.app`). The `vc_*` command-line tools ship inside the bundle at `VC3D.app/Contents/MacOS/`.
+
+To build from source on macOS, use the Homebrew LLVM build helper:
 
 ```bash
 scripts/build_macos.sh --install-deps

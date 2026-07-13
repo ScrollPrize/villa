@@ -22,7 +22,16 @@
 #include <vector>
 
 #include <fcntl.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#  include <io.h>
+#  define VC_DEVNULL "NUL"
+#  ifndef STDOUT_FILENO
+#    define STDOUT_FILENO 1
+#  endif
+#else
+#  include <unistd.h>
+#  define VC_DEVNULL "/dev/null"
+#endif
 
 namespace {
 
@@ -533,7 +542,7 @@ vc::lasagna::EclMaxflowResult runEclWithTerminalFloodScheduleQuiet(
 {
     std::fflush(stdout);
     const int savedStdout = dup(STDOUT_FILENO);
-    const int devNull = open("/dev/null", O_WRONLY);
+    const int devNull = open(VC_DEVNULL, O_WRONLY);
     if (savedStdout < 0 || devNull < 0) {
         if (savedStdout >= 0) close(savedStdout);
         if (devNull >= 0) close(devNull);
@@ -721,7 +730,7 @@ vc::lasagna::EclMaxflowResult runEclWithTerminalFringeQuiet(
 {
     std::fflush(stdout);
     const int savedStdout = dup(STDOUT_FILENO);
-    const int devNull = open("/dev/null", O_WRONLY);
+    const int devNull = open(VC_DEVNULL, O_WRONLY);
     if (savedStdout < 0 || devNull < 0) {
         if (savedStdout >= 0) close(savedStdout);
         if (devNull >= 0) close(devNull);

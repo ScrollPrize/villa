@@ -645,6 +645,9 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     CHECK(origin.at("sample_id").get<std::string>() == "PHerc0139");
     CHECK(origin.at("segment_id").get<std::string>() == "20260311000000");
 
+    metaIn.close();
+    originIn.close();
+    pkg.reset();
     std::filesystem::remove_all(cacheRoot);
 }
 
@@ -689,6 +692,8 @@ TEST_CASE("OpenDataSegmentCache does not downscale transformed tifxyz artifacts"
     CHECK(cachedGridSize.width == fixtureGridSize.width);
     CHECK(cachedGridSize.height == fixtureGridSize.height);
 
+    metaIn.close();
+    pkg.reset();
     std::filesystem::remove_all(cacheRoot);
 }
 
@@ -764,6 +769,8 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
     CHECK(meta.at("vc_open_data_transform_target_volume_id").get<std::string>() == "vol2");
     CHECK(meta.at("vc_open_data_volume_transform_matrix")[0][3].get<double>() == doctest::Approx(10.0));
 
+    metaIn.close();
+    pkg.reset();
     std::filesystem::remove_all(cacheRoot);
 }
 

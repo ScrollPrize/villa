@@ -70,8 +70,16 @@ int renderSamplerWorkerCount()
 
 utils::ThreadPool& renderSamplerPool()
 {
+#if defined(_WIN32)
+    // Avoid joining DLL-owned worker threads from a static destructor while
+    // Windows holds the loader lock during vc_core.dll shutdown.
+    static auto* pool = new utils::ThreadPool(
+        static_cast<std::size_t>(renderSamplerWorkerCount()));
+    return *pool;
+#else
     static utils::ThreadPool pool(static_cast<std::size_t>(renderSamplerWorkerCount()));
     return pool;
+#endif
 }
 
 bool shouldParallelizeSamples(int rows, int cols)

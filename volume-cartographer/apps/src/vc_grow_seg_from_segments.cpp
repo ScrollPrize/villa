@@ -17,6 +17,7 @@
 #include <set>
 
 #include "vc/core/util/PointIndex.hpp"
+#include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
@@ -860,7 +861,7 @@ static std::vector<QuadSurface*> load_source_surfaces(const std::filesystem::pat
             continue;
         }
 
-        std::string name = entry.path().filename();
+        std::string name = entry.path().filename().string();
         if (name.compare(0, std::strlen(kAutoGrowPrefix), kAutoGrowPrefix)) {
             continue;
         }
@@ -1139,7 +1140,7 @@ int main(int argc, char *argv[])
     } else {
         set_space_tracing_use_cuda(true);
     }
-    params["tgt_dir"] = tgt_dir;
+    params["tgt_dir"] = tgt_dir.string();
 
     std::unique_ptr<vc::VcDataset> ds = std::make_unique<vc::VcDataset>(vol_path / "0");
 

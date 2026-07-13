@@ -294,7 +294,7 @@ public:
     // ptr-space stores (col - center.x*scale.x, row - center.y*scale.y, 0).
     [[nodiscard]] cv::Vec2f ptrToGrid(const cv::Vec3f& ptr) const;
 
-    void save(const std::string &path, const std::string &uuid, bool force_overwrite = false);
+    void save(const std::filesystem::path &path, const std::string &uuid, bool force_overwrite = false);
     void save(const std::filesystem::path &path, bool force_overwrite = false);
     void save_meta();
     Rect3D bbox();
@@ -471,7 +471,7 @@ private:
     static std::recursive_mutex& dirWriteMutex(const std::filesystem::path& dir);
 };
 
-std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int flags = 0);
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &path, int flags = 0);
 
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3d> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);

@@ -1,0 +1,167 @@
+name: Publish VC3D latest release
+
+on:
+  workflow_run:
+    workflows:
+      - VC3D Windows Installer
+      - VC3D macOS App
+    types: [completed]
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: vc3d-publish-latest
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish tested packages
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PACKAGE_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Find both successful package runs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find_package_run() {
+            local workflow="$1"
+            local artifact="$2"
+            local run_ids
+            local artifact_id
+
+            run_ids="$(gh run list \
+              --workflow "$workflow" \
+              --commit "$PACKAGE_SHA" \
+              --event push \
+              --status success \
+              --limit 10 \
+              --json databaseId \
+              --jq '.[].databaseId')"
+
+            while IFS= read -r candidate; do
+              [[ -n "$candidate" ]] || continue
+              artifact_id="$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$candidate/artifacts" \
+                --jq ".artifacts | map(select(.name == \"$artifact\" and .expired == false)) | first | .id // empty")"
+              if [[ -n "$artifact_id" ]]; then
+                echo "$candidate"
+                return 0
+              fi
+            done <<< "$run_ids"
+          }
+
+          windows_run="$(find_package_run vc3d-windows.yml VC3D-windows-installer)"
+          macos_run="$(find_package_run vc3d-macos.yml VC3D-macos-app)"
+
+          # Each platform completion starts this coordinator. The first one to
+          # finish normally exits here; the second sees both artifacts and
+          # publishes the complete release.
+          if [[ -z "$windows_run" || -z "$macos_run" ]]; then
+            echo "Both platform packages are not ready for $PACKAGE_SHA yet."
+            echo "PACKAGES_READY=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "PACKAGES_READY=true" >> "$GITHUB_ENV"
+          echo "WINDOWS_RUN_ID=$windows_run" >> "$GITHUB_ENV"
+          echo "MACOS_RUN_ID=$macos_run" >> "$GITHUB_ENV"
+
+      - name: Ensure candidate advances latest
+        if: env.PACKAGES_READY == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --force origin main
+          if ! git merge-base --is-ancestor "$PACKAGE_SHA" origin/main; then
+            echo "::error::$PACKAGE_SHA is not on main"
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin refs/tags/latest \
+              >/dev/null 2>&1; then
+            git fetch --force origin refs/tags/latest:refs/tags/latest
+            current_latest="$(git rev-parse 'refs/tags/latest^{commit}')"
+
+            if [[ "$current_latest" == "$PACKAGE_SHA" ]]; then
+              echo "latest already points to $PACKAGE_SHA"
+              echo "SKIP_PUBLISH=true" >> "$GITHUB_ENV"
+              exit 0
+            fi
+
+            if ! git merge-base --is-ancestor "$current_latest" "$PACKAGE_SHA"; then
+              echo "A newer main package is already latest; refusing to move latest backward."
+              echo "SKIP_PUBLISH=true" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          fi
+
+          echo "SKIP_PUBLISH=false" >> "$GITHUB_ENV"
+
+      - name: Download package artifacts
+        if: env.PACKAGES_READY == 'true' && env.SKIP_PUBLISH != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir release-assets
+          gh run download "$WINDOWS_RUN_ID" \
+            --name VC3D-windows-installer \
+            --dir release-assets
+          gh run download "$MACOS_RUN_ID" \
+            --name VC3D-macos-app \
+            --dir release-assets
+
+          shopt -s nullglob
+          windows_exe=(release-assets/VC3D-*-win64.exe)
+          windows_zip=(release-assets/VC3D-*-win64.zip)
+          macos_dmg=(release-assets/VC3D-*-macos-*.dmg)
+          macos_zip=(release-assets/VC3D-*-macos-*.zip)
+
+          if [[ ${#windows_exe[@]} -ne 1 ||
+                ${#windows_zip[@]} -ne 1 ||
+                ${#macos_dmg[@]} -ne 1 ||
+                ${#macos_zip[@]} -ne 1 ]]; then
+            echo "::error::expected exactly one Windows installer, Windows ZIP, macOS DMG, and macOS ZIP"
+            find release-assets -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+      - name: Move latest tag and publish release
+        if: env.PACKAGES_READY == 'true' && env.SKIP_PUBLISH != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag --force --annotate latest "$PACKAGE_SHA" \
+            --message "VC3D latest release at $PACKAGE_SHA"
+          git push --force origin refs/tags/latest
+
+          # Replace the old rolling release after its tag advances. Stable is a
+          # separate tag/release and is never touched by this workflow.
+          if gh release view latest >/dev/null 2>&1; then
+            gh release delete latest --yes
+          fi
+
+          gh release create latest release-assets/* \
+            --verify-tag \
+            --title "VC3D Latest" \
+            --notes "Automatically packaged from main at commit $PACKAGE_SHA." \
+            --latest
