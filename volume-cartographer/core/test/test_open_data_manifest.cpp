@@ -292,6 +292,7 @@ TEST_CASE("OpenDataSegmentCache prepares lazy source and generated placeholders"
 {
     auto manifest = parseOpenDataManifest(kFixture);
     auto sample = *manifest.findSample("PHerc0139");
+    sample.segments.front().createdAt = "2026-06-02T20:44:01.955138Z";
     OpenDataVolume targetVolume;
     targetVolume.id = "vol2";
     sample.volumes.push_back(targetVolume);
@@ -331,6 +332,14 @@ TEST_CASE("OpenDataSegmentCache prepares lazy source and generated placeholders"
     CHECK(isOpenDataSegmentPlaceholder(sourceDir));
     CHECK(isOpenDataSegmentPlaceholder(generatedDir));
     CHECK(std::filesystem::is_regular_file(sourceDir / "meta.json"));
+    {
+        std::ifstream metaIn(sourceDir / "meta.json", std::ios::binary);
+        REQUIRE(metaIn.good());
+        const auto meta = nlohmann::json::parse(metaIn);
+        CHECK(meta.at("date_last_modified") == "20260602204401955");
+        CHECK(meta.at("vc_open_data_creation_date") ==
+              "2026-06-02T20:44:01.955138Z");
+    }
     CHECK_FALSE(std::filesystem::exists(sourceDir / "x.tif"));
     CHECK_FALSE(std::filesystem::exists(generatedDir / "x.tif"));
     CHECK(pkg->segmentEntries().size() == 2);
@@ -441,6 +450,7 @@ TEST_CASE("OpenDataManifest parses volumes and segment artifact availability")
     CHECK(segment.id == "20260311000000");
     CHECK(segment.longId == "PHerc0139-20260311000000");
     CHECK(segment.originalVolumeId == "vol1");
+    CHECK(segment.createdAt == "2026-03-11T00:00:00Z");
     REQUIRE(segment.width.has_value());
     CHECK(*segment.width == 123);
     REQUIRE(segment.height.has_value());
@@ -448,6 +458,20 @@ TEST_CASE("OpenDataManifest parses volumes and segment artifact availability")
     CHECK(segment.hasTifxyz());
     CHECK(segment.hasInkDetection());
     CHECK(segment.hasLayersZarr());
+}
+
+TEST_CASE("OpenDataManifest reads the live segment creation date shape")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "samples":{"sample":{"segments":{"segment":{
+        "creation":{"date":"2026-06-02T20:44:01.955138Z"}
+      }}}}
+    })");
+
+    REQUIRE(manifest.samples.size() == 1);
+    REQUIRE(manifest.samples.front().segments.size() == 1);
+    CHECK(manifest.samples.front().segments.front().createdAt ==
+          "2026-06-02T20:44:01.955138Z");
 }
 
 TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties or referenced scan")

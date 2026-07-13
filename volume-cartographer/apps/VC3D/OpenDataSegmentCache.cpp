@@ -137,6 +137,65 @@ std::string segmentStableId(const OpenDataSegment& segment)
     return safePathComponent(segment.suffix);
 }
 
+std::string surfaceTimestampFromCatalogDate(std::string_view date)
+{
+    const auto isDigit = [&](std::size_t index) {
+        return index < date.size() &&
+               std::isdigit(static_cast<unsigned char>(date[index]));
+    };
+    if (date.size() == 17 &&
+        std::all_of(date.begin(), date.end(), [](unsigned char c) {
+            return std::isdigit(c);
+        })) {
+        return std::string(date);
+    }
+    if (date.size() < 20 || date[4] != '-' || date[7] != '-' ||
+        date[10] != 'T' || date[13] != ':' || date[16] != ':' ||
+        !isDigit(0) || !isDigit(1) || !isDigit(2) || !isDigit(3) ||
+        !isDigit(5) || !isDigit(6) || !isDigit(8) || !isDigit(9) ||
+        !isDigit(11) || !isDigit(12) || !isDigit(14) || !isDigit(15) ||
+        !isDigit(17) || !isDigit(18)) {
+        return std::string(date);
+    }
+
+    std::size_t fraction = date.size();
+    if (date[19] == 'Z') {
+        if (date.size() != 20) {
+            return std::string(date);
+        }
+    } else if (date[19] == '.') {
+        fraction = 20;
+        auto suffix = fraction;
+        while (suffix < date.size() &&
+               std::isdigit(static_cast<unsigned char>(date[suffix]))) {
+            ++suffix;
+        }
+        if (suffix == fraction || suffix + 1 != date.size() ||
+            date[suffix] != 'Z') {
+            return std::string(date);
+        }
+    } else {
+        return std::string(date);
+    }
+
+    std::string timestamp;
+    timestamp.reserve(17);
+    for (const auto [begin, count] : {
+             std::pair<std::size_t, std::size_t>{0, 4},
+             {5, 2}, {8, 2}, {11, 2}, {14, 2}, {17, 2}}) {
+        timestamp.append(date.substr(begin, count));
+    }
+
+    for (int digit = 0; digit < 3; ++digit) {
+        timestamp.push_back(
+            fraction < date.size() &&
+                    std::isdigit(static_cast<unsigned char>(date[fraction]))
+                ? date[fraction++]
+                : '0');
+    }
+    return timestamp;
+}
+
 std::string sourceVolumeIdForSegment(const OpenDataSegment& segment);
 
 bool hasSegmentEntry(const VolumePkg& pkg, const std::string& location)
@@ -221,6 +280,11 @@ void applyOpenDataMetadata(nlohmann::json& meta,
         meta["vc_open_data_derived_volume_id"] = derivedId;
     }
     meta["vc_open_data_original_volume_downscale"] = originalVolumeDownscale(segment);
+    if (!segment.createdAt.empty()) {
+        meta["date_last_modified"] =
+            surfaceTimestampFromCatalogDate(segment.createdAt);
+        meta["vc_open_data_creation_date"] = segment.createdAt;
+    }
 }
 
 bool coordinatesAlreadyScaled(const nlohmann::json& meta, double expectedFactor)
@@ -450,6 +514,10 @@ bool cachedMetadataNeedsNormalization(const std::filesystem::path& metaPath,
             stringField("format") != "tifxyz" ||
             stringField("vc_open_data_segment_id") != segment.id ||
             stringField("vc_open_data_segment_long_id") != segment.longId ||
+            (!segment.createdAt.empty() &&
+             (stringField("date_last_modified") !=
+                  surfaceTimestampFromCatalogDate(segment.createdAt) ||
+              stringField("vc_open_data_creation_date") != segment.createdAt)) ||
             stringField("vc_open_data_source_path").empty() ||
             !meta.contains("vc_open_data_source_coordinate_scale_factor") ||
             !meta.contains("vc_open_data_source_original_resolution")) {
