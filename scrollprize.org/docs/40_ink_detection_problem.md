@@ -73,6 +73,7 @@ The target is not another model that performs well only where it was heavily lab
 
 ## Some ideas we've been considering, in no particular order
 Taken directly from our last brainstorming session on improving ink detection. Not intended as a comprehensive list, and the exclusion of any idea is not an indication that it is not worth considering.
+These can hopefully give some ideas for people hoping to work on ink detection. 
 
 <div className="vc-card my-8">
 
