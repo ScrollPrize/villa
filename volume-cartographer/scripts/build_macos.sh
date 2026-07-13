@@ -113,10 +113,10 @@ required_formulae=(
   # dependency even though we no longer use gfortran as the compiler.
   gcc
 )
-if (( use_ccache )); then
+if (( use_ccache )) && ! command -v ccache >/dev/null 2>&1; then
   required_formulae+=(ccache)
 fi
-if (( use_sccache )); then
+if (( use_sccache )) && ! command -v sccache >/dev/null 2>&1; then
   required_formulae+=(sccache)
 fi
 
