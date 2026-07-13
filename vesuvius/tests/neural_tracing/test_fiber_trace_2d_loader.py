@@ -113,7 +113,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _draw_trace2cp_fiber_overlay,
     _draw_trace2cp_overlay,
     _draw_trace2cp_tta_slice,
-    _project_side_presence_to_top_strip,
+    _side_presence_z_pillar_image,
     _export_augment_contact_sheet,
     _export_trace2cp_fiber_vis,
     _config_for_trace2cp_fiber_json,
@@ -905,16 +905,43 @@ def test_trace2cp_overlay_can_add_top_strip_column() -> None:
     )
 
 
-def test_project_side_presence_to_top_strip_samples_side_rows() -> None:
-    presence = np.tile(np.arange(7, dtype=np.float32).reshape(7, 1), (1, 7)) / 6.0
+def test_side_presence_z_pillar_image_samples_inferred_layers() -> None:
     valid = np.ones((7, 7), dtype=bool)
     trace = np.asarray([[0.0, 3.0], [6.0, 3.0]], dtype=np.float32)
+    layers: dict[int, SimpleNamespace] = {}
+    for layer in (-1, 0, 1):
+        presence = np.full((7, 7), 0.5 + 0.25 * float(layer), dtype=np.float32)
+        fields = SimpleNamespace(presence_hw=presence)
+        layers[layer] = SimpleNamespace(fields=fields, valid_mask=valid)
+    cache = SimpleNamespace(max_layer=1, get=lambda layer: layers[int(layer)])
 
-    projected = _project_side_presence_to_top_strip(presence, valid, valid, trace)
+    projected, projected_valid = _side_presence_z_pillar_image(cache, trace, width=7)
 
     assert projected is not None
-    assert int(projected[0, 3]) < int(projected[3, 3]) < int(projected[6, 3])
-    assert len(set(int(v) for v in projected[:, 3].tolist())) > 1
+    assert projected_valid is not None
+    assert projected.shape == (3, 7)
+    assert bool(projected_valid.all())
+    assert int(projected[0, 3]) < int(projected[1, 3]) < int(projected[2, 3])
+
+
+def test_side_presence_z_pillar_image_shifts_columns_by_trace_z() -> None:
+    valid = np.ones((7, 7), dtype=bool)
+    trace = np.asarray([[0.0, 3.0, 1.0], [6.0, 3.0, 1.0]], dtype=np.float32)
+    layers: dict[int, SimpleNamespace] = {}
+    for layer in (-2, -1, 0, 1, 2):
+        presence = np.full((7, 7), 0.5 + 0.125 * float(layer), dtype=np.float32)
+        fields = SimpleNamespace(presence_hw=presence)
+        layers[layer] = SimpleNamespace(fields=fields, valid_mask=valid)
+    cache = SimpleNamespace(max_layer=2, z_step_voxels=1.0, get=lambda layer: layers[int(layer)])
+
+    shifted, shifted_valid = _side_presence_z_pillar_image(cache, trace, width=7)
+
+    assert shifted is not None
+    assert shifted_valid is not None
+    assert shifted.shape == (5, 7)
+    # The center row is relative z=0, so with trace z=+1 it samples absolute layer +1.
+    assert int(shifted[2, 3]) == int(np.uint8(np.clip((0.5 + 0.125) * 255.0, 0.0, 255.0)))
+    assert not bool(shifted_valid[-1, 3])
 
 
 def test_trace2cp_target_column_wins_over_next_rf_margin() -> None:

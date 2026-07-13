@@ -10,6 +10,8 @@
   - traced fused z-corrected top strip when z-search is active.
 - Keep this visualization-only. It must not affect Trace2CP scoring, z-search,
   training, or top-model inference.
-- The presence top rows must not repeat one sampled CP/trace value over the
-  top-strip row direction. They should sample the available inferred side
-  presence slices at the corresponding side-strip coordinates.
+- Replace the previous top-presence projection with a z-pillar debug view:
+  each image column is the presence sampled from the inferred side-slice stack
+  across z layers. With `--trace2cp-z-max-layer 40`, the image is 81 px high.
+- For the z-search fused trace z-pillar, shift each column by that column's
+  selected z value so the center row is relative z=0 around the used layer.

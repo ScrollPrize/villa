@@ -6347,50 +6347,70 @@ def _draw_trace2cp_top_strip_panel(
     return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
 
 
-def _project_side_presence_to_top_strip(
-    presence_hw: np.ndarray | None,
-    presence_valid_mask: np.ndarray | None,
-    top_valid_mask: np.ndarray,
-    trace_xy: np.ndarray,
-) -> np.ndarray | None:
-    if presence_hw is None:
-        return None
-    presence = np.asarray(presence_hw, dtype=np.float32)
-    if presence.ndim != 2:
-        raise ValueError("presence_hw must have shape H,W")
-    valid = None if presence_valid_mask is None else np.asarray(presence_valid_mask, dtype=bool)
-    if valid is not None and valid.shape != presence.shape:
-        raise ValueError("presence_valid_mask must match presence shape")
-    top_valid = np.asarray(top_valid_mask, dtype=bool)
-    if top_valid.ndim != 2:
-        raise ValueError("top_valid_mask must have shape H,W")
-    trace = np.asarray(trace_xy, dtype=np.float32)
-    if trace.ndim != 2 or trace.shape[1] != 2 or trace.shape[0] == 0:
-        return None
+def _side_presence_z_pillar_image(
+    plane_cache: "_Trace2CpZPlaneCache",
+    trace_xy_or_xyz: np.ndarray,
+    *,
+    width: int,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    width_i = int(width)
+    if width_i <= 0:
+        raise ValueError("width must be positive")
+    trace = np.asarray(trace_xy_or_xyz, dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[1] not in {2, 3} or trace.shape[0] == 0:
+        return None, None
+    y_by_column = np.full((width_i,), np.nan, dtype=np.float32)
+    layer_shift_by_column = np.zeros((width_i,), dtype=np.int32)
+    for x in range(width_i):
+        if trace.shape[1] == 3:
+            point = _trace_xyz_at_x(trace, float(x))
+            if point is None or not bool(np.isfinite(point).all()):
+                continue
+            y_by_column[x] = np.float32(point[1])
+            z_step = float(plane_cache.z_step_voxels)
+            layer_shift_by_column[x] = int(round(float(point[2]) / z_step))
+        else:
+            y = _trace_y_at_x(trace, float(x))
+            if y is not None and np.isfinite(y):
+                y_by_column[x] = np.float32(y)
 
-    height, width = (int(v) for v in top_valid.shape)
-    center_y = (float(height) - 1.0) * 0.5
-    output = np.zeros((height, width), dtype=np.uint8)
+    layers = tuple(range(-int(plane_cache.max_layer), int(plane_cache.max_layer) + 1))
+    layer_data: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for layer in layers:
+        prediction = plane_cache.get(int(layer))
+        presence = prediction.fields.presence_hw
+        if presence is None:
+            return None, None
+        presence_arr = np.asarray(presence, dtype=np.float32)
+        if presence_arr.ndim != 2:
+            raise ValueError("presence field must have shape H,W")
+        layer_data[int(layer)] = (presence_arr, np.asarray(prediction.valid_mask, dtype=bool))
+    output = np.zeros((len(layers), width_i), dtype=np.uint8)
+    valid_output = np.zeros_like(output, dtype=bool)
     wrote_pixel = False
-    for x in range(width):
-        y = _trace_y_at_x(trace, float(x))
-        if y is None or not np.isfinite(y):
-            continue
-        valid_rows = np.flatnonzero(top_valid[:, x])
-        for row in valid_rows.tolist():
-            side_y = float(y) + (float(row) - center_y)
+    for row, relative_layer in enumerate(layers):
+        for x in range(width_i):
+            y = float(y_by_column[x])
+            if not np.isfinite(y):
+                continue
+            layer = int(relative_layer) + int(layer_shift_by_column[x])
+            layer_payload = layer_data.get(layer)
+            if layer_payload is None:
+                continue
+            presence_arr, valid = layer_payload
             value = _bilinear_scalar_sample(
-                presence,
-                np.asarray([float(x), side_y], dtype=np.float32),
+                presence_arr,
+                np.asarray([float(x), y], dtype=np.float32),
                 valid_mask=valid,
             )
             if value is None:
                 continue
-            output[int(row), x] = np.uint8(np.clip(float(value) * 255.0, 0.0, 255.0))
+            output[row, x] = np.uint8(np.clip(float(value) * 255.0, 0.0, 255.0))
+            valid_output[row, x] = True
             wrote_pixel = True
     if not wrote_pixel:
-        return None
-    return output
+        return None, None
+    return output, valid_output
 
 
 def _draw_trace2cp_side_top_z_compact_overlay(
@@ -8167,7 +8187,7 @@ def _draw_trace2cp_overlay(
                 line_xy=line_xy,
                 start_xy=start_xy,
                 target_xy=target_xy,
-                label="projected side presence on original top strip 0..1",
+                label="side presence z-pillar on original trace 0..1",
             )
         )
     if traced_top_strip_presence_image is not None and traced_top_strip_presence_valid_mask is not None:
@@ -8178,7 +8198,7 @@ def _draw_trace2cp_overlay(
                 line_xy=line_xy,
                 start_xy=start_xy,
                 target_xy=target_xy,
-                label="projected side presence on traced top strip z=0 0..1",
+                label="side presence z-pillar on traced fused trace 0..1",
             )
         )
     if z_top_strip_presence_image is not None and z_top_strip_presence_valid_mask is not None:
@@ -8189,7 +8209,7 @@ def _draw_trace2cp_overlay(
                 line_xy=line_xy,
                 start_xy=start_xy,
                 target_xy=target_xy,
-                label="projected side presence on traced top strip z-corrected 0..1",
+                label="side presence z-pillar on z-search fused trace 0..1",
             )
         )
     if top_model_direction_image is not None and top_model_direction_valid_mask is not None:
@@ -8792,7 +8812,7 @@ def _draw_trace2cp_fiber_overlay(
     if top_strip_presence_canvas is not None:
         rows.append(
             draw_top_strip_row(
-                "projected side presence on original top strip 0..1",
+                "side presence z-pillar on original trace 0..1",
                 top_strip_presence_canvas,
                 image_attr="top_strip_presence_image",
             )
@@ -8800,7 +8820,7 @@ def _draw_trace2cp_fiber_overlay(
     if traced_top_strip_presence_canvas is not None:
         rows.append(
             draw_top_strip_row(
-                "projected side presence on traced top strip z=0 0..1",
+                "side presence z-pillar on traced fused trace 0..1",
                 traced_top_strip_presence_canvas,
                 image_attr="traced_top_strip_presence_image",
             )
@@ -8808,7 +8828,7 @@ def _draw_trace2cp_fiber_overlay(
     if z_top_strip_presence_canvas is not None:
         rows.append(
             draw_top_strip_row(
-                "projected side presence on traced top strip z-corrected 0..1",
+                "side presence z-pillar on z-search fused trace 0..1",
                 z_top_strip_presence_canvas,
                 image_attr="z_top_strip_presence_image",
             )
@@ -9154,6 +9174,7 @@ def _evaluate_trace2cp_pair(
     combined_summary: _Trace2CpCombinedSummary | None = None
     debug_fiber_embeddings: np.ndarray | None = None
     z_search_debug: _Trace2CpZTraceDebug | None = None
+    z_plane_cache: _Trace2CpZPlaneCache | None = None
     presence_debug: np.ndarray | None = None
     z_config = z_search or _Trace2CpZSearchConfig(enabled=False)
     if combined:
@@ -9193,6 +9214,7 @@ def _evaluate_trace2cp_pair(
                 z_step_voxels=float(z_config.step_voxels),
                 max_layer=int(z_config.max_layer),
             )
+            z_plane_cache = plane_cache
             z_trace_fn = (
                 _trace_score_trace2cp_combined_z_dp_bidirectional
                 if bool(trace2cp_dp)
@@ -9365,17 +9387,11 @@ def _evaluate_trace2cp_pair(
         with _Timer() as top_original_timer:
             top_strip_image, top_strip_valid_mask = loader.sample_trace2cp_top_strip_source(segment_source)
         _append_trace2cp_timing(timing_rows, "top_strip_original", top_original_timer.elapsed_ms)
-        if fields.presence_hw is not None:
-            top_strip_presence_image = _project_side_presence_to_top_strip(
-                fields.presence_hw,
-                valid_mask,
-                top_strip_valid_mask,
+        if z_plane_cache is not None:
+            top_strip_presence_image, top_strip_presence_valid_mask = _side_presence_z_pillar_image(
+                z_plane_cache,
                 sample.line_xy,
-            )
-            top_strip_presence_valid_mask = (
-                None
-                if top_strip_presence_image is None
-                else np.asarray(top_strip_valid_mask, dtype=bool)
+                width=int(image.shape[1]),
             )
         fused_center_xyz: np.ndarray | None = None
         fused_xy = np.asarray(selected_result.refinement.fused_resampled_xy, dtype=np.float32)
@@ -9390,17 +9406,11 @@ def _evaluate_trace2cp_pair(
                     fused_center_xyz,
                 )
             _append_trace2cp_timing(timing_rows, "top_strip_traced", top_traced_timer.elapsed_ms)
-            if fields.presence_hw is not None:
-                traced_top_strip_presence_image = _project_side_presence_to_top_strip(
-                    fields.presence_hw,
-                    valid_mask,
-                    traced_top_strip_valid_mask,
+            if z_plane_cache is not None:
+                traced_top_strip_presence_image, traced_top_strip_presence_valid_mask = _side_presence_z_pillar_image(
+                    z_plane_cache,
                     fused_xy,
-                )
-                traced_top_strip_presence_valid_mask = (
-                    None
-                    if traced_top_strip_presence_image is None
-                    else np.asarray(traced_top_strip_valid_mask, dtype=bool)
+                    width=int(image.shape[1]),
                 )
         fused_z_trace = (
             None
@@ -9414,24 +9424,11 @@ def _evaluate_trace2cp_pair(
                     fused_z_trace,
                 )
             _append_trace2cp_timing(timing_rows, "top_strip_z_traced", top_z_timer.elapsed_ms)
-            z_presence_source: np.ndarray | None = None
-            z_presence_valid: np.ndarray | None = None
-            if z_search_debug is not None and z_search_debug.fused_z_presence is not None:
-                z_presence_source = np.asarray(z_search_debug.fused_z_presence, dtype=np.float32) / 255.0
-            elif fields.presence_hw is not None:
-                z_presence_source = fields.presence_hw
-                z_presence_valid = np.asarray(valid_mask, dtype=bool)
-            if z_presence_source is not None:
-                z_top_strip_presence_image = _project_side_presence_to_top_strip(
-                    z_presence_source,
-                    z_presence_valid,
-                    z_top_strip_valid_mask,
-                    fused_z_trace[:, :2],
-                )
-                z_top_strip_presence_valid_mask = (
-                    None
-                    if z_top_strip_presence_image is None
-                    else np.asarray(z_top_strip_valid_mask, dtype=bool)
+            if z_plane_cache is not None:
+                z_top_strip_presence_image, z_top_strip_presence_valid_mask = _side_presence_z_pillar_image(
+                    z_plane_cache,
+                    fused_z_trace,
+                    width=int(image.shape[1]),
                 )
         if top_model is not None:
             top_direction_image: np.ndarray | None

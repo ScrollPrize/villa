@@ -7,15 +7,18 @@
   rows for init, traced central-z, and z-corrected traced top strips.
 - Added projected-presence fields to `_Trace2CpPairEvaluation` and pass-through
   arguments for the single-pair Trace2CP overlay.
-- Added `_project_side_presence_to_top_strip`, which samples the side-strip
-  presence map at the side coordinate corresponding to each top-strip pixel:
-  `x` from the top column and `trace_y(x) + top_row_offset` from the row.
-  This avoids repeating one presence value down an entire top-strip column.
+- Replaced the earlier projected top-presence helper with
+  `_side_presence_z_pillar_image`. It samples the inferred side-presence stack
+  directly: each row is one z-search layer and each column samples that layer at
+  `(x, trace_y(x))`.
+- Updated the z-search fused trace panel to pass the full `(x, y, z)` trace
+  into `_side_presence_z_pillar_image`, shifting each column by the selected
+  z layer so the center row is relative to the used z value.
 - Whole-fiber rendering now stitches the same projected top-presence rows as
   the single-pair renderer.
 - Updated specs, code-structure docs, changelog, and focused renderer tests.
 - Validation:
-  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k "trace2cp_overlay_can_add_top_strip_column or trace2cp_fiber_overlay_adds_top_strip_rows"`
-    passed: 2 passed, 242 deselected.
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k "side_presence_z_pillar_image or trace2cp_overlay_can_add_top_strip_column or trace2cp_fiber_overlay_adds_top_strip_rows"`
+    passed: 4 passed, 242 deselected.
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-    passed: 244 passed.
+    passed: 246 passed.

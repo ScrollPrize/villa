@@ -622,17 +622,18 @@
   trace's selected-scale `z_voxels` value as a normal/mesh offset before the
   top-strip side-axis offset. This is visualization-only and must not change
   Trace2CP scoring.
-- When the side model exposes a sheet/fiber-presence head, Trace2CP
-  top-strip visualization also appends fixed-scale projected side-presence rows
-  below the regular top-strip slices: original/init, traced central-z, and
-  traced z-corrected when z-search is active. These rows sample the side-strip
-  presence map at each top-strip pixel's corresponding side-strip coordinate:
-  the top column gives `x`, and the row samples around the relevant side trace
-  as `trace_y(x) + top_row_offset`. The z-corrected row uses the already
-  z-selected side-presence image assembled from inferred side slices, so it
-  varies with the same per-column z layer as the z-corrected side image. These
-  rows are visualization-only, do not use the optional top-view model, and must
-  not affect Trace2CP scoring, z-search, or training.
+- When z-search is active and the side model exposes a sheet/fiber-presence
+  head, Trace2CP top-strip visualization also appends fixed-scale side-presence
+  z-pillar rows below the regular top-strip slices. For each output column `x`,
+  each pillar row samples one inferred side-slice layer at `(x, trace_y(x))`;
+  the image height is `2 * trace2cp_z_max_layer + 1`, so `+/-40` produces an
+  81 px tall z-pillar image. Separate z-pillar panels may be shown for the
+  original/init trace, the traced fused central-z line, and the z-search fused
+  line. For the z-search fused line, each column is shifted by that column's
+  selected z value (`round(z_voxels / z_step_voxels)`), so the center row
+  represents relative z=0 at the layer actually used by the trace. These rows
+  are visualization-only, do not use the optional top-view model, and must not
+  affect Trace2CP scoring, z-search, or training.
 - `--trace2cp-top-model-dir-vis` requires a checkpoint with
   `top_model_state_dict`. It samples a fixed top-strip normal-offset stack
   around the traced fused top strip using offsets `-4..+4` selected-scale

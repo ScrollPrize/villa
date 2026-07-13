@@ -2,10 +2,10 @@
 
 ## 2026-07-13
 
-- Added Trace2CP top-strip projected side-presence visualization rows for
-  original/init, traced central-z, and z-corrected traced top strips; the
-  projection samples inferred side-presence rows instead of repeating one value
-  down each top-strip column.
+- Added Trace2CP side-presence z-pillar visualization rows under the top-strip
+  section, sampling inferred side-slice presence across z layers for each trace
+  column; the z-search fused panel shifts columns by the selected z value so
+  rows are relative to the used layer.
 - Restored regular stepwise combined Trace2CP and stepwise z-search as the
   defaults, added explicit `--trace2cp-dp` routing for the monotone-DP backend,
   and made `--trace2cp-side-top-z-experiment` an exclusive export mode.

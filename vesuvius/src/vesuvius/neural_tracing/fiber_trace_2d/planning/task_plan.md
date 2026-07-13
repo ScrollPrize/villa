@@ -13,12 +13,16 @@
 
 - Add optional projected-presence fields to `_Trace2CpPairEvaluation` for the
   original/init, traced central-z, and z-corrected top-strip rows.
-- Add a helper that samples the inferred side-strip presence at each top-strip
-  pixel's corresponding side-strip coordinate: `x` from the top column and
-  `trace_y(x) + top_row_offset` from the row. For z-corrected output, feed it
-  the z-selected side-presence image produced from the inferred side slices.
-- Generate the projected presence rows during `_evaluate_trace2cp_pair` when
-  top-strip debug is enabled and the checkpoint exposes a presence head.
+- Add a helper that samples the inferred side-strip presence z stack as a
+  pillar image. For each output column `x` and each inferred layer
+  `-max_layer..+max_layer`, sample that layer's side-presence map at
+  `(x, trace_y(x))`. The output height is therefore `2 * max_layer + 1`.
+- When the helper receives a trace with z coordinates, shift each column's
+  sampled layer by `round(trace_z / z_step_voxels)`, so the output rows are
+  relative to the z-search-selected layer for that column.
+- Generate z-pillar presence rows during `_evaluate_trace2cp_pair` when
+  top-strip debug and z-search are enabled and the checkpoint exposes a
+  presence head.
 - Extend single-pair and whole-fiber Trace2CP overlay rendering to append the
   projected presence rows immediately after the regular top-strip rows.
 - Pass the new fields through existing trace2cp export calls.

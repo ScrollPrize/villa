@@ -366,11 +366,13 @@ The important behavior is:
   traced tangent and normal, then samples rows through the volume. If z-search
   is active, both modes also include a traced fused z-corrected top strip that
   uses the fused trace's per-column selected z offset along the strip normal.
-  When the side checkpoint exposes a presence head, the same top-strip section
-  appends projected side-presence rows for original/init, traced central-z, and
-  z-corrected traced strips. Those rows are fixed-scale `0..1` visualizations
-  sampled from the inferred side-strip presence maps at the side coordinates
-  corresponding to each top-strip pixel; they are not top-model predictions.
+  With z-search and a side presence head, the same top-strip section appends
+  side-presence z-pillar rows. Each column samples the inferred side-slice
+  presence stack across z layers at the relevant trace y coordinate, so a
+  `--trace2cp-z-max-layer 40` run produces 81-pixel-high z-pillar panels. These
+  are not top-model predictions. For the z-search fused trace panel, columns
+  are shifted by the selected trace z layer so the center row is relative z=0
+  around the used layer.
 - `--trace2cp-top-model-dir-vis` loads the checkpoint's top-view model and
   appends sparse predicted direction indicators over the traced fused top strip.
   It samples top-strip offsets `-4..+4` selected-scale voxels around the
@@ -511,8 +513,8 @@ The important behavior is:
   line, and optimized line. It then appends the original/init top strip, the
   traced fused top strip projected to central z, and with z-search also appends
   the traced fused z-corrected top strip. If side presence is available, it
-  appends projected side-presence rows for the same top-strip variants. The
-  summary includes requested, valid, and skipped pair counts plus mean/min/max
+  appends side-presence z-pillar rows for the same trace variants. The summary
+  includes requested, valid, and skipped pair counts plus mean/min/max
   trace2cp errors.
   Stdout prints the public whole-fiber metric on its own line as
   `trace2cp_error_mean=<value>`;
