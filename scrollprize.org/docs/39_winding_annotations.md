@@ -50,11 +50,11 @@ Winding constraints are sparse geometric evidence: points, lines, fibers, or sur
 
 
 ## Why we are focusing on winding constraints
-Given our recent work on PHercParis4, and the flexibility/sparsity afforded by the spiral fit,  **we believe that the fastest way to unroll scrolls at scale is to develop methods for creating winding constraints 
+Given our recent work on PHercParis4, and the flexibility/sparsity afforded by the spiral fit,  **we believe that the fastest way to unroll scrolls at scale is to develop methods for creating winding constraints
 that are precise and fast enough to use at scale** 
 
 We think that the spiral fit is flexible enough to unroll most scrolls given sufficient winding constraints. We don't know the exact minimum amount of winding
-evidence necessary for a given scroll ahead of time, but we know it is certainly *much less than full wrap segmentation*. 
+evidence necessary for a given scroll ahead of time, but we know it is certainly *much less than full wrap segmentation*.
 
 It's important to emphasize here how much this changes the goal of anyone who wishes to unroll scrolls at scale. Rather than focusing on methods which produce large multi-winding segmentations (often by combining patches, using a "bottom up" style approach), 
 and eventually must handle a more global idea of a fit if they wish to address inevitable surface prediction mistakes/sheet skips/etc -- often an extremely difficult task when starting from these bottom-up methods -- we now
@@ -207,7 +207,7 @@ very quickly, and likely learnable or doable with other classical computer visio
 
 #### Ink as same-winding evidence
 
-Easily identifiable correct letters, rows, or columns are a natural source of same-winding constraints (and are likely the most easily verified). 
+Easily identifiable correct letters, rows, or columns are a natural source of same-winding constraints (and are likely the most easily verified).
 
 <figure className="mb-6">
   <div className="grid grid-cols-1 md:grid-cols-[minmax(0,2.6fr)_minmax(0,1fr)] gap-4 items-stretch">
@@ -234,7 +234,7 @@ The blank vertical spaces between columns of text can form long, recognizable pa
 
 #### Kolleisis
 
-Kolleiseis -- the joins where papyrus sheets were pasted together -- could be used as relatively large, full height same-winding constraints. They stand out well in the CT scan, and should be a good candidate for 
+Kolleiseis -- the joins where papyrus sheets were pasted together -- could be used as relatively large, full height same-winding constraints. They stand out well in the CT scan, and should be a good candidate for
 a deep learning model to excel at.
 
 <figure className="mb-6">
