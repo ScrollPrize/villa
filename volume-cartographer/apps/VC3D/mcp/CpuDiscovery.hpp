@@ -30,11 +30,11 @@ struct CpuDiscoveryConfig {
     std::optional<std::filesystem::path> dinovolRepository;
     std::optional<std::filesystem::path> dinovolCheckpoint;
     std::string dinovolRepositoryCommit;
-    std::optional<std::filesystem::path> villaPython;
-    std::optional<std::filesystem::path> villaAdapter;
-    std::optional<std::filesystem::path> villaRepository;
-    std::optional<std::filesystem::path> villaCheckpoint;
-    std::string villaRepositoryCommit;
+    std::optional<std::filesystem::path> inkModelPython;
+    std::optional<std::filesystem::path> inkModelAdapter;
+    std::optional<std::filesystem::path> inkModelRepository;
+    std::optional<std::filesystem::path> inkModelCheckpoint;
+    std::string inkModelRepositoryCommit;
     std::chrono::seconds timeout{std::chrono::hours(2)};
 };
 
@@ -59,10 +59,10 @@ public:
         return config_.dinovolPython && config_.dinovolAdapter && config_.dinovolRepository && config_.dinovolCheckpoint &&
                !config_.dinovolRepositoryCommit.empty();
     }
-    bool villaAvailable() const noexcept
+    bool inkModelAvailable() const noexcept
     {
-        return config_.villaPython && config_.villaAdapter && config_.villaRepository && config_.villaCheckpoint &&
-               !config_.villaRepositoryCommit.empty();
+        return config_.inkModelPython && config_.inkModelAdapter && config_.inkModelRepository && config_.inkModelCheckpoint &&
+               !config_.inkModelRepositoryCommit.empty();
     }
     Json validate(const std::string& operation, const Json& request) const;
     WorkerResult run(const std::string& operation, const std::string& jobId, const Json& normalized, const std::atomic<bool>& cancelRequested, LogCallback log) const;

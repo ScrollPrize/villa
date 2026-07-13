@@ -34,19 +34,19 @@ def main()->int:
         assert 0<=result['overall_stability_score']<=1;assert len(result['comparisons'])==2;assert (out/'surface-stability.zarr'/'.zgroup').is_file()
         source={'job_id':'base','artifact_id':'registered-surface'};shape=[64,64]
 
-        vv,uu=np.mgrid[:64,:64];villa_raw=((uu+vv)/90-.2).astype(np.float32);dinovol_raw=(np.sin(uu/8)+np.cos(vv/9)).astype(np.float32)
-        villa=root/'villa';villa.mkdir();np.save(villa/'ink-probability.npy',villa_raw);villa_support=np.ones((64,64),np.uint8);villa_support[0]=0;np.save(villa/'ink-valid.npy',villa_support)
-        (villa/'manifest.json').write_text(json.dumps({'kind':'villa_ink_prediction_v1','output_shape_hw':shape,'source_surface_artifact':source}))
+        vv,uu=np.mgrid[:64,:64];ink_model_raw=((uu+vv)/90-.2).astype(np.float32);dinovol_raw=(np.sin(uu/8)+np.cos(vv/9)).astype(np.float32)
+        ink_model=root/'ink-model';ink_model.mkdir();np.save(ink_model/'ink-model-score.npy',ink_model_raw);ink_model_support=np.ones((64,64),np.uint8);ink_model_support[0]=0;np.save(ink_model/'ink-valid.npy',ink_model_support)
+        (ink_model/'manifest.json').write_text(json.dumps({'kind':'resnet152_ink_model_score_v1','output_shape_hw':shape,'source_surface_artifact':source}))
         dinovol=root/'dinovol';dinovol.mkdir();np.save(dinovol/'exemplar-similarity-surface.npy',dinovol_raw);dinovol_support=np.ones((64,64),np.uint8);dinovol_support[:,0]=0;np.save(dinovol/'surface-support.npy',dinovol_support)
         (dinovol/'manifest.json').write_text(json.dumps({'kind':'dinovol_registered_exemplar_v1','surface_shape_vu':shape,'source_surface_artifact':source}))
-        fusion_request={'villa':{'job_id':'villa','artifact_id':'ink-prediction'},'villa_path':str(villa),'dinovol':{'job_id':'dinovol','artifact_id':'dinovol-exemplar'},'dinovol_path':str(dinovol),'stability':{'job_id':'stability','artifact_id':'surface-stability'},'stability_path':str(out),'weights':{'villa':2,'dinovol':1,'stability':1}}
+        fusion_request={'ink_model':{'job_id':'ink-model','artifact_id':'ink-prediction'},'ink_model_path':str(ink_model),'dinovol':{'job_id':'dinovol','artifact_id':'dinovol-exemplar'},'dinovol_path':str(dinovol),'stability':{'job_id':'stability','artifact_id':'surface-stability'},'stability_path':str(out),'weights':{'ink_model':2,'dinovol':1,'stability':1}}
         fusion=adapter.fuse_ink_scores(fusion_request,root/'fusion');fused=zarr.open_group(str(root/'fusion/ink-fusion.zarr'),mode='r')
-        expected_arrays={'villa_probability_raw','villa_probability','dinovol_similarity_raw','dinovol_similarity_normalized','stability_local_score_raw','stability_local_score','combined_score','valid'}
-        assert set(fused.array_keys())==expected_arrays;assert np.array_equal(fused['villa_probability_raw'][:],villa_raw)
+        expected_arrays={'ink_model_score_raw','ink_model_score','dinovol_similarity_raw','dinovol_similarity_normalized','stability_local_score_raw','stability_local_score','combined_score','valid'}
+        assert set(fused.array_keys())==expected_arrays;assert np.array_equal(fused['ink_model_score_raw'][:],ink_model_raw)
         assert np.array_equal(fused['dinovol_similarity_raw'][:],dinovol_raw);assert fusion['source_surface_consistency']=='verified'
         assert fusion['valid_pixels']==63*63;assert (root/'fusion/fusion-valid.npy').is_file();assert set(fusion['component_maps_preserved'])==expected_arrays-{'combined_score','valid'}
         y,x=10,10;low=fusion['dinovol_normalization']['low'];high=fusion['dinovol_normalization']['high'];dn=np.clip((dinovol_raw[y,x]-low)/(high-low),0,1);stability=np.load(out/'stability-local-score.npy')[y,x]
-        assert np.isclose(fused['combined_score'][y,x],(2*np.clip(villa_raw[y,x],0,1)+dn+stability)/4)
+        assert np.isclose(fused['combined_score'][y,x],(2*np.clip(ink_model_raw[y,x],0,1)+dn+stability)/4)
         try: adapter.fuse_ink_scores({**fusion_request,'weights':{'mystery':1}},root/'bad-weight')
         except ValueError as error: assert 'unknown fusion weight' in str(error)
         else: raise AssertionError('unknown fusion weight accepted')

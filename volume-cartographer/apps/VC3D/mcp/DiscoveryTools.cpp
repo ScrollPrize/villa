@@ -108,14 +108,14 @@ void registerDiscoveryTools(fastmcpp::tools::ToolManager& tools, const std::shar
             true));
         tools.register_tool(makeTool(
             "surface_render_normal_stack",
-            "Render a bounded Villa-compatible HxWx26 or HxWx62 uint8 CT stack along registered surface normals",
+            "Render a bounded HxWx26 or HxWx62 uint8 CT stack for a supported ink-model input contract along registered surface normals",
             objectSchema(
                 withBase(
                     {{"surface", registeredReference},
-                     {"villa_profile", {{"type", "string"}, {"enum", Json::array({"villa-timesformer-26", "villa-resnet152-62"})}}},
+                     {"model_profile", {{"type", "string"}, {"enum", Json::array({"timesformer-26", "resnet152-3d-decoder-62"})}}},
                      {"reverse_layers", {{"type", "boolean"}}},
                      {"layer_step_voxels", {{"type", "number"}, {"exclusiveMinimum", 0}, {"maximum", 4}}}}),
-                Json::array({"surface", "villa_profile", "client_request_id"})),
+                Json::array({"surface", "model_profile", "client_request_id"})),
             store,
             true));
     }
@@ -210,18 +210,18 @@ void registerDiscoveryTools(fastmcpp::tools::ToolManager& tools, const std::shar
             Json::array());
         tools.register_tool(makeTool(
             "ink_fuse_registered_scores",
-            "Fuse registered Villa probability and DinoVol UV similarity while preserving every component and optional stability map",
+            "Fuse an uncalibrated ResNet152 ink-model score with DinoVol UV similarity while preserving every component and optional stability map; the result is review priority, not ink probability",
             objectSchema(
                 withBase(
-                    {{"villa", artifactReference("ink-prediction")},
+                    {{"ink_model", artifactReference("ink-prediction")},
                      {"dinovol", artifactReference("dinovol-exemplar")},
                      {"stability", artifactReference("surface-stability")},
                      {"weights", objectSchema(
-                         {{"villa", {{"type", "number"}, {"minimum", 0}, {"maximum", 100}}},
+                         {{"ink_model", {{"type", "number"}, {"minimum", 0}, {"maximum", 100}}},
                           {"dinovol", {{"type", "number"}, {"minimum", 0}, {"maximum", 100}}},
                           {"stability", {{"type", "number"}, {"minimum", 0}, {"maximum", 100}}}},
                          Json::array())}}),
-                Json::array({"villa", "dinovol", "client_request_id"})),
+                Json::array({"ink_model", "dinovol", "client_request_id"})),
             store,
             true));
         tools.register_tool(makeTool(
@@ -394,17 +394,17 @@ void registerDiscoveryTools(fastmcpp::tools::ToolManager& tools, const std::shar
                      "client_request_id"})),
             store));
     }
-    if (discovery && discovery->villaAvailable()) {
+    if (discovery && discovery->inkModelAvailable()) {
         const Json surfaceVolume = objectSchema(
             {{"job_id", {{"type", "string"}, {"minLength", 1}}}, {"artifact_id", {{"type", "string"}, {"const", "surface-volume"}}}},
             Json::array({"job_id", "artifact_id"}));
         tools.register_tool(makeTool(
-            "ink_run_villa_inference",
-            "Run the pinned canonical Villa ResNet152/3D-decoder checkpoint on a validated HxWx62 surface volume",
+            "ink_run_resnet152_inference",
+            "Produce an uncalibrated ink-model score with the pinned ResNet152/3D-decoder checkpoint on a validated HxWx62 surface volume",
             objectSchema(
                 withBase(
                     {{"surface_volume", surfaceVolume},
-                     {"model_profile", {{"type", "string"}, {"const", "villa-resnet152-62"}}},
+                     {"model_profile", {{"type", "string"}, {"const", "resnet152-3d-decoder-62"}}},
                      {"device", {{"type", "string"}, {"enum", Json::array({"cpu", "mps", "cuda"})}}},
                      {"tile_size", {{"type", "integer"}, {"enum", Json::array({64, 128, 256})}}},
                      {"stride", {{"type", "integer"}, {"minimum", 1}, {"maximum", 256}}},

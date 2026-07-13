@@ -107,16 +107,16 @@ if(VC_TESTING)
                     --stager "${CMAKE_CURRENT_SOURCE_DIR}/volume_stager.py")
         set_tests_properties(vc_mcp_volume_stager PROPERTIES TIMEOUT 30)
 
-        set(_vc_villa_test_args)
+        set(_vc_ink_model_test_args)
         if(EXISTS "${CMAKE_SOURCE_DIR}/../ink-detection/metadata.json")
-            list(APPEND _vc_villa_test_args --villa-root "${CMAKE_SOURCE_DIR}/../ink-detection")
+            list(APPEND _vc_ink_model_test_args --ink-model-root "${CMAKE_SOURCE_DIR}/../ink-detection")
         endif()
         add_test(NAME vc_mcp_surface_bundle_adapter
             COMMAND "${VC_MCP_NNUNET_TEST_PYTHON}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/SurfaceBundleAdapterTest.py"
                     --adapter "${CMAKE_CURRENT_SOURCE_DIR}/surface_bundle_adapter.py"
-                    --villa-contracts "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/villa_surface_volume_contracts.json"
-                    ${_vc_villa_test_args})
+                    --ink-model-contracts "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ink_model_surface_volume_contracts.json"
+                    ${_vc_ink_model_test_args})
         set_tests_properties(vc_mcp_surface_bundle_adapter PROPERTIES TIMEOUT 30)
 
         add_test(NAME vc_mcp_structural_evidence_adapter

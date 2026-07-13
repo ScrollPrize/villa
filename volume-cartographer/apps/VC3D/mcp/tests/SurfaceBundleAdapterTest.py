@@ -25,8 +25,8 @@ def load_adapter(path: Path):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--adapter", required=True, type=Path)
-    parser.add_argument("--villa-contracts", required=True, type=Path)
-    parser.add_argument("--villa-root", type=Path)
+    parser.add_argument("--ink-model-contracts", required=True, type=Path)
+    parser.add_argument("--ink-model-root", type=Path)
     arguments = parser.parse_args()
     adapter = load_adapter(arguments.adapter)
     with tempfile.TemporaryDirectory(prefix="vc-surface-bundle-") as temporary:
@@ -114,34 +114,34 @@ def main() -> int:
         assert alignment["interpolation"] == "trilinear"
         assert (alignment_output / "ct-alignment.zarr" / ".zgroup").is_file()
 
-        contracts = json.loads(arguments.villa_contracts.read_text())
-        villa_processing = None
-        if arguments.villa_root is not None:
-            timesformer_source = (arguments.villa_root / "train_timesformer_og.py").read_text()
+        contracts = json.loads(arguments.ink_model_contracts.read_text())
+        ink_model_processing = None
+        if arguments.ink_model_root is not None:
+            timesformer_source = (arguments.ink_model_root / "train_timesformer_og.py").read_text()
             match = re.search(r"def read_image_mask\(fragment_id,start_idx=(\d+),end_idx=(\d+)", timesformer_source)
             assert match and [int(match.group(1)), int(match.group(2))] == [17, 43]
-            resnet_metadata = json.loads((arguments.villa_root / "metadata.json").read_text())
+            resnet_metadata = json.loads((arguments.ink_model_root / "metadata.json").read_text())
             assert resnet_metadata["training_hyperparameters"]["model"]["in_chans"] == 62
             assert any(segment.get("layer_range") == [1, 63] for segment in resnet_metadata["segments"].values())
-            processing_source = (arguments.villa_root / "optimized_inference" / "processing.py").read_text()
+            processing_source = (arguments.ink_model_root / "optimized_inference" / "processing.py").read_text()
             assert "shape=(h, w, c)" in processing_source
             assert "chunks=(chunk_size, chunk_size, 1)" in processing_source
             assert "dtype=np.uint8" in processing_source
-            sys.path.insert(0, str(arguments.villa_root / "optimized_inference"))
-            import processing as villa_processing
-        villa_surface = root / "villa-surface"
-        villa_surface.mkdir()
-        villa_v, villa_u = np.mgrid[:80, :96]
-        tifffile.imwrite(villa_surface / "x.tif", (villa_u + 100).astype(np.float32))
-        tifffile.imwrite(villa_surface / "y.tif", (villa_v + 200).astype(np.float32))
-        tifffile.imwrite(villa_surface / "z.tif", np.full((80, 96), 100, np.float32))
-        tifffile.imwrite(villa_surface / "mask.tif", np.ones((80, 96), np.uint8))
-        (villa_surface / "meta.json").write_text(json.dumps({"format": "tifxyz", "scale": [1, 1]}))
+            sys.path.insert(0, str(arguments.ink_model_root / "optimized_inference"))
+            import processing as ink_model_processing
+        model_surface = root / "model-surface"
+        model_surface.mkdir()
+        model_v, model_u = np.mgrid[:80, :96]
+        tifffile.imwrite(model_surface / "x.tif", (model_u + 100).astype(np.float32))
+        tifffile.imwrite(model_surface / "y.tif", (model_v + 200).astype(np.float32))
+        tifffile.imwrite(model_surface / "z.tif", np.full((80, 96), 100, np.float32))
+        tifffile.imwrite(model_surface / "mask.tif", np.ones((80, 96), np.uint8))
+        (model_surface / "meta.json").write_text(json.dumps({"format": "tifxyz", "scale": [1, 1]}))
         undersized_error = None
         try:
             adapter.normal_stack(
                 {"surface": {"job_id": "registered", "artifact_id": "registered-surface"},
-                 "villa_profile": "villa-resnet152-62"},
+                 "model_profile": "resnet152-3d-decoder-62"},
                 output,
                 root / "undersized-stack",
             )
@@ -149,19 +149,19 @@ def main() -> int:
             undersized_error = str(error)
         assert undersized_error and "height and width" in undersized_error
 
-        low_padding_artifact = root / "villa-low-padding"
+        low_padding_artifact = root / "model-low-padding"
         low_padding_request = {
             "surface": {"job_id": "job_fixture", "artifact_id": "surface"},
             "coordinate_space": "ct_l0_xyz",
             "uv_region": {"u": 10, "v": 10, "width": 72, "height": 68},
             "normal_padding_voxels": 1,
         }
-        adapter.import_surface(low_padding_request, villa_surface, low_padding_artifact)
+        adapter.import_surface(low_padding_request, model_surface, low_padding_artifact)
         padding_error = None
         try:
             adapter.normal_stack(
                 {"surface": {"job_id": "registered", "artifact_id": "registered-surface"},
-                 "villa_profile": "villa-resnet152-62"},
+                 "model_profile": "resnet152-3d-decoder-62"},
                 low_padding_artifact,
                 root / "low-padding-stack",
             )
@@ -169,41 +169,41 @@ def main() -> int:
             padding_error = str(error)
         assert padding_error and "requires normal padding" in padding_error
 
-        villa_artifact = root / "villa-registered"
-        villa_request = {
+        model_artifact = root / "model-registered"
+        model_request = {
             "surface": {"job_id": "job_fixture", "artifact_id": "surface"},
             "coordinate_space": "ct_l0_xyz",
             "uv_region": {"u": 10, "v": 10, "width": 72, "height": 68},
             "normal_padding_voxels": 32,
         }
-        villa_import = adapter.import_surface(villa_request, villa_surface, villa_artifact)
-        villa_region = villa_import["required_volume_region_xyz"]
+        model_import = adapter.import_surface(model_request, model_surface, model_artifact)
+        model_region = model_import["required_volume_region_xyz"]
         zz, yy, xx = np.mgrid[
-            villa_region["z"] : villa_region["z"] + villa_region["depth"],
-            villa_region["y"] : villa_region["y"] + villa_region["height"],
-            villa_region["x"] : villa_region["x"] + villa_region["width"],
+            model_region["z"] : model_region["z"] + model_region["depth"],
+            model_region["y"] : model_region["y"] + model_region["height"],
+            model_region["x"] : model_region["x"] + model_region["width"],
         ]
-        villa_volume = ((zz * 3 + yy * 5 + xx * 7) % 256).astype(np.uint8)
-        villa_staging = villa_artifact / "staging"
-        villa_staging.mkdir()
-        np.save(villa_staging / "staged-volume.npy", villa_volume, allow_pickle=False)
-        (villa_staging / "stage-manifest.json").write_text(
-            json.dumps({"submitted_region_xyz": {**villa_region, "space": "ct_l0_xyz"}})
+        model_volume = ((zz * 3 + yy * 5 + xx * 7) % 256).astype(np.uint8)
+        model_staging = model_artifact / "staging"
+        model_staging.mkdir()
+        np.save(model_staging / "staged-volume.npy", model_volume, allow_pickle=False)
+        (model_staging / "stage-manifest.json").write_text(
+            json.dumps({"submitted_region_xyz": {**model_region, "space": "ct_l0_xyz"}})
         )
 
         import zarr
 
         rendered_stacks = {}
-        for profile in ("villa-timesformer-26", "villa-resnet152-62"):
+        for profile in ("timesformer-26", "resnet152-3d-decoder-62"):
             profile_output = root / profile
             rendered = adapter.normal_stack(
                 {
                     "surface": {"job_id": "registered", "artifact_id": "registered-surface"},
-                    "villa_profile": profile,
+                    "model_profile": profile,
                     "layer_step_voxels": 1.0,
                     "reverse_layers": False,
                 },
-                villa_artifact,
+                model_artifact,
                 profile_output,
             )
             expected = contracts["profiles"][profile]
@@ -225,34 +225,34 @@ def main() -> int:
             expected_values = [int((first_xyz[2] + offset) * 3 + first_xyz[1] * 5 + first_xyz[0] * 7) % 256
                                for offset in range(expected["offsets_voxels"][0], expected["offsets_voxels"][1] + 1)]
             assert stack[0, 0].tolist() == expected_values
-            if villa_processing is not None:
-                villa_output = root / f"{profile}-villa-prepare.zarr"
-                villa_processing.create_surface_volume_zarr(
+            if ink_model_processing is not None:
+                model_output = root / f"{profile}-model-prepare.zarr"
+                ink_model_processing.create_surface_volume_zarr(
                     [str(path) for path in sorted((profile_output / "layers").glob("*.tif"))],
-                    str(villa_output),
+                    str(model_output),
                     chunk_size=64,
                     max_workers=2,
                     use_compression=False,
                 )
-                villa_stack = np.asarray(zarr.open(str(villa_output), mode="r"))
-                assert villa_stack.shape == stack.shape
-                assert villa_stack.dtype == np.uint8
-                assert np.array_equal(villa_stack, stack)
+                model_stack = np.asarray(zarr.open(str(model_output), mode="r"))
+                assert model_stack.shape == stack.shape
+                assert model_stack.dtype == np.uint8
+                assert np.array_equal(model_stack, stack)
             rendered_stacks[profile] = stack
 
-        reverse_output = root / "villa-resnet152-62-reversed"
+        reverse_output = root / "resnet152-3d-decoder-62-reversed"
         reversed_manifest = adapter.normal_stack(
             {
                 "surface": {"job_id": "registered", "artifact_id": "registered-surface"},
-                "villa_profile": "villa-resnet152-62",
+                "model_profile": "resnet152-3d-decoder-62",
                 "layer_step_voxels": 1.0,
                 "reverse_layers": True,
             },
-            villa_artifact,
+            model_artifact,
             reverse_output,
         )
         reversed_stack = np.asarray(zarr.open(str(reverse_output / "surface-volume.zarr"), mode="r"))
-        assert np.array_equal(reversed_stack, rendered_stacks["villa-resnet152-62"][..., ::-1])
+        assert np.array_equal(reversed_stack, rendered_stacks["resnet152-3d-decoder-62"][..., ::-1])
         assert reversed_manifest["offsets_voxels"] == list(reversed(range(-31, 31)))
     print("SurfaceBundleAdapterTest passed")
     return 0

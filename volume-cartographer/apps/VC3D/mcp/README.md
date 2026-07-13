@@ -28,8 +28,8 @@ inspectable evidence:
    bounded raw-CT region against it.
 5. Measure geometry, CT alignment, periodic/grid structure, epoch-fold structure,
    and stability across explicitly supplied perturbations.
-6. Render Villa-compatible normal stacks and, when pinned assets are configured,
-   run Dataset 058 nnU-Net, Villa, DINOv3, or DinoVol adapters.
+6. Render model-compatible normal stacks and, when pinned assets are configured,
+   run Dataset 058 nnU-Net, ResNet152 ink-model, DINOv3, or DinoVol adapters.
 7. Preserve raw model components while fusing/ranking evidence for review.
 8. Create immutable review queues and reviewer assessments, then evaluate supplied
    labels for coverage, ranking quality, calibration, and reviewer agreement.
@@ -284,20 +284,51 @@ The configured checkpoint must have SHA-256
 The adapter runs the pinned EMA teacher backbone on MPS and projects 3D cosine
 similarity back to the registered UV chart.
 
-### Villa
+### ResNet152 ink-model inference
 
 ```bash
-export VC_MCP_VILLA_PYTHON="$HOME/.cache/vc-mcp/venvs/nnunet/bin/python"
-export VC_MCP_VILLA_ADAPTER="$PWD/apps/VC3D/mcp/villa_inference_adapter.py"
-export VC_MCP_VILLA_REPOSITORY="/absolute/path/to/ink-detection"
-export VC_MCP_VILLA_REPOSITORY_COMMIT="$(git -C "$VC_MCP_VILLA_REPOSITORY" rev-parse HEAD)"
-export VC_MCP_VILLA_CHECKPOINT="/absolute/path/to/r152_3ddec_v2_l5_epoch13.ckpt"
+export VC_MCP_INK_MODEL_PYTHON="$HOME/.cache/vc-mcp/venvs/nnunet/bin/python"
+export VC_MCP_INK_MODEL_ADAPTER="$PWD/apps/VC3D/mcp/resnet152_inference_adapter.py"
+export VC_MCP_INK_MODEL_REPOSITORY="/absolute/path/to/ink-detection"
+export VC_MCP_INK_MODEL_REPOSITORY_COMMIT="$(git -C "$VC_MCP_INK_MODEL_REPOSITORY" rev-parse HEAD)"
+export VC_MCP_INK_MODEL_CHECKPOINT="/absolute/path/to/r152_3ddec_v2_l5_epoch13.ckpt"
 ```
 
 The configured checkpoint must have SHA-256
 `36dd0de84b7b7aa6590184192c7415466cd8a1ba7c1e59f42c6373846373c3e0`.
-Villa preprocessing is the pinned `[0,200] / 200` contract. Outputs are
-uncalibrated model scores, not proof of ink.
+ResNet152 ink-model preprocessing is the pinned `[0,200] / 200` contract.
+
+#### What the ink-model score means
+
+For every valid pixel in a registered surface's UV chart, the adapter samples a
+62-layer CT stack along the surface normal and runs the pinned ResNet152 +
+3D-decoder checkpoint. It applies a sigmoid to the model logits, then combines
+overlapping tiles using normalized Hann-window blending. The resulting
+**ink-model score** is bounded to `[0,1]`.
+
+The score is not calibrated on PHerc0332: `0.8` does not mean an 80% probability
+of ink. It is learned evidence for prioritizing inspection, not proof of ink,
+proof of text, a transcription, or a measure of surface quality. Its meaning is
+specific to the pinned checkpoint, preprocessing, layer order, and input
+registration recorded in the artifact manifest.
+
+The API and artifacts call this the **ResNet152 ink-model score**. It is a
+model output, not a repository-level score.
+
+When `ink_fuse_registered_scores` is used, it computes a review-priority map:
+
+```text
+(w_ink_model * clip(ink_model_score, 0, 1)
+ + w_dinovol * roi_percentile_normalized_dinovol
+ + w_stability * clip(stability, 0, 1)) / sum(weights)
+```
+
+Default weights are `1` for the ink-model score, `1` for DinoVol, and `0.5` for
+stability when stability is supplied. DinoVol normalization is ROI-relative,
+and stability measures only the supplied perturbations. Consequently, the fused
+value is also an uncalibrated review-priority heuristic, not an ink probability.
+All raw and normalized components are preserved so reviewers do not have to
+interpret only the combined value.
 
 ## Common tool conventions
 
@@ -487,7 +518,7 @@ These are enabled by the analysis Python, stager, and surface-bundle adapter.
 | `surface_render_registered_roi` | `surface` (`surface` artifact), `volume`, `coordinate_space`, `client_request_id` | Import TIFXYZ, stage bounded CT, and register raw intensity. Optional `uv_region`, `normal_padding_voxels` (0–64). |
 | `surface_validate_geometry` | `surface` (`registered-surface`), `client_request_id` | Local stretch, normal discontinuity, folds/degeneracy, components, holes, and boundaries. |
 | `surface_measure_volume_alignment` | registered `surface`, `client_request_id` | Trilinear profiles along normals; optional `maximum_offset_voxels` (1–16). |
-| `surface_render_normal_stack` | registered `surface`, `villa_profile`, `client_request_id` | Render Villa-compatible uint8 H×W×C Zarr/TIFF; optional `reverse_layers`, `layer_step_voxels`. |
+| `surface_render_normal_stack` | registered `surface`, `model_profile`, `client_request_id` | Render model-compatible uint8 H×W×C Zarr/TIFF; optional `reverse_layers`, `layer_step_voxels`. |
 
 Example registration after a successful `vc_generate_surface` job:
 
@@ -520,12 +551,12 @@ offset than registration staged.
 
 Normal-stack profiles are:
 
-- `villa-timesformer-26`: source layers `[17,43)`, offsets `[-15,+10]`;
-- `villa-resnet152-62`: source layers `[1,63)`, offsets `[-31,+30]`.
+- `timesformer-26`: source layers `[17,43)`, offsets `[-15,+10]`;
+- `resnet152-3d-decoder-62`: source layers `[1,63)`, offsets `[-31,+30]`.
 
 Both follow a canonical 65-layer `[-32,+32]` source convention. Register with 32
 voxels of normal padding for the 62-layer profile. Height and width must each
-exceed the channel count so Villa cannot ambiguously infer HWC versus CHW.
+exceed the channel count so the optimized loader cannot ambiguously infer HWC versus CHW.
 
 ### Structural evidence (optional)
 
@@ -550,7 +581,7 @@ Enabled by `VC_MCP_EVIDENCE_FUSION_ADAPTER`.
 | Tool | Required artifacts | Purpose / options |
 | --- | --- | --- |
 | `surface_test_stability` | `baseline` plus 1–7 registered `variants` | Validity IoU, physical displacement, sign-invariant normal angle, signal difference, and worst local stability. Optional explicit scales. |
-| `ink_fuse_registered_scores` | `villa` (`ink-prediction`), `dinovol` (`dinovol-exemplar`) | Preserve raw/bounded components and calculate review priority; optional `stability` and weights. |
+| `ink_fuse_registered_scores` | `ink_model` (`ink-prediction`), `dinovol` (`dinovol-exemplar`) | Preserve raw/bounded components and calculate an uncalibrated review priority; optional `stability` and weights. |
 | `surface_rank_evidence` | 1–16 candidate records | Weighted geometric mean of geometry, alignment, grid, and optional stability; optional explicit weights. |
 
 A ranking candidate has a safe identifier plus `surface-geometry`,
@@ -565,9 +596,9 @@ it does not claim untested coverage. DinoVol normalization is ROI-relative.
 | --- | --- | --- |
 | `dinov3_exemplar_search` | local image, pinned repository/commit/weights/hash, positive 2D points, request ID | CPU dense-feature reranking in an optional bbox; supports negative points, top-k, threads, ViT-S/16 or ViT-S+/16. |
 | `dinovol_exemplar_search` | registered `surface`, `device: "mps"`, positive `(u,v,offset)` examples, request ID | 3D teacher-backbone exemplar similarity projected to UV; optional negative examples. |
-| `ink_run_villa_inference` | `surface_volume`, `model_profile: "villa-resnet152-62"`, request ID | Pinned Villa ResNet152/3D-decoder inference; optional device, tile size, stride, reverse layers. |
+| `ink_run_resnet152_inference` | `surface_volume`, `model_profile: "resnet152-3d-decoder-62"`, request ID | Produce an ink-model score using the pinned ResNet152/3D-decoder checkpoint; optional device, tile size, stride, reverse layers. |
 
-`ink_run_villa_inference` only consumes a validated `surface-volume` artifact
+`ink_run_resnet152_inference` only consumes a validated `surface-volume` artifact
 from `surface_render_normal_stack`; it cannot consume an arbitrary path. Devices
 are `cpu`, `mps`, or `cuda`, and tile size is 64/128/256. Learned outputs remain
 uncalibrated evidence.

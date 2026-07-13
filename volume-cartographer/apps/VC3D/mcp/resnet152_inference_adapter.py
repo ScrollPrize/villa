@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pinned, bounded local Villa ResNet152/3D-decoder inference adapter."""
+"""Pinned, bounded ResNet152/3D-decoder ink-model inference adapter."""
 from __future__ import annotations
 
 import argparse
@@ -41,16 +41,16 @@ def main() -> int:
     args = parser.parse_args()
 
     request = json.loads(args.request.read_text())
-    if request.get("model_profile") != "villa-resnet152-62":
-        raise ValueError("only villa-resnet152-62 is supported")
+    if request.get("model_profile") != "resnet152-3d-decoder-62":
+        raise ValueError("only resnet152-3d-decoder-62 is supported")
     if sha256(args.checkpoint) != EXPECTED_SHA256:
-        raise ValueError("Villa checkpoint SHA-256 mismatch")
+        raise ValueError("ResNet152 checkpoint SHA-256 mismatch")
     expected_commit = request["repository_commit"]
     actual_commit = subprocess.check_output(
         ["git", "-C", str(args.repository), "rev-parse", "HEAD"], text=True
     ).strip()
     if actual_commit != expected_commit:
-        raise ValueError(f"Villa repository commit mismatch: {actual_commit}")
+        raise ValueError(f"ink-model repository commit mismatch: {actual_commit}")
 
     import torch
     import torch.nn.functional as F
@@ -62,14 +62,14 @@ def main() -> int:
     from model_resnet3d_3d_decoder import load_model
 
     manifest = json.loads((args.artifact / "manifest.json").read_text())
-    if manifest.get("profile") != "villa-resnet152-62" or manifest.get("channels") != 62:
-        raise ValueError("surface-volume artifact is not a Villa ResNet152 62-layer stack")
+    if manifest.get("profile") != "resnet152-3d-decoder-62" or manifest.get("channels") != 62:
+        raise ValueError("surface-volume artifact is not a ResNet152 62-layer stack")
     stack = zarr.open(str(args.artifact / "surface-volume.zarr"), mode="r")
     if len(stack.shape) != 3 or stack.shape[2] != 62 or stack.dtype != np.uint8:
         raise ValueError(f"expected uint8 HxWx62 Zarr, got {stack.shape} {stack.dtype}")
     height, width, _ = stack.shape
     if height * width > MAX_PIXELS:
-        raise ValueError("Villa inference is limited to 4,194,304 surface pixels")
+        raise ValueError("ResNet152 inference is limited to 4,194,304 surface pixels")
 
     tile = int(request.get("tile_size", 64))
     stride = int(request.get("stride", max(1, tile // 2)))
@@ -113,16 +113,17 @@ def main() -> int:
     prediction = np.divide(prediction, counts, out=np.zeros_like(prediction), where=supported)
 
     args.output.mkdir(parents=True, exist_ok=True)
-    np.save(args.output / "ink-probability.npy", prediction, allow_pickle=False)
+    np.save(args.output / "ink-model-score.npy", prediction, allow_pickle=False)
     np.save(args.output / "ink-valid.npy", supported.astype(np.uint8), allow_pickle=False)
-    tifffile.imwrite(args.output / "ink-probability.tif", prediction)
+    tifffile.imwrite(args.output / "ink-model-score.tif", prediction)
     Image.fromarray(np.clip(np.rint(prediction * 255), 0, 255).astype(np.uint8)).save(
-        args.output / "ink-probability.png"
+        args.output / "ink-model-score.png"
     )
     output_manifest = {
-        "kind": "villa_ink_prediction_v1",
-        "score_semantics": "uncalibrated_model_probability_not_proof_of_ink",
-        "model_profile": "villa-resnet152-62",
+        "kind": "resnet152_ink_model_score_v1",
+        "score_semantics": "uncalibrated_ink_model_score_not_probability_or_proof_of_ink",
+        "score_display_name": "ResNet152 ink-model score",
+        "model_profile": "resnet152-3d-decoder-62",
         "checkpoint": args.checkpoint.name,
         "checkpoint_sha256": EXPECTED_SHA256,
         "repository_commit": actual_commit,
@@ -135,12 +136,12 @@ def main() -> int:
         "stride": stride,
         "reverse_layers": reverse,
         "preprocessing": {"clip": [0, 200], "scale_divisor": 200.0},
-        "blending": "Villa normalized 2D Hann overlap-add with raw nonzero validity",
+        "blending": "normalized 2D Hann overlap-add with raw nonzero validity",
         "minimum_score": float(prediction.min()),
         "maximum_score": float(prediction.max()),
         "mean_score": float(prediction.mean()),
         "supported_pixels": int(supported.sum()),
-        "artifacts": ["ink-probability.npy", "ink-valid.npy", "ink-probability.tif", "ink-probability.png"],
+        "artifacts": ["ink-model-score.npy", "ink-valid.npy", "ink-model-score.tif", "ink-model-score.png"],
     }
     (args.output / "manifest.json").write_text(json.dumps(output_manifest, indent=2) + "\n")
     print(json.dumps(output_manifest), flush=True)

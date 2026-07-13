@@ -62,7 +62,7 @@ Json capabilities(const ServerConfig& config)
         {"review_artifacts", config.discovery && config.discovery->reviewAvailable()},
         {"dinov3_exemplar_search", config.discovery && config.discovery->dinov3Available()},
         {"dinovol_exemplar_search", config.discovery && config.discovery->dinovolAvailable()},
-        {"villa_ink_inference", config.discovery && config.discovery->villaAvailable()},
+        {"resnet152_ink_inference", config.discovery && config.discovery->inkModelAvailable()},
         {"coordinate_spaces", Json::array({"ct_l0_xyz", "ct_l2_xyz"})},
         {"profiles", Json::array({"scroll3-conservative-v1"})},
         {"execution_mode", config.worker ? config.worker->executionMode() : "fake"}};

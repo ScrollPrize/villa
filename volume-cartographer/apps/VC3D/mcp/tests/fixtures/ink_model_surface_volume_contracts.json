@@ -2,13 +2,13 @@
   "canonical_source_layers": 65,
   "canonical_offsets_voxels": [-32, 32],
   "profiles": {
-    "villa-timesformer-26": {
+    "timesformer-26": {
       "channels": 26,
       "source_layer_range": [17, 43],
       "offsets_voxels": [-15, 10],
       "provenance": "ink-detection/train_timesformer_og.py read_image_mask defaults"
     },
-    "villa-resnet152-62": {
+    "resnet152-3d-decoder-62": {
       "channels": 62,
       "source_layer_range": [1, 63],
       "offsets_voxels": [-31, 30],

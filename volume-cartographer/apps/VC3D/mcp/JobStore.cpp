@@ -145,7 +145,7 @@ Json JobStore::submitDiscovery(const std::string& operation, const Json& request
 {
     require(discovery_ != nullptr, "CPU discovery service is unavailable");
     Json resolved = request;
-    for (const auto* key : {"surface", "surface_volume", "villa", "dinovol", "stability", "surface_a", "surface_b", "grid", "baseline", "ranking", "comparison", "queue"}) {
+    for (const auto* key : {"surface", "surface_volume", "ink_model", "dinovol", "stability", "surface_a", "surface_b", "grid", "baseline", "ranking", "comparison", "queue"}) {
         if (!request.contains(key) || !request.at(key).is_object())
             continue;
         const auto artifact = resolveArtifactReference(request.at(key));

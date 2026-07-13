@@ -140,19 +140,19 @@ std::shared_ptr<vc::mcp::CpuDiscovery> cpuDiscovery()
         config.dinovolRepository = dinovolRepository;
     if (!dinovolCheckpoint.empty())
         config.dinovolCheckpoint = dinovolCheckpoint;
-    const auto villaPython = environment("VC_MCP_VILLA_PYTHON");
-    const auto villaAdapter = environment("VC_MCP_VILLA_ADAPTER");
-    const auto villaRepository = environment("VC_MCP_VILLA_REPOSITORY");
-    const auto villaCheckpoint = environment("VC_MCP_VILLA_CHECKPOINT");
-    config.villaRepositoryCommit = environment("VC_MCP_VILLA_REPOSITORY_COMMIT");
-    if (!villaPython.empty())
-        config.villaPython = villaPython;
-    if (!villaAdapter.empty())
-        config.villaAdapter = villaAdapter;
-    if (!villaRepository.empty())
-        config.villaRepository = villaRepository;
-    if (!villaCheckpoint.empty())
-        config.villaCheckpoint = villaCheckpoint;
+    const auto inkModelPython = environment("VC_MCP_INK_MODEL_PYTHON");
+    const auto inkModelAdapter = environment("VC_MCP_INK_MODEL_ADAPTER");
+    const auto inkModelRepository = environment("VC_MCP_INK_MODEL_REPOSITORY");
+    const auto inkModelCheckpoint = environment("VC_MCP_INK_MODEL_CHECKPOINT");
+    config.inkModelRepositoryCommit = environment("VC_MCP_INK_MODEL_REPOSITORY_COMMIT");
+    if (!inkModelPython.empty())
+        config.inkModelPython = inkModelPython;
+    if (!inkModelAdapter.empty())
+        config.inkModelAdapter = inkModelAdapter;
+    if (!inkModelRepository.empty())
+        config.inkModelRepository = inkModelRepository;
+    if (!inkModelCheckpoint.empty())
+        config.inkModelCheckpoint = inkModelCheckpoint;
     return std::make_shared<vc::mcp::CpuDiscovery>(std::move(config));
 }
 

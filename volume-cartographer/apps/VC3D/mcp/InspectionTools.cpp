@@ -322,7 +322,7 @@ void registerInspectionTools(fastmcpp::tools::ToolManager& tools, fastmcpp::reso
         "vc_registered_ink_fusion_v1",
         "ink_fusion",
         {{{"combined_preview", "combined-score.png"},
-          {"villa_preview", "villa-probability.png"},
+          {"ink_model_preview", "ink-model-score.png"},
           {"dinovol_preview", "dinovol-similarity-normalized.png"}}}));
     tools.register_tool(surfaceEvidenceInspectorTool(
         store,

@@ -151,7 +151,7 @@ int main()
                 "tools/call",
                 {{"name", "surface_render_normal_stack"},
                  {"arguments",
-                  {{"surface", registeredReference}, {"villa_profile", profile}, {"reverse_layers", false}, {"layer_step_voxels", 1.0}, {"client_request_id", requestId}}}})));
+                  {{"surface", registeredReference}, {"model_profile", profile}, {"reverse_layers", false}, {"layer_step_voxels", 1.0}, {"client_request_id", requestId}}}})));
         const auto jobId = call.at("structuredContent").at("job_id").get<std::string>();
         const auto job = waitForJob(app, rpcId, jobId);
         if (job.at("state") != "succeeded") {
@@ -159,19 +159,19 @@ int main()
             std::abort();
         }
         const auto stackArtifact = app.store()->resolveArtifactReference({{"job_id", jobId}, {"artifact_id", "surface-volume"}});
-        assert(stackArtifact.at("media_type") == "application/vnd.villa.surface-volume+zarr");
+        assert(stackArtifact.at("media_type") == "application/vnd.vc.surface-volume+zarr");
         const std::filesystem::path output = stackArtifact.at("path").get<std::string>();
         const auto manifest = Json::parse(std::ifstream(output / "manifest.json"));
         const auto zarray = Json::parse(std::ifstream(output / "surface-volume.zarr" / ".zarray"));
         assert(manifest.at("shape_hwc") == Json::array({80, 96, channels}));
-        assert(manifest.at("villa_loader_compatible") == true);
+        assert(manifest.at("ink_model_loader_compatible") == true);
         assert(manifest.at("dtype") == "uint8");
         assert(zarray.at("shape") == Json::array({80, 96, channels}));
         assert(zarray.at("chunks").at(2) == 1);
         assert(std::distance(std::filesystem::directory_iterator(output / "layers"), std::filesystem::directory_iterator{}) == channels);
     };
-    validateNormalStack("villa-timesformer-26", 26, "registered-surface-timesformer-stack");
-    validateNormalStack("villa-resnet152-62", 62, "registered-surface-resnet-stack");
+    validateNormalStack("timesformer-26", 26, "registered-surface-timesformer-stack");
+    validateNormalStack("resnet152-3d-decoder-62", 62, "registered-surface-resnet-stack");
 
     const auto geometryCall = result(app.handle(
         rpc(rpcId++,

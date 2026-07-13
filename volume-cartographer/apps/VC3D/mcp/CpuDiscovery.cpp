@@ -505,44 +505,44 @@ WorkerResult registeredSurface(
     return {0, command, Json::array({artifact("registered-surface", output, "application/vnd.vc.registered-surface+zarr")})};
 }
 
-WorkerResult villaInference(
+WorkerResult resnet152Inference(
     const CpuDiscoveryConfig& config, const std::filesystem::path& output, const Json& input, const std::atomic<bool>& cancelled, const CpuDiscovery::LogCallback& log)
 {
     require(
-        config.villaPython && config.villaAdapter && config.villaRepository && config.villaCheckpoint && !config.villaRepositoryCommit.empty(),
-        "Villa inference is not configured");
+        config.inkModelPython && config.inkModelAdapter && config.inkModelRepository && config.inkModelCheckpoint && !config.inkModelRepositoryCommit.empty(),
+        "ResNet152 ink-model inference is not configured");
     std::filesystem::create_directories(output);
     Json adapterInput = input;
     adapterInput.erase("surface_volume_path");
     adapterInput.erase("surface_volume_media_type");
-    adapterInput["repository_commit"] = config.villaRepositoryCommit;
+    adapterInput["repository_commit"] = config.inkModelRepositoryCommit;
     const auto requestPath = output / "request.json";
     std::ofstream(requestPath) << adapterInput.dump(2) << '\n';
     runFixedProcess(
-        *config.villaPython,
-        {config.villaAdapter->string(),
+        *config.inkModelPython,
+        {config.inkModelAdapter->string(),
          "--request",
          requestPath.string(),
          "--artifact",
          input.at("surface_volume_path").get<std::string>(),
          "--checkpoint",
-         config.villaCheckpoint->string(),
+         config.inkModelCheckpoint->string(),
          "--repository",
-         config.villaRepository->string(),
+         config.inkModelRepository->string(),
          "--output",
          output.string()},
         config.timeout,
         cancelled,
         log,
-        "Villa ResNet152 inference");
-    require(std::filesystem::is_regular_file(output / "manifest.json"), "Villa inference produced no manifest");
+        "ResNet152 ink-model inference");
+    require(std::filesystem::is_regular_file(output / "manifest.json"), "ResNet152 ink-model inference produced no manifest");
     return {
         0,
-        {{"operation", "ink_run_villa_inference"},
+        {{"operation", "ink_run_resnet152_inference"},
          {"backend", "pinned-local"},
          {"checkpoint_sha256", "36dd0de84b7b7aa6590184192c7415466cd8a1ba7c1e59f42c6373846373c3e0"},
-         {"repository_commit", config.villaRepositoryCommit}},
-        Json::array({artifact("ink-prediction", output, "application/vnd.villa.ink-prediction+zarr")})};
+         {"repository_commit", config.inkModelRepositoryCommit}},
+        Json::array({artifact("ink-prediction", output, "application/vnd.vc.ink-model-score+zarr")})};
 }
 
 WorkerResult surfaceEvidence(
@@ -577,12 +577,12 @@ WorkerResult surfaceEvidence(
         cancelled,
         log,
         geometry      ? "surface geometry diagnostics"
-        : normalStack ? "Villa normal-stack rendering"
+        : normalStack ? "ink-model normal-stack rendering"
                       : "surface CT alignment");
     require(std::filesystem::is_regular_file(output / "manifest.json"), operation + " produced no manifest");
     const std::string artifactId = geometry ? "surface-geometry" : normalStack ? "surface-volume" : "surface-ct-alignment";
     const std::string mediaType = geometry      ? "application/vnd.vc.surface-geometry+zarr"
-                                  : normalStack ? "application/vnd.villa.surface-volume+zarr"
+                                  : normalStack ? "application/vnd.vc.surface-volume+zarr"
                                                 : "application/vnd.vc.surface-ct-alignment+zarr";
     return {0, {{"operation", operation}, {"backend", "cpu"}, {"adapter", config.surfaceBundleAdapter->string()}, {"source_artifact", input.at("surface")}}, Json::array({artifact(artifactId, output, mediaType)})};
 }
@@ -1143,10 +1143,10 @@ Json CpuDiscovery::validate(const std::string& operation, const Json& request) c
             require(maximumOffset >= 1 && maximumOffset <= 16, "maximum_offset_voxels must be from 1 to 16");
         }
         if (operation == "surface_render_normal_stack") {
-            const auto profile = request.value("villa_profile", "");
+            const auto profile = request.value("model_profile", "");
             require(
-                profile == "villa-timesformer-26" || profile == "villa-resnet152-62",
-                "villa_profile must be villa-timesformer-26 or villa-resnet152-62");
+                profile == "timesformer-26" || profile == "resnet152-3d-decoder-62",
+                "model_profile must be timesformer-26 or resnet152-3d-decoder-62");
             const double step = request.value("layer_step_voxels", 1.0);
             require(std::isfinite(step) && step > 0 && step <= 4, "layer_step_voxels must be finite, positive, and at most 4");
         }
@@ -1235,17 +1235,17 @@ Json CpuDiscovery::validate(const std::string& operation, const Json& request) c
                     require(std::isfinite(value) && value > 0 && value <= 1000, std::string(key) + " must be finite and positive");
                 }
         } else if (operation == "ink_fuse_registered_scores") {
-            require(request.contains("villa") && request.at("villa").is_object(),
-                    "villa artifact reference is required");
+            require(request.contains("ink_model") && request.at("ink_model").is_object(),
+                    "ink_model artifact reference is required");
             require(request.contains("dinovol") && request.at("dinovol").is_object(),
                     "dinovol artifact reference is required");
-            require(request.value("villa_media_type", "") ==
-                        "application/vnd.villa.ink-prediction+zarr",
-                    "villa must reference an ink-prediction artifact");
+            require(request.value("ink_model_media_type", "") ==
+                        "application/vnd.vc.ink-model-score+zarr",
+                    "ink_model must reference an ink-prediction artifact");
             require(request.value("dinovol_media_type", "") ==
                         "application/vnd.vc.dinovol-exemplar",
                     "dinovol must reference a dinovol-exemplar artifact");
-            out["villa_path"] = canonicalArtifactPath(request.at("villa_path"), "villa");
+            out["ink_model_path"] = canonicalArtifactPath(request.at("ink_model_path"), "ink_model");
             out["dinovol_path"] = canonicalArtifactPath(request.at("dinovol_path"), "dinovol");
             if (request.contains("stability")) {
                 require(request.value("stability_media_type", "") ==
@@ -1256,7 +1256,7 @@ Json CpuDiscovery::validate(const std::string& operation, const Json& request) c
             if (request.contains("weights")) {
                 require(request.at("weights").is_object(), "fusion weights must be an object");
                 for (const auto& [key, value] : request.at("weights").items()) {
-                    require(key == "villa" || key == "dinovol" || key == "stability",
+                    require(key == "ink_model" || key == "dinovol" || key == "stability",
                             "unsupported fusion weight: " + key);
                     const double weight = value.get<double>();
                     require(std::isfinite(weight) && weight >= 0 && weight <= 100,
@@ -1380,20 +1380,20 @@ Json CpuDiscovery::validate(const std::string& operation, const Json& request) c
         require(
             request.contains("positive_examples") && request.at("positive_examples").is_array() && !request.at("positive_examples").empty(),
             "positive_examples is required");
-    } else if (operation == "ink_run_villa_inference") {
-        require(villaAvailable(), "Villa inference is not configured");
+    } else if (operation == "ink_run_resnet152_inference") {
+        require(inkModelAvailable(), "ResNet152 ink-model inference is not configured");
         require(
             request.contains("surface_volume") && request.at("surface_volume").is_object(), "surface_volume artifact reference is required");
         require(
-            request.value("surface_volume_media_type", "") == "application/vnd.villa.surface-volume+zarr",
-            "surface_volume must reference a Villa surface-volume artifact");
+            request.value("surface_volume_media_type", "") == "application/vnd.vc.surface-volume+zarr",
+            "surface_volume must reference a supported surface-volume artifact");
         out["surface_volume_path"] = existingAbsolute(request, "surface_volume_path", true).string();
-        require(request.value("model_profile", "") == "villa-resnet152-62", "only villa-resnet152-62 is supported");
+        require(request.value("model_profile", "") == "resnet152-3d-decoder-62", "only resnet152-3d-decoder-62 is supported");
         const auto device = request.value("device", "mps");
         require(device == "cpu" || device == "mps" || device == "cuda", "device must be cpu, mps, or cuda");
         const int tile = request.value("tile_size", 64);
         const int stride = request.value("stride", std::max(1, tile / 2));
-        require((tile == 64 || tile == 128 || tile == 256) && stride >= 1 && stride <= tile, "invalid Villa tile_size or stride");
+        require((tile == 64 || tile == 128 || tile == 256) && stride >= 1 && stride <= tile, "invalid ink-model tile_size or stride");
     } else if (operation == "dinovol_exemplar_search") {
         require(dinovolAvailable(), "Dinovol MPS adapter is not configured");
         require(request.contains("surface") && request.at("surface").is_object(), "registered surface artifact reference is required");
@@ -1439,8 +1439,8 @@ WorkerResult CpuDiscovery::run(const std::string& operation, const std::string& 
         return layout(output, normalized, cancelled, log);
     if (operation == "dinov3_exemplar_search")
         return dinov3(config_, output, normalized, cancelled, log);
-    if (operation == "ink_run_villa_inference")
-        return villaInference(config_, output, normalized, cancelled, log);
+    if (operation == "ink_run_resnet152_inference")
+        return resnet152Inference(config_, output, normalized, cancelled, log);
     if (operation == "dinovol_exemplar_search")
         return dinovol(config_, output, normalized, cancelled, log);
     throw std::runtime_error("unknown CPU discovery operation");

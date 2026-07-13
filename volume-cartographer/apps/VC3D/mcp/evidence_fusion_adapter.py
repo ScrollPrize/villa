@@ -207,42 +207,42 @@ def perturbation_stability(request: dict, baseline_path: Path, variant_paths: li
 
 
 def fuse_ink_scores(request: dict, output: Path) -> dict:
-    """Fuse registered Villa and DinoVol UV scores without hiding components."""
+    """Fuse registered ResNet152 ink-model and DinoVol UV scores."""
     import tifffile
     import zarr
 
-    villa_path = Path(request["villa_path"])
+    ink_model_path = Path(request["ink_model_path"])
     dinovol_path = Path(request["dinovol_path"])
-    villa_manifest = read_json(villa_path / "manifest.json")
+    ink_model_manifest = read_json(ink_model_path / "manifest.json")
     dinovol_manifest = read_json(dinovol_path / "manifest.json")
-    if villa_manifest.get("kind") != "villa_ink_prediction_v1":
-        raise ValueError("villa artifact manifest has the wrong kind")
+    if ink_model_manifest.get("kind") != "resnet152_ink_model_score_v1":
+        raise ValueError("ink-model artifact manifest has the wrong kind")
     if dinovol_manifest.get("kind") != "dinovol_registered_exemplar_v1":
         raise ValueError("DinoVol artifact manifest has the wrong kind")
 
-    villa_raw = np.load(villa_path / "ink-probability.npy", allow_pickle=False).astype(np.float32)
+    ink_model_raw = np.load(ink_model_path / "ink-model-score.npy", allow_pickle=False).astype(np.float32)
     dinovol_raw = np.load(dinovol_path / "exemplar-similarity-surface.npy", allow_pickle=False).astype(np.float32)
-    if villa_raw.ndim != 2 or villa_raw.shape != dinovol_raw.shape or villa_raw.size > MAX_PIXELS:
-        raise ValueError("Villa and DinoVol UV maps must have one matching bounded 2D shape")
-    shape = villa_raw.shape
-    if villa_manifest.get("output_shape_hw") != list(shape) or dinovol_manifest.get("surface_shape_vu") != list(shape):
+    if ink_model_raw.ndim != 2 or ink_model_raw.shape != dinovol_raw.shape or ink_model_raw.size > MAX_PIXELS:
+        raise ValueError("ink-model and DinoVol UV maps must have one matching bounded 2D shape")
+    shape = ink_model_raw.shape
+    if ink_model_manifest.get("output_shape_hw") != list(shape) or dinovol_manifest.get("surface_shape_vu") != list(shape):
         raise ValueError("component manifest dimensions do not match the UV score maps")
 
-    valid = np.isfinite(villa_raw) & np.isfinite(dinovol_raw)
-    villa_support_path = villa_path / "ink-valid.npy"
+    valid = np.isfinite(ink_model_raw) & np.isfinite(dinovol_raw)
+    ink_model_support_path = ink_model_path / "ink-valid.npy"
     dinovol_support_path = dinovol_path / "surface-support.npy"
-    if villa_support_path.is_file():
-        villa_support = np.load(villa_support_path, allow_pickle=False)
-        if villa_support.shape != shape:
-            raise ValueError("Villa support map does not match the UV score maps")
-        valid &= villa_support != 0
+    if ink_model_support_path.is_file():
+        ink_model_support = np.load(ink_model_support_path, allow_pickle=False)
+        if ink_model_support.shape != shape:
+            raise ValueError("ink-model support map does not match the UV score maps")
+        valid &= ink_model_support != 0
     if dinovol_support_path.is_file():
         dinovol_support = np.load(dinovol_support_path, allow_pickle=False)
         if dinovol_support.shape != shape:
             raise ValueError("DinoVol support map does not match the UV score maps")
         valid &= dinovol_support != 0
 
-    villa = np.clip(villa_raw, 0, 1)
+    ink_model = np.clip(ink_model_raw, 0, 1)
     selected = dinovol_raw[valid]
     if selected.size < 16:
         raise ValueError("DinoVol map has insufficient registered support")
@@ -262,7 +262,7 @@ def fuse_ink_scores(request: dict, output: Path) -> dict:
             raise ValueError("stability artifact manifest has the wrong kind")
         stability_raw = np.load(stability_path / "stability-local-score.npy", allow_pickle=False).astype(np.float32)
         if stability_raw.shape != shape or stability_manifest.get("surface_shape_vu") != list(shape):
-            raise ValueError("stability map does not match Villa/DinoVol UV shape")
+            raise ValueError("stability map does not match the ink-model/DinoVol UV shape")
         stability_support_path = stability_path / "stability-valid.npy"
         if stability_support_path.is_file():
             stability_support = np.load(stability_support_path, allow_pickle=False)
@@ -273,7 +273,7 @@ def fuse_ink_scores(request: dict, output: Path) -> dict:
         stability = np.clip(stability_raw, 0, 1)
 
     source_artifacts = {
-        "villa": villa_manifest.get("source_surface_artifact"),
+        "ink_model": ink_model_manifest.get("source_surface_artifact"),
         "dinovol": dinovol_manifest.get("source_surface_artifact"),
         "stability": stability_manifest.get("baseline_artifact") if stability_manifest else None,
     }
@@ -282,9 +282,9 @@ def fuse_ink_scores(request: dict, output: Path) -> dict:
         raise ValueError("fusion artifacts do not refer to the same registered surface")
 
     supplied_weights = request.get("weights", {})
-    if not isinstance(supplied_weights, dict) or any(key not in {"villa", "dinovol", "stability"} for key in supplied_weights):
+    if not isinstance(supplied_weights, dict) or any(key not in {"ink_model", "dinovol", "stability"} for key in supplied_weights):
         raise ValueError("unknown fusion weight")
-    weights = {"villa": 1.0, "dinovol": 1.0, "stability": 0.5 if stability is not None else 0.0}
+    weights = {"ink_model": 1.0, "dinovol": 1.0, "stability": 0.5 if stability is not None else 0.0}
     weights.update({key: float(value) for key, value in supplied_weights.items()})
     if any(not math.isfinite(value) or value < 0 or value > 100 for value in weights.values()):
         raise ValueError("fusion weights must be finite and from 0 to 100")
@@ -293,7 +293,7 @@ def fuse_ink_scores(request: dict, output: Path) -> dict:
     denominator = sum(weights.values())
     if denominator <= 0:
         raise ValueError("fusion weights cannot all be zero")
-    combined = weights["villa"] * villa + weights["dinovol"] * dinovol
+    combined = weights["ink_model"] * ink_model + weights["dinovol"] * dinovol
     if stability is not None:
         combined += weights["stability"] * stability
     combined /= denominator
@@ -303,8 +303,8 @@ def fuse_ink_scores(request: dict, output: Path) -> dict:
     group = zarr.open_group(str(output / "ink-fusion.zarr"), mode="w", zarr_format=2)
     chunks = (min(256, shape[0]), min(256, shape[1]))
     map_values = [
-        ("villa_probability_raw", villa_raw, False),
-        ("villa_probability", villa, True),
+        ("ink_model_score_raw", ink_model_raw, False),
+        ("ink_model_score", ink_model, True),
         ("dinovol_similarity_raw", dinovol_raw, False),
         ("dinovol_similarity_normalized", dinovol, True),
     ]
@@ -328,7 +328,7 @@ def fuse_ink_scores(request: dict, output: Path) -> dict:
     manifest = {
         "kind": "vc_registered_ink_fusion_v1",
         "score_semantics": "transparent_review_priority_not_calibrated_ink_probability",
-        "villa_artifact": request["villa"],
+        "ink_model_artifact": request["ink_model"],
         "dinovol_artifact": request["dinovol"],
         "stability_artifact": stability_artifact,
         "source_surface_artifacts": source_artifacts,
@@ -340,8 +340,8 @@ def fuse_ink_scores(request: dict, output: Path) -> dict:
         "shape_uv": list(shape),
         "valid_pixels": int(valid.sum()),
         "weights": weights,
-        "formula": "(w_villa*clip(villa_raw,0,1) + w_dinovol*percentile_normalized_dinovol + w_stability*clip(stability_raw,0,1)) / sum(weights)",
-        "villa_normalization": {"method": "clip", "range": [0, 1]},
+        "formula": "(w_ink_model*clip(ink_model_raw,0,1) + w_dinovol*percentile_normalized_dinovol + w_stability*clip(stability_raw,0,1)) / sum(weights)",
+        "ink_model_normalization": {"method": "clip", "range": [0, 1]},
         "dinovol_normalization": {"method": "linear_percentile_clip", "percentiles": [1, 99], "low": float(low), "high": float(high)},
         "stability_normalization": {"method": "clip", "range": [0, 1]} if stability is not None else None,
         "component_maps_preserved": component_maps,
@@ -352,7 +352,7 @@ def fuse_ink_scores(request: dict, output: Path) -> dict:
         "validity_map": {"npy": "fusion-valid.npy", "tiff": "fusion-valid.tif", "preview": "fusion-valid.png"},
         "maps": maps,
         "limitations": [
-            "Villa probabilities are uncalibrated on PHerc0332",
+            "the ResNet152 ink-model scores are uncalibrated on PHerc0332",
             "DinoVol percentile normalization is ROI-relative and not a probability",
             "stability is a perturbation-robustness measurement, not independent ink evidence",
             "the combined score is a transparent review-priority heuristic, not proof of ink or text",

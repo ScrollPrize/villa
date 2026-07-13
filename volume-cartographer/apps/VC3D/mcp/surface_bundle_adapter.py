@@ -422,16 +422,16 @@ def trilinear_sample(volume: np.ndarray, x: np.ndarray, y: np.ndarray, z: np.nda
     return result, inside
 
 
-def villa_layer_contract(profile: str) -> dict:
-    """Return layer selection matching the tracked Villa training/inference code."""
+def ink_model_layer_contract(profile: str) -> dict:
+    """Return layer selection matching the tracked ink-model inference code."""
     contracts = {
         # Legacy TimeSformer reads layers [17,43) from canonical 00..64.
-        "villa-timesformer-26": {"channels": 26, "source_layer_range": [17, 43]},
+        "timesformer-26": {"channels": 26, "source_layer_range": [17, 43]},
         # ResNet152/3D-decoder reads layers [1,63) from canonical 00..64.
-        "villa-resnet152-62": {"channels": 62, "source_layer_range": [1, 63]},
+        "resnet152-3d-decoder-62": {"channels": 62, "source_layer_range": [1, 63]},
     }
     if profile not in contracts:
-        raise ValueError(f"unsupported Villa surface-volume profile: {profile}")
+        raise ValueError(f"unsupported ink-model surface-volume profile: {profile}")
     contract = dict(contracts[profile])
     start, end = contract["source_layer_range"]
     contract["offsets_voxels"] = list(range(start - 32, end - 32))
@@ -439,12 +439,12 @@ def villa_layer_contract(profile: str) -> dict:
 
 
 def normal_stack(request: dict, artifact: Path, output: Path) -> dict:
-    """Sample a Villa-compatible H×W×C uint8 stack along surface normals."""
+    """Sample an ink-model H×W×C uint8 stack along surface normals."""
     import tifffile
     import zarr
 
-    profile = request.get("villa_profile")
-    contract = villa_layer_contract(profile)
+    profile = request.get("model_profile")
+    contract = ink_model_layer_contract(profile)
     reverse_layers = bool(request.get("reverse_layers", False))
     layer_step = float(request.get("layer_step_voxels", 1.0))
     if not math.isfinite(layer_step) or layer_step <= 0 or layer_step > 4:
@@ -457,7 +457,7 @@ def normal_stack(request: dict, artifact: Path, output: Path) -> dict:
     channels = int(contract["channels"])
     if valid.shape[0] <= channels or valid.shape[1] <= channels:
         raise ValueError(
-            "surface chart height and width must both exceed the Villa channel count; "
+            "surface chart height and width must both exceed the model channel count; "
             "the optimized loader otherwise cannot disambiguate HWC from CHW"
         )
     if valid.size * channels > MAX_SURFACE_VOLUME_VALUES:
@@ -468,7 +468,7 @@ def normal_stack(request: dict, artifact: Path, output: Path) -> dict:
     available_padding = int(root.attrs.get("normal_padding_voxels", 0))
     if required_padding > available_padding:
         raise ValueError(
-            f"Villa profile requires normal padding {required_padding}, but registered surface has {available_padding}; "
+            f"ink-model profile requires normal padding {required_padding}, but registered surface has {available_padding}; "
             "rerun surface_render_registered_roi with larger normal_padding_voxels"
         )
 
@@ -476,7 +476,7 @@ def normal_stack(request: dict, artifact: Path, output: Path) -> dict:
     region = stage_manifest["submitted_region_xyz"]
     volume = np.load(artifact / "staging" / "staged-volume.npy", allow_pickle=False)
     if volume.ndim != 3 or volume.dtype != np.uint8:
-        raise ValueError("Villa normal stacks require a staged rank-3 uint8 CT volume")
+        raise ValueError("ink-model normal stacks require a staged rank-3 uint8 CT volume")
     local = xyz.copy()
     local[..., 0] -= int(region["x"])
     local[..., 1] -= int(region["y"])
@@ -507,7 +507,7 @@ def normal_stack(request: dict, artifact: Path, output: Path) -> dict:
     )
     array[:] = stack
     array.attrs.update({
-        "kind": "villa_surface_volume",
+        "kind": "ink_model_surface_volume",
         "version": 1,
         "axes": ["v", "u", "normal_depth"],
         "profile": profile,
@@ -534,7 +534,7 @@ def normal_stack(request: dict, artifact: Path, output: Path) -> dict:
     write_png(output / "surface-volume-middle.png", stack[..., middle])
 
     manifest = {
-        "kind": "vc_villa_surface_volume_v1",
+        "kind": "vc_ink_model_surface_volume_v1",
         "score_semantics": "raw_ct_samples_not_ink_probability",
         "source_artifact": request["surface"],
         "profile": profile,
@@ -542,7 +542,7 @@ def normal_stack(request: dict, artifact: Path, output: Path) -> dict:
         "dtype": "uint8",
         "axes": ["v", "u", "normal_depth"],
         "channels": channels,
-        "villa_loader_compatible": True,
+        "ink_model_loader_compatible": True,
         "source_layer_range": contract["source_layer_range"],
         "offsets_voxels": offsets,
         "layer_step_voxels": layer_step,
@@ -558,7 +558,7 @@ def normal_stack(request: dict, artifact: Path, output: Path) -> dict:
         "middle_layer_preview": "surface-volume-middle.png",
         "middle_layer_index": middle,
         "layer_hashes": layer_hashes,
-        "villa_contract": {
+        "model_contract": {
             "timesformer_26": "train_timesformer_og.py default layer range [17,43)",
             "resnet152_62": "train_resnet3d_3d_decoder.py layer range [1,63)",
             "optimized_inference_layout": "H,W,C uint8 Zarr with chunks Htile,Wtile,1",

@@ -25,7 +25,7 @@ Resolve paths relative to this skill directory when invoking bundled scripts. Re
 7. Every asynchronous submission gets a unique, stable `client_request_id`. Reuse it only to retry the same request in the same server process.
 8. Poll `vc_get_job`; on failure, read `vc://jobs/{job_id}/logs`. Never assume submission means completion.
 9. Keep the server process alive while using jobs: state and idempotency are process-local and disappear on restart.
-10. Surface/ink scores are evidence and review priorities, not proof, calibrated probabilities, or transcription.
+10. Surface/ink scores are evidence and review priorities, not proof, calibrated probabilities, or transcription. Describe the learned output as the “ResNet152 ink-model score.”
 11. Stop after generation review unless the user explicitly approves registered rendering, normal stacks, model inference, evidence fusion, or downstream publication.
 
 ## Locate the repository and server
@@ -78,7 +78,7 @@ AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 \
   .agents/skills/vc-generate-surface/scripts/vc-mcp-setup.sh install-python
 ```
 
-Default environment: `~/.cache/vc-mcp/venvs/analysis`. Override with `VC_MCP_PYTHON_ENV=/absolute/path`. This does **not** install nnU-Net, DINOv3, DinoVol, Villa, repositories, checkpoints, or model weights. Configure those only when the user supplies and approves pinned assets. Never silently substitute an unpinned model.
+Default environment: `~/.cache/vc-mcp/venvs/analysis`. Override with `VC_MCP_PYTHON_ENV=/absolute/path`. This does **not** install nnU-Net, DINOv3, DinoVol, the ResNet152 ink model, repositories, checkpoints, or model weights. Configure those only when the user supplies and approves pinned assets. Never silently substitute an unpinned model.
 
 ## Configure and build
 
@@ -148,7 +148,7 @@ Optional adapters are enabled only when their required paths exist. Common varia
 
 - Analysis/staging: `VC_MCP_ANALYSIS_PYTHON`, `VC_MCP_VOLUME_STAGER`, `VC_MCP_SURFACE_BUNDLE_ADAPTER`, `VC_MCP_STRUCTURAL_EVIDENCE_ADAPTER`, `VC_MCP_EVIDENCE_FUSION_ADAPTER`, `VC_MCP_REVIEW_ADAPTER`.
 - nnU-Net: `VC_MCP_NNUNET_PYTHON`, `VC_MCP_NNUNET_ADAPTER`, `VC_MCP_NNUNET_MODEL_DIR`.
-- DINO/Villa: the `VC_MCP_DINOV3_*`, `VC_MCP_DINOVOL_*`, and `VC_MCP_VILLA_*` families documented in `apps/VC3D/mcp/README.md`.
+- Learned evidence: the `VC_MCP_DINOV3_*`, `VC_MCP_DINOVOL_*`, and `VC_MCP_INK_MODEL_*` families documented in `apps/VC3D/mcp/README.md`.
 
 Do not advertise an optional adapter until `vc_capabilities` confirms it.
 
@@ -290,7 +290,7 @@ On success:
 2. Call `vc_inspect_artifacts` with the job ID.
 3. Review geometry summary, generation preview, manifests, and SHA-256 inventory.
 4. Clearly state that a generated surface is not automatically correct.
-5. **Stop and request approval before** `surface_render_registered_roi`, normal-stack generation, Villa/DinoVol inference, evidence fusion/ranking, or review publication.
+5. **Stop and request approval before** `surface_render_registered_roi`, normal-stack generation, ResNet152 ink-model/DinoVol inference, evidence fusion/ranking, or review publication.
 
 ## Tool families
 
@@ -301,7 +301,7 @@ Tool names are dynamic; verify them with `tools/list`.
 - CPU discovery: `vc_render_surface_diagnostics`, `ink_compute_classical_features`, `ink_find_candidate_regions`, `ink_render_candidate_report`, `text_analyze_layout`.
 - Optional segmentation/registration: `volume_run_segmentation`, `surface_render_registered_roi`, `surface_validate_geometry`, `surface_measure_volume_alignment`, `surface_render_normal_stack`.
 - Optional evidence/review: grid/epoch tools, stability, fusion/ranking, queue/assessment/metrics tools.
-- Optional learned models: `dinov3_exemplar_search`, `dinovol_exemplar_search`, `ink_run_villa_inference`.
+- Optional learned models: `dinov3_exemplar_search`, `dinovol_exemplar_search`, `ink_run_resnet152_inference`.
 
 For chained tools, pass immutable job artifact references exactly as required by the live schema. Never replace an artifact reference with a caller-selected filesystem path.
 
