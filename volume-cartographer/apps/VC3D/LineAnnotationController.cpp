@@ -2,6 +2,7 @@
 
 #include "CState.hpp"
 #include "FiberNameDisplay.hpp"
+#include "OpenDataCoordinateIdentity.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -187,6 +188,31 @@ struct LineAnnotationController::IntersectionInspectionSession {
 };
 
 namespace {
+
+std::optional<vc3d::opendata::CoordinateIdentity> coordinateIdentityForState(
+    const CState* state)
+{
+    if (!state || !state->vpkg() || state->currentVolumeId().empty())
+        return std::nullopt;
+    return vc3d::opendata::coordinateIdentityForVolume(
+        *state->vpkg(), state->currentVolumeId());
+}
+
+void copyCoordinateIdentityToJson(
+    nlohmann::json& target,
+    const std::optional<vc3d::opendata::CoordinateIdentity>& identity)
+{
+    if (!identity)
+        return;
+    target["vc_open_data_coordinate_space"] = identity->coordinateSpace;
+    target["vc_open_data_source_path"] = identity->sourcePath;
+    target["vc_open_data_source_coordinate_level"] =
+        identity->sourceCoordinateLevel;
+    target["vc_open_data_source_coordinate_scale_factor"] =
+        identity->sourceCoordinateScaleFactor;
+    target["vc_open_data_source_original_resolution"] =
+        identity->sourceOriginalResolution;
+}
 
 constexpr double kEpsilon = 1.0e-12;
 constexpr double kLineSegmentLength = 32.0;
@@ -2128,6 +2154,7 @@ void LineAnnotationController::exportFibers()
         root["type"] = "vc3d_fiber_collection";
         root["version"] = 1;
         root["scale"] = options->scale;
+        copyCoordinateIdentityToJson(root, coordinateIdentityForState(_state));
         root["point_collections"] = nlohmann::json::array();
         for (const auto& fiber : _fibers) {
             root["point_collections"].push_back(fiberToJson(fiber, options->scale));
@@ -2400,6 +2427,11 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
                                                        selected,
                                                        zeroWindingColumn,
                                                        std::move(mapping));
+        const auto coordinateIdentity = coordinateIdentityForState(_state);
+        copyCoordinateIdentityToJson(
+            atlas.metadata.coordinateMetadata, coordinateIdentity);
+        vc3d::opendata::copyCoordinateIdentityToSurface(
+            *selected.surface, coordinateIdentity);
         vc::atlas::saveAtlasBaseMeshCopy(*selected.surface,
                                          atlasDir / atlas.metadata.baseMeshPath);
         atlas.save(atlasDir);
@@ -5744,6 +5776,8 @@ std::vector<fs::path> LineAnnotationController::saveGeneratedQuadMeshes(LineAnno
 
         auto clone = std::make_shared<QuadSurface>(surface->rawPoints().clone(), surface->scale());
         clone->meta = surface->meta;
+        vc3d::opendata::copyCoordinateIdentityToSurface(
+            *clone, coordinateIdentityForState(_state));
 
         const fs::path outputPath = nextMeshExportPath(pathsDir, stem);
         const std::string outputName = outputPath.filename().string();
@@ -6795,6 +6829,7 @@ nlohmann::json LineAnnotationController::fiberToJson(const StoredFiber& fiber, d
     for (const auto& point : serialized.linePoints) {
         root["line_points"].push_back(pointToJson(point));
     }
+    copyCoordinateIdentityToJson(root, coordinateIdentityForState(_state));
     return root;
 }
 

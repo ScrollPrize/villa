@@ -201,4 +201,4 @@ jobs:
             --verify-tag \
             --title "VC3D Stable" \
             --notes "Promoted from tested package artifacts built at commit $PROMOTION_SHA." \
-            --latest=false
+            --latest
