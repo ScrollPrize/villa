@@ -694,6 +694,17 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     CHECK(std::find(pkg->volumeEntries()[2].tags.begin(),
                     pkg->volumeEntries()[2].tags.end(),
                     "ink-detection-3d") != pkg->volumeEntries()[2].tags.end());
+    CHECK(std::find(pkg->volumeEntries()[2].tags.begin(),
+                    pkg->volumeEntries()[2].tags.end(),
+                    "vc-open-data-coordinate-level-unknown:missing-parameters.level") !=
+          pkg->volumeEntries()[2].tags.end());
+    CHECK(std::any_of(
+        result.messages.begin(), result.messages.end(), [](const std::string& message) {
+            return message.find(
+                       "Skipped coordinate pairing for scan-volume "
+                       "(ink-detection-3d-zarr) against source L0:") !=
+                   std::string::npos;
+        }));
     CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
                     pkg->volumeEntries()[0].tags.end(),
                     "vc-open-data-volume-id:scan-volume") != pkg->volumeEntries()[0].tags.end());

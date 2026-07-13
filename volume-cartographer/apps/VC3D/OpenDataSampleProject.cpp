@@ -170,6 +170,34 @@ bool isSupportedSurfacePrediction(const OpenDataArtifact& artifact)
     return lowerCopy(artifact.type) == "surface-prediction-zarr";
 }
 
+bool isSupportedInk3dPrediction(const OpenDataArtifact& artifact)
+{
+    const auto type = lowerCopy(artifact.type);
+    return type == "ink-detection-3d-zarr" ||
+           type == "ink_detection_3d_zarr";
+}
+
+bool isSupportedCoordinatePrediction(const OpenDataArtifact& artifact)
+{
+    return isSupportedSurfacePrediction(artifact) ||
+           isSupportedInk3dPrediction(artifact);
+}
+
+std::optional<int> predictionSourceCoordinateLevel(const OpenDataArtifact& artifact)
+{
+    if (artifact.sourceCoordinateLevel)
+        return artifact.sourceCoordinateLevel;
+
+    // The first published 3D-ink stores predate parameters.level. They are
+    // native-resolution predictions, but only trust that legacy convention
+    // after preflightPredictionAndSource verifies the prediction descriptor
+    // against physical source /0.
+    if (isSupportedInk3dPrediction(artifact) && !artifact.levelParameterPresent)
+        return 0;
+
+    return std::nullopt;
+}
+
 std::string coordinateSpaceId(const OpenDataSample& sample,
                               const OpenDataVolume& volume,
                               int level)
@@ -437,6 +465,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         const OpenDataArtifact* prediction = nullptr;
         std::string predictionUrl;
         std::string sourceUrl;
+        int sourceCoordinateLevel = 0;
+        bool inferredSourceCoordinateLevel = false;
     };
     std::vector<PredictionCandidate> predictions;
     std::vector<std::string> attachedLocations;
@@ -453,7 +483,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         std::string preferredSourceUrl;
         if (preferredSource) {
             preferredSourceUrl = artifactUrl(*preferredSource);
-            if (isSupportedSurfacePrediction(*preferredSource) ||
+            if (isSupportedCoordinatePrediction(*preferredSource) ||
                 !isSupportedRemoteZarr(volume, *preferredSource, preferredSourceUrl)) {
                 preferredSource = nullptr;
                 preferredSourceUrl.clear();
@@ -481,7 +511,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
                 preferredNativeSource ? std::optional<int>{0} : std::nullopt,
                 preferredNativeSource ? volume.pixelSizeUm : std::nullopt,
                 preferredNativeSource ? preferredSourceUrl : std::string{});
-            if (isSupportedSurfacePrediction(artifact) &&
+            if (isSupportedCoordinatePrediction(artifact) &&
                 !artifact.sourceCoordinateLevel) {
                 tags.push_back(
                     artifact.levelParameterPresent
@@ -526,9 +556,18 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             if (hasVolumeEntry(pkg, url))
                 attachedLocations.push_back(url);
 
-            if (isSupportedSurfacePrediction(artifact)) {
+            if (const auto level = predictionSourceCoordinateLevel(artifact)) {
                 predictions.push_back(PredictionCandidate{
-                    &volume, &artifact, url, preferredSourceUrl});
+                    &volume,
+                    &artifact,
+                    url,
+                    preferredSourceUrl,
+                    *level,
+                    !artifact.sourceCoordinateLevel.has_value()});
+            } else if (isSupportedCoordinatePrediction(artifact)) {
+                result.messages.push_back(
+                    "Kept " + label +
+                    " coordinate-unspecified: parameters.level is missing or invalid.");
             }
         }
 
@@ -543,13 +582,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         const auto& volume = *candidate.volume;
         const auto& prediction = *candidate.prediction;
         const auto predictionLabel = volumeArtifactLabel(volume, prediction);
-        if (!prediction.sourceCoordinateLevel) {
-            result.messages.push_back(
-                "Kept " + predictionLabel +
-                " coordinate-unspecified: parameters.level is missing or invalid.");
-            continue;
-        }
-        const int level = *prediction.sourceCoordinateLevel;
+        const int level = candidate.sourceCoordinateLevel;
         if (candidate.sourceUrl.empty() ||
             std::find(attachedLocations.begin(), attachedLocations.end(),
                       candidate.sourceUrl) == attachedLocations.end()) {
@@ -574,7 +607,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         } catch (const std::exception& e) {
             ++result.failedVolumes;
             result.messages.push_back(
-                "Skipped coordinate pairing for " + predictionLabel + ": " + e.what());
+                "Skipped coordinate pairing for " + predictionLabel +
+                " against source L" + std::to_string(level) + ": " + e.what());
             continue;
         }
 
@@ -587,6 +621,11 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             candidate.predictionUrl,
             predictionTags,
             coordinateSingletonPrefixes());
+        if (candidate.inferredSourceCoordinateLevel) {
+            result.messages.push_back(
+                "Paired legacy " + predictionLabel + " with source L" +
+                std::to_string(level) + " after descriptor validation.");
+        }
 
         if (level == 0)
             continue;
