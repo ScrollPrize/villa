@@ -834,8 +834,8 @@ export function Landing() {
               <ChallengeBox
                 title="Virtual Unwrapping"
                 titleHref="/2026_open_problems#2-unwrapping-turning-disconnected-voxels-into-a-surface"
-                linkText="Chart the Path"
-                href="/tutorial_VC3D"
+                linkText="Current Path"
+                href="/open_problems/winding_annotations"
                 bounty={
                   (grandPrize2027 || progressPrizes) && {
                     href: (grandPrize2027 || progressPrizes).href,
