@@ -558,7 +558,7 @@ def train(config_path):
         progress_bar.update(0)
 
     def save_checkpoint(step):
-        if not accelerator.is_main_process or step % save_every != 0 or step <= 0:
+        if not accelerator.is_main_process or (step + 1) % save_every != 0:
             return
         checkpoint = {
             'model': accelerator.get_state_dict(model),
@@ -571,7 +571,7 @@ def train(config_path):
         if ema_model is not None and ema_save_in_checkpoint:
             checkpoint['ema_model'] = ema_model.state_dict()
             checkpoint['ema_optimizer_step'] = optimizer_step
-        torch.save(checkpoint, f'{out_dir}/ckpt_{step:06}.pth')
+        torch.save(checkpoint, f'{out_dir}/ckpt_{step + 1:06}.pth')
 
     for step in progress_bar:
         model.train()
