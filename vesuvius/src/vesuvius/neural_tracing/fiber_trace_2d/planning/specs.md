@@ -605,12 +605,16 @@
   column-by-column from the same trace z layers as the z-corrected image.
   Whole-fiber presence visualization must use the fused z-corrected presence
   when it is available.
-- When z-search is enabled, Trace2CP must use a cache-level Gaussian-smoothed
-  side-presence view for presence scoring and presence display. The smoothing
-  is separable and weighted by valid pixels over the side-z layer axis and
-  strip x axis only, with radius 11 px in z and 5 px in x. It must not blur
-  across side-strip y rows. Non-z Trace2CP presence scoring remains unblurred
-  because there is no side-z stack.
+- Trace2CP z-search uses raw per-layer side-presence by default. Adding
+  `--trace2cp-presence-blur` makes Trace2CP use a cache-level
+  Gaussian-smoothed side-presence view for presence scoring and presence
+  display. The smoothing is weighted by valid pixels and runs over side-z plus
+  side-image x/y. The side-z pass uses radius 21. The side-image pass uses a
+  per-pixel anisotropic Gaussian rotated around the side-z axis to align with
+  the local predicted side direction: radius 5 along the direction and radius 1
+  across it. The kernel is symmetric, so direction sign ambiguity does not
+  change the result. Non-z Trace2CP presence scoring remains unblurred because
+  there is no side-z stack.
 - Trace2CP visualization also appends VC3D-style top-strip output sampled from
   volume coordinates, not warped from rendered side-strip pixels. Single-pair
   `trace2cp_vis.jpg` gets a top-strip debug column. Whole-fiber

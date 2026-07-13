@@ -43,8 +43,10 @@ _TRACE2CP_SIDE_DP_DZ_SMOOTH_PENALTY = 0.5
 _TRACE2CP_DP_DY_SMOOTH_PENALTY = 0.0
 _TRACE2CP_DP_DZ_SMOOTH_PENALTY = 0.0
 _TRACE2CP_DP_ANGLE_BASE_DEGREES = 10.0
-_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_Z = 11
-_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_X = 5
+_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_Z = 21
+_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_ALONG = 5
+_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_ACROSS = 1
+_TRACE2CP_SIDE_PRESENCE_BLUR_GRID_TARGET_VALUES = 8_000_000
 
 
 def _path_arg_for_config(path: str | Path) -> str:
@@ -107,69 +109,160 @@ def _trace2cp_dp_direction_angle_penalty_torch(
     return base * (1.0 + torch.clamp(theta - knee, min=0.0) / knee)
 
 
-def _trace2cp_gaussian_kernel1d(radius: int) -> torch.Tensor:
+def _trace2cp_gaussian_kernel1d(radius: int, *, device: torch.device | None = None) -> torch.Tensor:
     radius_i = max(0, int(radius))
     if radius_i == 0:
-        return torch.ones((1,), dtype=torch.float32)
+        return torch.ones((1,), dtype=torch.float32, device=device)
     sigma = max(float(radius_i) / 3.0, 1.0e-6)
-    offsets = torch.arange(-radius_i, radius_i + 1, dtype=torch.float32)
+    offsets = torch.arange(-radius_i, radius_i + 1, dtype=torch.float32, device=device)
     kernel = torch.exp(-0.5 * (offsets / float(sigma)).square())
     return kernel / torch.clamp(kernel.sum(), min=1.0e-12)
 
 
-def _trace2cp_blur_tensor_xz(
-    values_lhw: np.ndarray,
+def _trace2cp_blur_tensor_z_lhw(values_lhw: torch.Tensor, *, radius_z: int) -> torch.Tensor:
+    if values_lhw.ndim != 3:
+        raise ValueError("Trace2CP presence z blur expects a tensor shaped layers,H,W")
+    radius_i = max(0, int(radius_z))
+    if radius_i == 0:
+        return values_lhw.to(dtype=torch.float32)
+    tensor = values_lhw.to(dtype=torch.float32).permute(1, 0, 2).unsqueeze(1).contiguous()
+    kernel_z = _trace2cp_gaussian_kernel1d(radius_i, device=values_lhw.device).view(1, 1, -1, 1)
+    tensor = torch.nn.functional.pad(tensor, (0, 0, radius_i, radius_i), mode="replicate")
+    return torch.nn.functional.conv2d(tensor, kernel_z).squeeze(1).permute(1, 0, 2).contiguous()
+
+
+def _trace2cp_directional_blur_xy_lhw(
+    weighted_values_lhw: torch.Tensor,
+    weights_lhw: torch.Tensor,
+    direction_lhw2: torch.Tensor,
     *,
-    radius_z: int,
-    radius_x: int,
-) -> np.ndarray:
-    values = np.asarray(values_lhw, dtype=np.float32)
-    if values.ndim != 3:
-        raise ValueError("Trace2CP presence blur expects a stack shaped layers,H,W")
-    tensor = torch.as_tensor(values, dtype=torch.float32).permute(1, 0, 2).unsqueeze(1).contiguous()
-    radius_x_i = max(0, int(radius_x))
-    radius_z_i = max(0, int(radius_z))
-    if radius_x_i > 0:
-        kernel_x = _trace2cp_gaussian_kernel1d(radius_x_i).view(1, 1, 1, -1)
-        tensor = torch.nn.functional.pad(tensor, (radius_x_i, radius_x_i, 0, 0), mode="replicate")
-        tensor = torch.nn.functional.conv2d(tensor, kernel_x)
-    if radius_z_i > 0:
-        kernel_z = _trace2cp_gaussian_kernel1d(radius_z_i).view(1, 1, -1, 1)
-        tensor = torch.nn.functional.pad(tensor, (0, 0, radius_z_i, radius_z_i), mode="replicate")
-        tensor = torch.nn.functional.conv2d(tensor, kernel_z)
-    return tensor.squeeze(1).permute(1, 0, 2).contiguous().cpu().numpy().astype(np.float32)
+    radius_along: int,
+    radius_across: int,
+) -> torch.Tensor:
+    if weighted_values_lhw.ndim != 3 or weights_lhw.shape != weighted_values_lhw.shape:
+        raise ValueError("Trace2CP directional presence blur expects matching layers,H,W tensors")
+    if direction_lhw2.shape != (*weighted_values_lhw.shape, 2):
+        raise ValueError("Trace2CP directional presence blur expects direction shaped layers,H,W,2")
+    layers, height, width = (int(v) for v in weighted_values_lhw.shape)
+    if layers == 0:
+        return weighted_values_lhw
+    radius_along_i = max(0, int(radius_along))
+    radius_across_i = max(0, int(radius_across))
+    if radius_along_i == 0 and radius_across_i == 0:
+        return torch.divide(
+            weighted_values_lhw,
+            torch.clamp(weights_lhw, min=1.0e-6),
+        )
+    device = weighted_values_lhw.device
+    along_offsets = tuple(float(v) for v in range(-radius_along_i, radius_along_i + 1))
+    across_offsets = tuple(float(v) for v in range(-radius_across_i, radius_across_i + 1))
+    along_kernel = tuple(float(v) for v in _trace2cp_gaussian_kernel1d(radius_along_i).tolist())
+    across_kernel = tuple(float(v) for v in _trace2cp_gaussian_kernel1d(radius_across_i).tolist())
+    xy_offsets: list[tuple[float, float, float]] = []
+    for across_index, across in enumerate(across_offsets):
+        across_weight = float(across_kernel[across_index])
+        for along_index, along in enumerate(along_offsets):
+            xy_offsets.append((float(along), float(across), float(along_kernel[along_index]) * across_weight))
+
+    pixels_per_layer = max(1, height * width)
+    chunk_layers = max(1, min(layers, int(_TRACE2CP_SIDE_PRESENCE_BLUR_GRID_TARGET_VALUES) // pixels_per_layer))
+    base_x = torch.arange(width, dtype=torch.float32, device=device).view(1, 1, width)
+    base_y = torch.arange(height, dtype=torch.float32, device=device).view(1, height, 1)
+    scale_x = 0.0 if width <= 1 else 2.0 / float(width - 1)
+    scale_y = 0.0 if height <= 1 else 2.0 / float(height - 1)
+    output_chunks: list[torch.Tensor] = []
+    for start in range(0, layers, chunk_layers):
+        end = min(layers, start + chunk_layers)
+        values = weighted_values_lhw[start:end].unsqueeze(1).contiguous()
+        weights = weights_lhw[start:end].unsqueeze(1).contiguous()
+        direction = direction_lhw2[start:end].to(dtype=torch.float32)
+        direction_norm = torch.linalg.vector_norm(direction, dim=-1, keepdim=True)
+        direction_valid = torch.isfinite(direction).all(dim=-1, keepdim=True) & (direction_norm > 1.0e-6)
+        fallback = torch.zeros_like(direction)
+        fallback[..., 0] = 1.0
+        unit = torch.where(direction_valid, direction / torch.clamp(direction_norm, min=1.0e-6), fallback)
+        perp_x = -unit[..., 1]
+        perp_y = unit[..., 0]
+        accum_values = torch.zeros((end - start, height, width), dtype=torch.float32, device=device)
+        accum_weights = torch.zeros_like(accum_values)
+        for along, across, offset_weight in xy_offsets:
+            source_x = base_x + float(along) * unit[..., 0] + float(across) * perp_x
+            source_y = base_y + float(along) * unit[..., 1] + float(across) * perp_y
+            grid_x = torch.zeros_like(source_x) if width <= 1 else source_x * scale_x - 1.0
+            grid_y = torch.zeros_like(source_y) if height <= 1 else source_y * scale_y - 1.0
+            grid = torch.stack((grid_x, grid_y), dim=-1)
+            sampled_values = torch.nn.functional.grid_sample(
+                values,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            ).squeeze(1)
+            sampled_weights = torch.nn.functional.grid_sample(
+                weights,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            ).squeeze(1)
+            weight = float(offset_weight)
+            accum_values = accum_values + sampled_values * weight
+            accum_weights = accum_weights + sampled_weights * weight
+        output_chunks.append(
+            torch.divide(
+                accum_values,
+                torch.clamp(accum_weights, min=1.0e-6),
+            )
+        )
+    return torch.cat(output_chunks, dim=0).contiguous()
 
 
-def _trace2cp_blur_presence_stack_xz(
+def _trace2cp_blur_presence_stack_directional(
     presence_stack: np.ndarray,
     valid_stack: np.ndarray,
     *,
+    direction_stack: np.ndarray,
+    output_indices: tuple[int, ...] | list[int] | None = None,
     radius_z: int = _TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_Z,
-    radius_x: int = _TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_X,
+    radius_along: int = _TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_ALONG,
+    radius_across: int = _TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_ACROSS,
+    device: torch.device | None = None,
 ) -> np.ndarray:
     values = np.asarray(presence_stack, dtype=np.float32)
     valid = np.asarray(valid_stack, dtype=bool)
     if values.ndim != 3 or valid.shape != values.shape:
         raise ValueError("Trace2CP presence blur expects matching layers,H,W stacks")
-    finite = np.isfinite(values)
-    weights = (valid & finite).astype(np.float32)
-    weighted_values = np.where(finite & valid, values, np.float32(0.0)).astype(np.float32) * weights
-    blurred_values = _trace2cp_blur_tensor_xz(
-        weighted_values,
-        radius_z=radius_z,
-        radius_x=radius_x,
-    )
-    blurred_weights = _trace2cp_blur_tensor_xz(
-        weights,
-        radius_z=radius_z,
-        radius_x=radius_x,
-    )
-    return np.divide(
-        blurred_values,
-        np.maximum(blurred_weights, np.float32(1.0e-6)),
-        out=np.zeros_like(blurred_values, dtype=np.float32),
-        where=blurred_weights > np.float32(1.0e-6),
-    ).astype(np.float32)
+    directions = np.asarray(direction_stack, dtype=np.float32)
+    if directions.shape != (*values.shape, 2):
+        raise ValueError("Trace2CP directional presence blur expects direction shaped layers,H,W,2")
+    layer_count = int(values.shape[0])
+    if output_indices is None:
+        output = tuple(range(layer_count))
+    else:
+        output = tuple(int(index) for index in output_indices)
+    if any(index < 0 or index >= layer_count for index in output):
+        raise ValueError("Trace2CP directional presence blur output index is outside the source stack")
+    if len(output) == 0:
+        return np.zeros((0, int(values.shape[1]), int(values.shape[2])), dtype=np.float32)
+    blur_device = torch.device("cpu") if device is None else torch.device(device)
+    with torch.no_grad():
+        values_t = torch.as_tensor(values, dtype=torch.float32, device=blur_device)
+        valid_t = torch.as_tensor(valid, dtype=torch.bool, device=blur_device)
+        finite_t = torch.isfinite(values_t)
+        weights_t = (valid_t & finite_t).to(dtype=torch.float32)
+        weighted_t = torch.where(valid_t & finite_t, values_t, torch.zeros_like(values_t)) * weights_t
+        blurred_values_z = _trace2cp_blur_tensor_z_lhw(weighted_t, radius_z=radius_z)
+        blurred_weights_z = _trace2cp_blur_tensor_z_lhw(weights_t, radius_z=radius_z)
+        output_t = torch.as_tensor(output, dtype=torch.long, device=blur_device)
+        direction_t = torch.as_tensor(directions, dtype=torch.float32, device=blur_device).index_select(0, output_t)
+        blurred = _trace2cp_directional_blur_xy_lhw(
+            blurred_values_z.index_select(0, output_t),
+            blurred_weights_z.index_select(0, output_t),
+            direction_t,
+            radius_along=radius_along,
+            radius_across=radius_across,
+        )
+        return blurred.detach().cpu().numpy().astype(np.float32)
 
 
 def _trace2cp_z_corrected_image_u8(
@@ -1765,6 +1858,7 @@ class _Trace2CpZSearchConfig:
     enabled: bool = False
     step_voxels: float = 2.0
     max_layer: int = 4
+    presence_blur_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -2443,6 +2537,7 @@ class _Trace2CpZPlaneCache:
         center_layer: _Trace2CpZLayerPrediction,
         z_step_voxels: float,
         max_layer: int,
+        presence_blur_enabled: bool = False,
     ) -> None:
         step = float(z_step_voxels)
         if not np.isfinite(step) or step <= 0.0:
@@ -2467,6 +2562,7 @@ class _Trace2CpZPlaneCache:
         self.segment_source = segment_source
         self.z_step_voxels = step
         self.max_layer = bound
+        self.presence_blur_enabled = bool(presence_blur_enabled)
         self.center_offset = float(center_layer.sample.strip_z_offset)
         self.layers: dict[int, _Trace2CpZLayerPrediction] = {0: center_layer}
         self._subvoxel_interpolation = bool(step < 1.0)
@@ -2559,10 +2655,21 @@ class _Trace2CpZPlaneCache:
         return prediction
 
     def blurred_presence_for_layer(self, layer: int) -> np.ndarray | None:
+        if not self.presence_blur_enabled:
+            prediction = self.get(int(layer))
+            fields = getattr(prediction, "fields", None)
+            return None if fields is None else getattr(fields, "presence_hw", None)
         return self.blurred_presence_for_layers((int(layer),))[0]
 
     def blurred_presence_for_layers(self, layers: tuple[int, ...] | list[int]) -> tuple[np.ndarray | None, ...]:
         requested = tuple(int(layer) for layer in layers)
+        if not self.presence_blur_enabled:
+            presences: list[np.ndarray | None] = []
+            for layer in requested:
+                prediction = self.get(int(layer))
+                fields = getattr(prediction, "fields", None)
+                presences.append(None if fields is None else getattr(fields, "presence_hw", None))
+            return tuple(presences)
         missing = tuple(layer for layer in requested if layer not in self._blurred_presence_layers)
         if missing:
             self._populate_blurred_presence_layers(missing)
@@ -2570,12 +2677,12 @@ class _Trace2CpZPlaneCache:
 
     def _populate_blurred_presence_layers(self, requested_layers: tuple[int, ...]) -> None:
         radius_z = max(0, int(_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_Z))
-        radius_x = max(0, int(_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_X))
         min_layer = max(-int(self.max_layer), min(int(layer) for layer in requested_layers) - radius_z)
         max_layer = min(int(self.max_layer), max(int(layer) for layer in requested_layers) + radius_z)
         source_layers = tuple(range(int(min_layer), int(max_layer) + 1))
         presences: list[np.ndarray] = []
         valids: list[np.ndarray] = []
+        directions: list[np.ndarray] = []
         shape_hw: tuple[int, int] | None = None
         for layer in source_layers:
             prediction = self.get(int(layer))
@@ -2586,9 +2693,12 @@ class _Trace2CpZPlaneCache:
                     self._blurred_presence_layers[int(requested)] = None
                 return
             presence_arr = np.asarray(presence, dtype=np.float32)
+            direction_arr = np.asarray(fields.direction_xy, dtype=np.float32)
             valid_arr = np.asarray(prediction.valid_mask, dtype=bool)
             if presence_arr.ndim != 2 or valid_arr.shape != presence_arr.shape:
                 raise ValueError("Trace2CP z presence blur requires matching 2D presence and valid masks")
+            if direction_arr.shape != (*presence_arr.shape, 2):
+                raise ValueError("Trace2CP z presence blur requires direction shaped H,W,2")
             current_shape = (int(presence_arr.shape[0]), int(presence_arr.shape[1]))
             if shape_hw is None:
                 shape_hw = current_shape
@@ -2596,15 +2706,21 @@ class _Trace2CpZPlaneCache:
                 raise ValueError("Trace2CP z presence blur requires same-shaped layer presence maps")
             presences.append(presence_arr)
             valids.append(valid_arr)
-        blurred_stack = _trace2cp_blur_presence_stack_xz(
+            directions.append(direction_arr)
+        source_index = {int(layer): index for index, layer in enumerate(source_layers)}
+        output_indices = tuple(source_index[int(requested)] for requested in requested_layers)
+        blurred_stack = _trace2cp_blur_presence_stack_directional(
             np.stack(presences, axis=0).astype(np.float32, copy=False),
             np.stack(valids, axis=0).astype(bool, copy=False),
+            direction_stack=np.stack(directions, axis=0).astype(np.float32, copy=False),
+            output_indices=output_indices,
             radius_z=radius_z,
-            radius_x=radius_x,
+            radius_along=max(0, int(_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_ALONG)),
+            radius_across=max(0, int(_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_ACROSS)),
+            device=self.device,
         )
-        source_index = {int(layer): index for index, layer in enumerate(source_layers)}
-        for requested in requested_layers:
-            self._blurred_presence_layers[int(requested)] = blurred_stack[source_index[int(requested)]].astype(
+        for blurred_index, requested in enumerate(requested_layers):
+            self._blurred_presence_layers[int(requested)] = blurred_stack[int(blurred_index)].astype(
                 np.float32,
                 copy=False,
             )
@@ -9615,6 +9731,7 @@ def _evaluate_trace2cp_pair(
                 center_layer=center_prediction,
                 z_step_voxels=float(z_config.step_voxels),
                 max_layer=int(z_config.max_layer),
+                presence_blur_enabled=bool(z_config.presence_blur_enabled),
             )
             z_plane_cache = plane_cache
             z_trace_fn = (
@@ -10424,6 +10541,7 @@ def _export_trace2cp_vis(
             center_layer=center_prediction,
             z_step_voxels=float(side_top_cfg.step_voxels),
             max_layer=int(side_top_cfg.max_layer),
+            presence_blur_enabled=bool(side_top_cfg.presence_blur_enabled),
         )
         side_top_experiment = _trace_score_trace2cp_side_top_z_experiment_bidirectional(
             loader=loader,
@@ -11871,6 +11989,11 @@ def main() -> None:
     parser.add_argument("--trace2cp-image-blur-radius", type=int, default=5)
     parser.add_argument("--trace2cp-z-step-voxels", type=float, default=1.0)
     parser.add_argument("--trace2cp-z-max-layer", type=int, default=4)
+    parser.add_argument(
+        "--trace2cp-presence-blur",
+        action="store_true",
+        help="Opt in to direction-aligned side-presence blur for Trace2CP z-search scoring and display",
+    )
     parser.add_argument("--trace2cp-side-top-z-radius", type=float, default=20.0)
     parser.add_argument("--trace2cp-side-top-z-patch-size", type=int, default=64)
     parser.add_argument("--trace2cp-refine-iterations", type=int, default=0)
@@ -12000,6 +12123,7 @@ def main() -> None:
             enabled=bool(args.trace2cp_z_search),
             step_voxels=float(args.trace2cp_z_step_voxels),
             max_layer=int(args.trace2cp_z_max_layer),
+            presence_blur_enabled=bool(args.trace2cp_presence_blur),
         )
         if args.fiber_json is not None:
             if args.trace2cp_target_cp_index is not None:

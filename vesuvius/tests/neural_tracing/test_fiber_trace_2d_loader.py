@@ -1718,27 +1718,104 @@ def test_trace2cp_z_plane_cache_interpolates_subvoxel_layers(monkeypatch: pytest
     assert sorted(inferred) == [0, 1]
 
 
-def test_trace2cp_presence_blur_runs_over_z_and_x_not_y() -> None:
-    presence = np.zeros((3, 5, 9), dtype=np.float32)
+def test_trace2cp_presence_blur_follows_direction_xy_and_z() -> None:
+    presence = np.zeros((3, 7, 9), dtype=np.float32)
     valid = np.ones_like(presence, dtype=bool)
-    presence[1, 2, 4] = 1.0
+    presence[1, 3, 4] = 1.0
+    horizontal = np.zeros((*presence.shape, 2), dtype=np.float32)
+    horizontal[..., 0] = 1.0
 
-    blurred = runner_module._trace2cp_blur_presence_stack_xz(
+    blurred_horizontal = runner_module._trace2cp_blur_presence_stack_directional(
         presence,
         valid,
+        direction_stack=horizontal,
         radius_z=1,
-        radius_x=2,
+        radius_along=2,
+        radius_across=0,
+        device=torch.device("cpu"),
     )
 
-    assert blurred.shape == presence.shape
-    assert float(blurred[1, 2, 4]) < 1.0
-    assert float(blurred[1, 2, 4]) > 0.0
-    assert float(blurred[0, 2, 4]) > 0.0
-    assert float(blurred[1, 2, 3]) > 0.0
-    assert float(blurred[1, 1, 4]) == pytest.approx(0.0)
+    assert blurred_horizontal.shape == presence.shape
+    assert float(blurred_horizontal[1, 3, 4]) < 1.0
+    assert float(blurred_horizontal[1, 3, 4]) > 0.0
+    assert float(blurred_horizontal[0, 3, 4]) > 0.0
+    assert float(blurred_horizontal[1, 3, 3]) > 0.0
+    assert float(blurred_horizontal[1, 2, 4]) == pytest.approx(0.0)
+
+    vertical = np.zeros((*presence.shape, 2), dtype=np.float32)
+    vertical[..., 1] = 1.0
+    blurred_vertical = runner_module._trace2cp_blur_presence_stack_directional(
+        presence,
+        valid,
+        direction_stack=vertical,
+        radius_z=0,
+        radius_along=2,
+        radius_across=0,
+        device=torch.device("cpu"),
+    )
+
+    assert float(blurred_vertical[1, 2, 4]) > 0.0
+    assert float(blurred_vertical[1, 3, 3]) == pytest.approx(0.0)
+
+    flipped = horizontal.copy()
+    flipped[..., 0] = -1.0
+    blurred_flipped = runner_module._trace2cp_blur_presence_stack_directional(
+        presence,
+        valid,
+        direction_stack=flipped,
+        radius_z=1,
+        radius_along=2,
+        radius_across=0,
+        device=torch.device("cpu"),
+    )
+    np.testing.assert_allclose(blurred_flipped, blurred_horizontal, atol=1.0e-6)
+
+
+def test_trace2cp_z_plane_cache_presence_blur_disabled_by_default() -> None:
+    presence = np.zeros((5, 11), dtype=np.float32)
+    presence[2, 5] = 1.0
+    direction = np.zeros((5, 11, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    center_layer = runner_module._Trace2CpZLayerPrediction(
+        layer=0,
+        z_voxels=0.0,
+        sample=SimpleNamespace(strip_z_offset=0.0),
+        image=np.zeros(presence.shape, dtype=np.float32),
+        valid_mask=np.ones(presence.shape, dtype=bool),
+        fields=_Trace2CpPredictedFields(
+            direction_xy=direction,
+            embedding_chw=None,
+            presence_hw=presence,
+        ),
+    )
+    cache = runner_module._Trace2CpZPlaneCache(
+        loader=object(),
+        model=torch.nn.Identity(),
+        sample_index=123,
+        target_cp_index=1,
+        target_offset=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        row_axis_alignment_line_index=None,
+        row_axis_alignment_xyz=None,
+        device=torch.device("cpu"),
+        segment_source=object(),
+        center_layer=center_layer,
+        z_step_voxels=1.0,
+        max_layer=1,
+    )
+
+    raw = cache.blurred_presence_for_layer(0)
+
+    assert raw is not None
+    np.testing.assert_array_equal(raw, presence)
+    assert cache._blurred_presence_layers == {}
 
 
 def test_trace2cp_z_plane_cache_blurs_presence_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner_module, "_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_Z", 1)
+    monkeypatch.setattr(runner_module, "_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_ALONG", 2)
+    monkeypatch.setattr(runner_module, "_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_ACROSS", 0)
     valid = np.ones((5, 11), dtype=bool)
 
     def make_sample(offset: float) -> FiberStripSegmentSample:
@@ -1811,6 +1888,7 @@ def test_trace2cp_z_plane_cache_blurs_presence_layers(monkeypatch: pytest.Monkey
         center_layer=center_layer,
         z_step_voxels=1.0,
         max_layer=1,
+        presence_blur_enabled=True,
     )
 
     blurred = cache.blurred_presence_for_layer(0)
@@ -2879,6 +2957,7 @@ def test_no_training_or_tta_image_space_geometric_augmentation_helpers_exist() -
         text = path.read_text(encoding="utf-8")
         if path.name == "runner.py":
             for allowed_name, end_marker in (
+                ("_trace2cp_directional_blur_xy_lhw", "\ndef _trace2cp_blur_presence_stack_directional"),
                 ("_direction_field_overlay_rgb", "\n@dataclass"),
                 ("_dir_vis_image_space_augmentations", "\ndef _render_dir_vis_panel"),
             ):

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-14
+
+- Changed Trace2CP z-search side-presence smoothing from axis-aligned x/z blur
+  to a direction-aligned anisotropic x/y blur plus side-z smoothing, weighted by
+  valid pixels and symmetric under direction sign ambiguity.
+- Put Trace2CP side-presence smoothing behind `--trace2cp-presence-blur`; raw
+  per-layer presence is again the default for z-search scoring/display.
+
 ## 2026-07-13
 
 - Added cache-level Gaussian smoothing for Trace2CP z-search side-presence
