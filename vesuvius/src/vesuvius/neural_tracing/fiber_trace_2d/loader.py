@@ -3497,6 +3497,34 @@ class FiberStrip2DLoader:
         *,
         normal_offsets_by_column: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
+        coords_xyz, grid_valid = self.trace2cp_top_strip_coords_xyz(
+            source,
+            normal_offsets_by_column=normal_offsets_by_column,
+        )
+        coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32, copy=False)
+        result = source.record.sampler.sample_coords(coords_zyx, grid_valid)
+        image = np.asarray(result.image, dtype=np.float32)
+        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        return image, valid_mask
+
+    def trace2cp_segment_coords_xyz(
+        self,
+        source: _Trace2CpSegmentSource,
+        *,
+        strip_z_offset: float | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        offset = float(source.center_offset) if strip_z_offset is None else float(strip_z_offset)
+        grid = self._offset_grid_from_source(source, offset)
+        coords_xyz = _as_numpy_float32(grid.coords_xyz)
+        grid_valid = _as_numpy_bool(grid.valid_mask)
+        return coords_xyz, grid_valid
+
+    def trace2cp_top_strip_coords_xyz(
+        self,
+        source: _Trace2CpSegmentSource,
+        *,
+        normal_offsets_by_column: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         grid = build_top_strip_patch_grid_tensor_from_line_window(
             source.line_window,
             patch_shape_hw=source.source_shape_hw,
@@ -3506,14 +3534,23 @@ class FiberStrip2DLoader:
             normal_offsets_by_column=normal_offsets_by_column,
             device=source.grid.coords_zyx.device,
         )
-        coords_zyx = _as_numpy_float32(grid.coords_zyx)
+        coords_xyz = _as_numpy_float32(grid.coords_xyz)
         grid_valid = _as_numpy_bool(grid.valid_mask)
+        return coords_xyz, grid_valid
+
+    def sample_trace2cp_traced_top_strip_source(
+        self,
+        source: _Trace2CpSegmentSource,
+        trace_xyz: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        coords_xyz, grid_valid = self.trace2cp_traced_top_strip_coords_xyz(source, trace_xyz)
+        coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32, copy=False)
         result = source.record.sampler.sample_coords(coords_zyx, grid_valid)
         image = np.asarray(result.image, dtype=np.float32)
         valid_mask = np.asarray(result.valid_mask, dtype=bool)
         return image, valid_mask
 
-    def sample_trace2cp_traced_top_strip_source(
+    def trace2cp_traced_top_strip_coords_xyz(
         self,
         source: _Trace2CpSegmentSource,
         trace_xyz: np.ndarray,
@@ -3579,11 +3616,7 @@ class FiberStrip2DLoader:
             & np.isfinite(coords_xyz).all(axis=2)
             & np.isfinite(side_axes).all(axis=1)[None, :]
         )
-        coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32, copy=False)
-        result = source.record.sampler.sample_coords(coords_zyx, grid_valid)
-        image = np.asarray(result.image, dtype=np.float32)
-        valid_mask = np.asarray(result.valid_mask, dtype=bool)
-        return image, valid_mask
+        return coords_xyz.astype(np.float32, copy=False), grid_valid.astype(bool, copy=False)
 
     def sample_trace2cp_segment_source(
         self,

@@ -168,6 +168,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace_median_tta_direction_line,
     _trace_side_top_z_line_to_target,
     _to_u8_display_image,
+    _write_scalar_surface_obj,
     _write_trace2cp_side_top_z_top_slice_debug,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
@@ -942,6 +943,33 @@ def test_side_presence_z_pillar_image_shifts_columns_by_trace_z() -> None:
     # The center row is relative z=0, so with trace z=+1 it samples absolute layer +1.
     assert int(shifted[2, 3]) == int(np.uint8(np.clip((0.5 + 0.125) * 255.0, 0.0, 255.0)))
     assert not bool(shifted_valid[-1, 3])
+
+
+def test_write_scalar_surface_obj_skips_invalid_vertices_and_faces(tmp_path: Path) -> None:
+    yy, xx = np.meshgrid(np.arange(3, dtype=np.float32), np.arange(3, dtype=np.float32), indexing="ij")
+    coords = np.stack([xx, yy, np.zeros_like(xx)], axis=2)
+    scalar = np.arange(9, dtype=np.float32).reshape(3, 3)
+    valid = np.ones((3, 3), dtype=bool)
+    valid[2, 2] = False
+    path = tmp_path / "surface.obj"
+
+    vertices, faces = _write_scalar_surface_obj(
+        path,
+        coords,
+        scalar,
+        valid,
+        scalar_min=0.0,
+        scalar_max=8.0,
+        object_name="test_surface",
+    )
+
+    text = path.read_text(encoding="utf-8").splitlines()
+    assert vertices == 8
+    assert faces == 3
+    assert sum(1 for line in text if line.startswith("v ")) == 8
+    assert sum(1 for line in text if line.startswith("f ")) == 3
+    assert "v 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000" in text
+    assert "v 1.000000 1.000000 0.000000 0.500000 0.500000 0.500000" in text
 
 
 def test_trace2cp_target_column_wins_over_next_rf_margin() -> None:

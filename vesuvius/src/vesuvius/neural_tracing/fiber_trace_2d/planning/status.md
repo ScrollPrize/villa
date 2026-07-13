@@ -1,10 +1,12 @@
-# Trace2CP Top-Slice Presence Visualization Status
+# Trace2CP Side Z-Axis Correction Status
 
-- [x] Read current request and fiber_trace_2d AGENTS workflow.
-- [x] Locate Trace2CP evaluation and overlay rendering paths.
-- [x] Update task and task plan.
-- [x] Add projected side-presence top-strip evaluation fields.
-- [x] Render projected presence rows for single-pair and whole-fiber Trace2CP.
-- [x] Update focused tests.
-- [x] Update specs, docs, changelog, and task log.
-- [x] Run focused validation.
+- [x] Read current task request.
+- [x] Inspect relevant side-strip geometry and Trace2CP z-layer call sites.
+- [x] Write task definition.
+- [x] Write implementation plan.
+- [x] Include spec/docs/testing plan.
+- [ ] Review plan against existing specs before implementation.
+- [ ] Implement explicit side z-axis handling.
+- [ ] Update specs/docs/changelog/task log.
+- [ ] Add/update tests.
+- [ ] Run focused/full validation.

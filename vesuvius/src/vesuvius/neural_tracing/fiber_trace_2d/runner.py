@@ -182,6 +182,46 @@ def _trace2cp_z_corrected_presence_u8(
     return output, missing, layers_by_column
 
 
+def _trace2cp_z_corrected_surface_coords_xyz(
+    loader: FiberStrip2DLoader,
+    segment_source: Any,
+    *,
+    layer_columns: np.ndarray,
+    z_step_voxels: float,
+    fallback_shape_hw: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    height, width = (int(v) for v in fallback_shape_hw)
+    layers = np.asarray(layer_columns, dtype=np.int32).reshape(-1)
+    if int(layers.size) != width:
+        raise ValueError(
+            "z-corrected surface layer column count must match strip width: "
+            f"got {int(layers.size)}, expected {width}"
+        )
+    coords = np.full((height, width, 3), np.nan, dtype=np.float32)
+    valid = np.zeros((height, width), dtype=bool)
+    center_offset = float(getattr(segment_source, "center_offset"))
+    for layer in sorted(int(v) for v in np.unique(layers) if int(v) > -9999):
+        layer_cols = layers == int(layer)
+        if not bool(np.any(layer_cols)):
+            continue
+        layer_offset = center_offset + float(layer) * float(z_step_voxels)
+        layer_coords, layer_valid = loader.trace2cp_segment_coords_xyz(
+            segment_source,
+            strip_z_offset=layer_offset,
+        )
+        layer_coords = np.asarray(layer_coords, dtype=np.float32)
+        layer_valid = np.asarray(layer_valid, dtype=bool)
+        if layer_coords.shape != coords.shape or layer_valid.shape != valid.shape:
+            raise ValueError(
+                "z-corrected surface layer grid shape mismatch: "
+                f"expected coords={coords.shape} valid={valid.shape}, "
+                f"got coords={layer_coords.shape} valid={layer_valid.shape}"
+            )
+        coords[:, layer_cols, :] = layer_coords[:, layer_cols, :]
+        valid[:, layer_cols] = layer_valid[:, layer_cols]
+    return coords, valid
+
+
 def _trace2cp_z_layer_tiff_stack(
     plane_cache: "_Trace2CpZPlaneCache",
 ) -> tuple[np.ndarray, tuple[str, ...]]:
@@ -337,6 +377,81 @@ def _write_jpg(path: Path, image_u8: np.ndarray) -> None:
     image = np.asarray(image_u8, dtype=np.uint8)
     mode = "RGB" if image.ndim == 3 and image.shape[-1] == 3 else "L"
     Image.fromarray(image, mode=mode).save(path, quality=95)
+
+
+def _scalar_values_to_obj_gray(
+    scalar: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    scalar_min: float,
+    scalar_max: float,
+) -> np.ndarray:
+    values = np.asarray(scalar, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if values.shape != valid.shape:
+        raise ValueError("scalar and valid_mask must have matching shapes")
+    lo = float(scalar_min)
+    hi = float(scalar_max)
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        raise ValueError("OBJ scalar range must be finite with max > min")
+    normalized = np.zeros(values.shape, dtype=np.float32)
+    finite = valid & np.isfinite(values)
+    normalized[finite] = np.clip((values[finite] - lo) / (hi - lo), 0.0, 1.0)
+    return normalized
+
+
+def _write_scalar_surface_obj(
+    path: Path,
+    coords_xyz: np.ndarray,
+    scalar: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    scalar_min: float,
+    scalar_max: float,
+    object_name: str,
+) -> tuple[int, int]:
+    coords = np.asarray(coords_xyz, dtype=np.float32)
+    values = np.asarray(scalar, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if coords.ndim != 3 or coords.shape[2] != 3:
+        raise ValueError(f"coords_xyz must have shape H,W,3; got {coords.shape}")
+    if values.shape != coords.shape[:2] or valid.shape != coords.shape[:2]:
+        raise ValueError(
+            "scalar and valid_mask must match coords spatial shape: "
+            f"coords={coords.shape} scalar={values.shape} valid={valid.shape}"
+        )
+    finite = valid & np.isfinite(values) & np.isfinite(coords).all(axis=2)
+    gray = _scalar_values_to_obj_gray(values, finite, scalar_min=scalar_min, scalar_max=scalar_max)
+    height, width = (int(v) for v in finite.shape)
+    vertex_indices = np.zeros((height, width), dtype=np.int64)
+    lines: list[str] = [
+        "# vertex-colored OBJ written by fiber_trace_2d Trace2CP",
+        f"o {object_name}",
+    ]
+    vertex_count = 0
+    for y in range(height):
+        for x in range(width):
+            if not bool(finite[y, x]):
+                continue
+            vertex_count += 1
+            vertex_indices[y, x] = vertex_count
+            px, py, pz = (float(v) for v in coords[y, x])
+            c = float(gray[y, x])
+            lines.append(f"v {px:.6f} {py:.6f} {pz:.6f} {c:.6f} {c:.6f} {c:.6f}")
+    face_count = 0
+    for y in range(height - 1):
+        for x in range(width - 1):
+            v00 = int(vertex_indices[y, x])
+            v01 = int(vertex_indices[y, x + 1])
+            v11 = int(vertex_indices[y + 1, x + 1])
+            v10 = int(vertex_indices[y + 1, x])
+            if v00 == 0 or v01 == 0 or v11 == 0 or v10 == 0:
+                continue
+            face_count += 1
+            lines.append(f"f {v00} {v01} {v11} {v10}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return vertex_count, face_count
 
 
 def _draw_cp_crosshair(image: np.ndarray, cp_xy: np.ndarray | None) -> np.ndarray:
@@ -9387,12 +9502,6 @@ def _evaluate_trace2cp_pair(
         with _Timer() as top_original_timer:
             top_strip_image, top_strip_valid_mask = loader.sample_trace2cp_top_strip_source(segment_source)
         _append_trace2cp_timing(timing_rows, "top_strip_original", top_original_timer.elapsed_ms)
-        if z_plane_cache is not None:
-            top_strip_presence_image, top_strip_presence_valid_mask = _side_presence_z_pillar_image(
-                z_plane_cache,
-                sample.line_xy,
-                width=int(image.shape[1]),
-            )
         fused_center_xyz: np.ndarray | None = None
         fused_xy = np.asarray(selected_result.refinement.fused_resampled_xy, dtype=np.float32)
         if fused_xy.ndim == 2 and fused_xy.shape[1] == 2 and fused_xy.shape[0] > 0:
@@ -9406,12 +9515,6 @@ def _evaluate_trace2cp_pair(
                     fused_center_xyz,
                 )
             _append_trace2cp_timing(timing_rows, "top_strip_traced", top_traced_timer.elapsed_ms)
-            if z_plane_cache is not None:
-                traced_top_strip_presence_image, traced_top_strip_presence_valid_mask = _side_presence_z_pillar_image(
-                    z_plane_cache,
-                    fused_xy,
-                    width=int(image.shape[1]),
-                )
         fused_z_trace = (
             None
             if z_search_debug is None
@@ -9424,12 +9527,6 @@ def _evaluate_trace2cp_pair(
                     fused_z_trace,
                 )
             _append_trace2cp_timing(timing_rows, "top_strip_z_traced", top_z_timer.elapsed_ms)
-            if z_plane_cache is not None:
-                z_top_strip_presence_image, z_top_strip_presence_valid_mask = _side_presence_z_pillar_image(
-                    z_plane_cache,
-                    fused_z_trace,
-                    width=int(image.shape[1]),
-                )
         if top_model is not None:
             top_direction_image: np.ndarray | None
             top_direction_valid: np.ndarray | None
@@ -9740,6 +9837,166 @@ def _write_trace2cp_iteration_artifacts(
     )
 
 
+def _write_trace2cp_obj_surfaces(
+    loader: FiberStrip2DLoader,
+    evaluation: _Trace2CpPairEvaluation,
+    output_dir: Path,
+) -> list[str]:
+    segment_source = evaluation.segment_source
+    if segment_source is None:
+        raise ValueError("Trace2CP OBJ export requires a segment source")
+    obj_dir = output_dir / "trace2cp_obj"
+    obj_dir.mkdir(parents=True, exist_ok=True)
+    for path in obj_dir.glob("*.obj"):
+        path.unlink()
+
+    rows: list[str] = ["name path vertices faces scalar"]
+
+    def add_surface(
+        name: str,
+        coords_xyz: np.ndarray,
+        scalar: np.ndarray,
+        valid_mask: np.ndarray,
+        *,
+        scalar_min: float,
+        scalar_max: float,
+        scalar_label: str,
+    ) -> None:
+        path = obj_dir / f"{name}.obj"
+        vertices, faces = _write_scalar_surface_obj(
+            path,
+            coords_xyz,
+            scalar,
+            valid_mask,
+            scalar_min=scalar_min,
+            scalar_max=scalar_max,
+            object_name=name,
+        )
+        rows.append(f"{name} {path.name} {int(vertices)} {int(faces)} {scalar_label}")
+
+    side_coords, side_grid_valid = loader.trace2cp_segment_coords_xyz(
+        segment_source,
+        strip_z_offset=float(evaluation.sample.strip_z_offset),
+    )
+    side_valid = np.asarray(side_grid_valid, dtype=bool) & np.asarray(evaluation.valid_mask, dtype=bool)
+    add_surface(
+        "side_volume",
+        side_coords,
+        evaluation.image,
+        side_valid,
+        scalar_min=0.0,
+        scalar_max=255.0,
+        scalar_label="volume_0_255",
+    )
+    if evaluation.presence_debug is not None:
+        add_surface(
+            "side_presence",
+            side_coords,
+            evaluation.presence_debug,
+            side_valid,
+            scalar_min=0.0,
+            scalar_max=1.0,
+            scalar_label="presence_0_1",
+        )
+
+    z_debug = evaluation.z_search_debug
+    if z_debug is not None:
+        for name, image, presence, layer_columns in (
+            ("z_forward", z_debug.forward_z_image, z_debug.forward_z_presence, z_debug.forward_layer_columns),
+            ("z_reverse", z_debug.reverse_z_image, z_debug.reverse_z_presence, z_debug.reverse_layer_columns),
+            ("z_fused", z_debug.fused_z_image, z_debug.fused_z_presence, z_debug.fused_layer_columns),
+        ):
+            coords, coord_valid = _trace2cp_z_corrected_surface_coords_xyz(
+                loader,
+                segment_source,
+                layer_columns=layer_columns,
+                z_step_voxels=float(z_debug.z_step_voxels),
+                fallback_shape_hw=tuple(int(v) for v in image.shape),
+            )
+            add_surface(
+                f"{name}_volume",
+                coords,
+                image,
+                coord_valid,
+                scalar_min=0.0,
+                scalar_max=255.0,
+                scalar_label="volume_0_255",
+            )
+            if presence is not None:
+                add_surface(
+                    f"{name}_presence",
+                    coords,
+                    presence,
+                    coord_valid,
+                    scalar_min=0.0,
+                    scalar_max=255.0,
+                    scalar_label="presence_u8_0_255",
+                )
+
+    if evaluation.top_strip_image is not None and evaluation.top_strip_valid_mask is not None:
+        top_coords, top_grid_valid = loader.trace2cp_top_strip_coords_xyz(segment_source)
+        add_surface(
+            "top_original_volume",
+            top_coords,
+            evaluation.top_strip_image,
+            np.asarray(top_grid_valid, dtype=bool) & np.asarray(evaluation.top_strip_valid_mask, dtype=bool),
+            scalar_min=0.0,
+            scalar_max=255.0,
+            scalar_label="volume_0_255",
+        )
+
+    fused_xy = np.asarray(evaluation.selected_result.refinement.fused_resampled_xy, dtype=np.float32)
+    if (
+        evaluation.traced_top_strip_image is not None
+        and evaluation.traced_top_strip_valid_mask is not None
+        and fused_xy.ndim == 2
+        and fused_xy.shape[1] == 2
+        and fused_xy.shape[0] > 0
+    ):
+        fused_center_xyz = np.concatenate(
+            [fused_xy, np.zeros((int(fused_xy.shape[0]), 1), dtype=np.float32)],
+            axis=1,
+        )
+        traced_coords, traced_grid_valid = loader.trace2cp_traced_top_strip_coords_xyz(
+            segment_source,
+            fused_center_xyz,
+        )
+        add_surface(
+            "top_traced_volume",
+            traced_coords,
+            evaluation.traced_top_strip_image,
+            np.asarray(traced_grid_valid, dtype=bool)
+            & np.asarray(evaluation.traced_top_strip_valid_mask, dtype=bool),
+            scalar_min=0.0,
+            scalar_max=255.0,
+            scalar_label="volume_0_255",
+        )
+
+    fused_z = None if z_debug is None else _trace2cp_nonempty_xyz_trace_or_none(z_debug.fused_trace_xyz)
+    if (
+        fused_z is not None
+        and evaluation.z_top_strip_image is not None
+        and evaluation.z_top_strip_valid_mask is not None
+    ):
+        z_top_coords, z_top_grid_valid = loader.trace2cp_traced_top_strip_coords_xyz(
+            segment_source,
+            fused_z,
+        )
+        add_surface(
+            "top_z_traced_volume",
+            z_top_coords,
+            evaluation.z_top_strip_image,
+            np.asarray(z_top_grid_valid, dtype=bool) & np.asarray(evaluation.z_top_strip_valid_mask, dtype=bool),
+            scalar_min=0.0,
+            scalar_max=255.0,
+            scalar_label="volume_0_255",
+        )
+
+    manifest = obj_dir / "manifest.txt"
+    manifest.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return rows[1:]
+
+
 def _export_trace2cp_vis(
     loader: FiberStrip2DLoader,
     sample_index: int,
@@ -9768,6 +10025,7 @@ def _export_trace2cp_vis(
     side_top_z_experiment: bool = False,
     side_top_z_radius_px: float = 20.0,
     side_top_z_patch_size: int = 64,
+    export_obj: bool = False,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -10066,6 +10324,11 @@ def _export_trace2cp_vis(
         with _Timer() as z_tif_timer:
             _write_trace2cp_z_layers_tif(z_layer_tif_path, z_debug)
         _append_trace2cp_timing(timing_rows, "write_z_layers_tif", z_tif_timer.elapsed_ms)
+    obj_rows: list[str] = []
+    if bool(export_obj):
+        with _Timer() as obj_timer:
+            obj_rows = _write_trace2cp_obj_surfaces(loader, evaluation, out)
+        _append_trace2cp_timing(timing_rows, "write_obj_surfaces", obj_timer.elapsed_ms)
     if z_debug is None:
         z_summary_lines = ["trace2cp_z_search=false"]
     else:
@@ -10115,6 +10378,9 @@ def _export_trace2cp_vis(
         f"trace2cp_top_model_direction_source={evaluation.top_model_direction_source}",
         f"trace2cp_top_model_direction_count={int(evaluation.top_model_direction_count)}",
         f"trace2cp_top_model_direction_debug={evaluation.top_model_direction_debug}",
+        f"trace2cp_obj_export={bool(export_obj)}",
+        f"trace2cp_obj_dir={str(out / 'trace2cp_obj') if bool(export_obj) else ''}",
+        f"trace2cp_obj_surfaces={len(obj_rows)}",
         *side_top_summary_lines,
         f"trace_points={trace_points}",
         f"trace2cp_error={metric.error:.8f}",
@@ -10279,6 +10545,12 @@ def _export_trace2cp_vis(
             "trace2cp z_layers_tif "
             f"path={z_layer_tif_path} "
             f"pages={0 if z_debug is None or z_debug.layer_tiff_stack is None else int(z_debug.layer_tiff_stack.shape[0])}"
+        )
+    if obj_rows:
+        print(
+            "trace2cp obj "
+            f"dir={out / 'trace2cp_obj'} "
+            f"surfaces={len(obj_rows)}"
         )
     _print_trace2cp_timing_table(timing_rows, title="trace2cp timings")
     print(f"exported trace2cp_vis.jpg and trace2cp_summary.txt to {out}")
@@ -11254,6 +11526,7 @@ def main() -> None:
         help="Use the experimental monotone dynamic-programming backend for combined Trace2CP; z-search alone uses the stepwise tracer",
     )
     parser.add_argument("--trace2cp-z-layers-tif", action="store_true")
+    parser.add_argument("--trace2cp-obj", action="store_true")
     parser.add_argument("--trace2cp-top-model-dir-vis", action="store_true")
     parser.add_argument("--trace2cp-side-top-z-experiment", action="store_true")
     parser.add_argument("--med-tta", action="store_true")
@@ -11395,10 +11668,14 @@ def main() -> None:
             raise SystemExit("--trace2cp-z-search does not currently support --med-tta")
         if args.trace2cp_z_layers_tif and not args.trace2cp_z_search:
             raise SystemExit("--trace2cp-z-layers-tif requires --trace2cp-z-search")
+        if args.trace2cp_obj and args.fiber_json is not None:
+            raise SystemExit("--trace2cp-obj currently supports single-pair --trace2cp-vis only, not --fiber-json")
         if args.trace2cp_side_top_z_experiment and args.trace2cp_dp:
             raise SystemExit("--trace2cp-side-top-z-experiment is exclusive and does not run --trace2cp-dp")
         if args.trace2cp_side_top_z_experiment and args.trace2cp_z_layers_tif:
             raise SystemExit("--trace2cp-side-top-z-experiment does not write --trace2cp-z-layers-tif")
+        if args.trace2cp_side_top_z_experiment and args.trace2cp_obj:
+            raise SystemExit("--trace2cp-side-top-z-experiment does not currently write --trace2cp-obj")
         if int(args.trace2cp_refine_iterations) < 0:
             raise SystemExit("--trace2cp-refine-iterations must be >= 0")
         if int(args.trace2cp_refine_smooth_window) < 1:
@@ -11470,6 +11747,7 @@ def main() -> None:
             side_top_z_experiment=bool(args.trace2cp_side_top_z_experiment),
             side_top_z_radius_px=float(args.trace2cp_side_top_z_radius),
             side_top_z_patch_size=int(args.trace2cp_side_top_z_patch_size),
+            export_obj=bool(args.trace2cp_obj),
         )
         return
 

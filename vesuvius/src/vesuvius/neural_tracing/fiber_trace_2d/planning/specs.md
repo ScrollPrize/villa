@@ -632,8 +632,11 @@
   line. For the z-search fused line, each column is shifted by that column's
   selected z value (`round(z_voxels / z_step_voxels)`), so the center row
   represents relative z=0 at the layer actually used by the trace. These rows
-  are visualization-only, do not use the optional top-view model, and must not
-  affect Trace2CP scoring, z-search, or training.
+  are side-stack projections rather than true top-strip surface predictions;
+  if the side presence field is broad or similar across shifted layers they
+  can resemble a narrow side-presence slice. They are visualization-only, do
+  not use the optional top-view model, and must not affect Trace2CP scoring,
+  z-search, or training.
 - `--trace2cp-top-model-dir-vis` requires a checkpoint with
   `top_model_state_dict`. It samples a fixed top-strip normal-offset stack
   around the traced fused top strip using offsets `-4..+4` selected-scale
@@ -774,6 +777,16 @@
   maps in the same sorted z-layer order. The export must use the existing
   z-search cache, must not re-sample the volume, and must not interpolate
   between z layers.
+- `--trace2cp-vis --trace2cp-obj` is an opt-in single-pair diagnostic export.
+  It writes vertex-colored OBJ meshes under `trace2cp_obj/` plus a manifest.
+  OBJ geometry must come from the same sampled Trace2CP coordinate grids used
+  for image loading: center side strip, z-search selected side-strip columns,
+  original top strip, traced fused top strip, and z-corrected traced top strip
+  when those surfaces exist. Vertex colors are grayscale scalar values from the
+  corresponding volume image (`0..255`) or side-model sheet/fiber presence
+  (`0..1` for raw presence, `0..255` for z-corrected debug presence). Quad
+  faces are emitted only where all four vertices are valid. The flag is not
+  currently supported by whole-fiber `--fiber-json` Trace2CP output.
 - Single-pair `trace2cp_vis.jpg` includes an additional embedding-debug column
   when the checkpoint exposes embedding channels. The column renders cosine
   similarity maps for the start CP embedding, target CP embedding, same-fiber

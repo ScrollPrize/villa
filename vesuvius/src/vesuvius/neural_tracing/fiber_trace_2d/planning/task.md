@@ -1,17 +1,17 @@
-# Trace2CP Top-Slice Presence Visualization
+# Trace2CP Side Z-Axis Correction
 
-- Add additional Trace2CP top-slice visualization rows for the side-strip
-  sheet/fiber-presence output.
-- These rows must use the existing side model presence head, not the optional
-  top-view model.
-- Show the projected presence below the regular top-strip slices for:
-  - original/init top strip;
-  - traced fused central-z top strip;
-  - traced fused z-corrected top strip when z-search is active.
-- Keep this visualization-only. It must not affect Trace2CP scoring, z-search,
-  training, or top-model inference.
-- Replace the previous top-presence projection with a z-pillar debug view:
-  each image column is the presence sampled from the inferred side-slice stack
-  across z layers. With `--trace2cp-z-max-layer 40`, the image is 81 px high.
-- For the z-search fused trace z-pillar, shift each column by that column's
-  selected z value so the center row is relative z=0 around the used layer.
+- Fix Trace2CP side-strip z-search so the z axis is the normal of the
+  side-strip surface, not the side-strip row/y axis.
+- In side-strip coordinates, x follows the fiber/tangent and y follows the
+  Lasagna mesh-normal/row direction. Z-search must move along the remaining
+  out-of-plane side axis, roughly orthogonal to side-strip y.
+- Apply this consistently to all Trace2CP side z-layer users:
+  - regular stepwise combined z-search;
+  - the joint/combined side search path;
+  - explicit side DP z-search;
+  - the side/top z experiment where it uses side z offsets;
+  - z-corrected debug visualizations and exports derived from those traces.
+- Do not patch the visualization to hide the issue. The sampled side z-layers
+  themselves must be generated with the correct 3D axis.
+- Keep Lasagna normal handling and ambiguous normal sign alignment unchanged.
+- Preserve existing non-z Trace2CP behavior.

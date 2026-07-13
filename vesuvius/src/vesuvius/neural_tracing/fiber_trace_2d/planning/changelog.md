@@ -2,6 +2,9 @@
 
 ## 2026-07-13
 
+- Added opt-in single-pair `--trace2cp-obj` export for vertex-colored OBJ
+  surfaces under `trace2cp_obj/`, using the same Trace2CP side/top/z-corrected
+  coordinate grids as the JPG/TIFF debug outputs.
 - Added Trace2CP side-presence z-pillar visualization rows under the top-strip
   section, sampling inferred side-slice presence across z layers for each trace
   column; the z-search fused panel shifts columns by the selected z value so

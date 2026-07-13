@@ -370,9 +370,19 @@ The important behavior is:
   side-presence z-pillar rows. Each column samples the inferred side-slice
   presence stack across z layers at the relevant trace y coordinate, so a
   `--trace2cp-z-max-layer 40` run produces 81-pixel-high z-pillar panels. These
-  are not top-model predictions. For the z-search fused trace panel, columns
-  are shifted by the selected trace z layer so the center row is relative z=0
-  around the used layer.
+  are side-stack projections, not true top-strip surface predictions and not
+  top-model predictions; they can resemble a narrow side-presence slice when
+  the side presence field is broad or similar across shifted layers. For the
+  z-search fused trace panel, columns are shifted by the selected trace z layer
+  so the center row is relative z=0 around the used layer.
+- `--trace2cp-obj` can be added to single-pair `--trace2cp-vis` to write
+  vertex-colored OBJ debug meshes under `trace2cp_obj/`. The meshes reuse the
+  same sampled Trace2CP coordinate grids as the images: center side strip,
+  z-search selected side-strip columns, original top strip, traced fused top
+  strip, and z-corrected traced top strip when present. Separate OBJ files are
+  written for volume intensity and available side-model presence values, with a
+  `manifest.txt` listing vertex and face counts. This flag is intentionally not
+  supported for stitched whole-fiber `--fiber-json` output yet.
 - `--trace2cp-top-model-dir-vis` loads the checkpoint's top-view model and
   appends sparse predicted direction indicators over the traced fused top strip.
   It samples top-strip offsets `-4..+4` selected-scale voxels around the
