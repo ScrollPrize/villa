@@ -87,6 +87,46 @@ when double-clicked from a desktop (no terminal attached).
 On systems without FUSE, prefix with `APPIMAGE_EXTRACT_AND_RUN=1` or install
 `libfuse2`.
 
+## Prerequisites (what the host must provide)
+
+The AppImage bundles glibc + the loader, Qt, OpenCV, Ceres, and the whole
+`vc_*` closure. It deliberately does **not** bundle the GPU/graphics stack or
+the font libraries (linuxdeploy's excludelist) — those are driver-coupled or
+version-sensitive and are present on every desktop. The host must provide:
+
+- **OpenGL (glvnd + a driver)** — `libGLX.so.0`, `libEGL.so.1`, `libOpenGL.so.0`
+  (Debian/Ubuntu: `libglvnd0 libglx0 libegl1 libopengl0 libgl1`) plus a driver
+  (`libgl1-mesa-dri libglx-mesa0`, or the vendor driver).
+- **X11 client libs** — `libX11.so.6`, `libX11-xcb.so.1`, `libxcb.so.1`,
+  `libICE.so.6`, `libSM.so.6` (`libx11-6 libx11-xcb1 libxcb1 libice6 libsm6`).
+- **Fonts / text shaping** — `libfontconfig.so.1`, `libfreetype.so.6`,
+  `libharfbuzz.so.0` (`libfontconfig1 libfreetype6 libharfbuzz0b`).
+- **Ubiquitous base libs** (already on essentially every system) —
+  `libexpat1 zlib1g libuuid1 libcom-err2 libgmp10 libgpg-error0`.
+
+On any normal Linux **desktop** these are all already installed; the list
+matters only for minimal/headless/container environments.
+
+### CLI tools vs. the GUI
+
+`vc_core` links Qt6::Gui, so every binary (CLI included) needs the libraries
+above to be *present* — but the CLI tools don't open a display and tolerate old
+versions. The GUI additionally needs a running display server (X, or Wayland via
+XWayland/xcb) and a **recent FreeType** (`FT_Get_Paint`, FreeType ≥ 2.11).
+
+Tested (glibc is bundled, so it's never the limit):
+
+| Distro | glibc | FreeType | CLI tools | GUI |
+| --- | --- | --- | --- | --- |
+| Ubuntu 24.04 | 2.39 | 2.13 | ✅ | ✅ |
+| Ubuntu 22.04 | 2.35 | 2.11 | ✅ | ✅ |
+| Ubuntu 20.04 | 2.31 | 2.10 | ✅ | ❌ `undefined symbol: FT_Get_Paint` |
+
+**Effective floor:** CLI → glibc 2.31+ (Ubuntu 20.04+); GUI → FreeType 2.11+
+(Ubuntu 22.04+, Debian 12+, Fedora 36+). Bundling `libfreetype`+`libharfbuzz`
+would lower the GUI floor to match the CLI, at the cost of using host font
+config — left to the host by default here.
+
 ## Size
 
 The Release build carries full DWARF debug info (VC3D alone is ~490 MB
