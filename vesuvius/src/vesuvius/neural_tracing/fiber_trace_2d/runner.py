@@ -2405,6 +2405,27 @@ def _sample_trace2cp_local_top_patch(
     return image, valid_mask
 
 
+def _trace2cp_format_seconds(seconds: float) -> str:
+    value = float(seconds)
+    if not np.isfinite(value):
+        return "inf"
+    value = max(0.0, value)
+    if value < 60.0:
+        return f"{value:.1f}s"
+    minutes, sec = divmod(int(round(value)), 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m{sec:02d}s"
+
+
+def _trace2cp_progress_bar(done: int, total: int, *, width: int = 24) -> str:
+    safe_total = max(1, int(total))
+    safe_done = min(max(0, int(done)), safe_total)
+    filled = int(math.floor(float(width) * float(safe_done) / float(safe_total)))
+    return "#" * filled + "-" * (int(width) - filled)
+
+
 def _trace_side_top_z_line_to_target(
     *,
     plane_cache: _Trace2CpZPlaneCache,
@@ -2422,6 +2443,8 @@ def _trace_side_top_z_line_to_target(
     top_radius_px: float,
     top_patch_shape_hw: tuple[int, int],
     max_steps: int | None = None,
+    progress_label: str | None = None,
+    progress_interval_s: float = 2.0,
 ) -> _Trace2CpSideTopZLineResult:
     center = plane_cache.get(0)
     shape_hw = tuple(int(v) for v in center.valid_mask.shape)
@@ -2447,6 +2470,51 @@ def _trace_side_top_z_line_to_target(
     top_slices: list[_Trace2CpSideTopZTopSliceDebug] = []
     max_abs_z = float(plane_cache.max_layer) * float(plane_cache.z_step_voxels)
     presence_required = float(weights.presence) != 0.0
+    progress_enabled = progress_label is not None
+    progress_name = "" if progress_label is None else str(progress_label).replace("\n", " ")
+    progress_total = max(1, int(math.ceil(abs(float(target[0]) - float(start[0])) / step)))
+    progress_start_s = time.perf_counter()
+    progress_last_s = progress_start_s
+    progress_interval = max(0.1, float(progress_interval_s))
+
+    def report_progress(done_steps: int, *, final: bool = False, reason: str | None = None) -> None:
+        nonlocal progress_last_s
+        if not progress_enabled:
+            return
+        now_s = time.perf_counter()
+        if not final and int(done_steps) > 0 and (now_s - progress_last_s) < progress_interval:
+            return
+        elapsed_s = max(0.0, now_s - progress_start_s)
+        bounded_done = min(max(0, int(done_steps)), progress_total)
+        rate = float(bounded_done) / max(elapsed_s, 1.0e-9)
+        eta_s = (
+            float(progress_total - bounded_done) / rate
+            if bounded_done < progress_total and rate > 0.0
+            else 0.0
+        )
+        reason_text = "" if reason is None else f" reason={reason}"
+        print(
+            "trace2cp side_top_z progress "
+            f"label={progress_name!r} [{_trace2cp_progress_bar(bounded_done, progress_total)}] "
+            f"steps={int(done_steps)}/{progress_total} "
+            f"top={int(top_patch_count)} invalid={int(top_invalid_count)} "
+            f"z={float(current_z):.3f} elapsed={_trace2cp_format_seconds(elapsed_s)} "
+            f"eta={_trace2cp_format_seconds(eta_s)}{reason_text}",
+            flush=True,
+        )
+        progress_last_s = now_s
+
+    def finish(reason: str) -> _Trace2CpSideTopZLineResult:
+        report_progress(max(0, len(points) - 1), final=True, reason=reason)
+        return _Trace2CpSideTopZLineResult(
+            trace_xyz=np.stack(points, axis=0).astype(np.float32),
+            reason=reason,
+            top_patch_count=int(top_patch_count),
+            top_invalid_count=int(top_invalid_count),
+            top_slices=tuple(top_slices),
+        )
+
+    report_progress(0)
 
     def sample_side_direction(
         prediction: _Trace2CpZLayerPrediction,
@@ -2465,24 +2533,12 @@ def _trace_side_top_z_line_to_target(
 
     for _ in range(int(max_steps)):
         if not _inside_trace_margin(current, shape_hw, rf_margin_px):
-            return _Trace2CpSideTopZLineResult(
-                trace_xyz=np.stack(points, axis=0).astype(np.float32),
-                reason=_trace_margin_reason(current, shape_hw, rf_margin_px),
-                top_patch_count=int(top_patch_count),
-                top_invalid_count=int(top_invalid_count),
-                top_slices=tuple(top_slices),
-            )
+            return finish(_trace_margin_reason(current, shape_hw, rf_margin_px))
         current_layer = int(np.clip(round(current_z / float(plane_cache.z_step_voxels)), -plane_cache.max_layer, plane_cache.max_layer))
         current_prediction = plane_cache.get(current_layer)
         current_direction = sample_side_direction(current_prediction, current, previous_direction)
         if current_direction is None:
-            return _Trace2CpSideTopZLineResult(
-                trace_xyz=np.stack(points, axis=0).astype(np.float32),
-                reason="invalid_side_direction",
-                top_patch_count=int(top_patch_count),
-                top_invalid_count=int(top_invalid_count),
-                top_slices=tuple(top_slices),
-            )
+            return finish("invalid_side_direction")
         current_presence_loss = 0.0
         if presence_required:
             sampled_presence_loss = _trace2cp_presence_loss(
@@ -2491,13 +2547,7 @@ def _trace_side_top_z_line_to_target(
                 valid_mask=current_prediction.valid_mask,
             )
             if sampled_presence_loss is None:
-                return _Trace2CpSideTopZLineResult(
-                    trace_xyz=np.stack(points, axis=0).astype(np.float32),
-                    reason="invalid_side_presence",
-                    top_patch_count=int(top_patch_count),
-                    top_invalid_count=int(top_invalid_count),
-                    top_slices=tuple(top_slices),
-                )
+                return finish("invalid_side_presence")
             current_presence_loss = float(sampled_presence_loss)
         angles, candidate_vectors = _trace2cp_candidate_fan_directions(
             current_direction,
@@ -2555,13 +2605,7 @@ def _trace_side_top_z_line_to_target(
                     )
                 )
         if not scored:
-            return _Trace2CpSideTopZLineResult(
-                trace_xyz=np.stack(points, axis=0).astype(np.float32),
-                reason=margin_reason or "invalid_side_candidate",
-                top_patch_count=int(top_patch_count),
-                top_invalid_count=int(top_invalid_count),
-                top_slices=tuple(top_slices),
-            )
+            return finish(margin_reason or "invalid_side_candidate")
         scored.sort(key=lambda row: (row[0], row[1], row[2]))
         (
             _selected_total,
@@ -2614,24 +2658,13 @@ def _trace_side_top_z_line_to_target(
             dz = float(np.clip((float(top_direction[1]) / denom) * float(selected_step), -float(selected_step), float(selected_step)))
         next_z = float(np.clip(current_z + dz, -max_abs_z, max_abs_z))
         points.append(np.asarray([next_point[0], next_point[1], next_z], dtype=np.float32))
+        current_z = float(next_z)
         if bool(crosses_target):
-            return _Trace2CpSideTopZLineResult(
-                trace_xyz=np.stack(points, axis=0).astype(np.float32),
-                reason="target_column",
-                top_patch_count=int(top_patch_count),
-                top_invalid_count=int(top_invalid_count),
-                top_slices=tuple(top_slices),
-            )
+            return finish("target_column")
+        report_progress(max(0, len(points) - 1))
         current = next_point.astype(np.float32)
         previous_direction = selected_direction.astype(np.float32)
-        current_z = float(next_z)
-    return _Trace2CpSideTopZLineResult(
-        trace_xyz=np.stack(points, axis=0).astype(np.float32),
-        reason="max_steps",
-        top_patch_count=int(top_patch_count),
-        top_invalid_count=int(top_invalid_count),
-        top_slices=tuple(top_slices),
-    )
+    return finish("max_steps")
 
 
 def _identity_source_xy_grid(shape_hw: tuple[int, int]) -> np.ndarray:
@@ -5093,6 +5126,11 @@ def _trace_score_trace2cp_side_top_z_experiment_bidirectional(
             rf_margin_px=rf_margin_px,
             top_radius_px=top_radius_px,
             top_patch_shape_hw=top_patch_shape_hw,
+            progress_label=(
+                "fw "
+                f"{float(np.asarray(start_xy, dtype=np.float32)[0]):.1f}->"
+                f"{float(np.asarray(target_xy, dtype=np.float32)[0]):.1f}"
+            ),
         )
         reverse_line = _trace_side_top_z_line_to_target(
             plane_cache=plane_cache,
@@ -5109,6 +5147,11 @@ def _trace_score_trace2cp_side_top_z_experiment_bidirectional(
             rf_margin_px=rf_margin_px,
             top_radius_px=top_radius_px,
             top_patch_shape_hw=top_patch_shape_hw,
+            progress_label=(
+                "bw "
+                f"{float(np.asarray(target_xy, dtype=np.float32)[0]):.1f}->"
+                f"{float(np.asarray(start_xy, dtype=np.float32)[0]):.1f}"
+            ),
         )
     local_timing: list[_Trace2CpTimingRow] = []
     _append_trace2cp_timing(local_timing, "side_top_z_trace", trace_timer.elapsed_ms)

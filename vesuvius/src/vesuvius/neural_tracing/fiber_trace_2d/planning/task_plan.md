@@ -26,6 +26,12 @@
   the new experiment flag is set.
 - When the experiment flag is set, branch before `_evaluate_trace2cp_refinement_chain`
   so the command does not write `trace2cp_vis.jpg` or `trace2cp_summary.txt`.
+- Add throttled progress rows to the forward/backward side/top-z step loops,
+  including a small bar, accepted step count, top-patch count, invalid top-patch
+  count, elapsed time, ETA, and final reason.
+- Keep the compact `trace2cp_side_top_z_experiment.jpg` free of per-step
+  top-direction ticks. The accepted per-step top-direction estimates belong in
+  the extracted top-slice overlay directory.
 - Use the same side candidate fan structure as the regular forward/backward
   combined tracer for every side x/y step: score candidates by interpolated
   current and candidate side direction agreement, and by optional presence when
@@ -75,6 +81,8 @@
   `--trace2cp-z-search` uses stepwise candidate-fan z-search.
 - Add that the side/top-z experiment is exclusive and writes only its own
   artifacts.
+- Add that side/top-z experiment traces print throttled `trace2cp side_top_z
+  progress` rows while running repeated local top-patch inference.
 - Specify that top-view directions for this experiment are re-inferred per step
   on a local patch and aggregated with ambiguity-aligned weighted median over a
   normal neighborhood, default radius 20 px.
@@ -90,6 +98,8 @@
 - Specify the two top-slice debug output directories and their contents.
 - Specify that the experiment exports separate diagnostics and must not silently
   replace default Trace2CP outputs or training metrics.
+- Specify that per-step top-direction overlays are written to the extracted
+  overlay directory, while the compact experiment JPG stays tick-free.
 
 ## Docs Updates
 
@@ -111,6 +121,10 @@
   by default, and explicit DP paths do call the DP helper.
 - Add an export regression test proving side/top-z experiment bypasses the
   normal Trace2CP refinement chain and does not write normal Trace2CP outputs.
+- Add a progress regression test proving side/top-z experiment tracing prints
+  progress bars and final reasons when enabled.
+- Add or keep an extracted-slice overlay regression test proving the
+  top-overlay helper draws the estimated direction line.
 - Run:
   `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
 - Run focused loader/runner tests covering Trace2CP paths.

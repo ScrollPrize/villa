@@ -5,6 +5,11 @@
 - Restored regular stepwise combined Trace2CP and stepwise z-search as the
   defaults, added explicit `--trace2cp-dp` routing for the monotone-DP backend,
   and made `--trace2cp-side-top-z-experiment` an exclusive export mode.
+- Added throttled progress-bar output for the forward/backward
+  `--trace2cp-side-top-z-experiment` traces.
+- Kept side/top-z per-step top-direction overlays in
+  `trace2cp_side_top_z_top_overlays/` while leaving the compact experiment JPG
+  tick-free.
 - Added opt-in single-pair `--trace2cp-side-top-z-experiment`, which keeps
   regular Trace2CP as the default, uses regular side candidate scoring for
   side x/y motion, and writes separate side/top z-offset diagnostic artifacts

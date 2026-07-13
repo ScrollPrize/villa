@@ -41,3 +41,8 @@
 - When `--trace2cp-side-top-z-experiment` is passed, the command should run
   only that experiment and write only its experiment-specific outputs; it must
   not also run the normal Trace2CP overlay/refinement path.
+- The side/top-z experiment should print throttled progress while the forward
+  and backward traces repeatedly sample local top patches and run inference.
+- The extracted forward/backward top-slice debug outputs must include
+  direction overlays in the extra overlay directory; the compact side/top-z JPG
+  should not draw those per-step ticks.

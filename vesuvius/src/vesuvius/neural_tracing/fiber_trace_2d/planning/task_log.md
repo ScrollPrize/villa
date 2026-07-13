@@ -16,6 +16,15 @@
 - Added focused tests covering default stepwise combined routing, explicit DP
   combined routing, default stepwise z-search routing, explicit z-DP routing,
   and exclusive side/top-z experiment export behavior.
+- Added throttled `trace2cp side_top_z progress` rows for side/top-z experiment
+  forward/backward traces. Rows include a bar, step count, top-patch and invalid
+  counts, current z, elapsed time, ETA, and final reason.
+- Added a focused progress regression test.
+- Removed the compact experiment JPG top-direction ticks again; the
+  forward/backward traced top-strip rows stay compact and tick-free.
+- Added an extracted-slice overlay regression test proving
+  `_draw_trace2cp_side_top_z_top_slice_direction_overlay` draws the estimated
+  direction line used for `trace2cp_side_top_z_top_overlays/`.
 - Updated `planning/specs.md`, `docs/code_structure.md`, `planning/task.md`,
   and `planning/task_plan.md` for the corrected semantics.
 - Validation:
@@ -23,7 +32,9 @@
     passed.
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'combined_defaults_to_stepwise or explicit_dp_uses_dp_backend or z_search_defaults_to_stepwise or z_search_explicit_dp or side_top_z_experiment_export_is_exclusive'`
     passed: 5 passed, 235 deselected.
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'side_top_z_experiment_progress_prints_bar or side_top_z_experiment_scores_candidate_side_direction or side_top_z_experiment_export_is_exclusive'`
+    passed: 3 passed, 238 deselected.
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-    passed: 240 passed.
+    passed: 241 passed.
   - `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/code_structure.md`
     passed.

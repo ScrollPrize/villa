@@ -409,13 +409,17 @@ The important behavior is:
   `trace2cp_side_top_z_summary.txt`. The experiment JPG is intentionally
   compact: it shows only forward/backward z-corrected side traces,
   forward/backward z-corrected presence, the input top strip, and the
-  forward/backward z-corrected traced top strips. It also writes every local
-  top slice used during the stepwise z update to
+  forward/backward z-corrected traced top strips, without per-step
+  top-direction ticks. It also writes every local top slice used during the
+  stepwise z update to
   `trace2cp_side_top_z_top_slices/`, plus native-size direction overlays to
   `trace2cp_side_top_z_top_overlays/`, with `fw_####.jpg` and `bw_####.jpg`
   names. The trace state is kept as floating-point xyz positions; z-layer
   rounding is only used when selecting side prediction layers or reconstructing
-  display columns.
+  display columns. During the slow repeated local top-patch inference loop,
+  forward and backward traces print throttled `trace2cp side_top_z progress`
+  rows with a small bar, accepted step count, top-patch counts, current z,
+  elapsed time, ETA, and the final reason.
 - `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` runs the same
   regular stepwise z-search over side-strip z layers by default. Each accepted
   candidate-fan step may choose the current or neighboring z layer. Adding

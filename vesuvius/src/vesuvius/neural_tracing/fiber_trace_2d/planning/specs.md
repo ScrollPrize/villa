@@ -683,7 +683,9 @@
   trace with z-corrected image, forward z-corrected presence, backward
   z-corrected presence, original top strip, forward traced top strip with
   z-correction, and backward traced top strip with z-correction. It must not
-  reuse the full Trace2CP overlay rows for fused/reference/similarity/DP debug.
+  draw per-step top-direction ticks there or reuse the full Trace2CP overlay
+  rows for
+  fused/reference/similarity/DP debug.
   The experiment additionally writes every local top slice actually used for
   z-update inference to `trace2cp_side_top_z_top_slices/` and a matching
   native-resolution direction overlay to `trace2cp_side_top_z_top_overlays/`;
@@ -691,6 +693,11 @@
   directories clear stale JPGs before each export. XYZ trace positions and z
   offsets are subpixel/floating-point throughout stepping; rounding is limited
   to side z-layer prediction lookup and column-wise display reconstruction.
+  Because this diagnostic repeatedly samples local top patches and runs top
+  model inference, it prints throttled `trace2cp side_top_z progress` rows for
+  the forward and backward traces. Each row includes a small progress bar,
+  accepted steps versus expected horizontal steps, top-patch and invalid counts,
+  current z offset, elapsed time, ETA, and the final termination reason.
 - Combined Trace2CP is an inspection/refinement path. It does not replace the
   public `trace2cp_error` definition, the direction-only tracer, training loss,
   or best-checkpoint selection unless explicitly enabled by the command-line

@@ -106,6 +106,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _direction_field_overlay_rgb,
     _draw_trace2cp_top_strip_panel,
     _draw_trace2cp_side_top_z_compact_overlay,
+    _draw_trace2cp_side_top_z_top_slice_direction_overlay,
     _draw_trace2cp_similarity_debug_column,
     _draw_trace2cp_fiber_overlay,
     _draw_trace2cp_overlay,
@@ -2670,6 +2671,69 @@ def test_trace2cp_side_top_z_experiment_scores_candidate_side_direction(monkeypa
     np.testing.assert_allclose(top_patch_points[0], traced.trace_xyz[1, :2], atol=1.0e-6)
 
 
+def test_trace2cp_side_top_z_experiment_progress_prints_bar(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    direction = np.zeros((8, 8, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((8, 8), dtype=bool)
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 2
+
+        def get(self, _layer: int):
+            return SimpleNamespace(
+                valid_mask=valid,
+                fields=SimpleNamespace(direction_xy=direction, presence_hw=None),
+            )
+
+    def fake_sample_top_patch(*_args, **_kwargs):
+        return np.zeros((5, 5), dtype=np.float32), np.ones((5, 5), dtype=bool)
+
+    def fake_predict_top_fields(*_args, **_kwargs):
+        top_direction = np.zeros((5, 5, 2), dtype=np.float32)
+        top_direction[:, :, 0] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=top_direction,
+            embedding_chw=None,
+            presence_hw=None,
+        )
+
+    monkeypatch.setattr(runner_module, "_sample_trace2cp_local_top_patch", fake_sample_top_patch)
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict_top_fields)
+
+    traced = _trace_side_top_z_line_to_target(
+        plane_cache=FakePlaneCache(),
+        segment_source=object(),
+        source_arrays=SimpleNamespace(),
+        top_model=object(),
+        start_xy=np.asarray([1.0, 3.0], dtype=np.float32),
+        target_xy=np.asarray([6.0, 3.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, presence=0.0),
+        candidate_max_degrees=0.0,
+        candidate_step_degrees=1.0,
+        device=torch.device("cpu"),
+        step_px=1.0,
+        rf_margin_px=0.0,
+        top_radius_px=2.0,
+        top_patch_shape_hw=(5, 5),
+        max_steps=2,
+        progress_label="unit",
+        progress_interval_s=0.0,
+    )
+
+    output = capsys.readouterr().out
+    assert traced.reason == "max_steps"
+    assert "trace2cp side_top_z progress" in output
+    assert "label='unit'" in output
+    assert "[" in output and "]" in output
+    assert "steps=2/5" in output
+    assert "eta=" in output
+    assert "reason=max_steps" in output
+
+
 def test_trace2cp_side_top_z_experiment_aligns_ambiguous_side_samples(monkeypatch: pytest.MonkeyPatch) -> None:
     direction = np.zeros((7, 8, 2), dtype=np.float32)
     direction[:, :, 0] = 1.0
@@ -3105,6 +3169,27 @@ def test_trace2cp_side_top_z_top_slice_debug_writes_raw_and_overlay_dirs(tmp_pat
     overlays = sorted(path.name for path in (tmp_path / "trace2cp_side_top_z_top_overlays").glob("*.jpg"))
     assert slices == ["bw_0000.jpg", "fw_0000.jpg"]
     assert overlays == ["bw_0000.jpg", "fw_0000.jpg"]
+
+
+def test_trace2cp_side_top_z_top_slice_direction_overlay_draws_direction() -> None:
+    height, width = 17, 19
+    debug = _Trace2CpSideTopZTopSliceDebug(
+        image=np.full((height, width), 32.0, dtype=np.float32),
+        valid_mask=np.ones((height, width), dtype=bool),
+        direction_xy=np.asarray([1.0, 0.0], dtype=np.float32),
+        point_xy=np.asarray([8.0, 8.0], dtype=np.float32),
+        z_offset_voxels=0.0,
+    )
+
+    overlay = _draw_trace2cp_side_top_z_top_slice_direction_overlay(debug)
+
+    assert overlay.shape == (height, width, 3)
+    yellow = (
+        (overlay[..., 0].astype(np.int16) > 220)
+        & (overlay[..., 1].astype(np.int16) > 190)
+        & (overlay[..., 2].astype(np.int16) < 100)
+    )
+    assert int(np.count_nonzero(yellow)) > 0
 
 
 def test_trace2cp_top_monotone_direction_path_connects_center_cps() -> None:
