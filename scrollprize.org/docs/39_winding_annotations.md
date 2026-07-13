@@ -74,14 +74,14 @@ An ideal winding constraint generator should be:
       <img
         src="/img/open-problems/sparse-patch-annotations-1.webp"
         alt="Many small, colored surface-patch annotations distributed across a scroll-volume slice"
-        className="w-[100%]"
+        className="w-[100%] rotate-180"
       />
     </a>
     <a href="/img/open-problems/sparse-patch-annotations-2.webp" target="_blank" className="flex-1 min-w-[280px]">
       <img
         src="/img/open-problems/sparse-patch-annotations-2.webp"
         alt="A sparse set of colored local surface-patch annotations in a scroll-volume region"
-        className="w-[100%]"
+        className="w-[100%] rotate-180"
       />
     </a>
   </div>
