@@ -236,7 +236,7 @@ a deep learning model to excel at.
       <img src="/img/open-problems/winding-annotations/kolleisis-volume.webp" alt="A kolleisis join viewed in two CT volume slices" className="w-[100%]" />
     </a>
   </div>
-  <figcaption className="mt-2">A possible kolleisis landmark shown in flattened and volumetric views.</figcaption>
+  <figcaption className="mt-2">A kolleisis shown in flattened and volumetric views.</figcaption>
 </figure>
 
 
