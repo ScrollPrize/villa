@@ -347,9 +347,9 @@ The full lasagna codebase lives at [github.com/ScrollPrize/villa/tree/main/lasag
 Flattening takes each point on the 3D mesh and assigns it a 2D coordinate. The same trick as making a flat map from a curved globe, but in our case we are aiming to preserve local distances as much as possible: we are looking for a transformation from 3D \-\> 2D which is isometric. 
 
 <Figure
-  variant="stack"
-  srcs={["/img/ash2text/image13.png", "/img/ash2text/image14.png"]}
-  alts={["3D ink recovery preview before flattening", "3D ink recovery preview after flattening"]}
+  variant="full"
+  srcs={["/img/ash2text/spiral-ink-flattening.webp"]}
+  alts={["VC3D preview of 3D ink recovery on a segment before and after flattening"]}
   caption="VC3D preview of 3D ink recovery on a segment before and after flattening. Flattening aims for a low-distortion parametrization."
 />
 
