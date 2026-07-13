@@ -98,7 +98,7 @@ Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us m
 
 ## 2027 Grand Prize {#2027-grand-prize}
 
-**\$800,000 to the first team or individual to fully unroll and read a scroll from the set below.** We also have prizes for **second place (\$100,000)**, **third place (\$50,000)**, and **fourth place (\$50,000)** — \$1,000,000 in total. Prizes are awarded according to the rules listed below.
+**<span className="vc-money">\$800,000</span> to the first team or individual to fully unroll and read a scroll from the set below.** We also have prizes for **second place (<span className="vc-money">\$100,000</span>)**, **third place (<span className="vc-money">\$50,000</span>)**, and **fourth place (<span className="vc-money">\$50,000</span>)** — <span className="vc-money">\$1,000,000</span> in total. Prizes are awarded according to the rules listed below.
 
 Prizes will be awarded to any team or individual that fully digitally unrolls and makes readable (according to the conditions and requirements specified below) one of the eligible CT scans of carbonized scrolls from Herculaneum:
 
@@ -195,7 +195,7 @@ One of the frontiers of Vesuvius Challenge is finding techniques that work acros
 While we’ve discovered text in some of our scrolls, others have not yet produced legible findings.
 These prizes bridge ink detection on fragments to the much harder problem of reading intact scrolls: we want to prove that ink detection works on scrolls where nothing has been read yet. The review bar is deliberately high — we’d rather be slow than wrong.
 
-**First Letters: \$50,000 per scroll, for any of the [scroll volumes eligible for the 2027 Grand Prize](#2027-grand-prize).** \$50,000 to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their methods and results (after winning the prize). First Letters prizes will be awarded for a maximum of 10 scrolls — up to \$500,000 in total.
+**First Letters: <span className="vc-money">\$50,000</span> per scroll, for any of the [scroll volumes eligible for the 2027 Grand Prize](#2027-grand-prize).** <span className="vc-money">\$50,000</span> to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their methods and results (after winning the prize). First Letters prizes will be awarded for a maximum of 10 scrolls — up to <span className="vc-money">\$500,000</span> in total.
 
 **Deadline: June 25th, 2027 (11:59pm Pacific)**
 
@@ -232,7 +232,7 @@ These prizes bridge ink detection on fragments to the much harder problem of rea
 
 Discovering a scroll’s title tells scholars what — and whom — they have been reading, and helps contextualize the entire work. We have already recovered the titles of [PHerc. 172](/data_browser/PHerc0172) and [PHerc. 139](/data_browser/PHerc0139) — but the title of Scroll 1, the scroll where the first passages were read, is still missing.
 
-**PHerc. Paris 4’s Title: \$50,000 to the first team to discover the title of [PHerc. Paris 4](/data_browser/PHercParis4) (Scroll 1), using any of its scans — including the 2.4 µm volumes.** Scroll 1 is one of our most-read scrolls: substantial continuous Greek text of an Epicurean prose work has been recovered, yet its author and title remain unknown. The expected title region has shown no detectable ink so far — possibly a different ink, and the top rows are physically missing — so finding it may take better methods, higher resolution, or looking somewhere new.
+**PHerc. Paris 4’s Title: <span className="vc-money">\$50,000</span> to the first team to discover the title of [PHerc. Paris 4](/data_browser/PHercParis4) (Scroll 1), using any of its scans — including the 2.4 µm volumes.** Scroll 1 is one of our most-read scrolls: substantial continuous Greek text of an Epicurean prose work has been recovered, yet its author and title remain unknown. The expected title region has shown no detectable ink so far — possibly a different ink, and the top rows are physically missing — so finding it may take better methods, higher resolution, or looking somewhere new.
 
 **Deadline: June 25th, 2027 (11:59pm Pacific)**
 
@@ -280,14 +280,14 @@ In addition to milestone-based prizes, we offer monthly prizes for open source c
 These prizes are more open-ended, and we have a wishlist to provide some ideas.
 If you are new to the project, this is a great place to start.
 
-**Best Submission of the Month: \$20,000, guaranteed every month, to the single best submission — selected by the Vesuvius Challenge team.**
+**Best Submission of the Month: <span className="vc-money">\$20,000</span>, guaranteed every month, to the single best submission — selected by the Vesuvius Challenge team.**
 
 Beyond that, progress prizes will be awarded at a range of levels based on the contribution:
 
-* Gold Aureus: \$20,000 (estimated 4-8 per year) – for major contributions
-* Denarius: \$10,000 (estimated 10-15 per year)
-* Sestertius: \$2,500 (estimated 25 per year)
-* Papyrus: \$1,000 (estimated 50 per year)
+* Gold Aureus: <span className="vc-money">\$20,000</span> (estimated 4-8 per year) – for major contributions
+* Denarius: <span className="vc-money">\$10,000</span> (estimated 10-15 per year)
+* Sestertius: <span className="vc-money">\$2,500</span> (estimated 25 per year)
+* Papyrus: <span className="vc-money">\$1,000</span> (estimated 50 per year)
 
 We favor submissions that:
 * Are **released or open-sourced early**. Tools released earlier have a higher chance of being used for reading the scrolls than those released the last day of the month.

@@ -186,3 +186,8 @@ a.vc-card:hover,
   outline: 2px solid var(--vc-accent);
   outline-offset: 2px;
 }
+
+/* Money: dollar amounts site-wide match the landing GP-card accent. */
+.vc-money {
+  color: var(--vc-accent);
+}
