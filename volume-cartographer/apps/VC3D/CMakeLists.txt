@@ -220,6 +220,13 @@ endif()
 
 add_executable(VC3D ${srcs} resources.qrc)
 
+if(WIN32)
+    # GUI subsystem so double-click launch doesn't open a console window.
+    set_target_properties(VC3D PROPERTIES WIN32_EXECUTABLE ON)
+    # Embed the app icon (windres compiles the .rc).
+    target_sources(VC3D PRIVATE VC3D.rc)
+endif()
+
 target_include_directories(VC3D
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}

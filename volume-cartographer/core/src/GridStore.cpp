@@ -15,18 +15,25 @@
 #include <fstream>
 #include <stdexcept>
 
-#include <arpa/inet.h>
+#include <bit>
+#include <filesystem>
 
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include "vc/core/util/MemMap.hpp"
 
 namespace vc::core::util {
 
 namespace {
 constexpr uint32_t GRIDSTORE_MAGIC = 0x56434753; // "VCGS"
 constexpr uint32_t GRIDSTORE_VERSION = 3;
+
+// On-disk format is big-endian; byte-swap on little-endian hosts. Portable
+// replacement for htonl/ntohl (same operation in both directions).
+inline uint32_t be32(uint32_t v) {
+    if constexpr (std::endian::native == std::endian::little) {
+        return std::byteswap(v);
+    }
+    return v;
+}
 
 // GridStore wire format is byte-packed with no alignment guarantees, so
 // dereferencing a uint32_t* into mmapped data is UB and trips ubsan.
@@ -35,7 +42,7 @@ constexpr uint32_t GRIDSTORE_VERSION = 3;
 inline uint32_t read_be_u32(const char* p) {
     uint32_t v;
     std::memcpy(&v, p, sizeof(v));
-    return ntohl(v);
+    return be32(v);
 }
 inline uint32_t read_be_u32_at(const char* base, size_t byte_offset) {
     return read_be_u32(base + byte_offset);
@@ -43,14 +50,9 @@ inline uint32_t read_be_u32_at(const char* base, size_t byte_offset) {
 }
 
 struct MmappedData {
-    void* data = MAP_FAILED;
+    vc::memmap::MappedFileRO map;
+    const void* data = nullptr;
     size_t size = 0;
-
-    ~MmappedData() {
-        if (data != MAP_FAILED) {
-            munmap(data, size);
-        }
-    }
 };
 
 class GridStore::GridStoreImpl {
@@ -352,16 +354,16 @@ public:
         uint32_t json_meta_offset = paths_offset + paths_size;
 
         // 4. Write header
-        uint32_t magic = htonl(GRIDSTORE_MAGIC);
-        uint32_t version = htonl(GRIDSTORE_VERSION);
-        uint32_t bounds_x = htonl(bounds_.x);
-        uint32_t bounds_y = htonl(bounds_.y);
-        uint32_t bounds_width = htonl(bounds_.width);
-        uint32_t bounds_height = htonl(bounds_.height);
-        uint32_t cell_size = htonl(cell_size_);
-        uint32_t num_buckets = htonl(grid_.size());
-        uint32_t num_paths = htonl(storage_.size());
-        uint32_t json_meta_size = htonl(meta_size);
+        uint32_t magic = be32(GRIDSTORE_MAGIC);
+        uint32_t version = be32(GRIDSTORE_VERSION);
+        uint32_t bounds_x = be32(bounds_.x);
+        uint32_t bounds_y = be32(bounds_.y);
+        uint32_t bounds_width = be32(bounds_.width);
+        uint32_t bounds_height = be32(bounds_.height);
+        uint32_t cell_size = be32(cell_size_);
+        uint32_t num_buckets = be32(grid_.size());
+        uint32_t num_paths = be32(storage_.size());
+        uint32_t json_meta_size = be32(meta_size);
 
         memcpy(current_ptr, &magic, sizeof(magic)); current_ptr += sizeof(magic);
         memcpy(current_ptr, &version, sizeof(version)); current_ptr += sizeof(version);
@@ -372,25 +374,25 @@ public:
         memcpy(current_ptr, &cell_size, sizeof(cell_size)); current_ptr += sizeof(cell_size);
         memcpy(current_ptr, &num_buckets, sizeof(num_buckets)); current_ptr += sizeof(num_buckets);
         memcpy(current_ptr, &num_paths, sizeof(num_paths)); current_ptr += sizeof(num_paths);
-        uint32_t net_bucket_indices_offset = htonl(bucket_indices_offset);
+        uint32_t net_bucket_indices_offset = be32(bucket_indices_offset);
         memcpy(current_ptr, &net_bucket_indices_offset, sizeof(net_bucket_indices_offset)); current_ptr += sizeof(net_bucket_indices_offset);
-        uint32_t net_paths_offset = htonl(paths_offset);
+        uint32_t net_paths_offset = be32(paths_offset);
         memcpy(current_ptr, &net_paths_offset, sizeof(net_paths_offset)); current_ptr += sizeof(net_paths_offset);
-        uint32_t net_json_meta_offset = htonl(json_meta_offset);
+        uint32_t net_json_meta_offset = be32(json_meta_offset);
         memcpy(current_ptr, &net_json_meta_offset, sizeof(net_json_meta_offset)); current_ptr += sizeof(net_json_meta_offset);
         memcpy(current_ptr, &json_meta_size, sizeof(json_meta_size)); current_ptr += sizeof(json_meta_size);
 
         // 5. Write v3 bucket structures
         char* bucket_indices_start = buffer.data() + bucket_indices_offset;
         for (uint32_t idx : bucket_path_indices) {
-            uint32_t net_idx = htonl(idx);
+            uint32_t net_idx = be32(idx);
             memcpy(bucket_indices_start, &net_idx, sizeof(net_idx));
             bucket_indices_start += sizeof(net_idx);
         }
 
         char* bucket_paths_start = buffer.data() + bucket_paths_offset;
         for (uint32_t offset : bucket_paths_flat) {
-            uint32_t net_offset = htonl(offset);
+            uint32_t net_offset = be32(offset);
             memcpy(bucket_paths_start, &net_offset, sizeof(net_offset));
             bucket_paths_start += sizeof(net_offset);
         }
@@ -446,20 +448,14 @@ public:
         read_only_ = true;
         mmapped_data_ = std::make_unique<MmappedData>();
 
-        int fd = open(path.c_str(), O_RDONLY);
-        if (fd == -1) {
+        std::error_code ec;
+        const auto file_size = std::filesystem::file_size(path, ec);
+        if (ec) {
             throw std::runtime_error("Failed to open file: " + path);
         }
-
-        struct stat sb;
-        if (fstat(fd, &sb) == -1) {
-            close(fd);
-            throw std::runtime_error("Failed to stat file: " + path);
-        }
-        mmapped_data_->size = sb.st_size;
+        mmapped_data_->size = static_cast<size_t>(file_size);
 
         if (mmapped_data_->size == 0) {
-            close(fd);
             // Handle empty file: Grid is already empty, just set bounds and return.
             bounds_ = cv::Rect();
             cell_size_ = 1; // Avoid division by zero
@@ -467,11 +463,8 @@ public:
             return;
         }
 
-        mmapped_data_->data = mmap(NULL, mmapped_data_->size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);  // Close immediately after mmap - mapping remains valid on Linux
-        if (mmapped_data_->data == MAP_FAILED) {
-            throw std::runtime_error("Failed to mmap file: " + path);
-        }
+        mmapped_data_->map.open(path);
+        mmapped_data_->data = mmapped_data_->map.data();
 
         const char* current = static_cast<const char*>(mmapped_data_->data);
         const char* end = current + mmapped_data_->size;
@@ -550,12 +543,12 @@ public:
 
 private:
     char* write_bucket(char* current, const std::vector<int>& bucket, const std::unordered_map<int, uint32_t>& path_offsets) const {
-        uint32_t num_indices = htonl(bucket.size());
+        uint32_t num_indices = be32(bucket.size());
         memcpy(current, &num_indices, sizeof(num_indices));
         current += sizeof(num_indices);
         for (int handle : bucket) {
             uint32_t offset = path_offsets.at(handle);
-            uint32_t net_offset = htonl(offset);
+            uint32_t net_offset = be32(offset);
             memcpy(current, &net_offset, sizeof(net_offset));
             current += sizeof(net_offset);
         }
@@ -564,9 +557,9 @@ private:
 
     char* write_seglist(char* current, const LineSegList& seglist) const {
         cv::Point start = seglist.start_point();
-        uint32_t start_x = htonl(start.x);
-        uint32_t start_y = htonl(start.y);
-        uint32_t num_offsets = htonl(seglist.compressed_data_size());
+        uint32_t start_x = be32(start.x);
+        uint32_t start_y = be32(start.y);
+        uint32_t num_offsets = be32(seglist.compressed_data_size());
 
         memcpy(current, &start_x, sizeof(start_x));
         current += sizeof(start_x);

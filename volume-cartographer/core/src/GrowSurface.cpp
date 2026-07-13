@@ -1503,7 +1503,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::set<QuadSurface *> approved_sm;
 
     std::set<std::string> used_approved_names;
-    std::string log_filename = "/tmp/vc_grow_seg_from_segments_" + get_surface_time_str() + "_used_approved_segments.txt";
+    std::string log_filename = (std::filesystem::temp_directory_path() /
+        ("vc_grow_seg_from_segments_" + get_surface_time_str() + "_used_approved_segments.txt")).string();
     std::ofstream approved_log(log_filename);
 
     for(auto &sm : surfs_v) {

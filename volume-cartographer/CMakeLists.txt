@@ -16,12 +16,24 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(BUILD_SHARED_LIBS ON CACHE BOOL "Build vc_* and FetchContent deps as .so")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Exes default to -fPIE; force -fPIC to match the shared libs' PCH. -no-pie
-# only on exe links (mold/lld reject it on a .so).
-add_compile_options(-fPIC)
-add_link_options($<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-no-pie>)
+# only on exe links (mold/lld reject it on a .so). PE/COFF has no PIC/PIE
+# distinction, so skip both on Windows.
+if(NOT WIN32)
+    add_compile_options(-fPIC)
+    add_link_options($<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-no-pie>)
+endif()
 # Find the .so via $ORIGIN without LD_LIBRARY_PATH.
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
-set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+if(APPLE)
+    # Packaged layout (cmake/MacPackaging.cmake): executables live in
+    # VC3D.app/Contents/MacOS, every dylib in ../Frameworks. Mach-O has no
+    # $ORIGIN; @loader_path is its equivalent and covers both the executables
+    # and dylib->dylib references (Frameworks/../Frameworks resolves to
+    # itself).
+    set(CMAKE_INSTALL_RPATH "@loader_path/../Frameworks")
+else()
+    set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+endif()
 set(CMAKE_BUILD_WITH_INSTALL_RPATH OFF)
 
 option(VC_MARCH_NATIVE     "Tune for the host CPU (-march=native)"        OFF)
@@ -37,7 +49,13 @@ option(VC_ENABLE_COVERAGE "Code coverage instrumentation"                OFF)
 option(VC_TESTING         "Build and run unit tests"                     OFF)
 option(VC_DEAD_CODE_REPORT "Enable dead-code reporting (curated -Wunused* + linker --print-gc-sections; use a Debug build to avoid LTO)" OFF)
 option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
-option(VC_BUILD_FLATBOI    "Build the flatboi SLIM flattening tool"      ON)
+# flatboi drags in PaStiX (Fortran + autotools + Scotch), which has no
+# practical Windows build — default it off there.
+if(WIN32)
+    option(VC_BUILD_FLATBOI "Build the flatboi SLIM flattening tool"      OFF)
+else()
+    option(VC_BUILD_FLATBOI "Build the flatboi SLIM flattening tool"      ON)
+endif()
 option(VC_BUILD_PYTHON     "Build Python bindings"                       OFF)
 option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
 option(VC_LIBBACKTRACE_UPDATE_DISCONNECTED
@@ -45,6 +63,7 @@ option(VC_LIBBACKTRACE_UPDATE_DISCONNECTED
     ON)
 option(VC_USE_PCH "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" OFF)
 option(VC_USE_CCACHE "Route the compiler through ccache" OFF)
+option(VC_USE_SCCACHE "Route the compiler through sccache" OFF)
 option(VC_ENABLE_ECL_MAXFLOW "Build CUDA ECL-MaxFlow integration for Lasagna maxflow" OFF)
 option(VC_ENABLE_AMGX "Build external AMGX-backed Lasagna screened-Laplace solver" OFF)
 set(AMGX_ROOT "" CACHE PATH "External AMGX installation prefix")
@@ -78,6 +97,10 @@ if(CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     message(STATUS "QuickBuild: -O1, PCH enabled, LTO disabled")
 endif()
 
+if(VC_USE_CCACHE AND VC_USE_SCCACHE)
+    message(FATAL_ERROR "VC_USE_CCACHE and VC_USE_SCCACHE are mutually exclusive.")
+endif()
+
 if(VC_USE_CCACHE)
     find_program(CCACHE_PROGRAM ccache)
     if(NOT CCACHE_PROGRAM)
@@ -92,6 +115,16 @@ if(VC_USE_CCACHE)
     endif()
     set(CMAKE_C_COMPILER_LAUNCHER "${_vc_ccache_launcher}" CACHE STRING "Compiler launcher for C" FORCE)
     set(CMAKE_CXX_COMPILER_LAUNCHER "${_vc_ccache_launcher}" CACHE STRING "Compiler launcher for CXX" FORCE)
+endif()
+
+if(VC_USE_SCCACHE)
+    find_program(SCCACHE_PROGRAM sccache)
+    if(NOT SCCACHE_PROGRAM)
+        message(FATAL_ERROR "VC_USE_SCCACHE=ON but sccache was not found on PATH.")
+    endif()
+    set(CMAKE_C_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}" CACHE STRING "Compiler launcher for C" FORCE)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}" CACHE STRING "Compiler launcher for CXX" FORCE)
+    message(STATUS "Compiler cache: sccache (${SCCACHE_PROGRAM})")
 endif()
 
 # Skip building app executables (vc_*, VC3D) when generating coverage:
@@ -144,12 +177,17 @@ if(VC_BUILD_PYTHON)
 endif()
 
 # Portable shippable defaults; VC_MARCH_NATIVE=ON (set by dev-* presets) opts
-# into host tuning. armv8.2-a floor avoids SVE so Apple M1-M3 + Qualcomm Oryon
-# work alongside Graviton.
+# into host tuning. Windows installers use the general x86-64 baseline so they
+# run on all supported amd64 CPUs; Linux retains the existing x86-64-v3 floor.
+# armv8.2-a avoids SVE so Apple M1-M3 + Qualcomm Oryon work alongside Graviton.
 if(VC_MARCH_NATIVE)
     add_compile_options(-pipe -march=native)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-    add_compile_options(-pipe -march=x86-64-v3)
+    if(WIN32)
+        add_compile_options(-pipe -march=x86-64)
+    else()
+        add_compile_options(-pipe -march=x86-64-v3)
+    endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     add_compile_options(-pipe -march=armv8.2-a)
 else()
@@ -189,6 +227,9 @@ else()
     set(_lto -flto=auto)
     if(APPLE)
         set(_link "")
+    elseif(WIN32)
+        # binutils PE linker: --gc-sections works, mold/lld are not options.
+        set(_link -Wl,--gc-sections -Wl,--as-needed)
     else()
         find_program(VC_MOLD_BINARY mold)
         if(VC_MOLD_BINARY)
@@ -200,6 +241,12 @@ else()
 endif()
 add_compile_options(${_dbg} -ffunction-sections -fdata-sections)
 add_link_options(${_link})
+
+if(WIN32)
+    # Several large TUs (Qt-heavy VC3D sources, template-dense core) exceed
+    # the default COFF 32k-section limit; -mbig-obj lifts it.
+    add_compile_options(-Wa,-mbig-obj)
+endif()
 
 # ---- Sanitizers + coverage --------------------------------------------------
 if(VC_ENABLE_ASAN AND VC_ENABLE_TSAN)
@@ -271,7 +318,9 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
 elseif(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
     add_compile_options(-Os)
 endif()
-if(NOT _san AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
+# LTO stays off on Windows: GCC LTO across DLLs interacts badly with PE
+# auto-import/export-all, and link times on the CI runners balloon.
+if(NOT _san AND NOT WIN32 AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     add_compile_options(${_lto})
     add_link_options(${_lto})
 endif()
@@ -375,6 +424,48 @@ endif()
 find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
+# OpenCV 5 split calib3d into geometry/calib/stereo/ptcloud. VC uses
+# Rodrigues (calib) and estimateAffine3D (geometry), so select both new
+# modules there while retaining the OpenCV 4 module name elsewhere.
+if(OpenCV_VERSION_MAJOR GREATER_EQUAL 5)
+    set(VC_OPENCV_CALIB_TARGETS opencv_calib opencv_geometry)
+else()
+    set(VC_OPENCV_CALIB_TARGETS opencv_calib3d)
+endif()
+
+# Homebrew's OpenCV package can occasionally report module names without
+# defining corresponding imported targets. Normalize any such module to an
+# absolute dylib path so it never degrades into a bare, unresolvable -l flag.
+if(APPLE)
+    set(_vc_opencv_modules
+        core imgproc imgcodecs video videoio flann ximgproc)
+    if(OpenCV_VERSION_MAJOR GREATER_EQUAL 5)
+        list(APPEND _vc_opencv_modules calib geometry)
+    else()
+        list(APPEND _vc_opencv_modules calib3d)
+    endif()
+    foreach(_vc_opencv_module IN LISTS _vc_opencv_modules)
+        set(_vc_opencv_target "opencv_${_vc_opencv_module}")
+        if(NOT TARGET ${_vc_opencv_target})
+            unset(_vc_opencv_library)
+            find_library(_vc_opencv_library
+                NAMES ${_vc_opencv_target}
+                HINTS
+                    "$ENV{HOMEBREW_PREFIX}/opt/opencv/lib"
+                    "${OpenCV_DIR}/../.."
+                NO_CACHE)
+            if(NOT _vc_opencv_library)
+                message(FATAL_ERROR
+                    "OpenCV module ${_vc_opencv_target} was not provided as a target and its library was not found")
+            endif()
+            add_library(${_vc_opencv_target} SHARED IMPORTED GLOBAL)
+            set_target_properties(${_vc_opencv_target} PROPERTIES
+                IMPORTED_LOCATION "${_vc_opencv_library}"
+                INTERFACE_INCLUDE_DIRECTORIES "${OpenCV_INCLUDE_DIRS}")
+        endif()
+    endforeach()
+    unset(_vc_opencv_library)
+endif()
 find_package(nlohmann_json REQUIRED)
 find_package(CURL REQUIRED)
 find_package(TIFF REQUIRED)
@@ -469,14 +560,16 @@ else()
 endif()
 
 set(VC_LIBBACKTRACE "")
-if(VC_USE_SYSTEM_LIBBACKTRACE)
+if(VC_USE_SYSTEM_LIBBACKTRACE AND NOT WIN32)
     pkg_check_modules(LIBBACKTRACE QUIET IMPORTED_TARGET libbacktrace)
     if(TARGET PkgConfig::LIBBACKTRACE)
         set(VC_LIBBACKTRACE PkgConfig::LIBBACKTRACE)
         message(STATUS "Using system libbacktrace")
     endif()
 endif()
-if(NOT VC_LIBBACKTRACE)
+# The crash handler (sole libbacktrace consumer) is Linux-only, and the
+# vendored build is autotools — skip it entirely on Windows.
+if(NOT VC_LIBBACKTRACE AND NOT WIN32)
     include(ExternalProject)
     include(ProcessorCount)
     ProcessorCount(_nproc)
@@ -509,6 +602,12 @@ include_directories(core/include)
 
 add_subdirectory(libs/OpenABF)
 add_subdirectory(libs/c3d)
+# igl::core is needed by flatboi (SLIM) and by apps/vc_obj_uv_lift; fetch it
+# here — before the sanitizer flags below — so both consumers see the target
+# even when flatboi is off (Windows).
+if(VC_BUILD_FLATBOI OR VC_BUILD_APPS)
+    include(cmake/FetchLibigl.cmake)
+endif()
 if(VC_BUILD_FLATBOI)
     add_subdirectory(libs/flatboi)
 endif()
@@ -551,13 +650,37 @@ foreach(_dir IN LISTS _vc_install_dirs)
     foreach(_tgt IN LISTS _dir_targets)
         get_target_property(_tgt_type ${_tgt} TYPE)
         if(_tgt_type STREQUAL "EXECUTABLE" OR _tgt_type STREQUAL "SHARED_LIBRARY")
-            install(TARGETS ${_tgt}
-                COMPONENT vc_runtime
-                RUNTIME DESTINATION bin
-                LIBRARY DESTINATION lib)
+            if(WIN32)
+                # Register each binary in a dependency set so the packaging
+                # step (cmake/WindowsPackaging.cmake) can bundle the full DLL
+                # closure. DLLs land in bin next to the executables — Windows
+                # has no RPATH.
+                install(TARGETS ${_tgt}
+                    COMPONENT vc_runtime
+                    RUNTIME_DEPENDENCY_SET vc_runtime_deps
+                    RUNTIME DESTINATION bin
+                    LIBRARY DESTINATION lib)
+            elseif(APPLE AND VC_BUILD_APPS)
+                # Everything ships inside the app bundle
+                # (cmake/MacPackaging.cmake): CLI tools next to VC3D in
+                # Contents/MacOS, vc_* dylibs in Contents/Frameworks, both
+                # wired up via the @loader_path rpath set above.
+                install(TARGETS ${_tgt}
+                    COMPONENT vc_runtime
+                    RUNTIME DESTINATION "VC3D.app/Contents/MacOS"
+                    LIBRARY DESTINATION "VC3D.app/Contents/Frameworks")
+            else()
+                install(TARGETS ${_tgt}
+                    COMPONENT vc_runtime
+                    RUNTIME DESTINATION bin
+                    LIBRARY DESTINATION lib)
+            endif()
         endif()
     endforeach()
 endforeach()
+
+include(${CMAKE_SOURCE_DIR}/cmake/WindowsPackaging.cmake)
+include(${CMAKE_SOURCE_DIR}/cmake/MacPackaging.cmake)
 
 if(VC_TESTING)
     enable_testing()

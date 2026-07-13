@@ -12,6 +12,16 @@
 #include <string>
 #include <algorithm>
 
+#if defined(_WIN32)
+// rand_r is POSIX-only. Same-contract stand-in (caller-owned seed, [0, 2^31)):
+// glibc-style LCG, good enough for the sampling here.
+static int rand_r(unsigned int* seedp)
+{
+    *seedp = *seedp * 1103515245u + 12345u;
+    return static_cast<int>(*seedp & 0x7fffffffu);
+}
+#endif
+
 namespace po = boost::program_options;
 
 static inline cv::Vec2f mul(const cv::Vec2f &a, const cv::Vec2f &b)

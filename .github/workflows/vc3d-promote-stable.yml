@@ -1,0 +1,204 @@
+name: Promote VC3D build to stable
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full commit SHA whose successful package artifacts should become stable
+        required: true
+        type: string
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: vc3d-promote-stable
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REQUESTED_SHA: ${{ inputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve selected commit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$REQUESTED_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::commit_sha must be a full 40-character Git SHA"
+            exit 1
+          fi
+
+          git fetch --force origin main
+          requested_sha="$(git rev-parse --verify "${REQUESTED_SHA}^{commit}")"
+          if ! git merge-base --is-ancestor "$requested_sha" origin/main; then
+            echo "::error::$requested_sha is not a commit on main"
+            exit 1
+          fi
+
+          echo "PROMOTION_SHA=$requested_sha" >> "$GITHUB_ENV"
+
+      - name: Find or rebuild package artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find_reusable_run() {
+            local workflow="$1"
+            local artifact="$2"
+            local run_id
+            local artifact_id
+
+            run_id="$(gh run list \
+              --workflow "$workflow" \
+              --commit "$PROMOTION_SHA" \
+              --status success \
+              --limit 20 \
+              --json databaseId \
+              --jq '.[].databaseId')"
+
+            while IFS= read -r candidate; do
+              [[ -n "$candidate" ]] || continue
+              artifact_id="$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$candidate/artifacts" \
+                --jq ".artifacts | map(select(.name == \"$artifact\" and .expired == false)) | first | .id // empty")"
+              if [[ -n "$artifact_id" ]]; then
+                echo "$candidate"
+                return 0
+              fi
+            done <<< "$run_id"
+          }
+
+          find_dispatched_run() {
+            local workflow="$1"
+            local title="$2"
+            local run_id=""
+
+            for _ in {1..24}; do
+              run_id="$(gh run list \
+                --workflow "$workflow" \
+                --event workflow_dispatch \
+                --limit 20 \
+                --json databaseId,displayTitle \
+                --jq "[.[] | select(.displayTitle == \"$title\")][0].databaseId // empty")"
+              if [[ -n "$run_id" ]]; then
+                echo "$run_id"
+                return 0
+              fi
+              sleep 5
+            done
+
+            echo "::error::timed out waiting for dispatched $workflow run" >&2
+            return 1
+          }
+
+          windows_run="$(find_reusable_run vc3d-windows.yml VC3D-windows-installer)"
+          macos_run="$(find_reusable_run vc3d-macos.yml VC3D-macos-app)"
+
+          rebuild_windows=false
+          rebuild_macos=false
+
+          if [[ -z "$windows_run" ]]; then
+            rebuild_windows=true
+            gh workflow run vc3d-windows.yml \
+              --ref main \
+              --raw-field commit_sha="$PROMOTION_SHA" \
+              --raw-field request_id="$GITHUB_RUN_ID" >/dev/null
+          fi
+
+          if [[ -z "$macos_run" ]]; then
+            rebuild_macos=true
+            gh workflow run vc3d-macos.yml \
+              --ref main \
+              --raw-field commit_sha="$PROMOTION_SHA" \
+              --raw-field request_id="$GITHUB_RUN_ID" >/dev/null
+          fi
+
+          if [[ "$rebuild_windows" == true ]]; then
+            windows_run="$(find_dispatched_run \
+              vc3d-windows.yml \
+              "VC3D Windows workflow_dispatch $GITHUB_RUN_ID")"
+          fi
+
+          if [[ "$rebuild_macos" == true ]]; then
+            macos_run="$(find_dispatched_run \
+              vc3d-macos.yml \
+              "VC3D macOS workflow_dispatch $GITHUB_RUN_ID")"
+          fi
+
+          # Both package builds have already been dispatched, so these waits do
+          # not serialize the actual Windows and macOS compilation work.
+          if [[ "$rebuild_windows" == true ]]; then
+            gh run watch "$windows_run" --exit-status --interval 15
+          fi
+          if [[ "$rebuild_macos" == true ]]; then
+            gh run watch "$macos_run" --exit-status --interval 15
+          fi
+
+          echo "WINDOWS_RUN_ID=$windows_run" >> "$GITHUB_ENV"
+          echo "MACOS_RUN_ID=$macos_run" >> "$GITHUB_ENV"
+
+      - name: Download packages from selected commit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir stable-assets
+          gh run download "$WINDOWS_RUN_ID" \
+            --name VC3D-windows-installer \
+            --dir stable-assets
+          gh run download "$MACOS_RUN_ID" \
+            --name VC3D-macos-app \
+            --dir stable-assets
+
+          shopt -s nullglob
+          windows_exe=(stable-assets/VC3D-*-win64.exe)
+          windows_zip=(stable-assets/VC3D-*-win64.zip)
+          macos_dmg=(stable-assets/VC3D-*-macos-*.dmg)
+          macos_zip=(stable-assets/VC3D-*-macos-*.zip)
+
+          if [[ ${#windows_exe[@]} -ne 1 ||
+                ${#windows_zip[@]} -ne 1 ||
+                ${#macos_dmg[@]} -ne 1 ||
+                ${#macos_zip[@]} -ne 1 ]]; then
+            echo "::error::expected exactly one Windows installer, Windows ZIP, macOS DMG, and macOS ZIP"
+            find stable-assets -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+      - name: Move stable tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag --force --annotate stable "$PROMOTION_SHA" \
+            --message "VC3D stable release at $PROMOTION_SHA"
+          git push --force origin refs/tags/stable
+
+          # The stable channel changes only through this manual workflow.
+          if gh release view stable >/dev/null 2>&1; then
+            gh release delete stable --yes
+          fi
+
+      - name: Publish stable release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release create stable stable-assets/* \
+            --verify-tag \
+            --title "VC3D Stable" \
+            --notes "Promoted from tested package artifacts built at commit $PROMOTION_SHA." \
+            --latest

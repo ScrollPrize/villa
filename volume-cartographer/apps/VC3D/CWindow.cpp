@@ -1,4 +1,5 @@
 #include "CWindow.hpp"
+#include "OpenDataCoordinateIdentity.hpp"
 
 #include "RenderBenchRecorder.hpp"
 #include "RenderBenchReplay.hpp"
@@ -662,6 +663,48 @@ QString openDataCatalogVolumeIdForLoadedVolume(const VolumePkg& pkg, const std::
     return {};
 }
 
+std::optional<int> openDataCoordinateLevelForLoadedVolume(
+    const VolumePkg& pkg,
+    const std::string& loadedVolumeId)
+{
+    constexpr std::string_view prefix = "vc-open-data-source-coordinate-level:";
+    for (const auto& tag : pkg.volumeTags(loadedVolumeId)) {
+        if (tag.rfind(prefix, 0) != 0)
+            continue;
+        const auto value = tag.substr(prefix.size());
+        try {
+            std::size_t consumed = 0;
+            const int level = std::stoi(value, &consumed);
+            if (consumed == value.size() && level >= 0 && level <= 5)
+                return level;
+        } catch (...) {
+        }
+    }
+    return std::nullopt;
+}
+
+std::string openDataCoordinateSpaceForLoadedVolume(
+    const VolumePkg& pkg,
+    const std::string& loadedVolumeId)
+{
+    constexpr std::string_view prefix = "vc-open-data-coordinate-space:";
+    for (const auto& tag : pkg.volumeTags(loadedVolumeId)) {
+        if (tag.rfind(prefix, 0) == 0)
+            return tag.substr(prefix.size());
+    }
+    return {};
+}
+
+cv::Matx44d coordinateLevelScale(int level)
+{
+    const double scale = std::ldexp(1.0, level);
+    return cv::Matx44d(
+        scale, 0, 0, 0,
+        0, scale, 0, 0,
+        0, 0, scale, 0,
+        0, 0, 0, 1);
+}
+
 bool isOpenDataSegmentsEntry(const vc::project::Entry& entry)
 {
     if (std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end()) {
@@ -752,6 +795,27 @@ const vc::project::Entry* findOpenDataSegmentsEntryForLoadedVolume(const VolumeP
                                                                    const std::string& loadedVolumeId,
                                                                    QString* matchedCatalogVolumeId = nullptr)
 {
+    const auto coordinateSpace =
+        openDataCoordinateSpaceForLoadedVolume(pkg, loadedVolumeId);
+    if (!coordinateSpace.empty()) {
+        const std::string coordinateTag =
+            "vc-open-data-coordinate-space:" + coordinateSpace;
+        for (const auto& entry : pkg.segmentEntries()) {
+            if (isAvailableOpenDataSegmentsEntry(pkg, entry) &&
+                std::find(entry.tags.begin(), entry.tags.end(), coordinateTag) !=
+                    entry.tags.end()) {
+                if (matchedCatalogVolumeId) {
+                    *matchedCatalogVolumeId =
+                        openDataCatalogVolumeIdForLoadedVolume(pkg, loadedVolumeId);
+                }
+                return &entry;
+            }
+        }
+        // Explicitly identified assets must never fall back to lineage-only
+        // association, because native and virtual views share that lineage.
+        return nullptr;
+    }
+
     for (const QString& candidate : openDataCatalogVolumeIdCandidates(pkg, loadedVolumeId)) {
         if (const auto* entry = findOpenDataSegmentsEntryForVolume(pkg, candidate)) {
             if (matchedCatalogVolumeId) {
@@ -2300,15 +2364,21 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
         return QString();
     }
 
-    // Entries tagged with an open-data volume id only apply to that volume;
-    // untagged entries keep the legacy behavior of applying to everything.
+    // Coordinate-tagged entries apply only to an exact coordinate view;
+    // untagged entries keep the legacy behavior for untagged volumes.
     const auto catalogIds =
         openDataCatalogVolumeIdCandidates(*pkg, loadedVolumeId);
+    const auto coordinateSpace =
+        openDataCoordinateSpaceForLoadedVolume(*pkg, loadedVolumeId);
+    const std::string coordinateTag = coordinateSpace.empty()
+        ? std::string{}
+        : "vc-open-data-coordinate-space:" + coordinateSpace;
     constexpr std::string_view volumeIdTagPrefix = "vc-open-data-volume-id:";
 
     QString untaggedFallback;
     for (const auto& path : paths) {
         const auto pathStr = path.string();
+        const QString candidateStr = QString::fromStdString(pathStr);
         const vc::project::Entry* owningEntry = nullptr;
         for (const auto& entry : pkg->normalGridEntries()) {
             if (pathStr == entry.location ||
@@ -2320,6 +2390,16 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
 
         std::vector<QString> entryVolumeIds;
         if (owningEntry) {
+            if (!coordinateTag.empty()) {
+                if (std::find(owningEntry->tags.begin(), owningEntry->tags.end(),
+                              coordinateTag) != owningEntry->tags.end()) {
+                    if (checkedPath) *checkedPath = candidateStr;
+                    qCInfo(lcSegGrowth) << "Normal grid resolved by coordinate space to"
+                                        << candidateStr;
+                    return candidateStr;
+                }
+                continue;
+            }
             for (const auto& tag : owningEntry->tags) {
                 if (tag.rfind(volumeIdTagPrefix, 0) == 0) {
                     entryVolumeIds.push_back(
@@ -2328,7 +2408,6 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
             }
         }
 
-        const QString candidateStr = QString::fromStdString(pathStr);
         if (entryVolumeIds.empty()) {
             if (untaggedFallback.isEmpty()) {
                 untaggedFallback = candidateStr;
@@ -2348,7 +2427,7 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
         }
     }
 
-    if (!untaggedFallback.isEmpty()) {
+    if (coordinateTag.empty() && !untaggedFallback.isEmpty()) {
         if (checkedPath) *checkedPath = untaggedFallback;
         qCInfo(lcSegGrowth) << "Normal grid resolved to" << untaggedFallback;
         return untaggedFallback;
@@ -2973,6 +3052,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             [this](const QString& message, int timeout) {
                 if (statusBar()) {
                     showStatusBarMessage(message, timeout);
+                }
+            });
+    connect(_state, &CState::volumeChanged, _volumeOverlay.get(),
+            [this](const std::shared_ptr<Volume>&, const std::string&) {
+                if (_volumeOverlay) {
+                    _volumeOverlay->refreshForCurrentVolume();
                 }
             });
     _viewerManager->setVolumeOverlay(_volumeOverlay.get());
@@ -4354,6 +4439,11 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 
     // CState handles cache budget and volume ID resolution, and emits volumeChanged
     _state->setCurrentVolume(newvol);
+    if (_viewerManager && _viewerManager->overlayVolume()) {
+        _viewerManager->setOverlayVolume(
+            _viewerManager->overlayVolume(),
+            _viewerManager->overlayVolumeId());
+    }
     if (_state->currentVolume() && !_state->currentVolumeId().empty()) {
         rememberCurrentVolumeForPackage(QString::fromStdString(_state->currentVolumeId()));
     }
@@ -4422,8 +4512,17 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
                 camera.scale = CChunkedVolumeViewer::clampCameraScale(
                     static_cast<float>(static_cast<double>(captured.camera.scale) / *navigationScale));
             }
-            camera.zOffset = captured.camera.zOffset;
+            camera.zOffset = navigationScale
+                ? static_cast<float>(static_cast<double>(captured.camera.zOffset) *
+                                     *navigationScale)
+                : captured.camera.zOffset;
             camera.zOffsetWorldDir = captured.camera.zOffsetWorldDir;
+            if (cv::norm(captured.camera.zOffsetWorldDir) > 0.0f) {
+                const auto direction = vc::core::util::transformNormal(
+                    captured.camera.zOffsetWorldDir, *navigationTransform);
+                if (finiteVec3(direction))
+                    camera.zOffsetWorldDir = direction;
+            }
             viewer->applyCameraState(camera, false);
         }
     }
@@ -7509,6 +7608,23 @@ void CWindow::CreateWidgets(void)
 
     connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
             this, &CWindow::onSegmentationEditingModeChanged);
+    connect(_segmentationModule.get(), &SegmentationModule::segmentationFolderChanged,
+            this, [this](const QString& surfaceId) {
+                refreshSegmentationDirectoryDropdown();
+                if (!_state || !_state->vpkg() || !_surfacePanel) {
+                    return;
+                }
+
+                _surfacePanel->setVolumePkg(_state->vpkg());
+                _surfacePanel->resetTagUi();
+                _surfacePanel->loadSurfaces(true);
+                _surfacePanel->refreshPointSetFilterOptions();
+
+                if (!restoreActiveSurfaceAfterSurfaceReload(surfaceId.toStdString())) {
+                    clearSurfaceSelection();
+                    _state->setSurface("segmentation", nullptr, true);
+                }
+            });
     connect(_segmentationModule.get(), &SegmentationModule::statusMessageRequested,
             this, &CWindow::onShowStatusMessage);
     connect(_segmentationModule.get(), &SegmentationModule::stopToolsRequested,
@@ -8848,7 +8964,31 @@ std::optional<cv::Matx44d> CWindow::openDataVolumeTransformForSwitch(
 {
     const std::string fromCatalogId = openDataVolumeIdForLoadedVolumeId(fromLoadedVolumeId);
     const std::string toCatalogId = openDataVolumeIdForLoadedVolumeId(toLoadedVolumeId);
-    if (fromCatalogId.empty() || toCatalogId.empty() || fromCatalogId == toCatalogId) {
+    if (fromCatalogId.empty() || toCatalogId.empty()) {
+        return std::nullopt;
+    }
+
+    const auto& pkg = *_state->vpkg();
+    const auto fromLevel = openDataCoordinateLevelForLoadedVolume(pkg, fromLoadedVolumeId);
+    const auto toLevel = openDataCoordinateLevelForLoadedVolume(pkg, toLoadedVolumeId);
+    const auto fromSpace = openDataCoordinateSpaceForLoadedVolume(pkg, fromLoadedVolumeId);
+    const auto toSpace = openDataCoordinateSpaceForLoadedVolume(pkg, toLoadedVolumeId);
+    const bool explicitCoordinates = fromLevel && toLevel &&
+                                     !fromSpace.empty() && !toSpace.empty();
+    if (explicitCoordinates) {
+        if (fromSpace == toSpace)
+            return cv::Matx44d::eye();
+        if (fromCatalogId == toCatalogId) {
+            const double factor = std::ldexp(1.0, *fromLevel - *toLevel);
+            return cv::Matx44d(
+                factor, 0, 0, 0,
+                0, factor, 0, 0,
+                0, 0, factor, 0,
+                0, 0, 0, 1);
+        }
+    } else if (fromCatalogId == toCatalogId) {
+        // Preserve legacy/manual same-lineage behavior when explicit
+        // coordinate identity is unavailable.
         return std::nullopt;
     }
 
@@ -8860,7 +9000,11 @@ std::optional<cv::Matx44d> CWindow::openDataVolumeTransformForSwitch(
     for (const auto& sample : manifest->samples) {
         if (auto matrix = vc3d::opendata::findSampleVolumeTransform(
                 sample, fromCatalogId, toCatalogId)) {
-            return matrix;
+            if (!explicitCoordinates)
+                return matrix;
+            const auto sourceScale = coordinateLevelScale(*fromLevel);
+            const auto targetScaleInv = coordinateLevelScale(-*toLevel);
+            return targetScaleInv * *matrix * sourceScale;
         }
     }
 
@@ -8999,6 +9143,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
     QVector<QPair<QString, QString>> volumeEntries;
     QVector<QPair<QString, QString>> openDataVolumeIdMap;
+    std::set<QString> preferredOpenDataSourceIds;
     std::set<QString> openDataVolumesWithoutSegments;
     std::vector<QString> orderedIds;
     QString activeCandidate = preferredVolumeId;
@@ -9048,16 +9193,31 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
             if (hasOpenDataSegments && !volumeHasOpenDataSegmentsEntry(*_state->vpkg(), id)) {
                 openDataVolumesWithoutSegments.insert(idStr);
             }
-            for (const auto& tag : _state->vpkg()->volumeTags(id)) {
+            const auto loadedVolumeTags = _state->vpkg()->volumeTags(id);
+            const bool preferredOpenDataSource =
+                std::find(loadedVolumeTags.begin(), loadedVolumeTags.end(),
+                          "vc-open-data-preferred-source") != loadedVolumeTags.end();
+            for (const auto& tag : loadedVolumeTags) {
                 constexpr std::string_view prefix = "vc-open-data-volume-id:";
                 if (tag.rfind(prefix, 0) != 0) {
                     continue;
                 }
                 const QString catalogVolumeId =
                     QString::fromStdString(tag.substr(prefix.size()));
-                if (!catalogVolumeId.isEmpty() &&
-                    openDataVolumeIdMappedToLoadedId(catalogVolumeId).isEmpty()) {
-                    openDataVolumeIdMap.append({catalogVolumeId, idStr});
+                if (!catalogVolumeId.isEmpty()) {
+                    const auto existing = std::find_if(
+                        openDataVolumeIdMap.begin(), openDataVolumeIdMap.end(),
+                        [&](const auto& mapping) {
+                            return mapping.first == catalogVolumeId;
+                        });
+                    if (existing == openDataVolumeIdMap.end()) {
+                        openDataVolumeIdMap.append({catalogVolumeId, idStr});
+                    } else if (preferredOpenDataSource &&
+                               !preferredOpenDataSourceIds.contains(catalogVolumeId)) {
+                        existing->second = idStr;
+                    }
+                    if (preferredOpenDataSource)
+                        preferredOpenDataSourceIds.insert(catalogVolumeId);
                 }
             }
 
@@ -9567,6 +9727,8 @@ void CWindow::onEditMaskPressed(const QString& segmentId)
         return;
     _maskRenderInProgress = true;
     showStatusBarMessage(tr("Rendering mask..."));
+    vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+        *surf, *_state->vpkg(), _state->currentVolumeId());
 
     auto* watcher = new QFutureWatcher<void>(this);
     connect(watcher, &QFutureWatcher<void>::finished, this,
@@ -9611,6 +9773,8 @@ void CWindow::onAppendMaskPressed(const QString& segmentId)
 
     std::filesystem::path path = surf->path/"mask.tif";
     auto volume = _state->currentVolume();
+    vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+        *surf, *_state->vpkg(), _state->currentVolumeId());
 
     auto* watcher = new QFutureWatcher<QString>(this);
     connect(watcher, &QFutureWatcher<QString>::finished, this,
@@ -9689,7 +9853,7 @@ QString CWindow::getCurrentVolumePath() const
         return QString();
     }
     if (volume->isRemote()) {
-        return QString::fromStdString(volume->remoteUrl());
+        return QString::fromStdString(volume->remoteLocator());
     }
     return QString::fromStdString(volume->path().string());
 }

@@ -24,6 +24,19 @@ fs::path makeDir(const std::string& tag)
     return p;
 }
 
+struct ConstantChunkComputer {
+    enum { BORDER = 0 };
+    enum { CHUNK_SIZE = 4 };
+    enum { FILL_V = 0 };
+    const std::string UNIQUE_ID_STRING = "destructor_cleanup";
+
+    template <typename Chunk, typename Element>
+    void compute(const Chunk&, Chunk& small, const cv::Vec3i&)
+    {
+        small.fill(static_cast<Element>(7));
+    }
+};
+
 } // namespace
 
 TEST_CASE("write then read meta.json round-trips a real dataset path")
@@ -90,4 +103,26 @@ TEST_CASE("read_cache_meta_dataset_path: missing dataset dir returns empty")
     auto got = read_cache_meta_dataset_path(dir / "meta.json");
     CHECK(got.empty());
     fs::remove_all(dir);
+}
+
+TEST_CASE("Chunked3d destruction releases mapped chunks before removing transient cache")
+{
+    const auto cacheRoot = makeDir("mapped_cleanup");
+    const auto cacheFamily = cacheRoot / "destructor_cleanup";
+    ConstantChunkComputer compute;
+
+    {
+        Chunked3d<std::uint8_t, ConstantChunkComputer> chunks(
+            compute, std::array<int, 3>{4, 4, 4}, nullptr, 0, cacheRoot);
+        const auto* chunk = chunks.chunk_safe(cv::Vec3i{0, 0, 0});
+        REQUIRE(chunk != nullptr);
+        CHECK(chunk[0] == 7);
+        REQUIRE(fs::exists(cacheFamily));
+        CHECK_FALSE(fs::is_empty(cacheFamily));
+    }
+
+    // On Windows this removal only succeeds if the mapped view was released
+    // before Chunked3d attempted to delete its per-instance cache directory.
+    CHECK(fs::is_empty(cacheFamily));
+    fs::remove_all(cacheRoot);
 }

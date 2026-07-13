@@ -49,12 +49,28 @@ utils::PriorityThreadPool& chunkWorkerPool(std::size_t workerCount)
     // Keep chunk I/O executors process-wide instead of viewer/cache-owned.
     // Destroying a viewer invalidates its cache state, but does not join
     // blocking file/HTTP reads from the UI thread.
+#if defined(_WIN32)
+    // Static destructors in a DLL run under the Windows loader lock. Joining
+    // worker threads there can deadlock because thread exit also requires
+    // loader notifications. These pools already have process lifetime, so
+    // let the OS reclaim them when the process exits instead of destructing
+    // them while vc_core.dll is detaching.
+    static auto* mutex = new std::mutex;
+    static auto* pools = new std::unordered_map<
+        std::size_t, std::unique_ptr<utils::PriorityThreadPool>>;
+#else
     static std::mutex mutex;
     static std::unordered_map<std::size_t, std::unique_ptr<utils::PriorityThreadPool>> pools;
+#endif
 
     workerCount = normalizedWorkerCount(workerCount);
+#if defined(_WIN32)
+    std::lock_guard lock(*mutex);
+    auto& pool = (*pools)[workerCount];
+#else
     std::lock_guard lock(mutex);
     auto& pool = pools[workerCount];
+#endif
     if (!pool)
         pool = std::make_unique<utils::PriorityThreadPool>(workerCount);
     return *pool;
@@ -65,8 +81,13 @@ utils::ThreadPool& persistentCacheWriterPool()
     // Keep disk-cache writes off the chunk read/fetch pool. A single writer
     // avoids same-path tmp/rename races while preventing writeback from
     // occupying workers needed by the current view.
+#if defined(_WIN32)
+    static auto* pool = new utils::ThreadPool(1);
+    return *pool;
+#else
     static utils::ThreadPool pool(1);
     return pool;
+#endif
 }
 
 utils::PriorityThreadPool& persistentCacheProbePool()
@@ -76,8 +97,13 @@ utils::PriorityThreadPool& persistentCacheProbePool()
     // routinely occupy every chunk worker for seconds. Without this lane a
     // chunk that is fully cached on disk can stay unrenderable for minutes
     // while finer-level downloads drain.
+#if defined(_WIN32)
+    static auto* pool = new utils::PriorityThreadPool(4);
+    return *pool;
+#else
     static utils::PriorityThreadPool pool(4);
     return pool;
+#endif
 }
 
 std::string fetchErrorMessage(const ChunkFetchResult& fetch)

@@ -1,5 +1,7 @@
 #include "SegmentationGrower.hpp"
 
+#include "OpenDataCoordinateIdentity.hpp"
+
 #include "../../NeuralTraceServiceManager.hpp"
 #include "../SegmentationModule.hpp"
 #include "../SegmentationWidget.hpp"
@@ -42,9 +44,7 @@
 
 #include "utils/Json.hpp"
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
+#include "vc/core/util/UnixSocket.hpp"
 
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth);
 
@@ -451,7 +451,11 @@ std::string generateTimestampString()
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
     std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &time);
+#else
     gmtime_r(&time, &tm);
+#endif
 
     char buffer[32];
     std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H-%M-%S", &tm);
@@ -894,21 +898,8 @@ bool uiPatchIndexMatchesSourceFolder(CState* state,
 utils::Json sendSocketJsonRequest(const QString& socketPath, const utils::Json& request)
 {
     const std::string socketStd = socketPath.toStdString();
-    int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) {
-        throw std::runtime_error("Failed to create UNIX socket.");
-    }
-
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    if (socketStd.size() >= sizeof(addr.sun_path)) {
-        ::close(sock);
-        throw std::runtime_error("Neural socket path is too long.");
-    }
-    std::strncpy(addr.sun_path, socketStd.c_str(), sizeof(addr.sun_path) - 1);
-
-    if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(sock);
+    vc::unixsocket::Socket sock = vc::unixsocket::connectStream(socketStd);
+    if (!vc::unixsocket::isValid(sock)) {
         throw std::runtime_error("Failed to connect to neural trace socket.");
     }
 
@@ -916,27 +907,24 @@ utils::Json sendSocketJsonRequest(const QString& socketPath, const utils::Json& 
     const char* ptr = requestPayload.c_str();
     size_t remaining = requestPayload.size();
     while (remaining > 0) {
-        ssize_t sent = ::send(sock, ptr, remaining, 0);
+        auto sent = ::send(sock, ptr, remaining, 0);
         if (sent < 0) {
-            ::close(sock);
+            vc::unixsocket::closeSocket(sock);
             throw std::runtime_error("Failed to send dense displacement request.");
         }
         ptr += sent;
-        remaining -= sent;
+        remaining -= static_cast<size_t>(sent);
     }
 
-    struct timeval tv;
-    tv.tv_sec = 300;  // 5 minute timeout
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    vc::unixsocket::setRecvTimeoutSeconds(sock, 300);  // 5 minute timeout
 
     std::string responsePayload;
     char buf[4096];
-    ssize_t n;
+    long long n;
     while ((n = ::recv(sock, buf, sizeof(buf), 0)) > 0) {
-        for (ssize_t i = 0; i < n; ++i) {
+        for (long long i = 0; i < n; ++i) {
             if (buf[i] == '\n') {
-                ::close(sock);
+                vc::unixsocket::closeSocket(sock);
                 if (responsePayload.empty()) {
                     throw std::runtime_error("Dense displacement service returned an empty response.");
                 }
@@ -945,7 +933,7 @@ utils::Json sendSocketJsonRequest(const QString& socketPath, const utils::Json& 
             responsePayload.push_back(buf[i]);
         }
     }
-    ::close(sock);
+    vc::unixsocket::closeSocket(sock);
 
     if (responsePayload.empty()) {
         throw std::runtime_error("Dense displacement service returned an empty response.");
@@ -2274,6 +2262,9 @@ void SegmentationGrower::onFutureFinished()
             const std::string newSegmentId = makeUniqueSegmentId(segmentsDir, baseId);
             const std::filesystem::path newSegmentPath = segmentsDir / newSegmentId;
             try {
+                vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+                    *surface, *request.volumeContext.package,
+                    request.volumeContext.activeVolumeId);
                 surface->save(newSegmentPath.string(), newSegmentId, false);
             } catch (const std::exception& ex) {
                 showStatus(tr("Failed to save displacement copy result: %1").arg(ex.what()), kStatusLong);
@@ -2374,6 +2365,9 @@ void SegmentationGrower::onFutureFinished()
         const std::filesystem::path newSegmentPath = segmentsDir / newSegmentId;
 
         try {
+            vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+                *result.surface, *request.volumeContext.package,
+                request.volumeContext.activeVolumeId);
             result.surface->save(newSegmentPath.string(), newSegmentId, false);
         } catch (const std::exception& ex) {
             showStatus(tr("Failed to save dense displacement result: %1").arg(ex.what()), kStatusLong);

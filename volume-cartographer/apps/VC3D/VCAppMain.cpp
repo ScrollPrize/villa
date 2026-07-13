@@ -20,6 +20,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
+#include <cstdio>
 #include <iostream>
 #include <thread>
 #include <omp.h>
@@ -29,7 +30,15 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #include <sys/resource.h>
 #endif
@@ -37,6 +46,17 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+
+// POSIX setenv with an MSVCRT/UCRT fallback (Windows has no setenv).
+static void vcSetEnv(const char* name, const char* value, int overwrite)
+{
+#if defined(_WIN32)
+    if (!overwrite && std::getenv(name)) return;
+    _putenv_s(name, value);
+#else
+    ::setenv(name, value, overwrite);
+#endif
+}
 
 // Runs before main() AND before all shared-library constructors.
 // .preinit_array is processed by the dynamic linker before any .init_array,
@@ -46,13 +66,13 @@ static void setThreadPoliciesEarly()
     // Force passive wait policy so OpenMP threads sleep instead of
     // spin-waiting with sched_yield.  overwrite=1 is intentional —
     // spin-waiting on 500+ OMP threads kills the machine.
-    setenv("OMP_WAIT_POLICY", "passive", 1);
-    setenv("OMP_NUM_THREADS", "1", 0);       // limit OpenMP parallelism
-    setenv("KMP_BLOCKTIME", "0", 1);         // LLVM/Intel OpenMP: sleep immediately
-    setenv("KMP_AFFINITY", "disabled", 0);   // skip sched_setaffinity per fork/join
-    setenv("OPENBLAS_NUM_THREADS", "1", 0);
-    setenv("GOTO_NUM_THREADS", "1", 0);      // legacy name for OpenBLAS
-    setenv("MKL_NUM_THREADS", "1", 0);       // Intel MKL
+    vcSetEnv("OMP_WAIT_POLICY", "passive", 1);
+    vcSetEnv("OMP_NUM_THREADS", "1", 0);       // limit OpenMP parallelism
+    vcSetEnv("KMP_BLOCKTIME", "0", 1);         // LLVM/Intel OpenMP: sleep immediately
+    vcSetEnv("KMP_AFFINITY", "disabled", 0);   // skip sched_setaffinity per fork/join
+    vcSetEnv("OPENBLAS_NUM_THREADS", "1", 0);
+    vcSetEnv("GOTO_NUM_THREADS", "1", 0);      // legacy name for OpenBLAS
+    vcSetEnv("MKL_NUM_THREADS", "1", 0);       // Intel MKL
 }
 #ifdef __linux__
 __attribute__((section(".preinit_array"), used))
@@ -71,6 +91,16 @@ static bool hasCliFlag(int argc, char* argv[], const char* flag)
 __attribute__((visibility("default")))
 auto main(int argc, char* argv[]) -> int
 {
+#ifdef _WIN32
+    // GUI-subsystem exe: stdout/stderr are detached by default. When launched
+    // from a terminal, reattach them so logs and --version/--help output are
+    // visible; double-click launches still get no console window.
+    if (::AttachConsole(ATTACH_PARENT_PROCESS)) {
+        std::freopen("CONOUT$", "w", stdout);
+        std::freopen("CONOUT$", "w", stderr);
+    }
+#endif
+
     vc::crash::install();
 
 #ifndef __linux__
@@ -164,6 +194,19 @@ auto main(int argc, char* argv[]) -> int
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));
     QApplication::setApplicationVersion(QString::fromStdString(ProjectInfo::VersionString()));
+
+    // Handle this before constructing the main window. QCommandLineParser's
+    // built-in version option normally exits from process(), but keeping the
+    // probe explicit makes the packaged GUI-subsystem executable a reliable
+    // non-interactive smoke test on Windows.
+    if (hasCliFlag(argc, argv, "--version")) {
+        std::cout << QApplication::applicationName().toStdString() << ' '
+                  << QApplication::applicationVersion().toStdString() << std::endl;
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(0);
+    }
+
     std::cout << "VC3D commit: " << ProjectInfo::RepositoryHash() << std::endl;
     std::cout << "creating remote volume cache at "
               << vc3d::remoteCachePath().toStdString() << std::endl;

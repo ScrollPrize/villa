@@ -83,6 +83,8 @@ public:
     void setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId);
     std::shared_ptr<Volume> overlayVolume() const { return _overlayVolume; }
     const std::string& overlayVolumeId() const { return _overlayVolumeId; }
+    std::shared_ptr<Volume> currentVolume() const;
+    std::string currentVolumeId() const;
 
     void setOverlayOpacity(float opacity);
     float overlayOpacity() const { return _overlayOpacity; }

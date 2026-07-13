@@ -41,6 +41,7 @@ public:
     void setVolumePkg(const std::shared_ptr<VolumePkg>& pkg, const QString& path);
     void clearVolumePkg();
     void refreshVolumeOptions();
+    void refreshForCurrentVolume();
     void toggleVisibility();
     bool hasOverlaySelection() const;
     void syncWindowFromManager(float low, float high);
