@@ -113,6 +113,7 @@ private:
     std::optional<OpenDataManifest> _manifest;
     std::vector<std::size_t> _visibleSampleIndexes;
     QFutureWatcher<ManifestLoadResult>* _fetchWatcher{nullptr};
+    bool _manifestRefreshPending{false};
     QFutureWatcher<PhotoLoadResult>* _photoWatcher{nullptr};
     std::vector<QFutureWatcher<PhotoLoadResult>*> _photoWatchers;
     QString _pendingPhotoSampleId;
