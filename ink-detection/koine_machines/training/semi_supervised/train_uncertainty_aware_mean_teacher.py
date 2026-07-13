@@ -801,7 +801,7 @@ def train(config_path):
                 if wandb.run is not None:
                     wandb.log(log_dict, step=step)
 
-        if accelerator.is_main_process and step % save_every == 0 and step > 0:
+        if accelerator.is_main_process and (step + 1) % save_every == 0:
             checkpoint_to_save = {
                 "model": accelerator.get_state_dict(model),
                 "optimizer": optimizer.state_dict(),
@@ -812,7 +812,7 @@ def train(config_path):
                 "step": step,
                 "wandb_run_id": wandb.run.id if wandb.run is not None else config.get("wandb_run_id"),
             }
-            torch.save(checkpoint_to_save, f"{out_dir}/ckpt_{step:06}.pth")
+            torch.save(checkpoint_to_save, f"{out_dir}/ckpt_{step + 1:06}.pth")
 
     accelerator.wait_for_everyone()
 
