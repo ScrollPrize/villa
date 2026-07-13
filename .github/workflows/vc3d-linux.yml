@@ -92,15 +92,28 @@ jobs:
 
       # Prove the AppImage is self-contained AND runs on an older glibc than the
       # 26.04 build image: run it on the plain ubuntu-24.04 runner (glibc 2.39)
-      # with no build deps installed.
+      # with no *build/dev* deps installed.
       - name: Smoke test the AppImage
         working-directory: volume-cartographer/dist
         timeout-minutes: 10
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
         run: |
+          # Install ONLY the documented runtime host prerequisites (the GL / X11 /
+          # font stack from scripts/appimage/README.md) — never any build/dev
+          # deps. The AppImage deliberately leaves this stack to the host: it is
+          # driver-coupled (GL) or version-sensitive (fonts). Note OpenCV is built
+          # WITH_OPENGL, so libopencv_core has a load-time libGLX.so.0 dependency —
+          # every tool links it, so even the CLI needs the GL libs *present* (no
+          # display required). Installing exactly this set both makes the test
+          # meaningful and validates that the documented prerequisite list is
+          # sufficient. xvfb supplies the virtual display for the GUI check only.
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xvfb
+          sudo apt-get install -y --no-install-recommends \
+            xvfb \
+            libglvnd0 libglx0 libegl1 libopengl0 libgl1 libgl1-mesa-dri libglx-mesa0 \
+            libx11-6 libx11-xcb1 libxcb1 libice6 libsm6 \
+            libfontconfig1 libfreetype6 libharfbuzz0b
           appimage="$(ls VC3D-*.AppImage)"
           chmod +x "$appimage"
           echo "runner glibc: $(ldd --version | head -1)"
