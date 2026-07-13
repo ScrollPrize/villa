@@ -208,7 +208,7 @@ Easily identifiable correct letters, rows, or columns are a natural fit for same
       <img src="/img/open-problems/winding-annotations/more-ink-as-same-wrap.webp" alt="Lines and individual letters highlighted as possible same-winding evidence" className="w-[100%] h-[100%] object-cover" />
     </a>
   </div>
-  <figcaption className="mt-2">Ink highlighted as possible same-winding evidence, from individual letters to complete lines.</figcaption>
+  <figcaption className="mt-2">Ink used same-winding annotation, from individual letters to complete lines.</figcaption>
 </figure>
 
 #### Intercolumnar gaps
