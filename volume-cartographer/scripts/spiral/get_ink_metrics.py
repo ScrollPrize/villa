@@ -21,8 +21,8 @@ Finally it aggregates the per-strip areas into a single total (the metric) and w
 metrics.json / metrics.csv.
 
 Usage:
-    get_ink_coverage.py /path/to/<run>/meshes/<...>/ink
-    get_ink_coverage.py /path/to/ink --output /somewhere/ink_metric --gpus 0,1,2
+    get_ink_metrics.py /path/to/<run>/meshes/<...>/ink
+    get_ink_metrics.py /path/to/ink --output /somewhere/ink_metric --gpus 0,1,2
 
 The nnU-Net model is pulled from HuggingFace (DEFAULT_MODEL below, cached locally by
 huggingface_hub on first use); pass --model to use another HF repo id or a local
@@ -84,7 +84,7 @@ def resolve_model(model):
 # CUDA_VISIBLE_DEVICES so the folds run in parallel.
 # ===========================================================================
 def run_worker(argv):
-    ap = argparse.ArgumentParser(prog='get_ink_coverage __worker__')
+    ap = argparse.ArgumentParser(prog='get_ink_metrics __worker__')
     ap.add_argument('--fold', type=int, required=True)
     ap.add_argument('--model', required=True)
     ap.add_argument('--checkpoint', required=True)
