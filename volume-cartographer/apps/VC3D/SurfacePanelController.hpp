@@ -244,5 +244,6 @@ private:
     QFutureWatcher<vc3d::opendata::OpenDataSegmentMaterializationResult>*
         _folderMaterializationWatcher{nullptr};
     std::string _pendingMaterializationId;
+    QPointer<QProgressDialog> _segmentMaterializationProgress;
     QPointer<QProgressDialog> _folderMaterializationProgress;
 };

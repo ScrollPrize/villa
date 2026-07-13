@@ -841,6 +841,19 @@ bool SurfacePanelController::startOpenDataMaterialization(
         tr("Fetching or creating segment %1...")
             .arg(QString::fromStdString(id)),
         0);
+
+    auto* dialog = new QProgressDialog(
+        tr("Fetching segment data for %1...")
+            .arg(QString::fromStdString(id)),
+        QString(), 0, 0, _ui.treeWidget);
+    dialog->setWindowTitle(tr("Loading Segment"));
+    dialog->setCancelButton(nullptr);
+    dialog->setWindowModality(Qt::WindowModal);
+    dialog->setMinimumDuration(0);
+    dialog->setAutoClose(false);
+    dialog->show();
+    _segmentMaterializationProgress = dialog;
+
     auto* watcher = new QFutureWatcher<
         vc3d::opendata::OpenDataSegmentMaterializationResult>(this);
     _segmentMaterializationWatcher = watcher;
@@ -852,6 +865,11 @@ bool SurfacePanelController::startOpenDataMaterialization(
                 _pendingMaterializationId.clear();
                 _segmentMaterializationWatcher = nullptr;
                 watcher->deleteLater();
+                if (_segmentMaterializationProgress) {
+                    _segmentMaterializationProgress->close();
+                    _segmentMaterializationProgress->deleteLater();
+                    _segmentMaterializationProgress = nullptr;
+                }
                 if (!result.success) {
                     emit statusMessageRequested(
                         tr("Failed to materialize %1: %2")
@@ -878,7 +896,15 @@ void SurfacePanelController::activateMaterializedSurface(
 {
     _overlaySegmentations.erase(path.string());
     loadSurfaces(true);
-    selectSurfaceById(id);
+    if (selectSurfaceById(id)) {
+        auto surface = getSurfaceById(id);
+        emit surfaceActivated(QString::fromStdString(id), surface.get());
+    } else {
+        emit statusMessageRequested(
+            tr("Segment %1 was fetched, but could not be activated.")
+                .arg(QString::fromStdString(id)),
+            8000);
+    }
     if (_viewerManager) {
         _viewerManager->primeSurfacePatchIndicesAsync();
     }
