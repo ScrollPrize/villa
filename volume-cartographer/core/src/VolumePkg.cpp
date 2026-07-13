@@ -8,12 +8,21 @@
 #include <set>
 #include <stdexcept>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include <cstdlib>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <pwd.h>
 #include <unistd.h>
 #endif
@@ -54,6 +63,21 @@ fs::path resolveLocalPath(const std::string& location, const fs::path& base)
 }
 
 namespace {
+
+void replaceFile(const fs::path& source, const fs::path& destination)
+{
+#if defined(_WIN32)
+    if (!::MoveFileExW(source.c_str(), destination.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const std::error_code ec(static_cast<int>(::GetLastError()),
+                                 std::system_category());
+        throw fs::filesystem_error(
+            "cannot replace project file", source, destination, ec);
+    }
+#else
+    fs::rename(source, destination);
+#endif
+}
 
 std::string asciiLower(std::string value)
 {
@@ -267,7 +291,7 @@ void atomicWriteString(const fs::path& target, const std::string& text)
         out.write(text.data(), static_cast<std::streamsize>(text.size()));
         if (!out) throw std::runtime_error("write failed for " + tmp.string());
     }
-    fs::rename(tmp, target);
+    replaceFile(tmp, target);
 }
 
 utils::Json entriesToJson(const std::vector<vc::project::Entry>& entries)

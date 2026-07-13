@@ -250,6 +250,25 @@ TEST_CASE("VolumePkg: save then load round-trips entries")
     fs::remove_all(d);
 }
 
+TEST_CASE("VolumePkg: saving over an existing project replaces it")
+{
+    auto d = tmpDir("save_overwrite");
+    auto jsonPath = d / "project.json";
+
+    auto p = VolumePkg::newEmpty();
+    p->setName("First");
+    p->save(jsonPath);
+    REQUIRE(fs::exists(jsonPath));
+
+    p->setName("Second");
+    p->save(jsonPath);
+
+    auto loaded = VolumePkg::load(jsonPath);
+    REQUIRE(loaded);
+    CHECK(loaded->name() == "Second");
+    fs::remove_all(d);
+}
+
 TEST_CASE("VolumePkg: missing selected_lasagna_dataset loads as empty")
 {
     auto d = tmpDir("lasagna_missing");
