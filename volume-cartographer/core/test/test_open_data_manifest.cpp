@@ -6,17 +6,40 @@
 #include "OpenDataSampleProject.hpp"
 #include "OpenDataSegmentCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/MemMap.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <utility>
-#include <unistd.h>
 
 using namespace vc3d::opendata;
 
 namespace {
+
+struct TestAutosaveRoot {
+    TestAutosaveRoot()
+        : previous(VolumePkg::autosaveRoot())
+        , root(std::filesystem::temp_directory_path() /
+               ("vc_open_data_manifest_autosave_" +
+                std::to_string(vc::memmap::pid())))
+    {
+        std::filesystem::remove_all(root);
+        VolumePkg::setAutosaveRoot(root);
+    }
+
+    ~TestAutosaveRoot()
+    {
+        VolumePkg::setAutosaveRoot(previous);
+        std::filesystem::remove_all(root);
+    }
+
+    std::filesystem::path previous;
+    std::filesystem::path root;
+};
+
+TestAutosaveRoot testAutosaveRoot;
 
 constexpr const char* kFixture = R"({
   "metadata": {
@@ -210,7 +233,7 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
     CHECK(second.string().find("L2-") != std::string::npos);
 }
 
-TEST_CASE("OpenDataSegmentCache classifies authored native and published representations")
+TEST_CASE("OpenDataSegmentCache selects one canonical source and published targets")
 {
     OpenDataSample sample;
     sample.id = "sample";
@@ -230,6 +253,10 @@ TEST_CASE("OpenDataSegmentCache classifies authored native and published represe
     authored.type = "tifxyz-flattened";
     authored.resolvedUrl = "https://example.test/authored";
     segment.artifacts.push_back(authored);
+    OpenDataArtifact normalized = authored;
+    normalized.type = "tifxyz-normalized";
+    normalized.resolvedUrl = "https://example.test/normalized";
+    segment.artifacts.push_back(normalized);
     OpenDataArtifact publishedA;
     publishedA.type = "tifxyz-transformed";
     publishedA.resolvedUrl = "https://example.test/published-a";
@@ -242,16 +269,16 @@ TEST_CASE("OpenDataSegmentCache classifies authored native and published represe
 
     const auto representations =
         classifyOpenDataSegmentRepresentations(sample, segment);
-    REQUIRE(representations.size() == 3);
-    CHECK(representations[0].kind == OpenDataSegmentRepresentationKind::Authored);
-    CHECK(representations[0].sourceCoordinateLevel == 2);
-    CHECK(representations[0].coordinateSpace == "sample/source@L2");
-    CHECK(representations[1].kind == OpenDataSegmentRepresentationKind::DerivedNative);
-    CHECK(representations[1].sourceCoordinateLevel == 0);
-    CHECK(representations[1].coordinateSpace == "sample/source@L0");
-    CHECK(representations[2].kind ==
+    REQUIRE(representations.size() == 2);
+    CHECK(representations[0].kind == OpenDataSegmentRepresentationKind::DerivedNative);
+    CHECK(representations[0].canonicalSource);
+    CHECK(representations[0].sourceCoordinateLevel == 0);
+    CHECK(representations[0].coordinateSpace == "sample/source@L0");
+    CHECK(representations[0].artifact == &segment.artifacts[0]);
+    CHECK(representations[1].kind ==
           OpenDataSegmentRepresentationKind::PublishedTransformed);
-    CHECK(representations[2].coordinateSpace == "sample/target@L0");
+    CHECK_FALSE(representations[1].canonicalSource);
+    CHECK(representations[1].coordinateSpace == "sample/target@L0");
     CHECK(representations[0].representationId !=
           representations[1].representationId);
 
@@ -259,9 +286,138 @@ TEST_CASE("OpenDataSegmentCache classifies authored native and published represe
     CHECK(openDataSegmentRepresentationCacheRoot(root, sample, representations[0]) !=
           openDataSegmentRepresentationCacheRoot(root, sample, representations[1]));
     CHECK(openDataSegmentRepresentationCacheDirectory(
-              root, sample, segment, representations[1]) !=
+              root, sample, segment, representations[0]) !=
           openDataSegmentRepresentationCacheDirectory(
-              root, sample, segment, representations[2]));
+              root, sample, segment, representations[1]));
+
+    OpenDataArtifact publishedSource = publishedA;
+    publishedSource.resolvedUrl = "https://example.test/published-source";
+    publishedSource.targetVolumeId = "source";
+    segment.artifacts.push_back(publishedSource);
+
+    const auto withPublishedSource =
+        classifyOpenDataSegmentRepresentations(sample, segment);
+    REQUIRE(withPublishedSource.size() == 2);
+    CHECK(withPublishedSource[0].kind ==
+          OpenDataSegmentRepresentationKind::PublishedTransformed);
+    CHECK(withPublishedSource[0].canonicalSource);
+    CHECK(withPublishedSource[0].coordinateSpace == "sample/source@L0");
+    CHECK(withPublishedSource[0].artifact == &segment.artifacts.back());
+    CHECK(std::none_of(
+        withPublishedSource.begin(), withPublishedSource.end(),
+        [](const auto& representation) {
+            return representation.kind ==
+                   OpenDataSegmentRepresentationKind::DerivedNative;
+        }));
+}
+
+TEST_CASE("OpenDataSegmentCache prepares lazy source and generated placeholders")
+{
+    auto manifest = parseOpenDataManifest(kFixture);
+    auto sample = *manifest.findSample("PHerc0139");
+    sample.segments.front().createdAt = "2026-06-02T20:44:01.955138Z";
+    OpenDataVolume targetVolume;
+    targetVolume.id = "vol2";
+    sample.volumes.push_back(targetVolume);
+    sample.properties["properties"]["volume_transforms"] = nlohmann::json::array({
+        {
+            {"from_volume_id", "vol1"},
+            {"transforms", nlohmann::json::array({
+                {
+                    {"to_volume_id", "vol2"},
+                    {"matrix", nlohmann::json::array({
+                        nlohmann::json::array({1.0, 0.0, 0.0, 10.0}),
+                        nlohmann::json::array({0.0, 1.0, 0.0, 20.0}),
+                        nlohmann::json::array({0.0, 0.0, 1.0, 30.0})
+                    })}
+                }
+            })}
+        }
+    });
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+        ("vc_open_data_lazy_placeholder_test_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(cacheRoot);
+    const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
+    VolumePkg::setAutosaveRoot(cacheRoot / "autosave");
+    auto pkg = VolumePkg::newEmpty();
+
+    const auto result = reconcileOpenDataSampleSegments(
+        *pkg, sample, cacheRoot, {}, false);
+    const auto sourceDir = openDataCanonicalSegmentCacheDirectory(
+        cacheRoot, sample, sample.segments.front());
+    const auto generatedDir = openDataTransformedSegmentCacheDirectory(
+        cacheRoot, sample, sample.segments.front(), "vol2");
+
+    CHECK(result.cachedTifxyzSegments == 0);
+    CHECK(result.transformedTifxyzSegments == 0);
+    CHECK(result.attachedSegmentEntries == 2);
+    CHECK(isOpenDataSegmentPlaceholder(sourceDir));
+    CHECK(isOpenDataSegmentPlaceholder(generatedDir));
+    CHECK(std::filesystem::is_regular_file(sourceDir / "meta.json"));
+    {
+        std::ifstream metaIn(sourceDir / "meta.json", std::ios::binary);
+        REQUIRE(metaIn.good());
+        const auto meta = nlohmann::json::parse(metaIn);
+        CHECK(meta.at("date_last_modified") == "20260602204401");
+        CHECK(meta.at("vc_open_data_creation_date") ==
+              "2026-06-02T20:44:01.955138Z");
+    }
+    CHECK_FALSE(std::filesystem::exists(sourceDir / "x.tif"));
+    CHECK_FALSE(std::filesystem::exists(generatedDir / "x.tif"));
+    CHECK(pkg->segmentEntries().size() == 2);
+    CHECK(pkg->segmentationIDs().size() == 1);
+    std::set<std::string> folderNames;
+    for (const auto& entry : pkg->segmentEntries()) {
+        folderNames.insert(
+            std::filesystem::path(entry.location).filename().string());
+        CHECK(std::find(entry.tags.begin(), entry.tags.end(),
+                        "vc-open-data-segment-aggregate") !=
+              entry.tags.end());
+    }
+    CHECK(folderNames == std::set<std::string>{"vol1", "vol2"});
+
+    pkg.reset();
+    VolumePkg::setAutosaveRoot(previousAutosaveRoot);
+    std::filesystem::remove_all(cacheRoot);
+}
+
+TEST_CASE("VolumePkg aggregate open-data folders deduplicate segment lineage")
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_open_data_aggregate_dedupe_test_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(root);
+    const auto published = root / "vol1" / "published-L0" / "published";
+    const auto generated =
+        root / "vol1" / "generated-from-source-L0" / "generated";
+    writeFile(published / "meta.json", nlohmann::json{
+        {"type", "seg"},
+        {"uuid", "published-id"},
+        {"format", "tifxyz"},
+        {"vc_open_data_catalog_segment_lineage_id", "same-lineage"},
+        {"vc_open_data_representation", "published-transformed"}
+    }.dump());
+    writeFile(generated / "meta.json", nlohmann::json{
+        {"type", "seg"},
+        {"uuid", "generated-id"},
+        {"format", "tifxyz"},
+        {"vc_open_data_catalog_segment_lineage_id", "same-lineage"},
+        {"vc_open_data_representation", "generated-native-transform"}
+    }.dump());
+
+    const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
+    VolumePkg::setAutosaveRoot(root / "autosave");
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addSegmentsEntry(
+        (root / "vol1").string(),
+        {"open-data", "immutable", "vc-open-data-segment-aggregate"}));
+    const auto ids = pkg->segmentationIDs();
+    REQUIRE(ids.size() == 1);
+    CHECK(ids.front() == "published-id");
+
+    pkg.reset();
+    VolumePkg::setAutosaveRoot(previousAutosaveRoot);
+    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("OpenDataManifest parses samples and computes summary counts")
@@ -317,6 +473,7 @@ TEST_CASE("OpenDataManifest parses volumes and segment artifact availability")
     CHECK(segment.id == "20260311000000");
     CHECK(segment.longId == "PHerc0139-20260311000000");
     CHECK(segment.originalVolumeId == "vol1");
+    CHECK(segment.createdAt == "2026-03-11T00:00:00Z");
     REQUIRE(segment.width.has_value());
     CHECK(*segment.width == 123);
     REQUIRE(segment.height.has_value());
@@ -324,6 +481,20 @@ TEST_CASE("OpenDataManifest parses volumes and segment artifact availability")
     CHECK(segment.hasTifxyz());
     CHECK(segment.hasInkDetection());
     CHECK(segment.hasLayersZarr());
+}
+
+TEST_CASE("OpenDataManifest reads the live segment creation date shape")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "samples":{"sample":{"segments":{"segment":{
+        "creation":{"date":"2026-06-02T20:44:01.955138Z"}
+      }}}}
+    })");
+
+    REQUIRE(manifest.samples.size() == 1);
+    REQUIRE(manifest.samples.front().segments.size() == 1);
+    CHECK(manifest.samples.front().segments.front().createdAt ==
+          "2026-06-02T20:44:01.955138Z");
 }
 
 TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties or referenced scan")
@@ -526,7 +697,9 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     volume.artifacts.push_back(artifact("obj", "http://127.0.0.1:9/mesh.obj"));
     sample.volumes.push_back(std::move(volume));
 
-    auto pkg = VolumePkg::newEmpty();
+    vc::project::LoadOptions loadOptions;
+    loadOptions.deferResolution = true;
+    auto pkg = VolumePkg::newEmpty(loadOptions);
     const auto result = attachOpenDataSampleVolumes(*pkg, sample);
 
     CHECK(result.supportedVolumes == 3);
@@ -546,6 +719,17 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     CHECK(std::find(pkg->volumeEntries()[2].tags.begin(),
                     pkg->volumeEntries()[2].tags.end(),
                     "ink-detection-3d") != pkg->volumeEntries()[2].tags.end());
+    CHECK(std::find(pkg->volumeEntries()[2].tags.begin(),
+                    pkg->volumeEntries()[2].tags.end(),
+                    "vc-open-data-coordinate-level-unknown:missing-parameters.level") !=
+          pkg->volumeEntries()[2].tags.end());
+    CHECK(std::any_of(
+        result.messages.begin(), result.messages.end(), [](const std::string& message) {
+            return message.find(
+                       "Skipped coordinate pairing for scan-volume "
+                       "(ink-detection-3d-zarr) against source L0:") !=
+                   std::string::npos;
+        }));
     CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
                     pkg->volumeEntries()[0].tags.end(),
                     "vc-open-data-volume-id:scan-volume") != pkg->volumeEntries()[0].tags.end());
@@ -605,7 +789,7 @@ TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
 TEST_CASE("OpenDataSegmentCache discovers cached ink detection overlays")
 {
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_ink_detection_test_" + std::to_string(getpid()));
+                           ("vc_open_data_ink_detection_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
     const auto segmentDir = cacheRoot / "segment";
     writeFile(segmentDir / "catalog-origin.json",
@@ -644,7 +828,7 @@ TEST_CASE("OpenDataSegmentCache reports local freshness against the live manifes
     REQUIRE(tifxyz != nullptr);
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_cache_state_test_" + std::to_string(getpid()));
+                           ("vc_open_data_cache_state_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
     const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, segment);
 
@@ -687,7 +871,7 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     const auto& sample = *manifest.findSample("PHerc0139");
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_sample_project_test_" + std::to_string(getpid()));
+                           ("vc_open_data_sample_project_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
 
     const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
@@ -732,17 +916,20 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     CHECK(pkg->hasSegmentations());
     const auto ids = pkg->segmentationIDs();
     REQUIRE(ids.size() == 1);
-    CHECK(ids.front().rfind(
-              "PHerc0139-20260311000000-derived-native-L0-", 0) == 0);
+    const auto representations = classifyOpenDataSegmentRepresentations(
+        sample, sample.segments.front());
+    REQUIRE(representations.size() == 1);
+    CHECK(ids.front() == representations.front().representationId);
     REQUIRE(!progressEvents.empty());
-    CHECK(progressEvents.back().status == "finished");
+    CHECK(progressEvents.back().status == "placeholders-finished");
     CHECK(progressEvents.back().completedFiles == 0);
-    CHECK(progressEvents.back().totalFiles == 6);
+    CHECK(progressEvents.back().totalFiles == 0);
     CHECK(progressEvents.back().completedSegments == 1);
     std::ifstream metaIn(segmentDir / "meta.json", std::ios::binary);
     REQUIRE(metaIn.good());
     const auto meta = nlohmann::json::parse(metaIn);
-    CHECK(meta.at("uuid").get<std::string>() == "PHerc0139-20260311000000");
+    CHECK(meta.at("uuid").get<std::string>() ==
+          representations.front().representationId);
     CHECK(meta.at("vc_open_data_segment_id").get<std::string>() == "20260311000000");
     CHECK(meta.at("vc_open_data_segment_long_id").get<std::string>() == "PHerc0139-20260311000000");
     CHECK(meta.at("vc_open_data_original_volume_id").get<std::string>() == "vol1");
@@ -774,7 +961,7 @@ TEST_CASE("OpenDataSegmentCache does not auto-associate transformed artifacts wi
     const auto& sample = *manifest.findSample("PHerc0139");
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_transformed_segment_test_" + std::to_string(getpid()));
+                           ("vc_open_data_transformed_segment_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
 
     const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
@@ -837,7 +1024,7 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
     });
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_volume_transform_test_" + std::to_string(getpid()));
+                           ("vc_open_data_volume_transform_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
 
     const auto sourceDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
@@ -867,8 +1054,9 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
     attachOpenDataSampleSegments(*pkg, sample, cacheRoot, result);
 
     CHECK(result.cachedTifxyzSegments == 1);
-    CHECK(result.transformedTifxyzSegments == 1);
+    CHECK(result.transformedTifxyzSegments == 0);
     REQUIRE(std::filesystem::is_regular_file(transformedDir / "meta.json"));
+    CHECK(isOpenDataSegmentPlaceholder(transformedDir));
     REQUIRE(pkg->segmentEntries().size() == 2);
     CHECK(std::any_of(pkg->segmentEntries().begin(),
                       pkg->segmentEntries().end(),
@@ -878,15 +1066,122 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
                                            "vc-open-data-target-volume-id:vol2") != entry.tags.end();
                       }));
 
+    const auto materialized =
+        materializeOpenDataSegmentFolder(transformedDir.parent_path());
+    REQUIRE(materialized.success);
+    CHECK(materialized.materializedSegments == 1);
+    CHECK_FALSE(isOpenDataSegmentPlaceholder(transformedDir));
+    const auto alreadyMaterialized = materializeOpenDataSegment(transformedDir);
+    REQUIRE(alreadyMaterialized.success);
+    CHECK(alreadyMaterialized.alreadyMaterialized);
+
+    sample.segments.front().createdAt = "2026-06-23T14:11:35.916443Z";
+    const auto refreshed = reconcileOpenDataSampleSegments(
+        *pkg, sample, cacheRoot, {}, false);
+    CHECK(refreshed.failedTransformedTifxyzSegments == 0);
+
     std::ifstream metaIn(transformedDir / "meta.json", std::ios::binary);
     REQUIRE(metaIn.good());
     const auto meta = nlohmann::json::parse(metaIn);
     CHECK(meta.at("vc_open_data_transform_source_volume_id").get<std::string>() == "vol1");
     CHECK(meta.at("vc_open_data_transform_target_volume_id").get<std::string>() == "vol2");
     CHECK(meta.at("vc_open_data_volume_transform_matrix")[0][3].get<double>() == doctest::Approx(10.0));
+    CHECK(meta.at("date_last_modified") == "20260623141135");
+    CHECK(meta.at("vc_open_data_creation_date") ==
+          "2026-06-23T14:11:35.916443Z");
 
     metaIn.close();
     pkg.reset();
+    std::filesystem::remove_all(cacheRoot);
+}
+
+TEST_CASE("OpenDataSegmentCache prefers published source and target representations")
+{
+    auto manifest = parseOpenDataManifest(kFixture);
+    auto sample = *manifest.findSample("PHerc0139");
+    OpenDataVolume targetVolume;
+    targetVolume.id = "vol2";
+    sample.volumes.push_back(targetVolume);
+    sample.properties["properties"]["volume_transforms"] = nlohmann::json::array({
+        {
+            {"from_volume_id", "vol1"},
+            {"transforms", nlohmann::json::array({
+                {
+                    {"to_volume_id", "vol2"},
+                    {"matrix", nlohmann::json::array({
+                        nlohmann::json::array({1.0, 0.0, 0.0, 10.0}),
+                        nlohmann::json::array({0.0, 1.0, 0.0, 20.0}),
+                        nlohmann::json::array({0.0, 0.0, 1.0, 30.0})
+                    })}
+                }
+            })}
+        }
+    });
+
+    OpenDataArtifact publishedSource;
+    publishedSource.type = "tifxyz-transformed";
+    publishedSource.resolvedUrl = "https://example.test/published-source";
+    publishedSource.targetVolumeId = "vol1";
+    sample.segments.front().artifacts.push_back(publishedSource);
+    OpenDataArtifact publishedTarget = publishedSource;
+    publishedTarget.resolvedUrl = "https://example.test/published-target";
+    publishedTarget.targetVolumeId = "vol2";
+    sample.segments.front().artifacts.push_back(publishedTarget);
+
+    const auto representations =
+        classifyOpenDataSegmentRepresentations(sample, sample.segments.front());
+    REQUIRE(representations.size() == 2);
+    REQUIRE(representations[0].canonicalSource);
+    CHECK(representations[0].coordinateVolumeId == "vol1");
+    CHECK(representations[1].coordinateVolumeId == "vol2");
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+        ("vc_open_data_published_precedence_test_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(cacheRoot);
+    const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
+                                "segments" / "20241113070770";
+    auto populateRepresentation = [&](const OpenDataSegmentRepresentation& representation) {
+        const auto dir = openDataSegmentRepresentationCacheDirectory(
+            cacheRoot, sample, sample.segments.front(), representation);
+        writeFile(dir / "meta.json",
+                  R"({"type":"seg","uuid":"cached","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+        copyFixtureFile(fixtureSegment / "x.tif", dir / "x.tif");
+        copyFixtureFile(fixtureSegment / "y.tif", dir / "y.tif");
+        copyFixtureFile(fixtureSegment / "z.tif", dir / "z.tif");
+        writeFile(dir / "catalog-origin.json",
+                  nlohmann::json{
+                      {"sample_id", sample.id},
+                      {"segment_id", sample.segments.front().id},
+                      {"resolved_http_url", representation.artifact->resolvedUrl},
+                      {"cache_state", "current"}
+                  }.dump());
+        return dir;
+    };
+    const auto sourcePublishedDir = populateRepresentation(representations[0]);
+    const auto targetPublishedDir = populateRepresentation(representations[1]);
+    const auto legacySourceDir = openDataSegmentCacheDirectory(
+        cacheRoot, sample, sample.segments.front());
+    const auto generatedDir = openDataTransformedSegmentCacheDirectory(
+        cacheRoot, sample, sample.segments.front(), "vol2");
+
+    const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
+    VolumePkg::setAutosaveRoot(cacheRoot / "autosave");
+    auto pkg = VolumePkg::newEmpty();
+    const auto result = reconcileOpenDataSampleSegments(
+        *pkg, sample, cacheRoot, {}, false);
+
+    CHECK(result.cachedTifxyzSegments == 1);
+    CHECK(result.transformedTifxyzSegments == 0);
+    CHECK(result.failedTifxyzSegments == 0);
+    CHECK(result.failedTransformedTifxyzSegments == 0);
+    CHECK(std::filesystem::is_regular_file(sourcePublishedDir / "meta.json"));
+    CHECK(std::filesystem::is_regular_file(targetPublishedDir / "meta.json"));
+    CHECK_FALSE(std::filesystem::exists(legacySourceDir));
+    CHECK_FALSE(std::filesystem::exists(generatedDir));
+    CHECK(pkg->segmentEntries().size() == 2);
+
+    pkg.reset();
+    VolumePkg::setAutosaveRoot(previousAutosaveRoot);
     std::filesystem::remove_all(cacheRoot);
 }
 
@@ -902,7 +1197,7 @@ TEST_CASE("OpenDataSegmentCache places GrowPatch output under the sample patches
 TEST_CASE("OpenDataSegmentCache counts manually created sample segments")
 {
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_manual_segment_count_test_" + std::to_string(getpid()));
+                           ("vc_open_data_manual_segment_count_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
 
     const auto sampleRoot = cacheRoot / "open_data" / "segments" / "PHerc0175A";
@@ -954,7 +1249,7 @@ TEST_CASE("OpenDataSegmentCache editable copy is selectable from its new folder"
 {
     const auto testRoot = std::filesystem::temp_directory_path() /
                           ("vc_open_data_editable_selection_test_" +
-                           std::to_string(getpid()));
+                           std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(testRoot);
 
     const auto sourceRoot = testRoot / "catalog-segments";
@@ -996,7 +1291,7 @@ TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
     sample.id = "Sample With Spaces";
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_cached_project_test_" + std::to_string(getpid()));
+                           ("vc_open_data_cached_project_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
 
     OpenDataSampleProjectResult firstResult;
@@ -1027,7 +1322,7 @@ TEST_CASE("OpenDataSampleProject reuses cached project and attaches existing cac
     auto sample = *manifest.findSample("PHerc0139");
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_cached_project_segments_test_" + std::to_string(getpid()));
+                           ("vc_open_data_cached_project_segments_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(cacheRoot);
 
     const auto segmentDir = openDataSegmentCacheDirectory(
@@ -1112,7 +1407,7 @@ TEST_CASE("OpenDataSampleProject reuses cached project and attaches existing cac
     CHECK(secondResult.cachedTifxyzSegments == 1);
     CHECK(secondResult.transformedTifxyzSegments == 1);
     CHECK(secondResult.attachedSegmentEntries == 1);
-    CHECK(secondProgressEvents.empty());
+    CHECK_FALSE(secondProgressEvents.empty());
     REQUIRE(second->segmentEntries().size() == 2);
     CHECK(std::any_of(second->segmentEntries().begin(),
                       second->segmentEntries().end(),
@@ -1124,7 +1419,7 @@ TEST_CASE("OpenDataSampleProject reuses cached project and attaches existing cac
     CHECK(std::any_of(secondResult.messages.begin(),
                       secondResult.messages.end(),
                       [](const std::string& message) {
-                          return message.find("Reused cached sample project segment entries") != std::string::npos;
+                          return message.find("Loaded cached sample project") != std::string::npos;
                       }));
 
     std::filesystem::remove_all(cacheRoot);

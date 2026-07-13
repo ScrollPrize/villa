@@ -44,6 +44,8 @@ class VolumePkg : public std::enable_shared_from_this<VolumePkg>
 {
 public:
     static std::shared_ptr<VolumePkg> newEmpty();
+    static std::shared_ptr<VolumePkg> newEmpty(
+        const vc::project::LoadOptions& opts);
     static std::shared_ptr<VolumePkg> load(const std::filesystem::path& jsonFile,
                                            const vc::project::LoadOptions& opts = {});
     static std::shared_ptr<VolumePkg> loadAutosave(const vc::project::LoadOptions& opts = {});

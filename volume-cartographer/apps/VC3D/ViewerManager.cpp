@@ -1,4 +1,5 @@
 #include "ViewerManager.hpp"
+#include "OpenDataSegmentCache.hpp"
 
 #include "VCSettings.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
@@ -720,6 +721,9 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     std::unordered_set<SurfacePatchIndex::SurfacePtr> seenSurfaces;
     for (const auto& surface : allSurfaces) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surface)) {
+            if (vc3d::opendata::isOpenDataSegmentPlaceholder(quad->path)) {
+                continue;
+            }
             // Skip if we've already seen this surface (shared_ptr hash uses underlying pointer)
             if (seenSurfaces.insert(quad).second) {
                 quadSurfaces.push_back(quad);
