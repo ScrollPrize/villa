@@ -1,6 +1,7 @@
 #include "SurfacePanelController.hpp"
 
 #include "SurfaceTreeWidget.hpp"
+#include "SurfaceDisplayName.hpp"
 #include "ViewerManager.hpp"
 #include "CState.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -192,7 +193,8 @@ void set_surface_tree_item_text(SurfaceTreeWidgetItem* item,
         return;
     }
 
-    const QString idText = QString::fromStdString(id);
+    const QString idText = QString::fromStdString(
+        vc3d::surfacePanelDisplayName(id, surf->meta));
     const QString longIdText = surface_long_id(surf);
     const double areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
     const double avgCost = vc::json::number_or(surf->meta, "avg_cost", -1.0);
@@ -1117,7 +1119,8 @@ void SurfacePanelController::handleTreeSelectionChanged()
 
     if (_segmentationViewerProvider) {
         if (auto* viewer = _segmentationViewerProvider()) {
-            viewer->setWindowTitle(surface ? tr("Surface %1").arg(idQString)
+            viewer->setWindowTitle(surface ? tr("Surface %1").arg(
+                                               firstSelected->text(SURFACE_ID_COLUMN))
                                            : tr("Surface"));
         }
     }
@@ -2515,7 +2518,9 @@ void SurfacePanelController::applyFiltersInternal()
 
         if (hasSurfaceIdFilter && !id.empty()) {
             const bool idMatches =
-                QString::fromStdString(id).contains(surfaceIdFilterText, Qt::CaseInsensitive);
+                QString::fromStdString(id).contains(surfaceIdFilterText, Qt::CaseInsensitive) ||
+                item->text(SURFACE_ID_COLUMN).contains(
+                    surfaceIdFilterText, Qt::CaseInsensitive);
             const bool longIdMatches =
                 item->text(SURFACE_LONG_ID_COLUMN).contains(surfaceIdFilterText, Qt::CaseInsensitive);
             show = show && (idMatches || longIdMatches);

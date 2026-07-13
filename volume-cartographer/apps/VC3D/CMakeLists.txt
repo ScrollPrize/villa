@@ -85,6 +85,7 @@ set(srcs
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
+    SurfaceDisplayName.hpp
     SeedingWidget.cpp
     SeedingWidget.hpp
     segmentation/SegmentationCommon.hpp
