@@ -181,7 +181,7 @@ A visible papyrus fiber can provide a natural path along one winding. Fiber anno
 
 ### Things we have not tried
 
-The following features may also provide useful same-winding evidence, but we have not yet tested them as inputs to the spiral fit.
+While we have used a few different types of winding annotations, there are **many** more things left to try. Here are some ideas we have thought about but have not yet had the time to implement:
 
 #### Drawn paths
 
