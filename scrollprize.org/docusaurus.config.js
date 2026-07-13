@@ -200,7 +200,7 @@ const config = {
                 },
                 {
                   to: "/open_problems/winding_annotations",
-                  label: "Winding Annotations",
+                  label: "Winding Constraints",
                 },
                 {
                   to: "/open_problems/ink_detection",
