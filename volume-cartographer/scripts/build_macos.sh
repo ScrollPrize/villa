@@ -4,13 +4,14 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/build_macos.sh [--install-deps] [--ccache] [--build-dir DIR] [--jobs N]
+  scripts/build_macos.sh [--install-deps] [--ccache|--sccache] [--build-dir DIR] [--jobs N]
 
 Build VC3D natively on macOS with Homebrew LLVM/Clang.
 
 Options:
   --install-deps   Install missing Homebrew formulae before configuring.
   --ccache         Enable ccache (installed when combined with --install-deps).
+  --sccache        Enable sccache (installed when combined with --install-deps).
   --build-dir DIR  Override the default build directory: build-macos
   --jobs N         Parallel build jobs. Defaults to the host CPU count.
 USAGE
@@ -28,6 +29,7 @@ cd "$script_dir/.."
 
 install_deps=0
 use_ccache=0
+use_sccache=0
 build_dir="build-macos"
 jobs="$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 
@@ -39,6 +41,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ccache)
       use_ccache=1
+      shift
+      ;;
+    --sccache)
+      use_sccache=1
       shift
       ;;
     --build-dir)
@@ -60,6 +66,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if (( use_ccache && use_sccache )); then
+  echo "--ccache and --sccache are mutually exclusive" >&2
+  exit 2
+fi
 
 if ! command -v brew >/dev/null 2>&1; then
   echo "Homebrew is required. Install it from https://brew.sh/ and rerun this script." >&2
@@ -104,6 +115,9 @@ required_formulae=(
 )
 if (( use_ccache )); then
   required_formulae+=(ccache)
+fi
+if (( use_sccache )); then
+  required_formulae+=(sccache)
 fi
 
 missing=()
@@ -156,8 +170,12 @@ fi
 
 extra_cmake_args=()
 if (( use_ccache )); then
-  extra_cmake_args+=("-DVC_USE_CCACHE=ON")
+  extra_cmake_args+=("-DVC_USE_CCACHE=ON" "-DVC_USE_SCCACHE=OFF")
   ccache --zero-stats
+fi
+if (( use_sccache )); then
+  extra_cmake_args+=("-DVC_USE_CCACHE=OFF" "-DVC_USE_SCCACHE=ON")
+  sccache --zero-stats
 fi
 # Eigen ships its CMake config under <prefix>/share/eigen3/cmake. Derive
 # the prefix via `brew --prefix eigen` so a Homebrew revision bump (eigen
@@ -205,4 +223,7 @@ cmake --build "$build_dir" -j "$jobs"
 
 if (( use_ccache )); then
   ccache --show-stats
+fi
+if (( use_sccache )); then
+  sccache --show-stats
 fi

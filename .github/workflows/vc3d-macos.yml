@@ -15,6 +15,8 @@ name: VC3D macOS App
 # LSMinimumSystemVersion in the app's Info.plist).
 
 on:
+  # Keep the existing workflow check present on PRs, but satisfy it with a
+  # lightweight no-op; vc3d-ci owns the required native macOS compile gate.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
@@ -35,20 +37,30 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # A newer main build supersedes an older package build. Never cancel a
+  # release or an explicitly requested build.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 jobs:
+  pr-noop:
+    name: Build + package (Homebrew LLVM, arm64)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - run: echo "Native compile coverage is provided by the required vc3d-ci macOS job."
+
   build-macos:
     name: Build + package (Homebrew LLVM, arm64)
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
     timeout-minutes: 180
     env:
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_INSTALL_CLEANUP: '1'
-      CCACHE_DIR: ${{ github.workspace }}/volume-cartographer/.ccache/macos-homebrew-llvm
-      CCACHE_BASEDIR: ${{ github.workspace }}/volume-cartographer
-      CCACHE_MAXSIZE: 3G
-      CCACHE_COMPRESS: 'true'
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-macos-15-arm64-homebrew-llvm-deps-b21145c7
     defaults:
       run:
         working-directory: volume-cartographer
@@ -72,16 +84,13 @@ jobs:
           "$GITHUB_WORKSPACE/vc3d-deps/macos/restore.sh" \
             "$RUNNER_TEMP/vc3d-macos-15-arm64.tar.zst"
 
-      - name: Restore compiler cache
-        uses: actions/cache@v4
+      - name: Set up shared compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.10
         with:
-          path: volume-cartographer/.ccache/macos-homebrew-llvm
-          key: vc3d-macos-15-homebrew-llvm-ccache-v1-${{ github.sha }}
-          restore-keys: |
-            vc3d-macos-15-homebrew-llvm-ccache-v1-
+          version: v0.15.0
 
       - name: Build
-        run: ./scripts/build_macos.sh --ccache
+        run: ./scripts/build_macos.sh --sccache
 
       - name: Package (DMG + ZIP)
         run: |

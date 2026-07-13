@@ -1,9 +1,9 @@
 name: VC3D Windows Installer
 
-# Builds VC3D natively on Windows under MSYS2/UCRT64 and produces a
-# self-contained NSIS installer (+ ZIP) with all DLLs and Qt plugins bundled.
-# On published releases the installer is attached to the GitHub release so
-# users can download and run a single .exe on Windows 10/11.
+# Compiles VC3D natively on Windows under MSYS2/UCRT64 for PRs. Main, release,
+# and manual runs also produce and smoke-test a self-contained NSIS installer
+# (+ ZIP) with all DLLs and Qt plugins bundled. Published-release installers
+# are attached to the GitHub release for Windows 10/11 users.
 
 on:
   pull_request:
@@ -26,18 +26,19 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # A newer PR/main commit supersedes the older build, but release and manual
+  # packaging runs must finish once started.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 jobs:
   build-windows:
-    name: Build + package (MSYS2 UCRT64)
+    name: ${{ github.event_name == 'pull_request' && 'Compile' || 'Build + package' }} (MSYS2 UCRT64)
     runs-on: windows-latest
     timeout-minutes: 150
     env:
-      CCACHE_DIR: ${{ github.workspace }}/volume-cartographer/.ccache/windows-mingw
-      CCACHE_BASEDIR: ${{ github.workspace }}/volume-cartographer
-      CCACHE_MAXSIZE: 3G
-      CCACHE_COMPRESS: 'true'
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-windows-ucrt64-mingw-deps-d84dfa07
     defaults:
       run:
         shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
@@ -64,45 +65,33 @@ jobs:
           & "$env:GITHUB_WORKSPACE\vc3d-deps\windows\restore.ps1" `
             -Archive "$env:RUNNER_TEMP\vc3d-windows-ucrt64.7z"
 
-      - name: Restore compiler cache
-        id: compiler-cache
-        uses: actions/cache/restore@v4
+      - name: Set up shared compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.10
         with:
-          path: volume-cartographer/.ccache/windows-mingw
-          key: vc3d-windows-mingw-ccache-v1-${{ github.sha }}
-          restore-keys: |
-            vc3d-windows-mingw-ccache-v1-
+          version: v0.15.0
 
       - name: Reset compiler cache statistics
-        run: ccache --zero-stats
+        run: sccache --zero-stats
 
       - name: Configure
-        run: cmake --preset ci-windows-mingw -DVC_USE_CCACHE=ON
+        run: cmake --preset ci-windows-mingw -DVC_USE_SCCACHE=ON
 
       - name: Build
         run: ninja -C build/ci-windows-mingw
 
-      # Persist compiler results before package smoke checks. Cache
-      # entries are immutable, so a rerun of this commit restores the exact
-      # build's cache even if a later step fails or times out.
-      - name: Save compiler cache
-        if: always() && steps.compiler-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: volume-cartographer/.ccache/windows-mingw
-          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
-
       - name: Report compiler cache statistics
         if: always()
-        run: ccache --show-stats
+        run: sccache --show-stats
 
       - name: Package (NSIS installer + ZIP)
+        if: github.event_name != 'pull_request'
         run: |
           cd build/ci-windows-mingw
           cpack -V
           ls -la *.exe *.zip
 
       - name: Upload installer artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: VC3D-windows-installer
@@ -115,6 +104,7 @@ jobs:
       # from plain PowerShell (no MSYS2 on PATH), so any DLL missing from the
       # bundle fails loudly here instead of on a user's machine.
       - name: Smoke test packaged tree
+        if: github.event_name != 'pull_request'
         shell: pwsh
         timeout-minutes: 10
         working-directory: volume-cartographer/build/ci-windows-mingw

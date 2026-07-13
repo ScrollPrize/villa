@@ -3,6 +3,13 @@ name: Continuous Integration (CI)
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  # Trusted main builds populate sccache entries that all subsequent PRs can
+  # read. Caches written by pull_request runs are scoped to that PR's merge ref.
+  push:
+    branches: [main]
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-ci.yml'
 
 permissions:
   contents: read
@@ -29,6 +36,7 @@ jobs:
             vc:
               - 'volume-cartographer/**'
               - '.github/workflows/vc3d-ci.yml'
+              - '.github/workflows/vc3d-macos.yml'
 
   skip:
     name: Skip (no volume-cartographer changes)
@@ -60,45 +68,41 @@ jobs:
           - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-release-tests, action: test, blocking: true }
           - { image: "ubuntu-26.04", compiler: clang, preset: ci-release-tests, action: test, blocking: true }
     env:
-      CCACHE_DIR: ${{ github.workspace }}/volume-cartographer/.ccache
-      CCACHE_BASEDIR: ${{ github.workspace }}/volume-cartographer
-      CCACHE_MAXSIZE: 3G
-      CCACHE_COMPRESS: 'true'
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-${{ matrix.compiler }}-${{ matrix.preset }}
     steps:
       - uses: actions/checkout@v4
-      - name: Restore compiler cache
-        uses: actions/cache@v4
+      - name: Set up shared compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.10
         with:
-          path: volume-cartographer/.ccache
-          key: vc3d-${{ matrix.image }}-${{ matrix.compiler }}-${{ matrix.preset }}-ccache-v1-${{ github.sha }}
-          restore-keys: |
-            vc3d-${{ matrix.image }}-${{ matrix.compiler }}-${{ matrix.preset }}-ccache-v1-
+          version: v0.15.0
       - name: ${{ matrix.action }}
         working-directory: volume-cartographer
         run: |
           preset="${{ matrix.preset }}-${{ matrix.compiler }}"
-          ccache --zero-stats
-          cmake --preset "$preset" -DVC_USE_CCACHE=ON
+          sccache --zero-stats
+          cmake --preset "$preset" -DVC_USE_SCCACHE=ON
           ninja -C "build/$preset"
           ctest --preset "$preset"
-          ccache --show-stats
+          sccache --show-stats
 
-  # macOS compile is a hard gate (parity with the Ubuntu Release cells).
-  # Smoke + toolchain-verifier run in a separate job that is non-blocking for
-  # now; promote that to a gate once it's been stable for a while.
+  # macOS compile is a hard PR gate (parity with the Ubuntu Release cells).
+  # Full packaging and packaged-app smoke checks run after merge and on releases.
   macos-build:
     name: macOS compile (${{ matrix.os }}, Homebrew LLVM)
     needs: changes
-    if: needs.changes.outputs.vc == 'true'
+    # The packaging workflow builds and seeds this same toolchain on main.
+    # Keep the required compile gate on PRs without rebuilding it after merge.
+    if: needs.changes.outputs.vc == 'true' && github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_INSTALL_CLEANUP: '1'
-      CCACHE_DIR: ${{ github.workspace }}/volume-cartographer/.ccache/macos-homebrew-llvm
-      CCACHE_BASEDIR: ${{ github.workspace }}/volume-cartographer
-      CCACHE_MAXSIZE: 3G
-      CCACHE_COMPRESS: 'true'
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-macos-15-arm64-homebrew-llvm-deps-b21145c7
     strategy:
       fail-fast: false
       matrix:
@@ -109,7 +113,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ScrollPrize/vc3d-deps
-          ref: cc7e7d53696998aaa25726044c8fc023b892fa36
+          ref: b21145c78af694a0fc574249a3f7ae6f037f8bea
           path: vc3d-deps
 
       - uses: oras-project/setup-oras@v1
@@ -119,20 +123,17 @@ jobs:
           GHCR_TOKEN: ${{ github.token }}
         run: |
           printf '%s' "$GHCR_TOKEN" | oras login ghcr.io -u '${{ github.actor }}' --password-stdin
-          oras pull ghcr.io/scrollprize/vc3d-deps/macos:sha-cc7e7d53696998aaa25726044c8fc023b892fa36 -o "$RUNNER_TEMP"
+          oras pull ghcr.io/scrollprize/vc3d-deps/macos:sha-b21145c78af694a0fc574249a3f7ae6f037f8bea -o "$RUNNER_TEMP"
           "$GITHUB_WORKSPACE/vc3d-deps/macos/restore.sh" \
             "$RUNNER_TEMP/vc3d-macos-15-arm64.tar.zst"
 
-      - name: Restore compiler cache
-        uses: actions/cache@v4
+      - name: Set up shared compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.10
         with:
-          path: volume-cartographer/.ccache/macos-homebrew-llvm
-          key: vc3d-${{ matrix.os }}-homebrew-llvm-ccache-v1-${{ github.sha }}
-          restore-keys: |
-            vc3d-${{ matrix.os }}-homebrew-llvm-ccache-v1-
+          version: v0.15.0
 
       - name: Configure + build
-        run: volume-cartographer/scripts/build_macos.sh --ccache
+        run: volume-cartographer/scripts/build_macos.sh --sccache
 
   ci:
     name: CI
