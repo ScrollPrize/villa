@@ -154,8 +154,9 @@ jobs:
             --message "VC3D latest release at $PACKAGE_SHA"
           git push --force origin refs/tags/latest
 
-          # Replace the old rolling release after its tag advances. Stable is a
-          # separate tag/release and is never touched by this workflow.
+          # Replace the old rolling release after its tag advances. Mark this
+          # main-branch snapshot as a pre-release so the manually promoted
+          # stable channel remains GitHub's designated latest release.
           if gh release view latest >/dev/null 2>&1; then
             gh release delete latest --yes
           fi
@@ -164,4 +165,5 @@ jobs:
             --verify-tag \
             --title "VC3D Latest" \
             --notes "Automatically packaged from main at commit $PACKAGE_SHA." \
-            --latest
+            --prerelease \
+            --latest=false
