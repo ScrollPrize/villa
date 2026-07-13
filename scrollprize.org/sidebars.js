@@ -35,7 +35,6 @@ const sidebars = {
       label: 'Open Problems',
       collapsible: true,
       collapsed: false,
-      link: { type: 'doc', id: 'open_problems' },
       items: [
         {
           type: 'doc',
@@ -62,8 +61,8 @@ const sidebars = {
       label: 'Data',
       collapsible: true,
       collapsed: false,
-      link: { type: 'doc', id: 'data_browser' },
       items: [
+        { type: 'doc', id: 'data_browser' },
         { type: 'doc', id: 'data' },
         { type: 'doc', id: 'data_datasets' },
       ],
@@ -74,8 +73,8 @@ const sidebars = {
       label: 'Milestones & Results',
       collapsible: true,
       collapsed: true,
-      link: { type: 'doc', id: 'winners' },
       items: [
+        { type: 'doc', id: 'winners', label: 'Prize Winners' },
         { type: 'doc', id: 'firstscroll' },
         { type: 'doc', id: 'grandprize' },
         { type: 'doc', id: 'firstletters' },
