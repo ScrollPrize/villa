@@ -1,12 +1,10 @@
-# Trace2CP Side Z-Axis Correction Status
+# Trace2CP Sub-Voxel Z-Step Interpolation Status
 
 - [x] Read current task request.
-- [x] Inspect relevant side-strip geometry and Trace2CP z-layer call sites.
+- [x] Inspect z-plane cache, stepwise z-search, DP z-search, and z-pillar users.
 - [x] Write task definition.
-- [x] Write implementation plan.
-- [x] Include spec/docs/testing plan.
-- [x] Review plan against existing specs before implementation.
-- [x] Implement explicit side z-axis handling.
+- [x] Write implementation plan with spec/docs/testing sections.
+- [x] Implement integer-voxel inference plus sub-voxel field interpolation.
 - [x] Update specs/docs/changelog/task log.
 - [x] Add/update tests.
 - [x] Run focused validation.

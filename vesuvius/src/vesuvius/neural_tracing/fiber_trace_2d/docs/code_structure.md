@@ -448,26 +448,33 @@ The important behavior is:
   bounded z-layer stack. The loader builds one aligned Trace2CP segment source
   from the CP-to-CP line window and Lasagna normals. In that side strip, image
   x follows the fiber tangent, image y follows the Lasagna row-normal axis, and
-  z-search layers move along the out-of-plane frame side axis. Layer `k` adds
-  `side_axis_zyx * (k * --trace2cp-z-step-voxels * volume_spacing_base)` to
-  the center coordinates before sampling the volume. The default z step is
-  `1.0` selected-scale voxel, with a bounded range controlled by
-  `--trace2cp-z-max-layer`. Z-search never warps an already sampled image and
-  never rebuilds unrelated planes. Direction and optional presence costs are
-  sampled from the selected z layer at each step/transition.
+  z-search layers move along the out-of-plane frame side axis. State layer `k`
+  represents `k * --trace2cp-z-step-voxels` selected-scale voxels along that
+  axis. Inference is capped at one selected-scale voxel spacing: z steps of
+  `1.0` or larger sample each requested state directly, while sub-voxel steps
+  infer only bracketing integer side-z offsets and interpolate direction and
+  optional presence fields for the requested state. Direction interpolation
+  sign-aligns the ambiguous vectors before interpolation and normalizes the
+  result. The default z step is `1.0` selected-scale voxel, with a bounded
+  range controlled by `--trace2cp-z-max-layer`. Z-search never warps an
+  already sampled image and never rebuilds unrelated planes. Direction and
+  optional presence costs are sampled from the selected state layer at each
+  step/transition.
 - Single-pair z-search visualization appends a z column with separate forward,
   reverse, and fused z-corrected views plus a fused z-layer map row. These
   images are reconstructed per column by rounding the trace/fused z value to
-  the nearest already inferred layer and copying that layer's sampled image
-  column. Columns outside the available trace/fused z path render black. This
-  visualization does not re-sample the volume and does not interpolate image
-  values between z layers.
+  the nearest z-search state layer and copying that state's sampled image
+  column. With sub-voxel z steps, interpolated states reuse the nearest
+  integer-inferred side-z image. Columns outside the available trace/fused z
+  path render black. This visualization does not re-sample the volume and does
+  not interpolate image values between z layers.
 - `--trace2cp-z-layers-tif` can be added to z-search Trace2CP runs to export
   the inferred layer cache as multilayer TIFF. Single-pair mode writes
   `trace2cp_z_layers.tif`; whole-fiber mode writes one pair-local TIFF per
   valid pair under `trace2cp_z_layers/`. Page order is all sampled slice images
-  in sorted z-layer order, followed by all available presence maps in the same
-  sorted z-layer order.
+  in sorted inferred z-layer order, followed by all available presence maps in
+  the same sorted inferred z-layer order. With sub-voxel z steps, this export
+  writes the actual integer-inferred layers, not the interpolated state layers.
 - When embedding channels are present, single-pair `trace2cp_vis.jpg` appends a
   debug column of fixed-scale cosine similarity maps: start CP, target CP,
   same-fiber CP-bank/global similarity when a combined Trace2CP bank is

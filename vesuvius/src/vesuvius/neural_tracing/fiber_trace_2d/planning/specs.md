@@ -738,20 +738,31 @@
   fiber tangent/arc direction, image y follows the Lasagna mesh-normal row
   axis, and z-search layers move along the remaining out-of-plane side axis
   aligned with the VC3D frame side direction, approximately
-  `mesh_normal x tangent`. Layer `k` is sampled by adding
-  `side_axis_zyx[y,x] * (k * --trace2cp-z-step-voxels *
-  volume_spacing_base)` to every center coordinate before volume sampling.
-  It must not use the side-strip image-y/row axis, a global normal, a
-  row-coordinate approximation, an image-space shift, or an unrelated rebuilt
-  plane. The default `--trace2cp-z-step-voxels 1.0` means layer `k` is offset
-  by `k` selected-scale voxels along the segment strip side-z axis.
+  `mesh_normal x tangent`. State layer `k` represents
+  `z_voxels = k * --trace2cp-z-step-voxels` along that axis. Volume/model
+  inference must run at no finer than one selected-scale voxel spacing: when
+  `--trace2cp-z-step-voxels >= 1.0`, the requested state layer is sampled
+  directly by adding `side_axis_zyx[y,x] * (z_voxels * volume_spacing_base)`
+  to every center coordinate before volume sampling; when
+  `--trace2cp-z-step-voxels < 1.0`, only the bracketing integer
+  selected-scale side-z voxel offsets are sampled and inferred. Direction and
+  sheet/fiber-presence fields for sub-voxel state layers are interpolated from
+  those integer layers, with ambiguous direction vectors sign-aligned before
+  interpolation and normalized afterward. It must not use the side-strip
+  image-y/row axis, a global normal, a row-coordinate approximation, an
+  image-space shift, or an unrelated rebuilt plane. The default
+  `--trace2cp-z-step-voxels 1.0` means layer `k` is offset by `k`
+  selected-scale voxels along the segment strip side-z axis.
   `--trace2cp-z-max-layer` bounds lazy expansion and defaults to `4`.
 - Default z-search lazily samples side-strip layers as the stepwise candidate
   tracer requests the current and neighboring z layers. Inference is
   deterministic and stores each layer's sampled image, valid mask, decoded
-  direction field, and optional presence field. Each selected path point
-  carries `x`, `y`, and selected-scale `z_voxels`; direction and presence costs
-  are sampled from the selected side-strip z layer.
+  direction field, and optional presence field. For sub-voxel z steps, lazy
+  sampling stores both requested state layers and the integer inferred layers
+  used to build them. Each selected path point carries `x`, `y`, and
+  selected-scale `z_voxels`; direction and presence costs are sampled from the
+  selected state layer, which may be interpolated from neighboring inferred
+  integer side-z layers.
 - With explicit `--trace2cp-dp`, z-search infers the bounded reachable layer
   stack for the pair before running the side DP. The DP may transition between
   neighboring z layers without an absolute z movement penalty, while its
@@ -767,19 +778,23 @@
   a fused z-layer map row so the selected layer per output column is visible
   even when neighboring sampled planes look similar. Each z-corrected image is
   assembled column-by-column by rounding the trace/fused z value to the nearest
-  already inferred layer and copying that layer's sampled image column. It
-  must not re-sample the volume and must not interpolate image values between
-  z layers; columns without a trace/fused z value and columns whose rounded
-  layer is missing render black and are counted in summary/debug output.
+  z-search state layer and copying that state's sampled image column. For
+  sub-voxel z steps, interpolated states reuse the nearest integer-inferred
+  side-z image. It must not re-sample the volume and must not interpolate image
+  values between z layers; columns without a trace/fused z value and columns
+  whose rounded layer is missing render black and are counted in summary/debug
+  output.
 - `--trace2cp-vis --trace2cp-z-search --trace2cp-z-layers-tif` exports the
   already inferred z-search layer cache as TIFF debug stacks. Single-pair mode
   writes `trace2cp_z_layers.tif`; whole-fiber mode writes one pair-local TIFF
   per valid pair under `trace2cp_z_layers/` because segment strips can have
   different shapes. Pages are uint8 and non-interleaved: all sampled slice
-  images first in sorted z-layer order, then all available sheet/fiber-presence
-  maps in the same sorted z-layer order. The export must use the existing
-  z-search cache, must not re-sample the volume, and must not interpolate
-  between z layers.
+  images first in sorted inferred z-layer order, then all available
+  sheet/fiber-presence maps in the same sorted inferred z-layer order. For
+  sub-voxel z steps, the TIFF stack exports only the actually inferred integer
+  side-z layers, not every interpolated DP/search state. The export must use
+  the existing z-search cache, must not re-sample the volume, and must not
+  interpolate image values between z layers.
 - `--trace2cp-vis --trace2cp-obj` is an opt-in single-pair diagnostic export.
   It writes vertex-colored OBJ meshes under `trace2cp_obj/` plus a manifest.
   OBJ geometry must come from the same sampled Trace2CP coordinate grids used

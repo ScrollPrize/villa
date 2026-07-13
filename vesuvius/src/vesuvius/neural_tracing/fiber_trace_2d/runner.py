@@ -223,17 +223,23 @@ def _trace2cp_z_corrected_surface_coords_xyz(
 def _trace2cp_z_layer_tiff_stack(
     plane_cache: "_Trace2CpZPlaneCache",
 ) -> tuple[np.ndarray, tuple[str, ...]]:
-    layers = tuple(sorted(int(layer) for layer in plane_cache.layers))
+    if hasattr(plane_cache, "inferred_layer_predictions"):
+        layer_predictions = plane_cache.inferred_layer_predictions()
+        layer_label = "inferred_layer"
+    else:
+        layer_predictions = tuple(
+            (int(layer), prediction)
+            for layer, prediction in sorted(getattr(plane_cache, "layers").items())
+        )
+        layer_label = "layer"
     pages: list[np.ndarray] = []
     labels: list[str] = []
-    for layer in layers:
-        prediction = plane_cache.layers[int(layer)]
+    for layer, prediction in layer_predictions:
         page = _to_u8_image(prediction.image, prediction.valid_mask)
         z_voxels = float(getattr(prediction, "z_voxels", float(layer) * float(plane_cache.z_step_voxels)))
         pages.append(page)
-        labels.append(f"slice layer={int(layer)} z_voxels={z_voxels:.6f}")
-    for layer in layers:
-        prediction = plane_cache.layers[int(layer)]
+        labels.append(f"slice {layer_label}={int(layer)} z_voxels={z_voxels:.6f}")
+    for layer, prediction in layer_predictions:
         fields = getattr(prediction, "fields", None)
         presence = None if fields is None else getattr(fields, "presence_hw", None)
         if presence is None:
@@ -241,7 +247,7 @@ def _trace2cp_z_layer_tiff_stack(
         page = _presence_map_to_u8(presence, prediction.valid_mask)
         z_voxels = float(getattr(prediction, "z_voxels", float(layer) * float(plane_cache.z_step_voxels)))
         pages.append(page)
-        labels.append(f"presence layer={int(layer)} z_voxels={z_voxels:.6f}")
+        labels.append(f"presence {layer_label}={int(layer)} z_voxels={z_voxels:.6f}")
     if not pages:
         raise ValueError("trace2cp z-search has no inferred layers to export")
     shape = tuple(int(v) for v in pages[0].shape)
@@ -2276,6 +2282,69 @@ def _predict_trace2cp_fields(
         )
 
 
+def _normalize_trace2cp_direction_field(direction_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    direction = np.asarray(direction_xy, dtype=np.float32)
+    if direction.ndim != 3 or int(direction.shape[2]) != 2:
+        raise ValueError("Trace2CP direction field must have shape H,W,2")
+    norm = np.linalg.norm(direction, axis=2, keepdims=True)
+    valid = np.isfinite(direction).all(axis=2) & (norm[..., 0] > 1.0e-6)
+    normalized = np.zeros_like(direction, dtype=np.float32)
+    normalized[valid] = direction[valid] / norm[valid]
+    return normalized, valid
+
+
+def _interpolate_trace2cp_z_fields(
+    lower: _Trace2CpZLayerPrediction,
+    upper: _Trace2CpZLayerPrediction,
+    weight: float,
+) -> tuple[_Trace2CpPredictedFields, np.ndarray]:
+    w = np.float32(np.clip(float(weight), 0.0, 1.0))
+    lo_dir, lo_dir_valid = _normalize_trace2cp_direction_field(lower.fields.direction_xy)
+    hi_dir, hi_dir_valid = _normalize_trace2cp_direction_field(upper.fields.direction_xy)
+    if lo_dir.shape != hi_dir.shape:
+        raise ValueError("Trace2CP z interpolation requires matching direction field shapes")
+    dot = np.sum(lo_dir * hi_dir, axis=2, keepdims=True)
+    hi_aligned = np.where(dot < 0.0, -hi_dir, hi_dir)
+    direction = (np.float32(1.0) - w) * lo_dir + w * hi_aligned
+    direction, dir_valid = _normalize_trace2cp_direction_field(direction)
+    valid_mask = (
+        np.asarray(lower.valid_mask, dtype=bool)
+        & np.asarray(upper.valid_mask, dtype=bool)
+        & lo_dir_valid
+        & hi_dir_valid
+        & dir_valid
+    )
+    presence: np.ndarray | None = None
+    if lower.fields.presence_hw is not None and upper.fields.presence_hw is not None:
+        lo_presence = np.asarray(lower.fields.presence_hw, dtype=np.float32)
+        hi_presence = np.asarray(upper.fields.presence_hw, dtype=np.float32)
+        if lo_presence.shape != hi_presence.shape or lo_presence.shape != valid_mask.shape:
+            raise ValueError("Trace2CP z interpolation requires matching presence field shapes")
+        presence = ((np.float32(1.0) - w) * lo_presence + w * hi_presence).astype(np.float32)
+    embedding: np.ndarray | None = None
+    if lower.fields.embedding_chw is not None and upper.fields.embedding_chw is not None:
+        lo_embedding = np.asarray(lower.fields.embedding_chw, dtype=np.float32)
+        hi_embedding = np.asarray(upper.fields.embedding_chw, dtype=np.float32)
+        if lo_embedding.shape != hi_embedding.shape:
+            raise ValueError("Trace2CP z interpolation requires matching embedding field shapes")
+        embedding = ((np.float32(1.0) - w) * lo_embedding + w * hi_embedding).astype(np.float32)
+        norm = np.linalg.norm(embedding, axis=0, keepdims=True)
+        embedding = np.divide(
+            embedding,
+            np.maximum(norm, np.float32(1.0e-6)),
+            out=np.zeros_like(embedding),
+            where=norm > np.float32(1.0e-6),
+        ).astype(np.float32)
+    return (
+        _Trace2CpPredictedFields(
+            direction_xy=direction.astype(np.float32, copy=False),
+            embedding_chw=embedding,
+            presence_hw=presence,
+        ),
+        valid_mask.astype(bool, copy=False),
+    )
+
+
 class _Trace2CpZPlaneCache:
     def __init__(
         self,
@@ -2320,6 +2389,8 @@ class _Trace2CpZPlaneCache:
         self.max_layer = bound
         self.center_offset = float(center_layer.sample.strip_z_offset)
         self.layers: dict[int, _Trace2CpZLayerPrediction] = {0: center_layer}
+        self._subvoxel_interpolation = bool(step < 1.0)
+        self._inferred_voxel_layers: dict[int, _Trace2CpZLayerPrediction] = {0: center_layer}
 
     def has_layer(self, layer: int) -> bool:
         return int(layer) in self.layers
@@ -2333,6 +2404,35 @@ class _Trace2CpZPlaneCache:
         existing = self.layers.get(layer_i)
         if existing is not None:
             return existing
+        if self._subvoxel_interpolation:
+            z_voxels = float(layer_i) * float(self.z_step_voxels)
+            lo_voxel = int(math.floor(z_voxels))
+            hi_voxel = int(math.ceil(z_voxels))
+            lower = self._get_inferred_voxel_layer(lo_voxel)
+            upper = self._get_inferred_voxel_layer(hi_voxel)
+            if lo_voxel == hi_voxel:
+                prediction = _Trace2CpZLayerPrediction(
+                    layer=layer_i,
+                    z_voxels=float(z_voxels),
+                    sample=lower.sample,
+                    image=lower.image,
+                    valid_mask=lower.valid_mask,
+                    fields=lower.fields,
+                )
+            else:
+                weight = (float(z_voxels) - float(lo_voxel)) / float(hi_voxel - lo_voxel)
+                fields, valid_mask = _interpolate_trace2cp_z_fields(lower, upper, weight)
+                nearest = lower if weight < 0.5 else upper
+                prediction = _Trace2CpZLayerPrediction(
+                    layer=layer_i,
+                    z_voxels=float(z_voxels),
+                    sample=nearest.sample,
+                    image=nearest.image,
+                    valid_mask=valid_mask,
+                    fields=fields,
+                )
+            self.layers[layer_i] = prediction
+            return prediction
         side_z_offset_voxels = float(layer_i) * self.z_step_voxels
         sample, image, valid_mask = self.loader.sample_trace2cp_segment_side_z_source(
             self.segment_source,
@@ -2350,6 +2450,33 @@ class _Trace2CpZPlaneCache:
         self.layers[layer_i] = prediction
         return prediction
 
+    def _get_inferred_voxel_layer(self, voxel_layer: int) -> _Trace2CpZLayerPrediction:
+        voxel_i = int(voxel_layer)
+        existing = self._inferred_voxel_layers.get(voxel_i)
+        if existing is not None:
+            return existing
+        max_abs_voxels = math.ceil(float(self.max_layer) * float(self.z_step_voxels) - 1.0e-6)
+        if abs(voxel_i) > int(max_abs_voxels):
+            raise ValueError(
+                f"trace2cp inferred z voxel {voxel_i} outside configured bound +/-{int(max_abs_voxels)}"
+            )
+        sample, image, valid_mask = self.loader.sample_trace2cp_segment_side_z_source(
+            self.segment_source,
+            side_z_offset_voxels=float(voxel_i),
+        )
+        fields = _predict_trace2cp_fields(self.model, image, valid_mask, device=self.device)
+        state_layer = int(round(float(voxel_i) / float(self.z_step_voxels)))
+        prediction = _Trace2CpZLayerPrediction(
+            layer=state_layer,
+            z_voxels=float(voxel_i),
+            sample=sample,
+            image=np.asarray(image, dtype=np.float32),
+            valid_mask=np.asarray(valid_mask, dtype=bool),
+            fields=fields,
+        )
+        self._inferred_voxel_layers[voxel_i] = prediction
+        return prediction
+
     def ensure_neighbors(self, layer: int) -> None:
         center = int(layer)
         for candidate in (center - 1, center, center + 1):
@@ -2358,6 +2485,14 @@ class _Trace2CpZPlaneCache:
 
     def layer_indices(self) -> tuple[int, ...]:
         return tuple(sorted(int(v) for v in self.layers))
+
+    def inferred_layer_predictions(self) -> tuple[tuple[int, _Trace2CpZLayerPrediction], ...]:
+        if self._subvoxel_interpolation:
+            return tuple(
+                (int(layer), prediction)
+                for layer, prediction in sorted(self._inferred_voxel_layers.items())
+            )
+        return tuple((int(layer), prediction) for layer, prediction in sorted(self.layers.items()))
 
 
 def _weighted_median_1d(values: np.ndarray, weights: np.ndarray) -> float:

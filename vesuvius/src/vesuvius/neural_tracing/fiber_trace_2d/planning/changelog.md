@@ -2,6 +2,10 @@
 
 ## 2026-07-13
 
+- Changed Trace2CP z-search with sub-voxel `--trace2cp-z-step-voxels` to infer
+  side-z model layers only at integer selected-scale voxel offsets, then
+  interpolate direction and sheet/fiber-presence fields for intermediate
+  DP/search states.
 - Corrected Trace2CP side z-search to offset layers along the side-strip
   out-of-plane frame side axis instead of the side-strip image-y/Lasagna row
   normal axis, covering stepwise z-search, DP z-search, side/top-z

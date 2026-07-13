@@ -1625,6 +1625,99 @@ def test_trace2cp_z_plane_cache_reuses_segment_source(monkeypatch: pytest.Monkey
     assert loader.sampled_offsets == [1.0, -2.0]
 
 
+def test_trace2cp_z_plane_cache_interpolates_subvoxel_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    valid = np.ones((3, 3), dtype=bool)
+
+    def make_sample(offset: float) -> FiberStripSegmentSample:
+        return FiberStripSegmentSample(
+            record_index=0,
+            fiber_path="fiber.json",
+            start_control_point_index=0,
+            target_control_point_index=1,
+            start_control_point_xyz=np.zeros(3, dtype=np.float32),
+            target_control_point_xyz=np.ones(3, dtype=np.float32),
+            strip_z_offset=0.0,
+            coords_zyx=np.zeros((3, 3, 3), dtype=np.float32),
+            valid_mask=valid,
+            frame=SimpleNamespace(),
+            line_xy=np.zeros((3, 2), dtype=np.float32),
+            start_control_point_xy=np.asarray([0.0, 1.0], dtype=np.float32),
+            target_control_point_xy=np.asarray([2.0, 1.0], dtype=np.float32),
+            line_point_indices=np.arange(3, dtype=np.int64),
+            line_normals_xyz=np.zeros((3, 3), dtype=np.float32),
+            start_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            target_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        )
+
+    class FakeLoader:
+        def __init__(self) -> None:
+            self.sampled_offsets: list[float] = []
+
+        def sample_trace2cp_segment_side_z_source(self, source, *, side_z_offset_voxels: float = 0.0):
+            self.sampled_offsets.append(float(side_z_offset_voxels))
+            image = np.full((3, 3), float(side_z_offset_voxels), dtype=np.float32)
+            return make_sample(float(side_z_offset_voxels)), image, valid
+
+    def fields_for_offset(offset: float) -> _Trace2CpPredictedFields:
+        direction = np.zeros((3, 3, 2), dtype=np.float32)
+        if float(offset) <= 0.0:
+            direction[:, :, 0] = 1.0
+        else:
+            direction[:, :, 1] = 1.0
+        embedding = np.zeros((2, 3, 3), dtype=np.float32)
+        embedding[0] = 1.0
+        presence = np.full((3, 3), float(offset), dtype=np.float32)
+        return _Trace2CpPredictedFields(
+            direction_xy=direction,
+            embedding_chw=embedding,
+            presence_hw=presence,
+        )
+
+    def fake_predict(model, image, valid_mask, *, device):
+        return fields_for_offset(float(np.asarray(image, dtype=np.float32)[0, 0]))
+
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict)
+    loader = FakeLoader()
+    center_layer = runner_module._Trace2CpZLayerPrediction(
+        layer=0,
+        z_voxels=0.0,
+        sample=make_sample(0.0),
+        image=np.zeros((3, 3), dtype=np.float32),
+        valid_mask=valid,
+        fields=fields_for_offset(0.0),
+    )
+    cache = runner_module._Trace2CpZPlaneCache(
+        loader=loader,
+        model=torch.nn.Identity(),
+        sample_index=123,
+        target_cp_index=1,
+        target_offset=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        row_axis_alignment_line_index=None,
+        row_axis_alignment_xyz=None,
+        device=torch.device("cpu"),
+        segment_source=object(),
+        center_layer=center_layer,
+        z_step_voxels=0.5,
+        max_layer=4,
+    )
+
+    half = cache.get(1)
+    expected = np.asarray([math.sqrt(0.5), math.sqrt(0.5)], dtype=np.float32)
+    np.testing.assert_allclose(half.fields.direction_xy[1, 1], expected, atol=1.0e-6)
+    assert half.fields.presence_hw is not None
+    assert float(half.fields.presence_hw[1, 1]) == pytest.approx(0.5)
+    assert half.z_voxels == pytest.approx(0.5)
+    assert loader.sampled_offsets == [1.0]
+
+    one = cache.get(2)
+    np.testing.assert_allclose(one.fields.direction_xy[1, 1], [0.0, 1.0], atol=1.0e-6)
+    assert loader.sampled_offsets == [1.0]
+    inferred = dict(cache.inferred_layer_predictions())
+    assert sorted(inferred) == [0, 1]
+
+
 def test_trace2cp_pair_builds_presence_z_pillar_panels(monkeypatch: pytest.MonkeyPatch) -> None:
     shape = (9, 21)
     valid = np.ones(shape, dtype=bool)
