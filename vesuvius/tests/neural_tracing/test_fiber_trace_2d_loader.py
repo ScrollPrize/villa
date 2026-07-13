@@ -84,7 +84,9 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _Trace2CpDirectionResult,
     _Trace2CpPredictedFields,
     _Trace2CpResult,
+    _Trace2CpTimingRow,
     _TtaDirectionField,
+    _aggregate_trace2cp_timings,
     _bilinear_direction_sample,
     _bilinear_direction_sample_ambiguous,
     _bilinear_embedding_sample,
@@ -362,6 +364,19 @@ def test_trace2cp_scoring_interpolates_target_column() -> None:
     assert result.score == pytest.approx(0.0)
     assert result.raw_y_error_px == pytest.approx(0.0)
     assert result.trace_y_at_target_x == pytest.approx(5.0)
+
+
+def test_trace2cp_timing_aggregation_preserves_stage_order() -> None:
+    rows = (
+        _Trace2CpTimingRow(stage="infer", elapsed_ms=10.0),
+        _Trace2CpTimingRow(stage="trace", elapsed_ms=3.0),
+        _Trace2CpTimingRow(stage="infer", elapsed_ms=6.0),
+    )
+
+    assert _aggregate_trace2cp_timings(rows) == [
+        ("infer", 2, pytest.approx(16.0), pytest.approx(8.0), pytest.approx(10.0)),
+        ("trace", 1, pytest.approx(3.0), pytest.approx(3.0), pytest.approx(3.0)),
+    ]
 
 
 def test_trace2cp_scoring_failure_is_edge_score() -> None:
@@ -2644,6 +2659,27 @@ def test_trace2cp_top_monotone_direction_path_z_stays_center_when_layers_match()
 
     assert path.shape == (3, 2)
     np.testing.assert_array_equal(layers, np.asarray([1, 1, 1], dtype=np.int32))
+
+
+def test_trace2cp_top_monotone_direction_path_z_progress_prints_eta(capsys) -> None:
+    direction = np.zeros((5, 19, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((5, 19), dtype=bool)
+
+    _trace2cp_top_monotone_direction_path_z(
+        [direction],
+        [valid],
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 2.0], dtype=np.float32),
+        progress_label="unit",
+        progress_interval_s=0.0,
+    )
+
+    captured = capsys.readouterr().out
+    assert "trace2cp dp start" in captured
+    assert "trace2cp dp progress" in captured
+    assert "eta_s=" in captured
+    assert "trace2cp dp done" in captured
 
 
 def test_trace2cp_top_monotone_direction_path_z_uses_better_direction_layer() -> None:

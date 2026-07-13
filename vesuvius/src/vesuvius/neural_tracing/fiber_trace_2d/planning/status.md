@@ -2,7 +2,9 @@
 
 - [x] Read current Trace2CP runner paths.
 - [x] Write task plan.
-- [ ] Implement timing collection and printing.
-- [ ] Update specs, docs, changelog, and task log.
-- [ ] Add focused tests.
-- [ ] Run validation.
+- [x] Implement timing collection and printing.
+- [x] Adjust side-DP transition and angle-penalty behavior.
+- [x] Add DP progress output with ETA.
+- [x] Update specs, docs, changelog, and task log.
+- [x] Add focused tests.
+- [x] Run validation.

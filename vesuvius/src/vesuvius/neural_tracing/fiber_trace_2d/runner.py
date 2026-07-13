@@ -36,6 +36,9 @@ from vesuvius.neural_tracing.fiber_trace_2d.model import (
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_line_index
 
 
+_TRACE2CP_SIDE_DP_HORIZONTAL_STEP_PX = 32
+
+
 def _path_arg_for_config(path: str | Path) -> str:
     path_s = str(path)
     if path_s.startswith(("s3://", "http://", "https://")):
@@ -4736,7 +4739,11 @@ def _trace_score_trace2cp_combined_bidirectional(
         rf_margin_px=rf_margin_px,
         z_step_voxels=0.0,
         max_abs_dz=0,
-        horizontal_step_px=max(1, int(round(float(step_px)))),
+        horizontal_step_px=_TRACE2CP_SIDE_DP_HORIZONTAL_STEP_PX,
+        max_direction_angle_degrees=float(candidate_max_degrees),
+        candidate_angles_degrees=_trace2cp_candidate_angles_degrees(candidate_max_degrees, candidate_step_degrees),
+        progress_label="side "
+        f"cp={float(np.asarray(start_xy, dtype=np.float32)[0]):.1f}->{float(np.asarray(target_xy, dtype=np.float32)[0]):.1f}",
     )
     return result, summary
 
@@ -4910,7 +4917,12 @@ def _trace_score_trace2cp_combined_z_bidirectional(
             rf_margin_px=rf_margin_px,
             z_step_voxels=float(plane_cache.z_step_voxels),
             max_abs_dz=1,
-            horizontal_step_px=max(1, int(round(float(step_px)))),
+            horizontal_step_px=_TRACE2CP_SIDE_DP_HORIZONTAL_STEP_PX,
+            max_direction_angle_degrees=float(candidate_max_degrees),
+            candidate_angles_degrees=_trace2cp_candidate_angles_degrees(candidate_max_degrees, candidate_step_degrees),
+            progress_label="side_z "
+            f"layers={-int(plane_cache.max_layer)}..{int(plane_cache.max_layer)} "
+            f"cp={float(np.asarray(start_xy, dtype=np.float32)[0]):.1f}->{float(np.asarray(target_xy, dtype=np.float32)[0]):.1f}",
         )
     if timing_rows is not None:
         _append_trace2cp_timing(timing_rows, "trace_combined_z_dp", dp_timer.elapsed_ms)
@@ -5381,6 +5393,10 @@ def _trace2cp_top_monotone_direction_path_z(
     dy_smooth_penalty: float = 0.05,
     dz_smooth_penalty: float = 0.1,
     horizontal_step_px: int = 8,
+    max_direction_angle_degrees: float | None = None,
+    angle_excess_penalty: float = 4.0,
+    progress_label: str | None = None,
+    progress_interval_s: float = 2.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     if not direction_fields:
         raise ValueError("at least one direction field is required")
@@ -5464,6 +5480,15 @@ def _trace2cp_top_monotone_direction_path_z(
     rows = np.arange(height, dtype=np.int32)
     max_dy = max(0, int(max_abs_dy))
     max_dz = max(0, int(max_abs_dz))
+    if max_direction_angle_degrees is None:
+        min_direction_alignment: float | None = None
+    else:
+        angle_limit = float(max_direction_angle_degrees)
+        if not np.isfinite(angle_limit) or angle_limit >= 90.0:
+            min_direction_alignment = None
+        else:
+            min_direction_alignment = float(np.cos(np.deg2rad(max(0.0, angle_limit))))
+    angle_penalty_scale = np.float32(max(0.0, float(angle_excess_penalty)))
     move_pairs = [(dy, dz) for dz in range(-max_dz, max_dz + 1) for dy in range(-max_dy, max_dy + 1)]
     move_dy = np.asarray([dy for dy, _dz in move_pairs], dtype=np.int32)
     move_dz = np.asarray([dz for _dy, dz in move_pairs], dtype=np.int32)
@@ -5477,6 +5502,19 @@ def _trace2cp_top_monotone_direction_path_z(
     dp_prev = np.full((layer_count, height, move_count), inf, dtype=np.float32)
     dp_prev[center_layer, y0, zero_move_index] = np.float32(0.0)
     backptr_move = np.full((int(columns.shape[0]), layer_count, height, move_count), -1, dtype=np.int16)
+    progress_enabled = progress_label is not None and int(columns.shape[0]) > 1
+    progress_name = "" if progress_label is None else str(progress_label).replace("\n", " ")
+    progress_total = max(1, int(columns.shape[0]) - 1)
+    progress_start_s = time.perf_counter()
+    progress_last_s = progress_start_s
+    progress_interval = max(0.1, float(progress_interval_s))
+    if progress_enabled:
+        print(
+            "trace2cp dp start "
+            f"label={progress_name!r} columns={progress_total} layers={layer_count} "
+            f"height={height} moves={move_count} hstep={horizontal_step}",
+            flush=True,
+        )
 
     for column_index in range(1, int(columns.shape[0])):
         prev_x = int(columns[column_index - 1])
@@ -5517,7 +5555,14 @@ def _trace2cp_top_monotone_direction_path_z(
                         sample_direction = unit[sample_layer, sample_y[sample_inside], sample_x, :]
                         sample_valid = field_valid[sample_layer, sample_y[sample_inside], sample_x]
                         alignment = np.abs(sample_direction[:, 0] * tangent_x + sample_direction[:, 1] * tangent_y)
-                        direction_cost = (1.0 - np.clip(alignment, 0.0, 1.0)).astype(np.float32)
+                        clipped_alignment = np.clip(alignment, 0.0, 1.0)
+                        direction_cost = (1.0 - clipped_alignment).astype(np.float32)
+                        if min_direction_alignment is not None and angle_penalty_scale > 0.0:
+                            excess = np.maximum(
+                                np.float32(0.0),
+                                np.float32(min_direction_alignment) - clipped_alignment,
+                            )
+                            direction_cost += angle_penalty_scale * excess.astype(np.float32)
                         sample_cost[sample_inside] = np.float32(float(direction_weight)) * direction_cost
                         if presence_stack is not None:
                             sample_presence = presence_stack[sample_layer, sample_y[sample_inside], sample_x]
@@ -5552,10 +5597,30 @@ def _trace2cp_top_monotone_direction_path_z(
                     dp_next[current_layer, update, current_move_index] = candidate[update]
                     backptr_move[column_index, current_layer, update, current_move_index] = best_prev_move[update_indices]
         dp_prev = dp_next
+        if progress_enabled:
+            now_s = time.perf_counter()
+            if column_index >= progress_total or (now_s - progress_last_s) >= progress_interval:
+                elapsed_s = max(0.0, now_s - progress_start_s)
+                rate = float(column_index) / max(elapsed_s, 1.0e-9)
+                eta_s = (float(progress_total - column_index) / rate) if rate > 0.0 else float("inf")
+                eta_text = "inf" if not np.isfinite(eta_s) else f"{eta_s:.1f}"
+                print(
+                    "trace2cp dp progress "
+                    f"label={progress_name!r} columns={column_index}/{progress_total} "
+                    f"elapsed_s={elapsed_s:.1f} eta_s={eta_text}",
+                    flush=True,
+                )
+                progress_last_s = now_s
 
     final_moves = dp_prev[center_layer, y1, :]
     final_move_index = int(np.argmin(final_moves))
     if not np.isfinite(float(final_moves[final_move_index])) or float(final_moves[final_move_index]) >= float(inf) * 0.5:
+        if progress_enabled:
+            print(
+                "trace2cp dp failed "
+                f"label={progress_name!r} columns={progress_total} elapsed_s={time.perf_counter() - progress_start_s:.1f}",
+                flush=True,
+            )
         return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.int32)
 
     path_y = np.full(int(columns.shape[0]), -1, dtype=np.int32)
@@ -5572,6 +5637,12 @@ def _trace2cp_top_monotone_direction_path_z(
         prev_layer = current_layer - current_dz
         prev_move_index = int(backptr_move[column_index, current_layer, current_y, current_move_index])
         if prev_y < 0 or prev_y >= height or prev_layer < 0 or prev_layer >= layer_count or prev_move_index < 0:
+            if progress_enabled:
+                print(
+                    "trace2cp dp failed "
+                    f"label={progress_name!r} columns={progress_total} elapsed_s={time.perf_counter() - progress_start_s:.1f}",
+                    flush=True,
+                )
             return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.int32)
         path_y[column_index - 1] = prev_y
         path_layer[column_index - 1] = prev_layer
@@ -5579,6 +5650,12 @@ def _trace2cp_top_monotone_direction_path_z(
     path = np.stack([columns.astype(np.float32), path_y.astype(np.float32)], axis=1).astype(np.float32)
     path[0] = start
     path[-1] = target
+    if progress_enabled:
+        print(
+            "trace2cp dp done "
+            f"label={progress_name!r} columns={progress_total} elapsed_s={time.perf_counter() - progress_start_s:.1f}",
+            flush=True,
+        )
     return path, path_layer.astype(np.int32)
 
 
@@ -5832,6 +5909,9 @@ def _trace_score_trace2cp_joint_dp_bidirectional(
     max_abs_dz: int = 0,
     max_abs_dy: int | None = None,
     horizontal_step_px: int = 8,
+    max_direction_angle_degrees: float | None = None,
+    candidate_angles_degrees: np.ndarray | None = None,
+    progress_label: str | None = None,
 ) -> tuple[_Trace2CpBidirectionalResult, _Trace2CpCombinedSummary, np.ndarray]:
     if not direction_fields:
         raise ValueError("joint Trace2CP DP requires at least one direction field")
@@ -5854,7 +5934,12 @@ def _trace_score_trace2cp_joint_dp_bidirectional(
         max_abs_dz=int(max_abs_dz),
         invalid_penalty=4.0,
         z_transition_penalty=0.1,
+        dy_smooth_penalty=0.05,
+        dz_smooth_penalty=0.1,
         horizontal_step_px=step,
+        max_direction_angle_degrees=max_direction_angle_degrees,
+        angle_excess_penalty=4.0,
+        progress_label=progress_label,
     )
     if path.size == 0:
         raise ValueError("joint Trace2CP DP could not connect the two CPs")
@@ -5879,6 +5964,11 @@ def _trace_score_trace2cp_joint_dp_bidirectional(
         path_z=path_z if int(max_abs_dz) > 0 or abs(float(z_step_voxels)) > 0.0 else None,
         reason="joint_dp",
     )
+    angles = (
+        np.zeros((0,), dtype=np.float32)
+        if candidate_angles_degrees is None
+        else np.asarray(candidate_angles_degrees, dtype=np.float32).reshape(-1)
+    )
     summary = _Trace2CpCombinedSummary(
         forward=stats,
         reverse=_Trace2CpCombinedTraceStats(
@@ -5892,7 +5982,7 @@ def _trace_score_trace2cp_joint_dp_bidirectional(
             reason="joint_dp_reverse_alias",
             presence_loss_sum=0.0,
         ),
-        candidate_angles_degrees=np.zeros((0,), dtype=np.float32),
+        candidate_angles_degrees=angles,
         fiber_bank_size=0,
         fiber_bank_skipped=0,
     )
@@ -5957,6 +6047,8 @@ def _trace2cp_top_model_direction_overlay(
             [float(np.asarray(target_xy, dtype=np.float32)[0]), center_y],
             dtype=np.float32,
         ),
+        progress_label="top_model "
+        f"layers={len(direction_fields)} cp={float(np.asarray(start_xy, dtype=np.float32)[0]):.1f}->{float(np.asarray(target_xy, dtype=np.float32)[0]):.1f}",
     )
     if monotone_path.size:
         rounded_x = np.rint(monotone_path[:, 0]).astype(np.int32)
@@ -7885,6 +7977,9 @@ def _export_trace2cp_vis(
         refine_smooth_window=int(refine_smooth_window),
         top_model=top_model,
     )
+    timing_rows: list[_Trace2CpTimingRow] = [
+        row for chain_evaluation in evaluations for row in chain_evaluation.timing_rows
+    ]
     evaluation = evaluations[0]
     sample = evaluation.sample
     image = evaluation.image
@@ -7903,32 +7998,36 @@ def _export_trace2cp_vis(
 
     image_u8 = _to_u8_image(image, valid_mask)
     result_label = _trace2cp_evaluation_label(evaluation)
-    overlay = _draw_trace2cp_overlay(
-        image_u8,
-        line_xy=sample.line_xy,
-        start_xy=start_xy,
-        target_xy=target_xy,
-        bidirectional_result=selected_result,
-        result_label=result_label,
-        reference_result=base_result if selected_result is not base_result else None,
-        reference_label="reference",
-        similarity_debug=evaluation.similarity_debug,
-        z_search_debug=evaluation.z_search_debug,
-        presence_debug=evaluation.presence_debug,
-        top_strip_image=evaluation.top_strip_image,
-        top_strip_valid_mask=evaluation.top_strip_valid_mask,
-        traced_top_strip_image=evaluation.traced_top_strip_image,
-        traced_top_strip_valid_mask=evaluation.traced_top_strip_valid_mask,
-        z_top_strip_image=evaluation.z_top_strip_image,
-        z_top_strip_valid_mask=evaluation.z_top_strip_valid_mask,
-        top_model_direction_image=evaluation.top_model_direction_image,
-        top_model_direction_valid_mask=evaluation.top_model_direction_valid_mask,
-        top_model_direction_source=evaluation.top_model_direction_source,
-        top_model_direction_count=evaluation.top_model_direction_count,
-        top_model_direction_debug=evaluation.top_model_direction_debug,
-        valid_mask=valid_mask,
-    )
-    _write_jpg(out / "trace2cp_vis.jpg", overlay)
+    with _Timer() as overlay_timer:
+        overlay = _draw_trace2cp_overlay(
+            image_u8,
+            line_xy=sample.line_xy,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            bidirectional_result=selected_result,
+            result_label=result_label,
+            reference_result=base_result if selected_result is not base_result else None,
+            reference_label="reference",
+            similarity_debug=evaluation.similarity_debug,
+            z_search_debug=evaluation.z_search_debug,
+            presence_debug=evaluation.presence_debug,
+            top_strip_image=evaluation.top_strip_image,
+            top_strip_valid_mask=evaluation.top_strip_valid_mask,
+            traced_top_strip_image=evaluation.traced_top_strip_image,
+            traced_top_strip_valid_mask=evaluation.traced_top_strip_valid_mask,
+            z_top_strip_image=evaluation.z_top_strip_image,
+            z_top_strip_valid_mask=evaluation.z_top_strip_valid_mask,
+            top_model_direction_image=evaluation.top_model_direction_image,
+            top_model_direction_valid_mask=evaluation.top_model_direction_valid_mask,
+            top_model_direction_source=evaluation.top_model_direction_source,
+            top_model_direction_count=evaluation.top_model_direction_count,
+            top_model_direction_debug=evaluation.top_model_direction_debug,
+            valid_mask=valid_mask,
+        )
+    _append_trace2cp_timing(timing_rows, "draw_overlay", overlay_timer.elapsed_ms)
+    with _Timer() as write_image_timer:
+        _write_jpg(out / "trace2cp_vis.jpg", overlay)
+    _append_trace2cp_timing(timing_rows, "write_overlay_jpg", write_image_timer.elapsed_ms)
     forward = selected_result.forward.result
     reverse = selected_result.reverse.result
     refinement = selected_result.refinement
@@ -7943,7 +8042,9 @@ def _export_trace2cp_vis(
         if z_debug is None:
             raise ValueError("--trace2cp-z-layers-tif requires an active z-search evaluation")
         z_layer_tif_path = out / "trace2cp_z_layers.tif"
-        _write_trace2cp_z_layers_tif(z_layer_tif_path, z_debug)
+        with _Timer() as z_tif_timer:
+            _write_trace2cp_z_layers_tif(z_layer_tif_path, z_debug)
+        _append_trace2cp_timing(timing_rows, "write_z_layers_tif", z_tif_timer.elapsed_ms)
     if z_debug is None:
         z_summary_lines = ["trace2cp_z_search=false"]
     else:
@@ -8061,18 +8162,22 @@ def _export_trace2cp_vis(
         "tta_fields:",
         *tta_rows,
     ]
-    (out / "trace2cp_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    with _Timer() as summary_timer:
+        (out / "trace2cp_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    _append_trace2cp_timing(timing_rows, "write_summary", summary_timer.elapsed_ms)
     for iteration, iteration_evaluation in enumerate(evaluations[1:], start=1):
-        _write_trace2cp_iteration_artifacts(
-            out,
-            iteration=iteration,
-            evaluation=iteration_evaluation,
-            checkpoint_path=checkpoint_path,
-            checkpoint=checkpoint,
-            step_px=step_px,
-            rf_margin_px=margin,
-            export_z_layers_tif=bool(export_z_layers_tif),
-        )
+        with _Timer() as iteration_timer:
+            _write_trace2cp_iteration_artifacts(
+                out,
+                iteration=iteration,
+                evaluation=iteration_evaluation,
+                checkpoint_path=checkpoint_path,
+                checkpoint=checkpoint,
+                step_px=step_px,
+                rf_margin_px=margin,
+                export_z_layers_tif=bool(export_z_layers_tif),
+            )
+        _append_trace2cp_timing(timing_rows, "write_iteration_artifacts", iteration_timer.elapsed_ms)
     print(f"trace2cp_error={metric.error:.8f}")
     print(
         "trace2cp details "
@@ -8130,6 +8235,7 @@ def _export_trace2cp_vis(
             f"path={z_layer_tif_path} "
             f"pages={0 if z_debug is None or z_debug.layer_tiff_stack is None else int(z_debug.layer_tiff_stack.shape[0])}"
         )
+    _print_trace2cp_timing_table(timing_rows, title="trace2cp timings")
     print(f"exported trace2cp_vis.jpg and trace2cp_summary.txt to {out}")
 
 
@@ -8281,6 +8387,7 @@ def _export_trace2cp_fiber_vis(
     row_axis_refs_by_line_index: dict[int, np.ndarray] = {}
     debug_rows: list[str] = []
     z_layer_tif_rows: list[str] = []
+    timing_rows: list[_Trace2CpTimingRow] = []
     z_layer_tif_dir = out / "trace2cp_z_layers"
     if export_z_layers_tif:
         z_layer_tif_dir.mkdir(parents=True, exist_ok=True)
@@ -8344,6 +8451,7 @@ def _export_trace2cp_fiber_vis(
             continue
         evaluations.append(evaluation)
         evaluation_chains.append(chain)
+        timing_rows.extend(row for chain_evaluation in chain for row in chain_evaluation.timing_rows)
         if export_z_layers_tif:
             z_debug = evaluation.z_search_debug
             if z_debug is None:
@@ -8352,7 +8460,9 @@ def _export_trace2cp_fiber_vis(
                 f"pair_{len(evaluations) - 1:04d}_cp_"
                 f"{int(start_cp_index)}_to_{int(target_cp_index)}.tif"
             )
-            _write_trace2cp_z_layers_tif(tif_path, z_debug)
+            with _Timer() as z_tif_timer:
+                _write_trace2cp_z_layers_tif(tif_path, z_debug)
+            _append_trace2cp_timing(timing_rows, "write_z_layers_tif", z_tif_timer.elapsed_ms)
             z_layer_tif_rows.append(
                 f"{int(start_cp_index)} {int(target_cp_index)} {tif_path} "
                 f"pages={0 if z_debug.layer_tiff_stack is None else int(z_debug.layer_tiff_stack.shape[0])} "
@@ -8427,12 +8537,16 @@ def _export_trace2cp_fiber_vis(
         f"{combined_label}"
         f"{z_label}"
     )
-    overlay = _draw_trace2cp_fiber_overlay(
-        evaluations,
-        control_point_x=cp_x,
-        label=label,
-    )
-    _write_jpg(out / "trace2cp_fiber_vis.jpg", overlay)
+    with _Timer() as overlay_timer:
+        overlay = _draw_trace2cp_fiber_overlay(
+            evaluations,
+            control_point_x=cp_x,
+            label=label,
+        )
+    _append_trace2cp_timing(timing_rows, "draw_fiber_overlay", overlay_timer.elapsed_ms)
+    with _Timer() as write_image_timer:
+        _write_jpg(out / "trace2cp_fiber_vis.jpg", overlay)
+    _append_trace2cp_timing(timing_rows, "write_fiber_overlay_jpg", write_image_timer.elapsed_ms)
     for iteration in range(1, max(0, int(refine_iterations)) + 1):
         iteration_evaluations = [
             chain[iteration] for chain in evaluation_chains if len(chain) > iteration
@@ -8455,12 +8569,16 @@ def _export_trace2cp_fiber_vis(
             f"trace2cp_error_max={float(np.max(iteration_metric_errors)):.4f} "
             f"mean_metric_raw_px={float(np.mean(iteration_actual_errors)):.2f}"
         )
-        iteration_overlay = _draw_trace2cp_fiber_overlay(
-            iteration_evaluations,
-            control_point_x=cp_x,
-            label=iteration_label,
-        )
-        _write_jpg(out / f"trace2cp_fiber_vis_it{iteration}.jpg", iteration_overlay)
+        with _Timer() as iteration_overlay_timer:
+            iteration_overlay = _draw_trace2cp_fiber_overlay(
+                iteration_evaluations,
+                control_point_x=cp_x,
+                label=iteration_label,
+            )
+        _append_trace2cp_timing(timing_rows, "draw_fiber_iteration_overlay", iteration_overlay_timer.elapsed_ms)
+        with _Timer() as iteration_write_timer:
+            _write_jpg(out / f"trace2cp_fiber_vis_it{iteration}.jpg", iteration_overlay)
+        _append_trace2cp_timing(timing_rows, "write_fiber_iteration_jpg", iteration_write_timer.elapsed_ms)
         iteration_summary = [
             f"iteration={iteration}",
             f"fiber_json={fiber_path_display}",
@@ -8481,17 +8599,21 @@ def _export_trace2cp_fiber_vis(
                 for evaluation in iteration_evaluations
             ),
         ]
-        (out / f"trace2cp_fiber_summary_it{iteration}.txt").write_text(
-            "\n".join(iteration_summary) + "\n",
-            encoding="utf-8",
-        )
+        with _Timer() as iteration_summary_timer:
+            (out / f"trace2cp_fiber_summary_it{iteration}.txt").write_text(
+                "\n".join(iteration_summary) + "\n",
+                encoding="utf-8",
+            )
+        _append_trace2cp_timing(timing_rows, "write_fiber_iteration_summary", iteration_summary_timer.elapsed_ms)
         print(
             f"trace2cp_fiber_it{iteration}_error_mean={float(np.mean(iteration_metric_errors)):.8f} "
             f"trace2cp_error_max={float(np.max(iteration_metric_errors)):.8f} "
             f"pairs={len(iteration_evaluations)} "
             f"vis={out / f'trace2cp_fiber_vis_it{iteration}.jpg'}"
         )
-    (out / "trace2cp_fiber_debug.txt").write_text("\n".join(debug_rows) + "\n", encoding="utf-8")
+    with _Timer() as debug_write_timer:
+        (out / "trace2cp_fiber_debug.txt").write_text("\n".join(debug_rows) + "\n", encoding="utf-8")
+    _append_trace2cp_timing(timing_rows, "write_fiber_debug", debug_write_timer.elapsed_ms)
 
     rows = [
         "start_cp target_cp trace2cp_error metric_raw_y_error_px metric_horizontal_span_px "
@@ -8621,7 +8743,9 @@ def _export_trace2cp_fiber_vis(
         "z_layer_tifs:",
         *z_layer_tif_rows,
     ]
-    (out / "trace2cp_fiber_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    with _Timer() as summary_write_timer:
+        (out / "trace2cp_fiber_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    _append_trace2cp_timing(timing_rows, "write_fiber_summary", summary_write_timer.elapsed_ms)
     print(f"trace2cp_error_mean={float(np.mean(metric_errors)):.8f}")
     print(
         "trace2cp fiber "
@@ -8663,6 +8787,7 @@ def _export_trace2cp_fiber_vis(
             "trace2cp z_layers_tif fiber "
             f"dir={z_layer_tif_dir} files={len(z_layer_tif_rows)}"
         )
+    _print_trace2cp_timing_table(timing_rows, title="trace2cp fiber timings")
     print(f"exported trace2cp_fiber_vis.jpg, trace2cp_fiber_summary.txt, and trace2cp_fiber_debug.txt to {out}")
 
 

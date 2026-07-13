@@ -521,6 +521,18 @@
   and `trace2cp_summary.txt`. Extra passes write `trace2cp_vis_it1.jpg`,
   `trace2cp_summary_it1.txt`, then `it2`, etc. If z-layer TIFF export is also
   enabled, extra passes write `trace2cp_z_layers_it1.tif`, etc.
+- Trace2CP CLI runs print a compact stage timing table after the metric/debug
+  summary. Single-pair mode prints `trace2cp timings`; whole-fiber mode prints
+  `trace2cp fiber timings` aggregated across valid pairs. Rows are grouped by
+  stage and include count, total milliseconds, mean milliseconds, and max
+  milliseconds, covering inference, source sampling, tracing, debug rendering,
+  and file output stages where applicable.
+- Slow Trace2CP dynamic-programming solves print live progress before the final
+  timing table. DP progress is opt-in at CLI call sites and uses rows
+  `trace2cp dp start`, `trace2cp dp progress`, `trace2cp dp done`, or
+  `trace2cp dp failed`. Progress rows include the DP label, solved columns,
+  elapsed seconds, and `eta_s` on progress rows. The low-level DP helper is
+  quiet by default for unit tests and internal direct calls.
 - Trace2CP uses `--med-tta` to determine whether TTA is used. Without
   `--med-tta`, it traces and scores both directions on the base strip
   direction field. With `--med-tta`, it builds deterministic random geometric
@@ -533,11 +545,21 @@
   path and its reverse. The non-combined reference tracer remains the public
   target-column `trace2cp_error` path.
 - The side-strip DP state is `(side_z_layer, y, prev_dy, prev_dz)`. It uses
-  fixed horizontal transitions based on `--line-trace-step`, plus the exact
-  target column, and integrates direction alignment cost
+  fixed 32 px horizontal transitions, plus the exact target column, and
+  integrates direction alignment cost
   `direction_weight * (1 - abs(dot(path_tangent, layer_direction)))` across
   every crossed pixel column. Invalid or missing direction pixels add a fixed
   penalty instead of breaking the path.
+- The side-strip DP still uses `--line-trace-step` only for resampling the
+  selected fused output trace and for the public trace visualization density.
+  It must not use short `--line-trace-step` values as the DP transition length,
+  because integer row states would otherwise quantize the path into mostly
+  horizontal/diagonal steps.
+- The side-strip DP must apply the existing Trace2CP candidate-angle setting as
+  an angular excess penalty: path tangents whose frame-ambiguous direction
+  agreement falls outside `--line-trace-candidate-max-degrees` receive extra
+  cost, keeping the global DP objective closer to the baseline direct
+  candidate tracer.
 - `--trace2cp-combined-mode direction` is the only active combined mode.
   `--trace2cp-combined-mode embedding`, `--trace2cp-use-embedding`,
   `--trace2cp-combined-mode image`, and `--trace2cp-use-image` are removed from

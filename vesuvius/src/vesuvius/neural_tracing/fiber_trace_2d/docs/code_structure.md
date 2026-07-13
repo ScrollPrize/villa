@@ -326,9 +326,14 @@ The important behavior is:
 - `--trace2cp-vis --trace2cp-combined` switches the selected Trace2CP output to
   a joint monotone-x dynamic-programming path from the start CP to the target
   CP. The DP state is `(side_z_layer, y, prev_dy, prev_dz)` and integrates
-  `1 - abs(dot(path_tangent, direction))` across crossed pixel columns. This
-  combined path is an inspection/refinement path; the non-combined reference
-  tracer remains the public target-column Trace2CP metric.
+  `1 - abs(dot(path_tangent, direction))` across crossed pixel columns. Side
+  DP uses fixed 32 px horizontal transitions, plus the exact target column, so
+  integer row states still provide fine angular steps. `--line-trace-step`
+  controls output resampling density, not DP transition length. The existing
+  candidate-angle limit is applied as an angular excess penalty so the global
+  DP remains close to the baseline direct candidate tracer. This combined path
+  is an inspection/refinement path; the non-combined reference tracer remains
+  the public target-column Trace2CP metric.
   `--trace2cp-combined-mode direction` is the only active combined mode.
   `--trace2cp-use-presence` adds `1 - sigmoid_presence` at sampled DP pixels,
   weighted by `--trace2cp-combined-presence-weight`. Embedding and image
@@ -428,7 +433,14 @@ The important behavior is:
   With `--trace2cp-combined`, the selected combined stack is rendered alongside
   the reference-only/base-inference stack and the summary/stdout include
   candidate settings, weights, embedding-bank size/skips, and mean score
-  components without duplicating the selected public metric label.
+  components without duplicating the selected public metric label. Trace2CP
+  stdout also ends with a compact timing table. Single-pair mode prints
+  `trace2cp timings`; whole-fiber mode prints `trace2cp fiber timings`
+  aggregated across valid pairs. Each row is one stage with count, total,
+  mean, and max milliseconds for source sampling, inference, tracing, debug
+  rendering, and file-output stages. Slow Trace2CP DP solves also emit
+  time-throttled `trace2cp dp ...` progress rows while running; progress rows
+  include solved columns, elapsed seconds, and `eta_s`.
 - The whole-fiber Trace2CP JPG is composed after pair scoring. Pair-local
   images and traced points are mapped into a shared fiber arc-length x
   coordinate system using each pair's local start/target CP columns and global

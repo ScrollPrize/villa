@@ -2,6 +2,12 @@
 
 ## 2026-07-13
 
+- Added Trace2CP stage timing tables for single-pair and whole-fiber
+  visualization commands, and changed side-strip joint DP tracing to use a
+  fixed 32 px transition plus candidate-angle excess penalties to reduce
+  coarse horizontal/diagonal artifacts.
+- Added time-throttled `trace2cp dp ...` progress rows with ETA for slow
+  Trace2CP side/z/top dynamic-programming solves.
 - Replaced active Trace2CP combined tracing with a joint side-strip monotone DP
   path over direction plus optional presence, including z-layer DP search.
 - Added second-order `dy/dz` smoothness to the visualization-only
