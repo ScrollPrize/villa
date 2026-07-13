@@ -185,6 +185,9 @@ bool isSupportedCoordinatePrediction(const OpenDataArtifact& artifact)
 
 std::optional<int> predictionSourceCoordinateLevel(const OpenDataArtifact& artifact)
 {
+    if (!isSupportedCoordinatePrediction(artifact))
+        return std::nullopt;
+
     if (artifact.sourceCoordinateLevel)
         return artifact.sourceCoordinateLevel;
 

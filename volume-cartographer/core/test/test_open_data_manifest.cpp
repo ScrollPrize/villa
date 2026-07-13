@@ -18,6 +18,28 @@ using namespace vc3d::opendata;
 
 namespace {
 
+struct TestAutosaveRoot {
+    TestAutosaveRoot()
+        : previous(VolumePkg::autosaveRoot())
+        , root(std::filesystem::temp_directory_path() /
+               ("vc_open_data_manifest_autosave_" + std::to_string(getpid())))
+    {
+        std::filesystem::remove_all(root);
+        VolumePkg::setAutosaveRoot(root);
+    }
+
+    ~TestAutosaveRoot()
+    {
+        VolumePkg::setAutosaveRoot(previous);
+        std::filesystem::remove_all(root);
+    }
+
+    std::filesystem::path previous;
+    std::filesystem::path root;
+};
+
+TestAutosaveRoot testAutosaveRoot;
+
 constexpr const char* kFixture = R"({
   "metadata": {
     "samples": {
