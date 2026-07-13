@@ -1,5 +1,6 @@
 #include "LineAnnotationDialog.hpp"
 
+#include "FiberNameDisplay.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "Keybinds.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -30,6 +31,7 @@
 #include <QResizeEvent>
 #include <QSettings>
 #include <QShortcut>
+#include <QSizePolicy>
 #include <QSplitter>
 #include <QSpinBox>
 #include <QVariant>
@@ -391,6 +393,13 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _optimizationStatusLabel = new QLabel(tr("not optimized"), buttonRow);
     _optimizationStatusLabel->installEventFilter(this);
     buttonLayout->addWidget(_optimizationStatusLabel);
+    _fiberNameLabel = new QLabel(buttonRow);
+    _fiberNameLabel->setObjectName(QStringLiteral("lineAnnotationFiberNameLabel"));
+    _fiberNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    _fiberNameLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _fiberNameLabel->setMinimumWidth(0);
+    _fiberNameLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    _fiberNameLabel->installEventFilter(this);
     _showAsMeshButton = new QPushButton(tr("show as mesh"), buttonRow);
     _showAsMeshButton->setEnabled(false);
     _showAsMeshButton->installEventFilter(this);
@@ -403,7 +412,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _resetViewsButton->setEnabled(false);
     _resetViewsButton->installEventFilter(this);
     buttonLayout->addWidget(_resetViewsButton);
-    buttonLayout->addStretch(1);
+    buttonLayout->addWidget(_fiberNameLabel, 1);
     _layout->addWidget(buttonRow, 0);
     connect(_showAsMeshButton, &QPushButton::clicked, this, [this]() {
         emit showAsMeshRequested();
@@ -546,6 +555,12 @@ void LineAnnotationDialog::setOptimizationStatus(bool optimized)
         return;
     }
     _optimizationStatusLabel->setText(optimized ? tr("optimized") : tr("not optimized"));
+}
+
+void LineAnnotationDialog::setFiberDisplayName(const QString& name)
+{
+    _fiberDisplayName = name;
+    updateFiberNameLabel();
 }
 
 void LineAnnotationDialog::setCloseAfterFinalizationAllowed(bool allowed)
@@ -2293,6 +2308,7 @@ void LineAnnotationDialog::resizeEvent(QResizeEvent* event)
 {
     QMainWindow::resizeEvent(event);
     updateOptimizationOverlayGeometry();
+    updateFiberNameLabel();
 }
 
 bool LineAnnotationDialog::toggleCurrentCutFollowFromKeyboard()
@@ -2351,6 +2367,9 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
 
 bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched == _fiberNameLabel && event->type() == QEvent::Resize) {
+        updateFiberNameLabel();
+    }
     if (event->type() == QEvent::KeyPress) {
         auto* keyEvent = static_cast<QKeyEvent*>(event);
         if (handleKeyPress(keyEvent)) {
@@ -2369,6 +2388,26 @@ void LineAnnotationDialog::updateOptimizationOverlayGeometry()
     if (_optimizationOverlay->isVisible()) {
         _optimizationOverlay->raise();
     }
+}
+
+void LineAnnotationDialog::updateFiberNameLabel()
+{
+    if (!_fiberNameLabel) {
+        return;
+    }
+
+    const QString fullName = _fiberDisplayName.trimmed();
+    if (fullName.isEmpty()) {
+        _fiberNameLabel->clear();
+        _fiberNameLabel->setToolTip(QString());
+        return;
+    }
+
+    _fiberNameLabel->setText(vc3d::adaptFiberNameToWidth(
+        fullName,
+        _fiberNameLabel->fontMetrics(),
+        _fiberNameLabel->contentsRect().width()));
+    _fiberNameLabel->setToolTip(fullName);
 }
 
 void LineAnnotationDialog::restoreWindowGeometry()

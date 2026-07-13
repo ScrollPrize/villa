@@ -141,6 +141,7 @@ qt6_wrap_cpp(cfiber_widget_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CFiberWidget.hpp)
 vc_add_test(NAME test_fiber_widget
     SOURCES test_fiber_widget.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CFiberWidget.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNameDisplay.cpp
             ${cfiber_widget_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
