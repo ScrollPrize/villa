@@ -36,10 +36,10 @@
   --ifm-table-border-color: var(--vc-line);
   --ifm-table-stripe-background: transparent; /* no zebra */
   --ifm-table-head-color: var(--vc-text-faint);
-  /* Docs container: article measure (720) + gutters + TOC (220) — keeps the
+  /* Docs container: article measure (720) + gutters + TOC (300) — keeps the
      TOC directly beside the main column instead of floating at the far edge. */
-  --ifm-container-width: 1000px;
-  --ifm-container-width-xl: 1000px;
+  --ifm-container-width: 1080px;
+  --ifm-container-width-xl: 1080px;
 }
 
 /* ==========================================================================
@@ -82,18 +82,30 @@ html.docs-doc-id-data_browser main .container article {
   max-width: none;
 }
 
-/* TOC column: 220px (spec §4). Only exists on >=997px layouts. The doc
-   column must yield to it at narrow desktop widths (997-1150px) or the row
-   overflows the viewport. */
+/* Give the TOC enough room for descriptive headings without sacrificing the
+   720px article measure. Use a slightly narrower value at the compact desktop
+   breakpoint, where the sidebar and TOC are both visible. The adjacent column
+   padding is halved so the content-to-TOC gutter is 16px instead of 32px. */
 @media (min-width: 997px) {
+  :root {
+    --vc-doc-toc-width: 260px;
+  }
   main .container > .row > .col.col--3 {
-    flex: 0 0 220px;
-    max-width: 220px;
+    flex: 0 0 var(--vc-doc-toc-width);
+    max-width: var(--vc-doc-toc-width);
+    padding-left: 8px;
+    padding-right: 0;
   }
   main .container > .row:has(> .col.col--3) > .col:not(.col--3) {
     flex: 1 1 0;
-    max-width: calc(100% - 220px);
+    max-width: calc(100% - var(--vc-doc-toc-width));
     min-width: 0;
+    padding-right: 8px;
+  }
+}
+@media (min-width: 1200px) {
+  :root {
+    --vc-doc-toc-width: 300px;
   }
 }
 

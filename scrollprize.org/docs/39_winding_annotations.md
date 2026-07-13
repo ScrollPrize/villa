@@ -97,7 +97,8 @@ These annotations do not need to form a dense surface or cover the entire scroll
 
 #### Surface patches
 
-A surface patch traces a locally connected area of a single winding. It can be created manually or by a segmentation method, then used as same-winding evidence by the spiral fit.
+A surface patch traces a locally connected area of a single winding. It can be created manually or by a segmentation method, then used as same-winding evidence by the spiral fit. An interesting avenue would be
+identifying methods to automatically crop "good" regions of the spiral fit, and using these as surface patch inputs to a subsequent run. 
 
 <figure className="mb-6 max-w-[680px] mx-auto">
   <a href="/img/open-problems/winding-annotations/surface-patches.webp" target="_blank">
@@ -106,9 +107,10 @@ A surface patch traces a locally connected area of a single winding. It can be c
   <figcaption className="mt-2">A local surface patch covering part of one winding.</figcaption>
 </figure>
 
-#### Same-winding point collections
+#### Same-winding point line collections
 
-These point collections follow individual sheet surfaces. All points in one collection assert that they belong to the same winding, even when the traced line covers only a short distance.
+These point collections follow individual sheet surfaces. All points in one collection assert that they belong to the same winding. These can be spread out a fair distance (though not too far) across the surface and do not 
+need to follow any particular scroll feature. 
 
 <figure className="mb-6">
   <div className="flex flex-wrap gap-4 items-start">
@@ -161,18 +163,81 @@ A visible papyrus fiber can provide a natural path along one winding. Fiber anno
 </figure>
 
 <figure className="mb-6">
-  <div className="flex flex-wrap gap-4 items-start">
-    <a href="/img/open-problems/winding-annotations/fiber-annotation-2.webp" target="_blank" className="flex-[2] min-w-[280px]">
-      <img src="/img/open-problems/winding-annotations/fiber-annotation-2.webp" alt="A sparse sequence of points following a horizontal papyrus fiber" className="w-[100%]" />
-    </a>
-    <a href="/img/open-problems/winding-annotations/fiber-annotation-3.webp" target="_blank" className="flex-1 min-w-[220px]">
-      <img src="/img/open-problems/winding-annotations/fiber-annotation-3.webp" alt="Four sparse points following a vertical papyrus fiber" className="w-[100%]" />
+  <div className="grid grid-cols-1 md:grid-cols-[minmax(0,2.6fr)_minmax(0,1fr)] gap-4 items-stretch">
+    <div className="flex flex-col gap-4">
+      <a href="/img/open-problems/winding-annotations/fiber-annotation-2.webp" target="_blank" className="block leading-none">
+        <img src="/img/open-problems/winding-annotations/fiber-annotation-2.webp" alt="A sparse sequence of points following a horizontal papyrus fiber" className="w-[100%]" />
+      </a>
+      <a href="/img/open-problems/winding-annotations/fiber-annotation-4.webp" target="_blank" className="block leading-none">
+        <img src="/img/open-problems/winding-annotations/fiber-annotation-4.webp" alt="Two sparse sequences of points following papyrus fibers across a wider surface region" className="w-[100%]" />
+      </a>
+    </div>
+    <a href="/img/open-problems/winding-annotations/fiber-annotation-3.webp" target="_blank" className="block h-[100%] leading-none">
+      <img src="/img/open-problems/winding-annotations/fiber-annotation-3.webp" alt="Four sparse points following a vertical papyrus fiber" className="w-[100%] h-[100%] object-cover" />
     </a>
   </div>
   <figcaption className="mt-2">Sparse fiber annotations: only enough high-confidence points to identify the local same-winding relationship.</figcaption>
 </figure>
 
-### Things we have not
+### Things we have not tried
+
+The following features may also provide useful same-winding evidence, but we have not yet tested them as inputs to the spiral fit.
+
+#### Drawn paths
+
+Long paths drawn by hand or automatically across a flattened surface or within the volume can be made very quickly and could provide better connectivity than disconnected fibers. Should be easy to do manually
+very quickly, and likely learnable or doable with other classical computer vision methods. Points on the 2d flattened surface can be trivially mapped back to 3d. 
+
+<figure className="mb-6">
+  <a href="/img/open-problems/winding-annotations/hand-drawn-paths.webp" target="_blank">
+    <img src="/img/open-problems/winding-annotations/hand-drawn-paths.webp" alt="Hand-drawn green paths connecting regions across a flattened papyrus surface" className="w-[100%]" />
+  </a>
+  <figcaption className="mt-2">Example hand-drawn paths following continuous features across a flattened surface.</figcaption>
+</figure>
+
+#### Ink as same-winding evidence
+
+Easily identifiable correct letters, rows, or columns are a natural fit for same-winding annotations (and are likely the most easily verified). 
+
+<figure className="mb-6">
+  <div className="grid grid-cols-1 md:grid-cols-[minmax(0,2.6fr)_minmax(0,1fr)] gap-4 items-stretch">
+    <a href="/img/open-problems/winding-annotations/ink-as-same-wrap.webp" target="_blank" className="block leading-none">
+      <img src="/img/open-problems/winding-annotations/ink-as-same-wrap.webp" alt="Ink highlighted in red on a flattened papyrus surface and corresponding volume slices" className="w-[100%]" />
+    </a>
+    <a href="/img/open-problems/winding-annotations/more-ink-as-same-wrap.webp" target="_blank" className="block h-[100%] leading-none">
+      <img src="/img/open-problems/winding-annotations/more-ink-as-same-wrap.webp" alt="Lines and individual letters highlighted as possible same-winding evidence" className="w-[100%] h-[100%] object-cover" />
+    </a>
+  </div>
+  <figcaption className="mt-2">Ink highlighted as possible same-winding evidence, from individual letters to complete lines.</figcaption>
+</figure>
+
+#### Intercolumnar gaps
+
+The blank vertical spaces between columns of text can form long, recognizable paths across the papyrus surface. Like ink, they could provide same-winding evidence that is easy to identify and verify.
+
+<figure className="mb-6">
+  <a href="/img/open-problems/winding-annotations/intercolumnar-gap.webp" target="_blank">
+    <img src="/img/open-problems/winding-annotations/intercolumnar-gap.webp" alt="Several intercolumnar gaps outlined in red between columns of papyrus text" className="w-[100%]" />
+  </a>
+  <figcaption className="mt-2">Intercolumnar gaps traced between several columns of text.</figcaption>
+</figure>
+
+#### Kolleisis
+
+Kolleiseis -- the joins where papyrus sheets were pasted together -- could be used as relatively large, full height same-winding annotations. They stand out well in the CT scan, and should be a good candidate for 
+a deep learning model to excel at.
+
+<figure className="mb-6">
+  <div className="flex flex-wrap gap-4 items-start">
+    <a href="/img/open-problems/winding-annotations/kolleisis-flat.webp" target="_blank" className="flex-1 min-w-[280px]">
+      <img src="/img/open-problems/winding-annotations/kolleisis-flat.webp" alt="A kolleisis join visible on a flattened papyrus surface" className="w-[100%]" />
+    </a>
+    <a href="/img/open-problems/winding-annotations/kolleisis-volume.webp" target="_blank" className="flex-1 min-w-[280px]">
+      <img src="/img/open-problems/winding-annotations/kolleisis-volume.webp" alt="A kolleisis join viewed in two CT volume slices" className="w-[100%]" />
+    </a>
+  </div>
+  <figcaption className="mt-2">A possible kolleisis landmark shown in flattened and volumetric views.</figcaption>
+</figure>
 
 
 ## Start here
@@ -183,4 +248,4 @@ A visible papyrus fiber can provide a natural path along one winding. Fiber anno
 - [Read the dataset layout and annotation files](pathname:///data/datasets/spiral-input-PHercParis4-README.md)
 - [Inspect the spiral-fitting code](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/scripts/spiral)
 
-Join the [Discord](https://discord.gg/V4fJhvtaQn) to coordinate new annotation or automation work with the team.
+Join the [Discord](https://discord.gg/V4fJhvtaQn) 
