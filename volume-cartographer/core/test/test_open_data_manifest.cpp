@@ -674,7 +674,9 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     volume.artifacts.push_back(artifact("obj", "http://127.0.0.1:9/mesh.obj"));
     sample.volumes.push_back(std::move(volume));
 
-    auto pkg = VolumePkg::newEmpty();
+    vc::project::LoadOptions loadOptions;
+    loadOptions.deferResolution = true;
+    auto pkg = VolumePkg::newEmpty(loadOptions);
     const auto result = attachOpenDataSampleVolumes(*pkg, sample);
 
     CHECK(result.supportedVolumes == 3);
