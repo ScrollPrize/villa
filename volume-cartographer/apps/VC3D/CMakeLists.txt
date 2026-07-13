@@ -47,6 +47,8 @@ set(srcs
     OpenDataNormalGrids.hpp
     OpenDataSegmentCache.cpp
     OpenDataSegmentCache.hpp
+    OpenDataSegmentCacheIO.cpp
+    OpenDataSegmentCacheIO.hpp
     SurfaceAffineTransformController.cpp
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp
