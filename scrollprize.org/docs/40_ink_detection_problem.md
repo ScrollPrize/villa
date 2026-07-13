@@ -74,6 +74,8 @@ The target is not another model that performs well only where it was heavily lab
 ## Some ideas we've been considering, in no particular order
 Taken directly from our last brainstorming session on improving ink detection. Not intended as a comprehensive list, and the exclusion of any idea is not an indication that it is not worth considering.
 
+<div className="vc-card my-8">
+
 ### image data
 
 - train 2d model slicewise, compute loss as max over channels
@@ -125,18 +127,17 @@ Taken directly from our last brainstorming session on improving ink detection. N
 ### semi-supervised / transfer / out-of-distribution / domain-shift
 
 - transfer learning from **self-supervised** models…
-    - scroll-DINO-pretrained model → sota for images → *high priority*
+    - scroll-DINO-pretrained model → sota for images →
         - https://arxiv.org/pdf/2512.00872 TAP-CT
         - https://arxiv.org/pdf/2511.17209 SPECTRE
-    - NEPA → simple and with few design decisions → *thus high priority*
-    - *JEPA-pretrained model (maybe LeJEPA)  → architecture agnostic but more hyperparameters re view selection etc — *thus slightly lower priority among these*
+    - NEPA → simple and with few design decisions →
+    - *JEPA-pretrained model (maybe LeJEPA)  → architecture agnostic but more hyperparameters re view selection etc
 - IRM-ish stuff — to encourage ‘smooth’ transfer across domains (BayesianIRM ?)
     - …or Vanilla GroupDRO or Group Distributionally Robust Machine Learning
 - alignment of features across scrolls (i.e. domain generalisation / robustness, smart than augmentations / lots-of-data)
     - adversarial (DANN; DGAFL) / variational / other
     - relevant in semi-supervised case, but also pretraining
 - mean teacher / cross-teaching / etc.
-    - *low priority since the signal is very weak and these methods are brittle*
     - pseudo-labels automatic weighting https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/09643.pdf
 - Adversarial Style Augmentation ( AdvStyle-ish https://arxiv.org/pdf/2207.04892)
 - more experiments on transfer from natural-image-pretrained DINO
@@ -155,13 +156,14 @@ Taken directly from our last brainstorming session on improving ink detection. N
 ### unsupervised / unpaired losses
 
 - 2D, ‘stitched’
-    - something based on expected column/line spacings and letter sizes and stroke thicknesses / characteristics → *low priority since it is almost guaranteed to become a fiber-detector*
-    - letter-recall (c.f. letter-recall unpaired metric) → *high priority, seems like the unpaired loss that’ll give the cleanest learning signal*
-    - score-distillation to use a diffusion prior for guidance, starting from a pretrained ckpt → *mid-priority, likely hard to learn but PMH half-did it last year*
+    - letter-recall (c.f. letter-recall unpaired metric) → *seems like the unpaired loss that’ll give the cleanest learning signal*
+    - score-distillation to use a diffusion prior for guidance, starting from a pretrained ckpt → *likely hard to learn*
 
 ### other ideas
 - 3d model conditioned on input seg mask , predict ink on this segment only, pool loss across normals
 - 2.5 flattened space seg mask conditioning (show the model which sheet we are looking for ink on)
+
+</div>
 
 ## Start here
 
