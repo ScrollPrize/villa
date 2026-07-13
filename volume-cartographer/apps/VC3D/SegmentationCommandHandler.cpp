@@ -1,4 +1,6 @@
 #include "SegmentationCommandHandler.hpp"
+
+#include "OpenDataCoordinateIdentity.hpp"
 #include "CState.hpp"
 #include "SurfacePanelController.hpp"
 #include "VCSettings.hpp"
@@ -112,7 +114,7 @@ static QString commandPathForVolume(const std::shared_ptr<Volume>& volume)
         return QString();
     }
     if (volume->isRemote()) {
-        return QString::fromStdString(volume->remoteUrl());
+        return QString::fromStdString(volume->remoteLocator());
     }
     return QString::fromStdString(volume->path().string());
 }
@@ -1737,7 +1739,7 @@ QString SegmentationCommandHandler::getCurrentRenderVolumePath(QString* remoteUr
     }
 
     if (volume->isRemote()) {
-        const QString remoteUrl = QString::fromStdString(volume->remoteUrl());
+        const QString remoteUrl = QString::fromStdString(volume->remoteLocator());
         if (remoteUrlOut) {
             *remoteUrlOut = remoteUrl;
         }
@@ -1842,7 +1844,7 @@ void SegmentationCommandHandler::configureCommandRunnerRemoteAuthForVolumePath(c
         }
 
         const auto& auth = volume->remoteAuth();
-        _cmdRunner->setRemoteVolumeUrl(QString::fromStdString(volume->remoteUrl()));
+        _cmdRunner->setRemoteVolumeUrl(QString::fromStdString(volume->remoteLocator()));
         _cmdRunner->setRemoteVolumeAuth(QString::fromStdString(auth.access_key),
                                         QString::fromStdString(auth.secret_key),
                                         QString::fromStdString(auth.session_token),
@@ -1890,6 +1892,11 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
     _cmdRunner->setSegmentPath(dlg.segmentPath());
     _cmdRunner->setOutputPattern(dlg.outputPattern());
     _cmdRunner->setRenderParams(static_cast<float>(dlg.scale()), dlg.groupIdx(), dlg.numSlices());
+    _cmdRunner->setRenderVoxelSize(
+        renderVolume ? renderVolume->voxelSize() : 0.0,
+        renderVolume &&
+            (renderVolume->baseScaleLevel() > 0 ||
+             renderVolume->hasExplicitVoxelSizeOverride()));
     _cmdRunner->setOmpThreads(dlg.ompThreads());
     _cmdRunner->setVolumePath(dlg.volumePath());
     const bool useRemoteVolume = dlg.volumePath() == volumePath && !remoteVolumeUrl.isEmpty();
@@ -2049,6 +2056,14 @@ void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& seg
 {
     auto* surface = requireSurfaceAndRunner(segmentId, true);
     if (!surface) return;
+    if (_state && _state->currentVolume() && _state->currentVolume()->isRemote()) {
+        QMessageBox::warning(
+            _parentWidget,
+            tr("Unsupported Remote Volume"),
+            tr("Run Trace uses vc_grow_seg_from_segments, which accepts only local volumes. "
+               "The remote volume locator was not modified or passed to the tool."));
+        return;
+    }
 
     QString srcSegment = QString::fromStdString(surface->path.string());
 
@@ -2447,6 +2462,7 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
                                       outputDirPath,
                                       QStringLiteral("local"));
     configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
+
     _cmdRunner->setOmpThreads(ompThreads);
     _cmdRunner->showConsoleOutput();
     _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
@@ -2649,12 +2665,17 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
 
     configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
 
+    const auto outputCoordinateIdentity =
+        vc3d::opendata::coordinateIdentityForVolume(
+            *_state->vpkg(), selectedVolumeId.toStdString());
+
     QPointer<SegmentationCommandHandler> guard(this);
     auto connection = std::make_shared<QMetaObject::Connection>();
     *connection = connect(_cmdRunner,
                           &CommandLineToolRunner::toolFinished,
                           this,
-                          [this, guard, connection, outputDirPath](CommandLineToolRunner::Tool tool,
+                          [this, guard, connection, outputDirPath,
+                           outputCoordinateIdentity](CommandLineToolRunner::Tool tool,
                                                                    bool success,
                                                                    const QString& message,
                                                                    const QString&,
@@ -2675,6 +2696,28 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
                                   tr("vc_grow_seg_from_seed failed.\n%1").arg(message));
             emit statusMessage(tr("Create segment failed"), 3000);
             return;
+        }
+
+        if (outputCoordinateIdentity) {
+            const QString metaPath = QDir(outputDirPath).filePath(QStringLiteral("meta.json"));
+            QFile metaFile(metaPath);
+            if (metaFile.open(QIODevice::ReadOnly)) {
+                auto document = QJsonDocument::fromJson(metaFile.readAll());
+                metaFile.close();
+                if (document.isObject()) {
+                    auto object = document.object();
+                    object.insert(
+                        QStringLiteral("vc_open_data_coordinate_space"),
+                        QString::fromStdString(outputCoordinateIdentity->coordinateSpace));
+                    object.insert(
+                        QStringLiteral("vc_open_data_source_coordinate_level"),
+                        outputCoordinateIdentity->sourceCoordinateLevel);
+                    if (metaFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                        metaFile.write(QJsonDocument(object).toJson(QJsonDocument::Indented));
+                        metaFile.close();
+                    }
+                }
+            }
         }
 
         if (_state && _state->vpkg()) {
@@ -2949,6 +2992,13 @@ void SegmentationCommandHandler::onAlphaCompRefine(const std::string& segmentId)
 {
     auto* surface = requireSurfaceAndRunner(segmentId, true);
     if (!surface) return;
+    if (_state && _state->currentVolume() && _state->currentVolume()->isRemote()) {
+        QMessageBox::warning(
+            _parentWidget, tr("Unsupported Remote Volume"),
+            tr("Alpha-comp refinement accepts only local volumes. The remote "
+               "locator was not modified or passed to the tool."));
+        return;
+    }
 
     QString volumePath = getCurrentVolumePath();
     if (volumePath.isEmpty()) {

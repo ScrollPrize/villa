@@ -101,6 +101,30 @@ From source :
 ### Data 
 VC3D requires a few changes to the data you may already have downloaded. All data must be in OME-Zarr format, of dtype uint8, and contain a meta.json file. To check if your zarr is in uint8 already, open a resolution group zarray file (located at /path/to.zarr/0/.zarray) look at the dtype field. "|u1" is uint8, and "|u2" is uint16. 
 
+### Remote virtual-volume locators
+
+VC3D can expose a public remote pyramid group as logical level 0 without
+copying or renumbering the source Zarr. Append the portable fragment selector
+`#vc-base-scale=N`, where `N` is an integer from 0 through 5:
+
+```text
+https://example.org/volume.zarr#vc-base-scale=2
+s3://bucket/volume.zarr#vc-base-scale=2
+```
+
+Level 0 canonicalizes to the ordinary selector-free locator. For a base-2
+view, source groups `/2`, `/3`, ... become logical levels 0, 1, ...; voxel
+coordinates and voxel size are therefore those of physical `/2`. The source
+must be a contiguous numeric, isotropic dyadic ZYX pyramid with zero coordinate
+translations. Query parameters remain part of the network URL and must precede
+the fragment, for example `volume.zarr?token=abc#vc-base-scale=2`.
+
+The selector is part of persistent volume identity but is never sent in HTTP
+requests. Tools that support remote volumes receive the complete portable
+locator. Local-only tools reject it instead of silently discarding the
+selector. Catalog surfaces, normal grids, and overlays are automatically paired
+only when their explicit coordinate-space tags match the selected view.
+
 The meta.json contains the following information. The only real change from a standard VC meta.json is the inclusion of the `format:"zarr"` key.
 ```json
 {"height":3550,"max":65535.0,"min":0.0,"name":"PHerc0332, 7.91 - zarr - s3_raw","slices":9778,"type":"vol","uuid":"20231117143551-zarr-s3_raw","voxelsize":7.91,"width":3400, "format":"zarr"}

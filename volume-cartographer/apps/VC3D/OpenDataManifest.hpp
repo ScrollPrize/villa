@@ -33,8 +33,16 @@ struct OpenDataOrigin {
 struct OpenDataArtifact {
     std::string type;
     std::vector<OpenDataOrigin> origins;
+    nlohmann::json parameters = nlohmann::json::object();
     nlohmann::json properties = nlohmann::json::object();
     nlohmann::json raw = nlohmann::json::object();
+
+    // Exact typed parameters used by coordinate-bearing catalog artifacts.
+    // levelParameterPresent distinguishes a missing value from malformed or
+    // out-of-range manifest data (both leave sourceCoordinateLevel empty).
+    bool levelParameterPresent = false;
+    std::optional<int> sourceCoordinateLevel;
+    std::optional<std::string> targetVolumeId;
 
     // Preferred public origin selected from origins/access_roots.
     std::string sourcePath;

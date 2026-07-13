@@ -96,6 +96,26 @@ std::string sanitizedCompositeMethod(const std::string& method)
     }
     return vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
 }
+
+std::string coordinateSpaceTag(const VolumePkg& pkg, const std::string& volumeId)
+{
+    constexpr std::string_view prefix = "vc-open-data-coordinate-space:";
+    for (const auto& tag : pkg.volumeTags(volumeId)) {
+        if (tag.rfind(prefix, 0) == 0)
+            return tag.substr(prefix.size());
+    }
+    return {};
+}
+
+bool overlayCoordinatesCompatible(const VolumePkg& pkg,
+                                  const std::string& baseId,
+                                  const std::string& overlayId)
+{
+    const auto base = coordinateSpaceTag(pkg, baseId);
+    const auto overlay = coordinateSpaceTag(pkg, overlayId);
+    return (base.empty() && overlay.empty()) ||
+           (!base.empty() && base == overlay);
+}
 } // namespace
 
 VolumeOverlayController::VolumeOverlayController(ViewerManager* manager, QObject* parent)
@@ -253,7 +273,13 @@ void VolumeOverlayController::refreshVolumeOptions()
     int indexToSelect = 0;
 
     if (_volumePkg) {
+        const std::string baseVolumeId = _viewerManager
+            ? _viewerManager->currentVolumeId()
+            : std::string{};
         for (const auto& id : _volumePkg->volumeIDs()) {
+            if (!baseVolumeId.empty() &&
+                !overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, id))
+                continue;
             std::shared_ptr<Volume> volume;
             try {
                 volume = _volumePkg->volume(id);
@@ -481,6 +507,21 @@ void VolumeOverlayController::populateColormapOptions()
 void VolumeOverlayController::applyOverlayVolume()
 {
     std::shared_ptr<Volume> overlayVolume;
+    if (_volumePkg && !_overlayVolumeId.empty()) {
+        const std::string baseVolumeId = _viewerManager
+            ? _viewerManager->currentVolumeId()
+            : std::string{};
+        if (!baseVolumeId.empty() &&
+            !overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, _overlayVolumeId)) {
+            emit requestStatusMessage(
+                tr("Overlay rejected: volume coordinate spaces do not match."), 5000);
+            _overlayVolumeId.clear();
+            if (_ui.volumeSelect) {
+                const QSignalBlocker blocker(_ui.volumeSelect);
+                _ui.volumeSelect->setCurrentIndex(0);
+            }
+        }
+    }
     if (_volumePkg && !_overlayVolumeId.empty()) {
         try {
             overlayVolume = _volumePkg->volume(_overlayVolumeId);

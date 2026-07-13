@@ -4,9 +4,13 @@
 #include "OpenDataSegmentCache.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/render/ZarrChunkFetcher.hpp"
+#include "vc/core/util/RemoteUrl.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <map>
@@ -50,14 +54,22 @@ bool isSupportedRemoteZarr(const OpenDataVolume& volume,
     if (url.empty()) {
         return false;
     }
-    const std::string loweredUrl = lowerCopy(url);
+    std::string networkUrl;
+    try {
+        networkUrl = vc::parseRemoteVolumeSpec(url).sourceUrl;
+    } catch (...) {
+        return false;
+    }
+    const std::string loweredUrl = lowerCopy(networkUrl);
+    const auto query = loweredUrl.find('?');
+    const std::string pathOnly = loweredUrl.substr(0, query);
     if (loweredUrl.rfind("http://", 0) != 0 &&
         loweredUrl.rfind("https://", 0) != 0 &&
         loweredUrl.rfind("s3://", 0) != 0) {
         return false;
     }
-    if (loweredUrl.size() >= 5 &&
-        loweredUrl.substr(loweredUrl.size() - 5) == ".zarr") {
+    if (pathOnly.size() >= 5 &&
+        pathOnly.substr(pathOnly.size() - 5) == ".zarr") {
         return true;
     }
     if (containsInsensitive(artifact.type, "zarr")) {
@@ -82,7 +94,10 @@ bool jsonStringEqualsInsensitive(const nlohmann::json& obj,
 
 std::vector<std::string> volumeTags(const OpenDataSample& sample,
                                     const OpenDataVolume& volume,
-                                    const OpenDataArtifact& artifact)
+                                    const OpenDataArtifact& artifact,
+                                    bool preferredNativeSource,
+                                    std::optional<int> coordinateLevel = std::nullopt,
+                                    std::optional<double> effectiveVoxelSize = std::nullopt)
 {
     std::vector<std::string> tags;
     auto addUnique = [&tags](std::string tag) {
@@ -122,11 +137,79 @@ std::vector<std::string> volumeTags(const OpenDataSample& sample,
     if (const auto normalGridsUrl = normalGridsArtifactUrl(volume); !normalGridsUrl.empty()) {
         addUnique(std::string(kOpenDataNormalGridsTagPrefix) + normalGridsUrl);
     }
-    if (volume.pixelSizeUm && *volume.pixelSizeUm > 0.0) {
+    if (preferredNativeSource && !coordinateLevel)
+        coordinateLevel = 0;
+    if (preferredNativeSource)
+        addUnique("vc-open-data-preferred-source");
+    if (coordinateLevel) {
+        addUnique("vc-open-data-source-coordinate-level:" +
+                  std::to_string(*coordinateLevel));
+        addUnique("vc-open-data-coordinate-space:" + sample.id + "/" +
+                  volume.id + "@L" + std::to_string(*coordinateLevel));
+    }
+    if (effectiveVoxelSize && *effectiveVoxelSize > 0.0) {
+        addUnique("vc-open-data-voxel-size-um:" + std::to_string(*effectiveVoxelSize));
+    } else if (!containsInsensitive(artifact.type, "prediction") &&
+               volume.pixelSizeUm && *volume.pixelSizeUm > 0.0) {
         addUnique("vc-open-data-voxel-size-um:" + std::to_string(*volume.pixelSizeUm));
     }
 
     return tags;
+}
+
+bool isSupportedSurfacePrediction(const OpenDataArtifact& artifact)
+{
+    return lowerCopy(artifact.type) == "surface-prediction-zarr";
+}
+
+std::string coordinateSpaceId(const OpenDataSample& sample,
+                              const OpenDataVolume& volume,
+                              int level)
+{
+    return sample.id + "/" + volume.id + "@L" + std::to_string(level);
+}
+
+std::vector<std::string> coordinateTags(const OpenDataSample& sample,
+                                        const OpenDataVolume& volume,
+                                        int level,
+                                        double voxelSize)
+{
+    return {
+        "vc-open-data-source-coordinate-level:" + std::to_string(level),
+        "vc-open-data-coordinate-space:" + coordinateSpaceId(sample, volume, level),
+        "vc-open-data-voxel-size-um:" + std::to_string(voxelSize),
+    };
+}
+
+const std::vector<std::string>& coordinateSingletonPrefixes()
+{
+    static const std::vector<std::string> prefixes{
+        "vc-open-data-voxel-size-um:",
+        "vc-open-data-source-coordinate-level:",
+        "vc-open-data-coordinate-space:",
+        "vc-open-data-name:",
+        "vc-open-data-coordinate-level-unknown",
+    };
+    return prefixes;
+}
+
+void preflightPredictionAndSource(const std::string& predictionUrl,
+                                  const std::string& sourceUrl,
+                                  int sourceLevel)
+{
+    auto prediction = vc::render::openHttpZarrPyramid(
+        predictionUrl, vc::HttpAuth{}, 0); // explicit zero requests strict validation
+    auto source = vc::render::openHttpZarrPyramid(
+        sourceUrl, vc::HttpAuth{}, sourceLevel);
+    if (prediction.shapes.empty() || source.shapes.empty())
+        throw std::runtime_error("prediction/source descriptor is empty");
+    if (prediction.shapes[0] != source.shapes[0])
+        throw std::runtime_error("prediction /0 shape does not match source physical /" +
+                                 std::to_string(sourceLevel));
+    if (prediction.dtype != source.dtype)
+        throw std::runtime_error("prediction/source dtype mismatch");
+    if (!prediction.physicalLevelZeroTransformIsIdentity)
+        throw std::runtime_error("prediction /0 coordinate scale must be identity");
 }
 
 bool hasVolumeEntry(const VolumePkg& pkg, const std::string& location)
@@ -238,9 +321,7 @@ int openDataSegmentEntryCount(const VolumePkg& pkg,
                        tag.rfind("vc-open-data-target-volume-id:", 0) == 0;
             });
         if (openDataSegmentEntry &&
-            entry.location.rfind(sampleSegmentsPrefix, 0) == 0 &&
-            entry.location.find(std::string(1, std::filesystem::path::preferred_separator),
-                                sampleSegmentsPrefix.size()) == std::string::npos) {
+            entry.location.rfind(sampleSegmentsPrefix, 0) == 0) {
             ++count;
         }
     }
@@ -266,6 +347,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
         try {
             vc::project::LoadOptions opts;
             opts.remoteCacheRoot = remoteCacheRoot;
+            opts.deferResolution = true;
             pkg = VolumePkg::load(
                 cachedProjectPath,
                 opts);
@@ -289,15 +371,6 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
         pkg->setRemoteCacheRoot(remoteCacheRoot);
     }
 
-    if (!remoteCacheRoot.empty()) {
-        const int attachedNormalGrids =
-            attachOpenDataNormalGrids(*pkg, sample, remoteCacheRoot);
-        if (attachedNormalGrids > 0) {
-            result.messages.push_back("Attached " + std::to_string(attachedNormalGrids) +
-                                      " streaming normal grid store(s).");
-        }
-    }
-
     auto attachResult = attachOpenDataSampleVolumes(*pkg, sample);
     result.supportedVolumes = attachResult.supportedVolumes;
     result.attachedVolumeEntries = attachResult.attachedVolumeEntries;
@@ -307,6 +380,14 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     result.messages.insert(result.messages.end(),
                            attachResult.messages.begin(),
                            attachResult.messages.end());
+    if (!remoteCacheRoot.empty()) {
+        const int attachedNormalGrids =
+            attachOpenDataNormalGrids(*pkg, sample, remoteCacheRoot);
+        if (attachedNormalGrids > 0) {
+            result.messages.push_back("Attached " + std::to_string(attachedNormalGrids) +
+                                      " streaming normal grid store(s).");
+        }
+    }
     if (loadedCachedProject &&
         openDataSegmentEntryCount(*pkg, remoteCacheRoot, sample) > 0) {
         const auto cacheAttachResult =
@@ -324,6 +405,24 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
         result.messages.push_back("Reused cached sample project segment entries.");
     } else {
         attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result, progressCallback);
+    }
+    // Catalog loads remain unresolved until volume tags, normal-grid paths,
+    // and every segment representation/cache entry have been reconciled.
+    if (loadedCachedProject) {
+        pkg->resolveDeferredEntries();
+        const std::string sampleTag =
+            std::string(kOpenDataSampleIdTagPrefix) + sample.id;
+        for (const auto& entry : pkg->volumeEntries()) {
+            if (std::find(entry.tags.begin(), entry.tags.end(), sampleTag) ==
+                    entry.tags.end() ||
+                pkg->hasLoadedVolumeEntry(entry.location)) {
+                continue;
+            }
+            ++result.failedVolumes;
+            result.messages.push_back(
+                "Cached catalog volume failed remote open/base-level validation: " +
+                entry.location + ".");
+        }
     }
 
     if (!cachedProjectPath.empty()) {
@@ -351,6 +450,15 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     OpenDataSampleProjectResult result;
     std::vector<std::string> supportedVolumeIds;
 
+    struct PredictionCandidate {
+        const OpenDataVolume* volume = nullptr;
+        const OpenDataArtifact* prediction = nullptr;
+        std::string predictionUrl;
+        std::string sourceUrl;
+    };
+    std::vector<PredictionCandidate> predictions;
+    std::vector<std::string> attachedLocations;
+
     for (const auto& volume : sample.volumes) {
         if (volume.artifacts.empty()) {
             ++result.skippedVolumes;
@@ -359,6 +467,16 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         }
 
         bool foundSupportedArtifact = false;
+        const auto* preferredSource = preferredVolumeArtifact(volume);
+        std::string preferredSourceUrl;
+        if (preferredSource) {
+            preferredSourceUrl = artifactUrl(*preferredSource);
+            if (isSupportedSurfacePrediction(*preferredSource) ||
+                !isSupportedRemoteZarr(volume, *preferredSource, preferredSourceUrl)) {
+                preferredSource = nullptr;
+                preferredSourceUrl.clear();
+            }
+        }
         for (const auto& artifact : volume.artifacts) {
             const std::string url = artifactUrl(artifact);
             if (!isSupportedRemoteZarr(volume, artifact, url)) {
@@ -375,33 +493,156 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             }
 
             const auto label = volumeArtifactLabel(volume, artifact);
-            const auto tags = volumeTags(sample, volume, artifact);
+            const bool preferredNativeSource = preferredSource == &artifact;
+            auto tags = volumeTags(
+                sample, volume, artifact, preferredNativeSource,
+                preferredNativeSource ? std::optional<int>{0} : std::nullopt,
+                preferredNativeSource ? volume.pixelSizeUm : std::nullopt);
+            if (isSupportedSurfacePrediction(artifact) &&
+                !artifact.sourceCoordinateLevel) {
+                tags.push_back(
+                    artifact.levelParameterPresent
+                        ? "vc-open-data-coordinate-level-unknown:invalid-parameters.level"
+                        : "vc-open-data-coordinate-level-unknown:missing-parameters.level");
+            }
             if (hasVolumeEntry(pkg, url)) {
-                pkg.mergeVolumeEntryTags(url, tags);
+                pkg.reconcileVolumeEntryTags(
+                    url, tags, coordinateSingletonPrefixes());
                 ++result.skippedVolumes;
                 result.messages.push_back("Skipped " + label + ": already attached.");
-                continue;
-            }
-
-            try {
-                if (pkg.addVolumeEntry(url, tags)) {
-                    ++result.attachedVolumeEntries;
-                } else {
+                if (!pkg.entryResolutionDeferred() &&
+                    !pkg.hasLoadedVolumeEntry(url)) {
                     ++result.failedVolumes;
-                    result.messages.push_back("Failed to attach " + label + ".");
+                    result.messages.push_back(
+                        "Attached entry remains unavailable after remote validation: " +
+                        label + ".");
                 }
-            } catch (const std::exception& e) {
-                ++result.failedVolumes;
-                result.messages.push_back("Failed to attach " + label + ": " + e.what());
-            } catch (...) {
-                ++result.failedVolumes;
-                result.messages.push_back("Failed to attach " + label + ": unknown error.");
+            } else {
+                try {
+                    if (pkg.addVolumeEntry(url, tags)) {
+                        ++result.attachedVolumeEntries;
+                        if (!pkg.entryResolutionDeferred() &&
+                            !pkg.hasLoadedVolumeEntry(url)) {
+                            ++result.failedVolumes;
+                            result.messages.push_back(
+                                "Persisted " + label +
+                                " but remote open/base-level validation failed.");
+                        }
+                    } else {
+                        ++result.failedVolumes;
+                        result.messages.push_back("Failed to attach " + label + ".");
+                    }
+                } catch (const std::exception& e) {
+                    ++result.failedVolumes;
+                    result.messages.push_back("Failed to attach " + label + ": " + e.what());
+                } catch (...) {
+                    ++result.failedVolumes;
+                    result.messages.push_back("Failed to attach " + label + ": unknown error.");
+                }
+            }
+            if (hasVolumeEntry(pkg, url))
+                attachedLocations.push_back(url);
+
+            if (isSupportedSurfacePrediction(artifact)) {
+                predictions.push_back(PredictionCandidate{
+                    &volume, &artifact, url, preferredSourceUrl});
             }
         }
 
         if (!foundSupportedArtifact) {
             ++result.skippedVolumes;
             result.messages.push_back("Skipped " + volumeLabel(volume) + ": unsupported volume artifact.");
+        }
+    }
+
+    std::vector<std::string> attachedVirtualLocators;
+    for (const auto& candidate : predictions) {
+        const auto& volume = *candidate.volume;
+        const auto& prediction = *candidate.prediction;
+        const auto predictionLabel = volumeArtifactLabel(volume, prediction);
+        if (!prediction.sourceCoordinateLevel) {
+            result.messages.push_back(
+                "Kept " + predictionLabel +
+                " coordinate-unspecified: parameters.level is missing or invalid.");
+            continue;
+        }
+        const int level = *prediction.sourceCoordinateLevel;
+        if (candidate.sourceUrl.empty() ||
+            std::find(attachedLocations.begin(), attachedLocations.end(),
+                      candidate.sourceUrl) == attachedLocations.end()) {
+            ++result.failedVolumes;
+            result.messages.push_back(
+                "Skipped virtual source for " + predictionLabel +
+                ": preferred source Zarr is unavailable or was not attached.");
+            continue;
+        }
+        if (!volume.pixelSizeUm || !std::isfinite(*volume.pixelSizeUm) ||
+            *volume.pixelSizeUm <= 0.0) {
+            ++result.failedVolumes;
+            result.messages.push_back(
+                "Skipped coordinate pairing for " + predictionLabel +
+                ": source volume has no positive voxel size.");
+            continue;
+        }
+
+        try {
+            preflightPredictionAndSource(
+                candidate.predictionUrl, candidate.sourceUrl, level);
+        } catch (const std::exception& e) {
+            ++result.failedVolumes;
+            result.messages.push_back(
+                "Skipped coordinate pairing for " + predictionLabel + ": " + e.what());
+            continue;
+        }
+
+        const double effectiveVoxelSize =
+            *volume.pixelSizeUm * static_cast<double>(std::uint64_t{1} << level);
+        auto predictionTags = volumeTags(
+            sample, volume, prediction, false, level, effectiveVoxelSize);
+        pkg.reconcileVolumeEntryTags(
+            candidate.predictionUrl,
+            predictionTags,
+            coordinateSingletonPrefixes());
+
+        if (level == 0)
+            continue;
+
+        const auto virtualLocator = vc::parseRemoteVolumeSpec(
+            candidate.sourceUrl + "#vc-base-scale=" + std::to_string(level)).portableLocator;
+        if (std::find(attachedVirtualLocators.begin(), attachedVirtualLocators.end(),
+                      virtualLocator) != attachedVirtualLocators.end()) {
+            continue;
+        }
+        attachedVirtualLocators.push_back(virtualLocator);
+
+        auto tags = coordinateTags(sample, volume, level, effectiveVoxelSize);
+        tags.push_back(std::string(kOpenDataSampleIdTagPrefix) + sample.id);
+        tags.push_back("vc-open-data-volume-id:" + volume.id);
+        tags.push_back("vc-open-data-virtual-source");
+        const std::string sourceName = volume.suffix.empty() ? volumeLabel(volume) : volume.suffix;
+        tags.push_back("vc-open-data-name:" + sourceName + " [source L" +
+                       std::to_string(level) + ", " +
+                       std::to_string(effectiveVoxelSize) + " um]");
+
+        if (hasVolumeEntry(pkg, virtualLocator)) {
+            pkg.reconcileVolumeEntryTags(
+                virtualLocator, tags, coordinateSingletonPrefixes());
+            ++result.skippedVolumes;
+        } else if (pkg.addVolumeEntry(virtualLocator, tags)) {
+            ++result.attachedVolumeEntries;
+            result.messages.push_back(
+                "Attached rebased source view " + virtualLocator + ".");
+            if (!pkg.entryResolutionDeferred() &&
+                !pkg.hasLoadedVolumeEntry(virtualLocator)) {
+                ++result.failedVolumes;
+                result.messages.push_back(
+                    "Persisted rebased source view but remote open/base-level validation failed: " +
+                    virtualLocator + ".");
+            }
+        } else {
+            ++result.failedVolumes;
+            result.messages.push_back(
+                "Failed to persist rebased source view " + virtualLocator + ".");
         }
     }
 

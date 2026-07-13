@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "OpenDataManifest.hpp"
+#include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "OpenDataSegmentCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -156,6 +157,112 @@ std::string fixtureWithSegmentArtifactType(const char* type)
 }
 
 } // namespace
+
+TEST_CASE("OpenDataManifest strictly parses coordinate-bearing artifact parameters")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "metadata":{"samples":{"sample":{"volumes":{"volume":{"data":[
+        {"type":"surface-prediction-zarr","parameters":{"level":2}},
+        {"type":"normal-grids","parameters":{"level":2.5}},
+        {"type":"surface-prediction-zarr"},
+        {"type":"tifxyz-transformed","parameters":{"target_volume":"target"}}
+      ]}}}}}
+    })");
+    REQUIRE(manifest.samples.size() == 1);
+    REQUIRE(manifest.samples[0].volumes.size() == 1);
+    const auto& artifacts = manifest.samples[0].volumes[0].artifacts;
+    REQUIRE(artifacts.size() == 4);
+    CHECK(artifacts[0].levelParameterPresent);
+    CHECK(artifacts[0].sourceCoordinateLevel == 2);
+    CHECK(artifacts[0].parameters.at("level") == 2);
+    CHECK(artifacts[1].levelParameterPresent);
+    CHECK_FALSE(artifacts[1].sourceCoordinateLevel.has_value());
+    CHECK_FALSE(artifacts[2].levelParameterPresent);
+    CHECK_FALSE(artifacts[2].sourceCoordinateLevel.has_value());
+    CHECK(artifacts[3].targetVolumeId == "target");
+}
+
+TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache identities")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "metadata":{"samples":{"sample":{"volumes":{"volume":{"data":[
+        {"type":"normal-grids","parameters":{"level":0},"origins":[{
+          "path":"grids/L0","access_roots":[{"type":"https","url":"https://example.test/","usage":"public-read"}]}]},
+        {"type":"normal-grids","parameters":{"level":2},"origins":[{
+          "path":"grids/L2","access_roots":[{"type":"https","url":"https://example.test/","usage":"public-read"}]}]},
+        {"type":"normal-grids","parameters":{"level":2.5},"origins":[{
+          "path":"grids/invalid","access_roots":[{"type":"https","url":"https://example.test/","usage":"public-read"}]}]}
+      ]}}}}}
+    })");
+    const auto& sample = manifest.samples.front();
+    const auto infos = normalGridsArtifacts(sample.id, sample.volumes.front());
+    REQUIRE(infos.size() == 2);
+    CHECK(infos[0].sourceCoordinateLevel == 0);
+    CHECK(infos[1].sourceCoordinateLevel == 2);
+
+    const auto root = std::filesystem::path("/tmp/open-data-normal-grids-test");
+    const auto first = normalGridsCacheDir(root, infos[0].sampleId, infos[0].volumeId,
+                                           infos[0].sourceCoordinateLevel, infos[0].url);
+    const auto second = normalGridsCacheDir(root, infos[1].sampleId, infos[1].volumeId,
+                                            infos[1].sourceCoordinateLevel, infos[1].url);
+    CHECK(first != second);
+    CHECK(first.string().find("L0-") != std::string::npos);
+    CHECK(second.string().find("L2-") != std::string::npos);
+}
+
+TEST_CASE("OpenDataSegmentCache classifies authored native and published representations")
+{
+    OpenDataSample sample;
+    sample.id = "sample";
+    OpenDataVolume source;
+    source.id = "source";
+    sample.volumes.push_back(source);
+    OpenDataVolume target;
+    target.id = "target";
+    sample.volumes.push_back(target);
+
+    OpenDataSegment segment;
+    segment.id = "segment";
+    segment.longId = "sample-segment";
+    segment.originalVolumeId = "source";
+    segment.properties["original_volume_downscale"] = 4;
+    OpenDataArtifact authored;
+    authored.type = "tifxyz-flattened";
+    authored.resolvedUrl = "https://example.test/authored";
+    segment.artifacts.push_back(authored);
+    OpenDataArtifact publishedA;
+    publishedA.type = "tifxyz-transformed";
+    publishedA.resolvedUrl = "https://example.test/published-a";
+    publishedA.targetVolumeId = "target";
+    segment.artifacts.push_back(publishedA);
+    OpenDataArtifact publishedUnknown = publishedA;
+    publishedUnknown.resolvedUrl = "https://example.test/published-unknown";
+    publishedUnknown.targetVolumeId = "missing";
+    segment.artifacts.push_back(publishedUnknown);
+
+    const auto representations =
+        classifyOpenDataSegmentRepresentations(sample, segment);
+    REQUIRE(representations.size() == 3);
+    CHECK(representations[0].kind == OpenDataSegmentRepresentationKind::Authored);
+    CHECK(representations[0].sourceCoordinateLevel == 2);
+    CHECK(representations[0].coordinateSpace == "sample/source@L2");
+    CHECK(representations[1].kind == OpenDataSegmentRepresentationKind::DerivedNative);
+    CHECK(representations[1].sourceCoordinateLevel == 0);
+    CHECK(representations[1].coordinateSpace == "sample/source@L0");
+    CHECK(representations[2].kind ==
+          OpenDataSegmentRepresentationKind::PublishedTransformed);
+    CHECK(representations[2].coordinateSpace == "sample/target@L0");
+    CHECK(representations[0].representationId !=
+          representations[1].representationId);
+
+    const auto root = std::filesystem::path("/tmp/segment-representations");
+    CHECK(openDataSegmentRepresentationCacheRoot(root, sample, representations[0]) !=
+          openDataSegmentRepresentationCacheRoot(root, sample, representations[1]));
+    CHECK(openDataSegmentRepresentationCacheDirectory(
+              root, sample, segment, representations[1]) !=
+          openDataSegmentRepresentationCacheDirectory(
+              root, sample, segment, representations[2]));
+}
 
 TEST_CASE("OpenDataManifest parses samples and computes summary counts")
 {
@@ -617,7 +724,8 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     CHECK(pkg->hasSegmentations());
     const auto ids = pkg->segmentationIDs();
     REQUIRE(ids.size() == 1);
-    CHECK(ids.front() == "PHerc0139-20260311000000");
+    CHECK(ids.front().rfind(
+              "PHerc0139-20260311000000-derived-native-L0-", 0) == 0);
     REQUIRE(!progressEvents.empty());
     CHECK(progressEvents.back().status == "finished");
     CHECK(progressEvents.back().completedFiles == 0);
@@ -651,7 +759,7 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     std::filesystem::remove_all(cacheRoot);
 }
 
-TEST_CASE("OpenDataSegmentCache does not downscale transformed tifxyz artifacts")
+TEST_CASE("OpenDataSegmentCache does not auto-associate transformed artifacts without a target")
 {
     const auto manifest = parseOpenDataManifest(
         fixtureWithSegmentArtifactType("tifxyz-transformed"));
@@ -678,14 +786,14 @@ TEST_CASE("OpenDataSegmentCache does not downscale transformed tifxyz artifacts"
     attachOpenDataSampleSegments(*pkg, sample, cacheRoot, result);
 
     CHECK(result.supportedTifxyzSegments == 1);
-    CHECK(result.cachedTifxyzSegments == 1);
-    CHECK(result.attachedSegmentEntries == 1);
-    REQUIRE(pkg->segmentEntries().size() == 1);
+    CHECK(result.cachedTifxyzSegments == 0);
+    CHECK(result.attachedSegmentEntries == 0);
+    CHECK(pkg->segmentEntries().empty());
 
     std::ifstream metaIn(segmentDir / "meta.json", std::ios::binary);
     REQUIRE(metaIn.good());
     const auto meta = nlohmann::json::parse(metaIn);
-    CHECK(meta.at("vc_open_data_original_volume_downscale").get<double>() == doctest::Approx(2.0));
+    CHECK_FALSE(meta.contains("vc_open_data_original_volume_downscale"));
     CHECK(!meta.contains("vc_open_data_coordinates_scaled_to_original_volume"));
 
     const cv::Size cachedGridSize = tifxyzGridSize(segmentDir);
@@ -729,8 +837,8 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
         cacheRoot, sample, sample.segments.front(), "vol2");
     CHECK(sourceDir.parent_path().filename() == "vol1");
     CHECK(sourceDir.parent_path().parent_path().filename() == "PHerc0139");
-    CHECK(transformedDir.parent_path().filename() == "vol2");
-    CHECK(transformedDir.parent_path().parent_path().filename() == "PHerc0139");
+    CHECK(transformedDir.parent_path().filename() == "generated-from-vol1-L0");
+    CHECK(transformedDir.parent_path().parent_path().filename() == "vol2");
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
     writeFile(sourceDir / "meta.json",

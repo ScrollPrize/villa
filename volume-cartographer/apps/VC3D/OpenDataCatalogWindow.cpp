@@ -1241,11 +1241,8 @@ void OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids()
         return;
     }
 
-    OpenDataNormalGridsInfo info;
-    info.sampleId = sample->id;
-    info.volumeId = volume->id;
-    info.url = normalGridsArtifactUrl(*volume);
-    if (info.url.empty()) {
+    const auto infos = normalGridsArtifacts(sample->id, *volume);
+    if (infos.empty()) {
         return;
     }
     const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
@@ -1304,22 +1301,26 @@ void OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids()
         };
 
     struct DownloadResult {
-        std::filesystem::path dir;
+        std::vector<std::filesystem::path> dirs;
         std::string error;
     };
 
     QFutureWatcher<DownloadResult> watcher;
     QEventLoop loop;
     connect(&watcher, &QFutureWatcher<DownloadResult>::finished, &loop, &QEventLoop::quit);
-    watcher.setFuture(QtConcurrent::run([info, remoteRoot, progressCallback, cancelFlag]() {
+    watcher.setFuture(QtConcurrent::run([infos, remoteRoot, progressCallback, cancelFlag]() {
         DownloadResult result;
-        result.dir = downloadOpenDataNormalGrids(
-            info,
-            remoteRoot,
-            kNormalGridsDownloadWorkers,
-            progressCallback,
-            cancelFlag.get(),
-            &result.error);
+        for (const auto& info : infos) {
+            std::string error;
+            auto dir = downloadOpenDataNormalGrids(
+                info, remoteRoot, kNormalGridsDownloadWorkers,
+                progressCallback, cancelFlag.get(), &error);
+            if (dir.empty()) {
+                result.error = error;
+                break;
+            }
+            result.dirs.push_back(std::move(dir));
+        }
         return result;
     }));
     if (!watcher.isFinished()) {
@@ -1331,14 +1332,14 @@ void OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids()
         dialogGuard->deleteLater();
     }
 
-    if (result.dir.empty()) {
+    if (result.dirs.size() != infos.size()) {
         setStatus(cancelFlag->load(std::memory_order_acquire)
                       ? tr("Normal grid download for %1 cancelled.").arg(volumeLabel)
                       : tr("Normal grid download for %1 failed: %2")
                             .arg(volumeLabel, qstr(result.error)));
     } else {
-        setStatus(tr("Normal grids for %1 downloaded to %2.")
-                      .arg(volumeLabel, qstr(result.dir.string())));
+        setStatus(tr("%1 normal-grid artifact(s) for %2 downloaded.")
+                      .arg(result.dirs.size()).arg(volumeLabel));
     }
 
     // Refresh the volume's status cell and the button state.
