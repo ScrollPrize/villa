@@ -1,0 +1,41 @@
+#!/bin/bash
+# Entry point for the Volume Cartographer AppImage.
+#
+# Responsibilities:
+#   1. Point Qt at the bundled plugins. When the app is launched through the
+#      bundled dynamic loader (glibc-bundle mode), /proc/self/exe is the loader,
+#      not the app, so Qt can't derive the plugin dir from qt.conf — we set
+#      QT_PLUGIN_PATH explicitly. (Harmless in non-bundled mode too.)
+#   2. Dispatch to the right executable. VC3D ships the GUI plus ~35 CLI tools
+#      in one AppImage. Symlink the .AppImage to a tool name
+#      (e.g. `ln -s VC3D-x86_64.AppImage vc_obj2tifxyz`) to run that tool;
+#      otherwise the GUI (VC3D) launches.
+#   3. If glibc was bundled (scripts/build_appimage.sh, default), launch through
+#      the bundled loader so the host's glibc is never used — this is what lets
+#      the AppImage run on distros older than the build machine. If not bundled,
+#      run the binary directly and rely on the host glibc.
+
+HERE="$(dirname "$(readlink -f "${0}")")"
+export APPDIR="$HERE"
+LIBDIR="$HERE/usr/lib"
+
+export QT_PLUGIN_PATH="$HERE/usr/plugins${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
+
+BIN=VC3D
+if [ -n "${ARGV0:-}" ]; then
+    cand="$(basename "$ARGV0")"
+    if [ "$cand" != "AppRun" ] && [ -x "$HERE/usr/bin/$cand" ]; then
+        BIN="$cand"
+    fi
+fi
+
+LOADER="$LIBDIR/ld-linux-x86-64.so.2"
+if [ -e "$LOADER" ]; then
+    # glibc-bundle mode: charset modules + resolve NSS/glibc satellites and
+    # dlopened Qt-plugin deps from our own libs.
+    export GCONV_PATH="$LIBDIR/gconv"
+    export LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    exec "$LOADER" --library-path "$LIBDIR" "$HERE/usr/bin/$BIN" "$@"
+else
+    exec "$HERE/usr/bin/$BIN" "$@"
+fi
