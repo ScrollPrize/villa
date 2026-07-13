@@ -36,7 +36,6 @@ title: "The Tutorials"
   />
 </head>
 
-import { TutorialsTop } from '@site/src/components/TutorialsTop';
 
 These tutorials share the best tools and techniques for virtually unwrapping and reading carbonized papyrus scrolls.
 
@@ -44,7 +43,6 @@ We expect you will build on these techniques, improving the tools and models. Bu
 
 There are five steps in our process for reading a carbonized scroll:
 
-<TutorialsTop/>
 
 :::warning[ARCHIVED]
 

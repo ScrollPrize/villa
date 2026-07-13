@@ -36,11 +36,9 @@ sidebar_label: "Scanning"
   />
 </head>
 
-import { TutorialsTop } from '@site/src/components/TutorialsTop';
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 
-<TutorialsTop highlightId={2} />
 
 :::warning[ARCHIVED]
 

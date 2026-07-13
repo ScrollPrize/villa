@@ -37,9 +37,7 @@ sidebar_label: "Segmentation"
 </head>
 
 
-import { TutorialsTop } from '@site/src/components/TutorialsTop';
 
-<TutorialsTop highlightId={4} />
 
 :::warning[ARCHIVED]
 

@@ -36,11 +36,9 @@ sidebar_label: "Segmentation and Flattening"
   />
 </head>
 
-import { TutorialsTop } from '@site/src/components/TutorialsTop';
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 
-<TutorialsTop highlightId={4} />
 
 :::warning[ARCHIVED]
 

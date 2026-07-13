@@ -85,9 +85,9 @@ Reading a scroll is a chain of complex problems:
 
 <TutorialsTop
   links={{
-    scanning: '#1-scanning-preserving-the-signal-before-algorithms-see-it',
+    scanning: '#1-scanning-capturing-the-signal',
     representation: '#2-unwrapping-turning-disconnected-voxels-into-a-surface',
-    segmentation: '#2d-parameterization-and-flattening-the-easier-problem-after-the-hard-one',
+    segmentation: '#2d-parameterization-and-flattening',
     ink: '#3-ink-recovery-reading-the-scrolls',
   }}
 />

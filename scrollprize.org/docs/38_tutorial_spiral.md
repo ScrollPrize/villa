@@ -36,10 +36,8 @@ sidebar_label: "Spiral Fitting"
   />
 </head>
 
-import { TutorialsTop } from '@site/src/components/TutorialsTop';
 import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
 
-<TutorialsTop highlightId={4} />
 
 *Last updated: July 9, 2026*
 

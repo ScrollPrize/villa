@@ -56,7 +56,7 @@ export function TutorialsTop({ highlightId, links = {}, labels = {} } = {}) {
     // arrows are fixed-width. Phones keep the centered wrap.
     <div className="mx-[-16px] sm:mx-0 flex flex-wrap sm:flex-nowrap items-start mb-4 text-center justify-center sm:justify-start">
       <Thumb
-        href={links.scanning || "/2026_open_problems#1-scanning-preserving-the-signal-before-algorithms-see-it"}
+        href={links.scanning || "/2026_open_problems#1-scanning-capturing-the-signal"}
         label={labels.scanning || "Scanning"}
         videoSrc="/img/tutorial-thumbs/top-scanning-small.webm?v=4"
         poster="/img/tutorial-thumbs/top-scanning-small.webp?v=4"

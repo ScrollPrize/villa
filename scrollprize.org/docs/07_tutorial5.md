@@ -38,10 +38,8 @@ import BeforeAfter from '@site/src/components/BeforeAfter';
   />
 </head>
 
-import { TutorialsTop } from '@site/src/components/TutorialsTop';
 import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
 
-<TutorialsTop highlightId={5} />
 
 *Last updated: July 10, 2026*
 
