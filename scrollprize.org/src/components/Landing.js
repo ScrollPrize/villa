@@ -758,13 +758,9 @@ export function Landing() {
                 )}
                 <a className="vc-stat vc-stat--link" href="/data_browser">
                   <span className="vc-stat__value">
-                    {counts.fragments ?? 10}
+                    {(counts.scrolls ?? 35) + (counts.fragments ?? 10)}
                   </span>
-                  <span className="vc-stat__label">fragments scanned</span>
-                </a>
-                <a className="vc-stat vc-stat--link" href="/data_browser">
-                  <span className="vc-stat__value">{counts.scrolls ?? 35}</span>
-                  <span className="vc-stat__label">scrolls scanned</span>
+                  <span className="vc-stat__label">scrolls &amp; fragments scanned</span>
                 </a>
                 <a className="vc-stat vc-stat--link" href="/data_browser">
                   <span className="vc-stat__value">1</span>
