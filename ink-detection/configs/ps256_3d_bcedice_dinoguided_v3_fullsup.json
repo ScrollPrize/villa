@@ -1,0 +1,100 @@
+{
+    "out_dir": "/ephemeral/3d_ink_checkpoints/ps256_bcedice_dinoguided_v3_fullsup",
+    "checkpoint": "/ephemeral/3d_ink_checkpoints/ps256_bcedice_dinoguided_v2/ckpt_077000.pth",
+    "weights_only": false,
+    "wandb_entity": "vesuvius-challenge",
+    "wandb_project": "vesuvius_2um_ink_3d",
+    "wandb_run_name": "ps256_3d_bcedice_dinoguided_paris4_v3_fullsup",
+    "mode": "full_3d",
+    "full_3d": {
+        "projection_half_thickness": 3.0
+    },
+    "patch_finding_scale": 4,
+    "seed": 27,
+    "patch_size": [256, 256, 256],
+
+    "batch_size": 2,
+    "patch_overlap": 0.5,
+    "patch_min_labeled_coverage": 0.02,
+    "num_iterations": 250000,
+    "val_every": 200,
+    "val_steps": 8,
+    "mixed_precision": "bf16",
+    "dice_label_smoothing": 0.1,
+    "bce_label_smoothing": 0.1,
+    "dataloader_workers": 8,
+    "prefetch_factor": 8,
+    "warmup_steps": 5000,
+    "image_normalization": "percentile_minmax",
+    "loss": {
+        "terms": [
+            {
+                "name": "LabelSmoothedDCAndBCELoss",
+                "metric_name": "base",
+                "weight": 1.0,
+                "weight_dice": 1.0,
+                "weight_ce": 1.0
+            }
+        ]
+    },
+    "model_type": "unet",
+    "step_count": 1,
+    "in_channels": 2,
+    "model_config": {
+        "autoconfigure": true
+    },
+    "ema": {
+        "enabled": true,
+        "decay": 0.9995,
+        "start_step": 1000,
+        "update_every_steps": 1,
+        "validate": true,
+        "save_in_checkpoint": true
+    },
+    "targets": {
+        "ink": {
+            "out_channels": 1,
+            "activation": "none"
+        }
+    },
+    "datasets": [
+        {
+            "volume_scale": 0,
+            "volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/",
+            "segments_path": "/ephemeral/2d_ink_dataset/phercparis4"
+        }
+    ],
+
+    "force_full_supervision": true,
+
+    "dynamic_label": {
+        "enabled": true,
+        "kind": "self_distill",
+        "primary_ckpt": "/ephemeral/3d_ink_checkpoints/ps256_bcedice_dinoguided_v2/ckpt_077000.pth",
+        "ensemble_ckpt": "/ephemeral/3d_ink_checkpoints/ps256_bcedice_dinoguided_v2/ckpt_064000.pth",
+        "primary_threshold": 0.17647,
+        "ensemble_threshold": 0.15686,
+        "mean_hi": 105.0,
+        "std_lo": 30.0,
+        "tta": true,
+        "input_mask_threshold": 50.0
+    },
+
+    "extra_patches": {
+        "enabled": true,
+        "fraction": 0.25,
+        "jitter": 1024,
+        "coords_xyz": [
+            [22167,  8793, 37628],
+            [19735, 19651, 35344],
+            [10649, 19605, 70688],
+            [12261, 16221, 41802],
+            [ 8270, 10039, 41652],
+            [ 8006,  8812, 41652],
+            [19310, 10476, 41652],
+            [27405, 17662, 41778]
+        ]
+    },
+
+    "save_every": 1000
+}
