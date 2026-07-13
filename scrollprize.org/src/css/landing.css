@@ -363,6 +363,11 @@
   text-decoration: none;
   background: var(--vc-raised);
 }
+/* The <a> background is covered by the opaque media + title span, so also
+   lift the visible title span on hover to match the other news items. */
+.vc-landing a.vc-newsbar__feature:hover .vc-newsbar__feature-title {
+  background: var(--vc-raised);
+}
 .vc-landing .vc-newsbar__media {
   display: block;
   width: 100%;
@@ -377,6 +382,7 @@
   padding: 6px 10px;
   border-left: 1px solid var(--vc-line);
   background: var(--vc-surface);
+  transition: background-color 0.15s;
   font-size: 0.8125rem;
   font-weight: 650;
   line-height: 1.3;
