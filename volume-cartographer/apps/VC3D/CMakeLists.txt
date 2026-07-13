@@ -86,6 +86,7 @@ set(srcs
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
     SurfaceDisplayName.hpp
+    SurfaceTimestamp.hpp
     SeedingWidget.cpp
     SeedingWidget.hpp
     segmentation/SegmentationCommon.hpp

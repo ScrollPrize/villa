@@ -2,6 +2,7 @@
 
 #include "SurfaceTreeWidget.hpp"
 #include "SurfaceDisplayName.hpp"
+#include "SurfaceTimestamp.hpp"
 #include "ViewerManager.hpp"
 #include "CState.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -113,7 +114,8 @@ QString surface_timestamp(QuadSurface* surf)
         return {};
     }
 
-    return QString::fromStdString(surf->meta["date_last_modified"].get_string());
+    return QString::fromStdString(vc3d::surfaceTimestampForDisplay(
+        surf->meta["date_last_modified"].get_string()));
 }
 
 std::string segment_display_id(const std::string& dirName, const std::string& segmentId, bool currentFolder)

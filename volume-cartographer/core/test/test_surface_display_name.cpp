@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "SurfaceDisplayName.hpp"
+#include "SurfaceTimestamp.hpp"
 
 TEST_CASE("Open-data surfaces use their original name as the panel label")
 {
@@ -20,4 +21,13 @@ TEST_CASE("Open-data surfaces use their original name as the panel label")
 
     const utils::Json localMetadata = {{"name", "local-friendly-name"}};
     CHECK(vc3d::surfacePanelDisplayName(internalId, localMetadata) == internalId);
+}
+
+TEST_CASE("Surface timestamps are human-readable without milliseconds")
+{
+    CHECK(vc3d::surfaceTimestampForDisplay("20260623141135") ==
+          "2026-06-23 14:11:35");
+    CHECK(vc3d::surfaceTimestampForDisplay("20260623141135916") ==
+          "2026-06-23 14:11:35");
+    CHECK(vc3d::surfaceTimestampForDisplay("unknown") == "unknown");
 }

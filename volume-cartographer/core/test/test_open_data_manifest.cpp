@@ -336,7 +336,7 @@ TEST_CASE("OpenDataSegmentCache prepares lazy source and generated placeholders"
         std::ifstream metaIn(sourceDir / "meta.json", std::ios::binary);
         REQUIRE(metaIn.good());
         const auto meta = nlohmann::json::parse(metaIn);
-        CHECK(meta.at("date_last_modified") == "20260602204401955");
+        CHECK(meta.at("date_last_modified") == "20260602204401");
         CHECK(meta.at("vc_open_data_creation_date") ==
               "2026-06-02T20:44:01.955138Z");
     }
@@ -1039,12 +1039,20 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
     REQUIRE(alreadyMaterialized.success);
     CHECK(alreadyMaterialized.alreadyMaterialized);
 
+    sample.segments.front().createdAt = "2026-06-23T14:11:35.916443Z";
+    const auto refreshed = reconcileOpenDataSampleSegments(
+        *pkg, sample, cacheRoot, {}, false);
+    CHECK(refreshed.failedTransformedTifxyzSegments == 0);
+
     std::ifstream metaIn(transformedDir / "meta.json", std::ios::binary);
     REQUIRE(metaIn.good());
     const auto meta = nlohmann::json::parse(metaIn);
     CHECK(meta.at("vc_open_data_transform_source_volume_id").get<std::string>() == "vol1");
     CHECK(meta.at("vc_open_data_transform_target_volume_id").get<std::string>() == "vol2");
     CHECK(meta.at("vc_open_data_volume_transform_matrix")[0][3].get<double>() == doctest::Approx(10.0));
+    CHECK(meta.at("date_last_modified") == "20260623141135");
+    CHECK(meta.at("vc_open_data_creation_date") ==
+          "2026-06-23T14:11:35.916443Z");
 
     metaIn.close();
     pkg.reset();
