@@ -4,7 +4,7 @@ import React from "react";
 // spiral that is the project's most recognizable visual. Drawn as a single
 // Archimedean spiral (2.6 turns), strokes in currentColor so each context
 // tints it via CSS.
-const SPIRAL =
+export const SPIRAL =
   "M14.9 16.4 L14.6 16.0 L14.4 15.5 L14.4 14.9 L14.7 14.2 L15.3 13.7 L16.0 13.3 " +
   "L16.9 13.2 L17.9 13.4 L18.8 14.0 L19.5 14.9 L19.9 16.0 L19.9 17.3 L19.5 18.6 " +
   "L18.7 19.7 L17.5 20.6 L16.0 21.1 L14.3 21.1 L12.7 20.5 L11.3 19.4 L10.2 17.9 " +

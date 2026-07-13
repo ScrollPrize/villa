@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
+import { SPIRAL } from "./ChatWidget/ChatAvatar";
 
 const BeforeAfter = ({
   beforeImage,
@@ -8,7 +9,6 @@ const BeforeAfter = ({
   beforeLabel,
   afterLabel,
   heightClass = "h-80",
-  accentHandle = false,
 }) => {
   const [sliderPosition, setSliderPosition] = useState(50);
   const containerRef = useRef(null);
@@ -89,14 +89,16 @@ const BeforeAfter = ({
         className="absolute top-0 bottom-0 w-0.5 bg-accent"
         style={{ left: `${sliderPosition}%`, cursor: "col-resize" }}
       >
-        <div
-          className={`absolute top-1/2 -translate-y-1/2 left-1/2 -translate-x-1/2 w-6 h-6 border-solid rounded-full ${
-            accentHandle ? "bg-accent border-2 border-accent" : "bg-bg border border-line"
-          }`}
-        >
-          {accentHandle && (
-            <div className="absolute inset-0.5 rounded-full border-2 border-solid border-bg"></div>
-          )}
+        <div className="absolute top-1/2 -translate-y-1/2 left-1/2 -translate-x-1/2 w-7 h-7 border border-solid border-line bg-bg rounded-full flex items-center justify-center">
+          <svg width="19" height="19" viewBox="0 0 33 33" fill="none" className="text-accent">
+            <path
+              d={SPIRAL}
+              stroke="currentColor"
+              strokeWidth="3"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
         </div>
       </div>
     </div>

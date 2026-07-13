@@ -425,7 +425,6 @@ The model trained on a single segment, so the interesting test is a segment it h
     beforeLabel="15,000 iterations"
     afterLabel="19,000 iterations"
     heightClass="aspect-[2/1]"
-    accentHandle
   />
   <figcaption className="mt-0">Predictions on a segment the model never trained on. Drag to compare the two checkpoints. Letters are starting to show, and the predictions have mostly converged, with the later checkpoint just slightly cleaner. This is still far from a good read.</figcaption>
 </figure>
