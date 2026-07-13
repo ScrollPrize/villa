@@ -486,9 +486,12 @@
 .vc-landing .vc-chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  align-items: center;
+  gap: 2px 0;
   margin: 4px 0 12px;
 }
+/* Base chip pill — still used by the open-prize tier breakdowns
+   (.vc-open-row__tier). The skills list overrides this below. */
 .vc-landing .vc-chip {
   font-size: 0.75rem;
   line-height: 1;
@@ -497,6 +500,24 @@
   border-radius: var(--vc-r-btn);
   color: var(--vc-text-faint);
   white-space: nowrap;
+}
+/* Skills list only: strip the pill back to a plain word. */
+.vc-landing .vc-chips .vc-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+}
+/* Skills read as a plain word list, each pair split by a short ember rule
+   set shorter than the cap height so it reads as a divider, not a border. */
+.vc-landing .vc-chips .vc-chip:not(:first-child)::before {
+  content: "";
+  display: inline-block;
+  width: 1px;
+  height: 0.85em;
+  margin: 0 10px;
+  background: var(--vc-line-strong);
 }
 /* Prize tie-in line — "solve this, win that" bridge into /prizes, sourced
    from the same plugin data as the open-prize board. One compact row. */
