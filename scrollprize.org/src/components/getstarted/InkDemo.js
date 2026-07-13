@@ -1447,16 +1447,16 @@ export default function InkDemo() {
         <div className="vc-gs-demo__poster">
           <img
             src={base + "papyrus.webp"}
-            alt="X-ray surface render of carbonized papyrus with faint crackle"
+            alt="X-ray surface render of carbonized papyrus with faint ink traces"
             loading="lazy"
             decoding="async"
           />
           <div className="vc-gs-demo__poster-overlay">
             <p>
-              A surface from inside a rolled scroll, as the X-ray sees it.
-              The ink survives as a faint cracked texture. Label what you
-              can see, and a model trains on your strokes to predict the
-              rest.
+              A surface from inside the same generous scroll, as the X-ray
+              sees it. The ink survives as the faint cracked texture. Label
+              what you can see, and a model trains on your strokes to
+              predict the rest.
             </p>
             <button
               className="vc-btn"

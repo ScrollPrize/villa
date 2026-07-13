@@ -76,7 +76,7 @@ Not all of that contrast is lost, though. What does the surviving signal look li
   <figcaption className="mt-0">The ink signal in the data: (a) a slice through the CT volume, (b) the same region with the ink segmented in red, and (c) a flattened surface volume where the crackle texture and the letter π are visible directly. Source: <a href="https://arxiv.org/abs/2606.29085">the PHerc. 1667 paper</a>.</figcaption>
 </figure>
 
-This crackle is what first revealed [letters inside an intact scroll](/firstletters), spotted by eye in raw surface volumes; a model learns to recognize the same signal, and picks up fainter variants a human would miss. Several scrolls are still waiting for their first letters, and each is worth \$50,000 in the open [First Letters Prizes](/prizes#first-letters-prizes). Finding them takes a searching eye and a model's predictions. By the end of this tutorial you'll have both — and maybe you'll be the first person to read those words in 2,000 years.
+This crackle is what first revealed [letters inside an intact scroll](/firstletters), spotted by eye in raw surface volumes. But it is the exception. Most scrolls show nothing so legible, so models trained on known ink learn to pick up traces the eye can't name. Several scrolls are still waiting for their first letters, and each is worth \$50,000 in the open [First Letters Prizes](/prizes#first-letters-prizes). Finding them takes a searching eye and a model's predictions. By the end of this tutorial you'll have both — and maybe you'll be the first person to read those words in 2,000 years.
 
 ### How ink detection works
 
