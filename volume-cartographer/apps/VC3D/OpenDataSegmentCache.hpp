@@ -2,6 +2,7 @@
 
 #include "OpenDataManifest.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -85,6 +86,10 @@ struct OpenDataInkDetectionEntry {
     const std::string& sampleId);
 
 [[nodiscard]] std::filesystem::path openDataPatchesRoot(
+    const std::filesystem::path& remoteCacheRoot,
+    const std::string& sampleId);
+
+[[nodiscard]] std::size_t manualOpenDataSegmentCount(
     const std::filesystem::path& remoteCacheRoot,
     const std::string& sampleId);
 

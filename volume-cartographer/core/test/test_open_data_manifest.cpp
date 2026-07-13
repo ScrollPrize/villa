@@ -783,6 +783,30 @@ TEST_CASE("OpenDataSegmentCache places GrowPatch output under the sample patches
           cacheRoot / "open_data" / "segments" / "Sample_With_Spaces" / "patches");
 }
 
+TEST_CASE("OpenDataSegmentCache counts manually created sample segments")
+{
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_manual_segment_count_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+
+    const auto sampleRoot = cacheRoot / "open_data" / "segments" / "PHerc0175A";
+    writeFile(sampleRoot / "patches" / "manual-1" / "meta.json", "{}");
+    writeFile(sampleRoot / "my-custom-folder" / "manual-2" / "meta.json", "{}");
+    writeFile(sampleRoot / "another" / "nested" / "manual-3" / "meta.json", "{}");
+    writeFile(sampleRoot / "volume-1_editable" / "manual-4" / "meta.json", "{}");
+    writeFile(sampleRoot / "patches" / "incomplete" / "x.tif", "x");
+    writeFile(sampleRoot / "patches" / "backups" / "manual-1" / "meta.json", "{}");
+    writeFile(sampleRoot / ".download-in-progress" / "manual-5" / "meta.json", "{}");
+    writeFile(sampleRoot / "volume-1" / "catalog-segment" / "meta.json", "{}");
+    writeFile(sampleRoot / "volume-1" / "catalog-segment" / "catalog-origin.json", "{}");
+    writeFile(sampleRoot / "notes.txt", "not a segment");
+
+    CHECK(manualOpenDataSegmentCount(cacheRoot, "PHerc0175A") == 4);
+    CHECK(manualOpenDataSegmentCount(cacheRoot, "PHerc1447") == 0);
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
 TEST_CASE("OpenDataSegmentCache names editable copies after the current segments folder")
 {
     const std::filesystem::path cacheRoot = "/home/test/.VC3D/remote_cache";

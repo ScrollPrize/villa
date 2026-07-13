@@ -1415,6 +1415,52 @@ std::filesystem::path openDataPatchesRoot(
            safePathComponent(sampleId.empty() ? "sample" : sampleId) / "patches";
 }
 
+std::size_t manualOpenDataSegmentCount(
+    const std::filesystem::path& remoteCacheRoot,
+    const std::string& sampleId)
+{
+    const auto sampleRoot = remoteCacheRoot / "open_data" / "segments" /
+                            safePathComponent(sampleId.empty() ? "sample" : sampleId);
+    std::error_code ec;
+    std::filesystem::recursive_directory_iterator entries(
+        sampleRoot,
+        std::filesystem::directory_options::skip_permission_denied,
+        ec);
+    if (ec) {
+        return 0;
+    }
+
+    std::size_t count = 0;
+    const std::filesystem::recursive_directory_iterator end;
+    while (entries != end) {
+        const auto& entry = *entries;
+        std::error_code entryEc;
+        if (entry.is_directory(entryEc) && !entryEc) {
+            const auto name = entry.path().filename().string();
+            if (name == "backups" || (!name.empty() && name.front() == '.')) {
+                entries.disable_recursion_pending();
+            } else {
+                const bool isSegment =
+                    std::filesystem::is_regular_file(entry.path() / "meta.json", entryEc);
+                entryEc.clear();
+                const bool isCatalogSegment = std::filesystem::is_regular_file(
+                    entry.path() / "catalog-origin.json", entryEc);
+                if (isSegment) {
+                    if (!isCatalogSegment) {
+                        ++count;
+                    }
+                    entries.disable_recursion_pending();
+                }
+            }
+        }
+        entries.increment(ec);
+        if (ec) {
+            break;
+        }
+    }
+    return count;
+}
+
 OpenDataSegmentCacheState cacheStateForSegment(
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSample& sample,
