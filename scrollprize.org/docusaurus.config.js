@@ -215,7 +215,7 @@ const config = {
               items: [
                 {
                   to: "/tutorial_VC3D",
-                  label: "Volume Cartographer 3D",
+                  label: "Virtual Unwrapping",
                 },
                 {
                   to: "/tutorial_spiral",

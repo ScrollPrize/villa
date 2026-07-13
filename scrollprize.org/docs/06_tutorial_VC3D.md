@@ -1,5 +1,5 @@
 ---
-title: "Volume Cartographer 3D (VC3D)"
+title: "Virtual Unwrapping with VC3D"
 ---
 
 <head>
@@ -7,7 +7,7 @@ title: "Volume Cartographer 3D (VC3D)"
 
   <meta
     name="description"
-    content="Volume Cartographer 3D (VC3D) tutorial: install and launch the GUI, load scroll data, navigate volumes, and annotate fibers and windings."
+    content="Virtual Unwrapping with VC3D tutorial: install and launch the GUI, load scroll data, navigate volumes, and annotate fibers and windings."
   />
 
   <meta property="og:type" content="website" />
@@ -15,7 +15,7 @@ title: "Volume Cartographer 3D (VC3D)"
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="Volume Cartographer 3D (VC3D) tutorial: install and launch the GUI, load scroll data, navigate volumes, and annotate fibers and windings."
+    content="Virtual Unwrapping with VC3D tutorial: install and launch the GUI, load scroll data, navigate volumes, and annotate fibers and windings."
   />
   <meta property="og:image" content="https://scrollprize.org/img/social/opengraph.jpg" />
 
@@ -24,7 +24,7 @@ title: "Volume Cartographer 3D (VC3D)"
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="Volume Cartographer 3D (VC3D) tutorial: install and launch the GUI, load scroll data, navigate volumes, and annotate fibers and windings."
+    content="Virtual Unwrapping with VC3D tutorial: install and launch the GUI, load scroll data, navigate volumes, and annotate fibers and windings."
   />
   <meta property="twitter:image" content="https://scrollprize.org/img/social/opengraph.jpg" />
 </head>
@@ -33,7 +33,7 @@ import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 
-# Volume Cartographer 3D (VC3D)
+# Virtual Unwrapping with VC3D
 
 *Last updated: July 12, 2026*
 
@@ -44,6 +44,9 @@ import TabItem from '@theme/TabItem';
 VC3D is updated frequently. Follow along in Discord for the latest changes.
 
 :::
+
+In this tutorial, you will see how to open a CT scan of a scroll in VC3D, our specialized software for virtual unwrapping, and how to segment part of the papyrus surface.
+
 
 ## Installing VC3D
 Downloads for all operating systems are available on the [releases page](https://github.com/ScrollPrize/villa/releases) of the villa repository.
@@ -83,7 +86,7 @@ Downloads for all operating systems are available on the [releases page](https:/
 </TabItem>
 
 <TabItem value="docker" label="Docker">
-  Prebuild docker containers are hosted on the GitHub container registry. To use them, run the following command:
+  Prebuilt docker containers are hosted on the GitHub container registry. To use them, run the following command:
   ```bash
   docker pull ghcr.io/scrollprize/villa/volume-cartographer:stable
   ```
@@ -97,11 +100,13 @@ Downloads for all operating systems are available on the [releases page](https:/
 Depending on your install method or operating system, the application may be launched in different ways.
 - **Mac:** Open the application from the Applications folder
 - **Windows:** Open the application from the Start menu
-- **Linux:** Navigate to the build folder and run the VC3D app. example: `cd build/bin && ./vc3d`
+- **Linux:** Navigate to the build folder and run the VC3D app. example: `cd build/bin && ./VC3D`
 
 ## Using VC3D
-VC3D is intended as a viewer of scroll data and to assist in the virtual unwrapping of scrolls, so the fastest way to get familiar with it is to unwrap some part of scroll. Let's start
-with PHerc1447. This scroll (as of July 13, 2026) has public surfaces, so let's make one. You should see the open data catalog window in the VC3D gui when you launch it, and from here
+
+### Viewing a scroll
+VC3D is intended as a viewer of scroll data and to assist in the virtual unwrapping of scrolls, so the fastest way to get familiar with it is to unwrap some part of a scroll. Let's start
+with PHerc1447. This scroll (as of July 13, 2026) has no public surfaces, so let's make one. You should see the open data catalog window in the VC3D gui when you launch it, and from here
 we can select our sample:
 
 *if the data catalog is not visible, you can reopen it*
@@ -113,16 +118,16 @@ we can select our sample:
   </video>
 </div>
 
-- Select PHerc1447 and either double click or press  → **Open Sample**
+- Select PHerc1447 and either double click or press **Open Sample**
 
 After a brief wait to download any necessary data, you should see the scroll data in the xy and yz planes (the two viewers to the right) and a large blank window to the left.
 
 General navigation tips:
 - You can zoom in and out in any viewer by using the mouse wheel.
-- Use right click to pan the view, and either `ctrl+click` or `R` to move the focus point. When the focus point is moved, the other planes will all align with it, so you are seeing the scroll data from different planes/orientations.
-- You can rotate the yz plane either by dragging the green handle in the yz view or by pressing the mousewheel in and dragging the mouse
-- you can slice through the planes by holding shift and moving the mousewheel up or down
-- you can increase the sensitivity of any navigation actions by changing the settings in viewer controls -> navigation
+- Use right click to pan the view, and either `ctrl+click` or `R` to move the focus point. When the focus point is moved, the other planes will all align with it, so you are seeing the same location in the scroll volume from different planes/orientations.
+- You can rotate the yz plane either by dragging the green handle in the xy view, or by pressing the mousewheel in and dragging the mouse in the yz view
+- You can slice through the planes by holding shift and moving the mousewheel up or down
+- You can increase the sensitivity of any navigation actions by changing the settings in `Viewer Controls → Navigation`
 
 PHerc1447 has recto surface predictions available from the open data catalog, and these should pre-populate in your overlay selector. Let's take a look at this volume with the surface predictions overlaid:
 
@@ -132,14 +137,17 @@ PHerc1447 has recto surface predictions available from the open data catalog, an
   </video>
 </div>
 
+### Growing surfaces
+
 Now that we've got all our necessary data, we can create our first segmentation. Let's find a place on the volume we would like to see unwrapped, and use `ctrl+right click` to bring up the volume actions menu.
 From here, click `Create Segment (GrowPatch)`, and a dialog box will pop up. From the volume selector, ensure that the volume containing "surface" is selected, set your growth iterations to 35, and check that
 the output path is to the desired location (by default, this will go to your open data catalog folder in a "patches" folder for the selected volume, you do not need to change this).
 
-You should see another dialog box pop up, and it will show the progress of the current segmentation growth. After a brief wait, it should say "Successful". Click `OK` and then click on volume package, and you should see your segment.
-Click on it to show it in the flattened view.
+You should see another dialog box pop up, and it will show the progress of the current segmentation growth. After a brief wait, it should say "Successful". Click `OK` and then click on `Volume Package`, and you should see your segment.
+Click on it to show it in the flattened view on the left. You can also see how the 2D sheet surface is situated in the original CT volume in the xy and yz views -- the orange line in these views shows where they slice through the sheet you have segmented.
+A high quality segment should follow the sheets in the cross-section views, and also have the horizontal and vertical fibers clearly visible in the flattened view -- this indicates the segment is followimg the original written surface of the papyrus accurately.
 
-This segment, while currently small, can be used already either for ink detection, as an input to the spiral fit, for training data, or for any other purpose. Any segment created by VC3D, regardless of how big, is in this same format.
+This segment, while currently small, can be used already either for [ink detection](tutorial5), as an input to the [spiral fit](tutorial_spiral), or for [training data](2026_open_problems#surface-prediction). Any segment created by VC3D, regardless of how big, is in this same format.
 
 <div className="mb-4 max-w-[760px]">
   <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/vc3d/grow_from_seed-poster.webp">
@@ -148,8 +156,8 @@ This segment, while currently small, can be used already either for ink detectio
 </div>
 
 Growth tips:
-- the more iterations you have selected, the longer it will take to complete. The growth becomes increasingly long as it gets larger due to the edges being longer.
-- Try and select an area that is on the surface predictions to get better results
+- the more iterations you have selected, the bigger the resulting segment, but the longer it will take to complete. Later iterations take longer due to the edges of the surface being longer.
+- Try and select an area that is on the surface predictions to get better results.
 
 If we want to make our segment larger, we can do this easily with the built-in segmentation tools. Click on `Segmentation` and `Enable Editing`. You can then use either the growth button or keybinds to grow in a desired direction.
 - `1` to grow left, `2` to grow up, `3` to grow down, `4` to grow right, `5` to grow in all directions
