@@ -71,17 +71,20 @@ jobs:
           version: v0.15.0
 
       - name: Reset compiler cache statistics
-        run: sccache --zero-stats
+        run: '"${SCCACHE_PATH}" --zero-stats'
 
       - name: Configure
-        run: cmake --preset ci-windows-mingw -DVC_USE_SCCACHE=ON
+        run: >-
+          cmake --preset ci-windows-mingw
+          -DVC_USE_SCCACHE=ON
+          -DSCCACHE_PROGRAM="${SCCACHE_PATH}"
 
       - name: Build
         run: ninja -C build/ci-windows-mingw
 
       - name: Report compiler cache statistics
         if: always()
-        run: sccache --show-stats
+        run: '"${SCCACHE_PATH}" --show-stats'
 
       - name: Package (NSIS installer + ZIP)
         if: github.event_name != 'pull_request'
