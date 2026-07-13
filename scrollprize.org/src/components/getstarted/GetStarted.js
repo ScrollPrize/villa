@@ -75,9 +75,6 @@ export function GetStarted() {
             and what to do first.
           </p>
           <div className="vc-gs-hero__ctas">
-            <a className="vc-btn" href="#read">
-              Start here ↓
-            </a>
             <a className="vc-btn-outline" href="https://discord.gg/V4fJhvtaQn">
               Join Discord
             </a>
@@ -92,14 +89,16 @@ export function GetStarted() {
             <p className="vc-gs-sub">Train your first ink model.</p>
             <p className="vc-gs-body">
               The ink is carbon. So is the scorched papyrus underneath it.
-              To an X-ray the two look nearly identical. But ink cracks as
-              it dries and ages, and that crackle leaves a faint texture on
-              the surface. A person spotted it first, by eye. Models have
-              since learned to find it everywhere.
+              To an X-ray the two look nearly identical. But one scroll was
+              generous with us. Its ink cracked as it dried, and a person
+              spotted the faint texture by eye. Those cracks gave up the
+              first words ever read from inside an unopened scroll. Most
+              scrolls give away less, so models have since learned to catch
+              traces that can slip past even the eye.
             </p>
             <p className="vc-gs-body">
-              This is easier to try than to explain, so here's a small piece
-              of a real scan. Paint the crackle you can see, and a model
+              This is easier to try than to explain, so here's a real piece
+              of that same scroll. Paint the ink you can see, and a model
               trains on your labels to predict the rest. It's only as good
               as the labels you give it.
             </p>
