@@ -2,6 +2,16 @@
 
 ## 2026-07-13
 
+- Restored regular stepwise combined Trace2CP and stepwise z-search as the
+  defaults, added explicit `--trace2cp-dp` routing for the monotone-DP backend,
+  and made `--trace2cp-side-top-z-experiment` an exclusive export mode.
+- Added opt-in single-pair `--trace2cp-side-top-z-experiment`, which keeps
+  regular Trace2CP as the default, uses regular side candidate scoring for
+  side x/y motion, and writes separate side/top z-offset diagnostic artifacts
+  using one top-model inference per accepted trace point.
+- Added side/top-z experiment top-slice debug exports:
+  `trace2cp_side_top_z_top_slices/` and
+  `trace2cp_side_top_z_top_overlays/`.
 - Added a torch-vectorized Trace2CP monotone-DP backend for CLI side/z/top
   solves, with side-z reachable-layer pruning.
 - Changed side-strip Trace2CP joint DP to use fixed 4 px transitions, removed

@@ -80,11 +80,16 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
 from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _DirVisImageAugment,
     _Trace2CpImageScoringConfig,
+    _Trace2CpBidirectionalResult,
     _Trace2CpCombinedWeights,
     _Trace2CpDirectionResult,
     _Trace2CpPredictedFields,
     _Trace2CpResult,
+    _Trace2CpSideTopZExperiment,
+    _Trace2CpSideTopZLineResult,
+    _Trace2CpSideTopZTopSliceDebug,
     _Trace2CpTimingRow,
+    _Trace2CpZTraceDebug,
     _TtaDirectionField,
     _aggregate_trace2cp_timings,
     _bilinear_direction_sample,
@@ -100,6 +105,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _dir_vis_half_image_paste_side,
     _direction_field_overlay_rgb,
     _draw_trace2cp_top_strip_panel,
+    _draw_trace2cp_side_top_z_compact_overlay,
     _draw_trace2cp_similarity_debug_column,
     _draw_trace2cp_fiber_overlay,
     _draw_trace2cp_overlay,
@@ -137,6 +143,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace2cp_image_descriptor,
     _trace2cp_image_descriptor_loss,
     _trace2cp_select_horizontal_median_direction,
+    _trace2cp_weighted_median_top_direction,
     _trace2cp_top_monotone_direction_path,
     _trace2cp_top_monotone_direction_path_z,
     _trace2cp_top_direction_traces,
@@ -149,9 +156,15 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _trace_direction_line_to_target,
     _trace_combined_direction_line_to_target_z,
     _trace_score_trace2cp_bidirectional,
+    _trace_score_trace2cp_combined_bidirectional,
+    _trace_score_trace2cp_combined_dp_bidirectional,
+    _trace_score_trace2cp_combined_z_bidirectional,
+    _trace_score_trace2cp_combined_z_dp_bidirectional,
     _trace_median_tta_direction_line_to_target,
     _trace_median_tta_direction_line,
+    _trace_side_top_z_line_to_target,
     _to_u8_display_image,
+    _write_trace2cp_side_top_z_top_slice_debug,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
@@ -2573,6 +2586,527 @@ def test_trace2cp_top_model_direction_selection_medians_horizontal_candidates() 
     assert int(layer[0, 0]) == 1
 
 
+def test_trace2cp_weighted_median_top_direction_aligns_ambiguous_signs() -> None:
+    angle = np.deg2rad(20.0)
+    expected = np.asarray([np.cos(angle), np.sin(angle)], dtype=np.float32)
+    direction = np.zeros((9, 9, 2), dtype=np.float32)
+    direction[:, :, :] = expected
+    direction[::2, :, :] *= -1.0
+    valid = np.ones((9, 9), dtype=bool)
+
+    selected = _trace2cp_weighted_median_top_direction(
+        direction,
+        valid,
+        center_xy=np.asarray([4.0, 4.0], dtype=np.float32),
+        reference_xy=np.asarray([1.0, 0.0], dtype=np.float32),
+        radius_px=4.0,
+    )
+
+    assert selected is not None
+    np.testing.assert_allclose(selected, expected, atol=1.0e-6)
+
+
+def test_trace2cp_side_top_z_experiment_scores_candidate_side_direction(monkeypatch: pytest.MonkeyPatch) -> None:
+    direction = np.zeros((16, 16, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    direction[4:7, 8:11] = np.asarray([0.0, 1.0], dtype=np.float32)
+    diagonal = np.asarray([math.sqrt(0.5), math.sqrt(0.5)], dtype=np.float32)
+    direction[7:10, 7:10] = diagonal
+    valid = np.ones((16, 16), dtype=bool)
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 32
+
+        def __init__(self) -> None:
+            self.layers: list[int] = []
+
+        def get(self, layer: int):
+            self.layers.append(int(layer))
+            return SimpleNamespace(
+                valid_mask=valid,
+                fields=SimpleNamespace(direction_xy=direction, presence_hw=None),
+            )
+
+    top_patch_points: list[np.ndarray] = []
+
+    def fake_sample_top_patch(*args, **_kwargs):
+        top_patch_points.append(np.asarray(args[2], dtype=np.float32))
+        return np.zeros((9, 9), dtype=np.float32), np.ones((9, 9), dtype=bool)
+
+    def fake_predict_top_fields(*_args, **_kwargs):
+        top_direction = np.zeros((9, 9, 2), dtype=np.float32)
+        top_direction[:, :, 0] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=top_direction,
+            embedding_chw=None,
+            presence_hw=None,
+        )
+
+    monkeypatch.setattr(runner_module, "_sample_trace2cp_local_top_patch", fake_sample_top_patch)
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict_top_fields)
+
+    traced = _trace_side_top_z_line_to_target(
+        plane_cache=FakePlaneCache(),
+        segment_source=object(),
+        source_arrays=SimpleNamespace(),
+        top_model=object(),
+        start_xy=np.asarray([5.0, 5.0], dtype=np.float32),
+        target_xy=np.asarray([14.0, 5.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, presence=0.0),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        device=torch.device("cpu"),
+        step_px=4.0,
+        rf_margin_px=0.0,
+        top_radius_px=4.0,
+        top_patch_shape_hw=(9, 9),
+        max_steps=1,
+    )
+
+    assert traced.reason == "max_steps"
+    assert traced.trace_xyz.shape[0] == 2
+    assert traced.trace_xyz[1, 1] > 7.0
+    np.testing.assert_allclose(top_patch_points[0], traced.trace_xyz[1, :2], atol=1.0e-6)
+
+
+def test_trace2cp_side_top_z_experiment_aligns_ambiguous_side_samples(monkeypatch: pytest.MonkeyPatch) -> None:
+    direction = np.zeros((7, 8, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    direction[:, 1::2, :] *= -1.0
+    valid = np.ones((7, 8), dtype=bool)
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 32
+
+        def get(self, _layer: int):
+            return SimpleNamespace(
+                valid_mask=valid,
+                fields=SimpleNamespace(direction_xy=direction, presence_hw=None),
+            )
+
+    def fake_sample_top_patch(*_args, **_kwargs):
+        return np.zeros((9, 9), dtype=np.float32), np.ones((9, 9), dtype=bool)
+
+    def fake_predict_top_fields(*_args, **_kwargs):
+        top_direction = np.zeros((9, 9, 2), dtype=np.float32)
+        top_direction[:, :, 0] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=top_direction,
+            embedding_chw=None,
+            presence_hw=None,
+        )
+
+    monkeypatch.setattr(runner_module, "_sample_trace2cp_local_top_patch", fake_sample_top_patch)
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict_top_fields)
+
+    traced = _trace_side_top_z_line_to_target(
+        plane_cache=FakePlaneCache(),
+        segment_source=object(),
+        source_arrays=SimpleNamespace(),
+        top_model=object(),
+        start_xy=np.asarray([1.5, 3.0], dtype=np.float32),
+        target_xy=np.asarray([6.5, 3.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, presence=0.0),
+        candidate_max_degrees=0.0,
+        candidate_step_degrees=1.0,
+        device=torch.device("cpu"),
+        step_px=1.0,
+        rf_margin_px=0.0,
+        top_radius_px=4.0,
+        top_patch_shape_hw=(9, 9),
+        max_steps=1,
+    )
+
+    assert traced.reason == "max_steps"
+    np.testing.assert_allclose(traced.trace_xyz[1, :2], np.asarray([2.5, 3.0], dtype=np.float32), atol=1.0e-6)
+
+
+def test_trace2cp_side_top_z_experiment_scores_candidate_presence(monkeypatch: pytest.MonkeyPatch) -> None:
+    direction = np.zeros((16, 16, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    presence = np.zeros((16, 16), dtype=np.float32)
+    presence[4:7, 4:7] = 1.0
+    presence[7:10, 7:10] = 1.0
+    valid = np.ones((16, 16), dtype=bool)
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 32
+
+        def get(self, _layer: int):
+            return SimpleNamespace(
+                valid_mask=valid,
+                fields=SimpleNamespace(direction_xy=direction, presence_hw=presence),
+            )
+
+    def fake_sample_top_patch(*_args, **_kwargs):
+        return np.zeros((9, 9), dtype=np.float32), np.ones((9, 9), dtype=bool)
+
+    def fake_predict_top_fields(*_args, **_kwargs):
+        top_direction = np.zeros((9, 9, 2), dtype=np.float32)
+        top_direction[:, :, 0] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=top_direction,
+            embedding_chw=None,
+            presence_hw=None,
+        )
+
+    monkeypatch.setattr(runner_module, "_sample_trace2cp_local_top_patch", fake_sample_top_patch)
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict_top_fields)
+
+    traced = _trace_side_top_z_line_to_target(
+        plane_cache=FakePlaneCache(),
+        segment_source=object(),
+        source_arrays=SimpleNamespace(),
+        top_model=object(),
+        start_xy=np.asarray([5.0, 5.0], dtype=np.float32),
+        target_xy=np.asarray([14.0, 5.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, presence=1.0),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        device=torch.device("cpu"),
+        step_px=4.0,
+        rf_margin_px=0.0,
+        top_radius_px=4.0,
+        top_patch_shape_hw=(9, 9),
+        max_steps=1,
+    )
+
+    assert traced.reason == "max_steps"
+    assert traced.trace_xyz.shape[0] == 2
+    assert traced.trace_xyz[1, 1] > 7.0
+
+
+def test_trace2cp_side_top_z_experiment_uses_current_z_side_layer(monkeypatch: pytest.MonkeyPatch) -> None:
+    layer0_direction = np.zeros((10, 10, 2), dtype=np.float32)
+    layer0_direction[:, :, 0] = 1.0
+    layer1_direction = np.zeros((10, 10, 2), dtype=np.float32)
+    layer1_direction[:, :, 1] = 1.0
+    valid = np.ones((10, 10), dtype=bool)
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 3
+
+        def __init__(self) -> None:
+            self.layers: list[int] = []
+
+        def get(self, layer: int):
+            self.layers.append(int(layer))
+            direction_field = layer1_direction if int(layer) == 1 else layer0_direction
+            return SimpleNamespace(
+                valid_mask=valid,
+                fields=SimpleNamespace(direction_xy=direction_field, presence_hw=None),
+            )
+
+    def fake_sample_top_patch(*_args, **_kwargs):
+        return np.zeros((9, 9), dtype=np.float32), np.ones((9, 9), dtype=bool)
+
+    def fake_predict_top_fields(*_args, **_kwargs):
+        top_direction = np.zeros((9, 9, 2), dtype=np.float32)
+        top_direction[:, :, :] = np.asarray([math.sqrt(0.5), math.sqrt(0.5)], dtype=np.float32)
+        return _Trace2CpPredictedFields(
+            direction_xy=top_direction,
+            embedding_chw=None,
+            presence_hw=None,
+        )
+
+    monkeypatch.setattr(runner_module, "_sample_trace2cp_local_top_patch", fake_sample_top_patch)
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict_top_fields)
+    cache = FakePlaneCache()
+
+    traced = _trace_side_top_z_line_to_target(
+        plane_cache=cache,
+        segment_source=object(),
+        source_arrays=SimpleNamespace(),
+        top_model=object(),
+        start_xy=np.asarray([1.0, 1.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 1.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, presence=0.0),
+        candidate_max_degrees=0.0,
+        candidate_step_degrees=1.0,
+        device=torch.device("cpu"),
+        step_px=1.0,
+        rf_margin_px=0.0,
+        top_radius_px=4.0,
+        top_patch_shape_hw=(9, 9),
+        max_steps=2,
+    )
+
+    assert traced.reason == "max_steps"
+    assert 1 in cache.layers
+    np.testing.assert_allclose(traced.trace_xyz[1], np.asarray([2.0, 1.0, 1.0], dtype=np.float32), atol=1.0e-6)
+    assert traced.trace_xyz[2, 1] > traced.trace_xyz[1, 1]
+
+
+def test_trace2cp_side_top_z_compact_overlay_has_only_relevant_panels(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner_module, "_draw_label_band", lambda image, _label: np.asarray(image, dtype=np.uint8))
+    height, width = 5, 7
+    forward = np.asarray([[1.0, 2.0, 0.0], [5.0, 2.0, 1.0]], dtype=np.float32)
+    reverse = np.asarray([[5.0, 3.0, 0.0], [1.0, 3.0, -1.0]], dtype=np.float32)
+    layer_columns = np.zeros((width,), dtype=np.int32)
+    z_debug = _Trace2CpZTraceDebug(
+        forward_trace_xyz=forward,
+        reverse_trace_xyz=reverse,
+        fused_trace_xyz=forward,
+        forward_z_image=np.full((height, width), 32, dtype=np.uint8),
+        reverse_z_image=np.full((height, width), 64, dtype=np.uint8),
+        fused_z_image=np.full((height, width), 96, dtype=np.uint8),
+        forward_missing_columns=0,
+        reverse_missing_columns=0,
+        fused_missing_columns=0,
+        forward_layer_columns=layer_columns,
+        reverse_layer_columns=layer_columns,
+        fused_layer_columns=layer_columns,
+        layers=(0,),
+        z_step_voxels=1.0,
+        max_layer=1,
+        forward_z_presence=np.full((height, width), 128, dtype=np.uint8),
+        reverse_z_presence=np.full((height, width), 160, dtype=np.uint8),
+    )
+    experiment = _Trace2CpSideTopZExperiment(
+        result=SimpleNamespace(),
+        z_debug=z_debug,
+        forward_line=_Trace2CpSideTopZLineResult(forward, "target_column", 1, 0),
+        reverse_line=_Trace2CpSideTopZLineResult(reverse, "target_column", 1, 0),
+        forward_top_strip_image=np.full((height, width), 80, dtype=np.float32),
+        forward_top_strip_valid_mask=np.ones((height, width), dtype=bool),
+        reverse_top_strip_image=np.full((height, width), 100, dtype=np.float32),
+        reverse_top_strip_valid_mask=np.ones((height, width), dtype=bool),
+        traced_top_strip_image=None,
+        traced_top_strip_valid_mask=None,
+        z_top_strip_image=None,
+        z_top_strip_valid_mask=None,
+        timing_rows=(),
+    )
+
+    overlay = _draw_trace2cp_side_top_z_compact_overlay(
+        line_xy=np.asarray([[0.0, 2.0], [6.0, 2.0]], dtype=np.float32),
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([5.0, 2.0], dtype=np.float32),
+        experiment=experiment,
+        input_top_strip_image=np.full((height, width), 48, dtype=np.float32),
+        input_top_strip_valid_mask=np.ones((height, width), dtype=bool),
+        fallback_shape_hw=(height, width),
+    )
+
+    assert overlay.shape == (7 * height, width, 3)
+
+
+def test_trace2cp_side_top_z_experiment_export_is_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image = np.zeros((9, 21), dtype=np.float32)
+    valid = np.ones_like(image, dtype=bool)
+    line_xy = np.asarray([[2.0, 4.0], [18.0, 4.0]], dtype=np.float32)
+    sample = FiberStripSegmentSample(
+        record_index=0,
+        fiber_path="fiber.json",
+        start_control_point_index=1,
+        target_control_point_index=2,
+        start_control_point_xyz=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        target_control_point_xyz=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        strip_z_offset=0.0,
+        coords_zyx=np.zeros((9, 21, 3), dtype=np.float32),
+        valid_mask=valid,
+        frame=None,
+        line_xy=line_xy,
+        start_control_point_xy=line_xy[0],
+        target_control_point_xy=line_xy[1],
+        line_point_indices=np.asarray([0, 1], dtype=np.int32),
+        line_normals_xyz=np.asarray([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=np.float32),
+        start_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        target_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+    )
+
+    class FakeLoader:
+        config = SimpleNamespace(augment=SimpleNamespace(device="cpu"))
+
+        def build_trace2cp_segment_source(self, *args, **kwargs):
+            return SimpleNamespace(name="segment")
+
+        def sample_trace2cp_segment_source(self, _source):
+            return sample, image, valid
+
+        def sample_trace2cp_top_strip_source(self, _source):
+            return image, valid
+
+    def fake_fields(*_args, **_kwargs):
+        direction = np.zeros((9, 21, 2), dtype=np.float32)
+        direction[:, :, 0] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=direction,
+            embedding_chw=np.zeros((2, 9, 21), dtype=np.float32),
+            presence_hw=np.ones((9, 21), dtype=np.float32),
+        )
+
+    def forbidden_chain(*_args, **_kwargs):
+        raise AssertionError("exclusive side/top experiment must not run normal Trace2CP chain")
+
+    def fake_experiment(**_kwargs):
+        result = _trace2cp_test_bidirectional_result()
+        trace_xyz = np.asarray([[2.0, 4.0, 0.0], [18.0, 4.0, 0.0]], dtype=np.float32)
+        layer_columns = np.zeros(21, dtype=np.int32)
+        z_debug = _Trace2CpZTraceDebug(
+            forward_trace_xyz=trace_xyz,
+            reverse_trace_xyz=trace_xyz[::-1].copy(),
+            fused_trace_xyz=trace_xyz,
+            forward_z_image=np.zeros((9, 21), dtype=np.uint8),
+            reverse_z_image=np.zeros((9, 21), dtype=np.uint8),
+            fused_z_image=np.zeros((9, 21), dtype=np.uint8),
+            forward_missing_columns=0,
+            reverse_missing_columns=0,
+            fused_missing_columns=0,
+            forward_layer_columns=layer_columns,
+            reverse_layer_columns=layer_columns,
+            fused_layer_columns=layer_columns,
+            layers=(0,),
+            z_step_voxels=1.0,
+            max_layer=0,
+            forward_z_presence=np.zeros((9, 21), dtype=np.uint8),
+            reverse_z_presence=np.zeros((9, 21), dtype=np.uint8),
+            fused_z_presence=np.zeros((9, 21), dtype=np.uint8),
+        )
+        line_result = _Trace2CpSideTopZLineResult(
+            trace_xyz=trace_xyz,
+            reason="target_column",
+            top_patch_count=0,
+            top_invalid_count=0,
+        )
+        return _Trace2CpSideTopZExperiment(
+            result=result,
+            z_debug=z_debug,
+            forward_line=line_result,
+            reverse_line=line_result,
+            forward_top_strip_image=image,
+            forward_top_strip_valid_mask=valid,
+            reverse_top_strip_image=image,
+            reverse_top_strip_valid_mask=valid,
+            traced_top_strip_image=image,
+            traced_top_strip_valid_mask=valid,
+            z_top_strip_image=image,
+            z_top_strip_valid_mask=valid,
+            timing_rows=(),
+        )
+
+    written: list[Path] = []
+    monkeypatch.setattr(
+        runner_module,
+        "_load_direction_model",
+        lambda *args, **kwargs: (object(), {"step": 3, "config": {"training": {"model_depth": 2}}}),
+    )
+    monkeypatch.setattr(runner_module, "_load_top_direction_model_from_checkpoint", lambda *args, **kwargs: object())
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_fields)
+    monkeypatch.setattr(runner_module, "_evaluate_trace2cp_refinement_chain", forbidden_chain)
+    monkeypatch.setattr(runner_module, "_trace_score_trace2cp_side_top_z_experiment_bidirectional", fake_experiment)
+    monkeypatch.setattr(
+        runner_module,
+        "_draw_trace2cp_side_top_z_compact_overlay",
+        lambda **_kwargs: np.zeros((9, 21, 3), dtype=np.uint8),
+    )
+    monkeypatch.setattr(runner_module, "_write_trace2cp_side_top_z_top_slice_debug", lambda *_args, **_kwargs: (0, 0))
+    monkeypatch.setattr(runner_module, "_write_jpg", lambda path, _image: written.append(Path(path)))
+
+    runner_module._export_trace2cp_vis(
+        FakeLoader(),
+        0,
+        tmp_path,
+        checkpoint_path=tmp_path / "checkpoint.pt",
+        step_px=4.0,
+        rf_margin_px=0.0,
+        target_offset=1,
+        target_cp_index=None,
+        combined=True,
+        combined_weights=_Trace2CpCombinedWeights(direction=1.0, presence=1.0),
+        combined_mode="direction",
+        z_search=runner_module._Trace2CpZSearchConfig(enabled=True, step_voxels=1.0, max_layer=4),
+        side_top_z_experiment=True,
+    )
+
+    assert [path.name for path in written] == ["trace2cp_side_top_z_experiment.jpg"]
+    assert (tmp_path / "trace2cp_side_top_z_summary.txt").exists()
+    assert not (tmp_path / "trace2cp_summary.txt").exists()
+
+
+def test_trace2cp_side_top_z_top_slice_debug_writes_raw_and_overlay_dirs(tmp_path: Path) -> None:
+    height, width = 5, 7
+    image = np.full((height, width), 42.0, dtype=np.float32)
+    valid = np.ones((height, width), dtype=bool)
+    forward_slice = _Trace2CpSideTopZTopSliceDebug(
+        image=image,
+        valid_mask=valid,
+        direction_xy=np.asarray([1.0, 0.0], dtype=np.float32),
+        point_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        z_offset_voxels=0.0,
+    )
+    reverse_slice = _Trace2CpSideTopZTopSliceDebug(
+        image=image + 1.0,
+        valid_mask=valid,
+        direction_xy=np.asarray([-1.0, 0.0], dtype=np.float32),
+        point_xy=np.asarray([5.0, 2.0], dtype=np.float32),
+        z_offset_voxels=1.0,
+    )
+    layer_columns = np.zeros((width,), dtype=np.int32)
+    z_debug = _Trace2CpZTraceDebug(
+        forward_trace_xyz=np.asarray([[1.0, 2.0, 0.0]], dtype=np.float32),
+        reverse_trace_xyz=np.asarray([[5.0, 2.0, 0.0]], dtype=np.float32),
+        fused_trace_xyz=np.asarray([[1.0, 2.0, 0.0]], dtype=np.float32),
+        forward_z_image=np.zeros((height, width), dtype=np.uint8),
+        reverse_z_image=np.zeros((height, width), dtype=np.uint8),
+        fused_z_image=np.zeros((height, width), dtype=np.uint8),
+        forward_missing_columns=0,
+        reverse_missing_columns=0,
+        fused_missing_columns=0,
+        forward_layer_columns=layer_columns,
+        reverse_layer_columns=layer_columns,
+        fused_layer_columns=layer_columns,
+        layers=(0,),
+        z_step_voxels=1.0,
+        max_layer=1,
+    )
+    experiment = _Trace2CpSideTopZExperiment(
+        result=SimpleNamespace(),
+        z_debug=z_debug,
+        forward_line=_Trace2CpSideTopZLineResult(
+            np.asarray([[1.0, 2.0, 0.0]], dtype=np.float32),
+            "target_column",
+            1,
+            0,
+            top_slices=(forward_slice,),
+        ),
+        reverse_line=_Trace2CpSideTopZLineResult(
+            np.asarray([[5.0, 2.0, 0.0]], dtype=np.float32),
+            "target_column",
+            1,
+            0,
+            top_slices=(reverse_slice,),
+        ),
+        forward_top_strip_image=None,
+        forward_top_strip_valid_mask=None,
+        reverse_top_strip_image=None,
+        reverse_top_strip_valid_mask=None,
+        traced_top_strip_image=None,
+        traced_top_strip_valid_mask=None,
+        z_top_strip_image=None,
+        z_top_strip_valid_mask=None,
+        timing_rows=(),
+    )
+    stale_dir = tmp_path / "trace2cp_side_top_z_top_slices"
+    stale_dir.mkdir()
+    (stale_dir / "stale.jpg").write_bytes(b"stale")
+
+    written, expected = _write_trace2cp_side_top_z_top_slice_debug(tmp_path, experiment)
+
+    assert written == expected == 2
+    slices = sorted(path.name for path in (tmp_path / "trace2cp_side_top_z_top_slices").glob("*.jpg"))
+    overlays = sorted(path.name for path in (tmp_path / "trace2cp_side_top_z_top_overlays").glob("*.jpg"))
+    assert slices == ["bw_0000.jpg", "fw_0000.jpg"]
+    assert overlays == ["bw_0000.jpg", "fw_0000.jpg"]
+
+
 def test_trace2cp_top_monotone_direction_path_connects_center_cps() -> None:
     direction = np.zeros((5, 19, 2), dtype=np.float32)
     direction[:, :, 0] = 1.0
@@ -2708,7 +3242,7 @@ def test_trace2cp_joint_dp_candidate_angle_does_not_cap_global_slope() -> None:
         presence_fields=None,
         start_xy=np.asarray([0.0, 30.0], dtype=np.float32),
         target_xy=np.asarray([16.0, 10.0], dtype=np.float32),
-        weights=_Trace2CpCombinedWeights(direction=1.0),
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0, image=0.0),
         step_px=4.0,
         rf_margin_px=0.0,
         horizontal_step_px=4,
@@ -2741,6 +3275,235 @@ def test_trace2cp_top_monotone_direction_path_z_progress_prints_eta(capsys) -> N
     assert "trace2cp dp progress" in captured
     assert "eta_s=" in captured
     assert "trace2cp dp done" in captured
+
+
+def _trace2cp_test_stats(reason: str = "target_column") -> runner_module._Trace2CpCombinedTraceStats:
+    return runner_module._Trace2CpCombinedTraceStats(
+        steps=1,
+        invalid_candidates=0,
+        direction_loss_sum=0.0,
+        last_loss_sum=0.0,
+        enclosing_loss_sum=0.0,
+        fiber_loss_sum=0.0,
+        total_loss_sum=0.0,
+        reason=reason,
+    )
+
+
+def _trace2cp_test_bidirectional_result() -> _Trace2CpBidirectionalResult:
+    direction = np.zeros((9, 21, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((9, 21), dtype=bool)
+    return _trace_score_trace2cp_bidirectional(
+        direction,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([18.0, 4.0], dtype=np.float32),
+        valid_mask=valid,
+        step_px=4.0,
+        rf_margin_px=0.0,
+    )
+
+
+def test_trace2cp_combined_defaults_to_stepwise_not_dp(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[float, float]] = []
+
+    def fake_stepwise(**kwargs):
+        start = np.asarray(kwargs["start_xy"], dtype=np.float32)
+        target = np.asarray(kwargs["target_xy"], dtype=np.float32)
+        calls.append((float(start[0]), float(target[0])))
+        return np.stack([start, target], axis=0).astype(np.float32), "target_column", _trace2cp_test_stats()
+
+    def forbidden_dp(**_kwargs):
+        raise AssertionError("DP backend should require explicit --trace2cp-dp routing")
+
+    monkeypatch.setattr(runner_module, "_trace_combined_direction_line_to_target", fake_stepwise)
+    monkeypatch.setattr(runner_module, "_trace_score_trace2cp_joint_dp_bidirectional", forbidden_dp)
+    direction = np.zeros((9, 21, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((9, 21), dtype=bool)
+
+    result, summary = _trace_score_trace2cp_combined_bidirectional(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=None,
+        presence_hw=None,
+        valid_mask=valid,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([18.0, 4.0], dtype=np.float32),
+        fiber_embeddings=None,
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0, image=0.0),
+        candidate_max_degrees=25.0,
+        candidate_step_degrees=1.0,
+        step_px=4.0,
+        rf_margin_px=0.0,
+    )
+
+    assert calls == [(2.0, 18.0), (18.0, 2.0)]
+    assert summary.steps == 2
+    assert result.metric.reached_target_columns
+
+
+def test_trace2cp_explicit_dp_uses_dp_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def forbidden_stepwise(**_kwargs):
+        raise AssertionError("stepwise backend should not run for explicit DP routing")
+
+    def fake_dp(**_kwargs):
+        calls.append("dp")
+        summary = runner_module._Trace2CpCombinedSummary(
+            forward=_trace2cp_test_stats(),
+            reverse=_trace2cp_test_stats(),
+            candidate_angles_degrees=np.asarray([0.0], dtype=np.float32),
+            fiber_bank_size=0,
+            fiber_bank_skipped=0,
+        )
+        path = np.asarray([[2.0, 4.0, 0.0], [18.0, 4.0, 0.0]], dtype=np.float32)
+        return _trace2cp_test_bidirectional_result(), summary, path
+
+    monkeypatch.setattr(runner_module, "_trace_combined_direction_line_to_target", forbidden_stepwise)
+    monkeypatch.setattr(runner_module, "_trace_score_trace2cp_joint_dp_bidirectional", fake_dp)
+    direction = np.zeros((9, 21, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((9, 21), dtype=bool)
+
+    result, summary = _trace_score_trace2cp_combined_dp_bidirectional(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=None,
+        presence_hw=None,
+        valid_mask=valid,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([18.0, 4.0], dtype=np.float32),
+        fiber_embeddings=None,
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0, image=0.0),
+        candidate_max_degrees=25.0,
+        candidate_step_degrees=1.0,
+        step_px=4.0,
+        rf_margin_px=0.0,
+        torch_device=torch.device("cpu"),
+    )
+
+    assert calls == ["dp"]
+    assert summary.steps == 2
+    assert result.metric.reached_target_columns
+
+
+def test_trace2cp_z_search_defaults_to_stepwise_not_dp(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[float, float]] = []
+
+    class FakePlaneCache:
+        max_layer = 4
+        z_step_voxels = 0.5
+
+        def __init__(self) -> None:
+            direction = np.zeros((9, 21, 2), dtype=np.float32)
+            direction[:, :, 0] = 1.0
+            self.center = SimpleNamespace(
+                fields=_Trace2CpPredictedFields(
+                    direction_xy=direction,
+                    embedding_chw=np.zeros((2, 9, 21), dtype=np.float32),
+                    presence_hw=np.ones((9, 21), dtype=np.float32),
+                ),
+                valid_mask=np.ones((9, 21), dtype=bool),
+            )
+
+        def get(self, _layer: int):
+            return self.center
+
+    def fake_stepwise_z(**kwargs):
+        start = np.asarray(kwargs["start_xy"], dtype=np.float32)
+        target = np.asarray(kwargs["target_xy"], dtype=np.float32)
+        calls.append((float(start[0]), float(target[0])))
+        return (
+            np.asarray([[start[0], start[1], 0.0], [target[0], target[1], 0.0]], dtype=np.float32),
+            "target_column",
+            _trace2cp_test_stats(),
+        )
+
+    def forbidden_dp(**_kwargs):
+        raise AssertionError("z-search should use stepwise candidate search unless DP is explicit")
+
+    monkeypatch.setattr(runner_module, "_trace_combined_direction_line_to_target_z", fake_stepwise_z)
+    monkeypatch.setattr(runner_module, "_trace_score_trace2cp_joint_dp_bidirectional", forbidden_dp)
+
+    result, summary, forward_xyz, reverse_xyz = _trace_score_trace2cp_combined_z_bidirectional(
+        plane_cache=FakePlaneCache(),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([18.0, 4.0], dtype=np.float32),
+        fiber_embeddings=None,
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0, image=0.0),
+        candidate_max_degrees=25.0,
+        candidate_step_degrees=1.0,
+        step_px=4.0,
+        rf_margin_px=0.0,
+    )
+
+    assert calls == [(2.0, 18.0), (18.0, 2.0)]
+    assert summary.steps == 2
+    assert result.metric.reached_target_columns
+    np.testing.assert_allclose(forward_xyz[:, 2], 0.0)
+    np.testing.assert_allclose(reverse_xyz[:, 2], 0.0)
+
+
+def test_trace2cp_z_search_explicit_dp_uses_dp_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    class FakePlaneCache:
+        max_layer = 0
+        z_step_voxels = 0.5
+        device = torch.device("cpu")
+
+        def __init__(self) -> None:
+            direction = np.zeros((9, 21, 2), dtype=np.float32)
+            direction[:, :, 0] = 1.0
+            self.center = SimpleNamespace(
+                fields=_Trace2CpPredictedFields(
+                    direction_xy=direction,
+                    embedding_chw=np.zeros((2, 9, 21), dtype=np.float32),
+                    presence_hw=np.ones((9, 21), dtype=np.float32),
+                ),
+                valid_mask=np.ones((9, 21), dtype=bool),
+            )
+
+        def get(self, _layer: int):
+            return self.center
+
+    def forbidden_stepwise_z(**_kwargs):
+        raise AssertionError("stepwise z backend should not run for explicit DP routing")
+
+    def fake_dp(**_kwargs):
+        calls.append("dp")
+        summary = runner_module._Trace2CpCombinedSummary(
+            forward=_trace2cp_test_stats(),
+            reverse=_trace2cp_test_stats(),
+            candidate_angles_degrees=np.asarray([0.0], dtype=np.float32),
+            fiber_bank_size=0,
+            fiber_bank_skipped=0,
+        )
+        path = np.asarray([[2.0, 4.0, 0.0], [18.0, 4.0, 0.0]], dtype=np.float32)
+        return _trace2cp_test_bidirectional_result(), summary, path
+
+    monkeypatch.setattr(runner_module, "_trace_combined_direction_line_to_target_z", forbidden_stepwise_z)
+    monkeypatch.setattr(runner_module, "_trace_score_trace2cp_joint_dp_bidirectional", fake_dp)
+
+    result, summary, forward_xyz, reverse_xyz = _trace_score_trace2cp_combined_z_dp_bidirectional(
+        plane_cache=FakePlaneCache(),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([18.0, 4.0], dtype=np.float32),
+        fiber_embeddings=None,
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0, image=0.0),
+        candidate_max_degrees=25.0,
+        candidate_step_degrees=1.0,
+        step_px=4.0,
+        rf_margin_px=0.0,
+    )
+
+    assert calls == ["dp"]
+    assert summary.steps == 2
+    assert result.metric.reached_target_columns
+    np.testing.assert_allclose(forward_xyz[:, 2], 0.0)
+    np.testing.assert_allclose(reverse_xyz[:, 2], 0.0)
 
 
 def test_trace2cp_top_monotone_direction_path_z_uses_better_direction_layer() -> None:

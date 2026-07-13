@@ -1,10 +1,10 @@
-# Trace2CP Regular Trace With Side-View Z Experiment Status
+# Trace2CP DP Routing And Side/Top Experiment Exclusivity Status
 
 - [x] Read fiber_trace_2d AGENTS workflow.
-- [x] Read current Trace2CP task/todo/spec/plan context.
-- [x] Replace active task with the regular-plus-top-z Trace2CP experiment.
-- [x] Create implementation plan with spec, docs, tests, and changelog notes.
-- [ ] Implement opt-in experimental tracer.
-- [ ] Update specs and docs.
-- [ ] Add focused tests.
-- [ ] Run validation.
+- [x] Inspect current Trace2CP combined, z-search, DP, and side/top experiment routing.
+- [x] Update task and plan for explicit DP routing plus exclusive side/top experiment behavior.
+- [x] Restore stepwise combined and z-search defaults while keeping DP behind `--trace2cp-dp`.
+- [x] Make `--trace2cp-side-top-z-experiment` bypass normal Trace2CP export.
+- [x] Add focused routing/export regression tests.
+- [x] Update specs, code-structure docs, and current-task log.
+- [x] Run full fiber_trace_2d validation.

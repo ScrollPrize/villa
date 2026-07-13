@@ -324,10 +324,13 @@ The important behavior is:
   grid for point lookup and each output-to-reference grid for direction
   mapping.
 - `--trace2cp-vis --trace2cp-combined` switches the selected Trace2CP output to
-  a joint monotone-x dynamic-programming path from the start CP to the target
-  CP. The DP state is `(side_z_layer, y, prev_dy, prev_dz)` and integrates
-  `1 - abs(dot(path_tangent, direction))` across crossed pixel columns. Side
-  DP uses fixed 4 px horizontal transitions, plus the exact target column.
+  the regular stepwise candidate-fan combined tracer. It scores side direction
+  at both the current/last point and candidate point, plus optional presence.
+  The monotone-x DP backend is still available for experiments, but only when
+  `--trace2cp-dp` is also supplied. In DP mode, the state is
+  `(side_z_layer, y, prev_dy, prev_dz)` and integrates
+  `1 - abs(dot(path_tangent, direction))` across crossed pixel columns. Side DP
+  uses fixed 4 px horizontal transitions, plus the exact target column.
   `--line-trace-step` controls output resampling density, not DP transition
   length. The existing candidate-angle limit is applied only as a local angular
   excess penalty against the sampled direction field; it must not cap global
@@ -383,16 +386,49 @@ The important behavior is:
   rather than a hard stop, for invalid/missing direction
   pixels. The panel is diagnostic only and does not change scoring or z-layer
   selection.
+- `--trace2cp-side-top-z-experiment` adds a separate single-pair diagnostic
+  path. It is exclusive: when this flag is set, the command writes only
+  `trace2cp_side_top_z_experiment.jpg`,
+  `trace2cp_side_top_z_summary.txt`, and the local top-slice debug
+  directories; it does not run the normal Trace2CP overlay/refinement chain or
+  write `trace2cp_vis.jpg`. It uses the regular side candidate fan scoring for side x/y steps: side
+  directions are interpolated at both the current/last point and candidate
+  point from the current z-layer prediction with ambiguity-aware two-cos
+  direction handling, and optional presence is scored when
+  `--trace2cp-use-presence` is active. It carries a bounded selected-scale
+  z/offset state, but top-model inference is run only once after a side
+  candidate has been accepted. That per-step top patch updates only the
+  z/lateral state; embedding/image scores and DP are not part of this
+  diagnostic. The top patch is centered at the accepted traced side point. Its
+  x axis is derived from the sampled side-view direction by tilting the
+  side-strip tangent within the tangent/normal plane, and its second in-plane
+  axis remains the side-strip lateral axis; this avoids optimizing roll around
+  the fiber line. The top direction is an ambiguity-aligned weighted median
+  over a normally weighted local neighborhood, default radius 20 px. Outputs
+  are `trace2cp_side_top_z_experiment.jpg` and
+  `trace2cp_side_top_z_summary.txt`. The experiment JPG is intentionally
+  compact: it shows only forward/backward z-corrected side traces,
+  forward/backward z-corrected presence, the input top strip, and the
+  forward/backward z-corrected traced top strips. It also writes every local
+  top slice used during the stepwise z update to
+  `trace2cp_side_top_z_top_slices/`, plus native-size direction overlays to
+  `trace2cp_side_top_z_top_overlays/`, with `fw_####.jpg` and `bw_####.jpg`
+  names. The trace state is kept as floating-point xyz positions; z-layer
+  rounding is only used when selecting side prediction layers or reconstructing
+  display columns.
 - `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` runs the same
-  monotone DP over a bounded stack of side-strip z layers. The loader builds
-  one aligned Trace2CP segment source from the CP-to-CP line window and Lasagna
-  normals, including the per-pixel strip offset axis. Layer `k` adds
+  regular stepwise z-search over side-strip z layers by default. Each accepted
+  candidate-fan step may choose the current or neighboring z layer. Adding
+  `--trace2cp-dp` switches the z-search to the experimental monotone DP over a
+  bounded z-layer stack. The loader builds one aligned Trace2CP segment source
+  from the CP-to-CP line window and Lasagna normals, including the per-pixel
+  strip offset axis. Layer `k` adds
   `offset_axis_zyx * (k * --trace2cp-z-step-voxels * volume_spacing_base)` to
   the center coordinates before sampling the volume. The default z step is
   `1.0` selected-scale voxel, with a bounded range controlled by
   `--trace2cp-z-max-layer`. Z-search never warps an already sampled image and
   never rebuilds unrelated planes. Direction and optional presence costs are
-  sampled from the DP-selected z layer at each transition.
+  sampled from the selected z layer at each step/transition.
 - Single-pair z-search visualization appends a z column with separate forward,
   reverse, and fused z-corrected views plus a fused z-layer map row. These
   images are reconstructed per column by rounding the trace/fused z value to
@@ -440,16 +476,17 @@ The important behavior is:
   `trace2cp timings`; whole-fiber mode prints `trace2cp fiber timings`
   aggregated across valid pairs. Each row is one stage with count, total,
   mean, and max milliseconds for source sampling, inference, tracing, debug
-  rendering, and file-output stages. Slow Trace2CP DP solves also emit
-  time-throttled `trace2cp dp ...` progress rows while running; progress rows
-  include solved columns, elapsed seconds, and `eta_s`.
+  rendering, and file-output stages. Slow Trace2CP DP solves emit
+  time-throttled `trace2cp dp ...` progress rows only when the explicit DP
+  backend is selected; progress rows include solved columns, elapsed seconds,
+  and `eta_s`.
   CLI side, side-z, and top-model DP calls use a torch-vectorized backend on
   the active model device. The column recurrence remains sequential, but each
   column is computed with tensor operations over all layers/rows and move
   chunks. Direct helper calls without a torch device still use the NumPy
   fallback. Side-z DP also caps the inferred layer stack to the center-anchored
-  reachable range, and side DP caps the move lattice from the configured
-  candidate-angle limit.
+  reachable range. The candidate-angle setting is a local direction excess
+  penalty, not a global side-DP move-lattice cap.
 - The whole-fiber Trace2CP JPG is composed after pair scoring. Pair-local
   images and traced points are mapped into a shared fiber arc-length x
   coordinate system using each pair's local start/target CP columns and global

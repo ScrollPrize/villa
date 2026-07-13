@@ -551,10 +551,12 @@
   traces both median-TTA directions in the reference segment strip.
 - Trace2CP supports an optional inspection/refinement mode enabled by
   `--trace2cp-combined` or `--trace2cp-use-presence`. In this mode the selected
-  trace is a single joint monotone-x dynamic-programming path from the start CP
-  to the target CP, represented in the existing visualization as the forward
-  path and its reverse. The non-combined reference tracer remains the public
-  target-column `trace2cp_error` path.
+  trace uses the regular stepwise candidate-fan tracer by default, scoring side
+  direction at both the current/last point and the candidate point, plus
+  optional presence. The non-combined reference tracer remains the public
+  target-column `trace2cp_error` path. The monotone-x dynamic-programming
+  backend is experimental and must only run when `--trace2cp-dp` is explicitly
+  supplied.
 - The side-strip DP state is `(side_z_layer, y, prev_dy, prev_dz)`. It uses
   fixed 4 px horizontal transitions, plus the exact target column, and
   integrates direction alignment cost
@@ -584,11 +586,11 @@
   functions may remain as inactive implementation experiments, but runner
   Trace2CP selection must not route through embedding or image similarity.
 - `--trace2cp-use-presence` adds an orthogonal sheet/fiber-presence score to
-  the side DP. It samples the sigmoid presence probability from the same
-  selected layer as the direction field and adds
-  `trace2cp_combined_presence_weight * (1 - presence_probability)` to the DP
-  transition cost. This requires a checkpoint/model output with a presence
-  channel and fails clearly if the channel is absent. Visualization appends
+  the active combined tracer. It samples the sigmoid presence probability from
+  the same selected layer as the direction field and adds
+  `trace2cp_combined_presence_weight * (1 - presence_probability)` to the
+  candidate/transition cost. This requires a checkpoint/model output with a
+  presence channel and fails clearly if the channel is absent. Visualization appends
   fixed-scale presence debug output when presence scoring is active: single-pair
   `trace2cp_vis.jpg` gets a presence column, whole-fiber
   `trace2cp_fiber_vis.jpg` gets a presence row, `0` renders black, `1` renders
@@ -651,14 +653,57 @@
   otherwise opposite signs from the Lasagna two-cos encoding can cancel or
   flip the sampled direction. This is visualization-only and must not change
   Trace2CP scoring or z-search layer selection.
+- `--trace2cp-side-top-z-experiment` is an opt-in single-pair diagnostic. It
+  is exclusive: when set, the runner writes only the side/top-z experiment
+  artifacts and does not run the normal Trace2CP overlay/refinement chain,
+  public `trace2cp_error` export, training metric, or best-checkpoint
+  selection. The
+  experiment runs regular stepwise side-strip traces from both CPs while also
+  carrying a selected-scale z/offset state. Side x/y stepping must use the same
+  candidate fan scoring semantics as the normal forward/backward combined
+  tracer: interpolate side direction at the current/last point and at each side
+  candidate point from the side prediction for the current z layer, using
+  ambiguity-aware two-cos direction interpolation, and include optional side
+  presence scoring when `--trace2cp-use-presence` is active. It must not score
+  embedding/image similarity or run DP in this diagnostic. Top
+  inference must not run for all side candidates. After the side candidate is
+  selected, the experiment builds one local top patch centered at that accepted
+  side point and runs the checkpoint's top-view model on that patch to update
+  only the carried z/offset state. The local top patch x axis is derived from the
+  sampled side-view direction: the side-strip tangent is tilted within the side
+  tangent/normal plane according to the side direction. The top patch keeps the
+  side-strip lateral axis as the second in-plane axis, so this experiment only
+  corrects angle relative to the side-view normal and does not optimize roll or
+  arbitrary rotation around the fiber line. The top direction used for the
+  offset update is an ambiguity-aligned weighted median over a normal
+  neighborhood, default radius 20 px. The experiment writes separate
+  `trace2cp_side_top_z_experiment.jpg` and
+  `trace2cp_side_top_z_summary.txt` artifacts. The JPG must stay compact and
+  diagnostic-specific: forward side trace with z-corrected image, backward side
+  trace with z-corrected image, forward z-corrected presence, backward
+  z-corrected presence, original top strip, forward traced top strip with
+  z-correction, and backward traced top strip with z-correction. It must not
+  reuse the full Trace2CP overlay rows for fused/reference/similarity/DP debug.
+  The experiment additionally writes every local top slice actually used for
+  z-update inference to `trace2cp_side_top_z_top_slices/` and a matching
+  native-resolution direction overlay to `trace2cp_side_top_z_top_overlays/`;
+  filenames are prefixed `fw_` or `bw_` by trace direction. These generated
+  directories clear stale JPGs before each export. XYZ trace positions and z
+  offsets are subpixel/floating-point throughout stepping; rounding is limited
+  to side z-layer prediction lookup and column-wise display reconstruction.
 - Combined Trace2CP is an inspection/refinement path. It does not replace the
   public `trace2cp_error` definition, the direction-only tracer, training loss,
   or best-checkpoint selection unless explicitly enabled by the command-line
-  flag. `--med-tta` is not supported by the combined DP tracer.
+  flag. `--med-tta` is supported only by the stepwise combined tracer, not by
+  the explicit `--trace2cp-dp` backend.
 - `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` enables an
-  experimental side-strip z-search DP mode. It requires combined tracing and
-  cannot be combined with `--med-tta`. Existing Trace2CP commands without
-  `--trace2cp-z-search` keep the center strip-z image-only behavior.
+  experimental side-strip z-search mode. It requires combined tracing and
+  cannot be combined with `--med-tta`. By default this is the regular stepwise
+  candidate-fan z-search that existed before the DP experiment: each accepted
+  side step may choose the current or neighboring z layer. Existing Trace2CP
+  commands without `--trace2cp-z-search` keep the center strip-z image-only
+  behavior. Adding `--trace2cp-dp` switches this z-search to the experimental
+  monotone DP backend.
 - Trace2CP z-search derives additional segment-strip planes from one accepted
   center segment source. The center source is built once from the CP-to-CP
   line window and Lasagna normals, including the row-axis sign alignment used
@@ -671,16 +716,17 @@
   plane. The default `--trace2cp-z-step-voxels 1.0` means layer `k` is offset
   by `k` selected-scale voxels along the segment strip offset axis.
   `--trace2cp-z-max-layer` bounds lazy expansion and defaults to `4`.
-- Z-search infers the full bounded layer stack `[-max_layer, +max_layer]` for
-  the pair before running the side DP. Inference is deterministic and stores
-  each layer's sampled image, valid mask, decoded direction field, and optional
-  presence field. The DP may transition between neighboring z layers with
-  `0.1 * abs(delta_layer)` cost and the same second-order `dy`/`dz` smoothing
-  used by the top diagnostic DP. Each selected path point carries `x`, `y`,
-  and selected-scale `z_voxels`; direction and presence costs are sampled from
-  the selected side-strip z layer.
-- Z-search combined output is already a fused CP-to-CP path, so the optimized
-  visualization row uses that joint DP path directly.
+- Default z-search lazily samples side-strip layers as the stepwise candidate
+  tracer requests the current and neighboring z layers. Inference is
+  deterministic and stores each layer's sampled image, valid mask, decoded
+  direction field, and optional presence field. Each selected path point
+  carries `x`, `y`, and selected-scale `z_voxels`; direction and presence costs
+  are sampled from the selected side-strip z layer.
+- With explicit `--trace2cp-dp`, z-search infers the bounded reachable layer
+  stack for the pair before running the side DP. The DP may transition between
+  neighboring z layers with the configured z cost and smoothness terms. DP
+  output is already a fused CP-to-CP path, so the optimized visualization row
+  uses that joint path directly.
 - Z-search does not change the public `trace2cp_error`, training test metric,
   or best-checkpoint selection. Those remain target-column y error per
   horizontal CP span.

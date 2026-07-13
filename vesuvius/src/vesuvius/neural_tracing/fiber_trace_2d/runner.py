@@ -767,6 +767,56 @@ def _bilinear_direction_sample(
     return (direction / norm).astype(np.float32)
 
 
+def _unit_vector_or_none(vector: np.ndarray) -> np.ndarray | None:
+    value = np.asarray(vector, dtype=np.float32).reshape(-1)
+    if value.shape != (3,) or not bool(np.isfinite(value).all()):
+        return None
+    norm = float(np.linalg.norm(value))
+    if not np.isfinite(norm) or norm <= 1.0e-6:
+        return None
+    return (value / np.float32(norm)).astype(np.float32, copy=False)
+
+
+def _bilinear_vector_sample_hwc(
+    values_hwc: np.ndarray,
+    point_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+) -> np.ndarray | None:
+    values = np.asarray(values_hwc, dtype=np.float32)
+    if values.ndim != 3:
+        raise ValueError("values_hwc must have shape H,W,C")
+    point = np.asarray(point_xy, dtype=np.float32)
+    if point.shape != (2,) or not bool(np.isfinite(point).all()):
+        return None
+    height, width, _channels = (int(v) for v in values.shape)
+    x = float(point[0])
+    y = float(point[1])
+    if x < 0.0 or y < 0.0 or x > float(width - 1) or y > float(height - 1):
+        return None
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    x1 = min(x0 + 1, width - 1)
+    y1 = min(y0 + 1, height - 1)
+    if valid_mask is not None:
+        valid = np.asarray(valid_mask, dtype=bool)
+        if valid.shape != (height, width):
+            raise ValueError("valid_mask must match values_hwc spatial shape")
+        if not (bool(valid[y0, x0]) and bool(valid[y0, x1]) and bool(valid[y1, x0]) and bool(valid[y1, x1])):
+            return None
+    corners = np.stack(
+        [values[y0, x0], values[y0, x1], values[y1, x0], values[y1, x1]],
+        axis=0,
+    )
+    if not bool(np.isfinite(corners).all()):
+        return None
+    tx = np.float32(x - float(x0))
+    ty = np.float32(y - float(y0))
+    top = corners[0] * (np.float32(1.0) - tx) + corners[1] * tx
+    bottom = corners[2] * (np.float32(1.0) - tx) + corners[3] * tx
+    return (top * (np.float32(1.0) - ty) + bottom * ty).astype(np.float32, copy=False)
+
+
 def _bilinear_direction_sample_ambiguous(
     direction_xy: np.ndarray,
     point_xy: np.ndarray,
@@ -1528,6 +1578,49 @@ class _Trace2CpZTraceDebug:
 
 
 @dataclass(frozen=True)
+class _Trace2CpSideTopZSourceArrays:
+    coords_xyz: np.ndarray
+    valid_mask: np.ndarray
+    offset_axis_xyz: np.ndarray
+    volume_spacing_base: float
+
+
+@dataclass(frozen=True)
+class _Trace2CpSideTopZLineResult:
+    trace_xyz: np.ndarray
+    reason: str
+    top_patch_count: int
+    top_invalid_count: int
+    top_slices: tuple["_Trace2CpSideTopZTopSliceDebug", ...] = ()
+
+
+@dataclass(frozen=True)
+class _Trace2CpSideTopZTopSliceDebug:
+    image: np.ndarray
+    valid_mask: np.ndarray
+    direction_xy: np.ndarray | None
+    point_xy: np.ndarray
+    z_offset_voxels: float
+
+
+@dataclass(frozen=True)
+class _Trace2CpSideTopZExperiment:
+    result: _Trace2CpBidirectionalResult
+    z_debug: _Trace2CpZTraceDebug
+    forward_line: _Trace2CpSideTopZLineResult
+    reverse_line: _Trace2CpSideTopZLineResult
+    forward_top_strip_image: np.ndarray | None
+    forward_top_strip_valid_mask: np.ndarray | None
+    reverse_top_strip_image: np.ndarray | None
+    reverse_top_strip_valid_mask: np.ndarray | None
+    traced_top_strip_image: np.ndarray | None
+    traced_top_strip_valid_mask: np.ndarray | None
+    z_top_strip_image: np.ndarray | None
+    z_top_strip_valid_mask: np.ndarray | None
+    timing_rows: tuple[_Trace2CpTimingRow, ...]
+
+
+@dataclass(frozen=True)
 class _Trace2CpEmbeddingBank:
     embeddings: np.ndarray
     skipped: int
@@ -2109,6 +2202,436 @@ class _Trace2CpZPlaneCache:
 
     def layer_indices(self) -> tuple[int, ...]:
         return tuple(sorted(int(v) for v in self.layers))
+
+
+def _weighted_median_1d(values: np.ndarray, weights: np.ndarray) -> float:
+    vals = np.asarray(values, dtype=np.float32).reshape(-1)
+    w = np.asarray(weights, dtype=np.float32).reshape(-1)
+    if vals.shape != w.shape:
+        raise ValueError("values and weights must have matching shape")
+    valid = np.isfinite(vals) & np.isfinite(w) & (w > 0.0)
+    if not bool(np.any(valid)):
+        return float("nan")
+    vals = vals[valid]
+    w = w[valid]
+    order = np.argsort(vals, kind="mergesort")
+    vals = vals[order]
+    w = w[order]
+    threshold = float(np.sum(w)) * 0.5
+    cdf = np.cumsum(w, dtype=np.float64)
+    index = int(np.searchsorted(cdf, threshold, side="left"))
+    index = max(0, min(index, int(vals.shape[0]) - 1))
+    return float(vals[index])
+
+
+def _trace2cp_weighted_median_top_direction(
+    direction_xy: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    center_xy: np.ndarray,
+    reference_xy: np.ndarray,
+    radius_px: float = 20.0,
+) -> np.ndarray | None:
+    field = np.asarray(direction_xy, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if field.ndim != 3 or field.shape[2] != 2:
+        raise ValueError("direction_xy must have shape H,W,2")
+    if valid.shape != field.shape[:2]:
+        raise ValueError("valid_mask must match direction_xy")
+    center = np.asarray(center_xy, dtype=np.float32)
+    reference = np.asarray(reference_xy, dtype=np.float32)
+    if center.shape != (2,) or reference.shape != (2,):
+        raise ValueError("center_xy and reference_xy must have shape (2,)")
+    ref_norm = float(np.linalg.norm(reference))
+    if not np.isfinite(ref_norm) or ref_norm <= 1.0e-6:
+        return None
+    ref = (reference / np.float32(ref_norm)).astype(np.float32)
+    radius = max(1.0, float(radius_px))
+    sigma = max(radius * 0.5, 1.0)
+    height, width = (int(v) for v in valid.shape)
+    x0 = max(0, int(math.floor(float(center[0]) - radius)))
+    x1 = min(width - 1, int(math.ceil(float(center[0]) + radius)))
+    y0 = max(0, int(math.floor(float(center[1]) - radius)))
+    y1 = min(height - 1, int(math.ceil(float(center[1]) + radius)))
+    if x1 < x0 or y1 < y0:
+        return None
+    yy, xx = np.mgrid[y0 : y1 + 1, x0 : x1 + 1].astype(np.float32)
+    delta_x = xx - np.float32(float(center[0]))
+    delta_y = yy - np.float32(float(center[1]))
+    dist2 = delta_x * delta_x + delta_y * delta_y
+    mask = (dist2 <= np.float32(radius * radius)) & valid[y0 : y1 + 1, x0 : x1 + 1]
+    vectors = field[y0 : y1 + 1, x0 : x1 + 1]
+    finite = np.isfinite(vectors).all(axis=2)
+    mask &= finite
+    if not bool(np.any(mask)):
+        return None
+    selected = vectors[mask].astype(np.float32, copy=True)
+    norms = np.linalg.norm(selected, axis=1)
+    usable = np.isfinite(norms) & (norms > 1.0e-6)
+    if not bool(np.any(usable)):
+        return None
+    selected = selected[usable] / norms[usable, None].astype(np.float32)
+    dots = selected @ ref
+    selected = np.where(dots[:, None] < 0.0, -selected, selected)
+    weights = np.exp(-0.5 * dist2[mask][usable] / np.float32(sigma * sigma)).astype(np.float32)
+    median = np.asarray(
+        [
+            _weighted_median_1d(selected[:, 0], weights),
+            _weighted_median_1d(selected[:, 1], weights),
+        ],
+        dtype=np.float32,
+    )
+    norm = float(np.linalg.norm(median))
+    if not np.isfinite(norm) or norm <= 1.0e-6:
+        return None
+    if float(np.dot(median, ref)) < 0.0:
+        median = -median
+    return (median / np.float32(norm)).astype(np.float32)
+
+
+def _trace2cp_side_top_z_source_arrays(segment_source: Any) -> _Trace2CpSideTopZSourceArrays:
+    grid = segment_source.grid
+    if getattr(grid, "offset_axis_xyz", None) is None:
+        raise ValueError("Trace2CP side/top-z experiment requires source offset-axis data")
+    return _Trace2CpSideTopZSourceArrays(
+        coords_xyz=np.asarray(grid.coords_xyz.detach().cpu().numpy(), dtype=np.float32),
+        valid_mask=np.asarray(grid.valid_mask.detach().cpu().numpy(), dtype=bool),
+        offset_axis_xyz=np.asarray(grid.offset_axis_xyz.detach().cpu().numpy(), dtype=np.float32),
+        volume_spacing_base=float(segment_source.record.volume_spacing_base),
+    )
+
+
+def _trace2cp_side_top_z_axes_at_point(
+    arrays: _Trace2CpSideTopZSourceArrays,
+    point_xy: np.ndarray,
+    side_direction_xy: np.ndarray,
+    *,
+    z_offset_voxels: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    point = np.asarray(point_xy, dtype=np.float32)
+    side_dir = np.asarray(side_direction_xy, dtype=np.float32)
+    if point.shape != (2,) or side_dir.shape != (2,):
+        raise ValueError("point_xy and side_direction_xy must have shape (2,)")
+    base_xyz = _bilinear_vector_sample_hwc(arrays.coords_xyz, point, valid_mask=arrays.valid_mask)
+    normal_xyz = _bilinear_vector_sample_hwc(arrays.offset_axis_xyz, point, valid_mask=arrays.valid_mask)
+    if base_xyz is None or normal_xyz is None:
+        return None
+    normal = _unit_vector_or_none(normal_xyz)
+    if normal is None:
+        return None
+    left = _bilinear_vector_sample_hwc(
+        arrays.coords_xyz,
+        point + np.asarray([-1.0, 0.0], dtype=np.float32),
+        valid_mask=arrays.valid_mask,
+    )
+    right = _bilinear_vector_sample_hwc(
+        arrays.coords_xyz,
+        point + np.asarray([1.0, 0.0], dtype=np.float32),
+        valid_mask=arrays.valid_mask,
+    )
+    tangent = None if left is None or right is None else _unit_vector_or_none(right - left)
+    if tangent is None:
+        up = _bilinear_vector_sample_hwc(
+            arrays.coords_xyz,
+            point + np.asarray([0.0, -1.0], dtype=np.float32),
+            valid_mask=arrays.valid_mask,
+        )
+        down = _bilinear_vector_sample_hwc(
+            arrays.coords_xyz,
+            point + np.asarray([0.0, 1.0], dtype=np.float32),
+            valid_mask=arrays.valid_mask,
+        )
+        if up is not None and down is not None:
+            tangent = _unit_vector_or_none(np.cross(normal, down - up))
+    if tangent is None:
+        return None
+    tangent = _unit_vector_or_none(tangent - normal * np.float32(float(np.dot(tangent, normal))))
+    if tangent is None:
+        return None
+    side_axis = _unit_vector_or_none(np.cross(normal, tangent))
+    if side_axis is None:
+        return None
+    corrected_tangent = _unit_vector_or_none(
+        tangent * np.float32(float(side_dir[0])) + normal * np.float32(float(side_dir[1]))
+    )
+    if corrected_tangent is None:
+        corrected_tangent = tangent
+    corrected_tangent = _unit_vector_or_none(
+        corrected_tangent - side_axis * np.float32(float(np.dot(corrected_tangent, side_axis)))
+    )
+    if corrected_tangent is None:
+        corrected_tangent = tangent
+    center_xyz = np.asarray(base_xyz, dtype=np.float32) + normal * np.float32(
+        float(z_offset_voxels) * float(arrays.volume_spacing_base)
+    )
+    return center_xyz.astype(np.float32), corrected_tangent.astype(np.float32), side_axis.astype(np.float32), normal.astype(np.float32)
+
+
+def _sample_trace2cp_local_top_patch(
+    segment_source: Any,
+    arrays: _Trace2CpSideTopZSourceArrays,
+    point_xy: np.ndarray,
+    side_direction_xy: np.ndarray,
+    *,
+    z_offset_voxels: float,
+    patch_shape_hw: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    axes = _trace2cp_side_top_z_axes_at_point(
+        arrays,
+        point_xy,
+        side_direction_xy,
+        z_offset_voxels=z_offset_voxels,
+    )
+    if axes is None:
+        return None
+    center_xyz, tangent_xyz, side_axis_xyz, _normal_xyz = axes
+    height, width = (int(v) for v in patch_shape_hw)
+    if height <= 0 or width <= 0:
+        raise ValueError("top patch shape must be positive")
+    spacing = np.float32(float(arrays.volume_spacing_base))
+    y_offsets = (np.arange(height, dtype=np.float32) - np.float32((float(height) - 1.0) * 0.5)) * spacing
+    x_offsets = (np.arange(width, dtype=np.float32) - np.float32((float(width) - 1.0) * 0.5)) * spacing
+    yy, xx = np.meshgrid(y_offsets, x_offsets, indexing="ij")
+    coords_xyz = (
+        center_xyz[None, None, :]
+        + xx[..., None] * tangent_xyz[None, None, :]
+        + yy[..., None] * side_axis_xyz[None, None, :]
+    ).astype(np.float32)
+    valid = np.isfinite(coords_xyz).all(axis=2)
+    coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32, copy=False)
+    result = segment_source.record.sampler.sample_coords(coords_zyx, valid)
+    image = np.asarray(result.image, dtype=np.float32)
+    valid_mask = np.asarray(result.valid_mask, dtype=bool)
+    return image, valid_mask
+
+
+def _trace_side_top_z_line_to_target(
+    *,
+    plane_cache: _Trace2CpZPlaneCache,
+    segment_source: Any,
+    source_arrays: _Trace2CpSideTopZSourceArrays,
+    top_model: torch.nn.Module,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    weights: _Trace2CpCombinedWeights,
+    candidate_max_degrees: float,
+    candidate_step_degrees: float,
+    device: torch.device,
+    step_px: float,
+    rf_margin_px: float,
+    top_radius_px: float,
+    top_patch_shape_hw: tuple[int, int],
+    max_steps: int | None = None,
+) -> _Trace2CpSideTopZLineResult:
+    center = plane_cache.get(0)
+    shape_hw = tuple(int(v) for v in center.valid_mask.shape)
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    if start.shape != (2,) or target.shape != (2,):
+        raise ValueError("start_xy and target_xy must have shape (2,)")
+    delta = target - start
+    delta_norm = float(np.linalg.norm(delta))
+    if not np.isfinite(delta_norm) or delta_norm <= 1.0e-6:
+        raise ValueError("trace2cp start and target points must be distinct")
+    step = max(float(step_px), 1.0e-3)
+    if max_steps is None:
+        max_steps = _trace2cp_target_trace_max_steps(shape_hw, start, target, step)
+    current = start.astype(np.float32)
+    previous_direction = (delta / np.float32(delta_norm)).astype(np.float32)
+    current_z = 0.0
+    target_x = float(target[0])
+    horizontal_sign = 1.0 if float(target[0]) >= float(start[0]) else -1.0
+    points = [np.asarray([current[0], current[1], current_z], dtype=np.float32)]
+    top_patch_count = 0
+    top_invalid_count = 0
+    top_slices: list[_Trace2CpSideTopZTopSliceDebug] = []
+    max_abs_z = float(plane_cache.max_layer) * float(plane_cache.z_step_voxels)
+    presence_required = float(weights.presence) != 0.0
+
+    def sample_side_direction(
+        prediction: _Trace2CpZLayerPrediction,
+        point_xy: np.ndarray,
+        reference_xy: np.ndarray,
+    ) -> np.ndarray | None:
+        sampled = _bilinear_direction_sample_ambiguous(
+            prediction.fields.direction_xy,
+            point_xy,
+            reference_xy,
+            valid_mask=prediction.valid_mask,
+        )
+        if sampled is None:
+            return None
+        return _orient_direction_to_previous(sampled, reference_xy)
+
+    for _ in range(int(max_steps)):
+        if not _inside_trace_margin(current, shape_hw, rf_margin_px):
+            return _Trace2CpSideTopZLineResult(
+                trace_xyz=np.stack(points, axis=0).astype(np.float32),
+                reason=_trace_margin_reason(current, shape_hw, rf_margin_px),
+                top_patch_count=int(top_patch_count),
+                top_invalid_count=int(top_invalid_count),
+                top_slices=tuple(top_slices),
+            )
+        current_layer = int(np.clip(round(current_z / float(plane_cache.z_step_voxels)), -plane_cache.max_layer, plane_cache.max_layer))
+        current_prediction = plane_cache.get(current_layer)
+        current_direction = sample_side_direction(current_prediction, current, previous_direction)
+        if current_direction is None:
+            return _Trace2CpSideTopZLineResult(
+                trace_xyz=np.stack(points, axis=0).astype(np.float32),
+                reason="invalid_side_direction",
+                top_patch_count=int(top_patch_count),
+                top_invalid_count=int(top_invalid_count),
+                top_slices=tuple(top_slices),
+            )
+        current_presence_loss = 0.0
+        if presence_required:
+            sampled_presence_loss = _trace2cp_presence_loss(
+                current_prediction.fields.presence_hw,
+                current,
+                valid_mask=current_prediction.valid_mask,
+            )
+            if sampled_presence_loss is None:
+                return _Trace2CpSideTopZLineResult(
+                    trace_xyz=np.stack(points, axis=0).astype(np.float32),
+                    reason="invalid_side_presence",
+                    top_patch_count=int(top_patch_count),
+                    top_invalid_count=int(top_invalid_count),
+                    top_slices=tuple(top_slices),
+                )
+            current_presence_loss = float(sampled_presence_loss)
+        angles, candidate_vectors = _trace2cp_candidate_fan_directions(
+            current_direction,
+            max_degrees=candidate_max_degrees,
+            step_degrees=candidate_step_degrees,
+        )
+        scored: list[tuple[float, float, int, np.ndarray, np.ndarray, np.ndarray, float, bool]] = []
+        margin_reason: str | None = None
+        for order, (angle, candidate_unit) in enumerate(zip(angles.tolist(), candidate_vectors)):
+            next_point = current + candidate_unit.astype(np.float32) * np.float32(step)
+            previous_x = float(current[0])
+            next_x = float(next_point[0])
+            crosses_target = (previous_x - target_x) == 0.0 or (previous_x - target_x) * (next_x - target_x) <= 0.0
+            terminal_point = (
+                _trace2cp_target_column_point(current, next_point, target_x)
+                if crosses_target
+                else next_point.astype(np.float32)
+            )
+            if not crosses_target and not _inside_trace_margin(next_point, shape_hw, rf_margin_px):
+                if margin_reason is None:
+                    margin_reason = _trace_margin_reason(next_point, shape_hw, rf_margin_px)
+                continue
+            candidate_direction = sample_side_direction(current_prediction, terminal_point, candidate_unit)
+            if candidate_direction is None:
+                continue
+            current_direction_loss = float(
+                1.0 - np.clip(float(np.dot(candidate_unit, current_direction)), -1.0, 1.0)
+            )
+            candidate_direction_loss = float(
+                1.0 - np.clip(float(np.dot(candidate_unit, candidate_direction)), -1.0, 1.0)
+            )
+            direction_loss = 0.5 * (current_direction_loss + candidate_direction_loss)
+            presence_loss = 0.0
+            if presence_required:
+                sampled_presence_loss = _trace2cp_presence_loss(
+                    current_prediction.fields.presence_hw,
+                    terminal_point,
+                    valid_mask=current_prediction.valid_mask,
+                )
+                if sampled_presence_loss is None:
+                    continue
+                presence_loss = 0.5 * (float(current_presence_loss) + float(sampled_presence_loss))
+            total = float(weights.direction) * direction_loss + float(weights.presence) * presence_loss
+            if np.isfinite(total):
+                scored.append(
+                    (
+                        total,
+                        abs(float(angle)),
+                        int(order),
+                        terminal_point.astype(np.float32),
+                        candidate_unit.astype(np.float32),
+                        candidate_direction.astype(np.float32),
+                        float(np.linalg.norm(terminal_point.astype(np.float32) - current)),
+                        bool(crosses_target),
+                    )
+                )
+        if not scored:
+            return _Trace2CpSideTopZLineResult(
+                trace_xyz=np.stack(points, axis=0).astype(np.float32),
+                reason=margin_reason or "invalid_side_candidate",
+                top_patch_count=int(top_patch_count),
+                top_invalid_count=int(top_invalid_count),
+                top_slices=tuple(top_slices),
+            )
+        scored.sort(key=lambda row: (row[0], row[1], row[2]))
+        (
+            _selected_total,
+            _selected_abs_angle,
+            _selected_order,
+            next_point,
+            selected_direction,
+            selected_side_direction,
+            selected_step,
+            crosses_target,
+        ) = scored[0]
+        top_direction: np.ndarray | None = None
+        top_patch = _sample_trace2cp_local_top_patch(
+            segment_source,
+            source_arrays,
+            next_point,
+            selected_side_direction,
+            z_offset_voxels=current_z,
+            patch_shape_hw=top_patch_shape_hw,
+        )
+        if top_patch is None:
+            top_invalid_count += 1
+        else:
+            top_patch_count += 1
+            top_image, top_valid = top_patch
+            top_fields = _predict_trace2cp_fields(top_model, top_image, top_valid, device=device)
+            center_xy = np.asarray(
+                [(float(top_image.shape[1]) - 1.0) * 0.5, (float(top_image.shape[0]) - 1.0) * 0.5],
+                dtype=np.float32,
+            )
+            top_direction = _trace2cp_weighted_median_top_direction(
+                top_fields.direction_xy,
+                top_valid,
+                center_xy=center_xy,
+                reference_xy=np.asarray([horizontal_sign, 0.0], dtype=np.float32),
+                radius_px=top_radius_px,
+            )
+            top_slices.append(
+                _Trace2CpSideTopZTopSliceDebug(
+                    image=np.asarray(top_image, dtype=np.float32),
+                    valid_mask=np.asarray(top_valid, dtype=bool),
+                    direction_xy=None if top_direction is None else np.asarray(top_direction, dtype=np.float32),
+                    point_xy=np.asarray(next_point, dtype=np.float32),
+                    z_offset_voxels=float(current_z),
+                )
+            )
+        dz = 0.0
+        if top_direction is not None:
+            denom = max(abs(float(top_direction[0])), 0.1)
+            dz = float(np.clip((float(top_direction[1]) / denom) * float(selected_step), -float(selected_step), float(selected_step)))
+        next_z = float(np.clip(current_z + dz, -max_abs_z, max_abs_z))
+        points.append(np.asarray([next_point[0], next_point[1], next_z], dtype=np.float32))
+        if bool(crosses_target):
+            return _Trace2CpSideTopZLineResult(
+                trace_xyz=np.stack(points, axis=0).astype(np.float32),
+                reason="target_column",
+                top_patch_count=int(top_patch_count),
+                top_invalid_count=int(top_invalid_count),
+                top_slices=tuple(top_slices),
+            )
+        current = next_point.astype(np.float32)
+        previous_direction = selected_direction.astype(np.float32)
+        current_z = float(next_z)
+    return _Trace2CpSideTopZLineResult(
+        trace_xyz=np.stack(points, axis=0).astype(np.float32),
+        reason="max_steps",
+        top_patch_count=int(top_patch_count),
+        top_invalid_count=int(top_invalid_count),
+        top_slices=tuple(top_slices),
+    )
 
 
 def _identity_source_xy_grid(shape_hw: tuple[int, int]) -> np.ndarray:
@@ -4535,6 +5058,207 @@ def _trace_score_trace2cp_bidirectional(
     return _Trace2CpBidirectionalResult(forward=forward, reverse=reverse, refinement=refinement, metric=metric)
 
 
+def _trace_score_trace2cp_side_top_z_experiment_bidirectional(
+    *,
+    loader: FiberStrip2DLoader,
+    segment_source: Any,
+    plane_cache: _Trace2CpZPlaneCache,
+    top_model: torch.nn.Module,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    weights: _Trace2CpCombinedWeights,
+    candidate_max_degrees: float,
+    candidate_step_degrees: float,
+    device: torch.device,
+    step_px: float,
+    rf_margin_px: float,
+    top_radius_px: float,
+    top_patch_shape_hw: tuple[int, int],
+    timing_rows: list[_Trace2CpTimingRow] | None = None,
+) -> _Trace2CpSideTopZExperiment:
+    source_arrays = _trace2cp_side_top_z_source_arrays(segment_source)
+    with _Timer() as trace_timer:
+        forward_line = _trace_side_top_z_line_to_target(
+            plane_cache=plane_cache,
+            segment_source=segment_source,
+            source_arrays=source_arrays,
+            top_model=top_model,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            weights=weights,
+            candidate_max_degrees=candidate_max_degrees,
+            candidate_step_degrees=candidate_step_degrees,
+            device=device,
+            step_px=step_px,
+            rf_margin_px=rf_margin_px,
+            top_radius_px=top_radius_px,
+            top_patch_shape_hw=top_patch_shape_hw,
+        )
+        reverse_line = _trace_side_top_z_line_to_target(
+            plane_cache=plane_cache,
+            segment_source=segment_source,
+            source_arrays=source_arrays,
+            top_model=top_model,
+            start_xy=target_xy,
+            target_xy=start_xy,
+            weights=weights,
+            candidate_max_degrees=candidate_max_degrees,
+            candidate_step_degrees=candidate_step_degrees,
+            device=device,
+            step_px=step_px,
+            rf_margin_px=rf_margin_px,
+            top_radius_px=top_radius_px,
+            top_patch_shape_hw=top_patch_shape_hw,
+        )
+    local_timing: list[_Trace2CpTimingRow] = []
+    _append_trace2cp_timing(local_timing, "side_top_z_trace", trace_timer.elapsed_ms)
+    shape_hw = tuple(int(v) for v in plane_cache.get(0).valid_mask.shape)
+    forward_result = _Trace2CpDirectionResult(
+        trace_xy=forward_line.trace_xyz[:, :2].astype(np.float32, copy=False),
+        result=_score_trace2cp(
+            forward_line.trace_xyz[:, :2],
+            target_xy,
+            shape_hw=shape_hw,
+            rf_margin_px=rf_margin_px,
+            termination_reason=forward_line.reason,
+        ),
+    )
+    reverse_result = _Trace2CpDirectionResult(
+        trace_xy=reverse_line.trace_xyz[:, :2].astype(np.float32, copy=False),
+        result=_score_trace2cp(
+            reverse_line.trace_xyz[:, :2],
+            start_xy,
+            shape_hw=shape_hw,
+            rf_margin_px=rf_margin_px,
+            termination_reason=reverse_line.reason,
+        ),
+    )
+    metric = _trace2cp_metric_from_traces(
+        forward_result.trace_xy,
+        reverse_result.trace_xy,
+        start_xy,
+        target_xy,
+        shape_hw=shape_hw,
+        rf_margin_px=rf_margin_px,
+    )
+    refinement = _trace2cp_refinement_from_traces_z(
+        forward_line.trace_xyz,
+        reverse_line.trace_xyz,
+        start_xy,
+        target_xy,
+        shape_hw=shape_hw,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    result = _Trace2CpBidirectionalResult(
+        forward=forward_result,
+        reverse=reverse_result,
+        refinement=refinement,
+        metric=metric,
+    )
+    fused_xyz = _trace2cp_refinement_fused_xyz(refinement)
+    with _Timer() as reconstruct_timer:
+        forward_z_image, forward_missing, forward_layer_columns = _trace2cp_z_corrected_image_u8(
+            plane_cache=plane_cache,
+            trace_xyz=forward_line.trace_xyz,
+            fallback_shape_hw=shape_hw,
+        )
+        reverse_z_image, reverse_missing, reverse_layer_columns = _trace2cp_z_corrected_image_u8(
+            plane_cache=plane_cache,
+            trace_xyz=reverse_line.trace_xyz,
+            fallback_shape_hw=shape_hw,
+        )
+        fused_z_image, fused_missing, fused_layer_columns = _trace2cp_z_corrected_image_u8(
+            plane_cache=plane_cache,
+            trace_xyz=fused_xyz,
+            fallback_shape_hw=shape_hw,
+        )
+        forward_z_presence, forward_presence_missing, _forward_presence_layer_columns = _trace2cp_z_corrected_presence_u8(
+            plane_cache=plane_cache,
+            trace_xyz=forward_line.trace_xyz,
+            fallback_shape_hw=shape_hw,
+        )
+        reverse_z_presence, reverse_presence_missing, _reverse_presence_layer_columns = _trace2cp_z_corrected_presence_u8(
+            plane_cache=plane_cache,
+            trace_xyz=reverse_line.trace_xyz,
+            fallback_shape_hw=shape_hw,
+        )
+    _append_trace2cp_timing(local_timing, "side_top_z_reconstruct", reconstruct_timer.elapsed_ms)
+    z_debug = _Trace2CpZTraceDebug(
+        forward_trace_xyz=forward_line.trace_xyz,
+        reverse_trace_xyz=reverse_line.trace_xyz,
+        fused_trace_xyz=fused_xyz,
+        forward_z_image=forward_z_image,
+        reverse_z_image=reverse_z_image,
+        fused_z_image=fused_z_image,
+        forward_missing_columns=int(forward_missing),
+        reverse_missing_columns=int(reverse_missing),
+        fused_missing_columns=int(fused_missing),
+        forward_layer_columns=forward_layer_columns,
+        reverse_layer_columns=reverse_layer_columns,
+        fused_layer_columns=fused_layer_columns,
+        layers=plane_cache.layer_indices(),
+        z_step_voxels=float(plane_cache.z_step_voxels),
+        max_layer=int(plane_cache.max_layer),
+        forward_z_presence=forward_z_presence,
+        reverse_z_presence=reverse_z_presence,
+        forward_presence_missing_columns=int(forward_presence_missing),
+        reverse_presence_missing_columns=int(reverse_presence_missing),
+    )
+    forward_top_strip_image: np.ndarray | None = None
+    forward_top_strip_valid_mask: np.ndarray | None = None
+    reverse_top_strip_image: np.ndarray | None = None
+    reverse_top_strip_valid_mask: np.ndarray | None = None
+    traced_top_strip_image: np.ndarray | None = None
+    traced_top_strip_valid_mask: np.ndarray | None = None
+    z_top_strip_image: np.ndarray | None = None
+    z_top_strip_valid_mask: np.ndarray | None = None
+    fused_xy = np.asarray(refinement.fused_resampled_xy, dtype=np.float32)
+    if fused_xy.ndim == 2 and fused_xy.shape[1] == 2 and fused_xy.shape[0] > 0:
+        with _Timer() as top_timer:
+            if forward_line.trace_xyz.ndim == 2 and forward_line.trace_xyz.shape[1] == 3 and forward_line.trace_xyz.shape[0] > 0:
+                forward_top_strip_image, forward_top_strip_valid_mask = loader.sample_trace2cp_traced_top_strip_source(
+                    segment_source,
+                    forward_line.trace_xyz,
+                )
+            if reverse_line.trace_xyz.ndim == 2 and reverse_line.trace_xyz.shape[1] == 3 and reverse_line.trace_xyz.shape[0] > 0:
+                reverse_top_strip_image, reverse_top_strip_valid_mask = loader.sample_trace2cp_traced_top_strip_source(
+                    segment_source,
+                    reverse_line.trace_xyz,
+                )
+            fused_center_xyz = np.concatenate(
+                [fused_xy, np.zeros((int(fused_xy.shape[0]), 1), dtype=np.float32)],
+                axis=1,
+            )
+            traced_top_strip_image, traced_top_strip_valid_mask = loader.sample_trace2cp_traced_top_strip_source(
+                segment_source,
+                fused_center_xyz,
+            )
+            if fused_xyz.ndim == 2 and fused_xyz.shape[1] == 3 and fused_xyz.shape[0] > 0:
+                z_top_strip_image, z_top_strip_valid_mask = loader.sample_trace2cp_traced_top_strip_source(
+                    segment_source,
+                    fused_xyz,
+                )
+        _append_trace2cp_timing(local_timing, "side_top_z_top_views", top_timer.elapsed_ms)
+    if timing_rows is not None:
+        timing_rows.extend(local_timing)
+    return _Trace2CpSideTopZExperiment(
+        result=result,
+        z_debug=z_debug,
+        forward_line=forward_line,
+        reverse_line=reverse_line,
+        forward_top_strip_image=forward_top_strip_image,
+        forward_top_strip_valid_mask=forward_top_strip_valid_mask,
+        reverse_top_strip_image=reverse_top_strip_image,
+        reverse_top_strip_valid_mask=reverse_top_strip_valid_mask,
+        traced_top_strip_image=traced_top_strip_image,
+        traced_top_strip_valid_mask=traced_top_strip_valid_mask,
+        z_top_strip_image=z_top_strip_image,
+        z_top_strip_valid_mask=z_top_strip_valid_mask,
+        timing_rows=tuple(local_timing),
+    )
+
+
 def _trace2cp_metric_bidirectional(
     direction_xy: np.ndarray,
     start_xy: np.ndarray,
@@ -4719,6 +5443,132 @@ def _trace_score_trace2cp_combined_bidirectional(
     rf_margin_px: float = 5.0,
     torch_device: torch.device | None = None,
 ) -> tuple[_Trace2CpBidirectionalResult, _Trace2CpCombinedSummary]:
+    del torch_device
+    if direction_xy is not None:
+        reference_direction = np.asarray(direction_xy, dtype=np.float32)
+        shape_hw = (int(reference_direction.shape[0]), int(reference_direction.shape[1]))
+    elif tta_fields:
+        reference_direction = np.asarray(tta_fields[0].direction_xy, dtype=np.float32)
+        shape_hw = (int(reference_direction.shape[0]), int(reference_direction.shape[1]))
+    elif presence_hw is not None:
+        reference_direction = None
+        presence = np.asarray(presence_hw)
+        shape_hw = (int(presence.shape[0]), int(presence.shape[1]))
+    elif embedding_chw is not None:
+        reference_direction = None
+        embedding = np.asarray(embedding_chw)
+        shape_hw = (int(embedding.shape[1]), int(embedding.shape[2]))
+    else:
+        raise ValueError("trace2cp combined tracing requires a spatial prediction field")
+    reference_valid = valid_mask if valid_mask is not None else (tta_fields[0].valid_mask if tta_fields else None)
+    start_embedding: np.ndarray | None = None
+    target_embedding: np.ndarray | None = None
+    if any(float(value) != 0.0 for value in (weights.last, weights.enclosing, weights.fiber)):
+        if embedding_chw is None:
+            raise ValueError("trace2cp combined embedding weights require embedding_chw")
+        embedding = _require_trace2cp_embedding_field(embedding_chw)
+        start_embedding = _bilinear_embedding_sample(embedding, start_xy, valid_mask=valid_mask)
+        target_embedding = _bilinear_embedding_sample(embedding, target_xy, valid_mask=valid_mask)
+        if start_embedding is None or target_embedding is None:
+            raise ValueError("trace2cp combined embedding scoring could not sample both CP embeddings")
+    forward, forward_stats = _trace_score_trace2cp_combined_direction(
+        direction_xy=direction_xy,
+        tta_fields=tta_fields,
+        embedding_chw=embedding_chw,
+        presence_hw=presence_hw,
+        valid_mask=valid_mask,
+        start_xy=start_xy,
+        target_xy=target_xy,
+        start_embedding=start_embedding,
+        target_embedding=target_embedding,
+        fiber_embeddings=fiber_embeddings,
+        weights=weights,
+        candidate_max_degrees=candidate_max_degrees,
+        candidate_step_degrees=candidate_step_degrees,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    reverse, reverse_stats = _trace_score_trace2cp_combined_direction(
+        direction_xy=direction_xy,
+        tta_fields=tta_fields,
+        embedding_chw=embedding_chw,
+        presence_hw=presence_hw,
+        valid_mask=valid_mask,
+        start_xy=target_xy,
+        target_xy=start_xy,
+        start_embedding=target_embedding,
+        target_embedding=start_embedding,
+        fiber_embeddings=fiber_embeddings,
+        weights=weights,
+        candidate_max_degrees=candidate_max_degrees,
+        candidate_step_degrees=candidate_step_degrees,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    metric = _trace2cp_metric_from_traces(
+        forward.trace_xy,
+        reverse.trace_xy,
+        start_xy,
+        target_xy,
+        shape_hw=shape_hw,
+        rf_margin_px=rf_margin_px,
+    )
+    if reference_direction is not None:
+        refinement = _trace2cp_refinement_from_traces(
+            forward.trace_xy,
+            reverse.trace_xy,
+            start_xy,
+            target_xy,
+            direction_xy=reference_direction,
+            valid_mask=reference_valid,
+            shape_hw=shape_hw,
+            step_px=step_px,
+            rf_margin_px=rf_margin_px,
+        )
+    else:
+        refinement = _trace2cp_refinement_from_traces(
+            forward.trace_xy,
+            reverse.trace_xy,
+            start_xy,
+            target_xy,
+            direction_xy=np.zeros((shape_hw[0], shape_hw[1], 2), dtype=np.float32),
+            valid_mask=reference_valid,
+            shape_hw=shape_hw,
+            step_px=step_px,
+            rf_margin_px=rf_margin_px,
+        )
+    summary = _Trace2CpCombinedSummary(
+        forward=forward_stats,
+        reverse=reverse_stats,
+        candidate_angles_degrees=_trace2cp_candidate_angles_degrees(candidate_max_degrees, candidate_step_degrees),
+        fiber_bank_size=0 if fiber_embeddings is None else int(np.asarray(fiber_embeddings).shape[0]),
+        fiber_bank_skipped=int(fiber_bank_skipped),
+    )
+    return (
+        _Trace2CpBidirectionalResult(forward=forward, reverse=reverse, refinement=refinement, metric=metric),
+        summary,
+    )
+
+
+def _trace_score_trace2cp_combined_dp_bidirectional(
+    *,
+    direction_xy: np.ndarray | None,
+    tta_fields: list[_TtaDirectionField] | None,
+    embedding_chw: np.ndarray | None,
+    presence_hw: np.ndarray | None,
+    valid_mask: np.ndarray | None,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    fiber_embeddings: np.ndarray | None,
+    weights: _Trace2CpCombinedWeights,
+    candidate_max_degrees: float,
+    candidate_step_degrees: float,
+    fiber_bank_skipped: int = 0,
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+    torch_device: torch.device | None = None,
+) -> tuple[_Trace2CpBidirectionalResult, _Trace2CpCombinedSummary]:
+    del embedding_chw, fiber_embeddings, fiber_bank_skipped
     if any(float(value) != 0.0 for value in (weights.last, weights.enclosing, weights.fiber, weights.image)):
         raise ValueError("Trace2CP DP combined tracing supports direction and presence terms only")
     if tta_fields is not None:
@@ -4894,6 +5744,121 @@ def _trace_score_trace2cp_combined_z_bidirectional(
     rf_margin_px: float = 5.0,
     timing_rows: list[_Trace2CpTimingRow] | None = None,
 ) -> tuple[_Trace2CpBidirectionalResult, _Trace2CpCombinedSummary, np.ndarray, np.ndarray]:
+    center = plane_cache.get(0)
+    shape_hw = tuple(int(v) for v in np.asarray(center.fields.direction_xy).shape[:2])
+    embedding_required = any(
+        float(value) != 0.0 for value in (weights.last, weights.enclosing, weights.fiber)
+    )
+    start_embedding: np.ndarray | None = None
+    target_embedding: np.ndarray | None = None
+    if embedding_required:
+        embedding = _require_trace2cp_embedding_field(center.fields.embedding_chw)
+        start_embedding = _bilinear_embedding_sample(
+            embedding,
+            start_xy,
+            valid_mask=center.valid_mask,
+        )
+        target_embedding = _bilinear_embedding_sample(
+            embedding,
+            target_xy,
+            valid_mask=center.valid_mask,
+        )
+        if start_embedding is None or target_embedding is None:
+            raise ValueError("trace2cp z-search embedding scoring could not sample both CP embeddings")
+    with _Timer() as step_timer:
+        forward_xyz, forward_reason, forward_stats = _trace_combined_direction_line_to_target_z(
+            plane_cache=plane_cache,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            start_embedding=start_embedding,
+            target_embedding=target_embedding,
+            fiber_embeddings=fiber_embeddings,
+            weights=weights,
+            candidate_max_degrees=candidate_max_degrees,
+            candidate_step_degrees=candidate_step_degrees,
+            step_px=step_px,
+            rf_margin_px=rf_margin_px,
+        )
+        reverse_xyz, reverse_reason, reverse_stats = _trace_combined_direction_line_to_target_z(
+            plane_cache=plane_cache,
+            start_xy=target_xy,
+            target_xy=start_xy,
+            start_embedding=target_embedding,
+            target_embedding=start_embedding,
+            fiber_embeddings=fiber_embeddings,
+            weights=weights,
+            candidate_max_degrees=candidate_max_degrees,
+            candidate_step_degrees=candidate_step_degrees,
+            step_px=step_px,
+            rf_margin_px=rf_margin_px,
+        )
+    if timing_rows is not None:
+        _append_trace2cp_timing(timing_rows, "trace_combined_z_stepwise", step_timer.elapsed_ms)
+    forward_xy = forward_xyz[:, :2].astype(np.float32, copy=False)
+    reverse_xy = reverse_xyz[:, :2].astype(np.float32, copy=False)
+    forward_result = _score_trace2cp(
+        forward_xy,
+        target_xy,
+        shape_hw=shape_hw,
+        rf_margin_px=rf_margin_px,
+        termination_reason=forward_reason,
+    )
+    reverse_result = _score_trace2cp(
+        reverse_xy,
+        start_xy,
+        shape_hw=shape_hw,
+        rf_margin_px=rf_margin_px,
+        termination_reason=reverse_reason,
+    )
+    forward = _Trace2CpDirectionResult(trace_xy=forward_xy, result=forward_result)
+    reverse = _Trace2CpDirectionResult(trace_xy=reverse_xy, result=reverse_result)
+    metric = _trace2cp_metric_from_traces(
+        forward.trace_xy,
+        reverse.trace_xy,
+        start_xy,
+        target_xy,
+        shape_hw=shape_hw,
+        rf_margin_px=rf_margin_px,
+    )
+    refinement = _trace2cp_refinement_from_traces_z(
+        forward_xyz,
+        reverse_xyz,
+        start_xy,
+        target_xy,
+        shape_hw=shape_hw,
+        step_px=step_px,
+        rf_margin_px=rf_margin_px,
+    )
+    summary = _Trace2CpCombinedSummary(
+        forward=forward_stats,
+        reverse=reverse_stats,
+        candidate_angles_degrees=_trace2cp_candidate_angles_degrees(candidate_max_degrees, candidate_step_degrees),
+        fiber_bank_size=0 if fiber_embeddings is None else int(np.asarray(fiber_embeddings).shape[0]),
+        fiber_bank_skipped=int(fiber_bank_skipped),
+    )
+    return (
+        _Trace2CpBidirectionalResult(forward=forward, reverse=reverse, refinement=refinement, metric=metric),
+        summary,
+        forward_xyz.astype(np.float32, copy=False),
+        reverse_xyz.astype(np.float32, copy=False),
+    )
+
+
+def _trace_score_trace2cp_combined_z_dp_bidirectional(
+    *,
+    plane_cache: _Trace2CpZPlaneCache,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    fiber_embeddings: np.ndarray | None,
+    weights: _Trace2CpCombinedWeights,
+    candidate_max_degrees: float,
+    candidate_step_degrees: float,
+    fiber_bank_skipped: int = 0,
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+    timing_rows: list[_Trace2CpTimingRow] | None = None,
+) -> tuple[_Trace2CpBidirectionalResult, _Trace2CpCombinedSummary, np.ndarray, np.ndarray]:
+    del fiber_embeddings, fiber_bank_skipped
     center = plane_cache.get(0)
     shape_hw = tuple(int(v) for v in np.asarray(center.fields.direction_xy).shape[:2])
     if any(float(value) != 0.0 for value in (weights.last, weights.enclosing, weights.fiber, weights.image)):
@@ -5295,6 +6260,206 @@ def _draw_trace2cp_top_strip_panel(
             y = center_y
             draw.ellipse((x - 2.0, y - 2.0, x + 2.0, y + 2.0), outline=color, width=1)
     return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
+
+
+def _draw_trace2cp_side_top_z_compact_overlay(
+    *,
+    line_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    experiment: _Trace2CpSideTopZExperiment,
+    input_top_strip_image: np.ndarray | None,
+    input_top_strip_valid_mask: np.ndarray | None,
+    fallback_shape_hw: tuple[int, int],
+) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    def side_panel(
+        image_u8: np.ndarray | None,
+        trace_xyz: np.ndarray,
+        *,
+        label: str,
+        color: tuple[int, int, int, int],
+    ) -> np.ndarray:
+        height, width = (int(v) for v in fallback_shape_hw)
+        if image_u8 is None:
+            panel = np.zeros((height, width, 3), dtype=np.uint8)
+        else:
+            arr = np.asarray(image_u8)
+            if arr.ndim != 2:
+                raise ValueError("compact side/top-z side panel expects H,W image")
+            panel = np.repeat(np.clip(arr, 0, 255).astype(np.uint8)[..., None], 3, axis=-1)
+        panel = overlay_line_coords_rgb(panel, line_xy, opacity=0.20, thickness=1)
+        trace = np.asarray(trace_xyz, dtype=np.float32)
+        if trace.ndim == 2 and trace.shape[1] == 3 and trace.shape[0] > 0:
+            panel = _overlay_polyline_rgb(panel, trace[:, :2], color_rgba=color, thickness=1)
+        pil = Image.fromarray(panel, mode="RGB")
+        draw = ImageDraw.Draw(pil, mode="RGBA")
+        for point_xy, marker_color in (
+            (start_xy, (32, 255, 255, 255)),
+            (target_xy, (255, 220, 64, 255)),
+        ):
+            point = np.asarray(point_xy, dtype=np.float32)
+            if point.shape == (2,) and bool(np.isfinite(point).all()):
+                x, y = (float(v) for v in point)
+                draw.ellipse((x - 2.0, y - 2.0, x + 2.0, y + 2.0), outline=marker_color, width=1)
+        return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
+
+    def top_panel(
+        image: np.ndarray | None,
+        valid_mask: np.ndarray | None,
+        *,
+        label: str,
+        color: tuple[int, int, int, int],
+    ) -> np.ndarray:
+        if image is None or valid_mask is None:
+            height, width = (int(v) for v in fallback_shape_hw)
+            panel = np.zeros((height, width, 3), dtype=np.uint8)
+            return _draw_label_band(panel, label + " unavailable")
+        valid = np.asarray(valid_mask, dtype=bool)
+        arr = np.asarray(image)
+        if arr.ndim == 2:
+            panel = np.repeat(_to_u8_image(arr, valid)[..., None], 3, axis=-1)
+        elif arr.ndim == 3 and arr.shape[2] == 3:
+            if valid.shape != arr.shape[:2]:
+                raise ValueError("valid_mask must match RGB top strip image shape")
+            panel = np.clip(arr, 0, 255).astype(np.uint8, copy=True)
+            panel[~valid] = 0
+        else:
+            raise ValueError("compact side/top-z top panel expects H,W or H,W,3 image")
+        height, width = panel.shape[:2]
+        center_y = (float(height) - 1.0) * 0.5
+        center_line = np.asarray([[0.0, center_y], [float(width - 1), center_y]], dtype=np.float32)
+        panel = _overlay_polyline_rgb(panel, center_line, color_rgba=color, thickness=1)
+        pil = Image.fromarray(panel, mode="RGB")
+        draw = ImageDraw.Draw(pil, mode="RGBA")
+        for point_xy, marker_color in (
+            (start_xy, (32, 255, 255, 255)),
+            (target_xy, (255, 220, 64, 255)),
+        ):
+            point = np.asarray(point_xy, dtype=np.float32)
+            if point.shape == (2,) and np.isfinite(float(point[0])):
+                x = float(np.clip(float(point[0]), 0.0, float(width - 1)))
+                draw.ellipse((x - 2.0, center_y - 2.0, x + 2.0, center_y + 2.0), outline=marker_color, width=1)
+        return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
+
+    forward_z = experiment.z_debug.forward_trace_xyz
+    reverse_z = experiment.z_debug.reverse_trace_xyz
+    rows = [
+        side_panel(
+            experiment.z_debug.forward_z_image,
+            forward_z,
+            label="fw trace z-corrected",
+            color=(0, 255, 0, 235),
+        ),
+        side_panel(
+            experiment.z_debug.reverse_z_image,
+            reverse_z,
+            label="bw trace z-corrected",
+            color=(255, 64, 220, 235),
+        ),
+        side_panel(
+            experiment.z_debug.forward_z_presence,
+            forward_z,
+            label="fw presence z-corrected",
+            color=(0, 255, 0, 235),
+        ),
+        side_panel(
+            experiment.z_debug.reverse_z_presence,
+            reverse_z,
+            label="bw presence z-corrected",
+            color=(255, 64, 220, 235),
+        ),
+        top_panel(
+            input_top_strip_image,
+            input_top_strip_valid_mask,
+            label="top input",
+            color=(255, 220, 64, 220),
+        ),
+        top_panel(
+            experiment.forward_top_strip_image,
+            experiment.forward_top_strip_valid_mask,
+            label="top fw trace z-corrected",
+            color=(0, 255, 0, 235),
+        ),
+        top_panel(
+            experiment.reverse_top_strip_image,
+            experiment.reverse_top_strip_valid_mask,
+            label="top bw trace z-corrected",
+            color=(255, 64, 220, 235),
+        ),
+    ]
+    width = max(int(row.shape[1]) for row in rows)
+    total_h = sum(int(row.shape[0]) for row in rows)
+    stack = np.zeros((total_h, width, 3), dtype=np.uint8)
+    y0 = 0
+    for row in rows:
+        h, w = row.shape[:2]
+        stack[y0 : y0 + h, :w] = row
+        y0 += h
+    return stack
+
+
+def _draw_trace2cp_side_top_z_top_slice_direction_overlay(
+    debug: _Trace2CpSideTopZTopSliceDebug,
+) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    image = _to_u8_image(debug.image, debug.valid_mask)
+    panel = np.repeat(image[..., None], 3, axis=-1)
+    height, width = panel.shape[:2]
+    center_x = (float(width) - 1.0) * 0.5
+    center_y = (float(height) - 1.0) * 0.5
+    pil = Image.fromarray(panel, mode="RGB")
+    draw = ImageDraw.Draw(pil, mode="RGBA")
+    draw.ellipse((center_x - 2.0, center_y - 2.0, center_x + 2.0, center_y + 2.0), outline=(255, 255, 255, 255), width=1)
+    direction = None if debug.direction_xy is None else np.asarray(debug.direction_xy, dtype=np.float32)
+    if direction is not None and direction.shape == (2,) and bool(np.isfinite(direction).all()):
+        norm = float(np.linalg.norm(direction))
+        if np.isfinite(norm) and norm > 1.0e-6:
+            unit = direction / np.float32(norm)
+            length = max(6.0, min(float(width), float(height)) * 0.42)
+            x0 = center_x - float(unit[0]) * length * 0.5
+            y0 = center_y - float(unit[1]) * length * 0.5
+            x1 = center_x + float(unit[0]) * length * 0.5
+            y1 = center_y + float(unit[1]) * length * 0.5
+            draw.line((x0, y0, x1, y1), fill=(255, 220, 64, 255), width=1)
+            arrow = max(3.0, length * 0.12)
+            perp = np.asarray([-unit[1], unit[0]], dtype=np.float32)
+            base_x = x1 - float(unit[0]) * arrow
+            base_y = y1 - float(unit[1]) * arrow
+            draw.line(
+                (x1, y1, base_x + float(perp[0]) * arrow * 0.45, base_y + float(perp[1]) * arrow * 0.45),
+                fill=(255, 220, 64, 255),
+                width=1,
+            )
+            draw.line(
+                (x1, y1, base_x - float(perp[0]) * arrow * 0.45, base_y - float(perp[1]) * arrow * 0.45),
+                fill=(255, 220, 64, 255),
+                width=1,
+            )
+    return np.asarray(pil, dtype=np.uint8)
+
+
+def _write_trace2cp_side_top_z_top_slice_debug(
+    output_dir: Path,
+    experiment: _Trace2CpSideTopZExperiment,
+) -> tuple[int, int]:
+    slices_dir = output_dir / "trace2cp_side_top_z_top_slices"
+    overlays_dir = output_dir / "trace2cp_side_top_z_top_overlays"
+    for directory in (slices_dir, overlays_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+        for path in directory.glob("*.jpg"):
+            path.unlink()
+    written = 0
+    for prefix, line in (("fw", experiment.forward_line), ("bw", experiment.reverse_line)):
+        for index, debug in enumerate(line.top_slices):
+            name = f"{prefix}_{index:04d}.jpg"
+            raw = _to_u8_image(debug.image, debug.valid_mask)
+            _write_jpg(slices_dir / name, raw)
+            _write_jpg(overlays_dir / name, _draw_trace2cp_side_top_z_top_slice_direction_overlay(debug))
+            written += 1
+    return written, int(len(experiment.forward_line.top_slices) + len(experiment.reverse_line.top_slices))
 
 
 def _trace2cp_select_horizontal_median_direction(
@@ -7660,6 +8825,7 @@ def _evaluate_trace2cp_pair(
     candidate_max_degrees: float = 25.0,
     candidate_step_degrees: float = 1.0,
     z_search: _Trace2CpZSearchConfig | None = None,
+    trace2cp_dp: bool = False,
     sample_mode: str = "random",
     row_axis_alignment_line_index: int | None = None,
     row_axis_alignment_xyz: np.ndarray | None = None,
@@ -7834,19 +9000,24 @@ def _evaluate_trace2cp_pair(
                 z_step_voxels=float(z_config.step_voxels),
                 max_layer=int(z_config.max_layer),
             )
-            selected_result, combined_summary, forward_xyz, reverse_xyz = _trace_score_trace2cp_combined_z_bidirectional(
-                plane_cache=plane_cache,
-                start_xy=start_xy,
-                target_xy=target_xy,
-                fiber_embeddings=None,
-                weights=weights,
-                candidate_max_degrees=float(candidate_max_degrees),
-                candidate_step_degrees=float(candidate_step_degrees),
-                fiber_bank_skipped=0,
-                step_px=step_px,
-                rf_margin_px=rf_margin_px,
-                timing_rows=timing_rows,
+            z_trace_fn = (
+                _trace_score_trace2cp_combined_z_dp_bidirectional
+                if bool(trace2cp_dp)
+                else _trace_score_trace2cp_combined_z_bidirectional
             )
+            selected_result, combined_summary, forward_xyz, reverse_xyz = z_trace_fn(
+                    plane_cache=plane_cache,
+                    start_xy=start_xy,
+                    target_xy=target_xy,
+                    fiber_embeddings=None,
+                    weights=weights,
+                    candidate_max_degrees=float(candidate_max_degrees),
+                    candidate_step_degrees=float(candidate_step_degrees),
+                    fiber_bank_skipped=0,
+                    step_px=step_px,
+                    rf_margin_px=rf_margin_px,
+                    timing_rows=timing_rows,
+                )
             with _Timer() as z_reconstruct_timer:
                 forward_z_image, forward_missing, forward_layer_columns = _trace2cp_z_corrected_image_u8(
                     plane_cache=plane_cache,
@@ -7912,13 +9083,18 @@ def _evaluate_trace2cp_pair(
                 layer_tiff_page_labels=layer_tiff_page_labels,
             )
             selected_mode = {
-                "direction": "combined_direction_z",
-                "embedding": "combined_embedding_z",
-                "image": "combined_image_z",
+                "direction": "combined_direction_z_dp" if bool(trace2cp_dp) else "combined_direction_z",
+                "embedding": "combined_embedding_z_dp" if bool(trace2cp_dp) else "combined_embedding_z",
+                "image": "combined_image_z_dp" if bool(trace2cp_dp) else "combined_image_z",
             }[mode]
         else:
             with _Timer() as combined_trace_timer:
-                selected_result, combined_summary = _trace_score_trace2cp_combined_bidirectional(
+                trace_fn = (
+                    _trace_score_trace2cp_combined_dp_bidirectional
+                    if bool(trace2cp_dp)
+                    else _trace_score_trace2cp_combined_bidirectional
+                )
+                selected_result, combined_summary = trace_fn(
                     direction_xy=None if med_tta else direction_xy,
                     tta_fields=med_fields if med_tta else None,
                     embedding_chw=None,
@@ -7935,8 +9111,15 @@ def _evaluate_trace2cp_pair(
                     rf_margin_px=rf_margin_px,
                     torch_device=device,
                 )
-            _append_trace2cp_timing(timing_rows, "trace_combined_dp", combined_trace_timer.elapsed_ms)
-            selected_mode = "combined_direction_med_tta" if med_tta else "combined_direction"
+            _append_trace2cp_timing(
+                timing_rows,
+                "trace_combined_dp" if bool(trace2cp_dp) else "trace_combined_stepwise",
+                combined_trace_timer.elapsed_ms,
+            )
+            if bool(trace2cp_dp):
+                selected_mode = "combined_direction_dp"
+            else:
+                selected_mode = "combined_direction_med_tta" if med_tta else "combined_direction"
     _raise_trace2cp_max_steps(
         base_result,
         mode="reference",
@@ -8115,6 +9298,7 @@ def _evaluate_trace2cp_refinement_chain(
     candidate_max_degrees: float,
     candidate_step_degrees: float,
     z_search: _Trace2CpZSearchConfig | None,
+    trace2cp_dp: bool = False,
     sample_mode: str = "random",
     row_axis_alignment_line_index: int | None = None,
     row_axis_alignment_xyz: np.ndarray | None = None,
@@ -8145,6 +9329,7 @@ def _evaluate_trace2cp_refinement_chain(
         candidate_max_degrees=candidate_max_degrees,
         candidate_step_degrees=candidate_step_degrees,
         z_search=z_search,
+        trace2cp_dp=trace2cp_dp,
         sample_mode=sample_mode,
         row_axis_alignment_line_index=row_axis_alignment_line_index,
         row_axis_alignment_xyz=row_axis_alignment_xyz,
@@ -8188,6 +9373,7 @@ def _evaluate_trace2cp_refinement_chain(
                 candidate_max_degrees=candidate_max_degrees,
                 candidate_step_degrees=candidate_step_degrees,
                 z_search=z_search,
+                trace2cp_dp=trace2cp_dp,
                 sample_mode=sample_mode,
                 segment_source=refined_source,
                 build_similarity_debug=build_similarity_debug,
@@ -8323,10 +9509,14 @@ def _export_trace2cp_vis(
     candidate_max_degrees: float = 25.0,
     candidate_step_degrees: float = 1.0,
     z_search: _Trace2CpZSearchConfig | None = None,
+    trace2cp_dp: bool = False,
     export_z_layers_tif: bool = False,
     refine_iterations: int = 0,
     refine_smooth_window: int = 5,
     top_model_dir_vis: bool = False,
+    side_top_z_experiment: bool = False,
+    side_top_z_radius_px: float = 20.0,
+    side_top_z_patch_size: int = 64,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -8334,7 +9524,7 @@ def _export_trace2cp_vis(
     model, checkpoint = _load_direction_model(checkpoint_path, loader, device=device)
     top_model = (
         _load_top_direction_model_from_checkpoint(checkpoint, checkpoint_path, device=device)
-        if bool(top_model_dir_vis)
+        if bool(top_model_dir_vis or side_top_z_experiment)
         else None
     )
     configured_depth = max(1, int(_model_config_from_checkpoint(checkpoint, loader).depth))
@@ -8347,6 +9537,181 @@ def _export_trace2cp_vis(
     if combined and mode in {"embedding", "image"}:
         raise ValueError("Trace2CP combined tracing now supports only direction plus optional presence")
     embedding_bank: _Trace2CpEmbeddingBank | None = None
+    if side_top_z_experiment:
+        if top_model is None:
+            raise ValueError("--trace2cp-side-top-z-experiment requires a checkpoint with top_model_state_dict")
+        if vis_tta:
+            raise ValueError("--trace2cp-side-top-z-experiment does not support --vis-tta")
+        if int(refine_iterations) != 0:
+            raise ValueError("--trace2cp-side-top-z-experiment is exclusive and does not support refinement iterations")
+        timing_rows: list[_Trace2CpTimingRow] = []
+        with _Timer() as segment_timer:
+            segment_source = loader.build_trace2cp_segment_source(
+                sample_index,
+                target_control_point_index=target_cp_index,
+                target_offset=target_offset,
+                rf_margin_px=margin,
+                device=device,
+                sample_mode="random",
+            )
+        _append_trace2cp_timing(timing_rows, "build_segment_source", segment_timer.elapsed_ms)
+        with _Timer() as sample_timer:
+            sample, image, valid_mask = loader.sample_trace2cp_segment_source(segment_source)
+        _append_trace2cp_timing(timing_rows, "sample_segment_source", sample_timer.elapsed_ms)
+        with _Timer() as infer_timer:
+            fields = _predict_trace2cp_fields(model, image, valid_mask, device=device)
+        _append_trace2cp_timing(timing_rows, "infer_center", infer_timer.elapsed_ms)
+        with _Timer() as top_original_timer:
+            top_strip_image, top_strip_valid_mask = loader.sample_trace2cp_top_strip_source(segment_source)
+        _append_trace2cp_timing(timing_rows, "top_strip_original", top_original_timer.elapsed_ms)
+
+        start_xy = np.asarray(sample.start_control_point_xy, dtype=np.float32)
+        target_xy = np.asarray(sample.target_control_point_xy, dtype=np.float32)
+        side_top_cfg = z_search or _Trace2CpZSearchConfig(enabled=True)
+        top_radius = float(side_top_z_radius_px)
+        if not np.isfinite(top_radius) or top_radius <= 0.0:
+            raise ValueError("--trace2cp-side-top-z-radius must be finite and > 0")
+        top_patch_side = max(
+            3,
+            int(side_top_z_patch_size),
+            int(math.ceil(2.0 * top_radius + 1.0)),
+        )
+        center_prediction = _Trace2CpZLayerPrediction(
+            layer=0,
+            z_voxels=0.0,
+            sample=sample,
+            image=np.asarray(image, dtype=np.float32),
+            valid_mask=np.asarray(valid_mask, dtype=bool),
+            fields=fields,
+        )
+        plane_cache = _Trace2CpZPlaneCache(
+            loader=loader,
+            model=model,
+            sample_index=sample_index,
+            target_cp_index=target_cp_index,
+            target_offset=target_offset,
+            rf_margin_px=margin,
+            sample_mode="random",
+            row_axis_alignment_line_index=None,
+            row_axis_alignment_xyz=None,
+            device=device,
+            segment_source=segment_source,
+            center_layer=center_prediction,
+            z_step_voxels=float(side_top_cfg.step_voxels),
+            max_layer=int(side_top_cfg.max_layer),
+        )
+        side_top_experiment = _trace_score_trace2cp_side_top_z_experiment_bidirectional(
+            loader=loader,
+            segment_source=segment_source,
+            plane_cache=plane_cache,
+            top_model=top_model,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            weights=weights,
+            candidate_max_degrees=float(candidate_max_degrees),
+            candidate_step_degrees=float(candidate_step_degrees),
+            device=device,
+            step_px=step_px,
+            rf_margin_px=margin,
+            top_radius_px=top_radius,
+            top_patch_shape_hw=(top_patch_side, top_patch_side),
+            timing_rows=timing_rows,
+        )
+        with _Timer() as side_top_overlay_timer:
+            side_top_overlay = _draw_trace2cp_side_top_z_compact_overlay(
+                line_xy=sample.line_xy,
+                start_xy=start_xy,
+                target_xy=target_xy,
+                experiment=side_top_experiment,
+                input_top_strip_image=top_strip_image,
+                input_top_strip_valid_mask=top_strip_valid_mask,
+                fallback_shape_hw=tuple(int(v) for v in valid_mask.shape),
+            )
+            _write_jpg(out / "trace2cp_side_top_z_experiment.jpg", side_top_overlay)
+        _append_trace2cp_timing(timing_rows, "side_top_z_draw_write", side_top_overlay_timer.elapsed_ms)
+        with _Timer() as side_top_top_slice_timer:
+            top_debug_written, top_debug_expected = _write_trace2cp_side_top_z_top_slice_debug(
+                out,
+                side_top_experiment,
+            )
+        _append_trace2cp_timing(timing_rows, "side_top_z_top_slice_debug_write", side_top_top_slice_timer.elapsed_ms)
+        exp_metric = side_top_experiment.result.metric
+        exp_refinement = side_top_experiment.result.refinement
+        exp_f_min, exp_f_max, exp_f_mean_abs = side_top_experiment.z_debug.z_stats(
+            side_top_experiment.forward_line.trace_xyz
+        )
+        exp_r_min, exp_r_max, exp_r_mean_abs = side_top_experiment.z_debug.z_stats(
+            side_top_experiment.reverse_line.trace_xyz
+        )
+        exp_z_min, exp_z_max, exp_z_mean_abs = side_top_experiment.z_debug.z_stats(
+            side_top_experiment.z_debug.fused_trace_xyz
+        )
+        summary_lines = [
+            "trace2cp_side_top_z_experiment=true",
+            f"sample_index={sample_index}",
+            f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
+            f"checkpoint_step={checkpoint.get('step', 'unknown')}",
+            f"fiber_path={sample.fiber_path}",
+            f"start_control_point_index={sample.start_control_point_index}",
+            f"target_control_point_index={sample.target_control_point_index}",
+            f"image_shape_hw=({int(image.shape[0])}, {int(image.shape[1])})",
+            f"start_cp_xy=({start_xy[0]:.3f}, {start_xy[1]:.3f})",
+            f"target_cp_xy=({target_xy[0]:.3f}, {target_xy[1]:.3f})",
+            f"step_px={float(step_px):.3f}",
+            f"rf_margin_px={margin:.3f}",
+            f"trace2cp_side_top_z_error={exp_metric.error:.8f}",
+            f"trace2cp_side_top_z_metric_raw_y_error_px={exp_metric.raw_y_error_px:.6f}",
+            f"trace2cp_side_top_z_metric_reason={exp_metric.reason}",
+            f"trace2cp_side_top_z_refine_score={side_top_experiment.result.score:.8f}",
+            f"trace2cp_side_top_z_radius_px={top_radius:.6f}",
+            f"trace2cp_side_top_z_patch_shape_hw=({top_patch_side}, {top_patch_side})",
+            f"trace2cp_side_top_z_step_voxels={float(side_top_cfg.step_voxels):.6f}",
+            f"trace2cp_side_top_z_max_layer={int(side_top_cfg.max_layer)}",
+            f"trace2cp_side_top_z_layers={','.join(str(int(v)) for v in side_top_experiment.z_debug.layers)}",
+            f"trace2cp_side_top_z_forward_reason={side_top_experiment.forward_line.reason}",
+            f"trace2cp_side_top_z_reverse_reason={side_top_experiment.reverse_line.reason}",
+            f"trace2cp_side_top_z_forward_top_patches={int(side_top_experiment.forward_line.top_patch_count)}",
+            f"trace2cp_side_top_z_reverse_top_patches={int(side_top_experiment.reverse_line.top_patch_count)}",
+            f"trace2cp_side_top_z_forward_top_invalid={int(side_top_experiment.forward_line.top_invalid_count)}",
+            f"trace2cp_side_top_z_reverse_top_invalid={int(side_top_experiment.reverse_line.top_invalid_count)}",
+            f"trace2cp_side_top_z_top_slice_debug_written={int(top_debug_written)}",
+            f"trace2cp_side_top_z_top_slice_debug_expected={int(top_debug_expected)}",
+            "trace2cp_side_top_z_top_slices_dir=trace2cp_side_top_z_top_slices",
+            "trace2cp_side_top_z_top_overlays_dir=trace2cp_side_top_z_top_overlays",
+            f"trace2cp_side_top_z_forward_z={exp_f_min:.6f}..{exp_f_max:.6f} mean_abs={exp_f_mean_abs:.6f}",
+            f"trace2cp_side_top_z_reverse_z={exp_r_min:.6f}..{exp_r_max:.6f} mean_abs={exp_r_mean_abs:.6f}",
+            f"trace2cp_side_top_z_fused_z={exp_z_min:.6f}..{exp_z_max:.6f} mean_abs={exp_z_mean_abs:.6f}",
+            f"trace2cp_side_top_z_fused_points={int(exp_refinement.fused_resampled_xy.shape[0])}",
+            "trace2cp_side_top_z_vis=trace2cp_side_top_z_experiment.jpg",
+        ]
+        with _Timer() as summary_timer:
+            (out / "trace2cp_side_top_z_summary.txt").write_text(
+                "\n".join(summary_lines) + "\n",
+                encoding="utf-8",
+            )
+        _append_trace2cp_timing(timing_rows, "write_summary", summary_timer.elapsed_ms)
+        print(f"trace2cp_side_top_z_error={exp_metric.error:.8f}")
+        print(
+            "trace2cp side_top_z_experiment "
+            f"error={exp_metric.error:.8f} "
+            f"raw_y_error_px={exp_metric.raw_y_error_px:.6f} "
+            f"forward_reason={side_top_experiment.forward_line.reason} "
+            f"reverse_reason={side_top_experiment.reverse_line.reason} "
+            f"forward_top_patches={int(side_top_experiment.forward_line.top_patch_count)} "
+            f"reverse_top_patches={int(side_top_experiment.reverse_line.top_patch_count)} "
+            f"top_slice_debug={len(side_top_experiment.forward_line.top_slices) + len(side_top_experiment.reverse_line.top_slices)} "
+            f"forward_z={exp_f_min:.3f}..{exp_f_max:.3f} mean_abs={exp_f_mean_abs:.3f} "
+            f"reverse_z={exp_r_min:.3f}..{exp_r_max:.3f} mean_abs={exp_r_mean_abs:.3f} "
+            "vis=trace2cp_side_top_z_experiment.jpg "
+            "slices=trace2cp_side_top_z_top_slices "
+            "overlays=trace2cp_side_top_z_top_overlays"
+        )
+        _print_trace2cp_timing_table(timing_rows, title="trace2cp side_top_z timings")
+        print(
+            "exported trace2cp_side_top_z_experiment.jpg and "
+            f"trace2cp_side_top_z_summary.txt to {out}"
+        )
+        return
     evaluations = _evaluate_trace2cp_refinement_chain(
         loader,
         model,
@@ -8367,6 +9732,7 @@ def _export_trace2cp_vis(
         candidate_max_degrees=candidate_max_degrees,
         candidate_step_degrees=candidate_step_degrees,
         z_search=z_search,
+        trace2cp_dp=trace2cp_dp,
         build_top_strip_debug=True,
         build_z_layer_tiff_stack=bool(export_z_layers_tif),
         refine_iterations=int(refine_iterations),
@@ -8424,6 +9790,8 @@ def _export_trace2cp_vis(
     with _Timer() as write_image_timer:
         _write_jpg(out / "trace2cp_vis.jpg", overlay)
     _append_trace2cp_timing(timing_rows, "write_overlay_jpg", write_image_timer.elapsed_ms)
+    side_top_experiment: _Trace2CpSideTopZExperiment | None = None
+    side_top_summary_lines: list[str] = ["trace2cp_side_top_z_experiment=false"]
     forward = selected_result.forward.result
     reverse = selected_result.reverse.result
     refinement = selected_result.refinement
@@ -8490,6 +9858,7 @@ def _export_trace2cp_vis(
         f"trace2cp_top_model_direction_source={evaluation.top_model_direction_source}",
         f"trace2cp_top_model_direction_count={int(evaluation.top_model_direction_count)}",
         f"trace2cp_top_model_direction_debug={evaluation.top_model_direction_debug}",
+        *side_top_summary_lines,
         f"trace_points={trace_points}",
         f"trace2cp_error={metric.error:.8f}",
         f"trace2cp_metric_error={metric.error:.8f}",
@@ -8625,6 +9994,29 @@ def _export_trace2cp_vis(
             f"missing_columns={int(z_debug.forward_missing_columns)}/"
             f"{int(z_debug.reverse_missing_columns)}/{int(z_debug.fused_missing_columns)}"
         )
+    if side_top_experiment is not None:
+        exp_metric = side_top_experiment.result.metric
+        f_min, f_max, f_mean_abs = side_top_experiment.z_debug.z_stats(
+            side_top_experiment.forward_line.trace_xyz
+        )
+        r_min, r_max, r_mean_abs = side_top_experiment.z_debug.z_stats(
+            side_top_experiment.reverse_line.trace_xyz
+        )
+        print(
+            "trace2cp side_top_z_experiment "
+            f"error={exp_metric.error:.8f} "
+            f"raw_y_error_px={exp_metric.raw_y_error_px:.6f} "
+            f"forward_reason={side_top_experiment.forward_line.reason} "
+            f"reverse_reason={side_top_experiment.reverse_line.reason} "
+            f"forward_top_patches={int(side_top_experiment.forward_line.top_patch_count)} "
+            f"reverse_top_patches={int(side_top_experiment.reverse_line.top_patch_count)} "
+            f"top_slice_debug={len(side_top_experiment.forward_line.top_slices) + len(side_top_experiment.reverse_line.top_slices)} "
+            f"forward_z={f_min:.3f}..{f_max:.3f} mean_abs={f_mean_abs:.3f} "
+            f"reverse_z={r_min:.3f}..{r_max:.3f} mean_abs={r_mean_abs:.3f} "
+            "vis=trace2cp_side_top_z_experiment.jpg "
+            "slices=trace2cp_side_top_z_top_slices "
+            "overlays=trace2cp_side_top_z_top_overlays"
+        )
     if z_layer_tif_path is not None:
         print(
             "trace2cp z_layers_tif "
@@ -8744,6 +10136,7 @@ def _export_trace2cp_fiber_vis(
     candidate_max_degrees: float = 25.0,
     candidate_step_degrees: float = 1.0,
     z_search: _Trace2CpZSearchConfig | None = None,
+    trace2cp_dp: bool = False,
     export_z_layers_tif: bool = False,
     refine_iterations: int = 0,
     refine_smooth_window: int = 5,
@@ -8818,6 +10211,7 @@ def _export_trace2cp_fiber_vis(
                 candidate_max_degrees=candidate_max_degrees,
                 candidate_step_degrees=candidate_step_degrees,
                 z_search=z_search,
+                trace2cp_dp=trace2cp_dp,
                 sample_mode="flat",
                 row_axis_alignment_line_index=alignment_line_index,
                 row_axis_alignment_xyz=alignment_axis,
@@ -9597,8 +10991,14 @@ def main() -> None:
     parser.add_argument("--trace2cp-vis", action="store_true")
     parser.add_argument("--trace2cp-combined", action="store_true")
     parser.add_argument("--trace2cp-z-search", action="store_true")
+    parser.add_argument(
+        "--trace2cp-dp",
+        action="store_true",
+        help="Use the experimental monotone dynamic-programming backend for combined Trace2CP; z-search alone uses the stepwise tracer",
+    )
     parser.add_argument("--trace2cp-z-layers-tif", action="store_true")
     parser.add_argument("--trace2cp-top-model-dir-vis", action="store_true")
+    parser.add_argument("--trace2cp-side-top-z-experiment", action="store_true")
     parser.add_argument("--med-tta", action="store_true")
     parser.add_argument("--vis-tta", action="store_true")
     parser.add_argument("--dir-vis", action="store_true")
@@ -9625,6 +11025,8 @@ def main() -> None:
     parser.add_argument("--trace2cp-image-blur-radius", type=int, default=5)
     parser.add_argument("--trace2cp-z-step-voxels", type=float, default=1.0)
     parser.add_argument("--trace2cp-z-max-layer", type=int, default=4)
+    parser.add_argument("--trace2cp-side-top-z-radius", type=float, default=20.0)
+    parser.add_argument("--trace2cp-side-top-z-patch-size", type=int, default=64)
     parser.add_argument("--trace2cp-refine-iterations", type=int, default=0)
     parser.add_argument("--trace2cp-refine-smooth-window", type=int, default=5)
     parser.add_argument("--trace2cp-combined-direction-weight", type=float, default=1.0)
@@ -9726,14 +11128,20 @@ def main() -> None:
             patch_across=int(args.trace2cp_image_patch_across),
             blur_radius=int(args.trace2cp_image_blur_radius),
         )
-        if combined_enabled and args.med_tta:
+        if combined_enabled and args.med_tta and args.trace2cp_dp:
             raise SystemExit("--med-tta is not supported by Trace2CP DP combined tracing")
-        if args.trace2cp_z_search and not combined_enabled:
+        if args.trace2cp_dp and not combined_enabled:
+            raise SystemExit("--trace2cp-dp requires --trace2cp-combined or an enabled combined scoring term")
+        if args.trace2cp_z_search and not combined_enabled and not args.trace2cp_side_top_z_experiment:
             raise SystemExit("--trace2cp-z-search requires --trace2cp-combined or an enabled combined scoring term")
-        if args.trace2cp_z_search and args.med_tta:
+        if args.trace2cp_z_search and args.med_tta and not args.trace2cp_side_top_z_experiment:
             raise SystemExit("--trace2cp-z-search does not currently support --med-tta")
         if args.trace2cp_z_layers_tif and not args.trace2cp_z_search:
             raise SystemExit("--trace2cp-z-layers-tif requires --trace2cp-z-search")
+        if args.trace2cp_side_top_z_experiment and args.trace2cp_dp:
+            raise SystemExit("--trace2cp-side-top-z-experiment is exclusive and does not run --trace2cp-dp")
+        if args.trace2cp_side_top_z_experiment and args.trace2cp_z_layers_tif:
+            raise SystemExit("--trace2cp-side-top-z-experiment does not write --trace2cp-z-layers-tif")
         if int(args.trace2cp_refine_iterations) < 0:
             raise SystemExit("--trace2cp-refine-iterations must be >= 0")
         if int(args.trace2cp_refine_smooth_window) < 1:
@@ -9748,6 +11156,8 @@ def main() -> None:
                 raise SystemExit("--trace2cp-vis --fiber-json cannot be combined with --trace2cp-target-cp-index")
             if args.vis_tta:
                 raise SystemExit("--trace2cp-vis --fiber-json does not support --vis-tta")
+            if args.trace2cp_side_top_z_experiment:
+                raise SystemExit("--trace2cp-side-top-z-experiment currently supports single-pair --trace2cp-vis only")
             _export_trace2cp_fiber_vis(
                 loader,
                 args.fiber_json,
@@ -9767,6 +11177,7 @@ def main() -> None:
                 candidate_max_degrees=args.trace2cp_candidate_max_deg,
                 candidate_step_degrees=args.trace2cp_candidate_step_deg,
                 z_search=z_search,
+                trace2cp_dp=bool(args.trace2cp_dp),
                 export_z_layers_tif=bool(args.trace2cp_z_layers_tif),
                 refine_iterations=int(args.trace2cp_refine_iterations),
                 refine_smooth_window=int(args.trace2cp_refine_smooth_window),
@@ -9794,10 +11205,14 @@ def main() -> None:
             candidate_max_degrees=args.trace2cp_candidate_max_deg,
             candidate_step_degrees=args.trace2cp_candidate_step_deg,
             z_search=z_search,
+            trace2cp_dp=bool(args.trace2cp_dp),
             export_z_layers_tif=bool(args.trace2cp_z_layers_tif),
             refine_iterations=int(args.trace2cp_refine_iterations),
             refine_smooth_window=int(args.trace2cp_refine_smooth_window),
             top_model_dir_vis=bool(args.trace2cp_top_model_dir_vis),
+            side_top_z_experiment=bool(args.trace2cp_side_top_z_experiment),
+            side_top_z_radius_px=float(args.trace2cp_side_top_z_radius),
+            side_top_z_patch_size=int(args.trace2cp_side_top_z_patch_size),
         )
         return
 
