@@ -704,7 +704,10 @@ bool cachedMetadataNeedsNormalization(const std::filesystem::path& metaPath,
             stringField("type") != "seg" ||
             stringField("format") != "tifxyz" ||
             stringField("vc_open_data_segment_id") != segment.id ||
-            stringField("vc_open_data_segment_long_id") != segment.longId) {
+            stringField("vc_open_data_segment_long_id") != segment.longId ||
+            stringField("vc_open_data_source_path").empty() ||
+            !meta.contains("vc_open_data_source_coordinate_scale_factor") ||
+            !meta.contains("vc_open_data_source_original_resolution")) {
             return true;
         }
         return applyDownscale &&
@@ -715,13 +718,69 @@ bool cachedMetadataNeedsNormalization(const std::filesystem::path& metaPath,
     }
 }
 
+const OpenDataVolume* findSampleVolume(const OpenDataSample& sample,
+                                       const std::string& volumeId)
+{
+    const auto it = std::find_if(
+        sample.volumes.begin(), sample.volumes.end(), [&](const auto& volume) {
+            return volume.id == volumeId;
+        });
+    return it == sample.volumes.end() ? nullptr : &*it;
+}
+
+void applySourceCoordinateMetadata(nlohmann::json& meta,
+                                   const OpenDataSample& sample,
+                                   const std::string& volumeId,
+                                   int coordinateLevel)
+{
+    const auto* volume = findSampleVolume(sample, volumeId);
+    if (!volume || !volume->pixelSizeUm ||
+        !std::isfinite(*volume->pixelSizeUm) || *volume->pixelSizeUm <= 0.0) {
+        return;
+    }
+    const auto* source = preferredVolumeArtifact(*volume);
+    if (!source)
+        return;
+    const std::string sourcePath = artifactUrl(*source);
+    if (sourcePath.empty())
+        return;
+    meta["vc_open_data_source_path"] = sourcePath;
+    meta["vc_open_data_source_coordinate_scale_factor"] =
+        std::uint64_t{1} << coordinateLevel;
+    meta["vc_open_data_source_original_resolution"] = *volume->pixelSizeUm;
+}
+
+void applySourceCoordinateMetadata(utils::Json& meta,
+                                   const OpenDataSample& sample,
+                                   const std::string& volumeId,
+                                   int coordinateLevel)
+{
+    const auto* volume = findSampleVolume(sample, volumeId);
+    if (!volume || !volume->pixelSizeUm ||
+        !std::isfinite(*volume->pixelSizeUm) || *volume->pixelSizeUm <= 0.0) {
+        return;
+    }
+    const auto* source = preferredVolumeArtifact(*volume);
+    if (!source)
+        return;
+    const std::string sourcePath = artifactUrl(*source);
+    if (sourcePath.empty())
+        return;
+    meta["vc_open_data_source_path"] = sourcePath;
+    meta["vc_open_data_source_coordinate_scale_factor"] =
+        std::uint64_t{1} << coordinateLevel;
+    meta["vc_open_data_source_original_resolution"] = *volume->pixelSizeUm;
+}
+
 void writeCachedMetadata(const std::string& baseUrl,
+                         const OpenDataSample& sample,
                          const OpenDataSegment& segment,
                          const std::filesystem::path& target,
                          const std::string& representationId,
                          const std::string& representation,
                          const std::string& coordinateSpace,
-                         int coordinateLevel)
+                         int coordinateLevel,
+                         const std::string& coordinateVolumeId)
 {
     const auto url = joinOpenDataUrl(baseUrl, "meta.json");
     auto bytes = vc::httpGetBytes(url);
@@ -750,18 +809,22 @@ void writeCachedMetadata(const std::string& baseUrl,
     meta["vc_open_data_source_coordinate_level"] = coordinateLevel;
     if (!coordinateSpace.empty())
         meta["vc_open_data_coordinate_space"] = coordinateSpace;
+    applySourceCoordinateMetadata(
+        meta, sample, coordinateVolumeId, coordinateLevel);
 
     writeStringAtomic(target, meta.dump(2));
 }
 
 void normalizeCachedMetadata(const std::string& baseUrl,
+                             const OpenDataSample& sample,
                              const OpenDataSegment& segment,
                              const std::filesystem::path& target,
                              bool applyDownscale,
                              const std::string& representationId,
                              const std::string& representation,
                              const std::string& coordinateSpace,
-                             int coordinateLevel)
+                             int coordinateLevel,
+                             const std::string& coordinateVolumeId)
 {
     auto meta = nlohmann::json::parse(readTextFile(target));
     if (!meta.is_object()) {
@@ -783,6 +846,8 @@ void normalizeCachedMetadata(const std::string& baseUrl,
     meta["vc_open_data_source_coordinate_level"] = coordinateLevel;
     if (!coordinateSpace.empty())
         meta["vc_open_data_coordinate_space"] = coordinateSpace;
+    applySourceCoordinateMetadata(
+        meta, sample, coordinateVolumeId, coordinateLevel);
     writeStringAtomic(target, meta.dump(2));
     if (applyDownscale) {
         applyOriginalVolumeDownscale(target.parent_path(), segment, representationId);
@@ -1160,6 +1225,7 @@ bool cacheTifxyzRepresentation(
                         bool applyDownscale,
                         const std::string& representationId,
                         const std::string& representation,
+                        const std::string& coordinateVolumeId,
                         const std::string& coordinateSpace,
                         int coordinateLevel,
                         std::string* errorOut,
@@ -1180,26 +1246,28 @@ bool cacheTifxyzRepresentation(
                                                  segment,
                                                  applyDownscale,
                                                  representationId)) {
-                normalizeCachedMetadata(url,
+                normalizeCachedMetadata(url, sample,
                                         segment,
                                         segmentDir / "meta.json",
                                         applyDownscale,
                                         representationId,
                                         representation,
                                         coordinateSpace,
-                                        coordinateLevel);
+                                        coordinateLevel,
+                                        coordinateVolumeId);
             }
             return true;
         }
         if (!origin || originMatches(*origin, sample, segment, artifact)) {
-            normalizeCachedMetadata(url,
+            normalizeCachedMetadata(url, sample,
                                     segment,
                                     segmentDir / "meta.json",
                                     applyDownscale,
                                     representationId,
                                     representation,
                                     coordinateSpace,
-                                    coordinateLevel);
+                                    coordinateLevel,
+                                    coordinateVolumeId);
             if (origin) {
                 writeCatalogOriginState(segmentDir, OpenDataSegmentCacheState::Current);
             } else {
@@ -1233,9 +1301,10 @@ bool cacheTifxyzRepresentation(
             if (fileProgress) fileProgress(fileName, "done");
         };
         runFile("meta.json", [&]() {
-            writeCachedMetadata(url, segment, tempDir / "meta.json",
+            writeCachedMetadata(url, sample, segment, tempDir / "meta.json",
                                 representationId, representation,
-                                coordinateSpace, coordinateLevel);
+                                coordinateSpace, coordinateLevel,
+                                coordinateVolumeId);
             return true;
         });
         runFile("x.tif", [&]() {
@@ -1260,14 +1329,15 @@ bool cacheTifxyzRepresentation(
         if (!requiredFilesPresent(tempDir)) {
             throw std::runtime_error("downloaded segment is missing required tifxyz files");
         }
-        normalizeCachedMetadata(url,
+        normalizeCachedMetadata(url, sample,
                                 segment,
                                 tempDir / "meta.json",
                                 applyDownscale,
                                 representationId,
                                 representation,
                                 coordinateSpace,
-                                coordinateLevel);
+                                coordinateLevel,
+                                coordinateVolumeId);
         writeStringAtomic(tempDir / "catalog-origin.json",
                           catalogOriginJson(sample, segment, artifact, downloadedFiles).dump(2));
         try {
@@ -1304,6 +1374,7 @@ bool cacheTifxyzSegment(const OpenDataSample& sample,
         sample, segment, *artifact, segmentDir, applyDownscale,
         segmentStableId(segment),
         applyDownscale ? "derived-native" : "published-native",
+        sourceId,
         sample.id + "/" + sourceId + "@L0", 0,
         errorOut, fileProgress, forceRefresh);
 }
@@ -1356,6 +1427,8 @@ bool cacheTransformedTifxyzSegment(const OpenDataSample& sample,
         surface->meta["vc_open_data_source_coordinate_level"] = 0;
         surface->meta["vc_open_data_coordinate_space"] =
             sample.id + "/" + targetVolumeId + "@L0";
+        applySourceCoordinateMetadata(
+            surface->meta, sample, targetVolumeId, 0);
         surface->save(
             tempDir.string(),
             segmentStableId(segment) + "-generated-" +
@@ -2213,11 +2286,12 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
                             std::filesystem::copy_options::recursive |
                                 std::filesystem::copy_options::overwrite_existing);
                         normalizeCachedMetadata(
-                            artifactUrl(*representation.artifact), *segment,
+                            artifactUrl(*representation.artifact), sample, *segment,
                             tempDir / "meta.json", true,
                             representation.representationId, representationName,
                             representation.coordinateSpace,
-                            representation.sourceCoordinateLevel);
+                            representation.sourceCoordinateLevel,
+                            representation.coordinateVolumeId);
                         publishSegmentDirectory(tempDir, dir);
                     }
                 } catch (const std::exception& e) {
@@ -2229,7 +2303,8 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
             if (!cacheTifxyzRepresentation(
                     sample, *segment, *representation.artifact, dir,
                     applyDownscale, representation.representationId,
-                    representationName, representation.coordinateSpace,
+                    representationName, representation.coordinateVolumeId,
+                    representation.coordinateSpace,
                     representation.sourceCoordinateLevel, &error, {}, forceRefresh)) {
                 ++result.failedTifxyzSegments;
                 result.messages.push_back(

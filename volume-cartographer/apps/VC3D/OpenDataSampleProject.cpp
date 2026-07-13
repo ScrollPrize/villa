@@ -97,7 +97,8 @@ std::vector<std::string> volumeTags(const OpenDataSample& sample,
                                     const OpenDataArtifact& artifact,
                                     bool preferredNativeSource,
                                     std::optional<int> coordinateLevel = std::nullopt,
-                                    std::optional<double> effectiveVoxelSize = std::nullopt)
+                                    std::optional<double> effectiveVoxelSize = std::nullopt,
+                                    std::string sourcePath = {})
 {
     std::vector<std::string> tags;
     auto addUnique = [&tags](std::string tag) {
@@ -146,6 +147,13 @@ std::vector<std::string> volumeTags(const OpenDataSample& sample,
                   std::to_string(*coordinateLevel));
         addUnique("vc-open-data-coordinate-space:" + sample.id + "/" +
                   volume.id + "@L" + std::to_string(*coordinateLevel));
+        if (!sourcePath.empty())
+            addUnique("vc-open-data-source-path:" + sourcePath);
+        if (volume.pixelSizeUm && std::isfinite(*volume.pixelSizeUm) &&
+            *volume.pixelSizeUm > 0.0) {
+            addUnique("vc-open-data-source-original-resolution:" +
+                      std::to_string(*volume.pixelSizeUm));
+        }
     }
     if (effectiveVoxelSize && *effectiveVoxelSize > 0.0) {
         addUnique("vc-open-data-voxel-size-um:" + std::to_string(*effectiveVoxelSize));
@@ -172,12 +180,16 @@ std::string coordinateSpaceId(const OpenDataSample& sample,
 std::vector<std::string> coordinateTags(const OpenDataSample& sample,
                                         const OpenDataVolume& volume,
                                         int level,
-                                        double voxelSize)
+                                        double voxelSize,
+                                        const std::string& sourcePath)
 {
     return {
         "vc-open-data-source-coordinate-level:" + std::to_string(level),
         "vc-open-data-coordinate-space:" + coordinateSpaceId(sample, volume, level),
         "vc-open-data-voxel-size-um:" + std::to_string(voxelSize),
+        "vc-open-data-source-path:" + sourcePath,
+        "vc-open-data-source-original-resolution:" +
+            std::to_string(*volume.pixelSizeUm),
     };
 }
 
@@ -187,6 +199,8 @@ const std::vector<std::string>& coordinateSingletonPrefixes()
         "vc-open-data-voxel-size-um:",
         "vc-open-data-source-coordinate-level:",
         "vc-open-data-coordinate-space:",
+        "vc-open-data-source-path:",
+        "vc-open-data-source-original-resolution:",
         "vc-open-data-name:",
         "vc-open-data-coordinate-level-unknown",
     };
@@ -497,7 +511,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             auto tags = volumeTags(
                 sample, volume, artifact, preferredNativeSource,
                 preferredNativeSource ? std::optional<int>{0} : std::nullopt,
-                preferredNativeSource ? volume.pixelSizeUm : std::nullopt);
+                preferredNativeSource ? volume.pixelSizeUm : std::nullopt,
+                preferredNativeSource ? preferredSourceUrl : std::string{});
             if (isSupportedSurfacePrediction(artifact) &&
                 !artifact.sourceCoordinateLevel) {
                 tags.push_back(
@@ -598,7 +613,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         const double effectiveVoxelSize =
             *volume.pixelSizeUm * static_cast<double>(std::uint64_t{1} << level);
         auto predictionTags = volumeTags(
-            sample, volume, prediction, false, level, effectiveVoxelSize);
+            sample, volume, prediction, false, level, effectiveVoxelSize,
+            candidate.sourceUrl);
         pkg.reconcileVolumeEntryTags(
             candidate.predictionUrl,
             predictionTags,
@@ -615,7 +631,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         }
         attachedVirtualLocators.push_back(virtualLocator);
 
-        auto tags = coordinateTags(sample, volume, level, effectiveVoxelSize);
+        auto tags = coordinateTags(
+            sample, volume, level, effectiveVoxelSize, candidate.sourceUrl);
         tags.push_back(std::string(kOpenDataSampleIdTagPrefix) + sample.id);
         tags.push_back("vc-open-data-volume-id:" + volume.id);
         tags.push_back("vc-open-data-virtual-source");

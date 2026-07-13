@@ -512,7 +512,52 @@ static bool selectRasterizeParams(QWidget* parent, RasterizeDialogResult* out)
     return true;
 }
 
-static bool updateVolumeIdentityMetadata(const QString& volumePath)
+static QJsonObject coordinateIdentityObject(
+    const std::optional<vc3d::opendata::CoordinateIdentity>& identity)
+{
+    QJsonObject metadata;
+    if (!identity)
+        return metadata;
+    metadata.insert(QStringLiteral("vc_open_data_coordinate_space"),
+                    QString::fromStdString(identity->coordinateSpace));
+    metadata.insert(QStringLiteral("vc_open_data_source_path"),
+                    QString::fromStdString(identity->sourcePath));
+    metadata.insert(QStringLiteral("vc_open_data_source_coordinate_level"),
+                    identity->sourceCoordinateLevel);
+    metadata.insert(QStringLiteral("vc_open_data_source_coordinate_scale_factor"),
+                    static_cast<int>(identity->sourceCoordinateScaleFactor));
+    metadata.insert(QStringLiteral("vc_open_data_source_original_resolution"),
+                    identity->sourceOriginalResolution);
+    return metadata;
+}
+
+static void copyCoordinateIdentity(QJsonObject& target,
+                                   const QJsonObject& coordinateIdentity)
+{
+    for (auto it = coordinateIdentity.begin(); it != coordinateIdentity.end(); ++it)
+        target.insert(it.key(), it.value());
+}
+
+static QJsonObject coordinateIdentityFromJson(const QJsonObject& source)
+{
+    QJsonObject metadata;
+    static const std::array<QString, 5> keys{
+        QStringLiteral("vc_open_data_coordinate_space"),
+        QStringLiteral("vc_open_data_source_path"),
+        QStringLiteral("vc_open_data_source_coordinate_level"),
+        QStringLiteral("vc_open_data_source_coordinate_scale_factor"),
+        QStringLiteral("vc_open_data_source_original_resolution"),
+    };
+    for (const auto& key : keys) {
+        if (source.contains(key))
+            metadata.insert(key, source.value(key));
+    }
+    return metadata;
+}
+
+static bool updateVolumeIdentityMetadata(
+    const QString& volumePath,
+    const QJsonObject& coordinateIdentity = {})
 {
     if (volumePath.isEmpty()) {
         return false;
@@ -536,6 +581,7 @@ static bool updateVolumeIdentityMetadata(const QString& volumePath)
 
     meta.insert(QStringLiteral("uuid"), volumeId);
     meta.insert(QStringLiteral("name"), volumeId);
+    copyCoordinateIdentity(meta, coordinateIdentity);
     return writeJsonObject(metaPath, meta);
 }
 
@@ -2706,12 +2752,8 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
                 metaFile.close();
                 if (document.isObject()) {
                     auto object = document.object();
-                    object.insert(
-                        QStringLiteral("vc_open_data_coordinate_space"),
-                        QString::fromStdString(outputCoordinateIdentity->coordinateSpace));
-                    object.insert(
-                        QStringLiteral("vc_open_data_source_coordinate_level"),
-                        outputCoordinateIdentity->sourceCoordinateLevel);
+                    copyCoordinateIdentity(
+                        object, coordinateIdentityObject(outputCoordinateIdentity));
                     if (metaFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
                         metaFile.write(QJsonDocument(object).toJson(QJsonDocument::Indented));
                         metaFile.close();
@@ -3365,6 +3407,9 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     const QString tempRootStr = QString::fromStdString(tempRoot.string());
     const QString stagedOutputRootStr = QString::fromStdString(stagedOutputRoot.string());
     const QString finalOutputRootStr = QString::fromStdString(finalOutputRoot.string());
+    const QJsonObject outputCoordinateIdentity = coordinateIdentityObject(
+        vc3d::opendata::coordinateIdentityForVolume(
+            *_state->vpkg(), _state->currentVolumeId()));
     QStringList args;
     args << tempRootStr
          << stagedOutputRootStr
@@ -3402,7 +3447,7 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
                          this,
                          [this, guard, connection, runner,
                           tempRootStr, stagedOutputRootStr, finalOutputRootStr,
-                          validIds, segmentPaths](CommandLineToolRunner::Tool tool,
+                          validIds, segmentPaths, outputCoordinateIdentity](CommandLineToolRunner::Tool tool,
                                                   bool success,
                                                   const QString& message,
                                                   const QString&,
@@ -3435,7 +3480,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
                 emit statusMessage(tr("Rasterize complete, but finalizing output failed"), 5000);
             } else {
                 finalizeOutput = true;
-                if (!updateVolumeIdentityMetadata(finalOutputRootStr)) {
+                if (!updateVolumeIdentityMetadata(
+                        finalOutputRootStr, outputCoordinateIdentity)) {
                     emit showWarning(
                         tr("Warning"),
                         tr("Rasterized volume created, but updating meta.json identity failed."));
@@ -3543,8 +3589,38 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
                                dlg.anchorCap(),
                                dlg.stripCols());
     if (dlg.ompThreads() > 0) _cmdRunner->setOmpThreads(dlg.ompThreads());
+    const QJsonObject outputCoordinateIdentity = coordinateIdentityObject(
+        vc3d::opendata::coordinateIdentityForVolume(
+            *vpkg, _state->currentVolumeId()));
+    QPointer<SegmentationCommandHandler> guard(this);
+    auto connection = std::make_shared<QMetaObject::Connection>();
+    *connection = connect(
+        _cmdRunner, &CommandLineToolRunner::toolFinished, this,
+        [this, guard, connection, outputCoordinateIdentity](
+            CommandLineToolRunner::Tool tool,
+            bool success,
+            const QString&,
+            const QString& outputPath,
+            bool) {
+            if (!guard) {
+                disconnect(*connection);
+                return;
+            }
+            if (tool != CommandLineToolRunner::Tool::MergeTifxyz)
+                return;
+            disconnect(*connection);
+            if (success && !updateVolumeIdentityMetadata(
+                               outputPath, outputCoordinateIdentity)) {
+                emit showWarning(
+                    tr("Warning"),
+                    tr("Merged tifxyz created, but coordinate metadata update failed."));
+            }
+        });
     _cmdRunner->showConsoleOutput();
-    _cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz);
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz)) {
+        disconnect(*connection);
+        return;
+    }
     emit statusMessage(tr("Merging tifxyz surfaces..."), 0);
 }
 
@@ -3795,6 +3871,8 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
         : QString();
     const QString finalOutputRootStr = QString::fromStdString(finalOutputRoot.string());
     const QString runOutputRootStr = useStaging ? stagedOutputRootStr : finalOutputRootStr;
+    const QJsonObject outputCoordinateIdentity = coordinateIdentityFromJson(
+        readJsonObject(QDir(params.volumePath).filePath(QStringLiteral("meta.json"))));
 
     QStringList args;
     args << params.volumePath
@@ -3951,7 +4029,8 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
                           &CommandLineToolRunner::toolFinished,
                           this,
                           [this, guard, finishConnection, outputConnection, progressDialog,
-                           useStaging, stagedOutputRootStr, finalOutputRootStr]
+                           useStaging, stagedOutputRootStr, finalOutputRootStr,
+                           outputCoordinateIdentity]
                           (CommandLineToolRunner::Tool tool,
                            bool success,
                            const QString& message,
@@ -3993,7 +4072,8 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
                 emit statusMessage(tr("Ignore label complete, but finalizing output failed"), 5000);
             } else {
                 finalized = true;
-                if (!updateVolumeIdentityMetadata(finalOutputRootStr)) {
+                if (!updateVolumeIdentityMetadata(
+                        finalOutputRootStr, outputCoordinateIdentity)) {
                     emit showWarning(
                         tr("Warning"),
                         tr("Ignore label volume created, but updating meta.json identity failed."));
@@ -4174,6 +4254,11 @@ void SegmentationCommandHandler::onExportWidthChunks(const std::string& segmentI
 
         // Create a temp surface for this chunk; scale is preserved.
         QuadSurface chunkSurf(roiCopy, surf->scale());
+        chunkSurf.meta = surf->meta;
+        if (_state && _state->vpkg()) {
+            vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+                chunkSurf, *_state->vpkg(), _state->currentVolumeId());
+        }
 
         // Build target dir under exportRoot, name "<segName>_<indexPadded>"
         const QString baseName = QString("%1_%2").arg(segName, padded(c));
@@ -4272,6 +4357,13 @@ bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outp
     metaJson.insert(QStringLiteral("source_mesh_count"), static_cast<int>(segmentIds.size()));
     metaJson.insert(QStringLiteral("rasterized_at"), rasterizedAt);
     metaJson.insert(QStringLiteral("rasterizer"), QStringLiteral("vc_tifxyz2zarr_sparse"));
+
+    if (_state && _state->vpkg()) {
+        copyCoordinateIdentity(
+            metaJson,
+            coordinateIdentityObject(vc3d::opendata::coordinateIdentityForVolume(
+                *_state->vpkg(), _state->currentVolumeId())));
+    }
 
     if (!writeJsonObject(metaJsonPath, metaJson)) {
         return false;

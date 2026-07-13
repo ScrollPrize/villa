@@ -552,6 +552,14 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
                     pkg->volumeEntries()[0].tags.end(),
                     "vc-open-data-voxel-size-um:7.910000") != pkg->volumeEntries()[0].tags.end());
+    CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
+                    pkg->volumeEntries()[0].tags.end(),
+                    "vc-open-data-source-path:http://127.0.0.1:9/base.zarr") !=
+          pkg->volumeEntries()[0].tags.end());
+    CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
+                    pkg->volumeEntries()[0].tags.end(),
+                    "vc-open-data-source-original-resolution:7.910000") !=
+          pkg->volumeEntries()[0].tags.end());
 }
 
 TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")

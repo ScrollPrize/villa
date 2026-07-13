@@ -863,14 +863,14 @@ bool VolumePkg::hasLoadedVolumeEntry(const std::string& location) const
     return false;
 }
 
-std::shared_ptr<Volume> VolumePkg::volume(const std::string& id)
+std::shared_ptr<Volume> VolumePkg::volume(const std::string& id) const
 {
     auto it = loadedVolumes_.find(id);
     if (it == loadedVolumes_.end()) return nullptr;
     return it->second;
 }
 
-std::shared_ptr<Volume> VolumePkg::volume()
+std::shared_ptr<Volume> VolumePkg::volume() const
 {
     if (loadedVolumes_.empty()) return nullptr;
     return loadedVolumes_.begin()->second;

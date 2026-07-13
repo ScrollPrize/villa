@@ -1,4 +1,5 @@
 #include "CWindow.hpp"
+#include "OpenDataCoordinateIdentity.hpp"
 
 #include "RenderBenchRecorder.hpp"
 #include "RenderBenchReplay.hpp"
@@ -9711,6 +9712,8 @@ void CWindow::onEditMaskPressed(const QString& segmentId)
         return;
     _maskRenderInProgress = true;
     showStatusBarMessage(tr("Rendering mask..."));
+    vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+        *surf, *_state->vpkg(), _state->currentVolumeId());
 
     auto* watcher = new QFutureWatcher<void>(this);
     connect(watcher, &QFutureWatcher<void>::finished, this,
@@ -9755,6 +9758,8 @@ void CWindow::onAppendMaskPressed(const QString& segmentId)
 
     std::filesystem::path path = surf->path/"mask.tif";
     auto volume = _state->currentVolume();
+    vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+        *surf, *_state->vpkg(), _state->currentVolumeId());
 
     auto* watcher = new QFutureWatcher<QString>(this);
     connect(watcher, &QFutureWatcher<QString>::finished, this,

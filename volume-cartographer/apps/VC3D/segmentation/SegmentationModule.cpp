@@ -1,6 +1,7 @@
 #include "SegmentationModule.hpp"
 
 #include "../OpenDataSegmentCache.hpp"
+#include "../OpenDataCoordinateIdentity.hpp"
 
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
@@ -175,6 +176,9 @@ bool ensureEditableOpenDataSegmentTarget(CState* state,
         if (!editableSurface) {
             editableSurface = std::make_shared<QuadSurface>(editablePath);
         }
+        vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+            *editableSurface, *pkg, state->currentVolumeId());
+        editableSurface->save_meta();
         state->setSurface("segmentation", editableSurface, false, false);
         if (folderChanged) {
             *folderChanged = true;

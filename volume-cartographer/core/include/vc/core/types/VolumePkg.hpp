@@ -111,8 +111,8 @@ public:
         return opts_.deferResolution;
     }
     [[nodiscard]] bool hasLoadedVolumeEntry(const std::string& location) const;
-    std::shared_ptr<Volume> volume();
-    std::shared_ptr<Volume> volume(const std::string& id);
+    std::shared_ptr<Volume> volume() const;
+    std::shared_ptr<Volume> volume(const std::string& id) const;
     bool addVolume(const std::shared_ptr<Volume>& volume);
     bool addSingleVolume(const std::string& volumeDirName);
     bool removeSingleVolume(const std::string& volumeIdOrDirName);
