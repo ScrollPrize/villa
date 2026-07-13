@@ -348,6 +348,10 @@ The important behavior is:
   weighted by `--trace2cp-combined-presence-weight`. Embedding and image
   similarity modes are no longer active tracer modes and now fail clearly if
   requested.
+  With z-search, side-model presence is read through the z-plane cache as a
+  weighted Gaussian-smoothed stack before scoring or display. The smoothing is
+  separable over side-z layers and strip x columns only, using radii 11 and 5
+  respectively; side-strip y rows are not blurred.
   When presence scoring is active, `trace2cp_vis.jpg` appends a fixed-scale
   presence column and whole-fiber `trace2cp_fiber_vis.jpg` appends a fixed-scale
   presence row: `0` is black, `1` is white, invalid pixels are black, and the

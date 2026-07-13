@@ -1,26 +1,36 @@
-# Trace2CP Side-DP Z Smoothness Re-Enable Plan
+# Trace2CP Side-Z Presence Blur Plan
 
 ## Implementation
 
-1. Change the side-view Trace2CP joint-DP dz smoothness default back to `0.5`.
-2. Keep `z_transition_penalty` at `0.0`.
-3. Update the regression test that captures the DP penalty values.
+- Add constants for the side-z presence blur radii: z=11, x=5.
+- Add a weighted separable Gaussian blur helper for presence stacks shaped
+  `[z_layer, y, x]`; invalid pixels must not contribute to the weighted average.
+- Add a cached `blurred_presence_for_layer()` API on `_Trace2CpZPlaneCache`.
+  It should gather the requested layer's z-radius neighborhood, blur over z and
+  x only, and return the requested layer's blurred presence map.
+- Route z-search stepwise candidate scoring, image-z candidate scoring, z-DP
+  presence stacks, z-corrected presence panels, z-pillar panels, and z-layer
+  TIFF presence pages through the blurred cache presence.
+- Leave non-z Trace2CP presence scoring unchanged because there is no side-z
+  stack to blur.
 
 ## Spec Update
 
-- Update side-DP specs to state the per-step z movement penalty is zero and
-  second-order dz smoothness is enabled with coefficient `0.5`.
+- Document that Trace2CP z-search presence is smoothed over side-z layers and
+  strip x before use/display, preserving y-localization.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` where it describes side DP z smoothing.
-- Replace `task_log.md` with this task's implementation notes and validation.
-- Add a changelog entry because this changes Trace2CP DP default scoring.
+- Update `docs/code_structure.md` Trace2CP/runner notes with the new cache-level
+  presence blur behavior.
 
 ## Testing
 
-- Run the focused fiber_trace_2d loader/runner regression suite:
+- Add focused unit tests for the weighted x/z blur helper and for
+  `_Trace2CpZPlaneCache.blurred_presence_for_layer()`.
+- Run the focused fiber_trace_2d loader test suite:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`.
 
-```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py
-```
+## Changelog
+
+- Add a short 2026-07-13 entry for side-z presence blurring.

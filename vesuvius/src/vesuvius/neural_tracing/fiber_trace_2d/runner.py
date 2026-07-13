@@ -43,6 +43,8 @@ _TRACE2CP_SIDE_DP_DZ_SMOOTH_PENALTY = 0.5
 _TRACE2CP_DP_DY_SMOOTH_PENALTY = 0.0
 _TRACE2CP_DP_DZ_SMOOTH_PENALTY = 0.0
 _TRACE2CP_DP_ANGLE_BASE_DEGREES = 10.0
+_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_Z = 11
+_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_X = 5
 
 
 def _path_arg_for_config(path: str | Path) -> str:
@@ -105,6 +107,71 @@ def _trace2cp_dp_direction_angle_penalty_torch(
     return base * (1.0 + torch.clamp(theta - knee, min=0.0) / knee)
 
 
+def _trace2cp_gaussian_kernel1d(radius: int) -> torch.Tensor:
+    radius_i = max(0, int(radius))
+    if radius_i == 0:
+        return torch.ones((1,), dtype=torch.float32)
+    sigma = max(float(radius_i) / 3.0, 1.0e-6)
+    offsets = torch.arange(-radius_i, radius_i + 1, dtype=torch.float32)
+    kernel = torch.exp(-0.5 * (offsets / float(sigma)).square())
+    return kernel / torch.clamp(kernel.sum(), min=1.0e-12)
+
+
+def _trace2cp_blur_tensor_xz(
+    values_lhw: np.ndarray,
+    *,
+    radius_z: int,
+    radius_x: int,
+) -> np.ndarray:
+    values = np.asarray(values_lhw, dtype=np.float32)
+    if values.ndim != 3:
+        raise ValueError("Trace2CP presence blur expects a stack shaped layers,H,W")
+    tensor = torch.as_tensor(values, dtype=torch.float32).permute(1, 0, 2).unsqueeze(1).contiguous()
+    radius_x_i = max(0, int(radius_x))
+    radius_z_i = max(0, int(radius_z))
+    if radius_x_i > 0:
+        kernel_x = _trace2cp_gaussian_kernel1d(radius_x_i).view(1, 1, 1, -1)
+        tensor = torch.nn.functional.pad(tensor, (radius_x_i, radius_x_i, 0, 0), mode="replicate")
+        tensor = torch.nn.functional.conv2d(tensor, kernel_x)
+    if radius_z_i > 0:
+        kernel_z = _trace2cp_gaussian_kernel1d(radius_z_i).view(1, 1, -1, 1)
+        tensor = torch.nn.functional.pad(tensor, (0, 0, radius_z_i, radius_z_i), mode="replicate")
+        tensor = torch.nn.functional.conv2d(tensor, kernel_z)
+    return tensor.squeeze(1).permute(1, 0, 2).contiguous().cpu().numpy().astype(np.float32)
+
+
+def _trace2cp_blur_presence_stack_xz(
+    presence_stack: np.ndarray,
+    valid_stack: np.ndarray,
+    *,
+    radius_z: int = _TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_Z,
+    radius_x: int = _TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_X,
+) -> np.ndarray:
+    values = np.asarray(presence_stack, dtype=np.float32)
+    valid = np.asarray(valid_stack, dtype=bool)
+    if values.ndim != 3 or valid.shape != values.shape:
+        raise ValueError("Trace2CP presence blur expects matching layers,H,W stacks")
+    finite = np.isfinite(values)
+    weights = (valid & finite).astype(np.float32)
+    weighted_values = np.where(finite & valid, values, np.float32(0.0)).astype(np.float32) * weights
+    blurred_values = _trace2cp_blur_tensor_xz(
+        weighted_values,
+        radius_z=radius_z,
+        radius_x=radius_x,
+    )
+    blurred_weights = _trace2cp_blur_tensor_xz(
+        weights,
+        radius_z=radius_z,
+        radius_x=radius_x,
+    )
+    return np.divide(
+        blurred_values,
+        np.maximum(blurred_weights, np.float32(1.0e-6)),
+        out=np.zeros_like(blurred_values, dtype=np.float32),
+        where=blurred_weights > np.float32(1.0e-6),
+    ).astype(np.float32)
+
+
 def _trace2cp_z_corrected_image_u8(
     *,
     plane_cache: _Trace2CpZPlaneCache,
@@ -155,9 +222,8 @@ def _trace2cp_z_corrected_presence_u8(
     if trace.ndim != 2 or trace.shape[1] != 3 or trace.shape[0] == 0:
         return None, width, layers_by_column
     layer_presence: dict[int, np.ndarray] = {}
-    for layer, prediction in plane_cache.layers.items():
-        fields = getattr(prediction, "fields", None)
-        presence = None if fields is None else getattr(fields, "presence_hw", None)
+    for layer, prediction in list(plane_cache.layers.items()):
+        presence = _trace2cp_presence_for_plane_layer(plane_cache, int(layer), prediction)
         if presence is None:
             continue
         layer_presence[int(layer)] = _presence_map_to_u8(presence, prediction.valid_mask)
@@ -180,6 +246,20 @@ def _trace2cp_z_corrected_presence_u8(
             continue
         output[:, x] = presence_u8[:, x]
     return output, missing, layers_by_column
+
+
+def _trace2cp_presence_for_plane_layer(
+    plane_cache: Any,
+    layer: int,
+    prediction: Any | None = None,
+) -> np.ndarray | None:
+    blurred = getattr(plane_cache, "blurred_presence_for_layer", None)
+    if callable(blurred):
+        return blurred(int(layer))
+    if prediction is None:
+        prediction = getattr(plane_cache, "layers", {}).get(int(layer))
+    fields = None if prediction is None else getattr(prediction, "fields", None)
+    return None if fields is None else getattr(fields, "presence_hw", None)
 
 
 def _trace2cp_z_corrected_surface_coords_xyz(
@@ -240,8 +320,8 @@ def _trace2cp_z_layer_tiff_stack(
         pages.append(page)
         labels.append(f"slice {layer_label}={int(layer)} z_voxels={z_voxels:.6f}")
     for layer, prediction in layer_predictions:
-        fields = getattr(prediction, "fields", None)
-        presence = None if fields is None else getattr(fields, "presence_hw", None)
+        presence_layer = int(getattr(prediction, "layer", int(layer)))
+        presence = _trace2cp_presence_for_plane_layer(plane_cache, presence_layer, prediction)
         if presence is None:
             continue
         page = _presence_map_to_u8(presence, prediction.valid_mask)
@@ -2391,6 +2471,7 @@ class _Trace2CpZPlaneCache:
         self.layers: dict[int, _Trace2CpZLayerPrediction] = {0: center_layer}
         self._subvoxel_interpolation = bool(step < 1.0)
         self._inferred_voxel_layers: dict[int, _Trace2CpZLayerPrediction] = {0: center_layer}
+        self._blurred_presence_layers: dict[int, np.ndarray | None] = {}
 
     def has_layer(self, layer: int) -> bool:
         return int(layer) in self.layers
@@ -2476,6 +2557,57 @@ class _Trace2CpZPlaneCache:
         )
         self._inferred_voxel_layers[voxel_i] = prediction
         return prediction
+
+    def blurred_presence_for_layer(self, layer: int) -> np.ndarray | None:
+        return self.blurred_presence_for_layers((int(layer),))[0]
+
+    def blurred_presence_for_layers(self, layers: tuple[int, ...] | list[int]) -> tuple[np.ndarray | None, ...]:
+        requested = tuple(int(layer) for layer in layers)
+        missing = tuple(layer for layer in requested if layer not in self._blurred_presence_layers)
+        if missing:
+            self._populate_blurred_presence_layers(missing)
+        return tuple(self._blurred_presence_layers.get(layer) for layer in requested)
+
+    def _populate_blurred_presence_layers(self, requested_layers: tuple[int, ...]) -> None:
+        radius_z = max(0, int(_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_Z))
+        radius_x = max(0, int(_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_X))
+        min_layer = max(-int(self.max_layer), min(int(layer) for layer in requested_layers) - radius_z)
+        max_layer = min(int(self.max_layer), max(int(layer) for layer in requested_layers) + radius_z)
+        source_layers = tuple(range(int(min_layer), int(max_layer) + 1))
+        presences: list[np.ndarray] = []
+        valids: list[np.ndarray] = []
+        shape_hw: tuple[int, int] | None = None
+        for layer in source_layers:
+            prediction = self.get(int(layer))
+            fields = getattr(prediction, "fields", None)
+            presence = None if fields is None else getattr(fields, "presence_hw", None)
+            if presence is None:
+                for requested in requested_layers:
+                    self._blurred_presence_layers[int(requested)] = None
+                return
+            presence_arr = np.asarray(presence, dtype=np.float32)
+            valid_arr = np.asarray(prediction.valid_mask, dtype=bool)
+            if presence_arr.ndim != 2 or valid_arr.shape != presence_arr.shape:
+                raise ValueError("Trace2CP z presence blur requires matching 2D presence and valid masks")
+            current_shape = (int(presence_arr.shape[0]), int(presence_arr.shape[1]))
+            if shape_hw is None:
+                shape_hw = current_shape
+            elif current_shape != shape_hw:
+                raise ValueError("Trace2CP z presence blur requires same-shaped layer presence maps")
+            presences.append(presence_arr)
+            valids.append(valid_arr)
+        blurred_stack = _trace2cp_blur_presence_stack_xz(
+            np.stack(presences, axis=0).astype(np.float32, copy=False),
+            np.stack(valids, axis=0).astype(bool, copy=False),
+            radius_z=radius_z,
+            radius_x=radius_x,
+        )
+        source_index = {int(layer): index for index, layer in enumerate(source_layers)}
+        for requested in requested_layers:
+            self._blurred_presence_layers[int(requested)] = blurred_stack[source_index[int(requested)]].astype(
+                np.float32,
+                copy=False,
+            )
 
     def ensure_neighbors(self, layer: int) -> None:
         center = int(layer)
@@ -2847,7 +2979,7 @@ def _trace_side_top_z_line_to_target(
         current_presence_loss = 0.0
         if presence_required:
             sampled_presence_loss = _trace2cp_presence_loss(
-                current_prediction.fields.presence_hw,
+                _trace2cp_presence_for_plane_layer(plane_cache, current_layer, current_prediction),
                 current,
                 valid_mask=current_prediction.valid_mask,
             )
@@ -2888,7 +3020,7 @@ def _trace_side_top_z_line_to_target(
             presence_loss = 0.0
             if presence_required:
                 sampled_presence_loss = _trace2cp_presence_loss(
-                    current_prediction.fields.presence_hw,
+                    _trace2cp_presence_for_plane_layer(plane_cache, current_layer, current_prediction),
                     terminal_point,
                     valid_mask=current_prediction.valid_mask,
                 )
@@ -3852,7 +3984,7 @@ def _trace_combined_direction_line_to_target_z(
         start_emb = None
         target_emb = None
     if presence_required:
-        center_presence = _require_trace2cp_presence_field(center.fields.presence_hw)
+        center_presence = _require_trace2cp_presence_field(_trace2cp_presence_for_plane_layer(plane_cache, 0, center))
         if tuple(int(v) for v in center_presence.shape) != shape_hw:
             raise ValueError("center presence spatial shape must match z-search direction field")
 
@@ -3957,7 +4089,7 @@ def _trace_combined_direction_line_to_target_z(
                     if presence_required:
                         candidate_prediction = plane_cache.get(candidate_layer)
                         sampled_presence_loss = _trace2cp_presence_loss(
-                            candidate_prediction.fields.presence_hw,
+                            _trace2cp_presence_for_plane_layer(plane_cache, candidate_layer, candidate_prediction),
                             terminal_point,
                             valid_mask=candidate_prediction.valid_mask,
                         )
@@ -4039,7 +4171,7 @@ def _trace_combined_direction_line_to_target_z(
                 presence_loss = 0.0
                 if presence_required:
                     sampled_presence_loss = _trace2cp_presence_loss(
-                        candidate_prediction.fields.presence_hw,
+                        _trace2cp_presence_for_plane_layer(plane_cache, candidate_layer, candidate_prediction),
                         next_point,
                         valid_mask=candidate_prediction.valid_mask,
                     )
@@ -4144,7 +4276,7 @@ def _trace_combined_image_line_to_target_z(
     shape_hw = (int(center_image.shape[0]), int(center_image.shape[1]))
     presence_required = float(weights.presence) != 0.0
     if presence_required:
-        center_presence = _require_trace2cp_presence_field(center.fields.presence_hw)
+        center_presence = _require_trace2cp_presence_field(_trace2cp_presence_for_plane_layer(plane_cache, 0, center))
         if tuple(int(v) for v in center_presence.shape) != shape_hw:
             raise ValueError("center presence spatial shape must match z-search image")
     step = max(float(step_px), 1.0e-3)
@@ -4256,7 +4388,7 @@ def _trace_combined_image_line_to_target_z(
                     if presence_required:
                         candidate_prediction = plane_cache.get(candidate_layer)
                         sampled_presence_loss = _trace2cp_presence_loss(
-                            candidate_prediction.fields.presence_hw,
+                            _trace2cp_presence_for_plane_layer(plane_cache, candidate_layer, candidate_prediction),
                             terminal_point,
                             valid_mask=candidate_prediction.valid_mask,
                         )
@@ -4324,7 +4456,7 @@ def _trace_combined_image_line_to_target_z(
                 presence_loss = 0.0
                 if presence_required:
                     sampled_presence_loss = _trace2cp_presence_loss(
-                        candidate_prediction.fields.presence_hw,
+                        _trace2cp_presence_for_plane_layer(plane_cache, candidate_layer, candidate_prediction),
                         next_point,
                         valid_mask=candidate_prediction.valid_mask,
                     )
@@ -6230,7 +6362,14 @@ def _trace_score_trace2cp_combined_z_dp_bidirectional(
     direction_fields = [np.asarray(pred.fields.direction_xy, dtype=np.float32) for pred in predictions]
     valid_masks = [np.asarray(pred.valid_mask, dtype=bool) for pred in predictions]
     presence_fields = (
-        [pred.fields.presence_hw for pred in predictions]
+        (
+            list(plane_cache.blurred_presence_for_layers(layers))
+            if hasattr(plane_cache, "blurred_presence_for_layers")
+            else [
+                _trace2cp_presence_for_plane_layer(plane_cache, layer, prediction)
+                for layer, prediction in zip(layers, predictions, strict=True)
+            ]
+        )
         if float(weights.presence) != 0.0
         else None
     )
@@ -6641,7 +6780,7 @@ def _side_presence_z_pillar_image(
     layer_data: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     for layer in layers:
         prediction = plane_cache.get(int(layer))
-        presence = prediction.fields.presence_hw
+        presence = _trace2cp_presence_for_plane_layer(plane_cache, int(layer), prediction)
         if presence is None:
             return None, None
         presence_arr = np.asarray(presence, dtype=np.float32)
@@ -9496,6 +9635,8 @@ def _evaluate_trace2cp_pair(
                     rf_margin_px=rf_margin_px,
                     timing_rows=timing_rows,
                 )
+            if float(weights.presence) != 0.0:
+                presence_debug = _trace2cp_presence_for_plane_layer(plane_cache, 0, plane_cache.get(0))
             with _Timer() as z_reconstruct_timer:
                 forward_z_image, forward_missing, forward_layer_columns = _trace2cp_z_corrected_image_u8(
                     plane_cache=plane_cache,

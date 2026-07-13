@@ -2,6 +2,8 @@
 
 ## 2026-07-13
 
+- Added cache-level Gaussian smoothing for Trace2CP z-search side-presence
+  scoring/display over side-z layers and strip x columns, preserving y rows.
 - Re-enabled the side-view Trace2CP joint-DP dz smoothness default
   (`0.5 * (dz_current - dz_previous)^2`) after the zero-smoothness test.
 - Set side-view Trace2CP joint-DP dz smoothness default to `0.0` for testing,
