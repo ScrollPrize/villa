@@ -143,6 +143,18 @@ default_config = {
     'num_patches_per_step': 360,
     'num_patches_per_step_for_dt': 240,
     'num_points_per_patch': 800,
+    # How patch-loss strips are sampled in patch ij space (patch radius/DT losses and the
+    # rel/abs-winding L-shapes):
+    #   'straight' -> contiguous subranges of single rows/columns (+ 4 cardinal L-shapes for
+    #                 the winding losses).
+    #   'dijkstra' -> wiggly geodesic strips: from a start cell, walk the 8-connected valid-quad
+    #                 graph to a distant reachable endpoint via shortest path, skirting holes /
+    #                 ragged edges. Paths land in small per-patch (and per-anchor, for the
+    #                 winding losses) pools, built and continuously refreshed dataloader-style
+    #                 by FIT_SPIRAL_STRIP_PATH_WORKERS background processes (default 4; 0 =
+    #                 inline builds with fixed pools); per-step sampling just subsamples points
+    #                 along a pooled path, so steady-state cost matches 'straight'.
+    'patch_strip_sampling': 'straight',
     'erode_patches': 1,  # if >0, erode every patch's valid region (verified + unverified) by this many grid cells
     'disable_patches': False,  # fit on PCLs + tracks only; load no verified/unverified patches
     'unverified_patch_radius_loss_margin': 0.025,

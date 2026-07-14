@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import strip_path_pools
 from sample_spiral import (
     canonical_winding_samples,
     get_theta_and_radii,
@@ -23,6 +24,8 @@ def configure_losses(config, z_begin_value, z_end_value):
     cfg = config
     z_begin = z_begin_value
     z_end = z_end_value
+    if cfg['patch_strip_sampling'] == 'dijkstra':
+        strip_path_pools.warm_workers()
 
 
 def _masked_mean(values, mask):
@@ -72,6 +75,39 @@ def run_containing_index(mask_1d: np.ndarray, idx: int) -> tuple[int, int] | Non
 
 
 
+# ============================================================================================
+# 'dijkstra' strip sampling (cfg['patch_strip_sampling'] == 'dijkstra'): instead of straight
+# rows/columns (and cardinal L-shapes), strips are geodesic shortest paths on the 8-connected
+# valid-quad graph, from a start cell to a 'distant' reachable endpoint, skirting holes and
+# ragged edges. Consecutive path cells are grid-adjacent, so a path is a contiguous walk and
+# unwrap_shifted_radii can stitch theta=0 crossings along it exactly as for straight
+# strips. The paths come from per-patch / per-anchor pools built and continuously refreshed by
+# background worker processes (see strip_path_pools.py; strip_paths.py has the actual path
+# computation); here we only subsample positions along a pooled path + subpixel jitter.
+# ============================================================================================
+
+def _sample_points_along_path(path_ij, num_points):
+    # Subsample `num_points` positions along a path (sorted in traversal order, so the unwrap
+    # sees a contiguous walk) with per-point subpixel jitter in both axes; path cells are valid
+    # quads, so jittered points stay on valid quads.
+    path_len = path_ij.shape[0]
+    positions = np.sort(np.random.choice(path_len, num_points, replace=num_points > path_len))
+    return path_ij[positions].astype(np.float32) + np.random.uniform(0., 1., size=[num_points, 2]).astype(np.float32)
+
+
+def _sample_dijkstra_strips_at_ij(patch, i_q, j_q, num_points):
+    # 'dijkstra'-mode replacement for _sample_l_shapes_at_ij: 4 geodesic strips from the
+    # annotated cell, one per cardinal cone; None while the anchor's pools are still being
+    # built in the background. Caller guarantees valid_quad[i_q, j_q].
+    pools = strip_path_pools.get_anchor_path_pools(patch, i_q, j_q)
+    if pools is None:
+        return None
+    return [
+        _sample_points_along_path(pool[np.random.randint(len(pool))], num_points)
+        for pool in pools
+    ]
+
+
 def _sample_strip_ijs(line_valid, seed, fixed_coord, axis, num_points):
     # Sample num_points fractional ijs along the contiguous True run of `line_valid`
     # containing `seed`, fixed at `fixed_coord` along `axis` (axis=0 -> fixed i, varying j;
@@ -118,17 +154,24 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
     if len(patch_indices) == 0:
         raise ValueError('Expected at least one patch index')
 
-    # For each patch, we take one row and one column. _sample_strip_ijs picks a contiguous
-    # subrange of each so unwrap_shifted_radii can reliably handle theta=0 crossings
-    # between consecutive sorted samples.
-
-    # TODO: instead of 'strict' horizontal & vertical strips, could/should take wiggly strips that take a mostly-horizontal
-    #  or mostly-vertical patch between distant points, skirting around gaps/holes; important for long, ragged traces
+    # For each patch, we take one row and one column ('straight' mode; _sample_strip_ijs picks
+    # a contiguous subrange of each) or two wiggly geodesic strips between distant points,
+    # skirting around gaps/holes ('dijkstra' mode; important for long, ragged traces). Either
+    # way each strip is a contiguous walk, so unwrap_shifted_radii can reliably handle
+    # theta=0 crossings between consecutive sorted samples.
 
     if num_points_per_patch is None:
         num_points_per_patch = cfg['num_points_per_patch']
     num_points_per_direction = num_points_per_patch // 2
     N = len(patch_indices)
+
+    use_dijkstra_strips = cfg['patch_strip_sampling'] == 'dijkstra'
+    if use_dijkstra_strips:
+        touched_patches = [patches[patch_idx] for patch_idx in dict.fromkeys(patch_indices)]
+        strip_path_pools.ensure_patch_path_pools(touched_patches)
+        # Submitted before the sampling below so the workers refresh while this step proceeds.
+        for patch in touched_patches:
+            strip_path_pools.submit_patch_pool_refresh(patch)
 
     P = num_points_per_direction
     horizontal_ijs_by_patch = np.empty([N, P, 2], dtype=np.float32)
@@ -141,6 +184,16 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
     var_jitters_v = rand((N, P)).astype(np.float32)
     for n, patch_idx in enumerate(patch_indices):
         patch = patches[patch_idx]
+
+        if use_dijkstra_strips:
+            # Two independent geodesic strips per patch (no horizontal/vertical distinction;
+            # the 'horizontal'/'vertical' arrays are just the two strip slots). Snapshot the
+            # pool once: a background refresh may swap the list, but never mutates it.
+            pool = patch._strip_path_pool
+            path_a, path_b = (pool[k] for k in np.random.choice(len(pool), 2, replace=len(pool) < 2))
+            horizontal_ijs_by_patch[n] = _sample_points_along_path(path_a, P)
+            vertical_ijs_by_patch[n] = _sample_points_along_path(path_b, P)
+            continue
 
         # Horizontal: pick a row uniformly from rows-with-valid-quads, then pick a run
         # within that row weighted by length (matches original `np.random.choice(flatnonzero)`).
@@ -467,11 +520,14 @@ def _sample_single_l_shape(valid_quad, i_q, j_q, leg1_axis, leg1_dir, leg2_dir, 
 
 
 def _sample_l_shapes_at_ij(patch, i, j, num_points):
-    # Sample 4 L-shapes anchored on the annotated point (i, j) of `patch`, one per cardinal
-    # primary direction: right (+j), left (-j), down (+i), up (-i). For each, leg 2's
+    # Sample 4 strips anchored on the annotated point (i, j) of `patch`, one per cardinal
+    # primary direction. In 'dijkstra' mode these are geodesic strips to distant endpoints
+    # (one per cardinal cone; see _sample_dijkstra_strips_at_ij); otherwise L-shapes, one per
+    # primary direction: right (+j), left (-j), down (+i), up (-i). For each L, leg 2's
     # perpendicular direction is chosen uniformly at random. Returns a list of 4 float32
     # [num_points, 2] arrays sampled in traversal order, or None if (i, j) doesn't lie on
-    # a valid quad. Each L is a single contiguous walk in patch space, so the unwrap can
+    # a valid quad (or, in dijkstra mode, while this anchor's path pools are still being
+    # built in the background). Each L is a single contiguous walk in patch space, so the unwrap can
     # handle theta=0 seam crossings along the bent strip just as it does along a straight
     # row/column.
     valid_quad = patch._sampling_valid_quad_mask_np
@@ -480,6 +536,9 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
     j_q = min(max(int(j), 0), W_q - 1)
     if not valid_quad[i_q, j_q]:
         return None
+
+    if cfg['patch_strip_sampling'] == 'dijkstra':
+        return _sample_dijkstra_strips_at_ij(patch, i_q, j_q, num_points)
 
     primary_specs = [(0, +1), (0, -1), (1, +1), (1, -1)]  # (leg1_axis, leg1_dir)
     return [
