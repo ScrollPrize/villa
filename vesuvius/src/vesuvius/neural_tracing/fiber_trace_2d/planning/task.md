@@ -1,13 +1,19 @@
-# NML Fiber Loading With Affine Volume Transforms
+# Replace Dense Disk Strip-Coordinate Cache With Compact In-RAM Fiber-Line Geometry
 
-Extend the fiber trace 2D dataset loader so dataset entries can load Knossos /
-WebKnossos `.nml` fiber annotations such as
-`fibers_s1a_00497z_01497y_03997x_256_v00.nml`.
+Remove the current per-control-point dense strip-coordinate disk cache. It is
+too large because it stores full `H x W x 3` coordinate fields for every CP,
+even though neighboring CPs overlap heavily and the strip grid is derived from
+an interpolated fiber centerline plus frame axes.
 
-The NML coordinates may be in an older source scan frame. Dataset entries must
-be able to specify the same affine volume transform convention already used by
-Lasagna cross-volume data loading so the parsed fiber coordinates are mapped
-into the current Lasagna/base-volume coordinate frame before normal sampling,
-strip construction, prefetch, training, and Trace2CP tooling use them.
+Instead, build one shared compact full-fiber geometry store at loader startup
+and keep it in RAM:
 
-Keep the existing VC3D JSON fiber path working unchanged.
+- one shared cache object per configured dataset/loader process, not duplicated
+  per worker/isolated loader;
+- progress output while startup preprocesses the fibers;
+- direct CP lookup into preprocessed records, with no search in the hot path;
+- compact per-column center/axis data that reconstructs side/top strip grids
+  quickly by broadcast math at sample time;
+- preserve current strip geometry semantics, Lasagna normal ambiguity handling,
+  deterministic sample order, prefetch behavior, training, and visualization
+  outputs.

@@ -180,29 +180,27 @@ The important behavior is:
 - Validates selected base-volume shape against the Lasagna manifest shape.
 - Skips any fiber whose control points are outside the manifest/base-volume
   bounds.
-- Loads only CP-local Lasagna normals needed for the requested strip window.
-- Builds one CP-local source strip with the torch-vectorized augment-vis path,
-  then derives all configured strip-z offsets from that source using the stored
-  strip offset axis.
+- Builds a compact in-RAM fiber-line geometry store at loader startup. Normals
+  are sampled once for each record, valid frame intervals are created, and
+  compact line/frame arrays are then shared read-only by loader clones and
+  threaded workers in the same process.
+- Builds one CP source strip from the compact geometry store with the
+  torch-vectorized augment-vis path, then derives all configured strip-z
+  offsets from that source using the stored strip offset axis.
 - Can derive one top-view patch per loaded CP sample with
   `load_top_batch_for_batch`. That path uses the same VC3D-style top-strip
   `lineSurface` coordinate construction as Trace2CP visualization and reuses
   the CP sample's deterministic geometric/value augmentation parameters. Its
-  source geometry uses separate top-view entries in `strip_coord_cache_dir`
-  with the same payload/cropping semantics as side-view source caches. Runtime
-  preparation mirrors the side-view path: batched augmentation maps, batched
-  coordinate resampling, and grouped `CoordinateSampler.sample_coord_batch`
-  calls. The transformed line and CP pixel coordinates are reused from the
-  center side-strip sample because those pixel-frame coordinates are identical
-  for the same augmentation.
-- Optionally caches CP-local source strip coordinates under
-  `strip_coord_cache_dir`. Cache hits skip local line-window normal sampling and
-  source-grid construction; larger cached source grids are center-cropped for
-  smaller requests. Cached entries also contain source-space line and
-  control-point pixel coordinates for unaugmented patch use. New cache payloads
-  store zyx coordinates and the zyx offset axis only; xyz tensors are derived
-  from those when needed so cache reads avoid redundant arrays while remaining
-  compatible with supported older cache entries.
+  source geometry uses the same compact geometry store as side-view source
+  construction. Runtime preparation mirrors the side-view path: batched
+  augmentation maps, batched coordinate resampling, and grouped
+  `CoordinateSampler.sample_coord_batch` calls. The transformed line and CP
+  pixel coordinates are reused from the center side-strip sample because those
+  pixel-frame coordinates are identical for the same augmentation.
+- Does not use a persistent dense strip-coordinate cache. The old
+  `strip_coord_cache_dir` config key is rejected; dense source coordinates are
+  generated from compact in-RAM frame arrays and then discarded after the
+  batch/source consumer no longer needs them.
 - Keeps source grids, strip-z offset grids, geometric coordinate augmentation,
   and transformed line/control-point coordinates as torch tensors until an
   explicit consumer needs NumPy.
@@ -739,8 +737,9 @@ Top-level keys used by `load_config`:
   the VC3D volume binding when available.
 - `volume_cache_offline`: passed to the Vesuvius Zarr cache opener.
 - `volume_cache_retry_seconds`: passed to the Vesuvius Zarr cache opener.
-- `strip_coord_cache_dir`: optional disk cache for CP-local source strip
-  coordinates. It is separate from the base-volume chunk cache.
+- `strip_coord_cache_dir`: removed. CP-local dense source-coordinate files are
+  no longer read or written; compact fiber-line geometry is built in RAM during
+  loader construction.
 - `augment_*`: parsed into `FiberStripAugmentConfig`.
 - `training`: optional object used by `train.py`; ignored by the loader/debug
   runner config parser.
@@ -1266,9 +1265,9 @@ The runner writes:
 
 With `--augment-profile`, it also prints two timing tables:
 
-- timing table with `descriptor`, `line_window`, `lasagna_normals`,
-  `strip_coords`, `coord_augmentation`, `volume_sample`, `value_augmentation`,
-  `line_coords`, `to_u8`, and `overlay`, plus finer training profile keys such
+- timing table with `descriptor`, `compact_geometry`, `strip_coords`,
+  `coord_augmentation`, `volume_sample`, `value_augmentation`, `line_coords`,
+  `to_u8`, and `overlay`, plus finer training profile keys such
   as `map_build`, `line_lookup`, `line_filter`, `coord_aug_batch`, and
   `value_aug_batch` where those paths are used;
 - volume sampler stats.

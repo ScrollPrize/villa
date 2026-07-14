@@ -39,7 +39,10 @@
 - [x] lets try disabling skew and scale loss (maybe throws off embedding?)
 - [x] for embedding similarity try best along some small z range (and short y as well)
 - [ ] integrate presence in side-z along x,z axis gaussian
-
+- [ ] 3d augmentations special cases
+    - [ ] smooth distortion (dist field in 1 dim, 2 dims and 3d
+    - [ ] blur in isotropic but also anisotropic (directional - 1 dir stronger two others small), and arbitrarily rorated
+    - [ ] ringing artifact?
 
 ## z-search training
 - [ ] Now lets do a modification that re-introduces multiple z-slices again int the training - we see that some difficulty in the embedding is mostly caused by the sample shifting in z

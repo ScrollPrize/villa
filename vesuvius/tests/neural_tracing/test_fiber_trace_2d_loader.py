@@ -5241,6 +5241,7 @@ def test_loader_clone_reuses_records_but_refreshes_samplers(tmp_path: Path) -> N
     assert clone.records[0].sampler is not loader.records[0].sampler
     assert clone._sample_identity_keys is loader._sample_identity_keys
     assert clone._random_pass_cache is loader._random_pass_cache
+    assert clone._geometry_store is loader._geometry_store
 
 
 def test_numpy_sampler_batch_loading_matches_repeated_patch_loading(tmp_path: Path) -> None:
@@ -5264,15 +5265,14 @@ def test_numpy_sampler_batch_loading_matches_repeated_patch_loading(tmp_path: Pa
     assert batch.stats["batch_mode_flattened"] == 1
 
 
-def test_config_parses_strip_coord_cache_dir(tmp_path: Path) -> None:
+def test_config_rejects_strip_coord_cache_dir(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config["strip_coord_cache_dir"] = "coord-cache"
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
-    parsed = load_config(config_path)
-
-    assert parsed.strip_coord_cache_dir == str((tmp_path / "coord-cache").resolve())
+    with pytest.raises(ValueError, match="strip_coord_cache_dir was removed"):
+        load_config(config_path)
 
 
 def test_config_and_loader_batch_shape(tmp_path: Path) -> None:
@@ -5356,8 +5356,7 @@ def test_loader_batch_profile_collects_stage_timings(tmp_path: Path) -> None:
     assert batch.images.shape == (1, 3, 1, 3, 3)
     for key in (
         "descriptor",
-        "line_window",
-        "lasagna_normals",
+        "compact_geometry",
         "strip_coords",
         "coord_augmentation",
         "line_coords",
@@ -5370,13 +5369,11 @@ def test_loader_batch_profile_collects_stage_timings(tmp_path: Path) -> None:
         assert profile[key] >= 0.0
 
 
-def test_training_profile_splits_coord_cache_and_line(capsys: pytest.CaptureFixture[str]) -> None:
+def test_training_profile_splits_compact_geometry_and_line(capsys: pytest.CaptureFixture[str]) -> None:
     stages = _benchmark_stage_totals(
         {
             "descriptor": 1.0,
-            "strip_coord_cache": 2.0,
-            "line_window": 3.0,
-            "lasagna_normals": 4.0,
+            "compact_geometry": 2.0,
             "strip_coords": 5.0,
             "line_coords": 6.0,
             "coord_augmentation": 7.0,
@@ -5391,14 +5388,14 @@ def test_training_profile_splits_coord_cache_and_line(capsys: pytest.CaptureFixt
     output = capsys.readouterr().out
 
     assert stages["descriptor"] == 1.0
-    assert stages["coord_cache"] == 2.0
-    assert stages["source_geom"] == 12.0
+    assert stages["compact_geometry"] == 2.0
+    assert stages["source_geom"] == 5.0
     assert stages["line"] == 6.0
-    assert stages["coord_gen"] == 21.0
+    assert stages["coord_gen"] == 14.0
     assert stages["loader_wall"] == 10.0
     assert stages["loader_worker"] == 25.0
     assert stages["loader_thread_factor"] == 2.5
-    assert "cache" in output
+    assert "geom" in output
     assert "source" in output
     assert "line" in output
     assert "tf" in output
@@ -5422,7 +5419,7 @@ def test_loader_skips_whole_fiber_with_out_of_volume_control_point(tmp_path: Pat
     assert Path(loader.records[0].fiber.path).name == "fiber.json"
 
 
-def test_loader_does_not_sample_normals_for_remote_line_endpoints(tmp_path: Path) -> None:
+def test_loader_tolerates_invalid_remote_line_endpoints_outside_cp_window(tmp_path: Path) -> None:
     points = [[0.0, 20.0, -10.0]]
     points.extend([[float(x), 20.0, 20.0] for x in range(5, 50, 5)])
     fiber = _write_fiber(
@@ -5464,11 +5461,11 @@ def test_loader_does_not_sample_normals_for_remote_line_endpoints(tmp_path: Path
 def test_loader_samples_only_cp_local_lasagna_normals(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    points = [[float(x), 20.0, 20.0] for x in range(0, 90, 10)]
+    points = [[float(x), 20.0, 20.0] for x in range(0, 45, 5)]
     fiber = _write_fiber(
         tmp_path / "fiber.json",
         points=points,
-        control_points=[[40.0, 20.0, 20.0]],
+        control_points=[[20.0, 20.0, 20.0]],
     )
     volume = _write_zarr(tmp_path / "vol.zarr")
     manifest = _write_lasagna_manifest(tmp_path)
@@ -5493,19 +5490,27 @@ def test_loader_samples_only_cp_local_lasagna_normals(
         ),
         encoding="utf-8",
     )
-    loader = _make_loader(load_config(config_path))
     sampled_indices: list[int | None] = []
+    original = FiberStrip2DLoader._lasagna_normal_at_zyx
 
-    def fake_normal(record, point_zyx_base, *, line_point_index=None, control_point_index=None):
+    def fake_normal(self, record, point_zyx_base, *, line_point_index=None, control_point_index=None):
         sampled_indices.append(line_point_index)
-        return np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+        return original(
+            self,
+            record,
+            point_zyx_base,
+            line_point_index=line_point_index,
+            control_point_index=control_point_index,
+        )
 
-    monkeypatch.setattr(loader, "_lasagna_normal_at_zyx", fake_normal)
+    monkeypatch.setattr(FiberStrip2DLoader, "_lasagna_normal_at_zyx", fake_normal)
+    loader = _make_loader(load_config(config_path))
+    startup_indices = list(sampled_indices)
 
     loader.build_center_strip_patch(0)
 
-    assert sampled_indices == [1, 2, 3, 4, 5, 6, 7]
-    assert len(sampled_indices) < len(points)
+    assert startup_indices == list(range(len(points)))
+    assert sampled_indices == list(range(len(points)))
 
 
 def test_augmentation_config_defaults_and_overrides(tmp_path: Path) -> None:
@@ -5922,134 +5927,84 @@ def test_augment_center_patch_loads_one_zarr_sample(
     assert sample.strip_z_offset == 0.0
 
 
-def test_strip_coord_cache_serves_fresh_loader_without_resampling_normals(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    config_path = _write_config(tmp_path, batch_size=1)
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    raw["strip_coord_cache_dir"] = str(tmp_path / "coord-cache")
-    config_path.write_text(json.dumps(raw), encoding="utf-8")
-    config = load_config(config_path)
-    first_loader = _make_loader(config)
-
-    cold_source = first_loader.build_strip_source(0, device=torch.device("cpu"))
-
-    cache_files = sorted((tmp_path / "coord-cache").glob("*/*.npz"))
-    assert len(cache_files) == 1
-
-    warm_loader = _make_loader(config)
-
-    def forbidden(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("Lasagna normals should not be sampled on strip coordinate cache hit")
-
-    monkeypatch.setattr(warm_loader, "_lasagna_normals_for_line_window", forbidden)
-
-    warm_source = warm_loader.build_strip_source(0, device=torch.device("cpu"))
-
-    assert np.allclose(
-        _as_test_numpy(cold_source.grid.coords_zyx),
-        _as_test_numpy(warm_source.grid.coords_zyx),
-    )
-    assert np.array_equal(
-        _as_test_numpy(cold_source.grid.valid_mask),
-        _as_test_numpy(warm_source.grid.valid_mask),
-    )
-    assert np.allclose(
-        _as_test_numpy(cold_source.source_line_xy),
-        _as_test_numpy(warm_source.source_line_xy),
-    )
-    assert np.allclose(
-        _as_test_numpy(cold_source.source_control_point_xy),
-        _as_test_numpy(warm_source.source_control_point_xy),
-    )
-
-
 def _as_test_numpy(value: torch.Tensor) -> np.ndarray:
     return value.detach().cpu().numpy()
 
 
-def test_strip_coord_cache_larger_source_satisfies_smaller_request(
+def test_compact_geometry_rebuilds_source_without_disk_cache(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    raw["strip_coord_cache_dir"] = str(tmp_path / "coord-cache")
-    raw["patch_shape_hw"] = [7, 7]
-    config_path.write_text(json.dumps(raw), encoding="utf-8")
-    large_config = load_config(config_path)
-    large_loader = _make_loader(large_config)
-    large_source = large_loader.build_strip_source(0, device=torch.device("cpu"))
-    assert large_source.grid.coords_zyx.shape[:2] == (7, 7)
+    config = load_config(config_path)
+    first_loader = _make_loader(config)
+    first_source = first_loader.build_strip_source(0, device=torch.device("cpu"))
 
-    raw["patch_shape_hw"] = [3, 3]
-    config_path.write_text(json.dumps(raw), encoding="utf-8")
-    small_config = load_config(config_path)
-    small_loader = _make_loader(small_config)
+    second_loader = _make_loader(config)
 
     def forbidden(*args, **kwargs):
         del args, kwargs
-        raise AssertionError("smaller strip source should be served from larger cached entry")
+        raise AssertionError("source construction should use compact geometry, not line-window normal sampling")
 
-    monkeypatch.setattr(small_loader, "_lasagna_normals_for_line_window", forbidden)
+    monkeypatch.setattr(second_loader, "_lasagna_normals_for_line_window", forbidden)
+    second_source = second_loader.build_strip_source(0, device=torch.device("cpu"))
 
+    assert np.allclose(
+        _as_test_numpy(first_source.grid.coords_zyx),
+        _as_test_numpy(second_source.grid.coords_zyx),
+    )
+    assert np.array_equal(
+        _as_test_numpy(first_source.grid.valid_mask),
+        _as_test_numpy(second_source.grid.valid_mask),
+    )
+    assert np.allclose(
+        _as_test_numpy(second_source.source_control_point_xy),
+        np.asarray([1.0, 1.0], dtype=np.float32),
+    )
+    assert not list(tmp_path.glob("coord-cache/**/*.npz"))
+
+
+def test_compact_geometry_source_shapes_are_generated_directly(tmp_path: Path) -> None:
+    large_dir = tmp_path / "large"
+    small_dir = tmp_path / "small"
+    large_dir.mkdir()
+    small_dir.mkdir()
+    large_path = _write_config(large_dir, batch_size=1)
+    raw = json.loads(large_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [7, 7]
+    large_path.write_text(json.dumps(raw), encoding="utf-8")
+    large_loader = _make_loader(load_config(large_path))
+    large_source = large_loader.build_strip_source(0, device=torch.device("cpu"))
+
+    small_path = _write_config(small_dir, batch_size=1)
+    small_loader = _make_loader(load_config(small_path))
     small_source = small_loader.build_strip_source(0, device=torch.device("cpu"))
 
+    assert large_source.grid.coords_zyx.shape[:2] == (7, 7)
     assert small_source.grid.coords_zyx.shape[:2] == (3, 3)
-    assert np.allclose(
-        _as_test_numpy(small_source.grid.coords_zyx),
-        _as_test_numpy(large_source.grid.coords_zyx)[2:5, 2:5],
-    )
-    assert np.allclose(
-        _as_test_numpy(small_source.source_line_xy),
-        np.asarray([[0.0, 1.0], [1.0, 1.0], [2.0, 1.0]], dtype=np.float32),
-    )
     assert np.allclose(
         _as_test_numpy(small_source.source_control_point_xy),
         np.asarray([1.0, 1.0], dtype=np.float32),
     )
 
 
-def test_top_strip_coord_cache_serves_fresh_loader_without_resampling_normals(
+def test_top_source_uses_compact_geometry_without_resampling_normals(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    config_path = _write_config(tmp_path, batch_size=1)
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    raw["strip_coord_cache_dir"] = str(tmp_path / "coord-cache")
-    config_path.write_text(json.dumps(raw), encoding="utf-8")
-    config = load_config(config_path)
-    first_loader = _make_loader(config)
-
-    cold_source = first_loader.build_top_strip_source(0, device=torch.device("cpu"))
-
-    cache_files = sorted((tmp_path / "coord-cache").glob("*/*.npz"))
-    assert len(cache_files) == 1
-
-    warm_loader = _make_loader(config)
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
 
     def forbidden(*args, **kwargs):
         del args, kwargs
-        raise AssertionError("Lasagna normals should not be sampled on top coordinate cache hit")
+        raise AssertionError("top source construction should use compact geometry")
 
-    monkeypatch.setattr(warm_loader, "_lasagna_normals_for_line_window", forbidden)
+    monkeypatch.setattr(loader, "_lasagna_normals_for_line_window", forbidden)
 
-    warm_source = warm_loader.build_top_strip_source(0, device=torch.device("cpu"))
+    source = loader.build_top_strip_source(0, device=torch.device("cpu"))
 
+    assert source.grid.coords_zyx.shape[:2] == (3, 3)
+    assert source.grid.valid_mask.shape == (3, 3)
     assert np.allclose(
-        _as_test_numpy(cold_source.grid.coords_zyx),
-        _as_test_numpy(warm_source.grid.coords_zyx),
-    )
-    assert np.array_equal(
-        _as_test_numpy(cold_source.grid.valid_mask),
-        _as_test_numpy(warm_source.grid.valid_mask),
-    )
-    assert np.allclose(
-        _as_test_numpy(cold_source.source_line_xy),
-        _as_test_numpy(warm_source.source_line_xy),
-    )
-    assert np.allclose(
-        _as_test_numpy(cold_source.source_control_point_xy),
-        _as_test_numpy(warm_source.source_control_point_xy),
+        _as_test_numpy(source.source_control_point_xy),
+        np.asarray([1.0, 1.0], dtype=np.float32),
     )
 
 

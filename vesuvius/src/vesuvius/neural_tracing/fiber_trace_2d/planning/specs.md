@@ -15,16 +15,31 @@
 - Neighboring strip-z context is represented as separate 2D patches.
 - The default strip-z offset settings are `strip_z_offset_count=16` and `strip_z_offset_step=1.0`, generating `-7..8` selected-scale offsets and giving 16 patches per selected control point.
 - Lasagna normals are used where needed to construct aligned strip frames.
-- For a selected control point, the loader computes the CP-local line window that can affect the requested strip width plus interpolation/frame margin, and samples Lasagna normals only for that local window.
-- Fiber endpoints or other distant line points outside the CP-local window must not be touched while loading that CP-local patch.
-- If a line point inside the CP-local window cannot be sampled from the Lasagna manifest channels, the loader must not fabricate or propagate a replacement normal.
+- At loader startup, the loader builds one shared compact in-RAM fiber-line
+  geometry store for all configured records. It samples Lasagna normals once
+  for each fiber line point, builds valid contiguous frame intervals, and keeps
+  compact per-line/frame arrays read-only for the rest of the process.
+- The compact geometry store is shared by all threaded loader workers and
+  cloned loaders in one process. `fiber_trace_2d` training does not currently
+  use DDP or `torch.distributed`; this task must not introduce per-worker
+  duplicated compact geometry.
+- Runtime side/top source-grid construction looks up the record/control-point
+  entry directly, evaluates only the requested source columns from the compact
+  frame arrays, and broadcasts rows by frame axes. It must not write/read a
+  dense per-CP coordinate cache.
+- If a line point required by a CP source window cannot be sampled from the
+  Lasagna manifest channels, the loader must not fabricate or propagate a
+  replacement normal. That CP is invalid and is skipped by training/prefetch in
+  deterministic stream order.
 - During prefetch and training batch assembly, invalid CP-local samples caused by Lasagna channel data such as missing samples or in-bounds `grad_mag == 0` are skipped and reported, then the deterministic sample stream advances to the next sample.
 - Fatal prefetch/training errors are infrastructure or programming failures such as missing APIs, broken bindings, interrupts, memory errors, or unexpected internal exceptions; those should stop the run rather than being hidden as data skips.
 - VC3D side-strip/surface/segment sampling semantics define patch coordinates.
 - Strip centerlines are sampled from all `line_points` with cubic Hermite interpolation over arc length; control points only select the strip anchor.
 - The coordinate construction must be equivalent to VC3D side strips; flat planar patch simplifications are not acceptable except where they match the VC3D algorithm for that case.
 - The implementation should reuse/export VC3D side-strip coordinate APIs when possible, or port the same algorithm with only small rounding/interpolation differences.
-- Dense side-strip coordinate generation may use torch vectorization for per-pixel Hermite interpolation and normal interpolation, but it must preserve the existing VC3D/Lasagna frame construction semantics.
+- Source-strip coordinate generation may use torch vectorization for Hermite
+  interpolation and normal interpolation, but it must preserve the existing
+  VC3D/Lasagna frame construction semantics.
 - Dense source-strip coordinates, strip-z offset coordinates, geometric coordinate augmentation, and transformed line/control-point coordinates stay as torch tensors on the configured augmentation device until an explicit NumPy consumer boundary.
 - The explicit NumPy boundaries are VC3D coordinate sampling, runner/PIL visualization/export, and sample metadata arrays. The loader must not repeatedly convert coordinates between NumPy and torch inside one source/augmentation path.
 - The augment-vis source/patch path is the canonical loader path for runner exports, training batch loading, and prefetch coordinate generation.
@@ -34,38 +49,11 @@
   `augment_device` for torch coordinate generation. With the example config,
   `augment_device: "auto"` uses CUDA when available. Prefetch dependency
   generation is the exception and stays CPU-pinned.
-- The loader builds CP-local source geometry once per selected control point and reuses it across augmentation variants or strip-z offsets as appropriate.
-- When `strip_coord_cache_dir` is configured, CP-local source geometry is cached
-  before strip-z offsets, coordinate augmentation, image sampling, or value
-  augmentation are applied. Training, augment-vis, runner center/line/dir
-  visualizations, and prefetch all use this cache through the shared
-  source-strip path.
-- Strip-coordinate cache entries include source-space line pixel coordinates
-  and source-space control-point pixel coordinates. Unaugmented patches reuse
-  those cached line/CP coordinates directly; augmented patches still compute
-  transformed output line/CP coordinates per patch because they depend on the
-  augmentation draw.
-- Strip-coordinate cache identity is based on the base-volume path, selected
-  scale and pixel spacing, strip-z offset step/center, control-point 3D
-  coordinate, and fiber-line identity. The requested source size is stored in
-  entry metadata rather than isolated into incompatible files so larger source
-  entries can satisfy smaller later requests for the same identity.
-- Top-view source-coordinate cache entries use the same cache payload and
-  larger-entry cropping semantics as side-view entries, but a separate
-  view-specific identity. Existing side-view cache keys remain stable and must
-  not be invalidated by adding top-view cache support.
-- A strip-coordinate cache entry with height and width greater than or equal to
-  the requested source size is a hit. The loader center-crops the cached source
-  grid to the requested size. If a larger source is generated later, it
-  atomically replaces the previous smaller entry.
-- Strip-coordinate cache writes use unique temporary files in the cache
-  directory followed by atomic rename. Corrupt or incompatible entries are
-  treated as misses and regenerated through the normal Lasagna/strip-coordinate
-  path. The current payload stores the zyx source coordinates, valid mask,
-  zyx offset axis, source-space line/CP pixels, and strip frame; xyz arrays are
-  derived from zyx when needed instead of stored redundantly. The cache key
-  remains compatible with the previous source-cache identity so existing
-  entries are reused where their payload version is supported.
+- The loader builds source geometry from the compact in-RAM store for each
+  selected CP and reuses that source across augmentation variants and strip-z
+  offsets as appropriate. Source-space line pixel coordinates remain the full
+  per-column centerline used by training visualization, while volume sampling
+  coordinates come from compact frame interpolation.
 - Image loading samples base-volume Zarr values from explicit coordinates.
 - Training/export coordinate sampling uses the VC3D blocking coordinate sampler: required chunks are collected and fetched/decoded before sampling, so a cold cache miss must not become an invalid output pixel.
 - Interactive/progressive VC3D `tryGetChunk` semantics are not acceptable for this loader path because they can queue I/O and return an all-invalid first sample.
@@ -84,7 +72,12 @@
   functionally valid because every output pixel samples from explicit 3D
   coordinates; only request traversal and cache/chunk locality may change.
 - Dataset and loader settings are specified in Vesuvius-style JSON.
-- Config keys include `datasets`, `batch_size`, `patch_shape_hw`, `strip_z_offset_count`, `strip_z_offset_step`, `seed`, `loader_workers`, `prefetch_workers`, `prefetch_sampler_workers`, `volume_cache_dir`, optional `volume_cache_memory_mib`, optional `volume_io_threads`, optional `strip_coord_cache_dir`, and optional cache settings.
+- Config keys include `datasets`, `batch_size`, `patch_shape_hw`,
+  `strip_z_offset_count`, `strip_z_offset_step`, `seed`, `loader_workers`,
+  `prefetch_workers`, `prefetch_sampler_workers`, `volume_cache_dir`, optional
+  `volume_cache_memory_mib`, optional `volume_io_threads`, and optional volume
+  cache settings. `strip_coord_cache_dir` has been removed and must be rejected
+  if present.
 - Augmentation config keys include `augment_enabled`, `augment_device`, `augment_seed`, `augment_shift_x`, `augment_shift_y`, `augment_rotation_degrees`, `augment_shear_x`, `augment_shear_y`, `augment_scale_min`, `augment_scale_max`, `augment_smooth_offset`, `augment_smooth_offset_stride`, `augment_brightness`, `augment_contrast_min`, `augment_contrast_max`, `augment_gamma_min`, `augment_gamma_max`, `augment_noise_std`, and `augment_blur_sigma`.
 - Default augmentation extrema are `+-patch_width/4` px horizontal offset, `+-patch_height/4` px vertical offset, `+-180` degree rotation, `+-1` px/px shear, `sqrt(0.5)x..sqrt(2.0)x` scale, smooth curve offset up to `+-8` px with 16 px control stride, `+-0.25` valid-range brightness offset, `0.5x..2.0x` contrast around the valid patch center, `0.5..2.0` gamma, valid-range-relative noise std up to `0.125`, and Gaussian blur sigma up to `2.0`.
 - Geometric strip augmentations operate on strip coordinates before image sampling.

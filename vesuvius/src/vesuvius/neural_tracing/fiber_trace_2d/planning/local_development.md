@@ -166,12 +166,12 @@ build CP-local source strips and collect chunk dependencies. Prefetch
 temporarily forces PyTorch CPU intra-op threads to `1` and restores the previous
 value afterward, so each producer does not fan out over the full machine.
 
-`strip_coord_cache_dir` enables a separate CP-local source-coordinate cache.
-This is not the remote Zarr chunk cache. It stores the torch-vectorized source
-strip coordinates before strip-z offsets, image sampling, and augmentations, and
-is used by training, augment-vis, line/dir visualizations, and prefetch through
-the shared loader source path. Larger cached source strips satisfy smaller
-source-size requests by center-cropping.
+The old `strip_coord_cache_dir` CP-local dense source-coordinate cache has been
+removed. The loader now builds a compact in-RAM fiber-line geometry store at
+startup. The populated geometry is shared by cloned/threaded loaders inside the
+process. This is separate from the remote Zarr chunk cache under
+`volume_cache_dir`, which remains the only persistent cache used for volume
+chunks.
 
 ## Focused Test Command
 

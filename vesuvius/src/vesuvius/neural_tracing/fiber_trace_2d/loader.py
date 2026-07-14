@@ -30,9 +30,13 @@ from vesuvius.data.affine import read_transform_json
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import Vc3dFiber, load_fiber_file
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     FiberStripFrame,
+    FiberStripFrameArrays,
     FiberStripGridTorch,
     FiberStripLineWindow,
+    build_side_strip_frame_arrays,
+    build_side_strip_patch_grid_tensor_from_frame_arrays,
     build_side_strip_patch_grid_tensor_from_line_window,
+    build_top_strip_patch_grid_tensor_from_frame_arrays,
     build_top_strip_patch_grid_tensor_from_line_window,
     control_point_line_index,
     side_strip_segment_line_window,
@@ -66,12 +70,6 @@ from vesuvius.neural_tracing.fiber_trace_2d.sampling import CoordinateSampler, m
 
 
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
-_STRIP_COORD_CACHE_VERSION = "fiber_strip_2d_source_v3"
-_STRIP_COORD_CACHE_KEY_VERSION = "fiber_strip_2d_source_v2"
-_SUPPORTED_STRIP_COORD_CACHE_VERSIONS = {
-    _STRIP_COORD_CACHE_KEY_VERSION,
-    _STRIP_COORD_CACHE_VERSION,
-}
 
 
 @dataclass(frozen=True)
@@ -90,7 +88,6 @@ class FiberStrip2DConfig:
     volume_io_threads: int | None = None
     volume_cache_offline: bool = False
     volume_cache_retry_seconds: float = 0.0
-    strip_coord_cache_dir: str | None = None
     augment: FiberStripAugmentConfig = FiberStripAugmentConfig()
     config_dir: Path | None = None
     suppress_record_warnings: bool = False
@@ -177,6 +174,53 @@ class _Record:
     nx_spacing_base: float | None
     ny_spacing_base: float | None
     dataset_config: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _FiberLineGeometryInterval:
+    start_index: int
+    end_index: int
+    start_arc: float
+    frame_arrays: FiberStripFrameArrays
+
+
+@dataclass(frozen=True)
+class _FiberLineGeometry:
+    record_index: int
+    cumulative: np.ndarray
+    control_line_indices: np.ndarray
+    normals_xyz: np.ndarray
+    normal_valid: np.ndarray
+    intervals: tuple[_FiberLineGeometryInterval, ...]
+    cp_interval_indices: np.ndarray
+    cp_valid: np.ndarray
+    invalid_cp_reasons: tuple[str, ...]
+
+    def interval_for_control_point(self, control_point_index: int) -> _FiberLineGeometryInterval:
+        cp_index = int(control_point_index)
+        if cp_index < 0 or cp_index >= int(self.cp_valid.shape[0]):
+            raise IndexError(cp_index)
+        interval_index = int(self.cp_interval_indices[cp_index])
+        if not bool(self.cp_valid[cp_index]) or interval_index < 0:
+            reason = self.invalid_cp_reasons[cp_index] if cp_index < len(self.invalid_cp_reasons) else ""
+            raise ValueError(
+                "fiber control point has no valid compact line geometry"
+                + (f": {reason}" if reason else "")
+            )
+        return self.intervals[interval_index]
+
+    def anchor_arc_for_control_point(self, control_point_index: int) -> float:
+        return float(self.cumulative[int(self.control_line_indices[int(control_point_index)])])
+
+
+@dataclass
+class _FiberLineGeometryStore:
+    by_record_index: list[_FiberLineGeometry | None]
+    by_fiber_identity: dict[str, _FiberLineGeometry]
+    lock: threading.Lock
+    memory_bytes: int
+    valid_control_points: int
+    skipped_control_points: int
 
 
 @dataclass(frozen=True)
@@ -416,7 +460,10 @@ def load_config(path: str | Path) -> FiberStrip2DConfig:
         volume_io_threads = int(volume_io_threads)
         if volume_io_threads <= 0:
             raise ValueError("volume_io_threads must be positive when provided")
-    strip_coord_cache_dir = raw.get("strip_coord_cache_dir")
+    if "strip_coord_cache_dir" in raw:
+        raise ValueError(
+            "strip_coord_cache_dir was removed; compact fiber-line geometry is built in RAM during loader construction"
+        )
     return FiberStrip2DConfig(
         datasets=tuple(dict(entry) for entry in datasets),
         batch_size=int(raw.get("batch_size", 1)),
@@ -432,11 +479,6 @@ def load_config(path: str | Path) -> FiberStrip2DConfig:
         volume_io_threads=volume_io_threads,
         volume_cache_offline=bool(raw.get("volume_cache_offline", False)),
         volume_cache_retry_seconds=float(raw.get("volume_cache_retry_seconds", 0.0)),
-        strip_coord_cache_dir=(
-            None
-            if strip_coord_cache_dir is None
-            else _resolve_path(strip_coord_cache_dir, config_path.parent)
-        ),
         augment=augment_config_from_mapping(raw),
         config_dir=config_path.parent,
     )
@@ -1020,6 +1062,7 @@ class FiberStrip2DLoader:
         *,
         sampler_factory: SamplerFactory | None = None,
         records: tuple[_Record, ...] | list[_Record] | None = None,
+        geometry_store: _FiberLineGeometryStore | None = None,
         sample_identity_keys: tuple[str, ...] | None = None,
         random_pass_cache: dict[int, np.ndarray] | None = None,
         random_pass_cache_lock: threading.Lock | None = None,
@@ -1058,6 +1101,13 @@ class FiberStrip2DLoader:
         self._loader_executor: ThreadPoolExecutor | None = None
         self._loader_executor_workers = 0
         self._loader_executor_lock = threading.Lock()
+        self._geometry_store = (
+            self._initialize_fiber_line_geometry_store()
+            if geometry_store is None
+            else geometry_store
+        )
+        if len(self._geometry_store.by_record_index) != len(self.records):
+            raise ValueError("geometry_store record count does not match loader records")
 
     def close(self) -> None:
         with self._loader_executor_lock:
@@ -1086,6 +1136,7 @@ class FiberStrip2DLoader:
             clone_config,
             sampler_factory=self._sampler_factory,
             records=self._clone_records_with_local_samplers(clone_config),
+            geometry_store=self._geometry_store,
             sample_identity_keys=self._sample_identity_keys,
             random_pass_cache=self._random_pass_cache,
             random_pass_cache_lock=self._random_pass_cache_lock,
@@ -1234,6 +1285,253 @@ class FiberStrip2DLoader:
         if not records:
             raise ValueError("no fiber records loaded")
         return records
+
+    @staticmethod
+    def _array_nbytes(value: np.ndarray) -> int:
+        return int(getattr(value, "nbytes", 0))
+
+    def _geometry_memory_bytes(self, geometry: _FiberLineGeometry) -> int:
+        memory_bytes = (
+            self._array_nbytes(geometry.cumulative)
+            + self._array_nbytes(geometry.control_line_indices)
+            + self._array_nbytes(geometry.normals_xyz)
+            + self._array_nbytes(geometry.normal_valid)
+            + self._array_nbytes(geometry.cp_interval_indices)
+            + self._array_nbytes(geometry.cp_valid)
+        )
+        for interval in geometry.intervals:
+            arrays = interval.frame_arrays
+            memory_bytes += (
+                self._array_nbytes(arrays.points_xyz)
+                + self._array_nbytes(arrays.cumulative)
+                + self._array_nbytes(arrays.derivatives)
+                + self._array_nbytes(arrays.frame_normals_xyz)
+                + self._array_nbytes(arrays.frame_sides_xyz)
+            )
+        return int(memory_bytes)
+
+    @staticmethod
+    def _store_geometry(
+        store: _FiberLineGeometryStore,
+        record: _Record,
+        *,
+        record_index: int,
+        geometry: _FiberLineGeometry,
+        memory_bytes: int,
+    ) -> None:
+        valid_cps = int(np.count_nonzero(geometry.cp_valid))
+        skipped_cps = int(geometry.cp_valid.size - valid_cps)
+        store.by_record_index[int(record_index)] = geometry
+        store.by_fiber_identity[record.fiber_identity] = geometry
+        store.memory_bytes += int(memory_bytes)
+        store.valid_control_points += int(valid_cps)
+        store.skipped_control_points += int(skipped_cps)
+
+    def _line_window_bounds_for_control_point(
+        self,
+        record: _Record,
+        *,
+        control_point_index: int,
+        source_shape_hw: tuple[int, int],
+    ) -> tuple[int, int]:
+        line_window = self._line_window_for_patch(
+            record,
+            control_point_index=int(control_point_index),
+            patch_shape_hw=source_shape_hw,
+        )
+        indices = np.asarray(line_window.original_line_indices, dtype=np.int64)
+        return int(indices[0]), int(indices[-1])
+
+    @staticmethod
+    def _interval_index_for_line_range(
+        intervals: tuple[_FiberLineGeometryInterval, ...],
+        *,
+        start_index: int,
+        end_index: int,
+    ) -> int:
+        for interval_index, interval in enumerate(intervals):
+            if int(start_index) >= interval.start_index and int(end_index) < interval.end_index:
+                return int(interval_index)
+        return -1
+
+    def _build_geometry_for_record(
+        self,
+        record: _Record,
+        record_index: int,
+        *,
+        source_shape_hw: tuple[int, int],
+    ) -> _FiberLineGeometry:
+        line_points = np.asarray(record.fiber.line_points_xyz, dtype=np.float64)
+        if line_points.ndim != 2 or line_points.shape[1] != 3 or line_points.shape[0] == 0:
+            raise ValueError("fiber points must have shape [N,3] with N > 0")
+        cumulative = self._line_arc_lengths(line_points)
+        normals = np.full((int(line_points.shape[0]), 3), np.nan, dtype=np.float32)
+        normal_valid = np.zeros((int(line_points.shape[0]),), dtype=bool)
+        invalid_by_line: dict[int, str] = {}
+        for line_index, point_xyz in enumerate(line_points):
+            try:
+                normals[line_index] = self._lasagna_normal_at_zyx(
+                    record,
+                    point_xyz[[2, 1, 0]],
+                    line_point_index=int(line_index),
+                    control_point_index=None,
+                )
+                normal_valid[line_index] = True
+            except ValueError as exc:
+                invalid_by_line[int(line_index)] = str(exc)
+
+        intervals_list: list[_FiberLineGeometryInterval] = []
+        start: int | None = None
+        for index, is_valid in enumerate(normal_valid.tolist() + [False]):
+            if is_valid and start is None:
+                start = int(index)
+            elif not is_valid and start is not None:
+                end = int(index)
+                points_slice = line_points[start:end]
+                normals_slice = normals[start:end]
+                frame_arrays = build_side_strip_frame_arrays(
+                    points_slice,
+                    sampled_normals=normals_slice,
+                )
+                intervals_list.append(
+                    _FiberLineGeometryInterval(
+                        start_index=int(start),
+                        end_index=int(end),
+                        start_arc=float(cumulative[start]),
+                        frame_arrays=frame_arrays,
+                    )
+                )
+                start = None
+        intervals = tuple(intervals_list)
+
+        control_points = np.asarray(record.fiber.control_points_xyz, dtype=np.float64)
+        control_line_indices = np.full((int(control_points.shape[0]),), -1, dtype=np.int64)
+        cp_interval_indices = np.full((int(control_points.shape[0]),), -1, dtype=np.int64)
+        cp_valid = np.zeros((int(control_points.shape[0]),), dtype=bool)
+        invalid_reasons: list[str] = []
+        for cp_index in range(int(control_points.shape[0])):
+            reason = ""
+            try:
+                line_index = control_point_line_index(record.fiber, int(cp_index))
+                control_line_indices[cp_index] = int(line_index)
+                start_index, end_index = self._line_window_bounds_for_control_point(
+                    record,
+                    control_point_index=int(cp_index),
+                    source_shape_hw=source_shape_hw,
+                )
+                interval_index = self._interval_index_for_line_range(
+                    intervals,
+                    start_index=start_index,
+                    end_index=end_index,
+                )
+                if interval_index < 0:
+                    missing = [
+                        idx
+                        for idx in range(int(start_index), int(end_index) + 1)
+                        if idx in invalid_by_line
+                    ]
+                    if missing:
+                        first = int(missing[0])
+                        reason = f"invalid Lasagna normal in source window at line_index={first}"
+                    else:
+                        reason = (
+                            "source window crosses a compact geometry interval boundary "
+                            f"line_range={start_index}:{end_index}"
+                        )
+                else:
+                    cp_interval_indices[cp_index] = int(interval_index)
+                    cp_valid[cp_index] = True
+            except (IndexError, ValueError) as exc:
+                reason = str(exc)
+            invalid_reasons.append(reason)
+        return _FiberLineGeometry(
+            record_index=int(record_index),
+            cumulative=cumulative.astype(np.float64, copy=False),
+            control_line_indices=control_line_indices,
+            normals_xyz=normals,
+            normal_valid=normal_valid,
+            intervals=intervals,
+            cp_interval_indices=cp_interval_indices,
+            cp_valid=cp_valid,
+            invalid_cp_reasons=tuple(invalid_reasons),
+        )
+
+    def _initialize_fiber_line_geometry_store(self) -> _FiberLineGeometryStore:
+        total_records = len(self.records)
+        source_shape_hw = self._source_shape_hw(use_augmentation_envelope=True)
+        store = _FiberLineGeometryStore(
+            by_record_index=[None] * total_records,
+            by_fiber_identity={},
+            lock=threading.Lock(),
+            memory_bytes=0,
+            valid_control_points=0,
+            skipped_control_points=0,
+        )
+        if total_records == 0:
+            return store
+        start_time = time.perf_counter()
+        last_print_time = 0.0
+        bar_width = 24
+        show_progress = total_records > 1 and not self.config.suppress_record_warnings
+        if show_progress:
+            print(
+                "fiber_trace_2d geometry: building shared compact in-RAM fiber-line store "
+                f"records={total_records} source_hw={source_shape_hw}",
+                flush=True,
+            )
+        for record_index, record in enumerate(self.records):
+            geometry = self._build_geometry_for_record(
+                record,
+                int(record_index),
+                source_shape_hw=source_shape_hw,
+            )
+            memory_bytes = self._geometry_memory_bytes(geometry)
+            self._store_geometry(
+                store,
+                record,
+                record_index=int(record_index),
+                geometry=geometry,
+                memory_bytes=memory_bytes,
+            )
+            if show_progress:
+                now = time.perf_counter()
+                done = int(record_index) + 1
+                if done == total_records or (now - last_print_time) >= 1.0:
+                    elapsed = max(now - start_time, 1.0e-9)
+                    rate = done / elapsed
+                    remaining = max(total_records - done, 0)
+                    eta = remaining / rate if rate > 0.0 else 0.0
+                    filled = int(math.floor(bar_width * done / max(total_records, 1)))
+                    bar = "#" * filled + "-" * (bar_width - filled)
+                    print(
+                        "\r"
+                        f"fiber_trace_2d geometry[{bar}] {done}/{total_records} "
+                        f"eta={_format_seconds(eta)} "
+                        f"valid_cps={store.valid_control_points} "
+                        f"skipped_cps={store.skipped_control_points} "
+                        f"mem={store.memory_bytes / (1024.0 * 1024.0):.1f}MiB",
+                        end="" if done < total_records else "\n",
+                        flush=True,
+                    )
+                    last_print_time = now
+        if show_progress:
+            elapsed = max(time.perf_counter() - start_time, 1.0e-9)
+            print(
+                "fiber_trace_2d geometry: built shared compact in-RAM fiber-line store "
+                f"records={total_records} valid_cps={store.valid_control_points} "
+                f"skipped_cps={store.skipped_control_points} "
+                f"mem={store.memory_bytes / (1024.0 * 1024.0):.1f}MiB "
+                f"elapsed={_format_seconds(elapsed)}",
+                flush=True,
+            )
+        return store
+
+    def _geometry_for_record(self, record: _Record, record_index: int) -> _FiberLineGeometry:
+        del record
+        existing = self._geometry_store.by_record_index[int(record_index)]
+        if existing is None:
+            raise RuntimeError(f"compact geometry was not built for record {int(record_index)}")
+        return existing
 
     @property
     def sample_count(self) -> int:
@@ -1670,6 +1968,28 @@ class FiberStrip2DLoader:
         *,
         control_point_index: int | None = None,
     ) -> np.ndarray:
+        geometry = getattr(self, "_geometry_store", None)
+        if geometry is not None:
+            cached = geometry.by_fiber_identity.get(record.fiber_identity)
+            if cached is not None:
+                indices = np.asarray(line_window.original_line_indices, dtype=np.int64)
+                if bool(np.all((indices >= 0) & (indices < cached.normal_valid.shape[0]))):
+                    invalid = indices[~cached.normal_valid[indices]]
+                    if invalid.size == 0:
+                        return np.asarray(cached.normals_xyz[indices], dtype=np.float32)
+                    first = int(invalid[0])
+                    point_xyz = np.asarray(record.fiber.line_points_xyz[first], dtype=np.float64)
+                    raise ValueError(
+                        "cached compact geometry has invalid Lasagna normal for requested line window: "
+                        + self._normal_sample_context(
+                            record,
+                            point_xyz[[2, 1, 0]],
+                            channel="grad_mag",
+                            spacing_base=record.grad_mag_spacing_base,
+                            line_point_index=first,
+                            control_point_index=control_point_index,
+                        )
+                    )
         normals = []
         for local_index, point_xyz in enumerate(np.asarray(line_window.line_points_xyz, dtype=np.float64)):
             line_point_index = int(line_window.original_line_indices[local_index])
@@ -1798,205 +2118,6 @@ class FiberStrip2DLoader:
             int(self.config.patch_shape_hw[1]) + 2 * pad.x,
         )
 
-    def _strip_coord_cache_path(
-        self,
-        record: _Record,
-        *,
-        control_point_index: int,
-        center_offset: float,
-        view: str = "side",
-    ) -> Path | None:
-        if self.config.strip_coord_cache_dir is None:
-            return None
-        cp_xyz = np.asarray(record.fiber.control_points_xyz[control_point_index], dtype=np.float64)
-        view_key = str(view)
-        if view_key == "side":
-            family_key = _stable_digest(
-                _STRIP_COORD_CACHE_KEY_VERSION,
-                record.volume_path,
-                record.volume_scale,
-                f"{record.volume_spacing_base:.12g}",
-                f"{float(center_offset):.12g}",
-                f"{float(self.config.strip_z_offset_step):.12g}",
-                record.fiber_identity,
-                control_point_index,
-                _round_json_array(cp_xyz),
-            )
-        else:
-            family_key = _stable_digest(
-                _STRIP_COORD_CACHE_KEY_VERSION,
-                f"view:{view_key}",
-                record.volume_path,
-                record.volume_scale,
-                f"{record.volume_spacing_base:.12g}",
-                f"{float(center_offset):.12g}",
-                record.fiber_identity,
-                control_point_index,
-                _round_json_array(cp_xyz),
-            )
-        root = Path(self.config.strip_coord_cache_dir)
-        return root / family_key[:2] / f"{family_key}.npz"
-
-    @staticmethod
-    def _crop_cached_source(
-        grid: FiberStripGridTorch,
-        source_line_xy: torch.Tensor,
-        source_control_point_xy: torch.Tensor,
-        cached_shape_hw: tuple[int, int],
-        shape_hw: tuple[int, int],
-    ) -> tuple[FiberStripGridTorch, torch.Tensor, torch.Tensor]:
-        cached_h, cached_w = (int(v) for v in cached_shape_hw)
-        height, width = (int(v) for v in shape_hw)
-        if cached_h < height or cached_w < width:
-            raise ValueError("cached source shape is smaller than requested source shape")
-        y0 = (cached_h - height) // 2
-        x0 = (cached_w - width) // 2
-        y1 = y0 + height
-        x1 = x0 + width
-
-        def crop_tensor(value: torch.Tensor | None) -> torch.Tensor | None:
-            if value is None:
-                return None
-            return value[y0:y1, x0:x1].contiguous()
-
-        cropped = FiberStripGridTorch(
-            coords_xyz=crop_tensor(grid.coords_xyz),
-            coords_zyx=crop_tensor(grid.coords_zyx),
-            valid_mask=crop_tensor(grid.valid_mask),
-            frame=grid.frame,
-            offset_axis_xyz=crop_tensor(grid.offset_axis_xyz),
-            offset_axis_zyx=crop_tensor(grid.offset_axis_zyx),
-            side_axis_xyz=crop_tensor(grid.side_axis_xyz),
-            side_axis_zyx=crop_tensor(grid.side_axis_zyx),
-        )
-        line = source_line_xy[x0:x1].contiguous()
-        shift = torch.tensor([float(x0), float(y0)], dtype=line.dtype, device=line.device)
-        line = line - shift.view(1, 2)
-        cp = source_control_point_xy - shift
-        return cropped, line, cp
-
-    def _load_strip_coord_cache(
-        self,
-        path: Path | None,
-        *,
-        source_shape_hw: tuple[int, int],
-        device: torch.device,
-        center_offset: float,
-        require_offset_axis: bool = True,
-    ) -> tuple[FiberStripGridTorch, torch.Tensor, torch.Tensor] | None:
-        if path is None or not path.is_file():
-            return None
-        try:
-            with np.load(path, allow_pickle=False) as data:
-                if str(data["version"].item()) not in _SUPPORTED_STRIP_COORD_CACHE_VERSIONS:
-                    return None
-                cached_shape = tuple(int(v) for v in data["source_shape_hw"].tolist())
-                if cached_shape[0] < int(source_shape_hw[0]) or cached_shape[1] < int(source_shape_hw[1]):
-                    return None
-                if abs(float(data["center_offset"].item()) - float(center_offset)) > 1.0e-6:
-                    return None
-                frame = FiberStripFrame(
-                    tangent_xyz=np.asarray(data["frame_tangent_xyz"], dtype=np.float32),
-                        side_xyz=np.asarray(data["frame_side_xyz"], dtype=np.float32),
-                        mesh_normal_xyz=np.asarray(data["frame_mesh_normal_xyz"], dtype=np.float32),
-                    )
-                coords_zyx = torch.as_tensor(np.asarray(data["coords_zyx"], dtype=np.float32), device=device)
-                offset_axis_zyx = (
-                    torch.as_tensor(
-                        np.asarray(data["offset_axis_zyx"], dtype=np.float32),
-                        device=device,
-                    )
-                    if bool(require_offset_axis)
-                    else None
-                )
-                side_axis_zyx_np = (
-                    np.asarray(data["side_axis_zyx"], dtype=np.float32)
-                    if "side_axis_zyx" in data
-                    else None
-                )
-                side_axis_zyx = (
-                    torch.as_tensor(side_axis_zyx_np, dtype=torch.float32, device=device)
-                    if side_axis_zyx_np is not None
-                    and side_axis_zyx_np.shape == tuple(coords_zyx.shape)
-                    else None
-                )
-                grid = FiberStripGridTorch(
-                    coords_xyz=coords_zyx[..., (2, 1, 0)].contiguous(),
-                    coords_zyx=coords_zyx,
-                    valid_mask=torch.as_tensor(np.asarray(data["valid_mask"], dtype=bool), device=device),
-                    frame=frame,
-                    offset_axis_xyz=(
-                        None
-                        if offset_axis_zyx is None
-                        else offset_axis_zyx[..., (2, 1, 0)].contiguous()
-                    ),
-                    offset_axis_zyx=offset_axis_zyx,
-                    side_axis_xyz=(
-                        None
-                        if side_axis_zyx is None
-                        else side_axis_zyx[..., (2, 1, 0)].contiguous()
-                    ),
-                    side_axis_zyx=side_axis_zyx,
-                )
-                source_line_xy = torch.as_tensor(np.asarray(data["source_line_xy"], dtype=np.float32), device=device)
-                source_control_point_xy = torch.as_tensor(
-                    np.asarray(data["source_control_point_xy"], dtype=np.float32),
-                    device=device,
-                )
-        except Exception:
-            return None
-        grid, source_line_xy, source_control_point_xy = self._crop_cached_source(
-            grid,
-            source_line_xy,
-            source_control_point_xy,
-            cached_shape,
-            source_shape_hw,
-        )
-        return grid, source_line_xy, source_control_point_xy
-
-    def _store_strip_coord_cache(
-        self,
-        path: Path | None,
-        grid: FiberStripGridTorch,
-        *,
-        source_shape_hw: tuple[int, int],
-        center_offset: float,
-        source_line_xy: torch.Tensor,
-        source_control_point_xy: torch.Tensor,
-    ) -> None:
-        if path is None:
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.parent / f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
-        frame = grid.frame
-        try:
-            with tmp.open("wb") as handle:
-                payload = {
-                    "version": np.asarray(_STRIP_COORD_CACHE_VERSION),
-                    "source_shape_hw": np.asarray(source_shape_hw, dtype=np.int64),
-                    "center_offset": np.asarray(float(center_offset), dtype=np.float64),
-                    "coords_zyx": _as_numpy_float32(grid.coords_zyx),
-                    "valid_mask": _as_numpy_bool(grid.valid_mask),
-                    "offset_axis_zyx": _as_numpy_float32(grid.offset_axis_zyx),
-                    "source_line_xy": _as_numpy_float32(source_line_xy),
-                    "source_control_point_xy": _as_numpy_float32(source_control_point_xy),
-                    "frame_tangent_xyz": np.asarray(frame.tangent_xyz, dtype=np.float32),
-                    "frame_side_xyz": np.asarray(frame.side_xyz, dtype=np.float32),
-                    "frame_mesh_normal_xyz": np.asarray(frame.mesh_normal_xyz, dtype=np.float32),
-                }
-                if grid.side_axis_zyx is not None:
-                    payload["side_axis_zyx"] = _as_numpy_float32(grid.side_axis_zyx)
-                np.savez(handle, **payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, path)
-        except Exception:
-            try:
-                tmp.unlink()
-            except FileNotFoundError:
-                pass
-            raise
-
     def build_strip_source(
         self,
         sample_index: int,
@@ -2025,80 +2146,27 @@ class FiberStrip2DLoader:
                 f"source_hw={source_shape_hw}",
                 flush=True,
             )
-            print(f"{debug_label} line_window start", flush=True)
-        cache_path = self._strip_coord_cache_path(
-            record,
-            control_point_index=cp_index,
-            center_offset=float(center_offset),
-        )
-        with _ProfileBlock(profile, "strip_coord_cache"):
-            cached_source = self._load_strip_coord_cache(
-                cache_path,
-                source_shape_hw=source_shape_hw,
-                device=device,
-                center_offset=float(center_offset),
-                require_offset_axis=not (
-                    len(self.strip_z_offsets) == 1
-                    and abs(float(self.strip_z_offsets[0]) - float(center_offset)) <= 1.0e-6
-                ),
-            )
-        if cached_source is not None:
-            cached_grid, source_line_xy, source_control_point_xy = cached_source
-            if debug_label is not None:
-                print(
-                    f"{debug_label} strip_coord_cache hit valid={int(torch.count_nonzero(cached_grid.valid_mask).item())}",
-                    flush=True,
-                )
-            return _StripSource(
-                record=record,
-                record_index=record_index,
-                control_point_index=cp_index,
-                center_offset=float(center_offset),
-                source_shape_hw=source_shape_hw,
-                grid=cached_grid,
-                source_line_xy=source_line_xy,
-                source_control_point_xy=source_control_point_xy,
-            )
-        with _ProfileBlock(profile, "line_window"):
-            line_window = self._line_window_for_patch(
-                record,
-                control_point_index=cp_index,
-                patch_shape_hw=source_shape_hw,
-            )
+            print(f"{debug_label} compact_geometry start", flush=True)
+        with _ProfileBlock(profile, "compact_geometry"):
+            geometry = self._geometry_for_record(record, int(record_index))
+            interval = geometry.interval_for_control_point(int(cp_index))
+            anchor_arc = geometry.anchor_arc_for_control_point(int(cp_index)) - float(interval.start_arc)
         if debug_label is not None:
             print(
-                f"{debug_label} line_window done points={len(line_window.line_points_xyz)} "
-                f"cp_local={line_window.local_control_point_index}",
+                f"{debug_label} compact_geometry done interval={interval.start_index}:{interval.end_index}",
                 flush=True,
             )
-            print(f"{debug_label} lasagna_normals start", flush=True)
-        with _ProfileBlock(profile, "lasagna_normals"):
-            sampled_normals = self._lasagna_normals_for_line_window(
-                record,
-                line_window,
-                control_point_index=cp_index,
-            )
-        if debug_label is not None:
-            print(f"{debug_label} lasagna_normals done count={len(sampled_normals)}", flush=True)
             print(f"{debug_label} strip_coords start device={device}", flush=True)
         with _ProfileBlock(profile, "strip_coords", device):
-            grid = build_side_strip_patch_grid_tensor_from_line_window(
-                line_window,
+            grid = build_side_strip_patch_grid_tensor_from_frame_arrays(
+                interval.frame_arrays,
+                anchor_arc=float(anchor_arc),
                 patch_shape_hw=source_shape_hw,
                 strip_z_offset=float(center_offset),
-                sampled_normals=sampled_normals,
                 pixel_spacing_base=record.volume_spacing_base,
                 device=device,
             )
         source_line_xy, source_control_point_xy = self._source_line_and_cp_tensors(source_shape_hw, device=device)
-        self._store_strip_coord_cache(
-            cache_path,
-            grid,
-            source_shape_hw=source_shape_hw,
-            center_offset=float(center_offset),
-            source_line_xy=source_line_xy,
-            source_control_point_xy=source_control_point_xy,
-        )
         if debug_label is not None:
             print(
                 f"{debug_label} strip_coords done valid={int(torch.count_nonzero(grid.valid_mask).item())}",
@@ -2133,61 +2201,19 @@ class FiberStrip2DLoader:
             else:
                 record, record_index, cp_index = descriptor
             source_shape_hw = self._source_shape_hw(use_augmentation_envelope=use_augmentation_envelope)
-        cache_path = self._strip_coord_cache_path(
-            record,
-            control_point_index=cp_index,
-            center_offset=0.0,
-            view="top",
-        )
-        with _ProfileBlock(profile, "strip_coord_cache"):
-            cached_source = self._load_strip_coord_cache(
-                cache_path,
-                source_shape_hw=source_shape_hw,
-                device=device,
-                center_offset=0.0,
-                require_offset_axis=True,
-            )
-        if cached_source is not None:
-            cached_grid, source_line_xy, source_control_point_xy = cached_source
-            return _StripSource(
-                record=record,
-                record_index=record_index,
-                control_point_index=cp_index,
-                center_offset=0.0,
-                source_shape_hw=source_shape_hw,
-                grid=cached_grid,
-                source_line_xy=source_line_xy,
-                source_control_point_xy=source_control_point_xy,
-            )
-        with _ProfileBlock(profile, "line_window"):
-            line_window = self._line_window_for_patch(
-                record,
-                control_point_index=cp_index,
-                patch_shape_hw=source_shape_hw,
-            )
-        with _ProfileBlock(profile, "lasagna_normals"):
-            sampled_normals = self._lasagna_normals_for_line_window(
-                record,
-                line_window,
-                control_point_index=cp_index,
-            )
+        with _ProfileBlock(profile, "compact_geometry"):
+            geometry = self._geometry_for_record(record, int(record_index))
+            interval = geometry.interval_for_control_point(int(cp_index))
+            anchor_arc = geometry.anchor_arc_for_control_point(int(cp_index)) - float(interval.start_arc)
         with _ProfileBlock(profile, "strip_coords", device):
-            grid = build_top_strip_patch_grid_tensor_from_line_window(
-                line_window,
+            grid = build_top_strip_patch_grid_tensor_from_frame_arrays(
+                interval.frame_arrays,
+                anchor_arc=float(anchor_arc),
                 patch_shape_hw=source_shape_hw,
-                sampled_normals=sampled_normals,
                 pixel_spacing_base=record.volume_spacing_base,
                 device=device,
             )
         source_line_xy, source_control_point_xy = self._source_line_and_cp_tensors(source_shape_hw, device=device)
-        self._store_strip_coord_cache(
-            cache_path,
-            grid,
-            source_shape_hw=source_shape_hw,
-            center_offset=0.0,
-            source_line_xy=source_line_xy,
-            source_control_point_xy=source_control_point_xy,
-        )
         return _StripSource(
             record=record,
             record_index=record_index,

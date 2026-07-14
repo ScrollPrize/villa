@@ -2,6 +2,10 @@
 
 ## 2026-07-14
 
+- Removed the dense per-control-point `strip_coord_cache_dir` disk cache and
+  replaced it with a shared compact in-RAM fiber-line geometry store used by
+  training, prefetch dependency generation, top-view loading, and
+  visualization source construction.
 - Added `fiber_trace_2d` NML fiber-source loading. NML `<thing>` simple path
   components are edge-ordered and normalized into `Vc3dFiber` records, while
   existing VC3D JSON input remains supported.

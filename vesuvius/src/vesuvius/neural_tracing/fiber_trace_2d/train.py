@@ -1094,7 +1094,7 @@ def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dic
     loader_wall = _stage_ms(loader_profile, "load_batch_wall")
     loader_worker = _stage_ms(loader_profile, "load_batch_worker")
     descriptor = _stage_ms(loader_profile, "random_order") + _stage_ms(loader_profile, "descriptor")
-    coord_cache = _stage_ms(loader_profile, "strip_coord_cache")
+    compact_geometry = _stage_ms(loader_profile, "compact_geometry")
     source_geom = (
         _stage_ms(loader_profile, "line_window")
         + _stage_ms(loader_profile, "lasagna_normals")
@@ -1103,7 +1103,7 @@ def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dic
     line = _stage_ms(loader_profile, "line_coords")
     coord_gen = (
         descriptor
-        + coord_cache
+        + compact_geometry
         + source_geom
         + line
     )
@@ -1118,7 +1118,7 @@ def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dic
         "prep_submit": _stage_ms(train_profile, "prep_submit"),
         "coord_gen": coord_gen,
         "descriptor": descriptor,
-        "coord_cache": coord_cache,
+        "compact_geometry": compact_geometry,
         "source_geom": source_geom,
         "line": line,
         "coord_aug": _stage_ms(loader_profile, "coord_augmentation"),
@@ -1142,7 +1142,7 @@ def _print_profile_header() -> None:
     print(
         "fiber_trace_2d profile columns: "
         "batch=batch-index patches=CNN image patches "
-        "total/cpu/wall/work/wait/prep/prep_gpu/prep_wait/submit/outside/coord/desc/cache/source/line/coord_aug/load/img_aug/fw/bw_step=ms per patch "
+        "total/cpu/wall/work/wait/prep/prep_gpu/prep_wait/submit/outside/coord/desc/geom/source/line/coord_aug/load/img_aug/fw/bw_step=ms per patch "
         "ctf=process cpu-time/total-wall-time tf=loader worker-time/load-wall-time",
         flush=True,
     )
@@ -1151,7 +1151,7 @@ def _print_profile_header() -> None:
         f"{'wall':>9} {'work':>9} {'tf':>6} {'wait':>9} "
         f"{'prep':>9} {'prep_gpu':>9} {'prep_wait':>9} {'submit':>9} {'outside':>9} "
         f"{'coord':>9} {'desc':>9} "
-        f"{'cache':>9} {'source':>9} {'line':>9} {'coord_aug':>9} "
+        f"{'geom':>9} {'source':>9} {'line':>9} {'coord_aug':>9} "
         f"{'load':>9} {'img_aug':>9} {'fw':>9} {'bw_step':>9}",
         flush=True,
     )
@@ -1175,7 +1175,7 @@ def _print_profile_row(batch_index: int, patch_count: int, elapsed_ms: float, st
         f"{stages.get('outside_fw_bw', 0.0) / denom:9.2f} "
         f"{stages.get('coord_gen', 0.0) / denom:9.2f} "
         f"{stages.get('descriptor', 0.0) / denom:9.2f} "
-        f"{stages.get('coord_cache', 0.0) / denom:9.2f} "
+        f"{stages.get('compact_geometry', 0.0) / denom:9.2f} "
         f"{stages.get('source_geom', 0.0) / denom:9.2f} "
         f"{stages.get('line', 0.0) / denom:9.2f} "
         f"{stages.get('coord_aug', 0.0) / denom:9.2f} "
@@ -1208,7 +1208,7 @@ def _print_benchmark_summary(summary: _BenchmarkSummary, *, profile: bool) -> No
             "outside_fw_bw",
             "coord_gen",
             "descriptor",
-            "coord_cache",
+            "compact_geometry",
             "source_geom",
             "line",
             "coord_aug",
@@ -1297,7 +1297,7 @@ def run_benchmark(
             "outside_fw_bw",
             "coord_gen",
             "descriptor",
-            "coord_cache",
+            "compact_geometry",
             "source_geom",
             "line",
             "coord_aug",

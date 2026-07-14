@@ -85,6 +85,15 @@ class FiberStripLineWindow:
     local_control_point_index: int
 
 
+@dataclass(frozen=True)
+class FiberStripFrameArrays:
+    points_xyz: np.ndarray
+    cumulative: np.ndarray
+    derivatives: np.ndarray
+    frame_normals_xyz: np.ndarray
+    frame_sides_xyz: np.ndarray
+
+
 def _finite(v: np.ndarray) -> bool:
     return bool(np.isfinite(v).all())
 
@@ -654,6 +663,23 @@ def _frame_side_array(frames: list[FiberStripFrame]) -> np.ndarray:
     return np.stack([np.asarray(frame.side_xyz, dtype=np.float64) for frame in frames], axis=0)
 
 
+def build_side_strip_frame_arrays(
+    points_xyz: np.ndarray,
+    *,
+    sampled_normals: np.ndarray,
+) -> FiberStripFrameArrays:
+    points = np.asarray(points_xyz, dtype=np.float64)
+    frames = _build_side_strip_frames_for_points(points, sampled_normals=sampled_normals)
+    cumulative = _arc_lengths(points)
+    return FiberStripFrameArrays(
+        points_xyz=points,
+        cumulative=cumulative,
+        derivatives=_arc_derivatives(points, cumulative),
+        frame_normals_xyz=_frame_normal_array(frames),
+        frame_sides_xyz=_frame_side_array(frames),
+    )
+
+
 def _cubic_hermite_line_torch(
     points_xyz: torch.Tensor,
     cumulative: torch.Tensor,
@@ -686,6 +712,158 @@ def _cubic_hermite_line_torch(
         + h11[..., None] * span[..., None] * m1
     )
     return center, c0, c1, t, valid
+
+
+def _precomputed_columns_torch(
+    frame_arrays: FiberStripFrameArrays,
+    arc_coord: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = arc_coord.device
+    dtype = torch.float64
+    points = torch.as_tensor(frame_arrays.points_xyz, dtype=dtype, device=device)
+    if points.shape[0] == 1:
+        center = points[0].view(1, 3).expand(arc_coord.shape + (3,))
+        normal = torch.as_tensor(
+            frame_arrays.frame_normals_xyz[0],
+            dtype=dtype,
+            device=device,
+        ).view(1, 3).expand(arc_coord.shape + (3,))
+        side = torch.as_tensor(
+            frame_arrays.frame_sides_xyz[0],
+            dtype=dtype,
+            device=device,
+        ).view(1, 3).expand(arc_coord.shape + (3,))
+        return center, normal, side, torch.ones_like(arc_coord, dtype=torch.bool)
+
+    cumulative = torch.as_tensor(frame_arrays.cumulative, dtype=dtype, device=device)
+    derivatives = torch.as_tensor(frame_arrays.derivatives, dtype=dtype, device=device)
+    frame_normals = torch.as_tensor(frame_arrays.frame_normals_xyz, dtype=dtype, device=device)
+    frame_sides = torch.as_tensor(frame_arrays.frame_sides_xyz, dtype=dtype, device=device)
+
+    center, c0, c1, t, valid = _cubic_hermite_line_torch(points, cumulative, derivatives, arc_coord)
+    normal = frame_normals[c0] * (1.0 - t[..., None]) + frame_normals[c1] * t[..., None]
+    normal_len = torch.linalg.norm(normal, dim=-1, keepdim=True)
+    normal = torch.where(normal_len > _EPS, normal / normal_len.clamp_min(_EPS), torch.zeros_like(normal))
+    side = frame_sides[c0] * (1.0 - t[..., None]) + frame_sides[c1] * t[..., None]
+    side_len = torch.linalg.norm(side, dim=-1, keepdim=True)
+    side = torch.where(side_len > _EPS, side / side_len.clamp_min(_EPS), torch.zeros_like(side))
+    return center, normal, side, valid
+
+
+def _frame_at_arc_from_arrays(frame_arrays: FiberStripFrameArrays, arc: float) -> FiberStripFrame:
+    points = np.asarray(frame_arrays.points_xyz, dtype=np.float64)
+    tangent = _cubic_hermite_tangent(points, float(arc))
+    if points.shape[0] == 1:
+        return _frame_from_mesh_normal(frame_arrays.frame_normals_xyz[0], tangent)
+    cumulative = np.asarray(frame_arrays.cumulative, dtype=np.float64)
+    c0, c1, t, _ = _arc_segment_indices(cumulative, np.asarray(arc, dtype=np.float64))
+    i0 = int(c0)
+    i1 = int(c1)
+    tv = float(t)
+    n0 = np.asarray(frame_arrays.frame_normals_xyz[i0], dtype=np.float64)
+    n1 = np.asarray(frame_arrays.frame_normals_xyz[i1], dtype=np.float64)
+    return _frame_from_mesh_normal(n0 * (1.0 - tv) + n1 * tv, tangent)
+
+
+def build_side_strip_patch_grid_tensor_from_frame_arrays(
+    frame_arrays: FiberStripFrameArrays,
+    *,
+    anchor_arc: float,
+    patch_shape_hw: tuple[int, int],
+    strip_z_offset: float,
+    pixel_spacing_base: float = 1.0,
+    anchor_column_px: float | None = None,
+    device: torch.device | str | None = None,
+) -> FiberStripGridTorch:
+    height, width = (int(v) for v in patch_shape_hw)
+    if height <= 0 or width <= 0:
+        raise ValueError(f"patch_shape_hw must contain positive values, got {patch_shape_hw}")
+    pixel_spacing_base = float(pixel_spacing_base)
+    if not np.isfinite(pixel_spacing_base) or pixel_spacing_base <= 0.0:
+        raise ValueError(f"pixel_spacing_base must be positive and finite, got {pixel_spacing_base}")
+    torch_device = torch.device("cpu") if device is None else torch.device(device)
+    dtype = torch.float64
+    row_offsets = (
+        (torch.arange(height, dtype=dtype, device=torch_device) - (float(height) - 1.0) * 0.5)
+        + float(strip_z_offset)
+    ) * pixel_spacing_base
+    anchor_col = (float(width) - 1.0) * 0.5 if anchor_column_px is None else float(anchor_column_px)
+    col_offsets = (
+        torch.arange(width, dtype=dtype, device=torch_device) - anchor_col
+    ) * pixel_spacing_base
+    arc_coord = torch.as_tensor(float(anchor_arc), dtype=dtype, device=torch_device) + col_offsets
+    center, normal, side, valid = _precomputed_columns_torch(frame_arrays, arc_coord)
+    coords_xyz = center.view(1, width, 3) + normal.view(1, width, 3) * row_offsets.view(height, 1, 1)
+    shape_valid = torch.isfinite(coords_xyz).all(dim=-1)
+    frame = _frame_at_arc_from_arrays(frame_arrays, float(anchor_arc))
+    normal_hw = normal.view(1, width, 3).expand(height, width, 3)
+    side_hw = side.view(1, width, 3).expand(height, width, 3)
+    valid_hw = valid.view(1, width).expand(height, width) & shape_valid
+    return FiberStripGridTorch(
+        coords_xyz=coords_xyz.to(dtype=torch.float32),
+        coords_zyx=coords_xyz[..., (2, 1, 0)].to(dtype=torch.float32),
+        valid_mask=valid_hw,
+        frame=frame,
+        offset_axis_xyz=normal_hw.to(dtype=torch.float32),
+        offset_axis_zyx=normal_hw[..., (2, 1, 0)].to(dtype=torch.float32),
+        side_axis_xyz=side_hw.to(dtype=torch.float32),
+        side_axis_zyx=side_hw[..., (2, 1, 0)].to(dtype=torch.float32),
+    )
+
+
+def build_top_strip_patch_grid_tensor_from_frame_arrays(
+    frame_arrays: FiberStripFrameArrays,
+    *,
+    anchor_arc: float,
+    patch_shape_hw: tuple[int, int],
+    pixel_spacing_base: float = 1.0,
+    anchor_column_px: float | None = None,
+    normal_offsets_by_column: np.ndarray | torch.Tensor | None = None,
+    device: torch.device | str | None = None,
+) -> FiberStripGridTorch:
+    height, width = (int(v) for v in patch_shape_hw)
+    if height <= 0 or width <= 0:
+        raise ValueError(f"patch_shape_hw must contain positive values, got {patch_shape_hw}")
+    pixel_spacing_base = float(pixel_spacing_base)
+    if not np.isfinite(pixel_spacing_base) or pixel_spacing_base <= 0.0:
+        raise ValueError(f"pixel_spacing_base must be positive and finite, got {pixel_spacing_base}")
+    torch_device = torch.device("cpu") if device is None else torch.device(device)
+    dtype = torch.float64
+    side_offsets = (
+        torch.arange(height, dtype=dtype, device=torch_device) - (float(height) - 1.0) * 0.5
+    ) * pixel_spacing_base
+    anchor_col = (float(width) - 1.0) * 0.5 if anchor_column_px is None else float(anchor_column_px)
+    col_offsets = (
+        torch.arange(width, dtype=dtype, device=torch_device) - anchor_col
+    ) * pixel_spacing_base
+    if normal_offsets_by_column is None:
+        normal_offsets = torch.zeros((width,), dtype=dtype, device=torch_device)
+    else:
+        normal_offsets = torch.as_tensor(normal_offsets_by_column, dtype=dtype, device=torch_device).reshape(-1)
+        if int(normal_offsets.numel()) != width:
+            raise ValueError(
+                "normal_offsets_by_column length must match strip width: "
+                f"got {int(normal_offsets.numel())}, expected {width}"
+            )
+    arc_coord = torch.as_tensor(float(anchor_arc), dtype=dtype, device=torch_device) + col_offsets
+    center, normal, side, valid = _precomputed_columns_torch(frame_arrays, arc_coord)
+    coords_xyz = (
+        center.view(1, width, 3)
+        + side.view(1, width, 3) * side_offsets.view(height, 1, 1)
+        + normal.view(1, width, 3) * (normal_offsets.view(1, width, 1) * pixel_spacing_base)
+    )
+    shape_valid = torch.isfinite(coords_xyz).all(dim=-1)
+    frame = _frame_at_arc_from_arrays(frame_arrays, float(anchor_arc))
+    side_hw = side.view(1, width, 3).expand(height, width, 3)
+    valid_hw = valid.view(1, width).expand(height, width) & shape_valid
+    return FiberStripGridTorch(
+        coords_xyz=coords_xyz.to(dtype=torch.float32),
+        coords_zyx=coords_xyz[..., (2, 1, 0)].to(dtype=torch.float32),
+        valid_mask=valid_hw,
+        frame=frame,
+        offset_axis_xyz=side_hw.to(dtype=torch.float32),
+        offset_axis_zyx=side_hw[..., (2, 1, 0)].to(dtype=torch.float32),
+    )
 
 
 def _interpolate_line_side_slice_torch(
