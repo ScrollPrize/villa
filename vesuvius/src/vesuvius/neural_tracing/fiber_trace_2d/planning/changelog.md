@@ -8,6 +8,12 @@
 - Corrected those top-dir DP diagnostics so the DP row offset is folded into
   the side-z optimized line and the optimized top-strip panel draws that line
   as the straight slice center.
+- Fixed optimized top-dir side/presence diagnostics using mostly black columns
+  by sizing the visualization z-plane cache from the combined optimized
+  side-z displacement.
+- Fixed z-corrected Trace2CP debug image/presence reconstruction to lazily
+  infer requested z-plane cache layers instead of rendering non-preloaded
+  layers as black.
 - Changed Trace2CP z-search side-presence smoothing from axis-aligned x/z blur
   to a direction-aligned anisotropic x/y blur plus side-z smoothing, weighted by
   valid pixels and symmetric under direction sign ambiguity.

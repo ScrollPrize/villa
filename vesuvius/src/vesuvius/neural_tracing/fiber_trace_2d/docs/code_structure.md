@@ -417,8 +417,12 @@ The important behavior is:
   and selected top-offset layers, a side slice reconstructed from the combined
   top-row plus selected-layer side displacement, and top z-pillar/side-column
   presence panels when side-model presence exists. The optimized top-strip
-  panel draws the optimized line as the straight slice center. These panels
-  are diagnostic only and do not change scoring or z-layer selection.
+  panel draws the optimized line as the straight slice center. Side/presence
+  panels use a visualization z-plane cache sized to that combined optimized
+  side displacement, not just the raw selected top-offset layer range.
+  Z-corrected debug helpers lazily infer the requested z-plane layers instead
+  of assuming `plane_cache.layers` is already complete. These panels are
+  diagnostic only and do not change scoring or z-layer selection.
 - `--trace2cp-side-top-z-experiment` adds a separate single-pair diagnostic
   path. It is exclusive: when this flag is set, the command writes only
   `trace2cp_side_top_z_experiment.jpg`,

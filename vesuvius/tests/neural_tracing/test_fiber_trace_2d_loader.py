@@ -2094,6 +2094,45 @@ def test_trace2cp_z_corrected_image_copies_nearest_inferred_layer_columns() -> N
     assert image[:, 2].tolist() == [30, 30]
 
 
+def test_trace2cp_z_corrected_image_fetches_missing_cache_layers_lazily() -> None:
+    class LazyCache:
+        z_step_voxels = 1.0
+
+        def __init__(self) -> None:
+            self.layers = {0: self._layer(20)}
+            self.requested: list[int] = []
+
+        @staticmethod
+        def _layer(value: int):
+            return SimpleNamespace(
+                image=np.full((2, 3), value, dtype=np.float32),
+                valid_mask=np.ones((2, 3), dtype=bool),
+            )
+
+        def get(self, layer: int):
+            self.requested.append(int(layer))
+            if int(layer) not in self.layers:
+                self.layers[int(layer)] = self._layer(20 + 10 * int(layer))
+            return self.layers[int(layer)]
+
+    cache = LazyCache()
+    trace = np.asarray([[0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [2.0, 0.0, 1.0]], dtype=np.float32)
+
+    image, missing, layer_columns = _trace2cp_z_corrected_image_u8(
+        plane_cache=cache,
+        trace_xyz=trace,
+        fallback_shape_hw=(2, 3),
+    )
+
+    assert missing == 0
+    assert layer_columns.tolist() == [-1, 0, 1]
+    assert image[:, 0].tolist() == [10, 10]
+    assert image[:, 1].tolist() == [20, 20]
+    assert image[:, 2].tolist() == [30, 30]
+    assert -1 in cache.requested
+    assert 1 in cache.requested
+
+
 def test_trace2cp_z_corrected_presence_copies_nearest_inferred_layer_columns() -> None:
     def layer(value: float):
         return SimpleNamespace(
@@ -2121,6 +2160,48 @@ def test_trace2cp_z_corrected_presence_copies_nearest_inferred_layer_columns() -
     assert presence[:, 0].tolist() == [25, 25]
     assert presence[:, 1].tolist() == [127, 127]
     assert presence[:, 2].tolist() == [229, 229]
+
+
+def test_trace2cp_z_corrected_presence_fetches_missing_cache_layers_lazily() -> None:
+    class LazyCache:
+        z_step_voxels = 1.0
+
+        def __init__(self) -> None:
+            self.layers = {0: self._layer(0.5)}
+            self.requested: list[int] = []
+
+        @staticmethod
+        def _layer(value: float):
+            return SimpleNamespace(
+                valid_mask=np.ones((2, 3), dtype=bool),
+                fields=SimpleNamespace(
+                    presence_hw=np.full((2, 3), value, dtype=np.float32),
+                ),
+            )
+
+        def get(self, layer: int):
+            self.requested.append(int(layer))
+            if int(layer) not in self.layers:
+                self.layers[int(layer)] = self._layer(0.5 + 0.25 * int(layer))
+            return self.layers[int(layer)]
+
+    cache = LazyCache()
+    trace = np.asarray([[0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [2.0, 0.0, 1.0]], dtype=np.float32)
+
+    presence, missing, layer_columns = _trace2cp_z_corrected_presence_u8(
+        plane_cache=cache,
+        trace_xyz=trace,
+        fallback_shape_hw=(2, 3),
+    )
+
+    assert presence is not None
+    assert missing == 0
+    assert layer_columns.tolist() == [-1, 0, 1]
+    assert presence[:, 0].tolist() == [63, 63]
+    assert presence[:, 1].tolist() == [127, 127]
+    assert presence[:, 2].tolist() == [191, 191]
+    assert -1 in cache.requested
+    assert 1 in cache.requested
 
 
 def test_trace2cp_z_corrected_image_marks_untraced_columns_black() -> None:

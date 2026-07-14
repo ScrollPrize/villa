@@ -278,10 +278,28 @@ def _trace2cp_z_corrected_image_u8(
     trace = np.asarray(trace_xyz, dtype=np.float32)
     if trace.ndim != 2 or trace.shape[1] != 3 or trace.shape[0] == 0:
         return output, width, layers_by_column
-    layer_images = {
-        int(layer): _to_u8_image(prediction.image, prediction.valid_mask)
-        for layer, prediction in plane_cache.layers.items()
-    }
+    layer_images: dict[int, np.ndarray] = {}
+
+    def image_for_layer(layer: int) -> np.ndarray | None:
+        layer_i = int(layer)
+        existing = layer_images.get(layer_i)
+        if existing is not None:
+            return existing
+        prediction = None
+        get_layer = getattr(plane_cache, "get", None)
+        if callable(get_layer):
+            try:
+                prediction = get_layer(layer_i)
+            except ValueError:
+                prediction = None
+        if prediction is None:
+            prediction = getattr(plane_cache, "layers", {}).get(layer_i)
+        if prediction is None:
+            return None
+        image_u8 = _to_u8_image(prediction.image, prediction.valid_mask)
+        layer_images[layer_i] = image_u8
+        return image_u8
+
     for x in range(width):
         point = _trace_xyz_at_x(trace, float(x))
         if point is None or not bool(np.isfinite(point).all()):
@@ -290,7 +308,7 @@ def _trace2cp_z_corrected_image_u8(
         z_voxels = float(point[2])
         layer = int(round(z_voxels / float(plane_cache.z_step_voxels)))
         layers_by_column[x] = layer
-        image_u8 = layer_images.get(layer)
+        image_u8 = image_for_layer(layer)
         if image_u8 is None:
             missing += 1
             continue
@@ -315,13 +333,36 @@ def _trace2cp_z_corrected_presence_u8(
     if trace.ndim != 2 or trace.shape[1] != 3 or trace.shape[0] == 0:
         return None, width, layers_by_column
     layer_presence: dict[int, np.ndarray] = {}
-    for layer, prediction in list(plane_cache.layers.items()):
-        presence = _trace2cp_presence_for_plane_layer(plane_cache, int(layer), prediction)
+    layer_missing_presence: set[int] = set()
+
+    def presence_for_layer(layer: int) -> np.ndarray | None:
+        layer_i = int(layer)
+        existing = layer_presence.get(layer_i)
+        if existing is not None:
+            return existing
+        if layer_i in layer_missing_presence:
+            return None
+        prediction = None
+        get_layer = getattr(plane_cache, "get", None)
+        if callable(get_layer):
+            try:
+                prediction = get_layer(layer_i)
+            except ValueError:
+                prediction = None
+        if prediction is None:
+            prediction = getattr(plane_cache, "layers", {}).get(layer_i)
+        if prediction is None:
+            layer_missing_presence.add(layer_i)
+            return None
+        presence = _trace2cp_presence_for_plane_layer(plane_cache, layer_i, prediction)
         if presence is None:
-            continue
-        layer_presence[int(layer)] = _presence_map_to_u8(presence, prediction.valid_mask)
-    if not layer_presence:
-        return None, width, layers_by_column
+            layer_missing_presence.add(layer_i)
+            return None
+        presence_u8 = _presence_map_to_u8(presence, prediction.valid_mask)
+        layer_presence[layer_i] = presence_u8
+        return presence_u8
+
+    wrote_presence = False
     for x in range(width):
         point = _trace_xyz_at_x(trace, float(x))
         if point is None or not bool(np.isfinite(point).all()):
@@ -330,7 +371,7 @@ def _trace2cp_z_corrected_presence_u8(
         z_voxels = float(point[2])
         layer = int(round(z_voxels / float(plane_cache.z_step_voxels)))
         layers_by_column[x] = layer
-        presence_u8 = layer_presence.get(layer)
+        presence_u8 = presence_for_layer(layer)
         if presence_u8 is None:
             missing += 1
             continue
@@ -338,6 +379,9 @@ def _trace2cp_z_corrected_presence_u8(
             missing += 1
             continue
         output[:, x] = presence_u8[:, x]
+        wrote_presence = True
+    if not wrote_presence and not layer_presence:
+        return None, missing, layers_by_column
     return output, missing, layers_by_column
 
 
@@ -10321,7 +10365,17 @@ def _evaluate_trace2cp_pair(
                             segment_source,
                             optimized_trace_xyz,
                         )
-                        if z_plane_cache is None:
+                        max_abs_side_z = float(np.max(np.abs(optimized_trace_xyz[:, 2])))
+                        top_cache_step = (
+                            float(z_plane_cache.z_step_voxels)
+                            if z_plane_cache is not None
+                            else 1.0
+                        )
+                        top_required_max_layer = max(
+                            1,
+                            int(np.ceil(max_abs_side_z / max(top_cache_step, 1.0e-6))),
+                        )
+                        if z_plane_cache is None or int(z_plane_cache.max_layer) < int(top_required_max_layer):
                             top_center_prediction = _Trace2CpZLayerPrediction(
                                 layer=0,
                                 z_voxels=0.0,
@@ -10330,13 +10384,7 @@ def _evaluate_trace2cp_pair(
                                 valid_mask=np.asarray(valid_mask, dtype=bool),
                                 fields=fields,
                             )
-                            top_max_layer = max(
-                                1,
-                                int(np.ceil(np.max(np.abs(top_model_path_debug.layer_offsets)).item()))
-                                if top_model_path_debug.layer_offsets.size
-                                else 1,
-                            )
-                            z_plane_cache = _Trace2CpZPlaneCache(
+                            top_debug_plane_cache = _Trace2CpZPlaneCache(
                                 loader=loader,
                                 model=model,
                                 sample_index=sample_index,
@@ -10349,16 +10397,22 @@ def _evaluate_trace2cp_pair(
                                 device=device,
                                 segment_source=segment_source,
                                 center_layer=top_center_prediction,
-                                z_step_voxels=1.0,
-                                max_layer=top_max_layer,
-                                presence_blur_enabled=False,
+                                z_step_voxels=float(top_cache_step),
+                                max_layer=int(top_required_max_layer),
+                                presence_blur_enabled=(
+                                    False
+                                    if z_plane_cache is None
+                                    else bool(z_plane_cache.presence_blur_enabled)
+                                ),
                             )
+                        else:
+                            top_debug_plane_cache = z_plane_cache
                         (
                             top_model_optimized_side_image,
                             top_model_side_missing,
                             top_model_optimized_layer_columns,
                         ) = _trace2cp_z_corrected_image_u8(
-                            plane_cache=z_plane_cache,
+                            plane_cache=top_debug_plane_cache,
                             trace_xyz=optimized_trace_xyz,
                             fallback_shape_hw=image.shape,
                         )
@@ -10371,7 +10425,7 @@ def _evaluate_trace2cp_pair(
                             top_model_side_presence_missing,
                             _top_model_presence_layer_columns,
                         ) = _trace2cp_z_corrected_presence_u8(
-                            plane_cache=z_plane_cache,
+                            plane_cache=top_debug_plane_cache,
                             trace_xyz=optimized_trace_xyz,
                             fallback_shape_hw=image.shape,
                         )
@@ -10381,7 +10435,7 @@ def _evaluate_trace2cp_pair(
                             top_model_optimized_top_presence_image,
                             top_model_optimized_top_presence_valid_mask,
                         ) = _side_presence_z_pillar_image(
-                            z_plane_cache,
+                            top_debug_plane_cache,
                             optimized_trace_xyz,
                             width=int(image.shape[1]),
                         )
@@ -10400,6 +10454,8 @@ def _evaluate_trace2cp_pair(
                             f"top_row_offset={top_offset_text} "
                             f"side_z={float(np.nanmin(optimized_trace_xyz[:, 2])):.1f}.."
                             f"{float(np.nanmax(optimized_trace_xyz[:, 2])):.1f} "
+                            f"side_cache_step={float(top_debug_plane_cache.z_step_voxels):.2f} "
+                            f"side_cache_max_layer={int(top_debug_plane_cache.max_layer)} "
                             f"side_missing_cols={int(top_model_side_missing)} "
                             f"presence_missing_cols={int(top_model_side_presence_missing)}"
                         )

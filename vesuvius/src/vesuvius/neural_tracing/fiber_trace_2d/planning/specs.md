@@ -685,8 +685,16 @@
   displacement is the sum of the selected top-offset layer and the DP
   top-row offset from the old center row. In the optimized top-strip panel,
   the optimized path is the slice center and is drawn as a straight centerline,
-  not as the pre-reslice curved path. These panels use the optimized line only
-  for visualization and do not feed back into Trace2CP scoring.
+  not as the pre-reslice curved path. Side-slice and presence diagnostics must
+  build a visualization z-plane cache whose bounds cover this combined
+  optimized side displacement; using only the raw selected top-offset layer
+  range can incorrectly turn out-of-cache columns black. These panels use the
+  optimized line only for visualization and do not feed back into Trace2CP
+  scoring.
+- Z-corrected side-image and side-presence visualization helpers must infer
+  requested cache layers on demand with the z-plane cache API. They must not
+  treat `plane_cache.layers` as a complete layer set, because visualization
+  caches may start with only the center layer populated.
   During top trace integration, ambiguous direction signs must be resolved
   before bilinear interpolation by flipping each of the four neighboring pixel
   direction samples, if needed, so it agrees with the current trace direction;
