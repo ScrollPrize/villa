@@ -369,17 +369,23 @@ def prepare_main_phase_tracks(tracks, anchor_scroll_zyxs, exclusion_radius, devi
         f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
     )
     return {
-        'flat_zyx': torch.from_numpy(flat_zyx_np).to(device=device),
+        # The full point cloud can be tens of millions of points, while a step
+        # consumes only a sampled batch. Keep coordinates in host RAM and stage
+        # that batch below; offsets/lengths remain on CUDA so sampling stays fast
+        # and retains the existing CUDA RNG sequence.
+        'flat_zyx_cpu': torch.from_numpy(flat_zyx_np).contiguous(),
         'offsets': torch.from_numpy(offsets_new).to(device=device),
         'lengths': torch.from_numpy(lengths_new).to(device=device),
+        'device': torch.device(device),
+        'staging': None,
     }
 
 
 def _sample_prepared_track_points(prepared_tracks, num_tracks_per_step, num_points_per_track):
-    flat_zyx = prepared_tracks['flat_zyx']
+    flat_zyx_cpu = prepared_tracks['flat_zyx_cpu']
     offsets = prepared_tracks['offsets']
     lengths = prepared_tracks['lengths']
-    device = flat_zyx.device
+    device = prepared_tracks['device']
     num_tracks = int(lengths.numel())
     if num_tracks == 0 or num_tracks_per_step <= 0 or num_points_per_track <= 0:
         return None
@@ -394,7 +400,20 @@ def _sample_prepared_track_points(prepared_tracks, num_tracks_per_step, num_poin
     ).to(torch.int64)
     point_idx_within, _ = torch.sort(point_idx_within, dim=-1)
     flat_idx = (track_offsets_sample[:, None] + point_idx_within).reshape(-1)
-    sampled_scroll = flat_zyx[flat_idx].view(k, num_points_per_track, 3)
+    flat_idx_cpu = flat_idx.to(device='cpu')
+    sampled_cpu = flat_zyx_cpu[flat_idx_cpu].view(k, num_points_per_track, 3)
+    if device.type == 'cuda':
+        staging = prepared_tracks.get('staging')
+        if staging is None or staging.shape != sampled_cpu.shape:
+            staging = torch.empty(sampled_cpu.shape, dtype=torch.float32, pin_memory=True)
+            prepared_tracks['staging'] = staging
+        staging.copy_(sampled_cpu)
+        # Synchronous reuse of one pinned buffer avoids a lifetime hazard between
+        # consecutive iterations. The transfer is only the sampled batch (~19 MB
+        # with the default full-range settings), not the complete track database.
+        sampled_scroll = staging.to(device=device, non_blocking=False)
+    else:
+        sampled_scroll = sampled_cpu.to(device=device)
     return track_idx, flat_idx, sampled_scroll
 
 

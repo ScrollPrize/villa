@@ -60,6 +60,7 @@ private:
     QPushButton* _removePcl = nullptr;
     QComboBox* _outwardSense = nullptr;
     QComboBox* _storageBackend = nullptr;
+    QCheckBox* _savePngVisualizations = nullptr;
     QPlainTextEdit* _advanced = nullptr;
     VolumeSelector* _volumeSelector = nullptr;
     QPushButton* _load = nullptr;

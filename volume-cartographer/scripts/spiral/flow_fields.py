@@ -108,7 +108,8 @@ class CartesianFlowField(nn.Module):
                 resolution,
             ]
         ])
-        self._pending_field = None
+        self._pending_lr_upsampled = None
+        self._pending_hr_scale = None
         self._field_grad_acc = None
 
     def get_sampler(self, t):
@@ -120,20 +121,28 @@ class CartesianFlowField(nn.Module):
         if self.num_flow_timesteps == 1:
             # Time-invariant: HR flow is already at the target resolution, so skip interpolating it.
             lr_upsampled = F.interpolate(lr_flow, size=hr_shape, mode='trilinear')[0] * self.flow_scales[0]
-            field = lr_upsampled + hr_flow[0] * self.flow_scales[1]
-            if not field.requires_grad:
+            training_field = torch.is_grad_enabled() and (lr_flow.requires_grad or hr_flow.requires_grad)
+            if not training_field:
+                field = lr_upsampled + hr_flow[0] * self.flow_scales[1]
                 return lambda y: sample_field(y, field)
+
+            # Sampling uses a detached combined field and accumulates dL/dfield in
+            # one caller-owned buffer.  Keep only the small LR interpolation graph;
+            # after all point losses have backpropagated, its gradient is propagated
+            # normally while the same full-resolution accumulator becomes the HR
+            # parameter gradient.  This avoids allocating a second HR-sized gradient.
+            field = lr_upsampled.detach() + hr_flow[0].detach() * self.flow_scales[1]
             if self._field_grad_acc is None or self._field_grad_acc.shape != field.shape:
                 self._field_grad_acc = torch.zeros_like(field)
             else:
                 self._field_grad_acc.zero_()
-            self._pending_field = field
-            field_detached = field.detach()
+            self._pending_lr_upsampled = lr_upsampled
+            self._pending_hr_scale = float(self.flow_scales[1])
             acc = self._field_grad_acc
 
             def sample(normalised_zyx):
                 flat = normalised_zyx.reshape(-1, 3)
-                return _SparseAccumTrilinearSample.apply(flat, field_detached, acc).view(*normalised_zyx.shape[:-1], 3)
+                return _SparseAccumTrilinearSample.apply(flat, field, acc).view(*normalised_zyx.shape[:-1], 3)
 
             return sample
         else:
@@ -150,9 +159,23 @@ class CartesianFlowField(nn.Module):
         return lambda y: sample_field(y, field)
 
     def apply_accumulated_field_grad(self):
-        if self._pending_field is not None:
-            self._pending_field.backward(gradient=self._field_grad_acc)
-            self._pending_field = None
+        if self._pending_lr_upsampled is None:
+            return
+
+        # dL/dLR is the interpolation backward of dL/dfield.
+        self._pending_lr_upsampled.backward(gradient=self._field_grad_acc)
+        self._pending_lr_upsampled = None
+
+        # dL/dHR = scale * dL/dfield.  Reuse the accumulator storage as the
+        # parameter's gradient instead of materialising another [3,Z,Y,X] tensor.
+        self._field_grad_acc.mul_(self._pending_hr_scale)
+        self._pending_hr_scale = None
+        hr_param = self.flows[1]
+        hr_grad = self._field_grad_acc.unsqueeze(0)
+        if hr_param.grad is None:
+            hr_param.grad = hr_grad
+        else:
+            hr_param.grad.add_(hr_grad)
 
 
 class CylindricalFlowField(nn.Module):

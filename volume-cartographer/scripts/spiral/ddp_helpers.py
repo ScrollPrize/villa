@@ -105,21 +105,22 @@ class StepTimer:
             return
         event = torch.cuda.Event(enable_timing=True)
         event.record()
-        self._events[name] = [event, None]
+        self._events.setdefault(name, []).append([event, None])
 
     def stop(self, name):
         if not self.enabled:
             return
         event = torch.cuda.Event(enable_timing=True)
         event.record()
-        self._events[name][1] = event
+        self._events[name][-1][1] = event
 
     def tick(self):
         if not self.enabled:
             return
         torch.cuda.synchronize()
-        for name, (start, stop) in self._events.items():
-            self.totals[name] = self.totals.get(name, 0.0) + start.elapsed_time(stop)
+        for name, intervals in self._events.items():
+            elapsed = sum(start.elapsed_time(stop) for start, stop in intervals)
+            self.totals[name] = self.totals.get(name, 0.0) + elapsed
         self._events.clear()
         self.count += 1
 

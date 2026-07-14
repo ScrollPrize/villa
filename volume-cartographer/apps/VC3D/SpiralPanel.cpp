@@ -145,6 +145,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _voxelSize = new QDoubleSpinBox(outputContents); _voxelSize->setRange(0.001, 10000); _voxelSize->setDecimals(4); _voxelSize->setValue(9.6);
     _legacyCheckpointStep = new QSpinBox(outputContents); _legacyCheckpointStep->setRange(0, 1000000000);
     _renderVolumeScale = new QSpinBox(outputContents); _renderVolumeScale->setRange(1, 4096); _renderVolumeScale->setValue(16);
+    _savePngVisualizations = new QCheckBox(tr("Save diagnostic PNG visualizations"), outputContents);
+    _savePngVisualizations->setChecked(false);
     _runTag = new QLineEdit(outputContents);
     _advanced = new QPlainTextEdit(QStringLiteral("{}"), outputContents); _advanced->setMaximumHeight(90);
     outputForm->addRow(tr("z begin"), _zBegin);
@@ -155,6 +157,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     outputForm->addRow(tr("Legacy checkpoint step"), _legacyCheckpointStep);
     outputForm->addRow(tr("Run tag"), _runTag);
     outputForm->addRow(tr("Render-volume scale"), _renderVolumeScale);
+    outputForm->addRow(_savePngVisualizations);
     outputForm->addRow(tr("Advanced config JSON"), _advanced);
 
     auto* displayGroup = makeSection(tr("Display"),
@@ -288,6 +291,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             [this](int) { markReloadRequired(); });
     connect(_storageBackend, qOverload<int>(&QComboBox::currentIndexChanged), this,
             [this](int) { markReloadRequired(); });
+    connect(_savePngVisualizations, &QCheckBox::toggled, this,
+            [this](bool) { markReloadRequired(); });
     connect(_advanced, &QPlainTextEdit::textChanged, this, &SpiralPanel::markReloadRequired);
     restore();
     _service->ensureStarted();
@@ -375,6 +380,8 @@ QJsonObject SpiralPanel::sessionRequest() const
     paths["pcls"] = pcls;
     QJsonParseError parseError;
     const QJsonDocument advanced = QJsonDocument::fromJson(_advanced->toPlainText().toUtf8(), &parseError);
+    QJsonObject config = advanced.isObject() ? advanced.object() : QJsonObject{};
+    config[QStringLiteral("save_png_visualizations")] = _savePngVisualizations->isChecked();
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
                     {"scroll_name", _scrollName->text()}, {"outward_sense", _outwardSense->currentText()},
                     {"voxel_size_um", _voxelSize->value()}, {"lasagna_group", _lasagnaGroup->text()},
@@ -383,7 +390,7 @@ QJsonObject SpiralPanel::sessionRequest() const
                     {"legacy_checkpoint_step", _legacyCheckpointStep->value()},
                     {"run_tag", _runTag->text()},
                     {"render_volume_scale", _renderVolumeScale->value()},
-                    {"config", advanced.isObject() ? advanced.object() : QJsonObject{}}};
+                    {"config", config}};
     return {{"paths", paths}, {"run", run}, {"preview", QJsonObject{{"first_winding", 10}}}};
 }
 
@@ -440,6 +447,7 @@ void SpiralPanel::persist() const
     settings.setValue("spiral/legacy_checkpoint_step", _legacyCheckpointStep->value());
     settings.setValue("spiral/run_tag", _runTag->text());
     settings.setValue("spiral/render_volume_scale", _renderVolumeScale->value());
+    settings.setValue("spiral/save_png_visualizations", _savePngVisualizations->isChecked());
     settings.setValue("spiral/iterations", _iterations->value());
     settings.setValue("spiral/advanced_config", _advanced->toPlainText());
 }
@@ -480,6 +488,8 @@ void SpiralPanel::restore()
     _legacyCheckpointStep->setValue(settings.value("spiral/legacy_checkpoint_step", 0).toInt());
     _runTag->setText(settings.value("spiral/run_tag").toString());
     _renderVolumeScale->setValue(settings.value("spiral/render_volume_scale", 16).toInt());
+    _savePngVisualizations->setChecked(
+        settings.value("spiral/save_png_visualizations", false).toBool());
     _iterations->setValue(settings.value("spiral/iterations", 100).toInt());
     _advanced->setPlainText(settings.value("spiral/advanced_config", "{}").toString());
     _applyingResolution = false;

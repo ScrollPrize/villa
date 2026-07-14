@@ -500,6 +500,7 @@ def save_overlay_and_print_satisfaction(
     voxel_size_um,
     get_or_build_unattached_pcl_flat,
     run_tag=None,
+    save_png_visualizations=False,
 ):
     satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(
         slice_to_spiral_transform, dr_per_winding, patches_list, z_begin, z_end, verbose=True,
@@ -632,7 +633,7 @@ def save_overlay_and_print_satisfaction(
         torch.full_like(satisfied_quads_flat, 2, dtype=torch.int64),
         satisfied_quads_flat.to(torch.int64),
     )
-    if os.environ.get('FIT_SPIRAL_SKIP_SAVE_OVERLAY') != '1':
+    if save_png_visualizations and os.environ.get('FIT_SPIRAL_SKIP_SAVE_OVERLAY') != '1':
         winding_range, patch_extents, pcl_extents = compute_winding_range_and_input_extents(
             slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
             cfg, z_begin, z_end, get_or_build_unattached_pcl_flat,

@@ -231,6 +231,9 @@ default_config = {
     'shell_table_smooth_sigma_z': 4.0,
     'shell_table_smooth_sigma_theta': 1.0,
     'shell_min_confidence': 0.25,
+    # Final diagnostic PNG overlays are expensive at scroll resolution and are
+    # not needed for mesh output or VC3D interactive previews.
+    'save_png_visualizations': False,
 }
 
 
@@ -367,30 +370,22 @@ class PatchGpuAtlas:
         offsets = [0]
         widths = []
         heights = []
-        valid_in_roi_pieces = []
         for p in patches_by_id.values():
             z = p.zyxs  # (H, W, 3) on CPU
             H, W = z.shape[:2]
-            z_flat = z.reshape(-1, 3).to(device=device, dtype=torch.float32)
+            z_flat = z.reshape(-1, 3).to(dtype=torch.float32)
             flat_pieces.append(z_flat)
             offsets.append(offsets[-1] + H * W)
             widths.append(W)
             heights.append(H)
-            valid_flat = p.valid_vertex_mask.reshape(-1).to(device=device)
-            z_in_roi = (z_flat[:, 0] >= z_begin) & (z_flat[:, 0] < z_end)
-            valid_in_roi_pieces.append(z_flat[valid_flat & z_in_roi])
-        self.zyxs_flat = torch.cat(flat_pieces, dim=0)
+        # Concatenate on CPU and perform one CUDA transfer. Concatenating pieces
+        # after individually uploading them temporarily requires roughly two
+        # complete atlases of VRAM during construction.
+        self.zyxs_flat = torch.cat(flat_pieces, dim=0).to(device=device)
         self.offsets = torch.tensor(offsets, device=device, dtype=torch.int64)  # (N+1,)
         self.widths = torch.tensor(widths, device=device, dtype=torch.int64)  # (N,)
         self.heights = torch.tensor(heights, device=device, dtype=torch.int64)  # (N,)
         self.id_to_idx = {pid: i for i, pid in enumerate(patches_by_id.keys())}
-        # Flat (N, 3) of every patch vertex with valid_vertex_mask & z-in-ROI, kept on GPU so
-        # callers (track-exclusion masking, snap anchors) can do batched pairwise comparisons
-        # without re-walking patches on the CPU each time.
-        self.valid_in_roi_zyxs = (
-            torch.cat(valid_in_roi_pieces, dim=0) if valid_in_roi_pieces
-            else torch.empty([0, 3], device=device, dtype=torch.float32)
-        )
 
     def memory_mb(self):
         return self.zyxs_flat.numel() * 4 / 1e6
@@ -903,21 +898,28 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # ==========================================================================================
 
     num_slices_for_visualisation = cfg.get('num_slices_for_visualization', 20)
-    rendering_slices_downsample_factor = cfg.get('rendering_slices_downsample_factor', 2)
-
     device = torch.device('cuda')
 
-    # Concatenate every in-ROI patch vertex (sourced from PatchGpuAtlas.valid_in_roi_zyxs,
-    # already on GPU) and every in-ROI unattached-pcl strip point as scroll-space zyxs on
-    # `device`. The result is the trusted point cloud used to mask out track and unverified
-    # patch points near already-constrained regions.
-    verified_patches_and_pcls = [patch_atlas.valid_in_roi_zyxs]
+    # The trusted point cloud is consumed only by a CPU cKDTree. Build it directly
+    # on CPU instead of storing it in the atlas on CUDA, concatenating it again on
+    # CUDA, and immediately copying it back here.
+    verified_patches_and_pcls_cpu = []
+    for patch in verified_patches_list:
+        z_flat = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
+        valid_flat = patch.valid_vertex_mask.reshape(-1)
+        z_in_roi = (z_flat[:, 0] >= z_begin) & (z_flat[:, 0] < z_end)
+        if (valid_flat & z_in_roi).any():
+            verified_patches_and_pcls_cpu.append(z_flat[valid_flat & z_in_roi])
     for strip in unattached_pcl_strips:
-        zyxs = torch.from_numpy(strip['zyxs']).to(device=device, dtype=torch.float32)
+        zyxs = torch.from_numpy(strip['zyxs']).to(dtype=torch.float32)
         in_roi = (zyxs[..., 0] >= z_begin) & (zyxs[..., 0] < z_end)
         if in_roi.any():
-            verified_patches_and_pcls.append(zyxs[in_roi])
-    verified_patches_and_pcls = torch.cat(verified_patches_and_pcls, dim=0)
+            verified_patches_and_pcls_cpu.append(zyxs[in_roi])
+    verified_patches_and_pcls_cpu = (
+        torch.cat(verified_patches_and_pcls_cpu, dim=0)
+        if verified_patches_and_pcls_cpu
+        else torch.empty([0, 3], dtype=torch.float32)
+    )
 
     unverified_patches_list = []
     unverified_patch_sampling_probabilities = None
@@ -934,7 +936,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     if unverified_patches or using_tracks:
         # Build a cKDTree over the scroll-space anchor points (CPU) for fixed-radius
         # nearest-neighbour queries.
-        verified_patches_and_pcls_np = verified_patches_and_pcls.detach().cpu().numpy()
+        verified_patches_and_pcls_np = verified_patches_and_pcls_cpu.numpy()
         verified_patches_and_pcls_np = np.ascontiguousarray(verified_patches_and_pcls_np, dtype=np.float32)
         if verified_patches_and_pcls_np.shape[0] > 0:
             trusted_geometry_tree = cKDTree(verified_patches_and_pcls_np)
@@ -1083,49 +1085,49 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         unverified_patch_sampling_probabilities = prepare_patch_sampling_cache(unverified_patches_list)
         unverified_patch_atlas = PatchGpuAtlas(unverified_patches, device='cuda')
 
-    # ==========================================================================
-    # Visualization inputs
-    # ==========================================================================
-
+    # The full z series is a model input. PNG-only slice grids and raster inputs
+    # are prepared lazily at final export, and never in a resident VC3D session.
     all_zs = np.arange(z_begin, z_end)
-    zs_for_visualisation = np.linspace(z_begin, z_end - 1, min(num_slices_for_visualisation, z_end - 1 - z_begin),
-                                       dtype=np.int64)
-
     umbilicus_zyx = torch.from_numpy(
         np.concatenate([all_zs[:, None], umbilicus(all_zs)], axis=-1).astype(np.float32)).to(device)
-
     all_zs = torch.from_numpy(all_zs).to(device)
 
-    if scroll_zarr is not None:
-        subvolume_shape = tuple([z_end - z_begin, *scroll_zarr.shape[1:]])
-        print('loading slices for visualisation')
-        vis_zs = np.floor(zs_for_visualisation / render_volume_scale).astype(np.int64)
-        scroll_slices_for_visualisation = (
-                    torch.from_numpy(scroll_zarr[vis_zs]).to(torch.float32) / np.iinfo(
-                scroll_zarr.dtype).max * 0.75 * 255).to(torch.uint8)
-        render_z_begin = int(np.floor(z_begin / render_volume_scale))
-        render_z_end = int(np.ceil(z_end / render_volume_scale))
-        scroll_slices_for_rendering = (torch.from_numpy(scroll_zarr[
-                                                            render_z_begin: render_z_end: rendering_slices_downsample_factor, ::rendering_slices_downsample_factor, ::rendering_slices_downsample_factor]).to(
-            torch.int32) // (np.iinfo(scroll_zarr.dtype).max // 255)).to(torch.uint8)
-    else:
-        subvolume_shape = [z_end - z_begin, int(np.ceil(32693 / render_volume_scale)), int(np.ceil(32693 / render_volume_scale))]
-        scroll_slices_for_visualisation = torch.zeros([len(zs_for_visualisation), *subvolume_shape[1:]])
-        scroll_slices_for_rendering = None
+    def prepare_png_visualization_inputs():
+        zs = np.linspace(
+            z_begin,
+            z_end - 1,
+            min(num_slices_for_visualisation, z_end - 1 - z_begin),
+            dtype=np.int64,
+        )
+        if scroll_zarr is not None:
+            subvolume_shape = (z_end - z_begin, *scroll_zarr.shape[1:])
+            print('loading slices for visualisation')
+            vis_zs = np.floor(zs / render_volume_scale).astype(np.int64)
+            scroll_slices = (
+                torch.from_numpy(scroll_zarr[vis_zs]).to(torch.float32)
+                / np.iinfo(scroll_zarr.dtype).max * 0.75 * 255
+            ).to(torch.uint8)
+        else:
+            subvolume_shape = (
+                z_end - z_begin,
+                int(np.ceil(32693 / render_volume_scale)),
+                int(np.ceil(32693 / render_volume_scale)),
+            )
+            scroll_slices = torch.zeros([len(zs), *subvolume_shape[1:]])
 
-    prediction_slices_for_visualisation, quad_label_map, _quad_offsets = overlay_patches_on_slices(
-        verified_patches_list,
-        zs_for_visualisation,
-        subvolume_shape[1:],
-        cache_path,
-        canvas_scale=render_volume_scale,
-    )
-
-    slice_yx = torch.stack(torch.meshgrid(
-        torch.arange(subvolume_shape[1], dtype=torch.float32),
-        torch.arange(subvolume_shape[2], dtype=torch.float32),
-        indexing='ij'
-    ), axis=-1).to(device) * render_volume_scale
+        prediction_slices, quad_labels, _ = overlay_patches_on_slices(
+            verified_patches_list,
+            zs,
+            subvolume_shape[1:],
+            cache_path,
+            canvas_scale=render_volume_scale,
+        )
+        yx = torch.stack(torch.meshgrid(
+            torch.arange(subvolume_shape[1], dtype=torch.float32),
+            torch.arange(subvolume_shape[2], dtype=torch.float32),
+            indexing='ij',
+        ), axis=-1).to(device) * render_volume_scale
+        return zs, yx, scroll_slices, prediction_slices, quad_labels
 
     # ==========================================================================
     # Model construction and resume
@@ -1367,7 +1369,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     if using_tracks:
         prepared_main_tracks = prepare_main_phase_tracks(
             tracks,
-            verified_patches_and_pcls,
+            None,
             float(cfg['track_exclusion_radius']),
             device,
             anchor_tree=trusted_geometry_tree,
@@ -1377,8 +1379,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         # for preview bounds instead of walking millions of short NumPy tracks.
         if prepared_main_tracks is not None:
             input_track_points = sum(len(track) for track in tracks)
-            if prepared_main_tracks['flat_zyx'].shape[0] == input_track_points:
-                preview_extent_tracks = (prepared_main_tracks['flat_zyx'],)
+            if prepared_main_tracks['flat_zyx_cpu'].shape[0] == input_track_points:
+                preview_extent_tracks = (prepared_main_tracks['flat_zyx_cpu'],)
 
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
     dr_per_winding = spiral_and_transform.get_dr_per_winding()
@@ -1467,6 +1469,21 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             'flow_field_high_res_lr_scale': spiral_and_transform.flow_field.flow_scales[1],
         }
 
+        def backward_family(weighted_losses):
+            """Accumulate one loss family's gradients, then release its graph."""
+            family_loss = sum(weighted_losses.values())
+            if family_loss.requires_grad:
+                step_timer.stop('fwd')
+                step_timer.start('bwd')
+                # dr_per_winding and the transform's scaled linear logits are shared
+                # by later families. retain_graph keeps those tiny common paths valid;
+                # the family-specific graph is released when this function returns.
+                family_loss.backward(retain_graph=True)
+                step_timer.stop('bwd')
+                step_timer.start('fwd')
+            for name, value in weighted_losses.items():
+                losses[name] = value.detach()
+
         compute_patch_dt = iteration > cfg['loss_start_patch_dt']
         track_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_track_dt'] is None else cfg['loss_start_track_dt']
         compute_track_dt = iteration > track_dt_start
@@ -1485,7 +1502,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         if track_dt_max_winding is not None:
             log_metrics['track_dt_max_winding'] = track_dt_max_winding
 
-        patch_radius_loss, umbilicus_loss, patch_dt_loss, shell_patch_radius_loss = get_patch_and_umbilicus_losses(
+        patch_loss_values = get_patch_and_umbilicus_losses(
             slice_to_spiral_transform,
             dr_per_winding,
             cfg['num_patches_per_step'],
@@ -1499,16 +1516,21 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             shell_outer_winding_idx=shell_outer_winding_idx,
             dt_max_winding=patch_dt_max_winding,
         )
-        losses['patch_radius'] = patch_radius_loss * cfg['loss_weight_patch_radius']
-        losses['patch_dt'] = patch_dt_loss * cfg['loss_weight_patch_dt']
+        patch_family = {
+            'patch_radius': patch_loss_values[0] * cfg['loss_weight_patch_radius'],
+            'patch_dt': patch_loss_values[2] * cfg['loss_weight_patch_dt'],
+            'umbilicus': patch_loss_values[1] * cfg['loss_weight_umbilicus'],
+        }
         if shell_valid_zyxs_gpu is not None:
-            losses['shell_patch_radius'] = shell_patch_radius_loss * cfg['loss_weight_shell_patch_radius']
+            patch_family['shell_patch_radius'] = patch_loss_values[3] * cfg['loss_weight_shell_patch_radius']
+        backward_family(patch_family)
+        del patch_family, patch_loss_values
 
         if unverified_patch_atlas is not None and (
             cfg['loss_weight_unverified_patch_radius'] > 0
             or cfg['loss_weight_unverified_patch_dt'] > 0
         ):
-            unverified_patch_radius_loss, unverified_patch_dt_loss = get_unverified_patch_losses(
+            unverified_loss_values = get_unverified_patch_losses(
                 slice_to_spiral_transform,
                 dr_per_winding,
                 cfg['unverified_num_patches_per_step'],
@@ -1519,49 +1541,60 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 compute_dt=compute_unverified_patch_dt,
                 dt_max_winding=unverified_patch_dt_max_winding,
             )
-            losses['unverified_patch_radius'] = unverified_patch_radius_loss * cfg['loss_weight_unverified_patch_radius']
-            losses['unverified_patch_dt'] = unverified_patch_dt_loss * cfg['loss_weight_unverified_patch_dt']
+            backward_family({
+                'unverified_patch_radius': unverified_loss_values[0] * cfg['loss_weight_unverified_patch_radius'],
+                'unverified_patch_dt': unverified_loss_values[1] * cfg['loss_weight_unverified_patch_dt'],
+            })
+            del unverified_loss_values
 
         if cfg['loss_weight_sym_dirichlet'] > 0:
-            sym_dirichlet_loss = get_symmetric_dirichlet_loss(
-                slice_to_spiral_transform,
-                dr_per_winding,
-                shell_outer_winding_idx,
-                cfg['regularisation_num_points'],
-            )
-            losses['sym_dirichlet'] = sym_dirichlet_loss * cfg['loss_weight_sym_dirichlet']
+            backward_family({
+                'sym_dirichlet': get_symmetric_dirichlet_loss(
+                    slice_to_spiral_transform,
+                    dr_per_winding,
+                    shell_outer_winding_idx,
+                    cfg['regularisation_num_points'],
+                ) * cfg['loss_weight_sym_dirichlet'],
+            })
 
         if cfg['loss_weight_rel_winding'] > 0 and cross_patch_pcls:
-            losses['rel_winding'] = get_patch_rel_winding_loss(
-                slice_to_spiral_transform,
-                dr_per_winding,
-                verified_patches,
-                patch_atlas,
-                cross_patch_pcls,
-            ) * cfg['loss_weight_rel_winding']
+            backward_family({
+                'rel_winding': get_patch_rel_winding_loss(
+                    slice_to_spiral_transform,
+                    dr_per_winding,
+                    verified_patches,
+                    patch_atlas,
+                    cross_patch_pcls,
+                ) * cfg['loss_weight_rel_winding'],
+            })
 
         if cfg['loss_weight_abs_winding'] > 0 and cross_patch_pcls:
-            losses['abs_winding'] = get_patch_abs_winding_loss(
-                slice_to_spiral_transform,
-                dr_per_winding,
-                verified_patches,
-                patch_atlas,
-                cross_patch_pcls,
-            ) * cfg['loss_weight_abs_winding']
+            backward_family({
+                'abs_winding': get_patch_abs_winding_loss(
+                    slice_to_spiral_transform,
+                    dr_per_winding,
+                    verified_patches,
+                    patch_atlas,
+                    cross_patch_pcls,
+                ) * cfg['loss_weight_abs_winding'],
+            })
 
         if (
             (cfg['loss_weight_dense_normals'] > 0 or cfg['loss_weight_dense_spacing'] > 0)
             and lasagna_volume is not None
         ):
-            dense_normals_loss, dense_spacing_loss = get_lasagna_losses(
+            dense_loss_values = get_lasagna_losses(
                 slice_to_spiral_transform,
                 dr_per_winding,
                 lasagna_volume,
                 shell_outer_winding_idx,
                 cfg['dense_normals_num_points'],
             )
-            losses['dense_normals'] = dense_normals_loss * cfg['loss_weight_dense_normals']
-            losses['dense_spacing'] = dense_spacing_loss * cfg['loss_weight_dense_spacing']
+            backward_family({
+                'dense_normals': dense_loss_values[0] * cfg['loss_weight_dense_normals'],
+                'dense_spacing': dense_loss_values[1] * cfg['loss_weight_dense_spacing'],
+            })
+            del dense_loss_values
             if lasagna_volume.get('backend') == 'mmap':
                 log_metrics.update({
                     f'lasagna_{name}': value
@@ -1572,7 +1605,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0)
             and unattached_pcl_strips
         ):
-            unattached_pcl_radius_loss, unattached_pcl_dt_loss = get_unattached_pcl_strip_losses(
+            unattached_loss_values = get_unattached_pcl_strip_losses(
                 slice_to_spiral_transform,
                 dr_per_winding,
                 unattached_pcl_strips,
@@ -1582,11 +1615,14 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 compute_dt=compute_patch_dt,
                 dt_max_winding=patch_dt_max_winding,
             )
-            losses['unattached_pcl_radius'] = unattached_pcl_radius_loss * cfg['loss_weight_unattached_pcl_radius']
-            losses['unattached_pcl_dt'] = unattached_pcl_dt_loss * cfg['loss_weight_unattached_pcl_dt']
+            backward_family({
+                'unattached_pcl_radius': unattached_loss_values[0] * cfg['loss_weight_unattached_pcl_radius'],
+                'unattached_pcl_dt': unattached_loss_values[1] * cfg['loss_weight_unattached_pcl_dt'],
+            })
+            del unattached_loss_values
 
         if prepared_main_tracks is not None:
-            track_radius_loss, track_dt_loss = get_track_losses(
+            track_loss_values = get_track_losses(
                 slice_to_spiral_transform,
                 dr_per_winding,
                 prepared_main_tracks,
@@ -1594,8 +1630,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 compute_dt=compute_track_dt,
                 dt_max_winding=track_dt_max_winding,
             )
-            losses['track_radius'] = track_radius_loss * cfg['loss_weight_track_radius']
-            losses['track_dt'] = track_dt_loss * cfg['loss_weight_track_dt']
+            backward_family({
+                'track_radius': track_loss_values[0] * cfg['loss_weight_track_radius'],
+                'track_dt': track_loss_values[1] * cfg['loss_weight_track_dt'],
+            })
+            del track_loss_values
 
         shell_metrics = {}
         if shell_map is not None:
@@ -1605,14 +1644,15 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 dr_per_winding,
                 shell_outer_winding_idx,
             )
-            losses['shell_outer'] = shell_outer_loss * cfg['loss_weight_shell_outer']
+            backward_family({
+                'shell_outer': shell_outer_loss * cfg['loss_weight_shell_outer'],
+            })
+            del shell_outer_loss
 
-        losses['umbilicus'] = umbilicus_loss * cfg['loss_weight_umbilicus']
         loss = sum(losses.values())
 
         step_timer.stop('fwd')
         step_timer.start('bwd')
-        loss.backward()
         apply_accumulated_field_grad = getattr(spiral_and_transform.flow_field, 'apply_accumulated_field_grad', None)
         if apply_accumulated_field_grad is not None:
             apply_accumulated_field_grad()
@@ -1682,6 +1722,20 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     suffix = 'fitted'
     if is_main_process():
         save_model(suffix, num_training_steps)
+        if cfg.get('save_png_visualizations', False):
+            (
+                zs_for_visualisation,
+                slice_yx,
+                scroll_slices_for_visualisation,
+                prediction_slices_for_visualisation,
+                quad_label_map,
+            ) = prepare_png_visualization_inputs()
+        else:
+            zs_for_visualisation = None
+            slice_yx = None
+            scroll_slices_for_visualisation = None
+            prediction_slices_for_visualisation = None
+            quad_label_map = None
         save_overlay_and_print_satisfaction(
             suffix,
             spiral_and_transform=spiral_and_transform,
@@ -1710,6 +1764,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             voxel_size_um=voxel_size_um,
             get_or_build_unattached_pcl_flat=get_or_build_unattached_pcl_flat,
             run_tag=run_tag,
+            save_png_visualizations=cfg.get('save_png_visualizations', False),
         )
 
 
