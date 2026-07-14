@@ -15,7 +15,7 @@
 #      This is what lets the AppImage run on distros OLDER than the build box —
 #      glibc is backward- but not forward-compatible, and the build image
 #      (Ubuntu 26.04) ships a very new glibc. Disable with BUNDLE_GLIBC=0.
-#   5. appimagetool: squash the AppDir into VC3D-<version>-<arch>.AppImage
+#   5. appimagetool: squash the AppDir into VC3D-<version>-linux-<arch>.AppImage
 #
 # Prereqs: a completed build (default preset ci-release-gcc), qt6-base-dev
 # (qmake6), and patchelf. Tools (linuxdeploy, the qt plugin, appimagetool) are
@@ -35,7 +35,7 @@
 #                 from VC3D alone. --strip-debug keeps .symtab so the crash
 #                 handler can still symbolize; use '--strip-unneeded' for the
 #                 smallest result, or STRIP_FLAGS= to skip.)
-#   DEBUG_BUNDLE  Also emit a VC3D-<arch>-debug.tar.* with the split-out debug
+#   DEBUG_BUNDLE  Also emit a VC3D-<version>-linux-<arch>-debug.tar.* with the split-out debug
 #                 symbols (linked to the stripped binaries via debuglink, so
 #                 crash reports stay symbolizable). 1/0, default 1. Ignored when
 #                 STRIP_FLAGS is empty.
@@ -70,7 +70,7 @@ BUNDLE_GLIBC="${BUNDLE_GLIBC:-1}"
 GLIBC_SRCDIR="${GLIBC_SRCDIR:-/usr/lib/${ARCH}-linux-gnu}"
 EXCLUDE_TOOLS="${EXCLUDE_TOOLS-vc_render_video vc_diffuse_winding}"
 STRIP_FLAGS="${STRIP_FLAGS---strip-debug}"   # unset (STRIP_FLAGS=) to skip
-DEBUG_BUNDLE="${DEBUG_BUNDLE:-1}"            # also emit VC3D-<version>-<arch>-debug.tar.* companion
+DEBUG_BUNDLE="${DEBUG_BUNDLE:-1}"            # also emit VC3D-<version>-linux-<arch>-debug.tar.* companion
 
 # Version string embedded in the artifact names, matching CMake's
 # VC_VERSION_STRING (<sha7>-<commit-date>) and the CPack names used by the
@@ -195,9 +195,9 @@ if [ -n "$STRIP_FLAGS" ]; then
     if [ -n "$dbgstage" ] && [ -d "$dbgstage" ]; then
         mkdir -p "$OUT_DIR"
         if command -v zstd >/dev/null 2>&1; then
-            dbgout="$OUT_DIR/VC3D-${VER_INFIX}${ARCH}-debug.tar.zst"; tar -C "$dbgstage" --zstd -cf "$dbgout" .
+            dbgout="$OUT_DIR/VC3D-${VER_INFIX}linux-${ARCH}-debug.tar.zst"; tar -C "$dbgstage" --zstd -cf "$dbgout" .
         else
-            dbgout="$OUT_DIR/VC3D-${VER_INFIX}${ARCH}-debug.tar.gz";  tar -C "$dbgstage" -czf "$dbgout" .
+            dbgout="$OUT_DIR/VC3D-${VER_INFIX}linux-${ARCH}-debug.tar.gz";  tar -C "$dbgstage" -czf "$dbgout" .
         fi
         echo "    Debug bundle: $dbgout ($(du -sh "$dbgout" | cut -f1))"
     fi
@@ -208,6 +208,6 @@ install -m755 "$here/appimage/AppRun" "$APPDIR/AppRun"
 
 echo "==> Squashing AppImage (appimagetool)"
 mkdir -p "$OUT_DIR"
-out="$OUT_DIR/VC3D-${VER_INFIX}${ARCH}.AppImage"
+out="$OUT_DIR/VC3D-${VER_INFIX}linux-${ARCH}.AppImage"
 ARCH="$ARCH" "$TOOLS_DIR/appimagetool-$ARCH.AppImage" "$APPDIR" "$out"
 echo "==> Done: $out"

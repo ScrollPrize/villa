@@ -1,9 +1,9 @@
 # Linux AppImage packaging
 
 Bundles VC3D (the GUI) plus all ~35 `vc_*` command-line tools into a single
-relocatable `VC3D-<version>-x86_64.AppImage`, where `<version>` is the git
+relocatable `VC3D-<version>-linux-x86_64.AppImage`, where `<version>` is the git
 `<sha7>-<commit-date>` (matching the macOS/Windows package names). Ad-hoc builds
-with no git info produce an unversioned `VC3D-x86_64.AppImage`.
+with no git info produce an unversioned `VC3D-linux-x86_64.AppImage`.
 
 **Runs on old distros.** The build image (Ubuntu 26.04) ships a very new glibc
 (2.43). glibc is backward- but not forward-compatible, so a binary built there
@@ -33,7 +33,7 @@ The AppImage icon reuses the GUI window icon (`apps/VC3D/logo.png`).
 
 ### Reproducible (Docker, recommended for releases)
 
-Writes `dist/VC3D-<version>-x86_64.AppImage` on the host. The build context is
+Writes `dist/VC3D-<version>-linux-x86_64.AppImage` on the host. The build context is
 only the `volume-cartographer/` subtree (no `.git`), so pass the revision in for
 a versioned name; without it the binaries and file name fall back to
 `Untracked`:
@@ -55,7 +55,7 @@ Needs a completed build (default preset `ci-release-gcc`) plus `qt6-base-dev`
 ```bash
 cmake --preset ci-release-gcc
 cmake --build --preset ci-release-gcc
-scripts/build_appimage.sh          # -> dist/VC3D-<version>-x86_64.AppImage
+scripts/build_appimage.sh          # -> dist/VC3D-<version>-linux-x86_64.AppImage
 ```
 
 Here the version is read from git in the source tree automatically (override
@@ -68,7 +68,7 @@ runs on hosts whose glibc is at least as new as the build machine's).
 
 The AppImage is a multitool: the first argument selects the GUI (`VC3D`) or any
 bundled CLI tool. The examples below write the file name as `VC3D.AppImage` for
-brevity — substitute the actual `VC3D-<version>-x86_64.AppImage` (or rename it).
+brevity — substitute the actual `VC3D-<version>-linux-x86_64.AppImage` (or rename it).
 
 ```bash
 ./VC3D.AppImage VC3D                   # launch the GUI
@@ -146,8 +146,8 @@ symbols into a separate companion. Two artifacts result:
 
 | Artifact | Size | Notes |
 | --- | --- | --- |
-| `VC3D-<version>-x86_64.AppImage` | **~116 MB** | Minified download. |
-| `VC3D-<version>-x86_64-debug.tar.zst` | ~375 MB | Split-out debug symbols, linked to the stripped binaries via `.gnu_debuglink` — keep it around to symbolize crash reports / run under gdb. |
+| `VC3D-<version>-linux-x86_64.AppImage` | **~116 MB** | Minified download. |
+| `VC3D-<version>-linux-x86_64-debug.tar.zst` | ~375 MB | Split-out debug symbols, linked to the stripped binaries via `.gnu_debuglink` — keep it around to symbolize crash reports / run under gdb. |
 
 Set `DEBUG_BUNDLE=0` to skip the companion, or `STRIP_FLAGS=` to ship an
 unstripped AppImage instead.
