@@ -300,6 +300,7 @@ int main(int argc, char** argv)
     require(reviewCheckbox->isChecked(), "Selected fiber tag should be checked");
     require(!todoCheckbox->isChecked(), "Unchecked known tag should not be checked");
     todoCheckbox->setChecked(true);
+    QApplication::processEvents();
     require(tagRequests == 1, "Checking a tag did not emit one tag request");
     require(requestedTagFiberId == 2, "Tag check emitted the wrong fiber ID");
     require(requestedTag == QStringLiteral("todo"), "Tag check emitted the wrong tag");
@@ -311,6 +312,7 @@ int main(int argc, char** argv)
     require(addTagButton != nullptr, "Add tag button was not found");
     newTagEdit->setText(QStringLiteral("needs-proofread"));
     addTagButton->click();
+    QApplication::processEvents();
     require(tagRequests == 2, "Adding a tag did not emit a second tag request");
     require(requestedTagFiberId == 2, "Added tag emitted the wrong fiber ID");
     require(requestedTag == QStringLiteral("needs-proofread"), "Added tag emitted the wrong tag");
