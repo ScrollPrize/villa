@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Run the Dataset001_Ink nnU-Net ensemble over the ink strips produced by render_ink.py
-and report how much inked surface area the segmentation ensemble finds.
+and report how much inked surface area the ensemble finds and how well that ink is
+organised into the layout expected of a written scroll (text lines and columns).
 
 render_ink.py writes one 8-bit grayscale strip jpg per winding-range chunk into an `ink/`
 folder (e.g. `w010-027.jpg`). This script feeds those strips through the trained 2d nnU-Net
 ensemble (3 folds, Dataset001_Ink), whose job is to segment inked (foreground) pixels.
 More foreground => more legible ink, so the total foreground area is a scalar quality metric
-for a render_ink output: higher is better.
+for a render_ink output: higher is better. Ink that additionally forms regularly spaced
+text lines and clean, correctly sized columns is more likely to be real writing than
+scattered false positives, so two layout scores complement the area.
 
 For each strip it:
   1. converts the strip to the single-channel PNG nnU-Net expects (`<stem>_0000.png`),
@@ -14,11 +17,16 @@ For each strip it:
      spread across the available GPUs so they run in parallel),
   3. averages the folds' probabilities (the standard nnU-Net ensemble) and thresholds them
      into a binary ink mask,
-  4. saves the mask (png) and a red ink-on-strip overlay (jpg),
-  5. counts foreground pixels (the surface area of predicted ink).
+  4. scores the layout of the ensemble ink probabilities: line-ness (text-line pitch close
+     to the expected ~80-120 px) and column-ness (columns close to the expected ~850 px
+     width, separated by ink-free gaps),
+  5. saves the mask (png) and a red ink-on-strip overlay (jpg, detected column edges in
+     cyan),
+  6. counts foreground pixels (the surface area of predicted ink).
 
-Finally it aggregates the per-strip areas into a single total (the metric) and writes
-metrics.json / metrics.csv.
+Finally it aggregates the per-strip areas and layout scores and writes
+metrics.json / metrics.csv (the json additionally carries the full per-strip column
+detection detail: run/gap positions and scores plus a downsampled density profile).
 
 Usage:
     get_ink_metrics.py /path/to/<run>/meshes/<...>/ink
@@ -34,6 +42,7 @@ import sys
 import csv
 import glob
 import json
+import math
 import time
 import shutil
 import argparse
@@ -42,6 +51,8 @@ import multiprocessing
 
 import numpy as np
 from PIL import Image
+from scipy.signal import find_peaks
+from scipy.ndimage import gaussian_filter1d
 
 # ---------------------------------------------------------------------------
 # The model: a HuggingFace repo id (downloaded to the HF cache on first use) or a
@@ -131,6 +142,148 @@ def run_worker(argv):
 
 
 # ===========================================================================
+# Layout ("grid-ness") metrics. Ancient writing has a grid: text lines at a
+# regular pitch inside columns of a roughly fixed width, separated by clean
+# vertical gaps (intercolumnia). Both scores work on 1D projections of the
+# ensemble ink-probability map and use the expected dimensions as a prior:
+# structure at the wrong scale (e.g. beautifully periodic 100 px "columns")
+# scores near zero.
+# ===========================================================================
+COL_WIDTH_PX = 850.0         # expected column width in strip pixels
+COL_WIDTH_TOL = 0.15         # fractional width variation that still scores 1.0
+LINE_PITCH_PX = (80.0, 120.0)  # expected text-line pitch band in strip pixels
+LINE_WIN_PX = 512            # x-window for line detection (~half a column)
+LINE_STEP_PX = 256
+LINE_MIN_WINDOW_INK = 0.01   # mean ink probability for a window to count
+LINE_MIN_GAPS = 10           # below this many observed gaps, scale the score down
+PROFILE_DS = 4               # downsampling of the density profile kept in metrics.json
+
+
+def band_score(value, lo, hi, log_sigma=0.22):
+    """1.0 for value inside [lo, hi], gaussian falloff outside, measured in log
+    space so 2x too large is punished like 2x too small. With the default sigma
+    a value 25% past a band edge scores ~0.5 and 2x past it ~0."""
+    if value <= 0 or lo <= 0:
+        return 0.0
+    d = max(0.0, math.log(lo / value), math.log(value / hi))
+    return math.exp(-0.5 * (d / log_sigma) ** 2)
+
+
+def score_columns(prob, width_px=COL_WIDTH_PX, tol=COL_WIDTH_TOL):
+    """Column-ness of one strip from the ensemble ink-probability map.
+
+    Pool the probabilities vertically into an ink-density profile along x: text
+    columns show up as wide high-density runs separated by low-density gaps.
+    The score is (mean prior conformity of detected column widths) x (how
+    ink-free the gaps are), so it punishes columns at the wrong scale, merged
+    columns (dirty gaps fuse runs into one over-wide run), and ink smeared into
+    the intercolumnia.
+
+    Returns (metrics dict, detail dict). The detail carries the detected runs
+    (with per-column width scores), the gaps between them (with per-gap
+    cleanliness), the detection threshold, and a downsampled density profile --
+    enough to redraw the detection later without the probability maps."""
+    h, w = prob.shape
+    metrics = {'col_score': 0.0, 'col_width_conformity': 0.0,
+               'col_gap_contrast': 0.0, 'col_count': 0, 'col_median_width_px': 0}
+    profile = prob.mean(axis=0)
+    detail = {'threshold': 0.0, 'runs': [], 'gaps': [],
+              'profile_ds': [round(float(v), 4) for v in profile[::PROFILE_DS]],
+              'profile_ds_factor': PROFILE_DS}
+    smooth = gaussian_filter1d(profile, sigma=max(3.0, width_px / 16.0))
+    lo_v, hi_v = np.percentile(smooth, [5, 95])
+    if hi_v < 0.02:  # essentially no ink anywhere
+        return metrics, detail
+
+    thr = float(lo_v + 0.3 * (hi_v - lo_v))
+    detail['threshold'] = thr
+    above = smooth >= thr
+    steps = np.diff(above.astype(np.int8), prepend=0, append=0)
+    starts, ends = np.flatnonzero(steps == 1), np.flatnonzero(steps == -1)
+    runs = [(int(s), int(e)) for s, e in zip(starts, ends) if e - s >= 25]
+    if not runs:
+        return metrics, detail
+
+    col_px = np.zeros(w, dtype=bool)
+    for s, e in runs:
+        col_px[s:e] = True
+    col_density = float(profile[col_px].mean())
+    gap_density = float(profile[~col_px].mean()) if (~col_px).any() else col_density
+    contrast = max(0.0, 1.0 - gap_density / col_density) if col_density > 0 else 0.0
+
+    # Runs touching the strip edge are (potentially) truncated columns; they
+    # count for gap cleanness but their width says nothing about the prior.
+    for s, e in runs:
+        interior = s > 0 and e < w
+        detail['runs'].append({
+            'start': s, 'end': e, 'width': e - s, 'interior': interior,
+            'width_score': band_score(e - s, width_px * (1 - tol), width_px * (1 + tol))
+                           if interior else None,
+        })
+    bounds = [0] + [x for s, e in runs for x in (s, e)] + [w]
+    for i in range(len(runs) + 1):
+        gs, ge = bounds[2 * i], bounds[2 * i + 1]
+        if ge - gs < 5:
+            continue
+        gd = float(profile[gs:ge].mean())
+        detail['gaps'].append({
+            'start': int(gs), 'end': int(ge),
+            'cleanliness': max(0.0, 1.0 - gd / col_density) if col_density > 0 else 0.0,
+        })
+
+    scores = [r['width_score'] for r in detail['runs'] if r['interior']]
+    conformity = float(np.mean(scores)) if scores else 0.0
+    widths = [r['width'] for r in detail['runs'] if r['interior']]
+    metrics.update({
+        'col_score': conformity * contrast,
+        'col_width_conformity': conformity,
+        'col_gap_contrast': contrast,
+        'col_count': len(runs),
+        'col_median_width_px': int(np.median(widths)) if widths else 0,
+    })
+    return metrics, detail
+
+
+def score_lines(prob, pitch=LINE_PITCH_PX, win=LINE_WIN_PX, step=LINE_STEP_PX):
+    """Line-ness of one strip from the ensemble ink-probability map.
+
+    Sweep windows along x (narrow enough to sit inside a single column); in
+    each window with enough ink, pool horizontally into a vertical profile,
+    detrend it, and find text-line peaks. The score is the mean prior
+    conformity of the gaps between consecutive lines: 1.0 when every observed
+    pitch is inside the expected band, ~0 for random spacings or structure at
+    the wrong scale. Windows without ink contribute nothing (missing coverage
+    is already measured by the area metric)."""
+    h, w = prob.shape
+    lo_p, hi_p = pitch
+    gaps = []
+    for x0 in range(0, max(1, w - win + 1), step):
+        chunk = prob[:, x0:x0 + win]
+        if chunk.mean() < LINE_MIN_WINDOW_INK:
+            continue
+        profile = chunk.mean(axis=1)
+        detrended = profile - gaussian_filter1d(profile, sigma=2.0 * hi_p)
+        detrended = gaussian_filter1d(detrended, sigma=lo_p / 8.0)
+        # Real text lines modulate the profile by roughly its own mean (ink is
+        # concentrated in the lines); gating the peak prominence on that mean
+        # keeps the ripple of pooled diffuse noise from posing as lines.
+        prominence = max(0.25 * float(detrended.std()), 0.2 * float(profile.mean()))
+        if prominence <= 0:
+            continue
+        peaks, _ = find_peaks(detrended, distance=max(1, int(0.3 * lo_p)),
+                              prominence=prominence)
+        gaps.extend(np.diff(peaks).tolist())
+
+    metrics = {'line_score': 0.0, 'line_median_pitch_px': 0, 'line_gap_count': len(gaps)}
+    if gaps:
+        evidence = min(1.0, len(gaps) / LINE_MIN_GAPS)
+        metrics['line_score'] = evidence * float(np.mean(
+            [band_score(g, lo_p, hi_p) for g in gaps]))
+        metrics['line_median_pitch_px'] = int(np.median(gaps))
+    return metrics
+
+
+# ===========================================================================
 # Orchestrator helpers
 # ===========================================================================
 def list_strips(ink_dir):
@@ -175,8 +328,9 @@ def load_fold_prob(npz_path):
     return p
 
 
-def save_predictions(out_dir, stem, gray, mask):
-    """Write the binary mask (png) and a red-ink overlay (jpg) for one strip."""
+def save_predictions(out_dir, stem, gray, mask, col_runs=()):
+    """Write the binary mask (png) and a red-ink overlay (jpg) for one strip,
+    with the detected column edges drawn in cyan on the overlay."""
     Image.fromarray((mask * 255).astype(np.uint8)).save(os.path.join(out_dir, f'{stem}_mask.png'))
 
     rgb = np.stack([gray, gray, gray], axis=-1).astype(np.float32)
@@ -184,6 +338,11 @@ def save_predictions(out_dir, stem, gray, mask):
     alpha = 0.45
     m = mask.astype(bool)
     rgb[m] = (1 - alpha) * rgb[m] + alpha * color
+    cyan = np.array([40.0, 255.0, 255.0])
+    for s, e in col_runs:
+        for x in (s, e - 1):
+            x0, x1 = max(0, x - 1), min(rgb.shape[1], x + 2)
+            rgb[:, x0:x1] = 0.4 * rgb[:, x0:x1] + 0.6 * cyan
     Image.fromarray(rgb.astype(np.uint8)).save(
         os.path.join(out_dir, f'{stem}_overlay.jpg'), quality=95)
 
@@ -206,6 +365,12 @@ def run_main(argv):
                     help='ensemble foreground-probability threshold for the mask '
                          '(0.5 == argmax; lower = more permissive)')
     ap.add_argument('--step', type=float, default=0.5, help='nnU-Net tile_step_size')
+    ap.add_argument('--col-width-px', type=float, default=COL_WIDTH_PX,
+                    help='expected text column width in strip pixels (layout prior)')
+    ap.add_argument('--col-width-tol', type=float, default=COL_WIDTH_TOL,
+                    help='fractional column-width variation that still scores 1.0')
+    ap.add_argument('--line-pitch-px', default=f'{LINE_PITCH_PX[0]:g},{LINE_PITCH_PX[1]:g}',
+                    help='expected text-line pitch band in strip pixels, as "min,max"')
     ap.add_argument('--no-tta', action='store_true',
                     help='disable mirroring test-time augmentation (~faster, slightly worse)')
     ap.add_argument('--procs', type=int, default=8,
@@ -298,11 +463,15 @@ def run_main(argv):
         raise SystemExit(f'prediction failed for folds {failed}; see logs in {log_dir}')
     print(f'prediction done in {time.time() - t0:.1f}s')
 
-    # 3. Ensemble the folds' softmax probabilities and threshold into ink masks; 4. save;
-    #    5. count foreground pixels (the ink surface area).
+    # 3. Ensemble the folds' softmax probabilities and threshold into ink masks;
+    #    4. score line-ness/column-ness of the probabilities; 5. save;
+    #    6. count foreground pixels (the ink surface area).
     px_area_cm2 = None
     if args.pixel_size_um:
         px_area_cm2 = (args.pixel_size_um * 1e-4) ** 2  # (um -> cm)^2 per pixel
+    line_band = tuple(float(x) for x in args.line_pitch_px.split(','))
+    if len(line_band) != 2 or line_band[0] >= line_band[1]:
+        ap.error(f'--line-pitch-px must be "min,max", got {args.line_pitch_px!r}')
 
     rows = []
     total_fg = 0
@@ -312,12 +481,15 @@ def run_main(argv):
         avg = np.mean(probs, axis=0)          # (num_classes, H, W)
         fg_prob = avg[1]                       # class 1 == ink
         mask = fg_prob >= args.fg_threshold
+        col_metrics, col_detail = score_columns(fg_prob, args.col_width_px, args.col_width_tol)
+        line_metrics = score_lines(fg_prob, line_band)
         gray = gray_by_stem[stem]
         # Guard against any resampling size drift between prob map and source strip.
         if mask.shape != gray.shape:
             gray = np.asarray(Image.fromarray(gray).resize(
                 (mask.shape[1], mask.shape[0]), Image.NEAREST))
-        save_predictions(pred_dir, stem, gray, mask)
+        save_predictions(pred_dir, stem, gray, mask,
+                         [(r['start'], r['end']) for r in col_detail['runs']])
 
         fg = int(mask.sum())
         n = int(mask.size)
@@ -334,21 +506,38 @@ def run_main(argv):
         }
         if px_area_cm2 is not None:
             row['fg_area_cm2'] = fg * px_area_cm2
+        row.update(line_metrics)
+        row.update(col_metrics)
+        # Full per-run/per-gap detection detail: goes to metrics.json, but stays
+        # out of the flat metrics.csv.
+        row['columns'] = col_detail
         rows.append(row)
         print(f'  {stem:14s} {mask.shape[1]:5d}x{mask.shape[0]:<5d} '
-              f'ink={fg:>10,d}px  ({row["fg_fraction"]*100:5.2f}%)')
+              f'ink={fg:>10,d}px  ({row["fg_fraction"]*100:5.2f}%)  '
+              f'lines={row["line_score"]:.2f}@{row["line_median_pitch_px"]}px  '
+              f'cols={row["col_score"]:.2f} '
+              f'({row["col_count"]} x ~{row["col_median_width_px"]}px)')
 
-    # 6. Aggregate + persist.
+    # 7. Aggregate + persist. Layout scores aggregate as strip-area-weighted
+    #    means, so a big structureless strip drags the overall score down.
+    def area_weighted(key):
+        return sum(r[key] * r['total_pixels'] for r in rows) / total_px if total_px else 0.0
+
     summary = {
         'ink_dir': ink_dir,
         'model': args.model,
         'checkpoint': args.checkpoint,
         'folds': folds,
         'fg_threshold': args.fg_threshold,
+        'col_width_px': args.col_width_px,
+        'col_width_tol': args.col_width_tol,
+        'line_pitch_px': list(line_band),
         'num_strips': len(rows),
         'total_fg_pixels': total_fg,
         'total_pixels': total_px,
         'overall_fg_fraction': (total_fg / total_px) if total_px else 0.0,
+        'overall_line_score': area_weighted('line_score'),
+        'overall_column_score': area_weighted('col_score'),
     }
     if px_area_cm2 is not None:
         summary['total_fg_area_cm2'] = total_fg * px_area_cm2
@@ -357,7 +546,8 @@ def run_main(argv):
     with open(os.path.join(out_dir, 'metrics.json'), 'w') as f:
         json.dump({'summary': summary, 'strips': rows}, f, indent=2)
     with open(os.path.join(out_dir, 'metrics.csv'), 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w = csv.DictWriter(f, fieldnames=[k for k in rows[0] if k != 'columns'],
+                           extrasaction='ignore')
         w.writeheader()
         w.writerows(rows)
 
@@ -365,12 +555,16 @@ def run_main(argv):
         shutil.rmtree(work_dir, ignore_errors=True)
 
     print('\n' + '=' * 64)
-    print('INK SURFACE-AREA METRIC')
+    print('INK METRICS')
     print('=' * 64)
     print(f'strips scored          : {len(rows)}')
     print(f'TOTAL ink foreground   : {total_fg:,} px   (metric; higher = more ink)')
     print(f'total strip area       : {total_px:,} px')
     print(f'overall ink fraction   : {summary["overall_fg_fraction"]*100:.3f} %')
+    print(f'overall line-ness      : {summary["overall_line_score"]:.3f}   '
+          f'(1 = all line pitches in {line_band[0]:g}-{line_band[1]:g} px band)')
+    print(f'overall column-ness    : {summary["overall_column_score"]:.3f}   '
+          f'(1 = clean columns of ~{args.col_width_px:g} px +/- {args.col_width_tol*100:g}%)')
     if px_area_cm2 is not None:
         print(f'TOTAL ink area         : {summary["total_fg_area_cm2"]:.3f} cm^2')
     print(f'predictions            : {pred_dir}')
