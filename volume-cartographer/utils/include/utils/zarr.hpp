@@ -733,7 +733,9 @@ private:
         shard_write_mutexes_ = std::make_shared<std::array<std::mutex, kShardMutexStripes>>();
 
     [[nodiscard]] std::mutex& shard_mutex_for(const std::filesystem::path& p) const {
-        std::size_t h = std::hash<std::string>{}(p.native());
+        // hash_value(path) instead of hash<string>(native()): path::native()
+        // is a wstring on Windows.
+        std::size_t h = std::filesystem::hash_value(p);
         return (*shard_write_mutexes_)[h % kShardMutexStripes];
     }
 };

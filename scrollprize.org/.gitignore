@@ -1,6 +1,15 @@
 # Dependencies
 /node_modules
 
+# Yarn (Berry) — node-modules linker + global cache
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+.pnp.*
+
 # Production
 /build
 

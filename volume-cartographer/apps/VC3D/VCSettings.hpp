@@ -87,9 +87,12 @@ namespace settings {
 namespace project {
     constexpr auto DEFAULT_PATH = "project/default_path";
     constexpr auto AUTO_OPEN = "project/auto_open";
+    constexpr auto SHOW_OPEN_DATA_CATALOG_ON_STARTUP = "project/show_open_data_catalog_on_startup";
     constexpr auto RECENT = "project/recent";
+    constexpr auto LAST_VOLUME_PREFIX = "project/last_volume/";
 
-    constexpr bool AUTO_OPEN_DEFAULT = true;
+    constexpr bool AUTO_OPEN_DEFAULT = false;
+    constexpr bool SHOW_OPEN_DATA_CATALOG_ON_STARTUP_DEFAULT = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -105,9 +108,6 @@ namespace viewer {
     constexpr auto ZSCROLL_SENSITIVITY = "viewer/zscroll_sensitivity";
     constexpr auto IMPACT_RANGE_STEPS = "viewer/impact_range_steps";
     constexpr auto SCAN_RANGE_STEPS = "viewer/scan_range_steps";
-    // Fallback voxel size (µm per level-0 voxel) for the scalebar when the loaded
-    // volume's metadata has none (e.g. .vca archives). 0 = unset (no fallback).
-    constexpr auto VOXEL_SIZE_UM = "viewer/voxel_size_um";
 
     constexpr int FWD_BACK_STEP_MS_DEFAULT = 25;
     constexpr bool CENTER_ON_ZOOM_DEFAULT = false;
@@ -115,7 +115,6 @@ namespace viewer {
     constexpr float PAN_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZOOM_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZSCROLL_SENSITIVITY_DEFAULT = 1.0f;
-    constexpr double VOXEL_SIZE_UM_DEFAULT = 0.0;   // unset; scalebar falls back to volume metadata only
     constexpr auto IMPACT_RANGE_STEPS_DEFAULT = "1-3, 5, 8, 11, 15, 20, 28, 40, 60, 100, 200";
     constexpr auto SCAN_RANGE_STEPS_DEFAULT = "1, 2, 5, 10, 20, 50, 100, 200, 500, 1000";
 
@@ -142,7 +141,7 @@ namespace viewer {
     constexpr double DIRECTION_STEP_DEFAULT = 10.0;
     constexpr bool USE_SEG_STEP_FOR_HINTS_DEFAULT = true;
     constexpr int DIRECTION_STEP_POINTS_DEFAULT = 5;
-    constexpr bool RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT = true;
+    constexpr bool RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT = false;
     constexpr bool SHOW_PLANE_INTERSECTION_LINES_DEFAULT = true;
     constexpr bool MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT = false;
     constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
@@ -163,7 +162,7 @@ namespace viewer {
 
     constexpr auto INTERSECTION_MAX_SURFACES = "viewer/intersection_max_surfaces";
 
-    constexpr int INTERSECTION_OPACITY_DEFAULT = 100;
+    constexpr int INTERSECTION_OPACITY_DEFAULT = 70;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
     constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
     constexpr int INTERSECTION_MAX_SURFACES_DEFAULT = 0;  // 0 = unlimited
@@ -172,12 +171,10 @@ namespace viewer {
     constexpr auto SHOW_AXIS_OVERLAYS = "viewer/show_axis_overlays";
     constexpr auto AXIS_OVERLAY_OPACITY = "viewer/axis_overlay_opacity";
     constexpr auto USE_AXIS_ALIGNED_SLICES = "viewer/use_axis_aligned_slices";
-    constexpr auto SLICE_STEP_SIZE = "viewer/slice_step_size";
 
     constexpr bool SHOW_AXIS_OVERLAYS_DEFAULT = true;
-    constexpr int AXIS_OVERLAY_OPACITY_DEFAULT = 100;
+    constexpr int AXIS_OVERLAY_OPACITY_DEFAULT = 70;
     constexpr bool USE_AXIS_ALIGNED_SLICES_DEFAULT = true;
-    constexpr int SLICE_STEP_SIZE_DEFAULT = 1;
 
     // Remote volume chunk cache directory. Resolved through
     // vc3d::remoteCachePath() — see that function for the priority rules.
@@ -194,22 +191,18 @@ namespace viewer {
     constexpr auto USERNAME_DEFAULT = "";
 
     // Viewer control group expansion states
-    constexpr auto GROUP_PREPROCESSING_EXPANDED = "viewer/group_preprocessing_expanded";
     constexpr auto GROUP_NORMAL_VIS_EXPANDED = "viewer/group_normal_vis_expanded";
     constexpr auto GROUP_VIEW_EXPANDED = "viewer/group_view_expanded";
     constexpr auto GROUP_OVERLAY_EXPANDED = "viewer/group_overlay_expanded";
     constexpr auto GROUP_RENDER_SETTINGS_EXPANDED = "viewer/group_render_settings_expanded";
     constexpr auto GROUP_COMPOSITE_EXPANDED = "viewer/group_composite_expanded";
-    constexpr auto GROUP_POSTPROCESSING_EXPANDED = "viewer/group_postprocessing_expanded";
     constexpr auto GROUP_TRANSFORMS_EXPANDED = "viewer/group_transforms_expanded";
 
-    constexpr bool GROUP_PREPROCESSING_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_NORMAL_VIS_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_VIEW_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_OVERLAY_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_COMPOSITE_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_POSTPROCESSING_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_TRANSFORMS_EXPANDED_DEFAULT = true;
 }
 
@@ -236,15 +229,24 @@ namespace perf {
     constexpr int PARALLEL_PROCESSES_DEFAULT = 8;
     constexpr int ITERATION_COUNT_DEFAULT = 1000;
     constexpr int DOWNSCALE_OVERRIDE_DEFAULT = 0;
+    constexpr int INTERPOLATION_METHOD_DEFAULT = 1;  // 0 = Nearest, 1 = Trilinear
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
-    // When true the disk cache stores c3d-compressed sharded zarr (smaller,
-    // lossy).  When false it stores source chunk bytes unchanged at the
-    // volume's native chunk size (larger, lossless).  Both modes use
-    // independent directories so they can coexist.  Requires restart.
-    constexpr auto DISK_CACHE_COMPRESSED = "perf/disk_cache_compressed";
-    constexpr bool DISK_CACHE_COMPRESSED_DEFAULT = true;
+    // When true, raw chunks downloaded from remote volumes are stored in the
+    // persistent disk cache compressed at the configured quantization width.
+    // Reading understands both formats regardless of this flag; it only
+    // controls the write format. Requires restart.
+    constexpr auto REMOTE_CACHE_COMPRESSION = "perf/remote_cache_compression";
+    constexpr bool REMOTE_CACHE_COMPRESSION_DEFAULT = true;
+
+    // Quantization bin width for compressed disk-cache writes
+    // (1 = lossless, 3 = max error +-1, 5 = +-2; see CacheCompression.hpp).
+    // Only affects newly written chunks; reading is unaffected. Requires
+    // restart, except for the explicit "recompress existing cache" action.
+    // Default lossless: compression saves space without changing voxels.
+    constexpr auto REMOTE_CACHE_QUANTIZATION = "perf/remote_cache_quantization";
+    constexpr int REMOTE_CACHE_QUANTIZATION_DEFAULT = 1;
 
     // LOD synthesis method.  Selects how c3d chunks are decoded when a
     // downscaled view is requested.  Value is one of:
@@ -273,6 +275,18 @@ namespace window {
     constexpr auto STATE_META_SCREEN_SIGNATURE = "mainWin/state_meta/screen_signature";
     constexpr auto STATE_META_QT_VERSION = "mainWin/state_meta/qt_version";
     constexpr auto STATE_META_APP_VERSION = "mainWin/state_meta/app_version";
+}
+
+namespace line_annotation {
+    constexpr auto GEOMETRY = "lineAnnotation/geometry";
+    constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
+    constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
+    constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes";
+    constexpr auto TOP_SPLITTER_SIZES = "lineAnnotation/top_splitter_sizes";
+    constexpr auto STRIP_SPLITTER_SIZES = "lineAnnotation/strip_splitter_sizes";
+    constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
+    constexpr auto SIDE_CUT_ZOOM = "lineAnnotation/side_cut_zoom";
+    constexpr auto STRIP_ZOOMS = "lineAnnotation/strip_zooms";
 }
 
 // -----------------------------------------------------------------------------
@@ -435,6 +449,17 @@ namespace volume_overlay {
     constexpr auto WINDOW_HIGH = "window_high";
     constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
+    constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
+    constexpr auto COMPOSITE_ENABLED = "composite_enabled";
+    constexpr auto COMPOSITE_METHOD = "composite_method";
+    constexpr auto COMPOSITE_LAYERS_FRONT = "composite_layers_front";
+    constexpr auto COMPOSITE_LAYERS_BEHIND = "composite_layers_behind";
+
+    constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
+    constexpr bool COMPOSITE_ENABLED_DEFAULT = false;
+    constexpr auto COMPOSITE_METHOD_DEFAULT = "max";
+    constexpr int COMPOSITE_LAYERS_FRONT_DEFAULT = 8;
+    constexpr int COMPOSITE_LAYERS_BEHIND_DEFAULT = 0;
 }
 
 } // namespace settings

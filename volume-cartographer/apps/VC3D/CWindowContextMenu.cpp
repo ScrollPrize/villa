@@ -301,7 +301,7 @@ public:
         QObject::connect(proc_, &QProcess::errorOccurred,
                          this, &SlimJob::onProcError_);
 
-        w_->statusBar()->showMessage(QObject::tr("Converting TIFXYZ to OBJ…"), 0);
+        w_->onShowStatusMessage(QObject::tr("Converting TIFXYZ to OBJ…"), 0);
         startToObj_();
     }
 
@@ -473,7 +473,7 @@ private:
             QDir(outTemp_).removeRecursively();
         }
 
-        w_->statusBar()->showMessage(QObject::tr("SLIM-flatten cancelled"), 5000);
+        w_->onShowStatusMessage(QObject::tr("SLIM-flatten cancelled"), 5000);
         progress_->close();
         progress_->deleteLater();
         QTimer::singleShot(0, this, [this](){ this->deleteLater(); });
@@ -510,7 +510,7 @@ private:
             }
 
             if (line.startsWith("Final stretch") || line.startsWith("Wrote:")) {
-                w_->statusBar()->showMessage(line, 0);
+                w_->onShowStatusMessage(line, 0);
             }
         }
     }
@@ -537,7 +537,7 @@ private:
         box->setAttribute(Qt::WA_DeleteOnClose);
         QObject::connect(box, &QMessageBox::finished, this, [this]() { cleanupAndDelete_(); });
         box->open();
-        w_->statusBar()->showMessage(QObject::tr("SLIM-flatten failed"), 5000);
+        w_->onShowStatusMessage(QObject::tr("SLIM-flatten failed"), 5000);
     }
 
     void onFinished_(int exitCode, QProcess::ExitStatus st) {
@@ -566,7 +566,7 @@ private:
                 this->deleteLater();
             });
             box->open();
-            w_->statusBar()->showMessage(QObject::tr("SLIM-flatten failed"), 5000);
+            w_->onShowStatusMessage(QObject::tr("SLIM-flatten failed"), 5000);
             return;
         }
 
@@ -606,7 +606,7 @@ private:
             finishSwapIfNeeded_();
             phase_ = Phase::Done;
 
-            w_->statusBar()->showMessage(QObject::tr("SLIM-flatten complete: %1").arg(outFinal_), 5000);
+            w_->onShowStatusMessage(QObject::tr("SLIM-flatten complete: %1").arg(outFinal_), 5000);
             showDoneAndCleanup_();
             return;
         }
@@ -855,7 +855,7 @@ private slots:
 
         if (result.canceled) {
             if (w_) {
-                w_->statusBar()->showMessage(QObject::tr("ABF++ flatten cancelled"), 5000);
+                w_->onShowStatusMessage(QObject::tr("ABF++ flatten cancelled"), 5000);
             }
             deleteLater();
             return;
@@ -863,7 +863,7 @@ private slots:
 
         if (!result.success) {
             if (w_) {
-                w_->statusBar()->showMessage(QObject::tr("ABF++ flatten failed"), 5000);
+                w_->onShowStatusMessage(QObject::tr("ABF++ flatten failed"), 5000);
                 const QString errorMsg = result.errorMsg.isEmpty()
                     ? QObject::tr("ABF++ flattening failed")
                     : result.errorMsg;
@@ -876,7 +876,7 @@ private slots:
         const QString label = !stem_.isEmpty() ? stem_ : outDir_;
 
         if (w_) {
-            w_->statusBar()->showMessage(QObject::tr("ABF++ flatten complete: %1").arg(label), 5000);
+            w_->onShowStatusMessage(QObject::tr("ABF++ flatten complete: %1").arg(label), 5000);
             QMessageBox::information(w_, QObject::tr("ABF++ Flatten Complete"),
                 QObject::tr("Flattened surface saved to:\n%1").arg(outDir_));
         }
@@ -964,7 +964,7 @@ void CWindow::onVisLasagnaObj(const std::string& segmentId)
 
     VisLasagnaObjDialog dlg(this, defaultOutput);
     if (dlg.exec() != QDialog::Accepted) {
-        statusBar()->showMessage(tr("Vis as OBJ cancelled"), 3000);
+        showStatusBarMessage(tr("Vis as OBJ cancelled"), 3000);
         return;
     }
 
@@ -1010,7 +1010,7 @@ void CWindow::onVisLasagnaObj(const std::string& segmentId)
             this, [this, connFinish, connError](const QString& outputDir) {
                 disconnect(*connFinish);
                 disconnect(*connError);
-                statusBar()->showMessage(
+                showStatusBarMessage(
                     tr("Vis OBJ export finished: %1").arg(outputDir), 5000);
             });
     *connError = connect(&mgr, &LasagnaServiceManager::visExportError,
@@ -1021,7 +1021,7 @@ void CWindow::onVisLasagnaObj(const std::string& segmentId)
             });
 
     mgr.exportLasagnaVis(request);
-    statusBar()->showMessage(
+    showStatusBarMessage(
         tr("Exporting vis OBJ for %1...").arg(QString::fromStdString(segmentId)), 3000);
 }
 
@@ -1036,7 +1036,7 @@ bool CWindow::initializeCommandLineRunner()
 
         connect(_cmdRunner, &CommandLineToolRunner::toolStarted,
                 [this](CommandLineToolRunner::Tool /*tool*/, const QString& message) {
-                    statusBar()->showMessage(message, 0);
+                    showStatusBarMessage(message, 0);
                 });
         connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
                 [this](CommandLineToolRunner::Tool tool, bool success, const QString& message,
@@ -1058,14 +1058,14 @@ bool CWindow::initializeCommandLineRunner()
                         if (success) {
                             QString displayMsg = message;
                             if (copyToClipboard) displayMsg += tr(" - Path copied to clipboard");
-                            statusBar()->showMessage(displayMsg, 5000);
+                            showStatusBarMessage(displayMsg, 5000);
                             QMessageBox::information(this, tr("Operation Complete"), displayMsg);
                         } else {
-                            statusBar()->showMessage(tr("Operation failed"), 5000);
+                            showStatusBarMessage(tr("Operation failed"), 5000);
                             QMessageBox::critical(this, tr("Error"), message);
                         }
                     } else {
-                        statusBar()->showMessage(tr("Neighbor copy pass 1 complete"), 2000);
+                        showStatusBarMessage(tr("Neighbor copy pass 1 complete"), 2000);
                     }
 
                     if (neighborJobActive) {

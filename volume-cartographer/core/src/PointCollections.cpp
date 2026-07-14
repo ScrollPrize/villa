@@ -554,7 +554,7 @@ float PointCollections::computeAutoFillValue(uint64_t collectionId) const
 
 bool PointCollections::saveToJSON(const std::string& filename) const
 {
-    Json j;
+    Json j = _fileMetadata.is_object() ? _fileMetadata : Json::object();
     j["vc_pointcollections_json_version"] = VC_POINTCOLLECTIONS_JSON_VERSION;
     Json collections_obj = Json::object();
     for (const auto& pair : _collections) {
@@ -590,6 +590,10 @@ bool PointCollections::loadFromJSON(const std::string& filename)
         if (!j.contains("vc_pointcollections_json_version") || j.at("vc_pointcollections_json_version").get_string() != VC_POINTCOLLECTIONS_JSON_VERSION) {
             throw std::runtime_error("JSON file has incorrect version or is missing version info.");
         }
+
+        _fileMetadata = j;
+        _fileMetadata.erase("vc_pointcollections_json_version");
+        _fileMetadata.erase("collections");
 
         Json collections_obj = j.at("collections");  // copy — ref into at() cache gets evicted by nested at() calls
         if (!collections_obj.is_object()) {
@@ -643,6 +647,16 @@ bool PointCollections::loadFromJSON(const std::string& filename)
     return true;
 }
 
+void PointCollections::setFileMetadata(const Json& metadata)
+{
+    _fileMetadata = metadata.is_object() ? metadata : Json::object();
+}
+
+const Json& PointCollections::fileMetadata() const
+{
+    return _fileMetadata;
+}
+
 bool PointCollections::saveToSegmentPath(const std::filesystem::path& segmentPath) const
 {
     if (segmentPath.empty()) {
@@ -673,7 +687,7 @@ bool PointCollections::saveToSegmentPath(const std::filesystem::path& segmentPat
         return true;
     }
 
-    Json j;
+    Json j = _fileMetadata.is_object() ? _fileMetadata : Json::object();
     j["vc_pointcollections_json_version"] = VC_POINTCOLLECTIONS_JSON_VERSION;
     j["collections"] = collections_obj;
 

@@ -10,6 +10,7 @@
 #include <QStringList>
 #include <QSet>
 #include <QTemporaryFile>
+#include <QVector3D>
 
 #include "elements/VolumeSelector.hpp"
 
@@ -59,6 +60,12 @@ public:
         std::unique_ptr<QTemporaryFile> paramsFile;
     };
 
+    struct GrowPatchSeedJob {
+        QString outputDir;
+        QString paramsPath;
+        std::unique_ptr<QTemporaryFile> paramsFile;
+    };
+
     // --- Construction ---
 
     explicit SegmentationCommandHandler(QWidget* parentWidget,
@@ -77,6 +84,12 @@ public:
      * If not set, normal3d zarr path will be empty.
      */
     void setNormal3dZarrPathGetter(std::function<QString()> fn) { _normal3dZarrPathGetter = std::move(fn); }
+
+    /**
+     * Callback that returns the normal grid path paired with the current
+     * volume. If not set, falls back to the project's first normal grid entry.
+     */
+    void setNormalGridPathGetter(std::function<QString()> fn) { _normalGridPathGetter = std::move(fn); }
 
     /**
      * Callback for checking if editing is in progress (from SegmentationModule).
@@ -133,6 +146,7 @@ public slots:
     void onAddIgnoreLabel();
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);
+    void onCreateSegmentGrowPatchFromSeed(const QVector3D& seedPoint);
     void onReloadFromBackup(const QString& segmentId, int backupIndex);
     void onCopySurfaceRequested(const QString& segmentId);
     void onMoveSegmentToPaths(const QString& segmentId);
@@ -185,9 +199,11 @@ private:
 
     std::optional<NeighborCopyJob> _neighborCopyJob;
     std::optional<ResumeLocalJob> _resumeLocalJob;
+    std::optional<GrowPatchSeedJob> _growPatchSeedJob;
 
     // Callbacks for CWindow-specific operations
     std::function<QString()> _normal3dZarrPathGetter;
+    std::function<QString()> _normalGridPathGetter;
     std::function<bool()> _isEditingCheck;
     std::function<void()> _clearSelectionCallback;
     std::function<void(const std::string&)> _restoreSelectionCallback;
