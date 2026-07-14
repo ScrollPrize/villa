@@ -1,6 +1,5 @@
 ---
 title: "Volume Cartographer (Segmentation)"
-hide_table_of_contents: true
 ---
 
 <head>
@@ -38,6 +37,12 @@ hide_table_of_contents: true
 
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
+
+:::warning[ARCHIVED]
+
+This page has been archived and is no longer maintained. It describes an earlier generation of the Vesuvius Challenge pipeline — tools, data layouts, and results referenced here may have been superseded. See [Open Problems](2026_open_problems) for the current state of the pipeline and [Prizes](prizes) for what is open today.
+
+:::
 
 Volume Cartographer was used to generate the 2023 [Grand Prize results](grandprize). This guide was made by @bruniss with feedback and help from @hari_seldon and @djosey of the segmentation team.
 

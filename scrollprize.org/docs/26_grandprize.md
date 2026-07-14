@@ -1,7 +1,6 @@
 ---
 title: "Vesuvius Challenge 2023 Grand Prize awarded: we can read the scrolls!"
-sidebar_label: "2023 Grand Prize (Feb 2024)"
-hide_table_of_contents: true
+sidebar_label: "2023 Grand Prize"
 hide_title: true
 ---
 
@@ -27,16 +26,15 @@ import JsonLd from '@site/src/components/JsonLd';
 
 <JsonLd data={{"@context":"https://schema.org","@type":"NewsArticle","headline":"Vesuvius Challenge 2023 Grand Prize awarded: we can read the scrolls","datePublished":"2024-02-05","dateModified":"2024-02-05","author":{"@type":"Organization","name":"Vesuvius Challenge"},"publisher":{"@type":"Organization","name":"Vesuvius Challenge","logo":{"@type":"ImageObject","url":"https://scrollprize.org/img/social/opengraph.jpg"}},"image":"https://scrollprize.org/img/social/opengraph.jpg","mainEntityOfPage":"https://scrollprize.org/grandprize"}} />
 
-<h1 className="color-white text-4xl md:text-7xl font-black !mb-2 leading-none tracking-tighter">Vesuvius Challenge 2023 Grand Prize awarded: <span style={{
-  background:
-    "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
-  WebkitBackgroundClip: "text",
-  WebkitTextFillColor: "transparent",
-  backgroundClip: "text",
-  textFillColor: "transparent",
-}}>we can read the first scroll!</span></h1>
+:::info[HISTORICAL MILESTONE]
 
-<div className="md:text-2xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none tracking-tight">The 2000-year-old scroll discusses music, food, and how to enjoy life’s pleasures.</div>
+This announcement is from February 2024. The 2023 Grand Prize it describes has been awarded; see [Prizes](prizes) for what is open today.
+
+:::
+
+<h1 className="color-white text-4xl md:text-7xl !mb-2 leading-none">Vesuvius Challenge 2023 Grand Prize awarded: <span className="text-accent">we can read the first scroll!</span></h1>
+
+<div className="md:text-2xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none">The 2000-year-old scroll discusses music, food, and how to enjoy life’s pleasures.</div>
 
 <div className="opacity-60 mb-8 italic">February 5th, 2024</div>
 
@@ -120,7 +118,7 @@ For the Grand Prize, they assembled into a superteam, crushing it by creating wh
 The submission contains results from three different model architectures, each supporting the findings of the others, with the strongest images often coming from a [TimeSformer](https://arxiv.org/abs/2102.05095)-based model. Multiple measures prevent overfitting and hallucination, including results from multiple architectures, a study across input/output window sizes, label smoothing, and varying validation folds. Like with all our prizes, this ink detection code has been made public as open source (on [GitHub](https://github.com/younader/Vesuvius-Grandprize-Winner)), leveling up everyone in the community.
 
 <div className="mb-4">
-  <a target="_blank" href="/img/grandprize/youssef_text_wbb.png"><img src="/img/grandprize/youssef_text_wbb-smaller.webp" className="w-[100%]" alt="The winners' main Grand Prize submission image, recovered text from a TimeSformer 64x64 model."/></a>
+  <a target="_blank" href="/img/grandprize/youssef_text_wbb-hq.webp"><img src="/img/grandprize/youssef_text_wbb-smaller.webp" className="w-[100%]" alt="The winners' main Grand Prize submission image, recovered text from a TimeSformer 64x64 model."/></a>
   <figcaption className="mt-[-6px]">The winners’ main submission image (TimeSformer 64x64).</figcaption>
 </div>
 
@@ -157,7 +155,7 @@ Of the remaining submissions, the scores from our team of papyrologists identify
   <figcaption className="mt-[-6px]">Louis Schlessinger and Arefeh Sherafati. <a href="https://github.com/lschlessinger1/vesuvius-grand-prize-submission">GitHub</a></figcaption>
 </div>
 
-These teams each brought to the table new approaches to the subtleties of ink labeling and sampling. Be sure to check out their methods at the links above. Other teams may also now choose to share their approaches, so be sure to follow our [Discord community](https://discord.com/invite/uTfNwwecCQ) for updates. Joining our community also provides access to the CT data and more images under our data agreement, as well as a front-row seat to daily discovery and collaboration!
+These teams each brought to the table new approaches to the subtleties of ink labeling and sampling. Be sure to check out their methods at the links above. Other teams may also now choose to share their approaches, so be sure to follow our [Discord community](https://discord.gg/V4fJhvtaQn) for updates. Joining our community also provides access to the CT data and more images under our data agreement, as well as a front-row seat to daily discovery and collaboration!
 
 ## What does the scroll say?
 
@@ -318,7 +316,7 @@ Machine learning models are infamous for “hallucinating”: making up text or 
 These scrolls were scanned at Diamond Light Source, a particle accelerator near Oxford, England. The facility produces a parallel beam of X-rays at high flux, allowing for fast, accurate, and high-resolution imaging. The X-ray photos are turned into a 3D volume of voxels using tomographic reconstruction algorithms, resulting in a stack of slice images.
 
 <figure>
-  <video autoPlay playsInline loop muted className="w-[100%] max-w-[600px]" poster="/img/grandprize/.webp">
+  <video autoPlay playsInline loop muted className="w-[100%] max-w-[600px]">
     <source src="/img/grandprize/scroll1.webm" type="video/webm"/>
   </video>
   <figcaption className="mt-[-6px]">Scrubbing through the slice images of the scroll.</figcaption>
@@ -438,7 +436,7 @@ After that, we will scan and read every scroll. We estimate that the scrolls we 
 
 And as if the prospect of reading hundreds of scrolls isn’t good enough, there might be an even bigger payoff at the end of all of this (as Nat said on the [Dwarkesh podcast](https://youtu.be/qcvMjoJdck4?t=646): <em>“there is gold in this mud”</em>).
 
-<div>Dr. Garrett Ryan (<a href="https://www.youtube.com/@toldinstone">toldinstone</a>) writes it best on our <a href="background">History page</a>:</div>
+<div>Dr. Garrett Ryan (<a href="https://www.youtube.com/@toldinstone">toldinstone</a>) writes it best:</div>
 
 <div className="italic ml-8 mb-4">“The scrolls we have now may be just the beginning. When part of the Villa of the Papyri was cleared in the 1990s, archaeologists realized that the building was much larger than previously thought, with two unexcavated levels. At the very least, these floors likely contain more papyri in cabinets and carrying cases. And it’s probable that they conceal a far greater treasure.</div>
 
@@ -449,7 +447,8 @@ The potential of tens of thousands of scrolls, still buried, waiting to be disco
 Read more detail about what comes next in our [Master Plan](master_plan).
 
 <div className="mb-4">
-  <img src="/img/landing/rocio-espin-pinar-villa-papyri-small.webp" className="w-[100%] max-w-[600px]" alt="Artist's reconstruction of the Villa of the Papyri by Rocio Espin Pinar."/>
+  <img src="/img/landing/rocio-espin-pinar-villa-papyri-small.webp" className="w-[100%] max-w-[600px]" alt="Artist's reconstruction of the Villa of the Papyri by Rocío Espín Pinar."/>
+  <figcaption className="mt-[-6px]">Artist's reconstruction of the Villa of the Papyri by <a href="https://www.artstation.com/rocioespin">Rocío Espín Pinar</a>.</figcaption>
 </div>
 
 ## Thank you

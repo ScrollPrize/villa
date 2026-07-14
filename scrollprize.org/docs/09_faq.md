@@ -1,6 +1,5 @@
 ---
 title: "FAQ"
-hide_table_of_contents: true
 ---
 
 <head>
@@ -36,13 +35,13 @@ hide_table_of_contents: true
   />
 </head>
 
-import TOCInline from '@theme/TOCInline';
+import AwardedTotal from '@site/src/components/AwardedTotal';
 
-<TOCInline
-  toc={toc}
-/>
+:::info[WORK IN PROGRESS]
 
----
+This page is being revised (July 8, 2026). Most answers are current; a few still describe earlier tooling or data layouts and are being updated.
+
+:::
 
 ### What is Vesuvius Challenge?
 
@@ -53,29 +52,32 @@ After their discovery in the 1750s, some were opened physically, mostly destroyi
 A few hundred scrolls were excavated that were never opened, and remain rolled up with their contents sealed away.
 Our community is building methods to read these scrolls using micro-CT and an algorithmic pipeline using machine learning and computer vision.
 
-We've awarded \$1,800,500 in prizes and broken through, revealing complete passages of Greek philosophy from the inside of a closed Herculaneum scroll for the first time.
-Now we are continuing - we want to go from reading 5% of one scroll to reading multiple complete scrolls.
+We've awarded <AwardedTotal /> in prizes and broken through twice: in 2023 the first passages of Greek were revealed inside a closed scroll, and in 2026 [PHerc. 1667](firstscroll) became the first scroll ever read from beginning to end.
+Now we want to read them all — starting with the [2027 Grand Prize](prizes#2027-grand-prize).
 Join us to win prizes and be a part of history!
 
 ### What dates do I need to know?
 
-Current prize opportunities are listed on the [Open Prizes](prizes) page. The [2024 prize](2024_prizes) deadlines closed on **December 31, 2024** and remain available for historical reference. [Join the community](get_started#1-join-the-community) to stay tuned!
+The [2027 Grand Prize](prizes#2027-grand-prize), [First Letters](prizes#first-letters-prizes), and [PHerc. Paris 4's Title](prizes#first-title-prize) prizes all close on **June 25th, 2027 (11:59pm Pacific)**. [Progress Prizes](prizes#progress-prizes) are awarded every month — including \$20,000 guaranteed for the best submission. See [Open Prizes](prizes) for everything in one place, and [join the community](get_started) to stay tuned!
 
 ### What's the historical background of Herculaneum and the scrolls?
 
-We have a [background page](background) for that!
+The story of the villa and its scrolls is told in [Our story](/#our-story) on the landing page!
 
 ### Where can I read the texts Vesuvius Challenge has uncovered?
 
-Check out [these images](https://drive.google.com/drive/folders/1nnWR3ZMcUxJhp4SJYkV8-REwHsQT0fQb?usp=sharing) of some text we've so far revealed!
+Recovered text is collected in the [Data Browser](data_browser) — each scroll's page shows its readings and ink predictions. Highlights: [PHerc. 1667](data_browser/PHerc1667), the first scroll read end to end; [PHerc. 172](data_browser/PHerc0172) (Philodemus, *On Vices*, Book 1 — the first title found); and [PHerc. 139](data_browser/PHerc0139) (Philodemus, *On Gods*, Book 8).
 
 Here are the scholarly publications so far resulting from Vesuvius Challenge:
 
+* [Complete virtual unwrapping and reading of a rolled Herculaneum papyrus](/pdf/main.pdf) ([arXiv](https://arxiv.org/abs/2606.29085)) — the 2026 PHerc. 1667 results
+* [Ink Detection from Surface Topography of the Herculaneum Papyri](https://www.nature.com/articles/s41598-026-58467-1) — Angelotti et al., *Scientific Reports*, 2026
 * [Revealing Text from a Still-rolled Herculaneum Papyrus Scroll (PHerc. Paris. 4)](https://www.iris.unina.it/handle/11588/959427) (2023 First Letters results)
 * [The final columns of PHerc.Paris. 4 revealed through virtual unwrapping](https://www.iris.unina.it/handle/11588/985203) (2023 Grand Prize results)
 
 Also of interest:
 
+* [An entire Herculaneum scroll has been read](firstscroll)
 * [Vesuvius Challenge 2023 Grand Prize awarded](grandprize)
 
 ### What about other texts from the physically opened Herculaneum scrolls?
@@ -98,8 +100,10 @@ Most are by Philodemus. This is a list of English translations we have found so 
 
 #### Academic papers
 
+* For the current end-to-end technical overview of the pipeline — and where you can help — see [Open Problems: Why Reading Every Herculaneum Scroll Is Still a Challenge](2026_open_problems).
+* 2026: [Complete virtual unwrapping and reading of a rolled Herculaneum papyrus](https://arxiv.org/abs/2606.29085) — the paper behind the first fully sealed scroll (PHerc. 1667) read end to end.
 * Data papers:
-  * 2019: [EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT](https://arxiv.org/abs/2304.02084)
+  * 2023: [EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT](https://arxiv.org/abs/2304.02084)
   * 2023: [EduceLab Herculaneum Scroll Data (2023) Info Sheet](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing)
 * [Hard-Hearted Scrolls: A Noninvasive Method for Reading the Herculaneum Papyri](https://uknowledge.uky.edu/cs_etds/138/) (Stephen Parsons’ PhD dissertation)
 * [From invisibility to readability: Recovering the ink of Herculaneum](https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0215775&type=printable)
@@ -153,14 +157,14 @@ Here are some other excellent books we recommend:
 
 ### What if I would like to contribute, but don’t have time to compete for the Grand Prize?
 
-* Join our [Discord](https://discord.com/invite/uTfNwwecCQ) to learn about current efforts and how you can pitch in.
+* Join our [Discord](https://discord.gg/V4fJhvtaQn) to learn about current efforts and how you can pitch in.
 * You can make smaller open source contributions, which would benefit the whole community. Everyone in the community will be grateful for your work, and you might even be able to win a prize - see those [already awarded](winners)!
 
 ### Can I share my progress on social media?
 
 Yes, in fact we encourage you to share your progress. Be sure to also post in our Discord, to get feedback from the community.
 
-The only exception is that per the data agreement, you’re not allowed to publicly share material revelation of text (e.g. entire words) without our permission (including the associated code), or share the raw data. You _are_ allowed to share these things on Discord, since everything uploaded on Discord falls under the same data agreement as our data server.
+The only exception: if you are competing for a prize that involves reading new text (the [Grand Prize](prizes#2027-grand-prize), [First Letters](prizes#first-letters-prizes), or [PHerc. Paris 4’s Title](prizes#first-title-prize)), do not make your discovery public — e.g., entire words or passages — until the prize is officially announced. We will work with you to announce your findings.
 
 ### I’m outside the United States, can I participate and win prizes?
 
@@ -177,11 +181,11 @@ This depends on the jurisdiction you live in, but generally yes, you do have to 
 * Any publications and presentations must cite the dataset(s) used. See the <a href="/data#how-to-cite">How to Cite</a> section on the data page for the correct citation for EduceLab-Scrolls data versus newer Vesuvius Challenge scan releases.
 * You won’t publish any revelation of hidden text (or associated code) without the written approval of Vesuvius Challenge.
 
-We very much encourage researchers and students to work on this! Be sure to reach out to us [on Discord or by email](/get_started#1-join-the-community).
+We very much encourage researchers and students to work on this! Be sure to reach out to us [on Discord or by email](/get_started).
 
 ### I have some ideas but need help. Who can I ask?
 
-Definitely ask the [Discord](https://discord.com/invite/uTfNwwecCQ) community!
+Definitely ask the [Discord](https://discord.gg/V4fJhvtaQn) community!
 
 You are also welcome to reach out to our [team](mailto:team@scrollprize.org) directly; though as contest organizers we can only provide limited information regarding specific ideas or submissions and will largely point you towards public resources such as this FAQ or the public Discord channels.
 
@@ -191,9 +195,9 @@ Please email us at team@scrollprize.org. We will keep it confidential. We apprec
 
 If you're open to sharing your improvements publicly (and be eligible for progress prizes), you can post in Discord.
 
-### Do we really need 7.91µm or 3.24µm resolution? These data files are huge!
+### What scan resolution do we really need? These data files are huge!
 
-We don't know yet what the minimum resolution necessary to detect ink is, but this paper suggests that it may be 7.91µm: [From invisibility to readability: Recovering the ink of Herculaneum](https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0215775&type=printable).
+We don't know yet what the minimum resolution necessary to detect ink is. [This paper](https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0215775&type=printable) suggested 7.91µm may suffice, and the first scroll scans were made at that resolution. Since then the catalog has grown: recent full-scroll scans reach 2.4µm, small regions have been imaged down to 1.1µm — where ink is markedly easier to read — and each scroll's scan parameters are listed in the [Data Browser](data_browser).
 
 ### Can machine learning models hallucinate letters that aren't there?
 
@@ -222,7 +226,7 @@ There are two ways you can write on papyrus: horizontally (“volumen”) or [ve
 
 ### How big are the letters, and where can we expect to find text?
 
-Letter sizes vary, and of course we don’t know what’s inside the unopened scrolls, but we expect the opened fragments to be fairly representative. You can measure how big the letters are by looking at the aligned surface images, which have a voxel resolution of approximately 3.24µm, like the original CT data (though there can be some local variation due to the registration / flattening process). So you could open, for example, <code>fragments/Frag1.volpkg/working/54keV_exposed_surface/ir.png</code>, measure a letter size in pixels, and multiply by 3.24µm.
+Letter sizes vary, and of course we don’t know what’s inside the unopened scrolls, but we expect the opened fragments to be fairly representative. You can measure how big the letters are by looking at the aligned surface images, which have a voxel resolution of approximately 3.24µm, like the original CT data (though there can be some local variation due to the registration / flattening process). For example, open a fragment page in the [Data Browser](data_browser) — say [PHerc. Paris 2 Fr 47](data_browser/PHercParis2Fr47) — measure a letter size in pixels on its surface image, and multiply by the pixel size.
 
 There are also some measurements in [this paper by Richard Janko](http://www-personal.umich.edu/~rjanko/how-to-read-and-reconstruct-a-herculaneum-papyrus.pdf), though it’s a little hard to infer actual letter sizing from it. If someone wants to do a more thorough review of the range of letter sizes found in all the Herculaneum papyri, we’d happily include your results here!
 
@@ -252,11 +256,12 @@ Of course, for it to be useful as ground truth data, you will need to find someo
 
 ### What software is available currently that might help me?
 
-The two main pieces of software developed by Dr. Seales’ lab are [Volume Cartographer](https://github.com/educelab/volume-cartographer/) and [ink-id](https://github.com/educelab/ink-id/). Both are open source and available on Github.
+The main tools maintained by the team live in the [villa monorepo](https://github.com/ScrollPrize/villa):
 
-In the tutorials we also show you how to use generic software to work with 3D volumes ([Fiji](https://imagej.net/software/fiji/downloads)) and meshes ([MeshLab](https://www.meshlab.net/#download)).
+* [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer) — the interactive segmentation and virtual-unwrapping toolkit (the much-evolved descendant of Volume Cartographer, originally built by Dr. Seales’ lab).
+* The [`vesuvius`](https://github.com/ScrollPrize/villa/tree/main/vesuvius) Python library — access scroll data in a couple of lines.
 
-There is a growing body of open source software now available as a result of Vesuvius Challenge. To learn more, check out the [previous prizes](winners) that have been awarded to many of these efforts and our list of [community projects](community_projects).
+There is also a growing body of open source software built by the community. To learn more, check out the [previous prizes](winners) that have been awarded to many of these efforts and our list of [community projects](community_projects).
 
 ### Where can I find collaborators?
 
@@ -281,8 +286,8 @@ We take X-ray photographs of the object from different angles. Typically this is
 
 <div>Just like with any digital camera, there are a lot of settings and parameters. The most important for you to know are:</div>
 
-* **Resolution:** the dimensions of each pixel in an X-ray photo, typically denoted in µm (micrometers or “microns”). Lower is better. We scanned the scrolls at 7.91µm, which we think should be enough to detect ink patterns, but we scanned the fragments at 3.24µm just in case. Renting beam time on a particle accelerator is expensive, but if we need to we can go back and scan objects at even lower resolutions.
-* **Energy level:** the energy of the X-ray electrons, typically expressed in keV (kilo electronvolts). For particle accelerators this is one precise number, whereas for bench top scanners this is more of a range. We think lower is better, since carbon responds better to lower energy levels. We scanned everything twice, at 54keV and 88keV (though for the scrolls we only had time for a smaller slice at 88keV).
+* **Resolution:** the dimensions of each pixel in an X-ray photo, typically denoted in µm (micrometers or “microns”). Lower is better. The first scrolls were scanned at 7.91µm (and the fragments at 3.24µm); recent full-scroll scans reach 2.4µm. Renting beam time on a particle accelerator is expensive, but resolutions keep improving.
+* **Energy level:** the energy of the X-ray electrons, typically expressed in keV (kilo electronvolts). For particle accelerators this is one precise number, whereas for bench top scanners this is more of a range. We think lower is better, since carbon responds better to lower energy levels. The first scans were made at 54keV and 88keV; the catalog now spans roughly 53–137keV depending on the scroll (see each scroll's page in the [Data Browser](data_browser)).
 
 At high resolutions the field of view of the camera is too small to capture the object in its entirety, so multiple passes have to be made. Typically these are stitched together as part of the scanning process.
 
@@ -330,7 +335,7 @@ For more information about the reconstruction method, check out:
 
 * Appendix A.1 of ["EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT"](https://arxiv.org/abs/2304.02084)
 * ["Data processing methods and data acquisition for samples larger than the field of view in parallel-beam tomography"](https://opg.optica.org/oe/fulltext.cfm?uri=oe-29-12-17849&id=451366)
-* The [algotom](ttps://github.com/algotom/algotom) reconstruction package
+* The [algotom](https://github.com/algotom/algotom) reconstruction package
 
 Reconstruction methods are out of scope for Vesuvius Challenge, which focuses on processing the reconstructed images.
 That said, if you have specific ideas you would like to share with us, please do so by reaching out to team@scrollprize.org!
@@ -355,10 +360,10 @@ The ensuing discussion is also informative and can be found [on our Discord](htt
 
 Based on this, the raw reconstruction values for a scan do not have units or physical interpretations attached to them.
 These 32-bit float values are typically in the range [-0.1, 0.1] or smaller.
-For more recent scans, we are releasing .hdf files that contain these original reconstruction output float values, so you can experiment with your own intensity windowing.
+Some earlier scan releases also included .hdf files with the original reconstruction float values, so you can experiment with your own intensity windowing; current volumes are released as cloud-optimized OME-Zarr (see each scroll’s [Data Browser](data_browser) page for available formats).
 For the 16-bit integer .tif slices that we release, we map the float range to [0, 2^16-1] by choosing a minimum and maximum in the raw float range and scaling accordingly.
-The fragments and all more recent scans use the 0.01 percentile and 99.99 percentile as the window min and max.
-Scroll 1 and Scroll 2 use 0.1 and 99.9, to achieve visually comparable output since they have so much more papyrus in the field of view.
+For those tif releases, the fragments and later scans used the 0.01 percentile and 99.99 percentile as the window min and max.
+Scroll 1 and Scroll 2 used 0.1 and 99.9, to achieve visually comparable output since they have so much more papyrus in the field of view.
 
 Reconstruction outputs should be nonnegative by the principles of backprojection (there can't be negative X-ray attenuation).
 But noise and other processes lead to some negative values in the reconstructions.
@@ -394,19 +399,19 @@ It could be worthwhile to try to reverse engineer what machine learning models a
 
 ### Does segmenting and flattening need to happen before ink detection?
 
-This ordering is largely historical and due to the way we’ve constructed label sets, which relies on doing the segmentation and flattening first. But this can’t be the only way to do it, and we’d love to see the pipeline get shaken up.
+This ordering is largely historical and due to the way our label sets were constructed, which relied on doing the segmentation and flattening first. It is no longer the only way: alongside surface-conditioned ink detection, **direct 3D ink segmentation** is now in use — on PHerc. Paris 4, ink is segmented directly in the 3D volume. See [Ink recovery](2026_open_problems#3-ink-recovery-reading-the-scrolls) and [Direct 3D ink segmentation](2026_open_problems#direct-3d-ink-segmentation) in the Open Problems post, and the released [ink\_3d\_dino\_guided](https://huggingface.co/scrollprize/ink_3d_dino_guided) checkpoint.
 
-For example, the model input of ink detection could be sampled directly from the original 3D X-ray volume, instead of using a “surface volume” as an intermediate step. This could avoid loss of resolution during the sampling process into a differently oriented volume, which happens when constructing a surface volume.
-
-The downside of such an approach is that a lot more data needs to be accessible on disk, since the original 3D X-ray volumes are much bigger than the surface volumes (37GB vs 1.6TB in total for all fragments). This can be problematic for cloud training, which might not have enough available hard drive space. However, since we only need to access the voxels around the mesh, the data size could be reduced (creating something like a surface volume, but retaining the original coordinate space, and avoiding any resampling).
+Sampling model inputs directly from the original 3D X-ray volume avoids the loss of resolution that resampling into a differently oriented surface volume introduces. The trade-off is data scale: full-scroll volumes are teravoxel-sized, which is why current releases are cloud-optimized OME-Zarr streamed from S3 so tools read only the region they need — see [Data scale](2026_open_problems#4-data-scale-the-infrastructure-bottleneck).
 
 ### Fiji/ImageJ crashes, what can I do about that?
 
-Fiji/ImageJ doesn’t work well with extremely large datasets such as our scrolls or fragment volumes, though downsampling might help. If you’re experiencing problems even with the <a href="https://gist.github.com/janpaul123/280262ebce904f7366fe4cc155593e90">campfire.zip</a> dataset, then try to increase the memory limit: *“Edit > Options > Memory and Threads”*. It might also help to run the software in a different operating system, such as in a Linux VM. For example, on Windows the following setup [seems to work well](https://discord.com/channels/1079907749569237093/1088311252595507242/1088314069519441950): WSL2, Ubuntu 20, Windows 11, using the default WSL X server setup.
+Fiji/ImageJ doesn’t work well with extremely large datasets such as our scrolls or fragment volumes. For viewing and working with scroll data we recommend the purpose-built tools instead: [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer) for interactive viewing, segmentation, and unwrapping; the Neuroglancer links on each scroll’s [Data Browser](data_browser) page for in-browser volume exploration; and the [`vesuvius`](https://github.com/ScrollPrize/villa/tree/main/vesuvius) Python library for programmatic access.
 
-A great contribution to the community would be to build an open source 3D volume viewer that is tailored to this problem. If you are interested in building something like that, do let us know in Discord!
+If you specifically want Fiji/ImageJ, downsampling might help, and you can increase its memory limit under *“Edit > Options > Memory and Threads”*.
 
 ### How are the scroll slices oriented?
+
+*The conventions below describe the original tif-stack releases of Scrolls 1–5. Newer volumes (see the [Data Browser](data_browser)) are released as OME-Zarr with per-volume metadata.*
 
 #### Scroll 1
 
@@ -435,12 +440,6 @@ There's a region in Scroll 2 where the scroll center appears to have drifted/squ
 Assuming consistent handedness, a counterclockwise spiral suggests the released half of Scroll 2 is the bottom half of the scroll: Slice 0 is in the middle and Slice 14000+ is the bottom.
 
 The direction of a given line of writing in Scroll 2 would be counterclockwise around the TIF cross-sections, with the bottom of the letters on higher-numbered images and the top of the letters on lower-numbered images.
-
-#### Scrolls 3, 4, 5
-
-Scrolls 3, 4, and 5 appear to be oriented like Scroll 2, with counterclockwise spirals. However, a change in scanning convention flipped the ordering of the tif stack. When viewing Scroll 3, 4, or 5 TIF cross-sections from the scan, the image number decreases from the screen toward the viewer’s eye. Therefore, the direction of a given line of writing should be counterclockwise around the TIF cross-sections. The bottom of the letters should be on the lower-numbered images, and the top of the letters should be on the higher-numbered images.
-
-Note: This flip in the scanning convention must be accounted for in any rendering pipelines.
 
 ### What happened to the people when Mount Vesuvius erupted? 😢
 
@@ -474,7 +473,7 @@ Nat read [24 Hours in Ancient Rome](https://www.amazon.com/24-Hours-Ancient-Rome
 
 ### I have a lot of money! Can I help sponsor this?
 
-Vesuvius Challenge Inc. is a 501c3 non-profit organization that was formed solely to solve the puzzle of the Herculaneum Papyri. It is currently funded by [the sponsors listed on the homepage](/#sponsors), and by many hours of volunteer contributions.
+Scroll Prize, Inc. is a 501c3 non-profit organization that was formed solely to solve the puzzle of the Herculaneum Papyri. It is currently funded by [the sponsors listed on the homepage](/#sponsors), and by many hours of volunteer contributions.
 
 If you want to contribute money to support our operational costs or to increase the prize amounts, please <a href="mailto:nat@nat.org">get in touch</a>!
 

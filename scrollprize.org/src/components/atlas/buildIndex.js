@@ -162,7 +162,20 @@ function extractInkSegments(sample, id, s3ToHttp) {
     // (so the 3 alpha-only PHercParis4 segments still appear).
     if (!full && !alphaPrev) continue;
     const layers = oneUrl(data.find((d) => d.type === "layers-zarr"));
-    const mesh = oneUrl(data.find((d) => d.type === "obj-flattened" || d.type === "obj"));
+    // Segment root folder (holds tifxyz/, surface-volumes/, ink-detection/…),
+    // derived from any of the segment's URLs and kept as an s3:// URI. The
+    // gallery renders it as a file-browser link + a copy-for-rclone button —
+    // community feedback: the old per-segment .obj link was useless (no tool
+    // consumes .obj) and the tifxyz was hard to find from the browser.
+    const segFolder = (u) => {
+      const m = String(u || "").match(/^(.*?\/segments\/[^/]+\/)/);
+      return m ? m[1] : null;
+    };
+    const folder =
+      segFolder(oneUrl(data.find((d) => d.type === "obj-flattened" || d.type === "obj"))) ||
+      segFolder(layers) ||
+      segFolder(oneUrl(data.find((d) => d.type === "ink-detection"))) ||
+      segFolder(alphaEntry ? oneUrl(alphaEntry) : null);
     out.push({
       id: key,
       label: inkSegmentLabel(sid),
@@ -173,7 +186,7 @@ function extractInkSegments(sample, id, s3ToHttp) {
       alpha,
       alphaPrev,
       layers,
-      mesh,
+      folder,
     });
   }
   // Order unwrap (winding) ranges in DECREASING order (highest winding first);
@@ -269,6 +282,21 @@ function normalizeStages(stages) {
   return stages;
 }
 
+// Human-readable inventory label: "PHerc0172" -> "PHerc. 172",
+// "PHerc0175A" -> "PHerc. 175A", "PHercParis4" -> "PHerc. Paris 4".
+// Non-PHerc ids pass through unchanged; routes/URLs keep the raw id.
+function phercLabel(id) {
+  const m = /^PHerc(.+)$/.exec(id || "");
+  if (!m) return id;
+  const rest = m[1];
+  const letters = /^([A-Za-z]+)(.*)$/.exec(rest);
+  if (letters) {
+    const tail = letters[2] ? ` ${letters[2].replace(/^0+(?=\d)/, "")}` : "";
+    return `PHerc. ${letters[1]}${tail}`;
+  }
+  return `PHerc. ${rest.replace(/^0+(?=\d)/, "")}`;
+}
+
 function curatedFields(overlayScroll, id) {
   const o = overlayScroll || {};
   let readings = o.readings ?? null;
@@ -279,6 +307,7 @@ function curatedFields(overlayScroll, id) {
   }
   return {
     display: o.display ?? id,
+    label: phercLabel(id),
     repository: o.repository ?? null,
     note: o.note ?? "",
     photo: o.photo ?? null,

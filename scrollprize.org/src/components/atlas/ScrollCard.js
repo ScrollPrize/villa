@@ -41,6 +41,16 @@ function caption(scroll) {
   return out.length > 15 ? out : "";
 }
 
+
+// Distinct scan pixel sizes, finest first — "2.4 µm / 7.91 µm / …".
+function pixelSizesText(scroll) {
+  const px = [...new Set((scroll.scans || []).map((s) => s.px).filter((v) => v != null))].sort(
+    (a, b) => a - b,
+  );
+  if (!px.length) return scroll.min_px ? `${scroll.min_px} µm` : "—";
+  return px.map((v) => `${v} µm`).join(" / ");
+}
+
 export default function ScrollCard({ scroll }) {
   // Registers this card's 3D viewport with the shared renderer. No-op when the
   // sample has no mesh; we only attach the ref to the .view in that case.
@@ -67,6 +77,7 @@ export default function ScrollCard({ scroll }) {
   const segN = scroll.n_segments || 0;
 
   const isScroll = scroll.type === "scroll";
+  const label = scroll.label || scroll.id;
   const nick = scroll.display && scroll.display !== scroll.id ? scroll.display : null;
   const cap = caption(scroll);
 
@@ -84,7 +95,7 @@ export default function ScrollCard({ scroll }) {
         <img
           className="fragimg"
           src={photo}
-          alt={`Photo of ${scroll.id}`}
+          alt={`Photo of ${label}`}
           loading="lazy"
         />
       </div>
@@ -101,11 +112,11 @@ export default function ScrollCard({ scroll }) {
     <Link
       className="card"
       to={`/data_browser/${scroll.id}`}
-      aria-label={`${scroll.id}${nick ? ` (${nick})` : ""} — details`}
+      aria-label={`${label}${nick ? ` (${nick})` : ""} — details`}
     >
       <div className="chead">
         <span className="name">
-          {scroll.id}
+          {label}
           {hasInk3d ? (
             <span
               className="pb ink3d"
@@ -146,17 +157,9 @@ export default function ScrollCard({ scroll }) {
             </b>
           </dd>
           <dt>Segments</dt>
-          <dd>
-            {segN.toLocaleString()}
-            {progress.patches ? (
-              <span className="hint">
-                {" "}
-                / {progress.patches.toLocaleString()} patches
-              </span>
-            ) : null}
-          </dd>
-          <dt>Min pixel size</dt>
-          <dd>{scroll.min_px ? `${scroll.min_px} µm` : "—"}</dd>
+          <dd>{segN.toLocaleString()}</dd>
+          <dt>Available pixel sizes</dt>
+          <dd>{pixelSizesText(scroll)}</dd>
         </dl>
         {cap ? <p className="desc">{cap}</p> : null}
       </div>

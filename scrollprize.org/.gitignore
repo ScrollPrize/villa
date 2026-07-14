@@ -31,3 +31,7 @@ yarn-error.log*
 
 # Generated build-time image dimension manifest
 .image-dimensions.json
+
+# Generated chat corpus (built by scripts/genChatCorpus.js)
+static/llms-full.txt
+api/_lib/corpus.json

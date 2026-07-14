@@ -12,21 +12,13 @@
       },
       {
         "big": "4",
-        "label": "with recovered text",
-        "sub": "Greek read; first Latin in progress",
+        "label": "with substantial text recovered",
         "derive": "text"
       },
       {
         "big": "9",
-        "label": "with ink-detection results",
-        "sub": "predictions on unrolled surfaces & fragments",
+        "label": "with verified ink detection results",
         "derive": "ink"
-      },
-      {
-        "big": "~4.3 PB",
-        "label": "open research data",
-        "sub": "3 scans at sub-2µm, down to 1.1µm",
-        "derive": "resolution"
       }
     ],
     "funnel": [
@@ -121,7 +113,7 @@
     {
       "id": "PHercParis4",
       "type": "scroll",
-      "desc": "PHerc. Paris 4 is a rolled Herculaneum papyrus from the [Institut de France](https://www.institutdefrance.fr/en/home/), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nThis is the scroll for which we have by far the most segments, where the [first letters](https://scrollprize.org/firstletters) were discovered and the [2023 Grand Prize](https://scrollprize.org/grandprize) was claimed.",
+      "desc": "PHerc. Paris 4 is a rolled Herculaneum papyrus from the [Institut de France](https://www.institutdefrance.fr/en/home/), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 7.91 µm), and rescanned in 2026 at the [ESRF](https://www.esrf.fr) in Grenoble, France (2.4 µm, plus 45.5 µm overview scans).\n\nIt is the scroll with by far the most segments, and the first from which substantial continuous Greek text — Epicurean philosophy attributed to Philodemus — was recovered: the [first letters](https://scrollprize.org/firstletters) were discovered here, and the [2023 Grand Prize](https://scrollprize.org/grandprize) was claimed on it.",
       "legacy": "https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/",
       "n_scans": 6,
       "n_volumes": 6,
@@ -195,12 +187,13 @@
       ],
       "volumeZarr": "https://data.aws.ash2txt.org/samples/PHercParis4/volumes/20230206171837-7.910um-54keV-masked.zarr/",
       "display": "Scroll 1",
+      "label": "PHerc. Paris 4",
       "repository": "Institut de France, Paris",
-      "note": "Scroll 1. The first scroll from which substantial continuous Greek text was recovered (2023 Vesuvius Challenge Grand Prize) — Epicurean philosophy attributed to Philodemus. Rescanned at ESRF at 2.4µm in 2026.",
+      "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis4/photos/PHercParis4_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis4/",
       "content": {
-        "work": "Epicurean prose (author/title not yet identified)",
+        "work": "Epicurean prose, attributed to Philodemus (title not yet identified)",
         "lang": "Greek",
         "summary": "Scroll 1 — the flagship. Substantial continuous Greek text recovered from the banner and body; site of the 2023 First Letters and Grand Prize.",
         "caveat": "The title region shows no detectable ink (possibly a different ink; the top rows are physically missing)."
@@ -272,7 +265,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623171929-w128-129/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623171929-w128-129/surface-renders/downsampled/PHercParis4-20260623171929-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623171929-w128-129/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623171929-w128-129/mesh/intermediate/20260623171929-w128-129_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623171929-w128-129/"
         },
         {
           "id": "20260701183151",
@@ -284,7 +277,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183151-w128-129/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183151-w128-129/surface-renders/downsampled/PHercParis4-20260701183151-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183151-w128-129/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183151-w128-129/mesh/intermediate/20260701183151-w128-129_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183151-w128-129/"
         },
         {
           "id": "20260623171400",
@@ -296,7 +289,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623171400-w126-127/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623171400-w126-127/surface-renders/downsampled/PHercParis4-20260623171400-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623171400-w126-127/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623171400-w126-127/mesh/intermediate/20260623171400-w126-127_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623171400-w126-127/"
         },
         {
           "id": "20260701183150",
@@ -308,7 +301,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183150-w126-127/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183150-w126-127/mesh/intermediate/20260701183150-w126-127_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183150-w126-127/"
         },
         {
           "id": "20260623170833",
@@ -320,7 +313,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623170833-w124-125/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623170833-w124-125/surface-renders/downsampled/PHercParis4-20260623170833-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623170833-w124-125/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623170833-w124-125/mesh/intermediate/20260623170833-w124-125_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623170833-w124-125/"
         },
         {
           "id": "20260701183149",
@@ -332,7 +325,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183149-w124-125/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183149-w124-125/surface-renders/downsampled/PHercParis4-20260701183149-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183149-w124-125/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183149-w124-125/mesh/intermediate/20260701183149-w124-125_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183149-w124-125/"
         },
         {
           "id": "20260623170305",
@@ -344,7 +337,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623170305-w122-123/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623170305-w122-123/surface-renders/downsampled/PHercParis4-20260623170305-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623170305-w122-123/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623170305-w122-123/mesh/intermediate/20260623170305-w122-123_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623170305-w122-123/"
         },
         {
           "id": "20260701183148",
@@ -356,7 +349,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183148-w122-123/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183148-w122-123/surface-renders/downsampled/PHercParis4-20260701183148-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183148-w122-123/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183148-w122-123/mesh/intermediate/20260701183148-w122-123_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183148-w122-123/"
         },
         {
           "id": "20260701183147",
@@ -368,7 +361,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183147-w120-121/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183147-w120-121/surface-renders/downsampled/PHercParis4-20260701183147-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183147-w120-121/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183147-w120-121/mesh/intermediate/20260701183147-w120-121_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183147-w120-121/"
         },
         {
           "id": "20260623165742",
@@ -380,7 +373,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623165742-w120-121/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623165742-w120-121/surface-renders/downsampled/PHercParis4-20260623165742-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623165742-w120-121/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623165742-w120-121/mesh/intermediate/20260623165742-w120-121_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623165742-w120-121/"
         },
         {
           "id": "20260701183146",
@@ -392,7 +385,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183146-w118-119/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183146-w118-119/surface-renders/downsampled/PHercParis4-20260701183146-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183146-w118-119/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183146-w118-119/mesh/intermediate/20260701183146-w118-119_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183146-w118-119/"
         },
         {
           "id": "20260623165230",
@@ -404,7 +397,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623165230-w118-119/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623165230-w118-119/surface-renders/downsampled/PHercParis4-20260623165230-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623165230-w118-119/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623165230-w118-119/mesh/intermediate/20260623165230-w118-119_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623165230-w118-119/"
         },
         {
           "id": "20260701183145",
@@ -416,7 +409,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183145-w116-117/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183145-w116-117/surface-renders/downsampled/PHercParis4-20260701183145-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183145-w116-117/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183145-w116-117/mesh/intermediate/20260701183145-w116-117_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183145-w116-117/"
         },
         {
           "id": "20260623164704",
@@ -428,7 +421,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623164704-w116-117/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623164704-w116-117/surface-renders/downsampled/PHercParis4-20260623164704-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623164704-w116-117/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623164704-w116-117/mesh/intermediate/20260623164704-w116-117_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623164704-w116-117/"
         },
         {
           "id": "20260623164141",
@@ -440,7 +433,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623164141-w113-115/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623164141-w113-115/surface-renders/downsampled/PHercParis4-20260623164141-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623164141-w113-115/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623164141-w113-115/mesh/intermediate/20260623164141-w113-115_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623164141-w113-115/"
         },
         {
           "id": "20260701183144",
@@ -452,7 +445,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183144-w113-115/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183144-w113-115/mesh/intermediate/20260701183144-w113-115_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183144-w113-115/"
         },
         {
           "id": "20260623163339",
@@ -464,7 +457,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623163339-w110-112/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623163339-w110-112/surface-renders/downsampled/PHercParis4-20260623163339-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623163339-w110-112/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623163339-w110-112/mesh/intermediate/20260623163339-w110-112_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623163339-w110-112/"
         },
         {
           "id": "20260623162614",
@@ -476,7 +469,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623162614-w107-109/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623162614-w107-109/surface-renders/downsampled/PHercParis4-20260623162614-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623162614-w107-109/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623162614-w107-109/mesh/intermediate/20260623162614-w107-109_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623162614-w107-109/"
         },
         {
           "id": "20260701183142",
@@ -488,7 +481,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183142-w107-109/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183142-w107-109/mesh/intermediate/20260701183142-w107-109_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183142-w107-109/"
         },
         {
           "id": "20260623161921",
@@ -500,7 +493,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623161921-w104-106/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623161921-w104-106/surface-renders/downsampled/PHercParis4-20260623161921-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623161921-w104-106/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623161921-w104-106/mesh/intermediate/20260623161921-w104-106_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623161921-w104-106/"
         },
         {
           "id": "20260701183141",
@@ -512,7 +505,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183141-w104-106/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183141-w104-106/mesh/intermediate/20260701183141-w104-106_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183141-w104-106/"
         },
         {
           "id": "20260701183140",
@@ -524,7 +517,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183140-w101-103/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183140-w101-103/mesh/intermediate/20260701183140-w101-103_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183140-w101-103/"
         },
         {
           "id": "20260623161233",
@@ -536,7 +529,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623161233-w101-103/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623161233-w101-103/surface-renders/downsampled/PHercParis4-20260623161233-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623161233-w101-103/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623161233-w101-103/mesh/intermediate/20260623161233-w101-103_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623161233-w101-103/"
         },
         {
           "id": "20260701183139",
@@ -548,7 +541,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183139-w098-100/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183139-w098-100/mesh/intermediate/20260701183139-w098-100_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183139-w098-100/"
         },
         {
           "id": "20260623160554",
@@ -560,7 +553,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623160554-w098-100/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623160554-w098-100/surface-renders/downsampled/PHercParis4-20260623160554-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623160554-w098-100/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623160554-w098-100/mesh/intermediate/20260623160554-w098-100_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623160554-w098-100/"
         },
         {
           "id": "20260701183138",
@@ -572,7 +565,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183138-w095-097/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183138-w095-097/surface-renders/downsampled/PHercParis4-20260701183138-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183138-w095-097/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183138-w095-097/mesh/intermediate/20260701183138-w095-097_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183138-w095-097/"
         },
         {
           "id": "20260623155914",
@@ -584,7 +577,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623155914-w095-097/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623155914-w095-097/surface-renders/downsampled/PHercParis4-20260623155914-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623155914-w095-097/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623155914-w095-097/mesh/intermediate/20260623155914-w095-097_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623155914-w095-097/"
         },
         {
           "id": "20260701183137",
@@ -596,7 +589,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183137-w092-094/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183137-w092-094/surface-renders/downsampled/PHercParis4-20260701183137-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183137-w092-094/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183137-w092-094/mesh/intermediate/20260701183137-w092-094_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183137-w092-094/"
         },
         {
           "id": "20260623155240",
@@ -608,7 +601,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623155240-w092-094/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623155240-w092-094/surface-renders/downsampled/PHercParis4-20260623155240-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623155240-w092-094/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623155240-w092-094/mesh/intermediate/20260623155240-w092-094_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623155240-w092-094/"
         },
         {
           "id": "20260701183136",
@@ -620,7 +613,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183136-w089-091/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183136-w089-091/surface-renders/downsampled/PHercParis4-20260701183136-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183136-w089-091/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183136-w089-091/mesh/intermediate/20260701183136-w089-091_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183136-w089-091/"
         },
         {
           "id": "20260623154617",
@@ -632,7 +625,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623154617-w089-091/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623154617-w089-091/surface-renders/downsampled/PHercParis4-20260623154617-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623154617-w089-091/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623154617-w089-091/mesh/intermediate/20260623154617-w089-091_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623154617-w089-091/"
         },
         {
           "id": "20260623154006",
@@ -644,7 +637,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623154006-w085-088/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623154006-w085-088/surface-renders/downsampled/PHercParis4-20260623154006-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623154006-w085-088/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623154006-w085-088/mesh/intermediate/20260623154006-w085-088_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623154006-w085-088/"
         },
         {
           "id": "20260701183135",
@@ -656,7 +649,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183135-w085-088/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183135-w085-088/mesh/intermediate/20260701183135-w085-088_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183135-w085-088/"
         },
         {
           "id": "20260701183134",
@@ -668,7 +661,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183134-w081-084/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183134-w081-084/mesh/intermediate/20260701183134-w081-084_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183134-w081-084/"
         },
         {
           "id": "20260623153216",
@@ -680,7 +673,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623153216-w081-084/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623153216-w081-084/surface-renders/downsampled/PHercParis4-20260623153216-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623153216-w081-084/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623153216-w081-084/mesh/intermediate/20260623153216-w081-084_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623153216-w081-084/"
         },
         {
           "id": "20260701183133",
@@ -692,7 +685,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183133-w077-080/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183133-w077-080/mesh/intermediate/20260701183133-w077-080_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183133-w077-080/"
         },
         {
           "id": "20260623152443",
@@ -704,7 +697,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623152443-w077-080/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623152443-w077-080/surface-renders/downsampled/PHercParis4-20260623152443-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623152443-w077-080/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623152443-w077-080/mesh/intermediate/20260623152443-w077-080_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623152443-w077-080/"
         },
         {
           "id": "20260623151729",
@@ -716,7 +709,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623151729-w073-076/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623151729-w073-076/surface-renders/downsampled/PHercParis4-20260623151729-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623151729-w073-076/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623151729-w073-076/mesh/intermediate/20260623151729-w073-076_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623151729-w073-076/"
         },
         {
           "id": "20260701183132",
@@ -728,7 +721,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183132-w073-076/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183132-w073-076/mesh/intermediate/20260701183132-w073-076_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183132-w073-076/"
         },
         {
           "id": "20260623151041",
@@ -740,7 +733,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623151041-w069-072/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623151041-w069-072/surface-renders/downsampled/PHercParis4-20260623151041-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623151041-w069-072/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623151041-w069-072/mesh/intermediate/20260623151041-w069-072_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623151041-w069-072/"
         },
         {
           "id": "20260701183131",
@@ -752,7 +745,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183131-w069-072/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183131-w069-072/surface-renders/downsampled/PHercParis4-20260701183131-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183131-w069-072/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183131-w069-072/mesh/intermediate/20260701183131-w069-072_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183131-w069-072/"
         },
         {
           "id": "20260623150417",
@@ -764,7 +757,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623150417-w064-068/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623150417-w064-068/surface-renders/downsampled/PHercParis4-20260623150417-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623150417-w064-068/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623150417-w064-068/mesh/intermediate/20260623150417-w064-068_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623150417-w064-068/"
         },
         {
           "id": "20260701183130",
@@ -776,7 +769,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183130-w064-068/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183130-w064-068/mesh/intermediate/20260701183130-w064-068_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183130-w064-068/"
         },
         {
           "id": "20260701183129",
@@ -788,7 +781,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183129-w059-063/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183129-w059-063/surface-renders/downsampled/PHercParis4-20260701183129-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183129-w059-063/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183129-w059-063/mesh/intermediate/20260701183129-w059-063_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183129-w059-063/"
         },
         {
           "id": "20260623145652",
@@ -800,7 +793,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623145652-w059-063/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623145652-w059-063/surface-renders/downsampled/PHercParis4-20260623145652-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623145652-w059-063/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623145652-w059-063/mesh/intermediate/20260623145652-w059-063_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623145652-w059-063/"
         },
         {
           "id": "20260623144957",
@@ -812,7 +805,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623144957-w053-058/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623144957-w053-058/surface-renders/downsampled/PHercParis4-20260623144957-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623144957-w053-058/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623144957-w053-058/mesh/intermediate/20260623144957-w053-058_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623144957-w053-058/"
         },
         {
           "id": "20260701183128",
@@ -824,7 +817,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183128-w053-058/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183128-w053-058/mesh/intermediate/20260701183128-w053-058_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183128-w053-058/"
         },
         {
           "id": "20260623141649",
@@ -836,7 +829,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623141649-w053-058_jordi/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623141649-w053-058_jordi/surface-renders/downsampled/PHercParis4-20260623141649-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623141649-w053-058_jordi/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623141649-w053-058_jordi/mesh/intermediate/20260623141649-w053-058_jordi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623141649-w053-058_jordi/"
         },
         {
           "id": "20260623144224",
@@ -848,7 +841,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623144224-w046-052/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623144224-w046-052/surface-renders/downsampled/PHercParis4-20260623144224-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623144224-w046-052/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623144224-w046-052/mesh/intermediate/20260623144224-w046-052_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623144224-w046-052/"
         },
         {
           "id": "20260701183127",
@@ -860,7 +853,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183127-w046-052/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183127-w046-052/mesh/intermediate/20260701183127-w046-052_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183127-w046-052/"
         },
         {
           "id": "20260623141135",
@@ -872,7 +865,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623141135-w046-052_jordi/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623141135-w046-052_jordi/surface-renders/downsampled/PHercParis4-20260623141135-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623141135-w046-052_jordi/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623141135-w046-052_jordi/mesh/intermediate/20260623141135-w046-052_jordi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623141135-w046-052_jordi/"
         },
         {
           "id": "20260623143441",
@@ -884,7 +877,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623143441-w038-045/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623143441-w038-045/surface-renders/downsampled/PHercParis4-20260623143441-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623143441-w038-045/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623143441-w038-045/mesh/intermediate/20260623143441-w038-045_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623143441-w038-045/"
         },
         {
           "id": "20260701183126",
@@ -896,7 +889,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183126-w038-045/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183126-w038-045/mesh/intermediate/20260701183126-w038-045_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183126-w038-045/"
         },
         {
           "id": "20260623142658",
@@ -908,7 +901,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623142658-w028-037/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623142658-w028-037/surface-renders/downsampled/PHercParis4-20260623142658-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623142658-w028-037/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623142658-w028-037/mesh/intermediate/20260623142658-w028-037_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623142658-w028-037/"
         },
         {
           "id": "20260701183125",
@@ -920,7 +913,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183125-w028-037/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183125-w028-037/surface-renders/downsampled/PHercParis4-20260701183125-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183125-w028-037/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183125-w028-037/mesh/intermediate/20260701183125-w028-037_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183125-w028-037/"
         },
         {
           "id": "20260701183124",
@@ -932,7 +925,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183124-w010-027/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260701183124-w010-027/surface-renders/downsampled/PHercParis4-20260701183124-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183124-w010-027/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183124-w010-027/mesh/intermediate/20260701183124-w010-027_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260701183124-w010-027/"
         },
         {
           "id": "20260623141924",
@@ -944,7 +937,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623141924-w010-027/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260623141924-w010-027/surface-renders/downsampled/PHercParis4-20260623141924-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623141924-w010-027/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623141924-w010-027/mesh/intermediate/20260623141924-w010-027_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260623141924-w010-027/"
         },
         {
           "id": "20260603005223",
@@ -956,7 +949,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603005223-5753_-1/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603005223-5753_-1/surface-renders/downsampled/PHercParis4-20260603005223-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603005223-5753_-1/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603005223-5753_-1/mesh/intermediate/20260603005223-5753_-1_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603005223-5753_-1/"
         },
         {
           "id": "20260603193311",
@@ -968,7 +961,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603193311-5753_-1_copy/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603193311-5753_-1_copy/surface-renders/downsampled/PHercParis4-20260603193311-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603193311-5753_-1_copy/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603193311-5753_-1_copy/mesh/intermediate/20260603193311-5753_-1_copy_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603193311-5753_-1_copy/"
         },
         {
           "id": "20260603024952",
@@ -980,7 +973,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603024952-5753_-2/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603024952-5753_-2/surface-renders/downsampled/PHercParis4-20260603024952-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603024952-5753_-2/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603024952-5753_-2/mesh/intermediate/20260603024952-5753_-2_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603024952-5753_-2/"
         },
         {
           "id": "20260603042357",
@@ -992,7 +985,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603042357-5753_-3/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603042357-5753_-3/surface-renders/downsampled/PHercParis4-20260603042357-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603042357-5753_-3/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603042357-5753_-3/mesh/intermediate/20260603042357-5753_-3_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603042357-5753_-3/"
         },
         {
           "id": "20260603145540",
@@ -1004,7 +997,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603145540-5753_-4/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603145540-5753_-4/surface-renders/downsampled/PHercParis4-20260603145540-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603145540-5753_-4/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603145540-5753_-4/mesh/intermediate/20260603145540-5753_-4_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603145540-5753_-4/"
         },
         {
           "id": "20260603190005",
@@ -1016,7 +1009,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603190005-5753_-5/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603190005-5753_-5/surface-renders/downsampled/PHercParis4-20260603190005-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603190005-5753_-5/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603190005-5753_-5/mesh/intermediate/20260603190005-5753_-5_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603190005-5753_-5/"
         },
         {
           "id": "20260603185441",
@@ -1028,7 +1021,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603185441-5753_-6/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603185441-5753_-6/surface-renders/downsampled/PHercParis4-20260603185441-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603185441-5753_-6/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603185441-5753_-6/mesh/intermediate/20260603185441-5753_-6_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603185441-5753_-6/"
         },
         {
           "id": "20260602204401",
@@ -1040,7 +1033,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260602204401-5753_-7/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260602204401-5753_-7/surface-renders/downsampled/PHercParis4-20260602204401-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260602204401-5753_-7/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260602204401-5753_-7/mesh/intermediate/20260602204401-5753_-7_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260602204401-5753_-7/"
         },
         {
           "id": "20260602225659",
@@ -1052,7 +1045,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260602225659-5753_0/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260602225659-5753_0/surface-renders/downsampled/PHercParis4-20260602225659-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260602225659-5753_0/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260602225659-5753_0/mesh/intermediate/20260602225659-5753_0_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260602225659-5753_0/"
         },
         {
           "id": "20230702185753",
@@ -1064,7 +1057,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20230702185753/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20230702185753/surface-renders/downsampled/PHercParis4-20230702185753-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20230702185753/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20230702185753/mesh/intermediate/20230702185753_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20230702185753/"
         },
         {
           "id": "20260602230115",
@@ -1076,7 +1069,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260602230115-20230702185753_v14/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260602230115-20230702185753_v14/surface-renders/downsampled/PHercParis4-20260602230115-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260602230115-20230702185753_v14/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260602230115-20230702185753_v14/mesh/intermediate/20260602230115-20230702185753_v14_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260602230115-20230702185753_v14/"
         },
         {
           "id": "20230929220926",
@@ -1088,7 +1081,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20230929220926/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20230929220926/surface-renders/downsampled/PHercParis4-20230929220926-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20230929220926/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20230929220926/mesh/intermediate/20230929220926_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20230929220926/"
         },
         {
           "id": "20231005123336",
@@ -1100,7 +1093,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231005123336/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231005123336/surface-renders/downsampled/PHercParis4-20231005123336-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231005123336/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231005123336/mesh/intermediate/20231005123336_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231005123336/"
         },
         {
           "id": "20260603222816",
@@ -1112,7 +1105,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603222816-20231005123336_v2_flatboi/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260603222816-20231005123336_v2_flatboi/surface-renders/downsampled/PHercParis4-20260603222816-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603222816-20231005123336_v2_flatboi/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603222816-20231005123336_v2_flatboi/mesh/intermediate/20260603222816-20231005123336_v2_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260603222816-20231005123336_v2_flatboi/"
         },
         {
           "id": "20231007101619",
@@ -1124,7 +1117,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231007101619/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231007101619/surface-renders/downsampled/PHercParis4-20231007101619-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231007101619/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231007101619/mesh/intermediate/20231007101619_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231007101619/"
         },
         {
           "id": "20231012184424",
@@ -1136,7 +1129,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231012184424/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231012184424/surface-renders/downsampled/PHercParis4-20231012184424-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231012184424/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231012184424/mesh/intermediate/20231012184424_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231012184424/"
         },
         {
           "id": "20231016151002",
@@ -1148,7 +1141,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231016151002/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231016151002/surface-renders/downsampled/PHercParis4-20231016151002-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231016151002/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231016151002/mesh/intermediate/20231016151002_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231016151002/"
         },
         {
           "id": "20231022170901",
@@ -1160,7 +1153,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231022170901/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231022170901/surface-renders/downsampled/PHercParis4-20231022170901-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231022170901/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231022170901/mesh/intermediate/20231022170901_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231022170901/"
         },
         {
           "id": "20231031143852",
@@ -1172,7 +1165,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231031143852/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231031143852/surface-renders/downsampled/PHercParis4-20231031143852-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231031143852/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231031143852/mesh/intermediate/20231031143852_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231031143852/"
         },
         {
           "id": "20231106155351",
@@ -1184,7 +1177,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231106155351/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231106155351/surface-renders/downsampled/PHercParis4-20231106155351-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231106155351/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231106155351/mesh/intermediate/20231106155351_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231106155351/"
         },
         {
           "id": "20231210121321",
@@ -1196,7 +1189,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231210121321/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231210121321/surface-renders/downsampled/PHercParis4-20231210121321-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231210121321/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231210121321/mesh/intermediate/20231210121321_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231210121321/"
         },
         {
           "id": "20260604223808",
@@ -1208,7 +1201,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260604223808-20231210121321_v8/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20260604223808-20231210121321_v8/surface-renders/downsampled/PHercParis4-20260604223808-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260604223808-20231210121321_v8/surface-volumes/2.4um-0.22m-78keV-volume-20260411134726.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260604223808-20231210121321_v8/mesh/intermediate/20260604223808-20231210121321_v8_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20260604223808-20231210121321_v8/"
         },
         {
           "id": "20231221180251",
@@ -1220,7 +1213,7 @@
           "alpha": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231221180251/surface-renders/2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined.tif",
           "alphaPrev": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHercParis4/segments/20231221180251/surface-renders/downsampled/PHercParis4-20231221180251-2.4um-0.22m-78keV-volume-20260411134726-alpha-overlay-combined-ds8.jpg",
           "layers": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231221180251/surface-volumes/45.532um-11.0m-74keV-volume-20260310170716.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231221180251/mesh/intermediate/20231221180251_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHercParis4/segments/20231221180251/"
         }
       ],
       "predictions": [
@@ -1268,7 +1261,7 @@
     {
       "id": "PHerc1667",
       "type": "scroll",
-      "desc": "PHerc. 1667 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 µm and 7.91 µm), and later rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025) — the scan from which it was virtually unwrapped and read in full.\n\nIt is similar in size to PHerc. 332 (Scroll 3).",
+      "desc": "PHerc. 1667 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 µm and 7.91 µm), and rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025). From that scan it became the first Herculaneum scroll ever virtually unwrapped and read in full, end to end, without being physically opened.\n\nIt is similar in size to PHerc. 332 (Scroll 3).",
       "legacy": "https://dl.ash2txt.org/full-scrolls/Scroll4/PHerc1667.volpkg/",
       "n_scans": 3,
       "n_volumes": 3,
@@ -1319,8 +1312,9 @@
       ],
       "volumeZarr": "https://data.aws.ash2txt.org/samples/PHerc1667/volumes/20231107190228-3.240um-88keV-masked.zarr/",
       "display": "Scroll 4",
+      "label": "PHerc. 1667",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Scroll 4 — the first Herculaneum scroll virtually unwrapped and read in full, end to end, without ever being physically opened. Scanned and read at 2.4µm.",
+      "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1667/photos/PHerc1667_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1667/",
       "content": {
@@ -1370,7 +1364,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260205070000-w041_2026020507_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260205070000-w041_2026020507_flatboi/mesh/intermediate/20260205070000-w041_2026020507_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260205070000-w041_2026020507_flatboi/"
         },
         {
           "id": "20260203210000",
@@ -1382,7 +1376,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260203210000-w040_2026020321_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260203210000-w040_2026020321_flatboi/mesh/intermediate/20260203210000-w040_2026020321_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260203210000-w040_2026020321_flatboi/"
         },
         {
           "id": "20260130150000",
@@ -1394,7 +1388,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260130150000-w039_2026013015_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260130150000-w039_2026013015_flatboi/mesh/intermediate/20260130150000-w039_2026013015_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260130150000-w039_2026013015_flatboi/"
         },
         {
           "id": "20260128140000",
@@ -1406,7 +1400,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260128140000-w038_2026012814_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260128140000-w038_2026012814_flatboi/mesh/intermediate/20260128140000-w038_2026012814_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260128140000-w038_2026012814_flatboi/"
         },
         {
           "id": "20260123230000",
@@ -1418,7 +1412,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260123230000-w037_2026012323_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260123230000-w037_2026012323_flatboi/mesh/intermediate/20260123230000-w037_2026012323_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260123230000-w037_2026012323_flatboi/"
         },
         {
           "id": "20260119120000",
@@ -1430,7 +1424,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260119120000-w036_2026011912_flatboi/surface-volumes/1.129um-0.22m-59keV-volume-20260323082859.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260119120000-w036_2026011912_flatboi/mesh/intermediate/20260119120000-w036_2026011912_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260119120000-w036_2026011912_flatboi/"
         },
         {
           "id": "20260116230000",
@@ -1442,7 +1436,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260116230000-w035_2026011623_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260116230000-w035_2026011623_flatboi/mesh/intermediate/20260116230000-w035_2026011623_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260116230000-w035_2026011623_flatboi/"
         },
         {
           "id": "20260115160000",
@@ -1454,7 +1448,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260115160000-w034_2026011516_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260115160000-w034_2026011516_flatboi/mesh/intermediate/20260115160000-w034_2026011516_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260115160000-w034_2026011516_flatboi/"
         },
         {
           "id": "20260110010000",
@@ -1466,7 +1460,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260110010000-w033_2026011001_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260110010000-w033_2026011001_flatboi/mesh/intermediate/20260110010000-w033_2026011001_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260110010000-w033_2026011001_flatboi/"
         },
         {
           "id": "20260105050000",
@@ -1478,7 +1472,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260105050000-w032_2026010505_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260105050000-w032_2026010505_flatboi/mesh/intermediate/20260105050000-w032_2026010505_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260105050000-w032_2026010505_flatboi/"
         },
         {
           "id": "20251223230000",
@@ -1490,7 +1484,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251223230000-w031_2025122323_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251223230000-w031_2025122323_flatboi/mesh/intermediate/20251223230000-w031_2025122323_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251223230000-w031_2025122323_flatboi/"
         },
         {
           "id": "20251220020000",
@@ -1502,7 +1496,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251220020000-w030_2025122002_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251220020000-w030_2025122002_flatboi/mesh/intermediate/20251220020000-w030_2025122002_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251220020000-w030_2025122002_flatboi/"
         },
         {
           "id": "20251212185248",
@@ -1514,7 +1508,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251212185248-w029_20251212185248662_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251212185248-w029_20251212185248662_flatboi/mesh/intermediate/20251212185248-w029_20251212185248662_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251212185248-w029_20251212185248662_flatboi/"
         },
         {
           "id": "20251208130119",
@@ -1526,7 +1520,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251208130119-w028_20251208130119156_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251208130119-w028_20251208130119156_flatboi/mesh/intermediate/20251208130119-w028_20251208130119156_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251208130119-w028_20251208130119156_flatboi/"
         },
         {
           "id": "20240304161941",
@@ -1538,7 +1532,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20240304161941-w023_20240304161941_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20240304161941-w023_20240304161941_flatboi/mesh/intermediate/20240304161941-w023_20240304161941_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20240304161941-w023_20240304161941_flatboi/"
         },
         {
           "id": "20240304144031",
@@ -1550,7 +1544,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20240304144031-w018_20240304144031_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20240304144031-w018_20240304144031_flatboi/mesh/intermediate/20240304144031-w018_20240304144031_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20240304144031-w018_20240304144031_flatboi/"
         },
         {
           "id": "20240304141531",
@@ -1562,7 +1556,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20240304141531-w013_20240304141531_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20251217075048.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20240304141531-w013_20240304141531_flatboi/mesh/intermediate/20240304141531-w013_20240304141531_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20240304141531-w013_20240304141531_flatboi/"
         },
         {
           "id": "20251206103305",
@@ -1574,7 +1568,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251206103305-w012_20251206103305555_flatboi/surface-volumes/1.129um-0.22m-59keV-volume-20260323082859.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251206103305-w012_20251206103305555_flatboi/mesh/intermediate/20251206103305-w012_20251206103305555_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20251206103305-w012_20251206103305555_flatboi/"
         },
         {
           "id": "20260108140509",
@@ -1586,7 +1580,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260108140509-w011_20260108140509268_flatboi/surface-volumes/1.129um-0.22m-59keV-volume-20260323082859.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260108140509-w011_20260108140509268_flatboi/mesh/intermediate/20260108140509-w011_20260108140509268_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc1667/segments/20260108140509-w011_20260108140509268_flatboi/"
         }
       ],
       "predictions": [],
@@ -1630,8 +1624,9 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0172/volumes/20241024131839-7.910um-53keV-masked.zarr/",
       "display": "Scroll 5",
+      "label": "PHerc. 172",
       "repository": "Bodleian Library, Oxford",
-      "note": "Scroll 5. ~70% geometrically unrolled by November 2025.",
+      "note": "About 70% geometrically unrolled as of November 2025.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0172/photos/PHerc0172_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0172/",
       "content": {
@@ -1690,7 +1685,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251206184729-w095_20251206184729906_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251206184729-w095_20251206184729906_flatboi/mesh/intermediate/20251206184729-w095_20251206184729906_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251206184729-w095_20251206184729906_flatboi/"
         },
         {
           "id": "20251205115859",
@@ -1702,7 +1697,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251205115859-w094_20251205115859448_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251205115859-w094_20251205115859448_flatboi/mesh/intermediate/20251205115859-w094_20251205115859448_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251205115859-w094_20251205115859448_flatboi/"
         },
         {
           "id": "20251204192708",
@@ -1714,7 +1709,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251204192708-w093_20251204192708445_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251204192708-w093_20251204192708445_flatboi/mesh/intermediate/20251204192708-w093_20251204192708445_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251204192708-w093_20251204192708445_flatboi/"
         },
         {
           "id": "20251204101314",
@@ -1726,7 +1721,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251204101314-w092_20251204101314959_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251204101314-w092_20251204101314959_flatboi/mesh/intermediate/20251204101314-w092_20251204101314959_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251204101314-w092_20251204101314959_flatboi/"
         },
         {
           "id": "20251204071911",
@@ -1738,7 +1733,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251204071911-w091_20251204071911070_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251204071911-w091_20251204071911070_flatboi/mesh/intermediate/20251204071911-w091_20251204071911070_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251204071911-w091_20251204071911070_flatboi/"
         },
         {
           "id": "20251204060522",
@@ -1750,7 +1745,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251204060522-w090_20251204060522416_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251204060522-w090_20251204060522416_flatboi/mesh/intermediate/20251204060522-w090_20251204060522416_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251204060522-w090_20251204060522416_flatboi/"
         },
         {
           "id": "20251203230500",
@@ -1762,7 +1757,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251203230500-w089_20251203230500465_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251203230500-w089_20251203230500465_flatboi/mesh/intermediate/20251203230500-w089_20251203230500465_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251203230500-w089_20251203230500465_flatboi/"
         },
         {
           "id": "20250926153406",
@@ -1774,7 +1769,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926153406-w088_20250926153406704_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926153406-w088_20250926153406704_flatboi/mesh/intermediate/20250926153406-w088_20250926153406704_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926153406-w088_20250926153406704_flatboi/"
         },
         {
           "id": "20251112000002",
@@ -1786,7 +1781,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251112000002-w087_20251112000002214_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251112000002-w087_20251112000002214_flatboi/mesh/intermediate/20251112000002-w087_20251112000002214_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251112000002-w087_20251112000002214_flatboi/"
         },
         {
           "id": "20250926150345",
@@ -1798,7 +1793,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926150345-w086_20250926150345176_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926150345-w086_20250926150345176_flatboi/mesh/intermediate/20250926150345-w086_20250926150345176_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926150345-w086_20250926150345176_flatboi/"
         },
         {
           "id": "20251110135146",
@@ -1810,7 +1805,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251110135146-w085_20251110135146457_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251110135146-w085_20251110135146457_flatboi/mesh/intermediate/20251110135146-w085_20251110135146457_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251110135146-w085_20251110135146457_flatboi/"
         },
         {
           "id": "20250926145427",
@@ -1822,7 +1817,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926145427-w084_20250926145427439_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926145427-w084_20250926145427439_flatboi/mesh/intermediate/20250926145427-w084_20250926145427439_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926145427-w084_20250926145427439_flatboi/"
         },
         {
           "id": "20250926132117",
@@ -1834,7 +1829,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926132117-w083_20250926132117595_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926132117-w083_20250926132117595_flatboi/mesh/intermediate/20250926132117-w083_20250926132117595_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926132117-w083_20250926132117595_flatboi/"
         },
         {
           "id": "20250926122938",
@@ -1846,7 +1841,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926122938-w082_20250926122938619_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926122938-w082_20250926122938619_flatboi/mesh/intermediate/20250926122938-w082_20250926122938619_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926122938-w082_20250926122938619_flatboi/"
         },
         {
           "id": "20251114202035",
@@ -1858,7 +1853,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251114202035-w081_20251114202035261_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251114202035-w081_20251114202035261_flatboi/mesh/intermediate/20251114202035-w081_20251114202035261_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251114202035-w081_20251114202035261_flatboi/"
         },
         {
           "id": "20250926114310",
@@ -1870,7 +1865,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926114310-w080_20250926114310705_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926114310-w080_20250926114310705_flatboi/mesh/intermediate/20250926114310-w080_20250926114310705_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926114310-w080_20250926114310705_flatboi/"
         },
         {
           "id": "20250926113336",
@@ -1882,7 +1877,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926113336-w079_20250926113336891_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926113336-w079_20250926113336891_flatboi/mesh/intermediate/20250926113336-w079_20250926113336891_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926113336-w079_20250926113336891_flatboi/"
         },
         {
           "id": "20250926112011",
@@ -1894,7 +1889,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926112011-w078_20250926112011918_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926112011-w078_20250926112011918_flatboi/mesh/intermediate/20250926112011-w078_20250926112011918_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250926112011-w078_20250926112011918_flatboi/"
         },
         {
           "id": "20251106133152",
@@ -1906,7 +1901,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251106133152-w077_20251106133152767_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251106133152-w077_20251106133152767_flatboi/mesh/intermediate/20251106133152-w077_20251106133152767_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251106133152-w077_20251106133152767_flatboi/"
         },
         {
           "id": "20251106170358",
@@ -1918,7 +1913,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251106170358-w076_20251106170358232_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251106170358-w076_20251106170358232_flatboi/mesh/intermediate/20251106170358-w076_20251106170358232_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251106170358-w076_20251106170358232_flatboi/"
         },
         {
           "id": "20251113204233",
@@ -1930,7 +1925,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251113204233-w075_20251113204233755_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251113204233-w075_20251113204233755_flatboi/mesh/intermediate/20251113204233-w075_20251113204233755_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251113204233-w075_20251113204233755_flatboi/"
         },
         {
           "id": "20251113152136",
@@ -1942,7 +1937,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251113152136-w074_20251113152136889_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251113152136-w074_20251113152136889_flatboi/mesh/intermediate/20251113152136-w074_20251113152136889_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251113152136-w074_20251113152136889_flatboi/"
         },
         {
           "id": "20251113130119",
@@ -1954,7 +1949,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251113130119-w073_20251113130119516_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251113130119-w073_20251113130119516_flatboi/mesh/intermediate/20251113130119-w073_20251113130119516_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251113130119-w073_20251113130119516_flatboi/"
         },
         {
           "id": "20251113021010",
@@ -1966,7 +1961,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251113021010-w072_20251113021010674_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251113021010-w072_20251113021010674_flatboi/mesh/intermediate/20251113021010-w072_20251113021010674_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251113021010-w072_20251113021010674_flatboi/"
         },
         {
           "id": "20251112163527",
@@ -1978,7 +1973,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251112163527-w071_20251112163527854_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251112163527-w071_20251112163527854_flatboi/mesh/intermediate/20251112163527-w071_20251112163527854_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251112163527-w071_20251112163527854_flatboi/"
         },
         {
           "id": "20251111210734",
@@ -1990,7 +1985,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251111210734-w070_20251111210734722_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251111210734-w070_20251111210734722_flatboi/mesh/intermediate/20251111210734-w070_20251111210734722_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251111210734-w070_20251111210734722_flatboi/"
         },
         {
           "id": "20251111151836",
@@ -2002,7 +1997,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251111151836-w069_20251111151836406_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251111151836-w069_20251111151836406_flatboi/mesh/intermediate/20251111151836-w069_20251111151836406_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251111151836-w069_20251111151836406_flatboi/"
         },
         {
           "id": "20251111010954",
@@ -2014,7 +2009,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251111010954-w068_20251111010954408_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251111010954-w068_20251111010954408_flatboi/mesh/intermediate/20251111010954-w068_20251111010954408_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251111010954-w068_20251111010954408_flatboi/"
         },
         {
           "id": "20251110135803",
@@ -2026,7 +2021,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251110135803-w067_20251110135803677_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251110135803-w067_20251110135803677_flatboi/mesh/intermediate/20251110135803-w067_20251110135803677_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251110135803-w067_20251110135803677_flatboi/"
         },
         {
           "id": "20251110110112",
@@ -2038,7 +2033,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251110110112-w066_20251110110112608_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251110110112-w066_20251110110112608_flatboi/mesh/intermediate/20251110110112-w066_20251110110112608_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251110110112-w066_20251110110112608_flatboi/"
         },
         {
           "id": "20251109232817",
@@ -2050,7 +2045,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251109232817-w065_20251109232817724_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251109232817-w065_20251109232817724_flatboi/mesh/intermediate/20251109232817-w065_20251109232817724_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251109232817-w065_20251109232817724_flatboi/"
         },
         {
           "id": "20251107110950",
@@ -2062,7 +2057,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251107110950-w064_20251107110950052_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251107110950-w064_20251107110950052_flatboi/mesh/intermediate/20251107110950-w064_20251107110950052_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251107110950-w064_20251107110950052_flatboi/"
         },
         {
           "id": "20251107063327",
@@ -2074,7 +2069,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251107063327-w063_20251107063327215_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251107063327-w063_20251107063327215_flatboi/mesh/intermediate/20251107063327-w063_20251107063327215_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251107063327-w063_20251107063327215_flatboi/"
         },
         {
           "id": "20250917143559",
@@ -2086,7 +2081,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250917143559-w062_20250917143559205_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250917143559-w062_20250917143559205_flatboi/mesh/intermediate/20250917143559-w062_20250917143559205_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20250917143559-w062_20250917143559205_flatboi/"
         },
         {
           "id": "20251107175958",
@@ -2098,7 +2093,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251107175958-w061_20251107175958270_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251107175958-w061_20251107175958270_flatboi/mesh/intermediate/20251107175958-w061_20251107175958270_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251107175958-w061_20251107175958270_flatboi/"
         },
         {
           "id": "20251207123912",
@@ -2110,7 +2105,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251207123912-w060_20251207123912611_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251207123912-w060_20251207123912611_flatboi/mesh/intermediate/20251207123912-w060_20251207123912611_flatboi_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251207123912-w060_20251207123912611_flatboi/"
         },
         {
           "id": "20251210142414",
@@ -2122,7 +2117,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251210142414-w059_20251210142414060_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251210142414-w059_20251210142414060_flatboi/mesh/intermediate/20251210142414-w059_20251210142414060_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251210142414-w059_20251210142414060_flatboi/"
         },
         {
           "id": "20251210153304",
@@ -2134,7 +2129,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251210153304-w058_20251210153304503_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251210153304-w058_20251210153304503_flatboi/mesh/intermediate/20251210153304-w058_20251210153304503_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251210153304-w058_20251210153304503_flatboi/"
         },
         {
           "id": "20251210160810",
@@ -2146,7 +2141,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251210160810-w057_20251210160810301_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251210160810-w057_20251210160810301_flatboi/mesh/intermediate/20251210160810-w057_20251210160810301_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251210160810-w057_20251210160810301_flatboi/"
         },
         {
           "id": "20251211095724",
@@ -2158,7 +2153,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251211095724-w056_20251211095724922_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251211095724-w056_20251211095724922_flatboi/mesh/intermediate/20251211095724-w056_20251211095724922_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251211095724-w056_20251211095724922_flatboi/"
         },
         {
           "id": "20251211111451",
@@ -2170,7 +2165,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251211111451-w055_20251211111451620_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251211111451-w055_20251211111451620_flatboi/mesh/intermediate/20251211111451-w055_20251211111451620_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251211111451-w055_20251211111451620_flatboi/"
         },
         {
           "id": "20251211135303",
@@ -2182,7 +2177,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251211135303-w054_20251211135303394_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251211135303-w054_20251211135303394_flatboi/mesh/intermediate/20251211135303-w054_20251211135303394_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251211135303-w054_20251211135303394_flatboi/"
         },
         {
           "id": "20251211152543",
@@ -2194,7 +2189,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251211152543-w053_20251211152543204_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251211152543-w053_20251211152543204_flatboi/mesh/intermediate/20251211152543-w053_20251211152543204_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251211152543-w053_20251211152543204_flatboi/"
         },
         {
           "id": "20251212105627",
@@ -2206,7 +2201,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251212105627-w052_20251212105627148_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251212105627-w052_20251212105627148_flatboi/mesh/intermediate/20251212105627-w052_20251212105627148_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251212105627-w052_20251212105627148_flatboi/"
         },
         {
           "id": "20251115002740",
@@ -2218,7 +2213,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002740-auto_grown_20251115002740308_0_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002740-auto_grown_20251115002740308_0_flatboi/mesh/intermediate/20251115002740-auto_grown_20251115002740308_0_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002740-auto_grown_20251115002740308_0_flatboi/"
         },
         {
           "id": "20251115002741",
@@ -2230,7 +2225,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002741-auto_grown_20251115002740308_1_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002741-auto_grown_20251115002740308_1_flatboi/mesh/intermediate/20251115002741-auto_grown_20251115002740308_1_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002741-auto_grown_20251115002740308_1_flatboi/"
         },
         {
           "id": "20251115002742",
@@ -2242,7 +2237,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002742-auto_grown_20251115002740308_2_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002742-auto_grown_20251115002740308_2_flatboi/mesh/intermediate/20251115002742-auto_grown_20251115002740308_2_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002742-auto_grown_20251115002740308_2_flatboi/"
         },
         {
           "id": "20251115002743",
@@ -2254,7 +2249,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002743-auto_grown_20251115002740308_3_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002743-auto_grown_20251115002740308_3_flatboi/mesh/intermediate/20251115002743-auto_grown_20251115002740308_3_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002743-auto_grown_20251115002740308_3_flatboi/"
         },
         {
           "id": "20251115002744",
@@ -2266,7 +2261,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002744-auto_grown_20251115002740308_4_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002744-auto_grown_20251115002740308_4_flatboi/mesh/intermediate/20251115002744-auto_grown_20251115002740308_4_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002744-auto_grown_20251115002740308_4_flatboi/"
         },
         {
           "id": "20251115002745",
@@ -2278,7 +2273,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002745-auto_grown_20251115002740308_5_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002745-auto_grown_20251115002740308_5_flatboi/mesh/intermediate/20251115002745-auto_grown_20251115002740308_5_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002745-auto_grown_20251115002740308_5_flatboi/"
         },
         {
           "id": "20251115002746",
@@ -2290,7 +2285,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002746-auto_grown_20251115002740308_6_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002746-auto_grown_20251115002740308_6_flatboi/mesh/intermediate/20251115002746-auto_grown_20251115002740308_6_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002746-auto_grown_20251115002740308_6_flatboi/"
         },
         {
           "id": "20251115002747",
@@ -2302,7 +2297,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002747-auto_grown_20251115002740308_7_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002747-auto_grown_20251115002740308_7_flatboi/mesh/intermediate/20251115002747-auto_grown_20251115002740308_7_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002747-auto_grown_20251115002740308_7_flatboi/"
         },
         {
           "id": "20251115002748",
@@ -2314,7 +2309,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002748-auto_grown_20251115002740308_8_flatboi/surface-volumes/7.91um-53keV-volume-20241024131838.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002748-auto_grown_20251115002740308_8_flatboi/mesh/intermediate/20251115002748-auto_grown_20251115002740308_8_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0172/segments/20251115002748-auto_grown_20251115002740308_8_flatboi/"
         }
       ],
       "predictions": [],
@@ -2382,9 +2377,10 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260319133050-2.403um-0.2m-77keV-masked.zarr/",
       "display": "PHerc0139",
+      "label": "PHerc. 139",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Title and author attribution recovered, identifying it as a work by the Epicurean philosopher Philodemus, specifically On Gods, Book 8. About 20% virtually unrolled.",
-      "photo": null,
+      "note": "Title and author recovered — On Gods, Book 8, by the Epicurean philosopher Philodemus. About 20% virtually unrolled.",
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0139/photos/PHerc0139_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0139/",
       "content": {
         "work": "Philodemus, On Gods (Περὶ θεῶν), Book 8",
@@ -2430,7 +2426,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250223000000-w059_2025022312/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250223000000-w059_2025022312/mesh/intermediate/20250223000000-w059_2025022312_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250223000000-w059_2025022312/"
         },
         {
           "id": "20260210000000",
@@ -2442,7 +2438,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260210000000-w058_2026021020/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260210000000-w058_2026021020/mesh/intermediate/20260210000000-w058_2026021020_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260210000000-w058_2026021020/"
         },
         {
           "id": "20260127000000",
@@ -2454,7 +2450,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260127000000-w057_2026012713/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260127000000-w057_2026012713/mesh/intermediate/20260127000000-w057_2026012713_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260127000000-w057_2026012713/"
         },
         {
           "id": "20260115000001",
@@ -2466,7 +2462,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260115000001-w056_2026011514/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260115000001-w056_2026011514/mesh/intermediate/20260115000001-w056_2026011514_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260115000001-w056_2026011514/"
         },
         {
           "id": "20251226000000",
@@ -2478,7 +2474,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20251226000000-w055_2025122611/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20251226000000-w055_2025122611/mesh/intermediate/20251226000000-w055_2025122611_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20251226000000-w055_2025122611/"
         },
         {
           "id": "20260206000002",
@@ -2490,7 +2486,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260206000002-w054_2026020617/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260206000002-w054_2026020617/mesh/intermediate/20260206000002-w054_2026020617_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260206000002-w054_2026020617/"
         },
         {
           "id": "20260220000000",
@@ -2502,7 +2498,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260220000000-w053_2026022021/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260220000000-w053_2026022021/mesh/intermediate/20260220000000-w053_2026022021_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260220000000-w053_2026022021/"
         },
         {
           "id": "20260227000000",
@@ -2514,7 +2510,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260227000000-w052_2026022705/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260227000000-w052_2026022705/mesh/intermediate/20260227000000-w052_2026022705_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260227000000-w052_2026022705/"
         },
         {
           "id": "20260306000001",
@@ -2526,7 +2522,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260306000001-w051_2026030600/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260306000001-w051_2026030600/mesh/intermediate/20260306000001-w051_2026030600_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260306000001-w051_2026030600/"
         },
         {
           "id": "20260302000001",
@@ -2538,7 +2534,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260302000001-w050_2026030220/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260302000001-w050_2026030220/mesh/intermediate/20260302000001-w050_2026030220_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260302000001-w050_2026030220/"
         },
         {
           "id": "20260318000000",
@@ -2550,7 +2546,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260318000000-w049_20260318/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260318000000-w049_20260318/mesh/intermediate/20260318000000-w049_20260318_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260318000000-w049_20260318/"
         },
         {
           "id": "20260219000001",
@@ -2562,7 +2558,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260219000001-w048_2026021912/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260219000001-w048_2026021912/mesh/intermediate/20260219000001-w048_2026021912_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260219000001-w048_2026021912/"
         },
         {
           "id": "20260206000001",
@@ -2574,7 +2570,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260206000001-w047_2026020613/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260206000001-w047_2026020613/mesh/intermediate/20260206000001-w047_2026020613_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260206000001-w047_2026020613/"
         },
         {
           "id": "20260325000000",
@@ -2586,7 +2582,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260325000000-w046_20260325/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260325000000-w046_20260325/mesh/intermediate/20260325000000-w046_20260325_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260325000000-w046_20260325/"
         },
         {
           "id": "20260126000000",
@@ -2598,7 +2594,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260126000000-w045_2026012619/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260126000000-w045_2026012619/mesh/intermediate/20260126000000-w045_2026012619_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260126000000-w045_2026012619/"
         },
         {
           "id": "20260115000000",
@@ -2610,7 +2606,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260115000000-w044_2026011522/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260115000000-w044_2026011522/mesh/intermediate/20260115000000-w044_2026011522_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260115000000-w044_2026011522/"
         },
         {
           "id": "20260112000000",
@@ -2622,7 +2618,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260112000000-w043_2026011217/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260112000000-w043_2026011217/mesh/intermediate/20260112000000-w043_2026011217_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260112000000-w043_2026011217/"
         },
         {
           "id": "20260206000000",
@@ -2634,7 +2630,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260206000000-w042_2026020613/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260206000000-w042_2026020613/mesh/intermediate/20260206000000-w042_2026020613_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260206000000-w042_2026020613/"
         },
         {
           "id": "20260108000000",
@@ -2646,7 +2642,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260108000000-w041_2026010816/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260108000000-w041_2026010816/mesh/intermediate/20260108000000-w041_2026010816_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260108000000-w041_2026010816/"
         },
         {
           "id": "20250831000000",
@@ -2658,7 +2654,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250831000000-w040_2025083102/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250831000000-w040_2025083102/mesh/intermediate/20250831000000-w040_2025083102_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250831000000-w040_2025083102/"
         },
         {
           "id": "20260302000000",
@@ -2670,7 +2666,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260302000000-w039_2026030210/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260302000000-w039_2026030210/mesh/intermediate/20260302000000-w039_2026030210_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260302000000-w039_2026030210/"
         },
         {
           "id": "20260306000000",
@@ -2682,7 +2678,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260306000000-w038_2026030608/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260306000000-w038_2026030608/mesh/intermediate/20260306000000-w038_2026030608_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260306000000-w038_2026030608/"
         },
         {
           "id": "20260310000000",
@@ -2694,7 +2690,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260310000000-w037_2026031015/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260310000000-w037_2026031015/mesh/intermediate/20260310000000-w037_2026031015_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260310000000-w037_2026031015/"
         },
         {
           "id": "20260316000000",
@@ -2706,7 +2702,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260316000000-w036_2026031607/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260316000000-w036_2026031607/mesh/intermediate/20260316000000-w036_2026031607_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260316000000-w036_2026031607/"
         },
         {
           "id": "20260317000000",
@@ -2718,7 +2714,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260317000000-w035_2026031718/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260317000000-w035_2026031718/mesh/intermediate/20260317000000-w035_2026031718_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260317000000-w035_2026031718/"
         },
         {
           "id": "20260303000000",
@@ -2730,7 +2726,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260303000000-w034_2026030317/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260303000000-w034_2026030317/mesh/intermediate/20260303000000-w034_2026030317_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260303000000-w034_2026030317/"
         },
         {
           "id": "20260219000000",
@@ -2742,7 +2738,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260219000000-w033_2026021913/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260219000000-w033_2026021913/mesh/intermediate/20260219000000-w033_2026021913_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260219000000-w033_2026021913/"
         },
         {
           "id": "20260203000000",
@@ -2754,7 +2750,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260203000000-w032_2026020303/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260203000000-w032_2026020303/mesh/intermediate/20260203000000-w032_2026020303_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260203000000-w032_2026020303/"
         },
         {
           "id": "20260130000000",
@@ -2766,7 +2762,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260130000000-w031_2026013019/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260130000000-w031_2026013019/mesh/intermediate/20260130000000-w031_2026013019_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260130000000-w031_2026013019/"
         },
         {
           "id": "20250108000005",
@@ -2778,7 +2774,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000005-w030_2025010818/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000005-w030_2025010818/mesh/intermediate/20250108000005-w030_2025010818_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000005-w030_2025010818/"
         },
         {
           "id": "20250108000004",
@@ -2790,7 +2786,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000004-w029_2025010827/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000004-w029_2025010827/mesh/intermediate/20250108000004-w029_2025010827_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000004-w029_2025010827/"
         },
         {
           "id": "20250108000003",
@@ -2802,7 +2798,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000003-w028_2025010836/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000003-w028_2025010836/mesh/intermediate/20250108000003-w028_2025010836_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000003-w028_2025010836/"
         },
         {
           "id": "20250108000002",
@@ -2814,7 +2810,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000002-w027_2025010845/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000002-w027_2025010845/mesh/intermediate/20250108000002-w027_2025010845_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000002-w027_2025010845/"
         },
         {
           "id": "20250108000001",
@@ -2826,7 +2822,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000001-w026_2025010854/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000001-w026_2025010854/mesh/intermediate/20250108000001-w026_2025010854_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000001-w026_2025010854/"
         },
         {
           "id": "20250108000000",
@@ -2838,7 +2834,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000000-w025_2025010863/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000000-w025_2025010863/mesh/intermediate/20250108000000-w025_2025010863_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20250108000000-w025_2025010863/"
         },
         {
           "id": "20260215000000",
@@ -2850,7 +2846,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260215000000-w024_2026021572/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260215000000-w024_2026021572/mesh/intermediate/20260215000000-w024_2026021572_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260215000000-w024_2026021572/"
         },
         {
           "id": "20260311000000",
@@ -2862,7 +2858,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260311000000-w023_202603112281/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260311000000-w023_202603112281/mesh/intermediate/20260311000000-w023_202603112281_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260311000000-w023_202603112281/"
         },
         {
           "id": "20260422000000",
@@ -2874,7 +2870,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260422000000-title_2026042222_zmid_flatboi/surface-volumes/2.399um-0.22m-78keV-volume-20260102150214.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260422000000-title_2026042222_zmid_flatboi/mesh/intermediate/20260422000000-title_2026042222_zmid_flatboi_flattened.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0139/segments/20260422000000-title_2026042222_zmid_flatboi/"
         }
       ],
       "predictions": [
@@ -2957,9 +2953,10 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0814/volumes/20260309142202-2.399um-0.2m-78keV-masked.zarr/",
       "display": "PHerc0814",
+      "label": "PHerc. 814",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0814/photos/PHerc0814_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0814/",
       "content": null,
       "progress": {
@@ -3000,7 +2997,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925161630-auto_grown_20250925161630635/surface-volumes/9.362um-1.2m-113keV-volume-20250804134230.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925161630-auto_grown_20250925161630635/mesh/intermediate/20250925161630-auto_grown_20250925161630635_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925161630-auto_grown_20250925161630635/"
         },
         {
           "id": "20250925182632",
@@ -3012,7 +3009,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925182632-auto_grown_20250925182632715/surface-volumes/2.399um-0.22m-78keV-volume-20260309142202.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925182632-auto_grown_20250925182632715/mesh/intermediate/20250925182632-auto_grown_20250925182632715_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925182632-auto_grown_20250925182632715/"
         },
         {
           "id": "20250925204843",
@@ -3024,7 +3021,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925204843-auto_grown_20250925204843950/surface-volumes/9.362um-1.2m-113keV-volume-20250804134230.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925204843-auto_grown_20250925204843950/mesh/intermediate/20250925204843-auto_grown_20250925204843950_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925204843-auto_grown_20250925204843950/"
         },
         {
           "id": "20250925212701",
@@ -3036,7 +3033,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925212701-auto_grown_20250925212701145/surface-volumes/9.362um-1.2m-113keV-volume-20250804134230.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925212701-auto_grown_20250925212701145/mesh/intermediate/20250925212701-auto_grown_20250925212701145_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925212701-auto_grown_20250925212701145/"
         },
         {
           "id": "20250925222237",
@@ -3048,7 +3045,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925222237-auto_grown_20250925222237459/surface-volumes/9.362um-1.2m-113keV-volume-20250804134230.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925222237-auto_grown_20250925222237459/mesh/intermediate/20250925222237-auto_grown_20250925222237459_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250925222237-auto_grown_20250925222237459/"
         },
         {
           "id": "20250926051122",
@@ -3060,7 +3057,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250926051122-auto_grown_20250926051122829/surface-volumes/9.362um-1.2m-113keV-volume-20250804134230.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250926051122-auto_grown_20250926051122829/mesh/intermediate/20250926051122-auto_grown_20250926051122829_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250926051122-auto_grown_20250926051122829/"
         },
         {
           "id": "20250926203608",
@@ -3072,7 +3069,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250926203608-auto_grown_20250926203608932/surface-volumes/9.362um-1.2m-113keV-volume-20250804134230.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250926203608-auto_grown_20250926203608932/mesh/intermediate/20250926203608-auto_grown_20250926203608932_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250926203608-auto_grown_20250926203608932/"
         },
         {
           "id": "20250928235953",
@@ -3084,7 +3081,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250928235953-auto_grown_20250928235953722/surface-volumes/9.362um-1.2m-113keV-volume-20250804134230.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250928235953-auto_grown_20250928235953722/mesh/intermediate/20250928235953-auto_grown_20250928235953722_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250928235953-auto_grown_20250928235953722/"
         },
         {
           "id": "20250929040153",
@@ -3096,7 +3093,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250929040153-auto_grown_20250929040153260/surface-volumes/9.362um-1.2m-113keV-volume-20250804134230.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250929040153-auto_grown_20250929040153260/mesh/intermediate/20250929040153-auto_grown_20250929040153260_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250929040153-auto_grown_20250929040153260/"
         },
         {
           "id": "20250930083742",
@@ -3108,7 +3105,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250930083742-auto_grown_20250930083742882/surface-volumes/9.362um-1.2m-113keV-volume-20250804134230.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250930083742-auto_grown_20250930083742882/mesh/intermediate/20250930083742-auto_grown_20250930083742882_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250930083742-auto_grown_20250930083742882/"
         },
         {
           "id": "20251001060526",
@@ -3120,7 +3117,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20251001060526-auto_grown_20251001060526760/surface-volumes/9.362um-1.2m-113keV-volume-20250804134230.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20251001060526-auto_grown_20251001060526760/mesh/intermediate/20251001060526-auto_grown_20251001060526760_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20251001060526-auto_grown_20251001060526760/"
         },
         {
           "id": "20250926165636",
@@ -3132,7 +3129,7 @@
           "alpha": null,
           "alphaPrev": null,
           "layers": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250926165636-auto_trace_20250926165636789/surface-volumes/9.362um-1.2m-113keV-volume-20250804134230.zarr/",
-          "mesh": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250926165636-auto_trace_20250926165636789/mesh/intermediate/20250926165636-auto_trace_20250926165636789_original.obj"
+          "folder": "s3://vesuvius-challenge-open-data/PHerc0814/segments/20250926165636-auto_trace_20250926165636789/"
         }
       ],
       "predictions": [
@@ -3214,6 +3211,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/",
       "display": "PHerc0500P2",
+      "label": "PHerc. 500P2",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0500P2/photos/PHerc0500P2_photo.jpg",
@@ -3319,6 +3317,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0343P/volumes/20260304131111-2.215um-0.4m-111keV-masked.zarr/",
       "display": "PHerc0343P",
+      "label": "PHerc. 343P",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0343P/photos/PHerc0343P_photo.jpg",
@@ -3413,9 +3412,10 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0841/volumes/20260319124803-2.403um-0.2m-77keV-masked.zarr/",
       "display": "PHerc0841",
+      "label": "PHerc. 841",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0841/photos/PHerc0841_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0841/",
       "content": null,
       "progress": {
@@ -3518,6 +3518,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20250521125136-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc0009B",
+      "label": "PHerc. 9B",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0009B/photos/PHerc0009B_photo.jpg",
@@ -3574,7 +3575,7 @@
     {
       "id": "PHerc0332",
       "type": "scroll",
-      "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nIt is the innermost part of a scroll, known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original. Its small size enabled scanning at extremely high resolution (3.24um).",
+      "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 µm and 7.91 µm), and rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025).\n\nIt is the innermost part of a scroll, known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original.",
       "legacy": "https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/",
       "n_scans": 4,
       "n_volumes": 4,
@@ -3632,8 +3633,9 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/",
       "display": "Scroll 3",
+      "label": "PHerc. 332",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Scroll 3.",
+      "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0332/photos/PHerc0332_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0332/",
       "content": {
@@ -3734,6 +3736,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc1451/volumes/20250521151225-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc1451",
+      "label": "PHerc. 1451",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1451/photos/PHerc1451_photo.jpg",
@@ -3833,9 +3836,10 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHercMANBp/volumes/20260427100434-1.129um-0.2m-59keV-masked.zarr/",
       "display": "PHercMANBp",
+      "label": "PHerc. MANBp",
       "repository": "Museo Archeologico Nazionale di Napoli",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercMANBp/photos/PHercMANBp_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMANBp/",
       "content": null,
       "progress": {
@@ -3927,9 +3931,10 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0846A/volumes/20260319102732-2.403um-0.2m-77keV-masked.zarr/",
       "display": "PHerc0846A",
+      "label": "PHerc. 846A",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0846A/photos/PHerc0846A_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0846A/",
       "content": null,
       "progress": {
@@ -4024,9 +4029,10 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHercMAN5/volumes/20260311104824-2.399um-0.2m-78keV-masked.zarr/",
       "display": "PHercMAN5",
+      "label": "PHerc. MAN 5",
       "repository": "Museo Archeologico Nazionale di Napoli",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercMAN5/photos/PHercMAN5_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMAN5/",
       "content": null,
       "progress": {
@@ -4080,7 +4086,7 @@
     {
       "id": "PHercParis3",
       "type": "scroll",
-      "desc": "",
+      "desc": "PHerc. Paris 3 is a rolled Herculaneum papyrus from the [Institut de France](https://www.institutdefrance.fr/en/home/), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK, and rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2026).",
       "legacy": null,
       "n_scans": 1,
       "n_volumes": 1,
@@ -4110,9 +4116,10 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHercParis3/volumes/20260427095331-2.400um-0.2m-78keV-masked.zarr/",
       "display": "Scroll 2",
+      "label": "PHerc. Paris 3",
       "repository": "Institut de France, Paris",
-      "note": "Scroll 2. Rescanned at ESRF at 2.4µm.",
-      "photo": null,
+      "note": "",
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis3/photos/PHercParis3_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis3/",
       "content": null,
       "progress": {
@@ -4186,9 +4193,10 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHercMANB/volumes/20260323091048-2.399um-0.2m-78keV-masked.zarr/",
       "display": "PHercMANB",
+      "label": "PHerc. MANB",
       "repository": "Museo Archeologico Nazionale di Napoli",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercMANB/photos/PHercMANB_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMANB/",
       "content": null,
       "progress": {
@@ -4272,9 +4280,10 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr/",
       "display": "PHerc1299",
+      "label": "PHerc. 1299",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1299/photos/PHerc1299_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1299/",
       "content": null,
       "progress": {
@@ -4366,6 +4375,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc1203/volumes/20260319130212-2.403um-0.2m-77keV-masked.zarr/",
       "display": "PHerc1203",
+      "label": "PHerc. 1203",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1203/photos/PHerc1203_photo.jpg",
@@ -4463,9 +4473,10 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0175A/volumes/20250521115057-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc0175A",
+      "label": "PHerc. 175A",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0175A/photos/PHerc0175A_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0175A/",
       "content": null,
       "progress": {
@@ -4549,9 +4560,10 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0343/volumes/20250521140437-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc0343",
+      "label": "PHerc. 343",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0343/photos/PHerc0343_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0343/",
       "content": null,
       "progress": {
@@ -4635,6 +4647,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0483B/volumes/20251124083638-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc0483B",
+      "label": "PHerc. 483B",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0483B/photos/PHerc0483B_photo.jpg",
@@ -4721,6 +4734,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0490A/volumes/20250521151210-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc0490A",
+      "label": "PHerc. 490A",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0490A/photos/PHerc0490A_photo.jpg",
@@ -4807,6 +4821,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0306B/volumes/20250521133212-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc0306B",
+      "label": "PHerc. 306B",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0306B/photos/PHerc0306B_photo.jpg",
@@ -4893,6 +4908,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc1218/volumes/20250521120456-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc1218",
+      "label": "PHerc. 1218",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1218/photos/PHerc1218_photo.jpg",
@@ -4979,6 +4995,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0175B/volumes/20250521125822-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc0175B",
+      "label": "PHerc. 175B",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0175B/photos/PHerc0175B_photo.jpg",
@@ -5065,6 +5082,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc0800",
+      "label": "PHerc. 800",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0800/photos/PHerc0800_photo.jpg",
@@ -5151,6 +5169,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0490B/volumes/20250521151215-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc0490B",
+      "label": "PHerc. 490B",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0490B/photos/PHerc0490B_photo.jpg",
@@ -5237,6 +5256,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0483A/volumes/20250521140913-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc0483A",
+      "label": "PHerc. 483A",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0483A/photos/PHerc0483A_photo.jpg",
@@ -5323,6 +5343,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0268/volumes/20251110183117-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc0268",
+      "label": "PHerc. 268",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0268/photos/PHerc0268_photo.jpg",
@@ -5409,6 +5430,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr/",
       "display": "PHerc1447",
+      "label": "PHerc. 1447",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1447/photos/PHerc1447_photo.jpg",
@@ -5495,6 +5517,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0826/volumes/20250821151701-9.362um-1.2m-113keV-masked.zarr/",
       "display": "PHerc0826",
+      "label": "PHerc. 826",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0826/photos/PHerc0826_photo.jpg",
@@ -5581,6 +5604,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0211/volumes/20250821151803-9.362um-1.2m-113keV-masked.zarr/",
       "display": "PHerc0211",
+      "label": "PHerc. 211",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0211/photos/PHerc0211_photo.jpg",
@@ -5667,6 +5691,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0813/volumes/20250821151723-9.362um-1.2m-113keV-masked.zarr/",
       "display": "PHerc0813",
+      "label": "PHerc. 813",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0813/photos/PHerc0813_photo.jpg",
@@ -5753,6 +5778,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0125/volumes/20250821151825-9.362um-1.2m-113keV-masked.zarr/",
       "display": "PHerc0125",
+      "label": "PHerc. 125",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0125/photos/PHerc0125_photo.jpg",
@@ -5839,9 +5865,10 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0846B/volumes/20250804142305-9.362um-1.2m-113keV-masked.zarr/",
       "display": "PHerc0846B",
+      "label": "PHerc. 846B",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
-      "photo": null,
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0846B/photos/PHerc0846B_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0846B/",
       "content": null,
       "progress": {
@@ -5925,6 +5952,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0358/volumes/20250821151737-9.362um-1.2m-113keV-masked.zarr/",
       "display": "PHerc0358",
+      "label": "PHerc. 358",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0358/photos/PHerc0358_photo.jpg",
@@ -6011,6 +6039,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0191/volumes/20250821151635-9.362um-1.2m-113keV-masked.zarr/",
       "display": "PHerc0191",
+      "label": "PHerc. 191",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0191/photos/PHerc0191_photo.jpg",
@@ -6097,6 +6126,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0257/volumes/20250821151750-9.362um-1.2m-113keV-masked.zarr/",
       "display": "PHerc0257",
+      "label": "PHerc. 257",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0257/photos/PHerc0257_photo.jpg",
@@ -6183,6 +6213,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc1545/volumes/20250821151648-9.362um-1.2m-113keV-masked.zarr/",
       "display": "PHerc1545",
+      "label": "PHerc. 1545",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1545/photos/PHerc1545_photo.jpg",
@@ -6257,6 +6288,7 @@
       ],
       "volumeZarr": null,
       "display": "PHercParis1Fr39",
+      "label": "PHerc. Paris 1Fr39",
       "repository": "Institut de France, Paris",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis1Fr39/photos/PHercParis1Fr39_photo.jpg",
@@ -6311,6 +6343,7 @@
       "licenses": [],
       "volumeZarr": null,
       "display": "PHerc51Cr4Fr8",
+      "label": "PHerc. 51Cr4Fr8",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc51Cr4Fr8/photos/PHerc51Cr4Fr8_photo.jpg",
@@ -6363,6 +6396,7 @@
       "licenses": [],
       "volumeZarr": null,
       "display": "PHerc1667Cr1Fr3",
+      "label": "PHerc. 1667Cr1Fr3",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1667Cr1Fr3/photos/PHerc1667Cr1Fr3_photo.jpg",
@@ -6420,6 +6454,7 @@
       ],
       "volumeZarr": null,
       "display": "PHercParis1Fr34",
+      "label": "PHerc. Paris 1Fr34",
       "repository": "Institut de France, Paris",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis1Fr34/photos/PHercParis1Fr34_photo.jpg",
@@ -6479,6 +6514,7 @@
       ],
       "volumeZarr": null,
       "display": "PHercParis2Fr47",
+      "label": "PHerc. Paris 2Fr47",
       "repository": "Institut de France, Paris",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis2Fr47/photos/PHercParis2Fr47_photo.jpg",
@@ -6538,6 +6574,7 @@
       ],
       "volumeZarr": null,
       "display": "PHercParis2Fr143",
+      "label": "PHerc. Paris 2Fr143",
       "repository": "Institut de France, Paris",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis2Fr143/photos/PHercParis2Fr143_photo.jpg",

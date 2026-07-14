@@ -1,7 +1,6 @@
 ---
 title: "First word discovered in unopened Herculaneum scroll by 21yo computer science student"
-sidebar_label: "First word discovered (Oct 2023)"
-hide_table_of_contents: true
+sidebar_label: "First word discovered"
 hide_title: true
 ---
 
@@ -23,33 +22,23 @@ hide_title: true
   <meta property="twitter:image" content="https://scrollprize.org/img/firstletters/purple_card-new.webp" />
 </head>
 
+:::info[HISTORICAL MILESTONE]
+
+This announcement is from October 2023. The \$700,000 2023 Grand Prize it references has since been [awarded](grandprize); see [Prizes](prizes) for what is open today.
+
+:::
+
 import JsonLd from '@site/src/components/JsonLd';
 
 <JsonLd data={{"@context":"https://schema.org","@type":"NewsArticle","headline":"First word discovered in unopened Herculaneum scroll","datePublished":"2023-10-12","dateModified":"2023-10-12","author":{"@type":"Organization","name":"Vesuvius Challenge"},"publisher":{"@type":"Organization","name":"Vesuvius Challenge","logo":{"@type":"ImageObject","url":"https://scrollprize.org/img/social/opengraph.jpg"}},"image":"https://scrollprize.org/img/firstletters/purple_card-new.webp","mainEntityOfPage":"https://scrollprize.org/firstletters"}} />
 
 <img src="/img/firstletters/composite_thumb.webp" alt="Composite image of recovered text from inside a Herculaneum scroll." />
 
-<h1 className="color-white text-4xl md:text-7xl font-black !mb-2 leading-none tracking-tighter">First word discovered in <span style={{
-  background:
-    "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
-  WebkitBackgroundClip: "text",
-  WebkitTextFillColor: "transparent",
-  backgroundClip: "text",
-  textFillColor: "transparent",
-}}>unopened Herculaneum scroll</span> by 21yo computer science student</h1>
+<h1 className="color-white text-4xl md:text-7xl !mb-2 leading-none">First word discovered in <span className="text-accent">unopened Herculaneum scroll</span> by 21yo computer science student</h1>
 
-<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none tracking-tight">Vesuvius Challenge \$700,000 Grand Prize “now definitely achievable”</div>
+<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none">Vesuvius Challenge \$700,000 Grand Prize “now definitely achievable”</div>
 
 <div className="opacity-60 mb-8 italic">October 12th, 2023</div>
-
-<!-- <div className="color-white text-2xl md:text-5xl font-black !mb-2 leading-none tracking-tighter" style={{
-  background:
-    "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
-  WebkitBackgroundClip: "text",
-  WebkitTextFillColor: "transparent",
-  backgroundClip: "text",
-  textFillColor: "transparent",
-}}>Vesuvius Challenge \$700,000 Grand Prize “now definitely achievable”</div> -->
 
 
 <figure className="">
@@ -108,7 +97,7 @@ His team also scanned and photographed detached scroll fragments bearing visible
   <figcaption className="mt-0">Training a machine learning model on the ground truth data from the detached fragments. From Stephen Parsons’ <a href="https://uknowledge.uky.edu/cs_etds/138/">PhD dissertation</a>.</figcaption>
 </figure>
 
-Professor Seales’ graduate student, Stephen Parsons, worked on detecting ink from the CT-scans using machine learning models and <a href="tutorial4">found success with the detached fragments</a>. That success caught the eye of tech entrepreneurs Nat Friedman and Daniel Gross, who started Vesuvius Challenge to accelerate this progress. They launched an open competition March of 2023, and — alongside a \$700,000 Grand Prize — awarded several smaller prizes for the development of open source tools and techniques.
+Professor Seales’ graduate student, Stephen Parsons, worked on detecting ink from the CT-scans using machine learning models and <a href="tutorial5">found success with the detached fragments</a>. That success caught the eye of tech entrepreneurs Nat Friedman and Daniel Gross, who started Vesuvius Challenge to accelerate this progress. They launched an open competition March of 2023, and — alongside a \$700,000 Grand Prize — awarded several smaller prizes for the development of open source tools and techniques.
 
 Early in the summer, a small team of annotators (the “segmentation team”) joined our effort. They began <a href="tutorial3">mapping the 3D structure of the scroll</a> using tools initially built by EduceLab and improved by our community. By July we had segmented and “virtually flattened” hundreds of cm2 of papyrus.
 
@@ -121,7 +110,7 @@ Early in the summer, a small team of annotators (the “segmentation team”) jo
 
 In early August, contestant Casey Handmer, an ex-JPL startup founder and polymath, wrote a <a href="https://caseyhandmer.wordpress.com/2023/08/05/reading-ancient-scrolls/">blog post</a> about his discovery of a “crackle pattern” that looks like ink.
 
-Casey found the pattern by staring at the segmented CT scans for hours on end. This was a major and surprising discovery. Stephen Parsons had seen <a href="tutorial4">direct evidence of ink</a> in detached fragments before, but not yet in the scrolls.
+Casey found the pattern by staring at the segmented CT scans for hours on end. This was a major and surprising discovery. Stephen Parsons had seen <a href="tutorial5">direct evidence of ink</a> in detached fragments before, but not yet in the scrolls.
 
 Casey was the first person in 2,000 years to find ink — and a letter — inside an unopened scroll.
 
@@ -179,7 +168,7 @@ If you’re trying to find these letters in the image, keep in mind that our mod
 Luke’s First Letters Prize submission is available now on <a href="https://github.com/lukeboi/scroll-first-letters">GitHub</a>.
 
 <figure>
-  <img className="max-w-[300px]" src="/img/firstletters/luke-reaction.gif" alt="Animated reaction of Luke celebrating when told he won the prize." />
+  <img className="max-w-[300px]" src="/img/firstletters/luke-reaction.webp" alt="Animated reaction of Luke celebrating when told he won the prize." />
   <figcaption className="mt-0">Luke’s reaction when we told him he won the prize a few days ago.</figcaption>
 </figure>
 
@@ -230,7 +219,7 @@ There were many contributions from different people in the critical path for the
 * Luke’s search for crackle was directly inspired by Casey’s work.
 * Casey was able to look through many sheets of papyrus because our segmentation team had mapped out hundreds of cm2.
 * The segmentation team was able to map out a lot of papyrus because of tooling built by contestants who worked on “Segmentation Tooling Prizes” (work by Julian Schilliger, Chuck, Yao Hsiao, and many others).
-* The segmentation tooling advances were possible because contestants built on top of existing open source tools by professor Seales’ team (work by Seth Parker, Stephen Parsons, and many others). And of course, the contest itself wouldn’t have been possible without the foundation that Dr. Seales and his team, along with their [funders](/#educelab-funders), have laid out and continue to support.
+* The segmentation tooling advances were possible because contestants built on top of existing open source tools by professor Seales’ team (work by Seth Parker, Stephen Parsons, and many others). And of course, the contest itself wouldn’t have been possible without the foundation that Dr. Seales and his team, along with their [funders](/#partners), have laid out and continue to support.
 
 Looking back at what got us to this point, it seems that almost every single thing we did in running this contest so far has been load-bearing. We’re not quite sure what to make of this! Perhaps that progress is more fragile and success is more contingent than it often seems in retrospect.
 
