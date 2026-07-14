@@ -97,8 +97,8 @@ export function TutorialsTop({ highlightId, links = {}, labels = {} } = {}) {
       <Thumb
         href={links.ink || "/tutorial5"}
         label={labels.ink || "Ink Detection"}
-        videoSrc="/img/tutorial-thumbs/top-prediction-small.webm?v=12"
-        poster="/img/tutorial-thumbs/top-prediction-small.webp?v=12"
+        videoSrc="/img/tutorial-thumbs/top-prediction-small.webm?v=19"
+        poster="/img/tutorial-thumbs/top-prediction-small.webp?v=19"
         highlight={highlightId == 5}
       />
     </div>

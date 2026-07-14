@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
-"""'Ink Detection' tutorial thumb — stylized but physical. Rev 4.
+"""'Ink Detection' tutorial thumb — stylized but physical. Rev 12.
 
 Picks up exactly where the flattening thumb ends: the tilted flat sheet,
-solidly red-voxelized. A TINY glowing inference kernel (a fraction of a
-letter — it finds ink *signal*; signals form letters, letters form the
-text) sweeps fast through the upper lines while the camera dives in on it,
-landing — slowed to a letter-by-letter cruise — on a fresh line about 2/3
-down, the lines above already showing. The camera glides alongside, then
-lets go: the kernel sprints on, sweeping row after row — visible (glow +
-motion trail) for the entire scan — while the camera pulls straight back,
-until the whole column (a REAL PHerc. Paris 4 ink prediction, recolored
-to the strip palette) is read, framed with breathing room.
+solidly red-voxelized, at the SAME framing (no zoom-out — the camera
+never pulls back before it zooms in). As the scan starts, the view PANS
+RIGHT: a second, close-by output sheet appears just to the right and
+behind the red one — like a real projection screen — and the scan
+appears on it. The camera then dwells a long time on the projection: a
+TINY glowing inference kernel (a fraction of a letter — it finds ink
+*signal*; signals form letters, letters form the text) sweeps the INTACT
+red sheet in raster rows — nothing is consumed — its reading beamed
+across the short gap, a projection ray landing on the output sheet where
+a synced write head prints the ink prediction line by line (below the
+raster front: nothing but background). Then a single, slow, DIRECT zoom
+dives into the prediction, easing into a letter-by-letter cruise on a
+fresh line about 2/3 down, watching the projection make the letters
+appear. The final move is one last zoom: straight out to the COMPLETED
+reconstruction — the text finishes filling in as the zoom lands, the
+rig untilts to a flat, dead-on view, and the red input sheet fades away
+— leaving the finished prediction (a REAL PHerc. Paris 4 ink
+prediction, recolored to the strip palette) held as a padded full image
+for the last second.
 
-The reveal strip is exactly the kernel height at all times.
+The write strip is exactly the kernel height at all times.
 
 This thumb runs 300 frames = 12.5 s (2x the strip cycle: the strip still
 re-syncs every 12.5 s). Shares flatten_thumb's exact geometry (same seeds,
@@ -252,6 +262,22 @@ TEX_W, TEX_H = 1408, 954
 XI0, XI1 = -S_TOTAL / 2 - 0.3, S_TOTAL / 2 + 0.3
 Z_TOP, Z_BOT = HEIGHT - 0.9, 0.2
 
+# output sheet: the prediction rasters onto a second plane parallel to the
+# input sheet, CLOSE BY — a bit to the right (in-plane) and behind it
+# (along the sheet normal), like a real projection screen behind the
+# object being read. The red input voxels stay put for the whole scan;
+# the kernel's reading is beamed across the short gap.
+D_XI = 22.0
+D_NU = -9.0
+
+def plane_pt(xi, z, dxi=0.0, nu=0.0):
+    """Project a point of the sheet-plane family (offset dxi in-plane,
+    nu along the normal) at the current pose."""
+    x = (xi + dxi) * PSI_D[0] + nu * PSI_N[0]
+    y = (xi + dxi) * PSI_D[1] + nu * PSI_N[1]
+    x, y, zz = tilt_pt(x, y, z, TAU)
+    return project_pt(x, y, zz, 0.0)
+
 def tex_uv(xi, z):
     return ((xi - XI0) / (XI1 - XI0) * TEX_W,
             (Z_TOP - z) / (Z_TOP - Z_BOT) * TEX_H)
@@ -305,13 +331,13 @@ def build_sheet_mask():
 INK_TEX = None
 SHEET_MASK = None
 
-# homography: texture px -> screen, as PIL PERSPECTIVE coeffs (screen -> tex)
-def _perspective_coeffs():
+# homography: texture px -> screen for a plane of the sheet family (offset
+# dxi in-plane, nu along the normal), as PIL PERSPECTIVE coeffs (screen -> tex)
+def _perspective_coeffs(dxi=0.0, nu=0.0):
     src = []   # screen
     dst = []   # texture
     for xi, z in ((XI0, Z_TOP), (XI1, Z_TOP), (XI1, Z_BOT), (XI0, Z_BOT)):
-        x, y, zz = tilt_pt(xi * PSI_D[0], xi * PSI_D[1], z, TAU)
-        u, v, _, _ = project_pt(x, y, zz, 0.0)
+        u, v, _, _ = plane_pt(xi, z, dxi, nu)
         src.append((u, v))
         dst.append(tex_uv(xi, z))
     A, B = [], []
@@ -323,16 +349,21 @@ def _perspective_coeffs():
 
 # ---- raster scan kinematics ---------------------------------------------------
 # The kernel is TINY (KH < a letter height): it detects ink signal, signals
-# form letters, letters form the text. It rasters boustrophedon rows from
-# the first text line downward at a slow, watchable speed, then its speed
-# doubles every DBL frames until the whole sheet is read (an accelerating
-# wipe). The reveal strip is exactly the kernel height at all times.
+# form letters, letters form the text. It rasters boustrophedon rows over
+# the intact red sheet from the top edge downward; its reading is beamed
+# across the gap to the output sheet, where the synced write head prints
+# the matching strip of prediction. The write strip is exactly the kernel
+# height at all times.
 N = 300
 KH = 0.22                       # kernel side (world units); letters are ~1.2
 CUBE = KH
-Z_START = Z_TOP                 # scan starts at the very top edge: no rows
-                                # are ever revealed "for free" above the
-                                # kernel — everything above it was scanned
+Z_START = Z_TOP + KH            # scan starts one kernel-height above the
+                                # top edge (the first pass skims the torn
+                                # boundary): no rows are ever revealed
+                                # "for free" above the kernel — and it
+                                # shifts every row up half a letter-notch,
+                                # placing the cruise front exactly where
+                                # the letter tops just keep emerging
 NR = math.ceil((Z_START - Z_BOT) / KH)
 EW = S_TOTAL / 2 + 0.8
 ROWPATH = 2 * EW
@@ -341,27 +372,38 @@ PATH_TOTAL = NR * ROWPATH
 # ---- camera profile (kernel-independent; the kernel speed plan needs it) -----
 POSE0 = (math.radians(36), math.radians(-25), math.radians(26))
 POSE1 = (math.radians(11), math.radians(-7), math.radians(11))
+POSE_FLAT = (0.0, 0.0, 0.0)     # the very end: no tilt at all — the
+                                # prediction faces the camera dead-on,
+                                # a flat 2D image
 TAU = POSE0[0]
 C0 = (0.0, 0.0, CZ_FLAT)        # flatten's look-at
-C1 = (0.0, 0.0, (Z_TOP + Z_BOT) / 2)   # final framing: sheet centered
 SC_MAX = 136.0                  # really close: double the previous zoom
-SC_END = 16.0                   # final scale: sheet fills ~85% of the width
-F_ZOOM = 75                     # zoom-in completes here
-F_B = 62                        # rendezvous: the (slowed) kernel meets the
+SC_END = 15.0                   # final scale: the flat prediction, padded
+F_PAN = 40                      # opening PAN RIGHT (no zoom!): flatten's
+                                # framing slides over to the projection —
+                                # red sheet left, output screen right —
+                                # as the scan starts
+F_DIVE = 110                    # long dwell on the projection first; only
+                                # then does the (single, direct) zoom-in
+F_ZOOM = 175                    # start — slow — completing here
+F_B = 165                       # rendezvous: the (slowed) kernel meets the
                                 # (zoomed) camera about 2/3 down the sheet,
                                 # with the lines above already read
-F_OUT = 130                     # zoom-out onset
-OUT_LEN = 120                   # slow pull-back
-F_FREEZE = 140                  # the follow point freezes here: from then
+F_FREEZE = 215                  # the follow point freezes here: from then
                                 # on the camera only zooms, zero shake
-F_DONE_TGT = 252                # the whole sheet is read by here
+F_TILT0 = 215                   # one LAST zoom: straight out to the
+F_TILT1 = 278                   # completed reconstruction — untilting to
+                                # the flat dead-on view as it lands
+F_DONE_TGT = 276                # ...and the text fully completes right as
+                                # that last zoom settles
 
 def scale_at(f):
-    # the camera holds wide for the first second (the kernel is seen
-    # starting its sweep), then dives
-    s_in = SCALE_FLAT + (SC_MAX - SCALE_FLAT) * smoothstep((f - 22) / (F_ZOOM - 22))
-    w_o = smoothstep((f - F_OUT) / OUT_LEN)
-    return s_in * (1 - w_o) + SC_END * w_o
+    # pan (constant scale), long projection dwell, one direct slow zoom-in,
+    # then one last zoom straight out to the flat completed reconstruction
+    s_in = (SCALE_FLAT
+            + (SC_MAX - SCALE_FLAT) * smoothstep((f - F_DIVE) / (F_ZOOM - F_DIVE)))
+    w_e = smoothstep((f - F_TILT0) / (F_TILT1 - F_TILT0))
+    return s_in * (1 - w_e) + SC_END * w_e
 
 # ---- kernel speed plan ---------------------------------------------------------
 # Planned in SCREEN px/frame, then divided by the zoom: while the camera
@@ -374,37 +416,38 @@ def scale_at(f):
 # by F_DONE_TGT.
 A_CRUISE = 11.0                 # apparent cruise speed (px/frame @600):
                                 # each letter dwells ~7 frames at full zoom
-S_MEET = 28 * ROWPATH + 8.0     # path position at F_B: 8 units into row 28 —
-                                # measured: the top core row of the line at
-                                # ~70% sheet height (the opening sweep reads
-                                # everything above it, so full lines already
-                                # show when the zoom lands), an even row so
-                                # the cruise runs LTR, and 8u in skips the
-                                # torn left edge: the slow pass runs right
-                                # over strong letters
+S_MEET = 30 * ROWPATH + 22.0    # path position at F_B: 22 units into row 30
+                                # (past the red sheet's right edge — the
+                                # zoom lands right-of-center on the
+                                # prediction, at the start of a column) —
+                                # two rows ABOVE the line's core: the
+                                # raster front sits just below the letter
+                                # tops, so only a hint of each letter
+                                # shows as it is written; an even row so
+                                # the cruise runs LTR
 
 KICK = 15.0                     # when the camera lets go of the kernel it
                                 # sprints: a smooth x15 ramp over 10 frames,
                                 # then exponential growth (rate solved)
-A_OPEN = 120.0                  # opening apparent speed (px/frame @600):
-                                # slow enough to WATCH the kernel take its
-                                # first passes at the wide view
-F_A1 = 24                       # ...for this long; then a solved burst
-F_PEAK = 44                     # (peaking here, mid-dive) covers the upper
-                                # third before easing into the cruise
+A0 = 18.0                       # opening apparent speed (px/frame @600);
+F_PEAK = F_DIVE                 # the kernel accelerates UNIFORMLY (linear
+                                # in screen speed) from A0 to the solved
+                                # peak exactly as the dive starts...
+F_SETTLE = 150                  # ...then eases down to the cruise speed
+                                # BEFORE the zoom lands: through the
+                                # landing the apparent speed is already
+                                # constant — no hitch, no slowdown
 
 def _plan():
     def build(a_hi, g):
         v = []
         base = A_CRUISE / scale_at(F_FREEZE)
         for f in range(N + 1):
-            if f <= F_A1:
-                v.append(A_OPEN / scale_at(f))
-            elif f <= F_PEAK:
-                a = A_OPEN + (a_hi - A_OPEN) * smoothstep((f - F_A1) / (F_PEAK - F_A1))
+            if f <= F_PEAK:
+                a = A0 + (a_hi - A0) * (f / F_PEAK)
                 v.append(a / scale_at(f))
-            elif f <= F_B:
-                a = A_CRUISE + (a_hi - A_CRUISE) * (1 - smoothstep((f - F_PEAK) / (F_B - F_PEAK)))
+            elif f <= F_SETTLE:
+                a = A_CRUISE + (a_hi - A_CRUISE) * (1 - smoothstep((f - F_PEAK) / (F_SETTLE - F_PEAK)))
                 v.append(a / scale_at(f))
             elif f <= F_FREEZE:
                 v.append(A_CRUISE / scale_at(f))
@@ -459,27 +502,29 @@ def row_of(z):
         return 0
     return min(NR - 1, int((Z_START - z) / KH))
 
-def revealed(xi, z, kxi, r, d, done):
-    if done:
-        return True
-    rv = row_of(z)
-    if rv != r:
-        return rv < r
-    trail = kxi - d * CUBE / 2
-    return xi < trail if d > 0 else xi > trail
-
 # ---- camera choreography --------------------------------------------------------
-# One steady move, no lateral shake: the camera glides (while slowly
-# rotating the sheet face-on) to the precomputed spot where the kernel
-# will be when the zoom lands, follows it along the letter row (the cruise
-# is one long row: the follow is a straight line, nothing whips), then the
-# follow point freezes and the camera purely zooms out to the padded
-# column while the kernel races on alone. Frame 0 is exactly flatten's
-# final camera.
+# One steady move, no lateral shake: pan right (constant scale) from
+# flatten's framing to the projection — red sheet left, output screen
+# right — dwell there watching the beam print the first rows, then glide
+# to the precomputed spot on the PREDICTION sheet where the write head
+# will be when the zoom lands, follow it along the letter row (the
+# cruise is one long row: the follow is a straight line, nothing whips),
+# then the follow point freezes and one last zoom pulls straight out to
+# the completed reconstruction — untilting to the flat, dead-on, padded
+# full image as it lands. Frame 0 is exactly flatten's final camera.
+ST_XI = 12.0                    # projection-stage look-at (in-plane /
+ST_NU = -4.5                    # normal offsets and height): frames the
+ST_Z = 14.0                     # gap — kernel, beam, and write head
+
 def set_pose(f):
     global TAU, PSI_D, PSI_N, _elev, _scale, _TARGET
-    ep = smoothstep(f / 110)
-    tau, psi, el = (a + (b - a) * ep for a, b in zip(POSE0, POSE1))
+    # pose in two stages: swing to the working angle through the dwell
+    # and dive, HOLD it through the cruise, then — only over the last
+    # zoom — untilt completely to the flat, dead-on view
+    ep = smoothstep(f / 160)
+    w_e = smoothstep((f - F_TILT0) / (F_TILT1 - F_TILT0))
+    tau, psi, el = (a + (b - a) * ep + (c - b) * w_e
+                    for a, b, c in zip(POSE0, POSE1, POSE_FLAT))
     TAU = tau
     PSI_D = (math.cos(psi), math.sin(psi))
     PSI_N = (math.sin(psi), -math.cos(psi))
@@ -494,13 +539,21 @@ def set_pose(f):
     fB = min(fB, float(F_FREEZE))
     kxi, kz, r, d = kernel_pos_cont(fB)
     txi = kxi - d * 1.2
-    P = tilt_pt(txi * PSI_D[0], txi * PSI_D[1], kz + 0.2, TAU)
-    # pan starts WITH the zoom (f22): the wide opening stays centered
-    w_t = smoothstep((f - 22) / (F_B - 22))
-    tgt = tuple(a + (b - a) * w_t for a, b in zip(C0, P))
-    w_o = smoothstep((f - F_OUT) / OUT_LEN)
+    # rendezvous/follow point: the WRITE HEAD on the prediction sheet
+    P = tilt_pt((txi + D_XI) * PSI_D[0] + D_NU * PSI_N[0],
+                (txi + D_XI) * PSI_D[1] + D_NU * PSI_N[1], kz + 0.2, TAU)
+    # opening: pan right from flatten's framing to the projection stage
+    ST = tilt_pt(ST_XI * PSI_D[0] + ST_NU * PSI_N[0],
+                 ST_XI * PSI_D[1] + ST_NU * PSI_N[1], ST_Z, TAU)
+    w_s = smoothstep(f / F_PAN)
+    tgt = tuple(a + (b - a) * w_s for a, b in zip(C0, ST))
+    w_t = smoothstep((f - F_DIVE) / (F_B - F_DIVE))
+    tgt = tuple(a + (b - a) * w_t for a, b in zip(tgt, P))
+    # ...and at the very end settle on the flat prediction alone
+    PC = tilt_pt(D_XI * PSI_D[0] + D_NU * PSI_N[0],
+                 D_XI * PSI_D[1] + D_NU * PSI_N[1], (Z_TOP + Z_BOT) / 2, TAU)
     _scale = scale_at(f)
-    _TARGET = tuple(a + (b - a) * w_o for a, b in zip(tgt, C1))
+    _TARGET = tuple(a + (b - a) * w_e for a, b in zip(tgt, PC))
 
 def draw_cube(dr, cube_xi, cube_z, fade=1.0):
     a = CUBE
@@ -541,11 +594,7 @@ def draw_kernel(img, f, kxi, kz, krow, kd, al):
     """Kernel with a soft glow halo and a motion trail along its row —
     it must stand out and stay visible at every zoom level."""
     def kpt(xi, z):
-        nu = 0.45 * CUBE
-        x = xi * PSI_D[0] + nu * PSI_N[0]
-        y = xi * PSI_D[1] + nu * PSI_N[1]
-        x, y, zz = tilt_pt(x, y, z, TAU)
-        return project_pt(x, y, zz, 0.0)
+        return plane_pt(xi, z, 0.0, 0.45 * CUBE)
     u, v, _, p = kpt(kxi, kz)
     cpx = CUBE * _scale * p
     # trail start: previous position, or the row entry edge after a wrap
@@ -572,6 +621,46 @@ def draw_kernel(img, f, kxi, kz, krow, kd, al):
     draw_cube(dr, kxi, kz, al)
     return img
 
+def draw_write_head(img, kxi, kz, al):
+    """The output cursor: a small bright square riding the raster front of
+    the prediction sheet, in sync with the kernel — it prints what the
+    kernel reads."""
+    u, v, _, p = plane_pt(kxi, kz, D_XI, D_NU)
+    rg = max(CUBE * _scale * p * 1.1, 8.0)
+    glow = Image.new("L", (S, S), 0)
+    ImageDraw.Draw(glow).ellipse([u - rg, v - rg, u + rg, v + rg],
+                                 fill=int(110 * al))
+    glow = glow.filter(ImageFilter.GaussianBlur(4))
+    img = Image.composite(Image.new("RGB", (S, S), (140, 235, 255)), img, glow)
+    dr = ImageDraw.Draw(img, "RGBA")
+    pts = [plane_pt(kxi + sx * CUBE / 2, kz + sz * CUBE / 2, D_XI, D_NU)[:2]
+           for sx, sz in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+    dr.polygon(pts, fill=(130, 225, 250, int(60 * al)),
+               outline=(150, 235, 255, int(230 * al)), width=2)
+    return img
+
+def draw_beam(img, kxi, kz, al):
+    """The projection: the kernel's reading beamed across the gap onto the
+    output sheet — a soft tapered ray from the kernel to the write head."""
+    ku, kv, _, kp = plane_pt(kxi, kz, 0.0, 0.45 * CUBE)
+    hu, hv, _, hp = plane_pt(kxi, kz, D_XI, D_NU)
+    glow = Image.new("L", (S, S), 0)
+    ImageDraw.Draw(glow).line([ku, kv, hu, hv], fill=int(55 * al), width=7)
+    glow = glow.filter(ImageFilter.GaussianBlur(4))
+    img = Image.composite(Image.new("RGB", (S, S), (140, 235, 255)), img, glow)
+    dr = ImageDraw.Draw(img, "RGBA")
+    dxu, dyv = hu - ku, hv - kv
+    L = math.hypot(dxu, dyv)
+    if L > 1.0:
+        nx, ny = -dyv / L, dxu / L
+        wk = max(CUBE * _scale * kp * 0.45, 1.5)
+        wh = max(CUBE * _scale * hp * 0.55, 2.5)
+        dr.polygon([(ku + nx * wk, kv + ny * wk), (hu + nx * wh, hv + ny * wh),
+                    (hu - nx * wh, hv - ny * wh), (ku - nx * wk, kv - ny * wk)],
+                   fill=(140, 235, 255, int(44 * al)))
+        dr.line([ku, kv, hu, hv], fill=(150, 235, 255, int(105 * al)), width=2)
+    return img
+
 def render_frame(f, out):
     global INK_TEX, SHEET_MASK
     if INK_TEX is None:
@@ -582,14 +671,7 @@ def render_frame(f, out):
     img = compose_scene()
     dr = ImageDraw.Draw(img, "RGBA")
 
-    # ghost mesh under everything (matches flatten's final frame)
-    V = {}
-    for i in range(N_TH):
-        for j in range(N_Z):
-            th, z = mesh_pt(i, j)
-            xi = arc_len(th) - S_TOTAL / 2
-            x, y, zz = tilt_pt(xi * PSI_D[0], xi * PSI_D[1], z, TAU)
-            V[(i, j)] = project_pt(x, y, zz, 0.0)
+    # ghost-mesh edge set shared by both sheets
     edges = set()
     for i in range(N_TH - 1):
         for j in range(N_Z - 1):
@@ -603,13 +685,26 @@ def render_frame(f, out):
         edges.add(((i, N_Z - 1), (i + 1, N_Z - 1)))
     for j in range(N_Z - 1):
         edges.add(((N_TH - 1, j), (N_TH - 1, j + 1)))
-    for a_, b_ in edges:
-        u1, v1, _, _ = V[a_]
-        u2, v2, _, _ = V[b_]
-        dr.line([u1, v1, u2, v2], fill=MESH + (148,), width=1)
 
-    # revealed papyrus: texture alpha = sheet boundary * raster-reveal mask
-    # (completed rows above + a partial current row, exactly kernel-height)
+    def draw_mesh(dr_, dxi, nu, alpha):
+        V = {}
+        for i in range(N_TH):
+            for j in range(N_Z):
+                th, z = mesh_pt(i, j)
+                V[(i, j)] = plane_pt(arc_len(th) - S_TOTAL / 2, z, dxi, nu)
+        for a_, b_ in edges:
+            dr_.line([V[a_][0], V[a_][1], V[b_][0], V[b_][1]],
+                     fill=MESH + (alpha,), width=1)
+
+    # output sheet (right, behind, a step lower): a faint ghost mesh marks
+    # the empty stage — fading in with the pull-out so frame 0 stays
+    # pixel-identical to flatten's final frame — then the prediction
+    # texture rasters onto it; alpha = torn-sheet boundary * raster mask
+    # (completed rows above + a partial current row, exactly kernel-
+    # height). Below the raster front there is nothing but background.
+    mesh_al = int(52 * smoothstep(f / 12))
+    if mesh_al > 0:
+        draw_mesh(dr, D_XI, D_NU, mesh_al)
     rev = Image.new("L", (TEX_W, TEX_H), 0)
     dv = ImageDraw.Draw(rev)
     if kdone:
@@ -630,44 +725,56 @@ def render_frame(f, out):
                        np.asarray(rev, np.uint16)).astype(np.uint8)
     tex = INK_TEX.copy()
     tex.putalpha(Image.fromarray(alpha))
-    coeffs = _perspective_coeffs()
+    coeffs = _perspective_coeffs(D_XI, D_NU)
     warped = tex.transform((S, S), Image.PERSPECTIVE, tuple(coeffs),
                            Image.BILINEAR)
     img = Image.alpha_composite(img.convert("RGBA"), warped).convert("RGB")
     dr = ImageDraw.Draw(img, "RGBA")
 
-    # remaining red voxels (skip revealed; glow at the reveal front)
+    # input sheet (left, front): ghost mesh + red voxels, intact for the
+    # ENTIRE scan (the kernel reads them, nothing is consumed); the scan
+    # front just glows warmer. Over the last zoom the input is DISMISSED:
+    # it slides off stage-left while fading — the sheets are close, and
+    # the flat final view is the reconstruction alone
+    red_al = 1.0 - smoothstep((f - 240) / 32)
+    red_off = -14.0 * smoothstep((f - 238) / 34)
+    if red_al > 0.003:
+        draw_mesh(dr, red_off, 0.0, int(148 * red_al))
     cubes = []
-    for xi, lk, zlist in _voxsheet_cols():
+    for xi, lk, zlist in (_voxsheet_cols() if red_al > 0.003 else []):
         for vz in zlist:
             zc = vz + RVOX / 2
-            if revealed(xi, zc, kxi, krow, kd, kdone):
-                continue
             em = 1.0
             if not kdone and row_of(zc) == krow and abs(xi - (kxi - kd * CUBE / 2)) < 0.9:
                 em = 1.18
-            x = xi * PSI_D[0]
-            y = xi * PSI_D[1]
+            x = (xi + red_off) * PSI_D[0]
+            y = (xi + red_off) * PSI_D[1]
             x, y, z = tilt_pt(x, y, zc, TAU)
             cubes.append((x, y, z, lk, em))
     cubes.sort(key=lambda cb: -project_pt(cb[0], cb[1], cb[2], 0.0)[2])
+    v_al = int(255 * red_al)
     for x, y, z, lk, em in cubes:
         u_, v_, _, p = project_pt(x, y, z, 0.0)
         h = (RVOX * _scale * 0.5) * p
         top = [(u_ - h, v_ - h * 1.55), (u_ + h, v_ - h * 1.55), (u_ + h, v_ - h * 0.55), (u_ - h, v_ - h * 0.55)]
         left = [(u_ - h, v_ - h * 0.55), (u_, v_ - h * 0.05), (u_, v_ + h * 1.05), (u_ - h, v_ + h * 0.5)]
         right = [(u_, v_ - h * 0.05), (u_ + h, v_ - h * 0.55), (u_ + h, v_ + h * 0.5), (u_, v_ + h * 1.05)]
-        dr.polygon(top, fill=shade(RED, 1.22 * em))
-        dr.polygon(left, fill=shade(RED, (0.76 + lk * 0.10) * em))
-        dr.polygon(right, fill=shade(RED, (0.94 + lk * 0.10) * em))
+        dr.polygon(top, fill=shade(RED, 1.22 * em) + (v_al,))
+        dr.polygon(left, fill=shade(RED, (0.76 + lk * 0.10) * em) + (v_al,))
+        dr.polygon(right, fill=shade(RED, (0.94 + lk * 0.10) * em) + (v_al,))
 
-    # the kernel works in view for the ENTIRE scan (glow + trail keep it
-    # legible even once it has shrunk to a spark); it only dims out over
-    # the last few frames as the final rows land
+    # the projection ray + both cursors work in view for the ENTIRE scan
+    # (glow + trail keep them legible even shrunk to sparks); they only
+    # dim out over the last few frames as the final rows land
     if not kdone:
-        k_al = smoothstep(f / 8) * clamp01((F_DONE - f) / 6)
+        # the cursors dim out before the red sheet starts its slide-off
+        # (the kernel rides the sheet — it must not be seen detaching)
+        k_al = (smoothstep(f / 8) * clamp01((F_DONE - f) / 6)
+                * (1 - smoothstep((f - 236) / 16)))
         if k_al > 0.01:
+            img = draw_beam(img, kxi, kz, k_al)
             img = draw_kernel(img, f, kxi, kz, krow, kd, k_al)
+            img = draw_write_head(img, kxi, kz, k_al)
 
     img = img.resize((300, 300), Image.LANCZOS)
     img.save(out)
