@@ -2,6 +2,7 @@
 
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
@@ -65,18 +66,31 @@ bool SpiralOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) cons
 void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder)
 {
     if (!isOverlayEnabledFor(viewer)) return;
-    // First-version Surface-pane projection is deliberately deferred; indexed
-    // input geometry is rendered only in the axis plane panes.
-    if (!dynamic_cast<PlaneSurface*>(viewer->currentSurface())) return;
     const QRectF rect = visibleSceneRect(viewer);
-    const cv::Vec3f corners[] = {
-        sceneToVolume(viewer, rect.topLeft()), sceneToVolume(viewer, rect.topRight()),
-        sceneToVolume(viewer, rect.bottomLeft()), sceneToVolume(viewer, rect.bottomRight())};
-    cv::Vec3f lo = corners[0], hi = corners[0];
-    for (const auto& point : corners) for (int axis = 0; axis < 3; ++axis) {
-        lo[axis] = std::min(lo[axis], point[axis]); hi[axis] = std::max(hi[axis], point[axis]);
+    const bool surfacePane = dynamic_cast<QuadSurface*>(viewer->currentSurface()) != nullptr;
+    const int samplesPerAxis = surfacePane ? 5 : 2;
+    cv::Vec3f lo, hi;
+    bool haveBounds = false;
+    for (int row = 0; row < samplesPerAxis; ++row) {
+        const qreal y = rect.top() + rect.height() * row / (samplesPerAxis - 1);
+        for (int col = 0; col < samplesPerAxis; ++col) {
+            const qreal x = rect.left() + rect.width() * col / (samplesPerAxis - 1);
+            const cv::Vec3f point = sceneToVolume(viewer, QPointF(x, y));
+            if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2]))
+                continue;
+            if (!haveBounds) {
+                lo = hi = point;
+                haveBounds = true;
+            } else {
+                for (int axis = 0; axis < 3; ++axis) {
+                    lo[axis] = std::min(lo[axis], point[axis]);
+                    hi[axis] = std::max(hi[axis], point[axis]);
+                }
+            }
+        }
     }
-    constexpr float slab = 4.0f;
+    if (!haveBounds) return;
+    const float slab = surfacePane ? 10.0f : 4.0f;
     lo -= cv::Vec3f(slab, slab, slab); hi += cv::Vec3f(slab, slab, slab);
     const QString key = QStringLiteral("%1:%2:%3:%4:%5:%6:%7:%8")
         .arg(_indexGeneration).arg(lo[0], 0, 'f', 1).arg(lo[1], 0, 'f', 1).arg(lo[2], 0, 'f', 1)
@@ -84,7 +98,29 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
         .arg(QString::fromStdString(viewer->surfName()));
     auto& cache = _cache[viewer];
     if (cache.requestKey != key) schedule(viewer, key, lo, hi);
-    for (const auto& path : cache.paths) builder.addPath(path);
+    for (const auto& path : cache.paths) {
+        if (!surfacePane) {
+            builder.addPath(path);
+            continue;
+        }
+        std::vector<QPointF> points;
+        points.reserve(path.points.size());
+        for (const cv::Vec3f& point : path.points) {
+            const QPointF scenePoint = viewer->volumeToScene(point);
+            if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
+                points.clear();
+                break;
+            }
+            points.push_back(scenePoint);
+        }
+        if (points.size() < 2) continue;
+        OverlayStyle style;
+        style.penColor = path.color;
+        style.penColor.setAlphaF(std::clamp(path.opacity, 0.0, 1.0));
+        style.penWidth = path.lineWidth;
+        style.z = path.z;
+        builder.addLineStrip(points, path.closed, style);
+    }
 }
 
 void SpiralOverlayController::schedule(VolumeViewerBase* viewer, const QString& key,

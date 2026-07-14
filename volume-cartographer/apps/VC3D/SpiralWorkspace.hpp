@@ -21,6 +21,7 @@ class ViewerSplitGrid;
 class VolumePkg;
 class PolylineIndex;
 class SpiralOverlayController;
+class SegmentationOverlayController;
 
 class SpiralWorkspace : public QMainWindow
 {
@@ -75,6 +76,7 @@ private:
     std::unique_ptr<ViewerManager> _viewerManager;
     std::unique_ptr<AxisAlignedSliceController> _slices;
     std::unique_ptr<SpiralOverlayController> _overlay;
+    std::unique_ptr<SegmentationOverlayController> _surfaceOverlapOverlay;
     SpiralServiceManager* _service = nullptr;
     SpiralPanel* _panel = nullptr;
     ViewerSplitGrid* _grid = nullptr;

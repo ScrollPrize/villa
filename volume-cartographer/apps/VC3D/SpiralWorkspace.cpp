@@ -6,6 +6,7 @@
 #include "SpiralServiceManager.hpp"
 #include "ViewerManager.hpp"
 #include "elements/ViewerSplitGrid.hpp"
+#include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/SpiralOverlayController.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
@@ -33,6 +34,16 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
+
+namespace {
+cv::Vec3b surfaceCategoryColor(const QString& category)
+{
+    if (category == QStringLiteral("verified")) return {80, 220, 80};
+    if (category == QStringLiteral("unverified")) return {60, 180, 255};
+    return {255, 180, 80};
+}
+}
 
 SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     : QMainWindow(parent), _mainState(mainState)
@@ -47,6 +58,9 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     _slices->applyOrientation();
     _overlay = std::make_unique<SpiralOverlayController>(this);
     _overlay->bindToViewerManager(_viewerManager.get());
+    _surfaceOverlapOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
+    _surfaceOverlapOverlay->setViewerManager(_viewerManager.get());
+    _viewerManager->setSegmentationOverlay(_surfaceOverlapOverlay.get());
     _surfaceCategoryVisible = {{QStringLiteral("verified"), false},
                                {QStringLiteral("unverified"), false},
                                {QStringLiteral("shell"), false}};
@@ -213,8 +227,6 @@ void SpiralWorkspace::installInputSurfaces(const InputSurfaceLoadResult& result,
     }
     const auto retired = _surfaceCategoryIds;
     _surfaceCategoryIds = replacement;
-    for (auto it = _surfaceCategoryVisible.begin(); it != _surfaceCategoryVisible.end(); ++it)
-        it.value() = false;
     updateSurfaceIntersections();
     QTimer::singleShot(0, this, [this, retired]() {
         if (_shuttingDown) return;
@@ -236,14 +248,24 @@ void SpiralWorkspace::setSurfaceCategoryVisible(const QString& category, bool vi
 void SpiralWorkspace::updateSurfaceIntersections()
 {
     std::set<std::string> intersections;
+    std::map<std::string, cv::Vec3b> surfaceOverlays;
     if (_outputVisible && _currentPreview) intersections.insert("segmentation");
     for (auto visible = _surfaceCategoryVisible.begin(); visible != _surfaceCategoryVisible.end(); ++visible) {
         if (!visible.value()) continue;
-        for (const QString& id : _surfaceCategoryIds.value(visible.key()))
+        const cv::Vec3b color = surfaceCategoryColor(visible.key());
+        for (const QString& id : _surfaceCategoryIds.value(visible.key())) {
             intersections.insert(id.toStdString());
+            surfaceOverlays.emplace(id.toStdString(), color);
+        }
     }
     for (auto* viewer : _viewerManager->baseViewers()) {
-        if (!viewer || viewer->surfName() == "segmentation") continue;
+        if (!viewer) continue;
+        if (viewer->surfName() == "segmentation") {
+            viewer->setSurfaceOverlays(surfaceOverlays);
+            viewer->setSurfaceOverlayEnabled(!surfaceOverlays.empty());
+            viewer->requestRender("Spiral surface overlays changed");
+            continue;
+        }
         viewer->setIntersects(intersections);
         viewer->requestRender("Spiral surface visibility changed");
     }
