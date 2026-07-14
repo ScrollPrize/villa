@@ -328,8 +328,13 @@ static cv::Mat accumulate(const std::vector<cv::Mat>& samples, size_t start, siz
 // Unified band rendering
 // ============================================================
 
-// Build the flat offset vector used by readMultiSlice
-static std::vector<float> buildOffsetList(int numSlices, double sliceStep, double dsScale,
+// Build the flat offset vector used by readMultiSlice. Offsets are distances along the
+// unit surface normal, in level-g voxels: base points are already scaled into level-g
+// index space (prepareBaseAndDirs) and dirs are unit length, so a step of sliceStep
+// advances exactly one level-g voxel. (Do NOT scale by ds_scale here — that would make
+// the through-normal spacing the native/level-0 resolution while the in-plane spacing is
+// level-g, yielding an anisotropic stack that mismatches the isotropic .zattrs scale.)
+static std::vector<float> buildOffsetList(int numSlices, double sliceStep,
                                            const std::vector<float>& accumOffsets)
 {
     double center = 0.5 * (std::max(1, numSlices) - 1.0);
@@ -339,21 +344,21 @@ static std::vector<float> buildOffsetList(int numSlices, double sliceStep, doubl
     for (int zi = 0; zi < numSlices; zi++) {
         float base = float((zi - center) * sliceStep);
         if (accumOffsets.empty())
-            out.push_back(base * float(dsScale));
+            out.push_back(base);
         else
             for (float ao : accumOffsets)
-                out.push_back((base + ao) * float(dsScale));
+                out.push_back(base + ao);
     }
     return out;
 }
 
 static std::vector<float> buildCompositeOffsetList(
-    int compositeStart, int compositeEnd, double sliceStep, double dsScale)
+    int compositeStart, int compositeEnd, double sliceStep)
 {
     std::vector<float> out;
     out.reserve(std::max(0, compositeEnd - compositeStart + 1));
     for (int zi = compositeStart; zi <= compositeEnd; zi++)
-        out.push_back(float(double(zi) * sliceStep * dsScale));
+        out.push_back(float(double(zi) * sliceStep));
     return out;
 }
 
@@ -485,8 +490,8 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
 {
     std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> uniq;
     std::vector<float> offsets = isComposite
-        ? buildCompositeOffsetList(compositeStart, compositeEnd, sliceStep, dsScale)
-        : buildOffsetList(numSlices, sliceStep, dsScale, accumOffsets);
+        ? buildCompositeOffsetList(compositeStart, compositeEnd, sliceStep)
+        : buildOffsetList(numSlices, sliceStep, accumOffsets);
 
     auto wallStart = std::chrono::steady_clock::now();
     auto lastPrint = wallStart;
@@ -602,7 +607,7 @@ static void renderBands(
     const uint32_t numBands = (uint32_t(tgtSize.height) + bandH - 1) / bandH;
 
     // Build offset list for readMultiSlice
-    auto allOffsets = buildOffsetList(numSlices, sliceStep, dsScale, accumOffsets);
+    auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
 
     auto wallStart = std::chrono::steady_clock::now();
     auto lastPrint = wallStart;
@@ -635,7 +640,7 @@ static void renderBands(
             cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
             if constexpr (std::is_same_v<T, uint8_t>) {
                 readCompositeFast(compOut, cache, level, base, dirs,
-                                  float(sliceStep * dsScale),
+                                  float(sliceStep),
                                   compositeStart, compositeEnd,
                                   compositeParams);
             }
@@ -732,7 +737,7 @@ static void renderTiles(
     surf->validMask();
 
     // Build offset list
-    auto allOffsets = buildOffsetList(numSlices, sliceStep, dsScale, accumOffsets);
+    auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
 
     const bool wantTif = tifWriters && !tifWriters->empty();
     const bool useU16 = (cvType == CV_16UC1);
@@ -844,7 +849,7 @@ static void renderTiles(
                     // and skips non-finite pixels, so size + zero it here.
                     cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
                     readCompositeFast(compOut, cache, level, base, dirs,
-                                      float(sliceStep * dsScale),
+                                      float(sliceStep),
                                       compositeStart, compositeEnd,
                                       compositeParams);
                     raw.resize(1);
