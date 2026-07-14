@@ -100,6 +100,63 @@ TEST_CASE("createChunkCache wraps openLocalZarrPyramid result")
     fs::remove_all(d);
 }
 
+TEST_CASE("validateAndRebaseVcPyramid maps physical level two to logical zero")
+{
+    auto d = tmpDir("rebase_two");
+    makeLocalVolume(d, /*numLevels=*/6);
+    auto physical = openLocalZarrPyramid(d);
+    REQUIRE(physical.fetchers.size() == 6);
+    const auto physicalLevelTwoFetcher = physical.fetchers[2];
+
+    auto rebased = vc::render::validateAndRebaseVcPyramid(std::move(physical), 2);
+    CHECK(rebased.fetchers.size() == 4);
+    CHECK(rebased.shapes[0] == std::array<int, 3>{16, 16, 16});
+    CHECK(rebased.chunkShapes.size() == 4);
+    CHECK(rebased.storageChunkShapes.size() == 4);
+    CHECK(rebased.levelNumbers == std::vector<int>{0, 1, 2, 3});
+    CHECK(rebased.transforms[0].scaleFromLevel0 == std::array<double, 3>{1.0, 1.0, 1.0});
+    CHECK(rebased.transforms[1].scaleFromLevel0 == std::array<double, 3>{0.5, 0.5, 0.5});
+    CHECK(rebased.fetchers[0] == physicalLevelTwoFetcher);
+    fs::remove_all(d);
+}
+
+TEST_CASE("validateAndRebaseVcPyramid accepts variable contiguous pyramid lengths")
+{
+    for (const size_t levels : {size_t{5}, size_t{7}}) {
+        auto d = tmpDir("rebase_length");
+        makeLocalVolume(d, levels);
+        auto rebased = vc::render::validateAndRebaseVcPyramid(
+            openLocalZarrPyramid(d), 2);
+        CHECK(rebased.fetchers.size() == levels - 2);
+        fs::remove_all(d);
+    }
+}
+
+TEST_CASE("validateAndRebaseVcPyramid rejects gaps and invalid retained fill values")
+{
+    auto d = tmpDir("rebase_invalid");
+    makeLocalVolume(d, /*numLevels=*/4);
+
+    auto gap = openLocalZarrPyramid(d);
+    gap.fetchers[1].reset();
+    CHECK_THROWS_WITH_AS(
+        vc::render::validateAndRebaseVcPyramid(std::move(gap), 2),
+        doctest::Contains("gap at /1"), std::runtime_error);
+
+    auto fills = openLocalZarrPyramid(d);
+    fills.fillValues[3] = 1.0;
+    CHECK_THROWS_WITH_AS(
+        vc::render::validateAndRebaseVcPyramid(std::move(fills), 2),
+        doctest::Contains("consistent fill value"), std::runtime_error);
+
+    auto shape = openLocalZarrPyramid(d);
+    shape.shapes[1][0] += shape.storageChunkShapes[1][0];
+    CHECK_THROWS_WITH_AS(
+        vc::render::validateAndRebaseVcPyramid(std::move(shape), 2),
+        doctest::Contains("dyadic downscale"), std::runtime_error);
+    fs::remove_all(d);
+}
+
 TEST_CASE("ZarrChunkFetcher fetches a present chunk from local")
 {
     auto d = tmpDir("fetch_present");

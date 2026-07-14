@@ -11,6 +11,8 @@ add_library(vc_core
         src/PointIndex.cpp
         src/Logging.cpp
         src/CrashHandler.cpp
+        src/MemMap.cpp
+        src/UnixSocket.cpp
         src/VolpkgConvert.cpp
         src/SparseChunkSpool.cpp
         src/Slicing.cpp
@@ -23,6 +25,7 @@ add_library(vc_core
         src/Tiff.cpp
         src/Zarr.cpp
         src/VcDataset.cpp
+        src/CacheCompression.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
         src/HttpFetch.cpp
@@ -50,7 +53,7 @@ target_link_libraries(vc_core
         opencv_core
         opencv_imgproc
         opencv_imgcodecs
-        opencv_calib3d
+        ${VC_OPENCV_CALIB_TARGETS}
         opencv_video
         nlohmann_json::nlohmann_json
         OpenMP::OpenMP_CXX
@@ -68,6 +71,12 @@ target_link_libraries(vc_core PRIVATE
     Blosc::blosc
     ${VC_LIBBACKTRACE}
 )
+
+# Winsock for the AF_UNIX compat layer (UnixSocket.cpp). PUBLIC because
+# consumers (vc_tracer, VC3D) call send()/recv() directly.
+if(WIN32)
+    target_link_libraries(vc_core PUBLIC ws2_32)
+endif()
 
 # Neutral PCH carrier shared by vc_core, downstream vc_* libs, and CLI apps.
 # Keep this separate from vc_core: shared-library targets add export macros

@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -13,6 +14,7 @@
 
 #include <opencv2/core/mat.hpp>
 
+#include "vc/core/util/Compositing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QMdiArea;
@@ -28,6 +30,7 @@ class PathsOverlayController;
 class BBoxOverlayController;
 class VectorOverlayController;
 class VolumeOverlayController;
+class InkDetectionOverlayController;
 class SegmentationModule;
 class ViewerOverlayControllerBase;
 class VolumeViewerBase;
@@ -71,6 +74,8 @@ public:
     void setBBoxOverlay(BBoxOverlayController* overlay);
     void setVectorOverlay(VectorOverlayController* overlay);
     void setVolumeOverlay(VolumeOverlayController* overlay);
+    void setInkDetectionOverlay(InkDetectionOverlayController* overlay);
+    InkDetectionOverlayController* inkDetectionOverlay() const { return _inkDetectionOverlay; }
 
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
@@ -78,6 +83,8 @@ public:
     void setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId);
     std::shared_ptr<Volume> overlayVolume() const { return _overlayVolume; }
     const std::string& overlayVolumeId() const { return _overlayVolumeId; }
+    std::shared_ptr<Volume> currentVolume() const;
+    std::string currentVolumeId() const;
 
     void setOverlayOpacity(float opacity);
     float overlayOpacity() const { return _overlayOpacity; }
@@ -90,6 +97,10 @@ public:
     void setOverlayWindow(float low, float high);
     float overlayWindowLow() const { return _overlayWindowLow; }
     float overlayWindowHigh() const { return _overlayWindowHigh; }
+    void setOverlayMaxDisplayedResolution(int level);
+    int overlayMaxDisplayedResolution() const { return _overlayMaxDisplayedResolution; }
+    void setOverlayComposite(const OverlayCompositeSettings& settings);
+    const OverlayCompositeSettings& overlayComposite() const { return _overlayComposite; }
 
     void setVolumeWindow(float low, float high);
     float volumeWindowLow() const { return _volumeWindowLow; }
@@ -102,6 +113,13 @@ public:
     void primeSurfacePatchIndicesAsync();
     void resetStrideUserOverride() {}
 
+    // Folder-selection keyed retention of built surface patch indexes. The
+    // surface panel sets the key before rebinding surfaces on a folder
+    // switch; the live index is stashed under the outgoing key and swapped
+    // back in (if still valid) when the user returns to that selection.
+    void setSurfacePatchIndexCacheKey(const QString& key);
+    void clearSurfacePatchIndexCache();
+
     bool resetDefaultFor(VolumeViewerBase* viewer) const;
     void setResetDefaultFor(VolumeViewerBase* viewer, bool value);
 
@@ -110,8 +128,8 @@ public:
     void broadcastLinkedCursor(VolumeViewerBase* source,
                                const std::optional<cv::Vec3f>& point);
 
-    void setSliceStepSize(int size);
-    int sliceStepSize() const { return _sliceStepSize; }
+    void setZScrollSensitivity(double sensitivity);
+    double zScrollSensitivity() const { return _zScrollSensitivity; }
 
     void forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const;
     void setIntersectionThickness(float thickness);
@@ -136,7 +154,7 @@ signals:
     void volumeWindowChanged(float low, float high);
     void overlayVolumeAvailabilityChanged(bool hasOverlay);
     void samplingStrideChanged(int stride);
-    void sliceStepSizeChanged(int size);
+    void zScrollSensitivityChanged(double sensitivity);
 
 private slots:
     void onGlobalTick();
@@ -199,16 +217,29 @@ private:
     std::string _overlayColormapId;
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
+    int _overlayMaxDisplayedResolution{0};
+    OverlayCompositeSettings _overlayComposite;
     float _volumeWindowLow{0.0f};
     float _volumeWindowHigh{255.0f};
     bool _mirrorCursorToSegmentation{false};
-    int _sliceStepSize{1};
+    double _zScrollSensitivity{1.0};
     int _surfacePatchSamplingStride{1};
     std::atomic<bool> _shuttingDown{false};
     int _intersectionMaxSurfaces{0};  // 0 = unlimited
 
     VolumeOverlayController* _volumeOverlay{nullptr};
+    InkDetectionOverlayController* _inkDetectionOverlay{nullptr};
     SurfacePatchIndex _surfacePatchIndex;
+    struct CachedSurfacePatchIndex {
+        SurfacePatchIndex index;
+        std::unordered_set<std::string> ids;
+    };
+    // Indexes stashed on folder-selection switches, keyed by the selection
+    // they were built for. Entries are validated against the current surface
+    // instances (and stride) before being swapped back in.
+    std::map<QString, CachedSurfacePatchIndex> _surfacePatchIndexCache;
+    QString _surfacePatchIndexCacheKey;
+    void invalidateSurfacePatchIndexCacheFor(const SurfacePatchIndex::SurfacePtr& surface);
     bool _surfacePatchIndexNeedsRebuild{true};
     // Use string IDs for surface tracking to avoid dangling pointers in async operations
     std::unordered_set<std::string> _indexedSurfaceIds;

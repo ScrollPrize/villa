@@ -23,7 +23,9 @@ COPY . /src
 WORKDIR /src
 RUN cmake --preset ci-release-gcc \
  && cmake --build --preset ci-release-gcc \
- && cp build/ci-release-gcc/bin/* /usr/local/bin/
+ # Lay the tree out as /usr/local/{bin,lib}. The apps resolve their internal
+ # shared libs via the install RPATH ($ORIGIN/../lib, set in CMakeLists.txt).
+ && cmake --install build/ci-release-gcc --prefix /usr/local --component vc_runtime
 
 FROM build AS runtime
 

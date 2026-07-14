@@ -8,6 +8,10 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(_WIN32)
+#include <malloc.h>  // _aligned_malloc/_aligned_free
+#endif
+
 namespace utils {
 
 static constexpr std::size_t kC3dChunkBytes =
@@ -20,7 +24,21 @@ bool is_c3d_compressed(std::span<const std::byte> data) noexcept
 }
 
 namespace {
-// Move-only RAII wrapper around aligned_alloc.  std::vector doesn't
+// C11 aligned_alloc is missing from the Windows UCRT; _aligned_malloc is the
+// equivalent but requires _aligned_free (plain free() is undefined on it).
+#if defined(_WIN32)
+inline uint8_t* vcAlignedAlloc(std::size_t align, std::size_t n) {
+    return static_cast<uint8_t*>(::_aligned_malloc(n, align));
+}
+inline void vcAlignedFree(uint8_t* p) { ::_aligned_free(p); }
+#else
+inline uint8_t* vcAlignedAlloc(std::size_t align, std::size_t n) {
+    return static_cast<uint8_t*>(std::aligned_alloc(align, n));
+}
+inline void vcAlignedFree(uint8_t* p) { std::free(p); }
+#endif
+
+// Move-only RAII wrapper around aligned allocation.  std::vector doesn't
 // guarantee the 32-byte alignment c3d's kernels assert on, so callers
 // with unaligned buffers stage through one of these.
 // Move-only (copy would double-free).
@@ -30,16 +48,16 @@ struct AlignedBuf {
     explicit AlignedBuf(std::size_t n)
         // aligned_alloc requires size to be a multiple of alignment —
         // c3d's C3D_ALIGN is 32 and n is always 256^3, so divisible.
-        : p(static_cast<uint8_t*>(std::aligned_alloc(C3D_ALIGN, n)))
+        : p(vcAlignedAlloc(C3D_ALIGN, n))
     {
         if (!p) throw std::bad_alloc();
     }
-    ~AlignedBuf() { std::free(p); }
+    ~AlignedBuf() { vcAlignedFree(p); }
     AlignedBuf(const AlignedBuf&) = delete;
     AlignedBuf& operator=(const AlignedBuf&) = delete;
     AlignedBuf(AlignedBuf&& o) noexcept : p(o.p) { o.p = nullptr; }
     AlignedBuf& operator=(AlignedBuf&& o) noexcept {
-        if (this != &o) { std::free(p); p = o.p; o.p = nullptr; }
+        if (this != &o) { vcAlignedFree(p); p = o.p; o.p = nullptr; }
         return *this;
     }
 };

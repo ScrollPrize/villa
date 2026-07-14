@@ -93,6 +93,11 @@
     { "name": "ci-release-clang",        "displayName": "CI Release (clang)",
       "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_TESTING": "OFF" } },
 
+    { "name": "ci-release-tests-gcc",    "displayName": "CI Release + tests (gcc)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_TESTING": "ON" } },
+    { "name": "ci-release-tests-clang",  "displayName": "CI Release + tests (clang)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_TESTING": "ON" } },
+
     { "name": "ci-relwithdebinfo-gcc",   "displayName": "CI RelWithDebInfo (gcc)",
       "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "VC_TESTING": "OFF" } },
     { "name": "ci-relwithdebinfo-clang", "displayName": "CI RelWithDebInfo (clang)",
@@ -137,6 +142,22 @@
       "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_DEAD_CODE_REPORT": "ON" } },
 
     {
+      "name": "ci-windows-mingw",
+      "displayName": "CI Windows (MSYS2 UCRT64 gcc, Release, NSIS packaging)",
+      "description": "Native Windows build under an MSYS2 UCRT64 shell. Dependencies come from mingw-w64 pacman packages; flatboi (PaStiX) is unavailable on Windows and defaults off.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "VC_USE_PCH": "ON",
+        "VC_TESTING": "OFF"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
       "name": "macos-homebrew-llvm",
       "displayName": "macOS Homebrew LLVM",
       "description": "Native macOS build using Homebrew LLVM/Clang, lld, and Homebrew binutils. The only Apple-toolchain pieces in the loop are SDKROOT (system headers/frameworks) and libSystem, because there is no Homebrew alternative for those.",
@@ -180,6 +201,8 @@
     { "name": "ci-debug-clang",           "configurePreset": "ci-debug-clang" },
     { "name": "ci-release-gcc",           "configurePreset": "ci-release-gcc" },
     { "name": "ci-release-clang",         "configurePreset": "ci-release-clang" },
+    { "name": "ci-release-tests-gcc",     "configurePreset": "ci-release-tests-gcc" },
+    { "name": "ci-release-tests-clang",   "configurePreset": "ci-release-tests-clang" },
     { "name": "ci-relwithdebinfo-gcc",    "configurePreset": "ci-relwithdebinfo-gcc" },
     { "name": "ci-relwithdebinfo-clang",  "configurePreset": "ci-relwithdebinfo-clang" },
     { "name": "ci-profiling-gcc",         "configurePreset": "ci-profiling-gcc" },
@@ -196,7 +219,8 @@
     { "name": "ci-strict-warnings-gcc",   "configurePreset": "ci-strict-warnings-gcc" },
     { "name": "ci-strict-warnings-clang", "configurePreset": "ci-strict-warnings-clang" },
     { "name": "ci-dead-code-gcc",         "configurePreset": "ci-dead-code-gcc" },
-    { "name": "ci-dead-code-clang",       "configurePreset": "ci-dead-code-clang" }
+    { "name": "ci-dead-code-clang",       "configurePreset": "ci-dead-code-clang" },
+    { "name": "ci-windows-mingw",         "configurePreset": "ci-windows-mingw" }
   ],
 
   "testPresets": [
@@ -208,6 +232,8 @@
     },
     { "name": "ci-tests-gcc",             "configurePreset": "ci-tests-gcc",            "inherits": "_test-base" },
     { "name": "ci-tests-clang",           "configurePreset": "ci-tests-clang",          "inherits": "_test-base" },
+    { "name": "ci-release-tests-gcc",     "configurePreset": "ci-release-tests-gcc",    "inherits": "_test-base" },
+    { "name": "ci-release-tests-clang",   "configurePreset": "ci-release-tests-clang",  "inherits": "_test-base" },
     { "name": "ci-asan-ubsan-gcc",        "configurePreset": "ci-asan-ubsan-gcc",       "inherits": "_test-base" },
     { "name": "ci-asan-ubsan-clang",      "configurePreset": "ci-asan-ubsan-clang",     "inherits": "_test-base" },
     { "name": "ci-tsan-gcc",              "configurePreset": "ci-tsan-gcc",             "inherits": "_test-base" },

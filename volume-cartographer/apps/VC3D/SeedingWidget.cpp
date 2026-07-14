@@ -28,6 +28,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/OpenCvCompat.hpp"
 
 #include "vc/ui/VCCollection.hpp"
 #include <array>
@@ -732,7 +733,7 @@ void SeedingWidget::onCastRaysClicked()
         cv::threshold(sliceData, binaryImage, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
 
         cv::Mat dt;
-        cv::distanceTransform(binaryImage, dt, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+        cv::distanceTransform(binaryImage, dt, vc::opencv::distanceL2, cv::DIST_MASK_PRECISE);
 
         // --- Helper lambdas ---
         auto sampleDistAt = [&](const cv::Vec3f& p) -> float {
@@ -949,7 +950,8 @@ void SeedingWidget::computeDistanceTransform()
     cv::threshold(sliceData, binaryImage, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
     
     // Compute the distance transform
-    cv::distanceTransform(binaryImage, distanceTransform, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    cv::distanceTransform(binaryImage, distanceTransform,
+                          vc::opencv::distanceL2, cv::DIST_MASK_PRECISE);
     
     // Normalize the distance transform for visualization if needed
     cv::Mat distNormalized;
@@ -1277,13 +1279,23 @@ void SeedingWidget::onRunSegmentationClicked()
 
         std::cout << "Starting job " << pointIndex << ": " << previewParts.join(' ').toStdString() << std::endl;
         
-        process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3" << executablePath <<
-                      QString::fromStdString(volumePath.string()) <<
-                      QString::fromStdString(pathsDir.string()) <<
-                      QString::fromStdString(seedJsonPath.string()) <<
-                      QString::number(point.p[0]) <<
-                      QString::number(point.p[1]) <<
-                      QString::number(point.p[2]));
+        const QStringList toolArgs = QStringList()
+                      << QString::fromStdString(volumePath.string())
+                      << QString::fromStdString(pathsDir.string())
+                      << QString::fromStdString(seedJsonPath.string())
+                      << QString::number(point.p[0])
+                      << QString::number(point.p[1])
+                      << QString::number(point.p[2]);
+#if defined(Q_OS_LINUX)
+        // Background priority so batch growth doesn't starve the UI.
+        process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3"
+                                             << executablePath << toolArgs);
+#elif defined(Q_OS_UNIX)
+        // ionice is Linux-specific; macOS still provides nice.
+        process->start("nice", QStringList() << "-n" << "19" << executablePath << toolArgs);
+#else
+        process->start(executablePath, toolArgs);
+#endif
         
         runningProcesses.append(QPointer<QProcess>(process));
     };
@@ -1328,7 +1340,10 @@ QString SeedingWidget::findExecutablePath()
 {
     // vc_grow_seg_from_seed should be in the same directory as the VC3D application
     QString execPath = QCoreApplication::applicationDirPath() + "/vc_grow_seg_from_seed";
-    
+#ifdef Q_OS_WIN
+    execPath += QStringLiteral(".exe");
+#endif
+
     QFileInfo fileInfo(execPath);
     if (fileInfo.exists() && fileInfo.isExecutable()) {
         return fileInfo.absoluteFilePath();
@@ -2248,10 +2263,20 @@ void SeedingWidget::onExpandSeedsClicked()
 
         std::cout << "Starting expansion job " << iterationIndex << ": " << previewParts.join(' ').toStdString() << std::endl;
         
-        process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3" << executablePath <<
-                      QString::fromStdString(volumePath.string()) <<
-                      QString::fromStdString(pathsDir.string()) <<
-                      QString::fromStdString(expandJsonPath.string()));
+        const QStringList toolArgs = QStringList()
+                      << QString::fromStdString(volumePath.string())
+                      << QString::fromStdString(pathsDir.string())
+                      << QString::fromStdString(expandJsonPath.string());
+#if defined(Q_OS_LINUX)
+        // Background priority so batch growth doesn't starve the UI.
+        process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3"
+                                             << executablePath << toolArgs);
+#elif defined(Q_OS_UNIX)
+        // ionice is Linux-specific; macOS still provides nice.
+        process->start("nice", QStringList() << "-n" << "19" << executablePath << toolArgs);
+#else
+        process->start(executablePath, toolArgs);
+#endif
         
         runningProcesses.append(QPointer<QProcess>(process));
     };

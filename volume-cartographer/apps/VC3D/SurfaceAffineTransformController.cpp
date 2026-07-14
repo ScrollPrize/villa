@@ -222,13 +222,12 @@ std::string SurfaceAffineTransformController::currentRemoteTransformJsonUrl() co
     if (!currentVolume || !currentVolume->isRemote() || currentVolume->remoteUrl().empty()) {
         return {};
     }
+    // transform.json is defined in native /0 coordinates and is not safe to
+    // apply implicitly to a rebased logical view.
+    if (currentVolume->baseScaleLevel() > 0)
+        return {};
 
-    std::string remoteTransformUrl = currentVolume->remoteUrl();
-    while (!remoteTransformUrl.empty() && remoteTransformUrl.back() == '/') {
-        remoteTransformUrl.pop_back();
-    }
-    remoteTransformUrl += "/transform.json";
-    return remoteTransformUrl;
+    return vc::joinRemoteUrlPath(currentVolume->remoteUrl(), "transform.json");
 }
 
 void SurfaceAffineTransformController::ensureCurrentRemoteTransformJsonAsync()
@@ -434,7 +433,6 @@ bool SurfaceAffineTransformController::applyTransformPreview(bool allowRemoteFet
     }
 
     previewSurface->path.clear();
-    previewSurface->id.clear();
 
     transformSurfacePoints(previewSurface.get(), scale, matrix);
     refreshTransformedSurfaceState(previewSurface.get());

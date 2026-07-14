@@ -1,0 +1,39 @@
+[project]
+name = "scrollkit"
+version = "0.1.0"
+description = "Vesuvius scroll wrap meshes: exact conversion, perceptual decimation, unwrap animation production"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.13",
+    "pillow>=10.3",
+    "pymeshlab>=2023.12",
+    "pyvista>=0.44",
+    "vtk>=9.5",
+    "libigl>=2.6.2",
+    "plyfile>=1.0",
+    "trimesh>=4.4",
+    "scikit-image>=0.24",
+    "matplotlib>=3.9",
+    "pypardiso>=0.4.6",
+    "pyamg>=5.2",
+    "tifffile>=2024.6.18",
+    "pyyaml>=6.0",
+    "rtree>=1.4.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scrollkit"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

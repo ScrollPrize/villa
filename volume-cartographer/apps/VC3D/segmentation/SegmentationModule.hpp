@@ -192,6 +192,7 @@ public slots:
 
 signals:
     void editingEnabledChanged(bool enabled);
+    void segmentationFolderChanged(const QString& surfaceId);
     void annotateModeChanged(bool enabled);
     void statusMessageRequested(const QString& text, int timeoutMs);
     void pendingChangesChanged(bool pending);

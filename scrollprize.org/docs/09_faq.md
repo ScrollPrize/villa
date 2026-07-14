@@ -59,7 +59,7 @@ Join us to win prizes and be a part of history!
 
 ### What dates do I need to know?
 
-The [2024 prize](2024_prizes) deadlines closed on **December 31, 2024**, and we are now evaluating the submissions and preparing the next stages. [Join the community](get_started#1-join-the-community) to stay tuned!
+Current prize opportunities are listed on the [Open Prizes](prizes) page. The [2024 prize](2024_prizes) deadlines closed on **December 31, 2024** and remain available for historical reference. [Join the community](get_started#1-join-the-community) to stay tuned!
 
 ### What's the historical background of Herculaneum and the scrolls?
 

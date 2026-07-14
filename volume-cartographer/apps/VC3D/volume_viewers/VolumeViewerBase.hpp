@@ -86,6 +86,7 @@ public:
     virtual void adjustSurfaceOffset(float delta) = 0;
     virtual void resetSurfaceOffsets() = 0;
     virtual void fitSurfaceInView() = 0;
+    virtual void resetViewForCurrentContent(bool forceRender = false) { (void)forceRender; }
 
     // --- Data access ---
     virtual Surface* currentSurface() const = 0;
@@ -127,6 +128,8 @@ public:
     virtual void setOverlayColormap(const std::string& colormapId) = 0;
     virtual void setOverlayThreshold(float threshold) = 0;
     virtual void setOverlayWindow(float low, float high) = 0;
+    virtual void setOverlayMaxDisplayedResolution(int level) = 0;
+    virtual void setOverlayComposite(const OverlayCompositeSettings& settings) = 0;
     virtual void reloadPerfSettings() = 0;
 
     // --- Interaction state ---

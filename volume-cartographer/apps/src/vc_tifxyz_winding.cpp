@@ -11,6 +11,16 @@
 #include <opencv2/imgproc.hpp>
 #include <omp.h>
 
+#if defined(_WIN32)
+// rand_r is POSIX-only. Same-contract stand-in (caller-owned seed, [0, 2^31)):
+// glibc-style LCG, good enough for the sampling here.
+static int rand_r(unsigned int* seedp)
+{
+    *seedp = *seedp * 1103515245u + 12345u;
+    return static_cast<int>(*seedp & 0x7fffffffu);
+}
+#endif
+
 
 
 using Json = utils::Json;

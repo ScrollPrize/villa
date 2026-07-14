@@ -16,6 +16,8 @@ set(srcs
     Keybinds.hpp
     CWindow.cpp
     CWindowContextMenu.cpp
+    StatusDockPanelHost.cpp
+    StatusDockPanelHost.hpp
     RenderBenchRecorder.cpp
     RenderBenchRecorder.hpp
     RenderBenchReplay.cpp
@@ -25,6 +27,8 @@ set(srcs
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
     LineAnnotationFiberClassification.hpp
+    FiberNameDisplay.cpp
+    FiberNameDisplay.hpp
     FiberSliceGeometry.cpp
     FiberSliceGeometry.hpp
     LineAnnotationController.cpp
@@ -33,6 +37,20 @@ set(srcs
     LineAnnotationDialog.hpp
     LineAnnotationGeneratedViews.cpp
     LineAnnotationGeneratedViews.hpp
+    OpenDataCatalogWindow.cpp
+    OpenDataCatalogWindow.hpp
+    OpenDataManifest.cpp
+    OpenDataManifest.hpp
+    OpenDataSampleProject.cpp
+    OpenDataSampleProject.hpp
+    OpenDataVolumePrefill.cpp
+    OpenDataVolumePrefill.hpp
+    OpenDataNormalGrids.cpp
+    OpenDataNormalGrids.hpp
+    OpenDataSegmentCache.cpp
+    OpenDataSegmentCache.hpp
+    OpenDataSegmentCacheIO.cpp
+    OpenDataSegmentCacheIO.hpp
     SurfaceAffineTransformController.cpp
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp
@@ -65,9 +83,12 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    RemoteVolumeCachePaths.cpp
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
+    SurfaceDisplayName.hpp
+    SurfaceTimestamp.hpp
     SeedingWidget.cpp
     SeedingWidget.hpp
     segmentation/SegmentationCommon.hpp
@@ -136,6 +157,8 @@ set(srcs
     overlays/AtlasControlPointsOverlayController.hpp
     overlays/FiberSliceOverlayController.cpp
     overlays/FiberSliceOverlayController.hpp
+    overlays/InkDetectionOverlayController.cpp
+    overlays/InkDetectionOverlayController.hpp
     overlays/VolumeOverlayController.cpp
     overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp
@@ -165,14 +188,12 @@ set(srcs
     viewer_controls/ViewerControlsPanel.hpp
     viewer_controls/panels/ViewerCompositePanel.cpp
     viewer_controls/panels/ViewerCompositePanel.hpp
+    viewer_controls/panels/ViewerInkDetectionPanel.cpp
+    viewer_controls/panels/ViewerInkDetectionPanel.hpp
     viewer_controls/panels/ViewerNavigationPanel.cpp
     viewer_controls/panels/ViewerNavigationPanel.hpp
     viewer_controls/panels/ViewerNormalVisualizationPanel.cpp
     viewer_controls/panels/ViewerNormalVisualizationPanel.hpp
-    viewer_controls/panels/ViewerPostprocessingPanel.cpp
-    viewer_controls/panels/ViewerPostprocessingPanel.hpp
-    viewer_controls/panels/ViewerPreprocessingPanel.cpp
-    viewer_controls/panels/ViewerPreprocessingPanel.hpp
     viewer_controls/panels/ViewerTransformsPanel.cpp
     viewer_controls/panels/ViewerTransformsPanel.hpp
     viewer_controls/panels/ViewerViewExtrasPanel.cpp
@@ -204,6 +225,13 @@ endif()
 
 
 add_executable(VC3D ${srcs} resources.qrc)
+
+if(WIN32)
+    # GUI subsystem so double-click launch doesn't open a console window.
+    set_target_properties(VC3D PROPERTIES WIN32_EXECUTABLE ON)
+    # Embed the app icon (windres compiles the .rc).
+    target_sources(VC3D PRIVATE VC3D.rc)
+endif()
 
 target_include_directories(VC3D
     PRIVATE
