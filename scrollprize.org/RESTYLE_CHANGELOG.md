@@ -453,6 +453,12 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - Track-record headline: "The winners were newcomers too." -> "Former winners were newcomers too."
 **Files:** `src/components/getstarted/{GetStarted,InkDemo,SegDemo}.js`.
 
+## C68 — VC3D <-> Winding Constraints cross-link, Paris 4 casing, wording
+
+- VC3D tutorial's Winding Annotation section now points to the new [In-depth: Winding Constraints](/open_problems/winding_annotations) page (the in-depth page already linked back to VC3D; the reverse link was missing).
+- Winding Constraints page: "PHercParis4" -> "PHerc. Paris 4" in prose (the dataset-README filename link is unchanged, it's a real path); "at scale" repetition in the opening sentence fixed ("fast enough to use at scale" -> "…use widely").
+**Files:** `docs/06_tutorial_VC3D.md`, `docs/39_winding_annotations.md`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

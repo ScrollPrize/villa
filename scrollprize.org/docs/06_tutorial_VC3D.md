@@ -172,7 +172,7 @@ If we want to make our segment larger, we can do this easily with the built-in s
 ## Winding Annotation
 
 VC3D can be used to create winding annotations for the spiral fit (see [the inputs section](tutorial_spiral#what-goes-in) of the spiral
-fitting document for more details on how these are used). VC3D outputs these primarily as  *patches (segmentations)* or *point collections*. 
+fitting document for more details on how these are used). VC3D outputs these primarily as  *patches (segmentations)* or *point collections*. See [In-depth: Winding Constraints](/open_problems/winding_annotations) for more on why these annotations matter and how they're used.
 
 When generating data for the spiral, we can think of the inputs broadly as two types of annotations:
 - same-winding annotations (fibers, patches, kolleisis, points along surface preds, etc)

@@ -50,8 +50,8 @@ Winding constraints are sparse geometric evidence: points, lines, fibers, or sur
 
 
 ## Why we are focusing on winding constraints
-Given our recent work on PHercParis4, and the flexibility/sparsity afforded by the spiral fit,  **we believe that the fastest way to unroll scrolls at scale is to develop methods for creating winding constraints
-that are precise and fast enough to use at scale** 
+Given our recent work on PHerc. Paris 4, and the flexibility/sparsity afforded by the spiral fit,  **we believe that the fastest way to unroll scrolls at scale is to develop methods for creating winding constraints
+that are precise and fast enough to use widely** 
 
 We think that the spiral fit is flexible enough to unroll most scrolls given sufficient winding constraints. We don't know the exact minimum amount of winding
 evidence necessary for a given scroll ahead of time, but we know it is certainly *much less than full wrap segmentation*.
