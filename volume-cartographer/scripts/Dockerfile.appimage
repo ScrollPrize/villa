@@ -7,7 +7,7 @@
 # via scripts/build_appimage.sh. glibc + the dynamic loader are bundled, so the
 # result runs on distros with an OLDER glibc than the 26.04 build image.
 #
-# Build (writes dist/VC3D-<version>-x86_64.AppImage on the host). Pass the git
+# Build (writes dist/VC3D-<version>-linux-x86_64.AppImage on the host). Pass the git
 # revision for a versioned name — the context (volume-cartographer/) has no .git:
 #   docker build -o type=local,dest=dist -f scripts/Dockerfile.appimage \
 #     --build-arg VC_GIT_SHA1="$(git rev-parse HEAD)" \
@@ -48,6 +48,6 @@ RUN GIT_SHA1="${VC_GIT_SHA1}" GIT_COMMIT_DATE="${VC_GIT_COMMIT_DATE}" \
     OUT_DIR=/out BUILD_DIR=/src/build/ci-release-gcc bash scripts/build_appimage.sh
 
 # Export the artifacts via `-o type=local,dest=dist`: the minified .AppImage
-# plus the split-out debug-symbols companion (VC3D-<version>-<arch>-debug.tar.zst).
+# plus the split-out debug-symbols companion (VC3D-<version>-linux-<arch>-debug.tar.zst).
 FROM scratch AS export
 COPY --from=build /out/ /
