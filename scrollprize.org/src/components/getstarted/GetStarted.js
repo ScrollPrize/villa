@@ -74,11 +74,6 @@ export function GetStarted() {
             Here's what the work actually looks like, where you'd fit in it,
             and what to do first.
           </p>
-          <div className="vc-gs-hero__ctas">
-            <a className="vc-btn-outline" href="https://discord.gg/V4fJhvtaQn">
-              Join Discord
-            </a>
-          </div>
         </div>
       </section>
 

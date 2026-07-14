@@ -76,7 +76,7 @@ html.docs-doc-id-get_started main .container article {
 /* ---- hero ---- */
 .vc-gs-hero {
   position: relative;
-  padding: clamp(40px, 8vh, 96px) 0 clamp(36px, 6vh, 64px);
+  padding: clamp(40px, 8vh, 96px) 0 clamp(28px, 4.5vh, 44px);
   overflow: hidden;
   /* full-bleed (same trick as the band sections) so the backdrop runs to
      the viewport edge */
@@ -136,7 +136,7 @@ html.docs-doc-id-get_started main .container article {
   padding-top: clamp(56px, 10vh, 110px);
 }
 .vc-gs-hero + .vc-gs-section {
-  padding-top: clamp(40px, 6.5vh, 64px);
+  padding-top: clamp(28px, 4.5vh, 44px);
 }
 /* imperative deck line under a section title */
 .vc-gs-sub {
