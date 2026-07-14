@@ -149,12 +149,24 @@ foreach(_path "$ENV{HOME}/miniconda3" "$ENV{HOME}/anaconda3")
 endforeach()
 
 # ---- Git revision (used for ProjectInfo::VersionString) ---------------------
+# Query git in the source tree. Build contexts with no .git (e.g. the Docker
+# AppImage build, whose context is only the volume-cartographer/ subtree) can
+# inject the revision via -DVC_GIT_SHA1=/-DVC_GIT_COMMIT_DATE=.
+set(VC_GIT_SHA1 "" CACHE STRING "Full commit SHA fallback when the tree has no .git")
+set(VC_GIT_COMMIT_DATE "" CACHE STRING "Commit date (YYYY-MM-DD) paired with VC_GIT_SHA1")
 find_package(Git QUIET)
 if(Git_FOUND)
     execute_process(COMMAND ${GIT_EXECUTABLE} -C "${CMAKE_SOURCE_DIR}" rev-parse HEAD
         OUTPUT_VARIABLE GIT_SHA1 OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
     execute_process(COMMAND ${GIT_EXECUTABLE} -C "${CMAKE_SOURCE_DIR}" log -1 --format=%cs HEAD
         OUTPUT_VARIABLE GIT_COMMIT_DATE OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+# The git query wins whenever it succeeds, so a stale cached VC_GIT_SHA1 can
+# never mask the real revision in a normal checkout; the injected value is used
+# only when the tree has no .git (or git is unavailable).
+if(NOT GIT_SHA1)
+    set(GIT_SHA1 "${VC_GIT_SHA1}")
+    set(GIT_COMMIT_DATE "${VC_GIT_COMMIT_DATE}")
 endif()
 if(GIT_SHA1)
     string(SUBSTRING ${GIT_SHA1} 0 7 GIT_SHA1_SHORT)
