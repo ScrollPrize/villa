@@ -228,6 +228,7 @@ class Inferer():
                  writer_workers: int = None,
                  verbose: bool = False,
                  skip_empty_patches: bool = True,  # Skip empty/homogeneous patches
+                 mask_empty_input: bool = True,  # Suppress logits where raw input volume is 0 (issue #1114)
                  # params to get passed to Volume 
                  scroll_id: [str, int] = None,
                  segment_id: [str, int] = None,
@@ -264,6 +265,7 @@ class Inferer():
         self.num_dataloader_workers = num_dataloader_workers
         self.writer_workers = writer_workers
         self.skip_empty_patches = skip_empty_patches
+        self.mask_empty_input = mask_empty_input
         self.scroll_id = scroll_id
         self.segment_id = segment_id
         self.energy = energy
@@ -700,6 +702,7 @@ class Inferer():
             verbose=self.verbose,
             mode='infer',
             skip_empty_patches=self.skip_empty_patches,
+            return_zero_mask=self.mask_empty_input,
             scroll_id=self.scroll_id,
             segment_id=self.segment_id,
             energy=self.energy,
@@ -995,6 +998,35 @@ class Inferer():
                         if self.verbose:
                             print("Batch contains only empty patches, skipping model inference")
 
+                    # Suppress predictions where the raw input volume is 0 (regions
+                    # removed by volume masking). Prevents phantom surface voxels at
+                    # mask boundaries -- see ScrollPrize/villa#1114. Overlapping
+                    # patches read identical raw voxels, so masking is consistent
+                    # across patches and survives gaussian blending. +/-20 matches
+                    # the logit saturation convention used in finalize_outputs.
+                    if self.mask_empty_input and isinstance(batch_data, dict) and 'zero_mask' in batch_data:
+                        zero_mask = to_device(batch_data['zero_mask'])  # (B, 1, Z, Y, X) bool
+                        if self.is_multi_task and getattr(self, 'target_info', None):
+                            # Per-target, matching finalize_outputs semantics:
+                            # single channel -> sigmoid (negative logit = background);
+                            # multi channel -> class 0 is background (drive it up).
+                            for _, info in self.target_info.items():
+                                s = info['start_channel']
+                                e = info.get('end_channel', s + 1)
+                                if e - s > 1:
+                                    output_batch[:, s:s + 1].masked_fill_(zero_mask, 20.0)
+                                    output_batch[:, s + 1:e].masked_fill_(zero_mask, -20.0)
+                                else:
+                                    output_batch[:, s:e].masked_fill_(zero_mask, -20.0)
+                        elif self.num_classes == 1:
+                            # Sigmoid: strongly negative logit -> p ~ 0
+                            output_batch.masked_fill_(zero_mask, -20.0)
+                        else:
+                            # Single-task softmax: drive background (class 0) up, others down
+                            output_batch[:, 0:1].masked_fill_(zero_mask, 20.0)
+                            output_batch[:, 1:].masked_fill_(zero_mask, -20.0)
+                        del zero_mask
+
                     output_np = self._finalize_output_batch(output_batch)
                     current_batch_size = output_np.shape[0]
 
@@ -1090,6 +1122,11 @@ def main():
     parser.add_argument('--no-skip-empty-patches', dest='skip_empty_patches', action='store_false',
                       help='Process all patches, even if they appear empty')
     parser.set_defaults(skip_empty_patches=True)
+    parser.add_argument('--no_mask_empty_input', dest='mask_empty_input', action='store_false',
+                      help='Disable suppression of predictions where the raw input volume is 0. '
+                           'By default such voxels (regions removed by volume masking) are forced '
+                           'to background to prevent phantom predictions (see issue #1114).')
+    parser.set_defaults(mask_empty_input=True)
     
     # Add arguments for Zarr compression
     parser.add_argument('--zarr-compressor', type=str, default='zstd',
@@ -1160,6 +1197,7 @@ def main():
         writer_workers=args.writer_workers,
         verbose=args.verbose,
         skip_empty_patches=args.skip_empty_patches,  # Skip empty patches flag
+        mask_empty_input=args.mask_empty_input,  # Suppress phantom preds where raw input is 0 (issue #1114)
         # Pass Volume-specific parameters to VCDataset
         scroll_id=scroll_id,
         segment_id=segment_id,
