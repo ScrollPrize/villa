@@ -1,0 +1,78 @@
+{
+  "batch_size": 128,
+  "patch_shape_hw": [64, 64],
+  "strip_z_offset_count": 1,
+  "strip_z_offset_step": 2.0,
+  "seed": 0,
+  "prefetch_workers": 16,
+  "prefetch_sampler_workers": 4,
+  "loader_workers": 4,
+  "augment_enabled": true,
+  "augment_seed": 0,
+  "augment_device": "auto",
+  "augment_shift_x": 16.0,
+  "augment_shift_y": 16.0,
+  "augment_rotation_degrees": 180.0,
+  "augment_shear_x": 1.0,
+  "augment_shear_y": 1.0,
+  "augment_scale_min": 0.7,
+  "augment_scale_max": 1.3,
+  "augment_smooth_offset": 8.0,
+  "augment_smooth_offset_stride": 16.0,
+  "augment_brightness": 0.25,
+  "augment_contrast_min": 0.5,
+  "augment_contrast_max": 2.0,
+  "augment_gamma_min": 0.5,
+  "augment_gamma_max": 2.0,
+  "augment_noise_std": 0.125,
+  "augment_blur_sigma": 2.0,
+  "volume_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/vesuvius_fiber_trace_zarr_cache",
+  "volume_cache_memory_mib": null,
+  "strip_coord_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/vesuvius_fiber_trace_strip_coord_cache",
+  "training": {
+    "run_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_2d_runs",
+    "run_name": "s1a_nml_test",
+    "max_steps": 1000000,
+    "max_sample_index": 0,
+    "learning_rate": 0.001,
+    "scalar_log_interval": 100,
+    "tensorboard_image_interval": 100,
+    "checkpoint_interval": 100,
+    "test_interval": 500,
+    "test_control_points": 0,
+    "test_start_sample_index": 0,
+    "control_points_per_step": 128,
+    "device": "auto",
+    "tensorboard_enabled": true,
+    "model_hidden_channels": 64,
+    "model_depth": 10,
+    "presence_enabled": true,
+    "presence_weight": 0.1,
+    "top_view_enabled": false,
+    "pipeline_depth": 16,
+    "pipeline_workers": 4,
+    "pipeline_isolated_loaders": false
+  },
+  "datasets": [
+    {
+      "fiber_glob": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fiber_vols/fibers_s1a_*.nml",
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "lasagna_manifest_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json",
+      "transform": [
+        [-0.23841071793061291, -0.19362400462393486, 0.0021338753748049444, 11024.043667710986],
+        [-0.19369582314244563, 0.23850010646891293, -0.003964264465841007, 2861.834433287773],
+        [-0.0008390736081137979, 0.004538179336261518, 0.30657436617414124, -9057.070809768327]
+      ],
+      "transform_invert": true
+    }
+  ],
+  "test_datasets": [
+    {
+      "fiber_glob": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_2026-06-16/test/*.json",
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "lasagna_manifest_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json"
+    }
+  ]
+}

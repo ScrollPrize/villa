@@ -700,9 +700,9 @@ The important behavior is:
   `/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fiber_vols/fibers_s1a_*.nml`.
 - Keeps the PHercParis4 78keV base volume, base-volume scale, Lasagna manifest,
   and JSON held-out test dataset settings from the normal example config.
-- Does not include a guessed affine transform. Add the actual old-S1/source to
-  current PHercParis4 base-volume transform via the dataset keys documented
-  below before using S1A coordinates that are not already in the current frame.
+- Includes the existing S1A/source-to-current PHercParis4 transform from
+  `/home/hendrik/business/aiconsulting/vesuviuschallenge/villa2/lasagna/configs/tifxyz_train_s3_dbg.json`:
+  inline `transform` plus `transform_invert: true`.
 
 ## Config Shape
 

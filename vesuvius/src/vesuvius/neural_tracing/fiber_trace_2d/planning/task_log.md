@@ -21,12 +21,17 @@
   coordinates and user bounding boxes are absolute source-scan coordinates
   matching the filename offsets, not local cube coordinates.
 
-## Open Questions
+## Follow-up Search
 
-- Need the exact old-s1-to-current affine config/file spelling used in the
-  local Lasagna training setup before adding transform keys to the S1A NML
-  example config. Checked the available Lasagna run snapshot configs; they only
-  point to older checkout config paths that are not present locally.
+- Rechecked with `s1 == s1a == scroll1a`. The concrete existing transform is in
+  `/home/hendrik/business/aiconsulting/vesuviuschallenge/villa2/lasagna/configs/tifxyz_train_s3_dbg.json`,
+  dataset entry for
+  `s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr`.
+- The same matrix is present in
+  `/home/hendrik/business/aiconsulting/vesuviuschallenge/villa2/lasagna/tmp/transform.json`.
+  Lasagna uses the inline 3x4 `transform` with `transform_invert: true`.
+- Added that exact inline `transform` plus `transform_invert: true` to
+  `configs/loader_example_s1a_nml.json`.
 
 ## Implementation Notes
 
@@ -54,6 +59,8 @@
 ## Validation
 
 - `python -m json.tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example_s1a_nml.json >/tmp/loader_example_s1a_nml_pretty_check.json`
+- `python -m json.tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example_s1a_nml.json`
+  - Result: parsed successfully after adding the S1A transform.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'nml or transform_json'`
   - Result: 5 passed, 259 deselected.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
