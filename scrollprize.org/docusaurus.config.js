@@ -233,11 +233,12 @@ const config = {
                   label: "Weights & Biases",
                   href: "https://wandb.ai/vesuvius-challenge/projects",
                 },
-                {
-                  label: "Donate",
-                  href: "https://donate.stripe.com/aEUg101vt9eN8gM144",
-                },
               ],
+            },
+            {
+              href: "https://donate.stripe.com/aEUg101vt9eN8gM144",
+              label: "Donate",
+              position: "left",
             },
             {
               href: "https://discord.gg/V4fJhvtaQn",

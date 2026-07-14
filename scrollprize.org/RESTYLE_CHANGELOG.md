@@ -464,6 +464,11 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 "real" removed from three spots: "here's a real piece of that same scroll" -> "here's a piece…"; "train the real model" -> "train the model"; "trace a real segment" -> "trace a segment".
 **Files:** `src/components/getstarted/GetStarted.js`.
 
+## C70 — navbar: Donate out of Community dropdown, own top-level item
+
+Donate moved out of the Community dropdown into its own navbar link, positioned immediately after Community (not pushed to the far right with Join Discord/Get Started). Verified zero navbar overflow at 997/1220/1440px.
+**Files:** `docusaurus.config.js`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
