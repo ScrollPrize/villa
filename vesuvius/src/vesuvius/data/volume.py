@@ -161,6 +161,7 @@ class Volume:
                  download_only: bool = False,
                  anon: bool = False,
                  read_retries: int = 4,
+                 return_zero_mask: bool = False,
                  ):
 
         """
@@ -207,6 +208,11 @@ class Volume:
             connections, truncated payloads, 429/5xx — are retried with exponential
             backoff so one hiccup does not abort a long streaming job. Deterministic
             errors are re-raised immediately. Pass 1 to disable retrying.
+        return_zero_mask : bool, default = False
+            If True, __getitem__ returns a tuple (data, zero_mask) where zero_mask
+            marks voxels whose RAW (pre-normalization) value is exactly 0, i.e.
+            regions removed by volume masking. Normalization maps raw zeros to a
+            nonzero value, so the mask must be captured before preprocessing.
         """
 
         # Initialize basic attributes
@@ -221,6 +227,7 @@ class Volume:
         self.verbose = verbose
         self.anon = anon
         self.read_retries = max(1, int(read_retries))
+        self.return_zero_mask = return_zero_mask
         self.inklabel = None  # Initialize inklabel
 
         # --- Input Validation ---
@@ -908,6 +915,10 @@ class Volume:
             print(f"  Error: {e}")
             raise  # Re-raise the exception
 
+        # Zero-mask must be computed on the RAW data: normalization maps raw
+        # zeros to a nonzero value (e.g. -mean/std under zscore schemes).
+        zero_mask = (data_slice == 0) if self.return_zero_mask else None
+
         # --- Preprocessing Steps ---
 
         # 1. Convert to float32 for normalization calculations (if needed)
@@ -1052,6 +1063,11 @@ class Volume:
             except Exception as e:
                 print(f"  Error converting NumPy array to PyTorch Tensor: {e}")
                 raise
+
+        if self.return_zero_mask:
+            if self.return_as_tensor:
+                zero_mask = torch.from_numpy(np.ascontiguousarray(zero_mask))
+            return data_slice, zero_mask
 
         return data_slice
 
