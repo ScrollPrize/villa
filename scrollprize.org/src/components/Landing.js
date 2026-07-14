@@ -377,6 +377,12 @@ const SponsorRow = ({ sponsor, dense }) => (
   </a>
 );
 
+/* Sponsor ordering: amount descending; ties alphabetical, Anonymous last. */
+const sponsorOrder = (a, b) =>
+  b.amount - a.amount ||
+  (a.name === "Anonymous") - (b.name === "Anonymous") ||
+  a.name.localeCompare(b.name);
+
 const SponsorTier = ({ label, title, list, dense, collapsible }) => {
   const grid = (
     <div className={`vc-tier__grid${dense ? " vc-tier__grid--dense" : ""}`}>
@@ -1051,7 +1057,9 @@ export function Landing() {
             <SponsorTier
               label="$200,000 and above"
               title="Caesars"
-              list={sponsors.filter((s) => s.amount >= 200000)}
+              list={sponsors
+                .filter((s) => s.amount >= 200000)
+                .sort(sponsorOrder)}
             />
             {/* Senators + Citizens expanders sit side by side on desktop
                 (vertical-space save); they stack on phones. */}
@@ -1059,15 +1067,17 @@ export function Landing() {
               <SponsorTier
                 label="$50,000 – $200,000"
                 title="Senators"
-                list={sponsors.filter(
-                  (s) => s.amount >= 50000 && s.amount < 200000
-                )}
+                list={sponsors
+                  .filter((s) => s.amount >= 50000 && s.amount < 200000)
+                  .sort(sponsorOrder)}
                 collapsible
               />
               <SponsorTier
                 label="Up to $50,000"
                 title="Citizens"
-                list={sponsors.filter((s) => s.amount < 50000)}
+                list={sponsors
+                  .filter((s) => s.amount < 50000)
+                  .sort(sponsorOrder)}
                 dense
                 collapsible
               />
