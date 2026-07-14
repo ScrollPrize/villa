@@ -273,6 +273,16 @@ if(VC_RUN_BENCHES)
     set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_volume_sample)
 endif()
 
+add_executable(bench_quadsurface_gen bench_quadsurface_gen.cpp)
+target_link_libraries(bench_quadsurface_gen PRIVATE doctest::doctest vc_core)
+# Perf-regression guard for QuadSurface::gen() (warp helpers + per-surface
+# cache reuse). Loose relative assertion; opt-in via VC_RUN_BENCHES, always
+# built as a target so it's runnable manually.
+if(VC_RUN_BENCHES)
+    add_test(NAME bench_quadsurface_gen COMMAND bench_quadsurface_gen)
+    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_quadsurface_gen)
+endif()
+
 add_executable(bench_chunked_plane_sampler bench_chunked_plane_sampler.cpp)
 target_link_libraries(bench_chunked_plane_sampler PRIVATE doctest::doctest vc_core)
 # Perf guard for the slice sampler hot path. Like bench_volume_sample it
