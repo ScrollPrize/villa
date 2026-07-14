@@ -41,11 +41,11 @@ _this package is in active development_
 ## 📓 Introductory notebooks
 To get started, we recommend these notebooks that jump right in:
 
-1. 📊 [Scroll Data Access](https://colab.research.google.com/github/ScrollPrize/vesuvius/blob/main/notebooks/example1_data_access.ipynb): an introduction to accessing scroll data using a few lines of Python!
+1. 📊 [Scroll Data Access](https://colab.research.google.com/github/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/examples/notebooks/example1_data_access.ipynb): an introduction to accessing scroll data using a few lines of Python!
 
-2. ✒️ [Ink Detection](https://colab.research.google.com/github/ScrollPrize/vesuvius/blob/main/notebooks/example2_ink_detection.ipynb): load and visualize segments with ink labels, and train models to detect ink in CT.
+2. ✒️ [Ink Detection](https://colab.research.google.com/github/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/examples/notebooks/example2_ink_detection.ipynb): load and visualize segments with ink labels, and train models to detect ink in CT.
 
-3. 🧩 [Volumetric instance segmentation cubes](https://colab.research.google.com/github/ScrollPrize/vesuvius/blob/main/notebooks/example3_cubes_bootstrap.ipynb): how to access instance-annotated cubes with the `Cube` class, used for volumetric segmentation approaches.
+3. 🧩 [Volumetric instance segmentation cubes](https://colab.research.google.com/github/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/examples/notebooks/example3_cubes_bootstrap.ipynb): how to access instance-annotated cubes with the `Cube` class, used for volumetric segmentation approaches.
 
 ## `vesuvius` does:
 - **Data retrieval**: Fetches volumetric scroll data, surface volumes of scroll segments, and annotated volumetric instance segmentation labels. Remote repositories and local files are supported.
