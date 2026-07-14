@@ -166,6 +166,16 @@ python render_ink.py /path/to/run/meshes/mesh --volume /path/to/ink_prediction.z
 
 You'll need a [VC3D build](segmentation#installation-instructions) on your `PATH` for the rendering and flattening binaries (`vc_render_tifxyz`, `flatboi`, …), and an ink-prediction zarr for the scroll. The output `ink/` folder fills with strips named by winding range (e.g. `w010-027.jpg`).
 
+#### Ink metrics
+
+The script `get_ink_metrics.py` computes some metrics based on the amount of letter-like ink signal detected in the ink renders. By default it uses the model `scrollprize/ink-coverage-32um` from HuggingFace; this is a 2D nnUNet operating on small patches, trained to do binary segmentation of clearly-identifiable ink. The script measures the total area of ink detected, as well as evaluating whether columns are coherent and have approximately the expected width, and lines are locally coherent (based on sliding windows) and have approximately the expected pitch.
+
+:::warning
+
+The ink-coverage model was only trained on PHerc. Paris 4, so it may not give accurate results for other scrolls with significantly different writing styles.
+
+:::
+
 ### How it works
 
 Up to this point we treated the fit as a black box; here is what is actually inside it. (There are more math details in the paper [*Virtually Unrolling the Herculaneum Papyri by Diffeomorphic Spiral Fitting*](https://arxiv.org/abs/2512.04927), though for a slightly older version of the algorithm.)
