@@ -37,6 +37,7 @@ struct AtlasMetadata {
     int seedLineIndex = 0;
     double seedAtlasU = 0.0;
     double seedAtlasV = 0.0;
+    nlohmann::json coordinateMetadata = nlohmann::json::object();
 };
 
 struct AtlasAnchor {

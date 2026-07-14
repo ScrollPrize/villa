@@ -41,7 +41,7 @@
             <string>Auto open last used *.volpkg upon app start</string>
            </property>
            <property name="checked">
-            <bool>true</bool>
+            <bool>false</bool>
            </property>
           </widget>
          </item>
@@ -315,45 +315,96 @@
           <item row="9" column="0" colspan="2">
            <widget class="QCheckBox" name="chkResetViewOnSurfaceChange">
             <property name="text">
-             <string>Reset view when switching between surfaces</string>
+             <string>Automatically rotate planes to align with segmentation</string>
+            </property>
+            <property name="checked">
+             <bool>false</bool>
+            </property>
+            <property name="toolTip">
+             <string>When enabled, switching segments automatically rotates the slicing planes to align with the segmentation surface</string>
+            </property>
+           </widget>
+          </item>
+          <item row="11" column="0" colspan="2">
+           <widget class="QCheckBox" name="chkShowPlaneIntersectionLines">
+            <property name="text">
+             <string>Show plane lines on segmentation view</string>
             </property>
             <property name="checked">
              <bool>true</bool>
             </property>
             <property name="toolTip">
-             <string>When enabled, the view will automatically fit and center on each surface when switching between segments</string>
+             <string>Show slice-plane intersection lines in the segmentation surface view</string>
             </property>
            </widget>
           </item>
-          <item row="10" column="0">
-           <widget class="QLabel" name="labelVoxelSize">
+          <item row="12" column="0">
+           <widget class="QLabel" name="labelInterpolation">
             <property name="text">
-             <string>Voxel size (µm)</string>
-            </property>
-            <property name="toolTip">
-             <string>Physical size of one volume voxel in micrometres, used by the scalebar. Falls back to the volume metadata; set here for volumes (e.g. .vca) that don't carry it. 0 = use metadata only.</string>
+             <string>Interpolation</string>
             </property>
            </widget>
           </item>
-          <item row="10" column="1">
-           <widget class="QDoubleSpinBox" name="spinVoxelSize">
-            <property name="decimals">
-             <number>4</number>
+          <item row="12" column="1">
+           <widget class="QComboBox" name="cmbInterpolation">
+            <item>
+             <property name="text">
+              <string>Nearest</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>Trilinear</string>
+             </property>
+            </item>
+           </widget>
+          </item>
+          <item row="13" column="0">
+           <widget class="QLabel" name="labelIntersectionOpacity">
+            <property name="text">
+             <string>Intersection opacity</string>
             </property>
+           </widget>
+          </item>
+          <item row="13" column="1">
+           <widget class="QSpinBox" name="spinIntersectionOpacity">
             <property name="minimum">
-             <double>0.000000000000000</double>
+             <number>0</number>
             </property>
             <property name="maximum">
-             <double>100000.000000000000000</double>
-            </property>
-            <property name="singleStep">
-             <double>0.100000000000000</double>
+             <number>100</number>
             </property>
             <property name="value">
-             <double>0.000000000000000</double>
+             <number>70</number>
             </property>
             <property name="suffix">
-             <string> µm</string>
+             <string>%</string>
+            </property>
+            <property name="toolTip">
+             <string>Adjust opacity of intersection overlays</string>
+            </property>
+           </widget>
+          </item>
+          <item row="14" column="0">
+           <widget class="QLabel" name="labelAxisOverlayOpacity">
+            <property name="text">
+             <string>Axis overlay opacity</string>
+            </property>
+           </widget>
+          </item>
+          <item row="14" column="1">
+           <widget class="QSpinBox" name="spinAxisOverlayOpacity">
+            <property name="minimum">
+             <number>0</number>
+            </property>
+            <property name="maximum">
+             <number>100</number>
+            </property>
+            <property name="value">
+             <number>70</number>
+            </property>
+            <property name="suffix">
+             <string>%</string>
             </property>
            </widget>
           </item>
@@ -623,79 +674,41 @@
             </property>
            </widget>
           </item>
-          <item row="2" column="0" colspan="3">
-           <widget class="QCheckBox" name="chkVideoRecompress">
+          <item row="2" column="0" colspan="2">
+           <widget class="QCheckBox" name="chkCompressRemoteCache">
             <property name="text">
-             <string>Compress disk cache (c3d)</string>
+             <string>Compress remote volume disk cache</string>
             </property>
             <property name="toolTip">
-             <string>When enabled, chunks fetched from remote volumes are re-encoded with the c3d codec before storing to the disk cache. Reduces disk usage but is lossy. When disabled, source chunk bytes are stored unchanged at the source volume's native chunk size. Both modes use separate directories. Requires restart.</string>
+             <string>When enabled, chunks downloaded from remote volumes are stored compressed in the disk cache using the selected accuracy below. Existing cache entries stay readable either way. Requires restart.</string>
+            </property>
+            <property name="checked">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="2">
+           <widget class="QPushButton" name="btnCompressExistingCache">
+            <property name="text">
+             <string>Compress existing cache...</string>
+            </property>
+            <property name="toolTip">
+             <string>Compress the already-downloaded chunks in the disk cache of the currently shown volume using the compression accuracy selected below. Runs with multiple workers and can be cancelled.</string>
             </property>
            </widget>
           </item>
           <item row="3" column="0">
-           <widget class="QLabel" name="labelVideoCodecType">
+           <widget class="QLabel" name="labelCacheQuantization">
             <property name="text">
-             <string>Video codec</string>
+             <string>Cache compression accuracy</string>
             </property>
            </widget>
           </item>
           <item row="3" column="1">
-           <widget class="QComboBox" name="cmbVideoCodecType">
-            <item>
-             <property name="text">
-              <string>H.265</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>C3D (3D DCT)</string>
-             </property>
-            </item>
-           </widget>
-          </item>
-          <item row="4" column="0">
-           <widget class="QLabel" name="labelVideoQualityPreset">
-            <property name="text">
-             <string>Compression level</string>
-            </property>
-           </widget>
-          </item>
-          <item row="4" column="1">
-           <widget class="QComboBox" name="cmbVideoQualityPreset">
+           <widget class="QComboBox" name="cmbCacheQuantization">
             <property name="toolTip">
-             <string>Controls quality vs compression ratio. Higher compression = more disk savings but lower fidelity.</string>
+             <string>Accuracy of compressed disk-cache chunks. Lossless preserves exact voxel values. Near-lossless modes bound the per-voxel error (±1 or ±2 gray levels) and shrink the cache further. Affects newly written chunks and the "Compress existing cache" action; requires restart for new downloads.</string>
             </property>
-            <item>
-             <property name="text">
-              <string>Lossless (1x)</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>1/2 lossless size</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>1/4 lossless size</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>1/8 lossless size</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>1/16 lossless size</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>1/32 lossless size</string>
-             </property>
-            </item>
            </widget>
           </item>
           <item row="6" column="0">

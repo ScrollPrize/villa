@@ -10,7 +10,11 @@ module.exports = {
   ],
   darkMode: ["class", '[data-theme="dark"]'], // hooks into docusaurus' dark mode settings
   theme: {
-    extend: {},
+    extend: {
+      colors: {
+        gold: "#c9a24b",
+      },
+    },
   },
   plugins: [],
   future: {

@@ -76,9 +76,14 @@ void buildPyramidLevel(const std::filesystem::path& outFile, int level,
 
 // Create pyramid level datasets L1-L5 (metadata only, no data).
 // Called by --pre so that multi-part workers can open existing datasets.
+// compressor/compressionLevel/dimensionSeparator are forwarded to
+// createZarrDataset so the pyramid matches L0.
 void createPyramidDatasets(const std::filesystem::path& outFile,
                            const std::vector<size_t>& shape0,
-                           size_t CH, size_t CW, bool isU16);
+                           size_t CH, size_t CW, bool isU16,
+                           const std::string& compressor = "blosc",
+                           int compressionLevel = -1,
+                           const std::string& dimensionSeparator = ".");
 
 // Write OME-Zarr .zattrs multiscales JSON.
 void writeZarrAttrs(const std::filesystem::path& outFile,

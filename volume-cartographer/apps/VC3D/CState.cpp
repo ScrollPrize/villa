@@ -1,4 +1,5 @@
 #include "CState.hpp"
+#include "OpenDataCoordinateIdentity.hpp"
 #include "VCSettings.hpp"
 
 #include <algorithm>
@@ -222,6 +223,12 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
     _currentVolume = std::move(vol);
     applyCacheBudget(_currentVolume);
     resolveCurrentVolumeId();
+    _pointCollection->setFileMetadata(
+        (_vpkg && !_currentVolumeId.empty())
+            ? vc3d::opendata::coordinateIdentityJson(
+                  vc3d::opendata::coordinateIdentityForVolume(
+                      *_vpkg, _currentVolumeId))
+            : utils::Json::object());
     emit volumeChanged(_currentVolume, _currentVolumeId);
 }
 
@@ -311,6 +318,7 @@ void CState::closeAll()
 
     _pois.clear();
     _pointCollection->clearAll();
+    _pointCollection->setFileMetadata(utils::Json::object());
 
     setVpkg(nullptr);
 }
@@ -348,6 +356,11 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     }
 
     _surfs[name] = surf;
+    if (!sameSurface) {
+        // Edit updates re-set the same pointer every frame; only a mapping
+        // change should invalidate cached views of the surface map.
+        ++_surfacesVersion;
+    }
 
     if (!noSignalSend || surf == nullptr) {
         emit surfaceChanged(name, surf, isEditUpdate);

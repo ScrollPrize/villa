@@ -83,6 +83,40 @@ private:
     std::array<uint8_t, 2> values_;
 };
 
+class UniformStatusArray : public vc::render::IChunkedArray {
+public:
+    explicit UniformStatusArray(ChunkStatus status)
+        : status_(status) {}
+
+    int numLevels() const override { return 1; }
+    std::array<int, 3> shape(int) const override { return {4, 4, 4}; }
+    std::array<int, 3> chunkShape(int) const override { return {4, 4, 4}; }
+    vc::render::ChunkDtype dtype() const override { return vc::render::ChunkDtype::UInt8; }
+    double fillValue() const override { return 0.0; }
+    LevelTransform levelTransform(int) const override { return {}; }
+
+    ChunkResult tryGetChunk(int, int, int, int) override
+    {
+        ChunkResult r;
+        r.dtype = vc::render::ChunkDtype::UInt8;
+        r.shape = shape(0);
+        r.status = status_;
+        return r;
+    }
+
+    ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override
+    {
+        return tryGetChunk(level, iz, iy, ix);
+    }
+
+    void prefetchChunks(const std::vector<ChunkKey>&, bool, int) override {}
+    ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback) override { return 0; }
+    void removeChunkReadyListener(ChunkReadyCallbackId) override {}
+
+private:
+    ChunkStatus status_;
+};
+
 cv::Mat_<cv::Vec3f> axisAlignedCoords(int rows, int cols, float z = 0.f)
 {
     cv::Mat_<cv::Vec3f> c(rows, cols);
@@ -196,6 +230,32 @@ TEST_CASE("samplePlaneFineToCoarse: falls back to coarse when fine is missing")
         out, coverage, {vc::Sampling::Nearest, 2});
     CHECK(stats.coveredPixels > 0);
     CHECK(out(0, 0) == 88);
+}
+
+TEST_CASE("samplePlaneFineToCoarse: known-missing chunks become covered black")
+{
+    UniformStatusArray a(ChunkStatus::Missing);
+    cv::Mat_<uint8_t> out(2, 2, uint8_t{123});
+    cv::Mat_<uint8_t> coverage(2, 2, uint8_t{0});
+    auto stats = ChunkedPlaneSampler::samplePlaneFineToCoarse(
+        a, 0, cv::Vec3f(0, 0, 0), cv::Vec3f(1, 0, 0), cv::Vec3f(0, 1, 0),
+        out, coverage, {vc::Sampling::Nearest, 2});
+    CHECK(stats.coveredPixels == 4);
+    CHECK(coverage(0, 0) == 1);
+    CHECK(out(0, 0) == 0);
+}
+
+TEST_CASE("samplePlaneFineToCoarse: queued chunks remain uncovered")
+{
+    UniformStatusArray a(ChunkStatus::MissQueued);
+    cv::Mat_<uint8_t> out(2, 2, uint8_t{123});
+    cv::Mat_<uint8_t> coverage(2, 2, uint8_t{0});
+    auto stats = ChunkedPlaneSampler::samplePlaneFineToCoarse(
+        a, 0, cv::Vec3f(0, 0, 0), cv::Vec3f(1, 0, 0), cv::Vec3f(0, 1, 0),
+        out, coverage, {vc::Sampling::Nearest, 2});
+    CHECK(stats.coveredPixels == 0);
+    CHECK(coverage(0, 0) == 0);
+    CHECK(out(0, 0) == 123);
 }
 
 TEST_CASE("samplePlaneCoarseToFine: paints coarse first, overwrites with fine")
