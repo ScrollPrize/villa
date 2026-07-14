@@ -164,6 +164,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
   
 - [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
     - [GPU-accelerated MLS projection for ScrollFiesta](https://github.com/pscamillo/scrollfiesta_public/blob/cuda-mls/BENCHMARKS.md) by pscamillo — OpenMP + CUDA FP32 acceleration, byte-identical, ~6x throughput.
+ 
+- [vesuvius-automesh](https://github.com/spencerdavis-tx/vesuvius-automesh) by spencerdavis-tx. Fully automated, QC-gated surface harvest: masks the public surface predictions against the CT, seed-sweeps the villa tracer, and accepts output per 25 mm window under a two-part quality gate plus an independent topology check - 279 cm2 of verified Scroll 3 surface with zero manual annotation, CPU only. Ships per-window QC records for all 157 windows (passes and failures) as a labeled set of tracer failure modes.
       
 ### 📦 Materials
 
