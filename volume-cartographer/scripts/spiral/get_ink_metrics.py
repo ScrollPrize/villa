@@ -24,9 +24,11 @@ For each strip it:
      cyan),
   6. counts foreground pixels (the surface area of predicted ink).
 
-Finally it aggregates the per-strip areas and layout scores and writes
+Finally it aggregates the per-strip areas and layout scores, writes
 metrics.json / metrics.csv (the json additionally carries the full per-strip column
-detection detail: run/gap positions and scores plus a downsampled density profile).
+detection detail: run/gap positions and scores plus a downsampled density profile),
+and renders everything into a single self-contained report.html next to them
+(see make_ink_report.py, which can also rebuild the report on its own).
 
 Usage:
     get_ink_metrics.py /path/to/<run>/meshes/<...>/ink
@@ -53,6 +55,8 @@ import numpy as np
 from PIL import Image
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
+
+from make_ink_report import build_report
 
 # ---------------------------------------------------------------------------
 # The model: a HuggingFace repo id (downloaded to the HF cache on first use) or a
@@ -551,6 +555,8 @@ def run_main(argv):
         w.writeheader()
         w.writerows(rows)
 
+    report_path = build_report(out_dir)
+
     if not args.keep_work:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -569,6 +575,7 @@ def run_main(argv):
         print(f'TOTAL ink area         : {summary["total_fg_area_cm2"]:.3f} cm^2')
     print(f'predictions            : {pred_dir}')
     print(f'metrics                : {os.path.join(out_dir, "metrics.json")}')
+    print(f'report                 : {report_path}')
 
 
 def main():
