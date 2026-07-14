@@ -342,6 +342,8 @@ vc_add_test(NAME test_gridstore)
 
 vc_add_test(NAME test_gridstore_branches)
 
+vc_add_test(NAME test_gridstore_malformed)
+
 # Live network test: anonymous read of the PHerc 0172 zarr on AWS S3.
 # Soft-skips on network failure so offline runs still pass; set
 # VC_TEST_REQUIRE_NETWORK=1 to flip those skips into hard failures.
