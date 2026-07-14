@@ -22,10 +22,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "vc/core/util/MemMap.hpp"
 
 #include <boost/geometry.hpp>
 #include <boost/geometry/index/rtree.hpp>
@@ -475,76 +472,21 @@ public:
     FileMapping() = default;
     FileMapping(const FileMapping&) = delete;
     FileMapping& operator=(const FileMapping&) = delete;
-    FileMapping(FileMapping&& other) noexcept { moveFrom(other); }
-    FileMapping& operator=(FileMapping&& other) noexcept
-    {
-        if (this != &other) {
-            close();
-            moveFrom(other);
-        }
-        return *this;
-    }
-    ~FileMapping() { close(); }
+    FileMapping(FileMapping&&) noexcept = default;
+    FileMapping& operator=(FileMapping&&) noexcept = default;
 
-    void open(const std::filesystem::path& path)
-    {
-        close();
-        fd_ = ::open(path.c_str(), O_RDONLY);
-        if (fd_ < 0) {
-            throw std::runtime_error("mmap open failed: " + path.string());
-        }
-        struct stat st {};
-        if (::fstat(fd_, &st) != 0 || st.st_size <= 0) {
-            close();
-            throw std::runtime_error("mmap stat failed: " + path.string());
-        }
-        size_ = static_cast<std::size_t>(st.st_size);
-        data_ = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-        if (data_ == MAP_FAILED) {
-            data_ = nullptr;
-            close();
-            throw std::runtime_error("mmap failed: " + path.string());
-        }
-        // The mapping owns the pages; the descriptor is only needed for mmap().
-        ::close(fd_);
-        fd_ = -1;
-    }
+    void open(const std::filesystem::path& path) { map_.open(path); }
 
     const std::uint8_t* bytes(std::uint64_t offset, std::uint64_t size) const
     {
-        if (!data_ || offset > size_ || size > size_ - offset) {
+        if (!map_ || offset > map_.size() || size > map_.size() - offset) {
             throw std::runtime_error("mmap TIFF strip points outside file");
         }
-        return static_cast<const std::uint8_t*>(data_) + offset;
+        return static_cast<const std::uint8_t*>(map_.data()) + offset;
     }
 
 private:
-    void close()
-    {
-        if (data_) {
-            ::munmap(data_, size_);
-            data_ = nullptr;
-        }
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
-        size_ = 0;
-    }
-
-    void moveFrom(FileMapping& other) noexcept
-    {
-        fd_ = other.fd_;
-        data_ = other.data_;
-        size_ = other.size_;
-        other.fd_ = -1;
-        other.data_ = nullptr;
-        other.size_ = 0;
-    }
-
-    int fd_ = -1;
-    void* data_ = nullptr;
-    std::size_t size_ = 0;
+    vc::memmap::MappedFileRO map_;
 };
 
 class MappedTifBand {
@@ -1264,10 +1206,13 @@ struct SurfacePatchIndex::Impl {
     // Sub-iterates at triStride to find the closest sub-quad, returning a
     // PatchHit with u,v expressed in tile-local source-mesh-cell units
     // (range [0, tileStride], not bary over the full tile).
+    // earlyOutDistSq >= 0 returns as soon as any sub-quad hit is at least that
+    // close — for callers that only need "within tolerance", not the minimum.
     static PatchHit evaluatePatch(const PatchRecord& rec,
                                   int tileStride,
                                   int triStride,
-                                  const cv::Vec3f& point) {
+                                  const cv::Vec3f& point,
+                                  float earlyOutDistSq = -1.0f) {
         PatchHit best;
         triStride = std::max(1, triStride);
         tileStride = std::max(triStride, tileStride);
@@ -1305,10 +1250,104 @@ struct SurfacePatchIndex::Impl {
                     float v = clamp01(tri.bary[1] + tri.bary[2]);
                     recordHit(u, v, tri.distSq);
                 }
+
+                if (earlyOutDistSq >= 0.0f && best.valid &&
+                    best.distSq <= earlyOutDistSq) {
+                    return best;
+                }
             }
         }
 
         return best;
+    }
+
+    // Per-surface metadata resolved once per query and shared across every
+    // tile of that surface (center/scale lookups are not free at ~100k-tile
+    // query volumes).
+    struct TileSurfaceCache {
+        float cx = 0.0f;
+        float cy = 0.0f;
+        int rows = 0;
+        int cols = 0;
+        SurfacePtr ownedPtr;  // Shared ownership for TriangleCandidate
+    };
+
+    // Emits the two fine triangles of every triStride sub-cell of the tile
+    // anchored at (rec.i, rec.j), bbox-culled against `bounds`. Shared by
+    // forEachTriangleImpl and the parallel plane-intersection path; must
+    // only touch read-only surface data so it can run concurrently from
+    // several worker threads while a reader holds the index lock.
+    template <typename Visitor>
+    static void emitTileTriangles(const PatchRecord& rec,
+                                  int triStride,
+                                  int tile,
+                                  const TileSurfaceCache& cache,
+                                  const Rect3D& bounds,
+                                  Visitor&& visitor)
+    {
+        // Sub-iteration bounds: stop at the tile edge AND the surface edge.
+        // loadPatchCorners requires col+stride and row+stride to be < cols/rows.
+        const int subColLimit = std::min(rec.i + tile, cache.cols - 1);
+        const int subRowLimit = std::min(rec.j + tile, cache.rows - 1);
+
+        for (int subJ = rec.j; subJ < subRowLimit; subJ += triStride) {
+            for (int subI = rec.i; subI < subColLimit; subI += triStride) {
+                const PatchRecord subRec{rec.surface, rec.mapped, subI, subJ};
+                std::array<cv::Vec3f, 4> corners;
+                if (!loadPatchCorners(subRec, triStride, corners)) {
+                    continue;
+                }
+
+                const float baseX = static_cast<float>(subI);
+                const float baseY = static_cast<float>(subJ);
+                const float effectiveStrideX = static_cast<float>(std::min(triStride, cache.cols - 1 - subI));
+                const float effectiveStrideY = static_cast<float>(std::min(triStride, cache.rows - 1 - subJ));
+
+                const std::array<cv::Vec3f, 4> params = {
+                    cv::Vec3f(baseX - cache.cx, baseY - cache.cy, 0.0f),
+                    cv::Vec3f(baseX + effectiveStrideX - cache.cx, baseY - cache.cy, 0.0f),
+                    cv::Vec3f(baseX + effectiveStrideX - cache.cx, baseY + effectiveStrideY - cache.cy, 0.0f),
+                    cv::Vec3f(baseX - cache.cx, baseY + effectiveStrideY - cache.cy, 0.0f)
+                };
+
+                for (int triIdx = 0; triIdx < 2; ++triIdx) {
+                    TriangleCandidate candidate;
+                    candidate.surface = cache.ownedPtr;
+                    candidate.i = subI;
+                    candidate.j = subJ;
+                    candidate.triangleIndex = triIdx;
+
+                    if (triIdx == 0) {
+                        candidate.world = {corners[0], corners[1], corners[3]};
+                        candidate.surfaceParams = {params[0], params[1], params[3]};
+                    } else {
+                        candidate.world = {corners[1], corners[2], corners[3]};
+                        candidate.surfaceParams = {params[1], params[2], params[3]};
+                    }
+
+                    const auto& w0 = candidate.world[0];
+                    const auto& w1 = candidate.world[1];
+                    const auto& w2 = candidate.world[2];
+                    // Short-circuited bbox cull: `max(a,b,c) < lo` == "all <
+                    // lo", `min(a,b,c) > hi` == "all > hi". Written out
+                    // this way to skip the std::max<initializer_list>
+                    // allocation+iterate dance the compiler can't optimise
+                    // away — this test fires once per triangle (~3M calls
+                    // per flattened-view intersection pass on the heavy
+                    // workload) and was ~1% of total CPU on its own.
+                    if ((w0[0] < bounds.low[0]  && w1[0] < bounds.low[0]  && w2[0] < bounds.low[0])  ||
+                        (w0[0] > bounds.high[0] && w1[0] > bounds.high[0] && w2[0] > bounds.high[0]) ||
+                        (w0[1] < bounds.low[1]  && w1[1] < bounds.low[1]  && w2[1] < bounds.low[1])  ||
+                        (w0[1] > bounds.high[1] && w1[1] > bounds.high[1] && w2[1] > bounds.high[1]) ||
+                        (w0[2] < bounds.low[2]  && w1[2] < bounds.low[2]  && w2[2] < bounds.low[2])  ||
+                        (w0[2] > bounds.high[2] && w1[2] > bounds.high[2] && w2[2] > bounds.high[2])) {
+                        continue;
+                    }
+
+                    visitor(candidate);
+                }
+            }
+        }
     }
 };
 
@@ -1321,6 +1360,8 @@ SurfacePatchIndex::SurfacePatchIndex(SurfacePatchIndex&& other) noexcept
 {
     std::unique_lock<std::shared_mutex> lock(other.mutex_);
     impl_ = std::move(other.impl_);
+    globalGeneration_.store(other.globalGeneration_.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
 }
 
 SurfacePatchIndex& SurfacePatchIndex::operator=(SurfacePatchIndex&& other) noexcept
@@ -1333,6 +1374,12 @@ SurfacePatchIndex& SurfacePatchIndex::operator=(SurfacePatchIndex&& other) noexc
     std::unique_lock<std::shared_mutex> otherLock(other.mutex_, std::defer_lock);
     std::lock(selfLock, otherLock);
     impl_ = std::move(other.impl_);
+    // Guarantee observers of *this see a generation change even if the
+    // incoming index happens to share the counter value.
+    globalGeneration_.store(
+        std::max(globalGeneration_.load(std::memory_order_relaxed),
+                 other.globalGeneration_.load(std::memory_order_relaxed)) + 1,
+        std::memory_order_relaxed);
     return *this;
 }
 
@@ -1656,6 +1703,7 @@ bool SurfacePatchIndex::loadCache(const std::filesystem::path& cachePath,
         newImpl->tree = std::make_unique<Impl::PatchTree>(entries.begin(), entries.end());
     }
     impl_ = std::move(newImpl);
+    globalGeneration_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -2020,6 +2068,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces,
         std::cout << "[SurfacePatchIndex] rebuild complete: surfaces=" << surfaceCount
                   << " patches=" << impl_->patchCount << std::endl;
     }
+    globalGeneration_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void SurfacePatchIndex::clear()
@@ -2032,6 +2081,7 @@ void SurfacePatchIndex::clear()
         impl_->surfaceRecords.clear();
         impl_->samplingStride = 1;
         impl_->tileStride = Impl::computeTileStride(1);
+        globalGeneration_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -2151,6 +2201,107 @@ SurfacePatchIndex::locate(const PointQuery& pointQuery) const
     }
     best.distance = std::sqrt(bestDistSq);
     return best;
+}
+
+std::optional<SurfacePatchIndex::LookupResult>
+SurfacePatchIndex::locateAny(const PointQuery& pointQuery) const
+{
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!impl_ || !impl_->tree || pointQuery.tolerance <= 0.0f ||
+        !isFinitePoint(pointQuery.worldPoint)) {
+        return std::nullopt;
+    }
+
+    const float tol = std::max(pointQuery.tolerance, 0.0f);
+    Impl::Point3 min_pt(pointQuery.worldPoint[0] - tol,
+                        pointQuery.worldPoint[1] - tol,
+                        pointQuery.worldPoint[2] - tol);
+    Impl::Point3 max_pt(pointQuery.worldPoint[0] + tol,
+                        pointQuery.worldPoint[1] + tol,
+                        pointQuery.worldPoint[2] + tol);
+    Impl::Box3 query(min_pt, max_pt);
+
+    const float toleranceSq = tol * tol;
+
+    // Filter directly against the caller's sets. makeRawSurfaceFilter copies
+    // the include/exclude sets per call, which is prohibitive when this runs
+    // per sample point with thousands of included surfaces.
+    const SurfaceFilter& filter = pointQuery.surfaces;
+    QuadSurface* const only = filter.only ? filter.only.get() : nullptr;
+    if ((filter.includeRaw && filter.includeRaw->empty()) ||
+        (!filter.includeRaw && filter.include && filter.include->empty())) {
+        return std::nullopt;
+    }
+    // Non-owning aliasing key for lookups in shared_ptr-keyed sets.
+    const auto sharedKey = [](QuadSurface* s) {
+        return std::shared_ptr<QuadSurface>(std::shared_ptr<QuadSurface>(), s);
+    };
+    const auto accepts = [&](QuadSurface* s) -> bool {
+        if (!s || (only && s != only)) {
+            return false;
+        }
+        if (filter.includeRaw) {
+            if (filter.includeRaw->find(s) == filter.includeRaw->end()) {
+                return false;
+            }
+        } else if (filter.include) {
+            if (filter.include->find(sharedKey(s)) == filter.include->end()) {
+                return false;
+            }
+        }
+        if (filter.excludeRaw &&
+            filter.excludeRaw->find(s) != filter.excludeRaw->end()) {
+            return false;
+        }
+        if (filter.exclude &&
+            filter.exclude->find(sharedKey(s)) != filter.exclude->end()) {
+            return false;
+        }
+        return true;
+    };
+
+    try {
+        for (auto it = impl_->tree->qbegin(bgi::intersects(query));
+             it != impl_->tree->qend(); ++it) {
+            const Impl::PatchRecord& rec = it->second;
+            if (!accepts(rec.surface)) {
+                continue;
+            }
+
+            Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
+                                                     impl_->samplingStride,
+                                                     pointQuery.worldPoint,
+                                                     toleranceSq);
+            if (!hit.valid || hit.distSq > toleranceSq) {
+                continue;
+            }
+
+            SurfacePatchIndex::LookupResult result;
+            const cv::Vec3f center = rec.surface->center();
+            const cv::Vec2f scale = rec.surface->scale();
+            const float absX = static_cast<float>(rec.i) + hit.u;
+            const float absY = static_cast<float>(rec.j) + hit.v;
+            result.ptr = {
+                absX - center[0] * scale[0],
+                absY - center[1] * scale[1],
+                0.0f
+            };
+            if (auto srIt = impl_->surfaceRecords.find(rec.surface);
+                srIt != impl_->surfaceRecords.end()) {
+                result.surface = srIt->second.surface;
+            }
+            result.distance = std::sqrt(hit.distSq);
+            return result;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[SurfacePatchIndex] locateAny query failed: " << e.what() << std::endl;
+        return std::nullopt;
+    } catch (...) {
+        std::cerr << "[SurfacePatchIndex] locateAny query failed: unknown exception" << std::endl;
+        return std::nullopt;
+    }
+
+    return std::nullopt;
 }
 
 std::vector<SurfacePatchIndex::LookupResult>
@@ -2424,14 +2575,7 @@ void SurfacePatchIndex::forEachTriangleImpl(
     Impl::Box3 query(min_pt, max_pt);
 
     // Cache surface metadata to avoid redundant lookups across patches
-    struct SurfaceCache {
-        float cx;
-        float cy;
-        int rows;
-        int cols;
-        SurfacePtr ownedPtr;  // Shared ownership for TriangleCandidate
-    };
-    std::unordered_map<QuadSurface*, SurfaceCache> surfaceCacheMap;
+    std::unordered_map<QuadSurface*, Impl::TileSurfaceCache> surfaceCacheMap;
     surfaceCacheMap.reserve(std::min<std::size_t>(
         surfaces.include ? surfaces.include->size() : 4, 4096));
 
@@ -2480,74 +2624,10 @@ void SurfacePatchIndex::forEachTriangleImpl(
                 cols = points ? points->cols : 0;
             }
             cacheIt = surfaceCacheMap.emplace(rec.surface,
-                SurfaceCache{center[0] * scale[0], center[1] * scale[1],
-                             rows, cols, srIt->second.surface}).first;
+                Impl::TileSurfaceCache{center[0] * scale[0], center[1] * scale[1],
+                                       rows, cols, srIt->second.surface}).first;
         }
-        const SurfaceCache& cache = cacheIt->second;
-
-        // Sub-iteration bounds: stop at the tile edge AND the surface edge.
-        // loadPatchCorners requires col+stride and row+stride to be < cols/rows.
-        const int subColLimit = std::min(rec.i + tile, cache.cols - 1);
-        const int subRowLimit = std::min(rec.j + tile, cache.rows - 1);
-
-        for (int subJ = rec.j; subJ < subRowLimit; subJ += triStride) {
-            for (int subI = rec.i; subI < subColLimit; subI += triStride) {
-                const Impl::PatchRecord subRec{rec.surface, rec.mapped, subI, subJ};
-                std::array<cv::Vec3f, 4> corners;
-                if (!Impl::loadPatchCorners(subRec, triStride, corners)) {
-                    continue;
-                }
-
-                const float baseX = static_cast<float>(subI);
-                const float baseY = static_cast<float>(subJ);
-                const float effectiveStrideX = static_cast<float>(std::min(triStride, cache.cols - 1 - subI));
-                const float effectiveStrideY = static_cast<float>(std::min(triStride, cache.rows - 1 - subJ));
-
-                const std::array<cv::Vec3f, 4> params = {
-                    cv::Vec3f(baseX - cache.cx, baseY - cache.cy, 0.0f),
-                    cv::Vec3f(baseX + effectiveStrideX - cache.cx, baseY - cache.cy, 0.0f),
-                    cv::Vec3f(baseX + effectiveStrideX - cache.cx, baseY + effectiveStrideY - cache.cy, 0.0f),
-                    cv::Vec3f(baseX - cache.cx, baseY + effectiveStrideY - cache.cy, 0.0f)
-                };
-
-                for (int triIdx = 0; triIdx < 2; ++triIdx) {
-                    TriangleCandidate candidate;
-                    candidate.surface = cache.ownedPtr;
-                    candidate.i = subI;
-                    candidate.j = subJ;
-                    candidate.triangleIndex = triIdx;
-
-                    if (triIdx == 0) {
-                        candidate.world = {corners[0], corners[1], corners[3]};
-                        candidate.surfaceParams = {params[0], params[1], params[3]};
-                    } else {
-                        candidate.world = {corners[1], corners[2], corners[3]};
-                        candidate.surfaceParams = {params[1], params[2], params[3]};
-                    }
-
-                    const auto& w0 = candidate.world[0];
-                    const auto& w1 = candidate.world[1];
-                    const auto& w2 = candidate.world[2];
-                    // Short-circuited bbox cull: `max(a,b,c) < lo` == "all <
-                    // lo", `min(a,b,c) > hi` == "all > hi". Written out
-                    // this way to skip the std::max<initializer_list>
-                    // allocation+iterate dance the compiler can't optimise
-                    // away — this test fires once per triangle (~3M calls
-                    // per flattened-view intersection pass on the heavy
-                    // workload) and was ~1% of total CPU on its own.
-                    if ((w0[0] < bounds.low[0]  && w1[0] < bounds.low[0]  && w2[0] < bounds.low[0])  ||
-                        (w0[0] > bounds.high[0] && w1[0] > bounds.high[0] && w2[0] > bounds.high[0]) ||
-                        (w0[1] < bounds.low[1]  && w1[1] < bounds.low[1]  && w2[1] < bounds.low[1])  ||
-                        (w0[1] > bounds.high[1] && w1[1] > bounds.high[1] && w2[1] > bounds.high[1]) ||
-                        (w0[2] < bounds.low[2]  && w1[2] < bounds.low[2]  && w2[2] < bounds.low[2])  ||
-                        (w0[2] > bounds.high[2] && w1[2] > bounds.high[2] && w2[2] > bounds.high[2])) {
-                        continue;
-                    }
-
-                    visitor(candidate);
-                }
-            }
-        }
+        Impl::emitTileTriangles(rec, triStride, tile, cacheIt->second, bounds, visitor);
     };
 
     try {
@@ -2805,6 +2885,7 @@ bool SurfacePatchIndex::updateSurface(const SurfacePtr& surface)
     const bool updated = impl_->replaceSurfaceEntries(surface, std::move(cells));
     if (updated) {
         ++impl_->surfaceGenerations[surface.get()];
+        globalGeneration_.fetch_add(1, std::memory_order_relaxed);
     }
     return updated;
 }
@@ -2855,6 +2936,7 @@ bool SurfacePatchIndex::updateSurfaceRegion(const SurfacePtr& surface,
     impl_->insertCells(cells);
     if (!cells.empty()) {
         ++impl_->surfaceGenerations[surface.get()];
+        globalGeneration_.fetch_add(1, std::memory_order_relaxed);
     }
     return !cells.empty();
 }
@@ -2865,7 +2947,11 @@ bool SurfacePatchIndex::removeSurface(const SurfacePtr& surface)
     if (!impl_ || !surface) {
         return false;
     }
-    return impl_->removeSurfaceEntries(surface);
+    const bool removed = impl_->removeSurfaceEntries(surface);
+    if (removed) {
+        globalGeneration_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return removed;
 }
 
 bool SurfacePatchIndex::setSamplingStride(int stride)
@@ -2883,6 +2969,7 @@ bool SurfacePatchIndex::setSamplingStride(int stride)
     impl_->tree.reset();
     impl_->surfaceRecords.clear();
     impl_->patchCount = 0;
+    globalGeneration_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -3370,6 +3457,9 @@ bool SurfacePatchIndex::flushPendingUpdates(const SurfacePtr& surface)
         }
     }
 
+    if (anyFlushed) {
+        globalGeneration_.fetch_add(1, std::memory_order_relaxed);
+    }
     return anyFlushed;
 }
 
@@ -3471,6 +3561,11 @@ uint64_t SurfacePatchIndex::generation(const SurfacePtr& surface) const
     return it != impl_->surfaceGenerations.end() ? it->second : 0;
 }
 
+uint64_t SurfacePatchIndex::globalGeneration() const
+{
+    return globalGeneration_.load(std::memory_order_relaxed);
+}
+
 std::unordered_map<SurfacePatchIndex::SurfacePtr, std::vector<SurfacePatchIndex::TriangleSegment>>
 SurfacePatchIndex::computePlaneIntersections(
     const PlaneSurface& plane,
@@ -3511,16 +3606,22 @@ SurfacePatchIndex::computePlaneIntersections(
         return result;
     }
 
-    // Pad the bbox by 25% of the max extent (minimum 64 units)
-    const cv::Vec3f extent = viewBbox.high - viewBbox.low;
-    const float maxExtent = std::max(
-        std::abs(extent[0]), std::max(std::abs(extent[1]), std::abs(extent[2])));
-    const float padding = std::max(64.0f, maxExtent * 0.25f);
-    viewBbox.low -= cv::Vec3f(padding, padding, padding);
-    viewBbox.high += cv::Vec3f(padding, padding, padding);
+    // The four ROI corners all lie on the plane, so viewBbox is flat along
+    // the plane normal. bgi::intersects with this (near-)zero-thickness box
+    // already returns exactly the patch bboxes that straddle or touch the
+    // plane inside the ROI; the only slack needed is the R-tree box
+    // quantization (~1.54 units/axis, see boxSnap) plus the clip tolerance.
+    // Padding by a fraction of the viewport extent instead (as this used to)
+    // turns the query into a thousands-of-units-thick slab at zoomed-out
+    // views and makes the R-tree enumerate a large share of ALL patches.
+    constexpr float kQueryPad = 4.0f;
+    viewBbox.low -= cv::Vec3f(kQueryPad, kQueryPad, kQueryPad);
+    viewBbox.high += cv::Vec3f(kQueryPad, kQueryPad, kQueryPad);
 
-    // Map raw target pointers back to their shared_ptrs. Do not pre-create
-    // result vectors for every visible surface: large VC3D sessions can have
+    // Map raw target pointers back to their shared_ptrs. Also serves as the
+    // include filter, so the (possibly ~100k-entry) target set is not copied
+    // into a second raw-pointer set per query. Do not pre-create result
+    // vectors for every visible surface: large VC3D sessions can have
     // 100k+ targets, while a single viewport/plane usually intersects only a
     // small fraction of them.
     std::unordered_map<const QuadSurface*, SurfacePtr> targetByRaw;
@@ -3530,56 +3631,184 @@ SurfacePatchIndex::computePlaneIntersections(
             targetByRaw.emplace(t.get(), t);
         }
     }
+    if (targetByRaw.empty()) {
+        return result;
+    }
 
-    // Patch-level reject: skip patches whose bbox lies entirely on one
-    // side of the plane. plane.scalarp(p) returns signed distance from
-    // plane to point; if all 8 bbox corners share the same side of the
-    // plane (and clear the tolerance), the patch can't intersect.
+    // Recover the plane normal via scalarp so `plane` can stay const
+    // (Surface::normal() is non-const): scalarp(p) = p·n - o·n with |n| = 1.
+    const float planeD0 = plane.scalarp({0.0f, 0.0f, 0.0f});
+    const cv::Vec3f planeNormalAbs(
+        std::abs(plane.scalarp({1.0f, 0.0f, 0.0f}) - planeD0),
+        std::abs(plane.scalarp({0.0f, 1.0f, 0.0f}) - planeD0),
+        std::abs(plane.scalarp({0.0f, 0.0f, 1.0f}) - planeD0));
+
+    // Patch-level reject: skip patches whose bbox lies entirely on one side
+    // of the plane, via the standard center-vs-projected-radius box/plane
+    // test (one scalarp instead of eight corner evaluations).
     //
     // R-tree boxes are quantized through boxSnap (16-bit per axis over
-    // ~101000 units → ~1.54 units/step). The stored lo/hi can each
-    // shift by up to half a step inward, shrinking the box by up to
-    // one full step per axis vs the true patch bbox. We expand the
-    // box by one step on every side before the corner test so a
+    // ~101000 units → ~1.54 units/step). The stored lo/hi can each shift by
+    // up to half a step inward, shrinking the box by up to one full step per
+    // axis vs the true patch bbox; kQuantPad widens the half-extents so a
     // genuinely-intersecting patch is never wrongly rejected.
     constexpr float kQuantPad = 1.6f;  // > one quant step (~1.541)
     auto bboxStraddlesPlane = [&](const Impl::Box3& box) {
         const auto& lo = box.min_corner();
         const auto& hi = box.max_corner();
-        const float lox = lo.get<0>() - kQuantPad;
-        const float loy = lo.get<1>() - kQuantPad;
-        const float loz = lo.get<2>() - kQuantPad;
-        const float hix = hi.get<0>() + kQuantPad;
-        const float hiy = hi.get<1>() + kQuantPad;
-        const float hiz = hi.get<2>() + kQuantPad;
-        const float d000 = plane.scalarp({lox, loy, loz});
-        const float d100 = plane.scalarp({hix, loy, loz});
-        const float d010 = plane.scalarp({lox, hiy, loz});
-        const float d110 = plane.scalarp({hix, hiy, loz});
-        const float d001 = plane.scalarp({lox, loy, hiz});
-        const float d101 = plane.scalarp({hix, loy, hiz});
-        const float d011 = plane.scalarp({lox, hiy, hiz});
-        const float d111 = plane.scalarp({hix, hiy, hiz});
-        const float dmin = std::min({d000, d100, d010, d110, d001, d101, d011, d111});
-        const float dmax = std::max({d000, d100, d010, d110, d001, d101, d011, d111});
-        return dmin <= clipTolerance && dmax >= -clipTolerance;
+        const float ex = 0.5f * (hi.get<0>() - lo.get<0>()) + kQuantPad;
+        const float ey = 0.5f * (hi.get<1>() - lo.get<1>()) + kQuantPad;
+        const float ez = 0.5f * (hi.get<2>() - lo.get<2>()) + kQuantPad;
+        const float radius = ex * planeNormalAbs[0] +
+                             ey * planeNormalAbs[1] +
+                             ez * planeNormalAbs[2];
+        const float centerDist = plane.scalarp({0.5f * (lo.get<0>() + hi.get<0>()),
+                                                0.5f * (lo.get<1>() + hi.get<1>()),
+                                                0.5f * (lo.get<2>() + hi.get<2>())});
+        return std::abs(centerDist) <= radius + clipTolerance;
     };
 
-    // Fused visitor: for every triangle the R-tree spits out, clip it
-    // against the plane right there and append the resulting segment to
-    // the per-surface bucket. Skips the intermediate TriangleCandidate
-    // vector and the bySurface grouping pass entirely.
-    SurfaceFilter surfaceFilter;
-    surfaceFilter.include = &targets;
-    forEachTriangleImpl(viewBbox, surfaceFilter,
-        [&](const TriangleCandidate& tri) {
-            auto seg = clipTriangleToPlane(tri, plane, clipTolerance);
-            if (!seg) return;
-            auto it = targetByRaw.find(tri.surface.get());
-            if (it == targetByRaw.end()) return;
-            result[it->second].push_back(std::move(*seg));
-        },
-        bboxStraddlesPlane);
+    // Hold the reader lock across BOTH phases below: phase 2's workers read
+    // surface/tile data without taking the lock themselves, relying on this
+    // thread to keep writers out until they are joined.
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!impl_ || !impl_->tree) {
+        return result;
+    }
+
+    const int triStride = std::max(1, impl_->samplingStride);
+    const int tile = std::max(triStride, impl_->tileStride);
+
+    // Phase 1 (serial): drain the R-tree query, keeping only tiles that
+    // belong to a target surface and actually straddle the plane, and
+    // resolve each surviving surface's metadata once.
+    std::vector<Impl::PatchRecord> tiles;
+    std::unordered_map<QuadSurface*, Impl::TileSurfaceCache> surfaceCacheMap;
+    auto collectTile = [&](const Impl::Entry& entry) {
+        const Impl::PatchRecord& rec = entry.second;
+        if (targetByRaw.find(rec.surface) == targetByRaw.end()) {
+            return;
+        }
+        if (!bboxStraddlesPlane(entry.first)) {
+            return;
+        }
+        auto cacheIt = surfaceCacheMap.find(rec.surface);
+        if (cacheIt == surfaceCacheMap.end()) {
+            auto srIt = impl_->surfaceRecords.find(rec.surface);
+            if (srIt == impl_->surfaceRecords.end()) {
+                return;
+            }
+            const cv::Vec3f center = rec.surface->center();
+            const cv::Vec2f scale = rec.surface->scale();
+            int rows = 0;
+            int cols = 0;
+            if (rec.mapped) {
+                rows = rec.mapped->rows();
+                cols = rec.mapped->cols();
+            } else {
+                const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
+                rows = points ? points->rows : 0;
+                cols = points ? points->cols : 0;
+            }
+            surfaceCacheMap.emplace(rec.surface,
+                Impl::TileSurfaceCache{center[0] * scale[0], center[1] * scale[1],
+                                       rows, cols, srIt->second.surface});
+        }
+        tiles.push_back(rec);
+    };
+
+    Impl::Point3 minPt(viewBbox.low[0], viewBbox.low[1], viewBbox.low[2]);
+    Impl::Point3 maxPt(viewBbox.high[0], viewBbox.high[1], viewBbox.high[2]);
+    try {
+        impl_->tree->query(bgi::intersects(Impl::Box3(minPt, maxPt)),
+                           boost::make_function_output_iterator(collectTile));
+    } catch (const std::exception& e) {
+        std::cerr << "[SurfacePatchIndex] plane intersection query failed: "
+                  << e.what() << std::endl;
+        return result;
+    } catch (...) {
+        std::cerr << "[SurfacePatchIndex] plane intersection query failed: unknown exception"
+                  << std::endl;
+        return result;
+    }
+    if (tiles.empty()) {
+        return result;
+    }
+
+    // Phase 2: sub-triangulate + clip every surviving tile, fanned out over
+    // std::async workers into per-worker buckets (cv::parallel_for_/OMP are
+    // deliberately pinned to one thread in VC3D, so fan out manually). The
+    // per-tile work is independent and reads only const data.
+    using RawBuckets = std::unordered_map<const QuadSurface*, std::vector<TriangleSegment>>;
+    auto processRange = [&](std::size_t begin, std::size_t end, RawBuckets& out) {
+        for (std::size_t k = begin; k < end; ++k) {
+            const Impl::PatchRecord& rec = tiles[k];
+            const Impl::TileSurfaceCache& cache = surfaceCacheMap.find(rec.surface)->second;
+            Impl::emitTileTriangles(rec, triStride, tile, cache, viewBbox,
+                [&](const TriangleCandidate& tri) {
+                    auto seg = clipTriangleToPlane(tri, plane, clipTolerance);
+                    if (!seg) {
+                        return;
+                    }
+                    out[rec.surface].push_back(std::move(*seg));
+                });
+        }
+    };
+
+    // Below ~a few hundred tiles the clip work is cheaper than thread spawn.
+    constexpr std::size_t kMinTilesPerWorker = 256;
+    const std::size_t hw = std::max(1u, std::thread::hardware_concurrency());
+    const std::size_t workerCount = std::min<std::size_t>(
+        {hw, 16, std::max<std::size_t>(1, tiles.size() / kMinTilesPerWorker)});
+
+    std::vector<RawBuckets> buckets(workerCount);
+    if (workerCount <= 1) {
+        processRange(0, tiles.size(), buckets[0]);
+    } else {
+        const std::size_t chunk = (tiles.size() + workerCount - 1) / workerCount;
+        std::vector<std::future<void>> futures;
+        futures.reserve(workerCount - 1);
+        try {
+            for (std::size_t w = 1; w < workerCount; ++w) {
+                const std::size_t begin = w * chunk;
+                const std::size_t end = std::min(tiles.size(), begin + chunk);
+                if (begin >= end) {
+                    break;
+                }
+                futures.push_back(std::async(std::launch::async,
+                    [&processRange, &buckets, begin, end, w]() {
+                        processRange(begin, end, buckets[w]);
+                    }));
+            }
+            processRange(0, std::min(tiles.size(), chunk), buckets[0]);
+            for (auto& f : futures) {
+                f.get();
+            }
+        } catch (const std::exception& e) {
+            // std::async futures join in their destructor, so remaining
+            // workers are safely drained before the lock is released.
+            std::cerr << "[SurfacePatchIndex] plane intersection clip failed: "
+                      << e.what() << std::endl;
+            return result;
+        }
+    }
+
+    for (auto& bucket : buckets) {
+        for (auto& [raw, segments] : bucket) {
+            auto it = targetByRaw.find(raw);
+            if (it == targetByRaw.end()) {
+                continue;
+            }
+            auto& out = result[it->second];
+            if (out.empty()) {
+                out = std::move(segments);
+            } else {
+                out.insert(out.end(),
+                           std::make_move_iterator(segments.begin()),
+                           std::make_move_iterator(segments.end()));
+            }
+        }
+    }
 
     return result;
 }

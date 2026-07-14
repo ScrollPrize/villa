@@ -52,6 +52,7 @@ public:
 
     // tool specific params 
     void setRenderParams(float scale, int resolution, int layers);
+    void setRenderVoxelSize(double voxelSizeUm, bool enabled);
     void setRenderAdvanced(int cropX, int cropY, int cropWidth, int cropHeight,
                            const QString& affinePath, bool invertAffine,
                            float scaleSegmentation, double rotateDegrees, int flipAxis);
@@ -159,6 +160,8 @@ private:
     float _scale;
     int _resolution;
     int _layers;
+    double _renderVoxelSizeUm{0.0};
+    bool _useRenderVoxelSize{false};
     // Advanced render options
     int _cropX{0};
     int _cropY{0};

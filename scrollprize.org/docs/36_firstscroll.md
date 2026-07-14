@@ -47,7 +47,7 @@ import JsonLd from '@site/src/components/JsonLd';
 
 <div className="opacity-60 mb-8 italic">June 25th, 2026</div>
 
-**Read the preprint:** <a href="/pdf/main.pdf" target="_blank" rel="noopener"><em>Complete virtual unwrapping and reading of a rolled Herculaneum papyrus</em> (PDF)</a>. The data is openly available at [scrollprize.org/data](/data), and the code on [GitHub](https://github.com/ScrollPrize/villa).
+**Read the preprint:** <a href="/pdf/main.pdf" target="_blank" rel="noopener"><em>Complete virtual unwrapping and reading of a rolled Herculaneum papyrus</em> (PDF)</a> and on <a href="https://arxiv.org/abs/2606.29085" target="_blank" rel="noopener">arXiv</a>. The data is openly available at [scrollprize.org/data](/data), and the code on [GitHub](https://github.com/ScrollPrize/villa).
 
 For almost 2,000 years, the carbonized library of Herculaneum has kept a cruel bargain: its scrolls survived the eruption of Mount Vesuvius, but only by becoming too fragile to open. To read one was to destroy it. Hundreds of rolls have therefore remained sealed, their contents preserved yet unreachable.
 
@@ -147,7 +147,7 @@ PHerc. 1667 is one scroll. Hundreds more remain sealed — an entire library of 
 
 If you want to help read the rest of the library:
 
-- **Read the science:** the <a href="/pdf/main.pdf" target="_blank" rel="noopener">preprint (PDF)</a>.
+- **Read the science:** the <a href="/pdf/main.pdf" target="_blank" rel="noopener">preprint (PDF)</a>, also on  <a href="https://arxiv.org/abs/2606.29085" target="_blank" rel="noopener">arXiv</a>.
 - **Get the data and code:** [scrollprize.org/data](/data) and [GitHub](https://github.com/ScrollPrize/villa).
 - **Join the effort:** [get started](/get_started) and become part of the community reading the scrolls.
 

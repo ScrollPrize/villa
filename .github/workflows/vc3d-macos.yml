@@ -1,0 +1,210 @@
+name: VC3D macOS App
+run-name: VC3D macOS ${{ github.event_name }} ${{ inputs.request_id || github.sha }}
+
+# Builds VC3D natively on macOS (Apple Silicon) with the Homebrew LLVM
+# toolchain and produces a self-contained VC3D.app — full dylib closure and
+# Qt plugins bundled via macdeployqt, everything ad-hoc signed — wrapped in a
+# drag-and-drop DMG by CPack, with a ZIP derived from that deployed bundle. On
+# published releases both are attached to the GitHub release.
+#
+# No Developer ID signing / notarization: downloads are Gatekeeper-quarantined,
+# so the first launch is right-click -> Open (or
+# `xattr -dr com.apple.quarantine VC3D.app`).
+#
+# Binaries link Homebrew bottles built for the runner's macOS release, so the
+# package effectively requires that macOS major version or newer (recorded as
+# LSMinimumSystemVersion in the app's Info.plist).
+
+on:
+  # Keep the existing workflow check present on PRs, but satisfy it with a
+  # lightweight no-op; vc3d-ci owns the required native macOS compile gate.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-macos.yml'
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Commit to package (defaults to the selected workflow ref)
+        required: false
+        type: string
+      request_id:
+        description: Optional caller correlation ID
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer main build supersedes an older package build. Never cancel a
+  # release or an explicitly requested build.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
+jobs:
+  pr-noop:
+    name: Build + package (Homebrew LLVM, arm64)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - run: echo "Native compile coverage is provided by the required vc3d-ci macOS job."
+
+  build-macos:
+    name: Build + package (Homebrew LLVM, arm64)
+    if: github.event_name != 'pull_request'
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-macos-15-arm64-homebrew-llvm-deps-b21145c7
+    defaults:
+      run:
+        working-directory: volume-cartographer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.sha }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ScrollPrize/vc3d-deps
+          ref: b21145c78af694a0fc574249a3f7ae6f037f8bea
+          path: vc3d-deps
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Restore prebuilt Homebrew dependencies
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | oras login ghcr.io -u '${{ github.actor }}' --password-stdin
+          oras pull ghcr.io/scrollprize/vc3d-deps/macos:sha-b21145c78af694a0fc574249a3f7ae6f037f8bea -o "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/vc3d-deps/macos/restore.sh" \
+            "$RUNNER_TEMP/vc3d-macos-15-arm64.tar.zst"
+
+      - name: Set up shared compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+
+      - name: Build
+        run: ./scripts/build_macos.sh --sccache
+
+      - name: Package (DMG + ZIP)
+        run: |
+          cd build-macos
+          cpack -V -G DragNDrop
+
+          # CPack stages and installs once per generator. Derive the ZIP from
+          # the completed DMG so macdeployqt and install-name rewriting run
+          # only once while both artifacts contain the exact same app bundle.
+          shopt -s nullglob
+          dmgs=(VC3D-*-macos-*.dmg)
+          if [[ ${#dmgs[@]} -ne 1 ]]; then
+            echo "::error::expected exactly one packaged DMG, found ${#dmgs[@]}"
+            exit 1
+          fi
+          dmg="${dmgs[0]}"
+          zip="${dmg%.dmg}.zip"
+          mountpoint="$RUNNER_TEMP/vc3d-package"
+          mkdir -p "$mountpoint"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mountpoint"
+          trap 'hdiutil detach "$mountpoint"' EXIT
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$mountpoint/VC3D.app" "$zip"
+          hdiutil detach "$mountpoint"
+          trap - EXIT
+
+          ls -la VC3D-*-macos-*.dmg VC3D-*-macos-*.zip
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VC3D-macos-app
+          path: |
+            volume-cartographer/build-macos/VC3D-*-macos-*.dmg
+            volume-cartographer/build-macos/VC3D-*-macos-*.zip
+          if-no-files-found: error
+
+      # Prove the bundle is self-contained: check no absolute Homebrew or
+      # build-tree paths survived in any Mach-O, then hide the entire Homebrew
+      # prefix and run binaries out of the DMG-installed app, so any dylib
+      # missing from the bundle fails loudly here instead of on a user's Mac.
+      - name: Smoke test packaged app
+        timeout-minutes: 15
+        working-directory: volume-cartographer/build-macos
+        run: |
+          hdiutil attach VC3D-*-macos-*.dmg -nobrowse -readonly -mountpoint /tmp/vc3d-dmg
+          cp -R /tmp/vc3d-dmg/VC3D.app smoke.app
+          hdiutil detach /tmp/vc3d-dmg
+          bin="$PWD/smoke.app/Contents/MacOS"
+
+          # Any absolute Homebrew/build-tree dependency path in the bundle
+          # would resolve on this runner but not on a user's machine. Scan
+          # every executable/dylib including framework binaries (no .dylib
+          # suffix); otool noise on non-Mach-O files is discarded.
+          leaks=$(find smoke.app -type f \( -perm +111 -o -name '*.dylib' \) \
+                    -exec otool -L {} + 2>/dev/null \
+                    | grep -E "$(brew --prefix)/|$GITHUB_WORKSPACE" || true)
+          if [[ -n "$leaks" ]]; then
+            echo "::error::absolute dependency paths leaked into the bundle:"
+            echo "$leaks"
+            exit 1
+          fi
+
+          sudo mv /opt/homebrew /opt/homebrew.hidden
+          trap 'sudo mv /opt/homebrew.hidden /opt/homebrew' EXIT
+
+          # Console CLI tool: loads the vc_core/OpenCV/Ceres dylib closure.
+          # No-args prints usage and exits 1; anything else means load failure.
+          set +e
+          "$bin/vc_tifxyz_trim"; rc=$?
+          set -e
+          if [[ $rc -ne 0 && $rc -ne 1 ]]; then
+            echo "::error::vc_tifxyz_trim failed to start (exit $rc)"
+            exit 1
+          fi
+          echo "vc_tifxyz_trim OK (exit $rc)"
+
+          # GUI app: Homebrew's macOS Qt package ships the native Cocoa
+          # platform plugin, not the offscreen plugin. --version exits without
+          # showing a window while still exercising the packaged Qt framework
+          # and native platform plugin lookup.
+          QT_QPA_PLATFORM=cocoa "$bin/VC3D" --version
+          echo "VC3D --version OK"
+
+  release-macos:
+    name: Attach macOS package to release
+    if: github.event_name == 'release'
+    needs: build-macos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download app artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: VC3D-macos-app
+          path: release-assets
+
+      - name: Attach app to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            release-assets/VC3D-*-macos-*.dmg \
+            release-assets/VC3D-*-macos-*.zip \
+            --clobber

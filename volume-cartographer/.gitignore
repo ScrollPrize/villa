@@ -55,5 +55,9 @@ VC.ini
 
 build/perf.data
 
+# AppImage packaging output (scripts/build_appimage.sh / Dockerfile.appimage)
+dist/
+*.AppImage
+
 # Claude Code runtime
 .claude/

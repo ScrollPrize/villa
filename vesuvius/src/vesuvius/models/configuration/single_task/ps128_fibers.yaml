@@ -1,0 +1,47 @@
+# Binary fiber segmentation in the PHercParis4 image frame.
+#
+# Labels (fibers): s1a-fibers-230125-ome.zarr, authored in the canonical
+# fixed frame. Image: the 2.4um masked volume, moving frame. The two are
+# related by transform.json (sibling of the image zarr). We sample patches
+# natively in label-voxel coords and resample the image through inv(M).
+#
+# Invocation:
+#   uv run vesuvius.train \
+#     --config src/vesuvius/models/configuration/single_task/ps128_fibers.yaml \
+#     --input /path/to/fibers_cache_dir \
+#     --output ./checkpoints
+
+tr_setup:
+  model_name: "fibers_ps128"
+
+tr_config:
+  patch_size: [128, 128, 128]
+  batch_size: 2
+  enable_deep_supervision: false
+  num_dataloader_workers: 4
+  max_epoch: 1000
+  max_steps_per_epoch: 250
+  max_val_steps_per_epoch: 50
+  optimizer: "SGD"
+  initial_lr: 0.01
+  weight_decay: 0.00003
+
+dataset_config:
+  dataset_type: "cross_frame"
+  image_zarr_url: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/0"
+  labels_zarr_url: "https://dl.ash2txt.org/other/dev/meshes/s1a-fibers-230125-ome.zarr/0"
+  transform_json_url: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/transform.json"
+  storage_options:
+    anon: true
+  min_labeled_ratio: 0.01
+  min_bbox_percent: 0.15
+  normalization_scheme: "zscore"
+  skip_patch_validation: false
+  # valid_patch_value: null  -> treat any nonzero label voxel as fiber (255 or 1)
+  targets:
+    fibers:
+      out_channels: 2
+      activation: "none"
+      losses:
+        - name: "nnUNet_DC_and_CE_loss"
+          weight: 1.0

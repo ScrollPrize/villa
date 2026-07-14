@@ -1,0 +1,169 @@
+name: VC3D Linux AppImage
+run-name: VC3D Linux ${{ github.event_name }} ${{ inputs.request_id || github.sha }}
+
+# Builds VC3D in the Ubuntu 26.04 CI builder image and packages it into a single
+# self-contained AppImage via scripts/Dockerfile.appimage. glibc + the dynamic
+# loader are bundled, so the result runs on distros with an OLDER glibc than the
+# build image; a split-out debug-symbols companion (VC3D-<arch>-debug.tar.zst) is
+# produced alongside. Main, release, and manual runs also smoke-test the AppImage
+# on the plain ubuntu-24.04 runner (glibc 2.39, older than the 26.04 build image)
+# with no build deps installed, so a missing bundle or a too-new glibc reference
+# fails loudly here instead of on a user's machine. Published-release AppImages
+# are attached to the GitHub release.
+
+on:
+  # Keep the workflow check present on PRs, but satisfy it with a lightweight
+  # no-op; vc3d-ci owns the required native Linux compile gate.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-linux.yml'
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Commit to package (defaults to the selected workflow ref)
+        required: false
+        type: string
+      request_id:
+        description: Optional caller correlation ID
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer main build supersedes an older package build. Never cancel a release
+  # or an explicitly requested build.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
+jobs:
+  pr-noop:
+    name: Build + package (AppImage)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - run: echo "Native compile coverage is provided by the required vc3d-ci Linux job."
+
+  build-linux:
+    name: Build + package (AppImage)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.sha }}
+
+      # The build runs inside the published CI builder image (Ubuntu 26.04 + all
+      # deps); logging in lets `docker build` pull it from ghcr.
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build AppImage
+        working-directory: volume-cartographer
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            -o type=local,dest=dist \
+            -f scripts/Dockerfile.appimage \
+            .
+          ls -la dist/
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VC3D-linux-appimage
+          path: |
+            volume-cartographer/dist/VC3D-*.AppImage
+            volume-cartographer/dist/VC3D-*-debug.tar.zst
+          if-no-files-found: error
+
+      # Prove the AppImage is self-contained AND runs on an older glibc than the
+      # 26.04 build image: run it on the plain ubuntu-24.04 runner (glibc 2.39)
+      # with no *build/dev* deps installed.
+      - name: Smoke test the AppImage
+        working-directory: volume-cartographer/dist
+        timeout-minutes: 10
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: |
+          # Install ONLY the documented runtime host prerequisites (the GL / X11 /
+          # font stack from scripts/appimage/README.md) — never any build/dev
+          # deps. The AppImage deliberately leaves this stack to the host: it is
+          # driver-coupled (GL) or version-sensitive (fonts). Note OpenCV is built
+          # WITH_OPENGL, so libopencv_core has a load-time libGLX.so.0 dependency —
+          # every tool links it, so even the CLI needs the GL libs *present* (no
+          # display required). Installing exactly this set both makes the test
+          # meaningful and validates that the documented prerequisite list is
+          # sufficient. xvfb supplies the virtual display for the GUI check only.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb \
+            libglvnd0 libglx0 libegl1 libopengl0 libgl1 libgl1-mesa-dri libglx-mesa0 \
+            libx11-6 libx11-xcb1 libxcb1 libice6 libsm6 \
+            libfontconfig1 libfreetype6 libharfbuzz0b
+          appimage="$(ls VC3D-*.AppImage)"
+          chmod +x "$appimage"
+          echo "runner glibc: $(ldd --version | head -1)"
+
+          # Console CLI tool via the symlink dispatch: loads the vc_core/OpenCV/
+          # Ceres closure against the bundled glibc. No-args prints usage and
+          # exits 1; anything else means a load failure (missing lib / too-new
+          # glibc reference).
+          ln -sf "$appimage" vc_tifxyz_trim
+          set +e; ./vc_tifxyz_trim; rc=$?; set -e
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+            echo "::error::vc_tifxyz_trim failed to start (exit $rc)"; exit 1
+          fi
+          echo "vc_tifxyz_trim OK (exit $rc)"
+
+          # GUI: initialize the real xcb Qt stack under a virtual display. VC3D
+          # has no clean --version/--help exit on Linux, so assert a known
+          # startup marker with no crash-report banner, then let the timeout stop
+          # it.
+          out="$(timeout 40 xvfb-run -a ./"$appimage" </dev/null 2>&1 || true)"
+          echo "$out" | grep -viE '^(Detected locale|Qt depends|If this causes|for more info)' | tail -20
+          if echo "$out" | grep -q "CRASH REPORT"; then
+            echo "::error::VC3D crashed during GUI startup"; exit 1
+          fi
+          if ! echo "$out" | grep -qiE "Axis-aligned slices|chunk cache budget"; then
+            echo "::error::VC3D GUI did not reach expected startup markers"; exit 1
+          fi
+          echo "VC3D GUI init OK"
+
+  release-linux:
+    name: Attach Linux AppImage to release
+    if: github.event_name == 'release'
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download AppImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: VC3D-linux-appimage
+          path: release-assets
+
+      - name: Attach AppImage to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            release-assets/VC3D-*.AppImage \
+            release-assets/VC3D-*-debug.tar.zst \
+            --clobber

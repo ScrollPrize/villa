@@ -69,9 +69,9 @@ TEST_CASE("PHerc 0172 zarr level 5 .zarray is reachable + has expected shape")
     REQUIRE(j.contains("shape"));
     REQUIRE(j.contains("chunks"));
     REQUIRE(j.contains("dtype"));
-    // Pinned values from the live bucket as observed 2026-05.
+    // Pinned values from the live bucket as observed 2026-06.
     CHECK(j["dtype"].get_string() == "|u1");
-    CHECK(j["shape"].at(0).get_int64() == 651);
+    CHECK(j["shape"].at(0).get_int64() == 657);
     CHECK(j["shape"].at(1).get_int64() == 210);
     CHECK(j["shape"].at(2).get_int64() == 285);
     CHECK(j["chunks"].at(0).get_int64() == 128);

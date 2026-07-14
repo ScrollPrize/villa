@@ -1,5 +1,7 @@
 #include "CFiberWidget.hpp"
 
+#include "FiberNameDisplay.hpp"
+
 #include <QAbstractItemView>
 #include <QAction>
 #include <QApplication>
@@ -25,7 +27,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <optional>
 #include <set>
 #include <utility>
 
@@ -66,163 +67,6 @@ bool containsTag(const std::vector<std::string>& tags, const std::string& tag)
     return std::find(tags.begin(), tags.end(), tag) != tags.end();
 }
 
-bool allDigits(const QString& text)
-{
-    if (text.isEmpty()) {
-        return false;
-    }
-    for (const QChar ch : text) {
-        if (!ch.isDigit()) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool looksLikeFiberTimestamp(const QString& text)
-{
-    if (text.size() < 10 || text[8] != QLatin1Char('T')) {
-        return false;
-    }
-    for (int i = 0; i < text.size(); ++i) {
-        if (i == 8) {
-            continue;
-        }
-        if (!text[i].isDigit()) {
-            return false;
-        }
-    }
-    return true;
-}
-
-QString displayStemForFiberFile(QString fileName)
-{
-    fileName = fileName.trimmed();
-    const int slash = std::max(fileName.lastIndexOf(QLatin1Char('/')),
-                               fileName.lastIndexOf(QLatin1Char('\\')));
-    if (slash >= 0) {
-        fileName = fileName.mid(slash + 1);
-    }
-    if (fileName.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive)) {
-        fileName.chop(5);
-    }
-    if (fileName.isEmpty()) {
-        return QString();
-    }
-
-    return fileName;
-}
-
-struct FiberNameParts {
-    QString prefix;
-    QString timestamp;
-    QString sequence;
-};
-
-std::optional<FiberNameParts> splitFiberName(QString name)
-{
-    const int lastSeparator = name.lastIndexOf(QLatin1Char('_'));
-    const int timestampSeparator = lastSeparator > 0
-        ? name.lastIndexOf(QLatin1Char('_'), lastSeparator - 1)
-        : -1;
-    if (timestampSeparator >= 0 && lastSeparator > timestampSeparator) {
-        const QString prefix = name.left(timestampSeparator);
-        const QString timestamp =
-            name.mid(timestampSeparator + 1, lastSeparator - timestampSeparator - 1);
-        const QString sequence = name.mid(lastSeparator + 1);
-        if (!prefix.isEmpty() &&
-            looksLikeFiberTimestamp(timestamp) &&
-            sequence.size() == 6 &&
-            allDigits(sequence)) {
-            return FiberNameParts{prefix, timestamp, sequence};
-        }
-    }
-
-    return std::nullopt;
-}
-
-QString rightElideAscii(const QString& text, const QFontMetrics& metrics, int width)
-{
-    if (width <= 0) {
-        return QString();
-    }
-    if (metrics.horizontalAdvance(text) <= width) {
-        return text;
-    }
-
-    const QString ellipsis = QStringLiteral("...");
-    if (metrics.horizontalAdvance(ellipsis) > width) {
-        return QString();
-    }
-
-    for (int kept = text.size() - 1; kept >= 0; --kept) {
-        const QString candidate = text.left(kept) + ellipsis;
-        if (metrics.horizontalAdvance(candidate) <= width) {
-            return candidate;
-        }
-    }
-
-    return ellipsis;
-}
-
-QString elidePrefixBeforeSuffix(const QString& prefix,
-                                const QString& suffix,
-                                const QFontMetrics& metrics,
-                                int width)
-{
-    if (width <= 0) {
-        return QString();
-    }
-
-    const QString full = prefix + suffix;
-    if (metrics.horizontalAdvance(full) <= width) {
-        return full;
-    }
-
-    if (metrics.horizontalAdvance(suffix) >= width) {
-        return metrics.elidedText(suffix, Qt::ElideLeft, width);
-    }
-
-    const int prefixWidth = width - metrics.horizontalAdvance(suffix);
-    QString shortenedPrefix = rightElideAscii(prefix, metrics, prefixWidth);
-    QString candidate = shortenedPrefix + suffix;
-    if (!shortenedPrefix.isEmpty() && metrics.horizontalAdvance(candidate) <= width) {
-        return candidate;
-    }
-
-    return suffix;
-}
-
-QString adaptFiberNameToWidth(const QString& name, const QFontMetrics& metrics, int width)
-{
-    if (width <= 0 || metrics.horizontalAdvance(name) <= width) {
-        return name;
-    }
-
-    const std::optional<FiberNameParts> parts = splitFiberName(name);
-    if (!parts) {
-        return metrics.elidedText(name, Qt::ElideRight, width);
-    }
-
-    const QString fixedText = parts->prefix + QStringLiteral("__") + parts->sequence;
-    const int timestampWidth = width - metrics.horizontalAdvance(fixedText);
-    QString timestamp = rightElideAscii(parts->timestamp, metrics, timestampWidth);
-    if (timestamp.isEmpty()) {
-        timestamp = QStringLiteral("...");
-    }
-
-    const QString candidate = parts->prefix + QLatin1Char('_') + timestamp +
-                              QLatin1Char('_') + parts->sequence;
-    if (metrics.horizontalAdvance(candidate) <= width) {
-        return candidate;
-    }
-
-    return elidePrefixBeforeSuffix(parts->prefix,
-                                   QStringLiteral("_..._") + parts->sequence,
-                                   metrics,
-                                   width);
-}
-
 class FiberNameDelegate final : public QStyledItemDelegate
 {
 public:
@@ -243,9 +87,9 @@ public:
 
         const QRect textRect =
             style->subElementRect(QStyle::SE_ItemViewItemText, &adjusted, adjusted.widget);
-        const QString displayText = adaptFiberNameToWidth(fullText,
-                                                          adjusted.fontMetrics,
-                                                          textRect.width());
+        const QString displayText = vc3d::adaptFiberNameToWidth(fullText,
+                                                                adjusted.fontMetrics,
+                                                                textRect.width());
         const QPalette::ColorRole textRole =
             adjusted.state & QStyle::State_Selected ? QPalette::HighlightedText : QPalette::Text;
 
@@ -545,6 +389,12 @@ void CFiberWidget::setupUi()
             this, &CFiberWidget::onRecalculateHvScoreClicked);
 
     auto* buttonLayout = new QHBoxLayout();
+    _importButton = new QPushButton(tr("Import"), mainWidget);
+    _importButton->setObjectName(QStringLiteral("fiberImportButton"));
+    buttonLayout->addWidget(_importButton);
+    _exportButton = new QPushButton(tr("Export"), mainWidget);
+    _exportButton->setObjectName(QStringLiteral("fiberExportButton"));
+    buttonLayout->addWidget(_exportButton);
     _deleteButton = new QPushButton(tr("Delete"), mainWidget);
     _deleteButton->setObjectName(QStringLiteral("fiberDeleteButton"));
     _deleteButton->setEnabled(false);
@@ -552,6 +402,12 @@ void CFiberWidget::setupUi()
     buttonLayout->addStretch(1);
     layout->addLayout(buttonLayout);
 
+    connect(_importButton, &QPushButton::clicked, this, [this]() {
+        emit importFibersRequested();
+    });
+    connect(_exportButton, &QPushButton::clicked, this, [this]() {
+        emit exportFibersRequested();
+    });
     connect(_deleteButton, &QPushButton::clicked, this, &CFiberWidget::onDeleteClicked);
 
     updateClassificationUi();
@@ -560,7 +416,7 @@ void CFiberWidget::setupUi()
 
 QString CFiberWidget::displayNameForFiber(const FiberEntry& fiber)
 {
-    const QString name = displayStemForFiberFile(QString::fromStdString(fiber.fileName));
+    const QString name = vc3d::displayStemForFiberFile(QString::fromStdString(fiber.fileName));
     return name.isEmpty() ? tr("unnamed") : name;
 }
 
@@ -1267,6 +1123,18 @@ void CFiberWidget::showContextMenu(const QPoint& pos)
     connect(newAtlasAction, &QAction::triggered, this, [this]() {
         if (_selectedFiberId != 0) {
             emit newAtlasFromFiberRequested(_selectedFiberId);
+        }
+    });
+    const auto selectedForCollection = selectedFiberIds();
+    auto* addToCollectionAction = menu.addAction(
+        selectedForCollection.size() > 1
+            ? tr("Add %1 lines to point collections").arg(selectedForCollection.size())
+            : tr("Add to point collection"));
+    addToCollectionAction->setEnabled(!selectedForCollection.empty());
+    connect(addToCollectionAction, &QAction::triggered, this, [this]() {
+        const auto ids = selectedFiberIds();
+        if (!ids.empty()) {
+            emit addFibersToPointCollectionsRequested(ids);
         }
     });
     auto* renameAction = createRenameFiberFileAction(&menu);

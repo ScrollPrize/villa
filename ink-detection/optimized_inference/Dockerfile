@@ -46,12 +46,17 @@ ENTRYPOINT ["python", "/app/entrypoint.py"]
 
 FROM python:3.11-slim AS cpu
 ENV DEBIAN_FRONTEND=noninteractive
+# build-essential: some deps (e.g. stringzilla, pulled in transitively by
+# albumentations -> albucore) ship no prebuilt aarch64 wheel and must compile
+# from source, which needs a C/C++ toolchain. The gpu stage above already
+# includes it for the same reason.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     ca-certificates \
     curl \
     git \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv

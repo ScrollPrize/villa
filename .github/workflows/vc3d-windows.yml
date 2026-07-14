@@ -1,0 +1,185 @@
+name: VC3D Windows Installer
+run-name: VC3D Windows ${{ github.event_name }} ${{ inputs.request_id || github.sha }}
+
+# Compiles VC3D natively on Windows under MSYS2/UCRT64 for PRs. Main, release,
+# and manual runs also produce and smoke-test a self-contained NSIS installer
+# (+ ZIP) with all DLLs and Qt plugins bundled. Published-release installers
+# are attached to the GitHub release for Windows 10/11 users.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-windows.yml'
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Commit to package (defaults to the selected workflow ref)
+        required: false
+        type: string
+      request_id:
+        description: Optional caller correlation ID
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer PR/main commit supersedes the older build, but release and manual
+  # packaging runs must finish once started.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
+jobs:
+  build-windows:
+    name: ${{ github.event_name == 'pull_request' && 'Compile' || 'Build + package' }} (MSYS2 UCRT64)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-windows-ucrt64-mingw-deps-d84dfa07
+    defaults:
+      run:
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+        working-directory: volume-cartographer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.sha }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ScrollPrize/vc3d-deps
+          ref: d84dfa0745dd2debbcec2126117878b241ffdb7f
+          path: vc3d-deps
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Restore prebuilt MSYS2 dependencies
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          $env:GHCR_TOKEN | oras login ghcr.io -u '${{ github.actor }}' --password-stdin
+          oras pull ghcr.io/scrollprize/vc3d-deps/windows:sha-d84dfa0745dd2debbcec2126117878b241ffdb7f -o $env:RUNNER_TEMP
+          & "$env:GITHUB_WORKSPACE\vc3d-deps\windows\restore.ps1" `
+            -Archive "$env:RUNNER_TEMP\vc3d-windows-ucrt64.7z"
+
+      - name: Set up shared compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+
+      - name: Reset compiler cache statistics
+        run: '"${SCCACHE_PATH}" --zero-stats'
+
+      - name: Configure
+        run: >-
+          cmake --preset ci-windows-mingw
+          -DVC_USE_SCCACHE=ON
+          -DSCCACHE_PROGRAM="${SCCACHE_PATH}"
+
+      - name: Build
+        run: ninja -C build/ci-windows-mingw
+
+      - name: Report compiler cache statistics
+        if: always()
+        run: '"${SCCACHE_PATH}" --show-stats'
+
+      - name: Package (NSIS installer + ZIP)
+        if: github.event_name != 'pull_request'
+        run: |
+          cd build/ci-windows-mingw
+          cpack -V
+          ls -la *.exe *.zip
+
+      - name: Upload installer artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: VC3D-windows-installer
+          path: |
+            volume-cartographer/build/ci-windows-mingw/VC3D-*-win64.exe
+            volume-cartographer/build/ci-windows-mingw/VC3D-*-win64.zip
+          if-no-files-found: error
+
+      # Prove the package is self-contained: unpack the ZIP and run binaries
+      # from plain PowerShell (no MSYS2 on PATH), so any DLL missing from the
+      # bundle fails loudly here instead of on a user's machine.
+      - name: Smoke test packaged tree
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        timeout-minutes: 10
+        working-directory: volume-cartographer/build/ci-windows-mingw
+        run: |
+          $zip = Get-Item VC3D-*-win64.zip
+          Expand-Archive $zip.FullName -DestinationPath smoke
+          $exe = Get-ChildItem smoke -Recurse -Filter VC3D.exe | Select-Object -First 1
+          $bin = $exe.DirectoryName
+          Write-Host "bundle bin dir: $bin"
+          # Console CLI tool: loads the vc_core/OpenCV/Ceres DLL closure.
+          # No-args prints usage and exits 1; anything else means load failure.
+          & "$bin\vc_tifxyz_trim.exe"
+          $trimExitCode = $LASTEXITCODE
+          if ($trimExitCode -notin 0,1) { throw "vc_tifxyz_trim failed to start (exit $trimExitCode)" }
+          Write-Host "vc_tifxyz_trim OK (exit $trimExitCode)"
+          # Start-Process below does not update $LASTEXITCODE. Clear the
+          # accepted usage exit so the Actions pwsh wrapper does not fail the
+          # step with this stale value after all smoke checks have passed.
+          $global:LASTEXITCODE = 0
+          # A deployed Windows Qt application uses platforms/qwindows.dll.
+          # Check it explicitly, then force that native backend so this probes
+          # the same platform plugin users will load. Do not force Qt's
+          # offscreen test backend: windeployqt does not deploy it for this app,
+          # and a GUI-subsystem Qt plugin-load error can block in a modal dialog.
+          $qwindows = Join-Path $bin "platforms\qwindows.dll"
+          if (-not (Test-Path $qwindows -PathType Leaf)) {
+            throw "Packaged Qt Windows platform plugin is missing: $qwindows"
+          }
+          $env:QT_QPA_PLATFORM = "windows"
+          # GUI-subsystem exe, so wait via Start-Process and check the exit
+          # code. Bound the process itself so a GUI-loop regression fails
+          # promptly instead of consuming the entire job-step timeout.
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList "--version" -PassThru -NoNewWindow
+          try {
+            Wait-Process -Id $p.Id -Timeout 60 -ErrorAction Stop
+          } catch {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw "VC3D --version did not exit within 60 seconds"
+          }
+          if ($p.ExitCode -ne 0) { throw "VC3D --version failed (exit $($p.ExitCode))" }
+          Write-Host "VC3D --version OK"
+
+  release-windows:
+    name: Attach Windows package to release
+    if: github.event_name == 'release'
+    needs: build-windows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: VC3D-windows-installer
+          path: release-assets
+
+      - name: Attach installer to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            release-assets/VC3D-*-win64.exe \
+            release-assets/VC3D-*-win64.zip \
+            --clobber

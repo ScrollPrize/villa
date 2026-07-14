@@ -52,15 +52,15 @@ TEST_CASE("Volume: shape and pyramid metadata match the upstream .zarray files")
     auto v = openOrSkip();
     if (!v) return;
 
-    // Base level (0) shape, pinned from the live bucket (.zarray observed 2026-05).
+    // Base level (0) shape, pinned from the live bucket (.zarray observed 2026-06).
     auto s0 = v->levelShape(0);
-    CHECK(s0[0] == 20820);
+    CHECK(s0[0] == 21000);
     CHECK(s0[1] == 6700);
     CHECK(s0[2] == 9100);
 
     // Level 5 (smallest pyramid level)
     auto s5 = v->levelShape(5);
-    CHECK(s5[0] == 651);
+    CHECK(s5[0] == 657);
     CHECK(s5[1] == 210);
     CHECK(s5[2] == 285);
 
@@ -121,8 +121,8 @@ TEST_CASE("Volume: chunkCount(level=5) matches grid size from the .zarray")
 {
     auto v = openOrSkip();
     if (!v) return;
-    // shape (651, 210, 285), chunks (128, 128, 128)
-    // grid = ceil(651/128)*ceil(210/128)*ceil(285/128) = 6*2*3 = 36
+    // shape (657, 210, 285), chunks (128, 128, 128)
+    // grid = ceil(657/128)*ceil(210/128)*ceil(285/128) = 6*2*3 = 36
     // (the live bucket actually has 30 chunks on-disk — missing ones are fill)
     CHECK(v->chunkCount(5) > 0);
 }

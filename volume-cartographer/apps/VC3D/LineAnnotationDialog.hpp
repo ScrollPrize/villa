@@ -1,9 +1,11 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QList>
 #include <QMetaObject>
 #include <QPointer>
 
+#include <cstdint>
 #include <memory>
 #include <functional>
 #include <map>
@@ -29,9 +31,11 @@ class QPoint;
 class QPushButton;
 class QCloseEvent;
 class QResizeEvent;
+class QTimer;
 class QVariantAnimation;
 class QVBoxLayout;
-class QWheelEvent;
+class QSplitter;
+class QSpinBox;
 class ViewerManager;
 class PlaneSurface;
 class QuadSurface;
@@ -90,6 +94,7 @@ public:
                                   VolumeSelectorFactory volumeSelectorFactory = {},
                                   QWidget* parent = nullptr);
 
+    void showWithSavedGeometry();
     CChunkedVolumeViewer* addPane(const std::string& surfaceName,
                                   const QString& title,
                                   const CChunkedVolumeViewer::CameraState& camera);
@@ -108,13 +113,18 @@ public:
     InitialDirectionMode initialDirectionMode() const;
     ReoptimizationMode reoptimizationMode() const;
     ShiftScrollMode shiftScrollMode() const;
+    int maxControlPointDistanceVx() const;
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
+    void setGeneratedBranchLinePoints(std::vector<std::vector<cv::Vec3f>> branchLinePoints);
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setGeneratedSpanAlignmentMetrics(
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
     void setOptimizationBusy(bool busy);
     void setOptimizationStatus(bool optimized);
+    void setFiberDisplayName(const QString& name);
     void setCloseAfterFinalizationAllowed(bool allowed);
+    void setWorkspaceEmbedded(bool embedded);
+    bool workspaceEmbedded() const { return _workspaceEmbedded; }
 
 signals:
     void paneClosed(const std::string& surfaceName);
@@ -125,6 +135,10 @@ signals:
     void generatedControlPointDeleteRequested(const std::string& surfaceName,
                                               double linePosition,
                                               cv::Vec3f volumePoint);
+    void generatedControlPointBranchRequested(const std::string& surfaceName,
+                                              size_t controlPointIndex);
+    void generatedControlPointBranchOpenRequested(uint64_t branchFiberId,
+                                                   int branchControlPointIndex);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
     void showAsMeshRequested();
@@ -151,20 +165,23 @@ private:
                                CChunkedVolumeViewer* viewer,
                                const GeneratedOverlay& overlay);
     double linePositionFromStripScene(CChunkedVolumeViewer* viewer, const QPointF& scenePoint) const;
-    void setCurrentLinePosition(double position,
-                                bool updateBottomCuts = true,
-                                bool updateCurrentCutOverlay = true);
+    // Coalesced entry point for the mouse-follow path: stores the latest line position and
+    // applies it at most once per ~render tick via _lineUpdateTimer, so a burst of mouse-move
+    // events collapses into a single (potentially O(N)) plane/overlay rebuild instead of one
+    // per event. Discrete callers (keyboard jumps, clicks, scroll) keep calling
+    // setCurrentLinePosition directly for immediate response.
+    void requestCurrentLinePosition(double position);
+    void setCurrentLinePosition(double position, bool updateCurrentCutOverlay = true);
     void cancelControlPointPreviewAnimation();
     void jumpToPreviousControlPoint();
     void jumpToNextControlPoint();
     void previewClosestControlPoint();
     bool shiftCurrentLinePositionByScrollSteps(int steps);
     bool shiftCurrentCutPlaneStraightByScrollSteps(int steps);
-    bool shiftBottomSlicesByScrollSteps(int steps);
-    bool scaleBottomSliceLineStepByScrollSteps(int steps);
-    bool handleBottomSliceStepWheel(QWheelEvent* event);
     void handleShiftScrollModeChanged();
     void setCurrentCutFollowsStripMouse(bool follows);
+    bool controlPointPlacementAllowedAt(double linePosition) const;
+    vc3d::line_annotation::GeneratedCurrentLineMarkerState currentLineMarkerState() const;
     double snappedControlPointPosition(double position) const;
     void rebuildGeneratedStaticStripOverlays();
     void rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay = true,
@@ -194,20 +211,29 @@ private:
     cv::Vec3f interpolatedLineTangent(double linePosition) const;
     cv::Vec3f interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const;
     bool updatePlaneSurface(PlaneSurface* plane, double linePosition) const;
-    void updateBottomSliceStepLabel();
+    bool updateSidePlaneSurface(PlaneSurface* plane, double linePosition);
+    // Least-squares fit of the side-view plane orientation for the window centered on the given
+    // (integer) line index. Pure/cacheable: depends only on the static line geometry.
+    bool computeSideFit(int center, cv::Vec3f& normal, cv::Vec3f& upHint) const;
     QPointF stripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                      QuadSurface* surface,
                                      double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);
     void updateOptimizationOverlayGeometry();
+    void updateFiberNameLabel();
+    void restoreWindowGeometry();
+    void saveWindowGeometry() const;
+    void restoreGeneratedViewStateSettings();
+    void saveGeneratedViewStateSettings();
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
     QComboBox* _initialDirectionCombo = nullptr;
     QComboBox* _reoptimizationCombo = nullptr;
     QComboBox* _shiftScrollCombo = nullptr;
+    QSpinBox* _maxControlPointDistanceSpin = nullptr;
+    QLabel* _fiberNameLabel = nullptr;
     QLabel* _sliceStepLabel = nullptr;
-    QLabel* _bottomSliceStepLabel = nullptr;
     QLabel* _optimizationStatusLabel = nullptr;
     QPushButton* _showAsMeshButton = nullptr;
     QPushButton* _fullOptimizationButton = nullptr;
@@ -217,23 +243,55 @@ private:
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;
     bool _closeAfterFinalizationAllowed = false;
+    bool _workspaceEmbedded = false;
+    QString _fiberDisplayName;
 
     QWidget* _generatedTopWidget = nullptr;
     std::vector<QPointer<QWidget>> _generatedContainers;
+    QPointer<QSplitter> _generatedOuterSplitter;
+    QPointer<QSplitter> _generatedTopSplitter;
+    QPointer<QSplitter> _generatedStripSplitter;
+    // Persisted splitter sizes so resizing survives the teardown/rebuild that happens on
+    // every point placement (mirrors the camera-state preservation in setGeneratedLineViews).
+    QList<int> _savedOuterSplitterSizes;
+    QList<int> _savedTopSplitterSizes;
+    QList<int> _savedStripSplitterSizes;
+    bool _haveSavedCurrentCutZoom = false;
+    float _savedCurrentCutZoom = 1.0f;
+    bool _haveSavedSideCutZoom = false;
+    float _savedSideCutZoom = 1.0f;
+    std::vector<float> _savedStripZooms;
     std::vector<QMetaObject::Connection> _generatedOverlayRefreshConnections;
     std::vector<FastStripOverlayItems> _fastStripOverlayItems;
     FastCurrentCutOverlayItems _fastCurrentCutOverlayItems;
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
+    QPointer<CChunkedVolumeViewer> _sideCutViewer;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
     GeneratedViews _generatedViews;
+    // Double-precision copy of _generatedViews.linePoints, built once when views are
+    // generated so the per-cursor-move side plane fit doesn't reconvert the whole polyline.
+    std::vector<cv::Vec3d> _linePointsd;
+    // Cached side-view best-fit plane orientations for the two integer window centers that
+    // straddle the current fractional position. The fit depends only on the (static) line
+    // geometry, so we recompute a center only when the straddling bracket shifts; between the
+    // two cached fits we interpolate by the fractional position so the side view re-orients
+    // continuously instead of snapping at discrete window centers.
+    struct SideFit {
+        int center = std::numeric_limits<int>::min();
+        cv::Vec3f normal{0.0f, 0.0f, 0.0f};
+        cv::Vec3f upHint{0.0f, 0.0f, 0.0f};
+        bool valid = false;
+    };
+    SideFit _sideFitBracket[2];
     bool _hasGeneratedViews = false;
+    // Coalescing of the mouse-follow line-position updates onto a ~render-tick cadence.
+    // requestCurrentLinePosition() stashes the latest position here and (re)arms the timer;
+    // its timeout applies the most recent value once, so N moves between ticks collapse to one.
+    QTimer* _lineUpdateTimer = nullptr;
+    double _pendingLinePosition = 0.0;
+    bool _lineUpdatePending = false;
     double _currentLinePosition = 0.0;
-    double _bottomCenterPosition = 0.0;
-    double _bottomSliceLineStep = 10.0;
     double _initialCurrentLinePosition = 0.0;
-    double _initialBottomCenterPosition = 0.0;
-    double _initialBottomSliceLineStep = 10.0;
-    int _bottomSliceStepWheelAccum = 0;
     bool _currentCutFollowsStripMouse = true;
     cv::Matx33f _currentCutManualRotation = cv::Matx33f::eye();
     bool _currentCutManualRotationActive = false;
@@ -241,7 +299,10 @@ private:
     bool _generatedOverlayRefreshQueued = false;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
+    bool _restoredWindowGeometry = false;
     bool _haveInitialCurrentCutCamera = false;
     CChunkedVolumeViewer::CameraState _initialCurrentCutCamera;
+    bool _haveInitialSideCutCamera = false;
+    CChunkedVolumeViewer::CameraState _initialSideCutCamera;
     std::vector<CChunkedVolumeViewer::CameraState> _initialStripCameras;
 };
