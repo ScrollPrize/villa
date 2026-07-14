@@ -81,24 +81,26 @@ configure_torch_threads_from_env()
 # PHercParis4
 dataset_path = '/ephemeral/paul/spiral/dataset'
 scroll_zarr_path = None
-normal_nx_zarr_path = f'{dataset_path}/normals/las_008_nx.ome.zarr'
-normal_ny_zarr_path = f'{dataset_path}/normals/las_008_ny.ome.zarr'
-grad_mag_zarr_path = '/ephemeral/paul/spiral/las_008_grad_mag.ome.zarr'
+normal_nx_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_nx.ome.zarr'
+normal_ny_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_ny.ome.zarr'
+grad_mag_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_grad_mag.ome.zarr'
 normal_zarr_group = '4'
 pcl_json_paths = [
-    f'{dataset_path}/rel_new.json',
-    f'{dataset_path}/new_same_wind.json',
+    f'{dataset_path}/abs_winding.json',
+    f'{dataset_path}/patch-overlap-pcls.json',
+    f'{dataset_path}/relative_windings.json',
+    f'{dataset_path}/same_windings.json',
 ]
 fibers_path = f'{dataset_path}/fibers'
-verified_patches_path = f'{dataset_path}/patches'
-unverified_patches_path = f'{dataset_path}/unproofed_patches_trimmed_deduped'
+verified_patches_path = f'{dataset_path}/verified_patches'
+unverified_patches_path = f'{dataset_path}/unverified_patches'
 run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
-shell_path = f'{dataset_path}/s1_2um_outer'
-tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'
+shell_path = f'{dataset_path}/outer_shell'
+tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'  # or: m7_ds2_z3000_18000_surf.dbm
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.json', coordinate_scale=1.0)
 scroll_name = 's1'
-z_begin, z_end = 7000, 17000
+z_begin, z_end = 4000, 17000
 voxel_size_um = 9.6
 cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
 lasagna_scale = 4
@@ -122,8 +124,8 @@ default_config = {
     'flow_bounds_radius': 3200,
     'flow_voxel_resolution': 16,
     'flow_field_type': 'cartesian',  # 'cartesian' or 'cylindrical'
-    'flow_field_high_res_lr_scale_initial': 3.0e-1,
-    'flow_field_high_res_lr_scale_final': 3.0e-1,
+    'flow_field_high_res_lr_scale_initial': 2.0e-1,
+    'flow_field_high_res_lr_scale_final': 2.0e-1,
     'flow_field_high_res_lr_ramp_start_step': 0,
     'flow_field_high_res_lr_ramp_steps': 1,
     'gap_expander_logit_resolution': 24,
@@ -190,7 +192,7 @@ default_config = {
     'loss_weight_track_dt': 10.,
     'loss_weight_sym_dirichlet': 10.0,
     'loss_weight_dense_normals': 1.e2,
-    'loss_weight_dense_spacing': 8.,
+    'loss_weight_dense_spacing': 12.,
     'loss_weight_umbilicus': 1.25,
     'loss_weight_shell_outer': 1.0,
     'loss_weight_shell_patch_radius': 0.0,
