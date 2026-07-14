@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <nlohmann/json.hpp>
 #include <opencv2/core/mat.hpp>
 
 #include "LineAnnotationFiberClassification.hpp"
@@ -104,6 +105,13 @@ public:
         std::vector<std::string> tags;
     };
 
+    struct FiberBranchRef {
+        int controlPointIndex = -1;
+        uint64_t branchFiberId = 0;
+        int branchControlPointIndex = -1;
+        std::string branchFileName;
+    };
+
     using DatasetPicker =
         std::function<std::optional<std::string>(QWidget*, const std::filesystem::path&)>;
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
@@ -133,6 +141,8 @@ public:
     void deleteFiber(uint64_t fiberId);
     void deleteFibers(std::vector<uint64_t> fiberIds);
     void renameFiberFile(uint64_t fiberId);
+    void importFibers();
+    void exportFibers();
     void setFiberManualHvTag(uint64_t fiberId, const QString& tag);
     void setFiberTag(uint64_t fiberId, const QString& tag, bool enabled);
     void recalculateFiberHvClassification(uint64_t fiberId);
@@ -141,6 +151,8 @@ public:
     void calculateFiberAlignmentMetrics(std::vector<uint64_t> orderedFiberIds);
     void requestFiberAlignmentMetrics(uint64_t fiberId);
     void createAtlasFromFiber(uint64_t fiberId);
+    void addFiberToPointCollection(uint64_t fiberId);
+    void addFibersToPointCollections(std::vector<uint64_t> fiberIds);
     void showFiberSlice(uint64_t fiberId, QMdiArea* targetArea);
     void showIntersectionInspection(const vc::atlas::FiberIntersectionResult& result,
                                     QMdiArea* targetArea,
@@ -165,6 +177,7 @@ public:
     void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
 
 signals:
+    void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
     void fiberAlignmentMetricsReset(bool pending);
     void fiberAlignmentMetricsUpdated(
@@ -216,6 +229,7 @@ private:
         uint64_t generation = 1;
         std::vector<cv::Vec3d> controlPoints;
         std::vector<cv::Vec3d> linePoints;
+        std::vector<FiberBranchRef> branches;
         vc3d::line_annotation::FiberHvClassification hvClassification;
         std::string manualHvTag;
         std::vector<std::string> tags;
@@ -254,6 +268,8 @@ private:
     void handleGeneratedControlPointDelete(const std::string& surfaceName,
                                            double linePosition,
                                            cv::Vec3f volumePoint);
+    void handleGeneratedControlPointBranch(const std::string& surfaceName,
+                                           size_t controlPointIndex);
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     bool ensureDatasetForSession(LineAnnotationSession& session);
@@ -298,7 +314,9 @@ private:
     void loadFibersForCurrentPackage();
     void emitFiberSummaries();
     void addKnownFiberTags(const std::vector<std::string>& tags);
+    [[nodiscard]] std::filesystem::path fibersRootDir() const;
     [[nodiscard]] std::filesystem::path fibersDir() const;
+    [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path fiberPath(uint64_t fiberId) const;
     [[nodiscard]] std::filesystem::path fiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path currentVolpkgRoot() const;
@@ -314,15 +332,26 @@ private:
     [[nodiscard]] std::string currentFiberUsername() const;
     [[nodiscard]] static std::string currentFiberDateTimeString();
     void ensureSessionFiberIdentity(LineAnnotationSession& session);
+    [[nodiscard]] std::vector<std::vector<cv::Vec3f>> generatedBranchLinePointsForSession(
+        const LineAnnotationSession& session) const;
+    void refreshBranchLineViews(uint64_t changedFiberId = 0);
+    void syncReciprocalBranchControlPointReferences(const LineAnnotationSession& session);
     [[nodiscard]] static double lineLengthVx(const std::vector<cv::Vec3d>& points);
+    static void scaleStoredFiber(StoredFiber& fiber, double scale);
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
         const vc::lasagna::NormalSampler* normalSampler);
     [[nodiscard]] static vc::lasagna::LineModel syntheticLineModelFromPoints(
         const std::vector<cv::Vec3d>& points);
     void saveSessionAsFiber(LineAnnotationSession& session);
+    [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
     void saveFiber(const StoredFiber& fiber) const;
+    [[nodiscard]] std::optional<StoredFiber> loadFiberJson(const nlohmann::json& root,
+                                                           const std::filesystem::path& path) const;
     [[nodiscard]] std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path) const;
+    [[nodiscard]] std::string uniqueImportedFiberFileName(const StoredFiber& fiber,
+                                                          std::unordered_set<std::string>& reserved,
+                                                          uint64_t& nextSequence) const;
     [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
         const StoredFiber& fiber);
     [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForFiber(

@@ -39,8 +39,8 @@ constexpr const char* kZarrRoot =
     "s3://vesuvius-challenge-open-data/PHerc0172/volumes/"
     "20241024131838-7.910um-53keV-masked.zarr";
 
-// PHerc 0172 level 5 pin (observed 2026-05): 651 z, 210 y, 285 x; 128^3 chunks.
-constexpr int kSliceCount = 651;
+// PHerc 0172 level 5 pin (observed 2026-06): 657 z, 210 y, 285 x; 128^3 chunks.
+constexpr int kSliceCount = 657;
 constexpr int kHeight = 210;
 constexpr int kWidth = 285;
 constexpr int kChunk = 128;

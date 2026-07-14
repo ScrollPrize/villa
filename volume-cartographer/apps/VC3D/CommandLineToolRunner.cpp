@@ -11,6 +11,7 @@
 #include <QClipboard>
 #include <QApplication>
 
+#include <cmath>
 
 
 namespace {
@@ -140,6 +141,12 @@ void CommandLineToolRunner::setRenderParams(float scale, int resolution, int lay
     _layers = layers;
 }
 
+void CommandLineToolRunner::setRenderVoxelSize(double voxelSizeUm, bool enabled)
+{
+    _renderVoxelSizeUm = voxelSizeUm;
+    _useRenderVoxelSize = enabled && std::isfinite(voxelSizeUm) && voxelSizeUm > 0.0;
+}
+
 void CommandLineToolRunner::setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment)
 {
     setVolumePath(volumePath);
@@ -257,6 +264,19 @@ bool CommandLineToolRunner::execute(Tool tool)
         }
     }
 
+    if (tool == Tool::GrowSegFromSegment || tool == Tool::AlphaCompRefine) {
+        const auto lowered = _volumePath.trimmed().toLower();
+        if (lowered.startsWith("http://") || lowered.startsWith("https://") ||
+            lowered.startsWith("s3://") || lowered.startsWith("s3+")) {
+            QMessageBox::warning(
+                nullptr,
+                tr("Unsupported Remote Volume"),
+                tr("This command accepts only a local volume path. "
+                   "Remote locators are rejected without stripping selectors."));
+            return false;
+        }
+    }
+
     if (tool == Tool::MergeTifxyz && _mergeJsonPath.isEmpty()) {
         QMessageBox::warning(nullptr, tr("Error"), tr("merge.json path not specified."));
         return false;
@@ -299,7 +319,8 @@ bool CommandLineToolRunner::execute(Tool tool)
 
     QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
     QString toolBaseName = QFileInfo(toolCmd).baseName();
-    QString logFilePath = QString("/tmp/%1_%2.txt").arg(toolBaseName).arg(timestamp);
+    QString logFilePath = QString("%1/%2_%3.txt")
+        .arg(QDir::tempPath()).arg(toolBaseName).arg(timestamp);
 
     if (_logStream) {
         delete _logStream;
@@ -585,6 +606,10 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                  << "--num-slices" << QString::number(_layers);
             if (!_remoteVolumeUrl.isEmpty()) {
                 args << "--remote-url" << _remoteVolumeUrl;
+            }
+            if (_useRenderVoxelSize) {
+                args << "--voxel-size" << QString::number(_renderVoxelSizeUm, 'g', 17)
+                     << "--voxel-unit" << "micrometer";
             }
             // Advanced / optional args
             if (_cropWidth > 0 && _cropHeight > 0) {

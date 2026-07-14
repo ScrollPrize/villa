@@ -79,8 +79,11 @@ ZarrMetadata parse_zarray(std::string_view json_str) {
         if (p->is_object()) {
             if (auto* cid = json_find(*p, "id"); cid && cid->is_string())
                 meta.compressor_id = cid->get_string();
+            // numcodecs uses "clevel" for blosc but "level" for zstd/gzip/zlib.
             if (auto* cl = json_find(*p, "clevel"); cl && cl->is_number())
                 meta.compression_level = cl->get_int();
+            else if (auto* lv = json_find(*p, "level"); lv && lv->is_number())
+                meta.compression_level = lv->get_int();
         }
     }
 
@@ -1280,17 +1283,28 @@ std::string serialize_zarray(const ZarrMetadata& meta) {
 
     // dtype
     s += "  \"dtype\": \"";
-    s += meta.byte_order;
+    // Byte order is not applicable to single-byte dtypes; zarr v2 uses '|'.
+    s += (dtype_size(meta.dtype) == 1) ? '|' : meta.byte_order;
     s += dtype_string_v2(meta.dtype);
     s += "\",\n";
 
-    // compressor
+    // compressor — emit a numcodecs-compatible config object (zarr v2 spec).
+    // Field names differ per codec: blosc requires cname/clevel/shuffle/blocksize,
+    // zstd/gzip/zlib use "level", lz4 uses "acceleration".
     if (meta.compressor_id.empty()) {
         s += "  \"compressor\": null,\n";
+    } else if (meta.compressor_id == "blosc") {
+        // Matches the encoder (VcDataset.cpp): cname=lz4, byte-shuffle, auto blocksize.
+        s += "  \"compressor\": {\"id\": \"blosc\", \"cname\": \"lz4\", \"clevel\": "
+             + std::to_string(meta.compression_level)
+             + ", \"shuffle\": 1, \"blocksize\": 0},\n";
+    } else if (meta.compressor_id == "lz4") {
+        s += "  \"compressor\": {\"id\": \"lz4\", \"acceleration\": "
+             + std::to_string(meta.compression_level) + "},\n";
     } else {
-        s += "  \"compressor\": {\"id\": \"" + meta.compressor_id + "\"";
-        s += ", \"clevel\": " + std::to_string(meta.compression_level);
-        s += "},\n";
+        // zstd, gzip, zlib, bz2, ...
+        s += "  \"compressor\": {\"id\": \"" + meta.compressor_id + "\", \"level\": "
+             + std::to_string(meta.compression_level) + "},\n";
     }
 
     // fill_value

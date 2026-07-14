@@ -1,16 +1,23 @@
 #pragma once
 
 #include <QObject>
+#include <QColor>
 #include <QPointF>
 #include <QString>
 #include <QStringList>
+#include <QPointer>
+
+#include "OpenDataSegmentCache.hpp"
 
 #include <functional>
+#include <filesystem>
+#include <map>
 #include <memory>
 #include <unordered_set>
 #include <vector>
 
 class CState;
+class Segmentation;
 class QLineEdit;
 class ViewerManager;
 class SurfaceTreeWidgetItem;
@@ -20,9 +27,12 @@ class VCCollection;
 class QTreeWidget;
 class QCheckBox;
 class QComboBox;
+class QDialog;
 class QDoubleSpinBox;
 class QPushButton;
 class QStandardItemModel;
+class QProgressDialog;
+template <typename T> class QFutureWatcher;
 class QuadSurface;
 class DropdownChecklistButton;
 
@@ -61,6 +71,7 @@ public:
     };
 
     struct TagUiRefs {
+        DropdownChecklistButton* dropdown{nullptr};
         QCheckBox* approved{nullptr};
         QCheckBox* defective{nullptr};
         QCheckBox* reviewed{nullptr};
@@ -72,6 +83,14 @@ public:
         Defective,
         Reviewed,
         Inspect,
+    };
+
+    struct SegmentFolderSelection {
+        std::string dirName;
+        std::filesystem::path path;
+        bool currentFolder{false};
+        bool defaultPalette{false};
+        QColor color;
     };
 
     SurfacePanelController(const UiRefs& ui,
@@ -98,6 +117,7 @@ public:
     void applyFilters();
 
     void syncSelectionUi(const std::string& surfaceId, QuadSurface* surface);
+    bool selectSurfaceById(const std::string& surfaceId);
     void resetTagUi();
 
     bool isCurrentOnlyFilterEnabled() const;
@@ -106,10 +126,13 @@ public:
     void reloadSurfacesFromDisk();
     void refreshFiltersOnly();
     void setSelectionLocked(bool locked);
+    void setTransformWarning(const QString& warningText);
+    void setVisibleSegmentFolders(std::vector<SegmentFolderSelection> folders);
     void addSingleSegmentation(const std::string& segId);
     void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
     bool cycleToNextVisibleSegment();
     bool cycleToPreviousVisibleSegment();
+    void materializeCurrentOpenDataFolder();
 
 signals:
     void surfacesLoaded();
@@ -129,6 +152,8 @@ signals:
     void exportTifxyzChunksRequested(const QString& segmentId);
     void alphaCompRefineRequested(const QString& segmentId);
     void rasterizeSegmentsRequested(const QStringList& segmentIds);
+    void generateSegmentMaskRequested(const QString& segmentId);
+    void appendSegmentMaskRequested(const QString& segmentId);
     void mergeTifxyzRequested(const QStringList& segmentIds);
     // Emitted when the user right-clicks two selected segments and picks
     // "Patch tifxyz...". CWindow wires this to
@@ -161,6 +186,11 @@ private:
 
     void connectFilterSignals();
     void connectTagSignals();
+    void setupSurfaceColumnMenu();
+    void restoreSurfaceColumnVisibility();
+    void showSurfaceColumnMenu(const QPoint& pos);
+    void buildFilterDialog();
+    void showFilterDialog();
     void rebuildPointSetFilterModel();
     void handleTreeSelectionChanged();
     void showContextMenu(const QPoint& pos);
@@ -168,15 +198,22 @@ private:
     void onTagCheckboxToggled();
     void applyFiltersInternal();
     void updateFilterSummary();
+    void updateTagSummary();
     void updateTagCheckboxStatesForSurface(QuadSurface* surface);
     void setTagCheckboxEnabled(bool enabledApproved,
                                bool enabledDefective,
                                bool enabledReviewed,
                                bool enabledInspect);
     void logSurfaceLoadSummary() const;
+    QString folderSelectionCacheKey() const;
     void applyHighlightSelection(const std::string& id, bool enabled);
+    void applyTransformWarningStyle(SurfaceTreeWidgetItem* item);
     bool cycleVisibleSegment(int direction);
     std::shared_ptr<QuadSurface> getSurfaceById(const std::string& id) const;
+    bool startOpenDataMaterialization(const std::string& id,
+                                      const std::shared_ptr<QuadSurface>& surface);
+    void activateMaterializedSurface(const std::string& id,
+                                     const std::filesystem::path& path);
 
     UiRefs _ui;
     CState* _state{nullptr};
@@ -186,6 +223,7 @@ private:
     std::function<void()> _filtersUpdated;
     FilterUiRefs _filters;
     TagUiRefs _tags;
+    QDialog* _filterDialog{nullptr};
     VCCollection* _pointCollection{nullptr};
     std::string _currentSurfaceId;
     QMetaObject::Connection _pointSetModelConnection;
@@ -193,5 +231,19 @@ private:
     bool _selectionLocked{false};
     QStringList _lockedSelectionIds;
     bool _selectionLockNotified{false};
+    QString _transformWarningText;
     std::unordered_set<std::string> _highlightedSurfaceIds;
+    std::vector<SegmentFolderSelection> _visibleSegmentFolders;
+    std::unordered_set<std::string> _multiFolderSurfaceIds;
+    // Segmentations loaded for non-current overlay folders, keyed by segment
+    // path. Retained so re-checking a folder (or switching back to a selection
+    // that includes it) reuses the already-loaded surfaces.
+    std::map<std::string, std::shared_ptr<Segmentation>> _overlaySegmentations;
+    QFutureWatcher<vc3d::opendata::OpenDataSegmentMaterializationResult>*
+        _segmentMaterializationWatcher{nullptr};
+    QFutureWatcher<vc3d::opendata::OpenDataSegmentMaterializationResult>*
+        _folderMaterializationWatcher{nullptr};
+    std::string _pendingMaterializationId;
+    QPointer<QProgressDialog> _segmentMaterializationProgress;
+    QPointer<QProgressDialog> _folderMaterializationProgress;
 };

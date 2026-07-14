@@ -235,6 +235,19 @@ class ConfigManager:
         }
         
         ### Dataset config ###
+        self.dataset_type = str(self.dataset_config.get("dataset_type", "zarr")).lower()
+        if self.dataset_type not in {"zarr", "cross_frame"}:
+            raise ValueError(
+                "dataset_config.dataset_type must be one of {'zarr', 'cross_frame'}; "
+                f"got {self.dataset_type!r}"
+            )
+        if self.dataset_type == "cross_frame":
+            for key in ("image_zarr_url", "labels_zarr_url", "transform_json_url"):
+                if not self.dataset_config.get(key):
+                    raise ValueError(
+                        f"dataset_config.{key} is required when dataset_type == 'cross_frame'"
+                    )
+
         self.min_labeled_ratio = float(self.dataset_config.get("min_labeled_ratio", 0.10))
         self.min_bbox_percent = float(self.dataset_config.get("min_bbox_percent", 0.95))
 

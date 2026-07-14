@@ -7,14 +7,18 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "volume-cartographer"
-version = "3.0.2"
-description = "Python bindings for Volume Cartographer volume access"
+version = "3.0.3"
+description = "Python bindings for Volume Cartographer"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
     "numpy",
+    "numcodecs>=0.16.5,<0.17",
 ]
 license = { file = "LICENSE" }
+
+[project.entry-points."numcodecs.codecs"]
+vcz1 = "vc.compression.vcz1_numcodecs:Vcz1"
 
 [tool.scikit-build]
 cmake.version = ">=3.22"
@@ -22,3 +26,12 @@ wheel.packages = []
 
 [tool.scikit-build.cmake.define]
 VC_BUILD_PYTHON = "ON"
+VC_BUILD_APPS = "OFF"
+VC_BUILD_UI_TRACER = "OFF"
+VC_BUILD_FLATBOI = "OFF"
+VC_TESTING = "OFF"
+
+[tool.uv.workspace]
+members = [
+    "scripts/spiral",
+]

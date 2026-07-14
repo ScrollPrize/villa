@@ -56,7 +56,7 @@ int main(int argc, char** argv)
     if (z_min == -1)
         z_min = (int)surface->bbox().low[2];
     if (z_max == -1)
-        z_min = (int)surface->bbox().high[2];
+        z_max = (int)surface->bbox().high[2];
 
     utils::Json metrics = calc_point_metrics(collection, surface.get(), z_min, z_max);
 

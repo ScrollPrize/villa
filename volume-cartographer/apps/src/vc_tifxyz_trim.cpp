@@ -13,7 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
-#include <unistd.h>
+#include "vc/core/util/MemMap.hpp"
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -115,7 +115,7 @@ int main(int argc, char* argv[])
               << " (rect c=" << c0 << "+" << bbW << " r=" << r0 << "+" << bbH << ")\n";
 
     fs::path stage = dst.parent_path() /
-        (".vctifxyz_trim_" + std::to_string(::getpid()) + "_" + dst.filename().string());
+        (".vctifxyz_trim_" + std::to_string(vc::memmap::pid()) + "_" + dst.filename().string());
     std::error_code ec;
     fs::remove_all(stage, ec);
     if (!fs::create_directories(stage, ec)) {
@@ -192,7 +192,7 @@ int main(int argc, char* argv[])
 
     if (fs::exists(dst)) {
         fs::path backup = dst.parent_path() /
-            (".vctifxyz_trim_old_" + std::to_string(::getpid()) + "_" + dst.filename().string());
+            (".vctifxyz_trim_old_" + std::to_string(vc::memmap::pid()) + "_" + dst.filename().string());
         fs::rename(dst, backup, ec);
         if (ec) {
             std::cerr << "error: cannot move existing " << dst

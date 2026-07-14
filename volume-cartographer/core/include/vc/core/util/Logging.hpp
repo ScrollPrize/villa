@@ -59,6 +59,7 @@ public:
 
     void set_level(LogLevel level);
     void add_file(const std::filesystem::path& path);
+    void clear_files();
 
 private:
     // The template stays trivial — make_format_args is cheap. The heavy

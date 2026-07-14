@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Volume Cartographer 3D
+GenericName=Volumetric Editor
+Comment=Volumetric processing and segmentation toolkit
+Exec=VC3D
+Icon=VC3D
+Categories=Graphics;Science;Education;
+Terminal=false
+StartupWMClass=VC3D

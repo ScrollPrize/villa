@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QString>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -72,6 +73,10 @@ public:
     std::vector<std::shared_ptr<Surface>> surfaces();
     std::vector<std::string> surfaceNames();
     void emitSurfacesChanged();
+    // Bumped on every setSurface() that changes the map (including
+    // noSignalSend calls), so callers can cheaply detect that a cached view
+    // of the surface map is stale.
+    uint64_t surfacesVersion() const { return _surfacesVersion; }
 
     // --- POIs (inlined from CSurfaceCollection) ---
     void setPOI(const std::string& name, POI* poi);
@@ -108,4 +113,5 @@ private:
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;
     std::unordered_map<std::string, std::unique_ptr<POI>> _pois;
+    uint64_t _surfacesVersion = 0;
 };
