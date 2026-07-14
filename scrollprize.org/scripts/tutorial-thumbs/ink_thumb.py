@@ -272,7 +272,7 @@ Z_TOP, Z_BOT = HEIGHT - 0.9, 0.2
 # like a scanner retracting.
 D_XI = 0.0
 D_NU = 0.0
-R_LIFT = 24.0                   # the hover: high enough that the red slab
+R_LIFT = 18.0                   # the hover: high enough that the red slab
                                 # does not sit in front of the freshly
                                 # painted rows — with the dwell pull-back
                                 # BOTH sheets show almost completely:
@@ -290,7 +290,7 @@ def red_z(f):
     cruise (no overlap at any zoom), and the final retracting rise as it
     is dismissed."""
     return (R_LIFT * smoothstep(f / F_LIFT)
-            + 6.0 * smoothstep((f - 108) / 37)
+            + 12.0 * smoothstep((f - 108) / 37)
             + 16.0 * smoothstep((f - 238) / 34))
 
 def plane_pt(xi, z, dxi=0.0, nu=0.0, dz=0.0):
@@ -395,7 +395,7 @@ PATH_TOTAL = NR * ROWPATH
 
 # ---- camera profile (kernel-independent; the kernel speed plan needs it) -----
 POSE0 = (math.radians(36), math.radians(-25), math.radians(26))
-POSE_D = (math.radians(58), math.radians(-14), math.radians(20))
+POSE_D = (math.radians(72), math.radians(-5), math.radians(20))
                                 # dwell pose: the rig rotates ON from
                                 # frame 0 (not just up!) to a much flatter
                                 # tilt — the two sheets read as stacked
@@ -552,7 +552,7 @@ def row_of(z):
 ST_XI = 2.0                     # projection-stage look-at (in-plane /
 ST_NU = 0.0                     # normal offsets, sheet height, and world
 ST_Z = 11.5                     # lift): frames the full stack — kernel on
-ST_DZ = 12.0                    # the hovering sheet, the perpendicular
+ST_DZ = 9.0                     # the hovering sheet, the perpendicular
                                 # down-beam, and the first written lines
 
 def set_pose(f):
