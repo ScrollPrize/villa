@@ -22,6 +22,7 @@
 #include <QStyledItemDelegate>
 #include <QStyleOptionViewItem>
 #include <QStringList>
+#include <QTimer>
 #include <QTreeView>
 #include <QVBoxLayout>
 
@@ -940,12 +941,15 @@ void CFiberWidget::onAddTagClicked()
     const std::vector<uint64_t> previousSelection = selectedFiberIds();
     _newTagEdit->clear();
     addUniqueSorted(_knownTags, tag.toStdString());
+    const uint64_t fiberId = _selectedFiberId;
     applyTagLocally(_selectedFiberId, tag.toStdString(), true);
     sortFibers();
     rebuildModel();
     selectFibers(previousSelection);
-    emit fiberTagChanged(_selectedFiberId, tag, true);
     rebuildTagList();
+    QTimer::singleShot(0, this, [this, fiberId, tag]() {
+        emit fiberTagChanged(fiberId, tag, true);
+    });
 }
 
 void CFiberWidget::onHeaderSectionClicked(int section)
@@ -1038,11 +1042,14 @@ void CFiberWidget::requestFiberTagChange(const QString& tag, bool enabled)
         return;
     }
     const std::vector<uint64_t> previousSelection = selectedFiberIds();
+    const uint64_t fiberId = _selectedFiberId;
     applyTagLocally(_selectedFiberId, tag.toStdString(), enabled);
     sortFibers();
     rebuildModel();
     selectFibers(previousSelection);
-    emit fiberTagChanged(_selectedFiberId, tag, enabled);
+    QTimer::singleShot(0, this, [this, fiberId, tag, enabled]() {
+        emit fiberTagChanged(fiberId, tag, enabled);
+    });
 }
 
 void CFiberWidget::applyTagLocally(uint64_t fiberId, const std::string& tag, bool enabled)
