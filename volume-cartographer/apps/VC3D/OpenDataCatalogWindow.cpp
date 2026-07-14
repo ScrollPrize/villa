@@ -618,10 +618,11 @@ void OpenDataCatalogWindow::buildUi()
 
 void OpenDataCatalogWindow::reloadManifest()
 {
-    if (_fetchWatcher && _fetchWatcher->isRunning()) {
+    if (_manifestRefreshPending) {
         return;
     }
 
+    _manifestRefreshPending = true;
     setLoading(true);
 
     _fetchWatcher = new QFutureWatcher<ManifestLoadResult>(this);
@@ -655,6 +656,7 @@ void OpenDataCatalogWindow::onFetchFinished()
     _fetchWatcher = nullptr;
     const ManifestLoadResult result = watcher->result();
     watcher->deleteLater();
+    _manifestRefreshPending = false;
     setLoading(false);
     if (!result.error.isEmpty()) {
         if (_manifest) {
@@ -706,8 +708,10 @@ void OpenDataCatalogWindow::setLoading(bool loading)
         _refreshButton->setEnabled(!loading);
         _refreshButton->setText(loading ? tr("Refreshing...") : tr("Refresh"));
     }
-    if (loading && !_manifest) {
-        setStatus(tr("Fetching open-data catalog..."));
+    if (loading) {
+        setStatus(_manifest
+            ? tr("Refreshing the live open-data catalog; cached data is preview-only...")
+            : tr("Fetching open-data catalog..."));
     }
     updateActionButtons();
 }
@@ -1126,7 +1130,7 @@ std::filesystem::path OpenDataCatalogWindow::selectedSegmentCacheDir() const
     if (!sample || !segment) {
         return {};
     }
-    return openDataSegmentCacheDirectory(
+    return openDataCanonicalSegmentCacheDirectory(
         std::filesystem::path(vc3d::remoteCachePath().toStdString()),
         *sample,
         *segment);
@@ -1134,11 +1138,12 @@ std::filesystem::path OpenDataCatalogWindow::selectedSegmentCacheDir() const
 
 void OpenDataCatalogWindow::updateActionButtons()
 {
+    const bool manifestReady = !_manifestRefreshPending;
     const bool hasVolumeUrl = !selectedVolumeUrl().isEmpty();
     const bool hasSegmentUrl = !selectedSegmentUrl().isEmpty();
     const auto* sample = selectedSample();
     const auto* segment = selectedSegment();
-    const bool canCacheSegment = segment && segment->hasTifxyz();
+    const bool canCacheSegment = manifestReady && segment && segment->hasTifxyz();
     const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
     const auto sampleSummary = sample
         ? sampleCacheSummary(remoteRoot, *sample)
@@ -1147,8 +1152,9 @@ void OpenDataCatalogWindow::updateActionButtons()
     const bool hasCacheDir = !cacheDir.empty() && std::filesystem::is_directory(cacheDir);
     const bool canOpenSample = sample != nullptr &&
                                static_cast<bool>(_openSampleHandler) &&
-                               !(_fetchWatcher && _fetchWatcher->isRunning() && !_manifest);
-    const bool canSyncSample = sample != nullptr && sampleSummary.hasTifxyz();
+                               manifestReady;
+    const bool canSyncSample = manifestReady && sample != nullptr &&
+                               sampleSummary.hasTifxyz();
     if (_openSampleButton) {
         _openSampleButton->setEnabled(canOpenSample);
     }
@@ -1167,7 +1173,7 @@ void OpenDataCatalogWindow::updateActionButtons()
             if (gridsState.complete) {
                 text = tr("Normal Grids Downloaded");
             } else {
-                canDownload = gridsState.hasArtifact;
+                canDownload = manifestReady && gridsState.hasArtifact;
             }
         }
         _downloadNormalGridsButton->setEnabled(canDownload);
@@ -1208,7 +1214,7 @@ void OpenDataCatalogWindow::updateActionButtons()
 void OpenDataCatalogWindow::openSelectedSample()
 {
     const auto* sample = selectedSample();
-    if (!sample || !_openSampleHandler) {
+    if (_manifestRefreshPending || !sample || !_openSampleHandler) {
         return;
     }
     if (_openSampleHandler(*sample)) {
@@ -1387,6 +1393,8 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
     oneSegmentSample.type = sample->type;
     oneSegmentSample.description = sample->description;
     oneSegmentSample.properties = sample->properties;
+    oneSegmentSample.volumes = sample->volumes;
+    oneSegmentSample.volumeTransforms = sample->volumeTransforms;
     oneSegmentSample.segments.push_back(*segment);
 
     auto pkg = VolumePkg::newEmpty();
@@ -1414,13 +1422,19 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
             }
         },
         forceRefresh);
+    const auto materialized = materializeOpenDataSegment(
+        openDataCanonicalSegmentCacheDirectory(
+            remoteRoot, oneSegmentSample,
+            oneSegmentSample.segments.front()));
 
     QCoreApplication::processEvents();
     refreshSelectedSampleCacheStatus();
     QString message = tr("Cached %1 of %2 selected tifxyz segment(s).")
-                          .arg(result.cachedTifxyzSegments)
+                          .arg(materialized.success ? 1 : 0)
                           .arg(result.supportedTifxyzSegments);
-    if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
+    if (!materialized.success) {
+        message += tr(" %1").arg(qstr(materialized.message));
+    } else if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
         message += tr(" %1").arg(qstr(result.messages.front()));
     }
     setStatus(message);
@@ -1475,12 +1489,27 @@ void OpenDataCatalogWindow::syncSelectedSampleCache()
         },
         forceRefresh);
 
+    int materializedRepresentations = 0;
+    int failedRepresentations = 0;
+    std::string materializationError;
+    for (const auto& entry : pkg->segmentEntries()) {
+        const auto materialized = materializeOpenDataSegmentFolder(entry.location);
+        materializedRepresentations += materialized.materializedSegments;
+        failedRepresentations += materialized.failedSegments;
+        if (materializationError.empty() && !materialized.message.empty()) {
+            materializationError = materialized.message;
+        }
+    }
+
     QCoreApplication::processEvents();
     refreshSelectedSampleCacheStatus();
-    QString message = tr("Synced %1 of %2 tifxyz segment(s).")
-                          .arg(result.cachedTifxyzSegments)
-                          .arg(result.supportedTifxyzSegments);
-    if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
+    QString message = tr("Created or fetched %1 segment representation(s).")
+                          .arg(materializedRepresentations);
+    if (failedRepresentations > 0) {
+        message += tr(" %1 failed: %2")
+                       .arg(failedRepresentations)
+                       .arg(qstr(materializationError));
+    } else if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
         message += tr(" %1").arg(qstr(result.messages.front()));
     }
     setStatus(message);

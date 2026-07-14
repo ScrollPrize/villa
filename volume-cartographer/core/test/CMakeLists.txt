@@ -75,6 +75,9 @@ vc_add_test(NAME test_segmentation_autosave_state
     LIBS doctest::doctest
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+vc_add_test(NAME test_surface_display_name
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 vc_add_test(NAME test_segmentation_intersection_invalidation
     LIBS Qt6::Core Qt6::Gui Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -89,6 +92,7 @@ vc_add_test(NAME test_ink_detection_overlay
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/VolumeViewerCmaps.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
@@ -137,6 +141,7 @@ qt6_wrap_cpp(cfiber_widget_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CFiberWidget.hpp)
 vc_add_test(NAME test_fiber_widget
     SOURCES test_fiber_widget.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CFiberWidget.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNameDisplay.cpp
             ${cfiber_widget_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -268,6 +273,16 @@ if(VC_RUN_BENCHES)
     set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_volume_sample)
 endif()
 
+add_executable(bench_quadsurface_gen bench_quadsurface_gen.cpp)
+target_link_libraries(bench_quadsurface_gen PRIVATE doctest::doctest vc_core)
+# Perf-regression guard for QuadSurface::gen() (warp helpers + per-surface
+# cache reuse). Loose relative assertion; opt-in via VC_RUN_BENCHES, always
+# built as a target so it's runnable manually.
+if(VC_RUN_BENCHES)
+    add_test(NAME bench_quadsurface_gen COMMAND bench_quadsurface_gen)
+    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_quadsurface_gen)
+endif()
+
 add_executable(bench_chunked_plane_sampler bench_chunked_plane_sampler.cpp)
 target_link_libraries(bench_chunked_plane_sampler PRIVATE doctest::doctest vc_core)
 # Perf guard for the slice sampler hot path. Like bench_volume_sample it
@@ -337,6 +352,8 @@ vc_add_test(NAME test_gridstore)
 
 vc_add_test(NAME test_gridstore_branches)
 
+vc_add_test(NAME test_gridstore_malformed)
+
 # Live network test: anonymous read of the PHerc 0172 zarr on AWS S3.
 # Soft-skips on network failure so offline runs still pass; set
 # VC_TEST_REQUIRE_NETWORK=1 to flip those skips into hard failures.
@@ -391,6 +408,8 @@ vc_add_test(NAME test_open_data_manifest
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataNormalGrids.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.hpp
     LIBS doctest::doctest Qt6::Core vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 

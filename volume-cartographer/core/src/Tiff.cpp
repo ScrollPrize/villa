@@ -341,15 +341,28 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
         std::sort(partFiles.begin(), partFiles.end());
         TIFF* first = TIFFOpen(partFiles[0].string().c_str(), "r");
         if (!first) { std::cerr << "Cannot open " << partFiles[0] << "\n"; failures++; continue; }
-        uint32_t w, h, tw, th; uint16_t bps, spp, sf, comp;
-        TIFFGetField(first, TIFFTAG_IMAGEWIDTH, &w);
-        TIFFGetField(first, TIFFTAG_IMAGELENGTH, &h);
-        TIFFGetField(first, TIFFTAG_TILEWIDTH, &tw);
-        TIFFGetField(first, TIFFTAG_TILELENGTH, &th);
+        // Initialize and check TIFFGetField: a part file from a killed/corrupt
+        // render job may be missing tags. Reading an unset tag leaves the
+        // variable uninitialized, and a missing TILEWIDTH/TILELENGTH makes tw/th
+        // zero -> the (w + tw - 1) / tw tiling below is a divide-by-zero. Skip
+        // such a group cleanly instead of crashing.
+        uint32_t w = 0, h = 0, tw = 0, th = 0; uint16_t bps = 0, spp = 0, sf = 0, comp = 0;
+        const bool haveGeom =
+            TIFFGetField(first, TIFFTAG_IMAGEWIDTH, &w)
+            && TIFFGetField(first, TIFFTAG_IMAGELENGTH, &h)
+            && TIFFGetField(first, TIFFTAG_TILEWIDTH, &tw)
+            && TIFFGetField(first, TIFFTAG_TILELENGTH, &th);
         TIFFGetField(first, TIFFTAG_BITSPERSAMPLE, &bps);
         TIFFGetField(first, TIFFTAG_SAMPLESPERPIXEL, &spp);
         TIFFGetField(first, TIFFTAG_SAMPLEFORMAT, &sf);
         TIFFGetField(first, TIFFTAG_COMPRESSION, &comp);
+        if (!haveGeom || w == 0 || h == 0 || tw == 0 || th == 0) {
+            std::cerr << "Skipping " << finalPath
+                      << ": first part missing/zero geometry tags\n";
+            TIFFClose(first);
+            failures++;
+            continue;
+        }
         uint16_t resUnit = 0;
         float xRes = 0, yRes = 0;
         bool hasRes = TIFFGetField(first, TIFFTAG_RESOLUTIONUNIT, &resUnit) && TIFFGetField(first, TIFFTAG_XRESOLUTION, &xRes) &&

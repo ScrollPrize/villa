@@ -48,6 +48,19 @@ struct OpenDataSegmentCacheReconcileResult {
     std::vector<std::string> messages;
 };
 
+struct OpenDataSegmentMaterializationResult {
+    bool success = false;
+    bool alreadyMaterialized = false;
+    int materializedSegments = 0;
+    int failedSegments = 0;
+    std::string message;
+};
+
+using OpenDataSegmentMaterializationProgress =
+    std::function<void(int completed, int total,
+                       const std::filesystem::path& segmentDir,
+                       const std::string& status)>;
+
 struct OpenDataInkDetectionEntry {
     std::string label;
     std::string sampleId;
@@ -68,16 +81,17 @@ struct OpenDataSegmentRepresentation {
     const OpenDataArtifact* artifact = nullptr;
     OpenDataSegmentRepresentationKind kind =
         OpenDataSegmentRepresentationKind::Authored;
+    bool canonicalSource = false;
     std::string coordinateVolumeId;
     int sourceCoordinateLevel = 0;
     std::string coordinateSpace;
     std::string representationId;
 };
 
-// Classify every coordinate-bearing tifxyz artifact. Authored artifacts keep
-// their manifest coordinate level and, for nonzero levels, also produce a
-// separate derived-native representation. Published transformed artifacts are
-// retained for their explicit target_volume at L0.
+// Select at most one representation per coordinate volume. The manifest's
+// source volume is canonical: an explicit published representation targeting
+// that volume wins, otherwise one authored artifact is converted to native L0.
+// Explicit published representations win for every other target as well.
 [[nodiscard]] std::vector<OpenDataSegmentRepresentation>
 classifyOpenDataSegmentRepresentations(const OpenDataSample& sample,
                                        const OpenDataSegment& segment);
@@ -92,6 +106,11 @@ classifyOpenDataSegmentRepresentations(const OpenDataSample& sample,
     const OpenDataSample& sample,
     const OpenDataSegment& segment,
     const OpenDataSegmentRepresentation& representation);
+
+[[nodiscard]] std::filesystem::path openDataCanonicalSegmentCacheDirectory(
+    const std::filesystem::path& remoteCacheRoot,
+    const OpenDataSample& sample,
+    const OpenDataSegment& segment);
 
 [[nodiscard]] const char* cacheStateName(OpenDataSegmentCacheState state) noexcept;
 
@@ -136,6 +155,20 @@ classifyOpenDataSegmentRepresentations(const OpenDataSample& sample,
 
 [[nodiscard]] bool isOpenDataCatalogSegmentDirectory(
     const std::filesystem::path& segmentDir);
+
+// Open-data placeholders contain complete display metadata and a persisted
+// materialization recipe, but defer x/y/z TIFF download or generation until
+// the surface is activated.
+[[nodiscard]] bool isOpenDataSegmentPlaceholder(
+    const std::filesystem::path& segmentDir);
+
+[[nodiscard]] OpenDataSegmentMaterializationResult materializeOpenDataSegment(
+    const std::filesystem::path& segmentDir);
+
+[[nodiscard]] OpenDataSegmentMaterializationResult
+materializeOpenDataSegmentFolder(
+    const std::filesystem::path& segmentsRoot,
+    const OpenDataSegmentMaterializationProgress& progressCallback = {});
 
 [[nodiscard]] std::vector<OpenDataInkDetectionEntry> cachedInkDetectionsForSegmentDirectory(
     const std::filesystem::path& segmentDir);

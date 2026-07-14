@@ -75,8 +75,16 @@ jobs:
       - name: Build AppImage
         working-directory: volume-cartographer
         run: |
+          # The Docker context is only volume-cartographer/ (no .git), so pass the
+          # checked-out revision in; CMake and build_appimage.sh use it for the
+          # embedded version and the VC3D-<sha7>-<date>-<arch>.AppImage name,
+          # matching the macOS/Windows package naming.
+          git_sha1="$(git rev-parse HEAD)"
+          git_date="$(git log -1 --format=%cs HEAD)"
           DOCKER_BUILDKIT=1 docker build \
             -o type=local,dest=dist \
+            --build-arg VC_GIT_SHA1="$git_sha1" \
+            --build-arg VC_GIT_COMMIT_DATE="$git_date" \
             -f scripts/Dockerfile.appimage \
             .
           ls -la dist/

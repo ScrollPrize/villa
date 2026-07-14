@@ -170,6 +170,37 @@ bool isSupportedSurfacePrediction(const OpenDataArtifact& artifact)
     return lowerCopy(artifact.type) == "surface-prediction-zarr";
 }
 
+bool isSupportedInk3dPrediction(const OpenDataArtifact& artifact)
+{
+    const auto type = lowerCopy(artifact.type);
+    return type == "ink-detection-3d-zarr" ||
+           type == "ink_detection_3d_zarr";
+}
+
+bool isSupportedCoordinatePrediction(const OpenDataArtifact& artifact)
+{
+    return isSupportedSurfacePrediction(artifact) ||
+           isSupportedInk3dPrediction(artifact);
+}
+
+std::optional<int> predictionSourceCoordinateLevel(const OpenDataArtifact& artifact)
+{
+    if (!isSupportedCoordinatePrediction(artifact))
+        return std::nullopt;
+
+    if (artifact.sourceCoordinateLevel)
+        return artifact.sourceCoordinateLevel;
+
+    // The first published 3D-ink stores predate parameters.level. They are
+    // native-resolution predictions, but only trust that legacy convention
+    // after preflightPredictionAndSource verifies the prediction descriptor
+    // against physical source /0.
+    if (isSupportedInk3dPrediction(artifact) && !artifact.levelParameterPresent)
+        return 0;
+
+    return std::nullopt;
+}
+
 std::string coordinateSpaceId(const OpenDataSample& sample,
                               const OpenDataVolume& volume,
                               int level)
@@ -309,39 +340,6 @@ bool isNonEmptyFile(const std::filesystem::path& path)
            !ec;
 }
 
-int openDataSegmentEntryCount(const VolumePkg& pkg,
-                              const std::filesystem::path& remoteCacheRoot,
-                              const OpenDataSample& sample)
-{
-    if (remoteCacheRoot.empty() || sample.tifxyzSegmentCount() == 0) {
-        return 0;
-    }
-
-    const auto sampleSegmentsRoot = remoteCacheRoot / "open_data" / "segments" /
-                                    safePathComponent(sample.id.empty() ? "sample" : sample.id);
-    const auto sampleSegmentsRootString = sampleSegmentsRoot.string();
-    const auto sampleSegmentsPrefix =
-        sampleSegmentsRootString + std::string(1, std::filesystem::path::preferred_separator);
-    int count = 0;
-    for (const auto& entry : pkg.segmentEntries()) {
-        std::error_code ec;
-        if (!std::filesystem::is_directory(entry.location, ec) || ec) {
-            continue;
-        }
-        const bool openDataSegmentEntry =
-            std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end() &&
-            std::any_of(entry.tags.begin(), entry.tags.end(), [](const std::string& tag) {
-                return tag.rfind("vc-open-data-source-volume-id:", 0) == 0 ||
-                       tag.rfind("vc-open-data-target-volume-id:", 0) == 0;
-            });
-        if (openDataSegmentEntry &&
-            entry.location.rfind(sampleSegmentsPrefix, 0) == 0) {
-            ++count;
-        }
-    }
-    return count;
-}
-
 } // namespace
 
 std::shared_ptr<VolumePkg> createOpenDataSampleProject(
@@ -352,7 +350,6 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
 {
     auto result = OpenDataSampleProjectResult{};
     std::shared_ptr<VolumePkg> pkg;
-    bool loadedCachedProject = false;
     const auto cachedProjectPath = remoteCacheRoot.empty()
         ? std::filesystem::path{}
         : sampleProjectCachePath(remoteCacheRoot, sample);
@@ -365,7 +362,6 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
             pkg = VolumePkg::load(
                 cachedProjectPath,
                 opts);
-            loadedCachedProject = true;
             result.messages.push_back("Loaded cached sample project: " +
                                       cachedProjectPath.string());
         } catch (const std::exception& e) {
@@ -378,7 +374,10 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     }
 
     if (!pkg) {
-        pkg = VolumePkg::newEmpty();
+        vc::project::LoadOptions opts;
+        opts.remoteCacheRoot = remoteCacheRoot;
+        opts.deferResolution = true;
+        pkg = VolumePkg::newEmpty(opts);
     }
     pkg->setName(sample.id.empty() ? "Open Data Sample" : sample.id);
     if (!remoteCacheRoot.empty()) {
@@ -402,28 +401,28 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
                                       " streaming normal grid store(s).");
         }
     }
-    if (loadedCachedProject &&
-        openDataSegmentEntryCount(*pkg, remoteCacheRoot, sample) > 0) {
-        const auto cacheAttachResult =
-            attachExistingOpenDataSegmentCaches(*pkg, sample, remoteCacheRoot);
-        result.supportedTifxyzSegments += cacheAttachResult.supportedTifxyzSegments;
-        result.cachedTifxyzSegments += cacheAttachResult.cachedTifxyzSegments;
-        result.attachedSegmentEntries += cacheAttachResult.attachedSegmentEntries;
-        result.skippedTifxyzSegments += cacheAttachResult.skippedTifxyzSegments;
-        result.failedTifxyzSegments += cacheAttachResult.failedTifxyzSegments;
-        result.transformedTifxyzSegments += cacheAttachResult.transformedTifxyzSegments;
-        result.failedTransformedTifxyzSegments += cacheAttachResult.failedTransformedTifxyzSegments;
-        result.messages.insert(result.messages.end(),
-                               cacheAttachResult.messages.begin(),
-                               cacheAttachResult.messages.end());
-        result.messages.push_back("Reused cached sample project segment entries.");
-    } else {
-        attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result, progressCallback);
-    }
+    // Reconcile against the current manifest on every open. This is metadata-
+    // only for lazy segments and also removes stale layout entries from older
+    // cached projects.
+    attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result,
+                                 progressCallback);
     // Catalog loads remain unresolved until volume tags, normal-grid paths,
     // and every segment representation/cache entry have been reconciled.
-    if (loadedCachedProject) {
+    if (pkg->entryResolutionDeferred()) {
+        if (progressCallback) {
+            OpenDataSampleDownloadProgress progress;
+            progress.totalSegments = static_cast<int>(sample.volumes.size());
+            progress.status = "resolving-volumes";
+            try { progressCallback(progress); } catch (...) {}
+        }
         pkg->resolveDeferredEntries();
+        if (progressCallback) {
+            OpenDataSampleDownloadProgress progress;
+            progress.totalSegments = static_cast<int>(sample.volumes.size());
+            progress.completedSegments = progress.totalSegments;
+            progress.status = "project-ready";
+            try { progressCallback(progress); } catch (...) {}
+        }
         const std::string sampleTag =
             std::string(kOpenDataSampleIdTagPrefix) + sample.id;
         for (const auto& entry : pkg->volumeEntries()) {
@@ -434,7 +433,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
             }
             ++result.failedVolumes;
             result.messages.push_back(
-                "Cached catalog volume failed remote open/base-level validation: " +
+                "Catalog volume failed remote open/base-level validation: " +
                 entry.location + ".");
         }
     }
@@ -469,6 +468,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         const OpenDataArtifact* prediction = nullptr;
         std::string predictionUrl;
         std::string sourceUrl;
+        int sourceCoordinateLevel = 0;
+        bool inferredSourceCoordinateLevel = false;
     };
     std::vector<PredictionCandidate> predictions;
     std::vector<std::string> attachedLocations;
@@ -485,7 +486,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         std::string preferredSourceUrl;
         if (preferredSource) {
             preferredSourceUrl = artifactUrl(*preferredSource);
-            if (isSupportedSurfacePrediction(*preferredSource) ||
+            if (isSupportedCoordinatePrediction(*preferredSource) ||
                 !isSupportedRemoteZarr(volume, *preferredSource, preferredSourceUrl)) {
                 preferredSource = nullptr;
                 preferredSourceUrl.clear();
@@ -513,7 +514,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
                 preferredNativeSource ? std::optional<int>{0} : std::nullopt,
                 preferredNativeSource ? volume.pixelSizeUm : std::nullopt,
                 preferredNativeSource ? preferredSourceUrl : std::string{});
-            if (isSupportedSurfacePrediction(artifact) &&
+            if (isSupportedCoordinatePrediction(artifact) &&
                 !artifact.sourceCoordinateLevel) {
                 tags.push_back(
                     artifact.levelParameterPresent
@@ -558,9 +559,18 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             if (hasVolumeEntry(pkg, url))
                 attachedLocations.push_back(url);
 
-            if (isSupportedSurfacePrediction(artifact)) {
+            if (const auto level = predictionSourceCoordinateLevel(artifact)) {
                 predictions.push_back(PredictionCandidate{
-                    &volume, &artifact, url, preferredSourceUrl});
+                    &volume,
+                    &artifact,
+                    url,
+                    preferredSourceUrl,
+                    *level,
+                    !artifact.sourceCoordinateLevel.has_value()});
+            } else if (isSupportedCoordinatePrediction(artifact)) {
+                result.messages.push_back(
+                    "Kept " + label +
+                    " coordinate-unspecified: parameters.level is missing or invalid.");
             }
         }
 
@@ -575,13 +585,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         const auto& volume = *candidate.volume;
         const auto& prediction = *candidate.prediction;
         const auto predictionLabel = volumeArtifactLabel(volume, prediction);
-        if (!prediction.sourceCoordinateLevel) {
-            result.messages.push_back(
-                "Kept " + predictionLabel +
-                " coordinate-unspecified: parameters.level is missing or invalid.");
-            continue;
-        }
-        const int level = *prediction.sourceCoordinateLevel;
+        const int level = candidate.sourceCoordinateLevel;
         if (candidate.sourceUrl.empty() ||
             std::find(attachedLocations.begin(), attachedLocations.end(),
                       candidate.sourceUrl) == attachedLocations.end()) {
@@ -606,7 +610,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         } catch (const std::exception& e) {
             ++result.failedVolumes;
             result.messages.push_back(
-                "Skipped coordinate pairing for " + predictionLabel + ": " + e.what());
+                "Skipped coordinate pairing for " + predictionLabel +
+                " against source L" + std::to_string(level) + ": " + e.what());
             continue;
         }
 
@@ -619,6 +624,11 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             candidate.predictionUrl,
             predictionTags,
             coordinateSingletonPrefixes());
+        if (candidate.inferredSourceCoordinateLevel) {
+            result.messages.push_back(
+                "Paired legacy " + predictionLabel + " with source L" +
+                std::to_string(level) + " after descriptor validation.");
+        }
 
         if (level == 0)
             continue;

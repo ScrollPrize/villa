@@ -121,6 +121,7 @@ public:
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
     void setOptimizationBusy(bool busy);
     void setOptimizationStatus(bool optimized);
+    void setFiberDisplayName(const QString& name);
     void setCloseAfterFinalizationAllowed(bool allowed);
     void setWorkspaceEmbedded(bool embedded);
     bool workspaceEmbedded() const { return _workspaceEmbedded; }
@@ -219,6 +220,7 @@ private:
                                      double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);
     void updateOptimizationOverlayGeometry();
+    void updateFiberNameLabel();
     void restoreWindowGeometry();
     void saveWindowGeometry() const;
     void restoreGeneratedViewStateSettings();
@@ -230,6 +232,7 @@ private:
     QComboBox* _reoptimizationCombo = nullptr;
     QComboBox* _shiftScrollCombo = nullptr;
     QSpinBox* _maxControlPointDistanceSpin = nullptr;
+    QLabel* _fiberNameLabel = nullptr;
     QLabel* _sliceStepLabel = nullptr;
     QLabel* _optimizationStatusLabel = nullptr;
     QPushButton* _showAsMeshButton = nullptr;
@@ -241,6 +244,7 @@ private:
     bool _suppressPaneClosed = false;
     bool _closeAfterFinalizationAllowed = false;
     bool _workspaceEmbedded = false;
+    QString _fiberDisplayName;
 
     QWidget* _generatedTopWidget = nullptr;
     std::vector<QPointer<QWidget>> _generatedContainers;

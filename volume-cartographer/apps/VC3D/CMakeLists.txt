@@ -27,6 +27,8 @@ set(srcs
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
     LineAnnotationFiberClassification.hpp
+    FiberNameDisplay.cpp
+    FiberNameDisplay.hpp
     FiberSliceGeometry.cpp
     FiberSliceGeometry.hpp
     LineAnnotationController.cpp
@@ -47,6 +49,8 @@ set(srcs
     OpenDataNormalGrids.hpp
     OpenDataSegmentCache.cpp
     OpenDataSegmentCache.hpp
+    OpenDataSegmentCacheIO.cpp
+    OpenDataSegmentCacheIO.hpp
     SurfaceAffineTransformController.cpp
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp
@@ -83,6 +87,8 @@ set(srcs
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
+    SurfaceDisplayName.hpp
+    SurfaceTimestamp.hpp
     SeedingWidget.cpp
     SeedingWidget.hpp
     segmentation/SegmentationCommon.hpp

@@ -1,6 +1,7 @@
 #include "LineAnnotationController.hpp"
 
 #include "CState.hpp"
+#include "FiberNameDisplay.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationFiberNaming.hpp"
@@ -222,6 +223,12 @@ struct FiberJsonPathOptions {
     fs::path path;
     double scale = 1.0;
 };
+
+QString fiberDisplayNameFromFileName(const std::string& fileName)
+{
+    const QString stem = vc3d::displayStemForFiberFile(QString::fromStdString(fileName));
+    return stem.isEmpty() ? QObject::tr("unsaved fiber") : stem;
+}
 
 std::optional<FiberJsonPathOptions> showFiberJsonPathDialog(QWidget* parent,
                                                             bool importMode,
@@ -1511,6 +1518,7 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     session->deferShowUntilGenerated = deferShowUntilGenerated;
     _state->setSurface(surfaceName, std::move(sourceSurface));
     auto* dialog = new LineAnnotationDialog(_viewerManager, _volumeSelectorFactory, nullptr);
+    dialog->setFiberDisplayName(fiberDisplayNameFromFileName(session->fiberFileName));
     if (!dialog->addPane(surfaceName, tr("Line Annotation Slice"), camera)) {
         dialog->deleteLater();
         _state->setSurface(surfaceName, nullptr);
@@ -1972,6 +1980,10 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
     for (const auto& pane : _panes) {
         if (pane.session && pane.session->fiberId == fiberId) {
             pane.session->fiberFileName = it->fileName;
+            if (pane.dialog) {
+                pane.dialog->setFiberDisplayName(
+                    fiberDisplayNameFromFileName(pane.session->fiberFileName));
+            }
         }
     }
     emitFiberSummaries();
@@ -6722,6 +6734,12 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         session.fiberFileName = fiber.fileName;
         session.fiberTags = fiber.tags;
         session.fiberMetricsMatchStoredFiber = true;
+        for (const auto& pane : _panes) {
+            if (pane.session.get() == &session && pane.dialog) {
+                pane.dialog->setFiberDisplayName(
+                    fiberDisplayNameFromFileName(session.fiberFileName));
+            }
+        }
         const uint64_t savedFiberId = fiber.id;
         const uint64_t savedGeneration = fiber.generation;
 

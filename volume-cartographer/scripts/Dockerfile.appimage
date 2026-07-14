@@ -7,8 +7,11 @@
 # via scripts/build_appimage.sh. glibc + the dynamic loader are bundled, so the
 # result runs on distros with an OLDER glibc than the 26.04 build image.
 #
-# Build (writes dist/VC3D-x86_64.AppImage on the host):
-#   docker build -o type=local,dest=dist -f scripts/Dockerfile.appimage .
+# Build (writes dist/VC3D-<version>-linux-x86_64.AppImage on the host). Pass the git
+# revision for a versioned name — the context (volume-cartographer/) has no .git:
+#   docker build -o type=local,dest=dist -f scripts/Dockerfile.appimage \
+#     --build-arg VC_GIT_SHA1="$(git rev-parse HEAD)" \
+#     --build-arg VC_GIT_COMMIT_DATE="$(git log -1 --format=%cs HEAD)" .
 #
 # Against the local dev builder image instead of ghcr:
 #   docker build -o type=local,dest=dist -f scripts/Dockerfile.appimage \
@@ -18,6 +21,13 @@ ARG BUILDER_IMAGE=ghcr.io/scrollprize/villa/volume-cartographer:builder-ubuntu-2
 
 FROM ${BUILDER_IMAGE} AS build
 ARG DEBIAN_FRONTEND=noninteractive
+
+# Git revision injected by the caller: the build context is only the
+# volume-cartographer/ subtree (no .git), so CMake can't derive the version
+# itself. vc3d-linux.yml passes the checked-out commit; empty for ad-hoc builds
+# (yields an "Untracked" version, same as any gitless build).
+ARG VC_GIT_SHA1=
+ARG VC_GIT_COMMIT_DATE=
 
 # patchelf: rewrites RPATHs during bundling. file/desktop-file-utils: used by
 # linuxdeploy for ELF/desktop validation. zstd: compresses the debug-symbols
@@ -30,12 +40,14 @@ COPY . /src
 WORKDIR /src
 
 RUN cmake --preset ci-release-gcc \
+      -DVC_GIT_SHA1="${VC_GIT_SHA1}" -DVC_GIT_COMMIT_DATE="${VC_GIT_COMMIT_DATE}" \
  && cmake --build --preset ci-release-gcc
 
 ENV QMAKE=/usr/bin/qmake6
-RUN OUT_DIR=/out BUILD_DIR=/src/build/ci-release-gcc bash scripts/build_appimage.sh
+RUN GIT_SHA1="${VC_GIT_SHA1}" GIT_COMMIT_DATE="${VC_GIT_COMMIT_DATE}" \
+    OUT_DIR=/out BUILD_DIR=/src/build/ci-release-gcc bash scripts/build_appimage.sh
 
 # Export the artifacts via `-o type=local,dest=dist`: the minified .AppImage
-# plus the split-out debug-symbols companion (VC3D-<arch>-debug.tar.zst).
+# plus the split-out debug-symbols companion (VC3D-<version>-linux-<arch>-debug.tar.zst).
 FROM scratch AS export
 COPY --from=build /out/ /

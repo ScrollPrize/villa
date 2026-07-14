@@ -399,6 +399,14 @@ OpenDataSegment parseSegment(std::string id, const nlohmann::json& segmentJson)
     segment.width = intValue(segmentJson, {"width"});
     segment.height = intValue(segmentJson, {"height"});
     segment.createdAt = nestedStringValue(segmentJson, {"created_at", "createdAt", "created"}).value_or("");
+    if (segment.createdAt.empty() && segmentJson.is_object()) {
+        const auto creation = segmentJson.find("creation");
+        if (creation != segmentJson.end() && creation->is_object()) {
+            segment.createdAt = stringValue(
+                *creation, {"date", "created_at", "createdAt", "created"})
+                                    .value_or("");
+        }
+    }
     segment.properties = objectOrEmpty(segmentJson, "properties");
     segment.artifacts = parseArtifacts(segmentJson);
     segment.raw = segmentJson.is_object() ? segmentJson : nlohmann::json::object();

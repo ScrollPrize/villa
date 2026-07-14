@@ -1,4 +1,5 @@
 #include "OpenDataSegmentCache.hpp"
+#include "OpenDataSegmentCacheIO.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/AffineTransform.hpp"
@@ -7,8 +8,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include <tiffio.h>
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -16,21 +15,31 @@
 #include <cmath>
 #include <cstdint>
 #include <ctime>
-#include <cstring>
 #include <exception>
-#include <fstream>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 
 namespace vc3d::opendata {
 namespace {
+
+using detail::cacheOptionalFile;
+using detail::isNonEmptyFile;
+using detail::readTextFile;
+using detail::writeBytesAtomic;
+using detail::writeCachedTifxyzBand;
+using detail::writeStringAtomic;
+
+constexpr const char* kMaterializationKey = "materialization";
+constexpr const char* kLazyPlaceholderMetaKey =
+    "vc_open_data_lazy_placeholder";
 
 std::string lowerCopy(std::string value)
 {
@@ -128,6 +137,57 @@ std::string segmentStableId(const OpenDataSegment& segment)
     return safePathComponent(segment.suffix);
 }
 
+std::string surfaceTimestampFromCatalogDate(std::string_view date)
+{
+    const auto isDigit = [&](std::size_t index) {
+        return index < date.size() &&
+               std::isdigit(static_cast<unsigned char>(date[index]));
+    };
+    if ((date.size() == 14 || date.size() == 17) &&
+        std::all_of(date.begin(), date.end(), [](unsigned char c) {
+            return std::isdigit(c);
+        })) {
+        return std::string(date.substr(0, 14));
+    }
+    if (date.size() < 20 || date[4] != '-' || date[7] != '-' ||
+        date[10] != 'T' || date[13] != ':' || date[16] != ':' ||
+        !isDigit(0) || !isDigit(1) || !isDigit(2) || !isDigit(3) ||
+        !isDigit(5) || !isDigit(6) || !isDigit(8) || !isDigit(9) ||
+        !isDigit(11) || !isDigit(12) || !isDigit(14) || !isDigit(15) ||
+        !isDigit(17) || !isDigit(18)) {
+        return std::string(date);
+    }
+
+    if (date[19] == 'Z') {
+        if (date.size() != 20) {
+            return std::string(date);
+        }
+    } else if (date[19] == '.') {
+        constexpr std::size_t fraction = 20;
+        auto suffix = fraction;
+        while (suffix < date.size() &&
+               std::isdigit(static_cast<unsigned char>(date[suffix]))) {
+            ++suffix;
+        }
+        if (suffix == fraction || suffix + 1 != date.size() ||
+            date[suffix] != 'Z') {
+            return std::string(date);
+        }
+    } else {
+        return std::string(date);
+    }
+
+    std::string timestamp;
+    timestamp.reserve(14);
+    for (const auto [begin, count] : {
+             std::pair<std::size_t, std::size_t>{0, 4},
+             {5, 2}, {8, 2}, {11, 2}, {14, 2}, {17, 2}}) {
+        timestamp.append(date.substr(begin, count));
+    }
+
+    return timestamp;
+}
+
 std::string sourceVolumeIdForSegment(const OpenDataSegment& segment);
 
 bool hasSegmentEntry(const VolumePkg& pkg, const std::string& location)
@@ -136,264 +196,6 @@ bool hasSegmentEntry(const VolumePkg& pkg, const std::string& location)
     return std::any_of(entries.begin(), entries.end(), [&](const auto& entry) {
         return entry.location == location;
     });
-}
-
-bool isNonEmptyFile(const std::filesystem::path& path)
-{
-    std::error_code ec;
-    return std::filesystem::is_regular_file(path, ec) &&
-           std::filesystem::file_size(path, ec) > 0 &&
-           !ec;
-}
-
-std::string readTextFile(const std::filesystem::path& path)
-{
-    std::ifstream in(path, std::ios::binary);
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
-}
-
-void writeBytesAtomic(const std::filesystem::path& path,
-                      const std::vector<std::byte>& bytes)
-{
-    std::filesystem::create_directories(path.parent_path());
-    const auto tmp = path.string() + ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!bytes.empty()) {
-            out.write(reinterpret_cast<const char*>(bytes.data()),
-                      static_cast<std::streamsize>(bytes.size()));
-        }
-        if (!out) {
-            throw std::runtime_error("failed to write " + tmp);
-        }
-    }
-    std::filesystem::rename(tmp, path);
-}
-
-void writeStringAtomic(const std::filesystem::path& path,
-                       const std::string& text)
-{
-    const auto bytes = std::vector<std::byte>(
-        reinterpret_cast<const std::byte*>(text.data()),
-        reinterpret_cast<const std::byte*>(text.data() + text.size()));
-    writeBytesAtomic(path, bytes);
-}
-
-struct TiffInfo {
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint16_t bits = 0;
-    uint16_t sampleFormat = SAMPLEFORMAT_UINT;
-    uint16_t samplesPerPixel = 1;
-    uint16_t compression = COMPRESSION_NONE;
-    uint32_t rowsPerStrip = 0;
-    tstrip_t strips = 0;
-    bool tiled = false;
-    bool byteSwapped = false;
-};
-
-TiffInfo readTiffInfo(const std::filesystem::path& path)
-{
-    TIFF* tif = TIFFOpen(path.string().c_str(), "r");
-    if (!tif) {
-        throw std::runtime_error("failed to open TIFF: " + path.string());
-    }
-    TiffInfo info;
-    TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &info.width);
-    TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &info.height);
-    TIFFGetFieldDefaulted(tif, TIFFTAG_BITSPERSAMPLE, &info.bits);
-    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT, &info.sampleFormat);
-    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &info.samplesPerPixel);
-    TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &info.compression);
-    TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &info.rowsPerStrip);
-    info.strips = TIFFNumberOfStrips(tif);
-    info.tiled = TIFFIsTiled(tif);
-    info.byteSwapped = TIFFIsByteSwapped(tif);
-    TIFFClose(tif);
-    return info;
-}
-
-bool isMmapCompatibleTiff(const TiffInfo& info)
-{
-    return !info.tiled &&
-           !info.byteSwapped &&
-           info.samplesPerPixel == 1 &&
-           info.bits == 32 &&
-           info.sampleFormat == SAMPLEFORMAT_IEEEFP &&
-           info.compression == COMPRESSION_NONE &&
-           info.strips == 1 &&
-           info.rowsPerStrip >= info.height &&
-           info.width > 0 &&
-           info.height > 0;
-}
-
-float tiffSampleToFloat(const uint8_t* p, uint16_t sampleFormat, uint16_t bits)
-{
-    switch (sampleFormat) {
-        case SAMPLEFORMAT_IEEEFP:
-            if (bits == 32) {
-                float v = 0.0f;
-                std::memcpy(&v, p, sizeof(v));
-                return v;
-            }
-            if (bits == 64) {
-                double v = 0.0;
-                std::memcpy(&v, p, sizeof(v));
-                return static_cast<float>(v);
-            }
-            break;
-        case SAMPLEFORMAT_UINT:
-            if (bits == 8) return static_cast<float>(*p);
-            if (bits == 16) {
-                uint16_t v = 0;
-                std::memcpy(&v, p, sizeof(v));
-                return static_cast<float>(v);
-            }
-            if (bits == 32) {
-                uint32_t v = 0;
-                std::memcpy(&v, p, sizeof(v));
-                return static_cast<float>(v);
-            }
-            break;
-        case SAMPLEFORMAT_INT:
-            if (bits == 8) return static_cast<float>(*reinterpret_cast<const int8_t*>(p));
-            if (bits == 16) {
-                int16_t v = 0;
-                std::memcpy(&v, p, sizeof(v));
-                return static_cast<float>(v);
-            }
-            if (bits == 32) {
-                int32_t v = 0;
-                std::memcpy(&v, p, sizeof(v));
-                return static_cast<float>(v);
-            }
-            break;
-        default:
-            break;
-    }
-    throw std::runtime_error("unsupported TIFF sample type");
-}
-
-std::vector<float> readTiffAsFloat(const std::filesystem::path& path, TiffInfo* outInfo)
-{
-    TIFF* tif = TIFFOpen(path.string().c_str(), "r");
-    if (!tif) {
-        throw std::runtime_error("failed to open TIFF: " + path.string());
-    }
-
-    const TiffInfo info = readTiffInfo(path);
-    if (info.width == 0 || info.height == 0 || info.samplesPerPixel != 1) {
-        TIFFClose(tif);
-        throw std::runtime_error("unsupported TIFF geometry: " + path.string());
-    }
-    if (!(info.bits == 8 || info.bits == 16 || info.bits == 32 || info.bits == 64)) {
-        TIFFClose(tif);
-        throw std::runtime_error("unsupported TIFF bits per sample: " + path.string());
-    }
-
-    const int bytesPer = (info.bits + 7) / 8;
-    std::vector<float> pixels(static_cast<std::size_t>(info.width) * info.height);
-    if (TIFFIsTiled(tif)) {
-        uint32_t tileW = 0;
-        uint32_t tileH = 0;
-        TIFFGetField(tif, TIFFTAG_TILEWIDTH, &tileW);
-        TIFFGetField(tif, TIFFTAG_TILELENGTH, &tileH);
-        if (tileW == 0 || tileH == 0) {
-            TIFFClose(tif);
-            throw std::runtime_error("invalid TIFF tile geometry: " + path.string());
-        }
-        const tmsize_t tileBytes = TIFFTileSize(tif);
-        std::vector<uint8_t> tileBuf(static_cast<std::size_t>(tileBytes));
-        for (uint32_t y0 = 0; y0 < info.height; y0 += tileH) {
-            const uint32_t dy = std::min(tileH, info.height - y0);
-            for (uint32_t x0 = 0; x0 < info.width; x0 += tileW) {
-                const uint32_t dx = std::min(tileW, info.width - x0);
-                const ttile_t tidx = TIFFComputeTile(tif, x0, y0, 0, 0);
-                if (TIFFReadEncodedTile(tif, tidx, tileBuf.data(), tileBytes) < 0) {
-                    TIFFClose(tif);
-                    throw std::runtime_error("failed reading tile: " + path.string());
-                }
-                for (uint32_t y = 0; y < dy; ++y) {
-                    const uint8_t* row = tileBuf.data() + static_cast<std::size_t>(y) * tileW * bytesPer;
-                    for (uint32_t x = 0; x < dx; ++x) {
-                        pixels[static_cast<std::size_t>(y0 + y) * info.width + x0 + x] =
-                            tiffSampleToFloat(row + static_cast<std::size_t>(x) * bytesPer,
-                                              info.sampleFormat,
-                                              info.bits);
-                    }
-                }
-            }
-        }
-    } else {
-        const tmsize_t scanBytes = TIFFScanlineSize(tif);
-        std::vector<uint8_t> scanBuf(static_cast<std::size_t>(scanBytes));
-        for (uint32_t y = 0; y < info.height; ++y) {
-            if (TIFFReadScanline(tif, scanBuf.data(), y, 0) != 1) {
-                TIFFClose(tif);
-                throw std::runtime_error("failed reading scanline: " + path.string());
-            }
-            for (uint32_t x = 0; x < info.width; ++x) {
-                pixels[static_cast<std::size_t>(y) * info.width + x] =
-                    tiffSampleToFloat(scanBuf.data() + static_cast<std::size_t>(x) * bytesPer,
-                                      info.sampleFormat,
-                                      info.bits);
-            }
-        }
-    }
-
-    TIFFClose(tif);
-    if (outInfo) {
-        *outInfo = info;
-    }
-    return pixels;
-}
-
-void writeMmapCompatibleTiff(const std::filesystem::path& path,
-                             const TiffInfo& info,
-                             const std::vector<float>& pixels)
-{
-    const auto tmp = path.string() + ".mmap_tmp";
-    const std::uint64_t pixelBytes =
-        static_cast<std::uint64_t>(pixels.size()) * sizeof(float);
-    const char* mode = pixelBytes > 0xffff0000ULL ? "w8" : "w";
-    TIFF* out = TIFFOpen(tmp.c_str(), mode);
-    if (!out) {
-        throw std::runtime_error("failed to create TIFF: " + tmp);
-    }
-
-    TIFFSetField(out, TIFFTAG_IMAGEWIDTH, info.width);
-    TIFFSetField(out, TIFFTAG_IMAGELENGTH, info.height);
-    TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, 1);
-    TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, 32);
-    TIFFSetField(out, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
-    TIFFSetField(out, TIFFTAG_COMPRESSION, COMPRESSION_NONE);
-    TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-    TIFFSetField(out, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
-    TIFFSetField(out, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
-    TIFFSetField(out, TIFFTAG_ROWSPERSTRIP, info.height);
-
-    const tsize_t bytes = static_cast<tsize_t>(pixelBytes);
-    if (TIFFWriteEncodedStrip(out, 0, const_cast<float*>(pixels.data()), bytes) < 0) {
-        TIFFClose(out);
-        std::error_code ec;
-        std::filesystem::remove(tmp, ec);
-        throw std::runtime_error("failed writing TIFF: " + tmp);
-    }
-    TIFFClose(out);
-    std::filesystem::rename(tmp, path);
-}
-
-void normalizeTiffForMmap(const std::filesystem::path& path)
-{
-    const TiffInfo info = readTiffInfo(path);
-    if (isMmapCompatibleTiff(info)) {
-        return;
-    }
-    TiffInfo readInfo;
-    auto pixels = readTiffAsFloat(path, &readInfo);
-    writeMmapCompatibleTiff(path, readInfo, pixels);
 }
 
 std::optional<double> jsonNumberLike(const nlohmann::json& obj, const char* key)
@@ -458,6 +260,22 @@ std::string sourceVolumeIdForSegment(const OpenDataSegment& segment)
     return derived.empty() ? segment.originalVolumeId : derived;
 }
 
+bool applyCatalogCreationMetadata(nlohmann::json& meta,
+                                  const OpenDataSegment& segment)
+{
+    if (segment.createdAt.empty()) {
+        return false;
+    }
+    const auto timestamp = surfaceTimestampFromCatalogDate(segment.createdAt);
+    const bool changed =
+        meta.value("date_last_modified", std::string{}) != timestamp ||
+        meta.value("vc_open_data_creation_date", std::string{}) !=
+            segment.createdAt;
+    meta["date_last_modified"] = timestamp;
+    meta["vc_open_data_creation_date"] = segment.createdAt;
+    return changed;
+}
+
 void applyOpenDataMetadata(nlohmann::json& meta,
                            const std::string& baseUrl,
                            const OpenDataSegment& segment)
@@ -470,6 +288,7 @@ void applyOpenDataMetadata(nlohmann::json& meta,
         meta["vc_open_data_derived_volume_id"] = derivedId;
     }
     meta["vc_open_data_original_volume_downscale"] = originalVolumeDownscale(segment);
+    applyCatalogCreationMetadata(meta, segment);
 }
 
 bool coordinatesAlreadyScaled(const nlohmann::json& meta, double expectedFactor)
@@ -485,12 +304,6 @@ bool coordinatesAlreadyScaled(const nlohmann::json& meta, double expectedFactor)
             "legacy catalog segment coordinate-scale marker does not match manifest downscale");
     }
     return true;
-}
-
-bool artifactAlreadyInOriginalVolumeScale(const OpenDataArtifact& artifact)
-{
-    const auto type = lowerCopy(artifact.type);
-    return type.find("transformed") != std::string::npos;
 }
 
 std::optional<cv::Matx44d> parseOpenDataMatrix(const nlohmann::json& matrixJson)
@@ -705,6 +518,10 @@ bool cachedMetadataNeedsNormalization(const std::filesystem::path& metaPath,
             stringField("format") != "tifxyz" ||
             stringField("vc_open_data_segment_id") != segment.id ||
             stringField("vc_open_data_segment_long_id") != segment.longId ||
+            (!segment.createdAt.empty() &&
+             (stringField("date_last_modified") !=
+                  surfaceTimestampFromCatalogDate(segment.createdAt) ||
+              stringField("vc_open_data_creation_date") != segment.createdAt)) ||
             stringField("vc_open_data_source_path").empty() ||
             !meta.contains("vc_open_data_source_coordinate_scale_factor") ||
             !meta.contains("vc_open_data_source_original_resolution")) {
@@ -772,49 +589,6 @@ void applySourceCoordinateMetadata(utils::Json& meta,
     meta["vc_open_data_source_original_resolution"] = *volume->pixelSizeUm;
 }
 
-void writeCachedMetadata(const std::string& baseUrl,
-                         const OpenDataSample& sample,
-                         const OpenDataSegment& segment,
-                         const std::filesystem::path& target,
-                         const std::string& representationId,
-                         const std::string& representation,
-                         const std::string& coordinateSpace,
-                         int coordinateLevel,
-                         const std::string& coordinateVolumeId)
-{
-    const auto url = joinOpenDataUrl(baseUrl, "meta.json");
-    auto bytes = vc::httpGetBytes(url);
-    if (bytes.empty()) {
-        throw std::runtime_error("missing or empty meta.json at " + url);
-    }
-    std::string body(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-
-    auto meta = nlohmann::json::parse(body);
-    if (!meta.is_object()) {
-        throw std::runtime_error("meta.json is not an object");
-    }
-    if (!meta.contains("type") || !meta["type"].is_string() || meta["type"].get<std::string>().empty()) {
-        meta["type"] = "seg";
-    }
-    meta["uuid"] = representationId;
-    if (!meta.contains("name") || !meta["name"].is_string() || meta["name"].get<std::string>().empty()) {
-        meta["name"] = segment.suffix.empty() ? segmentLabel(segment) : segment.suffix;
-    }
-    if (!meta.contains("format") || !meta["format"].is_string() || meta["format"].get<std::string>().empty()) {
-        meta["format"] = "tifxyz";
-    }
-    applyOpenDataMetadata(meta, baseUrl, segment);
-    meta["vc_open_data_catalog_segment_lineage_id"] = segmentStableId(segment);
-    meta["vc_open_data_representation"] = representation;
-    meta["vc_open_data_source_coordinate_level"] = coordinateLevel;
-    if (!coordinateSpace.empty())
-        meta["vc_open_data_coordinate_space"] = coordinateSpace;
-    applySourceCoordinateMetadata(
-        meta, sample, coordinateVolumeId, coordinateLevel);
-
-    writeStringAtomic(target, meta.dump(2));
-}
-
 void normalizeCachedMetadata(const std::string& baseUrl,
                              const OpenDataSample& sample,
                              const OpenDataSegment& segment,
@@ -852,36 +626,6 @@ void normalizeCachedMetadata(const std::string& baseUrl,
     if (applyDownscale) {
         applyOriginalVolumeDownscale(target.parent_path(), segment, representationId);
     }
-}
-
-void writeCachedTifxyzBand(const std::string& baseUrl,
-                           const char* fileName,
-                           const std::filesystem::path& target)
-{
-    const auto url = joinOpenDataUrl(baseUrl, fileName);
-    auto bytes = vc::httpGetBytes(url);
-    if (bytes.empty()) {
-        throw std::runtime_error("missing or empty " + std::string(fileName) +
-                                 " at " + url);
-    }
-    writeBytesAtomic(target, bytes);
-    normalizeTiffForMmap(target);
-}
-
-bool cacheOptionalFile(const std::string& baseUrl,
-                       const char* fileName,
-                       const std::filesystem::path& target)
-{
-    try {
-        const auto url = joinOpenDataUrl(baseUrl, fileName);
-        auto bytes = vc::httpGetBytes(url);
-        if (!bytes.empty()) {
-            writeBytesAtomic(target, bytes);
-            return true;
-        }
-    } catch (...) {
-    }
-    return false;
 }
 
 std::optional<nlohmann::json> readCatalogOrigin(const std::filesystem::path& dir);
@@ -946,101 +690,55 @@ std::vector<nlohmann::json> readInkDetectionRecords(const std::filesystem::path&
     return {};
 }
 
-void writeInkDetectionRecords(const std::filesystem::path& segmentDir,
-                              const std::vector<nlohmann::json>& records)
+nlohmann::json inkDetectionMaterializationRecipe(
+    const OpenDataSample& sample,
+    const OpenDataSegment& segment)
 {
-    nlohmann::json array = nlohmann::json::array();
-    for (const auto& record : records) {
-        array.push_back(record);
-    }
-    writeStringAtomic(segmentDir / "ink-detections.json", array.dump(2));
-
-    if (auto origin = readCatalogOrigin(segmentDir)) {
-        (*origin)["ink_detections"] = array;
-        writeStringAtomic(segmentDir / "catalog-origin.json", origin->dump(2));
-    }
-}
-
-std::size_t cacheInkDetectionImages(const OpenDataSample& sample,
-                                    const OpenDataSegment& segment,
-                                    const std::filesystem::path& segmentDir)
-{
-    std::vector<nlohmann::json> records = readInkDetectionRecords(segmentDir);
-    std::set<std::string> localFiles;
-    for (const auto& record : records) {
-        const auto it = record.find("local_file");
-        if (it != record.end() && it->is_string()) {
-            localFiles.insert(it->get<std::string>());
-        }
-    }
-
     std::vector<const OpenDataArtifact*> supportedArtifacts;
-    supportedArtifacts.reserve(segment.artifacts.size());
     bool hasJpegArtifact = false;
     for (const auto& artifact : segment.artifacts) {
         if (!isSupportedInkImageArtifact(artifact)) {
             continue;
         }
         const std::string ext = imageExtensionForUrl(artifactUrl(artifact));
-        if (isJpegExtension(ext)) {
-            hasJpegArtifact = true;
-        }
+        hasJpegArtifact = hasJpegArtifact || isJpegExtension(ext);
         supportedArtifacts.push_back(&artifact);
     }
 
+    nlohmann::json recipe = nlohmann::json::array();
     std::size_t supportedIndex = 0;
     for (const auto* artifactPtr : supportedArtifacts) {
         const auto& artifact = *artifactPtr;
         const std::string url = artifactUrl(artifact);
         const std::string ext = imageExtensionForUrl(url);
-        if (url.empty() || ext.empty()) {
-            continue;
-        }
-        if (hasJpegArtifact && !isJpegExtension(ext)) {
+        if (url.empty() || ext.empty() ||
+            (hasJpegArtifact && !isJpegExtension(ext))) {
             continue;
         }
 
-        std::string baseName = artifact.type.empty() ? "ink_detection" : artifact.type;
+        std::string baseName = artifact.type.empty() ? "ink_detection"
+                                                     : artifact.type;
         if (supportedIndex > 0) {
             baseName += "_" + std::to_string(supportedIndex + 1);
         }
-        const std::filesystem::path relative = std::filesystem::path("ink-detections") /
+        const auto relative = std::filesystem::path("ink-detections") /
             (safePathComponent(baseName) + ext);
-        const std::filesystem::path target = segmentDir / relative;
-        const std::string relativeString = relative.generic_string();
-
-        bool hasFile = isNonEmptyFile(target);
-        if (!hasFile) {
-            try {
-                auto bytes = vc::httpGetBytes(url);
-                if (!bytes.empty()) {
-                    writeBytesAtomic(target, bytes);
-                    hasFile = true;
-                }
-            } catch (...) {
-                hasFile = false;
-            }
-        }
-
-        if (hasFile && localFiles.insert(relativeString).second) {
-            nlohmann::json record;
-            record["label"] = inkDetectionLabel(segment, artifact, supportedIndex);
-            record["sample_id"] = sample.id;
-            record["segment_id"] = segment.id;
-            record["segment_long_id"] = segment.longId;
-            record["artifact_type"] = artifact.type;
-            record["original_source_uri"] = artifact.sourcePath;
-            record["resolved_http_url"] = artifact.resolvedUrl.empty() ? artifact.sourcePath : artifact.resolvedUrl;
-            record["local_file"] = relativeString;
-            records.push_back(std::move(record));
-        }
+        recipe.push_back({
+            {"download_url", url},
+            {"label", inkDetectionLabel(segment, artifact, supportedIndex)},
+            {"sample_id", sample.id},
+            {"segment_id", segment.id},
+            {"segment_long_id", segment.longId},
+            {"artifact_type", artifact.type},
+            {"original_source_uri", artifact.sourcePath},
+            {"resolved_http_url", artifact.resolvedUrl.empty()
+                                      ? artifact.sourcePath
+                                      : artifact.resolvedUrl},
+            {"local_file", relative.generic_string()}
+        });
         ++supportedIndex;
     }
-
-    if (!records.empty()) {
-        writeInkDetectionRecords(segmentDir, records);
-    }
-    return records.size();
+    return recipe;
 }
 
 std::string nowUtcIso()
@@ -1217,224 +915,220 @@ void publishSegmentDirectory(const std::filesystem::path& tempDir,
     std::filesystem::remove_all(backupDir, ec);
 }
 
-bool cacheTifxyzRepresentation(
-                        const OpenDataSample& sample,
-                        const OpenDataSegment& segment,
-                        const OpenDataArtifact& artifact,
-                        const std::filesystem::path& segmentDir,
-                        bool applyDownscale,
-                        const std::string& representationId,
-                        const std::string& representation,
-                        const std::string& coordinateVolumeId,
-                        const std::string& coordinateSpace,
-                        int coordinateLevel,
-                        std::string* errorOut,
-                        const std::function<void(const char*, const char*)>& fileProgress = {},
-                        bool forceRefresh = false)
+nlohmann::json placeholderMetadata(
+    const OpenDataSample& sample,
+    const OpenDataSegment& segment,
+    const std::string& representationId,
+    const std::string& representation,
+    const std::string& coordinateVolumeId,
+    const std::string& coordinateSpace,
+    const std::string& sourceUrl = {})
 {
-    const auto url = artifactUrl(artifact);
-    if (url.empty()) {
-        if (errorOut) *errorOut = "tifxyz artifact has no URL.";
+    nlohmann::json meta = nlohmann::json::object();
+    if (segment.raw.is_object()) {
+        const auto creation = segment.raw.find("creation");
+        if (creation != segment.raw.end() && creation->is_object()) {
+            const auto metadata = creation->find("metadata");
+            if (metadata != creation->end() && metadata->is_object()) {
+                meta = *metadata;
+            }
+        }
+    }
+    if (segment.properties.is_object()) {
+        const auto coverage = segment.properties.find("volume_coverage");
+        if (coverage != segment.properties.end() && coverage->is_object()) {
+            const auto target = coverage->find(coordinateVolumeId);
+            if (target != coverage->end() && target->is_object()) {
+                const auto bbox = target->find("bbox_transformed");
+                if (bbox != target->end() && bbox->is_array()) {
+                    meta["bbox"] = *bbox;
+                }
+            }
+        }
+    }
+    meta["type"] = "seg";
+    meta["uuid"] = representationId;
+    meta["name"] = segment.suffix.empty() ? segmentLabel(segment) : segment.suffix;
+    meta["format"] = "tifxyz";
+    if (!meta.contains("scale")) {
+        meta["scale"] = nlohmann::json::array({1.0, 1.0});
+    }
+    applyOpenDataMetadata(meta, sourceUrl, segment);
+    meta["vc_open_data_catalog_segment_lineage_id"] = segmentStableId(segment);
+    meta["vc_open_data_representation"] = representation;
+    meta["vc_open_data_source_coordinate_level"] = 0;
+    meta["vc_open_data_coordinate_space"] = coordinateSpace;
+    meta[kLazyPlaceholderMetaKey] = true;
+    applySourceCoordinateMetadata(meta, sample, coordinateVolumeId, 0);
+    return meta;
+}
+
+using PlaceholderPreparer = std::function<bool(
+    const std::filesystem::path&, std::string*)>;
+
+bool refreshMaterializedSegment(
+    const std::filesystem::path& segmentDir,
+    const PlaceholderPreparer& preparePlaceholder,
+    std::string* errorOut);
+
+bool prepareRepresentationPlaceholder(
+    const OpenDataSample& sample,
+    const OpenDataSegment& segment,
+    const OpenDataSegmentRepresentation& representation,
+    const std::filesystem::path& segmentDir,
+    bool forceRefresh,
+    std::string* errorOut)
+{
+    if (!representation.artifact) {
+        if (errorOut) *errorOut = "representation has no artifact";
         return false;
     }
-
-    if (!forceRefresh && requiredFilesPresent(segmentDir)) {
-        const auto origin = readCatalogOrigin(segmentDir);
-        if (origin && originMatches(*origin, sample, segment, artifact) &&
-            originStateAllowsFastOpen(*origin)) {
-            if (cachedMetadataNeedsNormalization(segmentDir / "meta.json",
-                                                 segment,
-                                                 applyDownscale,
-                                                 representationId)) {
-                normalizeCachedMetadata(url, sample,
-                                        segment,
-                                        segmentDir / "meta.json",
-                                        applyDownscale,
-                                        representationId,
-                                        representation,
-                                        coordinateSpace,
-                                        coordinateLevel,
-                                        coordinateVolumeId);
-            }
-            return true;
-        }
-        if (!origin || originMatches(*origin, sample, segment, artifact)) {
-            normalizeCachedMetadata(url, sample,
-                                    segment,
-                                    segmentDir / "meta.json",
-                                    applyDownscale,
-                                    representationId,
-                                    representation,
-                                    coordinateSpace,
-                                    coordinateLevel,
-                                    coordinateVolumeId);
-            if (origin) {
-                writeCatalogOriginState(segmentDir, OpenDataSegmentCacheState::Current);
-            } else {
-                writeStringAtomic(
-                    segmentDir / "catalog-origin.json",
-                    catalogOriginJson(sample,
-                                      segment,
-                                      artifact,
-                                      {"meta.json", "x.tif", "y.tif", "z.tif"}).dump(2));
-            }
+    const bool applyDownscale =
+        representation.kind ==
+        OpenDataSegmentRepresentationKind::DerivedNative;
+    const char* representationName =
+        representation.kind == OpenDataSegmentRepresentationKind::DerivedNative
+            ? "derived-native"
+            : "published-transformed";
+    if (forceRefresh) {
+        return refreshMaterializedSegment(
+            segmentDir,
+            [&](const std::filesystem::path& stagingDir,
+                std::string* stagingError) {
+                return prepareRepresentationPlaceholder(
+                    sample, segment, representation, stagingDir, false,
+                    stagingError);
+            },
+            errorOut);
+    }
+    if (requiredFilesPresent(segmentDir)) {
+        if (cachedMetadataNeedsNormalization(
+                segmentDir / "meta.json", segment, applyDownscale,
+                representation.representationId)) {
             try {
-                cacheInkDetectionImages(sample, segment, segmentDir);
-            } catch (...) {
+                normalizeCachedMetadata(
+                    artifactUrl(*representation.artifact), sample, segment,
+                    segmentDir / "meta.json", applyDownscale,
+                    representation.representationId,
+                    applyDownscale ? "derived-native"
+                                   : "published-transformed",
+                    representation.coordinateSpace,
+                    representation.sourceCoordinateLevel,
+                    representation.coordinateVolumeId);
+            } catch (const std::exception& e) {
+                if (errorOut) *errorOut = e.what();
+                return false;
             }
-            return true;
         }
+        return true;
+    }
+    const std::string url = artifactUrl(*representation.artifact);
+    if (url.empty()) {
+        if (errorOut) *errorOut = "representation has no public URL";
+        return false;
     }
 
     const auto tempDir = makeTempSegmentDir(segmentDir);
     std::error_code ec;
     std::filesystem::remove_all(tempDir, ec);
-    std::filesystem::create_directories(tempDir);
-    std::vector<std::string> downloadedFiles;
-
+    std::filesystem::create_directories(tempDir, ec);
+    if (ec) {
+        if (errorOut) *errorOut = ec.message();
+        return false;
+    }
     try {
-        auto runFile = [&](const char* fileName, const auto& fn) {
-            if (fileProgress) fileProgress(fileName, "start");
-            if (fn()) {
-                downloadedFiles.push_back(fileName);
-            }
-            if (fileProgress) fileProgress(fileName, "done");
+        writeStringAtomic(
+            tempDir / "meta.json",
+            placeholderMetadata(sample, segment,
+                                representation.representationId,
+                                representationName,
+                                representation.coordinateVolumeId,
+                                representation.coordinateSpace,
+                                url).dump(2));
+        auto origin = catalogOriginJson(sample, segment,
+                                        *representation.artifact,
+                                        {"meta.json"});
+        origin["cache_state"] = "remote";
+        origin[kMaterializationKey] = {
+            {"kind", "download"},
+            {"url", url},
+            {"representation_id", representation.representationId},
+            {"apply_downscale",
+             representation.kind ==
+                 OpenDataSegmentRepresentationKind::DerivedNative},
+            {"original_volume_downscale", originalVolumeDownscale(segment)}
         };
-        runFile("meta.json", [&]() {
-            writeCachedMetadata(url, sample, segment, tempDir / "meta.json",
-                                representationId, representation,
-                                coordinateSpace, coordinateLevel,
-                                coordinateVolumeId);
-            return true;
-        });
-        runFile("x.tif", [&]() {
-            writeCachedTifxyzBand(url, "x.tif", tempDir / "x.tif");
-            return true;
-        });
-        runFile("y.tif", [&]() {
-            writeCachedTifxyzBand(url, "y.tif", tempDir / "y.tif");
-            return true;
-        });
-        runFile("z.tif", [&]() {
-            writeCachedTifxyzBand(url, "z.tif", tempDir / "z.tif");
-            return true;
-        });
-        runFile("mask.tif", [&]() {
-            return cacheOptionalFile(url, "mask.tif", tempDir / "mask.tif");
-        });
-        runFile("overlapping.json", [&]() {
-            return cacheOptionalFile(url, "overlapping.json", tempDir / "overlapping.json");
-        });
-
-        if (!requiredFilesPresent(tempDir)) {
-            throw std::runtime_error("downloaded segment is missing required tifxyz files");
-        }
-        normalizeCachedMetadata(url, sample,
-                                segment,
-                                tempDir / "meta.json",
-                                applyDownscale,
-                                representationId,
-                                representation,
-                                coordinateSpace,
-                                coordinateLevel,
-                                coordinateVolumeId);
-        writeStringAtomic(tempDir / "catalog-origin.json",
-                          catalogOriginJson(sample, segment, artifact, downloadedFiles).dump(2));
-        try {
-            cacheInkDetectionImages(sample, segment, tempDir);
-        } catch (...) {
-        }
+        origin[kMaterializationKey]["ink_detections"] =
+            inkDetectionMaterializationRecipe(sample, segment);
+        writeStringAtomic(tempDir / "catalog-origin.json", origin.dump(2));
         publishSegmentDirectory(tempDir, segmentDir);
         return true;
     } catch (const std::exception& e) {
         std::filesystem::remove_all(tempDir, ec);
         if (errorOut) *errorOut = e.what();
-    } catch (...) {
-        std::filesystem::remove_all(tempDir, ec);
-        if (errorOut) *errorOut = "unknown error.";
+        return false;
     }
-    return false;
 }
 
-bool cacheTifxyzSegment(const OpenDataSample& sample,
-                        const OpenDataSegment& segment,
-                        const std::filesystem::path& segmentDir,
-                        std::string* errorOut,
-                        const std::function<void(const char*, const char*)>& fileProgress = {},
-                        bool forceRefresh = false)
+bool prepareGeneratedPlaceholder(
+    const OpenDataSample& sample,
+    const OpenDataSegment& segment,
+    const std::filesystem::path& sourceSegmentDir,
+    const std::filesystem::path& targetSegmentDir,
+    const std::string& targetVolumeId,
+    bool forceRefresh,
+    std::string* errorOut)
 {
-    const auto* artifact = preferredTifxyzArtifact(segment);
-    if (!artifact) {
-        if (errorOut) *errorOut = "no tifxyz artifact.";
-        return false;
+    if (forceRefresh) {
+        return refreshMaterializedSegment(
+            targetSegmentDir,
+            [&](const std::filesystem::path& stagingDir,
+                std::string* stagingError) {
+                return prepareGeneratedPlaceholder(
+                    sample, segment, sourceSegmentDir, stagingDir,
+                    targetVolumeId, false, stagingError);
+            },
+            errorOut);
     }
-    const bool applyDownscale = !artifactAlreadyInOriginalVolumeScale(*artifact);
-    const auto sourceId = sourceVolumeIdForSegment(segment);
-    return cacheTifxyzRepresentation(
-        sample, segment, *artifact, segmentDir, applyDownscale,
-        segmentStableId(segment),
-        applyDownscale ? "derived-native" : "published-native",
-        sourceId,
-        sample.id + "/" + sourceId + "@L0", 0,
-        errorOut, fileProgress, forceRefresh);
-}
-
-bool cacheTransformedTifxyzSegment(const OpenDataSample& sample,
-                                   const OpenDataSegment& segment,
-                                   const std::filesystem::path& sourceSegmentDir,
-                                   const std::filesystem::path& targetSegmentDir,
-                                   const std::string& targetVolumeId,
-                                   std::string* errorOut)
-{
-    if (!requiredFilesPresent(sourceSegmentDir)) {
-        if (errorOut) *errorOut = "source cached segment is incomplete.";
-        return false;
-    }
-
-    const std::string sourceVolumeId = sourceVolumeIdForSegment(segment);
-    const auto matrix = findVolumeTransformMatrix(sample, sourceVolumeId, targetVolumeId);
-    if (!matrix) {
-        if (errorOut) *errorOut = "no transform from " + sourceVolumeId + " to " + targetVolumeId + ".";
-        return false;
-    }
-
     if (requiredFilesPresent(targetSegmentDir)) {
-        const auto origin = readCatalogOrigin(targetSegmentDir);
-        if (origin && transformedOriginMatches(*origin, sample, segment, sourceVolumeId, targetVolumeId, *matrix)) {
+        try {
+            const auto metaPath = targetSegmentDir / "meta.json";
+            auto meta = nlohmann::json::parse(readTextFile(metaPath));
+            if (applyCatalogCreationMetadata(meta, segment)) {
+                writeStringAtomic(metaPath, meta.dump(2));
+            }
             return true;
+        } catch (const std::exception& e) {
+            if (errorOut) *errorOut = e.what();
+            return false;
         }
     }
+    const std::string sourceVolumeId = sourceVolumeIdForSegment(segment);
+    const auto matrix = findVolumeTransformMatrix(
+        sample, sourceVolumeId, targetVolumeId);
+    if (!matrix) {
+        if (errorOut) *errorOut = "missing volume transform";
+        return false;
+    }
 
+    const std::string representationId =
+        segmentStableId(segment) + "-generated-" +
+        safePathComponent(targetVolumeId) + "-L0";
     const auto tempDir = makeTempSegmentDir(targetSegmentDir);
     std::error_code ec;
     std::filesystem::remove_all(tempDir, ec);
-    std::filesystem::create_directories(tempDir);
-
+    std::filesystem::create_directories(tempDir, ec);
+    if (ec) {
+        if (errorOut) *errorOut = ec.message();
+        return false;
+    }
     try {
-        auto surface = load_quad_from_tifxyz(sourceSegmentDir.string());
-        if (!surface) {
-            throw std::runtime_error("failed to load source cached tifxyz segment");
-        }
-
-        vc::core::util::transformSurfacePoints(surface.get(), 1.0, *matrix, 1.0);
-        vc::core::util::refreshTransformedSurfaceState(surface.get());
-        surface->meta["vc_open_data_transform_source_volume_id"] = sourceVolumeId;
-        surface->meta["vc_open_data_transform_target_volume_id"] = targetVolumeId;
-        surface->meta["vc_open_data_volume_transform_matrix"] = matrixToUtilsJson(*matrix);
-        surface->meta["vc_open_data_catalog_segment_lineage_id"] =
-            segmentStableId(segment);
-        surface->meta["vc_open_data_representation"] = "generated-native-transform";
-        surface->meta["vc_open_data_source_coordinate_level"] = 0;
-        surface->meta["vc_open_data_coordinate_space"] =
-            sample.id + "/" + targetVolumeId + "@L0";
-        applySourceCoordinateMetadata(
-            surface->meta, sample, targetVolumeId, 0);
-        surface->save(
-            tempDir.string(),
-            segmentStableId(segment) + "-generated-" +
-                safePathComponent(targetVolumeId) + "-L0",
-            true);
-
+        writeStringAtomic(
+            tempDir / "meta.json",
+            placeholderMetadata(
+                sample, segment, representationId,
+                "generated-native-transform", targetVolumeId,
+                sample.id + "/" + targetVolumeId + "@L0").dump(2));
         nlohmann::json origin;
         origin["manifest_url"] = std::string(kDefaultManifestUrl);
         origin["sample_id"] = sample.id;
@@ -1443,20 +1137,232 @@ bool cacheTransformedTifxyzSegment(const OpenDataSample& sample,
         origin["source_volume_id"] = sourceVolumeId;
         origin["target_volume_id"] = targetVolumeId;
         origin["matrix"] = matrixToJson(*matrix);
-        origin["transformed_at_utc"] = nowUtcIso();
-        origin["cache_state"] = cacheStateName(OpenDataSegmentCacheState::Current);
+        origin["cache_state"] = "remote";
+        origin[kMaterializationKey] = {
+            {"kind", "generate"},
+            {"source_segment_dir", sourceSegmentDir.string()},
+            {"representation_id", representationId},
+            {"source_volume_id", sourceVolumeId},
+            {"target_volume_id", targetVolumeId},
+            {"coordinate_space", sample.id + "/" + targetVolumeId + "@L0"},
+            {"matrix", matrixToJson(*matrix)}
+        };
         writeStringAtomic(tempDir / "catalog-origin.json", origin.dump(2));
-
         publishSegmentDirectory(tempDir, targetSegmentDir);
         return true;
     } catch (const std::exception& e) {
         std::filesystem::remove_all(tempDir, ec);
         if (errorOut) *errorOut = e.what();
-    } catch (...) {
-        std::filesystem::remove_all(tempDir, ec);
-        if (errorOut) *errorOut = "unknown error.";
+        return false;
     }
-    return false;
+}
+
+std::shared_ptr<std::mutex> materializationMutexFor(
+    const std::filesystem::path& segmentDir)
+{
+    static std::mutex mutexesMutex;
+    static std::unordered_map<std::string, std::shared_ptr<std::mutex>> mutexes;
+    const auto key = std::filesystem::absolute(segmentDir).lexically_normal().string();
+    std::lock_guard<std::mutex> lock(mutexesMutex);
+    auto& mutex = mutexes[key];
+    if (!mutex) mutex = std::make_shared<std::mutex>();
+    return mutex;
+}
+
+OpenDataSegmentMaterializationResult materializeOne(
+    const std::filesystem::path& segmentDir)
+{
+    OpenDataSegmentMaterializationResult result;
+    const auto pathMutex = materializationMutexFor(segmentDir);
+    std::lock_guard<std::mutex> pathLock(*pathMutex);
+    if (requiredFilesPresent(segmentDir)) {
+        result.success = true;
+        result.alreadyMaterialized = true;
+        return result;
+    }
+
+    const auto origin = readCatalogOrigin(segmentDir);
+    if (!origin || !origin->is_object()) {
+        result.message = "segment has no open-data materialization recipe";
+        result.failedSegments = 1;
+        return result;
+    }
+    const auto recipeIt = origin->find(kMaterializationKey);
+    if (recipeIt == origin->end() || !recipeIt->is_object()) {
+        result.message = "segment has no open-data materialization recipe";
+        result.failedSegments = 1;
+        return result;
+    }
+    const auto& recipe = *recipeIt;
+    const std::string kind = recipe.value("kind", std::string{});
+    const auto tempDir = makeTempSegmentDir(segmentDir);
+    std::error_code ec;
+    std::filesystem::remove_all(tempDir, ec);
+    std::filesystem::create_directories(tempDir, ec);
+    if (ec) {
+        result.message = ec.message();
+        result.failedSegments = 1;
+        return result;
+    }
+
+    try {
+        auto meta = nlohmann::json::parse(readTextFile(segmentDir / "meta.json"));
+        meta.erase(kLazyPlaceholderMetaKey);
+        nlohmann::json materializedInkDetections = nlohmann::json::array();
+
+        if (kind == "download") {
+            const std::string url = recipe.value("url", std::string{});
+            if (url.empty()) {
+                throw std::runtime_error("download recipe has no URL");
+            }
+            writeStringAtomic(tempDir / "meta.json", meta.dump(2));
+            writeCachedTifxyzBand(url, "x.tif", tempDir / "x.tif");
+            writeCachedTifxyzBand(url, "y.tif", tempDir / "y.tif");
+            writeCachedTifxyzBand(url, "z.tif", tempDir / "z.tif");
+            (void)cacheOptionalFile(url, "mask.tif", tempDir / "mask.tif");
+            (void)cacheOptionalFile(url, "overlapping.json",
+                                    tempDir / "overlapping.json");
+            if (const auto inkIt = recipe.find("ink_detections");
+                inkIt != recipe.end() && inkIt->is_array()) {
+                for (const auto& item : *inkIt) {
+                    if (!item.is_object()) {
+                        continue;
+                    }
+                    const std::string imageUrl =
+                        item.value("download_url", std::string{});
+                    const std::string localFile =
+                        item.value("local_file", std::string{});
+                    if (imageUrl.empty() || localFile.empty()) {
+                        continue;
+                    }
+                    try {
+                        auto bytes = vc::httpGetBytes(imageUrl);
+                        if (bytes.empty()) {
+                            continue;
+                        }
+                        writeBytesAtomic(tempDir / localFile, bytes);
+                        auto record = item;
+                        record.erase("download_url");
+                        materializedInkDetections.push_back(std::move(record));
+                    } catch (...) {
+                    }
+                }
+            }
+            if (recipe.value("apply_downscale", false)) {
+                OpenDataSegment segment;
+                segment.properties["original_volume_downscale"] =
+                    recipe.value("original_volume_downscale", 1.0);
+                applyOriginalVolumeDownscale(
+                    tempDir, segment,
+                    recipe.value("representation_id", std::string{}));
+            }
+        } else if (kind == "generate") {
+            const auto sourceDir = std::filesystem::path(
+                recipe.value("source_segment_dir", std::string{}));
+            if (sourceDir.empty() ||
+                std::filesystem::absolute(sourceDir).lexically_normal() ==
+                    std::filesystem::absolute(segmentDir).lexically_normal()) {
+                throw std::runtime_error("invalid generated-segment source");
+            }
+            const auto sourceResult = materializeOne(sourceDir);
+            if (!sourceResult.success) {
+                throw std::runtime_error(
+                    "failed to materialize canonical source: " +
+                    sourceResult.message);
+            }
+            const auto matrix = parseOpenDataMatrix(recipe.at("matrix"));
+            if (!matrix) {
+                throw std::runtime_error("invalid generated-segment matrix");
+            }
+            auto surface = load_quad_from_tifxyz(sourceDir.string());
+            if (!surface) {
+                throw std::runtime_error("failed to load canonical source");
+            }
+            vc::core::util::transformSurfacePoints(
+                surface.get(), 1.0, *matrix, 1.0);
+            vc::core::util::refreshTransformedSurfaceState(surface.get());
+            surface->meta.update(utils::Json::parse(meta.dump()));
+            surface->meta.erase(kLazyPlaceholderMetaKey);
+            surface->meta["uuid"] =
+                recipe.value("representation_id", std::string{});
+            surface->meta["vc_open_data_transform_source_volume_id"] =
+                recipe.value("source_volume_id", std::string{});
+            surface->meta["vc_open_data_transform_target_volume_id"] =
+                recipe.value("target_volume_id", std::string{});
+            surface->meta["vc_open_data_volume_transform_matrix"] =
+                matrixToUtilsJson(*matrix);
+            surface->meta["vc_open_data_representation"] =
+                "generated-native-transform";
+            surface->meta["vc_open_data_source_coordinate_level"] = 0;
+            surface->meta["vc_open_data_coordinate_space"] =
+                recipe.value("coordinate_space", std::string{});
+            surface->save(
+                tempDir.string(),
+                recipe.value("representation_id", std::string{}), true);
+        } else {
+            throw std::runtime_error("unknown materialization recipe kind");
+        }
+
+        if (!requiredFilesPresent(tempDir)) {
+            throw std::runtime_error(
+                "materialized segment is missing required tifxyz files");
+        }
+        auto updatedOrigin = *origin;
+        updatedOrigin["cache_state"] =
+            cacheStateName(OpenDataSegmentCacheState::Current);
+        updatedOrigin["materialized_at_utc"] = nowUtcIso();
+        if (!materializedInkDetections.empty()) {
+            writeStringAtomic(tempDir / "ink-detections.json",
+                              materializedInkDetections.dump(2));
+            updatedOrigin["ink_detections"] = materializedInkDetections;
+        }
+        writeStringAtomic(tempDir / "catalog-origin.json",
+                          updatedOrigin.dump(2));
+        publishSegmentDirectory(tempDir, segmentDir);
+        result.success = true;
+        result.materializedSegments = 1;
+        return result;
+    } catch (const std::exception& e) {
+        std::filesystem::remove_all(tempDir, ec);
+        result.message = e.what();
+        result.failedSegments = 1;
+        return result;
+    }
+}
+
+bool refreshMaterializedSegment(
+    const std::filesystem::path& segmentDir,
+    const PlaceholderPreparer& preparePlaceholder,
+    std::string* errorOut)
+{
+    const auto stagingDir = makeTempSegmentDir(segmentDir);
+    std::error_code error;
+    std::filesystem::remove_all(stagingDir, error);
+
+    if (!preparePlaceholder(stagingDir, errorOut)) {
+        std::filesystem::remove_all(stagingDir, error);
+        return false;
+    }
+
+    const auto materialized = materializeOne(stagingDir);
+    if (!materialized.success) {
+        std::filesystem::remove_all(stagingDir, error);
+        if (errorOut) {
+            *errorOut = materialized.message;
+        }
+        return false;
+    }
+
+    try {
+        publishSegmentDirectory(stagingDir, segmentDir);
+        return true;
+    } catch (const std::exception& exception) {
+        std::filesystem::remove_all(stagingDir, error);
+        if (errorOut) {
+            *errorOut = exception.what();
+        }
+        return false;
+    }
 }
 
 void markOrphanedEntries(const std::filesystem::path& segmentsRoot,
@@ -1497,6 +1403,104 @@ void reportProgress(const OpenDataSampleProgressCallback& callback,
 
 } // namespace
 
+bool isOpenDataSegmentPlaceholder(const std::filesystem::path& segmentDir)
+{
+    if (requiredFilesPresent(segmentDir)) {
+        return false;
+    }
+    const auto origin = readCatalogOrigin(segmentDir);
+    return origin && origin->is_object() &&
+           origin->contains(kMaterializationKey) &&
+           (*origin)[kMaterializationKey].is_object();
+}
+
+OpenDataSegmentMaterializationResult materializeOpenDataSegment(
+    const std::filesystem::path& segmentDir)
+{
+    return materializeOne(segmentDir);
+}
+
+OpenDataSegmentMaterializationResult materializeOpenDataSegmentFolder(
+    const std::filesystem::path& segmentsRoot,
+    const OpenDataSegmentMaterializationProgress& progressCallback)
+{
+    OpenDataSegmentMaterializationResult result;
+    std::vector<std::filesystem::path> pending;
+    if (isOpenDataSegmentPlaceholder(segmentsRoot)) {
+        pending.push_back(segmentsRoot);
+    } else {
+        std::error_code ec;
+        std::filesystem::recursive_directory_iterator it(segmentsRoot, ec);
+        const std::filesystem::recursive_directory_iterator end;
+        while (!ec && it != end) {
+            if (it->is_directory() &&
+                isOpenDataSegmentPlaceholder(it->path())) {
+                pending.push_back(it->path());
+                it.disable_recursion_pending();
+            }
+            it.increment(ec);
+        }
+        if (ec) {
+            result.message = ec.message();
+            result.failedSegments = 1;
+            return result;
+        }
+    }
+    std::sort(pending.begin(), pending.end());
+    if (pending.empty()) {
+        result.success = true;
+        result.alreadyMaterialized = true;
+        return result;
+    }
+
+    std::atomic_size_t next{0};
+    std::atomic_int completed{0};
+    std::mutex resultMutex;
+    std::mutex callbackMutex;
+    const int total = static_cast<int>(pending.size());
+    const auto hardware = std::thread::hardware_concurrency();
+    const std::size_t workerCount = std::min<std::size_t>(
+        pending.size(), std::max<std::size_t>(
+                            1, std::min<std::size_t>(
+                                   hardware == 0 ? 4 : hardware, 8)));
+    auto report = [&](const std::filesystem::path& path,
+                      const std::string& status) {
+        if (!progressCallback) return;
+        std::lock_guard<std::mutex> lock(callbackMutex);
+        progressCallback(completed.load(std::memory_order_relaxed),
+                         total, path, status);
+    };
+    auto worker = [&]() {
+        for (;;) {
+            const auto index = next.fetch_add(1, std::memory_order_relaxed);
+            if (index >= pending.size()) return;
+            const auto& path = pending[index];
+            report(path, "starting");
+            const auto one = materializeOne(path);
+            {
+                std::lock_guard<std::mutex> lock(resultMutex);
+                result.materializedSegments += one.materializedSegments;
+                result.failedSegments += one.failedSegments;
+                if (!one.success && !one.message.empty()) {
+                    if (!result.message.empty()) result.message += '\n';
+                    result.message += path.filename().string() + ": " +
+                                      one.message;
+                }
+            }
+            completed.fetch_add(1, std::memory_order_relaxed);
+            report(path, one.success ? "done" : "failed");
+        }
+    };
+    std::vector<std::thread> workers;
+    workers.reserve(workerCount);
+    for (std::size_t i = 0; i < workerCount; ++i) {
+        workers.emplace_back(worker);
+    }
+    for (auto& workerThread : workers) workerThread.join();
+    result.success = result.failedSegments == 0;
+    return result;
+}
+
 std::vector<OpenDataSegmentRepresentation>
 classifyOpenDataSegmentRepresentations(const OpenDataSample& sample,
                                        const OpenDataSegment& segment)
@@ -1529,66 +1533,74 @@ classifyOpenDataSegmentRepresentations(const OpenDataSample& sample,
         return std::nullopt;
     }();
 
+    const std::string sourceId = sourceVolumeIdForSegment(segment);
+    if (sourceId.empty() || volumeIds.find(sourceId) == volumeIds.end()) {
+        return result;
+    }
+
+    const OpenDataArtifact* canonicalAuthored = nullptr;
+    for (const auto* preferredType :
+         {"tifxyz-flattened", "tifxyz", "tifxyz-normalized"}) {
+        const auto it = std::find_if(
+            segment.artifacts.begin(), segment.artifacts.end(),
+            [&](const OpenDataArtifact& artifact) {
+                return lowerCopy(artifact.type) == preferredType &&
+                       !artifactUrl(artifact).empty();
+            });
+        if (it != segment.artifacts.end()) {
+            canonicalAuthored = &*it;
+            break;
+        }
+    }
+
+    std::map<std::string, const OpenDataArtifact*> publishedByTarget;
     for (const auto& artifact : segment.artifacts) {
         const auto type = lowerCopy(artifact.type);
-        if (type.find("tifxyz") == std::string::npos || artifactUrl(artifact).empty())
-            continue;
-        const std::string hash = hashUrl(artifactUrl(artifact));
-        const std::string lineage = segmentStableId(segment);
-
-        if (type == "tifxyz-transformed") {
-            if (!artifact.targetVolumeId || artifact.targetVolumeId->empty() ||
-                volumeIds.find(*artifact.targetVolumeId) == volumeIds.end()) {
-                continue;
-            }
-            OpenDataSegmentRepresentation published;
-            published.artifact = &artifact;
-            published.kind = OpenDataSegmentRepresentationKind::PublishedTransformed;
-            published.coordinateVolumeId = *artifact.targetVolumeId;
-            published.sourceCoordinateLevel = 0;
-            published.coordinateSpace = sample.id + "/" +
-                published.coordinateVolumeId + "@L0";
-            published.representationId = lineage + "-published-" +
-                safePathComponent(published.coordinateVolumeId) + "-L0-" + hash;
-            result.push_back(std::move(published));
+        if (type != "tifxyz-transformed" || artifactUrl(artifact).empty() ||
+            !artifact.targetVolumeId || artifact.targetVolumeId->empty() ||
+            volumeIds.find(*artifact.targetVolumeId) == volumeIds.end()) {
             continue;
         }
+        publishedByTarget.emplace(*artifact.targetVolumeId, &artifact);
+    }
 
-        if (type != "tifxyz" && type != "tifxyz-flattened" &&
-            type != "tifxyz-normalized") {
+    const std::string lineage = segmentStableId(segment);
+    const auto makePublished = [&](const std::string& targetId,
+                                   const OpenDataArtifact& artifact,
+                                   bool canonicalSource) {
+        OpenDataSegmentRepresentation published;
+        published.artifact = &artifact;
+        published.kind = OpenDataSegmentRepresentationKind::PublishedTransformed;
+        published.canonicalSource = canonicalSource;
+        published.coordinateVolumeId = targetId;
+        published.sourceCoordinateLevel = 0;
+        published.coordinateSpace = sample.id + "/" + targetId + "@L0";
+        published.representationId = lineage + "-published-" +
+            safePathComponent(targetId) + "-L0-" + hashUrl(artifactUrl(artifact));
+        return published;
+    };
+
+    if (const auto publishedSource = publishedByTarget.find(sourceId);
+        publishedSource != publishedByTarget.end()) {
+        result.push_back(makePublished(sourceId, *publishedSource->second, true));
+    } else if (canonicalAuthored && levelForDownscale) {
+        OpenDataSegmentRepresentation canonical;
+        canonical.artifact = canonicalAuthored;
+        canonical.kind = OpenDataSegmentRepresentationKind::DerivedNative;
+        canonical.canonicalSource = true;
+        canonical.coordinateVolumeId = sourceId;
+        canonical.sourceCoordinateLevel = 0;
+        canonical.coordinateSpace = sample.id + "/" + sourceId + "@L0";
+        canonical.representationId = lineage + "-derived-native-L0-" +
+            hashUrl(artifactUrl(*canonicalAuthored));
+        result.push_back(std::move(canonical));
+    }
+
+    for (const auto& [targetId, artifact] : publishedByTarget) {
+        if (targetId == sourceId) {
             continue;
         }
-
-        // Flattened, normalized, and ordinary tifxyz artifacts are authored
-        // in the original-volume coordinate level described by the exact
-        // power-of-two downscale. Unknown factors remain manual-only.
-        if (!levelForDownscale)
-            continue;
-        const std::string sourceId = segment.originalVolumeId.empty()
-            ? sourceVolumeIdForSegment(segment)
-            : segment.originalVolumeId;
-        if (sourceId.empty() || volumeIds.find(sourceId) == volumeIds.end())
-            continue;
-
-        OpenDataSegmentRepresentation authored;
-        authored.artifact = &artifact;
-        authored.kind = OpenDataSegmentRepresentationKind::Authored;
-        authored.coordinateVolumeId = sourceId;
-        authored.sourceCoordinateLevel = *levelForDownscale;
-        authored.coordinateSpace = sample.id + "/" + sourceId + "@L" +
-            std::to_string(*levelForDownscale);
-        authored.representationId = lineage + "-authored-L" +
-            std::to_string(*levelForDownscale) + "-" + hash;
-        result.push_back(authored);
-
-        if (*levelForDownscale > 0) {
-            auto native = authored;
-            native.kind = OpenDataSegmentRepresentationKind::DerivedNative;
-            native.sourceCoordinateLevel = 0;
-            native.coordinateSpace = sample.id + "/" + sourceId + "@L0";
-            native.representationId = lineage + "-derived-native-L0-" + hash;
-            result.push_back(std::move(native));
-        }
+        result.push_back(makePublished(targetId, *artifact, false));
     }
     return result;
 }
@@ -1605,7 +1617,7 @@ std::filesystem::path openDataSegmentRepresentationCacheRoot(
             return root / ("authored-L" +
                            std::to_string(representation.sourceCoordinateLevel));
         case OpenDataSegmentRepresentationKind::DerivedNative:
-            return root / "derived-native-L0";
+            return root;
         case OpenDataSegmentRepresentationKind::PublishedTransformed:
             return root / "published-L0";
     }
@@ -1615,11 +1627,33 @@ std::filesystem::path openDataSegmentRepresentationCacheRoot(
 std::filesystem::path openDataSegmentRepresentationCacheDirectory(
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSample& sample,
-    const OpenDataSegment&,
+    const OpenDataSegment& segment,
     const OpenDataSegmentRepresentation& representation)
 {
+    if (representation.kind == OpenDataSegmentRepresentationKind::DerivedNative) {
+        return openDataSegmentRepresentationCacheRoot(
+                   remoteCacheRoot, sample, representation) /
+               safePathComponent(segment.id);
+    }
     return openDataSegmentRepresentationCacheRoot(remoteCacheRoot, sample, representation) /
            safePathComponent(representation.representationId);
+}
+
+std::filesystem::path openDataCanonicalSegmentCacheDirectory(
+    const std::filesystem::path& remoteCacheRoot,
+    const OpenDataSample& sample,
+    const OpenDataSegment& segment)
+{
+    const auto representations =
+        classifyOpenDataSegmentRepresentations(sample, segment);
+    const auto canonical = std::find_if(
+        representations.begin(), representations.end(),
+        [](const auto& representation) { return representation.canonicalSource; });
+    if (canonical == representations.end()) {
+        return {};
+    }
+    return openDataSegmentRepresentationCacheDirectory(
+        remoteCacheRoot, sample, segment, *canonical);
 }
 
 const char* cacheStateName(OpenDataSegmentCacheState state) noexcept
@@ -1744,25 +1778,32 @@ OpenDataSegmentCacheState cacheStateForSegment(
     const OpenDataSample& sample,
     const OpenDataSegment& segment)
 {
-    const auto dir = openDataSegmentCacheDirectory(remoteCacheRoot, sample, segment);
+    const auto representations =
+        classifyOpenDataSegmentRepresentations(sample, segment);
+    const auto canonical = std::find_if(
+        representations.begin(), representations.end(),
+        [](const auto& representation) { return representation.canonicalSource; });
+    if (canonical == representations.end() || !canonical->artifact) {
+        return OpenDataSegmentCacheState::Orphaned;
+    }
+    const auto dir = openDataSegmentRepresentationCacheDirectory(
+        remoteCacheRoot, sample, segment, *canonical);
     std::error_code ec;
     if (!std::filesystem::exists(dir, ec)) {
+        return OpenDataSegmentCacheState::Missing;
+    }
+    if (isOpenDataSegmentPlaceholder(dir)) {
         return OpenDataSegmentCacheState::Missing;
     }
     if (!requiredFilesPresent(dir)) {
         return OpenDataSegmentCacheState::Incomplete;
     }
 
-    const auto* artifact = preferredTifxyzArtifact(segment);
-    if (!artifact) {
-        return OpenDataSegmentCacheState::Orphaned;
-    }
-
     const auto origin = readCatalogOrigin(dir);
     if (!origin) {
         return OpenDataSegmentCacheState::Current;
     }
-    if (!originMatches(*origin, sample, segment, *artifact)) {
+    if (!originMatches(*origin, sample, segment, *canonical->artifact)) {
         return OpenDataSegmentCacheState::Stale;
     }
     const auto it = origin->find("cache_state");
@@ -1800,19 +1841,6 @@ OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
         }
     }
 
-    std::map<std::string, int> cachedSegmentsBySource;
-    for (const auto* segment : tifxyzSegments) {
-        const auto* preferred = preferredTifxyzArtifact(*segment);
-        if (preferred && lowerCopy(preferred->type) == "tifxyz-transformed")
-            continue;
-        const auto sourceVolumeId = sourceVolumeIdForSegment(*segment);
-        if (cacheStateForSegment(remoteCacheRoot, sample, *segment) ==
-            OpenDataSegmentCacheState::Current) {
-            ++result.cachedTifxyzSegments;
-            ++cachedSegmentsBySource[sourceVolumeId];
-        }
-    }
-
     auto attachEntry = [&](const std::string& location,
                            std::vector<std::string> tags,
                            const std::string& label,
@@ -1844,46 +1872,6 @@ OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
         }
     };
 
-    for (const auto& [sourceVolumeId, cachedCount] : cachedSegmentsBySource) {
-        if (cachedCount <= 0) {
-            continue;
-        }
-        bool hasDerivedRepresentationCache = false;
-        for (const auto* segment : tifxyzSegments) {
-            for (const auto& representation :
-                 classifyOpenDataSegmentRepresentations(sample, *segment)) {
-                if (representation.kind !=
-                        OpenDataSegmentRepresentationKind::DerivedNative ||
-                    representation.coordinateVolumeId != sourceVolumeId) {
-                    continue;
-                }
-                if (requiredFilesPresent(openDataSegmentRepresentationCacheDirectory(
-                        remoteCacheRoot, sample, *segment, representation))) {
-                    hasDerivedRepresentationCache = true;
-                    break;
-                }
-            }
-            if (hasDerivedRepresentationCache)
-                break;
-        }
-        if (hasDerivedRepresentationCache)
-            continue;
-        std::vector<std::string> tags = {
-            "open-data", "immutable",
-            "vc-open-data-segment-representation:derived-native"};
-        if (!sourceVolumeId.empty()) {
-            tags.push_back("vc-open-data-source-volume-id:" + sourceVolumeId);
-            tags.push_back("vc-open-data-source-coordinate-level:0");
-            tags.push_back("vc-open-data-coordinate-space:" + sample.id + "/" +
-                           sourceVolumeId + "@L0");
-        }
-        attachEntry(openDataSegmentCacheRoot(remoteCacheRoot, sample, sourceVolumeId).string(),
-                    std::move(tags),
-                    sourceVolumeId.empty() ? std::string("source volume") : sourceVolumeId,
-                    "cached tifxyz segment directory",
-                    result.failedTifxyzSegments);
-    }
-
     std::map<std::filesystem::path, OpenDataSegmentRepresentation>
         cachedRepresentationRoots;
     for (const auto* segment : tifxyzSegments) {
@@ -1891,8 +1879,12 @@ OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
              classifyOpenDataSegmentRepresentations(sample, *segment)) {
             const auto dir = openDataSegmentRepresentationCacheDirectory(
                 remoteCacheRoot, sample, *segment, representation);
-            if (!requiredFilesPresent(dir))
+            const bool materialized = requiredFilesPresent(dir);
+            if (!materialized && !isOpenDataSegmentPlaceholder(dir))
                 continue;
+            if (representation.canonicalSource && materialized) {
+                ++result.cachedTifxyzSegments;
+            }
             cachedRepresentationRoots.emplace(
                 openDataSegmentRepresentationCacheRoot(
                     remoteCacheRoot, sample, representation),
@@ -1926,13 +1918,13 @@ OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
         else
             tags.push_back("vc-open-data-source-volume-id:" +
                            representation.coordinateVolumeId);
-        if (representation.kind ==
-            OpenDataSegmentRepresentationKind::DerivedNative) {
-            pkg.relocateSegmentsEntry(
-                openDataSegmentCacheRoot(
-                    remoteCacheRoot, sample,
-                    representation.coordinateVolumeId).string(),
-                root.string());
+        if (representation.canonicalSource) {
+            tags.push_back("vc-open-data-canonical-source");
+            if (representation.kind ==
+                OpenDataSegmentRepresentationKind::PublishedTransformed) {
+                tags.push_back("vc-open-data-source-volume-id:" +
+                               representation.coordinateVolumeId);
+            }
         }
         attachEntry(root.string(), std::move(tags), representation.coordinateSpace,
                     "coordinate-specific tifxyz representation",
@@ -1953,21 +1945,35 @@ OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
             if (sourceVolumeId.empty() || sourceVolumeId == targetVolumeId) {
                 continue;
             }
+            const auto representations =
+                classifyOpenDataSegmentRepresentations(sample, *segment);
+            const bool hasPublishedTarget = std::any_of(
+                representations.begin(), representations.end(),
+                [&](const auto& representation) {
+                    return representation.kind ==
+                               OpenDataSegmentRepresentationKind::PublishedTransformed &&
+                           representation.coordinateVolumeId == targetVolumeId;
+                });
+            if (hasPublishedTarget) {
+                continue;
+            }
             const auto matrix = findVolumeTransformMatrix(sample, sourceVolumeId, targetVolumeId);
             if (!matrix) {
                 continue;
             }
             const auto transformedDir = openDataTransformedSegmentCacheDirectory(
                 remoteCacheRoot, sample, *segment, targetVolumeId);
-            if (!requiredFilesPresent(transformedDir)) {
+            const bool materialized = requiredFilesPresent(transformedDir);
+            if (!materialized &&
+                !isOpenDataSegmentPlaceholder(transformedDir)) {
                 continue;
             }
             const auto origin = readCatalogOrigin(transformedDir);
-            if (origin && !transformedOriginMatches(
+            if (materialized && origin && !transformedOriginMatches(
                               *origin, sample, *segment, sourceVolumeId, targetVolumeId, *matrix)) {
                 continue;
             }
-            ++result.transformedTifxyzSegments;
+            if (materialized) ++result.transformedTifxyzSegments;
             ++transformedByRoute[{sourceVolumeId, targetVolumeId}];
         }
     }
@@ -2127,240 +2133,137 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         return result;
     }
 
+    struct RepresentationTask {
+        const OpenDataSegment* segment = nullptr;
+        OpenDataSegmentRepresentation representation;
+    };
+
     std::vector<const OpenDataSegment*> tifxyzSegments;
+    std::vector<RepresentationTask> representationTasks;
     tifxyzSegments.reserve(sample.segments.size());
     std::map<std::string, std::set<std::string>> expectedDirNamesBySource;
+    for (const auto& volume : sample.volumes) {
+        if (!volume.id.empty()) {
+            expectedDirNamesBySource.try_emplace(volume.id);
+        }
+    }
     for (const auto& segment : sample.segments) {
         if (!segment.hasTifxyz()) {
             continue;
         }
         tifxyzSegments.push_back(&segment);
-        expectedDirNamesBySource[sourceVolumeIdForSegment(segment)].insert(safePathComponent(segment.id));
+        auto representations =
+            classifyOpenDataSegmentRepresentations(sample, segment);
+        if (representations.empty()) {
+            ++result.skippedTifxyzSegments;
+            result.messages.push_back(
+                "Skipped " + segmentLabel(segment) +
+                ": no canonical manifest source or valid published target.");
+            continue;
+        }
+        for (auto& representation : representations) {
+            if (representation.canonicalSource &&
+                representation.kind ==
+                    OpenDataSegmentRepresentationKind::DerivedNative) {
+                expectedDirNamesBySource[representation.coordinateVolumeId].insert(
+                    safePathComponent(segment.id));
+            }
+            representationTasks.push_back({&segment, std::move(representation)});
+        }
+    }
+    if (representationTasks.empty()) {
+        return result;
     }
 
-    std::atomic_size_t next{0};
-    std::atomic_int completedFiles{0};
-    std::atomic_int completedSegments{0};
-    std::atomic_int failedSegments{0};
-    std::atomic_int activeWorkers{0};
-    std::mutex resultMutex;
-    std::mutex progressMutex;
-    const auto hardware = std::thread::hardware_concurrency();
-    const std::size_t desiredWorkers = hardware == 0 ? 4 : hardware;
-    const std::size_t workerCount = std::min<std::size_t>(
-        tifxyzSegments.size(),
-        tifxyzSegments.size() <= 1
-            ? 1
-            : std::max<std::size_t>(2, std::min<std::size_t>(desiredWorkers, 8)));
-    constexpr int kProgressFilesPerSegment = 6;
-    const int totalFiles =
-        static_cast<int>(tifxyzSegments.size()) * kProgressFilesPerSegment;
-
-    auto makeProgress = [&](const OpenDataSegment* segment,
-                            const char* fileName,
-                            std::string status) {
-        OpenDataSampleDownloadProgress progress;
-        progress.totalSegments = static_cast<int>(tifxyzSegments.size());
-        progress.completedSegments = completedSegments.load(std::memory_order_relaxed);
-        progress.failedSegments = failedSegments.load(std::memory_order_relaxed);
-        progress.totalFiles = totalFiles;
-        progress.completedFiles = completedFiles.load(std::memory_order_relaxed);
-        progress.activeWorkers = activeWorkers.load(std::memory_order_relaxed);
-        progress.totalWorkers = static_cast<int>(workerCount);
-        if (segment) {
-            progress.segmentId = segmentLabel(*segment);
-        }
-        if (fileName) {
-            progress.fileName = fileName;
-        }
-        progress.status = std::move(status);
-        return progress;
-    };
-    auto emitProgress = [&](const OpenDataSegment* segment,
-                            const char* fileName,
-                            std::string status) {
-        auto progress = makeProgress(segment, fileName, std::move(status));
-        std::lock_guard<std::mutex> lk(progressMutex);
-        reportProgress(progressCallback, progress);
-    };
-    emitProgress(nullptr, nullptr, "starting");
-
-    auto worker = [&]() {
-        for (;;) {
-            const std::size_t idx = next.fetch_add(1);
-            if (idx >= tifxyzSegments.size()) {
-                return;
-            }
-            const auto& segment = *tifxyzSegments[idx];
-            const auto* preferred = preferredTifxyzArtifact(segment);
-            if (preferred && lowerCopy(preferred->type) == "tifxyz-transformed") {
-                completedSegments.fetch_add(1, std::memory_order_relaxed);
-                emitProgress(&segment, nullptr, "segment-representation-only");
-                continue;
-            }
-            const auto segmentDir = openDataSegmentCacheDirectory(remoteCacheRoot, sample, segment);
-            std::string error;
-            activeWorkers.fetch_add(1, std::memory_order_relaxed);
-            emitProgress(&segment, nullptr, "segment-start");
-            auto fileProgress = [&](const char* fileName, const char* status) {
-                if (std::string_view(status) == "done") {
-                    completedFiles.fetch_add(1, std::memory_order_relaxed);
-                }
-                emitProgress(&segment, fileName, status);
-            };
-            const bool cached = cacheTifxyzSegment(
-                sample,
-                segment,
-                segmentDir,
-                &error,
-                fileProgress,
-                forceRefresh);
-            activeWorkers.fetch_sub(1, std::memory_order_relaxed);
-            std::lock_guard<std::mutex> lk(resultMutex);
-            if (cached) {
+    std::vector<char> representationSucceeded(representationTasks.size(), 0);
+    int completedRepresentations = 0;
+    for (std::size_t i = 0; i < representationTasks.size(); ++i) {
+        const auto& task = representationTasks[i];
+        const auto& representation = task.representation;
+        const auto segmentDir = openDataSegmentRepresentationCacheDirectory(
+            remoteCacheRoot, sample, *task.segment, representation);
+        std::string error;
+        const bool prepared = prepareRepresentationPlaceholder(
+            sample, *task.segment, representation, segmentDir,
+            forceRefresh, &error);
+        if (prepared) {
+            representationSucceeded[i] = 1;
+            if (representation.canonicalSource &&
+                requiredFilesPresent(segmentDir)) {
                 ++result.cachedTifxyzSegments;
-                completedSegments.fetch_add(1, std::memory_order_relaxed);
-                emitProgress(&segment, nullptr, "segment-done");
-            } else {
-                ++result.failedTifxyzSegments;
-                failedSegments.fetch_add(1, std::memory_order_relaxed);
-                result.messages.push_back("Failed to cache " + segmentLabel(segment) +
-                                          ": " + error);
-                emitProgress(&segment, nullptr, "segment-failed");
             }
+        } else {
+            ++result.failedTifxyzSegments;
+            result.messages.push_back(
+                "Failed to prepare " + segmentLabel(*task.segment) +
+                " for " + representation.coordinateSpace + ": " + error);
         }
-    };
-
-    std::vector<std::thread> workers;
-    workers.reserve(workerCount);
-    for (std::size_t i = 0; i < workerCount; ++i) {
-        workers.emplace_back(worker);
-    }
-    for (auto& t : workers) {
-        t.join();
+        ++completedRepresentations;
+        OpenDataSampleDownloadProgress progress;
+        progress.totalSegments =
+            static_cast<int>(representationTasks.size());
+        progress.completedSegments = completedRepresentations;
+        progress.failedSegments = result.failedTifxyzSegments;
+        progress.segmentId = segmentLabel(*task.segment);
+        progress.status = prepared ? "placeholder-ready" : "placeholder-failed";
+        reportProgress(progressCallback, progress);
     }
     for (const auto& [sourceVolumeId, expectedDirNames] : expectedDirNamesBySource) {
         markOrphanedEntries(
             openDataSegmentCacheRoot(remoteCacheRoot, sample, sourceVolumeId),
             expectedDirNames);
     }
-    emitProgress(nullptr, nullptr, "finished");
-
-    // Preserve every manifest representation independently. The legacy cache
-    // above remains the derived-native migration target; authored bytes and
-    // published target-volume bytes live in representation-specific roots and
-    // therefore can never be overwritten by coordinate conversion.
     std::map<std::filesystem::path, OpenDataSegmentRepresentation> preparedRoots;
     int preparedRepresentations = 0;
-    for (const auto* segment : tifxyzSegments) {
-        for (const auto& representation :
-             classifyOpenDataSegmentRepresentations(sample, *segment)) {
-            const auto dir = openDataSegmentRepresentationCacheDirectory(
-                remoteCacheRoot, sample, *segment, representation);
-            std::string error;
-            const bool applyDownscale =
-                representation.kind == OpenDataSegmentRepresentationKind::DerivedNative;
-            const char* representationName =
-                representation.kind == OpenDataSegmentRepresentationKind::Authored
-                    ? "authored"
-                    : representation.kind == OpenDataSegmentRepresentationKind::DerivedNative
-                        ? "derived-native"
-                        : "published-transformed";
-            if (representation.kind ==
-                    OpenDataSegmentRepresentationKind::DerivedNative &&
-                !requiredFilesPresent(dir)) {
-                const auto legacyDir = openDataSegmentCacheDirectory(
-                    remoteCacheRoot, sample, *segment);
-                try {
-                    const auto legacyMeta = nlohmann::json::parse(
-                        readTextFile(legacyDir / "meta.json"));
-                    if (requiredFilesPresent(legacyDir) &&
-                        coordinatesAlreadyScaled(
-                            legacyMeta, originalVolumeDownscale(*segment))) {
-                        const auto tempDir = makeTempSegmentDir(dir);
-                        std::error_code ec;
-                        std::filesystem::remove_all(tempDir, ec);
-                        std::filesystem::create_directories(tempDir.parent_path());
-                        std::filesystem::copy(
-                            legacyDir, tempDir,
-                            std::filesystem::copy_options::recursive |
-                                std::filesystem::copy_options::overwrite_existing);
-                        normalizeCachedMetadata(
-                            artifactUrl(*representation.artifact), sample, *segment,
-                            tempDir / "meta.json", true,
-                            representation.representationId, representationName,
-                            representation.coordinateSpace,
-                            representation.sourceCoordinateLevel,
-                            representation.coordinateVolumeId);
-                        publishSegmentDirectory(tempDir, dir);
-                    }
-                } catch (const std::exception& e) {
-                    result.messages.push_back(
-                        "Could not migrate legacy derived-native cache for " +
-                        segmentLabel(*segment) + ": " + e.what());
-                }
-            }
-            if (!cacheTifxyzRepresentation(
-                    sample, *segment, *representation.artifact, dir,
-                    applyDownscale, representation.representationId,
-                    representationName, representation.coordinateVolumeId,
-                    representation.coordinateSpace,
-                    representation.sourceCoordinateLevel, &error, {}, forceRefresh)) {
-                ++result.failedTifxyzSegments;
-                result.messages.push_back(
-                    "Failed to preserve " + std::string(representationName) +
-                    " representation for " + segmentLabel(*segment) + ": " + error);
-                continue;
-            }
-            ++preparedRepresentations;
-            preparedRoots.emplace(
-                openDataSegmentRepresentationCacheRoot(
-                    remoteCacheRoot, sample, representation),
-                representation);
+    for (std::size_t i = 0; i < representationTasks.size(); ++i) {
+        if (!representationSucceeded[i]) {
+            continue;
+        }
+        const auto& representation = representationTasks[i].representation;
+        ++preparedRepresentations;
+        preparedRoots.emplace(
+            openDataSegmentRepresentationCacheRoot(
+                remoteCacheRoot, sample, representation),
+            representation);
+    }
+    std::set<std::string> aggregateVolumeIds;
+    for (const auto& volume : sample.volumes) {
+        if (!volume.id.empty()) aggregateVolumeIds.insert(volume.id);
+    }
+    for (const auto& [root, representation] : preparedRoots) {
+        (void)root;
+        if (!representation.coordinateVolumeId.empty()) {
+            aggregateVolumeIds.insert(representation.coordinateVolumeId);
         }
     }
-
-    for (const auto& [root, representation] : preparedRoots) {
-        std::string kindTag;
-        switch (representation.kind) {
-            case OpenDataSegmentRepresentationKind::Authored:
-                kindTag = "authored";
-                break;
-            case OpenDataSegmentRepresentationKind::DerivedNative:
-                kindTag = "derived-native";
-                break;
-            case OpenDataSegmentRepresentationKind::PublishedTransformed:
-                kindTag = "published-transformed";
-                break;
+    std::set<std::string> expectedSegmentEntryLocations;
+    for (const auto& volumeId : aggregateVolumeIds) {
+        const auto root = openDataSegmentCacheRoot(
+            remoteCacheRoot, sample, volumeId);
+        std::error_code ec;
+        std::filesystem::create_directories(root, ec);
+        if (ec) {
+            result.messages.push_back(
+                "Failed to prepare segment volume folder " + volumeId +
+                ": " + ec.message());
+            continue;
         }
-        std::vector<std::string> tags{
+        const auto location = root.string();
+        expectedSegmentEntryLocations.insert(location);
+        const std::vector<std::string> tags{
             "open-data",
             "immutable",
-            "vc-open-data-segment-representation:" + kindTag,
-            "vc-open-data-source-coordinate-level:" +
-                std::to_string(representation.sourceCoordinateLevel),
-            "vc-open-data-coordinate-space:" + representation.coordinateSpace,
+            "vc-open-data-segment-aggregate",
+            "vc-open-data-target-volume-id:" + volumeId,
+            "vc-open-data-source-coordinate-level:0",
+            "vc-open-data-coordinate-space:" + sample.id + "/" +
+                volumeId + "@L0",
         };
-        if (representation.kind == OpenDataSegmentRepresentationKind::PublishedTransformed) {
-            tags.push_back("vc-open-data-target-volume-id:" +
-                           representation.coordinateVolumeId);
-        } else {
-            tags.push_back("vc-open-data-source-volume-id:" +
-                           representation.coordinateVolumeId);
-        }
-        if (representation.kind ==
-            OpenDataSegmentRepresentationKind::DerivedNative) {
-            pkg.relocateSegmentsEntry(
-                openDataSegmentCacheRoot(
-                    remoteCacheRoot, sample,
-                    representation.coordinateVolumeId).string(),
-                root.string());
-        }
-        if (pkg.addSegmentsEntry(root.string(), tags)) {
+        if (pkg.addSegmentsEntry(location, tags)) {
             ++result.attachedSegmentEntries;
-        } else if (hasSegmentEntry(pkg, root.string())) {
+        } else if (hasSegmentEntry(pkg, location)) {
             pkg.reconcileSegmentsEntryTags(
-                root.string(), tags,
+                location, tags,
                 {"vc-open-data-source-coordinate-level:",
                  "vc-open-data-coordinate-space:",
                  "vc-open-data-source-volume-id:",
@@ -2369,67 +2272,8 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         }
     }
 
-    const int prepared = result.cachedTifxyzSegments + preparedRepresentations;
-    if (prepared <= 0) {
+    if (preparedRepresentations <= 0) {
         return result;
-    }
-
-    std::map<std::string, int> cachedSegmentsBySource;
-    for (const auto* segment : tifxyzSegments) {
-        const auto* preferred = preferredTifxyzArtifact(*segment);
-        if (preferred && lowerCopy(preferred->type) == "tifxyz-transformed")
-            continue;
-        const auto sourceVolumeId = sourceVolumeIdForSegment(*segment);
-        const auto sourceRoot = openDataSegmentCacheRoot(remoteCacheRoot, sample, sourceVolumeId);
-        if (requiredFilesPresent(sourceRoot / safePathComponent(segment->id))) {
-            ++cachedSegmentsBySource[sourceVolumeId];
-        }
-    }
-    for (const auto& [sourceVolumeId, cachedCount] : cachedSegmentsBySource) {
-        if (cachedCount <= 0) {
-            continue;
-        }
-        const bool hasDerivedRepresentation = std::any_of(
-            preparedRoots.begin(), preparedRoots.end(),
-            [&](const auto& entry) {
-                return entry.second.kind ==
-                           OpenDataSegmentRepresentationKind::DerivedNative &&
-                       entry.second.coordinateVolumeId == sourceVolumeId;
-            });
-        if (hasDerivedRepresentation)
-            continue;
-        const auto location = openDataSegmentCacheRoot(remoteCacheRoot, sample, sourceVolumeId).string();
-        std::vector<std::string> sourceTags = {
-            "open-data", "immutable",
-            "vc-open-data-segment-representation:derived-native"};
-        if (!sourceVolumeId.empty()) {
-            sourceTags.push_back("vc-open-data-source-volume-id:" + sourceVolumeId);
-            sourceTags.push_back("vc-open-data-source-coordinate-level:0");
-            sourceTags.push_back("vc-open-data-coordinate-space:" + sample.id + "/" +
-                                 sourceVolumeId + "@L0");
-        }
-        try {
-            if (pkg.addSegmentsEntry(location, sourceTags)) {
-                ++result.attachedSegmentEntries;
-            } else if (hasSegmentEntry(pkg, location)) {
-                pkg.reconcileSegmentsEntryTags(
-                    location, sourceTags,
-                    {"vc-open-data-source-coordinate-level:",
-                     "vc-open-data-coordinate-space:",
-                     "vc-open-data-source-volume-id:",
-                     "vc-open-data-target-volume-id:",
-                     "vc-open-data-segment-representation:"});
-            } else {
-                result.messages.push_back("Failed to attach cached tifxyz segment directory.");
-            }
-        } catch (const std::exception& e) {
-            ++result.failedTifxyzSegments;
-            result.messages.push_back("Failed to attach cached tifxyz segment directory: " +
-                                      std::string(e.what()));
-        } catch (...) {
-            ++result.failedTifxyzSegments;
-            result.messages.push_back("Failed to attach cached tifxyz segment directory: unknown error.");
-        }
     }
 
     std::set<std::string> targetVolumeIds;
@@ -2437,10 +2281,6 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         if (!volume.id.empty()) {
             targetVolumeIds.insert(volume.id);
         }
-    }
-    for (const auto& [sourceVolumeId, cachedCount] : cachedSegmentsBySource) {
-        (void)cachedCount;
-        targetVolumeIds.erase(sourceVolumeId);
     }
 
     struct TransformTask {
@@ -2451,7 +2291,19 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     for (const auto& targetVolumeId : targetVolumeIds) {
         for (const auto* segment : tifxyzSegments) {
             const auto sourceVolumeId = sourceVolumeIdForSegment(*segment);
-            if (sourceVolumeId.empty() || sourceVolumeId == targetVolumeId ||
+            if (sourceVolumeId.empty() || sourceVolumeId == targetVolumeId) {
+                continue;
+            }
+            const auto representations =
+                classifyOpenDataSegmentRepresentations(sample, *segment);
+            const bool hasPublishedTarget = std::any_of(
+                representations.begin(), representations.end(),
+                [&](const auto& representation) {
+                    return representation.kind ==
+                               OpenDataSegmentRepresentationKind::PublishedTransformed &&
+                           representation.coordinateVolumeId == targetVolumeId;
+                });
+            if (hasPublishedTarget ||
                 !findVolumeTransformMatrix(sample, sourceVolumeId, targetVolumeId)) {
                 continue;
             }
@@ -2459,143 +2311,70 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         }
     }
 
-    std::map<std::pair<std::string, std::string>, int> transformedByRoute;
-    if (!transformTasks.empty()) {
-        std::atomic_size_t nextTransform{0};
-        std::atomic_int completedTransforms{0};
-        std::atomic_int failedTransforms{0};
-        std::atomic_int activeTransformWorkers{0};
-        std::mutex transformResultMutex;
-        std::mutex transformProgressMutex;
-        const auto hardware = std::thread::hardware_concurrency();
-        const std::size_t desiredWorkers = hardware == 0 ? 4 : hardware;
-        const std::size_t transformWorkerCount = std::min<std::size_t>(
-            transformTasks.size(),
-            transformTasks.size() <= 1
-                ? 1
-                : std::max<std::size_t>(2, std::min<std::size_t>(desiredWorkers, 8)));
-
-        auto emitTransformProgress = [&](const TransformTask* task, std::string status) {
-            OpenDataSampleDownloadProgress progress;
-            progress.totalSegments = static_cast<int>(transformTasks.size());
-            progress.completedSegments = completedTransforms.load(std::memory_order_relaxed);
-            progress.failedSegments = failedTransforms.load(std::memory_order_relaxed);
-            progress.totalFiles = static_cast<int>(transformTasks.size());
-            progress.completedFiles = progress.completedSegments + progress.failedSegments;
-            progress.activeWorkers = activeTransformWorkers.load(std::memory_order_relaxed);
-            progress.totalWorkers = static_cast<int>(transformWorkerCount);
-            if (task && task->segment) {
-                progress.segmentId = segmentLabel(*task->segment);
-                progress.fileName = task->targetVolumeId;
+    int completedTransforms = 0;
+    for (const auto& task : transformTasks) {
+        const auto sourceSegmentDir = openDataCanonicalSegmentCacheDirectory(
+            remoteCacheRoot, sample, *task.segment);
+        const auto targetSegmentDir = openDataTransformedSegmentCacheDirectory(
+            remoteCacheRoot, sample, *task.segment, task.targetVolumeId);
+        std::string error;
+        if (prepareGeneratedPlaceholder(
+                sample, *task.segment, sourceSegmentDir, targetSegmentDir,
+                task.targetVolumeId, forceRefresh, &error)) {
+            if (requiredFilesPresent(targetSegmentDir)) {
+                ++result.transformedTifxyzSegments;
             }
-            progress.status = std::move(status);
-            std::lock_guard<std::mutex> lk(transformProgressMutex);
-            reportProgress(progressCallback, progress);
-        };
-        emitTransformProgress(nullptr, "transform-starting");
-
-        auto transformWorker = [&]() {
-            for (;;) {
-                const std::size_t idx = nextTransform.fetch_add(1);
-                if (idx >= transformTasks.size()) {
-                    return;
-                }
-                const auto& task = transformTasks[idx];
-                activeTransformWorkers.fetch_add(1, std::memory_order_relaxed);
-                emitTransformProgress(&task, "transform-segment-start");
-                const auto sourceSegmentDir = openDataSegmentCacheDirectory(
-                    remoteCacheRoot, sample, *task.segment);
-                const auto targetSegmentDir = openDataTransformedSegmentCacheDirectory(
-                    remoteCacheRoot, sample, *task.segment, task.targetVolumeId);
-                std::string error;
-                const bool transformed = cacheTransformedTifxyzSegment(sample,
-                                                                       *task.segment,
-                                                                       sourceSegmentDir,
-                                                                       targetSegmentDir,
-                                                                       task.targetVolumeId,
-                                                                       &error);
-                activeTransformWorkers.fetch_sub(1, std::memory_order_relaxed);
-                std::lock_guard<std::mutex> lk(transformResultMutex);
-                if (transformed) {
-                    ++result.transformedTifxyzSegments;
-                    ++transformedByRoute[
-                        {sourceVolumeIdForSegment(*task.segment), task.targetVolumeId}];
-                    completedTransforms.fetch_add(1, std::memory_order_relaxed);
-                    emitTransformProgress(&task, "transform-segment-done");
-                } else {
-                    ++result.failedTransformedTifxyzSegments;
-                    failedTransforms.fetch_add(1, std::memory_order_relaxed);
-                    result.messages.push_back("Failed to transform " + segmentLabel(*task.segment) +
-                                              " to " + task.targetVolumeId + ": " + error);
-                    emitTransformProgress(&task, "transform-segment-failed");
-                }
-            }
-        };
-
-        std::vector<std::thread> transformWorkers;
-        transformWorkers.reserve(transformWorkerCount);
-        for (std::size_t i = 0; i < transformWorkerCount; ++i) {
-            transformWorkers.emplace_back(transformWorker);
+        } else {
+            ++result.failedTransformedTifxyzSegments;
+            result.messages.push_back(
+                "Failed to prepare transform " +
+                segmentLabel(*task.segment) + " to " +
+                task.targetVolumeId + ": " + error);
         }
-        for (auto& t : transformWorkers) {
-            t.join();
-        }
-        emitTransformProgress(nullptr, "transform-finished");
+        ++completedTransforms;
+        OpenDataSampleDownloadProgress progress;
+        progress.totalSegments = static_cast<int>(
+            representationTasks.size() + transformTasks.size());
+        progress.completedSegments = completedRepresentations +
+                                     completedTransforms;
+        progress.failedSegments = result.failedTifxyzSegments +
+                                  result.failedTransformedTifxyzSegments;
+        progress.segmentId = segmentLabel(*task.segment);
+        progress.fileName = task.targetVolumeId;
+        progress.status = error.empty() ? "placeholder-transform-ready"
+                                        : "placeholder-transform-failed";
+        reportProgress(progressCallback, progress);
     }
 
-    for (const auto& [route, transformedForTarget] : transformedByRoute) {
-        if (transformedForTarget <= 0) {
+    const auto sampleSegmentsRoot = remoteCacheRoot / "open_data" / "segments" /
+        safePathComponent(sample.id.empty() ? "sample" : sample.id);
+    const auto sampleSegmentsPrefix = sampleSegmentsRoot.string() +
+        std::string(1, std::filesystem::path::preferred_separator);
+    const auto existingEntries = pkg.segmentEntries();
+    for (const auto& entry : existingEntries) {
+        const bool immutable =
+            std::find(entry.tags.begin(), entry.tags.end(), "immutable") !=
+            entry.tags.end();
+        if (!immutable ||
+            entry.location.rfind(sampleSegmentsPrefix, 0) != 0 ||
+            expectedSegmentEntryLocations.contains(entry.location)) {
             continue;
         }
-        const auto& sourceVolumeId = route.first;
-        const auto& targetVolumeId = route.second;
-
-        const auto transformedRoot = openDataTransformedSegmentCacheRoot(
-            remoteCacheRoot, sample, sourceVolumeId, targetVolumeId);
-        const auto transformedLocation = transformedRoot.string();
-        try {
-            if (pkg.addSegmentsEntry(transformedLocation,
-                                     {"open-data",
-                                      "immutable",
-                                      "open-data-transformed",
-                                      "vc-open-data-segment-representation:generated-native-transform",
-                                      "vc-open-data-source-volume-id:" + sourceVolumeId,
-                                      "vc-open-data-target-volume-id:" + targetVolumeId,
-                                      "vc-open-data-source-coordinate-level:0",
-                                      "vc-open-data-coordinate-space:" + sample.id + "/" +
-                                          targetVolumeId + "@L0"})) {
-                ++result.attachedSegmentEntries;
-            } else if (hasSegmentEntry(pkg, transformedLocation)) {
-                pkg.reconcileSegmentsEntryTags(
-                    transformedLocation,
-                    {"open-data",
-                     "immutable",
-                     "open-data-transformed",
-                     "vc-open-data-segment-representation:generated-native-transform",
-                     "vc-open-data-source-volume-id:" + sourceVolumeId,
-                     "vc-open-data-target-volume-id:" + targetVolumeId,
-                     "vc-open-data-source-coordinate-level:0",
-                     "vc-open-data-coordinate-space:" + sample.id + "/" +
-                         targetVolumeId + "@L0"},
-                    {"vc-open-data-source-coordinate-level:",
-                     "vc-open-data-coordinate-space:",
-                     "vc-open-data-source-volume-id:",
-                     "vc-open-data-target-volume-id:",
-                     "vc-open-data-segment-representation:"});
-            } else {
-                result.messages.push_back("Failed to attach transformed tifxyz segment directory for " +
-                                          targetVolumeId + ".");
-            }
-        } catch (const std::exception& e) {
-            ++result.failedTransformedTifxyzSegments;
-            result.messages.push_back("Failed to attach transformed tifxyz segment directory for " +
-                                      targetVolumeId + ": " + e.what());
-        } catch (...) {
-            ++result.failedTransformedTifxyzSegments;
-            result.messages.push_back("Failed to attach transformed tifxyz segment directory for " +
-                                      targetVolumeId + ": unknown error.");
+        if (pkg.removeEntry(entry.location)) {
+            result.messages.push_back(
+                "Removed stale open-data segment root: " + entry.location);
         }
     }
+
+    OpenDataSampleDownloadProgress finishedProgress;
+    finishedProgress.totalSegments = static_cast<int>(
+        representationTasks.size() + transformTasks.size());
+    finishedProgress.completedSegments = completedRepresentations +
+                                         completedTransforms;
+    finishedProgress.failedSegments = result.failedTifxyzSegments +
+                                      result.failedTransformedTifxyzSegments;
+    finishedProgress.status = "placeholders-finished";
+    reportProgress(progressCallback, finishedProgress);
 
     return result;
 }
