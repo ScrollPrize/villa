@@ -1287,7 +1287,7 @@ export default function SegDemo() {
           <div className="vc-gs-demo__poster-overlay">
             <p>
               This is a CT slice straight through a rolled scroll. Every
-              bright ring is the same sheet of papyrus, wound around
+              bright curve is the same sheet of papyrus, wound around
               itself. Trace one layer of it across three slices and we'll
               flatten it to show what's written on it.
             </p>

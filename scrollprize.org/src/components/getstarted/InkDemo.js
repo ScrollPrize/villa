@@ -1453,7 +1453,7 @@ export default function InkDemo() {
           />
           <div className="vc-gs-demo__poster-overlay">
             <p>
-              A surface from inside the same generous scroll, as the X-ray
+              A surface from inside the same scroll, as the X-ray
               sees it. The ink survives as the faint cracked texture. Label
               what you can see, and a model trains on your strokes to
               predict the rest.
@@ -1586,8 +1586,7 @@ export default function InkDemo() {
             <p className="vc-gs-demo__win">
               You labeled a fraction of the ink and the model read the
               rest. That loop, scaled up ten-thousand-fold, is how the
-              first scroll was read. Those bright patches were never
-              random: you've been labeling ancient Greek this whole time.
+              first scroll was read.
             </p>
             {readOn ? (
               <div className="vc-gs-read">

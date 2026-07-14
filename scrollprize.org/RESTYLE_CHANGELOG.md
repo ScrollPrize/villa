@@ -443,6 +443,16 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - Images: must be generated programmatically from the reconstructed CT volume AND the corresponding submitted mesh; each image named after the tifxyz mesh it was rendered from (replaces the vaguer position-description bullet). First Letters/Title sections untouched (mesh package is GP-specific).
 **Files:** `docs/34_prizes.md`.
 
+## C67 — Get Started: copy trim (owner review)
+
+- Removed "Those bright patches were never random: you've been labeling ancient Greek this whole time." (ink demo outro) and the doubled "generous" adjective describing the same demo scroll (two spots, ink demo intro + labeling panel).
+- "ring" -> "curve" in the segmentation demo's CT-slice description (a spiral, not concentric rings).
+- "I train models": removed the duplicated "two thousand years" (kept "2,000-year-old labels", cut "…uncover more text unseen for two thousand years" -> "…uncover more unseen text").
+- "I'm just curious": removed "the story of how the first scroll was read" from the list of open things.
+- "Join the community": "the team" -> "the Vesuvius Challenge team"; dropped "a few thousand" before "contributors".
+- Track-record headline: "The winners were newcomers too." -> "Former winners were newcomers too."
+**Files:** `src/components/getstarted/{GetStarted,InkDemo,SegDemo}.js`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

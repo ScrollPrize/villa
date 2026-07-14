@@ -89,9 +89,9 @@ export function GetStarted() {
             <p className="vc-gs-sub">Train your first ink model.</p>
             <p className="vc-gs-body">
               The ink is carbon. So is the scorched papyrus underneath it.
-              To an X-ray the two look nearly identical. But one scroll was
-              generous with us. Its ink cracked as it dried, and a person
-              spotted the faint texture by eye. Those cracks gave up the
+              To an X-ray the two look nearly identical. But one scroll's ink
+              cracked as it dried, and a person spotted the faint texture by
+              eye. Those cracks gave up the
               first words ever read from inside an unopened scroll. Most
               scrolls give away less, so models have since learned to catch
               traces that can slip past even the eye.
@@ -232,7 +232,7 @@ export function GetStarted() {
                 the same way: a computer-vision problem with 2,000-year-old
                 labels, and the tutorial takes you from download to a first
                 prediction in a weekend. Better predictions can win prizes
-                and uncover more text unseen for two thousand years.
+                and uncover more unseen text.
               </p>
               <p className="vc-gs-path__prize">
                 First Letters · up to $500,000
@@ -255,8 +255,7 @@ export function GetStarted() {
               <h3>I'm just curious</h3>
               <p>
                 Everything here is open: the scans, the renders, the
-                recovered text, the story of how the first scroll was read.
-                All of it is a browser tab away, and following along
+                recovered text. All of it is a browser tab away, and following along
                 closely is how many contributors started.
               </p>
               <p className="vc-gs-path__prize">No setup · no deadline</p>
@@ -275,7 +274,7 @@ export function GetStarted() {
       {/* ================= proof ================= */}
       <section className="vc-gs-section vc-gs-section--band" aria-labelledby="proof">
         <div className="vc-gs-container">
-          <SectionHead kicker="Track record" title="The winners were newcomers too." id="proof">
+          <SectionHead kicker="Track record" title="Former winners were newcomers too." id="proof">
             <p className="vc-gs-body">
               The first word ever read from inside a sealed scroll was
               ΠΟΡΦΥΡΑϹ, <em>purple</em>, the word you uncovered in Part 1.
@@ -301,8 +300,8 @@ export function GetStarted() {
           >
             <p className="vc-gs-body">
               Every path above starts in the same place. Come introduce
-              yourself and ask anything: the team is around every day, and
-              so are a few thousand contributors who have hit every wall
+              yourself and ask anything: the Vesuvius Challenge team is around every day, and
+              so are contributors who have hit every wall
               before you and are glad to help you past them.
             </p>
           </SectionHead>
