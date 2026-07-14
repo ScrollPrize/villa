@@ -180,10 +180,12 @@ The important behavior is:
 - Validates selected base-volume shape against the Lasagna manifest shape.
 - Skips any fiber whose control points are outside the manifest/base-volume
   bounds.
-- Builds a compact in-RAM fiber-line geometry store at loader startup. Normals
-  are sampled once for each record, valid frame intervals are created, and
-  compact line/frame arrays are then shared read-only by loader clones and
-  threaded workers in the same process.
+- Builds a compact in-RAM fiber-line geometry store at loader startup. The
+  loader first computes CP source-window line-index ranges, samples Lasagna
+  normals only for those required ranges with batched channel reads, creates
+  valid frame intervals, and shares compact line/frame arrays read-only by
+  loader clones and threaded workers in the same process. Startup record
+  construction uses `loader_workers` when more than one worker is configured.
 - Builds one CP source strip from the compact geometry store with the
   torch-vectorized augment-vis path, then derives all configured strip-z
   offsets from that source using the stored strip offset axis.
@@ -721,13 +723,15 @@ Top-level keys used by `load_config`:
   download concurrency. During prefetch, PyTorch CPU intra-op threads are
   temporarily forced to `1` and restored afterwards, so producer workers do not
   each expand over the full machine.
-- `loader_workers`: CP-sample worker count for `load_batch`. The default is
-  the logical CPU count. Set `loader_workers: 1` for serial debugging. Parallel
-  workers evaluate candidates concurrently, but accepted batch output remains
-  in deterministic sample-index order. For `loader_workers > 1`, the loader
-  keeps a lazy persistent executor and reuses it across batches; call
-  `FiberStrip2DLoader.close()` to shut it down explicitly in long-lived tools or
-  tests.
+- `loader_workers`: worker count for startup compact-geometry record
+  construction and CP-sample construction in `load_batch`. The default is the
+  logical CPU count. Set `loader_workers: 1` for serial debugging. Parallel
+  startup stores results by original record index, and parallel batch workers
+  evaluate candidates concurrently while accepted batch output remains in
+  deterministic sample-index order. For warm `load_batch` work with
+  `loader_workers > 1`, the loader keeps a lazy persistent executor and reuses
+  it across batches; call `FiberStrip2DLoader.close()` to shut it down
+  explicitly in long-lived tools or tests.
 - `volume_cache_dir`: optional cache directory for remote volume chunks.
 - `volume_cache_memory_mib`: optional per-VC3D-sampler decoded/hot cache budget
   in MiB. `null` or omission leaves VC3D's default behavior intact. Use a

@@ -16,9 +16,17 @@
 - The default strip-z offset settings are `strip_z_offset_count=16` and `strip_z_offset_step=1.0`, generating `-7..8` selected-scale offsets and giving 16 patches per selected control point.
 - Lasagna normals are used where needed to construct aligned strip frames.
 - At loader startup, the loader builds one shared compact in-RAM fiber-line
-  geometry store for all configured records. It samples Lasagna normals once
-  for each fiber line point, builds valid contiguous frame intervals, and keeps
+  geometry store for all configured records. It computes the line-index ranges
+  that can affect configured CP source windows, samples Lasagna normals only
+  for those required ranges, builds valid contiguous frame intervals, and keeps
   compact per-line/frame arrays read-only for the rest of the process.
+- Startup compact geometry construction may parallelize across independent
+  records with `loader_workers`. `loader_workers=1` is the serial startup/debug
+  path. Parallel startup may complete records out of order internally, but the
+  final store must be indexed by original record order.
+- Startup Lasagna normal sampling may use batched/vectorized channel reads and
+  normal decoding, but it must preserve Lasagna `_decode_normals`, ambiguous
+  normal principal-axis handling, and strict invalid-data semantics.
 - The compact geometry store is shared by all threaded loader workers and
   cloned loaders in one process. `fiber_trace_2d` training does not currently
   use DDP or `torch.distributed`; this task must not introduce per-worker
@@ -196,6 +204,8 @@
   `loader_workers=1` is the serial no-thread debug path. When
   `loader_workers > 1`, the loader reuses a persistent CP-level executor across
   batches instead of constructing a new thread pool per step.
+- The same `loader_workers` setting also controls startup compact-geometry
+  record construction. No separate startup worker-count key exists.
 - Parallel loader workers must not serialize on deterministic random-order
   locks during the warm path. Random dataset-pass orders are built once per
   pass, cached by pass index, and prewarmed for the attempted batch window

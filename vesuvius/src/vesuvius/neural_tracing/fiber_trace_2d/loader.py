@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -70,6 +70,8 @@ from vesuvius.neural_tracing.fiber_trace_2d.sampling import CoordinateSampler, m
 
 
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
+_MAX_NORMAL_SAMPLE_POINTS = 256
+_MAX_NORMAL_SAMPLE_BLOCK_VOXELS = 4_000_000
 
 
 @dataclass(frozen=True)
@@ -221,6 +223,15 @@ class _FiberLineGeometryStore:
     memory_bytes: int
     valid_control_points: int
     skipped_control_points: int
+
+
+@dataclass(frozen=True)
+class _FiberLineRequiredRanges:
+    control_line_indices: np.ndarray
+    cp_start_indices: np.ndarray
+    cp_end_indices: np.ndarray
+    invalid_cp_reasons: tuple[str, ...]
+    merged_ranges: tuple[tuple[int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -758,6 +769,42 @@ def _principal_tensor_axis(tensor: np.ndarray, hint: np.ndarray) -> np.ndarray:
     elif axis[2] < 0.0:
         axis *= -1.0
     return axis
+
+
+def _principal_tensor_axes(tensors: np.ndarray, hints: np.ndarray) -> np.ndarray:
+    tensors = np.asarray(tensors, dtype=np.float64)
+    hints = np.asarray(hints, dtype=np.float64)
+    if tensors.ndim != 3 or tensors.shape[1:] != (3, 3):
+        raise ValueError("tensors must have shape [N,3,3]")
+    if hints.shape != (tensors.shape[0], 3):
+        raise ValueError("hints must have shape [N,3]")
+    count = int(tensors.shape[0])
+    axes = np.asarray(hints, dtype=np.float64).copy()
+    hint_norm = np.linalg.norm(axes, axis=1)
+    valid_hint = np.isfinite(hint_norm) & (hint_norm > 1.0e-12)
+    axes[valid_hint] /= hint_norm[valid_hint, None]
+    if np.any(~valid_hint):
+        diag = np.stack([tensors[:, 0, 0], tensors[:, 1, 1], tensors[:, 2, 2]], axis=1)
+        fallback_axis = np.zeros((count, 3), dtype=np.float64)
+        fallback_axis[np.arange(count), np.argmax(diag, axis=1)] = 1.0
+        axes[~valid_hint] = fallback_axis[~valid_hint]
+    for _ in range(16):
+        next_axes = np.einsum("nij,nj->ni", tensors, axes)
+        norms = np.linalg.norm(next_axes, axis=1)
+        valid = np.isfinite(norms) & (norms > 1.0e-12)
+        axes[valid] = next_axes[valid] / norms[valid, None]
+    norms = np.linalg.norm(axes, axis=1)
+    valid_axes = np.isfinite(norms) & (norms > 1.0e-12)
+    axes[valid_axes] /= norms[valid_axes, None]
+    axes[~valid_axes] = 0.0
+    if np.any(valid_hint):
+        hint_unit = np.zeros_like(hints, dtype=np.float64)
+        hint_unit[valid_hint] = hints[valid_hint] / hint_norm[valid_hint, None]
+        flip = valid_hint & ((axes * hint_unit).sum(axis=1) < 0.0)
+        axes[flip] *= -1.0
+    no_hint_flip = (~valid_hint) & (axes[:, 2] < 0.0)
+    axes[no_hint_flip] *= -1.0
+    return axes
 
 
 def _as_numpy_float32(array: torch.Tensor) -> np.ndarray:
@@ -1354,6 +1401,129 @@ class FiberStrip2DLoader:
                 return int(interval_index)
         return -1
 
+    def _required_line_ranges_for_record(
+        self,
+        record: _Record,
+        *,
+        source_shape_hw: tuple[int, int],
+    ) -> _FiberLineRequiredRanges:
+        control_points = np.asarray(record.fiber.control_points_xyz, dtype=np.float64)
+        cp_count = int(control_points.shape[0])
+        control_line_indices = np.full((cp_count,), -1, dtype=np.int64)
+        cp_start_indices = np.full((cp_count,), -1, dtype=np.int64)
+        cp_end_indices = np.full((cp_count,), -1, dtype=np.int64)
+        invalid_reasons: list[str] = [""] * cp_count
+        ranges: list[tuple[int, int]] = []
+        for cp_index in range(cp_count):
+            try:
+                line_index = control_point_line_index(record.fiber, int(cp_index))
+                start_index, end_index = self._line_window_bounds_for_control_point(
+                    record,
+                    control_point_index=int(cp_index),
+                    source_shape_hw=source_shape_hw,
+                )
+                control_line_indices[cp_index] = int(line_index)
+                cp_start_indices[cp_index] = int(start_index)
+                cp_end_indices[cp_index] = int(end_index)
+                ranges.append((int(start_index), int(end_index) + 1))
+            except (IndexError, ValueError) as exc:
+                invalid_reasons[cp_index] = str(exc)
+
+        merged: list[tuple[int, int]] = []
+        for start_index, end_index in sorted(ranges):
+            if end_index <= start_index:
+                continue
+            if merged and start_index <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end_index))
+            else:
+                merged.append((int(start_index), int(end_index)))
+        return _FiberLineRequiredRanges(
+            control_line_indices=control_line_indices,
+            cp_start_indices=cp_start_indices,
+            cp_end_indices=cp_end_indices,
+            invalid_cp_reasons=tuple(invalid_reasons),
+            merged_ranges=tuple(merged),
+        )
+
+    @staticmethod
+    def _normal_block_voxels(
+        points_zyx_base: np.ndarray,
+        *,
+        spacing_base: float,
+        shape: tuple[int, int, int],
+    ) -> int:
+        points = np.asarray(points_zyx_base, dtype=np.float64)
+        if points.size == 0:
+            return 0
+        pos = points / float(spacing_base)
+        shape_array = np.asarray(shape, dtype=np.int64)
+        valid = (
+            np.isfinite(pos).all(axis=1)
+            & np.all(pos >= 0.0, axis=1)
+            & np.all(pos <= (shape_array - 1).astype(np.float64), axis=1)
+        )
+        if not bool(np.any(valid)):
+            return 0
+        base = np.floor(pos[valid]).astype(np.int64)
+        hi = np.minimum(base + 1, shape_array - 1)
+        lo = np.min(base, axis=0)
+        high = np.max(hi, axis=0)
+        block_shape = np.maximum(high - lo + 1, 1)
+        return int(np.prod(block_shape, dtype=np.int64))
+
+    def _normal_sampling_block_voxels(
+        self,
+        record: _Record,
+        points_zyx_base: np.ndarray,
+    ) -> int:
+        assert record.nx is not None
+        assert record.ny is not None
+        assert record.nx_spacing_base is not None
+        assert record.ny_spacing_base is not None
+        return max(
+            self._normal_block_voxels(
+                points_zyx_base,
+                spacing_base=record.grad_mag_spacing_base,
+                shape=tuple(int(v) for v in record.grad_mag.shape),
+            ),
+            self._normal_block_voxels(
+                points_zyx_base,
+                spacing_base=record.nx_spacing_base,
+                shape=tuple(int(v) for v in record.nx.shape),
+            ),
+            self._normal_block_voxels(
+                points_zyx_base,
+                spacing_base=record.ny_spacing_base,
+                shape=tuple(int(v) for v in record.ny.shape),
+            ),
+        )
+
+    def _iter_normal_sampling_subranges(
+        self,
+        record: _Record,
+        line_points_zyx: np.ndarray,
+        *,
+        start_index: int,
+        end_index: int,
+    ) -> Iterable[tuple[int, int]]:
+        stack: list[tuple[int, int]] = [(int(start_index), int(end_index))]
+        while stack:
+            start, end = stack.pop()
+            if end <= start:
+                continue
+            if end - start > _MAX_NORMAL_SAMPLE_POINTS:
+                mid = start + (end - start) // 2
+                stack.append((mid, end))
+                stack.append((start, mid))
+                continue
+            block_voxels = self._normal_sampling_block_voxels(record, line_points_zyx[start:end])
+            if block_voxels > _MAX_NORMAL_SAMPLE_BLOCK_VOXELS and end - start > 1:
+                mid = start + (end - start) // 2
+                stack.append((mid, end))
+                stack.append((start, mid))
+                continue
+            yield start, end
+
     def _build_geometry_for_record(
         self,
         record: _Record,
@@ -1365,20 +1535,30 @@ class FiberStrip2DLoader:
         if line_points.ndim != 2 or line_points.shape[1] != 3 or line_points.shape[0] == 0:
             raise ValueError("fiber points must have shape [N,3] with N > 0")
         cumulative = self._line_arc_lengths(line_points)
+        required = self._required_line_ranges_for_record(
+            record,
+            source_shape_hw=source_shape_hw,
+        )
         normals = np.full((int(line_points.shape[0]), 3), np.nan, dtype=np.float32)
         normal_valid = np.zeros((int(line_points.shape[0]),), dtype=bool)
         invalid_by_line: dict[int, str] = {}
-        for line_index, point_xyz in enumerate(line_points):
-            try:
-                normals[line_index] = self._lasagna_normal_at_zyx(
+        line_points_zyx = line_points[:, [2, 1, 0]]
+        for range_start, range_end in required.merged_ranges:
+            for start_index, end_index in self._iter_normal_sampling_subranges(
+                record,
+                line_points_zyx,
+                start_index=range_start,
+                end_index=range_end,
+            ):
+                line_indices = np.arange(start_index, end_index, dtype=np.int64)
+                batch_normals, batch_valid, batch_invalid = self._lasagna_normals_at_zyx_batch(
                     record,
-                    point_xyz[[2, 1, 0]],
-                    line_point_index=int(line_index),
-                    control_point_index=None,
+                    line_points_zyx[start_index:end_index],
+                    line_indices=line_indices,
                 )
-                normal_valid[line_index] = True
-            except ValueError as exc:
-                invalid_by_line[int(line_index)] = str(exc)
+                normals[line_indices[batch_valid]] = batch_normals[batch_valid]
+                normal_valid[start_index:end_index] = batch_valid
+                invalid_by_line.update(batch_invalid)
 
         intervals_list: list[_FiberLineGeometryInterval] = []
         start: int | None = None
@@ -1405,20 +1585,15 @@ class FiberStrip2DLoader:
         intervals = tuple(intervals_list)
 
         control_points = np.asarray(record.fiber.control_points_xyz, dtype=np.float64)
-        control_line_indices = np.full((int(control_points.shape[0]),), -1, dtype=np.int64)
+        control_line_indices = required.control_line_indices.copy()
         cp_interval_indices = np.full((int(control_points.shape[0]),), -1, dtype=np.int64)
         cp_valid = np.zeros((int(control_points.shape[0]),), dtype=bool)
         invalid_reasons: list[str] = []
         for cp_index in range(int(control_points.shape[0])):
-            reason = ""
-            try:
-                line_index = control_point_line_index(record.fiber, int(cp_index))
-                control_line_indices[cp_index] = int(line_index)
-                start_index, end_index = self._line_window_bounds_for_control_point(
-                    record,
-                    control_point_index=int(cp_index),
-                    source_shape_hw=source_shape_hw,
-                )
+            reason = required.invalid_cp_reasons[cp_index]
+            if not reason:
+                start_index = int(required.cp_start_indices[cp_index])
+                end_index = int(required.cp_end_indices[cp_index])
                 interval_index = self._interval_index_for_line_range(
                     intervals,
                     start_index=start_index,
@@ -1441,8 +1616,6 @@ class FiberStrip2DLoader:
                 else:
                     cp_interval_indices[cp_index] = int(interval_index)
                     cp_valid[cp_index] = True
-            except (IndexError, ValueError) as exc:
-                reason = str(exc)
             invalid_reasons.append(reason)
         return _FiberLineGeometry(
             record_index=int(record_index),
@@ -1473,47 +1646,80 @@ class FiberStrip2DLoader:
         last_print_time = 0.0
         bar_width = 24
         show_progress = total_records > 1 and not self.config.suppress_record_warnings
+        worker_count = min(max(1, int(self.config.loader_workers)), max(1, total_records))
         if show_progress:
             print(
                 "fiber_trace_2d geometry: building shared compact in-RAM fiber-line store "
-                f"records={total_records} source_hw={source_shape_hw}",
+                f"records={total_records} source_hw={source_shape_hw} workers={worker_count}",
                 flush=True,
             )
-        for record_index, record in enumerate(self.records):
+
+        def maybe_print_progress(done: int, *, force: bool = False) -> None:
+            nonlocal last_print_time
+            if not show_progress:
+                return
+            now = time.perf_counter()
+            if not force and done < total_records and (now - last_print_time) < 1.0:
+                return
+            elapsed = max(now - start_time, 1.0e-9)
+            rate = done / elapsed
+            remaining = max(total_records - done, 0)
+            eta = remaining / rate if rate > 0.0 else 0.0
+            filled = int(math.floor(bar_width * done / max(total_records, 1)))
+            bar = "#" * filled + "-" * (bar_width - filled)
+            print(
+                "\r"
+                f"fiber_trace_2d geometry[{bar}] {done}/{total_records} "
+                f"eta={_format_seconds(eta)} "
+                f"valid_cps={store.valid_control_points} "
+                f"skipped_cps={store.skipped_control_points} "
+                f"mem={store.memory_bytes / (1024.0 * 1024.0):.1f}MiB",
+                end="" if done < total_records else "\n",
+                flush=True,
+            )
+            last_print_time = now
+
+        def build_record(record_index: int, record: _Record) -> tuple[int, _Record, _FiberLineGeometry, int]:
             geometry = self._build_geometry_for_record(
                 record,
                 int(record_index),
                 source_shape_hw=source_shape_hw,
             )
             memory_bytes = self._geometry_memory_bytes(geometry)
-            self._store_geometry(
-                store,
-                record,
-                record_index=int(record_index),
-                geometry=geometry,
-                memory_bytes=memory_bytes,
-            )
-            if show_progress:
-                now = time.perf_counter()
-                done = int(record_index) + 1
-                if done == total_records or (now - last_print_time) >= 1.0:
-                    elapsed = max(now - start_time, 1.0e-9)
-                    rate = done / elapsed
-                    remaining = max(total_records - done, 0)
-                    eta = remaining / rate if rate > 0.0 else 0.0
-                    filled = int(math.floor(bar_width * done / max(total_records, 1)))
-                    bar = "#" * filled + "-" * (bar_width - filled)
-                    print(
-                        "\r"
-                        f"fiber_trace_2d geometry[{bar}] {done}/{total_records} "
-                        f"eta={_format_seconds(eta)} "
-                        f"valid_cps={store.valid_control_points} "
-                        f"skipped_cps={store.skipped_control_points} "
-                        f"mem={store.memory_bytes / (1024.0 * 1024.0):.1f}MiB",
-                        end="" if done < total_records else "\n",
-                        flush=True,
+            return int(record_index), record, geometry, int(memory_bytes)
+
+        if worker_count <= 1:
+            for record_index, record in enumerate(self.records):
+                built_index, built_record, geometry, memory_bytes = build_record(
+                    int(record_index),
+                    record,
+                )
+                self._store_geometry(
+                    store,
+                    built_record,
+                    record_index=built_index,
+                    geometry=geometry,
+                    memory_bytes=memory_bytes,
+                )
+                maybe_print_progress(int(record_index) + 1, force=int(record_index) + 1 == total_records)
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [
+                    executor.submit(build_record, int(record_index), record)
+                    for record_index, record in enumerate(self.records)
+                ]
+                done_count = 0
+                for future in as_completed(futures):
+                    built_index, built_record, geometry, memory_bytes = future.result()
+                    self._store_geometry(
+                        store,
+                        built_record,
+                        record_index=built_index,
+                        geometry=geometry,
+                        memory_bytes=memory_bytes,
                     )
-                    last_print_time = now
+                    done_count += 1
+                    maybe_print_progress(done_count, force=done_count == total_records)
         if show_progress:
             elapsed = max(time.perf_counter() - start_time, 1.0e-9)
             print(
@@ -1790,6 +1996,67 @@ class FiberStrip2DLoader:
                     cube[dz, dy, dx] = float(block[src_z, src_y, src_x])
         return cube, frac
 
+    @staticmethod
+    def _interpolation_cubes_block(
+        array: Any,
+        points_zyx_base: np.ndarray,
+        *,
+        array_spacing_base: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        points = np.asarray(points_zyx_base, dtype=np.float64)
+        count = int(points.shape[0])
+        cubes = np.zeros((count, 2, 2, 2), dtype=np.float64)
+        frac = np.zeros((count, 3), dtype=np.float64)
+        valid = np.zeros((count,), dtype=bool)
+        if count == 0:
+            return cubes, frac, valid
+        pos = points / float(array_spacing_base)
+        shape = np.asarray(array.shape, dtype=np.int64)
+        valid = (
+            np.isfinite(pos).all(axis=1)
+            & np.all(pos >= 0.0, axis=1)
+            & np.all(pos <= (shape - 1).astype(np.float64), axis=1)
+        )
+        if not bool(np.any(valid)):
+            return cubes, frac, valid
+        valid_indices = np.flatnonzero(valid)
+        valid_pos = pos[valid]
+        base = np.floor(valid_pos).astype(np.int64)
+        frac[valid] = valid_pos - base.astype(np.float64)
+        hi = np.minimum(base + 1, shape - 1)
+        lo = np.min(base, axis=0)
+        high = np.max(hi, axis=0)
+        block = np.asarray(
+            array[
+                int(lo[0]) : int(high[0]) + 1,
+                int(lo[1]) : int(high[1]) + 1,
+                int(lo[2]) : int(high[2]) + 1,
+            ]
+        )
+        if block.size == 0:
+            valid[:] = False
+            return cubes, frac, valid
+        for dz in (0, 1):
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    corner = np.minimum(base + np.asarray([dz, dy, dx], dtype=np.int64), shape - 1)
+                    rel = corner - lo
+                    cubes[valid_indices, dz, dy, dx] = block[rel[:, 0], rel[:, 1], rel[:, 2]]
+        return cubes, frac, valid
+
+    @staticmethod
+    def _trilinear_cubes(cubes: np.ndarray, frac: np.ndarray) -> np.ndarray:
+        fz = frac[:, 0]
+        fy = frac[:, 1]
+        fx = frac[:, 2]
+        c00 = cubes[:, 0, 0, 0] * (1.0 - fx) + cubes[:, 0, 0, 1] * fx
+        c01 = cubes[:, 0, 1, 0] * (1.0 - fx) + cubes[:, 0, 1, 1] * fx
+        c10 = cubes[:, 1, 0, 0] * (1.0 - fx) + cubes[:, 1, 0, 1] * fx
+        c11 = cubes[:, 1, 1, 0] * (1.0 - fx) + cubes[:, 1, 1, 1] * fx
+        c0 = c00 * (1.0 - fy) + c01 * fy
+        c1 = c10 * (1.0 - fy) + c11 * fy
+        return c0 * (1.0 - fz) + c1 * fz
+
     def _trilinear_cube(self, cube: np.ndarray, frac: np.ndarray) -> float:
         fz, fy, fx = (float(v) for v in frac)
         c00 = cube[0, 0, 0] * (1.0 - fx) + cube[0, 0, 1] * fx
@@ -1946,6 +2213,146 @@ class FiberStrip2DLoader:
                 )
             )
         return normal.astype(np.float32)
+
+    def _lasagna_normals_at_zyx_batch(
+        self,
+        record: _Record,
+        points_zyx_base: np.ndarray,
+        *,
+        line_indices: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, dict[int, str]]:
+        points = np.asarray(points_zyx_base, dtype=np.float64)
+        line_indices = np.asarray(line_indices, dtype=np.int64)
+        count = int(points.shape[0])
+        normals = np.full((count, 3), np.nan, dtype=np.float32)
+        valid = np.zeros((count,), dtype=bool)
+        invalid_by_line: dict[int, str] = {}
+        if count == 0:
+            return normals, valid, invalid_by_line
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError("points_zyx_base must have shape [N,3]")
+        if line_indices.shape != (count,):
+            raise ValueError("line_indices must have shape [N]")
+
+        grad_cube, grad_frac, grad_in_bounds = self._interpolation_cubes_block(
+            record.grad_mag,
+            points,
+            array_spacing_base=record.grad_mag_spacing_base,
+        )
+        grad_value = self._trilinear_cubes(grad_cube, grad_frac)
+        assert record.nx is not None
+        assert record.ny is not None
+        assert record.nx_spacing_base is not None
+        assert record.ny_spacing_base is not None
+        nx_cube, nx_frac, nx_in_bounds = self._interpolation_cubes_block(
+            record.nx,
+            points,
+            array_spacing_base=record.nx_spacing_base,
+        )
+        ny_cube, _ny_frac, ny_in_bounds = self._interpolation_cubes_block(
+            record.ny,
+            points,
+            array_spacing_base=record.ny_spacing_base,
+        )
+        decoded = _decode_normal_components(nx_cube, ny_cube)
+        corner_norm = np.linalg.norm(decoded, axis=-1)
+        corner_valid = np.isfinite(corner_norm) & (corner_norm > 1.0e-12)
+        fz = nx_frac[:, 0]
+        fy = nx_frac[:, 1]
+        fx = nx_frac[:, 2]
+        wz = np.stack([1.0 - fz, fz], axis=1)
+        wy = np.stack([1.0 - fy, fy], axis=1)
+        wx = np.stack([1.0 - fx, fx], axis=1)
+        weights = wz[:, :, None, None] * wy[:, None, :, None] * wx[:, None, None, :]
+        weights = np.where(corner_valid, weights, 0.0)
+        hint = np.sum(decoded * weights[..., None], axis=(1, 2, 3))
+        tensor = np.einsum("nabc,nabci,nabcj->nij", weights, decoded, decoded, optimize=True)
+        total_weight = np.sum(weights, axis=(1, 2, 3))
+        candidate_valid = (
+            grad_in_bounds
+            & np.isfinite(grad_value)
+            & (grad_value > 0.0)
+            & nx_in_bounds
+            & ny_in_bounds
+            & np.isfinite(total_weight)
+            & (total_weight > 1.0e-12)
+        )
+        if bool(np.any(candidate_valid)):
+            axes = _principal_tensor_axes(tensor[candidate_valid], hint[candidate_valid])
+            axis_norm = np.linalg.norm(axes, axis=1)
+            axis_valid = np.isfinite(axis_norm) & (axis_norm > 1.0e-12)
+            candidate_indices = np.flatnonzero(candidate_valid)
+            good_indices = candidate_indices[axis_valid]
+            normals[good_indices] = axes[axis_valid].astype(np.float32, copy=False)
+            valid[good_indices] = True
+            candidate_valid[candidate_indices[~axis_valid]] = False
+
+        for local_index in np.flatnonzero(~valid):
+            line_index = int(line_indices[int(local_index)])
+            point = points[int(local_index)]
+            if not bool(grad_in_bounds[int(local_index)]):
+                invalid_by_line[line_index] = (
+                    "missing Lasagna grad_mag sample at fiber line point: "
+                    + self._normal_sample_context(
+                        record,
+                        point,
+                        channel="grad_mag",
+                        spacing_base=record.grad_mag_spacing_base,
+                        line_point_index=line_index,
+                        control_point_index=None,
+                    )
+                )
+            elif not (np.isfinite(grad_value[int(local_index)]) and grad_value[int(local_index)] > 0.0):
+                invalid_by_line[line_index] = (
+                    f"Lasagna grad_mag sample is zero at fiber line point value={grad_value[int(local_index)]:.6g}: "
+                    + self._normal_sample_context(
+                        record,
+                        point,
+                        channel="grad_mag",
+                        spacing_base=record.grad_mag_spacing_base,
+                        line_point_index=line_index,
+                        control_point_index=None,
+                    )
+                )
+            elif not (bool(nx_in_bounds[int(local_index)]) and bool(ny_in_bounds[int(local_index)])):
+                missing = "nx" if not bool(nx_in_bounds[int(local_index)]) else "ny"
+                spacing = record.nx_spacing_base if missing == "nx" else record.ny_spacing_base
+                invalid_by_line[line_index] = (
+                    "missing Lasagna nx/ny sample at fiber line point: "
+                    + self._normal_sample_context(
+                        record,
+                        point,
+                        channel=missing,
+                        spacing_base=float(spacing),
+                        line_point_index=line_index,
+                        control_point_index=None,
+                    )
+                )
+            elif not (np.isfinite(total_weight[int(local_index)]) and total_weight[int(local_index)] > 1.0e-12):
+                invalid_by_line[line_index] = (
+                    "degenerate Lasagna normal sample at fiber line point: "
+                    + self._normal_sample_context(
+                        record,
+                        point,
+                        channel="nx",
+                        spacing_base=record.nx_spacing_base,
+                        line_point_index=line_index,
+                        control_point_index=None,
+                    )
+                )
+            else:
+                invalid_by_line[line_index] = (
+                    "degenerate Lasagna normal sample at fiber line point after principal-axis solve: "
+                    + self._normal_sample_context(
+                        record,
+                        point,
+                        channel="nx",
+                        spacing_base=record.nx_spacing_base,
+                        line_point_index=line_index,
+                        control_point_index=None,
+                    )
+                )
+        return normals, valid, invalid_by_line
 
     def _line_window_for_patch(
         self,

@@ -5437,6 +5437,14 @@ def test_loader_tolerates_invalid_remote_line_endpoints_outside_cp_window(tmp_pa
                 "patch_shape_hw": [3, 3],
                 "strip_z_offset_count": 1,
                 "strip_z_offset_step": 1.0,
+                "augment_shift_x": 0.0,
+                "augment_shift_y": 0.0,
+                "augment_rotation_degrees": 0.0,
+                "augment_shear_x": 0.0,
+                "augment_shear_y": 0.0,
+                "augment_scale_min": 1.0,
+                "augment_scale_max": 1.0,
+                "augment_smooth_offset": 0.0,
                 "seed": 123,
                 "datasets": [
                     {
@@ -5477,6 +5485,14 @@ def test_loader_samples_only_cp_local_lasagna_normals(
                 "patch_shape_hw": [3, 3],
                 "strip_z_offset_count": 1,
                 "strip_z_offset_step": 1.0,
+                "augment_shift_x": 0.0,
+                "augment_shift_y": 0.0,
+                "augment_rotation_degrees": 0.0,
+                "augment_shear_x": 0.0,
+                "augment_shear_y": 0.0,
+                "augment_scale_min": 1.0,
+                "augment_scale_max": 1.0,
+                "augment_smooth_offset": 0.0,
                 "seed": 123,
                 "datasets": [
                     {
@@ -5491,26 +5507,95 @@ def test_loader_samples_only_cp_local_lasagna_normals(
         encoding="utf-8",
     )
     sampled_indices: list[int | None] = []
-    original = FiberStrip2DLoader._lasagna_normal_at_zyx
+    original = FiberStrip2DLoader._lasagna_normals_at_zyx_batch
 
-    def fake_normal(self, record, point_zyx_base, *, line_point_index=None, control_point_index=None):
-        sampled_indices.append(line_point_index)
+    def fake_normal_batch(self, record, points_zyx_base, *, line_indices):
+        sampled_indices.extend(int(v) for v in line_indices)
         return original(
             self,
             record,
-            point_zyx_base,
-            line_point_index=line_point_index,
-            control_point_index=control_point_index,
+            points_zyx_base,
+            line_indices=line_indices,
         )
 
-    monkeypatch.setattr(FiberStrip2DLoader, "_lasagna_normal_at_zyx", fake_normal)
+    monkeypatch.setattr(FiberStrip2DLoader, "_lasagna_normals_at_zyx_batch", fake_normal_batch)
     loader = _make_loader(load_config(config_path))
     startup_indices = list(sampled_indices)
 
     loader.build_center_strip_patch(0)
 
-    assert startup_indices == list(range(len(points)))
-    assert sampled_indices == list(range(len(points)))
+    geometry = loader._geometry_store.by_record_index[0]
+    assert geometry is not None
+    expected_indices = np.flatnonzero(geometry.normal_valid).tolist()
+    assert startup_indices == expected_indices
+    assert sampled_indices == expected_indices
+    assert expected_indices != list(range(len(points)))
+
+
+def test_vectorized_lasagna_normals_match_scalar_path(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["loader_workers"] = 1
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    record = loader.records[0]
+    points_xyz = np.asarray(record.fiber.line_points_xyz, dtype=np.float64)
+    line_indices = np.arange(points_xyz.shape[0], dtype=np.int64)
+
+    batch_normals, batch_valid, batch_invalid = loader._lasagna_normals_at_zyx_batch(
+        record,
+        points_xyz[:, [2, 1, 0]],
+        line_indices=line_indices,
+    )
+
+    assert not batch_invalid
+    assert batch_valid.tolist() == [True] * int(points_xyz.shape[0])
+    scalar = np.stack(
+        [
+            loader._lasagna_normal_at_zyx(
+                record,
+                point_xyz[[2, 1, 0]],
+                line_point_index=int(index),
+            )
+            for index, point_xyz in enumerate(points_xyz)
+        ],
+        axis=0,
+    )
+    np.testing.assert_allclose(batch_normals, scalar, atol=1.0e-6)
+
+
+def test_parallel_startup_geometry_matches_serial(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    fiber_b = _write_fiber(
+        tmp_path / "fiber_b.json",
+        points=[[0.0, 22.0, 22.0], [10.0, 22.0, 22.0], [20.0, 22.0, 22.0]],
+    )
+    raw["datasets"][0]["fiber_paths"].append(str(fiber_b))
+
+    raw["loader_workers"] = 1
+    serial_path = tmp_path / "serial.json"
+    serial_path.write_text(json.dumps(raw), encoding="utf-8")
+    serial = _make_loader(load_config(serial_path))
+
+    raw["loader_workers"] = 2
+    parallel_path = tmp_path / "parallel.json"
+    parallel_path.write_text(json.dumps(raw), encoding="utf-8")
+    parallel = _make_loader(load_config(parallel_path))
+
+    assert len(serial._geometry_store.by_record_index) == len(parallel._geometry_store.by_record_index)
+    for serial_geometry, parallel_geometry in zip(
+        serial._geometry_store.by_record_index,
+        parallel._geometry_store.by_record_index,
+    ):
+        assert serial_geometry is not None
+        assert parallel_geometry is not None
+        np.testing.assert_array_equal(serial_geometry.control_line_indices, parallel_geometry.control_line_indices)
+        np.testing.assert_array_equal(serial_geometry.cp_valid, parallel_geometry.cp_valid)
+        np.testing.assert_array_equal(serial_geometry.cp_interval_indices, parallel_geometry.cp_interval_indices)
+        np.testing.assert_array_equal(serial_geometry.normal_valid, parallel_geometry.normal_valid)
+        np.testing.assert_allclose(serial_geometry.normals_xyz, parallel_geometry.normals_xyz, equal_nan=True)
+        assert serial_geometry.invalid_cp_reasons == parallel_geometry.invalid_cp_reasons
 
 
 def test_augmentation_config_defaults_and_overrides(tmp_path: Path) -> None:

@@ -6,6 +6,9 @@
   replaced it with a shared compact in-RAM fiber-line geometry store used by
   training, prefetch dependency generation, top-view loading, and
   visualization source construction.
+- Accelerated compact geometry startup by sampling only CP source-window line
+  ranges, batching Lasagna normal channel interpolation/decoding, and building
+  independent records in parallel with `loader_workers`.
 - Added `fiber_trace_2d` NML fiber-source loading. NML `<thing>` simple path
   components are edge-ordered and normalized into `Vc3dFiber` records, while
   existing VC3D JSON input remains supported.

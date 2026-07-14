@@ -173,6 +173,26 @@ process. This is separate from the remote Zarr chunk cache under
 `volume_cache_dir`, which remains the only persistent cache used for volume
 chunks.
 
+Startup compact-geometry construction uses `loader_workers` for record-level
+parallelism. Use `loader_workers: 1` for the serial/debug path; values above one
+build records concurrently while storing the final compact geometry in original
+record order.
+
+The current startup-geometry benchmark command is:
+
+```bash
+PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_2d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --benchmark --load-only --profile
+```
+
+Baseline before CP-window filtering/vectorized normals/parallel startup:
+startup compact geometry build was `8m53s` for `464` records,
+`14773/184` valid/skipped CPs, and `63.5 MiB`.
+
+After CP-window filtering, batched Lasagna normal sampling, and
+`loader_workers` startup parallelism on the same command/config: startup was
+`2m12s` for `464` records, `14773/184` valid/skipped CPs, and `40.0 MiB`;
+load-only/profile throughput was `119.96 patches/s` over `12800` patches.
+
 ## Focused Test Command
 
 ```bash
