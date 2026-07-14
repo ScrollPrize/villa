@@ -84,7 +84,8 @@ public:
     static std::shared_ptr<Volume> NewFromUrl(
         const std::string& url,
         const std::filesystem::path& cacheRoot = {},
-        const vc::HttpAuth& auth = {});
+        const vc::HttpAuth& auth = {},
+        const utils::Json& metadata = {});
 
     [[nodiscard]] bool isRemote() const noexcept { return isRemote_; }
     [[nodiscard]] std::string id() const;
@@ -96,6 +97,7 @@ public:
     void writeMetadata(const utils::Json& metadata);
     void updateMetadata(const utils::Json& metadata);
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
+    [[nodiscard]] const std::string& remoteLocator() const noexcept { return remoteLocator_; }
     [[nodiscard]] const vc::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
     [[nodiscard]] std::filesystem::path remoteCacheRoot() const noexcept { return remoteCacheRoot_; }
     [[nodiscard]] std::filesystem::path remotePersistentCachePath() const;
@@ -119,7 +121,11 @@ public:
     [[nodiscard]] double fillValue() const noexcept { return zarrFillValue_; }
 
     [[nodiscard]] size_t numScales() const noexcept;
-    [[nodiscard]] int baseScaleLevel() const noexcept { return 0; }
+    [[nodiscard]] int baseScaleLevel() const noexcept { return baseScaleLevel_; }
+    [[nodiscard]] bool hasExplicitVoxelSizeOverride() const noexcept
+    {
+        return hasExplicitVoxelSizeOverride_;
+    }
     [[nodiscard]] bool hasScaleLevel(int level) const noexcept;
     [[nodiscard]] std::vector<int> presentScaleLevels() const;
     [[nodiscard]] int firstPresentScaleLevel() const;
@@ -287,6 +293,9 @@ protected:
     // Remote volume state
     bool isRemote_ = false;
     std::string remoteUrl_;
+    std::string remoteLocator_;
+    int baseScaleLevel_ = 0;
+    bool hasExplicitVoxelSizeOverride_ = false;
     vc::HttpAuth remoteAuth_;
     std::filesystem::path remoteCacheRoot_;
     size_t remoteNumScales_ = 0;

@@ -10,6 +10,7 @@
             [receiver](int s) { receiver->slot(static_cast<Qt::CheckState>(s)); })
 
 #include <QStandardItem>
+#include <QCollator>
 #include <stdexcept>
 #include <vector>
 #include <algorithm>
@@ -21,10 +22,12 @@
 #include <QMenu>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QItemSelectionModel>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 
 #include <filesystem>
+#include <optional>
 #include "utils/Json.hpp"
 
 #include "vc/ui/VCCollection.hpp"
@@ -39,6 +42,19 @@ bool corrResultPositionMatches(const CorrPointResult& r, const cv::Vec3f& curren
            std::abs(r.p[0] - currentPos[0]) < kTol &&
            std::abs(r.p[1] - currentPos[1]) < kTol &&
            std::abs(r.p[2] - currentPos[2]) < kTol;
+}
+
+// Numeric-aware ("natural") comparison so collection names like
+// "1", "2", "15", "100" sort by value instead of lexicographically.
+bool naturalNameLess(const std::string& a, const std::string& b)
+{
+    static QCollator collator = [] {
+        QCollator c;
+        c.setNumericMode(true);
+        c.setCaseSensitivity(Qt::CaseInsensitive);
+        return c;
+    }();
+    return collator.compare(QString::fromStdString(a), QString::fromStdString(b)) < 0;
 }
 } // namespace
 
@@ -103,6 +119,7 @@ void CPointCollectionWidget::setupUi()
             });
 
     _tree_view = new QTreeView(main_widget);
+    _tree_view->setObjectName(QStringLiteral("pointCollectionTreeView"));
     _model = new QStandardItemModel(this);
     _tree_view->setModel(_model);
     _tree_view->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -223,6 +240,7 @@ void CPointCollectionWidget::setupUi()
     _save_button = new QPushButton("Save");
     file_layout->addWidget(_save_button);
     _reset_button = new QPushButton("Clear All Points");
+    _reset_button->setObjectName(QStringLiteral("pointCollectionClearAllButton"));
     file_layout->addWidget(_reset_button);
     layout->addLayout(file_layout);
 
@@ -245,16 +263,7 @@ void CPointCollectionWidget::setupUi()
 void CPointCollectionWidget::refreshTree()
 {
     if (_model) {
-        _model->blockSignals(true);
-
-        // Remove all rows before clearing
-        if (_model->rowCount() > 0) {
-            _model->removeRows(0, _model->rowCount());
-        }
-
-        _model->clear();
-        _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error", "Position"});
-        _model->blockSignals(false);
+        clearTreeModel();
     }
 
     if (!_point_collection) {
@@ -270,7 +279,7 @@ void CPointCollectionWidget::refreshTree()
     }
     std::sort(sorted_collections.begin(), sorted_collections.end(),
               [](const VCCollection::Collection& a, const VCCollection::Collection& b) {
-        return a.name < b.name;
+        return naturalNameLess(a.name, b.name);
     });
 
     // Iterate through sorted collections and add to tree
@@ -350,8 +359,15 @@ void CPointCollectionWidget::refreshTree()
 void CPointCollectionWidget::onResetClicked()
 {
     if (_point_collection) {
-        _tree_view->selectionModel()->clear();
+        if (auto* selection = _tree_view->selectionModel()) {
+            const QSignalBlocker selectionBlocker(selection);
+            selection->clear();
+            selection->setCurrentIndex(QModelIndex(), QItemSelectionModel::NoUpdate);
+        }
+        _selected_collection_id = 0;
+        _selected_point_id = 0;
         _point_collection->clearAll();
+        updateMetadataWidgets();
     }
 }
 
@@ -393,7 +409,16 @@ void CPointCollectionWidget::onCollectionsAdded(const std::vector<uint64_t>& col
         QStandardItem *col_pos_item = new QStandardItem();
         col_pos_item->setFlags(col_pos_item->flags() & ~Qt::ItemIsEditable);
 
-        _model->appendRow({name_item, count_item, col_winding_item, col_err_item, col_pos_item});
+        // Insert at the natural-sorted position so live-added collections stay
+        // ordered (matching refreshTree's sort) instead of being pinned to the bottom.
+        int insertRow = _model->rowCount();
+        for (int row = 0; row < _model->rowCount(); ++row) {
+            if (naturalNameLess(collection.name, _model->item(row, 0)->text().toStdString())) {
+                insertRow = row;
+                break;
+            }
+        }
+        _model->insertRow(insertRow, {name_item, count_item, col_winding_item, col_err_item, col_pos_item});
 
         for(const auto& point_pair : collection.points) {
             onPointAdded(point_pair.second);
@@ -421,14 +446,10 @@ void CPointCollectionWidget::onCollectionChanged(uint64_t collectionId)
 void CPointCollectionWidget::onCollectionRemoved(uint64_t collectionId)
 {
     if (collectionId == static_cast<uint64_t>(-1)) { // Clear all
-        // Properly clear the model
-        if (_model) {
-            _model->blockSignals(true);
-            _model->removeRows(0, _model->rowCount());
-            _model->clear();
-            _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error", "Position"});
-            _model->blockSignals(false);
-        }
+        _selected_collection_id = 0;
+        _selected_point_id = 0;
+        clearTreeModel();
+        updateMetadataWidgets();
         return;
     }
 
@@ -546,6 +567,24 @@ void CPointCollectionWidget::onPointRemoved(uint64_t pointId)
             }
         }
     }
+}
+
+void CPointCollectionWidget::clearTreeModel()
+{
+    if (!_model) {
+        return;
+    }
+
+    std::optional<QSignalBlocker> selectionBlocker;
+    if (_tree_view && _tree_view->selectionModel()) {
+        selectionBlocker.emplace(_tree_view->selectionModel());
+        _tree_view->selectionModel()->clear();
+        _tree_view->selectionModel()->setCurrentIndex(QModelIndex(), QItemSelectionModel::NoUpdate);
+    }
+
+    const QSignalBlocker modelBlocker(_model);
+    _model->clear();
+    _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error", "Position"});
 }
 
 void CPointCollectionWidget::onSelectionChanged(const QItemSelection &selected, const QItemSelection &deselected)

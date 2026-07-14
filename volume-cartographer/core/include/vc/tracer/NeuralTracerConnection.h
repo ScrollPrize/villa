@@ -4,6 +4,8 @@
 #include <optional>
 #include <opencv2/core.hpp>
 
+#include "vc/core/util/UnixSocket.hpp"
+
 
 class NeuralTracerConnection
 {
@@ -29,5 +31,5 @@ public:
     ) const;
 
 private:
-    int sock = -1;
+    vc::unixsocket::Socket sock = vc::unixsocket::invalidSocket;
 };

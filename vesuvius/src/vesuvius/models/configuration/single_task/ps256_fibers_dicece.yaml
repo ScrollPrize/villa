@@ -1,0 +1,68 @@
+# Binary fiber segmentation modeled after srf_2um/ps192_medial.yaml but at
+# 256^3 patches per user request.
+#
+# Differences vs ps192_medial.yaml:
+#   * patch_size: 256^3 (user-specified).
+#   * dataset_type: cross_frame -- labels and image live in different frames,
+#     bridged by transform.json; the dataset inverts it and resamples on the fly.
+#   * loss: nnUNet_DC_and_CE_loss. The repo only exposes a combined
+#     MedialSurfaceRecall (Dice + SoftSkeletonRecall + CE) -- there is no
+#     standalone "SkeletonRecall" registration -- so per-user instruction we
+#     fall back to Dice+CE here.
+#   * wandb_project: fibers (separate from srf_2um).
+#
+# Invocation (8-GPU DDP):
+#   uv run vesuvius.train \
+#     --config src/vesuvius/models/configuration/single_task/ps256_fibers_dicece.yaml \
+#     --input /home/ubuntu/fibers_cache \
+#     --output /home/ubuntu/fibers_ckpts \
+#     --ddp --gpus 0,1,2,3,4,5,6,7 --nproc-per-node 8 \
+#     --wandb-project fibers --wandb-entity vesuvius-challenge
+
+tr_setup:
+  wandb_project: "fibers"
+  wandb_entity: "vesuvius-challenge"
+  model_name: "ps256_fibers_dicece"
+  tr_val_split: 0.85
+
+tr_config:
+  patch_size: [256, 256, 256]
+  batch_size: 2
+  num_dataloader_workers: 6
+  enable_deep_supervision: false
+  max_epoch: 1000
+  max_steps_per_epoch: 250
+  max_val_steps_per_epoch: 50
+  optimizer: "SGD"
+  initial_lr: 0.01
+  weight_decay: 0.00003
+  # Skip torch.compile entirely: under DDP the first-compile phase was
+  # desyncing rank 0 (rank 0 stuck on CPU while ranks 1-7 blocked at the
+  # initial barrier). Plain eager-mode runs fine on H100 for this model size.
+  compile_policy: "off"
+  ddp_find_unused_parameters: false
+
+dataset_config:
+  dataset_type: "cross_frame"
+  image_zarr_url: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/0"
+  # Labels pulled to local disk with rsync:
+  #   rsync -aW rsync://dl.ash2txt.org/data/other/dev/meshes/s1a-fibers-230125-ome.zarr/ \
+  #             /ephemeral/fibers_labels/s1a-fibers-230125-ome.zarr/
+  labels_zarr_url: "/ephemeral/fibers_labels/s1a-fibers-230125-ome.zarr/0"
+  transform_json_url: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/transform.json"
+  storage_options:
+    anon: true
+  # Scan FG on the 8x-downsampled OME-Zarr level so the whole labels volume
+  # fits in memory and the index builds in seconds, not hours.
+  labels_scan_level: 3
+
+  min_labeled_ratio: 0.001
+  min_bbox_percent: 0.35
+  normalization_scheme: "zscore"
+  targets:
+    fibers:
+      out_channels: 2
+      activation: "none"
+      losses:
+        - name: "nnUNet_DC_and_CE_loss"
+          weight: 1.0

@@ -71,34 +71,107 @@ std::string deriveRemoteVolumeName(const std::string& url)
 }
 
 std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl,
-                                                    const vc::HttpAuth& auth)
+                                                    const vc::HttpAuth& auth,
+                                                    bool discoverPublicSamplePixelSize)
 {
-    const auto load = [&](const std::string& name) -> std::optional<utils::Json> {
-        const auto url = remoteUrl + "/" + name;
-        const auto body = vc::httpGetString(url, auth);
-        if (body.empty()) {
+    const auto numberFromObject = [](const utils::Json& obj,
+                                     std::initializer_list<const char*> keys) -> std::optional<double> {
+        if (!obj.is_object()) {
             return std::nullopt;
         }
-        auto json = utils::Json::parse(body);
-        if (name == METADATA_FILE_ALT.string()) {
-            if (!json.contains("scan")) {
-                throw std::runtime_error("metadata.json missing 'scan' key: " + url);
+        for (const char* key : keys) {
+            if (!obj.contains(key)) {
+                continue;
             }
-            json.update(json["scan"]);
-            if (!json.contains("format")) {
-                json["format"] = "zarr";
+            const auto& value = obj[key];
+            if (value.is_number()) {
+                return value.get_double();
+            }
+            if (value.is_string()) {
+                try {
+                    return std::stod(value.get_string());
+                } catch (...) {
+                }
             }
         }
+        return std::nullopt;
+    };
+
+    const auto voxelSizeFromMetadata = [&](const utils::Json& obj) -> std::optional<double> {
+        const auto keys = {
+            "voxelsize",
+            "voxel_size_um",
+            "voxelSizeUm",
+            "pixel_size_um",
+            "pixelSizeUm",
+            "resolution_um",
+        };
+        if (auto value = numberFromObject(obj, keys)) {
+            return value;
+        }
+        for (const char* key : {"scan", "volume", "properties", "metadata"}) {
+            if (obj.is_object() && obj.contains(key)) {
+                if (auto value = numberFromObject(obj[key], keys)) {
+                    return value;
+                }
+            }
+        }
+        return std::nullopt;
+    };
+
+    const auto normalize = [&](utils::Json json, const std::string& url) -> utils::Json {
         if (!json.is_object()) {
             throw std::runtime_error("remote volume metadata is not an object: " + url);
+        }
+        if (json.contains("scan") && json["scan"].is_object()) {
+            json.update(json["scan"]);
+        }
+        if (!json.contains("format")) {
+            json["format"] = "zarr";
+        }
+
+        bool hasVoxelSize = false;
+        if (json.contains("voxelsize") && json["voxelsize"].is_number()) {
+            hasVoxelSize = json["voxelsize"].get_double() > 0.0;
+        }
+        if (!hasVoxelSize) {
+            if (auto voxelSize = voxelSizeFromMetadata(json); voxelSize && *voxelSize > 0.0) {
+                json["voxelsize"] = *voxelSize;
+                hasVoxelSize = true;
+            }
+        }
+        if (!hasVoxelSize && discoverPublicSamplePixelSize) {
+            const utils::Json* current = &json;
+            for (const char* key : {"scan", "tomo", "acquisition", "detector"}) {
+                if (!current->is_object() || !current->contains(key)) {
+                    current = nullptr;
+                    break;
+                }
+                current = &(*current)[key];
+            }
+            if (current && current->is_object() &&
+                current->contains("samplePixelSize") &&
+                (*current)["samplePixelSize"].is_number()) {
+                const double millimeters = (*current)["samplePixelSize"].get_double();
+                if (std::isfinite(millimeters) && millimeters > 0.0)
+                    json["voxelsize"] = millimeters * 1000.0;
+            }
         }
         return json;
     };
 
-    if (auto meta = load(METADATA_FILE.string())) {
+    const auto loadUrl = [&](const std::string& url) -> std::optional<utils::Json> {
+        const auto body = vc::httpGetString(url, auth);
+        if (body.empty()) {
+            return std::nullopt;
+        }
+        return normalize(utils::Json::parse(body), url);
+    };
+
+    if (auto meta = loadUrl(vc::joinRemoteUrlPath(remoteUrl, METADATA_FILE.string()))) {
         return meta;
     }
-    return load(METADATA_FILE_ALT.string());
+    return loadUrl(vc::joinRemoteUrlPath(remoteUrl, METADATA_FILE_ALT.string()));
 }
 
 std::string deriveRemoteVolumeId(const std::string& url)
@@ -110,6 +183,19 @@ std::string deriveRemoteVolumeId(const std::string& url)
     std::ostringstream out;
     out << name << "-" << std::hex << std::nouppercase << std::setw(16)
         << std::setfill('0') << hash;
+    return out.str();
+}
+
+std::string deriveRebasedRemoteVolumeId(const std::string& descriptiveId,
+                                        const std::string& sourceUrl,
+                                        int baseScaleLevel)
+{
+    const std::string identity = sourceUrl + "#vc-base-scale=" +
+                                 std::to_string(baseScaleLevel);
+    const auto hash = utils::fnv1a(std::string_view(identity));
+    std::ostringstream out;
+    out << descriptiveId << "-vc-base-" << baseScaleLevel << "-"
+        << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << hash;
     return out.str();
 }
 
@@ -1222,25 +1308,27 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
 std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string& url,
     const std::filesystem::path& cacheRoot,
-    const vc::HttpAuth& authIn)
+    const vc::HttpAuth& authIn,
+    const utils::Json& metadata)
 {
-    // Resolve s3:// URLs to https:// and detect AWS credentials
-    auto resolved = vc::resolveRemoteUrl(url);
+    // Parse the client-side view selector before resolving S3 or constructing
+    // any network URL.
+    const auto spec = vc::parseRemoteVolumeSpec(url);
     vc::HttpAuth auth = authIn;
-    if (resolved.useAwsSigv4 && auth.empty()) {
+    if (spec.useAwsSigv4 && auth.empty()) {
         auth = vc::loadAwsCredentials();
         if (auth.region.empty())
-            auth.region = resolved.awsRegion;
+            auth.region = spec.awsRegion;
         // SigV4 is implicitly enabled when access_key is non-empty.
         // If credentials are missing, clear them so the request proceeds
         // unsigned (anonymous access for public buckets).
         if (auth.access_key.empty() || auth.secret_key.empty())
             auth = {};  // anonymous — no SigV4
-    } else if (resolved.useAwsSigv4 && auth.region.empty()) {
-        auth.region = resolved.awsRegion;
+    } else if (spec.useAwsSigv4 && auth.region.empty()) {
+        auth.region = spec.awsRegion;
     }
 
-    const std::string remoteUrl = normalizeRemoteVolumeUrl(resolved.httpsUrl);
+    const std::string& remoteUrl = spec.sourceUrl;
 
     vc::render::OpenedChunkedZarr opened;
     // Open the zarr metadata in memory. This performs the normal zarr metadata
@@ -1248,14 +1336,14 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     // If stale AWS credentials are present, public buckets may reject the
     // signed request even though the same object is readable anonymously.
     try {
-        opened = vc::render::openHttpZarrPyramid(remoteUrl, auth);
+        opened = vc::render::openHttpZarrPyramid(spec.portableLocator, auth);
     } catch (const std::exception& e) {
-        if (!resolved.useAwsSigv4 || auth.empty() || !isRemoteAuthError(e)) {
+        if (!spec.useAwsSigv4 || auth.empty() || !isRemoteAuthError(e)) {
             throw;
         }
 
         vc::HttpAuth anonymousAuth;
-        opened = vc::render::openHttpZarrPyramid(remoteUrl, anonymousAuth);
+        opened = vc::render::openHttpZarrPyramid(spec.portableLocator, anonymousAuth);
         auth = std::move(anonymousAuth);
     }
 
@@ -1277,6 +1365,8 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
 
     vol->isRemote_ = true;
     vol->remoteUrl_ = remoteUrl;
+    vol->remoteLocator_ = spec.portableLocator;
+    vol->baseScaleLevel_ = spec.baseScaleLevel;
     vol->remoteAuth_ = auth;
     vol->remoteCacheRoot_ = cacheRoot;
     vol->remoteNumScales_ = opened.shapes.size();
@@ -1286,7 +1376,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->zarrDtype_ = opened.dtype;
     vol->zarrFillValue_ = opened.fillValue;
     const auto& firstShape = opened.shapes[static_cast<std::size_t>(firstPresentLevel)];
-    const size_t firstScale = size_t{1} << firstPresentLevel;
+    const size_t firstScale = spec.baseScaleLevel > 0 ? 1 : size_t{1} << firstPresentLevel;
     vol->_slices = static_cast<int>(static_cast<size_t>(firstShape[0]) * firstScale);
     vol->_height = static_cast<int>(static_cast<size_t>(firstShape[1]) * firstScale);
     vol->_width = static_cast<int>(static_cast<size_t>(firstShape[2]) * firstScale);
@@ -1303,8 +1393,16 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->metadata_["min"] = double{};
     vol->metadata_["max"] = double{};
 
+    std::optional<double> nativeRemoteVoxelSize;
     try {
-        if (auto remoteMeta = loadRemoteVolumeMetadata(remoteUrl, auth)) {
+        if (auto remoteMeta = loadRemoteVolumeMetadata(
+                remoteUrl, auth, spec.baseScaleLevel > 0)) {
+            if (remoteMeta->contains("voxelsize") &&
+                (*remoteMeta)["voxelsize"].is_number()) {
+                const double value = (*remoteMeta)["voxelsize"].get_double();
+                if (std::isfinite(value) && value > 0.0)
+                    nativeRemoteVoxelSize = value;
+            }
             vol->metadata_.update(*remoteMeta);
             vol->metadata_["width"] = vol->_width;
             vol->metadata_["height"] = vol->_height;
@@ -1312,6 +1410,45 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         }
     } catch (const std::exception& e) {
         Logger()->warn("Failed to load remote volume metadata for '{}': {}", remoteUrl, e.what());
+    }
+
+    if (metadata.is_object()) {
+        if (metadata.contains("voxelsize") && metadata["voxelsize"].is_number()) {
+            const double value = metadata["voxelsize"].get_double();
+            vol->hasExplicitVoxelSizeOverride_ = std::isfinite(value) && value > 0.0;
+        }
+        vol->metadata_.update(metadata);
+        vol->metadata_["width"] = vol->_width;
+        vol->metadata_["height"] = vol->_height;
+        vol->metadata_["slices"] = vol->_slices;
+    }
+
+    if (spec.baseScaleLevel > 0) {
+        std::optional<double> logicalOverride;
+        if (metadata.is_object() && metadata.contains("voxelsize") &&
+            metadata["voxelsize"].is_number()) {
+            const double value = metadata["voxelsize"].get_double();
+            if (std::isfinite(value) && value > 0.0)
+                logicalOverride = value;
+        }
+        if (logicalOverride) {
+            vol->metadata_["voxelsize"] = *logicalOverride;
+        } else if (nativeRemoteVoxelSize) {
+            vol->metadata_["voxelsize"] =
+                *nativeRemoteVoxelSize * static_cast<double>(std::uint64_t{1} << spec.baseScaleLevel);
+        } else {
+            throw std::runtime_error(
+                "rebased remote volume requires a positive logical voxel-size override "
+                "or trustworthy native voxel size metadata");
+        }
+
+        std::string descriptiveId = id;
+        if (vol->metadata_.contains("uuid") && vol->metadata_["uuid"].is_string() &&
+            !vol->metadata_["uuid"].get_string().empty()) {
+            descriptiveId = vol->metadata_["uuid"].get_string();
+        }
+        vol->metadata_["uuid"] = deriveRebasedRemoteVolumeId(
+            descriptiveId, remoteUrl, spec.baseScaleLevel);
     }
 
     return vol;
@@ -1477,7 +1614,9 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
         options.persistentCachePath = remotePersistentCachePath();
 
     vc::render::OpenedChunkedZarr opened = isRemote_
-        ? vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_)
+        ? (baseScaleLevel_ > 0
+               ? vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_, baseScaleLevel_)
+               : vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_))
         : vc::render::openLocalZarrPyramid(path_);
 
     if (opened.fetchers.empty()) {
