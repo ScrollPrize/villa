@@ -208,6 +208,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Creating segments from intersecting horizontal and vertical fibers](https://gist.github.com/jrudolph/3e0ebbd6e731f794733c236a86ff39fb) by Johannes Rudolph
 
+- [Surface geometry failure diagnostic](https://github.com/Jinhojeong/vesuvius-surface-geometry-diagnostic) by Jinho Jeong. Geometry-stratified AUC analysis of where surface models fail in compressed and curved regions (villa #191), a fine-tune that repairs compressed-region discrimination at no measurable cost on the official metric, and a label-completeness QC tool relevant to #192/#193.
+
 ### 📊 Visualization
 
 - [Browser-based scroll viewer](https://discord.com/channels/1079907749569237093/1246129199304151052/1246129199304151052) by Yao Hsiao
