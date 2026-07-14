@@ -26,7 +26,8 @@ from vesuvius.neural_tracing.datasets.common import (
     end_zarr_cache_trace,
     open_zarr,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import Vc3dFiber, load_vc3d_fiber
+from vesuvius.data.affine import read_transform_json
+from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import Vc3dFiber, load_fiber_file
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     FiberStripFrame,
     FiberStripGridTorch,
@@ -489,6 +490,75 @@ def _resolve_fiber_paths(dataset_config: dict[str, Any], config: FiberStrip2DCon
     if not paths:
         raise ValueError("dataset entry did not resolve any fiber paths")
     return paths
+
+
+def _fiber_transform_invert_flag(dataset_config: dict[str, Any]) -> bool:
+    raw_flags = [
+        bool(dataset_config[key])
+        for key in ("fiber_transform_invert", "transform_invert")
+        if key in dataset_config
+    ]
+    if len(set(raw_flags)) > 1:
+        raise ValueError("fiber_transform_invert and transform_invert disagree")
+    return raw_flags[0] if raw_flags else False
+
+
+def _homogeneous_matrix_from_config(raw_matrix: Any, *, key: str) -> np.ndarray:
+    matrix = np.asarray(raw_matrix, dtype=np.float64)
+    if matrix.shape == (3, 4):
+        matrix = np.vstack([matrix, [0.0, 0.0, 0.0, 1.0]])
+    if matrix.shape != (4, 4):
+        raise ValueError(f"{key} must be a 3x4 or 4x4 XYZ affine matrix")
+    if not bool(np.isfinite(matrix).all()):
+        raise ValueError(f"{key} contains non-finite values")
+    if not np.allclose(matrix[3], np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64)):
+        raise ValueError(f"{key} must have homogeneous last row [0, 0, 0, 1]")
+    return matrix
+
+
+def _dataset_fiber_transform(
+    dataset_config: dict[str, Any], config: FiberStrip2DConfig
+) -> tuple[np.ndarray | None, str]:
+    json_sources = [
+        (key, dataset_config[key])
+        for key in ("fiber_transform_json", "fiber_transform_json_path")
+        if dataset_config.get(key) is not None
+    ]
+    inline_sources = [
+        (key, dataset_config[key])
+        for key in ("fiber_transform", "transform")
+        if dataset_config.get(key) is not None
+    ]
+    if len(json_sources) > 1:
+        raise ValueError("set only one of fiber_transform_json or fiber_transform_json_path")
+    if len(inline_sources) > 1:
+        raise ValueError("set only one of fiber_transform or transform")
+    source_count = len(json_sources) + len(inline_sources)
+    if source_count == 0:
+        return None, "none"
+    if source_count > 1:
+        raise ValueError("set only one fiber transform source")
+
+    invert = _fiber_transform_invert_flag(dataset_config)
+    if json_sources:
+        key, raw_path = json_sources[0]
+        resolved = _resolve_path(raw_path, config.config_dir)
+        matrix = np.asarray(read_transform_json(resolved).matrix_xyz, dtype=np.float64)
+        source_label = f"{key}:{resolved}"
+    else:
+        key, raw_matrix = inline_sources[0]
+        matrix = _homogeneous_matrix_from_config(raw_matrix, key=key)
+        source_label = key
+
+    if invert:
+        matrix = np.linalg.inv(matrix)
+    identity = _stable_digest(
+        "fiber_transform",
+        source_label,
+        f"invert={invert}",
+        _round_json_array(matrix, decimals=9),
+    )
+    return matrix, identity
 
 
 def _control_points_in_base_shape(fiber: Vc3dFiber, base_shape_zyx: tuple[int, int, int]) -> bool:
@@ -1099,43 +1169,68 @@ class FiberStrip2DLoader:
                 volume=volume,
                 volume_path=volume_path,
             )
+            fiber_transform_xyz, fiber_transform_identity = _dataset_fiber_transform(
+                dataset_config,
+                self.config,
+            )
             for fiber_path in _resolve_fiber_paths(dataset_config, self.config):
-                fiber = load_vc3d_fiber(fiber_path)
-                fiber_identity = _stable_digest(
-                    "fiber",
-                    str(fiber_path),
-                    _round_json_array(np.asarray(fiber.line_points_xyz, dtype=np.float64)),
+                fibers = load_fiber_file(
+                    fiber_path,
+                    transform_xyz=fiber_transform_xyz,
+                    transform_identity=fiber_transform_identity,
                 )
-                bad_control = _first_out_of_bounds_control_point(fiber, base_shape_zyx)
-                if bad_control is not None:
-                    bad_index, bad_zyx = bad_control
-                    if not self.config.suppress_record_warnings:
-                        print(
-                            "fiber_trace_2d: skipping fiber with out-of-volume control point "
-                            f"fiber_path='{fiber_path}' control_point_index={bad_index} "
-                            f"control_point_zyx=({bad_zyx[0]:.3f}, {bad_zyx[1]:.3f}, {bad_zyx[2]:.3f}) "
-                            f"base_shape_zyx={base_shape_zyx}",
-                            flush=True,
-                        )
-                    continue
-                records.append(
-                    _Record(
-                        fiber=fiber,
-                        volume=volume,
-                        volume_path=volume_path,
-                        volume_scale=volume_scale,
-                        volume_spacing_base=volume_spacing_base,
-                        fiber_identity=fiber_identity,
-                        sampler=sampler,
-                        grad_mag=grad_mag,
-                        grad_mag_spacing_base=grad_mag_spacing_base,
-                        nx=nx,
-                        ny=ny,
-                        nx_spacing_base=nx_spacing_base,
-                        ny_spacing_base=ny_spacing_base,
-                        dataset_config=dict(dataset_config),
+                if (
+                    not self.config.suppress_record_warnings
+                    and str(fiber_path).lower().endswith(".nml")
+                ):
+                    print(
+                        "fiber_trace_2d: loaded NML fiber source "
+                        f"fiber_path='{fiber_path}' fibers={len(fibers)} "
+                        f"transform={fiber_transform_identity}",
+                        flush=True,
                     )
-                )
+                for source_fiber_index, fiber in enumerate(fibers):
+                    fiber_identity = _stable_digest(
+                        "fiber",
+                        str(fiber_path),
+                        source_fiber_index,
+                        fiber_transform_identity,
+                        fiber.metadata.get("source_format", ""),
+                        fiber.metadata.get("nml_thing_id", ""),
+                        fiber.metadata.get("nml_component_index", ""),
+                        _round_json_array(np.asarray(fiber.line_points_xyz, dtype=np.float64)),
+                    )
+                    bad_control = _first_out_of_bounds_control_point(fiber, base_shape_zyx)
+                    if bad_control is not None:
+                        bad_index, bad_zyx = bad_control
+                        if not self.config.suppress_record_warnings:
+                            print(
+                                "fiber_trace_2d: skipping fiber with out-of-volume control point "
+                                f"fiber_path='{fiber_path}' source_fiber_index={source_fiber_index} "
+                                f"control_point_index={bad_index} "
+                                f"control_point_zyx=({bad_zyx[0]:.3f}, {bad_zyx[1]:.3f}, {bad_zyx[2]:.3f}) "
+                                f"base_shape_zyx={base_shape_zyx}",
+                                flush=True,
+                            )
+                        continue
+                    records.append(
+                        _Record(
+                            fiber=fiber,
+                            volume=volume,
+                            volume_path=volume_path,
+                            volume_scale=volume_scale,
+                            volume_spacing_base=volume_spacing_base,
+                            fiber_identity=fiber_identity,
+                            sampler=sampler,
+                            grad_mag=grad_mag,
+                            grad_mag_spacing_base=grad_mag_spacing_base,
+                            nx=nx,
+                            ny=ny,
+                            nx_spacing_base=nx_spacing_base,
+                            ny_spacing_base=ny_spacing_base,
+                            dataset_config=dict(dataset_config),
+                        )
+                    )
         if not records:
             raise ValueError("no fiber records loaded")
         return records
@@ -1147,12 +1242,15 @@ class FiberStrip2DLoader:
     def flat_sample_indices_for_fiber_json(self, fiber_json: str | Path) -> tuple[int, ...]:
         query_key = _path_match_key(fiber_json, self.config.config_dir)
         flat_offset = 0
+        matches: list[int] = []
         for record in self.records:
             record_path = "" if record.fiber.path is None else str(record.fiber.path)
             record_count = int(record.fiber.control_points_xyz.shape[0])
             if record_path and _path_match_key(record_path, None) == query_key:
-                return tuple(flat_offset + index for index in range(record_count))
+                matches.extend(flat_offset + index for index in range(record_count))
             flat_offset += record_count
+        if matches:
+            return tuple(matches)
         raise ValueError(
             "fiber_json is not present in configured datasets: "
             f"fiber_json='{_resolve_path(fiber_json, self.config.config_dir)}'"

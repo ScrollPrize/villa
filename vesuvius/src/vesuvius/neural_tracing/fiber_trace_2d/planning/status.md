@@ -7,7 +7,7 @@
 - [x] Inspect affine helpers and Lasagna cross-volume transform handling.
 - [x] Write current task and task plan.
 - [x] Add S1A NML variant config derived from `loader_example.json`.
-- [ ] Review plan against specs/task before implementation.
-- [ ] Implement NML parsing and dataset-level fiber transforms.
-- [ ] Update specs, docs, changelog, and task log.
-- [ ] Run focused tests.
+- [x] Review plan against specs/task before implementation.
+- [x] Implement NML parsing and dataset-level fiber transforms.
+- [x] Update specs, docs, changelog, and task log.
+- [x] Run focused tests.

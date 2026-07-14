@@ -1,7 +1,15 @@
 # 2D Fiber Trace Initial Loader Specs
 
 - The initial implementation loads batches of fiber-strip patches around random control points from the fiber dataset.
-- Fiber JSON parsing follows the existing VC3D fiber parsing semantics from `vesuvius.neural_tracing.fiber_trace.fiber_json`.
+- Fiber source parsing accepts existing VC3D fiber JSON files and Knossos /
+  WebKnossos `.nml` files. VC3D JSON parsing follows
+  `vesuvius.neural_tracing.fiber_trace.fiber_json`.
+- NML parsing orders nodes by edges, not XML order. Each usable open simple
+  path component becomes one normalized `Vc3dFiber`; branch components, closed
+  loops, disconnected singleton nodes, or malformed components are skipped or
+  rejected with diagnostics rather than guessed through.
+- NML line points and control points initially use the same ordered node
+  coordinates unless a later explicit control-point convention is added.
 - Each selected control point must be an exact member of `line_points`; otherwise the fiber JSON is rejected as inconsistent.
 - The loader works on 2D sampled fiber side-strip patches.
 - Neighboring strip-z context is represented as separate 2D patches.
@@ -164,6 +172,16 @@
 - Augment contact sheets draw a final visualization-only thin vertical marker at the transformed control-point coordinate for each patch, leaving a small gap around the CP pixel itself.
 - Augment contact-sheet cells include a top label band naming the shown augmentation; labels must not overlay image pixels.
 - Dataset entries include `fiber_paths` or `fiber_glob`, `base_volume_path`, `base_volume_scale`, and required `lasagna_manifest_path`.
+- Dataset entries may define a fiber-coordinate affine transform using one of
+  `fiber_transform_json` / `fiber_transform_json_path` for Vesuvius
+  registration `transform.json`, inline `fiber_transform`, or Lasagna-compatible
+  inline `transform`. Inline matrices are XYZ 3x4 or homogeneous 4x4. The
+  matrix direction is source/moving fiber XYZ to current/fixed base-volume XYZ;
+  `fiber_transform_invert` or `transform_invert` inverts it before use.
+- Fiber-coordinate transforms are applied once immediately after JSON/NML
+  parsing and before bounds checks, sample ordering, strip-coordinate cache
+  identity, prefetch, training, and Trace2CP tooling. Lasagna manifest normals
+  are still sampled from the current manifest after transformation.
 - Optional top-level `test_datasets` uses the same dataset-entry schema as `datasets`; when present it defines a separate deterministic test loader while reusing the rest of the loader configuration.
 - Strip-frame normals are sampled only through the Lasagna manifest `grad_mag`, `nx`, and `ny` channels.
 - Trace2CP segment samples carry the line-window original line indices and the

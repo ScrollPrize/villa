@@ -28,6 +28,35 @@
   example config. Checked the available Lasagna run snapshot configs; they only
   point to older checkout config paths that are not present locally.
 
+## Implementation Notes
+
+- Added NML parsing in `fiber_json.py`. Each edge-ordered open simple path
+  component becomes one normalized `Vc3dFiber`; branch/closed/malformed
+  components are skipped or rejected with diagnostics.
+- Added `load_fiber_file` so `.json` and `.nml` inputs share one loader-facing
+  API and both return normalized `Vc3dFiber` objects.
+- Added loader dataset transform parsing for `fiber_transform_json`,
+  `fiber_transform_json_path`, inline `fiber_transform`, and Lasagna-compatible
+  `transform`, plus corresponding invert flags.
+- Transform matrices are XYZ 3x4/4x4 and are applied once immediately after
+  parsing, before bounds checks, identity/cache keys, prefetch, training, or
+  Trace2CP use the fiber.
+- Updated flat path lookup so an NML file with multiple simple components
+  returns all matching flat CP indices instead of only the first record.
+- Kept the existing deterministic sample key format unchanged after a full-test
+  failure showed that adding `fiber_identity` changed legacy JSON sample order.
+  Transform-aware record/cache identity still includes the transform, and
+  transformed coordinates change sample keys when the matrix is non-identity.
+- Added unit tests for edge-ordered NML parsing, multiple components, branch
+  diagnostics, inline transforms, transform.json inverse handling, and loader
+  integration with fake zarr/Lasagna data.
+
 ## Validation
 
 - `python -m json.tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example_s1a_nml.json >/tmp/loader_example_s1a_nml_pretty_check.json`
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'nml or transform_json'`
+  - Result: 5 passed, 259 deselected.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - First result: 2 failed, 262 passed because adding `fiber_identity` to the
+    deterministic sample key changed existing JSON sample order.
+  - Final result after preserving the legacy sample key: 264 passed.

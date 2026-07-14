@@ -5,7 +5,7 @@ fiber side-strip patches around VC3D fiber control points.
 
 The important behavior is:
 
-- read VC3D fiber JSONs and Lasagna manifests;
+- read VC3D fiber JSONs or NML fiber annotations plus Lasagna manifests;
 - select deterministic control-point samples;
 - build VC3D-equivalent side-strip coordinate grids;
 - sample image values through the VC3D blocking coordinate sampler;
@@ -30,6 +30,12 @@ The important behavior is:
   `vesuvius.neural_tracing.fiber_trace.fiber_json`.
 - Keeps control-point and line-point parsing semantics shared with the existing
   3D fiber trace code.
+- Adds NML parsing for Knossos/WebKnossos `<thing>` graphs. NML nodes are
+  ordered by `<edge>` connectivity; each open simple path component is
+  normalized into one `Vc3dFiber`. Branching, closed, malformed, or singleton
+  components are skipped or rejected with diagnostics instead of being guessed.
+- Provides a shared `load_fiber_file` entrypoint that returns one or more
+  normalized `Vc3dFiber` objects for `.json` or `.nml` sources.
 
 `strip_geometry.py`
 
@@ -688,6 +694,16 @@ The important behavior is:
     4 CP-prep workers;
   - current augmentation extrema.
 
+`configs/loader_example_s1a_nml.json`
+
+- Variant of `loader_example.json` whose training `datasets` entry uses
+  `/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fiber_vols/fibers_s1a_*.nml`.
+- Keeps the PHercParis4 78keV base volume, base-volume scale, Lasagna manifest,
+  and JSON held-out test dataset settings from the normal example config.
+- Does not include a guessed affine transform. Add the actual old-S1/source to
+  current PHercParis4 base-volume transform via the dataset keys documented
+  below before using S1A coordinates that are not already in the current frame.
+
 ## Config Shape
 
 Top-level keys used by `load_config`:
@@ -857,11 +873,31 @@ Dataset entries must contain:
 - `base_volume_scale`;
 - `lasagna_manifest_path`.
 
+Fiber paths may point to VC3D `.json` fibers or `.nml` files. A single NML file
+can contribute multiple records when it contains multiple usable simple path
+components. JSON and NML sources are normalized into `Vc3dFiber` before all
+sampling, caching, prefetch, training, and Trace2CP paths.
+
 Optional dataset keys:
 
 - `base_volume_auth_json` / `volume_auth_json`;
 - `lasagna_auth_json`;
 - legacy `volume_path` / `volume_scale` aliases.
+- `fiber_transform_json` / `fiber_transform_json_path`: Vesuvius registration
+  `transform.json` with `p_fixed = M @ p_moving` in XYZ.
+- `fiber_transform`: inline XYZ affine matrix, either 3x4 or homogeneous 4x4.
+- `fiber_transform_invert`: invert the selected fiber transform before
+  applying it.
+- `transform` / `transform_invert`: Lasagna-compatible inline aliases for
+  `fiber_transform` / `fiber_transform_invert` on fiber coordinates.
+
+Fiber transforms apply only to parsed fiber coordinates. The matrix must map
+source/moving fiber XYZ coordinates into current/fixed base-volume XYZ
+coordinates unless the corresponding invert flag is set. The transform is
+applied once before control-point bounds checks, deterministic sample identity,
+strip-coordinate cache identity, prefetch, training, and Trace2CP use the
+fiber. Lasagna normals are still read from the configured current
+`lasagna_manifest_path` after coordinates are transformed.
 
 `strip_z_offsets` is intentionally rejected; use count and step.
 
@@ -879,9 +915,11 @@ For each dataset entry:
 4. Validate the selected base-volume level shape against the manifest-derived
    level shape.
 5. Open required Lasagna channels: `grad_mag`, `nx`, and `ny`.
-6. Resolve fiber paths/globs and parse each VC3D fiber JSON.
-7. Skip the whole fiber if any control point is outside the base-volume bounds.
-8. Store a `_Record` containing fiber, volume, sampler, manifest channels, and
+6. Resolve fiber paths/globs and parse each VC3D JSON or NML source.
+7. Apply any dataset-level fiber-coordinate transform in XYZ.
+8. Skip the whole normalized fiber if any control point is outside the
+   base-volume bounds.
+9. Store a `_Record` containing fiber, volume, sampler, manifest channels, and
    scale metadata.
 
 Only control points are checked during construction. Non-control line points are

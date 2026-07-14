@@ -42,7 +42,11 @@ from vesuvius.neural_tracing.fiber_trace_2d.embedding import (
     contrastive_negative_reachable_mask,
     presence_loss,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_vc3d_fiber
+from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import (
+    load_fiber_file,
+    load_vc3d_fiber,
+    load_nml_fibers,
+)
 from vesuvius.neural_tracing.fiber_trace_2d.loader import (
     FiberStrip2DLoader,
     FiberStripSegmentSample,
@@ -202,6 +206,29 @@ def _write_fiber(
         "generation": 1,
     }
     path.write_text(json.dumps(obj), encoding="utf-8")
+    return path
+
+
+def _write_nml(path: Path, *, things: list[dict[str, object]]) -> Path:
+    chunks = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<things>"]
+    for thing_index, thing in enumerate(things):
+        thing_id = str(thing.get("id", thing_index))
+        thing_name = str(thing.get("name", ""))
+        chunks.append(f"<thing id=\"{thing_id}\" name=\"{thing_name}\">")
+        chunks.append("<nodes>")
+        for node in thing["nodes"]:  # type: ignore[index]
+            node_id, x, y, z = node
+            chunks.append(
+                f"<node id=\"{node_id}\" x=\"{float(x):.6f}\" y=\"{float(y):.6f}\" z=\"{float(z):.6f}\" />"
+            )
+        chunks.append("</nodes>")
+        chunks.append("<edges>")
+        for source, target in thing["edges"]:  # type: ignore[index]
+            chunks.append(f"<edge source=\"{source}\" target=\"{target}\" />")
+        chunks.append("</edges>")
+        chunks.append("</thing>")
+    chunks.append("</things>")
+    path.write_text("\n".join(chunks), encoding="utf-8")
     return path
 
 
@@ -2653,6 +2680,229 @@ def test_loader_maps_fiber_json_to_flat_control_point_indices(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="not present"):
         loader.flat_sample_indices_for_fiber_json(tmp_path / "missing.json")
+
+
+def test_load_nml_fiber_orders_unordered_nodes_by_edges(tmp_path: Path) -> None:
+    nml = _write_nml(
+        tmp_path / "fiber.nml",
+        things=[
+            {
+                "id": "7",
+                "name": "ordered-by-edges",
+                "nodes": [
+                    ("3", 30.0, 0.0, 0.0),
+                    ("1", 10.0, 0.0, 0.0),
+                    ("2", 20.0, 0.0, 0.0),
+                ],
+                "edges": [("1", "2"), ("2", "3")],
+            }
+        ],
+    )
+
+    fibers = load_nml_fibers(nml)
+
+    assert len(fibers) == 1
+    np.testing.assert_allclose(
+        fibers[0].line_points_xyz,
+        np.asarray([[10.0, 0.0, 0.0], [20.0, 0.0, 0.0], [30.0, 0.0, 0.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(fibers[0].control_points_xyz, fibers[0].line_points_xyz)
+    assert fibers[0].metadata["source_format"] == "nml"
+    assert fibers[0].metadata["nml_thing_id"] == "7"
+
+
+def test_load_nml_fiber_splits_simple_path_components(tmp_path: Path) -> None:
+    nml = _write_nml(
+        tmp_path / "multi.nml",
+        things=[
+            {
+                "id": "1",
+                "nodes": [
+                    ("1", 10.0, 10.0, 10.0),
+                    ("2", 11.0, 10.0, 10.0),
+                    ("10", 20.0, 10.0, 10.0),
+                    ("11", 21.0, 10.0, 10.0),
+                ],
+                "edges": [("1", "2"), ("10", "11")],
+            }
+        ],
+    )
+
+    fibers = load_nml_fibers(nml)
+
+    assert len(fibers) == 2
+    assert [fiber.metadata["nml_component_index"] for fiber in fibers] == [0, 1]
+    assert [fiber.control_points_xyz.shape[0] for fiber in fibers] == [2, 2]
+
+
+def test_load_nml_fiber_rejects_only_branching_components(tmp_path: Path) -> None:
+    nml = _write_nml(
+        tmp_path / "branch.nml",
+        things=[
+            {
+                "id": "valid",
+                "nodes": [("1", 1.0, 1.0, 1.0), ("2", 2.0, 1.0, 1.0)],
+                "edges": [("1", "2")],
+            },
+            {
+                "id": "branch",
+                "nodes": [
+                    ("10", 10.0, 1.0, 1.0),
+                    ("11", 11.0, 1.0, 1.0),
+                    ("12", 12.0, 1.0, 1.0),
+                    ("13", 13.0, 1.0, 1.0),
+                ],
+                "edges": [("10", "11"), ("11", "12"), ("11", "13")],
+            },
+        ],
+    )
+
+    with pytest.warns(RuntimeWarning, match="branch"):
+        fibers = load_nml_fibers(nml)
+
+    assert len(fibers) == 1
+    assert fibers[0].metadata["nml_thing_id"] == "valid"
+
+
+def test_load_fiber_file_applies_inline_xyz_transform_and_inverse(tmp_path: Path) -> None:
+    nml = _write_nml(
+        tmp_path / "transform.nml",
+        things=[
+            {
+                "id": "1",
+                "nodes": [("1", 1.0, 2.0, 3.0), ("2", 4.0, 5.0, 6.0)],
+                "edges": [("1", "2")],
+            }
+        ],
+    )
+    matrix = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 10.0],
+            [0.0, 1.0, 0.0, 20.0],
+            [0.0, 0.0, 1.0, 30.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    transformed = load_fiber_file(nml, transform_xyz=matrix)[0]
+    inverted = load_fiber_file(nml, transform_xyz=np.linalg.inv(matrix))[0]
+
+    np.testing.assert_allclose(
+        transformed.control_points_xyz,
+        np.asarray([[11.0, 22.0, 33.0], [14.0, 25.0, 36.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        inverted.control_points_xyz,
+        np.asarray([[-9.0, -18.0, -27.0], [-6.0, -15.0, -24.0]], dtype=np.float32),
+    )
+
+
+def test_loader_loads_nml_components_and_applies_dataset_transform(tmp_path: Path) -> None:
+    nml = _write_nml(
+        tmp_path / "fibers.nml",
+        things=[
+            {
+                "id": "1",
+                "nodes": [
+                    ("1", 1.0, 1.0, 1.0),
+                    ("2", 2.0, 1.0, 1.0),
+                    ("10", 3.0, 1.0, 1.0),
+                    ("11", 4.0, 1.0, 1.0),
+                ],
+                "edges": [("1", "2"), ("10", "11")],
+            }
+        ],
+    )
+    volume = _write_zarr(tmp_path / "vol.zarr")
+    manifest = _write_lasagna_manifest(tmp_path)
+    config = {
+        "batch_size": 1,
+        "patch_shape_hw": [3, 3],
+        "strip_z_offset_count": 1,
+        "strip_z_offset_step": 1.0,
+        "seed": 123,
+        "datasets": [
+            {
+                "fiber_paths": [str(nml)],
+                "base_volume_path": str(volume),
+                "base_volume_scale": 0,
+                "lasagna_manifest_path": str(manifest),
+                "fiber_transform": [
+                    [1.0, 0.0, 0.0, 10.0],
+                    [0.0, 1.0, 0.0, 20.0],
+                    [0.0, 0.0, 1.0, 30.0],
+                ],
+            }
+        ],
+    }
+    config_path = tmp_path / "nml_config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    loader = _make_loader(load_config(config_path))
+
+    assert len(loader.records) == 2
+    assert loader.sample_count == 4
+    assert loader.flat_sample_indices_for_fiber_json(nml) == (0, 1, 2, 3)
+    np.testing.assert_allclose(loader.records[0].fiber.control_points_xyz[0], [11.0, 21.0, 31.0])
+    assert loader.records[0].fiber.metadata["fiber_transform_applied"] is True
+    assert loader.records[0].fiber_identity != loader.records[1].fiber_identity
+
+
+def test_loader_accepts_transform_json_and_invert(tmp_path: Path) -> None:
+    nml = _write_nml(
+        tmp_path / "invert.nml",
+        things=[
+            {
+                "id": "1",
+                "nodes": [("1", 11.0, 22.0, 33.0), ("2", 12.0, 22.0, 33.0)],
+                "edges": [("1", "2")],
+            }
+        ],
+    )
+    transform_path = tmp_path / "transform.json"
+    transform_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0.0",
+                "fixed_volume": "fixed.zarr",
+                "transformation_matrix": [
+                    [1.0, 0.0, 0.0, 10.0],
+                    [0.0, 1.0, 0.0, 20.0],
+                    [0.0, 0.0, 1.0, 30.0],
+                ],
+                "fixed_landmarks": [],
+                "moving_landmarks": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    volume = _write_zarr(tmp_path / "vol.zarr")
+    manifest = _write_lasagna_manifest(tmp_path)
+    config = {
+        "batch_size": 1,
+        "patch_shape_hw": [3, 3],
+        "strip_z_offset_count": 1,
+        "strip_z_offset_step": 1.0,
+        "seed": 123,
+        "datasets": [
+            {
+                "fiber_paths": [str(nml)],
+                "base_volume_path": str(volume),
+                "base_volume_scale": 0,
+                "lasagna_manifest_path": str(manifest),
+                "fiber_transform_json": str(transform_path),
+                "fiber_transform_invert": True,
+            }
+        ],
+    }
+    config_path = tmp_path / "transform_json_config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    loader = _make_loader(load_config(config_path))
+
+    assert loader.sample_count == 2
+    np.testing.assert_allclose(loader.records[0].fiber.control_points_xyz[0], [1.0, 2.0, 3.0])
 
 
 def test_trace2cp_fiber_json_config_narrows_loader_to_explicit_fiber(tmp_path: Path) -> None:

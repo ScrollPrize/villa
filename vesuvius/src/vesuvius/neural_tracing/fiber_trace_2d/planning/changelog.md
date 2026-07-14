@@ -2,6 +2,14 @@
 
 ## 2026-07-14
 
+- Added `fiber_trace_2d` NML fiber-source loading. NML `<thing>` simple path
+  components are edge-ordered and normalized into `Vc3dFiber` records, while
+  existing VC3D JSON input remains supported.
+- Added dataset-level fiber-coordinate affine transforms for JSON/NML sources
+  via Vesuvius `transform.json`, inline `fiber_transform`, and
+  Lasagna-compatible `transform` aliases.
+- Added `configs/loader_example_s1a_nml.json`, an S1A NML training-data variant
+  of the normal PHercParis4 example config.
 - Extended `--trace2cp-top-model-dir-vis` with optimized-line diagnostics from
   the yellow top-DP path: optimized top strip, side slice, and matching
   top/side presence panels.
