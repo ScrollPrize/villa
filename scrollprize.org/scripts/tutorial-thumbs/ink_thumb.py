@@ -3,24 +3,25 @@
 
 Picks up exactly where the flattening thumb ends: the tilted flat sheet,
 solidly red-voxelized, at the SAME framing (no zoom-out — the camera
-never pulls back before it zooms in). As the scan starts, the view PANS
-RIGHT: a second, close-by output sheet appears just to the right and
-behind the red one — like a real projection screen — and the scan
-appears on it. The camera then dwells a long time on the projection: a
-TINY glowing inference kernel (a fraction of a letter — it finds ink
-*signal*; signals form letters, letters form the text) sweeps the INTACT
-red sheet in raster rows — nothing is consumed — its reading beamed
-across the short gap, a projection ray landing on the output sheet where
-a synced write head prints the ink prediction line by line (below the
-raster front: nothing but background). Then a single, slow, DIRECT zoom
-dives into the prediction, easing into a letter-by-letter cruise on a
-fresh line about 2/3 down, watching the projection make the letters
-appear. The final move is one last zoom: straight out to the COMPLETED
-reconstruction — the text finishes filling in as the zoom lands, the
-rig untilts to a flat, dead-on view, and the red input sheet fades away
-— leaving the finished prediction (a REAL PHerc. Paris 4 ink
-prediction, recolored to the strip palette) held as a padded full image
-for the last second.
+never pulls back before it zooms in). As the scan starts, the red sheet
+LIFTS straight up off its plane and hovers overhead: a TINY glowing
+inference kernel (a fraction of a letter — it finds ink *signal*;
+signals form letters, letters form the text) sweeps the INTACT hovering
+sheet in raster rows — nothing is consumed — its reading projected DOWN
+across the gap, a ray landing on the EXACT plane the sheet lay on,
+where a synced write head prints the ink prediction line by line (below
+the raster front: nothing but background). The decoded text is written
+right where the sheet was — same footprint, same level, never an
+extension off to the side, and the sheets never overlap at any zoom.
+The camera dwells a long time on the projection, then a single, slow,
+DIRECT zoom dives into the prediction, easing into a letter-by-letter
+cruise — the raster front riding just below the letter tops. The final
+move is one last zoom: straight out to the COMPLETED reconstruction —
+the text finishes filling in as the zoom lands, the rig untilts to a
+flat, dead-on view, and the red input rises away and fades like a
+retracting scanner — leaving the finished prediction (a REAL PHerc.
+Paris 4 ink prediction, recolored to the strip palette) held as a
+padded full image for the last second.
 
 The write strip is exactly the kernel height at all times.
 
@@ -262,21 +263,44 @@ TEX_W, TEX_H = 1408, 954
 XI0, XI1 = -S_TOTAL / 2 - 0.3, S_TOTAL / 2 + 0.3
 Z_TOP, Z_BOT = HEIGHT - 0.9, 0.2
 
-# output sheet: the prediction rasters onto a second plane parallel to the
-# input sheet, CLOSE BY — a bit to the right (in-plane) and behind it
-# (along the sheet normal), like a real projection screen behind the
-# object being read. The red input voxels stay put for the whole scan;
-# the kernel's reading is beamed across the short gap.
-D_XI = 22.0
-D_NU = -9.0
+# output sheet: the prediction rasters onto the EXACT plane the red sheet
+# started on — same footprint, same level. The red input sheet LIFTS
+# straight up (a pure z rise in rig space) and the kernel's reading is
+# projected DOWN across the gap: the decoded text is written right where
+# the sheet lay, not off to the side (it must not read as an extension
+# of the prediction). At the very end the input rises further and fades,
+# like a scanner retracting.
+D_XI = 0.0
+D_NU = 0.0
+R_LIFT = 24.0                   # the hover: high enough that the red slab
+                                # does not sit in front of the freshly
+                                # painted rows — with the dwell pull-back
+                                # BOTH sheets show almost completely:
+                                # kernel riding the slab, the gap, and the
+                                # prediction being written below
+F_LIFT = 45                     # ...reached here (eased from frame 0)
 
-def plane_pt(xi, z, dxi=0.0, nu=0.0):
+def red_z(f):
+    """The input sheet's lift at frame f, in WORLD z (applied after the
+    tilt): it hovers straight up. Together with the flat dwell tilt the
+    stack reads as a right prism — the projection drops perpendicularly
+    onto the output plane. Three phases: rise to the hover (0 at frame 0
+    — frame 0 stays pixel-identical to flatten's final frame), rise
+    FURTHER as the dive starts so the slab clears the frame before the
+    cruise (no overlap at any zoom), and the final retracting rise as it
+    is dismissed."""
+    return (R_LIFT * smoothstep(f / F_LIFT)
+            + 6.0 * smoothstep((f - 108) / 37)
+            + 16.0 * smoothstep((f - 238) / 34))
+
+def plane_pt(xi, z, dxi=0.0, nu=0.0, dz=0.0):
     """Project a point of the sheet-plane family (offset dxi in-plane,
-    nu along the normal) at the current pose."""
+    nu along the normal, dz straight up in WORLD space) at the current
+    pose."""
     x = (xi + dxi) * PSI_D[0] + nu * PSI_N[0]
     y = (xi + dxi) * PSI_D[1] + nu * PSI_N[1]
     x, y, zz = tilt_pt(x, y, z, TAU)
-    return project_pt(x, y, zz, 0.0)
+    return project_pt(x, y, zz + dz, 0.0)
 
 def tex_uv(xi, z):
     return ((xi - XI0) / (XI1 - XI0) * TEX_W,
@@ -371,6 +395,13 @@ PATH_TOTAL = NR * ROWPATH
 
 # ---- camera profile (kernel-independent; the kernel speed plan needs it) -----
 POSE0 = (math.radians(36), math.radians(-25), math.radians(26))
+POSE_D = (math.radians(58), math.radians(-14), math.radians(20))
+                                # dwell pose: the rig rotates ON from
+                                # frame 0 (not just up!) to a much flatter
+                                # tilt — the two sheets read as stacked
+                                # shelves and the world-z lift is close to
+                                # their normal: a right prism, the beam
+                                # dropping perpendicularly
 POSE1 = (math.radians(11), math.radians(-7), math.radians(11))
 POSE_FLAT = (0.0, 0.0, 0.0)     # the very end: no tilt at all — the
                                 # prediction faces the camera dead-on,
@@ -378,6 +409,11 @@ POSE_FLAT = (0.0, 0.0, 0.0)     # the very end: no tilt at all — the
 TAU = POSE0[0]
 C0 = (0.0, 0.0, CZ_FLAT)        # flatten's look-at
 SC_MAX = 136.0                  # really close: double the previous zoom
+SC_DWELL = 12.0                 # dwell scale: a gentle pull-back during
+                                # the opening pan so the WHOLE projection
+                                # fits — both sheets almost complete, the
+                                # painted rows never hidden behind the
+                                # hovering slab
 SC_END = 15.0                   # final scale: the flat prediction, padded
 F_PAN = 40                      # opening PAN RIGHT (no zoom!): flatten's
                                 # framing slides over to the projection —
@@ -398,10 +434,11 @@ F_DONE_TGT = 276                # ...and the text fully completes right as
                                 # that last zoom settles
 
 def scale_at(f):
-    # pan (constant scale), long projection dwell, one direct slow zoom-in,
-    # then one last zoom straight out to the flat completed reconstruction
-    s_in = (SCALE_FLAT
-            + (SC_MAX - SCALE_FLAT) * smoothstep((f - F_DIVE) / (F_ZOOM - F_DIVE)))
+    # pan with a gentle pull-back to the dwell scale, long projection
+    # dwell, one direct slow zoom-in, then one last zoom straight out to
+    # the flat completed reconstruction
+    s0 = SCALE_FLAT + (SC_DWELL - SCALE_FLAT) * smoothstep(f / F_PAN)
+    s_in = s0 + (SC_MAX - s0) * smoothstep((f - F_DIVE) / (F_ZOOM - F_DIVE))
     w_e = smoothstep((f - F_TILT0) / (F_TILT1 - F_TILT0))
     return s_in * (1 - w_e) + SC_END * w_e
 
@@ -512,19 +549,23 @@ def row_of(z):
 # then the follow point freezes and one last zoom pulls straight out to
 # the completed reconstruction — untilting to the flat, dead-on, padded
 # full image as it lands. Frame 0 is exactly flatten's final camera.
-ST_XI = 12.0                    # projection-stage look-at (in-plane /
-ST_NU = -4.5                    # normal offsets and height): frames the
-ST_Z = 14.0                     # gap — kernel, beam, and write head
+ST_XI = 2.0                     # projection-stage look-at (in-plane /
+ST_NU = 0.0                     # normal offsets, sheet height, and world
+ST_Z = 11.5                     # lift): frames the full stack — kernel on
+ST_DZ = 12.0                    # the hovering sheet, the perpendicular
+                                # down-beam, and the first written lines
 
 def set_pose(f):
     global TAU, PSI_D, PSI_N, _elev, _scale, _TARGET
-    # pose in two stages: swing to the working angle through the dwell
-    # and dive, HOLD it through the cruise, then — only over the last
-    # zoom — untilt completely to the flat, dead-on view
-    ep = smoothstep(f / 160)
+    # pose in three stages: rotate to the flat DWELL tilt as the sheet
+    # lifts (the stack is watched as a right prism), swing to the working
+    # angle through the dive, HOLD it through the cruise, then — only
+    # over the last zoom — untilt completely to the flat, dead-on view
+    e1 = smoothstep(f / 60)
+    e2 = smoothstep((f - F_DIVE) / (F_B - F_DIVE))
     w_e = smoothstep((f - F_TILT0) / (F_TILT1 - F_TILT0))
-    tau, psi, el = (a + (b - a) * ep + (c - b) * w_e
-                    for a, b, c in zip(POSE0, POSE1, POSE_FLAT))
+    tau, psi, el = (a + (d - a) * e1 + (b - d) * e2 + (c - b) * w_e
+                    for a, d, b, c in zip(POSE0, POSE_D, POSE1, POSE_FLAT))
     TAU = tau
     PSI_D = (math.cos(psi), math.sin(psi))
     PSI_N = (math.sin(psi), -math.cos(psi))
@@ -545,6 +586,7 @@ def set_pose(f):
     # opening: pan right from flatten's framing to the projection stage
     ST = tilt_pt(ST_XI * PSI_D[0] + ST_NU * PSI_N[0],
                  ST_XI * PSI_D[1] + ST_NU * PSI_N[1], ST_Z, TAU)
+    ST = (ST[0], ST[1], ST[2] + ST_DZ)
     w_s = smoothstep(f / F_PAN)
     tgt = tuple(a + (b - a) * w_s for a, b in zip(C0, ST))
     w_t = smoothstep((f - F_DIVE) / (F_B - F_DIVE))
@@ -555,7 +597,7 @@ def set_pose(f):
     _scale = scale_at(f)
     _TARGET = tuple(a + (b - a) * w_e for a, b in zip(tgt, PC))
 
-def draw_cube(dr, cube_xi, cube_z, fade=1.0):
+def draw_cube(dr, cube_xi, cube_z, fade=1.0, lift=0.0):
     a = CUBE
     corners = {}
     for s1 in (0, 1):
@@ -567,7 +609,7 @@ def draw_cube(dr, cube_xi, cube_z, fade=1.0):
                 x = xi * PSI_D[0] + nu * PSI_N[0]
                 y = xi * PSI_D[1] + nu * PSI_N[1]
                 x, y, z = tilt_pt(x, y, z, TAU)
-                u, v, dep, _ = project_pt(x, y, z, 0.0)
+                u, v, dep, _ = project_pt(x, y, z + lift, 0.0)
                 corners[(s1, s2, s3)] = (u, v, dep)
     faces = [
         [(0,0,0),(1,0,0),(1,0,1),(0,0,1)], [(0,1,0),(1,1,0),(1,1,1),(0,1,1)],
@@ -593,8 +635,9 @@ def draw_cube(dr, cube_xi, cube_z, fade=1.0):
 def draw_kernel(img, f, kxi, kz, krow, kd, al):
     """Kernel with a soft glow halo and a motion trail along its row —
     it must stand out and stay visible at every zoom level."""
+    rz = red_z(f)
     def kpt(xi, z):
-        return plane_pt(xi, z, 0.0, 0.45 * CUBE)
+        return plane_pt(xi, z, 0.0, 0.45 * CUBE, rz)
     u, v, _, p = kpt(kxi, kz)
     cpx = CUBE * _scale * p
     # trail start: previous position, or the row entry edge after a wrap
@@ -618,7 +661,7 @@ def draw_kernel(img, f, kxi, kz, krow, kd, al):
     if L > 1.5:
         dr.line([su, sv, u, v], fill=(150, 235, 255, int(140 * al)),
                 width=max(2, int(cpx * 0.4)))
-    draw_cube(dr, kxi, kz, al)
+    draw_cube(dr, kxi, kz, al, rz)
     return img
 
 def draw_write_head(img, kxi, kz, al):
@@ -639,10 +682,11 @@ def draw_write_head(img, kxi, kz, al):
                outline=(150, 235, 255, int(230 * al)), width=2)
     return img
 
-def draw_beam(img, kxi, kz, al):
-    """The projection: the kernel's reading beamed across the gap onto the
-    output sheet — a soft tapered ray from the kernel to the write head."""
-    ku, kv, _, kp = plane_pt(kxi, kz, 0.0, 0.45 * CUBE)
+def draw_beam(img, f, kxi, kz, al):
+    """The projection: the kernel's reading beamed DOWN across the gap onto
+    the output sheet — a soft tapered ray from the kernel to the write
+    head, right below it."""
+    ku, kv, _, kp = plane_pt(kxi, kz, 0.0, 0.45 * CUBE, red_z(f))
     hu, hv, _, hp = plane_pt(kxi, kz, D_XI, D_NU)
     glow = Image.new("L", (S, S), 0)
     ImageDraw.Draw(glow).line([ku, kv, hu, hv], fill=int(55 * al), width=7)
@@ -686,12 +730,12 @@ def render_frame(f, out):
     for j in range(N_Z - 1):
         edges.add(((N_TH - 1, j), (N_TH - 1, j + 1)))
 
-    def draw_mesh(dr_, dxi, nu, alpha):
+    def draw_mesh(dr_, dxi, nu, alpha, dz=0.0):
         V = {}
         for i in range(N_TH):
             for j in range(N_Z):
                 th, z = mesh_pt(i, j)
-                V[(i, j)] = plane_pt(arc_len(th) - S_TOTAL / 2, z, dxi, nu)
+                V[(i, j)] = plane_pt(arc_len(th) - S_TOTAL / 2, z, dxi, nu, dz)
         for a_, b_ in edges:
             dr_.line([V[a_][0], V[a_][1], V[b_][0], V[b_][1]],
                      fill=MESH + (alpha,), width=1)
@@ -731,15 +775,15 @@ def render_frame(f, out):
     img = Image.alpha_composite(img.convert("RGBA"), warped).convert("RGB")
     dr = ImageDraw.Draw(img, "RGBA")
 
-    # input sheet (left, front): ghost mesh + red voxels, intact for the
-    # ENTIRE scan (the kernel reads them, nothing is consumed); the scan
-    # front just glows warmer. Over the last zoom the input is DISMISSED:
-    # it slides off stage-left while fading — the sheets are close, and
-    # the flat final view is the reconstruction alone
+    # input sheet (lifted overhead): ghost mesh + red voxels, intact for
+    # the ENTIRE scan (the kernel reads them, nothing is consumed); the
+    # scan front just glows warmer. Over the last zoom the input is
+    # DISMISSED: it rises further away while fading, like a scanner
+    # retracting — the flat final view is the reconstruction alone
     red_al = 1.0 - smoothstep((f - 240) / 32)
-    red_off = -14.0 * smoothstep((f - 238) / 34)
+    rz = red_z(f)
     if red_al > 0.003:
-        draw_mesh(dr, red_off, 0.0, int(148 * red_al))
+        draw_mesh(dr, 0.0, 0.0, int(148 * red_al), rz)
     cubes = []
     for xi, lk, zlist in (_voxsheet_cols() if red_al > 0.003 else []):
         for vz in zlist:
@@ -747,10 +791,10 @@ def render_frame(f, out):
             em = 1.0
             if not kdone and row_of(zc) == krow and abs(xi - (kxi - kd * CUBE / 2)) < 0.9:
                 em = 1.18
-            x = (xi + red_off) * PSI_D[0]
-            y = (xi + red_off) * PSI_D[1]
+            x = xi * PSI_D[0]
+            y = xi * PSI_D[1]
             x, y, z = tilt_pt(x, y, zc, TAU)
-            cubes.append((x, y, z, lk, em))
+            cubes.append((x, y, z + rz, lk, em))
     cubes.sort(key=lambda cb: -project_pt(cb[0], cb[1], cb[2], 0.0)[2])
     v_al = int(255 * red_al)
     for x, y, z, lk, em in cubes:
@@ -772,7 +816,7 @@ def render_frame(f, out):
         k_al = (smoothstep(f / 8) * clamp01((F_DONE - f) / 6)
                 * (1 - smoothstep((f - 236) / 16)))
         if k_al > 0.01:
-            img = draw_beam(img, kxi, kz, k_al)
+            img = draw_beam(img, f, kxi, kz, k_al)
             img = draw_kernel(img, f, kxi, kz, krow, kd, k_al)
             img = draw_write_head(img, kxi, kz, k_al)
 
