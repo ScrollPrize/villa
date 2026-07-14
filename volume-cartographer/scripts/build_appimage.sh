@@ -15,7 +15,7 @@
 #      This is what lets the AppImage run on distros OLDER than the build box —
 #      glibc is backward- but not forward-compatible, and the build image
 #      (Ubuntu 26.04) ships a very new glibc. Disable with BUNDLE_GLIBC=0.
-#   5. appimagetool: squash the AppDir into VC3D-<arch>.AppImage
+#   5. appimagetool: squash the AppDir into VC3D-<version>-<arch>.AppImage
 #
 # Prereqs: a completed build (default preset ci-release-gcc), qt6-base-dev
 # (qmake6), and patchelf. Tools (linuxdeploy, the qt plugin, appimagetool) are
@@ -39,6 +39,12 @@
 #                 symbols (linked to the stripped binaries via debuglink, so
 #                 crash reports stay symbolizable). 1/0, default 1. Ignored when
 #                 STRIP_FLAGS is empty.
+#   VERSION       Version infix for artifact names (<sha7>-<date>). Falls back to
+#                 GIT_SHA1[/GIT_COMMIT_DATE], then to querying git in the source
+#                 tree, then to an unversioned name.        (default: autodetect)
+#   GIT_SHA1      Full commit SHA to derive VERSION from, for build contexts with
+#                 no .git (the Docker AppImage build).       (default: unset)
+#   GIT_COMMIT_DATE  Commit date (YYYY-MM-DD) paired with GIT_SHA1.
 #   QMAKE         Path to qmake6                              (default: autodetect)
 #   ARCH          Target architecture                        (default: uname -m)
 #   BUNDLE_GLIBC  Bundle glibc for old-distro support (1/0)   (default 1)
@@ -64,7 +70,26 @@ BUNDLE_GLIBC="${BUNDLE_GLIBC:-1}"
 GLIBC_SRCDIR="${GLIBC_SRCDIR:-/usr/lib/${ARCH}-linux-gnu}"
 EXCLUDE_TOOLS="${EXCLUDE_TOOLS-vc_render_video vc_diffuse_winding}"
 STRIP_FLAGS="${STRIP_FLAGS---strip-debug}"   # unset (STRIP_FLAGS=) to skip
-DEBUG_BUNDLE="${DEBUG_BUNDLE:-1}"            # also emit VC3D-<arch>-debug.tar.* companion
+DEBUG_BUNDLE="${DEBUG_BUNDLE:-1}"            # also emit VC3D-<version>-<arch>-debug.tar.* companion
+
+# Version string embedded in the artifact names, matching CMake's
+# VC_VERSION_STRING (<sha7>-<commit-date>) and the CPack names used by the
+# macOS/Windows packages (VC3D-<version>-macos-<arch>, VC3D-<version>-win64).
+# Precedence: explicit VERSION > git in the source tree > GIT_SHA1[/
+# GIT_COMMIT_DATE] (the Docker build's context has no .git, so vc3d-linux.yml
+# passes these in) > empty (unversioned name, back-compat for ad-hoc builds).
+# The source tree wins over GIT_SHA1 to mirror CMakeLists.txt, so the embedded
+# version and the artifact name never disagree.
+VERSION="${VERSION:-}"
+if [ -z "$VERSION" ] && git -C "$repo_root" rev-parse HEAD >/dev/null 2>&1; then
+    VERSION="$(git -C "$repo_root" rev-parse HEAD | cut -c1-7)-$(git -C "$repo_root" log -1 --format=%cs HEAD)"
+fi
+if [ -z "$VERSION" ] && [ -n "${GIT_SHA1:-}" ]; then
+    VERSION="${GIT_SHA1:0:7}-${GIT_COMMIT_DATE:-}"
+fi
+# Filename infix, e.g. "31cbbdc-2026-07-14-" (empty when no version is known).
+VER_INFIX=""
+[ -n "$VERSION" ] && VER_INFIX="${VERSION}-"
 
 [ -d "$BUILD_DIR" ] || { echo "error: build dir '$BUILD_DIR' not found — configure & build first" >&2; exit 1; }
 [ -n "$QMAKE" ]     || { echo "error: qmake6 not found — install qt6-base-dev (or set QMAKE=...)" >&2; exit 1; }
@@ -170,9 +195,9 @@ if [ -n "$STRIP_FLAGS" ]; then
     if [ -n "$dbgstage" ] && [ -d "$dbgstage" ]; then
         mkdir -p "$OUT_DIR"
         if command -v zstd >/dev/null 2>&1; then
-            dbgout="$OUT_DIR/VC3D-$ARCH-debug.tar.zst"; tar -C "$dbgstage" --zstd -cf "$dbgout" .
+            dbgout="$OUT_DIR/VC3D-${VER_INFIX}${ARCH}-debug.tar.zst"; tar -C "$dbgstage" --zstd -cf "$dbgout" .
         else
-            dbgout="$OUT_DIR/VC3D-$ARCH-debug.tar.gz";  tar -C "$dbgstage" -czf "$dbgout" .
+            dbgout="$OUT_DIR/VC3D-${VER_INFIX}${ARCH}-debug.tar.gz";  tar -C "$dbgstage" -czf "$dbgout" .
         fi
         echo "    Debug bundle: $dbgout ($(du -sh "$dbgout" | cut -f1))"
     fi
@@ -183,6 +208,6 @@ install -m755 "$here/appimage/AppRun" "$APPDIR/AppRun"
 
 echo "==> Squashing AppImage (appimagetool)"
 mkdir -p "$OUT_DIR"
-out="$OUT_DIR/VC3D-$ARCH.AppImage"
+out="$OUT_DIR/VC3D-${VER_INFIX}${ARCH}.AppImage"
 ARCH="$ARCH" "$TOOLS_DIR/appimagetool-$ARCH.AppImage" "$APPDIR" "$out"
 echo "==> Done: $out"
