@@ -459,6 +459,11 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - Winding Constraints page: "PHercParis4" -> "PHerc. Paris 4" in prose (the dataset-README filename link is unchanged, it's a real path); "at scale" repetition in the opening sentence fixed ("fast enough to use at scale" -> "…use widely").
 **Files:** `docs/06_tutorial_VC3D.md`, `docs/39_winding_annotations.md`.
 
+## C69 — Get Started: drop "real" from piece/model/segment
+
+"real" removed from three spots: "here's a real piece of that same scroll" -> "here's a piece…"; "train the real model" -> "train the model"; "trace a real segment" -> "trace a segment".
+**Files:** `src/components/getstarted/GetStarted.js`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

@@ -97,7 +97,7 @@ export function GetStarted() {
               traces that can slip past even the eye.
             </p>
             <p className="vc-gs-body">
-              This is easier to try than to explain, so here's a real piece
+              This is easier to try than to explain, so here's a piece
               of that same scroll. Paint the ink you can see, and a model
               trains on your labels to predict the rest. It's only as good
               as the labels you give it.
@@ -106,7 +106,7 @@ export function GetStarted() {
           <InkDemo />
           <nav className="vc-gs-next" aria-label="Go deeper: ink detection">
             <span className="vc-gs-dim">Go deeper:</span>
-            <a href="/tutorial5">Ink detection tutorial: train the real model</a>
+            <a href="/tutorial5">Ink detection tutorial: train the model</a>
             <a href="/prizes#first-letters-prizes">
               First Letters: up to $500,000
             </a>
@@ -146,7 +146,7 @@ export function GetStarted() {
           <SegDemo />
           <nav className="vc-gs-next" aria-label="Go deeper: unwrapping">
             <span className="vc-gs-dim">Go deeper:</span>
-            <a href="/tutorial_VC3D">VC3D tutorial: trace a real segment</a>
+            <a href="/tutorial_VC3D">VC3D tutorial: trace a segment</a>
             <a href="/tutorial_spiral">Spiral fitting tutorial</a>
             <a href="/prizes#2027-grand-prize">2027 Grand Prize: $1,000,000</a>
             <a href="/2026_open_problems#2-unwrapping-turning-disconnected-voxels-into-a-surface">
