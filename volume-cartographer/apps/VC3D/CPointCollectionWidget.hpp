@@ -86,6 +86,7 @@ private slots:
  private:
     void keyPressEvent(QKeyEvent *event) override;
     void setupUi();
+    void clearTreeModel();
     void updateMetadataWidgets();
     QStandardItem* findCollectionItem(uint64_t collectionId);
 

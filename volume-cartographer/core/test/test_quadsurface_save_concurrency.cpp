@@ -13,7 +13,9 @@
 
 #include <atomic>
 #include <filesystem>
+#include <mutex>
 #include <random>
+#include <string>
 #include <thread>
 
 namespace fs = std::filesystem;
@@ -54,6 +56,15 @@ TEST_CASE("concurrent saveChannel + saveOverwrite on same dir does not crash or 
     constexpr int kIters = 200;
     std::atomic<bool> failed{false};
     std::atomic<int> done{0};
+    std::mutex errorMutex;
+    std::string errorMessage;
+
+    auto recordFailure = [&](const char* worker, const std::exception* error) {
+        failed = true;
+        std::lock_guard<std::mutex> lock(errorMutex);
+        errorMessage = worker;
+        errorMessage += error ? std::string(": ") + error->what() : ": unknown exception";
+    };
 
     // Worker A: approval channel writes (the main-thread equivalent).
     std::thread a([&] {
@@ -64,7 +75,11 @@ TEST_CASE("concurrent saveChannel + saveOverwrite on same dir does not crash or 
                 qs.setChannel("approval", mask(static_cast<uint8_t>(i)));
                 qs.saveChannel("approval");
             }
-        } catch (...) { failed = true; }
+        } catch (const std::exception& e) {
+            recordFailure("saveChannel worker", &e);
+        } catch (...) {
+            recordFailure("saveChannel worker", nullptr);
+        }
         ++done;
     });
 
@@ -79,14 +94,18 @@ TEST_CASE("concurrent saveChannel + saveOverwrite on same dir does not crash or 
                 qs.invalidateCache();
                 qs.saveOverwrite();
             }
-        } catch (...) { failed = true; }
+        } catch (const std::exception& e) {
+            recordFailure("saveOverwrite worker", &e);
+        } catch (...) {
+            recordFailure("saveOverwrite worker", nullptr);
+        }
         ++done;
     });
 
     a.join();
     b.join();
     CHECK(done == 2);
-    CHECK_FALSE(failed);
+    CHECK_MESSAGE(!failed.load(), errorMessage);
 
     // Surface remains loadable + intact after the contention.
     QuadSurface reloaded(seg);

@@ -230,6 +230,92 @@ def _apply_activation(array_np: np.ndarray, activation: Optional[str], *, is_sur
     return array_np
 
 
+# Categorical palette for multiclass segmentation visualization. Kept small
+# and stable: bg=black, class 1=red, class 2=green, class 3=grey (ignore),
+# classes 4+ cycle through distinct hues. Stored BGR for OpenCV.
+_SEG_PALETTE_BGR = np.array(
+    [
+        [0,   0,   0],    # 0: background
+        [0,   0,   255],  # 1: red
+        [0,   255, 0],    # 2: green
+        [128, 128, 128],  # 3: grey (conventional ignore slot)
+        [255, 0,   0],    # 4: blue
+        [0,   255, 255],  # 5: yellow
+        [255, 0,   255],  # 6: magenta
+        [255, 255, 0],    # 7: cyan
+        [0,   165, 255],  # 8: orange
+        [255, 255, 255],  # 9: white
+    ],
+    dtype=np.uint8,
+)
+
+
+def _is_multiclass_segmentation(task_cfg: Dict | None) -> bool:
+    """A target is multiclass seg when out_channels > 2 and the activation is
+    softmax-ish (``"none"`` / ``"softmax"``). out_channels == 2 is treated as
+    binary and handled by the existing grayscale branches.
+    """
+    if not task_cfg:
+        return False
+    out_channels = int(task_cfg.get("out_channels", 0) or 0)
+    if out_channels <= 2:
+        return False
+    activation = str(task_cfg.get("activation", "none") or "none").lower()
+    return activation in {"none", "softmax", "identity"}
+
+
+def _indices_to_bgr(indices_2d: np.ndarray) -> np.ndarray:
+    """Map a (H, W) integer array of class indices to a BGR uint8 image."""
+    idx = np.asarray(indices_2d)
+    if idx.ndim != 2:
+        raise ValueError(f"Expected (H, W), got shape {idx.shape}")
+    idx = np.clip(np.rint(idx).astype(np.int64), 0, len(_SEG_PALETTE_BGR) - 1)
+    return _SEG_PALETTE_BGR[idx]
+
+
+def _logits_to_class_indices(logits_c_hw: np.ndarray) -> np.ndarray:
+    """(C, H, W) -> (H, W) argmax across channels."""
+    return np.argmax(logits_c_hw, axis=0)
+
+
+# BGR channel (index) used for each foreground class: class 1 -> R,
+# class 2 -> G, class 3 -> B. Matches the GT palette so the same class
+# shows the same hue in GT and prediction.
+_FG_CHANNEL_ORDER_BGR = (2, 1, 0)  # R, G, B in BGR order
+
+
+def _softmax_probs(logits_c_hw: np.ndarray) -> np.ndarray:
+    """Numerically-stable softmax across channel 0, returning (C, H, W)."""
+    x = logits_c_hw.astype(np.float32, copy=False)
+    m = x.max(axis=0, keepdims=True)
+    e = np.exp(x - m)
+    return e / np.maximum(e.sum(axis=0, keepdims=True), 1e-12)
+
+
+def _logits_to_rgb_cloud(logits_c_hw: np.ndarray) -> np.ndarray:
+    """(C, H, W) logits -> (H, W, 3) BGR showing the softmax probability cloud.
+
+    Background (channel 0) is dropped so it renders black. Foreground
+    classes land in R/G/B (class 1 -> R, class 2 -> G, class 3 -> B) to
+    match the categorical GT palette; extra foreground classes cycle
+    through the same three channels. Soft / uncertain predictions show up
+    as dimmer pixels and color blends (the probability "cloud").
+    """
+    probs = _softmax_probs(logits_c_hw)  # (C, H, W), sums to 1 over axis 0
+    if probs.shape[0] <= 1:
+        return cv2.cvtColor(
+            np.clip(probs[0] * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR
+        )
+    fg = probs[1:]  # drop background
+    h, w = fg.shape[1], fg.shape[2]
+    bgr = np.zeros((h, w, 3), dtype=np.float32)
+    for i in range(fg.shape[0]):
+        ch = _FG_CHANNEL_ORDER_BGR[i % 3]
+        # Use max so cycled channels don't erase each other for high C.
+        bgr[..., ch] = np.maximum(bgr[..., ch], fg[i])
+    return np.clip(bgr * 255.0, 0, 255).astype(np.uint8)
+
+
 def _vector_to_bgr(vector_3ch):
     """Map a 3×H×W vector field to a BGR image using directional colouring."""
     if vector_3ch.shape[0] != 3:
@@ -287,8 +373,11 @@ def convert_slice_to_bgr(
         or task_type == "surface_frame"
         or (slice_2d_or_3d.ndim >= 3 and slice_2d_or_3d.shape[0] == 9)
     )
+    is_multiclass = _is_multiclass_segmentation(task_cfg)
 
     if slice_2d_or_3d.ndim == 2:
+        if is_multiclass:
+            return _indices_to_bgr(slice_2d_or_3d)
         # Single channel - convert to BGR
         ch_8u = minmax_scale_to_8bit(slice_2d_or_3d, value_range=value_range)
         return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
@@ -300,15 +389,22 @@ def convert_slice_to_bgr(
             except ValueError:
                 pass
         if slice_2d_or_3d.shape[0] == 1:
+            if is_multiclass:
+                return _indices_to_bgr(slice_2d_or_3d[0])
             # Single channel with channel dimension
             ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[0], value_range=value_range)
             return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
-        
+
+        elif is_multiclass and slice_2d_or_3d.shape[0] >= 2:
+            # Multiclass prediction logits (C, H, W): softmax -> RGB
+            # probability cloud. Keeps the full confidence range visible.
+            return _logits_to_rgb_cloud(slice_2d_or_3d)
+
         elif slice_2d_or_3d.shape[0] == 3:
             # RGB or normal map - just transpose and scale
             rgb = np.transpose(slice_2d_or_3d, (1, 2, 0))
             return minmax_scale_to_8bit(rgb, value_range=value_range)
-        
+
         elif slice_2d_or_3d.shape[0] == 2:
             # Binary segmentation - use foreground channel (channel 1)
             ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[1], value_range=value_range)
@@ -372,7 +468,11 @@ def _render_3d_volume_to_bgr(
         or (arr_np.ndim >= 4 and arr_np.shape[0] == 9)
     )
 
+    is_multiclass = _is_multiclass_segmentation(task_cfg)
+
     if arr_np.ndim == 3:
+        if is_multiclass:
+            return np.stack([_indices_to_bgr(arr_np[z]) for z in range(arr_np.shape[0])], axis=0)
         return _gray_volume_to_bgr(arr_np, value_range)
 
     if arr_np.ndim != 4:
@@ -385,7 +485,20 @@ def _render_3d_volume_to_bgr(
         )
 
     if arr_np.shape[0] == 1:
+        if is_multiclass:
+            return np.stack(
+                [_indices_to_bgr(arr_np[0, z]) for z in range(arr_np.shape[1])], axis=0
+            )
         return _gray_volume_to_bgr(arr_np[0], value_range)
+
+    if is_multiclass and arr_np.shape[0] >= 2:
+        # Multiclass pred logits (C, Z, H, W): softmax -> RGB probability
+        # cloud per slice. Uses the full confidence range instead of a
+        # hard argmax so uncertain regions are visible.
+        return np.stack(
+            [_logits_to_rgb_cloud(arr_np[:, z]) for z in range(arr_np.shape[1])],
+            axis=0,
+        )
 
     if arr_np.shape[0] == 3:
         rgb_zhwc = np.transpose(arr_np, (1, 2, 3, 0))

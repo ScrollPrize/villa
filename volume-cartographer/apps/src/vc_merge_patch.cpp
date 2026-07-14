@@ -34,6 +34,7 @@
 
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <opencv2/core.hpp>
@@ -689,7 +690,7 @@ Mat1f pmDistToBoundary(const Mat1b& mask)
     cv::Mat src;
     mask.convertTo(src, CV_8U, 255.0);
     cv::Mat dist;
-    cv::distanceTransform(src, dist, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    cv::distanceTransform(src, dist, vc::opencv::distanceL2, cv::DIST_MASK_PRECISE);
     Mat1f out;
     dist.convertTo(out, CV_32F);
     return out;
@@ -980,7 +981,7 @@ PMPatchStats pmApplyPatch(cv::Mat_<cv::Vec3f>& parent_points,
     // nearest zero cell. Inside the footprint this is "parent cells from
     // the warped child boundary".
     cv::Mat dt_in;
-    cv::distanceTransform(footprint, dt_in, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    cv::distanceTransform(footprint, dt_in, vc::opencv::distanceL2, cv::DIST_MASK_PRECISE);
 
     // Pass 2: actual patching. Smoothstep blend by dt_in.
     const double blend_inv = 1.0 / std::max(1, blend_cells);

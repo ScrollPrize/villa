@@ -2,12 +2,19 @@
 
 #include <QGraphicsView>
 #include <QPointF>
+#include <QString>
 
 class CVolumeViewerView : public QGraphicsView
 {
     Q_OBJECT
     
 public:
+    struct ScaleBarLabel {
+        double displayLength = 0.0;
+        QString unit;
+        QString text;
+    };
+
     CVolumeViewerView(QWidget* parent = 0);
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
@@ -22,6 +29,7 @@ public:
     void keyReleaseEvent(QKeyEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void setVoxelSize(double sx, double sy) { m_vx = sx; m_vy = sy; update(); }
+    static ScaleBarLabel formatScaleBarLength(double barUm);
     void setMiddleButtonPanEnabled(bool enabled) { _middleButtonPanEnabled = enabled; }
     bool middleButtonPanEnabled() const { return _middleButtonPanEnabled; }
     void setScrollPanDisabled(bool disabled) { _scrollPanDisabled = disabled; }
