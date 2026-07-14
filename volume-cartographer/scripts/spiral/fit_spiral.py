@@ -6,6 +6,7 @@ import zarr
 import torch
 import wandb
 import datetime
+import time
 import numpy as np
 import scipy.ndimage
 import torch.nn.functional as F
@@ -62,7 +63,8 @@ from spiral_helpers import (
     load_fiber_point_collections,
     scale_counts_for_z_range,
     _infer_shell_outer_winding_idx,
-    patch_intersects_z_roi
+    patch_intersects_z_roi,
+    save_combined_preview,
 )
 import sample_spiral
 from satisfaction_metrics import (
@@ -91,6 +93,9 @@ pcl_json_paths = [
     f'{dataset_path}/relative_windings.json',
     f'{dataset_path}/same_windings.json',
 ]
+# The interactive session API supplies explicit roles.  The legacy CLI leaves
+# this as None and retains the historical abs_winding.json basename behavior.
+pcl_input_specs = None
 fibers_path = f'{dataset_path}/fibers'
 verified_patches_path = f'{dataset_path}/verified_patches'
 unverified_patches_path = f'{dataset_path}/unverified_patches'
@@ -104,7 +109,17 @@ z_begin, z_end = 4000, 17000
 voxel_size_um = 9.6
 cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
 lasagna_scale = 4
+lasagna_storage_backend = 'dense_cuda'
 render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
+_active_lasagna_store = None
+
+
+def release_interactive_resources():
+    """Release worker pools and mmap handles owned by the resident session."""
+    global _active_lasagna_store
+    store, _active_lasagna_store = _active_lasagna_store, None
+    if store is not None:
+        store.close()
 
 default_config = {
     'random_seed': 1,
@@ -496,7 +511,8 @@ def get_progressive_dt_max_winding(iteration, dt_start_step, shell_outer_winding
     return w_inner + (w_outer - w_inner) * f_warped
 
 
-def main(load_only_patches_and_point_collections=False):
+def main(load_only_patches_and_point_collections=False, interactive_driver=None):
+    global _active_lasagna_store
 
     np.random.seed(cfg['random_seed'])
     torch.random.manual_seed(cfg['random_seed'])
@@ -571,7 +587,10 @@ def main(load_only_patches_and_point_collections=False):
     # be filtered to the z-roi.
     point_collections = {}
     next_id = 0
-    for pattern in pcl_json_paths:
+    input_specs = pcl_input_specs
+    if input_specs is None:
+        input_specs = [(pattern, None) for pattern in pcl_json_paths]
+    for pattern, explicit_role in input_specs:
         expanded = sorted(glob.glob(pattern)) if glob.has_magic(pattern) else [pattern]
         for path in expanded:
             loaded = load_point_collection(path) or {}
@@ -581,7 +600,12 @@ def main(load_only_patches_and_point_collections=False):
                 # only pcls loaded from abs_winding.json carry absolute winding
                 # numbers. Any metadata key in another file is ignored.
                 pcl.setdefault('metadata', {})['winding_is_absolute'] = (
-                    os.path.basename(path) == 'abs_winding.json'
+                    explicit_role == 'absolute'
+                    if explicit_role is not None
+                    else os.path.basename(path) == 'abs_winding.json'
+                )
+                pcl['metadata']['input_role'] = explicit_role or (
+                    'absolute' if os.path.basename(path) == 'abs_winding.json' else 'legacy'
                 )
                 point_collections[next_id] = pcl
                 next_id += 1
@@ -780,7 +804,11 @@ def main(load_only_patches_and_point_collections=False):
         z_begin=z_begin,
         z_end=z_end,
         lasagna_scale=lasagna_scale,
+        storage_backend=lasagna_storage_backend,
+        cache_directory=cache_path,
     )
+    if interactive_driver is not None and lasagna_volume and lasagna_volume.get('backend') == 'mmap':
+        _active_lasagna_store = lasagna_volume['store']
 
     if tracks_dbm_path is not None:
         print(f'loading tracks from {tracks_dbm_path}')
@@ -1114,13 +1142,37 @@ def main(load_only_patches_and_point_collections=False):
     resume_checkpoint = None
     model_z_begin, model_z_end = z_begin, z_end
     if resume_path:
-        resume_checkpoint = torch.load(resume_path, map_location='cpu')
+        resume_checkpoint = torch.load(resume_path, map_location='cpu', weights_only=False)
         checkpoint_lasagna_scale = resume_checkpoint.get('lasagna_scale') if isinstance(resume_checkpoint, dict) else None
         if checkpoint_lasagna_scale != lasagna_scale:
             raise RuntimeError(
                 f'checkpoint {resume_path} has lasagna_scale={checkpoint_lasagna_scale!r}; '
                 f'this run uses lasagna_scale={lasagna_scale!r}'
             )
+        if isinstance(resume_checkpoint, dict) and resume_checkpoint.get('schema_version', 1) >= 2:
+            if resume_checkpoint.get('lasagna_group') != normal_zarr_group:
+                raise RuntimeError(
+                    f'checkpoint Lasagna group {resume_checkpoint.get("lasagna_group")!r} '
+                    f'does not match requested group {normal_zarr_group!r}'
+                )
+            if resume_checkpoint.get('spiral_outward_sense') != spiral_outward_sense:
+                raise RuntimeError(
+                    f'checkpoint outward sense {resume_checkpoint.get("spiral_outward_sense")!r} '
+                    f'does not match requested sense {spiral_outward_sense!r}'
+                )
+            checkpoint_cfg = resume_checkpoint.get('cfg', {})
+            shape_keys = (
+                'num_flow_integration_steps', 'flow_integration_solver', 'num_flow_timesteps',
+                'flow_bounds_z_margin', 'flow_bounds_radius', 'flow_voxel_resolution',
+                'flow_field_type', 'gap_expander_logit_resolution',
+                'gap_expander_num_windings', 'linear_z_resolution',
+            )
+            incompatible = [
+                key for key in shape_keys
+                if key in checkpoint_cfg and checkpoint_cfg[key] != cfg[key]
+            ]
+            if incompatible:
+                raise RuntimeError(f'checkpoint model-shaping config mismatch: {incompatible}')
         if isinstance(resume_checkpoint, dict) and 'z_begin' in resume_checkpoint:
             model_z_begin, model_z_end = resume_checkpoint['z_begin'], resume_checkpoint['z_end']
             if (model_z_begin, model_z_end) != (z_begin, z_end):
@@ -1221,26 +1273,76 @@ def main(load_only_patches_and_point_collections=False):
     else:
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lambda step: 1.)
 
-    def save_model(suffix):
-        torch.save({
+    def checkpoint_payload(completed_iterations):
+        return {
+            'schema_version': 2,
+            'completed_iterations': int(completed_iterations),
             'spiral_and_transform': spiral_and_transform.state_dict(),
             'optimiser': optimiser.state_dict(),
+            'scheduler': lr_scheduler.state_dict(),
             'cfg': dict(cfg),
+            'requested_config': dict(getattr(interactive_driver, 'requested_config', dict(cfg))),
+            'resolved_config': dict(cfg),
             'lasagna_scale': lasagna_scale,
+            'lasagna_group': normal_zarr_group,
             'z_begin': z_begin,
             'z_end': z_end,
-        }, f'{out_path}/checkpoint_{suffix}.ckpt')
+            'spiral_outward_sense': spiral_outward_sense,
+            'numpy_rng_state': np.random.get_state(),
+            'torch_cpu_rng_state': torch.random.get_rng_state(),
+            'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
+            'input_manifest': dict(getattr(interactive_driver, 'input_manifest', {})),
+            'preview_first_winding': 10,
+        }
+
+    def save_model_to(path, completed_iterations):
+        destination = os.path.abspath(path)
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        temporary = f'{destination}.tmp-{os.getpid()}-{time.time_ns()}'
+        try:
+            torch.save(checkpoint_payload(completed_iterations), temporary)
+            with open(temporary, 'rb') as stream:
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+            try:
+                directory_fd = os.open(os.path.dirname(destination), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+            return destination
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def save_model(suffix, completed_iterations=num_training_steps):
+        return save_model_to(f'{out_path}/checkpoint_{suffix}.ckpt', completed_iterations)
 
     def load_model(checkpoint):
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
         spiral_and_transform.load_state_dict(transformed_spiral_state)
         optimiser.load_state_dict(optimiser_state)
+        if checkpoint.get('scheduler') is not None:
+            lr_scheduler.load_state_dict(checkpoint['scheduler'])
 
     if resume_path:
+        embedded_iteration = resume_checkpoint.get('completed_iterations') if isinstance(resume_checkpoint, dict) else None
+        if embedded_iteration is not None:
+            start_iteration = int(embedded_iteration)
         print(f'resuming from {resume_path} at iteration {start_iteration}')
         load_model(resume_checkpoint)
-        for _ in range(start_iteration):
-            lr_scheduler.step()
+        if not isinstance(resume_checkpoint, dict) or resume_checkpoint.get('scheduler') is None:
+            for _ in range(start_iteration):
+                lr_scheduler.step()
+        if isinstance(resume_checkpoint, dict):
+            if resume_checkpoint.get('numpy_rng_state') is not None:
+                np.random.set_state(resume_checkpoint['numpy_rng_state'])
+            if resume_checkpoint.get('torch_cpu_rng_state') is not None:
+                torch.random.set_rng_state(resume_checkpoint['torch_cpu_rng_state'])
+            if resume_checkpoint.get('torch_cuda_rng_states') is not None:
+                torch.cuda.set_rng_state_all(resume_checkpoint['torch_cuda_rng_states'])
 
     broadcast_model_params(spiral_and_transform)
 
@@ -1261,6 +1363,7 @@ def main(load_only_patches_and_point_collections=False):
     # ==========================================================================
 
     prepared_main_tracks = None
+    preview_extent_tracks = tracks
     if using_tracks:
         prepared_main_tracks = prepare_main_phase_tracks(
             tracks,
@@ -1269,6 +1372,13 @@ def main(load_only_patches_and_point_collections=False):
             device,
             anchor_tree=trusted_geometry_tree,
         )
+        # With the usual zero exclusion radius, the training bundle already
+        # contains every authoritative track point as one GPU tensor.  Reuse it
+        # for preview bounds instead of walking millions of short NumPy tracks.
+        if prepared_main_tracks is not None:
+            input_track_points = sum(len(track) for track in tracks)
+            if prepared_main_tracks['flat_zyx'].shape[0] == input_track_points:
+                preview_extent_tracks = (prepared_main_tracks['flat_zyx'],)
 
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
     dr_per_winding = spiral_and_transform.get_dr_per_winding()
@@ -1296,7 +1406,56 @@ def main(load_only_patches_and_point_collections=False):
     nonfinite_grad_steps = torch.zeros((), device=dist_grad_params[0].device)
     nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in dist_grad_named}
 
+    def export_interactive_preview(generation_path, surface_id):
+        # Export has its own saved RNG envelope so pausing does not alter the
+        # stochastic training sequence.
+        numpy_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all()
+        try:
+            return save_combined_preview(
+                spiral_and_transform.get_slice_to_spiral_transform(),
+                spiral_and_transform.get_dr_per_winding(),
+                verified_patches_list,
+                unattached_pcl_strips,
+                generation_path,
+                cfg,
+                z_begin,
+                z_end,
+                voxel_size_um,
+                get_or_build_unattached_pcl_flat,
+                tracks=preview_extent_tracks,
+                surface_id=surface_id,
+            )
+        finally:
+            np.random.set_state(numpy_state)
+            torch.random.set_rng_state(torch_state)
+            torch.cuda.set_rng_state_all(cuda_states)
+
+    if interactive_driver is not None:
+        from geometry_snapshot import write_geometry_snapshot
+        fiber_root = os.path.abspath(fibers_path) if fibers_path else None
+        snapshot_categories = {'fibers': [], 'pcls': [], 'tracks': []}
+        for strip in unattached_pcl_strips:
+            source = os.path.abspath(strip.get('source_file') or '')
+            category = 'fibers' if fiber_root and os.path.commonpath([fiber_root, source]) == fiber_root else 'pcls'
+            snapshot_categories[category].append(strip['zyxs'])
+        if tracks:
+            snapshot_categories['tracks'] = [np.asarray(track, dtype=np.float32) for track in tracks if len(track)]
+        geometry_path = os.path.join(out_path, '.spiral-geometry', f'generation-{time.time_ns()}')
+        write_geometry_snapshot(geometry_path, snapshot_categories, input_order='ZYX')
+        interactive_driver.on_ready(
+            completed_iterations=start_iteration,
+            session_horizon=num_training_steps,
+            output_path=out_path,
+            save_checkpoint=save_model_to,
+            export_preview=export_interactive_preview,
+            geometry_snapshot_manifest=os.path.join(geometry_path, 'manifest.json'),
+        )
+
     for iteration in tqdm(range(start_iteration, num_training_steps), disable=not is_main_process()):
+        if interactive_driver is not None and not interactive_driver.wait_for_iteration(iteration):
+            break
         step_timer.start('fwd')
         spiral_and_transform.flow_field.flow_scales[1] = get_flow_field_high_res_lr_scale(iteration)
 
@@ -1403,6 +1562,11 @@ def main(load_only_patches_and_point_collections=False):
             )
             losses['dense_normals'] = dense_normals_loss * cfg['loss_weight_dense_normals']
             losses['dense_spacing'] = dense_spacing_loss * cfg['loss_weight_dense_spacing']
+            if lasagna_volume.get('backend') == 'mmap':
+                log_metrics.update({
+                    f'lasagna_{name}': value
+                    for name, value in lasagna_volume['store'].last_timings.items()
+                })
 
         if (
             (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0)
@@ -1476,6 +1640,15 @@ def main(load_only_patches_and_point_collections=False):
         if profiler is not None:
             profiler.step()
 
+        if interactive_driver is not None:
+            interactive_driver.iteration_completed(
+                completed_iterations=iteration + 1,
+                total_loss=float(loss.detach().item()),
+                losses={name: float(value.detach().item()) for name, value in losses.items()},
+                learning_rate=float(optimiser.param_groups[0]['lr']),
+                metrics={name: float(value) for name, value in log_metrics.items()},
+            )
+
         if iteration % 200 == 0:
             # Only sync to CPU and log when we actually print, avoiding a per-iter
             # GPU->CPU sync that would otherwise stall CPU/GPU overlap.
@@ -1502,9 +1675,13 @@ def main(load_only_patches_and_point_collections=False):
     # Final outputs
     # ==========================================================================
 
+    if interactive_driver is not None:
+        interactive_driver.session_finished()
+        return
+
     suffix = 'fitted'
     if is_main_process():
-        save_model(suffix)
+        save_model(suffix, num_training_steps)
         save_overlay_and_print_satisfaction(
             suffix,
             spiral_and_transform=spiral_and_transform,

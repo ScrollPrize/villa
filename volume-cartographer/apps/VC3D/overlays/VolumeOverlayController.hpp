@@ -37,6 +37,7 @@ public:
 
     explicit VolumeOverlayController(ViewerManager* manager, QObject* parent = nullptr);
 
+    void setViewerManager(ViewerManager* manager);
     void setUi(const UiRefs& ui);
     void setVolumePkg(const std::shared_ptr<VolumePkg>& pkg, const QString& path);
     void clearVolumePkg();

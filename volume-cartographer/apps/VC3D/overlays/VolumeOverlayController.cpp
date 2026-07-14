@@ -124,6 +124,55 @@ VolumeOverlayController::VolumeOverlayController(ViewerManager* manager, QObject
 {
 }
 
+void VolumeOverlayController::setViewerManager(ViewerManager* manager)
+{
+    if (_viewerManager == manager) {
+        return;
+    }
+    if (_viewerManager) {
+        _viewerManager->setVolumeOverlay(nullptr);
+    }
+
+    _viewerManager = manager;
+    if (!_viewerManager) {
+        updateUiEnabled();
+        return;
+    }
+
+    const bool wasSuspended = _suspendPersistence;
+    _suspendPersistence = true;
+    _overlayVolume = _viewerManager->overlayVolume();
+    _overlayVolumeId = _viewerManager->overlayVolumeId();
+    _overlayOpacity = _viewerManager->overlayOpacity();
+    _overlayOpacityBeforeToggle = _overlayOpacity;
+    _overlayColormapName = _viewerManager->overlayColormap();
+    _overlayWindowLow = _viewerManager->overlayWindowLow();
+    _overlayWindowHigh = _viewerManager->overlayWindowHigh();
+    _overlayMaxDisplayedResolution = _viewerManager->overlayMaxDisplayedResolution();
+    const auto& composite = _viewerManager->overlayComposite();
+    _compositeEnabled = composite.enabled;
+    _compositeMethod = composite.method;
+    _compositeLayersFront = composite.layersFront;
+    _compositeLayersBehind = composite.layersBehind;
+    _overlayVisible = hasOverlaySelection() && _overlayOpacity > 0.0f;
+
+    _viewerManager->setVolumeOverlay(this);
+    refreshVolumeOptions();
+    populateColormapOptions();
+    applyOverlayVolume();
+    setOpacity(_overlayOpacity);
+    setWindowBounds(_overlayWindowLow, _overlayWindowHigh);
+    if (_ui.maxDisplayedResolutionSpin) {
+        const QSignalBlocker blocker(_ui.maxDisplayedResolutionSpin);
+        _ui.maxDisplayedResolutionSpin->setValue(_overlayMaxDisplayedResolution);
+    }
+    _viewerManager->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
+    syncCompositeUi();
+    pushCompositeToManager();
+    updateUiEnabled();
+    _suspendPersistence = wasSuspended;
+}
+
 void VolumeOverlayController::setUi(const UiRefs& ui)
 {
     disconnectUiSignals();

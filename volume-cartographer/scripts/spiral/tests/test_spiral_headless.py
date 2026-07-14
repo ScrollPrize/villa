@@ -1,0 +1,150 @@
+import json
+from pathlib import Path
+import tempfile
+import threading
+import time
+import unittest
+
+import numpy as np
+import torch
+
+from fit_session import (PclInputSpec, PclRole, resolve_dataset_root,
+                         resolve_logical_dbm, validate_checkpoint_container)
+from geometry_snapshot import validate_geometry_snapshot, write_geometry_snapshot
+from spiral_helpers import compute_winding_range_and_input_extents
+from spiral_service import ServiceState
+from tifxyz import save_combined_tifxyz
+
+
+class DatasetResolverTests(unittest.TestCase):
+    def test_truncated_torch_checkpoint_is_rejected_before_loading(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "truncated.ckpt"
+            checkpoint.write_bytes(b"PK\x03\x04" + bytes(128))
+            with self.assertRaisesRegex(ValueError, "incomplete or corrupt"):
+                validate_checkpoint_container(checkpoint)
+
+    def test_conventional_resolution_and_logical_dbm_suffix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "umbilicus.json").write_text("{}")
+            (root / "verified_patches").mkdir()
+            (root / "tracks").mkdir()
+            (root / "tracks" / "only.dbm.db").write_bytes(b"")
+            (root / "abs_winding.json").write_text("{}")
+            result = resolve_dataset_root(root)
+            self.assertTrue(result.ok)
+            self.assertEqual(result.resolved["tracks_dbm"], str(root / "tracks" / "only.dbm"))
+            self.assertEqual(result.pcl_inputs[0]["role"], "absolute")
+            self.assertEqual(resolve_logical_dbm(root / "tracks" / "only.dbm.db"),
+                             str(root / "tracks" / "only.dbm"))
+
+    def test_dbm_ambiguity_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "umbilicus.json").write_text("{}")
+            (root / "verified_patches").mkdir()
+            (root / "tracks").mkdir()
+            for name in ("z.dbm.db", "a.dbm.db"):
+                (root / "tracks" / name).write_bytes(b"")
+            result = resolve_dataset_root(root)
+            self.assertEqual(result.ambiguities["tracks_dbm"], [
+                str(root / "tracks" / "a.dbm"), str(root / "tracks" / "z.dbm")])
+
+
+class HandoffTests(unittest.TestCase):
+    def test_geometry_snapshot_converts_zyx_to_xyz(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "snapshot"
+            write_geometry_snapshot(destination, {
+                "fibers": [np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)]
+            }, input_order="ZYX")
+            validate_geometry_snapshot(destination)
+            points = np.fromfile(destination / "fibers.points.xyz.f32le", dtype="<f4").reshape(-1, 3)
+            np.testing.assert_array_equal(points, [[3, 2, 1], [6, 5, 4]])
+
+    def test_combined_preview_has_separators_and_ordered_components(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "generation-1"
+            blocks = {winding: np.full((3, 2, 3), winding, dtype=np.float32)
+                      for winding in range(10, 13)}
+            save_combined_tifxyz(blocks, destination, "preview", 20, 9.6, "test")
+            metadata = json.loads((destination / "preview" / "meta.json").read_text())
+            self.assertEqual(metadata["components"], [[0, 2], [3, 5], [6, 8]])
+            self.assertEqual(metadata["component_winding_ids"], [10, 11, 12])
+            from PIL import Image
+            x = np.asarray(Image.open(destination / "preview" / "x.tif"))
+            self.assertTrue(np.all(x[:, 2] == -1))
+            self.assertTrue(np.all(x[:, 5] == -1))
+
+
+class PreviewRangeTests(unittest.TestCase):
+    def test_many_short_tracks_are_transformed_in_point_batches(self):
+        class CountingIdentity:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, value):
+                self.calls += 1
+                return value
+
+        transform = CountingIdentity()
+        tracks = [np.array([[50, 0, x]], dtype=np.float32) for x in range(70_000)]
+        winding_range, patch_extents, pcl_extents = compute_winding_range_and_input_extents(
+            transform,
+            torch.tensor(10.0),
+            [],
+            [],
+            {"output_first_winding": 10, "output_winding_margin": 4},
+            0,
+            100,
+            lambda *_: None,
+            authoritative_zyx_lines=tracks,
+        )
+
+        self.assertEqual(transform.calls, 2)
+        self.assertEqual(winding_range, (10, 7005))
+        self.assertEqual(patch_extents, [])
+        self.assertEqual(pcl_extents, [])
+
+
+class ProtocolTests(unittest.TestCase):
+    def test_mutating_command_is_deduplicated(self):
+        service = ServiceState()
+        calls = []
+        first = service.deduplicated("same-command", lambda: calls.append(1) or {"accepted": True})
+        second = service.deduplicated("same-command", lambda: calls.append(2) or {"accepted": True})
+        self.assertEqual(calls, [1])
+        self.assertEqual(first, second)
+
+    def test_concurrent_duplicate_waits_for_one_execution(self):
+        service = ServiceState()
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        results = []
+
+        def operation():
+            calls.append(1)
+            entered.set()
+            release.wait(2)
+            return {"accepted": True}
+
+        first = threading.Thread(target=lambda: results.append(
+            service.deduplicated("concurrent-command", operation)))
+        second = threading.Thread(target=lambda: results.append(
+            service.deduplicated("concurrent-command", operation)))
+        first.start()
+        self.assertTrue(entered.wait(1))
+        second.start()
+        time.sleep(0.02)
+        release.set()
+        first.join(2)
+        second.join(2)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(calls, [1])
+        self.assertEqual(results[0], results[1])
+
+
+if __name__ == "__main__":
+    unittest.main()

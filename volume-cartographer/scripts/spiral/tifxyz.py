@@ -338,3 +338,140 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):
         }, f, indent=4)
     return True
 
+
+def save_combined_tifxyz(
+    winding_zyxs,
+    path,
+    uuid,
+    step_size,
+    voxel_size_um,
+    source,
+    *,
+    first_winding=10,
+):
+    """Atomically write disconnected winding grids as one QuadSurface.
+
+    ``winding_zyxs`` is a mapping from integer winding id to equally tall
+    ``[z, theta, 3]`` ZYX float arrays.  Components use half-open column ranges,
+    matching QuadSurface's metadata contract.  An invalid separator column is
+    inserted between every pair even though components are also recorded; the
+    redundancy keeps old readers from constructing cross-winding quads.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    if not winding_zyxs:
+        raise ValueError("No winding grids were supplied")
+    by_id = {int(key): np.asarray(value, dtype=np.float32) for key, value in winding_zyxs.items()}
+    last_winding = max(by_id)
+    if last_winding < int(first_winding):
+        raise ValueError(
+            f"No preview winding is at or above {int(first_winding)} (last={last_winding})"
+        )
+    ids = list(range(int(first_winding), last_winding + 1))
+    missing = [winding for winding in ids if winding not in by_id]
+    if missing:
+        raise ValueError(f"Missing preview winding grids: {missing}")
+
+    rows = None
+    blocks = []
+    components = []
+    cursor = 0
+    for index, winding in enumerate(ids):
+        block = by_id[winding]
+        if block.ndim != 3 or block.shape[-1] != 3 or block.shape[1] < 2:
+            raise ValueError(f"Winding {winding} must have shape [rows, cols>=2, 3]")
+        if rows is None:
+            rows = block.shape[0]
+        if block.shape[0] != rows:
+            raise ValueError("All winding grids must have the same row count")
+        if not np.isfinite(block[block != -1]).all():
+            raise ValueError(f"Winding {winding} contains non-finite coordinates")
+        start = cursor
+        blocks.append(block)
+        cursor += block.shape[1]
+        components.append([start, cursor])
+        if index + 1 < len(ids):
+            blocks.append(np.full((rows, 1, 3), -1.0, dtype=np.float32))
+            cursor += 1
+
+    combined = np.concatenate(blocks, axis=1)
+    destination = os.path.abspath(os.fspath(path))
+    parent = os.path.dirname(destination)
+    os.makedirs(parent, exist_ok=True)
+    temp_root = tempfile.mkdtemp(prefix=f".{os.path.basename(destination)}.", dir=parent)
+    try:
+        surface_dir = os.path.join(temp_root, uuid)
+        os.makedirs(surface_dir)
+        Image.fromarray(combined[..., 2]).save(os.path.join(surface_dir, "x.tif"))
+        Image.fromarray(combined[..., 1]).save(os.path.join(surface_dir, "y.tif"))
+        Image.fromarray(combined[..., 0]).save(os.path.join(surface_dir, "z.tif"))
+
+        valid_vertex = np.any(combined != -1, axis=-1)
+        valid_quad = (
+            valid_vertex[:-1, :-1]
+            & valid_vertex[1:, :-1]
+            & valid_vertex[:-1, 1:]
+            & valid_vertex[1:, 1:]
+        )
+        area_vx2 = int(valid_quad.sum()) * step_size ** 2
+        valid_zyxs = combined[valid_vertex]
+        bbox = (
+            [valid_zyxs.min(axis=0)[::-1].tolist(), valid_zyxs.max(axis=0)[::-1].tolist()]
+            if valid_zyxs.size
+            else [[-1.0] * 3, [-1.0] * 3]
+        )
+        metadata = {
+            "scale": [1 / step_size, 1 / step_size],
+            "bbox": bbox,
+            "area_vx2": area_vx2,
+            "area_cm2": area_vx2 * voxel_size_um ** 2 / 1.e8,
+            "format": "tifxyz",
+            "type": "seg",
+            "uuid": uuid,
+            "source": source,
+            "components": components,
+            "component_winding_ids": ids,
+            "output_first_winding": ids[0],
+            "output_last_winding": ids[-1],
+        }
+        meta_path = os.path.join(surface_dir, "meta.json")
+        with open(meta_path, "w", encoding="utf-8") as stream:
+            json.dump(metadata, stream, indent=4)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        published = {
+            "schema_version": 1,
+            "kind": "spiral_combined_preview",
+            "surface_path": os.path.join(destination, uuid),
+            "surface_id": uuid,
+            "first_winding": ids[0],
+            "last_winding": ids[-1],
+            "components": components,
+            "winding_ids": ids,
+            "manifest_path": os.path.join(destination, "manifest.json"),
+        }
+        with open(os.path.join(temp_root, "manifest.json"), "w", encoding="utf-8") as stream:
+            json.dump(published, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        # Publish the generation directory only after all files and metadata are complete.
+        if os.path.exists(destination):
+            raise FileExistsError(destination)
+        os.replace(temp_root, destination)
+        temp_root = ""
+        try:
+            parent_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except OSError:
+            pass
+        return published
+    finally:
+        if temp_root:
+            shutil.rmtree(temp_root, ignore_errors=True)

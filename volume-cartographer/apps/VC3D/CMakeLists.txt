@@ -83,6 +83,8 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    elements/ViewerSplitGrid.cpp
+    elements/ViewerSplitGrid.hpp
     RemoteVolumeCachePaths.cpp
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
@@ -163,6 +165,8 @@ set(srcs
     overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp
     overlays/ViewerOverlayControllerBase.hpp
+    overlays/SpiralOverlayController.cpp
+    overlays/SpiralOverlayController.hpp
     SurfacePanelController.cpp
     SurfacePanelController.hpp
     MenuActionController.cpp
@@ -178,6 +182,12 @@ set(srcs
     NeuralTraceServiceManager.hpp
     LasagnaServiceManager.cpp
     LasagnaServiceManager.hpp
+    SpiralServiceManager.cpp
+    SpiralServiceManager.hpp
+    SpiralPanel.cpp
+    SpiralPanel.hpp
+    SpiralWorkspace.cpp
+    SpiralWorkspace.hpp
     LasagnaBatchWindow.cpp
     LasagnaBatchWindow.hpp
     segmentation/panels/SegmentationLasagnaPanel.cpp
@@ -292,3 +302,13 @@ if(VC_USE_PCH)
         "$<$<COMPILE_LANGUAGE:CXX>:<QtWidgets/QtWidgets>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<QtConcurrent/QtConcurrent>>")
 endif()
+
+# The manager checks this location after the development-tree and explicit
+# SPIRAL_SERVICE_PATH candidates.  Install the complete module set because the
+# service deliberately reuses the existing fitter rather than duplicating it.
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/spiral/
+    DESTINATION share/volume-cartographer/spiral
+    FILES_MATCHING
+        PATTERN "*.py"
+        PATTERN "tests" EXCLUDE
+        PATTERN "__pycache__" EXCLUDE)

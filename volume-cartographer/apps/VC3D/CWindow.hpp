@@ -112,6 +112,7 @@ class AtlasControlPointsDock;
 class StatusDockPanelHost;
 class ViewerCompositePanel;
 class LineAnnotationDialog;
+class SpiralWorkspace;
 
 class CWindow : public QMainWindow
 {
@@ -154,6 +155,8 @@ protected:
 private:
     void CreateWidgets(void);
     QMainWindow* segmentWorkspaceWindow() const { return _segmentWorkspaceWindow; }
+    ViewerManager* activeWorkspaceViewerManager() const;
+    void updateActiveWorkspaceViewerControls();
     void populateDockToggleMenu(QMenu* menu) const;
     void createAtlasWorkspace();
     void displayAtlasFromDirectory(const std::filesystem::path& atlasDir);
@@ -334,6 +337,8 @@ private:
     QMainWindow* _atlasWorkspaceWindow{nullptr};
     QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
     QMainWindow* _intersectionsWorkspaceWindow{nullptr};
+    QMainWindow* _spiralWorkspaceWindow{nullptr};
+    SpiralWorkspace* _spiralWorkspace{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
     QDockWidget* _inkDetectionDock{nullptr};

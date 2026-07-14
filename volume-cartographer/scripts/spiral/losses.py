@@ -810,7 +810,8 @@ def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume
     if lasagna_volume is None or outer_winding_idx is None:
         return zero, zero
 
-    volume = lasagna_volume['volume']  # 3 (nx, ny, grad_mag), z, y, x  uint8
+    backend = lasagna_volume.get('backend', 'dense_cuda')
+    volume = lasagna_volume.get('volume')  # dense: 3 (nx, ny, grad_mag), z, y, x uint8
     z_size, y_size, x_size = lasagna_volume['shape']
     z_origin = lasagna_volume['z_origin']
     lasagna_scale = lasagna_volume['lasagna_scale']
@@ -846,8 +847,33 @@ def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume
     zi = zi.clamp(0, z_size - 1)
     yi = yi.clamp(0, y_size - 1)
     xi = xi.clamp(0, x_size - 1)
-    nx_u8 = volume[0, zi, yi, xi]
-    ny_u8 = volume[1, zi, yi, xi]
+
+    # Build both sparse requests before touching the mmap backend, so its one
+    # bounded pool can schedule normal and spacing page faults together.
+    density_decode = cfg['grad_mag_factor'] / cfg['grad_mag_encode_scale'] * lasagna_scale
+    num_steps = int(cfg['spacing_integration_steps'])
+    step_frac = (torch.arange(num_steps, device=device).float() + 0.5) / num_steps
+    integration_zyx = scroll_inner[:, None, :] + step_frac[None, :, None] * scroll_displacement[:, None, :]
+    int_idx = (integration_zyx.detach() / lasagna_scale).round().long()
+    izi = int_idx[..., 0] - z_origin
+    iyi = int_idx[..., 1]
+    ixi = int_idx[..., 2]
+    int_in_bounds = (izi >= 0) & (izi < z_size) & (iyi >= 0) & (iyi < y_size) & (ixi >= 0) & (ixi < x_size)
+    izi = izi.clamp(0, z_size - 1)
+    iyi = iyi.clamp(0, y_size - 1)
+    ixi = ixi.clamp(0, x_size - 1)
+
+    if backend == 'mmap':
+        normal_indices = torch.stack([zi, yi, xi], dim=-1)
+        grad_indices = torch.stack([izi, iyi, ixi], dim=-1)
+        normal_u8, grad_mag_u8 = lasagna_volume['store'].gather_pair(
+            normal_indices, grad_indices, device)
+        nx_u8, ny_u8 = normal_u8.unbind(dim=-1)
+        grad_mag_u8 = grad_mag_u8.reshape(izi.shape)
+    else:
+        nx_u8 = volume[0, zi, yi, xi]
+        ny_u8 = volume[1, zi, yi, xi]
+        grad_mag_u8 = volume[2, izi, iyi, ixi]
     normal_weight = (((nx_u8 != 0) | (ny_u8 != 0)) & in_bounds).float()
     nx = _decode_uint8_normal_component(nx_u8.float())
     ny = _decode_uint8_normal_component(ny_u8.float())
@@ -863,20 +889,6 @@ def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume
     # the one-winding scroll-space segment (scroll_inner -> scroll_outer) is the line integral of
     # this density along it, so we sample the density at evenly spaced midpoints along the segment
     # and accumulate density * dl (a midpoint Riemann sum). For a correct fit the integral equals 1.
-    density_decode = cfg['grad_mag_factor'] / cfg['grad_mag_encode_scale'] * lasagna_scale
-    num_steps = int(cfg['spacing_integration_steps'])
-    step_frac = (torch.arange(num_steps, device=device).float() + 0.5) / num_steps  # midpoints in [0, 1]
-    # [num_points, num_steps, 3] scroll-space samples along scroll_inner -> scroll_outer
-    integration_zyx = scroll_inner[:, None, :] + step_frac[None, :, None] * scroll_displacement[:, None, :]
-    int_idx = (integration_zyx.detach() / lasagna_scale).round().long()
-    izi = int_idx[..., 0] - z_origin
-    iyi = int_idx[..., 1]
-    ixi = int_idx[..., 2]
-    int_in_bounds = (izi >= 0) & (izi < z_size) & (iyi >= 0) & (iyi < y_size) & (ixi >= 0) & (ixi < x_size)
-    izi = izi.clamp(0, z_size - 1)
-    iyi = iyi.clamp(0, y_size - 1)
-    ixi = ixi.clamp(0, x_size - 1)
-    grad_mag_u8 = volume[2, izi, iyi, ixi]  # [num_points, num_steps]
     sample_valid = (grad_mag_u8 != 0) & int_in_bounds
     density = grad_mag_u8.float() * density_decode  # current-grid windings/voxel
     # dl is the per-step scroll-space length (current-grid voxels); gradient flows through it so the
@@ -1017,4 +1029,3 @@ def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, oute
     # Per-sample cap so a single near-degenerate sample doesn't dominate the batch mean / gradient.
     energy = energy.clamp(max=1.e2)
     return energy.mean()
-

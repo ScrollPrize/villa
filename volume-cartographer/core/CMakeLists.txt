@@ -9,6 +9,7 @@ add_library(vc_core
         src/VolumePkg.cpp
         src/SurfacePatchIndex.cpp
         src/PointIndex.cpp
+        src/PolylineIndex.cpp
         src/Logging.cpp
         src/CrashHandler.cpp
         src/MemMap.cpp

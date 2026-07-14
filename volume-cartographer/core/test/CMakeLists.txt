@@ -429,6 +429,8 @@ vc_add_test(NAME test_logging)
 
 vc_add_test(NAME test_plane_surface_branches)
 
+vc_add_test(NAME test_polyline_index)
+
 vc_add_test(NAME test_affine_transform_surface)
 
 vc_add_test(NAME test_quadsurface_more)

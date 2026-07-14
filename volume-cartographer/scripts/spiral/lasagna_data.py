@@ -83,6 +83,8 @@ def prepare_lasagna_volume(
     z_begin,
     z_end,
     lasagna_scale,
+    storage_backend='dense_cuda',
+    cache_directory=None,
 ):
     # Densely load the precomputed nx/ny normal-component and grad_mag
     # (windings-per-base-voxel) zarrs over the z-ROI into a compact uint8 volume.
@@ -128,6 +130,19 @@ def prepare_lasagna_volume(
         raise RuntimeError(f'lasagna z-ROI [{z_lo}, {z_hi}) is empty (zarr z size {z_size})')
 
     roi_shape = (z_hi - z_lo, reference_shape[1], reference_shape[2])
+    if storage_backend in ('auto', 'mmap'):
+        from lasagna_mmap import prepare_lasagna_mmap
+        store = prepare_lasagna_mmap(
+            nx_array=nx_array, ny_array=ny_array, grad_mag_array=grad_mag_array,
+            source_paths={'normal_x': normal_nx_zarr_path, 'normal_y': normal_ny_zarr_path,
+                          'gradient_magnitude': grad_mag_zarr_path},
+            group=normal_zarr_group, z_lo=z_lo, z_hi=z_hi,
+            lasagna_scale=lasagna_scale, cache_directory=cache_directory,
+        )
+        print(f'lasagna: using mmap cache {store.directory} with {store.worker_count} gather workers')
+        return {'backend': 'mmap', 'store': store, 'z_origin': z_lo,
+                'lasagna_scale': lasagna_scale, 'shape': roi_shape}
+
     print(f'loading lasagna for z in [{z_lo}, {z_hi}) (shape {roi_shape[0]}, {roi_shape[1]}, {roi_shape[2]})')
     with ThreadPoolExecutor(max_workers=3) as executor:
         nx_future = executor.submit(_read_zarr_zslab_chunked, nx_array, z_lo, z_hi) if use_normals else None
@@ -140,6 +155,7 @@ def prepare_lasagna_volume(
     print(f'lasagna: loaded {volume.nbytes / 1e9:.2f} GB volume {volume.shape}')
     volume = torch.from_numpy(volume).to(device='cuda')
     return {
+        'backend': 'dense_cuda',
         'volume': volume,
         'z_origin': z_lo,
         'lasagna_scale': lasagna_scale,

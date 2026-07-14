@@ -636,6 +636,7 @@ def save_overlay_and_print_satisfaction(
         winding_range, patch_extents, pcl_extents = compute_winding_range_and_input_extents(
             slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
             cfg, z_begin, z_end, get_or_build_unattached_pcl_flat,
+            authoritative_zyx_lines=tracks,
         )
         _warn_if_inputs_exceed_flow_bounds(
             list(patches_dict.keys()), patch_extents,
@@ -666,5 +667,6 @@ def save_overlay_and_print_satisfaction(
             slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
             out_path, cfg, z_begin, z_end, voxel_size_um,
             get_or_build_unattached_pcl_flat, get_patch_satisfied_areas_for_mesh,
+            tracks=tracks,
             run_tag=run_tag, name=suffix,
         )

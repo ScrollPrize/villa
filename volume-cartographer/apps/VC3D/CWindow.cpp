@@ -128,6 +128,7 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
+#include "elements/ViewerSplitGrid.hpp"
 #include "CPointCollectionWidget.hpp"
 #include "WrapAnnotationWidget.hpp"
 #include "AtlasControlPointsDock.hpp"
@@ -149,6 +150,7 @@
 #include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
+#include "SpiralWorkspace.hpp"
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -179,6 +181,7 @@ using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 namespace
 {
 constexpr auto WORKSPACE_TAB_SETTING = "mainWin/workspace_tab";
+constexpr auto WORKSPACE_ID_SETTING = "mainWin/workspace_id";
 constexpr auto MAIN_VIEWER_SPLIT_X_SETTING = "mainWin/main_viewer_split_x";
 constexpr auto MAIN_VIEWER_SPLIT_Y_SETTING = "mainWin/main_viewer_split_y";
 constexpr auto MAIN_VIEWER_LAYOUT_SURFACES_SETTING = "mainWin/main_viewer_layout_surfaces";
@@ -873,394 +876,6 @@ protected:
 
 private:
     DockMenuBuilder _dockMenuBuilder;
-};
-
-class ViewerSplitGrid : public QWidget
-{
-public:
-    explicit ViewerSplitGrid(QWidget* parent = nullptr)
-        : QWidget(parent)
-    {
-        setContentsMargins(0, 0, 0, 0);
-        _topColumnHandle = makeHandle(Qt::SplitHCursor);
-        _bottomColumnHandle = makeHandle(Qt::SplitHCursor);
-        _leftRowHandle = makeHandle(Qt::SplitVCursor);
-        _rightRowHandle = makeHandle(Qt::SplitVCursor);
-        _centerHandle = makeHandle(Qt::SizeAllCursor);
-    }
-
-    void setViewer(int index, QWidget* widget)
-    {
-        if (index < 0 || index >= 4) {
-            return;
-        }
-        if (_viewers[index] && _viewers[index] != widget) {
-            _viewers[index]->hide();
-        }
-        if (widget) {
-            for (int i = 0; i < 4; ++i) {
-                if (i != index && _viewers[i] == widget) {
-                    _viewers[i] = nullptr;
-                }
-            }
-            widget->setParent(this);
-            widget->setVisible(!_hidden[index]);
-        }
-        _viewers[index] = widget;
-        layoutChildren();
-    }
-
-    QWidget* viewer(int index) const
-    {
-        return index >= 0 && index < 4 ? _viewers[index] : nullptr;
-    }
-
-    int indexOf(QWidget* widget) const
-    {
-        if (!widget) {
-            return -1;
-        }
-        for (int i = 0; i < 4; ++i) {
-            if (_viewers[i] == widget) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    void swapViewers(int first, int second)
-    {
-        if (first < 0 || first >= 4 || second < 0 || second >= 4 || first == second) {
-            return;
-        }
-        std::swap(_viewers[first], _viewers[second]);
-        layoutChildren();
-    }
-
-    void setPaneHidden(int index, bool hidden)
-    {
-        if (index < 0 || index >= 4) {
-            return;
-        }
-        if (hidden && visiblePaneCount() <= 1 && !_hidden[index]) {
-            return;
-        }
-        _hidden[index] = hidden;
-        if (_viewers[index]) {
-            _viewers[index]->setVisible(!hidden);
-        }
-        layoutChildren();
-        notifySplitChanged();
-    }
-
-    bool paneHidden(int index) const
-    {
-        return index >= 0 && index < 4 ? _hidden[index] : false;
-    }
-
-    bool fullSizeActive() const
-    {
-        return _fullSizePane >= 0;
-    }
-
-    bool fullSizeActiveForPane(int index) const
-    {
-        return _fullSizePane == index;
-    }
-
-    void setFullSizePane(int index)
-    {
-        if (index < 0 || index >= 4 || !_viewers[index]) {
-            return;
-        }
-
-        if (_fullSizePane < 0) {
-            _savedFullSizeHidden = _hidden;
-            _savedFullSizeSplitX = _splitX;
-            _savedFullSizeSplitY = _splitY;
-        }
-
-        _fullSizePane = index;
-        for (int pane = 0; pane < 4; ++pane) {
-            _hidden[pane] = pane != index;
-        }
-        applyVisibility();
-        layoutChildren();
-    }
-
-    void exitFullSize()
-    {
-        if (_fullSizePane < 0) {
-            return;
-        }
-
-        _hidden = _savedFullSizeHidden;
-        _splitX = _savedFullSizeSplitX;
-        _splitY = _savedFullSizeSplitY;
-        _fullSizePane = -1;
-        applyVisibility();
-        layoutChildren();
-    }
-
-    void resetSplits()
-    {
-        _fullSizePane = -1;
-        _splitX = 0.5;
-        _splitY = 0.5;
-        layoutChildren();
-        notifySplitChanged();
-    }
-
-    void setSplits(double splitX, double splitY)
-    {
-        _splitX = std::clamp(splitX, 0.1, 0.9);
-        _splitY = std::clamp(splitY, 0.1, 0.9);
-        layoutChildren();
-    }
-
-    double splitX() const { return _splitX; }
-    double splitY() const { return _splitY; }
-
-    std::function<void()> onSplitChanged;
-
-protected:
-    void resizeEvent(QResizeEvent*) override
-    {
-        layoutChildren();
-    }
-
-    bool eventFilter(QObject* watched, QEvent* event) override
-    {
-        auto handle = handleKind(watched);
-        if (handle == HandleKind::None) {
-            return QWidget::eventFilter(watched, event);
-        }
-
-        if (event->type() == QEvent::MouseButtonPress) {
-            auto* mouse = static_cast<QMouseEvent*>(event);
-            if (mouse->button() != Qt::LeftButton) {
-                return false;
-            }
-            _dragging = handle;
-            _dragStartGlobal = mouse->globalPosition().toPoint();
-            _dragStartSplitX = splitXPx();
-            _dragStartSplitY = splitYPx();
-            event->accept();
-            return true;
-        }
-
-        if (event->type() == QEvent::MouseMove && _dragging != HandleKind::None) {
-            auto* mouse = static_cast<QMouseEvent*>(event);
-            const QPoint delta = mouse->globalPosition().toPoint() - _dragStartGlobal;
-            const int widthPx = std::max(1, width());
-            const int heightPx = std::max(1, height());
-            if (_dragging == HandleKind::Column || _dragging == HandleKind::Both) {
-                _splitX = static_cast<double>(clampSplitPx(_dragStartSplitX + delta.x(), widthPx)) / widthPx;
-            }
-            if (_dragging == HandleKind::Row || _dragging == HandleKind::Both) {
-                _splitY = static_cast<double>(clampSplitPx(_dragStartSplitY + delta.y(), heightPx)) / heightPx;
-            }
-            layoutChildren();
-            notifySplitChanged();
-            event->accept();
-            return true;
-        }
-
-        if (event->type() == QEvent::MouseButtonRelease && _dragging != HandleKind::None) {
-            _dragging = HandleKind::None;
-            notifySplitChanged();
-            event->accept();
-            return true;
-        }
-
-        return QWidget::eventFilter(watched, event);
-    }
-
-private:
-    enum class HandleKind {
-        None,
-        Column,
-        Row,
-        Both,
-    };
-
-    QFrame* makeHandle(Qt::CursorShape cursor)
-    {
-        auto* handle = new QFrame(this);
-        handle->setFrameShape(QFrame::NoFrame);
-        handle->setCursor(cursor);
-        handle->setAutoFillBackground(true);
-        handle->setStyleSheet(QStringLiteral("background: rgba(80, 80, 80, 96);"));
-        handle->installEventFilter(this);
-        handle->show();
-        return handle;
-    }
-
-    HandleKind handleKind(QObject* object) const
-    {
-        if (object == _topColumnHandle || object == _bottomColumnHandle) {
-            return HandleKind::Column;
-        }
-        if (object == _leftRowHandle || object == _rightRowHandle) {
-            return HandleKind::Row;
-        }
-        if (object == _centerHandle) {
-            return HandleKind::Both;
-        }
-        return HandleKind::None;
-    }
-
-    int splitXPx() const
-    {
-        return clampSplitPx(static_cast<int>(std::lround(_splitX * width())), width());
-    }
-
-    int splitYPx() const
-    {
-        return clampSplitPx(static_cast<int>(std::lround(_splitY * height())), height());
-    }
-
-    int clampSplitPx(int value, int extent) const
-    {
-        const int halfHandle = handleWidth() / 2;
-        const int minValue = std::min(std::max(_minPanePx + halfHandle, halfHandle), extent / 2);
-        const int maxValue = std::max(minValue, extent - minValue);
-        return std::clamp(value, minValue, maxValue);
-    }
-
-    int handleWidth() const
-    {
-        return 5;
-    }
-
-    void layoutChildren()
-    {
-        const int w = width();
-        const int h = height();
-        if (w <= 0 || h <= 0) {
-            return;
-        }
-
-        const int handle = handleWidth();
-        const int half = handle / 2;
-        const int splitX = splitXPx();
-        const int splitY = splitYPx();
-
-        const bool leftVisible = paneVisible(0) || paneVisible(2);
-        const bool rightVisible = paneVisible(1) || paneVisible(3);
-        const int leftX = 0;
-        const int rightX = leftVisible ? splitX : 0;
-        const int leftW = rightVisible ? splitX : w;
-        const int rightW = leftVisible ? w - splitX : w;
-
-        layoutColumn(0, 2, QRect(leftX, 0, leftW, h), splitY);
-        layoutColumn(1, 3, QRect(rightX, 0, rightW, h), splitY);
-
-        const bool topLeft = paneVisible(0);
-        const bool bottomLeft = paneVisible(2);
-        const bool topRight = paneVisible(1);
-        const bool bottomRight = paneVisible(3);
-        _topColumnHandle->setVisible(leftVisible && rightVisible && (topLeft || topRight));
-        _bottomColumnHandle->setVisible(leftVisible && rightVisible && (bottomLeft || bottomRight));
-        _leftRowHandle->setVisible(topLeft && bottomLeft);
-        _rightRowHandle->setVisible(topRight && bottomRight);
-        _centerHandle->setVisible(leftVisible && rightVisible &&
-                                  (topLeft || topRight) &&
-                                  (bottomLeft || bottomRight));
-
-        _topColumnHandle->setGeometry(splitX - half, 0, handle, splitY);
-        _bottomColumnHandle->setGeometry(splitX - half, splitY, handle, h - splitY);
-        _leftRowHandle->setGeometry(0, splitY - half, splitX, handle);
-        _rightRowHandle->setGeometry(splitX, splitY - half, w - splitX, handle);
-        _centerHandle->setGeometry(splitX - half, splitY - half, handle, handle);
-
-        for (auto* handleWidget : {_topColumnHandle,
-                                   _bottomColumnHandle,
-                                   _leftRowHandle,
-                                   _rightRowHandle,
-                                   _centerHandle}) {
-            handleWidget->raise();
-        }
-    }
-
-    void layoutColumn(int topIndex, int bottomIndex, const QRect& columnRect, int splitY)
-    {
-        const bool topVisible = paneVisible(topIndex);
-        const bool bottomVisible = paneVisible(bottomIndex);
-        if (topVisible && bottomVisible) {
-            setViewerGeometry(topIndex, QRect(columnRect.x(), 0, columnRect.width(), splitY));
-            setViewerGeometry(bottomIndex, QRect(columnRect.x(), splitY, columnRect.width(), height() - splitY));
-        } else if (topVisible) {
-            setViewerGeometry(topIndex, columnRect);
-        } else if (bottomVisible) {
-            setViewerGeometry(bottomIndex, columnRect);
-        }
-        if (_viewers[topIndex]) {
-            _viewers[topIndex]->setVisible(topVisible);
-        }
-        if (_viewers[bottomIndex]) {
-            _viewers[bottomIndex]->setVisible(bottomVisible);
-        }
-    }
-
-    void applyVisibility()
-    {
-        for (int i = 0; i < 4; ++i) {
-            if (_viewers[i]) {
-                _viewers[i]->setVisible(!_hidden[i]);
-            }
-        }
-    }
-
-    void setViewerGeometry(int index, const QRect& rect)
-    {
-        if (index < 0 || index >= 4 || !_viewers[index]) {
-            return;
-        }
-        _viewers[index]->setGeometry(rect.normalized());
-    }
-
-    bool paneVisible(int index) const
-    {
-        return index >= 0 && index < 4 && _viewers[index] && !_hidden[index];
-    }
-
-    int visiblePaneCount() const
-    {
-        int count = 0;
-        for (int i = 0; i < 4; ++i) {
-            if (paneVisible(i)) {
-                ++count;
-            }
-        }
-        return count;
-    }
-
-    void notifySplitChanged()
-    {
-        if (onSplitChanged) {
-            onSplitChanged();
-        }
-    }
-
-    QWidget* _viewers[4] = {};
-    std::array<bool, 4> _hidden{};
-    std::array<bool, 4> _savedFullSizeHidden{};
-    QFrame* _topColumnHandle = nullptr;
-    QFrame* _bottomColumnHandle = nullptr;
-    QFrame* _leftRowHandle = nullptr;
-    QFrame* _rightRowHandle = nullptr;
-    QFrame* _centerHandle = nullptr;
-    double _splitX = 0.5;
-    double _splitY = 0.5;
-    double _savedFullSizeSplitX = 0.5;
-    double _savedFullSizeSplitY = 0.5;
-    int _fullSizePane = -1;
-    static constexpr int _minPanePx = 80;
-    HandleKind _dragging = HandleKind::None;
-    QPoint _dragStartGlobal;
-    int _dragStartSplitX = 0;
-    int _dragStartSplitY = 0;
 };
 
 struct MainViewerSpec {
@@ -2886,6 +2501,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _intersectionsWorkspaceWindow->setObjectName(QStringLiteral("intersectionsWorkspaceWindow"));
     _intersectionsWorkspaceWindow->setDockOptions(dockOptions());
 
+    // The real Spiral workspace is installed after Main's CState exists. Keep
+    // an inert shell here so it can be appended without shifting legacy tabs.
+    _spiralWorkspaceWindow = new QMainWindow(this);
+    _spiralWorkspaceWindow->setObjectName(QStringLiteral("spiralWorkspaceShell"));
+
     _workspaceTabs = new QTabWidget(this);
     _workspaceTabs->setObjectName(QStringLiteral("workspaceTabs"));
     _workspaceTabs->setTabsClosable(true);
@@ -2894,13 +2514,23 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _workspaceTabs->addTab(_atlasWorkspaceWindow, tr("Atlas"));
     _workspaceTabs->addTab(_fiberSliceWorkspaceWindow, tr("Fiber Slice"));
     _workspaceTabs->addTab(_intersectionsWorkspaceWindow, tr("Intersections"));
+    _workspaceTabs->addTab(_spiralWorkspaceWindow, tr("Spiral"));
+    _segmentWorkspaceWindow->setProperty("workspaceId", QStringLiteral("main"));
+    _lasagnaWorkspaceWindow->setProperty("workspaceId", QStringLiteral("lasagna"));
+    _atlasWorkspaceWindow->setProperty("workspaceId", QStringLiteral("atlas"));
+    _fiberSliceWorkspaceWindow->setProperty("workspaceId", QStringLiteral("fiber-slice"));
+    _intersectionsWorkspaceWindow->setProperty("workspaceId", QStringLiteral("intersections"));
+    _spiralWorkspaceWindow->setProperty("workspaceId", QStringLiteral("spiral"));
     if (auto* tabBar = _workspaceTabs->tabBar()) {
         for (int i = 0; i < _workspaceTabs->count(); ++i) {
             tabBar->setTabButton(i, QTabBar::RightSide, nullptr);
         }
     }
     setCentralWidget(_workspaceTabs);
-    connect(_workspaceTabs, &QTabWidget::currentChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_workspaceTabs, &QTabWidget::currentChanged, this, [this]() {
+        scheduleWindowStateSave();
+        updateActiveWorkspaceViewerControls();
+    });
     connect(_workspaceTabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
         if (!_workspaceTabs) {
             return;
@@ -2963,6 +2593,17 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
+    if (_workspaceTabs && _spiralWorkspaceWindow) {
+        const int spiralIndex = _workspaceTabs->indexOf(_spiralWorkspaceWindow);
+        auto* shell = _spiralWorkspaceWindow;
+        _workspaceTabs->removeTab(spiralIndex);
+        _spiralWorkspace = new SpiralWorkspace(_state, this);
+        _spiralWorkspace->setProperty("workspaceId", QStringLiteral("spiral"));
+        _spiralWorkspaceWindow = _spiralWorkspace;
+        _workspaceTabs->insertTab(spiralIndex, _spiralWorkspace, tr("Spiral"));
+        if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(spiralIndex, QTabBar::RightSide, nullptr);
+        shell->deleteLater();
+    }
     _lineAnnotationController = std::make_unique<LineAnnotationController>(_state,
                                                                            _viewerManager.get(),
                                                                            this,
@@ -3060,7 +2701,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             });
     connect(_state, &CState::volumeChanged, _volumeOverlay.get(),
             [this](const std::shared_ptr<Volume>&, const std::string&) {
-                if (_volumeOverlay) {
+                if (_volumeOverlay && activeWorkspaceViewerManager() == _viewerManager.get()) {
                     _volumeOverlay->refreshForCurrentVolume();
                 }
             });
@@ -3259,7 +2900,17 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     }
 
     if (_workspaceTabs) {
-        const int workspaceIndex = geometry.value(WORKSPACE_TAB_SETTING, 0).toInt();
+        int workspaceIndex = -1;
+        const QString workspaceId = geometry.value(WORKSPACE_ID_SETTING).toString();
+        if (!workspaceId.isEmpty()) {
+            for (int i = 0; i < _workspaceTabs->count(); ++i) {
+                if (_workspaceTabs->widget(i)->property("workspaceId").toString() == workspaceId) {
+                    workspaceIndex = i;
+                    break;
+                }
+            }
+        }
+        if (workspaceIndex < 0) workspaceIndex = geometry.value(WORKSPACE_TAB_SETTING, 0).toInt();
         if (workspaceIndex >= 0 && workspaceIndex < _workspaceTabs->count()) {
             _workspaceTabs->setCurrentIndex(workspaceIndex);
         }
@@ -3408,8 +3059,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         bool current = settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
         bool next = !current;
         settings.setValue(viewer::SHOW_DIRECTION_HINTS, next ? "1" : "0");
-        if (_viewerManager) {
-            _viewerManager->forEachBaseViewer([next](VolumeViewerBase* viewer) {
+        if (auto* manager = activeWorkspaceViewerManager()) {
+            manager->forEachBaseViewer([next](VolumeViewerBase* viewer) {
                 if (viewer) {
                     viewer->setShowDirectionHints(next);
                 }
@@ -3426,8 +3077,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         bool current = settings.value(viewer::SHOW_SURFACE_NORMALS, viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
         bool next = !current;
         settings.setValue(viewer::SHOW_SURFACE_NORMALS, next ? "1" : "0");
-        if (_viewerManager) {
-            _viewerManager->forEachBaseViewer([next](VolumeViewerBase* viewer) {
+        if (auto* manager = activeWorkspaceViewerManager()) {
+            manager->forEachBaseViewer([next](VolumeViewerBase* viewer) {
                 if (viewer) {
                     viewer->setShowSurfaceNormals(next);
                 }
@@ -4186,6 +3837,29 @@ VolumeViewerBase* CWindow::segmentationBaseViewer() const
 
 VolumeViewerBase* CWindow::activeBaseViewer() const
 {
+    if (auto* manager = activeWorkspaceViewerManager(); manager && manager != _viewerManager.get()) {
+        QWidget* focus = QApplication::focusWidget();
+        for (auto* viewer : manager->baseViewers()) {
+            auto* widget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr;
+            if (widget && focus && (widget == focus || widget->isAncestorOf(focus))) {
+                return viewer;
+            }
+        }
+        for (auto* viewer : manager->baseViewers()) {
+            auto* widget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr;
+            if (widget && widget->isVisible() && widget->underMouse()) {
+                return viewer;
+            }
+        }
+        for (auto* viewer : manager->baseViewers()) {
+            auto* widget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr;
+            if (widget && widget->isVisible()) {
+                return viewer;
+            }
+        }
+        return nullptr;
+    }
+
     if (_activeBaseViewer) {
         if (auto* activeObject = _activeBaseViewer->asQObject()) {
             if (!activeObject->parent()) {
@@ -4203,6 +3877,29 @@ VolumeViewerBase* CWindow::activeBaseViewer() const
         return nullptr;
     }
     return baseViewerFromWidget(subWindow->widget());
+}
+
+ViewerManager* CWindow::activeWorkspaceViewerManager() const
+{
+    if (_workspaceTabs && _spiralWorkspace &&
+        _workspaceTabs->currentWidget() == _spiralWorkspace) {
+        return _spiralWorkspace->viewerManager();
+    }
+    return _viewerManager.get();
+}
+
+void CWindow::updateActiveWorkspaceViewerControls()
+{
+    auto* manager = activeWorkspaceViewerManager();
+    if (_viewerControlsPanel) {
+        _viewerControlsPanel->setViewerManager(manager);
+    }
+    if (_viewerCompositePanel) {
+        _viewerCompositePanel->setViewerManager(manager);
+    }
+    if (_volumeOverlay) {
+        _volumeOverlay->setViewerManager(manager);
+    }
 }
 
 void CWindow::resetSegmentationViews(bool persistLayout)
@@ -8279,6 +7976,7 @@ void CWindow::CreateWidgets(void)
         if (_viewerControlsPanel) {
             _viewerControlsPanel->setOverlayWindowAvailable(_volumeOverlay->hasOverlaySelection());
         }
+        updateActiveWorkspaceViewerControls();
     }
 
     // Setup surface overlay controls
@@ -8562,6 +8260,8 @@ void CWindow::saveWindowState()
     }
     if (_workspaceTabs) {
         settings.setValue(WORKSPACE_TAB_SETTING, _workspaceTabs->currentIndex());
+        if (auto* workspace = _workspaceTabs->currentWidget())
+            settings.setValue(WORKSPACE_ID_SETTING, workspace->property("workspaceId").toString());
     }
     settings.setValue(vc3d::settings::window::RESTORE_DISABLED, false);
     settings.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, false);
@@ -9392,6 +9092,12 @@ void CWindow::CloseVolume(void)
 
     if (_volumeOverlay) {
         _volumeOverlay->clearVolumePkg();
+    }
+    if (_viewerManager) {
+        _viewerManager->setOverlayVolume(nullptr, {});
+    }
+    if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
+        _spiralWorkspace->viewerManager()->setOverlayVolume(nullptr, {});
     }
 
     if (_surfaceAffineTransforms) {

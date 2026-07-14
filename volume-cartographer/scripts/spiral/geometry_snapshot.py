@@ -1,0 +1,120 @@
+"""Atomic, versioned flat-geometry snapshots shared with VC3D."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shutil
+import tempfile
+from typing import Iterable, Mapping, Sequence
+
+import numpy as np
+
+
+SNAPSHOT_SCHEMA_VERSION = 1
+
+
+def _normalise_polylines(polylines: Iterable[np.ndarray], input_order: str) -> tuple[np.ndarray, np.ndarray]:
+    pieces: list[np.ndarray] = []
+    offsets = [0]
+    for index, polyline in enumerate(polylines):
+        points = np.asarray(polyline, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"Polyline {index} must have shape [N, 3]")
+        if len(points) == 0:
+            raise ValueError(f"Polyline {index} is empty")
+        if not np.isfinite(points).all():
+            raise ValueError(f"Polyline {index} contains non-finite coordinates")
+        if input_order.upper() == "ZYX":
+            points = points[:, ::-1].copy()
+        elif input_order.upper() != "XYZ":
+            raise ValueError("input_order must be XYZ or ZYX")
+        pieces.append(np.asarray(points, dtype="<f4"))
+        offsets.append(offsets[-1] + len(points))
+    flat = np.concatenate(pieces, axis=0) if pieces else np.empty((0, 3), dtype="<f4")
+    return flat, np.asarray(offsets, dtype="<u8")
+
+
+def write_geometry_snapshot(
+    destination: str | os.PathLike[str],
+    categories: Mapping[str, Sequence[np.ndarray]],
+    *,
+    input_order: str = "ZYX",
+    coordinate_identity: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    destination = Path(destination).resolve(strict=False)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp: Path | None = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
+    manifest: dict[str, object] = {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "coordinate_order": "XYZ",
+        "source_coordinate_order": input_order.upper(),
+        "dtype": "float32",
+        "offset_dtype": "uint64",
+        "byte_order": "little",
+        "coordinate_identity": dict(coordinate_identity or {}),
+        "categories": {},
+    }
+    try:
+        for category in sorted(categories):
+            flat, offsets = _normalise_polylines(categories[category], input_order)
+            safe = "".join(character if character.isalnum() or character in "-_" else "_" for character in category)
+            points_name = f"{safe}.points.xyz.f32le"
+            offsets_name = f"{safe}.offsets.u64le"
+            flat.tofile(temp / points_name)
+            offsets.tofile(temp / offsets_name)
+            manifest["categories"][category] = {
+                "points_file": points_name,
+                "offsets_file": offsets_name,
+                "point_count": int(len(flat)),
+                "polyline_count": int(max(0, len(offsets) - 1)),
+            }
+        with (temp / "manifest.json").open("w", encoding="utf-8") as stream:
+            json.dump(manifest, stream, indent=2, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if destination.exists():
+            raise FileExistsError(destination)
+        os.replace(temp, destination)
+        temp = None
+        return manifest
+    finally:
+        if temp is not None and temp.exists():
+            shutil.rmtree(temp, ignore_errors=True)
+
+
+def validate_geometry_snapshot(
+    directory: str | os.PathLike[str],
+    *,
+    max_points: int = 1_000_000_000,
+) -> dict[str, object]:
+    directory = Path(directory)
+    with (directory / "manifest.json").open("r", encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    if manifest.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+        raise ValueError("Unsupported geometry snapshot schema")
+    if (manifest.get("coordinate_order"), manifest.get("dtype"), manifest.get("offset_dtype"), manifest.get("byte_order")) != (
+        "XYZ", "float32", "uint64", "little"
+    ):
+        raise ValueError("Unsupported geometry snapshot encoding")
+    for name, entry in manifest.get("categories", {}).items():
+        point_count = int(entry["point_count"])
+        polyline_count = int(entry["polyline_count"])
+        if point_count < 0 or point_count > max_points or polyline_count < 0 or polyline_count > point_count:
+            raise ValueError(f"Invalid counts for category {name}")
+        points_path = directory / entry["points_file"]
+        offsets_path = directory / entry["offsets_file"]
+        if points_path.stat().st_size != point_count * 3 * 4:
+            raise ValueError(f"Point file size mismatch for category {name}")
+        if offsets_path.stat().st_size != (polyline_count + 1) * 8:
+            raise ValueError(f"Offset file size mismatch for category {name}")
+        offsets = np.memmap(offsets_path, mode="r", dtype="<u8")
+        if not len(offsets) or offsets[0] != 0 or offsets[-1] != point_count or np.any(offsets[1:] < offsets[:-1]):
+            raise ValueError(f"Invalid offsets for category {name}")
+        if np.any(offsets[1:] == offsets[:-1]):
+            raise ValueError(f"Zero-length polyline in category {name}")
+        points = np.memmap(points_path, mode="r", dtype="<f4", shape=(point_count, 3))
+        if not np.isfinite(points).all():
+            raise ValueError(f"Non-finite coordinate in category {name}")
+    return manifest
