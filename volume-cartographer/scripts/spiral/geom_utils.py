@@ -41,6 +41,27 @@ def expm_2x2(L):
     return out
 
 
+@maybe_compile
+def bilinear_atlas_lookup(zyxs_flat, offsets, widths, patch_indices, ijs):
+    """Bilinearly sample packed patch grids at fractional ``(i, j)`` coordinates."""
+    base = offsets[patch_indices]
+    width = widths[patch_indices]
+    ijs = ijs.to(torch.float32)
+    i0 = ijs[..., 0].floor().to(torch.int64)
+    j0 = ijs[..., 1].floor().to(torch.int64)
+    di = (ijs[..., 0] - i0.to(torch.float32)).unsqueeze(-1)
+    dj = (ijs[..., 1] - j0.to(torch.float32)).unsqueeze(-1)
+
+    flat_tl = base + i0 * width + j0
+    tl = zyxs_flat[flat_tl]
+    tr = zyxs_flat[flat_tl + 1]
+    bl = zyxs_flat[flat_tl + width]
+    br = zyxs_flat[flat_tl + width + 1]
+    top = tl + (tr - tl) * dj
+    bottom = bl + (br - bl) * dj
+    return top + (bottom - top) * di
+
+
 def interp1d(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor, dim: int=-1, extrapolate: str='const') -> torch.Tensor:
     # See https://github.com/pytorch/pytorch/issues/50334
     m = (fp[1:] - fp[:-1]) / (xp[1:] - xp[:-1])

@@ -131,6 +131,49 @@ def _progressive_dt_active_mask(snapped_winding, dr_per_winding, dt_max_winding)
     return winding_idx <= dt_max_winding
 
 
+@geom_utils.maybe_compile
+def _masked_all_pairs_l1(p1, p2, mask1, mask2, expected_diff):
+    """Mean ``abs(p2 - p1 - expected_diff)`` over every valid point pair.
+
+    Sorting one side and using prefix sums computes the same all-pairs L1
+    objective in O(P log P) work and O(P) memory per batch item, instead of
+    materialising the O(P**2) broadcast tensors.
+    """
+    num_points = p1.shape[-1]
+    valid_counts1 = mask1.sum(dim=-1)
+    valid_counts2 = mask2.sum(dim=-1)
+
+    # abs(p2 - p1 - expected) == abs(p2 - (p1 + expected)). Invalid
+    # entries sort to the end and are excluded from the prefix sums.
+    shifted_p1 = p1 + expected_diff[:, None]
+    sortable_p1 = torch.where(mask1, shifted_p1, torch.full_like(shifted_p1, torch.inf))
+    sorted_p1 = sortable_p1.sort(dim=-1).values
+    sorted_positions = torch.arange(num_points, device=p1.device)
+    sorted_valid = sorted_positions[None, :] < valid_counts1[:, None]
+    prefix = F.pad(
+        torch.where(sorted_valid, sorted_p1, torch.zeros_like(sorted_p1)).cumsum(dim=-1),
+        (1, 0),
+    )
+
+    # Values strictly below and above p2 contribute their signed distance.
+    # The left/right split deliberately excludes exact ties, matching abs()'s
+    # zero subgradient there.
+    left_count = torch.searchsorted(sorted_p1, p2, right=False)
+    right_begin = torch.searchsorted(sorted_p1, p2, right=True)
+    left_sum = prefix.gather(dim=-1, index=left_count)
+    right_prefix = prefix.gather(dim=-1, index=right_begin)
+    total = prefix.gather(dim=-1, index=valid_counts1[:, None]).squeeze(-1)
+    per_p2_sum = (
+        p2 * left_count - left_sum
+        + (total[:, None] - right_prefix)
+        - p2 * (valid_counts1[:, None] - right_begin)
+    )
+
+    total_error = (per_p2_sum * mask2).sum()
+    num_valid_pairs = (valid_counts1 * valid_counts2).sum()
+    return total_error / num_valid_pairs.clamp(min=1)
+
+
 
 def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng):
     # CPU part of the patch-strip sampler: for each patch, one row strip and
@@ -680,12 +723,8 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
         dr_per_winding,
         [strip_pair[5] for strip_pair in strip_pairs],
     )
-    expected_diff = ((winding_diffs * dr_per_winding) - pcl_seam_adjustments)[:, None, None]
-
-    diff = p2_r[:, :, None] - p1_r[:, None, :]
-    pair_mask = m2[:, :, None] & m1[:, None, :]
-    err = (diff - expected_diff).abs()
-    return (err * pair_mask).sum() / pair_mask.sum().clamp(min=1)
+    expected_diff = (winding_diffs * dr_per_winding) - pcl_seam_adjustments
+    return _masked_all_pairs_l1(p1_r, p2_r, m1, m2, expected_diff)
 
 
 

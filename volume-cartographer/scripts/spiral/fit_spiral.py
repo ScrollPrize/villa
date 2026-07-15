@@ -30,7 +30,7 @@ from ddp_helpers import (
 from lasagna_data import prepare_lasagna_volume
 from checkpoint_io import load_checkpoint_cpu
 from tifxyz import load_tifxyz
-from geom_utils import interp1d
+from geom_utils import bilinear_atlas_lookup, interp1d
 from point_collection import (
     link_points_to_patches,
     load_point_collection,
@@ -396,25 +396,13 @@ class PatchGpuAtlas:
         # patch_idx_per_sample: (...,) int64 on GPU
         # ijs: (..., 2) float on GPU
         # returns (..., 3) on GPU. Caller must ensure floor(ij) lies on a valid quad.
-        base = self.offsets[patch_idx_per_sample]
-        W = self.widths[patch_idx_per_sample]
-        ij = ijs.to(torch.float32)
-        i0 = ij[..., 0].floor().to(torch.int64)
-        j0 = ij[..., 1].floor().to(torch.int64)
-        di = (ij[..., 0] - i0.to(torch.float32)).unsqueeze(-1)
-        dj = (ij[..., 1] - j0.to(torch.float32)).unsqueeze(-1)
-        flat_tl = base + i0 * W + j0
-        flat_tr = flat_tl + 1
-        flat_bl = flat_tl + W
-        flat_br = flat_bl + 1
-        z = self.zyxs_flat
-        tl = z[flat_tl]
-        tr = z[flat_tr]
-        bl = z[flat_bl]
-        br = z[flat_br]
-        top = tl + (tr - tl) * dj
-        bottom = bl + (br - bl) * dj
-        return top + (bottom - top) * di
+        return bilinear_atlas_lookup(
+            self.zyxs_flat,
+            self.offsets,
+            self.widths,
+            patch_idx_per_sample,
+            ijs,
+        )
 
 
 class _UnattachedPclStripList(list):

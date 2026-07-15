@@ -1,8 +1,9 @@
 """Equivalence tests for the fit-speedup changes.
 
 Each test compares the optimised code path against an inline copy of the
-pre-change implementation and requires bitwise-identical outputs (the changes
-only reorder *what is cached/batched*, never the per-point math).
+pre-change implementation. Cache/batching changes require bitwise identity;
+fused or algebraically equivalent kernels use tight tolerances for expected
+floating-point reassociation differences.
 
 Run from scripts/spiral with the opt versions of transforms.py / losses.py in
 place:  python -m pytest <this file> -v   (or unittest main).
@@ -15,8 +16,17 @@ import torch.nn.functional as F
 
 from transforms import GapExpanderParams, GapExpandingTransform, IntegratedFlowDiffeomorphism
 from flow_fields import CartesianFlowField
-from losses import _batched_pcl_chain_seam_adjustments, _unwrap_track_shifted_radii
+from geom_utils import bilinear_atlas_lookup
+from losses import (
+    _batched_pcl_chain_seam_adjustments,
+    _masked_all_pairs_l1,
+    _unwrap_track_shifted_radii,
+)
 from sample_spiral import get_theta_and_radii
+from tracks import (
+    _same_radius_loss_for_shifted_radii,
+    _unwrap_track_shifted_radii as _unwrap_main_track_shifted_radii,
+)
 
 
 class _ReferenceGapExpandingTransform(GapExpandingTransform):
@@ -126,6 +136,107 @@ class BatchedChainSeamAdjustmentTests(unittest.TestCase):
         reference = self._reference(transform, dr, chains)
         self.assertFalse(batched.requires_grad)
         self.assertTrue(torch.equal(batched, reference))
+
+
+class MaskedAllPairsL1Tests(unittest.TestCase):
+    @staticmethod
+    def _reference(p1, p2, mask1, mask2, expected_diff):
+        diff = p2[:, :, None] - p1[:, None, :]
+        pair_mask = mask2[:, :, None] & mask1[:, None, :]
+        error = (diff - expected_diff[:, None, None]).abs()
+        return (error * pair_mask).sum() / pair_mask.sum().clamp(min=1)
+
+    def test_values_and_gradients_match_quadratic_reference(self):
+        torch.manual_seed(31)
+        p1 = torch.randn(5, 29, requires_grad=True)
+        p2 = torch.randn(5, 29, requires_grad=True)
+        expected = torch.randn(5, requires_grad=True)
+        mask1 = torch.rand(5, 29) > 0.25
+        mask2 = torch.rand(5, 29) > 0.2
+        reference = self._reference(p1, p2, mask1, mask2, expected)
+        reference_grads = torch.autograd.grad(reference, (p1, p2, expected))
+        actual = _masked_all_pairs_l1(p1, p2, mask1, mask2, expected)
+        actual_grads = torch.autograd.grad(actual, (p1, p2, expected))
+
+        torch.testing.assert_close(actual, reference, rtol=1e-6, atol=1e-6)
+        for actual_grad, reference_grad in zip(actual_grads, reference_grads):
+            torch.testing.assert_close(actual_grad, reference_grad, rtol=1e-5, atol=1e-7)
+
+    def test_empty_mask_returns_zero_with_zero_gradients(self):
+        p1 = torch.randn(2, 7, requires_grad=True)
+        p2 = torch.randn(2, 7, requires_grad=True)
+        expected = torch.randn(2, requires_grad=True)
+        mask1 = torch.zeros(2, 7, dtype=torch.bool)
+        mask2 = torch.ones(2, 7, dtype=torch.bool)
+
+        loss = _masked_all_pairs_l1(p1, p2, mask1, mask2, expected)
+        grads = torch.autograd.grad(loss, (p1, p2, expected))
+        self.assertEqual(loss.item(), 0.0)
+        for grad in grads:
+            self.assertEqual(torch.count_nonzero(grad).item(), 0)
+
+
+class BilinearAtlasLookupTests(unittest.TestCase):
+    @staticmethod
+    def _reference(zyxs_flat, offsets, widths, patch_indices, ijs):
+        base = offsets[patch_indices]
+        width = widths[patch_indices]
+        i0 = ijs[..., 0].floor().to(torch.int64)
+        j0 = ijs[..., 1].floor().to(torch.int64)
+        di = (ijs[..., 0] - i0.to(torch.float32)).unsqueeze(-1)
+        dj = (ijs[..., 1] - j0.to(torch.float32)).unsqueeze(-1)
+        flat_tl = base + i0 * width + j0
+        tl = zyxs_flat[flat_tl]
+        tr = zyxs_flat[flat_tl + 1]
+        bl = zyxs_flat[flat_tl + width]
+        br = zyxs_flat[flat_tl + width + 1]
+        top = tl + (tr - tl) * dj
+        bottom = bl + (br - bl) * dj
+        return top + (bottom - top) * di
+
+    def test_packed_lookup_matches_original_arithmetic(self):
+        torch.manual_seed(32)
+        height, width, num_patches = 7, 9, 4
+        patch_size = height * width
+        zyxs_flat = torch.randn(num_patches * patch_size, 3)
+        offsets = torch.arange(num_patches + 1, dtype=torch.int64) * patch_size
+        widths = torch.full((num_patches,), width, dtype=torch.int64)
+        patch_indices = torch.randint(num_patches, (3, 5))
+        ijs = torch.rand(3, 5, 2) * torch.tensor([height - 1.01, width - 1.01])
+
+        actual = bilinear_atlas_lookup(zyxs_flat, offsets, widths, patch_indices, ijs)
+        reference = self._reference(zyxs_flat, offsets, widths, patch_indices, ijs)
+        self.assertTrue(torch.equal(actual, reference))
+
+
+class CompiledTrackTensorHelperTests(unittest.TestCase):
+    def test_main_track_unwrap_matches_shared_loss_helper(self):
+        torch.manual_seed(33)
+        theta = torch.rand(13, 24) * (2 * torch.pi)
+        shifted = torch.randn(13, 24, requires_grad=True)
+        dr = torch.tensor(16.0, requires_grad=True)
+        actual = _unwrap_main_track_shifted_radii(theta, shifted, dr)
+        reference = _unwrap_track_shifted_radii(theta, shifted, dr)
+        self.assertTrue(torch.equal(actual, reference))
+
+    def test_radius_reducer_matches_reference_for_mean_and_median(self):
+        torch.manual_seed(34)
+        shifted = torch.randn(41, 24, requires_grad=True)
+        dr = torch.tensor(16.0, requires_grad=True)
+        for target in ('mean', 'median'):
+            cfg = {
+                'track_radius_loss_margin': 0.025,
+                'track_radius_target': target,
+                'track_radius_within_norm_p': 6.0,
+            }
+            if target == 'mean':
+                centre = shifted.mean(dim=-1, keepdim=True)
+            else:
+                centre = shifted.median(dim=-1, keepdim=True).values
+            hinged = F.relu((shifted - centre).abs() - dr.detach() * 0.025)
+            reference = (((hinged + 1.e-5) ** 6.0).mean(dim=-1) ** (1.0 / 6.0)).mean()
+            actual = _same_radius_loss_for_shifted_radii(shifted, dr, cfg)
+            torch.testing.assert_close(actual, reference, rtol=1e-6, atol=1e-7)
 
 
 class SparseSamplerConstCacheTests(unittest.TestCase):

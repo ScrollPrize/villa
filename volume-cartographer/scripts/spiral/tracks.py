@@ -11,6 +11,7 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 import prefetch
+import geom_utils
 from sample_spiral import get_theta_and_radii
 
 
@@ -42,6 +43,7 @@ def load_tracks_from_dbm(path, z_lo, z_hi):
     return tracks
 
 
+@geom_utils.maybe_compile
 def _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding):
     if theta.shape[-1] <= 1:
         return shifted_radii
@@ -471,21 +473,38 @@ def _sample_prepared_track_points(prepared_tracks, num_tracks_per_step, num_poin
     return _draw_track_sample(prepared_tracks, k, num_points_per_track)
 
 
-def _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding, cfg):
-    radius_hinge_margin = dr_per_winding.detach() * cfg['track_radius_loss_margin']
-    if cfg['track_radius_target'] == 'mean':
-        radius_target_per_track = shifted_radii.mean(dim=-1, keepdim=True)
-    elif cfg['track_radius_target'] == 'median':
+@geom_utils.maybe_compile
+def _same_radius_loss_tensor(
+    shifted_radii,
+    dr_per_winding,
+    use_median_target,
+    radius_loss_margin,
+    within_p,
+):
+    radius_hinge_margin = dr_per_winding.detach() * radius_loss_margin
+    if use_median_target:
         radius_target_per_track = shifted_radii.median(dim=-1, keepdim=True).values
     else:
-        raise ValueError(f"track_radius_target must be 'mean' or 'median', got {cfg['track_radius_target']!r}")
+        radius_target_per_track = shifted_radii.mean(dim=-1, keepdim=True)
     deviations = (shifted_radii - radius_target_per_track).abs()
     hinged = F.relu(deviations - radius_hinge_margin)
-    within_p = cfg['track_radius_within_norm_p']
     if within_p == 1.0:
         return hinged.mean()
     per_track = ((hinged + 1.e-5) ** within_p).mean(dim=-1) ** (1.0 / within_p)
     return per_track.mean()
+
+
+def _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding, cfg):
+    target = cfg['track_radius_target']
+    if target not in ('mean', 'median'):
+        raise ValueError(f"track_radius_target must be 'mean' or 'median', got {target!r}")
+    return _same_radius_loss_tensor(
+        shifted_radii,
+        dr_per_winding,
+        target == 'median',
+        cfg['track_radius_loss_margin'],
+        cfg['track_radius_within_norm_p'],
+    )
 
 
 def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_max_winding=None):
