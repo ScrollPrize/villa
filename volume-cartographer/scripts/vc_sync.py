@@ -687,7 +687,14 @@ class S3SyncManager:
         ok = self._run_rclone(['copy', self.local_dir, self._rclone_remote()],
                               list(pre_stats))
         if not ok:
-            print("  ⚠️  rclone reported errors during upload; verifying what was transferred")
+            # Don't advance tracking on a partial failure: a same-size stale
+            # remote object would pass the size check below and the file would
+            # then be recorded as in sync, permanently skipping the re-upload.
+            # Leaving tracking unchanged re-schedules every file next sync;
+            # rclone skips the ones that did transfer, so the retry is cheap.
+            print(f"  ❌ rclone reported errors during upload; tracking left "
+                  f"unchanged for all {len(pre_stats)} files, will retry on next sync")
+            return 0
 
         for path, (size, mtime) in pre_stats.items():
             try:
@@ -727,7 +734,12 @@ class S3SyncManager:
         print(f"  Downloading {len(paths)} files ({self.RCLONE_TRANSFERS} parallel transfers)...")
         ok = self._run_rclone(['copy', self._rclone_remote(), self.local_dir], paths)
         if not ok:
-            print("  ⚠️  rclone reported errors during download; verifying what was transferred")
+            # Mirror of the upload case: a same-size stale local file would
+            # pass the size check and be recorded as in sync with the new
+            # remote ETag, permanently skipping the re-download
+            print(f"  ❌ rclone reported errors during download; tracking left "
+                  f"unchanged for all {len(paths)} files, will retry on next sync")
+            return 0
 
         success_count = 0
         with self._get_db() as conn:
