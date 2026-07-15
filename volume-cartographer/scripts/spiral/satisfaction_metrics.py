@@ -24,15 +24,15 @@ metrics_config = {
 }
 
 
-def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches, z_begin, z_end, verbose=False):
+def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches, z_begin, z_end, verbose=False, metrics_overrides=None):
     """Per-patch satisfaction metrics.
 
     Returns ``(satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks,
     boundary_satisfied_count, target_winding_idx_per_patch)``: a bool flag per patch
-    indicating whether at least ``metrics_config['satisfied_patch_quad_fraction']`` of
+    indicating whether at least ``satisfied_patch_quad_fraction`` of
     its valid quads are satisfied, the satisfied/total area tensors, the per-patch
     (H-1, W-1) bool quad masks, a bool flag per patch indicating whether at least
-    ``metrics_config['boundary_satisfied_patch_quad_fraction']`` of its boundary quads
+    ``boundary_satisfied_patch_quad_fraction`` of its boundary quads
     (in-ROI valid quads with at least one 4-neighbor that is out-of-bounds or not
     in-ROI-valid) are satisfied, and the per-patch (H-1, W-1) int64 winding-index
     tensors (the integer output-mesh winding each quad's snap-target sits on; -1 where
@@ -53,9 +53,15 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
     (b) the absolute scan-space distance tolerance of
     `satisfaction_distance_tolerance` voxels to the corresponding point on the target
     winding.
+
+    ``metrics_overrides`` optionally overrides individual ``metrics_config`` entries
+    for this call only (e.g. looser thresholds for splicing decisions).
     """
-    spiral_tolerance = dr_per_winding.detach() * metrics_config['satisfaction_radius_tolerance']
-    scan_tolerance = metrics_config['satisfaction_distance_tolerance']
+    thresholds = dict(metrics_config)
+    if metrics_overrides:
+        thresholds.update(metrics_overrides)
+    spiral_tolerance = dr_per_winding.detach() * thresholds['satisfaction_radius_tolerance']
+    scan_tolerance = thresholds['satisfaction_distance_tolerance']
     dr = dr_per_winding.detach()
     device = dr_per_winding.device
 
@@ -292,11 +298,11 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
                 continue
             num_satisfied_quads = int(satisfied_quad_mask.sum().item())
             satisfied_areas[patch_index] = float(patch.area) * num_satisfied_quads / max(total_full_valid_quads, 1)
-            satisfied_patches[patch_index] = num_satisfied_quads >= metrics_config['satisfied_patch_quad_fraction'] * total_valid_quads
+            satisfied_patches[patch_index] = num_satisfied_quads >= thresholds['satisfied_patch_quad_fraction'] * total_valid_quads
             num_boundary_quads = int(boundary_quad_mask.sum().item())
             if num_boundary_quads > 0:
                 num_satisfied_boundary_quads = int((boundary_quad_mask & satisfied_quad_mask).sum().item())
-                boundary_satisfied_patches[patch_index] = num_satisfied_boundary_quads >= metrics_config['boundary_satisfied_patch_quad_fraction'] * num_boundary_quads
+                boundary_satisfied_patches[patch_index] = num_satisfied_boundary_quads >= thresholds['boundary_satisfied_patch_quad_fraction'] * num_boundary_quads
 
     return satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch
 
@@ -657,9 +663,10 @@ def save_overlay_and_print_satisfaction(
             render_volume_scale=render_volume_scale,
         )
     if os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1':
-        def get_patch_satisfied_areas_for_mesh(transform, winding_delta, patches, verbose=False):
+        def get_patch_satisfied_areas_for_mesh(transform, winding_delta, patches, verbose=False, metrics_overrides=None):
             return get_patch_satisfied_areas(
                 transform, winding_delta, patches, z_begin, z_end, verbose=verbose,
+                metrics_overrides=metrics_overrides,
             )
 
         save_mesh(
