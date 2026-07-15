@@ -7,34 +7,12 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Iterable, Mapping, Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
 
 SNAPSHOT_SCHEMA_VERSION = 1
-
-
-def _normalise_polylines(polylines: Iterable[np.ndarray], input_order: str) -> tuple[np.ndarray, np.ndarray]:
-    pieces: list[np.ndarray] = []
-    offsets = [0]
-    for index, polyline in enumerate(polylines):
-        points = np.asarray(polyline, dtype=np.float32)
-        if points.ndim != 2 or points.shape[1] != 3:
-            raise ValueError(f"Polyline {index} must have shape [N, 3]")
-        if len(points) == 0:
-            raise ValueError(f"Polyline {index} is empty")
-        if not np.isfinite(points).all():
-            raise ValueError(f"Polyline {index} contains non-finite coordinates")
-        if input_order.upper() == "ZYX":
-            points = points[:, ::-1].copy()
-        elif input_order.upper() != "XYZ":
-            raise ValueError("input_order must be XYZ or ZYX")
-        pieces.append(np.asarray(points, dtype="<f4"))
-        offsets.append(offsets[-1] + len(points))
-    flat = np.concatenate(pieces, axis=0) if pieces else np.empty((0, 3), dtype="<f4")
-    return flat, np.asarray(offsets, dtype="<u8")
-
 
 def write_geometry_snapshot(
     destination: str | os.PathLike[str],
@@ -58,17 +36,50 @@ def write_geometry_snapshot(
     }
     try:
         for category in sorted(categories):
-            flat, offsets = _normalise_polylines(categories[category], input_order)
             safe = "".join(character if character.isalnum() or character in "-_" else "_" for character in category)
             points_name = f"{safe}.points.xyz.f32le"
             offsets_name = f"{safe}.offsets.u64le"
-            flat.tofile(temp / points_name)
-            offsets.tofile(temp / offsets_name)
+            point_count = 0
+            polyline_count = 0
+            offset_buffer = np.empty(65_536, dtype="<u8")
+            buffered_offsets = 1
+            offset_buffer[0] = 0
+            # Write one polyline at a time.  Building reversed-coordinate pieces
+            # and concatenating the complete category used two additional full
+            # point-cloud copies during the resident fitter's VC3D handoff.
+            with (
+                (temp / points_name).open("wb") as points_stream,
+                (temp / offsets_name).open("wb") as offsets_stream,
+            ):
+                for index, polyline in enumerate(categories[category]):
+                    points = np.asarray(polyline, dtype=np.float32)
+                    if points.ndim != 2 or points.shape[1] != 3:
+                        raise ValueError(f"Polyline {index} must have shape [N, 3]")
+                    if len(points) == 0:
+                        raise ValueError(f"Polyline {index} is empty")
+                    if not np.isfinite(points).all():
+                        raise ValueError(f"Polyline {index} contains non-finite coordinates")
+                    if input_order.upper() == "ZYX":
+                        output_points = np.ascontiguousarray(points[:, ::-1], dtype="<f4")
+                    elif input_order.upper() == "XYZ":
+                        output_points = np.ascontiguousarray(points, dtype="<f4")
+                    else:
+                        raise ValueError("input_order must be XYZ or ZYX")
+                    output_points.tofile(points_stream)
+                    point_count += len(output_points)
+                    polyline_count += 1
+                    offset_buffer[buffered_offsets] = point_count
+                    buffered_offsets += 1
+                    if buffered_offsets == len(offset_buffer):
+                        offset_buffer.tofile(offsets_stream)
+                        buffered_offsets = 0
+                if buffered_offsets:
+                    offset_buffer[:buffered_offsets].tofile(offsets_stream)
             manifest["categories"][category] = {
                 "points_file": points_name,
                 "offsets_file": offsets_name,
-                "point_count": int(len(flat)),
-                "polyline_count": int(max(0, len(offsets) - 1)),
+                "point_count": int(point_count),
+                "polyline_count": int(polyline_count),
             }
         with (temp / "manifest.json").open("w", encoding="utf-8") as stream:
             json.dump(manifest, stream, indent=2, sort_keys=True)

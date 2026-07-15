@@ -7,7 +7,7 @@ from PIL import Image
 from typing import Optional, Union, Literal
 from einops import rearrange
 import torch.nn.functional as F
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -17,6 +17,9 @@ class Patch:
     overlapping_ids: Optional[list[str]]  # None implies no overlapping.json (hence unknown overlaps)
     winding: Optional[Union[Literal['single'], torch.Tensor]]  # None means no winding.tif found
     uuid: Optional[str] = None
+    _valid_vertex_indices: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
+    _valid_quad_indices: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
+    _valid_zyxs: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
 
     def _get_face_indices(self):
         h, w = self.zyxs.shape[:2]
@@ -32,13 +35,35 @@ class Patch:
 
     def __post_init__(self):
         self.valid_vertex_mask = torch.any(self.zyxs != -1, dim=-1)
-        self.valid_vertex_indices = torch.stack(torch.where(self.valid_vertex_mask), dim=-1)
         # In valid_quad_mask, the ij'th element says whether all four corners of the quad with min-corner at vertex ij are valid
         self.valid_quad_mask = self.valid_vertex_mask[:-1, :-1] & self.valid_vertex_mask[1:, :-1] & self.valid_vertex_mask[:-1, 1:] & self.valid_vertex_mask[1:, 1:]
-        self.valid_quad_indices = torch.stack(torch.where(self.valid_quad_mask), dim=-1)
-        assert len(self.valid_quad_indices) > 0
+        assert bool(self.valid_quad_mask.any())
         self.area = (self.valid_quad_mask).sum() * (1 / self.scale).prod()
-        self.valid_zyxs = self.zyxs[self.valid_vertex_mask]
+        self.release_derived_caches()
+
+    @property
+    def valid_vertex_indices(self):
+        if self._valid_vertex_indices is None:
+            self._valid_vertex_indices = torch.stack(torch.where(self.valid_vertex_mask), dim=-1)
+        return self._valid_vertex_indices
+
+    @property
+    def valid_quad_indices(self):
+        if self._valid_quad_indices is None:
+            self._valid_quad_indices = torch.stack(torch.where(self.valid_quad_mask), dim=-1)
+        return self._valid_quad_indices
+
+    @property
+    def valid_zyxs(self):
+        if self._valid_zyxs is None:
+            self._valid_zyxs = self.zyxs[self.valid_vertex_mask]
+        return self._valid_zyxs
+
+    def release_derived_caches(self):
+        """Release tensors reproducible from ``zyxs`` and the validity masks."""
+        self._valid_vertex_indices = None
+        self._valid_quad_indices = None
+        self._valid_zyxs = None
 
     def ij_to_zyx(self, ij: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Bilinearly interpolate zyx coordinates at fractional (i, j) pixel locations.

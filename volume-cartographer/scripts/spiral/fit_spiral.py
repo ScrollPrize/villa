@@ -27,6 +27,7 @@ from ddp_helpers import (
     split_counts_across_ranks,
 )
 from lasagna_data import prepare_lasagna_volume
+from checkpoint_io import load_checkpoint_cpu
 from tifxyz import load_tifxyz
 from geom_utils import interp1d
 from point_collection import (
@@ -35,8 +36,8 @@ from point_collection import (
     normalise_pcl_winding_annotations,
 )
 from tracks import (
-    get_track_losses,
     get_track_satisfied_counts_in_chunks,
+    iter_track_losses,
     load_tracks_from_dbm,
     prepare_main_phase_tracks,
 )
@@ -48,7 +49,7 @@ from sample_spiral import (
 )
 from losses import (
     configure_losses,
-    get_lasagna_losses,
+    iter_lasagna_losses,
     get_patch_abs_winding_loss,
     get_patch_and_umbilicus_losses,
     get_patch_rel_winding_loss,
@@ -572,6 +573,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             if not patch_intersects_z_roi(patch, z_begin, z_end):
                 del patches[patch_id]
                 continue
+            # ROI testing may materialise the compact valid-coordinate view.
+            # Training retains the base grid and masks, so regenerate this view
+            # lazily only for a later exporter that actually requests it.
+            patch.release_derived_caches()
 
     # ==========================================================================
     # Point collection loading
@@ -783,6 +788,12 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     )
     if load_only_patches_and_point_collections:
         return verified_patches, unverified_patches, shell_patch, cross_patch_pcls, unattached_pcl_strips
+
+    # The strip arrays and cross-patch list are the compact training forms.
+    # Drop the JSON-shaped source containers, especially the independent deep
+    # copies made for PCLs that participate in both loss families.
+    del point_collections, fiber_point_collections
+    del unattached_point_collections, cross_patch_point_collections
 
     # ==========================================================================
     # lasagna and tracks loading
@@ -1144,7 +1155,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     resume_checkpoint = None
     model_z_begin, model_z_end = z_begin, z_end
     if resume_path:
-        resume_checkpoint = torch.load(resume_path, map_location='cpu', weights_only=False)
+        resume_checkpoint = load_checkpoint_cpu(resume_path)
         checkpoint_lasagna_scale = resume_checkpoint.get('lasagna_scale') if isinstance(resume_checkpoint, dict) else None
         if checkpoint_lasagna_scale != lasagna_scale:
             raise RuntimeError(
@@ -1345,10 +1356,15 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 torch.random.set_rng_state(resume_checkpoint['torch_cpu_rng_state'])
             if resume_checkpoint.get('torch_cuda_rng_states') is not None:
                 torch.cuda.set_rng_state_all(resume_checkpoint['torch_cuda_rng_states'])
+        # load_state_dict has moved the model and optimiser state to their
+        # destination tensors.  Release the CPU-side archive mappings before
+        # entering the resident training loop.
+        del resume_checkpoint
+        resume_checkpoint = None
 
     broadcast_model_params(spiral_and_transform)
 
-    if False:
+    if os.environ.get('FIT_SPIRAL_TORCH_PROFILE') == '1':
         profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             schedule=torch.profiler.schedule(wait=5, warmup=2, active=2, repeat=1),
@@ -1375,12 +1391,18 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             anchor_tree=trusted_geometry_tree,
         )
         # With the usual zero exclusion radius, the training bundle already
-        # contains every authoritative track point as one GPU tensor.  Reuse it
+        # contains every authoritative track point as one flat CPU tensor.  Reuse it
         # for preview bounds instead of walking millions of short NumPy tracks.
         if prepared_main_tracks is not None:
             input_track_points = sum(len(track) for track in tracks)
             if prepared_main_tracks['flat_zyx_cpu'].shape[0] == input_track_points:
                 preview_extent_tracks = (prepared_main_tracks['flat_zyx_cpu'],)
+
+    # The trusted cloud and its double-precision cKDTree are setup-only data.
+    # Track sampling retains its own compact offsets and coordinates.
+    trusted_geometry_tree = None
+    verified_patches_and_pcls_cpu = None
+    verified_patches_and_pcls_np = None
 
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
     dr_per_winding = spiral_and_transform.get_dr_per_winding()
@@ -1446,6 +1468,12 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             snapshot_categories['tracks'] = [np.asarray(track, dtype=np.float32) for track in tracks if len(track)]
         geometry_path = os.path.join(out_path, '.spiral-geometry', f'generation-{time.time_ns()}')
         write_geometry_snapshot(geometry_path, snapshot_categories, input_order='ZYX')
+        del snapshot_categories
+        # In the usual zero-exclusion case preview bounds reuse the prepared
+        # flat tensor, so the original list of per-track arrays is no longer
+        # needed after the one-time VC3D geometry handoff.
+        if preview_extent_tracks is not tracks:
+            tracks = None
         interactive_driver.on_ready(
             completed_iterations=start_iteration,
             session_horizon=num_training_steps,
@@ -1583,18 +1611,22 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             (cfg['loss_weight_dense_normals'] > 0 or cfg['loss_weight_dense_spacing'] > 0)
             and lasagna_volume is not None
         ):
-            dense_loss_values = get_lasagna_losses(
+            for dense_loss_name, dense_loss_value in iter_lasagna_losses(
                 slice_to_spiral_transform,
                 dr_per_winding,
                 lasagna_volume,
                 shell_outer_winding_idx,
                 cfg['dense_normals_num_points'],
-            )
-            backward_family({
-                'dense_normals': dense_loss_values[0] * cfg['loss_weight_dense_normals'],
-                'dense_spacing': dense_loss_values[1] * cfg['loss_weight_dense_spacing'],
-            })
-            del dense_loss_values
+            ):
+                weight = (
+                    cfg['loss_weight_dense_normals']
+                    if dense_loss_name == 'dense_normals'
+                    else cfg['loss_weight_dense_spacing']
+                )
+                backward_family({dense_loss_name: dense_loss_value * weight})
+                # Release before the generator builds the next loss's graph,
+                # or both large transform graphs are resident at peak.
+                del dense_loss_value
             if lasagna_volume.get('backend') == 'mmap':
                 log_metrics.update({
                     f'lasagna_{name}': value
@@ -1622,19 +1654,23 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             del unattached_loss_values
 
         if prepared_main_tracks is not None:
-            track_loss_values = get_track_losses(
+            for track_loss_name, track_loss_value in iter_track_losses(
                 slice_to_spiral_transform,
                 dr_per_winding,
                 prepared_main_tracks,
                 cfg,
                 compute_dt=compute_track_dt,
                 dt_max_winding=track_dt_max_winding,
-            )
-            backward_family({
-                'track_radius': track_loss_values[0] * cfg['loss_weight_track_radius'],
-                'track_dt': track_loss_values[1] * cfg['loss_weight_track_dt'],
-            })
-            del track_loss_values
+            ):
+                weight = (
+                    cfg['loss_weight_track_radius']
+                    if track_loss_name == 'track_radius'
+                    else cfg['loss_weight_track_dt']
+                )
+                backward_family({track_loss_name: track_loss_value * weight})
+                # Release before the generator builds the next loss's graph,
+                # or both large transform graphs are resident at peak.
+                del track_loss_value
 
         shell_metrics = {}
         if shell_map is not None:

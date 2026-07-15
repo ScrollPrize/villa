@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 
+import geom_utils
+
 
 def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_winding=False, device='cuda'):
 
@@ -65,6 +67,7 @@ def get_theta(relative_yx):
     return theta, relative_yx
 
 
+@geom_utils.maybe_compile
 def get_theta_and_radii(relative_yx, dr_per_winding):
     theta, relative_yx = get_theta(relative_yx)
     radius = torch.linalg.norm(relative_yx, dim=-1)

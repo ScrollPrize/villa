@@ -95,10 +95,16 @@ class InteractiveFitSession:
 
             config = dict(fitter.default_config)
             if self.paths.checkpoint:
-                import torch
-                checkpoint_config = torch.load(self.paths.checkpoint, map_location='cpu', weights_only=False)
-                if isinstance(checkpoint_config, dict) and isinstance(checkpoint_config.get('cfg'), Mapping):
-                    config.update(dict(checkpoint_config['cfg']))
+                from checkpoint_io import load_checkpoint_cpu
+                checkpoint_config = load_checkpoint_cpu(self.paths.checkpoint)
+                try:
+                    if isinstance(checkpoint_config, dict) and isinstance(checkpoint_config.get('cfg'), Mapping):
+                        config.update(dict(checkpoint_config['cfg']))
+                finally:
+                    # This first load exists only to resolve configuration.  Do
+                    # not retain a complete model + optimiser checkpoint for the
+                    # lifetime of the resident fitter thread.
+                    del checkpoint_config
             unknown = sorted(set(self.run_config.config) - set(config))
             if unknown:
                 raise ValueError(f"Unknown advanced config keys: {unknown}")

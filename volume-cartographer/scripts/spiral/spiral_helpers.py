@@ -14,8 +14,8 @@ from tifxyz import load_tifxyz, save_tifxyz, save_combined_tifxyz
 def scale_patch(patch, downsample_factor):
     patch.scale *= downsample_factor
     patch.zyxs /= downsample_factor
-    patch.valid_zyxs /= downsample_factor
     patch.area /= downsample_factor ** 2
+    patch.release_derived_caches()
 
 
 def patch_intersects_z_roi(patch, z_begin, z_end):

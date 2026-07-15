@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path
 import shutil
@@ -89,6 +90,18 @@ class LasagnaMmapStore:
         self._staging_lock = threading.Lock()
         self._normal_staging = None
         self._grad_staging = None
+        self.drop_pages_after_gather = os.environ.get(
+            "FIT_SPIRAL_MMAP_DROP_PAGES", "1"
+        ).strip().lower() not in {"0", "false", "no"}
+        # These files are sampled sparsely across a very large ROI.  Disable
+        # sequential readahead, which otherwise brings unrelated neighbouring
+        # pages into the resident set.
+        if hasattr(mmap, "MADV_RANDOM"):
+            for array in (self.normals, self.grad_mag):
+                try:
+                    array._mmap.madvise(mmap.MADV_RANDOM)
+                except (AttributeError, OSError, ValueError):
+                    pass
         self.last_timings = {}
 
     @property
@@ -105,6 +118,15 @@ class LasagnaMmapStore:
 
     def close(self):
         self._pool.shutdown(wait=True, cancel_futures=True)
+
+    def _drop_resident_pages(self):
+        if not self.drop_pages_after_gather or not hasattr(mmap, "MADV_DONTNEED"):
+            return
+        for array in (self.normals, self.grad_mag):
+            try:
+                array._mmap.madvise(mmap.MADV_DONTNEED)
+            except (AttributeError, OSError, ValueError):
+                pass
 
     def _parallel_gather(self, array, indices, channels=None):
         indices = np.ascontiguousarray(indices, dtype=np.int64).reshape(-1, 3)
@@ -150,8 +172,14 @@ class LasagnaMmapStore:
         for request in requests:
             request.result()
         after_gather = time.perf_counter()
+        # Outputs own their bytes now.  The next step samples an almost entirely
+        # different random set, so retaining all faulted file pages grows RSS
+        # with little cache benefit.  Set FIT_SPIRAL_MMAP_DROP_PAGES=0 to retain
+        # the kernel-selected working set on a machine with abundant RAM.
+        self._drop_resident_pages()
+        after_eviction = time.perf_counter()
         with self._staging_lock:
-            pinned = torch.cuda.is_available()
+            pinned = torch.device(device).type == "cuda" and torch.cuda.is_available()
             if self._normal_staging is None or self._normal_staging.shape != normal_values.shape:
                 self._normal_staging = torch.empty(normal_values.shape, dtype=torch.uint8, pin_memory=pinned)
             if self._grad_staging is None or self._grad_staging.shape != grad_values.shape:
@@ -164,7 +192,8 @@ class LasagnaMmapStore:
         self.last_timings = {
             "index_gpu_to_cpu_seconds": after_indices - start,
             "gather_seconds": after_gather - after_indices,
-            "staging_and_async_copy_seconds": after_copy - after_gather,
+            "cache_eviction_seconds": after_eviction - after_gather,
+            "staging_and_async_copy_seconds": after_copy - after_eviction,
         }
         return normal_gpu, grad_gpu
 

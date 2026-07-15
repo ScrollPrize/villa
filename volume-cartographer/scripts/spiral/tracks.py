@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
+import prefetch
 from sample_spiral import get_theta_and_radii
 
 
@@ -341,6 +342,41 @@ def prepare_main_phase_tracks(tracks, anchor_scroll_zyxs, exclusion_radius, devi
     print('removing tracks near patches')
     if anchor_tree is None:
         anchor_tree = _build_anchor_kdtree(anchor_scroll_zyxs)
+
+    # The common configuration has no exclusion radius.  The generic path
+    # below creates several point-count-sized int64 arrays and stable-sorts the
+    # already grouped tracks; none of that changes the result when every point
+    # is kept.  Concatenate only the surviving (length >= 2) tracks directly.
+    if exclusion_radius <= 0 or anchor_tree is None:
+        surviving_tracks = [
+            np.asarray(track, dtype=np.float32)
+            for track in tracks
+            if len(track) >= 2
+        ]
+        print(f'kept {len(surviving_tracks)} / {len(tracks)} tracks')
+        if not surviving_tracks:
+            return None
+        lengths_new = np.fromiter(
+            (len(track) for track in surviving_tracks),
+            dtype=np.int64,
+            count=len(surviving_tracks),
+        )
+        flat_zyx_np = np.concatenate(surviving_tracks, axis=0)
+        offsets_new = np.empty(len(lengths_new) + 1, dtype=np.int64)
+        offsets_new[0] = 0
+        np.cumsum(lengths_new, out=offsets_new[1:])
+        print(
+            f'track radius loss: {len(surviving_tracks)}/{len(tracks)} tracks survive exclusion '
+            f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
+        )
+        return {
+            'flat_zyx_cpu': torch.from_numpy(flat_zyx_np).contiguous(),
+            'offsets': torch.from_numpy(offsets_new).to(device=device),
+            'lengths': torch.from_numpy(lengths_new).to(device=device),
+            'device': torch.device(device),
+            'staging': None,
+        }
+
     flat_zyx_np = np.concatenate([t.astype(np.float32) for t in tracks], axis=0)
     track_id_np = np.concatenate([
         np.full(len(t), i, dtype=np.int64) for i, t in enumerate(tracks)
@@ -381,21 +417,21 @@ def prepare_main_phase_tracks(tracks, anchor_scroll_zyxs, exclusion_radius, devi
     }
 
 
-def _sample_prepared_track_points(prepared_tracks, num_tracks_per_step, num_points_per_track):
+def _draw_track_sample(prepared_tracks, k, num_points_per_track, generator=None):
+    # GPU index math, one forced D2H of the flat indices, the big host-side
+    # coordinate gather, and the H2D upload. Under prefetch this runs on the
+    # worker thread for the next step, so the syncs stall the worker rather
+    # than the training loop.
     flat_zyx_cpu = prepared_tracks['flat_zyx_cpu']
     offsets = prepared_tracks['offsets']
     lengths = prepared_tracks['lengths']
     device = prepared_tracks['device']
     num_tracks = int(lengths.numel())
-    if num_tracks == 0 or num_tracks_per_step <= 0 or num_points_per_track <= 0:
-        return None
-
-    k = min(int(num_tracks_per_step), num_tracks)
-    track_idx = torch.randint(num_tracks, (k,), device=device)
+    track_idx = torch.randint(num_tracks, (k,), device=device, generator=generator)
     track_lengths_sample = lengths[track_idx]
     track_offsets_sample = offsets[track_idx]
     point_idx_within = (
-        torch.rand([k, num_points_per_track], device=device)
+        torch.rand([k, num_points_per_track], device=device, generator=generator)
         * track_lengths_sample[:, None].to(torch.float32)
     ).to(torch.int64)
     point_idx_within, _ = torch.sort(point_idx_within, dim=-1)
@@ -417,6 +453,24 @@ def _sample_prepared_track_points(prepared_tracks, num_tracks_per_step, num_poin
     return track_idx, flat_idx, sampled_scroll
 
 
+def _sample_prepared_track_points(prepared_tracks, num_tracks_per_step, num_points_per_track):
+    lengths = prepared_tracks['lengths']
+    device = prepared_tracks['device']
+    num_tracks = int(lengths.numel())
+    if num_tracks == 0 or num_tracks_per_step <= 0 or num_points_per_track <= 0:
+        return None
+    k = min(int(num_tracks_per_step), num_tracks)
+
+    if prefetch.prefetch_enabled() and device.type == 'cuda':
+        pf = prefetch.get_prefetcher()
+        generator = pf.torch_rng('tracks', device)
+        return pf.pop_or_run(
+            ('tracks', k, num_points_per_track),
+            lambda: _draw_track_sample(prepared_tracks, k, num_points_per_track, generator),
+        )
+    return _draw_track_sample(prepared_tracks, k, num_points_per_track)
+
+
 def _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding, cfg):
     radius_hinge_margin = dr_per_winding.detach() * cfg['track_radius_loss_margin']
     if cfg['track_radius_target'] == 'mean':
@@ -434,18 +488,28 @@ def _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding, cfg):
     return per_track.mean()
 
 
-def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_max_winding=None):
+def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_max_winding=None):
+    """Yield radius then DT losses so the caller can backward them separately.
+
+    The DT target is detached before its inverse transform, so its graph does
+    not depend on the radius-loss forward graph.  Yielding at that boundary
+    prevents both large transform graphs from being resident together.
+    """
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if prepared_tracks is None:
-        return zero, zero
+        yield 'track_radius', zero
+        yield 'track_dt', zero
+        return
     sample = _sample_prepared_track_points(
         prepared_tracks,
         cfg['track_num_per_step'],
         cfg['track_num_points_per_step'],
     )
     if sample is None:
-        return zero, zero
+        yield 'track_radius', zero
+        yield 'track_dt', zero
+        return
     _, _, sampled_scroll = sample
     k = sampled_scroll.shape[0]
     num_points = sampled_scroll.shape[1]
@@ -456,7 +520,10 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     radius_loss = _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding, cfg)
 
     if not compute_dt:
-        return radius_loss, zero
+        yield 'track_radius', radius_loss
+        del radius_loss, sampled_spiral, theta, shifted_radii
+        yield 'track_dt', zero
+        return
 
     target_shifted_radii = torch.round(shifted_radii.median(dim=-1, keepdim=True).values / dr_per_winding) * dr_per_winding
     target_radii = target_shifted_radii + theta / (2 * np.pi) * dr_per_winding
@@ -465,6 +532,13 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
         torch.sin(theta) * target_radii,
         torch.cos(theta) * target_radii,
     ], dim=-1).detach()
+    active_mask = _progressive_dt_active_mask(target_shifted_radii.squeeze(-1), dr_per_winding, dt_max_winding)
+
+    yield 'track_radius', radius_loss
+    # The caller has now released the radius graph.  Keep only detached DT
+    # inputs before constructing the inverse-transform graph.
+    del radius_loss, sampled_spiral, theta, shifted_radii
+    del target_radii, target_shifted_radii
     target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs.reshape(-1, 3)).reshape(*target_spiral_zyxs.shape)
 
     within_p = cfg['track_dt_within_track_norm_p']
@@ -472,10 +546,9 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     point_distances = torch.linalg.norm(sampled_scroll - target_scroll_zyxs, dim=-1)
     point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5
     track_losses = (point_distances ** within_p).mean(dim=-1) ** (1 / within_p)
-    active_mask = _progressive_dt_active_mask(target_shifted_radii.squeeze(-1), dr_per_winding, dt_max_winding)
     dt_loss = _aggregate_dt_track_losses(track_losses, across_p, active_mask)
 
-    return radius_loss, dt_loss
+    yield 'track_dt', dt_loss
 
 
 def render_spiral_on_tracks_for_slice(

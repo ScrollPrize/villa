@@ -1,11 +1,15 @@
 import unittest
+from pathlib import Path
+import tempfile
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from flow_fields import CartesianFlowField, sample_field
-from tracks import _sample_prepared_track_points, prepare_main_phase_tracks
+from checkpoint_io import load_checkpoint_cpu
+from tifxyz import Patch
+from tracks import _sample_prepared_track_points, iter_track_losses, prepare_main_phase_tracks
 
 
 class CartesianFlowGradientTests(unittest.TestCase):
@@ -93,6 +97,100 @@ class CpuTrackStorageTests(unittest.TestCase):
         _, _, sampled = _sample_prepared_track_points(prepared, 2, 4)
         self.assertEqual(sampled.shape, (2, 4, 3))
         self.assertEqual(sampled.device.type, 'cpu')
+
+    def test_zero_exclusion_fast_path_drops_short_tracks_without_reordering(self):
+        tracks = [
+            np.array([[1, 2, 3]], dtype=np.float32),
+            np.arange(18, dtype=np.float32).reshape(6, 3),
+            np.arange(30, 48, dtype=np.float32).reshape(6, 3),
+        ]
+        prepared = prepare_main_phase_tracks(
+            tracks,
+            anchor_scroll_zyxs=None,
+            exclusion_radius=0.0,
+            device='cpu',
+        )
+        np.testing.assert_array_equal(
+            prepared['flat_zyx_cpu'].numpy(),
+            np.concatenate(tracks[1:], axis=0),
+        )
+        np.testing.assert_array_equal(prepared['offsets'].numpy(), [0, 6, 12])
+        np.testing.assert_array_equal(prepared['lengths'].numpy(), [6, 6])
+
+    def test_staged_track_backward_matches_combined_backward(self):
+        class Translation:
+            def __init__(self, parameter, sign=1.0):
+                self.parameter = parameter
+                self.sign = sign
+
+            def __call__(self, points):
+                return points + self.parameter * self.sign
+
+            @property
+            def inv(self):
+                return Translation(self.parameter, -self.sign)
+
+        tracks = [
+            np.array([[1, 5, 8], [2, 6, 9], [3, 7, 10], [4, 8, 11]], dtype=np.float32),
+            np.array([[5, 9, 12], [6, 10, 13], [7, 11, 14], [8, 12, 15]], dtype=np.float32),
+        ]
+        prepared = prepare_main_phase_tracks(tracks, None, 0.0, 'cpu')
+        config = {
+            'track_num_per_step': 2,
+            'track_num_points_per_step': 4,
+            'track_radius_loss_margin': 0.025,
+            'track_radius_target': 'mean',
+            'track_radius_within_norm_p': 3.0,
+            'track_dt_loss_margin': 0.025,
+            'track_dt_within_track_norm_p': 3.0,
+            'track_dt_norm_p': 0.5,
+        }
+        dr = torch.tensor(10.0)
+
+        combined_parameter = torch.tensor(0.2, requires_grad=True)
+        torch.manual_seed(12)
+        combined_parts = list(iter_track_losses(
+            Translation(combined_parameter), dr, prepared, config, compute_dt=True,
+        ))
+        sum(value for _, value in combined_parts).backward()
+
+        staged_parameter = torch.tensor(0.2, requires_grad=True)
+        torch.manual_seed(12)
+        staged_parts = []
+        for name, value in iter_track_losses(
+            Translation(staged_parameter), dr, prepared, config, compute_dt=True,
+        ):
+            staged_parts.append((name, value.detach()))
+            value.backward()
+
+        self.assertEqual([name for name, _ in staged_parts], ['track_radius', 'track_dt'])
+        torch.testing.assert_close(
+            torch.stack([value for _, value in staged_parts]),
+            torch.stack([value.detach() for _, value in combined_parts]),
+        )
+        torch.testing.assert_close(staged_parameter.grad, combined_parameter.grad)
+
+
+class LazyPatchCacheTests(unittest.TestCase):
+    def test_large_derived_tensors_are_lazy_and_releasable(self):
+        zyxs = torch.zeros([5, 6, 3], dtype=torch.float32)
+        patch = Patch(zyxs, torch.ones(3), None, None)
+        self.assertIsNone(patch._valid_vertex_indices)
+        self.assertIsNone(patch._valid_quad_indices)
+        self.assertIsNone(patch._valid_zyxs)
+        self.assertEqual(patch.valid_zyxs.shape, (30, 3))
+        patch.release_derived_caches()
+        self.assertIsNone(patch._valid_zyxs)
+
+
+class CheckpointLoadingTests(unittest.TestCase):
+    def test_modern_checkpoint_loads_on_cpu(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'checkpoint.pt'
+            torch.save({'tensor': torch.arange(8), 'cfg': {'value': 3}}, path)
+            loaded = load_checkpoint_cpu(path)
+            torch.testing.assert_close(loaded['tensor'], torch.arange(8))
+            self.assertEqual(loaded['cfg']['value'], 3)
 
 
 if __name__ == '__main__':

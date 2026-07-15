@@ -1,6 +1,22 @@
+import os
+
 import torch
 
 
+def maybe_compile(fn):
+    # torch.compile the hot pure-tensor helpers when FIT_SPIRAL_COMPILE=1.
+    # Inductor fuses the elementwise chains (fwd and generated bwd) but uses
+    # FMA contraction, so results shift at the last-ulp level; off by default.
+    if os.environ.get('FIT_SPIRAL_COMPILE', '0') == '1':
+        # The training loop backwards each loss family with retain_graph=True;
+        # donated buffers assume single-use backward graphs and hard-error.
+        import torch._functorch.config
+        torch._functorch.config.donated_buffer = False
+        return torch.compile(fn, dynamic=True)
+    return fn
+
+
+@maybe_compile
 def expm_2x2(L):
     # Closed-form matrix exponential for (..., 2, 2) matrices:
     # exp(L) = e^m (cosh(s) I + sinh(s)/s (L - m I)), where

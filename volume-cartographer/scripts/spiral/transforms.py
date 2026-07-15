@@ -7,6 +7,7 @@ import pyro.distributions
 from einops import rearrange
 from torchdiffeq import odeint
 
+import gap_triton
 import sample_spiral
 from flow_fields import CartesianFlowField, CylindricalFlowField
 from geom_utils import expm_2x2, interp1d
@@ -29,10 +30,14 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
         self._event_dim = event_dim
         self._flow_range_zyx = self.flow_max_corner_zyx - self.flow_min_corner_zyx
         self.num_flow_timesteps = getattr(flow_field, 'num_flow_timesteps', 1)
-        # Cached sampler closure at t=0 for the num_flow_timesteps==1 fast path. Built once
-        # per diffeomorphism instance (one per training iteration), shared across forward and
-        # inverse calls so per-iteration setup (e.g. trilinear LR->HR upsampling) is amortised.
+        # Cached sampler/integrator closure at t=0 for the num_flow_timesteps==1 fast path.
+        # Built once per diffeomorphism instance (one per training iteration), shared across
+        # forward and inverse calls so per-iteration setup (e.g. trilinear LR->HR upsampling)
+        # is amortised. A closure built under no_grad cannot route gradients to the field
+        # parameters, so it is upgraded (rebuilt) if a later call arrives with grad enabled.
         self._cached_sampler = None
+        self._cached_integrator = None
+        self._cached_sampler_grad_mode = False
 
     def _velocity(self, t_int, current_zyx_scaled):
         # t_int is a scalar in [0, 1]; flow_field expects t in [-1, 1]
@@ -47,18 +52,31 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
         t_span = n_steps / self.num_steps
         h = (-t_span if inverse else t_span) / n_steps
         if self.num_flow_timesteps == 1:
-            # Time-invariant flow: build the sampler once and inline a manual rk4 loop to skip
-            # torchdiffeq's per-step dispatch overhead.
+            # Time-invariant flow: skip torchdiffeq's per-step dispatch overhead.
             assert self.solver == 'rk4'
-            if self._cached_sampler is None:
-                self._cached_sampler = self.flow_field.get_sampler(0.0)
-            sampler = self._cached_sampler
-            for _ in range(n_steps):
-                k1 = sampler(y)
-                k2 = sampler(y + (h / 2) * k1)
-                k3 = sampler(y + (h / 2) * k2)
-                k4 = sampler(y + h * k3)
-                y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+            get_integrator = getattr(self.flow_field, 'get_time_invariant_integrator', None)
+            if get_integrator is not None:
+                # Cartesian fast path: the whole RK4 integration runs as ONE
+                # autograd node (identical arithmetic and gradient values; see
+                # _RK4SparseFlowIntegrate), instead of ~42 nodes per call.
+                if self._cached_integrator is None or (torch.is_grad_enabled() and not self._cached_sampler_grad_mode):
+                    self._cached_integrator = get_integrator()
+                    self._cached_sampler_grad_mode = torch.is_grad_enabled()
+                if n_steps > 0:
+                    orig_shape = y.shape
+                    y = self._cached_integrator(y.reshape(-1, 3), h, n_steps).view(orig_shape)
+            else:
+                # e.g. CylindricalFlowField: build the sampler once and inline a manual rk4 loop.
+                if self._cached_sampler is None or (torch.is_grad_enabled() and not self._cached_sampler_grad_mode):
+                    self._cached_sampler = self.flow_field.get_sampler(0.0)
+                    self._cached_sampler_grad_mode = torch.is_grad_enabled()
+                sampler = self._cached_sampler
+                for _ in range(n_steps):
+                    k1 = sampler(y)
+                    k2 = sampler(y + (h / 2) * k1)
+                    k3 = sampler(y + (h / 2) * k2)
+                    k4 = sampler(y + h * k3)
+                    y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
         else:
             t0 = 1. if inverse else 0.
             ts = torch.linspace(t0, t0 + h * n_steps, n_steps + 1, device=y.device)
@@ -92,6 +110,39 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         self.max_z = max_z
         self.gap_expander_lr_scale = gap_expander_lr_scale
         self.truncate_frac = truncate_frac
+        # One transform instance exists per training iteration, and the logits
+        # parameter does not change within an iteration. Build the pinned+scaled
+        # logits once and share it across every _call/_inverse; each grid_sample
+        # then saves a reference to this single tensor instead of a fresh
+        # full-size cat+mul copy per transform invocation.
+        self._pinned_scaled_logits = None
+
+    def _get_pinned_scaled_logits(self):
+        if self._pinned_scaled_logits is None:
+            # Pin the 0th logit (i.e. theta=0 on 1th winding) to be zero, to avoid a jump going from winding #0 to #1
+            logits = torch.cat([torch.zeros_like(self.params.logits[..., :1]), self.params.logits[..., 1:]], dim=-1)
+            self._pinned_scaled_logits = logits * self.gap_expander_lr_scale
+        return self._pinned_scaled_logits
+
+    def _triton_consts(self):
+        # Constants for the fused gap_triton kernels, cached on the (long
+        # lived) params module so float() conversions of tensor scalars do not
+        # sync the GPU once per training iteration.
+        consts = getattr(self.params, '_triton_consts', None)
+        if consts is None:
+            idx = self.params.winding_first_logit_idx.to(torch.float32).contiguous()
+            consts = {
+                'idx': idx,
+                'idx_total': float(idx[-1]),
+                'min_z': float(self.min_z),
+                'max_z': float(self.max_z),
+            }
+            self.params._triton_consts = consts
+        return consts
+
+    def _use_triton(self, input_zyx, dr):
+        return isinstance(dr, torch.Tensor) and gap_triton.gap_triton_available(
+            input_zyx, self.params.logits, dr)
 
     def get_transformed_winding_radii(self, theta, z):
         # This returns the sequence of winding radii (true, not shifted) for the radials given by theta and z
@@ -101,9 +152,7 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         winding_coords = torch.lerp(winding_first_logit_idx[:-1], winding_first_logit_idx[1:], theta_normalised[..., None])
         winding_coords_normalised = winding_coords / winding_first_logit_idx[-1] * 2 - 1
         z_normalised = (z - self.min_z) / (self.max_z - self.min_z) * 2 - 1
-        # Pin the 0th logit (i.e. theta=0 on 1th winding) to be zero, to avoid a jump going from winding #0 to #1
-        logits = torch.cat([torch.zeros_like(self.params.logits[..., :1]), self.params.logits[..., 1:]], dim=-1)
-        logits = logits * self.gap_expander_lr_scale
+        logits = self._get_pinned_scaled_logits()
         # Note the 0th logit/scale/distance here adjusts the gap directly outside the 0th winding (with the 0th winding being always canonical)
         logits_by_winding = F.grid_sample(
             logits,
@@ -122,10 +171,18 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
 
     def _call(self, input_zyx):
         theta, original_radius, inner_winding, _ = get_bounding_windings(input_zyx[..., 1:], self.dr_per_winding)
-        transformed_winding_radii = self.get_transformed_winding_radii(theta, input_zyx[..., 0])
-        inner_winding_clipped = inner_winding.to(torch.int64).clip(min=0, max=transformed_winding_radii.shape[-1] - 2)
-        transformed_inner_radius = torch.gather(transformed_winding_radii, dim=-1, index=inner_winding_clipped[..., None]).squeeze(-1)
-        transformed_outer_radius = torch.gather(transformed_winding_radii, dim=-1, index=(inner_winding_clipped + 1)[..., None]).squeeze(-1)
+        num_windings = len(self.params.num_by_winding)
+        inner_winding_clipped = inner_winding.to(torch.int64).clip(min=0, max=num_windings - 2)
+        if self._use_triton(input_zyx, self.dr_per_winding):
+            consts = self._triton_consts()
+            transformed_inner_radius, transformed_outer_radius = gap_triton.gap_bracketing_radii(
+                theta, input_zyx[..., 0], self._get_pinned_scaled_logits(),
+                consts['idx'], consts['idx_total'], self.dr_per_winding,
+                inner_winding_clipped, self.truncate_frac, consts['min_z'], consts['max_z'])
+        else:
+            transformed_winding_radii = self.get_transformed_winding_radii(theta, input_zyx[..., 0])
+            transformed_inner_radius = torch.gather(transformed_winding_radii, dim=-1, index=inner_winding_clipped[..., None]).squeeze(-1)
+            transformed_outer_radius = torch.gather(transformed_winding_radii, dim=-1, index=(inner_winding_clipped + 1)[..., None]).squeeze(-1)
         original_inner_radius = (inner_winding_clipped + theta / (2 * torch.pi)) * self.dr_per_winding
         original_outer_radius = original_inner_radius + self.dr_per_winding
         frac = (original_radius - original_inner_radius) / (original_outer_radius - original_inner_radius)
@@ -137,13 +194,20 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
 
     def _inverse(self, input_zyx):
         theta, transformed_radius, _ = get_theta_and_radii(input_zyx[..., 1:], self.dr_per_winding)
-        transformed_winding_radii = self.get_transformed_winding_radii(theta, input_zyx[..., 0])
-        inner_winding_indices = torch.searchsorted(transformed_winding_radii, transformed_radius[..., None]).squeeze(-1) - 1
-        # If shifted_radius is exactly zero, avoid this being -1.
-        inner_winding_clipped = inner_winding_indices.clip(min=0, max=transformed_winding_radii.shape[-1] - 2)
+        if self._use_triton(input_zyx, self.dr_per_winding):
+            consts = self._triton_consts()
+            transformed_inner_radius, transformed_outer_radius, inner_winding_clipped = gap_triton.gap_search_radii(
+                theta, input_zyx[..., 0], self._get_pinned_scaled_logits(),
+                consts['idx'], consts['idx_total'], self.dr_per_winding,
+                transformed_radius, self.truncate_frac, consts['min_z'], consts['max_z'])
+        else:
+            transformed_winding_radii = self.get_transformed_winding_radii(theta, input_zyx[..., 0])
+            inner_winding_indices = torch.searchsorted(transformed_winding_radii, transformed_radius[..., None]).squeeze(-1) - 1
+            # If shifted_radius is exactly zero, avoid this being -1.
+            inner_winding_clipped = inner_winding_indices.clip(min=0, max=transformed_winding_radii.shape[-1] - 2)
 
-        transformed_inner_radius = torch.gather(transformed_winding_radii, dim=-1, index=inner_winding_clipped[..., None]).squeeze(-1)
-        transformed_outer_radius = torch.gather(transformed_winding_radii, dim=-1, index=(inner_winding_clipped + 1)[..., None]).squeeze(-1)
+            transformed_inner_radius = torch.gather(transformed_winding_radii, dim=-1, index=inner_winding_clipped[..., None]).squeeze(-1)
+            transformed_outer_radius = torch.gather(transformed_winding_radii, dim=-1, index=(inner_winding_clipped + 1)[..., None]).squeeze(-1)
         original_inner_radius = (inner_winding_clipped + theta / (2 * torch.pi)) * self.dr_per_winding
         original_outer_radius = original_inner_radius + self.dr_per_winding
         frac = (transformed_radius - transformed_inner_radius) / (transformed_outer_radius - transformed_inner_radius)

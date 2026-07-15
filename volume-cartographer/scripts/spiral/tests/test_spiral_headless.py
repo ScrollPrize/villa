@@ -24,6 +24,13 @@ class DatasetResolverTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "incomplete or corrupt"):
                 validate_checkpoint_container(checkpoint)
 
+    def test_legacy_torch_checkpoint_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "legacy.ckpt"
+            torch.save({"value": 1}, checkpoint, _use_new_zipfile_serialization=False)
+            with self.assertRaisesRegex(ValueError, "Legacy pickle checkpoints are not supported"):
+                validate_checkpoint_container(checkpoint)
+
     def test_conventional_resolution_and_logical_dbm_suffix(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -62,6 +69,16 @@ class HandoffTests(unittest.TestCase):
             validate_geometry_snapshot(destination)
             points = np.fromfile(destination / "fibers.points.xyz.f32le", dtype="<f4").reshape(-1, 3)
             np.testing.assert_array_equal(points, [[3, 2, 1], [6, 5, 4]])
+
+    def test_geometry_snapshot_streams_offset_buffer_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "snapshot"
+            line = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
+            write_geometry_snapshot(destination, {"tracks": [line] * 70_000}, input_order="ZYX")
+            manifest = validate_geometry_snapshot(destination)
+            entry = manifest["categories"]["tracks"]
+            self.assertEqual(entry["polyline_count"], 70_000)
+            self.assertEqual(entry["point_count"], 140_000)
 
     def test_combined_preview_has_separators_and_ordered_components(self):
         with tempfile.TemporaryDirectory() as temporary:

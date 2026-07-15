@@ -191,15 +191,13 @@ def resolve_logical_dbm(path: str | Path) -> str:
 
 
 def validate_checkpoint_container(path: str | Path) -> None:
-    """Cheaply reject truncated modern torch.save archives before GPU teardown.
-
-    Legacy pickle-based torch checkpoints are intentionally allowed through and
-    are validated by torch.load on the fitter thread.
-    """
+    """Require a complete modern torch.save archive before GPU teardown."""
     checkpoint = Path(path)
     with checkpoint.open("rb") as stream:
         signature = stream.read(4)
-    if signature.startswith(b"PK") and not zipfile.is_zipfile(checkpoint):
+    if not signature.startswith(b"PK"):
+        raise ValueError("Legacy pickle checkpoints are not supported; resave as a modern torch.save archive")
+    if not zipfile.is_zipfile(checkpoint):
         raise ValueError("checkpoint is an incomplete or corrupt PyTorch ZIP archive")
 
 

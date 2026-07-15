@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import geom_utils
+import prefetch
 from sample_spiral import canonical_winding_samples, get_theta_and_radii
 from spiral_helpers import _huber_abs
 
@@ -67,6 +69,7 @@ def run_containing_index(mask_1d: np.ndarray, idx: int) -> tuple[int, int] | Non
 
 
 
+@geom_utils.maybe_compile
 def _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding):
     if theta.shape[-1] <= 1:
         return shifted_radii
@@ -129,27 +132,16 @@ def _progressive_dt_active_mask(snapped_winding, dr_per_winding, dt_max_winding)
 
 
 
-def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, patch_indices, extra_zyxs=None, num_points_per_patch=None):
-    if len(patch_indices) == 0:
-        raise ValueError('Expected at least one patch index')
-
-    # For each patch, we take one row and one column. _sample_strip_ijs picks a contiguous
-    # subrange of each so _unwrap_track_shifted_radii can reliably handle theta=0 crossings
-    # between consecutive sorted samples.
-
-    # TODO: instead of 'strict' horizontal & vertical strips, could/should take wiggly strips that take a mostly-horizontal
-    #  or mostly-vertical patch between distant points, skirting around gaps/holes; important for long, ragged traces
-
-    if num_points_per_patch is None:
-        num_points_per_patch = cfg['num_points_per_patch']
-    num_points_per_direction = num_points_per_patch // 2
+def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng):
+    # CPU part of the patch-strip sampler: for each patch, one row strip and
+    # one column strip of fractional ijs. Pure numpy + `rng` so it can run on
+    # the prefetch worker for the next step while the GPU works on this one.
     N = len(patch_indices)
-
     P = num_points_per_direction
     horizontal_ijs_by_patch = np.empty([N, P, 2], dtype=np.float32)
     vertical_ijs_by_patch = np.empty([N, P, 2], dtype=np.float32)
-    rand = np.random.random
-    randint = np.random.randint
+    rand = rng.random
+    randint = rng.randint
     fixed_jitters_h = rand(N).astype(np.float32)
     fixed_jitters_v = rand(N).astype(np.float32)
     var_jitters_h = rand((N, P)).astype(np.float32)
@@ -171,7 +163,7 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
         lo_h = patch._h_runs_los[k][r]
         hi_h = patch._h_runs_his[k][r]
         run_len_h = hi_h - lo_h
-        coords_h = np.sort(np.random.choice(run_len_h, P, replace=P > run_len_h))
+        coords_h = np.sort(rng.choice(run_len_h, P, replace=P > run_len_h))
         horizontal_ijs_by_patch[n, :, 0] = row_idx + fixed_jitters_h[n]
         horizontal_ijs_by_patch[n, :, 1] = lo_h + coords_h + var_jitters_h[n]
 
@@ -188,16 +180,55 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
         lo_v = patch._v_runs_los[k][r]
         hi_v = patch._v_runs_his[k][r]
         run_len_v = hi_v - lo_v
-        coords_v = np.sort(np.random.choice(run_len_v, P, replace=P > run_len_v))
+        coords_v = np.sort(rng.choice(run_len_v, P, replace=P > run_len_v))
         vertical_ijs_by_patch[n, :, 1] = col_idx + fixed_jitters_v[n]
         vertical_ijs_by_patch[n, :, 0] = lo_v + coords_v + var_jitters_v[n]
 
+    return np.stack([horizontal_ijs_by_patch, vertical_ijs_by_patch], axis=0)  # (2, N, P, 2)
+
+
+def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
+                        num_points_per_direction):
+    # Returns (combined_ijs_gpu (2,N,P,2), patch_indices_gpu (N,)). With
+    # prefetch enabled the batch was assembled and uploaded for this step
+    # during the previous one, and next step's batch is scheduled now.
+    if num_to_sample <= 0:
+        raise ValueError('Expected at least one patch index')
+
+    def build(rng):
+        patch_indices = rng.choice(len(patches), num_to_sample,
+                                   p=sampling_probabilities, replace=True)
+        ijs_np = _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng)
+        ijs_gpu = torch.from_numpy(ijs_np).cuda(non_blocking=True)
+        idx_gpu = torch.from_numpy(
+            np.ascontiguousarray(patch_indices, dtype=np.int64)).cuda(non_blocking=True)
+        return ijs_gpu, idx_gpu
+
+    if prefetch.prefetch_enabled() and torch.cuda.is_available():
+        pf = prefetch.get_prefetcher()
+        rng = pf.np_rng(key)
+        return pf.pop_or_run((key, num_to_sample, num_points_per_direction),
+                             lambda: build(rng))
+    return build(prefetch.LegacyNumpyRandom)
+
+
+def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, batch, extra_zyxs=None, num_points_per_patch=None):
+    # For each patch, we take one row and one column. _sample_strip_ijs picks a contiguous
+    # subrange of each so _unwrap_track_shifted_radii can reliably handle theta=0 crossings
+    # between consecutive sorted samples.
+
+    # TODO: instead of 'strict' horizontal & vertical strips, could/should take wiggly strips that take a mostly-horizontal
+    #  or mostly-vertical patch between distant points, skirting around gaps/holes; important for long, ragged traces
+
+    if num_points_per_patch is None:
+        num_points_per_patch = cfg['num_points_per_patch']
+    num_points_per_direction = num_points_per_patch // 2
+
     # Batched bilinear interp on GPU: ijs are guaranteed to fall on valid quads by the
-    # _sample_strip_ijs sampler (it draws i0/j0 from `_sampling_valid_quad_*`), so we
+    # strip sampler (it draws i0/j0 from `_sampling_valid_quad_*`), so we
     # skip the per-call validity check used by patch.ij_to_zyx.
-    combined_ijs_np = np.stack([horizontal_ijs_by_patch, vertical_ijs_by_patch], axis=0)  # (2, N, P, 2)
-    combined_ijs_gpu = torch.from_numpy(combined_ijs_np).cuda(non_blocking=True)
-    patch_indices_gpu = torch.from_numpy(np.ascontiguousarray(patch_indices, dtype=np.int64)).cuda(non_blocking=True)
+    combined_ijs_gpu, patch_indices_gpu = batch
+    N = combined_ijs_gpu.shape[1]
     patch_idx_per_sample = patch_indices_gpu[None, :, None].expand(2, N, num_points_per_direction)
     all_slice_zyxs = patch_atlas.lookup(patch_idx_per_sample, combined_ijs_gpu)
 
@@ -308,7 +339,9 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
     # Sample once and share the tracks between the radius and DT losses; the loss using
     # fewer patches takes a prefix of the larger sample.
     num_patches_to_sample = max(num_patches_for_radius, num_patches_for_dt) if compute_dt else num_patches_for_radius
-    patch_indices = np.random.choice(len(patches), num_patches_to_sample, p=patch_sampling_probabilities, replace=True)
+    batch = _sample_patch_batch(
+        'verified_patches', patches, patch_sampling_probabilities,
+        num_patches_to_sample, cfg['num_points_per_patch'] // 2)
 
     n_umb = umbilicus_zyx.shape[0]
     if shell_valid_zyxs is not None:
@@ -323,7 +356,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         dr_per_winding,
         patches,
         patch_atlas,
-        patch_indices,
+        batch,
         extra_zyxs,
     )
     umbilicus_spiral = extra_spiral[:n_umb]
@@ -359,14 +392,16 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
     # masked away near trusted geometry upstream (see _mask_patches_near_trusted_geometry), so
     # they only constrain regions the verified inputs don't cover.
     num_patches_to_sample = max(num_patches_for_radius, num_patches_for_dt) if compute_dt else num_patches_for_radius
-    patch_indices = np.random.choice(len(patches), num_patches_to_sample, p=patch_sampling_probabilities, replace=True)
+    batch = _sample_patch_batch(
+        'unverified_patches', patches, patch_sampling_probabilities,
+        num_patches_to_sample, cfg['unverified_num_points_per_patch'] // 2)
 
     all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii, _ = _sample_patch_tracks(
         slice_to_spiral_transform,
         dr_per_winding,
         patches,
         patch_atlas,
-        patch_indices,
+        batch,
         num_points_per_patch=cfg['unverified_num_points_per_patch'],
     )
 
@@ -477,6 +512,31 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
         )
         for leg1_axis, leg1_dir in primary_specs
     ]
+
+
+
+def _batched_pcl_chain_seam_adjustments(slice_to_spiral_transform, dr_per_winding, chain_zyxs_list):
+    # Cumulative theta=0 seam adjustment (last unwrap entry) for each pcl chain.
+    # The adjustments are built purely from detached thetas and detached
+    # dr_per_winding -- there is no gradient path from them into the loss -- so
+    # all chains can be transformed in one batched no-grad call instead of one
+    # full transform (flow-ODE integration) per pair. Chains are padded to the
+    # longest length by repeating their last point: identical consecutive
+    # points give exactly zero theta-diffs, so the unwrapped adjustment at the
+    # padded end equals the adjustment at the true chain end.
+    num_chains = len(chain_zyxs_list)
+    max_chain_len = max(len(chain) for chain in chain_zyxs_list)
+    chains_np = np.empty([num_chains, max_chain_len, 3], dtype=np.float32)
+    for k, chain_zyxs in enumerate(chain_zyxs_list):
+        n = len(chain_zyxs)
+        chains_np[k, :n] = chain_zyxs
+        chains_np[k, n:] = chain_zyxs[-1]
+    with torch.no_grad():
+        chains_t = torch.from_numpy(chains_np).to(device=dr_per_winding.device, non_blocking=True)
+        chain_spiral = slice_to_spiral_transform(chains_t.reshape(-1, 3)).reshape(num_chains, max_chain_len, 3)
+        chain_theta, _, _ = get_theta_and_radii(chain_spiral[..., 1:], dr_per_winding)
+        chain_adjustments = _unwrap_track_shifted_radii(chain_theta, torch.zeros_like(chain_theta), dr_per_winding)
+        return chain_adjustments[:, -1]
 
 
 
@@ -615,15 +675,11 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
         device='cuda',
         dtype=torch.float32,
     )
-    pcl_seam_adjustments = []
-    for _, _, _, _, _, pcl_chain_zyxs in strip_pairs:
-        chain_zyxs = torch.from_numpy(pcl_chain_zyxs).cuda(non_blocking=True)
-        chain_spiral = slice_to_spiral_transform(chain_zyxs)
-        chain_theta, _, _ = get_theta_and_radii(chain_spiral[..., 1:], dr_per_winding)
-        zero_shifted = torch.zeros_like(chain_theta)
-        chain_adjustments = _unwrap_track_shifted_radii(chain_theta, zero_shifted, dr_per_winding)
-        pcl_seam_adjustments.append(chain_adjustments[-1])
-    pcl_seam_adjustments = torch.stack(pcl_seam_adjustments)
+    pcl_seam_adjustments = _batched_pcl_chain_seam_adjustments(
+        slice_to_spiral_transform,
+        dr_per_winding,
+        [strip_pair[5] for strip_pair in strip_pairs],
+    )
     expected_diff = ((winding_diffs * dr_per_winding) - pcl_seam_adjustments)[:, None, None]
 
     diff = p2_r[:, :, None] - p1_r[:, None, :]
@@ -791,7 +847,7 @@ def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points):
 
 
 
-def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=None):
+def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=None):
     # Sample points uniformly over the spiral cylinder (a disk of radius
     # dr_per_winding * outer_winding_idx in spiral yx, over the z-ROI). Two losses are computed:
     #   (normals) the spiral radial covector at each sample is pulled back to scroll space via
@@ -808,7 +864,9 @@ def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if lasagna_volume is None or outer_winding_idx is None:
-        return zero, zero
+        yield 'dense_spacing', zero
+        yield 'dense_normals', zero
+        return
 
     backend = lasagna_volume.get('backend', 'dense_cuda')
     volume = lasagna_volume.get('volume')  # dense: 3 (nx, ny, grad_mag), z, y, x uint8
@@ -880,10 +938,6 @@ def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume
     nz = torch.sqrt((1. - nx * nx - ny * ny).clamp(min=0.))
     target_normal = F.normalize(torch.stack([nz, ny, nx], dim=-1), dim=-1)  # zyx
 
-    scroll_normal = get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_center, spiral_zyx=spiral_zyx, epsilon=epsilon)
-    normals_residual = 1. - (scroll_normal * target_normal).sum(dim=-1).abs()
-    normals_loss = (normals_residual * normal_weight).sum() / normal_weight.sum().clamp(min=1)
-
     # grad_mag encodes a winding density (windings per base-volume voxel); the decode factor below
     # also rescales it to current-grid windings/voxel. The number of windings actually crossed by
     # the one-winding scroll-space segment (scroll_inner -> scroll_outer) is the line integral of
@@ -901,7 +955,24 @@ def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume
     spacing_residual = (integrated_windings - 1.).abs()
     spacing_loss = (spacing_residual * spacing_weight).sum() / spacing_weight.sum().clamp(min=1)
 
-    return normals_loss, spacing_loss
+    scroll_center_detached = scroll_center.detach()
+    spiral_zyx_detached = spiral_zyx.detach()
+    yield 'dense_spacing', spacing_loss
+
+    # The caller has released the endpoint/integration graph.  Dense normals
+    # use detached sample positions and build their own finite-difference graph,
+    # so the two large transform graphs never need to coexist.
+    del spacing_loss, scroll_samples, scroll_inner, scroll_outer, scroll_center
+    del scroll_displacement, scroll_segment_length, integration_zyx
+    scroll_normal = get_radial_normal_in_scroll_space(
+        slice_to_spiral_transform,
+        scroll_center_detached,
+        spiral_zyx=spiral_zyx_detached,
+        epsilon=epsilon,
+    )
+    normals_residual = 1. - (scroll_normal * target_normal).sum(dim=-1).abs()
+    normals_loss = (normals_residual * normal_weight).sum() / normal_weight.sum().clamp(min=1)
+    yield 'dense_normals', normals_loss
 
 
 
