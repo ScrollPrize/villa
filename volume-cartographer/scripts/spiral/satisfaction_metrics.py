@@ -214,15 +214,22 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
                     if propagate_branch_offset(source, source_pos, target, target_pos):
                         queue.append(target)
 
-            component_center_rows = [
-                subrow['row_idx']
-                for subrow in all_subrows
-                if subrow['branch_offset'] is not None and subrow['j_min'] <= center_col < subrow['j_max']
-            ]
-            if len(component_center_rows) == 0:
+            # Snap-target winding is chosen from the center column across the connected
+            # component. Gather the BRANCH-CONSISTENT (unwrapped, branch-offset-removed)
+            # shifted radius at that column - the same `adjusted_shifted` frame the
+            # satisfaction check below compares against - NOT the raw shifted_radius_all.
+            # Raw values jump by ~dr across a theta=0 crossing even on the same physical
+            # winding, so a raw median lands between windings and mismatches every quad
+            # (spuriously reporting a well-fit seam-crossing patch as 0% satisfied).
+            component_col_shifted = []
+            for subrow in all_subrows:
+                if subrow['branch_offset'] is None or not (subrow['j_min'] <= center_col < subrow['j_max']):
+                    continue
+                pos = center_col - subrow['j_min']
+                component_col_shifted.append(subrow['unwrapped_shifted'][pos] - subrow['branch_offset'])
+            if len(component_col_shifted) == 0:
                 continue
-            component_center_rows_t = torch.tensor(component_center_rows, device=device, dtype=torch.long)
-            component_col_shifted = shifted_radius_all[component_center_rows_t, center_col]
+            component_col_shifted = torch.stack(component_col_shifted)
             median_shifted_radius = torch.median(component_col_shifted)
             modulus = median_shifted_radius % dr
             target_shifted_radius = torch.where(
