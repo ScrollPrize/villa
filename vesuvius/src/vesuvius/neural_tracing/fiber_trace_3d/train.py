@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
+import os
 import re
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DBatch,
@@ -666,9 +668,10 @@ def run_training(config_path: str | Path) -> None:
         test_control_points = test_loader.sample_count if test_loader is not None else loader.sample_count
     direction_weight = float(training.get("direction_weight", 1.0))
     presence_weight = float(training.get("presence_weight", 1.0))
-    pipeline_enabled = bool(training.get("pipeline_enabled", True))
-    pipeline_depth = max(1, int(training.get("pipeline_depth", 2)))
-    pipeline_workers = max(1, int(training.get("pipeline_workers", 1)))
+    loader_workers = _loader_worker_count(raw_config)
+    loader_prefetch_factor = _loader_prefetch_factor(raw_config)
+    loader_worker_device = _loader_worker_device(raw_config)
+    loader_context = _loader_multiprocessing_context(raw_config)
     best_metric = math.inf
 
     print(
@@ -676,38 +679,31 @@ def run_training(config_path: str | Path) -> None:
         f"samples={loader.sample_count} batch_size={loader.config.batch_size} "
         f"patch_shape_zyx={loader.config.patch_shape_zyx} device={device} run_dir={run_dir} "
         f"trace2cp_enabled={bool(trace2cp_loader is not None)} "
-        f"pipeline_enabled={pipeline_enabled} pipeline_depth={pipeline_depth} "
-        f"pipeline_workers={pipeline_workers}",
+        f"loader_workers={loader_workers} loader_prefetch_factor={loader_prefetch_factor} "
+        f"loader_worker_device={loader_worker_device} "
+        f"loader_multiprocessing_context={loader_context or 'default'}",
         flush=True,
     )
 
-    pipeline: _OrderedBatchLoadPipeline | None = None
+    remaining_steps = max(0, int(max_steps) - int(start_step))
+    train_dataloader = _make_batch_dataloader(
+        config_path,
+        raw_config=raw_config,
+        start_batch_index=start_step,
+        batch_count=remaining_steps,
+        sample_mode="random",
+    )
+    train_iterator = iter(train_dataloader) if train_dataloader is not None else None
     try:
-        if pipeline_enabled:
-            pipeline = _OrderedBatchLoadPipeline(
-                loader,
-                device=device,
-                sample_mode="random",
-                workers=pipeline_workers,
-            )
-            pipeline.__enter__()
-            for queued_step in range(
-                start_step + 1,
-                min(max_steps, start_step + pipeline_depth) + 1,
-            ):
-                pipeline.submit((queued_step - 1) * loader.config.batch_size)
-
         for step in range(start_step + 1, max_steps + 1):
-            load_start = time.perf_counter()
             sample_index = (step - 1) * loader.config.batch_size
-            if pipeline is None:
-                batch = loader.load_batch(sample_index, sample_mode="random", device=device)
-            else:
-                batch = pipeline.result(sample_index)
-                next_step = step + pipeline_depth
-                if next_step <= max_steps:
-                    pipeline.submit((next_step - 1) * loader.config.batch_size)
-            load_ms = (time.perf_counter() - load_start) * 1000.0
+            batch, load_ms, to_device_ms = _next_training_batch(
+                iterator=train_iterator,
+                loader=loader,
+                sample_index=sample_index,
+                sample_mode="random",
+                device=device,
+            )
             optimizer.zero_grad(set_to_none=True)
             fw_start = time.perf_counter()
             losses = _forward_loss(
@@ -725,7 +721,8 @@ def run_training(config_path: str | Path) -> None:
                     f"step={step} loss_total={losses['total']:.6f} "
                     f"loss_direction={losses['direction']:.6f} "
                     f"loss_presence={losses['presence']:.6f} "
-                    f"load_ms={load_ms:.1f} fw_bw_step_ms={step_ms:.1f}",
+                    f"load_ms={load_ms:.1f} to_device_ms={to_device_ms:.1f} "
+                    f"fw_bw_step_ms={step_ms:.1f}",
                     flush=True,
                 )
             if writer is not None and (step == 1 or step % scalar_interval == 0):
@@ -734,6 +731,7 @@ def run_training(config_path: str | Path) -> None:
                 writer.add_scalar("train/loss_presence", losses["presence"], step)
                 writer.add_scalar("timing/load_ms", load_ms, step)
                 writer.add_scalar("timing/load_wait_ms", load_ms, step)
+                writer.add_scalar("timing/batch_to_device_ms", to_device_ms, step)
                 writer.add_scalar("timing/fw_bw_step_ms", step_ms, step)
             if writer is not None and sample_vis_interval > 0 and (
                 step == 1 or step % sample_vis_interval == 0
@@ -827,8 +825,9 @@ def run_training(config_path: str | Path) -> None:
                     metric_name=metric_name,
                 )
     finally:
-        if pipeline is not None:
-            pipeline.__exit__(None, None, None)
+        if train_dataloader is not None:
+            train_iterator = None
+            train_dataloader = None
     if writer is not None:
         writer.flush()
         writer.close()
@@ -1180,46 +1179,214 @@ def dataclass_replace(value: _Trace2Cp3DConfig, **kwargs: Any) -> _Trace2Cp3DCon
     return _Trace2Cp3DConfig(**data)
 
 
-class _OrderedBatchLoadPipeline:
+def _identity_batch_collate(sample: Any) -> Any:
+    if isinstance(sample, list):
+        if len(sample) != 1:
+            raise ValueError(
+                "fiber_trace_3d DataLoader must yield one complete FiberTrace3DBatch per item"
+            )
+        return sample[0]
+    return sample
+
+
+class _FiberTrace3DBatchDataset(Dataset):
     def __init__(
         self,
-        loader: FiberTrace3DLoader,
+        config_source: str | Path | Any,
         *,
-        device: torch.device,
+        start_batch_index: int,
+        batch_count: int,
         sample_mode: str,
-        workers: int,
+        worker_device: str | torch.device = "cpu",
     ) -> None:
-        self.loader = loader
-        self.device = device
+        self.config_source = config_source
+        self.start_batch_index = int(start_batch_index)
+        self.batch_count = int(batch_count)
         self.sample_mode = str(sample_mode)
-        self.executor = ThreadPoolExecutor(max_workers=max(1, int(workers)))
-        self.futures: dict[int, Future[FiberTrace3DBatch]] = {}
+        self.worker_device = str(worker_device)
+        self._loader: FiberTrace3DLoader | None = None
 
-    def __enter__(self) -> "_OrderedBatchLoadPipeline":
-        return self
+    def __len__(self) -> int:
+        return max(0, int(self.batch_count))
 
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        for future in self.futures.values():
-            future.cancel()
-        self.executor.shutdown(wait=True, cancel_futures=True)
+    def _get_loader(self) -> FiberTrace3DLoader:
+        if self._loader is None:
+            if isinstance(self.config_source, (str, Path)):
+                config = load_config(self.config_source)
+            else:
+                config = self.config_source
+            self._loader = FiberTrace3DLoader(config)
+        return self._loader
 
-    def submit(self, sample_index: int) -> None:
-        index = int(sample_index)
-        if index in self.futures:
-            return
-        self.futures[index] = self.executor.submit(
-            self.loader.load_batch,
-            index,
+    def __getitem__(self, index: int) -> FiberTrace3DBatch:
+        if int(index) < 0 or int(index) >= len(self):
+            raise IndexError(index)
+        loader = self._get_loader()
+        batch_index = self.start_batch_index + int(index)
+        sample_index = batch_index * int(loader.config.batch_size)
+        worker_device = torch.device(self.worker_device)
+        batch = loader.load_batch(
+            sample_index,
             sample_mode=self.sample_mode,
-            device=self.device,
+            device=worker_device,
         )
+        if worker_device.type == "cuda":
+            torch.cuda.synchronize(worker_device)
+            batch = batch.to("cpu")
+        return batch
 
-    def result(self, sample_index: int) -> FiberTrace3DBatch:
-        index = int(sample_index)
-        future = self.futures.pop(index, None)
-        if future is None:
-            return self.loader.load_batch(index, sample_mode=self.sample_mode, device=self.device)
-        return future.result()
+
+def _loader_worker_count(raw_config: dict[str, Any]) -> int:
+    training = dict(raw_config.get("training", {}))
+    raw_workers = training.get("loader_workers", raw_config.get("loader_workers", 0))
+    workers = int(raw_workers)
+    if workers < 0:
+        raise ValueError("training.loader_workers must be >= 0")
+    return workers
+
+
+def _loader_prefetch_factor(raw_config: dict[str, Any]) -> int:
+    training = dict(raw_config.get("training", {}))
+    raw_factor = training.get("loader_prefetch_factor", raw_config.get("loader_prefetch_factor", 2))
+    factor = int(raw_factor)
+    if factor <= 0:
+        raise ValueError("training.loader_prefetch_factor must be > 0")
+    return factor
+
+
+def _loader_worker_device(raw_config: dict[str, Any]) -> str:
+    training = dict(raw_config.get("training", {}))
+    return str(training.get("loader_worker_device", raw_config.get("loader_worker_device", "cpu")))
+
+
+def _loader_multiprocessing_context(raw_config: dict[str, Any]) -> str | None:
+    training = dict(raw_config.get("training", {}))
+    explicit = training.get(
+        "loader_multiprocessing_context",
+        raw_config.get("loader_multiprocessing_context"),
+    )
+    if explicit is not None:
+        value = str(explicit).strip().lower()
+        if value in {"", "default", "none"}:
+            return None
+        if value not in mp.get_all_start_methods():
+            raise ValueError(
+                "training.loader_multiprocessing_context must be one of "
+                f"{mp.get_all_start_methods()}, got {explicit!r}"
+            )
+        return value
+    methods = set(mp.get_all_start_methods())
+    if torch.device(_loader_worker_device(raw_config)).type == "cuda":
+        return "spawn" if "spawn" in methods else None
+    if "forkserver" in methods:
+        return "forkserver"
+    if "fork" in methods:
+        return "fork"
+    if "spawn" in methods:
+        return "spawn"
+    return None
+
+
+def _make_batch_dataloader(
+    config_source: str | Path | Any,
+    *,
+    raw_config: dict[str, Any],
+    start_batch_index: int,
+    batch_count: int,
+    sample_mode: str,
+) -> DataLoader | None:
+    workers = _loader_worker_count(raw_config)
+    if workers <= 0 or int(batch_count) <= 0:
+        return None
+    dataset = _FiberTrace3DBatchDataset(
+        config_source,
+        start_batch_index=int(start_batch_index),
+        batch_count=int(batch_count),
+        sample_mode=sample_mode,
+        worker_device=_loader_worker_device(raw_config),
+    )
+    context = _loader_multiprocessing_context(raw_config)
+    kwargs: dict[str, Any] = {}
+    if context is not None:
+        kwargs["multiprocessing_context"] = context
+    return DataLoader(
+        dataset,
+        batch_size=None,
+        shuffle=False,
+        sampler=None,
+        num_workers=workers,
+        collate_fn=_identity_batch_collate,
+        persistent_workers=True,
+        prefetch_factor=_loader_prefetch_factor(raw_config),
+        pin_memory=False,
+        **kwargs,
+    )
+
+
+def _next_training_batch(
+    *,
+    iterator: Any | None,
+    loader: FiberTrace3DLoader,
+    sample_index: int,
+    sample_mode: str,
+    device: torch.device,
+) -> tuple[FiberTrace3DBatch, float, float]:
+    wait_start = time.perf_counter()
+    if iterator is None:
+        batch = loader.load_batch(sample_index, sample_mode=sample_mode, device=device)
+        wait_ms = (time.perf_counter() - wait_start) * 1000.0
+        return batch, wait_ms, 0.0
+
+    batch = next(iterator)
+    wait_ms = (time.perf_counter() - wait_start) * 1000.0
+    to_device_start = time.perf_counter()
+    batch = batch.to(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    to_device_ms = (time.perf_counter() - to_device_start) * 1000.0
+    return batch, wait_ms + to_device_ms, to_device_ms
+
+
+_CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+def _process_cpu_seconds(pid: int) -> float | None:
+    stat_path = Path("/proc") / str(int(pid)) / "stat"
+    try:
+        text = stat_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        rest = text.rsplit(")", 1)[1].strip().split()
+        utime_ticks = int(rest[11])
+        stime_ticks = int(rest[12])
+    except (IndexError, ValueError):
+        return None
+    return float(utime_ticks + stime_ticks) / float(_CLK_TCK)
+
+
+def _dataloader_worker_pids(iterator: Any | None) -> tuple[int, ...]:
+    workers = getattr(iterator, "_workers", None)
+    if workers is None:
+        return ()
+    pids: list[int] = []
+    for worker in workers:
+        pid = getattr(worker, "pid", None)
+        if pid is not None:
+            pids.append(int(pid))
+    return tuple(pids)
+
+
+def _cpu_seconds_for_pids(pids: tuple[int, ...]) -> float | None:
+    total = 0.0
+    seen = False
+    for pid in pids:
+        seconds = _process_cpu_seconds(pid)
+        if seconds is None:
+            continue
+        total += seconds
+        seen = True
+    return total if seen else None
 
 
 def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> None:
@@ -1231,15 +1398,38 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
     model.eval()
     direction_weight = float(training.get("direction_weight", 1.0))
     presence_weight = float(training.get("presence_weight", 1.0))
-    print("batch patches total_ms load_ms fw_ms")
+    loader_workers = _loader_worker_count(raw_config)
+    loader_prefetch_factor = _loader_prefetch_factor(raw_config)
+    loader_worker_device = _loader_worker_device(raw_config)
+    loader_context = _loader_multiprocessing_context(raw_config)
+    dataloader = _make_batch_dataloader(
+        config_path,
+        raw_config=raw_config,
+        start_batch_index=0,
+        batch_count=int(batches),
+        sample_mode="random",
+    )
+    iterator = iter(dataloader) if dataloader is not None else None
+    cpu_pids = (os.getpid(),) + _dataloader_worker_pids(iterator)
+    print(
+        "fiber_trace_3d benchmark: "
+        f"loader_workers={loader_workers} loader_prefetch_factor={loader_prefetch_factor} "
+        f"loader_worker_device={loader_worker_device} "
+        f"loader_multiprocessing_context={loader_context or 'default'} "
+        f"device={device} load_only={bool(load_only)}",
+        flush=True,
+    )
+    print("batch patches total_ms load_ms to_device_ms fw_ms cpu_ms cpu_x")
     for batch_index in range(1, int(batches) + 1):
         start = time.perf_counter()
-        batch = loader.load_batch(
-            (batch_index - 1) * loader.config.batch_size,
+        cpu_start = _cpu_seconds_for_pids(cpu_pids)
+        batch, load_ms, to_device_ms = _next_training_batch(
+            iterator=iterator,
+            loader=loader,
+            sample_index=(batch_index - 1) * loader.config.batch_size,
             sample_mode="random",
             device=device,
         )
-        load_ms = (time.perf_counter() - start) * 1000.0
         fw_ms = 0.0
         if not load_only:
             fw_start = time.perf_counter()
@@ -1255,11 +1445,20 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
                 torch.cuda.synchronize(device)
             fw_ms = (time.perf_counter() - fw_start) * 1000.0
         total_ms = (time.perf_counter() - start) * 1000.0
+        cpu_end = _cpu_seconds_for_pids(cpu_pids)
+        cpu_ms = math.nan
+        cpu_factor = math.nan
+        if cpu_start is not None and cpu_end is not None and cpu_end >= cpu_start:
+            cpu_ms = (cpu_end - cpu_start) * 1000.0
+            cpu_factor = cpu_ms / max(total_ms, 1.0e-6)
         print(
             f"{batch_index:5d} {loader.config.batch_size:7d} "
-            f"{total_ms:8.2f} {load_ms:8.2f} {fw_ms:8.2f}",
+            f"{total_ms:8.2f} {load_ms:8.2f} {to_device_ms:12.2f} "
+            f"{fw_ms:8.2f} {cpu_ms:8.2f} {cpu_factor:6.2f}",
             flush=True,
         )
+    iterator = None
+    dataloader = None
 
 
 def run_prefetch(config_path: str | Path, *, prefetch_steps: int, workers: int | None) -> None:

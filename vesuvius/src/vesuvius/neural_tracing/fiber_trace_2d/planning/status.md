@@ -4,10 +4,10 @@
 - [x] Replace `planning/task.md` with the current user task.
 - [x] Replace `planning/task_plan.md` with the implementation plan.
 - [x] Review current code/spec context for DataLoader integration.
-- [ ] Implement PyTorch DataLoader-backed 3D batch loading.
-- [ ] Remove the thread-backed `_OrderedBatchLoadPipeline`.
-- [ ] Update 3D config keys and defaults.
-- [ ] Update specs/docs/changelog/task_log.
-- [ ] Add/adjust DataLoader determinism tests.
-- [ ] Run focused tests.
-- [ ] Rerun the approved 3D load-only benchmark command.
+- [x] Implement PyTorch DataLoader-backed 3D batch loading.
+- [x] Remove the thread-backed `_OrderedBatchLoadPipeline`.
+- [x] Update 3D config keys and defaults.
+- [x] Update specs/docs/changelog/task_log.
+- [x] Add/adjust DataLoader whole-batch determinism tests.
+- [x] Run focused tests.
+- [x] Rerun the approved 3D load-only benchmark command.

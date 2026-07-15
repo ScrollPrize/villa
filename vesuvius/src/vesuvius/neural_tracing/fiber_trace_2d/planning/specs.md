@@ -93,6 +93,22 @@
 - `python -m vesuvius.neural_tracing.fiber_trace_3d.train` is the 3D training
   entrypoint. It supports normal training, `--benchmark`, `--load-only`, and
   `--prefetch`.
+- 3D training and `--benchmark --load-only` runtime loading use
+  `torch.utils.data.DataLoader` worker processes when
+  `training.loader_workers > 0`. Each DataLoader item is one complete
+  `FiberTrace3DBatch`, not an individual CP patch, and PyTorch default
+  collation is bypassed so the custom dataclass is not nested or reshaped.
+- Each 3D DataLoader worker lazily constructs its own `FiberTrace3DLoader` and
+  VC3D sampler state in the worker process. Worker outputs are CPU
+  `FiberTrace3DBatch` objects; the main training process transfers the whole
+  batch to `training.device` immediately before forward/backward. The old
+  thread-backed `_OrderedBatchLoadPipeline` is not a supported 3D loading path.
+- `training.loader_workers` controls 3D DataLoader worker process count.
+  `0` is the explicit serial/debug path. `training.loader_prefetch_factor`
+  maps directly to PyTorch DataLoader prefetch factor for worker processes.
+  `training.loader_worker_device` defaults to `"cpu"`. CPU worker processes
+  use a guarded `forkserver` multiprocessing context where available, falling
+  back to `fork` only when needed; CUDA worker devices select `spawn`.
 - 3D prefetch computes chunk dependencies from the same explicit coordinate
   path used by training and the VC3D sampler. `--prefetch-steps 0` means all
   deterministic CP samples.

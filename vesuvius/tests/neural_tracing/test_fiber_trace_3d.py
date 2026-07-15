@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import FiberStripFrame
@@ -33,8 +34,11 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_bridge import (
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
+    _FiberTrace3DBatchDataset,
     _Trace2Cp3DConfig,
     _evaluate_trace2cp_metric_fixed_set_3d,
+    _identity_batch_collate,
+    _make_batch_dataloader,
     _make_train_sample_3d_sheet,
 )
 
@@ -216,6 +220,53 @@ def test_loader_builds_deterministic_cp_centered_3d_batch() -> None:
     assert bool(batch_a.direction_mask.any())
     assert bool((batch_a.presence_target > 0.5).any())
     assert bool((batch_a.presence_target < 0.5).any())
+
+
+def test_3d_batch_dataset_preserves_whole_batch_items() -> None:
+    config = _loader(augment_enabled=False).config
+    serial_dataset = _FiberTrace3DBatchDataset(
+        config,
+        start_batch_index=0,
+        batch_count=3,
+        sample_mode="random",
+        worker_device="cpu",
+    )
+    serial_batches = [serial_dataset[index] for index in range(3)]
+    dataloader_dataset = _FiberTrace3DBatchDataset(
+        config,
+        start_batch_index=0,
+        batch_count=3,
+        sample_mode="random",
+        worker_device="cpu",
+    )
+    assert (
+        _make_batch_dataloader(
+            config,
+            raw_config={"training": {"loader_workers": 0}},
+            start_batch_index=0,
+            batch_count=3,
+            sample_mode="random",
+        )
+        is None
+    )
+    dataloader = DataLoader(
+        dataloader_dataset,
+        batch_size=None,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=_identity_batch_collate,
+    )
+    dataloader_batches = list(dataloader)
+    assert len(dataloader_batches) == len(serial_batches)
+    for expected, actual in zip(serial_batches, dataloader_batches, strict=True):
+        assert type(actual).__name__ == "FiberTrace3DBatch"
+        assert torch.equal(actual.sample_indices, expected.sample_indices)
+        assert torch.equal(actual.record_indices, expected.record_indices)
+        assert torch.equal(actual.control_point_indices, expected.control_point_indices)
+        assert actual.fiber_paths == expected.fiber_paths
+        assert torch.allclose(actual.volume, expected.volume)
+        assert torch.allclose(actual.presence_target, expected.presence_target)
+        assert torch.allclose(actual.direction_target, expected.direction_target)
 
 
 def test_loader_augmented_batch_is_finite() -> None:

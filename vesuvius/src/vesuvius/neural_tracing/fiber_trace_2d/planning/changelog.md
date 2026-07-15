@@ -2,6 +2,11 @@
 
 ## 2026-07-15
 
+- Replaced the 3D training/benchmark thread-backed batch queue with
+  `torch.utils.data.DataLoader` process workers. `training.loader_workers` and
+  `training.loader_prefetch_factor` now control the 3D runtime loading path,
+  each worker lazily owns its `FiberTrace3DLoader`/VC3D sampler, and
+  `load_ms` reports DataLoader wait plus main-process device transfer.
 - Reworked the 3D fiber loader hot path to sample CP-centered patches through
   VC3D explicit coordinate sampling instead of oversized zarr crops plus torch
   resampling; NML dense targets now rasterize transformed segment capsules

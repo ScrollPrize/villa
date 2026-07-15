@@ -129,6 +129,23 @@ This is the approved load-only comparison command for the current 3D loader
 work. Do not change the config path, flags, or PYTHONPATH shape unless the user
 explicitly asks for a different measurement.
 
+Latest 3D DataLoader process-worker validation with that exact command and the
+checked-in S1A NML config:
+
+- `training.loader_workers=8`, `training.loader_prefetch_factor=2`,
+  `training.loader_worker_device=cpu`, multiprocessing context `forkserver`.
+- Previous single-batch VC3D coordinate-sampler baseline after warmup:
+  median `1359.06 ms`, post-warmup mean `1359.79 ms`.
+- 2026-07-15 forkserver run: all-batch mean/median/min/max
+  `1989.75 / 169.02 / 124.12 / 17115.35 ms`; post-first-batch
+  mean/median/min/max `309.13 / 163.80 / 124.12 / 1131.87 ms`.
+- The first row includes DataLoader worker startup plus worker-local loader
+  construction. `load_ms` includes CPU batch wait and main-process batch
+  transfer; `to_device_ms` reports the transfer portion.
+- A follow-up run with benchmark `cpu_ms/cpu_x` columns showed post-startup
+  weighted `cpu_x=2.44`, median row `cpu_x=3.02`, and mean row `cpu_x=3.02`;
+  this is not full CPU utilization on a 32-logical-CPU machine.
+
 ## Fiber Trace 2D Training Prefetch Commands
 
 Prefetch the base-volume chunks needed for the first 10 configured training

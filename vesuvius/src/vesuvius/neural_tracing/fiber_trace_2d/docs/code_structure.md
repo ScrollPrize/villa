@@ -102,10 +102,19 @@ side/top strip input loading.
   data, target presence, predicted presence, and direction angular error.
 - `batch_size` is the actual CP-patch batch passed through the 3D U-Net. The
   trainer does not internally micro-batch.
-- Normal training can queue deterministic future `load_batch` calls with
-  `training.pipeline_enabled`, `training.pipeline_depth`, and
-  `training.pipeline_workers` so VC3D/CPU loading can overlap the current
-  optimization step.
+- Normal training and `--benchmark --load-only` use
+  `torch.utils.data.DataLoader` process workers when
+  `training.loader_workers > 0`. Each worker lazily constructs its own
+  `FiberTrace3DLoader` and VC3D coordinate sampler, and each DataLoader item is
+  a complete `FiberTrace3DBatch` keyed by deterministic batch index.
+- Worker batches are returned on CPU. The main process transfers the complete
+  batch to the configured training device before model execution. Console
+  `load_ms` includes DataLoader wait plus this main-process transfer;
+  `to_device_ms` reports the transfer portion separately.
+- In `--benchmark` mode, `cpu_ms` and `cpu_x` report sampled CPU time for the
+  main process plus DataLoader worker processes during each benchmark row where
+  `/proc/<pid>/stat` is available. `cpu_x=1.0` is roughly one fully occupied
+  CPU core for that row.
 - When `training.test_trace2cp_enabled` is true, test evaluation builds
   Trace2CP side-strip geometry with the 2D loader, runs tiled dense 3D inference
   blocks over the requested strip coordinates, projects direction/presence into
