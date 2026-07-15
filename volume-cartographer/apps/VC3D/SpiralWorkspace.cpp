@@ -3,6 +3,7 @@
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
 #include "ConsoleOutputWidget.hpp"
+#include "Keybinds.hpp"
 #include "SpiralPanel.hpp"
 #include "SpiralServiceManager.hpp"
 #include "ViewerManager.hpp"
@@ -13,10 +14,8 @@
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
-#include <QCursor>
 #include <QDialog>
 #include <QDockWidget>
 #include <QDir>
@@ -25,6 +24,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
+#include <QLabel>
 #include <QSettings>
 #include <QStatusBar>
 #include <QTimer>
@@ -53,12 +53,20 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 {
     setObjectName(QStringLiteral("spiralWorkspaceWindow"));
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
-    _state = new CState(0, this); // zero budget: never resets the shared Volume cache
+    // Mirror Main's cache budget so sharedChunkCacheForVolume() resolves to the
+    // same ChunkCache instance for the same volume (the budget is part of the
+    // cache key). Volume::setCacheBudget is a no-op for an unchanged budget, so
+    // re-applying it here never resets the warm cache.
+    _state = new CState(_mainState ? _mainState->cacheSizeBytes() : 0, this);
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     _slices = std::make_unique<AxisAlignedSliceController>(_state, this);
     _slices->setViewerManager(_viewerManager.get());
-    _slices->setEnabled(true);
+    // Spiral always uses axis-aligned slices; don't write the user's global
+    // preference for the main workspace.
+    _slices->setEnabled(true, nullptr, nullptr, false);
     _slices->applyOrientation();
+    connect(_viewerManager.get(), &ViewerManager::focusCenteredByUser, this,
+            [this](const cv::Vec3f&) { _focusIsAutoDefault = false; });
     _overlay = std::make_unique<SpiralOverlayController>(this);
     _overlay->bindToViewerManager(_viewerManager.get());
     _surfaceOverlapOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
@@ -76,23 +84,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         {"segmentation", {"seg xz", "seg yz"}}, {"xy plane", {"segmentation"}},
         {"seg xz", {"segmentation"}}, {"seg yz", {"segmentation"}},
     };
+    // Ctrl+click-to-focus is wired by ViewerManager for every viewer.
     for (int pane = 0; pane < 4; ++pane) {
         auto* viewer = _viewerManager->createViewerInWidget(specs[pane].surface, _grid);
         viewer->setIntersects(specs[pane].intersects);
-        if (auto* chunkedViewer = dynamic_cast<CChunkedVolumeViewer*>(viewer)) {
-            connect(chunkedViewer, &CChunkedVolumeViewer::sendVolumeClicked, this,
-                    [this](cv::Vec3f position, cv::Vec3f normal, Surface* surface,
-                           Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-                if (button != Qt::LeftButton ||
-                    modifiers.testFlag(Qt::ShiftModifier) ||
-                    !modifiers.testFlag(Qt::ControlModifier)) {
-                    return;
-                }
-                const std::string surfaceId =
-                    _state && surface ? _state->findSurfaceId(surface) : std::string{};
-                setFocusAt(position, normal, surfaceId);
-            });
-        }
         _grid->setViewer(pane, qobject_cast<QWidget*>(viewer->asQObject()));
     }
     _grid->setPaneHidden(2, true);
@@ -104,6 +99,15 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         settings.setValue(QStringLiteral("spiral/split_x"), _grid->splitX());
         settings.setValue(QStringLiteral("spiral/split_y"), _grid->splitY());
     };
+
+    auto* cacheStatsLabel = new QLabel(this);
+    cacheStatsLabel->setContentsMargins(8, 0, 8, 0);
+    cacheStatsLabel->setText(tr("RAM --  disk --  network --"));
+    statusBar()->addPermanentWidget(cacheStatsLabel);
+    connect(_viewerManager.get(), &ViewerManager::sharedCacheStatsChanged, cacheStatsLabel,
+            [cacheStatsLabel](const QStringList& items) {
+                if (!items.isEmpty()) cacheStatsLabel->setText(items.join(QStringLiteral("  ")));
+            });
 
     _service = new SpiralServiceManager(this);
 
@@ -307,93 +311,63 @@ SpiralWorkspace::~SpiralWorkspace()
     _shuttingDown = true;
     if (_viewerManager) _viewerManager->beginShutdown();
     if (_service) _service->stopService();
-    if (_state) _state->closeAll(); // no package was ever assigned, so Main cannot be unloaded
+    if (_state) {
+        _state->setVpkg(nullptr); // the package is borrowed from Main; drop it so closeAll() cannot unload Main's surfaces
+        _state->closeAll();
+    }
 }
 
 void SpiralWorkspace::keyPressEvent(QKeyEvent* event)
 {
-    if (event && event->key() == Qt::Key_R && event->modifiers() == Qt::NoModifier) {
-        centerFocusOnCursor();
+    using namespace vc3d::keybinds;
+    if (event && event->key() == keypress::CenterFocusOnCursor.key &&
+        event->modifiers() == keypress::CenterFocusOnCursor.modifiers) {
+        _viewerManager->centerFocusOnCursor();
+        event->accept();
+        return;
+    }
+    if (event && event->key() == keypress::RecenterFocus.key &&
+        event->modifiers() == keypress::RecenterFocus.modifiers) {
+        _viewerManager->recenterViewersOnCurrentFocus();
         event->accept();
         return;
     }
     QMainWindow::keyPressEvent(event);
 }
 
-bool SpiralWorkspace::centerFocusOnCursor()
+void SpiralWorkspace::ensureInitialFocus()
 {
-    if (!_state || !_viewerManager) return false;
-    const QPoint globalPosition = QCursor::pos();
-    for (auto* viewer : _viewerManager->baseViewers()) {
-        if (!viewer) continue;
-        auto* graphicsView = viewer->graphicsView();
-        auto* viewport = graphicsView ? graphicsView->viewport() : nullptr;
-        if (!viewport || !viewport->isVisible()) continue;
-        const QPoint viewportPosition = viewport->mapFromGlobal(globalPosition);
-        if (!viewport->rect().contains(viewportPosition)) continue;
-
-        const QPointF scenePosition = graphicsView->mapToScene(viewportPosition);
-        const cv::Vec3f position = viewer->sceneToVolume(scenePosition);
-        if (!std::isfinite(position[0]) || !std::isfinite(position[1]) ||
-            !std::isfinite(position[2])) {
-            return false;
-        }
-        cv::Vec3f normal(0, 0, 0);
-        if (auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface()))
-            normal = plane->normal({}, {});
-        setFocusAt(position, normal, viewer->surfName());
-        return true;
+    if (!_state || _state->poi("focus")) return;
+    if (_currentPreview) {
+        initializePreviewFocus();
+        return;
     }
-    return false;
-}
-
-void SpiralWorkspace::setFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal,
-                                 const std::string& surfaceId)
-{
-    if (!_state) return;
-    POI* focus = _state->poi("focus");
-    if (!focus) focus = new POI;
-    focus->p = position;
-    if (cv::norm(normal) > 0.0f) focus->n = normal;
-    focus->surfaceId = surfaceId.empty() ? "segmentation" : surfaceId;
-    focus->surfacePtr.reset();
-    focus->suppressTransientPlaneIntersections = true;
-    _state->setPOI("focus", focus);
-    finishFocusChange();
-}
-
-void SpiralWorkspace::finishFocusChange()
-{
-    if (!_state || !_viewerManager || !_slices) return;
-    POI* focus = _state->poi("focus");
-    if (!focus) return;
-
-    _slices->applyOrientation();
-    const cv::Vec3f position = focus->p;
-    for (auto* viewer : _viewerManager->baseViewers()) {
-        if (!viewer) continue;
-        viewer->centerOnVolumePoint(position);
-        viewer->invalidateIntersect();
-        viewer->renderIntersections("Spiral focus changed");
-        viewer->requestRender("Spiral focus changed");
-    }
+    // No preview yet: default to the volume center (same policy as the main
+    // workspace) so the plane viewers show data immediately.
+    if (_viewerManager->resetFocusForVolumeChange(true)) _focusIsAutoDefault = true;
 }
 
 void SpiralWorkspace::initializePreviewFocus()
 {
     if (!_state || !_currentPreview) return;
-    if (!_state->poi("focus")) {
-        auto focus = _state->createSurfaceFocusPoi(*_currentPreview);
-        if (!focus) return;
-        _state->setPOI("focus", focus.release());
-    }
-    finishFocusChange();
+    if (_state->poi("focus") && !_focusIsAutoDefault) return;
+    auto focus = _state->createSurfaceFocusPoi(*_currentPreview);
+    if (!focus) return;
+    _state->setPOI("focus", focus.release());
+    _focusIsAutoDefault = false;
+    // Plane viewers recenter via ViewerManager::handleFocusPoiChanged; also
+    // bring the segmentation viewer to the new preview's focus point.
+    _viewerManager->recenterViewersOnCurrentFocus();
 }
 
 void SpiralWorkspace::refreshVolumes()
 {
     QVector<VolumeSelector::VolumeOption> options;
     auto package = _mainState ? _mainState->vpkg() : nullptr;
+    // Borrow Main's package so volume-ID resolution, coordinate identity and
+    // the remote chunk-cache root all match Main's viewers. Teardown clears it
+    // again before closeAll() so the shared package is never unloaded from here.
+    if (_state->vpkg() != package) _state->setVpkg(package);
     if (package) {
         for (const auto& id : package->volumeIDs()) {
             auto volume = package->volume(id);
@@ -407,8 +381,8 @@ void SpiralWorkspace::refreshVolumes()
     _panel->setVolumes(options, selected);
     if (!_state->currentVolume() && _mainState) {
         _state->setCurrentVolume(_mainState->currentVolume());
-        if (!_state->poi("focus")) initializePreviewFocus();
     }
+    ensureInitialFocus();
 }
 
 void SpiralWorkspace::selectVolume(const QString& id)
@@ -418,11 +392,17 @@ void SpiralWorkspace::selectVolume(const QString& id)
     auto volume = package->volume(id.toStdString());
     if (!volume) return;
     if (volume == _state->currentVolume()) {
-        if (!_state->poi("focus")) initializePreviewFocus();
+        ensureInitialFocus();
         return;
     }
-    _state->setCurrentVolume(volume);
-    if (!_state->poi("focus")) initializePreviewFocus();
+    const bool hadFocus = _state->poi("focus") != nullptr;
+    _viewerManager->switchVolume(volume);
+    if (!hadFocus) {
+        // switchVolume created a volume-center default; prefer the preview
+        // focus when one is already loaded.
+        _focusIsAutoDefault = true;
+        initializePreviewFocus();
+    }
     for (auto* viewer : _viewerManager->baseViewers()) if (viewer) viewer->requestRender("Spiral display volume changed");
 }
 
@@ -502,12 +482,12 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(const PreviewLoadResult& re
         });
         return;
     }
-    const bool hadFocus = _state->poi("focus") != nullptr;
     auto previous = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
     if (previous) _retiredPreviews.emplace_back(QString::fromStdString(previous->id), previous);
     _currentPreview = result.surface;
     if (_outputVisible) _state->setSurface("segmentation", result.surface);
-    if (!hadFocus) initializePreviewFocus();
+    // No-op unless the focus is still missing or the automatic default.
+    initializePreviewFocus();
     updateSurfaceIntersections();
     for (auto* viewer : _viewerManager->baseViewers()) if (viewer) {
         viewer->invalidateIntersect("segmentation");

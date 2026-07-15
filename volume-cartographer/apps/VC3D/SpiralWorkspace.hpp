@@ -67,11 +67,8 @@ private:
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
     void setSurfaceCategoryVisible(const QString& category, bool visible);
     void updateSurfaceIntersections();
+    void ensureInitialFocus();
     void initializePreviewFocus();
-    void setFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal,
-                    const std::string& surfaceId);
-    void finishFocusChange();
-    bool centerFocusOnCursor();
 
     CState* _mainState = nullptr;
     CState* _state = nullptr;
@@ -92,5 +89,8 @@ private:
     quint64 _inputSurfaceGeneration = 0;
     std::shared_ptr<QuadSurface> _currentPreview;
     bool _outputVisible = true;
+    // True while the focus is the automatic volume-center default (no user
+    // interaction and no preview yet); the first preview may then retarget it.
+    bool _focusIsAutoDefault = false;
     bool _shuttingDown = false;
 };

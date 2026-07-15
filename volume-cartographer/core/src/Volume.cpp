@@ -1634,6 +1634,12 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
 void Volume::setCacheBudget(size_t hotBytes)
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
+    if (cacheBudgetHot_ == hotBytes) {
+        // Re-applying the same budget must not drop the warm cache; multiple
+        // workspaces share Volume instances and each applies its budget on
+        // volume selection.
+        return;
+    }
     cacheBudgetHot_ = hotBytes;
     chunkedCache_.reset();
 }

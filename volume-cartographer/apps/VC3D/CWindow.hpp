@@ -127,7 +127,6 @@ signals:
 
 public slots:
     void onShowStatusMessage(QString text, int timeout);
-    void onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onVisLasagnaObj(const std::string& segmentId);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
@@ -368,7 +367,6 @@ private:
     QMdiArea *mdiArea;
     QMdiArea* _fiberSliceMdiArea{nullptr};
     QMdiArea* _intersectionsMdiArea{nullptr};
-    VolumeViewerBase* _activeBaseViewer{nullptr};
 
     bool can_change_volume_();
 
