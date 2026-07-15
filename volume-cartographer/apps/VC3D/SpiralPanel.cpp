@@ -268,9 +268,13 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             return;
         }
         persist();
+        emit pythonOutputRequested();
         _service->loadSession(sessionRequest());
     });
-    connect(_run, &QPushButton::clicked, this, [this]() { _service->runIterations(_iterations->value()); });
+    connect(_run, &QPushButton::clicked, this, [this]() {
+        emit pythonOutputRequested();
+        _service->runIterations(_iterations->value());
+    });
     connect(_stop, &QPushButton::clicked, _service, &SpiralServiceManager::stopAfterIteration);
     connect(_save, &QPushButton::clicked, this, [this]() {
         const QString initial = QDir(_paths["output_directory"]->text())

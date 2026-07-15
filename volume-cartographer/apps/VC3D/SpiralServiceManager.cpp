@@ -111,6 +111,7 @@ void SpiralServiceManager::ensureStarted()
     const QString moduleDir = QFileInfo(service).absolutePath();
     const QString oldPythonPath = environment.value(QStringLiteral("PYTHONPATH"));
     environment.insert(QStringLiteral("PYTHONPATH"), oldPythonPath.isEmpty() ? moduleDir : moduleDir + QDir::listSeparator() + oldPythonPath);
+    environment.insert(QStringLiteral("PYTHONUNBUFFERED"), QStringLiteral("1"));
     _process->setProcessEnvironment(environment);
     emit serviceStateChanged(tr("Starting"));
     _process->start(python, {service, QStringLiteral("--nonce"), _nonce,

@@ -12,6 +12,8 @@
 
 class AxisAlignedSliceController;
 class CState;
+class ConsoleOutputWidget;
+class QDialog;
 class QKeyEvent;
 class QuadSurface;
 class SpiralPanel;
@@ -79,6 +81,8 @@ private:
     std::unique_ptr<SegmentationOverlayController> _surfaceOverlapOverlay;
     SpiralServiceManager* _service = nullptr;
     SpiralPanel* _panel = nullptr;
+    ConsoleOutputWidget* _pythonOutput = nullptr;
+    QDialog* _pythonOutputDialog = nullptr;
     ViewerSplitGrid* _grid = nullptr;
     std::vector<std::pair<QString, std::shared_ptr<QuadSurface>>> _retiredPreviews;
     qint64 _requestedPreviewGeneration = -1;

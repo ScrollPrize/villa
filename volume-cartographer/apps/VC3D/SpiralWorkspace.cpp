@@ -2,6 +2,7 @@
 
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
+#include "ConsoleOutputWidget.hpp"
 #include "SpiralPanel.hpp"
 #include "SpiralServiceManager.hpp"
 #include "ViewerManager.hpp"
@@ -16,6 +17,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <QCursor>
+#include <QDialog>
 #include <QDockWidget>
 #include <QDir>
 #include <QFile>
@@ -26,6 +28,7 @@
 #include <QSettings>
 #include <QStatusBar>
 #include <QTimer>
+#include <QVBoxLayout>
 #include <QtEndian>
 #include <QtConcurrent/QtConcurrent>
 
@@ -103,6 +106,26 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     };
 
     _service = new SpiralServiceManager(this);
+
+    _pythonOutputDialog = new QDialog(this, Qt::Window);
+    _pythonOutputDialog->setObjectName(QStringLiteral("spiralPythonOutputDialog"));
+    _pythonOutputDialog->setWindowTitle(tr("Spiral Python Output"));
+    _pythonOutputDialog->setModal(false);
+    _pythonOutputDialog->resize(900, 500);
+    auto* pythonOutputLayout = new QVBoxLayout(_pythonOutputDialog);
+    _pythonOutput = new ConsoleOutputWidget(_pythonOutputDialog);
+    _pythonOutput->setTitle(tr("Spiral Python stdout / stderr"));
+    _pythonOutput->setMaximumBlockCount(10000);
+    pythonOutputLayout->addWidget(_pythonOutput);
+    connect(_service, &SpiralServiceManager::logMessage,
+            _pythonOutput, &ConsoleOutputWidget::appendOutput);
+    connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
+        statusBar()->showMessage(error, 15000);
+        _pythonOutput->appendOutput(tr("Error: %1").arg(error));
+        _pythonOutputDialog->show();
+        _pythonOutputDialog->raise();
+    });
+
     _panel = new SpiralPanel(_service, this);
     auto* dock = new QDockWidget(tr("Spiral"), this);
     dock->setObjectName(QStringLiteral("spiralControlDock"));
@@ -112,6 +135,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     resizeDocks({dock}, {390}, Qt::Horizontal);
 
     connect(_panel, &SpiralPanel::volumeSelected, this, &SpiralWorkspace::selectVolume);
+    connect(_panel, &SpiralPanel::pythonOutputRequested, this, [this]() {
+        _pythonOutputDialog->show();
+        _pythonOutputDialog->raise();
+        _pythonOutputDialog->activateWindow();
+    });
     connect(_panel, &SpiralPanel::visibilityChanged, this, [this](const QString& category, bool shown) {
         if (category == QStringLiteral("output")) {
             _outputVisible = shown;
@@ -142,9 +170,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             _geometryManifestPath = path;
             loadGeometrySnapshot(path, static_cast<quint64>(status.value(QStringLiteral("session_generation")).toInteger()));
         }
-    });
-    connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
-        statusBar()->showMessage(error, 15000);
     });
     if (_mainState) {
         connect(_mainState, &CState::vpkgChanged, this, [this](const std::shared_ptr<VolumePkg>&) { refreshVolumes(); });

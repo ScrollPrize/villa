@@ -1355,7 +1355,16 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             if resume_checkpoint.get('torch_cpu_rng_state') is not None:
                 torch.random.set_rng_state(resume_checkpoint['torch_cpu_rng_state'])
             if resume_checkpoint.get('torch_cuda_rng_states') is not None:
-                torch.cuda.set_rng_state_all(resume_checkpoint['torch_cuda_rng_states'])
+                # The checkpoint holds one state per GPU on the machine that
+                # saved it, which may not match this machine's device count.
+                saved_cuda_states = resume_checkpoint['torch_cuda_rng_states']
+                local_device_count = torch.cuda.device_count()
+                if len(saved_cuda_states) != local_device_count:
+                    print(f'checkpoint has {len(saved_cuda_states)} CUDA RNG states but '
+                          f'{local_device_count} device(s) are visible; restoring the first '
+                          f'{min(len(saved_cuda_states), local_device_count)}')
+                for device_index, state in enumerate(saved_cuda_states[:local_device_count]):
+                    torch.cuda.set_rng_state(state, device_index)
         # load_state_dict has moved the model and optimiser state to their
         # destination tensors.  Release the CPU-side archive mappings before
         # entering the resident training loop.

@@ -28,6 +28,7 @@ public:
 signals:
     void volumeSelected(const QString& id);
     void visibilityChanged(const QString& category, bool visible);
+    void pythonOutputRequested();
 
 private:
     QLineEdit* addPathRow(QFormLayout* form, const QString& key, const QString& label,
