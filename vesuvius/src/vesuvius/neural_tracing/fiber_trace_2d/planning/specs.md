@@ -21,16 +21,22 @@
   for those required ranges, builds valid contiguous frame intervals, and keeps
   compact per-line/frame arrays read-only for the rest of the process.
 - Startup compact geometry construction may parallelize across independent
-  records with `loader_workers`. `loader_workers=1` is the serial startup/debug
-  path. Parallel startup may complete records out of order internally, but the
-  final store must be indexed by original record order.
+  records with process workers controlled by `loader_workers`.
+  `loader_workers=0` means all logical CPU cores, and `loader_workers=1` is
+  the serial startup/debug path. Each process opens its own base-volume and
+  Lasagna channel handles, builds compact geometry for assigned records, and
+  returns only compact arrays/metadata to the parent. Parallel startup may
+  complete records out of order internally, but the final parent-owned store
+  must be indexed by original record order.
 - Startup Lasagna normal sampling may use batched/vectorized channel reads and
   normal decoding, but it must preserve Lasagna `_decode_normals`, ambiguous
   normal principal-axis handling, and strict invalid-data semantics.
-- The compact geometry store is shared by all threaded loader workers and
-  cloned loaders in one process. `fiber_trace_2d` training does not currently
-  use DDP or `torch.distributed`; this task must not introduce per-worker
-  duplicated compact geometry.
+- The compact geometry store is assembled and owned by the parent process, then
+  shared by all threaded loader workers and cloned loaders in that process.
+  Startup process workers must not remain as runtime geometry owners.
+  `fiber_trace_2d` training does not currently use DDP or
+  `torch.distributed`; this task must not introduce per-worker duplicated
+  compact geometry.
 - Runtime side/top source-grid construction looks up the record/control-point
   entry directly, evaluates only the requested source columns from the compact
   frame arrays, and broadcasts rows by frame axes. It must not write/read a
@@ -198,14 +204,17 @@
 - The deterministic pseudo-random training order covers every configured control point exactly once per dataset pass before repeating.
 - Changing training step counts, batch size, or control points per step must only truncate or extend the consumed prefix of that deterministic sample stream; it must not reshuffle earlier samples.
 - `load_batch` may parallelize CP-sample construction with `loader_workers`,
-  defaulting to the machine logical CPU count. Parallel workers may evaluate
-  candidate samples out of order, but accepted output samples and skip handling
-  must follow the same deterministic sample-index order as serial loading.
+  defaulting to the machine logical CPU count. `loader_workers=0` explicitly
+  requests all logical CPU cores. Parallel workers may evaluate candidate
+  samples out of order, but accepted output samples and skip handling must
+  follow the same deterministic sample-index order as serial loading.
   `loader_workers=1` is the serial no-thread debug path. When
   `loader_workers > 1`, the loader reuses a persistent CP-level executor across
   batches instead of constructing a new thread pool per step.
 - The same `loader_workers` setting also controls startup compact-geometry
-  record construction. No separate startup worker-count key exists.
+  record construction. Startup uses process workers, while warm
+  `load_batch` CP-sample construction uses the persistent in-process thread
+  executor above. No separate startup worker-count key exists.
 - Parallel loader workers must not serialize on deterministic random-order
   locks during the warm path. Random dataset-pass orders are built once per
   pass, cached by pass index, and prewarmed for the attempted batch window

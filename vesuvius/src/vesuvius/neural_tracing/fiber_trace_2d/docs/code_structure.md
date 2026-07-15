@@ -185,7 +185,9 @@ The important behavior is:
   normals only for those required ranges with batched channel reads, creates
   valid frame intervals, and shares compact line/frame arrays read-only by
   loader clones and threaded workers in the same process. Startup record
-  construction uses `loader_workers` when more than one worker is configured.
+  construction uses process workers when `loader_workers > 1`; each process
+  opens its own base-volume and Lasagna handles, returns compact geometry, and
+  the parent assembles the single shared store in original record order.
 - Builds one CP source strip from the compact geometry store with the
   torch-vectorized augment-vis path, then derives all configured strip-z
   offsets from that source using the stored strip offset axis.
@@ -725,13 +727,16 @@ Top-level keys used by `load_config`:
   each expand over the full machine.
 - `loader_workers`: worker count for startup compact-geometry record
   construction and CP-sample construction in `load_batch`. The default is the
-  logical CPU count. Set `loader_workers: 1` for serial debugging. Parallel
-  startup stores results by original record index, and parallel batch workers
-  evaluate candidates concurrently while accepted batch output remains in
-  deterministic sample-index order. For warm `load_batch` work with
-  `loader_workers > 1`, the loader keeps a lazy persistent executor and reuses
-  it across batches; call `FiberStrip2DLoader.close()` to shut it down
-  explicitly in long-lived tools or tests.
+  logical CPU count. Set `loader_workers: 0` to explicitly use all logical CPU
+  cores from the config, or `loader_workers: 1` for serial debugging. Parallel
+  startup uses worker processes that open their own volume/Lasagna handles and
+  return compact geometry for parent-owned storage by original record index.
+  Parallel warm batch workers evaluate candidates concurrently while accepted
+  batch output remains in deterministic sample-index order. For warm
+  `load_batch` work with `loader_workers > 1`, the loader keeps a lazy
+  persistent thread executor and reuses it across batches; call
+  `FiberStrip2DLoader.close()` to shut it down explicitly in long-lived tools
+  or tests.
 - `volume_cache_dir`: optional cache directory for remote volume chunks.
 - `volume_cache_memory_mib`: optional per-VC3D-sampler decoded/hot cache budget
   in MiB. `null` or omission leaves VC3D's default behavior intact. Use a

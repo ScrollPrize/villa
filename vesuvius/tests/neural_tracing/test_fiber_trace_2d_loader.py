@@ -2821,6 +2821,7 @@ def test_loader_loads_nml_components_and_applies_dataset_transform(tmp_path: Pat
         "patch_shape_hw": [3, 3],
         "strip_z_offset_count": 1,
         "strip_z_offset_step": 1.0,
+        "loader_workers": 1,
         "seed": 123,
         "datasets": [
             {
@@ -5189,6 +5190,21 @@ def test_config_loader_workers_defaults_to_logical_cpu_count(tmp_path: Path) -> 
     assert parsed.loader_workers == max(1, loader_module.os.cpu_count() or 1)
 
 
+def test_config_loader_workers_zero_means_logical_cpu_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loader_module.os, "cpu_count", lambda: 32)
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["loader_workers"] = 0
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    parsed = load_config(config_path)
+
+    assert parsed.loader_workers == 32
+
+
 def test_config_loader_workers_accepts_single_worker_debug_mode(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -5198,6 +5214,16 @@ def test_config_loader_workers_accepts_single_worker_debug_mode(tmp_path: Path) 
     parsed = load_config(config_path)
 
     assert parsed.loader_workers == 1
+
+
+def test_config_rejects_negative_loader_workers(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["loader_workers"] = -1
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="loader_workers must be positive"):
+        load_config(config_path)
 
 
 def test_config_parses_vc3d_cache_budget_and_io_threads(tmp_path: Path) -> None:
@@ -5214,7 +5240,7 @@ def test_config_parses_vc3d_cache_budget_and_io_threads(tmp_path: Path) -> None:
     assert parsed.volume_io_threads == 3
 
 
-def test_loader_clone_reuses_records_but_refreshes_samplers(tmp_path: Path) -> None:
+def test_loader_clone_reuses_metadata_but_refreshes_sampler(tmp_path: Path) -> None:
     created_samplers: list[_RecordingCoordinateSampler] = []
 
     def factory(**kwargs):
@@ -5292,6 +5318,7 @@ def test_fiber_group_batch_concatenates_same_fiber_control_point_groups(tmp_path
     config_path = _write_config(tmp_path, batch_size=4)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["strip_z_offset_count"] = 1
+    raw["loader_workers"] = 1
     fiber_a = _write_fiber(
         tmp_path / "fiber_a.json",
         points=[[0.0, 20.0, 20.0], [10.0, 20.0, 20.0]],
@@ -5581,7 +5608,9 @@ def test_parallel_startup_geometry_matches_serial(tmp_path: Path) -> None:
     raw["loader_workers"] = 2
     parallel_path = tmp_path / "parallel.json"
     parallel_path.write_text(json.dumps(raw), encoding="utf-8")
-    parallel = _make_loader(load_config(parallel_path))
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(loader_module, "ProcessPoolExecutor", loader_module.ThreadPoolExecutor)
+        parallel = _make_loader(load_config(parallel_path))
 
     assert len(serial._geometry_store.by_record_index) == len(parallel._geometry_store.by_record_index)
     for serial_geometry, parallel_geometry in zip(
@@ -7224,6 +7253,7 @@ def test_load_top_batch_for_batch_uses_grouped_coordinate_batch_sampling(tmp_pat
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["strip_z_offset_count"] = 1
     raw["augment_device"] = "cpu"
+    raw["loader_workers"] = 1
     config_path.write_text(json.dumps(raw), encoding="utf-8")
     samplers: list[_RecordingCoordinateSampler] = []
 

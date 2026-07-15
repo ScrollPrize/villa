@@ -6,7 +6,7 @@
   "seed": 0,
   "prefetch_workers": 16,
   "prefetch_sampler_workers": 4,
-  "loader_workers": 4,
+  "loader_workers": 0,
   "augment_enabled": true,
   "augment_seed": 0,
   "augment_device": "auto",

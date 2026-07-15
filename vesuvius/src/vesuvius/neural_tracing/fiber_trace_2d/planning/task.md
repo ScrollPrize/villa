@@ -1,17 +1,26 @@
-# Accelerate Startup Compact Geometry Build
+# Process-Level Startup Fiber Geometry Preload
 
-The compact in-RAM fiber-line geometry store is correct and small, but full
-dataset construction is too slow: the current `loader_example.json` startup
-build took `8m53s` for `464` records.
+The loader must preload compact fiber-line geometry at startup by splitting
+fibers/records across independent worker processes. Each process should do its
+assigned fiber work independently, including opening the needed volume/Lasagna
+handles inside that process. The parent process must collect the compact
+geometry results, store them in deterministic record order, and keep one shared
+in-memory geometry store for subsequent training/prefetch/runner use.
 
-Implement the next optimization pass using all four agreed directions:
+This replaces the incorrect thread-local zarr/VC3D handle direction. Do not
+lazy-build geometry during the first training pass, and do not use per-thread
+record handle caches as the solution for startup preload.
 
-- parallelize compact geometry construction by record;
-- vectorize Lasagna normal sampling/decoding per record;
-- only preprocess line points that can affect a configured CP source window;
-- combine those changes and benchmark the startup build plus load-only hot
-  path.
+Keep these existing requirements:
 
-Use the existing `loader_workers` setting for startup geometry parallelism
-instead of adding another config key. `loader_workers=1` must remain the
-deterministic serial/debug path.
+- Build the compact geometry store during `FiberStrip2DLoader` construction.
+- Show startup progress while building the store.
+- `loader_workers=0` means all logical CPU cores.
+- `loader_workers=1` remains the serial/debug path.
+- Final geometry order, deterministic sample order, skip behavior, and compact
+  geometry contents must match the serial path.
+- The compact geometry store must not be duplicated after startup; worker
+  processes return compact results to the parent, and the parent owns the
+  shared store.
+- Parallel startup must not share opened zarr/VC3D/Lasagna objects between
+  workers.

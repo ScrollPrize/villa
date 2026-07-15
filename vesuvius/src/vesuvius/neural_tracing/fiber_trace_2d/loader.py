@@ -11,7 +11,14 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -168,7 +175,7 @@ class _Record:
     volume_scale: int
     volume_spacing_base: float
     fiber_identity: str
-    sampler: CoordinateSampler
+    sampler: CoordinateSampler | None
     grad_mag: Any
     grad_mag_spacing_base: float
     nx: Any | None
@@ -176,6 +183,18 @@ class _Record:
     nx_spacing_base: float | None
     ny_spacing_base: float | None
     dataset_config: dict[str, Any]
+
+@dataclass(frozen=True)
+class _GeometryBuildJob:
+    record_index: int
+    fiber: Vc3dFiber
+    volume_path: str
+    volume_scale: int
+    volume_spacing_base: float
+    fiber_identity: str
+    dataset_config: dict[str, Any]
+    config: FiberStrip2DConfig
+    source_shape_hw: tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -449,6 +468,22 @@ def strip_z_offsets_from_count_step(count: int, step: float) -> tuple[float, ...
     return tuple((start + i) * step for i in range(count))
 
 
+def _logical_cpu_count() -> int:
+    return max(1, int(os.cpu_count() or 1))
+
+
+def _parse_positive_worker_count(value: Any, *, key: str, zero_means_logical: bool = False) -> int:
+    count = int(value)
+    if zero_means_logical and count == 0:
+        return _logical_cpu_count()
+    if count <= 0:
+        raise ValueError(
+            f"{key} must be positive"
+            + (" or 0 to use all logical CPU cores" if zero_means_logical else "")
+        )
+    return int(count)
+
+
 def load_config(path: str | Path) -> FiberStrip2DConfig:
     config_path = Path(path).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as handle:
@@ -482,9 +517,16 @@ def load_config(path: str | Path) -> FiberStrip2DConfig:
         strip_z_offset_count=int(raw.get("strip_z_offset_count", 16)),
         strip_z_offset_step=float(raw.get("strip_z_offset_step", 1.0)),
         seed=int(raw.get("seed", 1)),
-        prefetch_workers=max(1, int(raw.get("prefetch_workers", 16))),
-        prefetch_sampler_workers=max(1, int(raw.get("prefetch_sampler_workers", 2))),
-        loader_workers=max(1, int(raw.get("loader_workers", max(1, os.cpu_count() or 1)))),
+        prefetch_workers=_parse_positive_worker_count(raw.get("prefetch_workers", 16), key="prefetch_workers"),
+        prefetch_sampler_workers=_parse_positive_worker_count(
+            raw.get("prefetch_sampler_workers", 2),
+            key="prefetch_sampler_workers",
+        ),
+        loader_workers=_parse_positive_worker_count(
+            raw.get("loader_workers", 0),
+            key="loader_workers",
+            zero_means_logical=True,
+        ),
         volume_cache_dir=None if cache_dir is None else str(cache_dir),
         volume_cache_memory_mib=cache_memory_mib,
         volume_io_threads=volume_io_threads,
@@ -1121,7 +1163,10 @@ class FiberStrip2DLoader:
         )
         self.config = config
         self._sampler_factory = make_coordinate_sampler if sampler_factory is None else sampler_factory
-        self.records = self._load_records() if records is None else list(records)
+        if records is None:
+            self.records = self._load_records()
+        else:
+            self.records = list(records)
         self._flat_sample_count = sum(record.fiber.control_points_xyz.shape[0] for record in self.records)
         if self._flat_sample_count <= 0:
             raise ValueError("no control points found in configured fibers")
@@ -1679,47 +1724,67 @@ class FiberStrip2DLoader:
             )
             last_print_time = now
 
-        def build_record(record_index: int, record: _Record) -> tuple[int, _Record, _FiberLineGeometry, int]:
+        worker_config = replace(self.config, suppress_record_warnings=True)
+
+        def build_job(record_index: int) -> _GeometryBuildJob:
+            record = self.records[int(record_index)]
+            return _GeometryBuildJob(
+                record_index=int(record_index),
+                fiber=record.fiber,
+                volume_path=record.volume_path,
+                volume_scale=int(record.volume_scale),
+                volume_spacing_base=float(record.volume_spacing_base),
+                fiber_identity=record.fiber_identity,
+                dataset_config=dict(record.dataset_config),
+                config=worker_config,
+                source_shape_hw=source_shape_hw,
+            )
+
+        def build_record(record_index: int) -> tuple[int, _FiberLineGeometry, int]:
+            record = self.records[int(record_index)]
             geometry = self._build_geometry_for_record(
                 record,
                 int(record_index),
                 source_shape_hw=source_shape_hw,
             )
             memory_bytes = self._geometry_memory_bytes(geometry)
-            return int(record_index), record, geometry, int(memory_bytes)
+            return int(record_index), geometry, int(memory_bytes)
 
         if worker_count <= 1:
             for record_index, record in enumerate(self.records):
-                built_index, built_record, geometry, memory_bytes = build_record(
-                    int(record_index),
-                    record,
-                )
+                built_index, geometry, memory_bytes = build_record(int(record_index))
                 self._store_geometry(
                     store,
-                    built_record,
+                    record,
                     record_index=built_index,
                     geometry=geometry,
                     memory_bytes=memory_bytes,
                 )
                 maybe_print_progress(int(record_index) + 1, force=int(record_index) + 1 == total_records)
         else:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            executor = ProcessPoolExecutor(max_workers=worker_count)
+            try:
                 futures = [
-                    executor.submit(build_record, int(record_index), record)
-                    for record_index, record in enumerate(self.records)
+                    executor.submit(_build_fiber_line_geometry_process, build_job(int(record_index)))
+                    for record_index, _record in enumerate(self.records)
                 ]
                 done_count = 0
                 for future in as_completed(futures):
-                    built_index, built_record, geometry, memory_bytes = future.result()
+                    built_index, geometry, memory_bytes = future.result()
                     self._store_geometry(
                         store,
-                        built_record,
+                        self.records[int(built_index)],
                         record_index=built_index,
                         geometry=geometry,
                         memory_bytes=memory_bytes,
                     )
                     done_count += 1
                     maybe_print_progress(done_count, force=done_count == total_records)
+            except BaseException:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True, cancel_futures=True)
         if show_progress:
             elapsed = max(time.perf_counter() - start_time, 1.0e-9)
             print(
@@ -2974,11 +3039,10 @@ class FiberStrip2DLoader:
         cp_index = int(side_sample.control_point_index)
         if record_index < 0 or record_index >= len(self.records):
             raise IndexError(f"record_index {record_index} out of range for {len(self.records)} records")
-        record = self.records[record_index]
         source = self.build_top_strip_source(
             0,
             device=device,
-            descriptor=(record, record_index, cp_index),
+            descriptor=(self.records[record_index], record_index, cp_index),
             profile=profile,
         )
         grid = source.grid
@@ -4495,6 +4559,12 @@ class FiberStrip2DLoader:
         fiber_paths: list[str] = []
         augmentation_params: list[FiberStripAugmentParams | None] = []
         batch_wall_start = time.perf_counter()
+        max_attempts = (
+            len(flat_index_sequence)
+            if flat_index_sequence is not None
+            else max(batch_size * 4, batch_size + 1000)
+        )
+        worker_count = min(max(1, int(self.config.loader_workers)), max(1, batch_size), max_attempts)
 
         def report_skip(current_sample_index: int, exc: ValueError) -> None:
             self._load_batch_skipped_samples += 1
@@ -4507,10 +4577,14 @@ class FiberStrip2DLoader:
             ValueError | None,
         ]:
             current_sample_index = self._bounded_sample_index(raw_sample_index, sample_index_limit)
-            descriptor = None
             if flat_index_sequence is not None:
                 current_sample_index = int(flat_index_sequence[int(attempt_index)])
                 descriptor = self._descriptor_for_flat_index(current_sample_index)
+            else:
+                descriptor = self.descriptor_for_sample_index(
+                    current_sample_index,
+                    sample_mode=sample_mode,
+                )
             value_augmentation_sample_index = (
                 None
                 if value_sync_size is None
@@ -4556,13 +4630,7 @@ class FiberStrip2DLoader:
         try:
             next_attempt_to_submit = 0
             next_attempt_to_consume = 0
-            max_attempts = (
-                len(flat_index_sequence)
-                if flat_index_sequence is not None
-                else max(batch_size * 4, batch_size + 1000)
-            )
             attempts = 0
-            worker_count = min(max(1, int(self.config.loader_workers)), max(1, batch_size), max_attempts)
             if sample_mode == "random" and flat_index_sequence is None:
                 with _ProfileBlock(profile, "random_order"):
                     self._ensure_random_pass_orders_for_indices(
@@ -5169,6 +5237,56 @@ class FiberStrip2DLoader:
             "first_sample_skip": counters.first_sample_skip,
             "max_exclusive_sample_index": counters.max_exclusive_sample_index,
         }
+
+
+def _build_fiber_line_geometry_process(
+    job: _GeometryBuildJob,
+) -> tuple[int, _FiberLineGeometry, int]:
+    volume = _open_dataset_volume(job.dataset_config, job.config)
+    (
+        _base_shape_zyx,
+        grad_mag,
+        grad_mag_spacing_base,
+        nx,
+        ny,
+        nx_spacing_base,
+        ny_spacing_base,
+    ) = _open_manifest_channels(
+        job.dataset_config,
+        job.config,
+        volume=volume,
+        volume_path=job.volume_path,
+    )
+    record = _Record(
+        fiber=job.fiber,
+        volume=volume,
+        volume_path=job.volume_path,
+        volume_scale=int(job.volume_scale),
+        volume_spacing_base=float(job.volume_spacing_base),
+        fiber_identity=job.fiber_identity,
+        sampler=None,
+        grad_mag=grad_mag,
+        grad_mag_spacing_base=float(grad_mag_spacing_base),
+        nx=nx,
+        ny=ny,
+        nx_spacing_base=nx_spacing_base,
+        ny_spacing_base=ny_spacing_base,
+        dataset_config=dict(job.dataset_config),
+    )
+    builder = FiberStrip2DLoader.__new__(FiberStrip2DLoader)
+    builder.config = job.config
+    builder.strip_z_offsets = strip_z_offsets_from_count_step(
+        job.config.strip_z_offset_count,
+        job.config.strip_z_offset_step,
+    )
+    geometry = FiberStrip2DLoader._build_geometry_for_record(
+        builder,
+        record,
+        int(job.record_index),
+        source_shape_hw=job.source_shape_hw,
+    )
+    memory_bytes = FiberStrip2DLoader._geometry_memory_bytes(builder, geometry)
+    return int(job.record_index), geometry, int(memory_bytes)
 
 
 def iter_batches(

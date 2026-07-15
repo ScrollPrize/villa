@@ -9,6 +9,10 @@
 - Accelerated compact geometry startup by sampling only CP source-window line
   ranges, batching Lasagna normal channel interpolation/decoding, and building
   independent records in parallel with `loader_workers`.
+- Changed `loader_workers: 0` to mean all logical CPU cores and updated the
+  checked-in example fiber2d configs to use that setting.
+- Changed startup compact geometry preload to use process-level parallel record
+  builders that return compact geometry to one parent-owned in-memory store.
 - Added `fiber_trace_2d` NML fiber-source loading. NML `<thing>` simple path
   components are edge-ordered and normalized into `Vc3dFiber` records, while
   existing VC3D JSON input remains supported.

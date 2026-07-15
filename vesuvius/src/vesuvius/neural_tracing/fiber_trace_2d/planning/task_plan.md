@@ -1,198 +1,173 @@
-# Startup Compact Geometry Acceleration Plan
+# Process-Level Startup Fiber Geometry Preload Plan
 
 ## Findings
 
-- Current startup geometry construction is correct but serial:
-  - `_initialize_fiber_line_geometry_store()` loops over records;
-  - `_build_geometry_for_record()` loops over every line point;
-  - each line point calls `_lasagna_normal_at_zyx()`;
-  - `_lasagna_normal_at_zyx()` performs three tiny 2x2x2 channel reads
-    (`grad_mag`, `nx`, `ny`), trilinear interpolation, Lasagna ambiguous normal
-    decoding, and a small principal-axis solve.
-- Measured baseline with `loader_example.json`:
-  - startup compact geometry build: `8m53s`;
-  - records: `464`;
-  - valid/skipped CPs: `14773/184`;
-  - compact store memory: `63.5 MiB`;
-  - hot path after startup: `compact_geometry=0.012 ms/patch`.
-- The startup build has three clear waste sources:
-  - record construction is independent but currently sequential;
-  - normal sampling is point-by-point Python work with many tiny zarr reads;
-  - normals are sampled for line points that may never be inside any configured
-    CP source window.
+- The current task files incorrectly describe a same-process thread-local
+  handle cache. That is not the desired direction.
+- Startup compact geometry must be precomputed during loader construction, not
+  lazily during training.
+- The useful existing pieces should stay:
+  - deterministic sample ordering;
+  - compact in-RAM fiber-line geometry store;
+  - CP-window range filtering;
+  - vectorized Lasagna normal sampling;
+  - `loader_workers=0` meaning all logical CPU cores.
+- The wrong pieces to remove are:
+  - `_RecordOpenSpec`;
+  - `self._worker_local`;
+  - `_record_for_index(... use_worker_local=...)`;
+  - descriptor-index plumbing whose only purpose is thread-local record handle
+    lookup;
+  - tests/docs that assert per-thread worker-local records.
 
 ## Goals
 
-- Implement all four acceleration directions together:
-  1. parallelize by record;
-  2. vectorize per-record normal sampling/decoding;
-  3. preprocess only CP-relevant line points;
-  4. combine and benchmark the full path.
-- Preserve deterministic record order, sample order, CP validity semantics, and
-  compact store sharing.
-- Do not add a new worker-count config key. Reuse existing `loader_workers` for
-  startup compact geometry construction:
-  - `loader_workers=1`: serial/debug path;
-  - `loader_workers>1`: parallel record build.
+- Build all compact fiber-line geometry at `FiberStrip2DLoader` startup.
+- Parallelize that startup build across independent worker processes.
+- Each worker process opens its own base-volume/Lasagna channel handles.
+- The parent process stores the returned compact geometries in original record
+  order.
+- Runtime batch loading uses the shared compact store exactly as before.
+- Keep serial `loader_workers=1` as the reference/debug path.
+- Keep `loader_workers=0` as all logical cores.
 
 ## Implementation Plan
 
-### 1. CP-Relevant Line Range Filtering
+### 1. Replace The Wrong Planning/Docs State
 
-- Add a helper such as `_required_line_ranges_for_record(record, source_shape_hw)`.
-- For every control point in the record:
-  - compute its existing source-window line-index bounds with
-    `_line_window_bounds_for_control_point()`;
-  - retain the CP's exact `control_point_line_index()`;
-  - record the CP-to-required-range mapping for later validity checks.
-- Merge overlapping or adjacent line-index ranges into compact intervals.
-- Only sample Lasagna normals for line indices inside those merged ranges.
-- Keep arrays full-record sized where downstream code expects full line-index
-  addressing:
-  - `normals_xyz`: full `[num_line_points,3]`, with `NaN` outside relevant
-    ranges;
-  - `normal_valid`: full `[num_line_points]`, false outside relevant ranges.
-- A CP remains valid only if its entire source-window range lies inside one
-  valid normal interval.
-- This keeps behavior strict: no fabricated normals, no nearest-normal
-  propagation, no valid CP if required data is missing.
+- Replace `planning/task.md`, `planning/task_plan.md`, `planning/status.md`,
+  and `planning/task_log.md` with this process-level task.
+- Do not update `specs.md` until implementation is underway; the plan below
+  lists the required spec deltas.
 
-### 2. Vectorized Lasagna Normal Sampling
+### 2. Revert Thread-Local Loader Handle Experiment
 
-- Add a batched normal sampler, for example
-  `_lasagna_normals_at_zyx_batch(record, points_zyx_base, line_indices)`.
-- The batch sampler should preserve `_lasagna_normal_at_zyx()` semantics:
-  - `grad_mag` must be present and trilinearly positive;
-  - `nx` and `ny` must be present;
-  - Lasagna normals must be decoded through
-    `lasagna.omezarr_pyramid._decode_normals`;
-  - the two-sign ambiguity is handled by the same tensor/principal-axis logic.
-- Avoid thousands of tiny zarr reads:
-  - process each merged relevant line interval, or sub-ranges of it;
-  - compute channel-space bounding boxes with one-voxel interpolation margin;
-  - read `grad_mag`, `nx`, and `ny` blocks once per sub-range;
-  - if a bounding box is too large, split the interval and retry.
-- Use NumPy vectorization inside each loaded block:
-  - compute base indices and interpolation fractions for all points;
-  - gather the 8 interpolation corners for `grad_mag`, `nx`, and `ny`;
-  - compute trilinear weights in arrays;
-  - decode all 8 normal corners with `_decode_normals`;
-  - build `tensor[N,3,3]` and `hint[N,3]` with vectorized weighted sums.
-- Vectorize the principal-axis solve:
-  - run the current 16-step power iteration over all valid tensors with
-    `np.einsum`/batched matrix-vector multiplication;
-  - sign-align against the vectorized hint, matching scalar behavior.
-- Return:
-  - `normals[N,3]`;
-  - `valid[N]`;
-  - compact invalid reason metadata sufficient to produce useful CP skip
-    diagnostics.
-- Keep the scalar `_lasagna_normal_at_zyx()` for focused tests, debugging, and
-  fallback if the vectorized path encounters an unsupported array/indexing
-  case.
+- Remove `_RecordOpenSpec`.
+- Remove `record_open_specs` from `FiberStrip2DLoader.__init__`.
+- Remove `self._worker_local`.
+- Restore `_load_records()` to return only `list[_Record]`.
+- Restore `clone()` to reuse fiber metadata and refresh only per-clone samplers
+  via `_clone_records_with_local_samplers(...)`.
+- Remove `_record_open_specs_from_records`, `_open_records_from_specs`,
+  `_open_record_from_spec`, and `_record_for_index`.
+- Remove `descriptor_indices` and `use_worker_records` parameters from:
+  - `build_strip_source`;
+  - `build_top_strip_source`;
+  - `_prepare_sample`;
+  - `_prepare_top_sample_from_side_sample`.
+- Restore parallel `load_batch` and `load_top_batch_for_batch` to use the
+  normal descriptor/sample paths. Runtime CP-level threading can remain, but it
+  is not the startup preload solution.
 
-### 3. Parallel Record-Level Startup Build
+### 3. Add Picklable Process Jobs For Startup Geometry
 
-- Modify `_initialize_fiber_line_geometry_store()` to use a
-  `ThreadPoolExecutor` when `loader_workers > 1`.
-- Use `worker_count = min(loader_workers, total_records)`.
-- Each worker builds exactly one record geometry using the CP-relevant,
-  vectorized path.
-- The main thread collects futures and stores results by original
-  `record_index`; final `by_record_index` order must be identical to serial.
-- Progress output remains in the main thread:
-  - records done/total;
-  - valid/skipped CP totals;
-  - resident memory;
-  - ETA;
-  - optionally worker count in the start line.
-- Do not let progress output interleave from workers.
-- Do not duplicate the compact geometry store:
-  - workers return `_FiberLineGeometry` plus memory/valid/skipped counts;
-  - the main thread updates the single shared store.
-- Preserve clone behavior: cloned loaders still receive the already-built store
-  by reference.
+- Add a small top-level job dataclass, e.g. `_GeometryBuildJob`, containing:
+  - `record_index`;
+  - `fiber`;
+  - `volume_path`;
+  - `volume_scale`;
+  - `volume_spacing_base`;
+  - `fiber_identity`;
+  - `dataset_config`;
+  - the loader config fields required to open volumes/channels;
+  - `source_shape_hw`.
+- Add a top-level worker function so `ProcessPoolExecutor` can pickle it.
+- In the worker process:
+  - open the dataset volume from the job config;
+  - open Lasagna manifest channels from the job config;
+  - create a minimal `_Record` for geometry construction;
+  - build compact geometry using the same CP-window filtering and vectorized
+    Lasagna normal sampling as the serial path;
+  - return `(record_index, geometry, memory_bytes)`.
+- Do not create a VC3D coordinate sampler in the worker unless geometry code
+  actually needs it. Startup geometry should only need volume shape/channel
+  data and fiber metadata.
 
-### 4. Combined Integration
+### 4. Keep One Serial Reference Path
 
-- Update `_build_geometry_for_record()` so it uses:
-  - CP-relevant line ranges;
-  - vectorized normal sampling for those ranges;
-  - existing interval construction and `build_side_strip_frame_arrays()` over
-    valid contiguous ranges.
-- Keep `build_side_strip_frame_arrays()` and source-grid reconstruction
-  unchanged unless a bug is uncovered.
-- Keep the exact hot-path compact lookup shape from the previous task.
-- Keep invalid CP behavior deterministic:
-  - record geometry may be built out of order;
-  - final store order and CP validity arrays are ordered by original record/CP;
-  - training/prefetch sample stream sees the same ordered dataset.
+- For `loader_workers <= 1`, call `_build_geometry_for_record(...)` directly
+  in the parent process using canonical records.
+- This path remains the easiest debugger and correctness reference.
+
+### 5. Use `ProcessPoolExecutor` For Startup
+
+- In `_initialize_fiber_line_geometry_store()`:
+  - compute `worker_count = min(loader_workers, total_records)`;
+  - submit one geometry job per record when `worker_count > 1`;
+  - collect futures in the parent;
+  - store results by original `record_index`;
+  - update progress from the parent only.
+- On `KeyboardInterrupt`, cancel pending futures and shut the process pool down
+  with `wait=False` where supported.
+- Do not let worker processes print progress.
+
+### 6. Preserve Determinism And Store Sharing
+
+- Returned geometry can complete out of order, but parent insertion must use
+  `record_index`.
+- `by_fiber_identity`, `valid_control_points`, `skipped_control_points`, and
+  `memory_bytes` must be computed in the parent from returned geometry.
+- Cloned loaders must receive the already-built store by reference.
+- Training/prefetch/runner sample streams must see the same CP validity and
+  ordering as the serial path.
+
+### 7. Tests
+
+- Remove thread-local tests:
+  - parallel startup uses worker-local records;
+  - parallel load batch uses worker-local records;
+  - clone refreshes all opened I/O handles.
+- Restore clone test expectations:
+  - clone shares fiber and volume/channel metadata where appropriate;
+  - clone refreshes sampler;
+  - clone shares compact geometry store.
+- Keep tests for:
+  - `loader_workers=0` maps to logical CPU count;
+  - negative `loader_workers` is rejected;
+  - serial vs parallel startup geometry equality.
+- Add or adjust tests for process startup:
+  - `loader_workers=2` startup produces the same compact geometry as
+    `loader_workers=1`;
+  - store ordering remains deterministic even when parallel build completes out
+    of order if a local fake executor can cover that without multiprocessing
+    brittleness.
+- Run:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+
+### 8. Benchmark
+
+- Reuse the established command where possible:
+  `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_2d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --benchmark --load-only --profile`
+- Report startup wall time, CPU factor if available, compact store memory,
+  valid/skipped CP counts, and load-only throughput.
 
 ## Spec Update
 
-- Add to `planning/specs.md`:
-  - startup compact geometry construction may parallelize by record using
-    `loader_workers`;
-  - startup normal sampling may vectorize channel reads and normal decoding but
-    must preserve Lasagna decoding, ambiguity handling, and strict invalid-data
-    semantics;
-  - startup preprocessing should only require line points that can affect the
-    configured CP source windows;
-  - `loader_workers=1` is the serial deterministic debug path.
-- No new config key is planned.
+Update `planning/specs.md` after code changes:
+
+- Startup compact geometry preload is process-level parallel when
+  `loader_workers > 1`.
+- Worker processes independently open zarr/VC3D/Lasagna handles and return only
+  compact geometry.
+- The parent owns the single shared compact geometry store.
+- `loader_workers=1` is the serial/debug path.
+- `loader_workers=0` means all logical cores.
+- No thread-local record handle cache is part of the startup preload design.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md`:
-  - describe record-level parallel compact geometry build;
-  - describe CP-relevant range filtering and vectorized normal sampling;
-  - document the `loader_workers` interaction for startup geometry.
-- Update `planning/local_development.md` with the benchmark command and the
-  baseline/result table.
-- Update `planning/changelog.md` after implementation.
-- Keep `planning/task_log.md` scoped to this task only.
-
-## Testing
-
-- Unit tests:
-  - vectorized normal sampling matches scalar `_lasagna_normal_at_zyx()` on
-    local fake/zarr arrays within tight tolerance;
-  - CP-relevant range filtering does not sample irrelevant line endpoints;
-  - invalid `grad_mag == 0` inside a required CP window still invalidates that
-    CP;
-  - invalid data outside all CP source windows does not invalidate unrelated
-    CPs;
-  - serial (`loader_workers=1`) and parallel (`loader_workers>1`) startup
-    produce identical CP validity arrays and source geometry for representative
-    samples;
-  - cloned loaders share the same built geometry store.
-- Regression command:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-
-## Benchmark / Validation
-
-- Reuse the exact benchmark command already used for this task:
-  `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_2d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --benchmark --load-only --profile`
-- Compare against baseline:
-  - startup: `8m53s`;
-  - compact store memory: `63.5 MiB`;
-  - hot path: `76.76 patches/s`, `compact_geometry=0.012 ms/patch`.
-- Report:
-  - startup total wall time;
-  - valid/skipped CP counts;
-  - compact store MiB;
-  - hot-path benchmark summary;
-  - profile breakdown;
-  - worker count used.
+- Update `docs/code_structure.md` to describe process-level startup geometry
+  preload and parent-owned store assembly.
+- Update `planning/local_development.md` only if benchmark/development commands
+  or workflow notes change.
+- Update `planning/changelog.md` with a one-line durable entry after
+  implementation.
 
 ## Risks / Checks
 
-- Threading may not scale if zarr/NumPy work holds the GIL too often. The
-  vectorized block sampler is included to remove much of that Python-loop work.
-- Bounding-box block reads can over-read if a fiber interval spans a large
-  region. Split intervals by max block size to avoid memory spikes.
-- Vectorized power iteration may differ by tiny floating-point roundoff from
-  scalar per-point logic. Tests should compare with tolerances and source-grid
-  regressions, not exact bit identity.
-- Reading larger channel blocks can increase transient memory. Keep block size
-  bounded and release block arrays after each interval/sub-range.
+- Multiprocessing requires picklable job data. Do not pass opened zarr arrays,
+  VC3D sampler objects, locks, or executor objects to workers.
+- Process startup may increase transient memory because each process opens its
+  own handles. Keep cache budgets explicit and measure.
+- On platforms using spawn, worker functions must be module-level.
+- The process path must not silently fall back to lazy geometry construction.

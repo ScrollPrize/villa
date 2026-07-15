@@ -1,47 +1,50 @@
-# Startup Compact Geometry Acceleration Task Log
+# Process-Level Startup Fiber Geometry Preload Task Log
 
 ## Planning Notes
 
-- Baseline from the previous task:
-  - startup compact geometry build: `464` records, `14773` valid CPs,
-    `184` skipped CPs, `63.5 MiB`, `8m53s`;
-  - hot-path profile after startup: `compact_geometry=0.012 ms/patch`.
-- Current bottleneck is loader construction, specifically serial Lasagna normal
-  sampling and decoding over line points.
-- This task should not add a new worker-count config key. Startup geometry uses
-  the existing `loader_workers`; `loader_workers=1` remains the serial path.
+- User rejected the thread-local zarr/VC3D handle direction.
+- Correct requirement is startup preload by splitting fibers/records across
+  independent worker processes.
+- Geometry must be built during loader construction, not lazily during the
+  first training pass.
+- Parent process must own one compact in-RAM geometry store after startup.
+- Keep deterministic serial-vs-parallel output equivalence.
 
 ## Implementation Log
 
-- Added CP-window line range discovery before startup normal sampling.
-  Geometry arrays remain full-record sized, but only required line ranges are
-  sampled and marked valid.
-- Added batched 2x2x2 channel interpolation for Lasagna `grad_mag`, `nx`, and
-  `ny`, vectorized normal decoding through Lasagna `_decode_normals`, and a
-  batched principal-axis solve matching the scalar ambiguity handling.
-- Kept `_lasagna_normal_at_zyx()` as the scalar debug/reference path.
-- Added record-level startup construction with `loader_workers`; the serial
-  path is still selected by `loader_workers=1`, and the final store remains
-  indexed by original record order.
-- Updated specs, code-structure docs, local-development notes, and changelog.
+- Replaced the current planning files with the process-level startup preload
+  task and plan before changing loader code.
+- Removed the `_RecordOpenSpec` / worker-local record-opening path from
+  `loader.py`.
+- Restored cloning to share loaded record metadata and the compact geometry
+  store while creating fresh samplers for the clone.
+- Added `_GeometryBuildJob` and a module-level
+  `_build_fiber_line_geometry_process(...)` worker entry point. Worker
+  processes reopen the configured base volume and Lasagna channels, build the
+  compact geometry for their assigned record, and return compact geometry plus
+  memory accounting to the parent.
+- Changed startup geometry initialization to use `ProcessPoolExecutor` when
+  `loader_workers > 1`, preserving the direct serial path for
+  `loader_workers=1`.
+- Runtime `load_batch` and top-batch preparation now use normal descriptor
+  tuples and the parent-owned compact store; they no longer have descriptor
+  index or worker-local record switches.
+- Updated specs, code-structure docs, changelog, and loader tests to reflect
+  process-level startup preload rather than thread-local record handles.
 
 ## Validation
 
-- Targeted geometry tests:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py::test_loader_tolerates_invalid_remote_line_endpoints_outside_cp_window vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py::test_loader_samples_only_cp_local_lasagna_normals vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py::test_vectorized_lasagna_normals_match_scalar_path vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py::test_parallel_startup_geometry_matches_serial`
-  - Result: `4 passed in 2.35s`.
-- Focused loader suite:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  - Result: `266 passed in 7.46s`.
-- Startup/load-only/profile benchmark:
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  passed: 268 passed in 7.58s.
+- The focused test environment denies Python 3.14 forkserver socket creation,
+  so the serial-vs-parallel startup equality test monkeypatches the executor
+  symbol to run submitted worker jobs without spawning OS processes. The real
+  example benchmark below exercised the actual process startup path.
+- Benchmark command:
   `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_2d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --benchmark --load-only --profile`
-  - Startup compact geometry: `464` records, `14773` valid CPs, `184`
-    skipped CPs, `40.0 MiB`, `2m12s`.
-  - Benchmark: `100` batches, `12800` patches, `106697.8 ms`,
-    `119.96 patches/s`.
-  - Profile summary highlights: `coord_gen=13.856 ms/patch`,
-    `compact_geometry=0.012 ms/patch`, `source_geom=10.903 ms/patch`,
-    `loading=7.536 ms/patch`.
-  - Baseline comparison: startup improved from `8m53s` to `2m12s`, compact
-    memory from `63.5 MiB` to `40.0 MiB`, and load-only throughput from
-    `76.76` to `119.96 patches/s`.
+  completed. Startup geometry built 464 records with 32 workers in 12.7s,
+  producing 14,773 valid CPs, 184 skipped CPs, and a 40.0 MiB compact store.
+  The load-only benchmark processed 12,800 patches in 155,183 ms
+  (82.48 patches/s).

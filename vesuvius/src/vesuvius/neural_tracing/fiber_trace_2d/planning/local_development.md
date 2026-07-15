@@ -174,7 +174,8 @@ process. This is separate from the remote Zarr chunk cache under
 chunks.
 
 Startup compact-geometry construction uses `loader_workers` for record-level
-parallelism. Use `loader_workers: 1` for the serial/debug path; values above one
+parallelism. Use `loader_workers: 0` to resolve to all logical CPU cores on the
+machine, `loader_workers: 1` for the serial/debug path, and values above one to
 build records concurrently while storing the final compact geometry in original
 record order.
 
