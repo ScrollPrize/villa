@@ -23,10 +23,18 @@ protected:
     void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private:
+    // Worker result: tracks stay individual viewport-culled segments; fibers
+    // and pcls are merged back into ordered control-point chains so they can
+    // be drawn as point-collection-style dots + polylines.
+    struct GeometryBatch {
+        std::vector<PathPrimitive> paths;
+        QHash<QString, std::vector<std::vector<cv::Vec3f>>> chains;
+    };
     struct Cache {
         QString requestKey;
         quint64 requestGeneration = 0;
         std::vector<PathPrimitive> paths;
+        QHash<QString, std::vector<std::vector<cv::Vec3f>>> chains;
     };
     void schedule(VolumeViewerBase* viewer, const QString& key,
                   const cv::Vec3f& lo, const cv::Vec3f& hi);

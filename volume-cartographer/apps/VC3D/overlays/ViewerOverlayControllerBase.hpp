@@ -181,6 +181,24 @@ public:
         std::function<bool(const QPointF&, size_t)> scenePredicate;
     };
 
+    // Point-collection-style rendering of an ordered chain of volume points:
+    // white-bordered dots connected by polylines that only ever join
+    // consecutive chain points, fading out with distance to the viewer's
+    // surface.
+    struct PointChainStyle {
+        QColor color{Qt::white};
+        QColor pointBorderColor{255, 255, 255, 200};
+        qreal pointRadius{5.0};
+        qreal pointPenWidth{1.5};
+        qreal lineWidth{5.0};
+        float lineOpacity{1.0f};
+        qreal pointZ{95.0};
+        qreal lineZ{94.0};
+        float distanceTolerance{std::numeric_limits<float>::infinity()};
+        bool drawPoints{true};
+        bool drawLines{true};
+    };
+
     explicit ViewerOverlayControllerBase(std::string overlayGroupKey, QObject* parent = nullptr);
     ~ViewerOverlayControllerBase() override;
 
@@ -290,6 +308,33 @@ protected:
     FilteredPoints filterPoints(VolumeViewerBase* viewer,
                                 const std::vector<cv::Vec3f>& points,
                                 const PointFilterOptions& options) const;
+
+    // Keeps points within `tolerance` of the viewer's plane or quad surface,
+    // fading opacity linearly with distance (binary at the surface when
+    // tolerance <= 0). `opacities`, when given, is filled aligned with the
+    // returned points.
+    FilteredPoints filterPointsNearViewerSurface(VolumeViewerBase* viewer,
+                                                 const std::vector<cv::Vec3f>& points,
+                                                 float tolerance,
+                                                 std::vector<float>* opacities = nullptr) const;
+
+    // Longest volume-space distance two consecutive chain points may span and
+    // still be joined by a polyline: 4x the median inter-point distance, or
+    // infinity when the chain is too short to yield a robust median.
+    static float polylineBreakDistance(const std::vector<cv::Vec3f>& positions);
+
+    // Emits line strips joining consecutive filtered points, breaking the
+    // strip whenever a source point was filtered out in between or the
+    // volume-space gap exceeds maxSegmentDistance.
+    static void addBrokenLineStrips(OverlayBuilder& builder,
+                                    const FilteredPoints& filtered,
+                                    float maxSegmentDistance,
+                                    const OverlayStyle& style);
+
+    void renderPointChain(VolumeViewerBase* viewer,
+                          OverlayBuilder& builder,
+                          const std::vector<cv::Vec3f>& points,
+                          const PointChainStyle& style) const;
 
     void clearOverlay(VolumeViewerBase* viewer) const;
 

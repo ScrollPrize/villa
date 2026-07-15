@@ -537,6 +537,156 @@ ViewerOverlayControllerBase::filterPoints(VolumeViewerBase* viewer,
     return result;
 }
 
+ViewerOverlayControllerBase::FilteredPoints
+ViewerOverlayControllerBase::filterPointsNearViewerSurface(VolumeViewerBase* viewer,
+                                                           const std::vector<cv::Vec3f>& points,
+                                                           float tolerance,
+                                                           std::vector<float>* opacities) const
+{
+    Surface* surface = viewerSurface(viewer);
+    auto* planeSurface = dynamic_cast<PlaneSurface*>(surface);
+    auto* quadSurface = dynamic_cast<QuadSurface*>(surface);
+    auto* patchIndex = _manager ? _manager->surfacePatchIndex() : nullptr;
+
+    std::vector<float> pointOpacities(points.size(), 1.0f);
+    PointFilterOptions filter;
+    filter.clipToSurface = false;
+    filter.requireSceneVisibility = true;
+    filter.computeScenePoints = true;
+    filter.volumePredicate = [planeSurface, quadSurface, patchIndex, tolerance,
+                              &pointOpacities](const cv::Vec3f& point, size_t index) {
+        auto opacityForDistance = [tolerance](float dist) {
+            if (dist < 0.0f) {
+                return 0.0f;
+            }
+            if (tolerance <= 0.0f) {
+                return dist <= 0.0f ? 1.0f : 0.0f;
+            }
+            return dist >= tolerance ? 0.0f : 1.0f - (dist / tolerance);
+        };
+        float opacity = 1.0f;
+        if (planeSurface) {
+            opacity = opacityForDistance(std::fabs(planeSurface->pointDist(point)));
+        } else if (quadSurface) {
+            cv::Vec3f ptr(0, 0, 0);
+            const float dist = quadSurface->pointTo(ptr, point, std::max(tolerance, 0.0f), 100, patchIndex);
+            opacity = opacityForDistance(dist);
+        }
+        pointOpacities[index] = opacity;
+        return opacity > 0.0f;
+    };
+
+    FilteredPoints filtered = filterPoints(viewer, points, filter);
+    if (opacities) {
+        opacities->clear();
+        opacities->reserve(filtered.sourceIndices.size());
+        for (size_t sourceIndex : filtered.sourceIndices) {
+            opacities->push_back(pointOpacities[sourceIndex]);
+        }
+    }
+    return filtered;
+}
+
+float ViewerOverlayControllerBase::polylineBreakDistance(const std::vector<cv::Vec3f>& positions)
+{
+    if (positions.size() < 4) {
+        return std::numeric_limits<float>::infinity();
+    }
+
+    std::vector<float> distances;
+    distances.reserve(positions.size() - 1);
+    for (size_t i = 1; i < positions.size(); ++i) {
+        const float distance = cv::norm(positions[i] - positions[i - 1]);
+        if (distance > 1e-4f) {
+            distances.push_back(distance);
+        }
+    }
+    if (distances.size() < 3) {
+        return std::numeric_limits<float>::infinity();
+    }
+
+    auto medianIt = distances.begin() + static_cast<std::ptrdiff_t>(distances.size() / 2);
+    std::nth_element(distances.begin(), medianIt, distances.end());
+    const float medianDistance = *medianIt;
+    if (medianDistance <= 1e-4f) {
+        return std::numeric_limits<float>::infinity();
+    }
+    return medianDistance * 4.0f;
+}
+
+void ViewerOverlayControllerBase::addBrokenLineStrips(OverlayBuilder& builder,
+                                                      const FilteredPoints& filtered,
+                                                      float maxSegmentDistance,
+                                                      const OverlayStyle& style)
+{
+    std::vector<QPointF> lineStrip;
+    lineStrip.reserve(filtered.scenePoints.size());
+    size_t previousSourceIndex = 0;
+    bool hasPreviousSourceIndex = false;
+    auto flushLineStrip = [&]() {
+        if (lineStrip.size() >= 2) {
+            builder.addLineStrip(lineStrip, false, style);
+        }
+        lineStrip.clear();
+    };
+    for (size_t i = 0; i < filtered.scenePoints.size(); ++i) {
+        const size_t sourceIndex = filtered.sourceIndices.empty() ? i : filtered.sourceIndices[i];
+        if (hasPreviousSourceIndex && sourceIndex != previousSourceIndex + 1) {
+            flushLineStrip();
+        } else if (hasPreviousSourceIndex && i < filtered.volumePoints.size()) {
+            const float segmentDistance =
+                cv::norm(filtered.volumePoints[i] - filtered.volumePoints[i - 1]);
+            if (segmentDistance > maxSegmentDistance) {
+                flushLineStrip();
+            }
+        }
+        lineStrip.push_back(filtered.scenePoints[i]);
+        previousSourceIndex = sourceIndex;
+        hasPreviousSourceIndex = true;
+    }
+    flushLineStrip();
+}
+
+void ViewerOverlayControllerBase::renderPointChain(VolumeViewerBase* viewer,
+                                                   OverlayBuilder& builder,
+                                                   const std::vector<cv::Vec3f>& points,
+                                                   const PointChainStyle& style) const
+{
+    if (points.empty()) {
+        return;
+    }
+    std::vector<float> opacities;
+    const FilteredPoints filtered =
+        filterPointsNearViewerSurface(viewer, points, style.distanceTolerance, &opacities);
+    if (filtered.scenePoints.empty()) {
+        return;
+    }
+
+    if (style.drawLines && filtered.scenePoints.size() >= 2) {
+        OverlayStyle lineStyle;
+        lineStyle.penColor = style.color;
+        lineStyle.penColor.setAlphaF(std::clamp(style.lineOpacity, 0.0f, 1.0f));
+        lineStyle.penWidth = style.lineWidth;
+        lineStyle.brushColor = Qt::transparent;
+        lineStyle.z = style.lineZ;
+        addBrokenLineStrips(builder, filtered, polylineBreakDistance(points), lineStyle);
+    }
+
+    if (style.drawPoints) {
+        for (size_t i = 0; i < filtered.scenePoints.size(); ++i) {
+            const float opacity = i < opacities.size() ? opacities[i] : 1.0f;
+            OverlayStyle pointStyle;
+            pointStyle.penColor = style.pointBorderColor;
+            pointStyle.penColor.setAlphaF(pointStyle.penColor.alphaF() * opacity);
+            pointStyle.brushColor = style.color;
+            pointStyle.brushColor.setAlphaF(opacity);
+            pointStyle.penWidth = style.pointPenWidth;
+            pointStyle.z = style.pointZ;
+            builder.addPoint(filtered.scenePoints[i], style.pointRadius, pointStyle);
+        }
+    }
+}
+
 QGraphicsScene* ViewerOverlayControllerBase::viewerScene(VolumeViewerBase* viewer) const
 {
     if (!viewer || !viewer->graphicsView()) {

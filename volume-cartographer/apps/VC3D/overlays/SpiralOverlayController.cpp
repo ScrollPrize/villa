@@ -98,6 +98,17 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
         .arg(QString::fromStdString(viewer->surfName()));
     auto& cache = _cache[viewer];
     if (cache.requestKey != key) schedule(viewer, key, lo, hi);
+    // Fibers and pcls are ordered control-point chains: draw them like point
+    // collections (dots + polylines joining only consecutive points), fading
+    // out with distance to the pane's plane or surface.
+    for (auto chains = cache.chains.begin(); chains != cache.chains.end(); ++chains) {
+        PointChainStyle chainStyle;
+        chainStyle.color = categoryColor(chains.key());
+        chainStyle.lineOpacity = 0.75f;
+        chainStyle.distanceTolerance = slab;
+        for (const auto& chain : chains.value())
+            renderPointChain(viewer, builder, chain, chainStyle);
+    }
     for (const auto& path : cache.paths) {
         if (!surfacePane) {
             builder.addPath(path);
@@ -132,32 +143,57 @@ void SpiralOverlayController::schedule(VolumeViewerBase* viewer, const QString& 
     auto& cache = _cache[viewer];
     cache.requestKey = key;
     cache.requestGeneration = request;
-    auto* watcher = new QFutureWatcher<std::vector<PathPrimitive>>(this);
-    connect(watcher, &QFutureWatcher<std::vector<PathPrimitive>>::finished, this,
+    auto* watcher = new QFutureWatcher<GeometryBatch>(this);
+    connect(watcher, &QFutureWatcher<GeometryBatch>::finished, this,
             [this, watcher, viewer, request]() {
         auto found = _cache.find(viewer);
         if (found != _cache.end() && found->second.requestGeneration == request) {
-            found->second.paths = watcher->result();
+            GeometryBatch batch = watcher->result();
+            found->second.paths = std::move(batch.paths);
+            found->second.chains = std::move(batch.chains);
             refreshViewer(viewer);
         }
         watcher->deleteLater();
     });
     watcher->setFuture(QtConcurrent::run([index, visible, lo, hi]() {
-        std::vector<PathPrimitive> paths;
+        GeometryBatch batch;
         constexpr std::size_t maximum = 12000;
-        for (auto it = visible.begin(); it != visible.end() && paths.size() < maximum; ++it) {
+        std::size_t used = 0;
+        for (auto it = visible.begin(); it != visible.end() && used < maximum; ++it) {
             if (!it.value()) continue;
-            const auto segments = index->query(lo, hi, it.key().toStdString(), maximum - paths.size());
+            const auto segments = index->query(lo, hi, it.key().toStdString(), maximum - used);
+            used += segments.size();
+            if (it.key() == QStringLiteral("tracks")) {
+                for (const auto& segment : segments) {
+                    PathPrimitive path;
+                    path.points = {segment.first, segment.second};
+                    path.color = categoryColor(it.key());
+                    path.lineWidth = 1.0;
+                    path.opacity = 0.9;
+                    path.z = 70.0;
+                    batch.paths.push_back(std::move(path));
+                }
+                continue;
+            }
+            // Merge the viewport-culled segments (sorted by objectId then
+            // segmentIndex) back into ordered control-point chains, breaking
+            // wherever a segment was culled so strips never bridge gaps.
+            auto& chains = batch.chains[it.key()];
+            uint64_t previousObject = 0;
+            uint64_t previousSegment = 0;
+            bool havePrevious = false;
             for (const auto& segment : segments) {
-                PathPrimitive path;
-                path.points = {segment.first, segment.second};
-                path.color = categoryColor(it.key());
-                path.lineWidth = it.key() == QStringLiteral("tracks") ? 1.0 : 2.0;
-                path.opacity = 0.9;
-                path.z = 70.0;
-                paths.push_back(std::move(path));
+                if (havePrevious && segment.objectId == previousObject
+                    && segment.segmentIndex == previousSegment + 1) {
+                    chains.back().push_back(segment.second);
+                } else {
+                    chains.push_back({segment.first, segment.second});
+                }
+                previousObject = segment.objectId;
+                previousSegment = segment.segmentIndex;
+                havePrevious = true;
             }
         }
-        return paths;
+        return batch;
     }));
 }

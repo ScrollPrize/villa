@@ -192,6 +192,18 @@ private:
     std::string surfName_{"fake"};
 };
 
+class ChainTestController final : public ViewerOverlayControllerBase {
+public:
+    ChainTestController() : ViewerOverlayControllerBase("chain_test") {}
+    using ViewerOverlayControllerBase::OverlayBuilder;
+    using ViewerOverlayControllerBase::polylineBreakDistance;
+    using ViewerOverlayControllerBase::addBrokenLineStrips;
+    using ViewerOverlayControllerBase::renderPointChain;
+
+protected:
+    void collectPrimitives(VolumeViewerBase*, OverlayBuilder&) override {}
+};
+
 } // namespace
 
 class ViewerOverlaySurfacePrimitivesTest final : public QObject {
@@ -448,6 +460,82 @@ private slots:
         QCOMPARE(dock.results().front().snapMeshXyz[2], 8.0f);
         QCOMPARE(dock.results().front().snapModelH, 11.0f);
         QCOMPARE(dock.results().front().snapModelW, 12.0f);
+    }
+    void polylineBreakDistanceUsesMedianSpacing()
+    {
+        std::vector<cv::Vec3f> positions;
+        for (int i = 0; i < 6; ++i) {
+            positions.emplace_back(10.0f * i, 0.0f, 0.0f);
+        }
+        QCOMPARE(ChainTestController::polylineBreakDistance(positions), 40.0f);
+
+        positions.resize(3);
+        QVERIFY(std::isinf(ChainTestController::polylineBreakDistance(positions)));
+    }
+
+    void brokenLineStripsSplitOnSkippedPointsAndGaps()
+    {
+        FakeViewer viewer;
+        ChainTestController::OverlayBuilder builder(&viewer);
+
+        ViewerOverlayControllerBase::FilteredPoints filtered;
+        filtered.volumePoints = {{0, 0, 0}, {10, 0, 0}, {20, 0, 0},
+                                 {40, 0, 0}, {50, 0, 0}, {200, 0, 0}};
+        // Source index 3 was filtered out, so the strip must break between the
+        // third and fourth kept points; the jump to x=200 exceeds the segment
+        // limit, so the last point must not be joined either.
+        filtered.sourceIndices = {0, 1, 2, 4, 5, 6};
+        for (const auto& point : filtered.volumePoints) {
+            filtered.scenePoints.emplace_back(point[0], point[1]);
+        }
+
+        ViewerOverlayControllerBase::OverlayStyle style;
+        ChainTestController::addBrokenLineStrips(builder, filtered, 60.0f, style);
+
+        const auto primitives = builder.takePrimitives();
+        QCOMPARE(primitives.size(), std::size_t{2});
+        const auto* first =
+            std::get_if<ViewerOverlayControllerBase::LineStripPrimitive>(&primitives[0]);
+        const auto* second =
+            std::get_if<ViewerOverlayControllerBase::LineStripPrimitive>(&primitives[1]);
+        QVERIFY(first != nullptr);
+        QVERIFY(second != nullptr);
+        QCOMPARE(first->points.size(), std::size_t{3});
+        QCOMPARE(first->points.back().x(), 20.0);
+        QCOMPARE(second->points.size(), std::size_t{2});
+        QCOMPARE(second->points.front().x(), 40.0);
+        QCOMPARE(second->points.back().x(), 50.0);
+    }
+
+    void renderPointChainEmitsDotsAndOrderedPolyline()
+    {
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+
+        ChainTestController controller;
+        ChainTestController::OverlayBuilder builder(&viewer);
+        const std::vector<cv::Vec3f> chain = {
+            {1.0f, 1.0f, 0.0f}, {2.0f, 1.0f, 0.0f}, {3.0f, 1.0f, 0.0f}, {4.0f, 1.0f, 0.0f}};
+        ViewerOverlayControllerBase::PointChainStyle style;
+        controller.renderPointChain(&viewer, builder, chain, style);
+
+        const auto primitives = builder.takePrimitives();
+        std::size_t strips = 0;
+        std::size_t dots = 0;
+        for (const auto& primitive : primitives) {
+            if (const auto* strip =
+                    std::get_if<ViewerOverlayControllerBase::LineStripPrimitive>(&primitive)) {
+                ++strips;
+                QCOMPARE(strip->points.size(), chain.size());
+                for (std::size_t i = 1; i < strip->points.size(); ++i) {
+                    QVERIFY(strip->points[i - 1].x() < strip->points[i].x());
+                }
+            } else if (std::holds_alternative<ViewerOverlayControllerBase::PointPrimitive>(primitive)) {
+                ++dots;
+            }
+        }
+        QCOMPARE(strips, std::size_t{1});
+        QCOMPARE(dots, chain.size());
     }
 };
 
