@@ -1,23 +1,31 @@
-# 3D Prefetch Coordinate Shape And 64-Patch Augmentation Config
+# 3D Prefetch Must Follow 2D Streaming Prefetcher
 
-The 3D prefetch path crashes for
-`fiber_trace_3d/configs/train_s1a_nml_all_64_sd2.json` because it passes a
-full `[Z,Y,X,3]` coordinate volume into the VC3D dependency API, whose current
-Python binding expects a 2D coordinate surface shaped `[H,W,3]`.
+The 3D prefetcher currently prints
+`fiber_trace_3d prefetch: generating chunk requests ...` and then generates all
+chunk requests serially before downloads begin. This differs from the 2D
+prefetcher, which streams dependency generation and downloads concurrently with
+progress output.
 
 Required behavior:
 
-- Fix 3D prefetch so it can generate chunk requests for 3D CP-centered patches
-  without changing the training coordinate sampling path.
-- Keep using VC3D dependency metadata and Python prefetch downloads.
-- Preserve deterministic sample order and augmentation parameter generation.
-- Update tests to cover 3D chunk dependency request generation.
-- Update the 64/sd2 config so the implemented important augmentations are
-  enabled for fast 64-voxel patch experiments:
-  - keep affine/value augmentations enabled;
-  - enable implemented smooth displacement;
-  - enable implemented isotropic blur;
-  - enable implemented anisotropic blur;
-  - do not add shear or ringing because the 3D loader intentionally rejects
-    those unsupported keys.
-- Document the prefetch shape behavior and the 64/sd2 augmentation intent.
+- Rework the 3D prefetcher to follow the 2D prefetcher architecture as closely
+  as possible.
+- Use parallel dependency/sampler producer workers controlled by
+  `prefetch_sampler_workers`.
+- Use bounded parallel download workers controlled by `prefetch_workers`.
+- Stream producer results into the same cache-hit/missing/download
+  classification flow instead of generating the full request set first.
+- Consume producer results in raw deterministic sample-index order before chunk
+  classification/enqueueing, matching the 2D prefetcher.
+- Prioritize downloads by the earliest raw deterministic sample index that
+  requested each chunk, matching the 2D prefetcher.
+- Report live sample/dependency progress and download progress during the whole
+  run, including deterministic safe-prefix `idx`.
+- Preserve VC3D-provided chunk metadata and Python atomic temp-file download
+  behavior.
+- Keep only the necessary 2D-vs-3D differences:
+  - 3D samples generate one CP-centered 3D patch dependency request set;
+  - 3D has no strip-z offset loop;
+  - 3D has no 2D top-view prefetch branch;
+  - 3D uses the 3D augmentation-envelope coordinate volume.
+- Update specs/docs/tests/changelog for the 3D streaming prefetch behavior.

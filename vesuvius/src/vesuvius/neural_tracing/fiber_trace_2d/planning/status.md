@@ -1,12 +1,12 @@
-# 3D Prefetch Coordinate Shape And 64-Patch Augmentation Config Status
+# 3D Streaming Prefetcher Status
 
 - [x] Read local AGENTS.md workflow.
 - [x] Replace `planning/task.md` with the current user task.
-- [x] Inspect 3D prefetch and VC3D dependency call sites.
-- [x] Replace `planning/task_plan.md` with the focused fix plan.
-- [x] Implement 3D prefetch dependency splitting.
-- [x] Update 64/sd2 augmentation config.
-- [x] Add regression test.
-- [x] Update specs/docs/changelog/task_log.
-- [x] Run focused tests.
-- [x] Record that full remote prefetch smoke was not run.
+- [x] Inspect 2D and 3D prefetch implementations.
+- [x] Replace `planning/task_plan.md` with the focused streaming prefetch plan.
+- [x] Explicitly list all planned differences from the 2D prefetcher.
+- [ ] Implement 3D streaming producer/download prefetcher.
+- [ ] Add/update regression tests.
+- [ ] Update specs/docs/changelog/task_log.
+- [ ] Run focused tests.
+- [ ] Run optional remote/cache smoke if available.
