@@ -1,14 +1,12 @@
-# 3D Fiber Sparse Line Supervision Targets Status
+# 3D Prefetch Coordinate Shape And 64-Patch Augmentation Config Status
 
 - [x] Read local AGENTS.md workflow.
 - [x] Replace `planning/task.md` with the current user task.
-- [x] Inspect current 3D target-generation code paths.
-- [x] Replace `planning/task_plan.md` with the sparse line-index target plan.
-- [x] Review plan against current 3D target specs.
-- [x] Implement sparse GPU line-index materialization.
-- [x] Keep dense presence creation GPU-only in the main process.
-- [x] Update direction loss to gather sparse supervised voxels.
-- [x] Update visualization/evaluation paths.
+- [x] Inspect 3D prefetch and VC3D dependency call sites.
+- [x] Replace `planning/task_plan.md` with the focused fix plan.
+- [x] Implement 3D prefetch dependency splitting.
+- [x] Update 64/sd2 augmentation config.
+- [x] Add regression test.
 - [x] Update specs/docs/changelog/task_log.
 - [x] Run focused tests.
-- [x] Run benchmark.
+- [x] Record that full remote prefetch smoke was not run.

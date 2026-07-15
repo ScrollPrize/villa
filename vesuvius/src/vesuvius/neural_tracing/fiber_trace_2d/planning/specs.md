@@ -87,6 +87,13 @@
   `augment_shift_zyx: [48,48,48]`, and a fixed six-stage U-Net depth
   (`[16,32,64,128,256,512]`) so the deepest feature map remains appropriate
   for 192-voxel patches.
+- `train_s1a_nml_all_64_sd2.json` is a fast experimental S1A NML config for
+  64-voxel patches at `base_volume_scale: 2`. It keeps the same implemented
+  augmentation families enabled at smaller magnitudes appropriate for that
+  patch size: affine shift/rotation/scale/flip, value brightness/contrast/
+  gamma/noise, isotropic blur, smooth displacement, and anisotropic blur.
+  Shear/skew and ringing remain unsupported and must not appear as enabled
+  keys in this config.
 - 3D training TensorBoard visualization logs three principal CP-centered
   planes at `training.sample_vis_interval`, showing image data, target
   presence, predicted presence, and direction angular error.
@@ -141,6 +148,13 @@
 - 3D prefetch computes chunk dependencies from the same explicit coordinate
   path used by training and the VC3D sampler. `--prefetch-steps 0` means all
   deterministic CP samples.
+- VC3D dependency collection currently accepts 2D coordinate surfaces shaped
+  `[H,W,3]`. When 3D prefetch has a regular coordinate volume shaped
+  `[Z,Y,X,3]` or another higher-rank `[...,H,W,3]` grid, the sampler wrapper
+  flattens it into one 2D surface using the same convention as training
+  sampling (`[Z,Y,X,3] -> [Z*Y,X,3]`), collects dependency metadata once, and
+  de-duplicates chunks by `(store_identity, key)`. It must preserve VC3D
+  returned metadata rather than reconstructing cache paths in Python.
 - V0 3D prefetch uses VC3D chunk dependency metadata and the shared Python
   prefetch writer with atomic cache-file renames and `.empty` marker handling.
   It does not prefetch Lasagna manifest channels.

@@ -129,6 +129,16 @@ This is the approved load-only comparison command for the current 3D loader
 work. Do not change the config path, flags, or PYTHONPATH shape unless the user
 explicitly asks for a different measurement.
 
+For quick 64-voxel S1A NML augmentation experiments, use
+`fiber_trace_3d/configs/train_s1a_nml_all_64_sd2.json`. That config reads
+`base_volume_scale: 2`, uses `patch_shape_zyx: [64,64,64]`, and enables the
+implemented affine, value, smooth-displacement, isotropic-blur, and
+anisotropic-blur augmentations. Its prefetch path uses the same command shape:
+
+```bash
+PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_all_64_sd2.json --prefetch --prefetch-steps 1
+```
+
 Latest 3D DataLoader process-worker validation with that exact command and the
 checked-in S1A NML config:
 

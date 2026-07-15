@@ -2,6 +2,12 @@
 
 ## 2026-07-15
 
+- Fixed 3D prefetch dependency generation for regular 3D coordinate volumes by
+  flattening higher-rank coordinate grids into one VC3D-compatible 2D surface,
+  matching the regular training sampling adapter, and de-duplicating returned
+  chunk metadata. The 64-voxel S1A NML scale-2 config now enables the
+  implemented smooth displacement, isotropic blur, and anisotropic blur
+  augmentations for fast augmentation experiments.
 - Switched 3D NML target materialization from radius-expanded
   distance-to-segment tube volumes to sparse drawn centerline voxel indices.
   Dense presence is still created on the main training GPU, while direction

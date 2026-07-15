@@ -143,6 +143,12 @@ side/top strip input loading.
   blocks over the requested strip coordinates, projects direction/presence into
   the 2D frame, logs `test/trace2cp_error`, and uses that value for `best.pt`
   selection. Dense 3D test loss remains a diagnostic.
+- 3D prefetch uses the same explicit coordinate path as training, then asks
+  VC3D for chunk dependency metadata. Because the VC3D dependency binding
+  accepts 2D coordinate surfaces, rank-4 regular patch coordinates such as
+  `[Z,Y,X,3]` are flattened to `[Z*Y,X,3]`, matching the regular training
+  sampling adapter. Returned chunk requests are de-duplicated before Python
+  prefetch downloads.
 
 Example commands:
 

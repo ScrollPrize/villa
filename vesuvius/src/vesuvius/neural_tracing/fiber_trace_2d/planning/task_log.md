@@ -1,44 +1,31 @@
-# Task Log: 3D Fiber Sparse Line Supervision Targets
+# 3D Prefetch Coordinate Shape And 64-Patch Augmentation Config Task Log
 
-## Implementation Notes
+## Notes
 
-- Added sparse direction target fields to `FiberTrace3DBatch`.
-- Replaced the 3D NML target materializer's radius-expanded
-  distance-to-segment tube rasterization with vectorized GPU centerline voxel
-  drawing from transformed clipped segment endpoints.
-- Kept dense `presence_target` and `presence_mask` creation in the main
-  process on the training device.
-- Switched direction loss to gather predicted six-channel Lasagna 3x2 outputs
-  at `direction_indices_bzyx` and compare against sparse encoded targets.
-- Updated train-sample visualization to scatter sparse direction angle errors
-  only for supervised voxels in the displayed principal planes.
-- Updated benchmark column labels from dense raster/encode terminology to
-  sparse target stages (`line_idx`, `cp_idx`, `scatter`, `dir_enc`, `linePts`,
-  `dirPts`).
-- Updated specs, code-structure docs, local benchmark notes, changelog, and
-  status.
+- Started from user-reported crash:
+  `ValueError: coords_xyz must have shape [H, W, 3]` during
+  `fiber_trace_3d --prefetch` with `train_s1a_nml_all_64_sd2.json`.
+- Root cause: the 3D loader sends a regular `[Z,Y,X,3]` coordinate volume to
+  `Vc3dCoordinateSampler.chunk_requests_for_coords`, while VC3D dependency
+  collection currently accepts only 2D coordinate surfaces.
+- Corrected implementation: prefetch dependency collection now follows the
+  regular training sampling adapter and flattens `[Z,Y,X,3]` to `[Z*Y,X,3]`
+  for one VC3D dependency call, rather than issuing one dependency call per
+  Z surface.
+- The 64/sd2 config already had affine/value augmentations enabled, but smooth
+  displacement, isotropic blur, and anisotropic blur were set to no-op values.
 
-## Deviations / Simplifications / Deferred Items
+## Deviations Or Deferrals
 
-- Non-NML CP-only radius-neighborhood semantics remain unchanged as planned.
-- The old dense direction dataclass fields remain as compatibility slots, but
-  normal materialization leaves them `None` and uses sparse direction fields.
-- No custom CUDA/Triton kernel was added.
+- Shear/skew and ringing remain unsupported because the 3D loader explicitly
+  rejects those keys and the current spec keeps them out of scope.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/targets.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/loader.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed: `18 passed in 2.62s`.
-- Benchmark command:
-  `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_all.json --benchmark --load-only --benchmark-batches 40`
-  completed.
-- Benchmark dataset/config: `train_s1a_nml_all.json`, `batch_size=1`,
-  `patch_shape_zyx=[192,192,192]`, `loader_workers=32`, `device=cuda`.
-- Benchmark rows 33-40 after worker startup:
-  - total ms: mean `112.82`, median `12.59`, min `12.09`, max `809.34`;
-  - excluding the one row-35 wait outlier: mean `13.32 ms/crop`
-    (`75.1 crops/s`);
-  - median steady-state throughput: `79.5 crops/s`;
-  - target materialization rows 33-40: mean `2.73 ms`, median `2.54 ms`.
+- Focused tests:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+  passed with `19 passed`.
+- `git diff --check` passed.
+- Full remote prefetch smoke was not completed in this task; the regression
+  test covers the reported VC3D shape failure with a fake VC3D dependency
+  binding that rejects non-2D coordinate inputs.

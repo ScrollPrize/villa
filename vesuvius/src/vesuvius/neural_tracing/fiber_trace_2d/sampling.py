@@ -165,16 +165,18 @@ class Vc3dCoordinateSampler(CoordinateSampler):
     def chunk_requests_for_coords(
         self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
     ) -> list[ZarrChunkRequest]:
-        dependencies = self.volume.collect_coords_dependencies(
-            _coords_zyx_base_to_xyz(coords_zyx_base),
-            np.ascontiguousarray(valid_mask, dtype=np.bool_),
-            self.level,
-            self.sampling,
-            32,
-        )
         store = _Vc3dChunkStore(self.volume)
-        requests: list[ZarrChunkRequest] = []
-        for dependency in dependencies:
+        requests_by_identity: dict[tuple[str, str], ZarrChunkRequest] = {}
+        coords = np.asarray(coords_zyx_base, dtype=np.float32)
+        valid = np.asarray(valid_mask, dtype=np.bool_)
+        if coords.ndim < 3 or coords.shape[-1] != 3:
+            raise ValueError("coords_zyx_base must have shape [..., H, W, 3]")
+        if valid.shape != coords.shape[:-1]:
+            raise ValueError(
+                "valid_mask must match coords_zyx_base without the coordinate channel"
+            )
+
+        def append_dependency(dependency: Any) -> None:
             if isinstance(dependency, dict):
                 def _path_or_none(name: str) -> Path | None:
                     value = str(dependency.get(name, "") or "")
@@ -187,26 +189,44 @@ class Vc3dCoordinateSampler(CoordinateSampler):
                     iy = int(dependency["iy"])
                     ix = int(dependency["ix"])
                     key = f"{level}/{iz}/{iy}/{ix}"
-                requests.append(
-                    ZarrChunkRequest(
-                        store=store,
-                        store_identity=self.store_identity,
-                        key=key,
-                        cache_path=_path_or_none("cache_path"),
-                        empty_path=_path_or_none("empty_path"),
-                        remote_url=str(dependency.get("remote_url", "")) or None,
-                        remote_chunk_key=str(dependency.get("remote_chunk_key", "")) or None,
-                        cache_payload_format=str(dependency.get("cache_payload_format", "")) or None,
-                        persistent_extension=str(dependency.get("persistent_extension", "")) or None,
-                    )
+                request = ZarrChunkRequest(
+                    store=store,
+                    store_identity=self.store_identity,
+                    key=key,
+                    cache_path=_path_or_none("cache_path"),
+                    empty_path=_path_or_none("empty_path"),
+                    remote_url=str(dependency.get("remote_url", "")) or None,
+                    remote_chunk_key=str(dependency.get("remote_chunk_key", "")) or None,
+                    cache_payload_format=str(dependency.get("cache_payload_format", "")) or None,
+                    persistent_extension=str(dependency.get("persistent_extension", "")) or None,
                 )
-                continue
+                requests_by_identity.setdefault((request.store_identity, request.key), request)
+                return
             raise RuntimeError(
                 "VC3D collect_coords_dependencies returned legacy tuple dependencies. "
                 "Rebuild/use the updated volume-cartographer Python bindings so chunk "
                 "metadata includes remote_url, cache_path, empty_path, and cache_payload_format."
             )
-        return requests
+
+        def collect_flattened(flat_coords: np.ndarray, flat_valid: np.ndarray) -> None:
+            if not bool(np.asarray(flat_valid, dtype=bool).any()):
+                return
+            dependencies = self.volume.collect_coords_dependencies(
+                _coords_zyx_base_to_xyz(flat_coords),
+                np.ascontiguousarray(flat_valid, dtype=np.bool_),
+                self.level,
+                self.sampling,
+                32,
+            )
+            for dependency in dependencies:
+                append_dependency(dependency)
+
+        height = int(np.prod(coords.shape[:-2], dtype=np.int64))
+        width = int(coords.shape[-2])
+        flat_coords = np.ascontiguousarray(coords.reshape(height, width, 3))
+        flat_valid = np.ascontiguousarray(valid.reshape(height, width))
+        collect_flattened(flat_coords, flat_valid)
+        return list(requests_by_identity.values())
 
 
 class _Vc3dChunkStore:

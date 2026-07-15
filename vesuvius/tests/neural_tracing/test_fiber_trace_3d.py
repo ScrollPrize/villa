@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import FiberStripFrame
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import Vc3dCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     decode_lasagna_direction_3x2_analytic,
     encode_lasagna_direction_2d,
@@ -429,6 +430,68 @@ def test_local_prefetch_has_no_remote_chunks() -> None:
     summary = loader.prefetch(0, 2)
     assert summary["chunks"] == 0
     assert summary["errors"] == 0
+
+
+def test_vc3d_dependency_prefetch_flattens_3d_coords_like_training_sampling() -> None:
+    class _FakeVolume:
+        remote_url = "s3://example/volume.zarr"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, ...]] = []
+
+        def collect_coords_dependencies(
+            self,
+            coords_xyz: np.ndarray,
+            valid_mask: np.ndarray,
+            level: int,
+            sampling: str,
+            workers: int,
+        ) -> list[dict[str, object]]:
+            if coords_xyz.ndim != 3 or coords_xyz.shape[-1] != 3:
+                raise ValueError("coords_xyz must have shape [H, W, 3]")
+            if valid_mask.shape != coords_xyz.shape[:2]:
+                raise ValueError("valid_mask must have shape [H, W]")
+            call_index = len(self.calls)
+            self.calls.append(tuple(int(v) for v in coords_xyz.shape))
+            assert level == 2
+            assert sampling == "trilinear"
+            assert workers == 32
+            return [
+                {
+                    "key": f"2/0/0/{call_index}",
+                    "cache_path": f"/tmp/cache/{call_index}.bin",
+                    "empty_path": f"/tmp/cache/{call_index}.empty",
+                    "remote_url": "https://example.invalid/volume.zarr",
+                    "remote_chunk_key": f"2/0/0/{call_index}",
+                    "cache_payload_format": "direct",
+                    "persistent_extension": ".bin",
+                },
+                {
+                    "key": "2/shared",
+                    "cache_path": "/tmp/cache/shared.bin",
+                    "empty_path": "/tmp/cache/shared.empty",
+                    "remote_url": "https://example.invalid/volume.zarr",
+                    "remote_chunk_key": "2/shared",
+                    "cache_payload_format": "direct",
+                    "persistent_extension": ".bin",
+                },
+            ]
+
+    fake = _FakeVolume()
+    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
+    sampler.volume = fake
+    sampler.level = 2
+    sampler.sampling = "trilinear"
+    sampler.blocking = True
+
+    coords = np.zeros((3, 4, 5, 3), dtype=np.float32)
+    valid = np.ones((3, 4, 5), dtype=bool)
+    valid[1, :, :] = False
+    requests = sampler.chunk_requests_for_coords(coords, valid)
+
+    assert fake.calls == [(12, 5, 3)]
+    assert [request.key for request in requests] == ["2/0/0/0", "2/shared"]
+    assert requests[0].cache_path is not None
 
 
 def test_3d_model_and_losses_smoke() -> None:
