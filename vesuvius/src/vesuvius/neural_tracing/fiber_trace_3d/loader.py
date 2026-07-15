@@ -778,6 +778,40 @@ def _sample_forward_map_points(
     return out, valid
 
 
+def _clip_segment_to_aabb(
+    p0: np.ndarray,
+    p1: np.ndarray,
+    *,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    eps: float = 1.0e-12,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    p0 = np.asarray(p0, dtype=np.float64)
+    p1 = np.asarray(p1, dtype=np.float64)
+    direction = p1 - p0
+    if (not np.isfinite(p0).all()) or (not np.isfinite(p1).all()):
+        return None
+    t_min = 0.0
+    t_max = 1.0
+    for axis in range(3):
+        d = float(direction[axis])
+        if abs(d) <= eps:
+            if float(p0[axis]) < float(lo[axis]) or float(p0[axis]) > float(hi[axis]):
+                return None
+            continue
+        t0 = (float(lo[axis]) - float(p0[axis])) / d
+        t1 = (float(hi[axis]) - float(p0[axis])) / d
+        if t0 > t1:
+            t0, t1 = t1, t0
+        t_min = max(t_min, t0)
+        t_max = min(t_max, t1)
+        if t_min > t_max:
+            return None
+    if t_max - t_min <= eps:
+        return None
+    return p0 + t_min * direction, p0 + t_max * direction
+
+
 def _read_raw_block(array: Any, start_zyx: np.ndarray, end_zyx: np.ndarray) -> np.ndarray:
     start = np.asarray(start_zyx, dtype=np.int64)
     end = np.asarray(end_zyx, dtype=np.int64)
@@ -1610,20 +1644,40 @@ class FiberTrace3DLoader:
             cp_index,
             params,
         )
-        points_out, points_valid = self._source_points_to_output_np(line_points, geometry)
-        if points_out.shape[0] < 2:
+        if line_points.shape[0] < 2:
             raise ValueError("label line window must contain at least two points")
-        segment_start = points_out[:-1].astype(np.float32)
-        segment_vec = (points_out[1:] - points_out[:-1]).astype(np.float32)
+        forward_shape = np.asarray(geometry.forward_map_zyx.shape[:3], dtype=np.float64)
+        domain_lo = np.asarray(geometry.forward_source_start_zyx, dtype=np.float64)
+        domain_hi = domain_lo + np.maximum(forward_shape - 1.0, 0.0)
+        clipped_segments: list[tuple[np.ndarray, np.ndarray]] = []
+        for index in range(int(line_points.shape[0]) - 1):
+            clipped = _clip_segment_to_aabb(
+                line_points[index],
+                line_points[index + 1],
+                lo=domain_lo,
+                hi=domain_hi,
+            )
+            if clipped is not None:
+                clipped_segments.append(clipped)
+        if not clipped_segments:
+            raise ValueError("label line window has no source-domain-overlapping segments")
+        clipped_points = np.asarray(
+            [point for segment in clipped_segments for point in segment],
+            dtype=np.float64,
+        )
+        points_out, points_valid = self._source_points_to_output_np(clipped_points, geometry)
+        segment_start = points_out[0::2].astype(np.float32)
+        segment_end = points_out[1::2].astype(np.float32)
+        segment_vec = (segment_end - segment_start).astype(np.float32)
         segment_len2 = np.sum(segment_vec * segment_vec, axis=1)
         valid_segments = (
-            points_valid[:-1]
-            & points_valid[1:]
+            points_valid[0::2]
+            & points_valid[1::2]
             & np.isfinite(segment_len2)
             & (segment_len2 > 1.0e-12)
         )
         if not bool(valid_segments.any()):
-            raise ValueError("label line window has no valid segments")
+            raise ValueError("label line window has no valid clipped segments")
         segment_start = segment_start[valid_segments]
         segment_vec = segment_vec[valid_segments]
         segment_len2 = segment_len2[valid_segments]

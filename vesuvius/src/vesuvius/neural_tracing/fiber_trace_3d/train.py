@@ -21,6 +21,9 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     _read_raw_block,
     load_config,
 )
+from vesuvius.neural_tracing.fiber_trace_3d.direction import (
+    decode_lasagna_direction_3x2_analytic,
+)
 from vesuvius.neural_tracing.fiber_trace_3d.model import (
     build_fiber_trace_3d_model,
     direction_output,
@@ -653,6 +656,12 @@ def run_training(config_path: str | Path) -> None:
     )
     if writer is not None:
         writer.add_text("config/json", json.dumps(_json_safe(raw_config), indent=2, sort_keys=True), 0)
+        writer.add_text(
+            "train_sample_3d/layout",
+            "Rows: yx, zx, zy principal slices through the sampled CP. "
+            "Columns: image, target presence, predicted presence, direction angle error.",
+            0,
+        )
 
     max_steps = int(training.get("max_steps", 1))
     if max_steps <= 0:
@@ -661,6 +670,9 @@ def run_training(config_path: str | Path) -> None:
     scalar_interval = int(training.get("scalar_log_interval", 100))
     checkpoint_interval = int(training.get("checkpoint_interval", 100))
     test_interval = int(training.get("test_interval", 0))
+    sample_vis_interval = int(
+        training.get("sample_vis_interval", training.get("train_sample_vis_interval", 1000))
+    )
     test_control_points = int(training.get("test_control_points", loader.config.batch_size))
     if test_control_points <= 0:
         test_control_points = test_loader.sample_count if test_loader is not None else loader.sample_count
@@ -708,6 +720,21 @@ def run_training(config_path: str | Path) -> None:
             writer.add_scalar("train/loss_presence", losses["presence"], step)
             writer.add_scalar("timing/load_ms", load_ms, step)
             writer.add_scalar("timing/fw_bw_step_ms", step_ms, step)
+        if writer is not None and sample_vis_interval > 0 and (
+            step == 1 or step % sample_vis_interval == 0
+        ):
+            was_training = bool(model.training)
+            model.eval()
+            with torch.no_grad():
+                vis_output = model(batch.volume[:1])
+            if was_training:
+                model.train()
+            writer.add_image(
+                "train_sample_3d/principal_slices",
+                _make_train_sample_3d_sheet(batch, vis_output),
+                step,
+                dataformats="HWC",
+            )
 
         metric = losses["total"]
         metric_name = "train/loss_total"
@@ -804,6 +831,105 @@ def _image_to_u8(image: np.ndarray, valid: np.ndarray) -> np.ndarray:
     scaled = np.clip((arr - lo) / max(hi - lo, 1.0e-6), 0.0, 1.0)
     out[mask] = np.rint(scaled[mask] * 255.0).astype(np.uint8)
     return out
+
+
+def _gray_to_rgb(values: np.ndarray, *, mask: np.ndarray | None = None) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    valid = np.isfinite(arr) if mask is None else (np.asarray(mask, dtype=bool) & np.isfinite(arr))
+    out = np.zeros((*arr.shape, 3), dtype=np.uint8)
+    clipped = np.clip(arr, 0.0, 1.0)
+    gray = np.rint(clipped * 255.0).astype(np.uint8)
+    out[valid] = gray[valid, None]
+    return out
+
+
+def _angle_error_rgb(angle_degrees: np.ndarray, *, mask: np.ndarray) -> np.ndarray:
+    angle = np.asarray(angle_degrees, dtype=np.float32)
+    valid = np.asarray(mask, dtype=bool) & np.isfinite(angle)
+    scaled = np.clip(angle / 90.0, 0.0, 1.0)
+    out = np.zeros((*angle.shape, 3), dtype=np.uint8)
+    out[..., 0] = np.rint(scaled * 255.0).astype(np.uint8)
+    out[..., 2] = np.rint((1.0 - scaled) * 255.0).astype(np.uint8)
+    out[~valid] = 0
+    return out
+
+
+def _mark_slice_cp(panel: np.ndarray, row: int, col: int) -> None:
+    h, w = int(panel.shape[0]), int(panel.shape[1])
+    r = int(np.clip(row, 0, max(h - 1, 0)))
+    c = int(np.clip(col, 0, max(w - 1, 0)))
+    color = np.asarray([255, 255, 255], dtype=np.uint8)
+    for delta in range(4, 10):
+        if 0 <= r - delta < h:
+            panel[r - delta, c] = color
+        if 0 <= r + delta < h:
+            panel[r + delta, c] = color
+        if 0 <= c - delta < w:
+            panel[r, c - delta] = color
+        if 0 <= c + delta < w:
+            panel[r, c + delta] = color
+
+
+def _make_train_sample_3d_sheet(
+    batch: FiberTrace3DBatch,
+    output: torch.Tensor,
+) -> np.ndarray:
+    volume = batch.volume[0, 0].detach().cpu().numpy()
+    valid = batch.valid_mask[0, 0].detach().cpu().numpy().astype(bool)
+    target_presence = batch.presence_target[0, 0].detach().cpu().numpy()
+    pred_presence = presence_output(output)[0, 0].detach().cpu().numpy()
+    direction_mask = batch.direction_mask[0, 0].detach().cpu().numpy().astype(bool)
+
+    target_encoded = batch.direction_target[0].permute(1, 2, 3, 0)
+    pred_encoded = direction_output(output)[0].permute(1, 2, 3, 0)
+    target_dir = decode_lasagna_direction_3x2_analytic(target_encoded)
+    pred_dir = decode_lasagna_direction_3x2_analytic(pred_encoded)
+    agreement = torch.abs(torch.sum(target_dir * pred_dir, dim=-1)).clamp(0.0, 1.0)
+    angle = torch.rad2deg(torch.acos(agreement)).detach().cpu().numpy()
+
+    cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long).detach().cpu().numpy()
+    cp = np.clip(cp, [0, 0, 0], np.asarray(volume.shape, dtype=np.int64) - 1)
+    z, y, x = (int(v) for v in cp)
+    slice_specs = (
+        ("yx", volume[z, :, :], valid[z, :, :], target_presence[z, :, :], pred_presence[z, :, :], angle[z, :, :], direction_mask[z, :, :], y, x),
+        ("zx", volume[:, y, :], valid[:, y, :], target_presence[:, y, :], pred_presence[:, y, :], angle[:, y, :], direction_mask[:, y, :], z, x),
+        ("zy", volume[:, :, x], valid[:, :, x], target_presence[:, :, x], pred_presence[:, :, x], angle[:, :, x], direction_mask[:, :, x], z, y),
+    )
+
+    rows: list[np.ndarray] = []
+    gap = 4
+    for _name, image, image_valid, target_p, pred_p, angle_p, angle_mask, cp_row, cp_col in slice_specs:
+        image_rgb = np.repeat(_image_to_u8(image, image_valid)[..., None], 3, axis=2)
+        target_rgb = _gray_to_rgb(target_p, mask=image_valid)
+        pred_rgb = _gray_to_rgb(pred_p, mask=image_valid)
+        angle_rgb = _angle_error_rgb(angle_p, mask=angle_mask)
+        panels = [image_rgb, target_rgb, pred_rgb, angle_rgb]
+        for panel in panels:
+            _mark_slice_cp(panel, cp_row, cp_col)
+        height = max(int(panel.shape[0]) for panel in panels)
+        padded_panels = []
+        for panel in panels:
+            if int(panel.shape[0]) < height:
+                pad = np.zeros((height - int(panel.shape[0]), int(panel.shape[1]), 3), dtype=np.uint8)
+                panel = np.concatenate([panel, pad], axis=0)
+            padded_panels.append(panel)
+        sep = np.zeros((height, gap, 3), dtype=np.uint8)
+        row = padded_panels[0]
+        for panel in padded_panels[1:]:
+            row = np.concatenate([row, sep, panel], axis=1)
+        rows.append(row)
+    width = max(int(row.shape[1]) for row in rows)
+    padded_rows = []
+    for row in rows:
+        if int(row.shape[1]) < width:
+            pad = np.zeros((int(row.shape[0]), width - int(row.shape[1]), 3), dtype=np.uint8)
+            row = np.concatenate([row, pad], axis=1)
+        padded_rows.append(row)
+    sep_row = np.zeros((gap, width, 3), dtype=np.uint8)
+    sheet = padded_rows[0]
+    for row in padded_rows[1:]:
+        sheet = np.concatenate([sheet, sep_row, row], axis=0)
+    return sheet
 
 
 def _draw_trace2cp_3d_panel(

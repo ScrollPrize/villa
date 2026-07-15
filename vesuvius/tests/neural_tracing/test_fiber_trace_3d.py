@@ -35,6 +35,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _Trace2Cp3DConfig,
     _evaluate_trace2cp_metric_fixed_set_3d,
+    _make_train_sample_3d_sheet,
 )
 
 
@@ -48,6 +49,25 @@ def _straight_fiber() -> Vc3dFiber:
         version=1,
         line_points_xyz=points,
         control_points_xyz=points[::4].copy(),
+        generation=1,
+        metadata={},
+    )
+
+
+def _long_segment_fiber() -> Vc3dFiber:
+    points = np.asarray(
+        [
+            [0.0, 32.0, 32.0],
+            [32.0, 32.0, 32.0],
+            [80.0, 32.0, 32.0],
+        ],
+        dtype=np.float32,
+    )
+    return Vc3dFiber(
+        path=None,
+        version=1,
+        line_points_xyz=points,
+        control_points_xyz=points[1:2].copy(),
         generation=1,
         metadata={},
     )
@@ -79,6 +99,36 @@ def _loader(*, augment_enabled: bool = False) -> FiberTrace3DLoader:
                 {
                     "volume": volume,
                     "fiber": _straight_fiber(),
+                    "volume_path": "synthetic",
+                }
+            ],
+        }
+    )
+    return FiberTrace3DLoader(config)
+
+
+def _long_segment_loader() -> FiberTrace3DLoader:
+    z, y, x = np.meshgrid(
+        np.arange(96, dtype=np.float32),
+        np.arange(96, dtype=np.float32),
+        np.arange(96, dtype=np.float32),
+        indexing="ij",
+    )
+    volume = z * 0.01 + y * 0.1 + x
+    config = config_from_mapping(
+        {
+            "batch_size": 1,
+            "patch_shape_zyx": [16, 16, 16],
+            "seed": 11,
+            "cp_margin_voxels": 3,
+            "presence_radius_voxels": 1.5,
+            "image_normalization": "none",
+            "augment_enabled": False,
+            "round_source_to_chunk_boundaries": False,
+            "_array_records": [
+                {
+                    "volume": volume,
+                    "fiber": _long_segment_fiber(),
                     "volume_path": "synthetic",
                 }
             ],
@@ -174,6 +224,38 @@ def test_loader_augmented_batch_is_finite() -> None:
     assert torch.isfinite(batch.volume).all()
     assert torch.isfinite(batch.direction_target).all()
     assert batch.volume.shape == (2, 1, 16, 16, 16)
+
+
+def test_loader_clips_long_label_segments_to_patch_domain() -> None:
+    loader = _long_segment_loader()
+    batch = loader.load_batch(0, sample_mode="flat")
+    assert batch.volume.shape == (1, 1, 16, 16, 16)
+    assert bool(batch.direction_mask.any())
+    assert bool((batch.presence_target > 0.5).any())
+    cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
+    assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), int(cp[2])] > 0.5
+
+
+def test_train_sample_3d_sheet_contains_principal_slice_panels() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = loader.load_batch(0)
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    with torch.no_grad():
+        output = model(batch.volume[:1])
+    sheet = _make_train_sample_3d_sheet(batch, output)
+    assert sheet.ndim == 3
+    assert sheet.shape[2] == 3
+    assert sheet.dtype == np.uint8
+    assert sheet.shape[0] > 16
+    assert sheet.shape[1] > 4 * 16
 
 
 def test_affine_only_forward_map_matches_matrix_transform() -> None:

@@ -64,11 +64,23 @@
   elsewhere inside the valid/reachable patch interior. Edge voxels that could
   not contain a CP because of shift augmentation are ignored for negative
   presence loss.
+- 3D target generation must clip fiber-line segments to the sampled
+  forward-map/source domain before mapping them into output-patch coordinates.
+  A segment that overlaps the patch must contribute supervision even if one or
+  both original line vertices are outside the patch. Endpoint-inside-only
+  segment validity is invalid for NML fibers with long inter-node spacing.
 - The first 3D model uses direction plus presence losses. Contrastive embedding
   remains unsupported by default in the 3D V0 path.
 - Effective `batch_size` is the logical CP-patch batch size. Dense 3D U-Net
   memory pressure is handled by `training.model_micro_batch_size`, which splits
   forward/backward passes without changing the deterministic sample stream.
+- The S1A NML 3D training config uses `patch_shape_zyx: [192,192,192]`,
+  `augment_shift_zyx: [48,48,48]`, and a fixed six-stage U-Net depth
+  (`[16,32,64,128,256,512]`) so the deepest feature map remains appropriate
+  for 192-voxel patches.
+- 3D training TensorBoard visualization logs three principal CP-centered
+  planes at `training.sample_vis_interval`, showing image data, target
+  presence, predicted presence, and direction angular error.
 - `python -m vesuvius.neural_tracing.fiber_trace_3d.train` is the 3D training
   entrypoint. It supports normal training, `--benchmark`, `--load-only`, and
   `--prefetch`.

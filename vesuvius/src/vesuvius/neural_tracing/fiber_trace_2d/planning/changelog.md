@@ -2,6 +2,10 @@
 
 ## 2026-07-15
 
+- Updated the S1A NML 3D training config to `192^3` patches, `48`-voxel CP
+  shift, and a six-stage U-Net; fixed 3D target generation to clip long
+  source-line segments to the patch/domain, and added principal-slice
+  TensorBoard training visualization.
 - Wired 3D Trace2CP evaluation into `fiber_trace_3d.train`: tiled dense 3D
   inference over 2D Trace2CP geometry, TensorBoard/stdout metrics, best
   checkpoint selection by `test/trace2cp_error`, and a compact

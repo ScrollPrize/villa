@@ -1,6 +1,6 @@
 {
   "batch_size": 192,
-  "patch_shape_zyx": [32, 32, 32],
+  "patch_shape_zyx": [192, 192, 192],
   "seed": 0,
   "cp_margin_voxels": 4,
   "presence_radius_voxels": 2.0,
@@ -8,7 +8,7 @@
   "round_source_to_chunk_boundaries": true,
   "image_normalization": "zscore",
   "augment_enabled": true,
-  "augment_shift_zyx": [8.0, 8.0, 8.0],
+  "augment_shift_zyx": [48.0, 48.0, 48.0],
   "augment_rotation_degrees": 25.0,
   "augment_scale_min": 0.9,
   "augment_scale_max": 1.1,
@@ -35,7 +35,7 @@
     "input_channels": 1,
     "output_channels": 7,
     "unet_base_channels": 16,
-    "unet_depth": 4,
+    "unet_depth": 6,
     "decoder_upsample_mode": "pixelshuffle",
     "squeeze_excitation": false
   },
@@ -46,6 +46,7 @@
     "learning_rate": 0.001,
     "model_micro_batch_size": 8,
     "scalar_log_interval": 100,
+    "sample_vis_interval": 1000,
     "checkpoint_interval": 100,
     "test_interval": 500,
     "test_control_points": 0,

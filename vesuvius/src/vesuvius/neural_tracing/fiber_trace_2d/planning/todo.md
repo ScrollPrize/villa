@@ -45,6 +45,7 @@
     - ([ ] ringing artifact?)
     - [ ] no skew?
     - [ ] special load/aug config key - round training patch to chunk boundaries
+- [ ] check the various 3d augmetnations with a contact sheet
 
 ## z-search training
 - [ ] Now lets do a modification that re-introduces multiple z-slices again int the training - we see that some difficulty in the embedding is mostly caused by the sample shifting in z

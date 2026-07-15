@@ -1,21 +1,20 @@
-# 3D Trace2CP Metric Wiring Fix
+# 3D CP Training Config And Segment Target Fix
 
-Finish the explicitly requested 3D Trace2CP metric wiring that was only
-partially implemented in the previous 3D follow-up.
+Fix the 3D CP-centered training path after the first S1A NML training run.
 
 Required behavior:
 
-- 3D training test evaluation must be able to run the public Trace2CP metric by
-  projecting dense 3D model outputs onto the existing 2D Trace2CP side-strip
-  geometry.
-- Best checkpoint selection must use `test/trace2cp_error` when this metric is
-  enabled.
-- TensorBoard and stdout must log the 3D Trace2CP metric clearly.
-- Add the minimal required 3D config keys rather than silently inferring
-  missing 2D Trace2CP geometry settings.
-- Add a 3D CLI inspection path that can run the same projection metric for a
-  checkpoint and export a compact visualization.
-
-The 3D training path must still load ordinary CP-centered 3D blocks for
-training. Trace2CP evaluation may reuse the existing 2D loader only for metric
-geometry and visualization.
+- The S1A NML 3D training config must use the intended larger 3D patch size:
+  `patch_shape_zyx: [192, 192, 192]`.
+- The configured CP shift must match that patch scale: `augment_shift_zyx:
+  [48, 48, 48]`.
+- The 3D U-Net depth must be fixed to a depth appropriate for 192-voxel
+  patches rather than the shallow 4-stage setup.
+- 3D label generation must not discard a fiber segment only because one of the
+  original line vertices is outside the sampled patch/source-map domain. It
+  must keep segment portions that overlap the crop by clipping to the
+  forward-map/source domain before mapping to output coordinates.
+- This is a training target-generation fix, not a data-skip workaround.
+- 3D training TensorBoard visualization must show the three principal slices
+  through a sampled CP, including image data, presence, and direction/angle
+  information.

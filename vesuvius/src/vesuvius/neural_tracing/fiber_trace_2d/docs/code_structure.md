@@ -58,6 +58,10 @@ side/top strip input loading.
   used to sample the image. Direction labels use the six Lasagna 3x2 channels;
   presence positives are near the transformed line and negatives are balanced
   in the valid interior.
+- Clips source-space fiber-line segments to the forward-map/source domain
+  before mapping them into the output patch for target generation. Long NML
+  edges that cross the patch are therefore supervised even when their original
+  vertices are outside the patch.
 - Provides a conservative base-volume prefetch path from the configured
   augmentation envelope.
 
@@ -90,6 +94,9 @@ side/top strip input loading.
   and `best.pt`.
 - Logs scalar losses/timings and the full training config JSON to TensorBoard
   when `training.tensorboard_enabled` is true.
+- Logs `train_sample_3d/principal_slices` at `training.sample_vis_interval`.
+  The sheet uses the sampled CP's three principal planes with columns for image
+  data, target presence, predicted presence, and direction angular error.
 - Uses `training.model_micro_batch_size` to split dense 3D U-Net forwards while
   preserving the configured logical CP-patch `batch_size` (default target:
   around 192).
