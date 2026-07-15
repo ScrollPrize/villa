@@ -38,7 +38,6 @@ class InteractiveFitSession:
         self._completed = 0
         self._target = 0
         self._pending = 0
-        self._horizon = 0
         self._stop_requested = False
         self._shutdown = False
         self._latest_metrics = {}
@@ -64,7 +63,7 @@ class InteractiveFitSession:
                 "state": self._state, "phase": self._phase,
                 "current_iteration": self._completed,
                 "target_iteration": self._target,
-                "session_horizon": self._horizon,
+                "session_horizon": None,
                 "latest_metrics": copy.deepcopy(self._latest_metrics),
                 "warnings": list(self._warnings), "error": self._error,
                 "preview_manifest_path": self._preview_manifest,
@@ -176,11 +175,10 @@ class InteractiveFitSession:
                 wandb.finish(quiet=True)
 
     # Fitter-thread callbacks.
-    def on_ready(self, *, completed_iterations, session_horizon, output_path,
+    def on_ready(self, *, completed_iterations, output_path,
                  save_checkpoint, export_preview, geometry_snapshot_manifest=None):
         with self._condition:
             self._completed = self._target = completed_iterations
-            self._horizon = session_horizon
             self._output_path = output_path
             self._save_checkpoint = save_checkpoint
             self._export_preview = export_preview
@@ -243,10 +241,7 @@ class InteractiveFitSession:
             self._preview_manifest = str(manifest["manifest_path"])
 
     def session_finished(self):
-        self._set_state("Paused", "Session horizon reached")
-        while True:
-            self.wait_for_iteration(self._completed)
-            raise RuntimeError("Cannot run beyond the configured session horizon")
+        raise RuntimeError("Interactive optimizer loop ended unexpectedly")
 
     # Coordinator-thread commands.
     def run(self, count):
@@ -255,8 +250,6 @@ class InteractiveFitSession:
         with self._condition:
             if self._state not in {"Ready", "Paused"}:
                 raise RuntimeError(f"Run is not allowed while session state is {self._state}")
-            if self._completed + count > self._horizon:
-                raise ValueError(f"Run exceeds fixed session horizon {self._horizon}")
             self._pending = count
             self._target = self._completed + count
             self._state, self._phase = "Running", "Optimizing"

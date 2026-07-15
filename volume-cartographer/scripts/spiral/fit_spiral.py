@@ -1,5 +1,6 @@
 import os
 import copy
+import itertools
 import json
 import glob
 import zarr
@@ -1485,14 +1486,21 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             tracks = None
         interactive_driver.on_ready(
             completed_iterations=start_iteration,
-            session_horizon=num_training_steps,
             output_path=out_path,
             save_checkpoint=save_model_to,
             export_preview=export_interactive_preview,
             geometry_snapshot_manifest=os.path.join(geometry_path, 'manifest.json'),
         )
 
-    for iteration in tqdm(range(start_iteration, num_training_steps), disable=not is_main_process()):
+    # Interactive fits are resident sessions: num_training_steps still defines
+    # the learning-rate schedule, but it must not cap how long the user can
+    # continue optimizing (especially after restoring a completed checkpoint).
+    iteration_sequence = (
+        itertools.count(start_iteration)
+        if interactive_driver is not None
+        else range(start_iteration, num_training_steps)
+    )
+    for iteration in tqdm(iteration_sequence, disable=not is_main_process()):
         if interactive_driver is not None and not interactive_driver.wait_for_iteration(iteration):
             break
         step_timer.start('fwd')

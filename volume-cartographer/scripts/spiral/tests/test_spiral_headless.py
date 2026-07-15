@@ -11,6 +11,7 @@ import torch
 from fit_session import (PclInputSpec, PclRole, resolve_dataset_root,
                          resolve_logical_dbm, validate_checkpoint_container)
 from geometry_snapshot import validate_geometry_snapshot, write_geometry_snapshot
+from spiral_runtime import InteractiveFitSession
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
 from tifxyz import save_combined_tifxyz
@@ -126,6 +127,21 @@ class PreviewRangeTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_interactive_run_can_continue_past_checkpoint_training_steps(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Ready"
+        session._completed = 30_000
+        session._pending = 0
+        session._target = 30_000
+
+        target = session.run(250)
+
+        self.assertEqual(target, 30_250)
+        self.assertEqual(session._pending, 250)
+        self.assertEqual(session._target, 30_250)
+        self.assertEqual(session._state, "Running")
+
     def test_mutating_command_is_deduplicated(self):
         service = ServiceState()
         calls = []
