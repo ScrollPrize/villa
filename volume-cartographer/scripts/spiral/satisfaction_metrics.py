@@ -4,7 +4,11 @@ import os
 import numpy as np
 import torch
 
-from sample_spiral import get_theta_and_radii
+from sample_spiral import (
+    get_theta_and_radii,
+    get_theta_crossing_step_adjustments,
+    radius_from_unwrapped_shifted,
+)
 from spiral_helpers import (
     compute_winding_range_and_input_extents,
     save_mesh,
@@ -151,10 +155,7 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
                     if row_thetas.numel() <= 1:
                         cum_adj = torch.zeros_like(row_thetas)
                     else:
-                        theta_diffs = row_thetas[1:] - row_thetas[:-1]
-                        # Signed: theta_diff < -pi means we wrapped 2pi->0+ (theta jumped down),
-                        # so naive shifted_radius is too high by dr; subtract. Opposite for >+pi.
-                        step_adj = ((theta_diffs > np.pi).to(row_thetas.dtype) - (theta_diffs < -np.pi).to(row_thetas.dtype)) * dr
+                        step_adj = get_theta_crossing_step_adjustments(row_thetas, dr)
                         cum_adj = torch.cat([torch.zeros([1], device=device, dtype=row_thetas.dtype), torch.cumsum(step_adj, dim=0)], dim=0)
                     subrow_infos.append({
                         'row_idx': i,
@@ -355,18 +356,13 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         spiral_zyxs = transform_in_chunks(zyxs, slice_to_spiral_transform)
         theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
 
-        # Segmented version of _unwrap_track_shifted_radii: build
+        # Segmented version of unwrap_shifted_radii: build
         # adjustments via a global cumsum where step_adj is zeroed across strip
         # boundaries, then subtract each strip's start value so each strip
         # starts at 0 in its own frame.
         if T > 1:
-            theta_d = theta.detach()
-            diffs = theta_d[1:] - theta_d[:-1]
             same_strip = strip_id[1:] == strip_id[:-1]
-            step_adj = (
-                (diffs > np.pi).to(shifted_radii.dtype)
-                - (diffs < -np.pi).to(shifted_radii.dtype)
-            ) * dr
+            step_adj = get_theta_crossing_step_adjustments(theta, dr)
             step_adj = torch.where(same_strip, step_adj, torch.zeros_like(step_adj))
             cumsum_inner = torch.cumsum(step_adj, dim=0)
             cumsum_flat = torch.cat([
@@ -430,7 +426,9 @@ def _strip_satisfaction_from_target(ctx, target_normalised_per_strip):
         target_shifted = target_normalised + windings * dr
         spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
 
-        target_radii = target_shifted - adjustments + theta / (2 * np.pi) * dr
+        target_radii = radius_from_unwrapped_shifted(
+            theta, target_shifted, adjustments, dr,
+        )
         target_spiral_zyxs = torch.stack([
             spiral_zyxs[..., 0],
             torch.sin(theta) * target_radii,
