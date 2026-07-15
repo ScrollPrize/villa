@@ -2,6 +2,11 @@
 
 ## 2026-07-15
 
+- Reworked the 3D fiber loader hot path to sample CP-centered patches through
+  VC3D explicit coordinate sampling instead of oversized zarr crops plus torch
+  resampling; NML dense targets now rasterize transformed segment capsules
+  directly, 3D prefetch uses VC3D coordinate dependencies, and training can
+  queue deterministic future `load_batch` calls.
 - Updated the S1A NML 3D training config to `192^3` patches, `48`-voxel CP
   shift, and a six-stage U-Net; fixed 3D target generation to clip long
   source-line segments to the patch/domain, and added principal-slice

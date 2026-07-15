@@ -119,6 +119,16 @@ jq '.training.tensorboard_enabled=false | .training.pipeline_depth=4 | .training
 Then rerun the exact same benchmark command above. Do not introduce a new temp
 config filename or extra CLI flags unless the user explicitly approves it.
 
+For the S1A 3D fiber loader benchmark, reuse this exact command:
+
+```bash
+PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_all.json --benchmark --load-only --benchmark-batches 10
+```
+
+This is the approved load-only comparison command for the current 3D loader
+work. Do not change the config path, flags, or PYTHONPATH shape unless the user
+explicitly asks for a different measurement.
+
 ## Fiber Trace 2D Training Prefetch Commands
 
 Prefetch the base-volume chunks needed for the first 10 configured training

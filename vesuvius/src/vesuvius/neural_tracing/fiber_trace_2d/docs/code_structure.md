@@ -41,13 +41,15 @@ side/top strip input loading.
   dataset-level XYZ affine transforms follow the same rules as the 2D loader.
 - Requires Lasagna manifests for normal dataset entries and validates the base
   volume shape against the manifest.
-- Samples ordinary CP-centered 3D ZYX source blocks from the selected Zarr
-  level. It does not create fiber-aligned strips or slices for 3D input.
-- Builds the final regular 3D patch with explicit paired coordinate maps.
+- Samples ordinary CP-centered 3D ZYX patches from the selected Zarr level
+  through explicit coordinates and the VC3D blocking coordinate sampler. It
+  does not create fiber-aligned strips or slices for 3D input, and normal
+  training no longer loads an oversized zarr block for torch `grid_sample`.
+- Builds the final regular 3D patch with explicit coordinate maps.
   `backward_source_zyx` maps output voxels to source-volume coordinates for
-  image sampling, while `forward_map_zyx` maps source-volume coordinates back to
-  output patch coordinates for line/control-point lookup and labels. This is
-  the 3D equivalent of the 2D paired fused-map contract.
+  image sampling, while source fiber points are mapped into output patch
+  coordinates by the matching analytic forward transform from the same
+  augmentation parameters.
 - Coordinate-space geometric augmentation supports CP-local shift, isotropic
   scale, arbitrary 3D rotation, independent axis flips, and opt-in smooth
   displacement. Smooth displacement modes (`1d`, `2d`, `3d`) are built as
@@ -58,16 +60,13 @@ side/top strip input loading.
   blur is a torch value operation after volume sampling, not a geometric
   transform.
 - Builds direction and presence targets in source-format-specific form.
-  NML records supervise densely along the transformed fiber line; JSON/array
-  records supervise only the sampled CP neighborhood. Direction labels use the
-  six Lasagna 3x2 channels, and presence negatives are balanced in the valid
+  NML records supervise densely along the transformed fiber line by directly
+  rasterizing bounded output-space segment capsules; JSON/array records
+  supervise only the sampled CP neighborhood. Direction labels use the six
+  Lasagna 3x2 channels, and presence negatives are balanced in the valid
   interior.
-- Clips source-space fiber-line segments to the forward-map/source domain
-  before mapping NML dense targets into the output patch. Long NML edges that
-  cross the patch are therefore supervised even when their original vertices
-  are outside the patch.
-- Provides a conservative base-volume prefetch path from the configured
-  augmentation envelope.
+- Prefetch uses the same explicit coordinate path as training and collects
+  VC3D chunk dependencies instead of conservative zarr crop bboxes.
 
 `fiber_trace_3d/projection.py`
 
@@ -101,9 +100,12 @@ side/top strip input loading.
 - Logs `train_sample_3d/principal_slices` at `training.sample_vis_interval`.
   The sheet uses the sampled CP's three principal planes with columns for image
   data, target presence, predicted presence, and direction angular error.
-- Uses `training.model_micro_batch_size` to split dense 3D U-Net forwards while
-  preserving the configured logical CP-patch `batch_size` (default target:
-  around 192).
+- `batch_size` is the actual CP-patch batch passed through the 3D U-Net. The
+  trainer does not internally micro-batch.
+- Normal training can queue deterministic future `load_batch` calls with
+  `training.pipeline_enabled`, `training.pipeline_depth`, and
+  `training.pipeline_workers` so VC3D/CPU loading can overlap the current
+  optimization step.
 - When `training.test_trace2cp_enabled` is true, test evaluation builds
   Trace2CP side-strip geometry with the 2D loader, runs tiled dense 3D inference
   blocks over the requested strip coordinates, projects direction/presence into

@@ -5,6 +5,7 @@ import json
 import math
 import re
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -665,138 +666,169 @@ def run_training(config_path: str | Path) -> None:
         test_control_points = test_loader.sample_count if test_loader is not None else loader.sample_count
     direction_weight = float(training.get("direction_weight", 1.0))
     presence_weight = float(training.get("presence_weight", 1.0))
+    pipeline_enabled = bool(training.get("pipeline_enabled", True))
+    pipeline_depth = max(1, int(training.get("pipeline_depth", 2)))
+    pipeline_workers = max(1, int(training.get("pipeline_workers", 1)))
     best_metric = math.inf
 
     print(
         "fiber_trace_3d train: "
         f"samples={loader.sample_count} batch_size={loader.config.batch_size} "
         f"patch_shape_zyx={loader.config.patch_shape_zyx} device={device} run_dir={run_dir} "
-        f"trace2cp_enabled={bool(trace2cp_loader is not None)}",
+        f"trace2cp_enabled={bool(trace2cp_loader is not None)} "
+        f"pipeline_enabled={pipeline_enabled} pipeline_depth={pipeline_depth} "
+        f"pipeline_workers={pipeline_workers}",
         flush=True,
     )
 
-    for step in range(start_step + 1, max_steps + 1):
-        load_start = time.perf_counter()
-        sample_index = (step - 1) * loader.config.batch_size
-        batch = loader.load_batch(sample_index, sample_mode="random", device=device)
-        load_ms = (time.perf_counter() - load_start) * 1000.0
-        optimizer.zero_grad(set_to_none=True)
-        fw_start = time.perf_counter()
-        losses = _forward_loss(
-            model,
-            batch,
-            direction_weight=direction_weight,
-            presence_weight=presence_weight,
-            backward=True,
-        )
-        optimizer.step()
-        step_ms = (time.perf_counter() - fw_start) * 1000.0
-
-        if step <= 100 or step % scalar_interval == 0:
-            print(
-                f"step={step} loss_total={losses['total']:.6f} "
-                f"loss_direction={losses['direction']:.6f} "
-                f"loss_presence={losses['presence']:.6f} "
-                f"load_ms={load_ms:.1f} fw_bw_step_ms={step_ms:.1f}",
-                flush=True,
-            )
-        if writer is not None and (step == 1 or step % scalar_interval == 0):
-            writer.add_scalar("train/loss_total", losses["total"], step)
-            writer.add_scalar("train/loss_direction", losses["direction"], step)
-            writer.add_scalar("train/loss_presence", losses["presence"], step)
-            writer.add_scalar("timing/load_ms", load_ms, step)
-            writer.add_scalar("timing/fw_bw_step_ms", step_ms, step)
-        if writer is not None and sample_vis_interval > 0 and (
-            step == 1 or step % sample_vis_interval == 0
-        ):
-            was_training = bool(model.training)
-            model.eval()
-            with torch.no_grad():
-                vis_output = model(batch.volume[:1])
-            if was_training:
-                model.train()
-            writer.add_image(
-                "train_sample_3d/principal_slices",
-                _make_train_sample_3d_sheet(batch, vis_output),
-                step,
-                dataformats="HWC",
-            )
-
-        metric = losses["total"]
-        metric_name = "train/loss_total"
-        if test_loader is not None and test_interval > 0 and step % test_interval == 0:
-            test_losses = evaluate_dense_loss(
-                model,
-                test_loader,
+    pipeline: _OrderedBatchLoadPipeline | None = None
+    try:
+        if pipeline_enabled:
+            pipeline = _OrderedBatchLoadPipeline(
+                loader,
                 device=device,
-                start_sample_index=int(training.get("test_start_sample_index", 0)),
-                sample_count=test_control_points,
+                sample_mode="random",
+                workers=pipeline_workers,
+            )
+            pipeline.__enter__()
+            for queued_step in range(
+                start_step + 1,
+                min(max_steps, start_step + pipeline_depth) + 1,
+            ):
+                pipeline.submit((queued_step - 1) * loader.config.batch_size)
+
+        for step in range(start_step + 1, max_steps + 1):
+            load_start = time.perf_counter()
+            sample_index = (step - 1) * loader.config.batch_size
+            if pipeline is None:
+                batch = loader.load_batch(sample_index, sample_mode="random", device=device)
+            else:
+                batch = pipeline.result(sample_index)
+                next_step = step + pipeline_depth
+                if next_step <= max_steps:
+                    pipeline.submit((next_step - 1) * loader.config.batch_size)
+            load_ms = (time.perf_counter() - load_start) * 1000.0
+            optimizer.zero_grad(set_to_none=True)
+            fw_start = time.perf_counter()
+            losses = _forward_loss(
+                model,
+                batch,
                 direction_weight=direction_weight,
                 presence_weight=presence_weight,
+                backward=True,
             )
-            metric = test_losses["total"]
-            metric_name = "test/loss_total"
-            print(
-                f"test step={step} loss_total={test_losses['total']:.6f} "
-                f"loss_direction={test_losses['direction']:.6f} "
-                f"loss_presence={test_losses['presence']:.6f}",
-                flush=True,
-            )
-            if writer is not None:
-                writer.add_scalar("test/loss_total", test_losses["total"], step)
-                writer.add_scalar("test/loss_direction", test_losses["direction"], step)
-                writer.add_scalar("test/loss_presence", test_losses["presence"], step)
-        if trace2cp_loader is not None and test_interval > 0 and step % test_interval == 0:
-            trace2cp_metric = _evaluate_trace2cp_metric_fixed_set_3d(
-                model,
-                trace2cp_loader,
-                image_normalization=loader.config.image_normalization,
-                cfg=trace2cp_cfg,
-                device=device,
-            )
-            metric = trace2cp_metric.error_mean
-            metric_name = "test/trace2cp_error"
-            print(
-                f"test_trace2cp step={step} trace2cp_error={trace2cp_metric.error_mean:.6f} "
-                f"raw_y_error_mean_px={trace2cp_metric.raw_y_error_mean_px:.3f} "
-                f"segments={trace2cp_metric.segments} skipped={trace2cp_metric.skipped_segments}",
-                flush=True,
-            )
-            if writer is not None:
-                writer.add_scalar("test/trace2cp_error", trace2cp_metric.error_mean, step)
-                writer.add_scalar(
-                    "test/trace2cp_raw_y_error_mean_px",
-                    trace2cp_metric.raw_y_error_mean_px,
-                    step,
+            optimizer.step()
+            step_ms = (time.perf_counter() - fw_start) * 1000.0
+
+            if step <= 100 or step % scalar_interval == 0:
+                print(
+                    f"step={step} loss_total={losses['total']:.6f} "
+                    f"loss_direction={losses['direction']:.6f} "
+                    f"loss_presence={losses['presence']:.6f} "
+                    f"load_ms={load_ms:.1f} fw_bw_step_ms={step_ms:.1f}",
+                    flush=True,
                 )
-                writer.add_scalar("test/trace2cp_segments", trace2cp_metric.segments, step)
-                writer.add_scalar(
-                    "test/trace2cp_skipped_segments",
-                    trace2cp_metric.skipped_segments,
+            if writer is not None and (step == 1 or step % scalar_interval == 0):
+                writer.add_scalar("train/loss_total", losses["total"], step)
+                writer.add_scalar("train/loss_direction", losses["direction"], step)
+                writer.add_scalar("train/loss_presence", losses["presence"], step)
+                writer.add_scalar("timing/load_ms", load_ms, step)
+                writer.add_scalar("timing/load_wait_ms", load_ms, step)
+                writer.add_scalar("timing/fw_bw_step_ms", step_ms, step)
+            if writer is not None and sample_vis_interval > 0 and (
+                step == 1 or step % sample_vis_interval == 0
+            ):
+                was_training = bool(model.training)
+                model.eval()
+                with torch.no_grad():
+                    vis_output = model(batch.volume[:1])
+                if was_training:
+                    model.train()
+                writer.add_image(
+                    "train_sample_3d/principal_slices",
+                    _make_train_sample_3d_sheet(batch, vis_output),
                     step,
+                    dataformats="HWC",
                 )
 
-        if step % checkpoint_interval == 0 or step == max_steps:
-            _save_snapshot(
-                snapshot_dir / "current.pt",
-                model=model,
-                optimizer=optimizer,
-                step=step,
-                config=raw_config,
-                metric=metric,
-                metric_name=metric_name,
-            )
-        if metric < best_metric:
-            best_metric = float(metric)
-            _save_snapshot(
-                snapshot_dir / "best.pt",
-                model=model,
-                optimizer=optimizer,
-                step=step,
-                config=raw_config,
-                metric=best_metric,
-                metric_name=metric_name,
-            )
+            metric = losses["total"]
+            metric_name = "train/loss_total"
+            if test_loader is not None and test_interval > 0 and step % test_interval == 0:
+                test_losses = evaluate_dense_loss(
+                    model,
+                    test_loader,
+                    device=device,
+                    start_sample_index=int(training.get("test_start_sample_index", 0)),
+                    sample_count=test_control_points,
+                    direction_weight=direction_weight,
+                    presence_weight=presence_weight,
+                )
+                metric = test_losses["total"]
+                metric_name = "test/loss_total"
+                print(
+                    f"test step={step} loss_total={test_losses['total']:.6f} "
+                    f"loss_direction={test_losses['direction']:.6f} "
+                    f"loss_presence={test_losses['presence']:.6f}",
+                    flush=True,
+                )
+                if writer is not None:
+                    writer.add_scalar("test/loss_total", test_losses["total"], step)
+                    writer.add_scalar("test/loss_direction", test_losses["direction"], step)
+                    writer.add_scalar("test/loss_presence", test_losses["presence"], step)
+            if trace2cp_loader is not None and test_interval > 0 and step % test_interval == 0:
+                trace2cp_metric = _evaluate_trace2cp_metric_fixed_set_3d(
+                    model,
+                    trace2cp_loader,
+                    image_normalization=loader.config.image_normalization,
+                    cfg=trace2cp_cfg,
+                    device=device,
+                )
+                metric = trace2cp_metric.error_mean
+                metric_name = "test/trace2cp_error"
+                print(
+                    f"test_trace2cp step={step} trace2cp_error={trace2cp_metric.error_mean:.6f} "
+                    f"raw_y_error_mean_px={trace2cp_metric.raw_y_error_mean_px:.3f} "
+                    f"segments={trace2cp_metric.segments} skipped={trace2cp_metric.skipped_segments}",
+                    flush=True,
+                )
+                if writer is not None:
+                    writer.add_scalar("test/trace2cp_error", trace2cp_metric.error_mean, step)
+                    writer.add_scalar(
+                        "test/trace2cp_raw_y_error_mean_px",
+                        trace2cp_metric.raw_y_error_mean_px,
+                        step,
+                    )
+                    writer.add_scalar("test/trace2cp_segments", trace2cp_metric.segments, step)
+                    writer.add_scalar(
+                        "test/trace2cp_skipped_segments",
+                        trace2cp_metric.skipped_segments,
+                        step,
+                    )
+
+            if step % checkpoint_interval == 0 or step == max_steps:
+                _save_snapshot(
+                    snapshot_dir / "current.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    step=step,
+                    config=raw_config,
+                    metric=metric,
+                    metric_name=metric_name,
+                )
+            if metric < best_metric:
+                best_metric = float(metric)
+                _save_snapshot(
+                    snapshot_dir / "best.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    step=step,
+                    config=raw_config,
+                    metric=best_metric,
+                    metric_name=metric_name,
+                )
+    finally:
+        if pipeline is not None:
+            pipeline.__exit__(None, None, None)
     if writer is not None:
         writer.flush()
         writer.close()
@@ -1146,6 +1178,48 @@ def dataclass_replace(value: _Trace2Cp3DConfig, **kwargs: Any) -> _Trace2Cp3DCon
     data = value.__dict__.copy()
     data.update(kwargs)
     return _Trace2Cp3DConfig(**data)
+
+
+class _OrderedBatchLoadPipeline:
+    def __init__(
+        self,
+        loader: FiberTrace3DLoader,
+        *,
+        device: torch.device,
+        sample_mode: str,
+        workers: int,
+    ) -> None:
+        self.loader = loader
+        self.device = device
+        self.sample_mode = str(sample_mode)
+        self.executor = ThreadPoolExecutor(max_workers=max(1, int(workers)))
+        self.futures: dict[int, Future[FiberTrace3DBatch]] = {}
+
+    def __enter__(self) -> "_OrderedBatchLoadPipeline":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        for future in self.futures.values():
+            future.cancel()
+        self.executor.shutdown(wait=True, cancel_futures=True)
+
+    def submit(self, sample_index: int) -> None:
+        index = int(sample_index)
+        if index in self.futures:
+            return
+        self.futures[index] = self.executor.submit(
+            self.loader.load_batch,
+            index,
+            sample_mode=self.sample_mode,
+            device=self.device,
+        )
+
+    def result(self, sample_index: int) -> FiberTrace3DBatch:
+        index = int(sample_index)
+        future = self.futures.pop(index, None)
+        if future is None:
+            return self.loader.load_batch(index, sample_mode=self.sample_mode, device=self.device)
+        return future.result()
 
 
 def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> None:

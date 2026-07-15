@@ -62,6 +62,9 @@
     "test_trace2cp_tile_shape_hw": [128, 128],
     "test_trace2cp_block_context_voxels": 4,
     "device": "auto",
+    "pipeline_enabled": true,
+    "pipeline_depth": 2,
+    "pipeline_workers": 2,
     "tensorboard_enabled": true,
     "direction_weight": 1.0,
     "presence_weight": 1.0

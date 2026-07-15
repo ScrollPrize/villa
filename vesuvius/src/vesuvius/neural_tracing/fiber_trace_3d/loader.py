@@ -18,8 +18,6 @@ import torch.nn.functional as F
 from vesuvius.data.affine import read_transform_json
 from vesuvius.neural_tracing.datasets.common import open_zarr
 from vesuvius.neural_tracing.fiber_trace.dataset import (
-    ZarrChunkRequest,
-    _chunk_requests_for_bbox,
     _load_lasagna_volume,
     _omezarr_level_shape,
     _resolve_config_relative_path,
@@ -29,6 +27,13 @@ from vesuvius.neural_tracing.fiber_trace.dataset import (
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import (
     Vc3dFiber,
     load_fiber_file,
+)
+from vesuvius.neural_tracing.fiber_trace_2d.loader import _download_prefetch_request
+from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import (
+    CoordinateSampler,
+    NumpyZarrCoordinateSampler,
+    make_coordinate_sampler,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     control_point_line_index,
@@ -94,6 +99,7 @@ class FiberTrace3DConfig:
 class _Record:
     fiber: Vc3dFiber
     volume: Any
+    sampler: CoordinateSampler
     volume_path: str
     volume_scale: int
     volume_spacing_base: float
@@ -132,8 +138,7 @@ class _Augment3DParams:
 @dataclass(frozen=True)
 class _GeometryMaps3D:
     backward_source_zyx: torch.Tensor
-    forward_source_start_zyx: np.ndarray
-    forward_map_zyx: torch.Tensor
+    params: _Augment3DParams
 
 
 @dataclass(frozen=True)
@@ -728,56 +733,6 @@ def _smooth_backward_rel_zyx(
     return out
 
 
-def _sample_forward_map_points(
-    map_zyx: torch.Tensor,
-    points_local_zyx: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if map_zyx.ndim != 4 or map_zyx.shape[-1] != 3:
-        raise ValueError("forward_map_zyx must have shape D,H,W,3")
-    points = points_local_zyx.to(dtype=torch.float32, device=map_zyx.device)
-    d, h, w = int(map_zyx.shape[0]), int(map_zyx.shape[1]), int(map_zyx.shape[2])
-    valid = (
-        torch.isfinite(points).all(dim=-1)
-        & (points[..., 0] >= 0.0)
-        & (points[..., 0] <= float(d - 1))
-        & (points[..., 1] >= 0.0)
-        & (points[..., 1] <= float(h - 1))
-        & (points[..., 2] >= 0.0)
-        & (points[..., 2] <= float(w - 1))
-    )
-    clamped = torch.stack(
-        [
-            points[..., 0].clamp(0.0, float(max(d - 1, 0))),
-            points[..., 1].clamp(0.0, float(max(h - 1, 0))),
-            points[..., 2].clamp(0.0, float(max(w - 1, 0))),
-        ],
-        dim=-1,
-    )
-    p0 = torch.floor(clamped).to(dtype=torch.long)
-    p1 = torch.stack(
-        [
-            torch.clamp(p0[..., 0] + 1, max=max(d - 1, 0)),
-            torch.clamp(p0[..., 1] + 1, max=max(h - 1, 0)),
-            torch.clamp(p0[..., 2] + 1, max=max(w - 1, 0)),
-        ],
-        dim=-1,
-    )
-    frac = clamped - p0.to(dtype=clamped.dtype)
-    out = torch.zeros((*points.shape[:-1], 3), dtype=torch.float32, device=map_zyx.device)
-    for dz in (0, 1):
-        wz = frac[..., 0] if dz else (1.0 - frac[..., 0])
-        iz = p1[..., 0] if dz else p0[..., 0]
-        for dy in (0, 1):
-            wy = frac[..., 1] if dy else (1.0 - frac[..., 1])
-            iy = p1[..., 1] if dy else p0[..., 1]
-            for dx in (0, 1):
-                wx = frac[..., 2] if dx else (1.0 - frac[..., 2])
-                ix = p1[..., 2] if dx else p0[..., 2]
-                weight = (wz * wy * wx).unsqueeze(-1)
-                out = out + map_zyx[iz, iy, ix] * weight
-    return out, valid
-
-
 def _clip_segment_to_aabb(
     p0: np.ndarray,
     p1: np.ndarray,
@@ -1047,6 +1002,7 @@ class FiberTrace3DLoader:
                     _Record(
                         fiber=fiber,
                         volume=volume,
+                        sampler=NumpyZarrCoordinateSampler(volume, level_spacing_base=1.0),
                         volume_path=str(record.get("volume_path", f"array:{index}")),
                         volume_scale=0,
                         volume_spacing_base=1.0,
@@ -1065,6 +1021,15 @@ class FiberTrace3DLoader:
             volume_scale = int(dataset_config.get("base_volume_scale", dataset_config.get("volume_scale", 0)))
             volume_spacing_base = float(1 << volume_scale)
             volume = _open_dataset_volume(dataset_config, self.config)
+            sampler = make_coordinate_sampler(
+                volume_path=volume_path,
+                array=volume,
+                level=volume_scale,
+                level_spacing_base=volume_spacing_base,
+                cache_root=self.config.volume_cache_dir,
+                cache_budget_bytes=self.config.volume_cache_memory_bytes,
+                io_threads=self.config.volume_io_threads,
+            )
             base_shape_zyx = _validate_dataset_manifest(
                 dataset_config,
                 self.config,
@@ -1105,6 +1070,7 @@ class FiberTrace3DLoader:
                         _Record(
                             fiber=fiber,
                             volume=volume,
+                            sampler=sampler,
                             volume_path=volume_path,
                             volume_scale=volume_scale,
                             volume_spacing_base=volume_spacing_base,
@@ -1452,10 +1418,11 @@ class FiberTrace3DLoader:
         self,
         params: _Augment3DParams,
         *,
-        forward_start_zyx: np.ndarray,
-        forward_end_zyx: np.ndarray,
         device: torch.device,
+        forward_start_zyx: np.ndarray | None = None,
+        forward_end_zyx: np.ndarray | None = None,
     ) -> _GeometryMaps3D:
+        del forward_start_zyx, forward_end_zyx
         patch_shape = tuple(int(v) for v in self.config.patch_shape_zyx)
         local = _zyx_grid(patch_shape, device=device)
         cp_local = torch.as_tensor(params.cp_local_zyx, dtype=torch.float32, device=device)
@@ -1466,41 +1433,39 @@ class FiberTrace3DLoader:
         controls = _smooth_control_tensors(params.smooth, device=device)
         rel_source = _smooth_backward_rel_zyx(rel_aug, params.smooth, controls)
         backward_source = cp_volume.view(1, 1, 1, 3) + rel_source
-
-        forward_start = np.asarray(forward_start_zyx, dtype=np.int64)
-        forward_end = np.asarray(forward_end_zyx, dtype=np.int64)
-        forward_shape = tuple(int(v) for v in np.maximum(forward_end - forward_start, 1))
-        source_grid = _zyx_grid(forward_shape, device=device)
-        source_start_t = torch.as_tensor(forward_start, dtype=torch.float32, device=device)
-        rel_source_grid = source_grid + source_start_t.view(1, 1, 1, 3) - cp_volume.view(1, 1, 1, 3)
-        rel_aug_grid = _smooth_forward_rel_zyx(rel_source_grid, params.smooth, controls)
-        matrix = torch.as_tensor(params.source_to_output_zyx, dtype=torch.float32, device=device)
-        rel_output_grid = torch.einsum("...i,ji->...j", rel_aug_grid, matrix)
-        forward_map = cp_local.view(1, 1, 1, 3) + rel_output_grid
         return _GeometryMaps3D(
             backward_source_zyx=backward_source,
-            forward_source_start_zyx=forward_start.astype(np.float64),
-            forward_map_zyx=forward_map,
+            params=params,
         )
 
     def _source_points_to_output_np(
         self,
         points_volume_zyx: np.ndarray,
-        geometry: _GeometryMaps3D,
+        params: _Augment3DParams | _GeometryMaps3D,
     ) -> tuple[np.ndarray, np.ndarray]:
+        if isinstance(params, _GeometryMaps3D):
+            params = params.params
+        points_np = np.asarray(points_volume_zyx, dtype=np.float32)
         points = torch.as_tensor(
-            np.asarray(points_volume_zyx, dtype=np.float32),
+            points_np,
             dtype=torch.float32,
-            device=geometry.forward_map_zyx.device,
+            device=torch.device("cpu"),
         )
-        start = torch.as_tensor(
-            geometry.forward_source_start_zyx,
-            dtype=torch.float32,
-            device=geometry.forward_map_zyx.device,
-        )
-        mapped, valid = _sample_forward_map_points(
-            geometry.forward_map_zyx,
-            points - start.view(1, 3),
+        cp_volume = torch.as_tensor(params.cp_volume_zyx, dtype=torch.float32, device=points.device)
+        cp_local = torch.as_tensor(params.cp_local_zyx, dtype=torch.float32, device=points.device)
+        rel_source = points - cp_volume.view(1, 3)
+        rel_aug = _smooth_forward_rel_zyx(rel_source, params.smooth)
+        matrix = torch.as_tensor(params.source_to_output_zyx, dtype=torch.float32, device=points.device)
+        mapped = cp_local.view(1, 3) + torch.einsum("...i,ji->...j", rel_aug, matrix)
+        patch = torch.as_tensor(self.config.patch_shape_zyx, dtype=torch.float32, device=points.device)
+        valid = (
+            torch.isfinite(mapped).all(dim=-1)
+            & (mapped[..., 0] >= 0.0)
+            & (mapped[..., 0] <= patch[0] - 1.0)
+            & (mapped[..., 1] >= 0.0)
+            & (mapped[..., 1] <= patch[1] - 1.0)
+            & (mapped[..., 2] >= 0.0)
+            & (mapped[..., 2] <= patch[2] - 1.0)
         )
         return (
             mapped.detach().cpu().numpy().astype(np.float32),
@@ -1510,42 +1475,24 @@ class FiberTrace3DLoader:
     def _sample_volume_patch(
         self,
         record: _Record,
-        block: np.ndarray,
-        source_start_zyx: np.ndarray,
         geometry: _GeometryMaps3D,
         *,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        block_t = torch.as_tensor(block, dtype=torch.float32, device=device).view(
-            1, 1, *block.shape
-        )
-        source_start = torch.as_tensor(source_start_zyx, dtype=torch.float32, device=device)
-        source_local = geometry.backward_source_zyx - source_start.view(1, 1, 1, 3)
-
-        d, h, w = (int(v) for v in block.shape)
-        valid = (
-            torch.isfinite(source_local).all(dim=-1)
-            & (source_local[..., 0] >= 0.0)
-            & (source_local[..., 0] <= float(d - 1))
-            & (source_local[..., 1] >= 0.0)
-            & (source_local[..., 1] <= float(h - 1))
-            & (source_local[..., 2] >= 0.0)
-            & (source_local[..., 2] <= float(w - 1))
-        )
-        gx = source_local[..., 2] * (2.0 / float(max(w - 1, 1))) - 1.0 if w > 1 else torch.zeros_like(source_local[..., 2])
-        gy = source_local[..., 1] * (2.0 / float(max(h - 1, 1))) - 1.0 if h > 1 else torch.zeros_like(source_local[..., 1])
-        gz = source_local[..., 0] * (2.0 / float(max(d - 1, 1))) - 1.0 if d > 1 else torch.zeros_like(source_local[..., 0])
-        grid = torch.stack([gx, gy, gz], dim=-1).unsqueeze(0)
-        sampled = F.grid_sample(
-            block_t,
-            grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )[0, 0]
-        sampled = torch.where(valid, sampled, torch.zeros_like(sampled))
-        del record
-        return sampled, valid
+        coords_selected = geometry.backward_source_zyx.detach().cpu().numpy().astype(np.float32)
+        coords_base = np.ascontiguousarray(coords_selected * float(record.volume_spacing_base))
+        base_shape = np.asarray(record.base_shape_zyx, dtype=np.float32)
+        valid = np.isfinite(coords_base).all(axis=-1)
+        valid &= (coords_base[..., 0] >= 0.0) & (coords_base[..., 0] <= float(base_shape[0] - 1.0))
+        valid &= (coords_base[..., 1] >= 0.0) & (coords_base[..., 1] <= float(base_shape[1] - 1.0))
+        valid &= (coords_base[..., 2] >= 0.0) & (coords_base[..., 2] <= float(base_shape[2] - 1.0))
+        result = record.sampler.sample_coord_batch(coords_base, np.ascontiguousarray(valid))
+        sampled_np = np.asarray(result.image, dtype=np.float32)
+        sampled_valid_np = np.asarray(result.valid_mask, dtype=bool) & valid
+        sampled = torch.as_tensor(sampled_np, dtype=torch.float32, device=device)
+        sampled_valid = torch.as_tensor(sampled_valid_np, dtype=torch.bool, device=device)
+        sampled = torch.where(sampled_valid, sampled, torch.zeros_like(sampled))
+        return sampled, sampled_valid
 
     def _apply_value_augmentation(
         self,
@@ -1697,7 +1644,7 @@ class FiberTrace3DLoader:
         )
         tangent_out_points, tangent_valid = self._source_points_to_output_np(
             tangent_points,
-            geometry,
+            params,
         )
         if bool(tangent_valid.all()):
             tangent_out = tangent_out_points[1] - tangent_out_points[0]
@@ -1736,6 +1683,61 @@ class FiberTrace3DLoader:
             self._presence_loss_mask(valid_mask, patch_shape),
         )
 
+    def _rasterize_segment_targets(
+        self,
+        segment_start: np.ndarray,
+        segment_end: np.ndarray,
+        patch_shape: tuple[int, int, int],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        radius = float(self.config.presence_radius_voxels)
+        radius2 = np.float32(radius * radius)
+        min_dist2 = np.full(patch_shape, np.inf, dtype=np.float32)
+        nearest_tangent = np.zeros((*patch_shape, 3), dtype=np.float32)
+        patch_hi = np.asarray(patch_shape, dtype=np.float32) - 1.0
+        for p0_raw, p1_raw in zip(segment_start, segment_end, strict=True):
+            clipped = _clip_segment_to_aabb(
+                p0_raw,
+                p1_raw,
+                lo=-np.full((3,), radius, dtype=np.float64),
+                hi=patch_hi.astype(np.float64) + radius,
+            )
+            if clipped is None:
+                continue
+            p0 = clipped[0].astype(np.float32)
+            p1 = clipped[1].astype(np.float32)
+            vec = (p1 - p0).astype(np.float32)
+            length2 = np.float32(np.sum(vec * vec))
+            if not np.isfinite(length2) or float(length2) <= 1.0e-12:
+                continue
+            lo = np.floor(np.minimum(p0, p1) - radius).astype(np.int64)
+            hi = np.ceil(np.maximum(p0, p1) + radius).astype(np.int64) + 1
+            lo = np.maximum(lo, 0)
+            hi = np.minimum(hi, np.asarray(patch_shape, dtype=np.int64))
+            if bool(np.any(hi <= lo)):
+                continue
+            z = np.arange(int(lo[0]), int(hi[0]), dtype=np.float32)
+            y = np.arange(int(lo[1]), int(hi[1]), dtype=np.float32)
+            x = np.arange(int(lo[2]), int(hi[2]), dtype=np.float32)
+            zz, yy, xx = np.meshgrid(z, y, x, indexing="ij")
+            grid = np.stack([zz, yy, xx], axis=-1)
+            rel = grid - p0.reshape(1, 1, 1, 3)
+            alpha = np.sum(rel * vec.reshape(1, 1, 1, 3), axis=-1) / length2
+            alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
+            closest = p0.reshape(1, 1, 1, 3) + alpha[..., None] * vec.reshape(1, 1, 1, 3)
+            dist2 = np.sum((grid - closest) ** 2, axis=-1).astype(np.float32)
+            region = min_dist2[int(lo[0]) : int(hi[0]), int(lo[1]) : int(hi[1]), int(lo[2]) : int(hi[2])]
+            replace_mask = dist2 < region
+            if not bool(np.any(replace_mask)):
+                continue
+            region[replace_mask] = dist2[replace_mask]
+            tangent_region = nearest_tangent[
+                int(lo[0]) : int(hi[0]),
+                int(lo[1]) : int(hi[1]),
+                int(lo[2]) : int(hi[2]),
+            ]
+            tangent_region[replace_mask] = vec
+        return min_dist2 <= radius2, nearest_tangent
+
     def _build_targets(
         self,
         record: _Record,
@@ -1761,73 +1763,21 @@ class FiberTrace3DLoader:
         )
         if line_points.shape[0] < 2:
             raise ValueError("label line window must contain at least two points")
-        forward_shape = np.asarray(geometry.forward_map_zyx.shape[:3], dtype=np.float64)
-        domain_lo = np.asarray(geometry.forward_source_start_zyx, dtype=np.float64)
-        domain_hi = domain_lo + np.maximum(forward_shape - 1.0, 0.0)
-        clipped_segments: list[tuple[np.ndarray, np.ndarray]] = []
-        for index in range(int(line_points.shape[0]) - 1):
-            clipped = _clip_segment_to_aabb(
-                line_points[index],
-                line_points[index + 1],
-                lo=domain_lo,
-                hi=domain_hi,
-            )
-            if clipped is not None:
-                clipped_segments.append(clipped)
-        if not clipped_segments:
-            raise ValueError("label line window has no source-domain-overlapping segments")
-        clipped_points = np.asarray(
-            [point for segment in clipped_segments for point in segment],
-            dtype=np.float64,
-        )
-        points_out, points_valid = self._source_points_to_output_np(clipped_points, geometry)
-        segment_start = points_out[0::2].astype(np.float32)
-        segment_end = points_out[1::2].astype(np.float32)
-        segment_vec = (segment_end - segment_start).astype(np.float32)
-        segment_len2 = np.sum(segment_vec * segment_vec, axis=1)
-        valid_segments = (
-            points_valid[0::2]
-            & points_valid[1::2]
-            & np.isfinite(segment_len2)
-            & (segment_len2 > 1.0e-12)
-        )
-        if not bool(valid_segments.any()):
-            raise ValueError("label line window has no valid clipped segments")
+        points_out, _points_valid = self._source_points_to_output_np(line_points, params)
+        segment_start = points_out[:-1].astype(np.float32)
+        segment_end = points_out[1:].astype(np.float32)
+        valid_segments = np.isfinite(segment_start).all(axis=1) & np.isfinite(segment_end).all(axis=1)
         segment_start = segment_start[valid_segments]
-        segment_vec = segment_vec[valid_segments]
-        segment_len2 = segment_len2[valid_segments]
-
-        grid = np.stack(
-            np.meshgrid(
-                np.arange(patch_shape[0], dtype=np.float32),
-                np.arange(patch_shape[1], dtype=np.float32),
-                np.arange(patch_shape[2], dtype=np.float32),
-                indexing="ij",
-            ),
-            axis=-1,
-        ).reshape(-1, 3)
-        min_dist2 = np.full((grid.shape[0],), np.inf, dtype=np.float32)
-        nearest_tangent = np.zeros((grid.shape[0], 3), dtype=np.float32)
-        for start in range(0, int(segment_start.shape[0]), 64):
-            stop = min(start + 64, int(segment_start.shape[0]))
-            p0 = segment_start[start:stop]
-            vec = segment_vec[start:stop]
-            length2 = segment_len2[start:stop]
-            rel = grid[:, None, :] - p0[None, :, :]
-            alpha = np.sum(rel * vec[None, :, :], axis=2) / length2[None, :]
-            alpha = np.clip(alpha, 0.0, 1.0)
-            closest = p0[None, :, :] + alpha[..., None] * vec[None, :, :]
-            dist2 = np.sum((grid[:, None, :] - closest) ** 2, axis=2)
-            local_nearest = np.argmin(dist2, axis=1)
-            local_dist2 = dist2[np.arange(grid.shape[0]), local_nearest]
-            replace_mask = local_dist2 < min_dist2
-            if bool(np.any(replace_mask)):
-                min_dist2[replace_mask] = local_dist2[replace_mask]
-                nearest_tangent[replace_mask] = vec[local_nearest[replace_mask]]
-
-        radius = float(self.config.presence_radius_voxels)
-        positive = min_dist2.reshape(patch_shape) <= np.float32(radius * radius)
-        tangent_zyx = nearest_tangent.reshape(*patch_shape, 3)
+        segment_end = segment_end[valid_segments]
+        if segment_start.shape[0] == 0:
+            raise ValueError("label line window has no finite output-space segments")
+        positive, tangent_zyx = self._rasterize_segment_targets(
+            segment_start,
+            segment_end,
+            patch_shape,
+        )
+        if not bool(np.any(positive)):
+            raise ValueError("label line window has no patch-overlapping positive voxels")
         tangent_xyz = tangent_zyx[..., [2, 1, 0]]
         direction_target_np = encode_lasagna_direction_3x2(tangent_xyz).astype(np.float32)
         direction_weight_np = projection_magnitude_weights_3x2(tangent_xyz).astype(np.float32)
@@ -1866,19 +1816,12 @@ class FiberTrace3DLoader:
             sample_mode=sample_mode,
         )
         params = self._sample_augment_params(record, cp_index, int(sample_index))
-        map_start, map_end = self._source_bbox_for_maps(record, params)
-        source_start, source_end = self._actual_source_bbox(record, params)
-        block = _read_raw_block(record.volume, source_start, source_end)
         geometry = self._build_geometry_maps(
             params,
-            forward_start_zyx=map_start,
-            forward_end_zyx=map_end,
             device=resolved_device,
         )
         volume, valid = self._sample_volume_patch(
             record,
-            block,
-            source_start,
             geometry,
             device=resolved_device,
         )
@@ -1903,7 +1846,11 @@ class FiberTrace3DLoader:
             presence_target=presence_target,
             presence_mask=presence_mask,
             cp_local_zyx=torch.as_tensor(params.cp_local_zyx, dtype=torch.float32, device=resolved_device),
-            crop_origin_zyx=torch.as_tensor(source_start, dtype=torch.float32, device=resolved_device),
+            crop_origin_zyx=torch.as_tensor(
+                np.floor(params.cp_volume_zyx - params.cp_local_zyx).astype(np.float32),
+                dtype=torch.float32,
+                device=resolved_device,
+            ),
         )
 
     def load_batch(
@@ -1947,8 +1894,19 @@ class FiberTrace3DLoader:
             sample_index,
             sample_mode=sample_mode,
         )
-        start, end = self._prefetch_source_bbox(record, cp_index)
-        return _chunk_requests_for_bbox(record.volume, (start, end), label="base")
+        params = self._sample_augment_params(record, cp_index, int(sample_index))
+        geometry = self._build_geometry_maps(
+            params,
+            device=torch.device("cpu"),
+        )
+        coords_selected = geometry.backward_source_zyx.detach().cpu().numpy().astype(np.float32)
+        coords_base = np.ascontiguousarray(coords_selected * float(record.volume_spacing_base))
+        base_shape = np.asarray(record.base_shape_zyx, dtype=np.float32)
+        valid = np.isfinite(coords_base).all(axis=-1)
+        valid &= (coords_base[..., 0] >= 0.0) & (coords_base[..., 0] <= float(base_shape[0] - 1.0))
+        valid &= (coords_base[..., 1] >= 0.0) & (coords_base[..., 1] <= float(base_shape[1] - 1.0))
+        valid &= (coords_base[..., 2] >= 0.0) & (coords_base[..., 2] <= float(base_shape[2] - 1.0))
+        return record.sampler.chunk_requests_for_coords(coords_base, np.ascontiguousarray(valid))
 
     def prefetch(
         self,
@@ -1988,12 +1946,11 @@ class FiberTrace3DLoader:
         start_time = time.perf_counter()
         done = 0
         errors = 0
+        downloaded = 0
+        cache_hits = 0
+        missing = 0
         bytes_read = 0
         bar_width = 24
-
-        def fetch(request: ZarrChunkRequest) -> int:
-            data = request.store[request.key]
-            return len(data)
 
         def print_progress(*, force: bool = False) -> None:
             if not force and done < len(requests) and done % 32 != 0:
@@ -2008,16 +1965,34 @@ class FiberTrace3DLoader:
             print(
                 "\r"
                 f"fiber_trace_3d prefetch[{bar}] {done}/{len(requests)} "
-                f"eta={_format_seconds(eta)} errors={errors} {mib:.1f}MiB {mib_s:.1f}MiB/s",
+                f"eta={_format_seconds(eta)} hits={cache_hits} downloaded={downloaded} "
+                f"missing={missing} errors={errors} {mib:.1f}MiB {mib_s:.1f}MiB/s",
                 end="" if done < len(requests) else "\n",
                 flush=True,
             )
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(fetch, request) for request in requests]
+            futures = [
+                executor.submit(
+                    _download_prefetch_request,
+                    request,
+                    retry_seconds=float(self.config.volume_cache_retry_seconds),
+                )
+                for request in requests
+            ]
             for future in as_completed(futures):
                 try:
-                    bytes_read += int(future.result())
+                    result = dict(future.result())
+                    status = str(result.get("status", "error"))
+                    bytes_read += int(result.get("bytes", 0))
+                    if status == "cache_hit":
+                        cache_hits += 1
+                    elif status == "downloaded":
+                        downloaded += 1
+                    elif status in {"known_missing", "new_missing"}:
+                        missing += 1
+                    else:
+                        errors += 1
                 except Exception:
                     errors += 1
                 done += 1
@@ -2027,7 +2002,9 @@ class FiberTrace3DLoader:
         return {
             "samples": total,
             "chunks": len(requests),
-            "downloaded": done - errors,
+            "cache_hits": cache_hits,
+            "downloaded": downloaded,
+            "missing": missing,
             "errors": errors,
             "elapsed_s": elapsed,
             "mib": bytes_read / (1024.0 * 1024.0),
