@@ -77,6 +77,11 @@ private:
     QComboBox* _outwardSense = nullptr;
     QComboBox* _storageBackend = nullptr;
     QCheckBox* _savePngVisualizations = nullptr;
+    QCheckBox* _influenceEnabled = nullptr;
+    QSpinBox* _influenceZ = nullptr;
+    QDoubleSpinBox* _influenceWindings = nullptr;
+    QSpinBox* _influenceThetaPct = nullptr;
+    QDoubleSpinBox* _influenceAnchorWeight = nullptr;
     QPlainTextEdit* _advanced = nullptr;
     VolumeSelector* _volumeSelector = nullptr;
     QPushButton* _load = nullptr;

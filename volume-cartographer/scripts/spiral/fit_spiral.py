@@ -29,6 +29,7 @@ from ddp_helpers import (
 )
 from lasagna_data import prepare_lasagna_volume
 from checkpoint_io import load_checkpoint_cpu
+from influence import InteractiveInfluenceState, make_influence_state, subsample_rows
 from tifxyz import load_tifxyz
 from geom_utils import bilinear_atlas_lookup, interp1d
 from point_collection import (
@@ -237,6 +238,25 @@ default_config = {
     # Final diagnostic PNG overlays are expensive at scroll resolution and are
     # not needed for mesh output or VC3D interactive previews.
     'save_png_visualizations': False,
+    # Localized influence regions for interactive (ephemeral) inputs: when
+    # enabled, each input added to a resident session mid-run may only adjust
+    # the fit within its own footprint dilated by the extents below (gaussian
+    # decay towards the boundary), while everything outside is held in place
+    # by gradient masking plus an anchoring loss. See influence.py.
+    'interactive_influence_enabled': False,
+    'interactive_influence_z': 3000.0,        # hard half-extent along z, full-res voxels
+    'interactive_influence_windings': 5.0,    # hard half-extent across wraps, windings
+    'interactive_influence_theta_frac': 0.5,  # hard half-extent along the wrap, fraction of a full turn (circular; 0.5 = the whole circle is within reach of some point)
+    'interactive_influence_sigma': 0.3333,    # gaussian sigma as a fraction of the hard extent
+    'interactive_influence_footprint_points': 2048,  # subsampled per incorporated input
+    'loss_weight_anchor': 20.0,
+    # Anchor-bank sizes are absolute (not scaled with the z-range like the
+    # per-step object counts): the bank must cover the fitted volume densely
+    # enough regardless of how many objects each loss samples per step.
+    'interactive_influence_anchor_lattice_points': 100_000,
+    'interactive_influence_anchor_geometry_points': 100_000,
+    'interactive_influence_anchor_samples_per_step': 4096,
+    'interactive_influence_anchor_ramp_power': 2.0,
 }
 
 
@@ -1308,6 +1328,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         {'params': flow_field_params, 'weight_decay': cfg['weight_decay_flow_field']},
     ]
     optimiser = torch.optim.AdamW(param_groups, lr=cfg.learning_rate, betas=(0.9, 0.999), eps=1.e-8, fused=True)
+    influence_state = None  # set on first influence-restricted incorporation, or restored from a checkpoint
     if cfg['exp_lr_schedule']:
         gamma = cfg['lr_final_factor'] ** (1.0 / max(1, num_training_steps))
         lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimiser, gamma=gamma)
@@ -1334,6 +1355,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
             'input_manifest': dict(getattr(interactive_driver, 'input_manifest', {})),
             'preview_first_winding': 10,
+            # Optional key: absent/None in checkpoints predating influence
+            # regions. Masks cannot be regenerated (they were evaluated against
+            # transforms at past incorporation times), so persist them in full.
+            'interactive_influence': influence_state.state_dict() if influence_state is not None else None,
         }
 
     def save_model_to(path, completed_iterations):
@@ -1374,6 +1399,14 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             start_iteration = int(embedded_iteration)
         print(f'resuming from {resume_path} at iteration {start_iteration}')
         load_model(resume_checkpoint)
+        if isinstance(resume_checkpoint, dict):
+            influence_state = InteractiveInfluenceState.from_state_dict(
+                resume_checkpoint.get('interactive_influence'), torch.device('cuda'))
+            if influence_state is not None:
+                influence_state.assert_matches_model(spiral_and_transform)
+                influence_state.reapply_optimizer_overrides_(spiral_and_transform, optimiser)
+                print(f'restored interactive influence state '
+                      f'({influence_state.num_incorporations} incorporation(s))')
         if not isinstance(resume_checkpoint, dict) or resume_checkpoint.get('scheduler') is None:
             for _ in range(start_iteration):
                 lr_scheduler.step()
@@ -1434,6 +1467,19 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             input_track_points = sum(len(track) for track in tracks)
             if prepared_main_tracks['flat_zyx_cpu'].shape[0] == input_track_points:
                 preview_extent_tracks = (prepared_main_tracks['flat_zyx_cpu'],)
+
+    # A compact subsample of the trusted cloud seeds the influence anchor bank
+    # if inputs are later incorporated with influence regions enabled. It must
+    # be stashed here because the full cloud is released just below.
+    influence_anchor_geometry = None
+    if interactive_driver is not None and cfg['interactive_influence_enabled']:
+        stash_generator = torch.Generator()
+        stash_generator.manual_seed(int(cfg['random_seed']))
+        influence_anchor_geometry = subsample_rows(
+            verified_patches_and_pcls_cpu,
+            int(cfg['interactive_influence_anchor_geometry_points']),
+            stash_generator,
+        ).clone()
 
     # The trusted cloud and its double-precision cKDTree are setup-only data.
     # Track sampling retains its own compact offsets and coordinates.
@@ -1504,7 +1550,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         service's deterministic order, so a multi-rank session would append the
         same items in the same order on every rank.
         """
-        nonlocal patch_sampling_probabilities, next_id
+        nonlocal patch_sampling_probabilities, next_id, influence_state
         # Incorporation has its own saved RNG envelope so adding inputs does
         # not alter the stochastic training sequence (same discipline as the
         # interactive preview export).
@@ -1669,6 +1715,20 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 # The flat GPU bundle is derived from the strip list; drop it so
                 # the next consumer rebuilds it including the appended strips.
                 unattached_pcl_strips.flat = None
+
+            if cfg['interactive_influence_enabled'] and (new_patches or new_collections):
+                if influence_state is None:
+                    influence_state = make_influence_state(cfg, torch.device('cuda'))
+                influence_state.activate_or_extend_(
+                    new_patches=new_patches,
+                    new_collections=new_collections,
+                    spiral_and_transform=spiral_and_transform,
+                    optimiser=optimiser,
+                    cfg=cfg,
+                    z_begin=z_begin,
+                    z_end=z_end,
+                    anchor_geometry_zyx=influence_anchor_geometry,
+                )
 
             print(f'incorporated {len(new_patches)} patches and '
                   f'{len(new_collections)} point collections into the resident session')
@@ -1914,6 +1974,15 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             })
             del shell_outer_loss
 
+        if influence_state is not None and influence_state.active and cfg['loss_weight_anchor'] > 0:
+            backward_family({
+                'anchor': influence_state.get_anchor_loss(
+                    slice_to_spiral_transform,
+                    dr_per_winding,
+                    int(cfg['interactive_influence_anchor_samples_per_step']),
+                ) * cfg['loss_weight_anchor'],
+            })
+
         loss = sum(losses.values())
 
         step_timer.stop('fwd')
@@ -1935,9 +2004,16 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
         nonfinite_grad_steps += step_had_nonfinite.to(nonfinite_grad_steps.dtype)
 
+        if influence_state is not None and influence_state.active:
+            # After the all-reduce and the accumulated-field-grad handoff, so
+            # every rank masks identical averaged gradients on both flow paths.
+            influence_state.apply_grad_masks_(spiral_and_transform)
+
         step_timer.start('opt')
         optimiser.step()
         step_timer.stop('opt')
+        if influence_state is not None and influence_state.active:
+            influence_state.apply_masked_gap_decay_(spiral_and_transform, optimiser)
         optimiser.zero_grad(set_to_none=True)
         lr_scheduler.step()
         step_timer.tick()

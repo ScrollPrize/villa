@@ -327,7 +327,7 @@ class SpiralAndTransform(nn.Module):
     def device(self):
         return self.linear_logits.device
 
-    def get_slice_to_spiral_transform(self, truncate_at_step=None):
+    def _get_transform_parts(self, truncate_at_step=None):
         truncate_frac = None if truncate_at_step is None else truncate_at_step / (self.flow_integration_steps - 1)
         diffeomorphism = IntegratedFlowDiffeomorphism(self.flow_field, self.flow_min_corner_zyx, self.flow_max_corner_zyx, num_steps=self.flow_integration_steps, solver=self.flow_integration_solver, truncate_at_step=truncate_at_step)
         gap_expander = GapExpandingTransform(
@@ -344,6 +344,10 @@ class SpiralAndTransform(nn.Module):
             assert self.spiral_outward_sense == 'ACW'
             # To make spiral go anticlockwise in slice space (going outwards from the centre), flip it horizontally
             maybe_flip = [pyro.distributions.transforms.AffineTransform(loc=0., scale=torch.tensor([1., 1., -1.], device=self.device))]
+        return gap_expander, maybe_flip, diffeomorphism, truncate_frac
+
+    def get_slice_to_spiral_transform(self, truncate_at_step=None):
+        gap_expander, maybe_flip, diffeomorphism, truncate_frac = self._get_transform_parts(truncate_at_step)
         return pyro.distributions.transforms.ComposeTransform([
             gap_expander,
             *maybe_flip,
@@ -351,6 +355,18 @@ class SpiralAndTransform(nn.Module):
             VaryingLinearTransform(self.linear_logits * self.linear_logits_scale, self.flow_min_corner_zyx[0], self.flow_max_corner_zyx[0], truncate_frac),
             self.umbilicus_transform,
         ]).inv
+
+    def get_flowbox_to_spiral_transform(self, include_diffeomorphism=True):
+        # Maps positions expressed in the flow lattice's coordinate frame (the
+        # spiral-side intermediate space in which the diffeomorphism integrates)
+        # back to canonical spiral space. With include_diffeomorphism a lattice
+        # position is treated as an integration-trajectory *end* point; without,
+        # as a trajectory *start* point. The two differ by at most the flow
+        # displacement, so evaluating both brackets the material coordinates a
+        # flow voxel can influence.
+        gap_expander, maybe_flip, diffeomorphism, _ = self._get_transform_parts()
+        parts = [gap_expander, *maybe_flip] + ([diffeomorphism] if include_diffeomorphism else [])
+        return pyro.distributions.transforms.ComposeTransform(parts).inv
 
     def get_dr_per_winding(self):
         return F.softplus(self.dr_per_winding_logit * self.dr_per_winding_scale)

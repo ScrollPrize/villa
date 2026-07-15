@@ -246,6 +246,23 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _renderVolumeScale = new QSpinBox(outputContents); _renderVolumeScale->setRange(1, 4096); _renderVolumeScale->setValue(16);
     _savePngVisualizations = new QCheckBox(tr("Save diagnostic PNG visualizations"), outputContents);
     _savePngVisualizations->setChecked(false);
+    _influenceEnabled = new QCheckBox(tr("Localize fit around added inputs"), outputContents);
+    _influenceEnabled->setChecked(false);
+    _influenceEnabled->setToolTip(tr("Restrict optimization to a region around each input added to "
+                                     "the running fit; the rest of the fit is held in place. Takes "
+                                     "effect when inputs are added to a running session."));
+    _influenceZ = new QSpinBox(outputContents);
+    _influenceZ->setRange(0, 1000000); _influenceZ->setValue(3000);
+    _influenceZ->setToolTip(tr("Max influence half-extent above/below the added input, in voxels"));
+    _influenceWindings = new QDoubleSpinBox(outputContents);
+    _influenceWindings->setRange(0.1, 100.0); _influenceWindings->setDecimals(1); _influenceWindings->setValue(5.0);
+    _influenceWindings->setToolTip(tr("Max influence half-extent across wraps, in windings"));
+    _influenceThetaPct = new QSpinBox(outputContents);
+    _influenceThetaPct->setRange(1, 100); _influenceThetaPct->setSuffix(tr("% of wrap")); _influenceThetaPct->setValue(50);
+    _influenceThetaPct->setToolTip(tr("Max influence half-extent along the wrap, as a fraction of a full turn"));
+    _influenceAnchorWeight = new QDoubleSpinBox(outputContents);
+    _influenceAnchorWeight->setRange(0.0, 10000.0); _influenceAnchorWeight->setDecimals(1); _influenceAnchorWeight->setValue(20.0);
+    _influenceAnchorWeight->setToolTip(tr("Weight of the loss holding the fit in place outside the influence region"));
     _runTag = new QLineEdit(outputContents);
     _advanced = new QPlainTextEdit(QStringLiteral("{}"), outputContents); _advanced->setMaximumHeight(90);
     outputForm->addRow(tr("z begin"), _zBegin);
@@ -257,6 +274,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     outputForm->addRow(tr("Run tag"), _runTag);
     outputForm->addRow(tr("Render-volume scale"), _renderVolumeScale);
     outputForm->addRow(_savePngVisualizations);
+    outputForm->addRow(_influenceEnabled);
+    outputForm->addRow(tr("Influence z extent"), _influenceZ);
+    outputForm->addRow(tr("Influence windings"), _influenceWindings);
+    outputForm->addRow(tr("Influence theta"), _influenceThetaPct);
+    outputForm->addRow(tr("Influence anchor weight"), _influenceAnchorWeight);
     outputForm->addRow(tr("Advanced config JSON"), _advanced);
 
     auto* displayGroup = makeSection(tr("Display"),
@@ -489,10 +511,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     });
     connect(_volumeSelector->comboBox(), qOverload<int>(&QComboBox::currentIndexChanged), this,
             [this](int) { emit volumeSelected(_volumeSelector->selectedVolumeId()); });
-    for (QSpinBox* spin : {_zBegin, _zEnd, _lasagnaScale, _legacyCheckpointStep, _renderVolumeScale})
+    for (QSpinBox* spin : {_zBegin, _zEnd, _lasagnaScale, _legacyCheckpointStep, _renderVolumeScale,
+                           _influenceZ, _influenceThetaPct})
         connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) { markReloadRequired(); });
-    connect(_voxelSize, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
-            [this](double) { markReloadRequired(); });
+    for (QDoubleSpinBox* spin : {_voxelSize, _influenceWindings, _influenceAnchorWeight})
+        connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+                [this](double) { markReloadRequired(); });
     for (QLineEdit* edit : {_lasagnaGroup, _scrollName, _runTag})
         connect(edit, &QLineEdit::textEdited, this, [this](const QString&) { markReloadRequired(); });
     connect(_outwardSense, qOverload<int>(&QComboBox::currentIndexChanged), this,
@@ -500,6 +524,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_storageBackend, qOverload<int>(&QComboBox::currentIndexChanged), this,
             [this](int) { markReloadRequired(); });
     connect(_savePngVisualizations, &QCheckBox::toggled, this,
+            [this](bool) { markReloadRequired(); });
+    connect(_influenceEnabled, &QCheckBox::toggled, this,
             [this](bool) { markReloadRequired(); });
     connect(_advanced, &QPlainTextEdit::textChanged, this, &SpiralPanel::markReloadRequired);
 
@@ -795,6 +821,13 @@ QJsonObject SpiralPanel::sessionRequest() const
     const QJsonDocument advanced = QJsonDocument::fromJson(_advanced->toPlainText().toUtf8(), &parseError);
     QJsonObject config = advanced.isObject() ? advanced.object() : QJsonObject{};
     config[QStringLiteral("save_png_visualizations")] = _savePngVisualizations->isChecked();
+    config[QStringLiteral("interactive_influence_enabled")] = _influenceEnabled->isChecked();
+    if (_influenceEnabled->isChecked()) {
+        config[QStringLiteral("interactive_influence_z")] = static_cast<double>(_influenceZ->value());
+        config[QStringLiteral("interactive_influence_windings")] = _influenceWindings->value();
+        config[QStringLiteral("interactive_influence_theta_frac")] = _influenceThetaPct->value() / 100.0;
+        config[QStringLiteral("loss_weight_anchor")] = _influenceAnchorWeight->value();
+    }
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
                     {"scroll_name", _scrollName->text()}, {"outward_sense", _outwardSense->currentText()},
                     {"voxel_size_um", _voxelSize->value()}, {"lasagna_group", _lasagnaGroup->text()},
@@ -888,6 +921,11 @@ void SpiralPanel::persist() const
     settings.setValue(prefix + "run_tag", _runTag->text());
     settings.setValue(prefix + "render_volume_scale", _renderVolumeScale->value());
     settings.setValue(prefix + "save_png_visualizations", _savePngVisualizations->isChecked());
+    settings.setValue(prefix + "influence_enabled", _influenceEnabled->isChecked());
+    settings.setValue(prefix + "influence_z", _influenceZ->value());
+    settings.setValue(prefix + "influence_windings", _influenceWindings->value());
+    settings.setValue(prefix + "influence_theta_pct", _influenceThetaPct->value());
+    settings.setValue(prefix + "influence_anchor_weight", _influenceAnchorWeight->value());
     settings.setValue(prefix + "iterations", _iterations->value());
     settings.setValue(prefix + "advanced_config", _advanced->toPlainText());
 }
@@ -942,6 +980,12 @@ void SpiralPanel::restore()
     _renderVolumeScale->setValue(settings.value(valuePrefix + "render_volume_scale", 16).toInt());
     _savePngVisualizations->setChecked(
         settings.value(valuePrefix + "save_png_visualizations", false).toBool());
+    _influenceEnabled->setChecked(settings.value(valuePrefix + "influence_enabled", false).toBool());
+    _influenceZ->setValue(settings.value(valuePrefix + "influence_z", 3000).toInt());
+    _influenceWindings->setValue(settings.value(valuePrefix + "influence_windings", 5.0).toDouble());
+    _influenceThetaPct->setValue(settings.value(valuePrefix + "influence_theta_pct", 50).toInt());
+    _influenceAnchorWeight->setValue(
+        settings.value(valuePrefix + "influence_anchor_weight", 20.0).toDouble());
     _iterations->setValue(settings.value(valuePrefix + "iterations", 100).toInt());
     _advanced->setPlainText(settings.value(valuePrefix + "advanced_config", "{}").toString());
     _applyingResolution = false;
