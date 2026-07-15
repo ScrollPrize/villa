@@ -2,6 +2,12 @@
 
 ## 2026-07-15
 
+- Wired 3D Trace2CP evaluation into `fiber_trace_3d.train`: tiled dense 3D
+  inference over 2D Trace2CP geometry, TensorBoard/stdout metrics, best
+  checkpoint selection by `test/trace2cp_error`, and a compact
+  `--trace2cp-vis` inspection export.
+- Replaced the 3D Trace2CP unit-sphere/grid-search direction decoder with the
+  analytic Lasagna 3x2 reconstruction/sign-alignment path.
 - Added the V0 `fiber_trace_3d` sibling package for CP-centered 3D fiber
   training: ordinary 3D volume-block loading around control points,
   coordinate-space 3D augmentation, Lasagna 3x2 direction targets,

@@ -44,4 +44,56 @@
 
 ## Validation
 
-- Planning-only task; no code validation run yet.
+- Implemented `decode_lasagna_direction_3x2_analytic(...)` in
+  `fiber_trace_3d.direction` and replaced `fiber_trace_3d.projection` with an
+  analytic-only projection path. The previous candidate-grid decoder is no
+  longer present in production 3D code.
+- Updated `trace2cp_bridge` so 3D Trace2CP projection no longer accepts or
+  forwards `candidate_count`.
+- Added explicit 3D Trace2CP config parsing in `fiber_trace_3d.train`.
+  Auto-built metric geometry now requires explicit 2D strip geometry keys when
+  no separate `test_trace2cp_loader_config` is supplied.
+- Added tiled 3D inference over 2D Trace2CP segment coordinates. It tiles in
+  Trace2CP image space, reads a selected-level 3D bounding block for each tile,
+  runs the 3D model, projects direction/presence back to 2D, and scores with
+  the existing 2D Trace2CP scorer.
+- Wired 3D test evaluation to log `test/trace2cp_error`,
+  `test/trace2cp_raw_y_error_mean_px`, valid segment count, and skipped segment
+  count. Checkpoint metadata now includes `metric_name`, and `best.pt` uses
+  `test/trace2cp_error` when Trace2CP evaluation is enabled.
+- Added `fiber_trace_3d.train --trace2cp-vis` for single-sample and
+  `--fiber-json` whole-fiber inspection. It exports `trace2cp_3d_vis.jpg` and
+  prints `trace2cp_error=...` or `trace2cp_error_mean=...`.
+- Added explicit Trace2CP metric keys to `fiber_trace_3d/configs/loader_example.json`.
+  Added disabled-by-default Trace2CP keys to `train_s1a_nml_all.json` because
+  that config currently has no `test_datasets`.
+- Added focused tests for analytic 3x2 round-trip decoding and synthetic
+  fixed-set 3D Trace2CP evaluator wiring.
+
+Validation command:
+
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+
+Result:
+
+`13 passed in 2.58s`
+
+Regression command:
+
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py vesuvius/tests/neural_tracing/test_fiber_trace.py`
+
+Result:
+
+`332 passed in 9.85s`
+
+## Reported Limitations / Deferred Items
+
+- The 3D Trace2CP visualization is intentionally compact and does not recreate
+  every panel from the mature 2D Trace2CP runner. It uses the same 3D metric
+  projection/scoring path, but exports source+direction/traces and presence
+  only.
+- Whole-fiber 3D Trace2CP visualization stacks per-pair panels vertically
+  rather than composing them into the 2D runner's shared arc-length canvas.
+- Dense 3D Trace2CP inference currently tiles over 2D strip tiles and runs one
+  3D block per tile. It is correct and bounded but not yet optimized for
+  merging neighboring tile blocks.

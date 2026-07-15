@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import torch
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
+from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import FiberStripFrame
 from vesuvius.neural_tracing.fiber_trace_3d.direction import (
+    decode_lasagna_direction_3x2_analytic,
     encode_lasagna_direction_2d,
     encode_lasagna_direction_3x2,
 )
@@ -28,6 +32,10 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_bridge import (
     score_trace2cp_projected_fields,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses
+from vesuvius.neural_tracing.fiber_trace_3d.train import (
+    _Trace2Cp3DConfig,
+    _evaluate_trace2cp_metric_fixed_set_3d,
+)
 
 
 def _straight_fiber() -> Vc3dFiber:
@@ -125,6 +133,25 @@ def test_lasagna_3x2_encoding_matches_projection_formula() -> None:
     assert np.allclose(encoded_3d[:2], encoded_2d[0])
     assert np.allclose(encoded_3d[2:4], encoded_2d[0])
     assert np.allclose(encoded_3d[4:], [0.5, 0.5])
+
+
+def test_lasagna_3x2_analytic_decode_round_trips_ambiguous_axes() -> None:
+    axes = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 2.0, 3.0],
+            [-0.2, 0.4, 0.9],
+            [1.0e-4, 1.0, 2.0e-4],
+        ],
+        dtype=torch.float32,
+    )
+    axes = axes / torch.linalg.vector_norm(axes, dim=1, keepdim=True)
+    encoded = encode_lasagna_direction_3x2(axes)
+    decoded = decode_lasagna_direction_3x2_analytic(encoded)
+    agreement = torch.abs(torch.sum(decoded * axes, dim=1))
+    assert torch.all(agreement > 0.999)
 
 
 def test_loader_builds_deterministic_cp_centered_3d_batch() -> None:
@@ -255,7 +282,6 @@ def test_3d_projection_bridge_recovers_straight_xy_direction() -> None:
         encoded,
         frame_x_xyz=torch.tensor([1.0, 0.0, 0.0]),
         frame_y_xyz=torch.tensor([0.0, 1.0, 0.0]),
-        candidate_count=512,
     )
     assert torch.abs(projected[0, 0]) > 0.95
     assert torch.abs(projected[0, 1]) < 0.15
@@ -280,7 +306,6 @@ def test_trace2cp_bridge_scores_projected_3d_field() -> None:
         np.ones((8, 12), dtype=bool),
         frame_x_xyz=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
         frame_y_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
-        candidate_count=2048,
     )
     score = score_trace2cp_projected_fields(
         fields,
@@ -291,3 +316,78 @@ def test_trace2cp_bridge_scores_projected_3d_field() -> None:
     )
     assert score.trace2cp_error < 0.05
     assert score.reached_target_columns
+
+
+def test_3d_trace2cp_fixed_set_evaluator_scores_synthetic_source() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class ConstantTrace2CpModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6] = 1.0
+            return out
+
+    yy, xx = np.meshgrid(
+        np.arange(8, dtype=np.float32),
+        np.arange(12, dtype=np.float32),
+        indexing="ij",
+    )
+    coords_xyz = np.stack([xx, yy, np.ones_like(xx)], axis=-1)
+    valid = np.ones((8, 12), dtype=bool)
+    grid = SimpleNamespace(
+        coords_xyz=torch.as_tensor(coords_xyz, dtype=torch.float32),
+        valid_mask=torch.as_tensor(valid, dtype=torch.bool),
+        frame=FiberStripFrame(
+            tangent_xyz=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            side_xyz=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+            mesh_normal_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        ),
+        offset_axis_xyz=torch.as_tensor(
+            np.broadcast_to(np.asarray([0.0, 1.0, 0.0], dtype=np.float32), (8, 12, 3)).copy()
+        ),
+    )
+    source = SimpleNamespace(
+        grid=grid,
+        record=SimpleNamespace(
+            volume=np.ones((3, 8, 12), dtype=np.float32),
+            volume_spacing_base=1.0,
+        ),
+        start_control_point_xy=np.asarray([1.0, 4.0], dtype=np.float32),
+        target_control_point_xy=np.asarray([10.0, 4.0], dtype=np.float32),
+    )
+
+    class FakeGeometryLoader:
+        sample_count = 1
+
+        def build_trace2cp_segment_source(self, *_args, **_kwargs):
+            return source
+
+    cfg = _Trace2Cp3DConfig(
+        enabled=True,
+        control_points=1,
+        start_sample_index=0,
+        sample_mode="flat",
+        step_px=1.0,
+        rf_margin_px=0.0,
+        presence_enabled=True,
+        patch_shape_hw=(8, 12),
+        strip_z_offset_count=1,
+        strip_z_offset_step=1.0,
+        tile_shape_hw=(8, 12),
+        block_context_voxels=0,
+        loader_config_path=None,
+    )
+    result = _evaluate_trace2cp_metric_fixed_set_3d(
+        ConstantTrace2CpModel(),
+        FakeGeometryLoader(),
+        image_normalization="none",
+        cfg=cfg,
+        device=torch.device("cpu"),
+    )
+    assert result.error_mean < 0.05
+    assert result.segments == 1
+    assert result.skipped_segments == 0

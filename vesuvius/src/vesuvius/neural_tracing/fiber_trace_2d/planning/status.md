@@ -9,11 +9,12 @@
 - [x] Add explicit requirement to remove 3D Lasagna grid-search decoding and
   use analytic decoding/reconstruction.
 - [x] Report other deferred/ignored items from the previous follow-up.
-- [ ] Implement 3D Trace2CP config parsing and evaluator.
-- [ ] Remove 3D grid-search direction decode from Trace2CP projection.
-- [ ] Add torch-vectorized analytic Lasagna 3x2 direction decode tests.
-- [ ] Wire 3D training test metric, TensorBoard, stdout, and best checkpoint
+- [x] Implement 3D Trace2CP config parsing and evaluator.
+- [x] Remove 3D grid-search direction decode from Trace2CP projection.
+- [x] Add torch-vectorized analytic Lasagna 3x2 direction decode tests.
+- [x] Wire 3D training test metric, TensorBoard, stdout, and best checkpoint
   selection.
-- [ ] Add 3D Trace2CP CLI visualization.
-- [ ] Update specs/docs/changelog after implementation.
-- [ ] Run focused and regression tests.
+- [x] Add 3D Trace2CP CLI visualization.
+- [x] Update specs/docs/changelog after implementation.
+- [x] Run focused 3D tests.
+- [x] Run full regression command.

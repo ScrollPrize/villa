@@ -83,6 +83,34 @@
   frame, carries presence through, and reuses the existing 2D Trace2CP scorer.
   This bridge is metric/debug tooling only and does not change 3D input
   loading into strip loading.
+- 3D Trace2CP projection must decode the six Lasagna 3x2 direction channels
+  analytically: each two-channel projection is decoded with
+  `theta = atan2(sin2theta, cos2theta) / 2`, then the three projection planes
+  are reconstructed/sign-aligned with the Lasagna three-plane logic. Unit-sphere
+  candidate tables, binned direction lookup, or grid-search decoding are not
+  allowed for 3D Trace2CP projection.
+- 3D training test evaluation may reuse the 2D `FiberStrip2DLoader` only to
+  construct Trace2CP segment geometry. It must keep normal 3D training samples
+  as CP-centered volume blocks. For Trace2CP evaluation, dense 3D inference is
+  run over tiled axis-aligned blocks covering the requested 2D strip
+  coordinates plus configured context, then sampled/projected back to 2D.
+- When `training.test_trace2cp_enabled` is true, 3D training logs
+  `test/trace2cp_error`, raw y-error, valid segment count, and skipped segment
+  count. `best.pt` and `current.pt` store `metric_name`; best-checkpoint
+  selection uses `test/trace2cp_error` when it is available.
+- `training.test_trace2cp_control_points: 0` means the full held-out Trace2CP
+  CP set in flat order. Positive values use the deterministic random held-out
+  range beginning at `training.test_trace2cp_start_sample_index` or, when that
+  key is omitted, `training.test_start_sample_index`.
+- The 3D Trace2CP metric path performs no training augmentations. Required 2D
+  metric geometry must be explicit through `training.test_trace2cp_loader_config`
+  or the 3D config keys `test_trace2cp_patch_shape_hw`,
+  `test_trace2cp_strip_z_offset_count`, and `test_trace2cp_strip_z_offset_step`;
+  missing required geometry must fail loudly.
+- `python -m vesuvius.neural_tracing.fiber_trace_3d.train --trace2cp-vis`
+  runs the same 3D projection/scoring path for one sample or a whole
+  `--fiber-json`, prints `trace2cp_error=...` or `trace2cp_error_mean=...`, and
+  exports `trace2cp_3d_vis.jpg`.
 
 - The initial implementation loads batches of fiber-strip patches around random control points from the fiber dataset.
 - Fiber source parsing accepts existing VC3D fiber JSON files and Knossos /

@@ -15,6 +15,10 @@ side/top strip input loading.
 - Implements Lasagna's 3D direction target layout as three ambiguous 2D
   double-angle projection pairs:
   `dir0_z,dir1_z`, `dir0_y,dir1_y`, and `dir0_x,dir1_x`.
+- Decodes Lasagna 3x2 predictions analytically by decoding each two-channel
+  projection with `theta = atan2(sin2theta, cos2theta) / 2` and applying the
+  Lasagna three-plane reconstruction/sign-alignment logic. There is no
+  unit-sphere candidate or grid-search decode path.
 - Provides projection-magnitude weights for directions that are nearly
   degenerate in one projection plane.
 
@@ -59,10 +63,9 @@ side/top strip input loading.
 
 `fiber_trace_3d/projection.py`
 
-- Provides the initial evaluation bridge from 3D direction predictions to a 2D
-  strip frame. It decodes six-channel Lasagna predictions with a deterministic
-  unit-sphere candidate table and projects the recovered ambiguous 3D axis into
-  caller-provided 2D frame axes.
+- Projects analytically decoded six-channel Lasagna predictions into
+  caller-provided 2D strip-frame axes. The frame axes may be constant or
+  per-pixel arrays from a Trace2CP segment source.
 
 `fiber_trace_3d/trace2cp_bridge.py`
 
@@ -81,7 +84,8 @@ side/top strip input loading.
   python -m vesuvius.neural_tracing.fiber_trace_3d.train <config.json>
   ```
 
-- Supports `--prefetch`, `--prefetch-steps`, `--benchmark`, and `--load-only`.
+- Supports `--prefetch`, `--prefetch-steps`, `--benchmark`, `--load-only`, and
+  `--trace2cp-vis`.
 - Writes snapshots to `<run_path>/<run_name>_<datestr>/snapshots/current.pt`
   and `best.pt`.
 - Logs scalar losses/timings and the full training config JSON to TensorBoard
@@ -89,6 +93,11 @@ side/top strip input loading.
 - Uses `training.model_micro_batch_size` to split dense 3D U-Net forwards while
   preserving the configured logical CP-patch `batch_size` (default target:
   around 192).
+- When `training.test_trace2cp_enabled` is true, test evaluation builds
+  Trace2CP side-strip geometry with the 2D loader, runs tiled dense 3D inference
+  blocks over the requested strip coordinates, projects direction/presence into
+  the 2D frame, logs `test/trace2cp_error`, and uses that value for `best.pt`
+  selection. Dense 3D test loss remains a diagnostic.
 
 Example commands:
 
@@ -96,6 +105,7 @@ Example commands:
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --benchmark --load-only
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --prefetch --prefetch-steps 1
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json
+PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --trace2cp-vis --checkpoint /path/to/best.pt --sample-index 0 --export-dir /tmp/fiber_trace_3d_trace2cp
 ```
 
 The important behavior is:

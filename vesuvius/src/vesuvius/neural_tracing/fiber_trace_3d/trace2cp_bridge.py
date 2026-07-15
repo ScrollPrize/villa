@@ -58,7 +58,6 @@ def project_3d_output_to_trace2cp_fields(
     frame_x_xyz: np.ndarray | torch.Tensor,
     frame_y_xyz: np.ndarray | torch.Tensor,
     volume_origin_zyx: np.ndarray | torch.Tensor | None = None,
-    candidate_count: int = 1024,
 ) -> Trace2Cp3DProjectedFields:
     """Sample dense 3D prediction fields and project them into Trace2CP 2D fields.
 
@@ -87,7 +86,6 @@ def project_3d_output_to_trace2cp_fields(
         sampled_dir,
         frame_x_xyz=torch.as_tensor(frame_x_xyz, dtype=torch.float32, device=values.device),
         frame_y_xyz=torch.as_tensor(frame_y_xyz, dtype=torch.float32, device=values.device),
-        candidate_count=int(candidate_count),
     )
     d, h, w = (int(v) for v in values.shape[1:])
     in_bounds = (
