@@ -10,6 +10,9 @@
 - Documented the 3D CP model boundary in the fiber trace specs and code
   structure docs, including the explicit guarantee that 3D input loading does
   not use 2D side/top strip slicing.
+- Added paired forward/backward 3D coordinate maps, opt-in explicitly
+  invertible smooth displacement modes, opt-in anisotropic 3D blur, and a
+  low-level 3D-output-to-Trace2CP projection bridge.
 
 ## 2026-07-14
 

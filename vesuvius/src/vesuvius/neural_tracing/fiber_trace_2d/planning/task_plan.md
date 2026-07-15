@@ -158,6 +158,12 @@ Plan:
 10. Best checkpoint selection should use `test/trace2cp_error` when this
     metric is enabled; otherwise keep current dense loss selection.
 
+Implementation note for this task: the completed implementation adds the
+low-level 3D-output projection/scoring bridge (`trace2cp_bridge.py`) and tests
+it against the existing 2D scorer. The train-loop best-checkpoint switch is
+deferred until the 2D metric-loader config/coordinate ownership is specified
+explicitly, rather than inferred from the 3D training config.
+
 ## Shear And Ringing
 
 Do not implement these in this follow-up:

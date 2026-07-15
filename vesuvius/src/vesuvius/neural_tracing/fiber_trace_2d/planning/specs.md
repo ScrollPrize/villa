@@ -20,20 +20,37 @@
   covers every configured control point once per pass before repeating. Changing
   batch size or step count may truncate/extend the consumed prefix, but must not
   reshuffle earlier samples.
-- 3D geometric augmentation is represented as output-voxel to source-volume
-  coordinate sampling before the final volume patch is materialized. It applies
-  to the image, transformed fiber line, transformed CP, and direction targets
-  together.
+- 3D geometric augmentation is represented by paired concrete coordinate maps
+  before the final volume patch is materialized. `backward_source_zyx` maps
+  output voxels to selected-level source-volume coordinates for image sampling,
+  and `forward_map_zyx` maps source-volume coordinates back to output-patch
+  coordinates for fiber line/control-point lookup and target generation. It
+  applies to the image, transformed fiber line, transformed CP, and direction
+  targets together.
 - V0 3D geometric augmentations support CP-local shift, isotropic scale,
   arbitrary 3D rotation, and independent axis flips. Non-zero 3D shear/skew and
   ringing artifact keys are rejected until their semantics are specified.
+- 3D smooth displacement is opt-in through
+  `augment_smooth_displacement_mode` (`none`, `1d`, `2d`, `3d`),
+  `augment_smooth_displacement_amplitude_zyx`,
+  `augment_smooth_displacement_control_spacing_zyx`, and
+  `augment_smooth_displacement_probability`. Smooth modes must use explicit
+  paired map construction, matching the 2D fused-map contract. Runtime paths
+  must not invert one map direction into the other by search, brute-force
+  nearest lookup, iterative solving, or formula re-evaluation. The current 3D
+  mode uses explicitly invertible 1D/2D offsets and 3D triangular coupling
+  stages.
 - The 3D loader may load an oversized axis-aligned source block around the CP,
   then use torch `grid_sample` to form the final regular 3D patch. Value-only
   augmentations happen after sampling as torch tensor operations.
 - V0 3D value augmentations support normalization, brightness, contrast, gamma,
-  noise, and separable isotropic Gaussian blur. Directional/anisotropic blur and
-  smooth displacement fields are future extensions unless explicitly enabled by
-  a later task.
+  noise, and separable isotropic Gaussian blur. Opt-in anisotropic blur is
+  configured with `augment_anisotropic_blur_probability`,
+  `augment_anisotropic_blur_sigma_along`,
+  `augment_anisotropic_blur_sigma_across`,
+  `augment_anisotropic_blur_orientation`, and
+  `augment_anisotropic_blur_roll_degrees`. It is a value augmentation after
+  coordinate sampling, not a geometric transform.
 - The 3D model output layout is seven channels by default:
   six Lasagna 3x2 ambiguous direction channels followed by one sigmoid
   sheet/fiber-presence channel.
@@ -60,10 +77,12 @@
   CP samples.
 - V0 3D prefetch reuses the opened Zarr store/cache path to fetch required base
   chunks and reports progress. It does not prefetch Lasagna manifest channels.
-- The initial 3D-to-2D evaluation bridge decodes/project predicted 3D direction
-  fields into a requested 2D frame so existing 2D strip tracing/Trace2CP
-  tooling can be reused for tests. This bridge is metric/debug tooling only and
-  does not change 3D input loading into strip loading.
+- The 3D-to-2D evaluation bridge in `fiber_trace_3d.trace2cp_bridge` samples
+  dense 3D model outputs at explicit 2D Trace2CP strip coordinates, projects
+  six-channel Lasagna 3x2 direction predictions into the requested 2D strip
+  frame, carries presence through, and reuses the existing 2D Trace2CP scorer.
+  This bridge is metric/debug tooling only and does not change 3D input
+  loading into strip loading.
 
 - The initial implementation loads batches of fiber-strip patches around random control points from the fiber dataset.
 - Fiber source parsing accepts existing VC3D fiber JSON files and Knossos /

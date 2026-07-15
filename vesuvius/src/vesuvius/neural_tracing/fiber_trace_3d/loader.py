@@ -65,6 +65,15 @@ class FiberTrace3DConfig:
     augment_gamma_max: float = 1.0
     augment_noise_std: float = 0.0
     augment_blur_sigma: float = 0.0
+    augment_smooth_displacement_mode: str = "none"
+    augment_smooth_displacement_amplitude_zyx: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    augment_smooth_displacement_control_spacing_zyx: tuple[float, float, float] = (16.0, 16.0, 16.0)
+    augment_smooth_displacement_probability: float = 0.0
+    augment_anisotropic_blur_probability: float = 0.0
+    augment_anisotropic_blur_sigma_along: float = 0.0
+    augment_anisotropic_blur_sigma_across: float = 0.0
+    augment_anisotropic_blur_orientation: str = "fiber"
+    augment_anisotropic_blur_roll_degrees: float = 0.0
     round_source_to_chunk_boundaries: bool = True
     prefetch_workers: int = 16
     volume_cache_dir: str | None = None
@@ -94,6 +103,15 @@ class _Record:
 
 
 @dataclass(frozen=True)
+class _SmoothDisplacement3DParams:
+    mode: str
+    amplitude_zyx: np.ndarray
+    control_spacing_zyx: np.ndarray
+    control_min_zyx: np.ndarray
+    controls: tuple[np.ndarray, ...]
+
+
+@dataclass(frozen=True)
 class _Augment3DParams:
     sample_index: int
     cp_local_zyx: np.ndarray
@@ -105,6 +123,17 @@ class _Augment3DParams:
     gamma: float
     noise_std: float
     blur_sigma: float
+    smooth: _SmoothDisplacement3DParams | None
+    anisotropic_blur_sigma_along: float
+    anisotropic_blur_sigma_across: float
+    anisotropic_blur_axis_zyx: np.ndarray | None
+
+
+@dataclass(frozen=True)
+class _GeometryMaps3D:
+    backward_source_zyx: torch.Tensor
+    forward_source_start_zyx: np.ndarray
+    forward_map_zyx: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -240,6 +269,26 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
         cache_memory_mib = float(cache_memory_mib)
         if not math.isfinite(cache_memory_mib) or cache_memory_mib <= 0.0:
             raise ValueError("volume_cache_memory_mib must be positive when provided")
+    smooth_mode = str(raw.get("augment_smooth_displacement_mode", "none")).lower()
+    if smooth_mode not in {"none", "1d", "2d", "3d"}:
+        raise ValueError("augment_smooth_displacement_mode must be one of none, 1d, 2d, 3d")
+    smooth_spacing = _as_float_zyx3(
+        raw.get("augment_smooth_displacement_control_spacing_zyx", [16.0, 16.0, 16.0]),
+        key="augment_smooth_displacement_control_spacing_zyx",
+    )
+    if any(v <= 0.0 for v in smooth_spacing):
+        raise ValueError("augment_smooth_displacement_control_spacing_zyx values must be > 0")
+    smooth_probability = float(raw.get("augment_smooth_displacement_probability", 0.0))
+    if not 0.0 <= smooth_probability <= 1.0:
+        raise ValueError("augment_smooth_displacement_probability must be in [0,1]")
+    anisotropic_probability = float(raw.get("augment_anisotropic_blur_probability", 0.0))
+    if not 0.0 <= anisotropic_probability <= 1.0:
+        raise ValueError("augment_anisotropic_blur_probability must be in [0,1]")
+    anisotropic_orientation = str(raw.get("augment_anisotropic_blur_orientation", "fiber")).lower()
+    if anisotropic_orientation not in {"fiber", "random", "axis", "z", "y", "x"}:
+        raise ValueError(
+            "augment_anisotropic_blur_orientation must be fiber, random, axis, z, y, or x"
+        )
     for unsupported in (
         "augment_shear_x",
         "augment_shear_y",
@@ -284,6 +333,24 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
         augment_gamma_max=float(raw.get("augment_gamma_max", 1.0)),
         augment_noise_std=float(raw.get("augment_noise_std", 0.0)),
         augment_blur_sigma=float(raw.get("augment_blur_sigma", 0.0)),
+        augment_smooth_displacement_mode=smooth_mode,
+        augment_smooth_displacement_amplitude_zyx=_as_float_zyx3(
+            raw.get("augment_smooth_displacement_amplitude_zyx", [0.0, 0.0, 0.0]),
+            key="augment_smooth_displacement_amplitude_zyx",
+        ),
+        augment_smooth_displacement_control_spacing_zyx=smooth_spacing,
+        augment_smooth_displacement_probability=smooth_probability,
+        augment_anisotropic_blur_probability=anisotropic_probability,
+        augment_anisotropic_blur_sigma_along=float(
+            raw.get("augment_anisotropic_blur_sigma_along", 0.0)
+        ),
+        augment_anisotropic_blur_sigma_across=float(
+            raw.get("augment_anisotropic_blur_sigma_across", 0.0)
+        ),
+        augment_anisotropic_blur_orientation=anisotropic_orientation,
+        augment_anisotropic_blur_roll_degrees=float(
+            raw.get("augment_anisotropic_blur_roll_degrees", 0.0)
+        ),
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
         prefetch_workers=_parse_worker_count(raw.get("prefetch_workers", 16), key="prefetch_workers"),
         volume_cache_dir=None if raw.get("volume_cache_dir") is None else str(raw.get("volume_cache_dir")),
@@ -465,6 +532,252 @@ def _axis_angle_rotation(axis: np.ndarray, angle_rad: float) -> np.ndarray:
     return ident + math.sin(angle_rad) * skew + (1.0 - math.cos(angle_rad)) * (skew @ skew)
 
 
+def _zyx_grid(
+    shape_zyx: tuple[int, int, int],
+    *,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    z = torch.arange(int(shape_zyx[0]), dtype=dtype, device=device)
+    y = torch.arange(int(shape_zyx[1]), dtype=dtype, device=device)
+    x = torch.arange(int(shape_zyx[2]), dtype=dtype, device=device)
+    zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
+    return torch.stack([zz, yy, xx], dim=-1)
+
+
+def _sample_control_1d(
+    control: torch.Tensor,
+    coord: torch.Tensor,
+    *,
+    origin: float,
+    spacing: float,
+) -> torch.Tensor:
+    if control.ndim != 1:
+        raise ValueError("1D smooth displacement control must be one-dimensional")
+    if control.numel() == 1:
+        return torch.full_like(coord, float(control[0]))
+    u = (coord - float(origin)) / float(spacing)
+    u = torch.clamp(u, 0.0, float(control.numel() - 1))
+    lo = torch.floor(u).to(dtype=torch.long)
+    hi = torch.clamp(lo + 1, max=int(control.numel() - 1))
+    frac = (u - lo.to(dtype=u.dtype)).to(dtype=control.dtype)
+    return control[lo] * (1.0 - frac) + control[hi] * frac
+
+
+def _sample_control_2d(
+    control: torch.Tensor,
+    coord_a: torch.Tensor,
+    coord_b: torch.Tensor,
+    *,
+    origin_a: float,
+    origin_b: float,
+    spacing_a: float,
+    spacing_b: float,
+) -> torch.Tensor:
+    if control.ndim != 2:
+        raise ValueError("2D smooth displacement control must be two-dimensional")
+    height, width = int(control.shape[0]), int(control.shape[1])
+    if height <= 0 or width <= 0:
+        raise ValueError("2D smooth displacement control must not be empty")
+    ua = torch.clamp((coord_a - float(origin_a)) / float(spacing_a), 0.0, float(max(height - 1, 0)))
+    ub = torch.clamp((coord_b - float(origin_b)) / float(spacing_b), 0.0, float(max(width - 1, 0)))
+    a0 = torch.floor(ua).to(dtype=torch.long)
+    b0 = torch.floor(ub).to(dtype=torch.long)
+    a1 = torch.clamp(a0 + 1, max=max(height - 1, 0))
+    b1 = torch.clamp(b0 + 1, max=max(width - 1, 0))
+    wa = (ua - a0.to(dtype=ua.dtype)).to(dtype=control.dtype)
+    wb = (ub - b0.to(dtype=ub.dtype)).to(dtype=control.dtype)
+    c00 = control[a0, b0]
+    c01 = control[a0, b1]
+    c10 = control[a1, b0]
+    c11 = control[a1, b1]
+    c0 = c00 * (1.0 - wb) + c01 * wb
+    c1 = c10 * (1.0 - wb) + c11 * wb
+    return c0 * (1.0 - wa) + c1 * wa
+
+
+def _smooth_control_tensors(
+    smooth: _SmoothDisplacement3DParams | None,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, ...]:
+    if smooth is None:
+        return ()
+    return tuple(torch.as_tensor(control, dtype=torch.float32, device=device) for control in smooth.controls)
+
+
+def _smooth_forward_rel_zyx(
+    rel_zyx: torch.Tensor,
+    smooth: _SmoothDisplacement3DParams | None,
+    controls: tuple[torch.Tensor, ...] | None = None,
+) -> torch.Tensor:
+    if smooth is None or smooth.mode == "none":
+        return rel_zyx
+    tensors = _smooth_control_tensors(smooth, device=rel_zyx.device) if controls is None else controls
+    out = rel_zyx.clone()
+    origin = np.asarray(smooth.control_min_zyx, dtype=np.float64)
+    spacing = np.asarray(smooth.control_spacing_zyx, dtype=np.float64)
+    if smooth.mode == "1d":
+        out[..., 0] = out[..., 0] + _sample_control_1d(
+            tensors[0],
+            out[..., 2],
+            origin=float(origin[2]),
+            spacing=float(spacing[2]),
+        )
+    elif smooth.mode == "2d":
+        out[..., 0] = out[..., 0] + _sample_control_2d(
+            tensors[0],
+            out[..., 1],
+            out[..., 2],
+            origin_a=float(origin[1]),
+            origin_b=float(origin[2]),
+            spacing_a=float(spacing[1]),
+            spacing_b=float(spacing[2]),
+        )
+    elif smooth.mode == "3d":
+        out[..., 0] = out[..., 0] + _sample_control_2d(
+            tensors[0],
+            out[..., 1],
+            out[..., 2],
+            origin_a=float(origin[1]),
+            origin_b=float(origin[2]),
+            spacing_a=float(spacing[1]),
+            spacing_b=float(spacing[2]),
+        )
+        out[..., 1] = out[..., 1] + _sample_control_2d(
+            tensors[1],
+            out[..., 0],
+            out[..., 2],
+            origin_a=float(origin[0]),
+            origin_b=float(origin[2]),
+            spacing_a=float(spacing[0]),
+            spacing_b=float(spacing[2]),
+        )
+        out[..., 2] = out[..., 2] + _sample_control_2d(
+            tensors[2],
+            out[..., 0],
+            out[..., 1],
+            origin_a=float(origin[0]),
+            origin_b=float(origin[1]),
+            spacing_a=float(spacing[0]),
+            spacing_b=float(spacing[1]),
+        )
+    else:
+        raise ValueError(f"unsupported smooth displacement mode {smooth.mode!r}")
+    return out
+
+
+def _smooth_backward_rel_zyx(
+    rel_zyx: torch.Tensor,
+    smooth: _SmoothDisplacement3DParams | None,
+    controls: tuple[torch.Tensor, ...] | None = None,
+) -> torch.Tensor:
+    if smooth is None or smooth.mode == "none":
+        return rel_zyx
+    tensors = _smooth_control_tensors(smooth, device=rel_zyx.device) if controls is None else controls
+    out = rel_zyx.clone()
+    origin = np.asarray(smooth.control_min_zyx, dtype=np.float64)
+    spacing = np.asarray(smooth.control_spacing_zyx, dtype=np.float64)
+    if smooth.mode == "1d":
+        out[..., 0] = out[..., 0] - _sample_control_1d(
+            tensors[0],
+            out[..., 2],
+            origin=float(origin[2]),
+            spacing=float(spacing[2]),
+        )
+    elif smooth.mode == "2d":
+        out[..., 0] = out[..., 0] - _sample_control_2d(
+            tensors[0],
+            out[..., 1],
+            out[..., 2],
+            origin_a=float(origin[1]),
+            origin_b=float(origin[2]),
+            spacing_a=float(spacing[1]),
+            spacing_b=float(spacing[2]),
+        )
+    elif smooth.mode == "3d":
+        out[..., 2] = out[..., 2] - _sample_control_2d(
+            tensors[2],
+            out[..., 0],
+            out[..., 1],
+            origin_a=float(origin[0]),
+            origin_b=float(origin[1]),
+            spacing_a=float(spacing[0]),
+            spacing_b=float(spacing[1]),
+        )
+        out[..., 1] = out[..., 1] - _sample_control_2d(
+            tensors[1],
+            out[..., 0],
+            out[..., 2],
+            origin_a=float(origin[0]),
+            origin_b=float(origin[2]),
+            spacing_a=float(spacing[0]),
+            spacing_b=float(spacing[2]),
+        )
+        out[..., 0] = out[..., 0] - _sample_control_2d(
+            tensors[0],
+            out[..., 1],
+            out[..., 2],
+            origin_a=float(origin[1]),
+            origin_b=float(origin[2]),
+            spacing_a=float(spacing[1]),
+            spacing_b=float(spacing[2]),
+        )
+    else:
+        raise ValueError(f"unsupported smooth displacement mode {smooth.mode!r}")
+    return out
+
+
+def _sample_forward_map_points(
+    map_zyx: torch.Tensor,
+    points_local_zyx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if map_zyx.ndim != 4 or map_zyx.shape[-1] != 3:
+        raise ValueError("forward_map_zyx must have shape D,H,W,3")
+    points = points_local_zyx.to(dtype=torch.float32, device=map_zyx.device)
+    d, h, w = int(map_zyx.shape[0]), int(map_zyx.shape[1]), int(map_zyx.shape[2])
+    valid = (
+        torch.isfinite(points).all(dim=-1)
+        & (points[..., 0] >= 0.0)
+        & (points[..., 0] <= float(d - 1))
+        & (points[..., 1] >= 0.0)
+        & (points[..., 1] <= float(h - 1))
+        & (points[..., 2] >= 0.0)
+        & (points[..., 2] <= float(w - 1))
+    )
+    clamped = torch.stack(
+        [
+            points[..., 0].clamp(0.0, float(max(d - 1, 0))),
+            points[..., 1].clamp(0.0, float(max(h - 1, 0))),
+            points[..., 2].clamp(0.0, float(max(w - 1, 0))),
+        ],
+        dim=-1,
+    )
+    p0 = torch.floor(clamped).to(dtype=torch.long)
+    p1 = torch.stack(
+        [
+            torch.clamp(p0[..., 0] + 1, max=max(d - 1, 0)),
+            torch.clamp(p0[..., 1] + 1, max=max(h - 1, 0)),
+            torch.clamp(p0[..., 2] + 1, max=max(w - 1, 0)),
+        ],
+        dim=-1,
+    )
+    frac = clamped - p0.to(dtype=clamped.dtype)
+    out = torch.zeros((*points.shape[:-1], 3), dtype=torch.float32, device=map_zyx.device)
+    for dz in (0, 1):
+        wz = frac[..., 0] if dz else (1.0 - frac[..., 0])
+        iz = p1[..., 0] if dz else p0[..., 0]
+        for dy in (0, 1):
+            wy = frac[..., 1] if dy else (1.0 - frac[..., 1])
+            iy = p1[..., 1] if dy else p0[..., 1]
+            for dx in (0, 1):
+                wx = frac[..., 2] if dx else (1.0 - frac[..., 2])
+                ix = p1[..., 2] if dx else p0[..., 2]
+                weight = (wz * wy * wx).unsqueeze(-1)
+                out = out + map_zyx[iz, iy, ix] * weight
+    return out, valid
+
+
 def _read_raw_block(array: Any, start_zyx: np.ndarray, end_zyx: np.ndarray) -> np.ndarray:
     start = np.asarray(start_zyx, dtype=np.int64)
     end = np.asarray(end_zyx, dtype=np.int64)
@@ -537,6 +850,74 @@ def _normalize_image(volume: torch.Tensor, valid_mask: torch.Tensor, mode: str) 
     raise ValueError(f"unsupported image_normalization {mode!r}")
 
 
+def _gaussian_kernel1d(sigma: float, *, device: torch.device) -> torch.Tensor:
+    sigma_f = float(sigma)
+    if sigma_f <= 0.0:
+        return torch.ones((1,), dtype=torch.float32, device=device)
+    radius = max(1, int(math.ceil(3.0 * sigma_f)))
+    coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
+    kernel = torch.exp(-0.5 * (coords / sigma_f) ** 2)
+    return kernel / kernel.sum().clamp_min(1.0e-12)
+
+
+def _perpendicular_axes_zyx(axis_zyx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    axis = axis_zyx.to(dtype=torch.float32)
+    axis = axis / torch.linalg.vector_norm(axis).clamp_min(1.0e-12)
+    ref = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=axis.device)
+    if float(torch.abs(torch.dot(axis, ref)).detach().cpu()) > 0.9:
+        ref = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=axis.device)
+    # torch.cross expects consistent dim. Vectors are in ZYX component order,
+    # but a right-handed basis is enough for sampling offsets.
+    across_a = torch.linalg.cross(axis, ref, dim=0)
+    across_a = across_a / torch.linalg.vector_norm(across_a).clamp_min(1.0e-12)
+    across_b = torch.linalg.cross(axis, across_a, dim=0)
+    across_b = across_b / torch.linalg.vector_norm(across_b).clamp_min(1.0e-12)
+    return axis, across_a, across_b
+
+
+def _oriented_blur_1d(volume: torch.Tensor, axis_zyx: torch.Tensor, sigma: float) -> torch.Tensor:
+    if float(sigma) <= 0.0:
+        return volume
+    kernel = _gaussian_kernel1d(float(sigma), device=volume.device)
+    radius = int((kernel.numel() - 1) // 2)
+    d, h, w = (int(v) for v in volume.shape)
+    base = _zyx_grid((d, h, w), device=volume.device)
+    axis = axis_zyx.to(dtype=torch.float32, device=volume.device)
+    axis = axis / torch.linalg.vector_norm(axis).clamp_min(1.0e-12)
+    accum = torch.zeros_like(volume)
+    data = volume.view(1, 1, d, h, w)
+    for offset, weight in zip(range(-radius, radius + 1), kernel, strict=True):
+        sample_zyx = base + float(offset) * axis.view(1, 1, 1, 3)
+        gx = sample_zyx[..., 2] * (2.0 / float(max(w - 1, 1))) - 1.0 if w > 1 else torch.zeros_like(sample_zyx[..., 2])
+        gy = sample_zyx[..., 1] * (2.0 / float(max(h - 1, 1))) - 1.0 if h > 1 else torch.zeros_like(sample_zyx[..., 1])
+        gz = sample_zyx[..., 0] * (2.0 / float(max(d - 1, 1))) - 1.0 if d > 1 else torch.zeros_like(sample_zyx[..., 0])
+        grid = torch.stack([gx, gy, gz], dim=-1).unsqueeze(0)
+        sampled = F.grid_sample(
+            data,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )[0, 0]
+        accum = accum + sampled * weight
+    return accum
+
+
+def _anisotropic_blur_3d(
+    volume: torch.Tensor,
+    *,
+    axis_zyx: np.ndarray,
+    sigma_along: float,
+    sigma_across: float,
+) -> torch.Tensor:
+    axis = torch.as_tensor(axis_zyx, dtype=torch.float32, device=volume.device)
+    along, across_a, across_b = _perpendicular_axes_zyx(axis)
+    out = _oriented_blur_1d(volume, along, float(sigma_along))
+    out = _oriented_blur_1d(out, across_a, float(sigma_across))
+    out = _oriented_blur_1d(out, across_b, float(sigma_across))
+    return out
+
+
 def _format_seconds(seconds: float) -> str:
     seconds = max(0.0, float(seconds))
     if seconds < 60.0:
@@ -567,6 +948,22 @@ class FiberTrace3DLoader:
             raise ValueError("augment_scale_min must be <= augment_scale_max")
         if not (0.0 <= config.augment_flip_probability <= 1.0):
             raise ValueError("augment_flip_probability must be in [0,1]")
+        if config.augment_smooth_displacement_mode not in {"none", "1d", "2d", "3d"}:
+            raise ValueError("unsupported augment_smooth_displacement_mode")
+        if any(v < 0.0 for v in config.augment_smooth_displacement_amplitude_zyx):
+            raise ValueError("augment_smooth_displacement_amplitude_zyx values must be >= 0")
+        if any(v <= 0.0 for v in config.augment_smooth_displacement_control_spacing_zyx):
+            raise ValueError("augment_smooth_displacement_control_spacing_zyx values must be > 0")
+        if not (0.0 <= config.augment_smooth_displacement_probability <= 1.0):
+            raise ValueError("augment_smooth_displacement_probability must be in [0,1]")
+        if not (0.0 <= config.augment_anisotropic_blur_probability <= 1.0):
+            raise ValueError("augment_anisotropic_blur_probability must be in [0,1]")
+        if config.augment_anisotropic_blur_sigma_along < 0.0:
+            raise ValueError("augment_anisotropic_blur_sigma_along must be >= 0")
+        if config.augment_anisotropic_blur_sigma_across < 0.0:
+            raise ValueError("augment_anisotropic_blur_sigma_across must be >= 0")
+        if config.augment_anisotropic_blur_orientation not in {"fiber", "random", "axis", "z", "y", "x"}:
+            raise ValueError("unsupported augment_anisotropic_blur_orientation")
         self.config = config
         self.records = self._load_records()
         self._flat_offsets: list[int] = []
@@ -715,6 +1112,143 @@ class FiberTrace3DLoader:
         cp_zyx_base = np.asarray(record.fiber.control_points_zyx[int(cp_index)], dtype=np.float64)
         return cp_zyx_base / float(record.volume_spacing_base)
 
+    def _line_tangent_volume_zyx(self, record: _Record, cp_index: int) -> np.ndarray:
+        line_points = np.asarray(record.fiber.line_points_zyx, dtype=np.float64) / float(
+            record.volume_spacing_base
+        )
+        if line_points.shape[0] < 2:
+            return np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+        line_index = control_point_line_index(record.fiber, int(cp_index))
+        prev_index = max(0, int(line_index) - 1)
+        next_index = min(int(line_points.shape[0]) - 1, int(line_index) + 1)
+        tangent = line_points[next_index] - line_points[prev_index]
+        norm = float(np.linalg.norm(tangent))
+        if not math.isfinite(norm) or norm <= 1.0e-12:
+            return np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+        return tangent / norm
+
+    def _smooth_control_radius_zyx(self) -> np.ndarray:
+        patch = np.asarray(self.config.patch_shape_zyx, dtype=np.float64)
+        min_scale = max(float(self.config.augment_scale_min), 1.0e-6)
+        shift = np.asarray(self.config.augment_shift_zyx, dtype=np.float64)
+        amplitude = np.asarray(
+            self.config.augment_smooth_displacement_amplitude_zyx,
+            dtype=np.float64,
+        )
+        radius = (patch - 1.0) / min_scale + shift + amplitude + 8.0
+        return np.maximum(radius, np.asarray([8.0, 8.0, 8.0], dtype=np.float64))
+
+    def _make_smooth_params(
+        self,
+        sample_index: int,
+        rng: np.random.Generator,
+    ) -> _SmoothDisplacement3DParams | None:
+        mode = str(self.config.augment_smooth_displacement_mode).lower()
+        amplitude = np.asarray(
+            self.config.augment_smooth_displacement_amplitude_zyx,
+            dtype=np.float64,
+        )
+        if (
+            (not self.config.augment_enabled)
+            or mode == "none"
+            or float(np.max(amplitude)) <= 0.0
+            or float(self.config.augment_smooth_displacement_probability) <= 0.0
+            or float(rng.random()) > float(self.config.augment_smooth_displacement_probability)
+        ):
+            return None
+        spacing = np.asarray(
+            self.config.augment_smooth_displacement_control_spacing_zyx,
+            dtype=np.float64,
+        )
+        radius = self._smooth_control_radius_zyx()
+        control_min = -radius
+        counts = np.maximum(2, np.ceil((2.0 * radius) / spacing).astype(np.int64) + 1)
+        control_rng = np.random.default_rng(
+            _stable_seed(self.config.seed, "smooth3d", sample_index)
+        )
+
+        def control_1d(axis: int, component: int) -> np.ndarray:
+            values = control_rng.uniform(
+                -float(amplitude[component]),
+                float(amplitude[component]),
+                size=(int(counts[axis]),),
+            )
+            return values.astype(np.float32)
+
+        def control_2d(axis_a: int, axis_b: int, component: int) -> np.ndarray:
+            values = control_rng.uniform(
+                -float(amplitude[component]),
+                float(amplitude[component]),
+                size=(int(counts[axis_a]), int(counts[axis_b])),
+            )
+            return values.astype(np.float32)
+
+        if mode == "1d":
+            controls = (control_1d(2, 0),)
+        elif mode == "2d":
+            controls = (control_2d(1, 2, 0),)
+        elif mode == "3d":
+            controls = (
+                control_2d(1, 2, 0),
+                control_2d(0, 2, 1),
+                control_2d(0, 1, 2),
+            )
+        else:
+            raise ValueError(f"unsupported augment_smooth_displacement_mode {mode!r}")
+        return _SmoothDisplacement3DParams(
+            mode=mode,
+            amplitude_zyx=amplitude.astype(np.float64),
+            control_spacing_zyx=spacing.astype(np.float64),
+            control_min_zyx=control_min.astype(np.float64),
+            controls=tuple(controls),
+        )
+
+    def _anisotropic_axis_zyx(
+        self,
+        record: _Record,
+        cp_index: int,
+        source_to_output_zyx: np.ndarray,
+        rng: np.random.Generator,
+    ) -> np.ndarray | None:
+        if (
+            (not self.config.augment_enabled)
+            or float(self.config.augment_anisotropic_blur_probability) <= 0.0
+            or (
+                float(self.config.augment_anisotropic_blur_sigma_along) <= 0.0
+                and float(self.config.augment_anisotropic_blur_sigma_across) <= 0.0
+            )
+            or float(rng.random()) > float(self.config.augment_anisotropic_blur_probability)
+        ):
+            return None
+        orientation = str(self.config.augment_anisotropic_blur_orientation).lower()
+        if orientation in {"axis", "z"}:
+            axis = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+        elif orientation == "y":
+            axis = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+        elif orientation == "x":
+            axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+        elif orientation == "random":
+            axis = rng.normal(size=3).astype(np.float64)
+        else:
+            tangent = self._line_tangent_volume_zyx(record, cp_index)
+            axis = tangent @ np.asarray(source_to_output_zyx, dtype=np.float64).T
+        norm = float(np.linalg.norm(axis))
+        if not math.isfinite(norm) or norm <= 1.0e-12:
+            return np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+        axis = axis / norm
+        roll = math.radians(float(self.config.augment_anisotropic_blur_roll_degrees))
+        if roll != 0.0 and orientation == "fiber":
+            # Roll is represented as a deterministic small axis-angle perturbation
+            # around a stable perpendicular vector so the principal blur axis stays
+            # fiber-aligned up to the configured roll angle.
+            perp = np.cross(axis, np.asarray([1.0, 0.0, 0.0], dtype=np.float64))
+            if float(np.linalg.norm(perp)) <= 1.0e-12:
+                perp = np.cross(axis, np.asarray([0.0, 1.0, 0.0], dtype=np.float64))
+            rot = _axis_angle_rotation(perp, float(rng.uniform(-roll, roll)))
+            axis = axis @ rot.T
+            axis = axis / max(float(np.linalg.norm(axis)), 1.0e-12)
+        return axis.astype(np.float64)
+
     def _sample_augment_params(
         self,
         record: _Record,
@@ -769,6 +1303,13 @@ class FiberTrace3DLoader:
             gamma = 1.0
             noise_std = 0.0
             blur_sigma = 0.0
+        smooth = self._make_smooth_params(sample_index, rng)
+        anisotropic_axis = self._anisotropic_axis_zyx(
+            record,
+            cp_index,
+            source_to_output,
+            rng,
+        )
 
         return _Augment3DParams(
             sample_index=int(sample_index),
@@ -781,9 +1322,32 @@ class FiberTrace3DLoader:
             gamma=gamma,
             noise_std=noise_std,
             blur_sigma=blur_sigma,
+            smooth=smooth,
+            anisotropic_blur_sigma_along=float(self.config.augment_anisotropic_blur_sigma_along)
+            if anisotropic_axis is not None
+            else 0.0,
+            anisotropic_blur_sigma_across=float(self.config.augment_anisotropic_blur_sigma_across)
+            if anisotropic_axis is not None
+            else 0.0,
+            anisotropic_blur_axis_zyx=anisotropic_axis,
         )
 
-    def _actual_source_bbox(
+    def _output_points_to_source_volume_np(
+        self,
+        output_points_zyx: np.ndarray,
+        params: _Augment3DParams,
+    ) -> np.ndarray:
+        device = torch.device("cpu")
+        points = torch.as_tensor(output_points_zyx, dtype=torch.float32, device=device)
+        cp_local = torch.as_tensor(params.cp_local_zyx, dtype=torch.float32, device=device)
+        cp_volume = torch.as_tensor(params.cp_volume_zyx, dtype=torch.float32, device=device)
+        inv_matrix = torch.as_tensor(params.output_to_source_zyx, dtype=torch.float32, device=device)
+        rel_output = points - cp_local.view(1, 3)
+        rel_aug = torch.einsum("...i,ji->...j", rel_output, inv_matrix)
+        rel_source = _smooth_backward_rel_zyx(rel_aug, params.smooth)
+        return (cp_volume.view(1, 3) + rel_source).detach().cpu().numpy().astype(np.float64)
+
+    def _source_bbox_for_maps(
         self,
         record: _Record,
         params: _Augment3DParams,
@@ -794,10 +1358,24 @@ class FiberTrace3DLoader:
             dtype=np.float64,
         )
         rel_output = corners - params.cp_local_zyx.reshape(1, 3)
-        rel_source = rel_output @ params.output_to_source_zyx.T
-        coords = params.cp_volume_zyx.reshape(1, 3) + rel_source
-        start = np.floor(np.min(coords, axis=0) - 2.0).astype(np.int64)
-        end = np.ceil(np.max(coords, axis=0) + 3.0).astype(np.int64)
+        del rel_output
+        coords = self._output_points_to_source_volume_np(corners, params)
+        amplitude = (
+            np.asarray(params.smooth.amplitude_zyx, dtype=np.float64)
+            if params.smooth is not None
+            else np.zeros((3,), dtype=np.float64)
+        )
+        start = np.floor(np.min(coords, axis=0) - 2.0 - amplitude).astype(np.int64)
+        end = np.ceil(np.max(coords, axis=0) + 3.0 + amplitude).astype(np.int64)
+        del record
+        return start, end
+
+    def _actual_source_bbox(
+        self,
+        record: _Record,
+        params: _Augment3DParams,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        start, end = self._source_bbox_for_maps(record, params)
         if self.config.round_source_to_chunk_boundaries:
             start, end = _round_bbox_to_chunks(record.volume, start, end)
         return start, end
@@ -811,38 +1389,95 @@ class FiberTrace3DLoader:
         patch = np.asarray(self.config.patch_shape_zyx, dtype=np.float64)
         min_scale = max(float(self.config.augment_scale_min), 1.0e-6)
         shift = np.asarray(self.config.augment_shift_zyx, dtype=np.float64)
-        radius = float(np.linalg.norm(patch - 1.0)) / min_scale + float(np.max(shift)) + 4.0
+        smooth_amp = np.asarray(
+            self.config.augment_smooth_displacement_amplitude_zyx,
+            dtype=np.float64,
+        )
+        radius = (
+            float(np.linalg.norm(patch - 1.0)) / min_scale
+            + float(np.max(shift))
+            + float(np.max(smooth_amp))
+            + 4.0
+        )
         start = np.floor(cp - radius).astype(np.int64)
         end = np.ceil(cp + radius + 1.0).astype(np.int64)
         if self.config.round_source_to_chunk_boundaries:
             start, end = _round_bbox_to_chunks(record.volume, start, end)
         return start, end
 
+    def _build_geometry_maps(
+        self,
+        params: _Augment3DParams,
+        *,
+        forward_start_zyx: np.ndarray,
+        forward_end_zyx: np.ndarray,
+        device: torch.device,
+    ) -> _GeometryMaps3D:
+        patch_shape = tuple(int(v) for v in self.config.patch_shape_zyx)
+        local = _zyx_grid(patch_shape, device=device)
+        cp_local = torch.as_tensor(params.cp_local_zyx, dtype=torch.float32, device=device)
+        cp_volume = torch.as_tensor(params.cp_volume_zyx, dtype=torch.float32, device=device)
+        inv_matrix = torch.as_tensor(params.output_to_source_zyx, dtype=torch.float32, device=device)
+        rel_output = local - cp_local.view(1, 1, 1, 3)
+        rel_aug = torch.einsum("...i,ji->...j", rel_output, inv_matrix)
+        controls = _smooth_control_tensors(params.smooth, device=device)
+        rel_source = _smooth_backward_rel_zyx(rel_aug, params.smooth, controls)
+        backward_source = cp_volume.view(1, 1, 1, 3) + rel_source
+
+        forward_start = np.asarray(forward_start_zyx, dtype=np.int64)
+        forward_end = np.asarray(forward_end_zyx, dtype=np.int64)
+        forward_shape = tuple(int(v) for v in np.maximum(forward_end - forward_start, 1))
+        source_grid = _zyx_grid(forward_shape, device=device)
+        source_start_t = torch.as_tensor(forward_start, dtype=torch.float32, device=device)
+        rel_source_grid = source_grid + source_start_t.view(1, 1, 1, 3) - cp_volume.view(1, 1, 1, 3)
+        rel_aug_grid = _smooth_forward_rel_zyx(rel_source_grid, params.smooth, controls)
+        matrix = torch.as_tensor(params.source_to_output_zyx, dtype=torch.float32, device=device)
+        rel_output_grid = torch.einsum("...i,ji->...j", rel_aug_grid, matrix)
+        forward_map = cp_local.view(1, 1, 1, 3) + rel_output_grid
+        return _GeometryMaps3D(
+            backward_source_zyx=backward_source,
+            forward_source_start_zyx=forward_start.astype(np.float64),
+            forward_map_zyx=forward_map,
+        )
+
+    def _source_points_to_output_np(
+        self,
+        points_volume_zyx: np.ndarray,
+        geometry: _GeometryMaps3D,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        points = torch.as_tensor(
+            np.asarray(points_volume_zyx, dtype=np.float32),
+            dtype=torch.float32,
+            device=geometry.forward_map_zyx.device,
+        )
+        start = torch.as_tensor(
+            geometry.forward_source_start_zyx,
+            dtype=torch.float32,
+            device=geometry.forward_map_zyx.device,
+        )
+        mapped, valid = _sample_forward_map_points(
+            geometry.forward_map_zyx,
+            points - start.view(1, 3),
+        )
+        return (
+            mapped.detach().cpu().numpy().astype(np.float32),
+            valid.detach().cpu().numpy().astype(bool),
+        )
+
     def _sample_volume_patch(
         self,
         record: _Record,
         block: np.ndarray,
         source_start_zyx: np.ndarray,
-        params: _Augment3DParams,
+        geometry: _GeometryMaps3D,
         *,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        patch_shape = tuple(int(v) for v in self.config.patch_shape_zyx)
         block_t = torch.as_tensor(block, dtype=torch.float32, device=device).view(
             1, 1, *block.shape
         )
-        z = torch.arange(patch_shape[0], dtype=torch.float32, device=device)
-        y = torch.arange(patch_shape[1], dtype=torch.float32, device=device)
-        x = torch.arange(patch_shape[2], dtype=torch.float32, device=device)
-        zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
-        local = torch.stack([zz, yy, xx], dim=-1)
-        cp_local = torch.as_tensor(params.cp_local_zyx, dtype=torch.float32, device=device)
-        cp_volume = torch.as_tensor(params.cp_volume_zyx, dtype=torch.float32, device=device)
-        inv_matrix = torch.as_tensor(params.output_to_source_zyx, dtype=torch.float32, device=device)
         source_start = torch.as_tensor(source_start_zyx, dtype=torch.float32, device=device)
-        rel_output = local - cp_local.view(1, 1, 1, 3)
-        rel_source = torch.einsum("...i,ji->...j", rel_output, inv_matrix)
-        source_local = cp_volume.view(1, 1, 1, 3) + rel_source - source_start.view(1, 1, 1, 3)
+        source_local = geometry.backward_source_zyx - source_start.view(1, 1, 1, 3)
 
         d, h, w = (int(v) for v in block.shape)
         valid = (
@@ -913,6 +1548,19 @@ class FiberTrace3DLoader:
                 padding[(2 - axis) * 2 + 1] = radius
                 data = F.conv3d(F.pad(data, padding, mode="replicate"), weight)
             out = data[0, 0]
+        if (
+            params.anisotropic_blur_axis_zyx is not None
+            and (
+                params.anisotropic_blur_sigma_along > 0.0
+                or params.anisotropic_blur_sigma_across > 0.0
+            )
+        ):
+            out = _anisotropic_blur_3d(
+                out,
+                axis_zyx=params.anisotropic_blur_axis_zyx,
+                sigma_along=float(params.anisotropic_blur_sigma_along),
+                sigma_across=float(params.anisotropic_blur_sigma_across),
+            )
         return torch.where(valid_mask, out, torch.zeros_like(out))
 
     def _line_window_for_labels(
@@ -953,6 +1601,7 @@ class FiberTrace3DLoader:
         record: _Record,
         cp_index: int,
         params: _Augment3DParams,
+        geometry: _GeometryMaps3D,
         valid_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         patch_shape = tuple(int(v) for v in self.config.patch_shape_zyx)
@@ -961,14 +1610,18 @@ class FiberTrace3DLoader:
             cp_index,
             params,
         )
-        rel_source = line_points - params.cp_volume_zyx.reshape(1, 3)
-        points_out = params.cp_local_zyx.reshape(1, 3) + rel_source @ params.source_to_output_zyx.T
+        points_out, points_valid = self._source_points_to_output_np(line_points, geometry)
         if points_out.shape[0] < 2:
             raise ValueError("label line window must contain at least two points")
         segment_start = points_out[:-1].astype(np.float32)
         segment_vec = (points_out[1:] - points_out[:-1]).astype(np.float32)
         segment_len2 = np.sum(segment_vec * segment_vec, axis=1)
-        valid_segments = np.isfinite(segment_len2) & (segment_len2 > 1.0e-12)
+        valid_segments = (
+            points_valid[:-1]
+            & points_valid[1:]
+            & np.isfinite(segment_len2)
+            & (segment_len2 > 1.0e-12)
+        )
         if not bool(valid_segments.any()):
             raise ValueError("label line window has no valid segments")
         segment_start = segment_start[valid_segments]
@@ -1063,13 +1716,20 @@ class FiberTrace3DLoader:
             sample_mode=sample_mode,
         )
         params = self._sample_augment_params(record, cp_index, int(sample_index))
+        map_start, map_end = self._source_bbox_for_maps(record, params)
         source_start, source_end = self._actual_source_bbox(record, params)
         block = _read_raw_block(record.volume, source_start, source_end)
+        geometry = self._build_geometry_maps(
+            params,
+            forward_start_zyx=map_start,
+            forward_end_zyx=map_end,
+            device=resolved_device,
+        )
         volume, valid = self._sample_volume_patch(
             record,
             block,
             source_start,
-            params,
+            geometry,
             device=resolved_device,
         )
         volume = self._apply_value_augmentation(volume, valid, params)
@@ -1079,7 +1739,7 @@ class FiberTrace3DLoader:
             direction_mask,
             presence_target,
             presence_mask,
-        ) = self._build_targets(record, cp_index, params, valid)
+        ) = self._build_targets(record, cp_index, params, geometry, valid)
         return FiberTrace3DSample(
             sample_index=int(sample_index),
             record_index=int(record_index),
@@ -1243,6 +1903,42 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         augment_scale_min=float(raw.get("augment_scale_min", 1.0)),
         augment_scale_max=float(raw.get("augment_scale_max", 1.0)),
         augment_flip_probability=float(raw.get("augment_flip_probability", 0.0)),
+        augment_brightness=float(raw.get("augment_brightness", 0.0)),
+        augment_contrast_min=float(raw.get("augment_contrast_min", 1.0)),
+        augment_contrast_max=float(raw.get("augment_contrast_max", 1.0)),
+        augment_gamma_min=float(raw.get("augment_gamma_min", 1.0)),
+        augment_gamma_max=float(raw.get("augment_gamma_max", 1.0)),
+        augment_noise_std=float(raw.get("augment_noise_std", 0.0)),
+        augment_blur_sigma=float(raw.get("augment_blur_sigma", 0.0)),
+        augment_smooth_displacement_mode=str(
+            raw.get("augment_smooth_displacement_mode", "none")
+        ).lower(),
+        augment_smooth_displacement_amplitude_zyx=_as_float_zyx3(
+            raw.get("augment_smooth_displacement_amplitude_zyx", [0.0, 0.0, 0.0]),
+            key="augment_smooth_displacement_amplitude_zyx",
+        ),
+        augment_smooth_displacement_control_spacing_zyx=_as_float_zyx3(
+            raw.get("augment_smooth_displacement_control_spacing_zyx", [16.0, 16.0, 16.0]),
+            key="augment_smooth_displacement_control_spacing_zyx",
+        ),
+        augment_smooth_displacement_probability=float(
+            raw.get("augment_smooth_displacement_probability", 0.0)
+        ),
+        augment_anisotropic_blur_probability=float(
+            raw.get("augment_anisotropic_blur_probability", 0.0)
+        ),
+        augment_anisotropic_blur_sigma_along=float(
+            raw.get("augment_anisotropic_blur_sigma_along", 0.0)
+        ),
+        augment_anisotropic_blur_sigma_across=float(
+            raw.get("augment_anisotropic_blur_sigma_across", 0.0)
+        ),
+        augment_anisotropic_blur_orientation=str(
+            raw.get("augment_anisotropic_blur_orientation", "fiber")
+        ).lower(),
+        augment_anisotropic_blur_roll_degrees=float(
+            raw.get("augment_anisotropic_blur_roll_degrees", 0.0)
+        ),
         image_normalization=str(raw.get("image_normalization", "zscore")),
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
         prefetch_workers=int(raw.get("prefetch_workers", 16)),

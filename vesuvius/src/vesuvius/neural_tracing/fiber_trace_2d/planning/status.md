@@ -8,9 +8,10 @@
 - [x] Corrected the plan to preserve the 2D paired forward/backward map
   augmentation contract for 3D smooth displacement.
 - [x] Replaced `planning/task_log.md` with current-task planning notes only.
-- [ ] Review plan against specs before implementation.
-- [ ] Implement smooth displacement coordinate-map refactor.
-- [ ] Implement anisotropic blur.
-- [ ] Implement full 3D Trace2CP metric bridge.
-- [ ] Update specs/docs/changelog after implementation.
-- [ ] Run focused and compatibility tests.
+- [x] Review plan against specs before implementation.
+- [x] Implement smooth displacement coordinate-map refactor.
+- [x] Implement anisotropic blur.
+- [x] Implement 3D Trace2CP projection/scoring bridge.
+- [x] Update specs/docs/changelog after implementation.
+- [x] Run focused 3D tests.
+- [x] Run broader 2D/3D compatibility tests.

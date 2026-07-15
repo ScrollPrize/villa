@@ -36,9 +36,20 @@ side/top strip input loading.
   volume shape against the manifest.
 - Samples ordinary CP-centered 3D ZYX source blocks from the selected Zarr
   level. It does not create fiber-aligned strips or slices for 3D input.
-- Builds the final regular 3D patch with coordinate-space geometric
-  augmentation: CP-local shift, isotropic scale, arbitrary 3D rotation, and
-  independent axis flips.
+- Builds the final regular 3D patch with explicit paired coordinate maps.
+  `backward_source_zyx` maps output voxels to source-volume coordinates for
+  image sampling, while `forward_map_zyx` maps source-volume coordinates back to
+  output patch coordinates for line/control-point lookup and labels. This is
+  the 3D equivalent of the 2D paired fused-map contract.
+- Coordinate-space geometric augmentation supports CP-local shift, isotropic
+  scale, arbitrary 3D rotation, independent axis flips, and opt-in smooth
+  displacement. Smooth displacement modes (`1d`, `2d`, `3d`) are built as
+  explicit paired maps; runtime paths do not invert one map direction by search
+  or solve.
+- Value augmentation includes normalization, brightness, contrast, gamma, noise,
+  separable isotropic Gaussian blur, and opt-in anisotropic blur. Anisotropic
+  blur is a torch value operation after volume sampling, not a geometric
+  transform.
 - Builds direction and presence targets from the same transformed 3D fiber line
   used to sample the image. Direction labels use the six Lasagna 3x2 channels;
   presence positives are near the transformed line and negatives are balanced
@@ -52,8 +63,15 @@ side/top strip input loading.
   strip frame. It decodes six-channel Lasagna predictions with a deterministic
   unit-sphere candidate table and projects the recovered ambiguous 3D axis into
   caller-provided 2D frame axes.
-- This is for test/metric integration with the existing 2D tracer; 3D loading
-  remains CP-centered block loading.
+
+`fiber_trace_3d/trace2cp_bridge.py`
+
+- Samples dense 3D checkpoint outputs at explicit 2D Trace2CP strip
+  coordinates, projects the six Lasagna direction channels into the local strip
+  frame, carries presence values through, and calls the existing 2D Trace2CP
+  scorer.
+- This is for test/metric integration with the existing 2D tracer; 3D training
+  and loading remain CP-centered block loading.
 
 `fiber_trace_3d/train.py`
 
