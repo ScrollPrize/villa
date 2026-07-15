@@ -395,6 +395,13 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
     """
     numcodecs.blosc.use_threads = False
     storage_opts = {'anon': False} if is_s3 else None
+    support_store = None
+    if finalize_config is not None and finalize_config.support_volume_path is not None:
+        from vesuvius.models.run.finalize_outputs import open_support_volume
+        support_store = open_support_volume(
+            finalize_config.support_volume_path,
+            anon=finalize_config.support_anon,
+        )
     _worker_state.update({
         'part_files': part_files,
         'gaussian_map': gaussian_map,
@@ -404,6 +411,7 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
         'logits_stores': {},
         'output_store': open_zarr(output_path, mode='r+', storage_options=storage_opts),
         'finalize_config': finalize_config,
+        'support_store': support_store,
     })
 
 
@@ -444,6 +452,7 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
     patches_processed = 0
     patches_skipped_empty = 0
     num_patch_reads = 0
+    support_stats = None
     bytes_per_read = num_classes * pZ * pY * pX * 4  # uncompressed float32
 
     for part_id, patches in chunk_patches.items():
@@ -529,6 +538,24 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
         if finalize_config is not None:
             from vesuvius.models.run.finalize_outputs import apply_finalization
             result, is_empty = apply_finalization(chunk_logits, num_classes, finalize_config)
+            support_store = _worker_state.get('support_store')
+            if not is_empty and support_store is not None:
+                from vesuvius.models.run.finalize_outputs import (
+                    apply_support_mask,
+                    read_support_chunk,
+                )
+                spatial_slices = (
+                    slice(z_start, z_end),
+                    slice(y_start, y_end),
+                    slice(x_start, x_end),
+                )
+                support_np = read_support_chunk(support_store, spatial_slices)
+                result, support_stats = apply_support_mask(
+                    result,
+                    support_np,
+                    threshold=finalize_config.support_threshold,
+                )
+                is_empty = not np.any(result)
             if not is_empty:
                 # Finalized output may have different channel count than blended logits;
                 # write using slices that match the finalized shape.
@@ -548,6 +575,7 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
         'patches_skipped_empty': patches_skipped_empty,
         'num_patch_reads': num_patch_reads,
         'bytes_read_uncompressed': num_patch_reads * bytes_per_read,
+        'support_stats': support_stats,
     }
 
 # --- Utility Functions ---
@@ -713,7 +741,34 @@ def merge_inference_outputs(
             finalize_config.is_multi_task = part0_logits_store.attrs.get('is_multi_task', False)
             finalize_config.target_info = part0_logits_store.attrs.get('target_info', None)
 
-        from vesuvius.models.run.finalize_outputs import compute_finalized_shape
+        from vesuvius.models.run.finalize_outputs import (
+            SUPPORT_STAT_COUNT_KEYS,
+            compute_finalized_shape,
+            empty_support_mask_stats,
+            open_support_volume,
+            support_mask_stats_with_fraction,
+            validate_support_volume,
+        )
+        if finalize_config.support_volume_path is not None:
+            if finalize_config.mode != 'binary':
+                raise ValueError(
+                    "Support masking is currently supported only in binary mode."
+                )
+            if not np.isfinite(finalize_config.support_threshold):
+                raise ValueError(
+                    "support_threshold must be finite, got "
+                    f"{finalize_config.support_threshold}"
+                )
+            support_store = open_support_volume(
+                finalize_config.support_volume_path,
+                anon=finalize_config.support_anon,
+            )
+            validate_support_volume(support_store, original_volume_shape)
+            print(
+                f"Support mask: {finalize_config.support_volume_path} "
+                f"(supported when value > {finalize_config.support_threshold})"
+            )
+
         output_shape = compute_finalized_shape(original_volume_shape, num_classes, finalize_config)
         output_dtype = np.uint8
         print(f"Fused blend+finalize mode: {finalize_config.mode}, threshold={finalize_config.threshold}")
@@ -766,7 +821,8 @@ def merge_inference_outputs(
             compressor=compressor,
             dtype=output_dtype,
             fill_value=0,
-            write_empty_chunks=False
+            config={'write_empty_chunks': False},
+            zarr_format=2,
         )
     else:
         # Other parts wait for part 0 to create the arrays, then open them in r+ mode
@@ -853,6 +909,9 @@ def merge_inference_outputs(
     total_patch_reads = 0
     total_bytes_read = 0
     chunks_completed = 0
+    support_totals = (
+        empty_support_mask_stats() if finalize_config is not None else None
+    )
     wall_start = time.perf_counter()
 
     def print_progress_stats():
@@ -895,6 +954,10 @@ def merge_inference_outputs(
                 total_patches_skipped_empty += result.get('patches_skipped_empty', 0)
                 total_patch_reads += result.get('num_patch_reads', 0)
                 total_bytes_read += result.get('bytes_read_uncompressed', 0)
+                stats = result.get('support_stats')
+                if stats:
+                    for key in SUPPORT_STAT_COUNT_KEYS:
+                        support_totals[key] += int(stats[key])
 
                 chunks_completed += 1
 
@@ -924,6 +987,17 @@ def merge_inference_outputs(
         print(f"  Avg chunk size (uncompressed): {avg_bytes / 1024:.1f} KB")
         print(f"  Total data (uncompressed): {gb_read:.2f} GB")
         print(f"  Wall throughput: {gb_read / wall_elapsed:.2f} GB/s ({num_workers} workers)")
+    if finalize_config is not None and finalize_config.support_volume_path is not None:
+        support_summary = support_mask_stats_with_fraction(
+            support_totals,
+            scope='chunks_with_nonempty_finalized_output',
+        )
+        print(
+            "  Support mask: removed "
+            f"{support_totals['nonzero_voxels_removed']:,} nonzero spatial voxels; "
+            f"phantom fraction before masking was "
+            f"{support_summary['phantom_fraction_before']:.4%}"
+        )
     print(f"{'='*60}")
 
     # --- 10. Save Metadata ---
@@ -948,6 +1022,25 @@ def merge_inference_outputs(
             output_zarr.attrs['processing_mode'] = finalize_config.mode
             output_zarr.attrs['threshold_applied'] = finalize_config.threshold
             output_zarr.attrs['fused_blend_finalize'] = True
+            if finalize_config.support_volume_path is not None:
+                output_zarr.attrs['support_mask_applied'] = True
+                output_zarr.attrs['support_volume_path'] = finalize_config.support_volume_path
+                output_zarr.attrs['support_threshold'] = float(
+                    finalize_config.support_threshold
+                )
+                output_zarr.attrs['support_anonymous_access'] = bool(
+                    finalize_config.support_anon
+                )
+                output_zarr.attrs['support_alignment_validation'] = (
+                    'shape_only_physical_alignment_asserted_by_caller'
+                )
+                if num_parts == 1:
+                    output_zarr.attrs['support_mask_stats'] = (
+                        support_mask_stats_with_fraction(
+                            support_totals,
+                            scope='chunks_with_nonempty_finalized_output',
+                        )
+                    )
 
     print(f"\n--- Merging Finished ---")
     print(f"Final merged output saved to: {output_path}")
@@ -1042,8 +1135,14 @@ def blend_and_finalize_main():
     # Finalization args
     parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
                         help='Finalization mode. Default: binary')
-    from vesuvius.models.run.finalize_outputs import add_threshold_arguments, resolve_threshold
+    from vesuvius.models.run.finalize_outputs import (
+        add_support_mask_arguments,
+        add_threshold_arguments,
+        resolve_support_mask,
+        resolve_threshold,
+    )
     add_threshold_arguments(parser)
+    add_support_mask_arguments(parser)
 
     args = parser.parse_args()
 
@@ -1051,6 +1150,9 @@ def blend_and_finalize_main():
         parser.error(f"Invalid part_id {args.part_id} for num_parts {args.num_parts}.")
 
     effective_threshold = resolve_threshold(parser, args)
+    support_volume_path, support_threshold, support_anon = resolve_support_mask(
+        parser, args
+    )
 
     chunks = None
     if args.chunk_size:
@@ -1062,7 +1164,13 @@ def blend_and_finalize_main():
             parser.error("Invalid chunk_size format. Expected 3 comma-separated integers (Z,Y,X).")
 
     from vesuvius.models.run.finalize_outputs import FinalizeConfig
-    finalize_config = FinalizeConfig(mode=args.mode, threshold=effective_threshold)
+    finalize_config = FinalizeConfig(
+        mode=args.mode,
+        threshold=effective_threshold,
+        support_volume_path=support_volume_path,
+        support_threshold=support_threshold,
+        support_anon=support_anon,
+    )
 
     try:
         merge_inference_outputs(

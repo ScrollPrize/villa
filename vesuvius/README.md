@@ -26,6 +26,7 @@ _this package is in active development_
 | `vesuvius.predict`            | `models.run.inference`             | outputs logits from a pretrained nnUNet-v2 model or one trained within the Vesuvius training framework; currently only works on Zarr data and can be fully distributed with `--num_parts` and `--part_id` |
 | `vesuvius.blend_logits`       | `models.run.blending`              | blends the logits from `vesuvius.predict` using Gaussian blending                                                                                                                                         |
 | `vesuvius.finalize_outputs`   | `models.run.finalize_outputs`      | performs softmax / argmax / none on the blended array and writes a final `uint8` volume                                                                                                                   |
+| `vesuvius.mask_predictions`   | `models.run.mask_predictions`      | writes a support-masked copy of an existing finalized binary prediction and records phantom-positive statistics                                                                                           |
 | `vesuvius.compute_st`         | `structure_tensor.run_create_st`   | computes structure tensors on input data and derives eigen-values/vectors                                                                                                                                 |
 | `vesuvius.napari_trainer`     | `napari_trainer.main_window`       | launches a Napari window for interactive training and inference                                                                                                                                           |
 | `vesuvius.proofreader`        | `utils.vc_proofreader.main`        | opens a Napari window that loads local / remote image-label arrays and extracts training patches                                                                                                          |
@@ -34,6 +35,10 @@ _this package is in active development_
 | `vesuvius.render_obj`         | `rendering.mesh_to_surface`        | renders `.obj` meshes and outputs their surface-volume layers                                                                                                                                             |
 | `vesuvius.flatten_obj`        | `rendering.slim_uv`                | flattens an `.obj` mesh using `slim_uv`                                                                                                                                                                   |
 | `vesuvius.train`              | `models.run.train`                 | main entry point for training models                                                                                                                                                                      |
+
+Install the `blending` extra to use `vesuvius.blend_logits`,
+`vesuvius.blend_and_finalize`, `vesuvius.finalize_outputs`, or
+`vesuvius.mask_predictions`.
 
 
 

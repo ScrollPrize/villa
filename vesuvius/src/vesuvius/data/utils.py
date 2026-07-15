@@ -117,6 +117,13 @@ def open_zarr(path: str, mode: str = 'r',
     if verbose:
         print(f"Opening zarr store at {path} with mode={mode}")
     
+    # Zarr 3.2 rejects ``storage_options={}`` for local paths because those
+    # options are only meaningful for fsspec URLs. Pass the keyword only when
+    # there are actual backend options to apply.
+    storage_kwargs = (
+        {'storage_options': storage_options} if storage_options else {}
+    )
+
     # If we're creating a new array (mode='w') and shape is provided, pass creation parameters
     if mode == 'w' and shape is not None:
         create_kwargs = {}
@@ -137,7 +144,13 @@ def open_zarr(path: str, mode: str = 'r',
         if verbose:
             print(f"Creating new zarr array with shape={shape}, chunks={chunks}, dtype={dtype}")
         
-        return zarr.open(path, mode=mode, shape=shape, storage_options=storage_options, **create_kwargs)
+        return zarr.open(
+            path,
+            mode=mode,
+            shape=shape,
+            **storage_kwargs,
+            **create_kwargs,
+        )
     else:
         # Just open the existing array
-        return zarr.open(path, mode=mode, storage_options=storage_options, **kwargs)
+        return zarr.open(path, mode=mode, **storage_kwargs, **kwargs)

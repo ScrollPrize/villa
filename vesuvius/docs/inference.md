@@ -105,12 +105,97 @@ vesuvius.finalize_outputs /tmp/merged_logits.zarr /tmp/final_output.zarr \
 | `--mode` | `binary` (default), `multiclass`, or `surface_frame` (keeps 9-channel frame outputs; no thresholding).
 | `--threshold` | Binarize the probability map. In `binary` mode cuts at the probability given by `--threshold-value` (default `0.5`). In `multiclass` mode emits the argmax channel. Ignored in `surface_frame` mode.
 | `--threshold-value T` | Override the `--threshold` cutoff with `T` in `(0, 1)`. Requires `--threshold`. Binary mode only — rejected in `multiclass` since argmax ignores the cutoff.
+| `--support-volume PATH` | Mask finalized binary predictions with an exactly aligned 3-D support Zarr array (or a singleton-channel 4-D array).
+| `--support-threshold T` | Treat support values `<= T` as background (default `0`). Requires `--support-volume` when set to a non-default value.
+| `--support-authenticated` | Use configured credentials for an S3 support volume. Public S3 access is anonymous by default.
 | `--delete-intermediates` | Remove the source logits after a successful run.
 | `--chunk-size` | Spatial chunk size for the output store (`Z,Y,X`). Defaults to the logits chunking.
 | `--num-workers` | Worker processes for finalization (defaults to half of CPU cores).
 | `--quiet` | Suppress verbose logging.
 
 Without `--threshold`, binary mode outputs a single softmax foreground channel; multiclass mode writes one channel per class plus an argmax channel. `surface_frame` mode bypasses thresholding entirely and stores orthonormal 9-channel frames in float32.
+
+### Optional CT/support masking
+
+`vesuvius.finalize_outputs` and the fused `vesuvius.blend_and_finalize` command share the three support-mask options above. This feature is opt-in and currently supports only `--mode binary`. `--support-volume` must point directly to a Zarr array with spatial shape `(Z,Y,X)` exactly matching the output grid; a `(1,Z,Y,X)` singleton-channel array is also accepted. For an OME-Zarr pyramid, include the aligned resolution level in the path. The command validates rank and shape; the caller must verify that both arrays represent the same physical scan, axes, resolution level, and coordinate transform.
+
+The support mask is applied after softmax and optional prediction thresholding. A voxel remains supported only when its support value is finite and greater than `--support-threshold`; all output values at other voxels are set to background. Public `s3://` support volumes use anonymous access by default. Add `--support-authenticated` only when the support array requires configured AWS credentials.
+
+For example, [issue #1114](https://github.com/ScrollPrize/villa/issues/1114) compares this public PHerc0332 prediction level:
+
+```text
+s3://vesuvius-challenge-open-data/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr/0
+```
+
+with level `2` of the aligned masked CT volume; both have shape `(8398,3941,3941)`. To reproduce that artifact from its merged logits while removing voxels where the masked CT is `<= 5`:
+
+```bash
+vesuvius.finalize_outputs /path/to/PHerc0332-merged-logits.zarr /path/to/final.zarr \
+  --mode binary \
+  --threshold --threshold-value 0.2 \
+  --support-volume s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/2 \
+  --support-threshold 5
+```
+
+The same mask can be applied without writing merged logits first:
+
+```bash
+vesuvius.blend_and_finalize /path/to/partial-logits /path/to/final.zarr \
+  --mode binary \
+  --threshold --threshold-value 0.2 \
+  --support-volume s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/2 \
+  --support-threshold 5
+```
+
+Masked runs record `support_mask_applied`, the support path, threshold, and access mode in the output Zarr attributes. They also print the number and fraction of nonzero predictions removed. Single-part runs store those metrics in `support_mask_stats`; its scope is explicitly marked as chunks with nonempty finalized output.
+
+### Repair an existing finalized prediction
+
+Use `vesuvius.mask_predictions` when the prediction already exists, including
+published 3-D or singleton-channel binary Zarr arrays. It writes a masked copy,
+preserves supported values and source attributes, and records an exact
+artifact-wide phantom fraction over all nonzero input predictions:
+
+Install the package with its `blending` extra before using this command. When
+prediction and support chunks differ, its default work/output chunk is a
+memory-bounded common multiple (384³ for the 192³ prediction and 128³ CT in the
+example), avoiding repeated reads across mismatched chunk boundaries.
+
+```bash
+vesuvius.mask_predictions \
+  s3://vesuvius-challenge-open-data/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr/0 \
+  /data/PHerc0332-surface-m7-supported.zarr \
+  --support-volume s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/2 \
+  --support-threshold 5 \
+  --num-workers 8
+```
+
+Public S3 inputs are anonymous by default. Use `--authenticated-inputs` only
+for private prediction or support arrays. The output path must not replace
+or contain either input (and vice versa). This command writes one plain Zarr
+array, not an OME multiscale root. Before publishing it as a drop-in
+replacement, regenerate the pyramid and root metadata while copying the
+support-mask provenance and statistics to the published root. Pyramid
+regeneration is deliberately outside this single-array command.
+
+To audit an already-finalized artifact without writing a corrected full volume,
+stream only selected planes with the bundled benchmark:
+
+```bash
+uv run --extra blending python -m vesuvius.models.benchmarks.benchmark_support_mask \
+  s3://vesuvius-challenge-open-data/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr/0 \
+  s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/2 \
+  --planes 2000 4224 6000 \
+  --support-threshold 5 \
+  --output-json PHerc0332-support-audit.json
+```
+
+The JSON report includes per-plane and aggregate phantom-positive fractions,
+removed voxel counts, supported-value preservation, elapsed time, and source
+array metadata. It materializes only one prediction/support plane pair at a
+time. `logical_plane_bytes` is the in-memory NumPy payload; the separate
+intersecting-chunk upper bound describes uncompressed 3-D chunk payload and is
+not a claim about compressed network transfer.
 
 ## Full Remote Workflow Example
 

@@ -23,6 +23,142 @@ class FinalizeConfig:
     threshold: Optional[float] = None  # None=probabilities; float in (0,1)=binarize at that probability
     is_multi_task: bool = False
     target_info: Optional[dict] = None
+    support_volume_path: Optional[str] = None
+    support_threshold: float = 0.0
+    support_anon: bool = True
+
+
+SUPPORT_STAT_COUNT_KEYS = (
+    "spatial_voxels",
+    "supported_voxels",
+    "unsupported_voxels",
+    "nonzero_voxels_before",
+    "nonzero_voxels_after",
+    "nonzero_voxels_removed",
+)
+
+
+def empty_support_mask_stats():
+    """Return zeroed counters used to aggregate chunk-level mask statistics."""
+    return {key: 0 for key in SUPPORT_STAT_COUNT_KEYS}
+
+
+def support_mask_stats_with_fraction(totals, *, scope: str):
+    """Add the issue #1114 phantom fraction and an explicit counting scope."""
+    stats = {key: int(totals[key]) for key in SUPPORT_STAT_COUNT_KEYS}
+    positives = stats["nonzero_voxels_before"]
+    stats["phantom_fraction_before"] = (
+        float(stats["nonzero_voxels_removed"] / positives) if positives else 0.0
+    )
+    stats["scope"] = scope
+    return stats
+
+
+def apply_support_mask(output_np, support_np, threshold: float = 0.0):
+    """Mask finalized predictions where the source volume has no support.
+
+    ``output_np`` is channel-first ``(C, Z, Y, X)`` data. ``support_np`` may
+    be either ``(Z, Y, X)`` or a singleton-channel ``(1, Z, Y, X)`` array.
+    Non-finite support values and values less than or equal to ``threshold``
+    are treated as unsupported.
+
+    Returns a masked copy and spatial-voxel statistics. A spatial voxel is
+    counted once even when multiple output channels were non-zero there.
+    """
+    output_np = np.asarray(output_np)
+    support_np = np.asarray(support_np)
+
+    if output_np.ndim != 4:
+        raise ValueError(
+            f"output_np must have shape (C, Z, Y, X), got {output_np.shape}"
+        )
+    if support_np.ndim == 4:
+        if support_np.shape[0] != 1:
+            raise ValueError(
+                "4D support arrays must have a singleton channel dimension; "
+                f"got {support_np.shape}"
+            )
+        support_np = support_np[0]
+    if support_np.ndim != 3:
+        raise ValueError(
+            f"support_np must have shape (Z, Y, X) or (1, Z, Y, X), got {support_np.shape}"
+        )
+    if output_np.shape[1:] != support_np.shape:
+        raise ValueError(
+            "Support/output spatial shape mismatch: "
+            f"{support_np.shape} vs {output_np.shape[1:]}"
+        )
+    if not np.isfinite(threshold):
+        raise ValueError(f"support threshold must be finite, got {threshold}")
+
+    supported = np.isfinite(support_np) & (support_np > threshold)
+    nonzero_before = np.any(output_np != 0, axis=0)
+    removed = nonzero_before & ~supported
+    nonzero_after = nonzero_before & supported
+
+    masked = output_np.copy()
+    masked[:, ~supported] = 0
+    stats = {
+        "spatial_voxels": int(supported.size),
+        "supported_voxels": int(np.count_nonzero(supported)),
+        "unsupported_voxels": int(np.count_nonzero(~supported)),
+        "nonzero_voxels_before": int(np.count_nonzero(nonzero_before)),
+        "nonzero_voxels_after": int(np.count_nonzero(nonzero_after)),
+        "nonzero_voxels_removed": int(np.count_nonzero(removed)),
+    }
+    return masked, stats
+
+
+def open_support_volume(path: str, anon: bool = True):
+    """Open a support Zarr array using public-S3 defaults when appropriate."""
+    storage_options = {"anon": bool(anon)} if path.startswith("s3://") else None
+    return open_zarr(path=path, mode="r", storage_options=storage_options)
+
+
+_support_store_cache = {}
+
+
+def get_cached_support_volume(path: str, anon: bool = True):
+    """Open a support array once per process and reuse it for later chunks."""
+    key = (path, bool(anon))
+    if key not in _support_store_cache:
+        _support_store_cache[key] = open_support_volume(path, anon=anon)
+    return _support_store_cache[key]
+
+
+def validate_support_volume(support_store, spatial_shape):
+    """Validate rank and shape; physical-grid alignment remains caller-asserted."""
+    if not hasattr(support_store, "shape"):
+        raise ValueError(
+            "Support volume must point to a Zarr array (for OME-Zarr, include the "
+            "resolution level such as '/2'), not a group."
+        )
+
+    shape = tuple(int(v) for v in support_store.shape)
+    if len(shape) == 4 and shape[0] == 1:
+        support_spatial_shape = shape[1:]
+    elif len(shape) == 3:
+        support_spatial_shape = shape
+    else:
+        raise ValueError(
+            "Support volume must have shape (Z, Y, X) or (1, Z, Y, X), "
+            f"got {shape}"
+        )
+
+    expected = tuple(int(v) for v in spatial_shape)
+    if support_spatial_shape != expected:
+        raise ValueError(
+            "Support/output spatial shape mismatch: "
+            f"{support_spatial_shape} vs {expected}. Choose the aligned OME-Zarr level."
+        )
+    return shape
+
+
+def read_support_chunk(support_store, spatial_slices):
+    """Read a spatial chunk from a validated 3D or singleton-channel array."""
+    if len(support_store.shape) == 4:
+        return np.asarray(support_store[(0,) + tuple(spatial_slices)])
+    return np.asarray(support_store[tuple(spatial_slices)])
 
 
 def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
@@ -39,9 +175,9 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
     Returns:
         (output_uint8, is_empty) — finalized uint8 array or (None, True) for empty chunks
     """
-    # Check if this is an empty chunk (all values are the same)
-    first_value = logits_np.flat[0]
-    is_empty = np.allclose(logits_np, first_value, rtol=1e-6)
+    # A zero-filled chunk means no model contributions in this pipeline. Other
+    # constant logits are valid predictions and must still be finalized.
+    is_empty = not np.any(logits_np)
 
     if is_empty:
         return None, True
@@ -113,6 +249,11 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
 
     if mode == "binary":
         output_np = np.clip(output_np * 255.0, 0, 255).astype(np.uint8)
+    elif threshold is not None:
+        # Thresholded multiclass output is a label map. Preserve the class IDs
+        # verbatim so their values do not depend on which labels happen to be
+        # present in an individual chunk.
+        output_np = np.clip(output_np, 0, 255).astype(np.uint8)
     else:
         # Scale to uint8 range [0, 255]
         min_val = output_np.min()
@@ -120,11 +261,11 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
         if min_val < max_val:
             output_np = ((output_np - min_val) / (max_val - min_val) * 255).astype(np.uint8)
         else:
-            return None, True
+            output_np = np.clip(output_np, 0, 255).astype(np.uint8)
 
-        # Final check: if the processed data is homogeneous, don't write it
-        first_processed_value = output_np.flat[0]
-        if np.all(output_np == first_processed_value):
+    if mode == "multiclass":
+        # A homogeneous nonzero label is still a valid multiclass prediction.
+        if not np.any(output_np):
             return None, True
 
     return output_np, False
@@ -160,7 +301,21 @@ def compute_finalized_shape(spatial_shape, num_classes, config: FinalizeConfig):
             return (num_classes + 1, *spatial_shape)
 
 
-def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, output_chunks, is_multi_task=False, target_info=None):
+def process_chunk(
+    chunk_info,
+    input_path,
+    output_path,
+    mode,
+    threshold,
+    num_classes,
+    spatial_shape,
+    output_chunks,
+    is_multi_task=False,
+    target_info=None,
+    support_volume_path=None,
+    support_threshold=0.0,
+    support_anon=True,
+):
     """
     Process a single chunk of the volume in parallel.
 
@@ -175,6 +330,9 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
         output_chunks: Chunk size for output
         is_multi_task: Whether this is a multi-task model
         target_info: Dictionary with target information for multi-task models
+        support_volume_path: Optional aligned CT/support Zarr array
+        support_threshold: Support values <= this threshold are masked
+        support_anon: Use anonymous credentials for an S3 support volume
     """
     
     chunk_idx = chunk_info['indices']
@@ -208,11 +366,40 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
     output_np, is_empty = apply_finalization(logits_np, num_classes, config)
 
     if is_empty:
-        return {'chunk_idx': chunk_idx, 'processed_voxels': 0, 'empty': True}
+        return {
+            'chunk_idx': chunk_idx,
+            'processed_voxels': 0,
+            'empty': True,
+            'support_stats': None,
+        }
+
+    support_stats = None
+    if support_volume_path is not None:
+        support_store = get_cached_support_volume(
+            support_volume_path,
+            anon=support_anon,
+        )
+        support_np = read_support_chunk(support_store, spatial_slices)
+        output_np, support_stats = apply_support_mask(
+            output_np,
+            support_np,
+            threshold=support_threshold,
+        )
+        if not np.any(output_np):
+            return {
+                'chunk_idx': chunk_idx,
+                'processed_voxels': 0,
+                'empty': True,
+                'support_stats': support_stats,
+            }
 
     output_slice = (slice(None),) + spatial_slices
     output_store[output_slice] = output_np
-    return {'chunk_idx': chunk_idx, 'processed_voxels': np.prod(output_np.shape)}
+    return {
+        'chunk_idx': chunk_idx,
+        'processed_voxels': int(np.prod(output_np.shape)),
+        'support_stats': support_stats,
+    }
 
 
 def finalize_logits(
@@ -225,7 +412,10 @@ def finalize_logits(
     num_workers: int = None,  # Number of worker processes to use
     verbose: bool = True,
     num_parts: int = 1,  # Number of parts to split processing into
-    part_id: int = 0  # Part ID for this process (0-indexed)
+    part_id: int = 0,  # Part ID for this process (0-indexed)
+    support_volume_path: Optional[str] = None,
+    support_threshold: float = 0.0,
+    support_anon: bool = True,
 ):
     """
     Process merged logits and apply softmax/argmax to produce final outputs.
@@ -241,6 +431,10 @@ def finalize_logits(
         verbose: Print progress messages
         num_parts: Number of parts to split the finalization process into
         part_id: Part ID for this process (0-indexed). Used for Z-axis partitioning
+        support_volume_path: Optional aligned CT/support Zarr array. Values at
+            or below support_threshold are removed from finalized outputs.
+        support_threshold: Maximum value considered unsupported.
+        support_anon: Use anonymous credentials for an S3 support volume.
     """
     tqdm_kwargs = get_tqdm_kwargs()
     if not verbose:
@@ -277,6 +471,20 @@ def finalize_logits(
     input_shape = input_store.shape
     num_classes = input_shape[0]
     spatial_shape = input_shape[1:]  # (Z, Y, X)
+
+    if support_volume_path is not None:
+        if mode != "binary":
+            raise ValueError("Support masking is currently supported only in binary mode.")
+        if not np.isfinite(support_threshold):
+            raise ValueError(
+                f"support_threshold must be finite, got {support_threshold}"
+            )
+        support_store = open_support_volume(support_volume_path, anon=support_anon)
+        validate_support_volume(support_store, spatial_shape)
+        print(
+            f"Support mask: {support_volume_path} "
+            f"(supported when value > {support_threshold})"
+        )
     
     # Check for multi-task metadata
     is_multi_task = False
@@ -367,8 +575,8 @@ def finalize_logits(
             chunks=output_chunks,
             dtype=np.uint8,
             compressor=compressor,
-            write_empty_chunks=False,
-            overwrite=True
+            config={'write_empty_chunks': False},
+            zarr_format=2,
         )
     else:
         # Other parts wait for part 0 to create the array, then open it in r+ mode
@@ -447,11 +655,15 @@ def finalize_logits(
         spatial_shape=spatial_shape,
         output_chunks=output_chunks,
         is_multi_task=is_multi_task,
-        target_info=target_info
+        target_info=target_info,
+        support_volume_path=support_volume_path,
+        support_threshold=support_threshold,
+        support_anon=support_anon,
     )
     
     total_processed = 0
     empty_chunks = 0
+    support_totals = empty_support_mask_stats()
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
 
         future_to_chunk = {executor.submit(process_chunk_partial, chunk): chunk for chunk in chunk_infos}
@@ -469,11 +681,26 @@ def finalize_logits(
                     empty_chunks += 1
                 else:
                     total_processed += result['processed_voxels']
+                stats = result.get('support_stats')
+                if stats:
+                    for key in SUPPORT_STAT_COUNT_KEYS:
+                        support_totals[key] += int(stats[key])
             except Exception as e:
                 print(f"Error processing chunk: {e}")
                 raise e
     
     print(f"\nOutput processing complete. Processed {total_chunks - empty_chunks} chunks, skipped {empty_chunks} empty chunks ({empty_chunks/total_chunks:.2%}).")
+    if support_volume_path is not None:
+        support_summary = support_mask_stats_with_fraction(
+            support_totals,
+            scope='chunks_with_nonempty_finalized_output',
+        )
+        print(
+            "Support masking removed "
+            f"{support_totals['nonzero_voxels_removed']:,} nonzero spatial voxels; "
+            f"phantom fraction before masking was "
+            f"{support_summary['phantom_fraction_before']:.4%}."
+        )
 
     # Only part 0 updates metadata to avoid conflicts
     if part_id == 0:
@@ -487,6 +714,21 @@ def finalize_logits(
                 output_store.attrs['empty_chunks_skipped'] = empty_chunks
                 output_store.attrs['total_chunks'] = total_chunks
                 output_store.attrs['empty_chunk_percentage'] = float(empty_chunks/total_chunks) if total_chunks > 0 else 0.0
+                if support_volume_path is not None:
+                    output_store.attrs['support_mask_applied'] = True
+                    output_store.attrs['support_volume_path'] = support_volume_path
+                    output_store.attrs['support_threshold'] = float(support_threshold)
+                    output_store.attrs['support_anonymous_access'] = bool(support_anon)
+                    output_store.attrs['support_alignment_validation'] = (
+                        'shape_only_physical_alignment_asserted_by_caller'
+                    )
+                    if num_parts == 1:
+                        output_store.attrs['support_mask_stats'] = (
+                            support_mask_stats_with_fraction(
+                                support_totals,
+                                scope='chunks_with_nonempty_finalized_output',
+                            )
+                        )
         except Exception as e:
             print(f"Warning: Failed to copy metadata: {e}")
     elif verbose:
@@ -535,6 +777,57 @@ def add_threshold_arguments(parser):
                              '(float in (0, 1)). Binary mode only.')
 
 
+def add_support_mask_arguments(parser):
+    """Register opt-in source-volume support masking arguments."""
+    parser.add_argument(
+        '--support-volume',
+        dest='support_volume',
+        type=str,
+        default=None,
+        help=(
+            'Shape-aligned 3D source/support Zarr array. Finalized predictions are set '
+            'to background where its value is <= --support-threshold. For an '
+            "OME-Zarr pyramid, include the matching resolution level (for example '/2'). "
+            'The caller must assert physical-grid alignment.'
+        ),
+    )
+    parser.add_argument(
+        '--support-threshold',
+        dest='support_threshold',
+        type=float,
+        default=0.0,
+        help='Maximum source value treated as unsupported. Default: 0.',
+    )
+    parser.add_argument(
+        '--support-authenticated',
+        dest='support_authenticated',
+        action='store_true',
+        help='Use configured credentials for an S3 support volume. Public S3 is anonymous by default.',
+    )
+
+
+def resolve_support_mask(parser, args):
+    """Validate support-mask CLI arguments and return path, threshold, anon."""
+    if args.support_volume is None:
+        if args.support_threshold != 0.0:
+            parser.error("--support-threshold requires --support-volume")
+        if args.support_authenticated:
+            parser.error("--support-authenticated requires --support-volume")
+        return None, 0.0, True
+
+    if args.mode != 'binary':
+        parser.error("--support-volume is currently supported only with --mode binary")
+    if not np.isfinite(args.support_threshold):
+        parser.error(
+            f"--support-threshold must be finite, got {args.support_threshold}"
+        )
+    return (
+        args.support_volume,
+        float(args.support_threshold),
+        not args.support_authenticated,
+    )
+
+
 def resolve_threshold(parser, args):
     """Validate --threshold / --threshold-value and return the effective Optional[float] cutoff.
 
@@ -563,6 +856,7 @@ def main():
     parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
                       help='Processing mode. "binary" for 2-class segmentation, "multiclass" for >2 classes. Default: binary')
     add_threshold_arguments(parser)
+    add_support_mask_arguments(parser)
     parser.add_argument('--delete-intermediates', dest='delete_intermediates', action='store_true',
                       help='Delete intermediate logits after processing')
     parser.add_argument('--chunk-size', dest='chunk_size', type=str, default=None,
@@ -583,6 +877,9 @@ def main():
         parser.error(f"Invalid part_id {args.part_id} for num_parts {args.num_parts}. part_id must be 0 <= part_id < num_parts")
 
     effective_threshold = resolve_threshold(parser, args)
+    support_volume_path, support_threshold, support_anon = resolve_support_mask(
+        parser, args
+    )
 
     chunks = None
     if args.chunk_size:
@@ -603,7 +900,10 @@ def main():
             num_workers=args.num_workers,
             verbose=not args.quiet,
             num_parts=args.num_parts,
-            part_id=args.part_id
+            part_id=args.part_id,
+            support_volume_path=support_volume_path,
+            support_threshold=support_threshold,
+            support_anon=support_anon,
         )
         return 0
     except Exception as e:
