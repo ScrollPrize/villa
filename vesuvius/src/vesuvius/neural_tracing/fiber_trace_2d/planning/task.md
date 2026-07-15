@@ -1,15 +1,29 @@
-# S1A NML All-Data Training Config
+# 3D Fiber CP Model Variant
 
-Rename and clean up the S1A NML config so it clearly loads all available S1A
-NML files from the local `fiber_vols` source as training data.
+Plan a 3D variant of the current CP-centered 2D fiber model approach.
 
 Requirements:
 
-- Rename the config away from the generic/test example name.
-- Use the full S1A NML glob:
-  `/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fiber_vols/fibers_s1a_*.nml`.
-- Keep the PHercParis4 base volume, selected scale, Lasagna manifest, and
-  existing S1A affine transform settings.
-- Avoid silently mixing the old JSON held-out test dataset into this S1A config.
-- Keep `training.max_sample_index: 0` so training/prefetch can cover the full
-  deterministic S1A CP stream.
+- Load 3D patches around fiber control points.
+- Do not construct fiber-aligned 3D strips or slices for loading; the 3D path
+  loads an ordinary CP-centered 3D volume block and applies augmentation to that
+  block.
+- Apply deterministic coordinate-space geometric augmentation and GPU value
+  augmentation around those CPs.
+- Use an existing Vesuvius 3D U-Net/fiber model configuration where possible,
+  or wrap the regular Vesuvius 3D U-Net backbone with fiber-specific heads.
+- Train fiber direction and fiber presence, analogous to the current 2D side
+  model.
+- Encode 3D direction as Lasagna's 3x2 ambiguous direction channels.
+- For the initial evaluation path, run 3D inference, project the predicted 3D
+  direction field onto a 2D test fiber strip, and reuse the 2D strip tracer
+  there.
+- Read the 3D augmentation special-case TODOs from `planning/todo.md` and
+  include an explicit augmentation-by-augmentation adaptation plan.
+- Keep the current 2D fiber training, runner, prefetch, and visualization code
+  supported.
+- Share the fast Zarr/chunk loading and prefetch code between 2D and 3D where
+  practical, while keeping the 3D model/loader/training path separate.
+- Target significantly larger effective training batches, around 192 CP
+  patches per optimizer step, with micro-batching if dense 3D U-Net memory
+  requires it.

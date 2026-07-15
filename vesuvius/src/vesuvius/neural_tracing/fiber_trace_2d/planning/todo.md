@@ -42,8 +42,8 @@
 - [ ] 3d augmentations special cases
     - [ ] smooth distortion (dist field in 1 dim, 2 dims and 3d
     - [ ] blur in isotropic but also anisotropic (directional - 1 dir stronger two others small), and arbitrarily rorated
-    - [ ] ringing artifact?
-    - [ ] no shift?
+    - ([ ] ringing artifact?)
+    - [ ] no skew?
     - [ ] special load/aug config key - round training patch to chunk boundaries
 
 ## z-search training
