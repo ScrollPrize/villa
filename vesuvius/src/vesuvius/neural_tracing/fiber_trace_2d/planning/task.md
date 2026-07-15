@@ -1,28 +1,34 @@
-# 3D Fiber Loader Performance Rewrite
+# 3D Fiber PyTorch DataLoader Parallelism
 
-The current 3D CP-centered training path has abysmal loader performance. The
-observed training output shows `load_ms` around 10-15 seconds for a single
-192^3 patch while forward/backward is around 0.5 seconds.
+The previous 3D loader optimization did not fulfill the requested runtime
+parallelism requirement. It replaced the slow zarr-crop/grid-sample path with
+VC3D coordinate sampling, but the training overlap path used a
+`ThreadPoolExecutor` around `load_batch` instead of PyTorch data-loader
+parallelism.
 
 Required behavior:
 
-- Establish a current load-only benchmark baseline before changing the loader.
-- Stop using the custom `_read_raw_block` zarr crop path plus torch
-  `grid_sample` as the normal 3D training input loader.
-- Build explicit 3D augmentation coordinate maps in the same spirit as the 2D
-  fiber loader: geometry is represented as concrete output-to-source and
-  source-to-output maps, with no search, brute-force inversion, or iterative
-  inverse solving.
-- Use the VC3D coordinate sampler for 3D patch loading so chunk discovery,
-  blocking chunk fetch/decode, cache use, and sampling go through the same
-  production machinery as the 2D fiber loader.
-- Use sensible runtime parallelization inspired by the 2D fiber loader. Do not
-  rely on `ThreadPoolExecutor` for CPU-heavy Python work that is effectively
-  serialized by the GIL.
-- Ground-truth creation must draw/project the transformed fiber segments and
-  segment mask directly from the coordinate maps. Preprocessing/loading must not
-  require nearest-segment searches over full dense patches, inverse solving, or
-  other search-based geometry recovery.
-- Preserve deterministic random sample ordering: changing batch size or max
-  step count may truncate/extend the deterministic prefix, but must not reshuffle
-  prior samples.
+- Replace the thread-backed `_OrderedBatchLoadPipeline` with a real
+  `torch.utils.data.DataLoader` based batch-loading path for
+  `fiber_trace_3d.train`.
+- Use PyTorch worker processes (`num_workers`) for independent batch loading,
+  not Python threads for CPU-heavy work.
+- Each worker must lazily construct/open its own `FiberTrace3DLoader` and VC3D
+  sampler state inside the worker process; opened zarr/VC3D handles must not be
+  pickled from the main process.
+- Preserve deterministic training order exactly. Changing worker count,
+  prefetch factor, batch size, or max steps must not reshuffle the sample-index
+  sequence consumed by training.
+- DataLoader items should represent whole training batches or otherwise avoid
+  nested/default collation that would corrupt `FiberTrace3DBatch` dataclasses.
+- Workers must return CPU tensors only. Any optional worker-side CUDA
+  coordinate generation must use worker-owned CUDA context/stream and must
+  synchronize/copy to CPU before returning data to the main training process.
+- Main training process moves the returned batch to the training device before
+  forward/backward.
+- `--benchmark --load-only` must exercise the same DataLoader path so loader
+  parallelism can be measured directly without model work.
+- Keep the existing VC3D coordinate sampling and search-free segment target
+  generation semantics from the previous patch.
+- Document and test this explicitly. Silent fallback to the old thread-backed
+  path is not acceptable.

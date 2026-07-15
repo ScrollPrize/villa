@@ -1,17 +1,13 @@
-# 3D Fiber Loader Performance Rewrite Status
+# 3D Fiber PyTorch DataLoader Parallelism Status
 
 - [x] Read AGENTS.md workflow.
 - [x] Replace `planning/task.md` with the current user task.
 - [x] Replace `planning/task_plan.md` with the implementation plan.
-- [x] Review task plan against current specs before implementation.
-- [x] Run current 3D load-only benchmark baseline.
-- [x] Implement VC3D coordinate-map loading for 3D.
-- [x] Implement search-free 3D segment target drawing.
-- [ ] Implement process-parallel 3D batch loading.
-- [x] Implement ordered training load pipeline.
-- [x] Update 3D prefetch to use coordinate dependencies.
-- [x] Add/adjust tests.
-- [x] Update specs/docs/changelog/task_log.
-- [x] Run focused tests.
-- [x] Run after-change load-only benchmark.
-- [ ] Run after-change full forward/backward benchmark.
+- [x] Review current code/spec context for DataLoader integration.
+- [ ] Implement PyTorch DataLoader-backed 3D batch loading.
+- [ ] Remove the thread-backed `_OrderedBatchLoadPipeline`.
+- [ ] Update 3D config keys and defaults.
+- [ ] Update specs/docs/changelog/task_log.
+- [ ] Add/adjust DataLoader determinism tests.
+- [ ] Run focused tests.
+- [ ] Rerun the approved 3D load-only benchmark command.
