@@ -58,9 +58,9 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     with open(path, 'r') as f:
         data = json.load(f)
 
-    points_xyz = data.get('line_points') or data.get('control_points') or []
+    points_xyz = data.get('control_points', [])
     if not points_xyz:
-        print(f'WARNING: fiber {path} has no line_points/control_points; skipping')
+        print(f'WARNING: fiber {path} has no control_points; skipping')
         return None
 
     points_xyz = np.asarray(points_xyz, dtype=np.float32)
