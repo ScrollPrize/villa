@@ -459,6 +459,94 @@ class UploadTests(unittest.TestCase):
         self.assertFalse(ephemeral_dir.exists())
 
 
+def _zip_checkpoint_bytes():
+    import io as _io
+    import zipfile
+    buffer = _io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("data.pkl", b"payload")
+    return buffer.getvalue()
+
+
+class CheckpointUploadTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        (self.root / "umbilicus.json").write_text("{}")
+        (self.root / "verified_patches").mkdir()
+        (self.root / "spiral_output").mkdir()
+        self.resolution = resolve_dataset_root(self.root)
+        self.assertTrue(self.resolution.ok)
+        self.state = ServiceState(dataset_root=str(self.root),
+                                  dataset_resolution=self.resolution)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _upload_checkpoint(self, name, data=None):
+        data = data if data is not None else _zip_checkpoint_bytes()
+        upload_id = _upload_input(self.state, "checkpoint", name, {name: data})
+        return self.state.finalize_upload(upload_id)["input"]
+
+    def test_checkpoint_upload_works_without_a_session_in_dataset_mode(self):
+        record = self._upload_checkpoint("resume.ckpt")
+        published = Path(record["path"])
+        self.assertTrue(published.is_file())
+        self.assertIn("uploaded-checkpoints", str(published))
+        # The published path lies under the output directory, so the
+        # dataset-mode load validation accepts it as a resume checkpoint.
+        request = self.state._dataset_session_request(
+            {"paths": {"checkpoint": str(published)},
+             "run": {"z_begin": 0, "z_end": 10}})
+        self.assertEqual(request["paths"]["checkpoint"], str(published))
+        # Checkpoint uploads are not session inputs: nothing ephemeral listed.
+        self.assertEqual(self.state.status()["ephemeral_inputs"], [])
+
+    def test_checkpoint_upload_requires_output_root(self):
+        bare = ServiceState()
+        with self.assertRaises(ApiError) as caught:
+            bare.begin_upload({"kind": "checkpoint", "id": "resume.ckpt",
+                               "files": [{"name": "resume.ckpt", "size": 1,
+                                          "sha256": "0" * 64}]})
+        self.assertEqual(caught.exception.status, 409)
+
+    def test_invalid_container_is_rejected(self):
+        upload_id = _upload_input(self.state, "checkpoint", "bad.ckpt",
+                                  {"bad.ckpt": b"not a torch archive"})
+        with self.assertRaisesRegex(ApiError, "Invalid checkpoint"):
+            self.state.finalize_upload(upload_id)
+        self.assertFalse(any((self.root / "spiral_output" / "uploaded-checkpoints").glob("*"))
+                         if (self.root / "spiral_output" / "uploaded-checkpoints").exists()
+                         else False)
+
+    def test_name_collision_is_uniquified_not_overwritten(self):
+        first = self._upload_checkpoint("resume.ckpt")
+        second = self._upload_checkpoint("resume.ckpt")
+        self.assertNotEqual(first["path"], second["path"])
+        self.assertTrue(Path(first["path"]).is_file())
+        self.assertTrue(Path(second["path"]).is_file())
+
+    def test_retention_prunes_old_uploads(self):
+        published = [Path(self._upload_checkpoint(f"resume-{i}.ckpt")["path"])
+                     for i in range(spiral_service.UPLOADED_CHECKPOINTS_KEPT + 2)]
+        for old_age, path in enumerate(published):
+            if path.exists():
+                # Ensure distinguishable mtimes for deterministic pruning.
+                os.utime(path, (time.time() + old_age, time.time() + old_age))
+        surviving = [path for path in published if path.exists()]
+        self.assertLessEqual(len(surviving), spiral_service.UPLOADED_CHECKPOINTS_KEPT)
+        self.assertTrue(published[-1].exists(), "the newest upload must survive")
+
+    def test_checkpoint_uploads_are_exempt_from_ephemeral_quota(self):
+        original = spiral_service.EPHEMERAL_QUOTA_BYTES
+        spiral_service.EPHEMERAL_QUOTA_BYTES = 1
+        try:
+            record = self._upload_checkpoint("big.ckpt")
+            self.assertTrue(Path(record["path"]).is_file())
+        finally:
+            spiral_service.EPHEMERAL_QUOTA_BYTES = original
+
+
 class CommitTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

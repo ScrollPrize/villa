@@ -120,6 +120,16 @@ a fiber in the Fibers panel and pick *Add to current spiral fit*. Added inputs
 are uploaded into a session-scoped ephemeral folder, used from the next run
 onward, and can be moved into the dataset with *Commit current inputs*.
 
+**Resume checkpoints on a remote profile:** the Checkpoint field accepts a
+service-advertised checkpoint (a `*.ckpt` at the dataset root), a service path
+under the output directory (for example the autosave), or a **client-local
+`.ckpt` file** — use the browse button. A local file is uploaded to the
+service's `<output>/uploaded-checkpoints/` directory before the session loads
+(the panel shows progress; the transfer restarts if interrupted). The service
+validates the archive, never overwrites an existing upload, and keeps the
+newest few uploaded checkpoints. To bring a fit result back to the client, use
+*Download Checkpoint…*.
+
 ### Shutdown and logs
 
 Stop the service with `Ctrl-C` or `SIGTERM` (`tmux kill-session -t spiral`);

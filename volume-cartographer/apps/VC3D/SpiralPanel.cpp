@@ -414,6 +414,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
         _warnings->setText(error);
     });
+    connect(_service, &SpiralServiceManager::checkpointUploadProgress, this,
+            [this](qint64 sent, qint64 total) {
+                if (total > 0)
+                    _state->setText(tr("Uploading resume checkpoint… %1 / %2 MB")
+                                        .arg(sent / 1000000).arg(total / 1000000));
+            });
     connect(_service, &SpiralServiceManager::checkpointDownloadFinished, this,
             [this](const QString& path, const QString& error) {
                 if (error.isEmpty())
@@ -671,10 +677,17 @@ void SpiralPanel::setRemoteMode(bool remote)
     const QStringList clientSelectable{QStringLiteral("checkpoint"), QStringLiteral("tracks_dbm")};
     for (auto it = _paths.begin(); it != _paths.end(); ++it) {
         const bool selectable = clientSelectable.contains(it.key());
+        // The checkpoint browse button stays in remote mode: a client-local
+        // .ckpt selected here is uploaded to the service before the load.
+        const bool browsable = !remote || it.key() == QStringLiteral("checkpoint");
         it.value()->setReadOnly(remote && !selectable);
         if (_pathBrowseButtons.contains(it.key()))
-            _pathBrowseButtons[it.key()]->setVisible(!remote);
+            _pathBrowseButtons[it.key()]->setVisible(browsable);
     }
+    _paths[QStringLiteral("checkpoint")]->setToolTip(
+        remote ? tr("A service-advertised checkpoint, a service path under the output "
+                    "directory, or a local .ckpt file to upload for resume")
+               : QString());
     _refill->setVisible(!remote);
     _pclRole->setEnabled(!remote);
     _pclPath->setEnabled(!remote);

@@ -79,6 +79,7 @@ signals:
     void previewAvailable(const QString& manifestPath, qint64 generation);
     void geometryAvailable(const QString& manifestPath, quint64 generation);
     void checkpointDownloadFinished(const QString& localPath, const QString& error);
+    void checkpointUploadProgress(qint64 sentBytes, qint64 totalBytes);
     void inputUploadFinished(const QString& inputId, const QString& error);
     void logMessage(const QString& message);
     void errorOccurred(const QString& message);
@@ -122,6 +123,12 @@ private:
     QJsonObject remoteInputPaths() const;
     void continueUpload(const QString& uploadId, const QString& inputId,
                         const QString& baseDir, QStringList pendingFiles);
+    void sendLoadRequest(QJsonObject request, const QJsonObject& inputPaths);
+    // Streams a client-local resume checkpoint into the service's
+    // uploaded-checkpoints directory and reports the resulting host path.
+    void uploadCheckpointForResume(const QString& localPath,
+                                   std::function<void(const QString& hostPath,
+                                                      const QString& error)> done);
 
     SpiralServiceProfile _profile;
     QProcess* _process = nullptr;       // owned local service process, if any

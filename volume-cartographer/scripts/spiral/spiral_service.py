@@ -34,7 +34,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
 from fit_session import (API_VERSION, PclRole, parse_session_request,
-                         resolve_dataset_root, validate_session_request)
+                         resolve_dataset_root, validate_checkpoint_container,
+                         validate_session_request)
 
 
 SERVICE_VERSION = "2.0.0"
@@ -48,6 +49,12 @@ MAX_UPLOAD_FILES = 256
 UPLOAD_GC_SECONDS = 3600.0
 EPHEMERAL_QUOTA_BYTES = int(os.environ.get("SPIRAL_EPHEMERAL_QUOTA_BYTES",
                                            4 * 1024 * 1024 * 1024))
+# Uploaded resume checkpoints are service-scoped (usable by future sessions),
+# exempt from the ephemeral quota, and bounded by retention instead.
+UPLOADED_CHECKPOINTS_KEPT = 3
+MAX_CHECKPOINT_UPLOAD_BYTES = int(os.environ.get(
+    "SPIRAL_CHECKPOINT_UPLOAD_MAX_BYTES", 64 * 1024 * 1024 * 1024))
+UPLOADED_CHECKPOINTS_DIRNAME = "uploaded-checkpoints"
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@ -]{0,127}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -329,6 +336,16 @@ def _load_single_json(directory, kind):
 def _validate_upload_content(kind, role, directory):
     if kind == "patch":
         _validate_patch_content(directory)
+        return
+    if kind == "checkpoint":
+        files = [p for p in directory.rglob("*") if p.is_file()]
+        if len(files) != 1:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "A checkpoint upload must contain exactly one file")
+        try:
+            validate_checkpoint_container(files[0])
+        except (OSError, ValueError) as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid checkpoint: {exc}")
         return
     document, _ = _load_single_json(directory, kind)
     if kind == "fiber":
@@ -734,25 +751,36 @@ class ServiceState:
     # Session input uploads
     # ------------------------------------------------------------------
 
+    def _output_root(self):
+        """Output directory known before any session in dataset mode."""
+        if self.session_paths is not None and self.session_paths.output_directory:
+            return Path(self.session_paths.output_directory)
+        if self.dataset_resolution is not None:
+            return Path(self.dataset_resolution.resolved["output_directory"])
+        return None
+
     def _session_ephemeral_dir(self):
         if self.session_paths is None or self.session_id is None:
             return None
         return Path(self.session_paths.output_directory) / ".spiral-ephemeral" / self.session_id
 
-    def _session_staging_dir(self):
-        return Path(self.session_paths.output_directory) / ".spiral-upload-staging"
+    def _staging_root(self):
+        return self._output_root() / ".spiral-upload-staging"
+
+    def _checkpoint_upload_root(self):
+        return self._output_root() / UPLOADED_CHECKPOINTS_DIRNAME
 
     def _ephemeral_bytes_in_use(self):
         total = sum(record["bytes"] for record in self.ephemeral_records)
         total += sum(upload.declared_bytes() for upload in self.uploads.values()
-                     if upload.record is None)
+                     if upload.record is None and upload.kind != "checkpoint")
         return total
 
     def begin_upload(self, request):
         kind = str(request.get("kind") or "").strip()
-        if kind not in ("patch", "fiber", "pcl"):
+        if kind not in ("patch", "fiber", "pcl", "checkpoint"):
             raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Input kind must be one of patch, fiber, pcl")
+                           "Input kind must be one of patch, fiber, pcl, checkpoint")
         role = request.get("role")
         if kind == "pcl":
             if role not in _PCL_ROLE_FILES:
@@ -765,18 +793,33 @@ class ServiceState:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "The input id must be a single safe path component")
         manifest = _validate_upload_manifest(request)
+        declared = sum(entry["size"] for entry in manifest.values())
         with self.lock:
-            self._require_session()
-            if any(record["id"] == input_id and record["kind"] == kind
-                   for record in self.ephemeral_records):
-                raise ApiError(HTTPStatus.CONFLICT,
-                               f"An ephemeral {kind} named {input_id!r} already exists")
-            declared = sum(entry["size"] for entry in manifest.values())
-            if self._ephemeral_bytes_in_use() + declared > EPHEMERAL_QUOTA_BYTES:
-                raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                               "The ephemeral input quota is exhausted")
+            if kind == "checkpoint":
+                # Resume checkpoints are needed before a session exists, so
+                # they are service-scoped: allowed whenever an output
+                # directory is known (a --dataset launch or a live session).
+                if self._output_root() is None:
+                    raise ApiError(HTTPStatus.CONFLICT,
+                                   "Checkpoint uploads need a --dataset service "
+                                   "or an active session")
+                if len(manifest) != 1:
+                    raise ApiError(HTTPStatus.BAD_REQUEST,
+                                   "A checkpoint upload must declare exactly one file")
+                if declared > MAX_CHECKPOINT_UPLOAD_BYTES:
+                    raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                                   "The checkpoint exceeds the upload size limit")
+            else:
+                self._require_session()
+                if any(record["id"] == input_id and record["kind"] == kind
+                       for record in self.ephemeral_records):
+                    raise ApiError(HTTPStatus.CONFLICT,
+                                   f"An ephemeral {kind} named {input_id!r} already exists")
+                if self._ephemeral_bytes_in_use() + declared > EPHEMERAL_QUOTA_BYTES:
+                    raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                                   "The ephemeral input quota is exhausted")
             upload_id = secrets.token_hex(16)
-            staging = self._session_staging_dir() / upload_id
+            staging = self._staging_root() / upload_id
             upload = Upload(upload_id, self.session_id, kind, role, input_id,
                             manifest, staging)
             self.uploads[upload_id] = upload
@@ -786,7 +829,10 @@ class ServiceState:
     def _get_upload(self, upload_id):
         with self.lock:
             upload = self.uploads.get(upload_id)
-            if upload is None or upload.session_id != self.session_id:
+            # Checkpoint uploads are service-scoped; the ephemeral kinds are
+            # bound to the session they were started for.
+            if upload is None or (upload.kind != "checkpoint"
+                                  and upload.session_id != self.session_id):
                 raise ApiError(HTTPStatus.NOT_FOUND, "Unknown upload")
             return upload
 
@@ -842,6 +888,12 @@ class ServiceState:
                                [{"field": name, "message": "File was not uploaded"}
                                 for name in missing])
             _validate_upload_content(upload.kind, upload.role, upload.staging_dir)
+            if upload.kind == "checkpoint":
+                record = self._publish_checkpoint_upload(upload)
+                upload.record = record
+                with self.lock:
+                    self.status_generation += 1
+                return {**self.status(), "input": dict(record), "accepted": True}
             with self.lock:
                 self._require_session()
                 ephemeral_root = self._session_ephemeral_dir()
@@ -874,6 +926,53 @@ class ServiceState:
             self.ephemeral_records.append(record)
             self.status_generation += 1
         return {**self.status(), "input": dict(record), "accepted": True}
+
+    def _publish_checkpoint_upload(self, upload):
+        """Move a finalized checkpoint into the service's upload directory.
+
+        The published path lies under the output directory, which the
+        dataset-mode load validation already accepts for resume checkpoints.
+        """
+        root = self._checkpoint_upload_root()
+        if root is None:
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "The service no longer has an output directory for "
+                           "uploaded checkpoints")
+        root.mkdir(parents=True, exist_ok=True)
+        source = next(p for p in upload.staging_dir.rglob("*") if p.is_file())
+        destination = root / upload.input_id
+        if destination.exists():
+            # Never overwrite: an earlier upload with the same name may be the
+            # one a resident session is resuming from.
+            destination = root / f"{destination.stem}-{secrets.token_hex(4)}{destination.suffix}"
+        os.replace(source, destination)
+        shutil.rmtree(upload.staging_dir, ignore_errors=True)
+        self._prune_uploaded_checkpoints(destination)
+        return {
+            "id": upload.input_id,
+            "kind": "checkpoint",
+            "role": None,
+            "path": str(destination),
+            "bytes": upload.declared_bytes(),
+            "state": "uploaded",
+            "upload_id": upload.upload_id,
+        }
+
+    def _prune_uploaded_checkpoints(self, just_published):
+        root = self._checkpoint_upload_root()
+        if root is None or not root.is_dir():
+            return
+        with self.lock:
+            active = self.session_paths.checkpoint if self.session_paths else ""
+        entries = sorted((path for path in root.iterdir() if path.is_file()),
+                         key=lambda path: path.stat().st_mtime, reverse=True)
+        kept = 0
+        for path in entries:
+            protected = path == Path(just_published) or str(path) == active
+            if protected or kept < UPLOADED_CHECKPOINTS_KEPT:
+                kept += 1
+                continue
+            path.unlink(missing_ok=True)
 
     def delete_upload(self, upload_id):
         with self.lock:

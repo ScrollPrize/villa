@@ -412,24 +412,161 @@ void SpiralServiceManager::resolveDataset(const QString& root)
 void SpiralServiceManager::loadSession(QJsonObject request)
 {
     QJsonObject inputPaths = request.value(QStringLiteral("paths")).toObject();
-    if (_serviceOwnsDataset) {
-        // The service owns its base inputs; a remote load request carries run
-        // parameters and preview configuration only.
-        const QJsonObject requested = inputPaths;
-        inputPaths = remoteInputPaths();
-        QJsonObject selectable;
-        for (const QString& key : {QStringLiteral("checkpoint"), QStringLiteral("tracks_dbm")})
-            if (!requested.value(key).toString().isEmpty())
-                selectable[key] = requested.value(key).toString();
-        if (selectable.isEmpty()) request.remove(QStringLiteral("paths"));
-        else request[QStringLiteral("paths")] = selectable;
+    if (!_serviceOwnsDataset) {
+        request[QStringLiteral("command_id")] = commandId();
+        sendLoadRequest(request, inputPaths);
+        return;
     }
-    request[QStringLiteral("command_id")] = commandId();
+    // The service owns its base inputs; a remote load request carries run
+    // parameters plus the client-selectable checkpoint/tracks values only.
+    const QJsonObject requested = inputPaths;
+    inputPaths = remoteInputPaths();
+    QJsonObject selectable;
+    const QString tracks = requested.value(QStringLiteral("tracks_dbm")).toString().trimmed();
+    if (!tracks.isEmpty()) selectable[QStringLiteral("tracks_dbm")] = tracks;
+    const QString checkpoint = requested.value(QStringLiteral("checkpoint")).toString().trimmed();
+
+    auto finish = [this, request, inputPaths, selectable](const QString& checkpointHostPath) mutable {
+        if (!checkpointHostPath.isEmpty())
+            selectable[QStringLiteral("checkpoint")] = checkpointHostPath;
+        QJsonObject load = request;
+        if (selectable.isEmpty()) load.remove(QStringLiteral("paths"));
+        else load[QStringLiteral("paths")] = selectable;
+        load[QStringLiteral("command_id")] = commandId();
+        sendLoadRequest(load, inputPaths);
+    };
+
+    if (checkpoint.isEmpty()) {
+        finish({});
+        return;
+    }
+    // Service-advertised checkpoints and paths under the service's output
+    // directory pass through unchanged; an existing client-local file is
+    // uploaded first and the load resumes from the returned host path.
+    bool serviceSide = false;
+    for (const QJsonValue& value :
+         _advertisedDataset.value(QStringLiteral("detected_checkpoints")).toArray())
+        if (value.toString() == checkpoint) serviceSide = true;
+    const QString outputDir = _advertisedDataset.value(QStringLiteral("resolved")).toObject()
+                                  .value(QStringLiteral("output_directory")).toString();
+    if (!outputDir.isEmpty() && checkpoint.startsWith(outputDir)) serviceSide = true;
+    if (serviceSide || !QFileInfo(checkpoint).isFile()) {
+        finish(checkpoint);
+        return;
+    }
+    emit logMessage(tr("Uploading resume checkpoint %1 to the service…").arg(checkpoint));
+    uploadCheckpointForResume(checkpoint,
+                              [this, finish](const QString& hostPath, const QString& error) mutable {
+                                  if (hostPath.isEmpty()) {
+                                      emit errorOccurred(tr("Resume checkpoint upload failed: %1").arg(error));
+                                      return;
+                                  }
+                                  emit logMessage(tr("Checkpoint uploaded to service path %1").arg(hostPath));
+                                  finish(hostPath);
+                              });
+}
+
+void SpiralServiceManager::sendLoadRequest(QJsonObject request, const QJsonObject& inputPaths)
+{
     postWithRetry(QStringLiteral("/session/load"), request, Timeout::Load, kMutationRetries,
                   [this, inputPaths](const QJsonObject& response) {
                       emit sessionAccepted(inputPaths,
                                            response.value(QStringLiteral("session_generation")).toInteger());
                   });
+}
+
+void SpiralServiceManager::uploadCheckpointForResume(
+    const QString& localPath,
+    std::function<void(const QString&, const QString&)> done)
+{
+    const quint64 generation = _connectionGeneration;
+    auto* watcher = new QFutureWatcher<QJsonObject>(this);
+    connect(watcher, &QFutureWatcher<QJsonObject>::finished, this,
+            [this, watcher, localPath, generation, done]() {
+                const QJsonObject digest = watcher->result();
+                watcher->deleteLater();
+                if (generation != _connectionGeneration) return;
+                if (digest.contains(QStringLiteral("error"))) {
+                    done({}, digest.value(QStringLiteral("error")).toString());
+                    return;
+                }
+                QString inputId = QFileInfo(localPath).fileName();
+                inputId.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9._-]")),
+                                QStringLiteral("-"));
+                while (!inputId.isEmpty()
+                       && !QRegularExpression(QStringLiteral("^[A-Za-z0-9]")).match(inputId).hasMatch())
+                    inputId.remove(0, 1);
+                if (inputId.isEmpty()) inputId = QStringLiteral("uploaded.ckpt");
+                inputId.truncate(120);
+                const QJsonObject begin{
+                    {QStringLiteral("kind"), QStringLiteral("checkpoint")},
+                    {QStringLiteral("id"), inputId},
+                    {QStringLiteral("files"), QJsonArray{QJsonObject{
+                        {QStringLiteral("name"), inputId},
+                        {QStringLiteral("size"), digest.value(QStringLiteral("size"))},
+                        {QStringLiteral("sha256"), digest.value(QStringLiteral("sha256"))},
+                    }}},
+                };
+                post(QStringLiteral("/session/inputs"), begin, Timeout::Command,
+                     [this, localPath, inputId, done](const QJsonObject& response) {
+                         const QString uploadId =
+                             response.value(QStringLiteral("upload_id")).toString();
+                         if (uploadId.isEmpty()) {
+                             done({}, tr("The service did not return an upload id"));
+                             return;
+                         }
+                         auto file = std::make_unique<QFile>(localPath);
+                         if (!file->open(QIODevice::ReadOnly)) {
+                             done({}, tr("Cannot read %1").arg(localPath));
+                             return;
+                         }
+                         // Checkpoints can be multiple gigabytes: no total
+                         // transfer timeout; a dead transport surfaces as a
+                         // socket error (the SSH tunnel keepalives bound it).
+                         QNetworkRequest request = makeRequest(
+                             QStringLiteral("/session/inputs/%1/files/%2").arg(uploadId, inputId), 0);
+                         request.setHeader(QNetworkRequest::ContentTypeHeader,
+                                           QStringLiteral("application/octet-stream"));
+                         QFile* fileRaw = file.release();
+                         auto* reply = _network->put(request, fileRaw);
+                         fileRaw->setParent(reply);
+                         connect(reply, &QNetworkReply::uploadProgress, this,
+                                 [this](qint64 sent, qint64 total) {
+                                     emit checkpointUploadProgress(sent, total);
+                                 });
+                         const quint64 putGeneration = _connectionGeneration;
+                         connect(reply, &QNetworkReply::finished, this,
+                                 [this, reply, putGeneration, uploadId, done]() {
+                                     handleReply(reply, putGeneration,
+                                                 [this, uploadId, done](const QJsonObject&) {
+                                                     post(QStringLiteral("/session/inputs/%1/finalize").arg(uploadId),
+                                                          {}, Timeout::LongCommand,
+                                                          [done](const QJsonObject& response) {
+                                                              const QString hostPath =
+                                                                  response.value(QStringLiteral("input")).toObject()
+                                                                      .value(QStringLiteral("path")).toString();
+                                                              done(hostPath,
+                                                                   hostPath.isEmpty()
+                                                                       ? QObject::tr("The service did not return the checkpoint path")
+                                                                       : QString());
+                                                          },
+                                                          [done](const QString& error) { done({}, error); });
+                                                 },
+                                                 [done](const QString& error) { done({}, error); });
+                                 });
+                     },
+                     [done](const QString& error) { done({}, error); });
+            });
+    watcher->setFuture(QtConcurrent::run([localPath]() -> QJsonObject {
+        QFile file(localPath);
+        if (!file.open(QIODevice::ReadOnly))
+            return {{QStringLiteral("error"), tr("Cannot read %1").arg(localPath)}};
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        if (!hash.addData(&file))
+            return {{QStringLiteral("error"), tr("Cannot hash %1").arg(localPath)}};
+        return {{QStringLiteral("size"), file.size()},
+                {QStringLiteral("sha256"), QString::fromLatin1(hash.result().toHex())}};
+    }));
 }
 
 QJsonObject SpiralServiceManager::remoteInputPaths() const
