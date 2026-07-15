@@ -143,17 +143,27 @@ def compute_losses(
     presence_weight: float,
 ) -> dict[str, torch.Tensor]:
     require_materialized_targets(batch)
-    assert batch.direction_target is not None
-    assert batch.direction_weight is not None
-    assert batch.direction_mask is not None
+    assert batch.direction_indices_bzyx is not None
+    assert batch.direction_target_sparse is not None
+    assert batch.direction_weight_sparse is not None
     assert batch.presence_target is not None
     assert batch.presence_mask is not None
     pred_dir = direction_output(output)
     pred_presence = presence_output(output)
-    direction_mask = batch.direction_mask.expand_as(pred_dir)
-    direction_error = (pred_dir - batch.direction_target) ** 2
-    direction_error = direction_error * batch.direction_weight
-    direction_loss = _masked_mean(direction_error, direction_mask)
+    indices = batch.direction_indices_bzyx.to(dtype=torch.long)
+    if int(indices.shape[0]) > 0:
+        pred_sparse = pred_dir[
+            indices[:, 0],
+            :,
+            indices[:, 1],
+            indices[:, 2],
+            indices[:, 3],
+        ]
+        direction_error = (pred_sparse - batch.direction_target_sparse) ** 2
+        direction_error = direction_error * batch.direction_weight_sparse
+        direction_loss = direction_error.mean()
+    else:
+        direction_loss = pred_dir.sum() * 0.0
 
     presence_mask = batch.presence_mask.expand_as(pred_presence)
     presence_bce = F.binary_cross_entropy(
@@ -598,6 +608,20 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
         segment_start = 0
         segment_stop = 0
         new_offsets = batch.target_segment_offsets[start:stop]
+    sparse_indices = batch.direction_indices_bzyx
+    sparse_target = batch.direction_target_sparse
+    sparse_weight = batch.direction_weight_sparse
+    sparse_tangent = batch.direction_tangent_sparse_zyx
+    if sparse_indices is not None:
+        sparse_mask = (sparse_indices[:, 0] >= int(start)) & (sparse_indices[:, 0] < int(stop))
+        sparse_indices = sparse_indices[sparse_mask].clone()
+        sparse_indices[:, 0] -= int(start)
+        if sparse_target is not None:
+            sparse_target = sparse_target[sparse_mask]
+        if sparse_weight is not None:
+            sparse_weight = sparse_weight[sparse_mask]
+        if sparse_tangent is not None:
+            sparse_tangent = sparse_tangent[sparse_mask]
     return FiberTrace3DBatch(
         volume=batch.volume[start:stop],
         valid_mask=batch.valid_mask[start:stop],
@@ -622,6 +646,10 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
         if batch.direction_weight is None
         else batch.direction_weight[start:stop],
         direction_mask=None if batch.direction_mask is None else batch.direction_mask[start:stop],
+        direction_indices_bzyx=sparse_indices,
+        direction_target_sparse=sparse_target,
+        direction_weight_sparse=sparse_weight,
+        direction_tangent_sparse_zyx=sparse_tangent,
         presence_target=None
         if batch.presence_target is None
         else batch.presence_target[start:stop],
@@ -940,18 +968,34 @@ def _make_train_sample_3d_sheet(
     batch: FiberTrace3DBatch,
     output: torch.Tensor,
 ) -> np.ndarray:
+    assert batch.presence_target is not None
+    assert batch.direction_indices_bzyx is not None
+    assert batch.direction_target_sparse is not None
     volume = batch.volume[0, 0].detach().cpu().numpy()
     valid = batch.valid_mask[0, 0].detach().cpu().numpy().astype(bool)
     target_presence = batch.presence_target[0, 0].detach().cpu().numpy()
     pred_presence = presence_output(output)[0, 0].detach().cpu().numpy()
-    direction_mask = batch.direction_mask[0, 0].detach().cpu().numpy().astype(bool)
-
-    target_encoded = batch.direction_target[0].permute(1, 2, 3, 0)
-    pred_encoded = direction_output(output)[0].permute(1, 2, 3, 0)
-    target_dir = decode_lasagna_direction_3x2_analytic(target_encoded)
-    pred_dir = decode_lasagna_direction_3x2_analytic(pred_encoded)
-    agreement = torch.abs(torch.sum(target_dir * pred_dir, dim=-1)).clamp(0.0, 1.0)
-    angle = torch.rad2deg(torch.acos(agreement)).detach().cpu().numpy()
+    direction_mask = np.zeros_like(valid, dtype=bool)
+    angle = np.zeros_like(volume, dtype=np.float32)
+    sparse_indices = batch.direction_indices_bzyx.to(dtype=torch.long)
+    sample_sparse = sparse_indices[:, 0] == 0
+    if bool(sample_sparse.any()):
+        sample_indices = sparse_indices[sample_sparse]
+        target_encoded = batch.direction_target_sparse[sample_sparse]
+        pred_encoded = direction_output(output)[
+            sample_indices[:, 0],
+            :,
+            sample_indices[:, 1],
+            sample_indices[:, 2],
+            sample_indices[:, 3],
+        ]
+        target_dir = decode_lasagna_direction_3x2_analytic(target_encoded)
+        pred_dir = decode_lasagna_direction_3x2_analytic(pred_encoded)
+        agreement = torch.abs(torch.sum(target_dir * pred_dir, dim=-1)).clamp(0.0, 1.0)
+        sparse_angle = torch.rad2deg(torch.acos(agreement)).detach().cpu().numpy()
+        sparse_zyx = sample_indices[:, 1:4].detach().cpu().numpy()
+        angle[sparse_zyx[:, 0], sparse_zyx[:, 1], sparse_zyx[:, 2]] = sparse_angle
+        direction_mask[sparse_zyx[:, 0], sparse_zyx[:, 1], sparse_zyx[:, 2]] = True
 
     cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long).detach().cpu().numpy()
     cp = np.clip(cp, [0, 0, 0], np.asarray(volume.shape, dtype=np.int64) - 1)
@@ -1550,7 +1594,8 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
         "batch patches total_ms load_ms wait_ms to_device_ms target_ms fw_ms "
         "worker_ms worker_cpu cpu/w construct_ms desc_ms params_ms geom_ms coord_ms valid_ms "
         "sample_ms tensor_ms value_ms spec_ms line_ms map_ms clip_ms "
-        "gpu_ms gpu_raster gpu_encode gpu_mask segs bboxM posK stack_ms cpu_ms cpu_x"
+        "gpu_ms line_idx cp_idx scatter dir_enc gpu_mask segs linePts dirPts posK "
+        "stack_ms cpu_ms cpu_x"
     )
     profile_rows: list[dict[str, float]] = []
     for batch_index in range(1, int(batches) + 1):
@@ -1608,11 +1653,14 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
             f"{timing_ms('target_points_to_output_ms'):6.2f} "
             f"{timing_ms('target_clip_ms'):7.2f} "
             f"{timing_ms('target_gpu_total_ms'):7.2f} "
-            f"{timing_ms('target_gpu_raster_ms'):10.2f} "
-            f"{timing_ms('target_gpu_encode_ms'):10.2f} "
+            f"{timing_ms('target_line_index_ms'):8.2f} "
+            f"{timing_ms('target_cp_index_ms'):6.2f} "
+            f"{timing_ms('target_presence_scatter_ms'):7.2f} "
+            f"{timing_ms('target_direction_encode_ms'):7.2f} "
             f"{timing_ms('target_gpu_mask_ms'):8.2f} "
-            f"{timing_ms('target_gpu_raster_segments'):5.0f} "
-            f"{timing_ms('target_gpu_raster_bbox_voxels') / 1.0e6:6.2f} "
+            f"{timing_ms('target_line_segments'):5.0f} "
+            f"{timing_ms('target_line_points'):7.0f} "
+            f"{timing_ms('target_direction_points'):6.0f} "
             f"{timing_ms('target_gpu_positive_voxels') / 1.0e3:5.1f} "
             f"{timing_ms('batch_stack_ms'):8.2f} "
             f"{cpu_ms:8.2f} {cpu_factor:6.2f}",

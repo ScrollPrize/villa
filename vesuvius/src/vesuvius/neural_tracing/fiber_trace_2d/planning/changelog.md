@@ -2,6 +2,10 @@
 
 ## 2026-07-15
 
+- Switched 3D NML target materialization from radius-expanded
+  distance-to-segment tube volumes to sparse drawn centerline voxel indices.
+  Dense presence is still created on the main training GPU, while direction
+  loss now gathers sparse Lasagna 3x2 targets at supervised line/CP voxels.
 - Moved 3D dense direction/presence target materialization out of DataLoader
   workers. Workers now return compact CP/segment descriptors; the main process
   materializes dense targets on the training device via

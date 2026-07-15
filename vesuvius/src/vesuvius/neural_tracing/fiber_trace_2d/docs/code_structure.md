@@ -60,11 +60,11 @@ side/top strip input loading.
   blur is a torch value operation after volume sampling, not a geometric
   transform.
 - Builds direction and presence targets in source-format-specific form.
-  NML records supervise densely along the transformed fiber line by directly
-  rasterizing bounded output-space segment capsules; JSON/array records
-  supervise only the sampled CP neighborhood. Direction labels use the six
-  Lasagna 3x2 channels, and presence negatives are balanced in the valid
-  interior.
+  NML records supervise along the transformed fiber centerline by drawing
+  rounded output-space line voxels; JSON/array records supervise only the
+  sampled CP neighborhood. NML line targets are not radius-expanded tubes.
+  Direction labels use the six Lasagna 3x2 channels, and presence negatives
+  are balanced in the valid interior.
 - Prefetch uses the same explicit coordinate path as training and collects
   VC3D chunk dependencies instead of conservative zarr crop bboxes.
 
@@ -116,7 +116,12 @@ side/top strip input loading.
   metadata, and NML dense-line samples store transformed output-space segment
   endpoints plus patch bboxes. The main process calls
   `fiber_trace_3d.targets.materialize_targets(...)` after transfer to create
-  dense direction/presence targets on the training device.
+  dense presence targets/masks on the training device. Direction supervision is
+  sparse: the materializer builds `direction_indices_bzyx`,
+  `direction_target_sparse`, and `direction_weight_sparse`, and the loss
+  gathers the predicted six-channel direction output at those supervised
+  centerline/CP voxels. The normal training path does not allocate a full
+  dense `[B,6,Z,Y,X]` direction target.
 - In `--benchmark` mode, `cpu_ms` and `cpu_x` report sampled CPU time for the
   main process plus DataLoader worker processes during each benchmark row where
   `/proc/<pid>/stat` is available. `cpu_x=1.0` is roughly one fully occupied
@@ -126,10 +131,13 @@ side/top strip input loading.
   descriptor lookup, augmentation parameter sampling, coordinate-map creation,
   coordinate conversion/valid-mask generation, VC3D volume sampling, tensor
   conversion, value augmentation, compact target-spec generation, and batch
-  stacking. Dense target materialization is reported separately with
-  `target_ms` and the `gpu_*` target columns. `wait_ms` is the main process
-  blocking on the next DataLoader item; it is distinct from `to_device_ms`, the
-  CPU-to-training-device transfer.
+  stacking. Main-process target materialization is reported separately with
+  `target_ms` plus sparse/dense target columns such as `line_idx`, `cp_idx`,
+  `scatter`, `dir_enc`, `gpu_mask`, `linePts`, `dirPts`, and `posK`. `wait_ms`
+  is the main process blocking on the next DataLoader item; it is distinct from
+  `to_device_ms`, the CPU-to-training-device transfer. With worker processes,
+  the first `loader_workers` benchmark rows can include worker-local loader
+  construction and should be excluded from steady-state throughput summaries.
 - When `training.test_trace2cp_enabled` is true, test evaluation builds
   Trace2CP side-strip geometry with the 2D loader, runs tiled dense 3D inference
   blocks over the requested strip coordinates, projects direction/presence into

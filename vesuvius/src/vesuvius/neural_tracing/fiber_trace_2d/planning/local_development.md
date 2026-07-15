@@ -247,6 +247,25 @@ After CP-window filtering, batched Lasagna normal sampling, and
 `2m12s` for `464` records, `14773/184` valid/skipped CPs, and `40.0 MiB`;
 load-only/profile throughput was `119.96 patches/s` over `12800` patches.
 
+## 3D Fiber Trace Benchmark
+
+Use the exact benchmark command below when measuring the 3D NML loader/target
+path in this checkout:
+
+```bash
+PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_all.json --benchmark --load-only --benchmark-batches 40
+```
+
+The 3D benchmark reports one complete CP-centered 3D batch per row. With
+`training.loader_workers: 32`, rows 1-32 can include worker-local loader and
+VC3D sampler construction; use rows after that for steady-state throughput.
+Target columns are main-process GPU work: `line_idx` draws sparse NML
+centerline voxel indices, `cp_idx` handles CP-only radius indices, `scatter`
+builds dense presence, `dir_enc` encodes sparse Lasagna 3x2 direction targets,
+`gpu_mask` builds the dense presence loss mask, `linePts` is the drawn
+centerline voxel count before valid filtering, `dirPts` is the sparse direction
+supervision count, and `posK` is dense positive-presence voxels in thousands.
+
 ## Focused Test Command
 
 ```bash

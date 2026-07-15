@@ -1,218 +1,222 @@
-# 3D Fiber GPU-Side Target Materialization Plan
+# 3D Fiber Sparse Line Supervision Target Plan
 
 ## Scope
 
-Move full dense 3D direction/presence target construction out of
-DataLoader workers. Workers should return image data plus compact target
-descriptors; the main training process realizes full target tensors on the
-training GPU.
+Replace 3D NML dense-line target materialization with sparse centerline voxel
+supervision. The target path should draw line voxel indices, supervise
+direction only at those indices, and create dense presence only on the training
+GPU in the main process.
 
-This task does not change model architecture, patch size, sample order,
-augmentation semantics, VC3D volume sampling, or loss definitions.
+This task does not change model architecture, VC3D patch loading,
+augmentation semantics, deterministic sample order, or non-NML CP-only target
+semantics.
+
+## Better Option: GPU Sparse Indices
+
+Use GPU-side vectorized line-index generation rather than CPU worker
+rasterization.
+
+Rationale:
+
+- Workers already return compact transformed segment endpoints.
+- CPU-generated ragged index tensors would increase DataLoader IPC payloads
+  and still need transfer to the training GPU.
+- GPU generation keeps workers compact, preserves the current main-process
+  target realization split, and avoids dense distance-volume construction.
+- It also lets direction loss gather predictions directly at supervised voxels
+  instead of building a full `[B,6,Z,Y,X]` dense direction target.
 
 ## Current Problem
 
-- `FiberTrace3DLoader.load_sample(...)` calls `_build_targets(...)` in the
-  worker process.
-- For NML samples, `_build_targets(...)` currently:
-  - transforms line points to output patch coordinates;
-  - rasterizes segment neighborhoods into full `positive` and tangent volumes;
-  - encodes a dense six-channel Lasagna 3x2 direction target;
-  - builds dense direction/presence masks.
-- Benchmark profiling shows the worker-side encode/tensor target stage can be
-  hundreds of milliseconds per patch and creates large IPC payloads.
+- `fiber_trace_3d.targets._materialize_dense_line_sample(...)` loops over
+  samples and segments in Python.
+- For each segment it builds a local 3D bbox grid, computes closest distance to
+  the segment, and marks positives within `presence_radius_voxels`.
+- That creates a tube-like target and does unnecessary dense work.
+- Benchmark profiling now shows `target_gpu_encode_ms` as a fixed cost because
+  the code still creates full dense six-channel direction targets over the
+  whole patch.
 
 ## Implementation Plan
 
-### 1. Split Batch Data From Dense Targets
+### 1. Keep Worker Output Compact
 
-- Introduce compact target-spec dataclasses in
-  `fiber_trace_3d.loader`, for example:
-  - `FiberTrace3DTargetSpec`;
-  - `FiberTrace3DDenseLineSpec`;
-  - `FiberTrace3DCpOnlySpec`.
-- Update `FiberTrace3DSample` / `FiberTrace3DBatch` so worker-returned batches
-  carry:
-  - `volume`;
-  - `valid_mask`;
-  - sample/record/control-point metadata;
-  - `cp_local_zyx` and `crop_origin_zyx`;
-  - compact per-sample target descriptors.
-- Do not include worker-built `direction_target`, `direction_weight`,
-  `direction_mask`, `presence_target`, or `presence_mask` in the normal
-  DataLoader batch payload.
+- Leave `FiberTrace3DLoader` worker output as compact metadata:
+  - image volume;
+  - valid mask;
+  - CP/crop/sample metadata;
+  - transformed output-space segment starts/ends for NML samples;
+  - CP/tangent metadata for CP-only samples.
+- Do not create dense presence or direction tensors in workers.
+- Keep worker-side segment clipping to the patch AABB because it reduces
+  metadata and preserves current invalid-data checks.
 
-### 2. Build Compact Target Metadata In Workers
+### 2. Add Sparse Target Representation
 
-- Replace worker `_build_targets(...)` calls with a compact metadata builder.
-- For NML dense supervision:
-  - reuse `_line_window_for_labels(...)`;
-  - reuse `_source_points_to_output_np(...)`;
-  - return finite transformed output-space `segment_start_zyx` and
-    `segment_end_zyx`;
-  - keep only segments that overlap or may overlap the patch after
-    `presence_radius_voxels` expansion;
-  - fail loudly if no patch-overlapping segment remains.
-- For non-NML CP-only supervision:
-  - return `cp_local_zyx`;
-  - return the transformed local tangent used by the current CP-only path.
-- Preserve all existing invalid-sample/data-failure behavior. This change
-  only moves dense realization; it does not hide malformed fibers.
+- Extend `FiberTrace3DBatch` target fields to support sparse direction
+  supervision:
+  - `direction_indices_bzyx`: integer `[N,4]` index tensor or equivalent
+    separate `b,z,y,x` tensors;
+  - `direction_target_sparse`: float `[N,6]` Lasagna 3x2 target values;
+  - `direction_weight_sparse`: float `[N,6]` projection weights;
+  - optional `direction_tangent_sparse_zyx` for debug/profiling.
+- Keep `presence_target` dense because presence loss still uses dense
+  negatives.
+- Keep `presence_mask` dense, created from `valid_mask` and edge masking on
+  the training GPU.
+- Remove dependence on dense `direction_target`, `direction_weight`, and
+  `direction_mask` in the normal training loss path.
 
-### 3. Represent Variable Segment Counts Compactly
+### 3. Vectorized NML Line Rasterization
 
-- In `load_batch(...)`, pack per-sample segment arrays into a padded tensor or
-  flat tensor plus offsets:
-  - preferred: `segment_start_zyx_flat`, `segment_end_zyx_flat`,
-    `segment_offsets`, `segment_counts`;
-  - this avoids Python object lists across the hot training path.
-- Keep the tensors on CPU in worker output.
-- `FiberTrace3DBatch.to(device)` transfers compact segment tensors to the
-  training device together with image data.
+- For all NML segments in a batch:
+  - compute segment deltas in output-space ZYX;
+  - compute `steps = ceil(max(abs(delta_zyx))) + 1`;
+  - build a padded/vectorized interpolation tensor
+    `t = arange(max_steps) / max(steps - 1, 1)`;
+  - compute points as `p0 + t * (p1 - p0)`;
+  - round to integer voxel coordinates;
+  - mask padded entries and out-of-bounds coordinates;
+  - de-duplicate repeated voxel indices after rounding.
+- Associate each drawn point with its segment tangent.
+- Do not apply `presence_radius_voxels` to NML dense-line targets.
+- Track timing counters:
+  - `line_index_ms`;
+  - `line_point_count`;
+  - `line_segment_count`.
 
-### 4. Add GPU Target Materializer
+### 4. CP-Only Compatibility
 
-- Add a GPU-side materializer in `fiber_trace_3d.train` or a small sibling
-  module, e.g. `fiber_trace_3d.targets`.
-- API shape:
+- Keep CP-only samples radius-based for now:
+  - generate CP positive voxels on GPU from the cached patch grid;
+  - add those voxels to dense `presence_target`;
+  - add their indices and tangent values to sparse direction supervision.
+- This preserves existing non-NML semantics while still avoiding dense
+  direction-target tensors.
 
-  `materialize_targets(batch, config, device) -> FiberTrace3DPreparedBatch`
+### 5. Dense Presence On GPU Only
 
-- It returns or attaches:
-  - `direction_target`;
-  - `direction_weight`;
-  - `direction_mask`;
-  - `presence_target`;
-  - `presence_mask`.
-- Cache regular coordinate grids and edge-interior masks by
-  `(patch_shape_zyx, device)` to avoid rebuilding them every batch.
+- In `materialize_targets(...)`, allocate dense presence tensors on the
+  training device:
+  - `presence_target = zeros([B,1,Z,Y,X], device=batch.volume.device)`;
+  - scatter line/CP positive indices to `1.0`;
+  - `presence_mask = valid_mask & cached_edge_interior_mask`.
+- No worker path may create or serialize `presence_target` or `presence_mask`.
+- Keep positive/negative presence loss balancing in `_forward_loss(...)`
+  unchanged unless the dense target shape requires a small adapter.
 
-### 5. GPU Dense-Line Rasterization
+### 6. Sparse Direction Loss
 
-- Port `_rasterize_segment_targets(...)` semantics to torch on the GPU.
-- Keep the existing search-free segment rasterization logic:
-  - clip each transformed segment to the patch AABB expanded by radius;
-  - compute a local bounding box;
-  - update `min_dist2` and nearest tangent for voxels inside that bbox;
-  - mark positives where `min_dist2 <= radius^2`.
-- The first implementation may loop over samples and their finite segments in
-  Python, but all per-voxel bbox math and tensor writes must run on the GPU.
-- Do not perform a full voxel-by-all-segments dense distance tensor if it
-  explodes memory.
-- If segment-loop launch overhead remains large, batch/vectorize by grouped
-  segment bbox size in a follow-up. Do not silently change semantics.
+- Update `_forward_loss(...)`:
+  - read predicted direction output `[B,6,Z,Y,X]`;
+  - gather predictions at `direction_indices_bzyx`;
+  - compute squared error against `direction_target_sparse`;
+  - apply `direction_weight_sparse`;
+  - reduce over sparse supervised entries only.
+- Preserve Lasagna 3x2 ambiguous direction encoding by using the existing torch
+  helper on the sparse tangent vectors.
+- Remove normal-training reliance on dense `direction_target` and
+  `direction_mask`.
 
-### 6. GPU CP-Only Target Realization
+### 7. Visualization And Test Paths
 
-- Reimplement `_cp_only_targets(...)` on torch:
-  - distance from cached grid to `cp_local_zyx`;
-  - positive mask within `presence_radius_voxels`;
-  - transformed local tangent broadcast to target voxels;
-  - direction mask gated by `valid_mask & positive`.
-- This path should not create NumPy grids.
+- TensorBoard target visualization still needs dense-like images for display:
+  - use dense `presence_target`;
+  - for direction error views, compute sparse/gathered error or scatter a
+    debug-only sparse direction-error volume for the displayed slice only.
+- Dense test/evaluation should use the same sparse direction loss path as
+  training.
+- Any compatibility helper that expects dense direction targets should either
+  be updated or explicitly limited to tests/debug.
 
-### 7. Torch Lasagna 3x2 Encoding
+### 8. Remove Tube Rasterization
 
-- Add torch equivalents of:
-  - `encode_lasagna_direction_3x2`;
-  - `projection_magnitude_weights_3x2`.
-- Match the existing NumPy analytic formulas exactly enough for tests.
-- Add focused tests comparing torch outputs with the current NumPy helpers on
-  representative directions, including degenerate projection cases.
+- Delete or stop using `_materialize_dense_line_sample(...)` distance-to-line
+  bbox rasterization for NML targets.
+- Remove benchmark fields that describe bbox voxels for the line-supervision
+  path.
+- Keep the cached grid only for CP-only radius samples and presence edge masks.
 
-### 8. Presence Mask On GPU
+### 9. Benchmark/Profile Output
 
-- Move `_presence_loss_mask(...)` realization to torch/GPU:
-  - start from `valid_mask`;
-  - apply the same negative edge margin rule;
-  - cache the interior mask by shape/device/margin.
-- Keep positive and negative presence-loss balance unchanged in
-  `compute_losses(...)`.
+- Update 3D benchmark columns:
+  - replace `gpu_raster`, `gpu_encode`, `bboxM`, and related tube wording with
+    sparse target timings:
+    - `line_idx_ms`;
+    - `line_pts`;
+    - `presence_scatter_ms`;
+    - `dir_encode_ms`;
+    - `dir_gather_ms` where applicable.
+- Keep total `target_ms`.
+- Continue reporting throughput after DataLoader worker startup; with
+  `loader_workers=32`, rows 1-32 are startup-contaminated and should not be
+  used as steady-state throughput.
 
-### 9. Training Integration
+### 10. Tests
 
-- In `_next_training_batch(...)`:
-  - receive CPU image/valid/metadata batch from DataLoader;
-  - transfer compact batch to training device;
-  - call GPU target materializer;
-  - pass the prepared batch into `_forward_loss(...)`.
-- Keep `compute_losses(...)` compatible with a prepared batch that has dense
-  target tensors.
-- Update TensorBoard visualization and dense test loss to call the same
-  materializer before accessing target tensors.
-
-### 10. Benchmark/Profile Output
-
-- Update `--benchmark --load-only --profile` to report:
-  - DataLoader wait;
-  - batch transfer;
-  - worker image/sample time;
-  - compact target-spec build time;
-  - GPU target materialization time.
-- Remove or rename old worker-side target columns:
-  - old `target_ms`, `raster_ms`, `encode_ms`, `mask_ms` should not imply
-    dense target construction happened in workers.
-- Add a clear `target_gpu_ms` column when profiling is enabled.
-
-### 11. Tests
-
-- Run syntax check:
-  `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/loader.py`
 - Run focused tests:
+
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-- Add tests for:
-  - serial worker batch no longer carries dense target tensors before
-    materialization;
-  - materialized CP-only targets match old CPU semantics on a small synthetic
-    patch;
-  - materialized dense-line targets match old CPU semantics on a small
-    synthetic line segment;
-  - torch Lasagna 3x2 encoding matches NumPy helper outputs;
-  - DataLoader multi-worker deterministic sample order remains unchanged.
 
-### 12. Performance Validation
+- Add or update tests for:
+  - raw worker batches still carry no dense presence/direction targets;
+  - NML diagonal segment rasterizes expected integer line voxels;
+  - NML off-line neighboring voxels are not positive just because they are
+    within the old radius;
+  - CP-only samples still produce radius-neighborhood positives;
+  - sparse direction loss matches a small hand-built expected gather;
+  - deterministic DataLoader sample order is unchanged.
 
-- Use the same approved command shape for the 3D loader benchmark:
+### 11. Performance Validation
+
+- Reuse the established benchmark command:
 
   `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_all.json --benchmark --load-only --benchmark-batches 40`
 
-- Also run normal benchmark/profile with model work after the load-only path
-  improves enough to matter.
-- Report mean/median/min/max after warmup and include worker overlap plus
-  `target_gpu_ms`.
+- Report:
+  - overall throughput including startup;
+  - steady-state throughput excluding the first `loader_workers` rows;
+  - mean/median/min/max crop time;
+  - target timing breakdown.
 
 ## Spec Update
 
-- Update `planning/specs.md`:
-  - 3D DataLoader workers return compact target metadata, not dense target
-    tensors;
-  - dense direction/presence targets are realized in the main process on the
-    training GPU;
-  - NML target descriptors are transformed output-space segments;
-  - CP-only descriptors are local CP/tangent metadata;
-  - Lasagna 3x2 encoding must have torch and NumPy-compatible semantics.
+Update `planning/specs.md`:
+
+- NML 3D dense-line supervision is centerline-index based, not a
+  radius-expanded tube.
+- Dense `presence_target` and `presence_mask` are created only in the main
+  process on the training GPU.
+- Direction supervision for 3D training is sparse/gathered at supervised line
+  or CP voxels; dense full-patch six-channel direction targets are not the
+  normal training representation.
+- `presence_radius_voxels` applies to non-NML CP-only supervision, not to NML
+  dense-line centerline rasterization.
+- Benchmark steady-state throughput must account for the first
+  `loader_workers` startup-contaminated rows.
 
 ## Docs Updates
 
 - Update `docs/code_structure.md`:
-  - describe the split between worker image loading/compact descriptors and
-    GPU target materialization;
-  - document the target materializer module/function;
-  - document updated benchmark columns.
-- Update `planning/local_development.md` only if benchmark command usage or
-  column interpretation changes.
+  - describe sparse line-index target generation;
+  - describe dense GPU-only presence construction;
+  - describe sparse direction gather loss.
+- Update `planning/local_development.md`:
+  - document how to interpret benchmark throughput with 32 workers;
+  - document new benchmark timing columns.
 
 ## Changelog
 
-- Add a 2026-07-15 changelog entry that 3D training moved dense target
-  materialization from DataLoader workers to the main GPU path.
+- Add a 2026-07-15 entry that 3D NML supervision changed from
+  distance-to-segment tube targets to sparse drawn centerline voxel targets,
+  with dense presence created only on GPU.
 
 ## Explicit Non-Goals
 
-- Do not change label semantics.
-- Do not change model architecture, precision, patch size, or augmentation
-  ranges.
-- Do not remove NML dense-line supervision.
-- Do not hide invalid data as successful samples.
-- Do not reintroduce worker-side dense target tensor construction as a silent
-  fallback.
+- Do not change VC3D loading, augmentation coordinate semantics, or sample
+  order.
+- Do not change model architecture, precision, patch shape, or training
+  optimizer settings.
+- Do not silently fall back to worker-side dense target construction.
+- Do not change non-NML CP-only radius semantics in this task.
+- Do not add a custom CUDA/Triton kernel in the first implementation.

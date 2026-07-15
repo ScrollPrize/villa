@@ -185,6 +185,13 @@ def _load_materialized_batch(
     return materialize_targets(batch, loader.config, profile=True)
 
 
+def _has_sparse_direction_at(batch: object, sample: int, z: int, y: int, x: int) -> bool:
+    indices = batch.direction_indices_bzyx
+    assert indices is not None
+    target = torch.tensor([sample, z, y, x], dtype=indices.dtype, device=indices.device)
+    return bool(torch.any(torch.all(indices == target.view(1, 4), dim=1)))
+
+
 def test_lasagna_3x2_encoding_matches_projection_formula() -> None:
     encoded_2d = encode_lasagna_direction_2d(
         np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
@@ -223,17 +230,20 @@ def test_loader_builds_deterministic_cp_centered_3d_batch() -> None:
     loader = _loader(augment_enabled=False)
     raw_batch = loader.load_batch(0)
     assert raw_batch.direction_target is None
+    assert raw_batch.direction_indices_bzyx is None
     assert raw_batch.presence_target is None
     assert raw_batch.target_modes.shape == (2,)
     assert raw_batch.target_tangent_zyx.shape == (2, 3)
     batch_a = _load_materialized_batch(loader, 0)
     batch_b = _load_materialized_batch(loader, 0)
     assert batch_a.volume.shape == (2, 1, 16, 16, 16)
-    assert batch_a.direction_target.shape == (2, 6, 16, 16, 16)
+    assert batch_a.direction_target is None
+    assert batch_a.direction_indices_bzyx.shape[1] == 4
+    assert batch_a.direction_target_sparse.shape[1] == 6
     assert batch_a.presence_target.shape == (2, 1, 16, 16, 16)
     assert torch.equal(batch_a.sample_indices, batch_b.sample_indices)
     assert torch.allclose(batch_a.volume, batch_b.volume)
-    assert bool(batch_a.direction_mask.any())
+    assert int(batch_a.direction_indices_bzyx.shape[0]) > 0
     assert bool((batch_a.presence_target > 0.5).any())
     assert bool((batch_a.presence_target < 0.5).any())
 
@@ -284,14 +294,15 @@ def test_3d_batch_dataset_preserves_whole_batch_items() -> None:
         assert actual.fiber_paths == expected.fiber_paths
         assert torch.allclose(actual.volume, expected.volume)
         assert torch.allclose(actual.presence_target, expected.presence_target)
-        assert torch.allclose(actual.direction_target, expected.direction_target)
+        assert torch.equal(actual.direction_indices_bzyx, expected.direction_indices_bzyx)
+        assert torch.allclose(actual.direction_target_sparse, expected.direction_target_sparse)
 
 
 def test_loader_augmented_batch_is_finite() -> None:
     loader = _loader(augment_enabled=True)
     batch = _load_materialized_batch(loader, 1)
     assert torch.isfinite(batch.volume).all()
-    assert torch.isfinite(batch.direction_target).all()
+    assert torch.isfinite(batch.direction_target_sparse).all()
     assert batch.volume.shape == (2, 1, 16, 16, 16)
 
 
@@ -299,22 +310,24 @@ def test_loader_clips_long_label_segments_to_patch_domain() -> None:
     loader = _long_segment_loader(source_format="nml")
     batch = _load_materialized_batch(loader, 0, sample_mode="flat")
     assert batch.volume.shape == (1, 1, 16, 16, 16)
-    assert bool(batch.direction_mask.any())
+    assert int(batch.direction_indices_bzyx.shape[0]) > 0
     assert bool((batch.presence_target > 0.5).any())
     cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
     assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), int(cp[2])] > 0.5
-    far_on_segment_x = min(int(cp[2]) + 5, 15)
+    far_on_segment_x = min(int(cp[2]) + 4, 15)
     assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), far_on_segment_x] > 0.5
+    off_line_y = min(int(cp[1]) + 1, 15)
+    assert batch.presence_target[0, 0, int(cp[0]), off_line_y, far_on_segment_x] == 0.0
 
 
 def test_loader_uses_cp_only_supervision_for_non_nml_fibers() -> None:
     loader = _long_segment_loader(source_format=None)
     batch = _load_materialized_batch(loader, 0, sample_mode="flat")
     cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
-    far_on_segment_x = min(int(cp[2]) + 5, 15)
+    far_on_segment_x = min(int(cp[2]) + 4, 15)
     assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), int(cp[2])] > 0.5
     assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), far_on_segment_x] == 0.0
-    assert not bool(batch.direction_mask[0, 0, int(cp[0]), int(cp[1]), far_on_segment_x])
+    assert not _has_sparse_direction_at(batch, 0, int(cp[0]), int(cp[1]), far_on_segment_x)
 
 
 def test_train_sample_3d_sheet_contains_principal_slice_panels() -> None:
@@ -375,10 +388,11 @@ def test_smooth_displacement_modes_are_deterministic_and_finite() -> None:
         batch_a = _load_materialized_batch(loader, 2)
         batch_b = _load_materialized_batch(loader, 2)
         assert torch.isfinite(batch_a.volume).all()
-        assert torch.isfinite(batch_a.direction_target).all()
+        assert torch.isfinite(batch_a.direction_target_sparse).all()
         assert torch.allclose(batch_a.volume, batch_b.volume)
-        assert torch.allclose(batch_a.direction_target, batch_b.direction_target)
-        assert bool(batch_a.direction_mask.any())
+        assert torch.equal(batch_a.direction_indices_bzyx, batch_b.direction_indices_bzyx)
+        assert torch.allclose(batch_a.direction_target_sparse, batch_b.direction_target_sparse)
+        assert int(batch_a.direction_indices_bzyx.shape[0]) > 0
 
 
 def test_anisotropic_blur_spreads_along_configured_axis() -> None:

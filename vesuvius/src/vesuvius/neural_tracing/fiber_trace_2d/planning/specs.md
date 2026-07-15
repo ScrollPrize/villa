@@ -107,15 +107,20 @@
   target tensors. Worker batches carry image/valid tensors plus compact target
   descriptors: CP-only samples carry local CP/tangent metadata, and NML
   dense-line samples carry transformed output-space line segments with
-  precomputed patch bboxes. Dense `direction_target`, `direction_weight`,
-  `direction_mask`, `presence_target`, and `presence_mask` are created by
-  `fiber_trace_3d.targets.materialize_targets(...)` in the main training
-  process on the training device.
+  precomputed patch bboxes. Dense `presence_target` and `presence_mask` are
+  created by `fiber_trace_3d.targets.materialize_targets(...)` in the main
+  training process on the training device. Direction supervision is represented
+  sparsely as `direction_indices_bzyx`, `direction_target_sparse`, and
+  `direction_weight_sparse`; normal training must gather predictions at those
+  supervised line/CP voxels instead of creating full-patch dense six-channel
+  direction targets.
 - The GPU target materializer must preserve the existing label semantics:
-  NML sources supervise direction/presence along overlapping clipped fiber-line
-  segments, non-NML sources supervise only the sampled CP neighborhood, presence
-  negative edge masking is unchanged, and Lasagna 3x2 direction encoding uses
-  the shared NumPy/torch-compatible helper semantics.
+  NML sources supervise direction/presence by drawing the overlapping clipped
+  fiber centerline voxels only, without a radius-expanded distance-to-segment
+  tube. Non-NML sources supervise only the sampled CP neighborhood using
+  `presence_radius_voxels`; that radius does not apply to NML centerline
+  targets. Presence negative edge masking is unchanged, and Lasagna 3x2
+  direction encoding uses the shared NumPy/torch-compatible helper semantics.
 - `training.loader_workers` controls 3D DataLoader worker process count.
   `0` is the explicit serial/debug path. `training.loader_prefetch_factor`
   maps directly to PyTorch DataLoader prefetch factor for worker processes.
@@ -129,7 +134,10 @@
   sampling, tensor conversion, value augmentation, compact target-spec
   generation, batch stacking, worker wall time, and worker CPU time. Dense
   target work is reported separately as main-process GPU target materialization
-  timings (`target_ms`, `gpu_ms`, `gpu_raster`, `gpu_encode`, `gpu_mask`).
+  timings (`target_ms`, `gpu_ms`, `line_idx`, `cp_idx`, `scatter`, `dir_enc`,
+  `gpu_mask`, `linePts`, `dirPts`, and `posK`). With worker processes, the
+  first `loader_workers` benchmark rows can include worker-local loader
+  construction and should not be used as steady-state throughput.
 - 3D prefetch computes chunk dependencies from the same explicit coordinate
   path used by training and the VC3D sampler. `--prefetch-steps 0` means all
   deterministic CP samples.

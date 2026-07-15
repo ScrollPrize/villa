@@ -179,6 +179,10 @@ class FiberTrace3DBatch:
     direction_target: torch.Tensor | None = None
     direction_weight: torch.Tensor | None = None
     direction_mask: torch.Tensor | None = None
+    direction_indices_bzyx: torch.Tensor | None = None
+    direction_target_sparse: torch.Tensor | None = None
+    direction_weight_sparse: torch.Tensor | None = None
+    direction_tangent_sparse_zyx: torch.Tensor | None = None
     presence_target: torch.Tensor | None = None
     presence_mask: torch.Tensor | None = None
     profile_timings_ms: dict[str, float] | None = None
@@ -208,6 +212,18 @@ class FiberTrace3DBatch:
             if self.direction_weight is None
             else self.direction_weight.to(device),
             direction_mask=None if self.direction_mask is None else self.direction_mask.to(device),
+            direction_indices_bzyx=None
+            if self.direction_indices_bzyx is None
+            else self.direction_indices_bzyx.to(device),
+            direction_target_sparse=None
+            if self.direction_target_sparse is None
+            else self.direction_target_sparse.to(device),
+            direction_weight_sparse=None
+            if self.direction_weight_sparse is None
+            else self.direction_weight_sparse.to(device),
+            direction_tangent_sparse_zyx=None
+            if self.direction_tangent_sparse_zyx is None
+            else self.direction_tangent_sparse_zyx.to(device),
             presence_target=None
             if self.presence_target is None
             else self.presence_target.to(device),

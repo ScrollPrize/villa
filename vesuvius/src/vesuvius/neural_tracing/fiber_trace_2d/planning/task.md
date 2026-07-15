@@ -1,34 +1,33 @@
-# 3D Fiber GPU-Side Target Materialization
+# 3D Fiber Sparse Line Supervision Targets
 
-The current 3D fiber DataLoader worker path still materializes full dense
-target tensors inside each worker:
-
-- six-channel Lasagna 3x2 `direction_target`;
-- six-channel `direction_weight`;
-- `direction_mask`;
-- `presence_target`;
-- `presence_mask`.
-
-That creates expensive CPU work, large per-worker tensors, and large IPC
-payloads. The worker should only load/synthesize the image patch and return
-compact metadata needed to build the targets. Full line/direction/presence
-tensors should be realized only in the main training process on the GPU.
+The current 3D NML target materializer treats dense line supervision as a
+radius-expanded distance-to-segment volume. That is the wrong primitive for the
+NML line data. For NML fibers, supervision should be built by drawing the
+fiber centerline through the output patch and supervising only those drawn line
+voxels for direction and positive presence.
 
 Required behavior:
 
-- Keep VC3D coordinate sampling and deterministic sample order unchanged.
-- DataLoader workers return CPU image/valid data plus compact target metadata,
-  not full direction/presence tensors.
-- NML dense supervision returns transformed output-space line segments that
-  overlap or may overlap the patch; it does not rasterize them in workers.
-- Non-NML CP-only supervision returns compact CP/tangent metadata only.
-- Main training process transfers the batch to the training device and then
-  materializes direction/presence targets on GPU before loss/visualization.
-- Target semantics must match the existing CPU path:
-  - NML: dense supervision along overlapping line segments;
-  - non-NML: CP-neighborhood supervision only;
-  - same presence radius, negative edge mask, valid mask handling;
-  - same Lasagna 3x2 ambiguous direction encoding and projection weights.
-- Benchmark/profile output should separate image loading from GPU target
-  materialization so the remaining bottleneck is measurable.
-- No silent fallback to worker-side dense target tensor construction.
+- Keep DataLoader workers compact:
+  - workers may return image/valid tensors and compact target metadata;
+  - workers must not create dense `presence_target`, `presence_mask`,
+    `direction_target`, `direction_weight`, or `direction_mask`;
+  - dense presence must be created only in the main training process on the
+    training GPU.
+- For NML dense-line samples:
+  - rasterize clipped output-space fiber segments into integer voxel indices;
+  - set positive presence only at the drawn line voxels;
+  - supervise direction only at the drawn line voxels;
+  - do not use distance-to-segment tube/radius expansion for the line target.
+- For non-NML CP-only samples:
+  - keep the existing CP-neighborhood supervision unless explicitly changed in
+    a separate task.
+- Keep presence negatives dense over valid non-edge voxels, with the existing
+  valid-mask and negative-edge-mask semantics.
+- Keep Lasagna 3x2 ambiguous direction encoding semantics, but encode only the
+  supervised line/CP direction samples rather than a full dense six-channel
+  direction target where possible.
+- Keep deterministic sample order, VC3D coordinate sampling, augmentation
+  semantics, and invalid-data handling unchanged.
+- Benchmark output should make the sparse line-index path measurable and show
+  throughput after DataLoader worker startup.
