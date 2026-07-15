@@ -109,6 +109,12 @@
   `training.loader_worker_device` defaults to `"cpu"`. CPU worker processes
   use a guarded `forkserver` multiprocessing context where available, falling
   back to `fork` only when needed; CUDA worker devices select `spawn`.
+- 3D `--benchmark --load-only` timing output separates main-process
+  `wait_ms` from `to_device_ms`. It also reports worker-side profiling columns
+  for loader construction, descriptor lookup, augmentation parameters,
+  geometry-map creation, coordinate conversion, valid-mask generation, VC3D
+  sampling, tensor conversion, value augmentation, target generation, batch
+  stacking, worker wall time, and worker CPU time.
 - 3D prefetch computes chunk dependencies from the same explicit coordinate
   path used by training and the VC3D sampler. `--prefetch-steps 0` means all
   deterministic CP samples.

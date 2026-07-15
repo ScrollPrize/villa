@@ -5,6 +5,7 @@ import hashlib
 import itertools
 import json
 import math
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
@@ -156,6 +157,7 @@ class FiberTrace3DSample:
     presence_mask: torch.Tensor
     cp_local_zyx: torch.Tensor
     crop_origin_zyx: torch.Tensor
+    profile_timings_ms: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -173,6 +175,7 @@ class FiberTrace3DBatch:
     record_indices: torch.Tensor
     control_point_indices: torch.Tensor
     fiber_paths: tuple[str, ...]
+    profile_timings_ms: dict[str, float] | None = None
 
     def to(self, device: torch.device | str) -> "FiberTrace3DBatch":
         return FiberTrace3DBatch(
@@ -189,6 +192,7 @@ class FiberTrace3DBatch:
             record_indices=self.record_indices.to(device),
             control_point_indices=self.control_point_indices.to(device),
             fiber_paths=self.fiber_paths,
+            profile_timings_ms=self.profile_timings_ms,
         )
 
 
@@ -1478,20 +1482,35 @@ class FiberTrace3DLoader:
         geometry: _GeometryMaps3D,
         *,
         device: torch.device,
+        profile_timings_ms: dict[str, float] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        start = time.perf_counter()
         coords_selected = geometry.backward_source_zyx.detach().cpu().numpy().astype(np.float32)
         coords_base = np.ascontiguousarray(coords_selected * float(record.volume_spacing_base))
+        if profile_timings_ms is not None:
+            profile_timings_ms["coord_to_numpy_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
+        start = time.perf_counter()
         base_shape = np.asarray(record.base_shape_zyx, dtype=np.float32)
         valid = np.isfinite(coords_base).all(axis=-1)
         valid &= (coords_base[..., 0] >= 0.0) & (coords_base[..., 0] <= float(base_shape[0] - 1.0))
         valid &= (coords_base[..., 1] >= 0.0) & (coords_base[..., 1] <= float(base_shape[1] - 1.0))
         valid &= (coords_base[..., 2] >= 0.0) & (coords_base[..., 2] <= float(base_shape[2] - 1.0))
+        if profile_timings_ms is not None:
+            profile_timings_ms["coord_valid_ms"] = (time.perf_counter() - start) * 1000.0
+        start = time.perf_counter()
         result = record.sampler.sample_coord_batch(coords_base, np.ascontiguousarray(valid))
+        if profile_timings_ms is not None:
+            profile_timings_ms["volume_sample_ms"] = (time.perf_counter() - start) * 1000.0
+        start = time.perf_counter()
         sampled_np = np.asarray(result.image, dtype=np.float32)
         sampled_valid_np = np.asarray(result.valid_mask, dtype=bool) & valid
         sampled = torch.as_tensor(sampled_np, dtype=torch.float32, device=device)
         sampled_valid = torch.as_tensor(sampled_valid_np, dtype=torch.bool, device=device)
         sampled = torch.where(sampled_valid, sampled, torch.zeros_like(sampled))
+        if profile_timings_ms is not None:
+            profile_timings_ms["volume_tensor_ms"] = (time.perf_counter() - start) * 1000.0
         return sampled, sampled_valid
 
     def _apply_value_augmentation(
@@ -1688,12 +1707,15 @@ class FiberTrace3DLoader:
         segment_start: np.ndarray,
         segment_end: np.ndarray,
         patch_shape: tuple[int, int, int],
+        profile_timings_ms: dict[str, float] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         radius = float(self.config.presence_radius_voxels)
         radius2 = np.float32(radius * radius)
         min_dist2 = np.full(patch_shape, np.inf, dtype=np.float32)
         nearest_tangent = np.zeros((*patch_shape, 3), dtype=np.float32)
         patch_hi = np.asarray(patch_shape, dtype=np.float32) - 1.0
+        raster_segments = 0
+        raster_bbox_voxels = 0
         for p0_raw, p1_raw in zip(segment_start, segment_end, strict=True):
             clipped = _clip_segment_to_aabb(
                 p0_raw,
@@ -1715,6 +1737,8 @@ class FiberTrace3DLoader:
             hi = np.minimum(hi, np.asarray(patch_shape, dtype=np.int64))
             if bool(np.any(hi <= lo)):
                 continue
+            raster_segments += 1
+            raster_bbox_voxels += int(np.prod(hi - lo))
             z = np.arange(int(lo[0]), int(hi[0]), dtype=np.float32)
             y = np.arange(int(lo[1]), int(hi[1]), dtype=np.float32)
             x = np.arange(int(lo[2]), int(hi[2]), dtype=np.float32)
@@ -1736,7 +1760,12 @@ class FiberTrace3DLoader:
                 int(lo[2]) : int(hi[2]),
             ]
             tangent_region[replace_mask] = vec
-        return min_dist2 <= radius2, nearest_tangent
+        positive = min_dist2 <= radius2
+        if profile_timings_ms is not None:
+            profile_timings_ms["target_raster_segments"] = float(raster_segments)
+            profile_timings_ms["target_raster_bbox_voxels"] = float(raster_bbox_voxels)
+            profile_timings_ms["target_positive_voxels"] = float(np.count_nonzero(positive))
+        return positive, nearest_tangent
 
     def _build_targets(
         self,
@@ -1745,6 +1774,7 @@ class FiberTrace3DLoader:
         params: _Augment3DParams,
         geometry: _GeometryMaps3D,
         valid_mask: torch.Tensor,
+        profile_timings_ms: dict[str, float] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         patch_shape = tuple(int(v) for v in self.config.patch_shape_zyx)
         if not _uses_dense_fiber_supervision(record):
@@ -1756,28 +1786,43 @@ class FiberTrace3DLoader:
                 valid_mask,
                 patch_shape,
             )
+        start = time.perf_counter()
         line_points, _local_line_index = self._line_window_for_labels(
             record,
             cp_index,
             params,
         )
+        if profile_timings_ms is not None:
+            profile_timings_ms["target_line_window_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
         if line_points.shape[0] < 2:
             raise ValueError("label line window must contain at least two points")
+        start = time.perf_counter()
         points_out, _points_valid = self._source_points_to_output_np(line_points, params)
         segment_start = points_out[:-1].astype(np.float32)
         segment_end = points_out[1:].astype(np.float32)
         valid_segments = np.isfinite(segment_start).all(axis=1) & np.isfinite(segment_end).all(axis=1)
         segment_start = segment_start[valid_segments]
         segment_end = segment_end[valid_segments]
+        if profile_timings_ms is not None:
+            profile_timings_ms["target_points_to_output_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
         if segment_start.shape[0] == 0:
             raise ValueError("label line window has no finite output-space segments")
+        start = time.perf_counter()
         positive, tangent_zyx = self._rasterize_segment_targets(
             segment_start,
             segment_end,
             patch_shape,
+            profile_timings_ms,
         )
+        if profile_timings_ms is not None:
+            profile_timings_ms["target_raster_ms"] = (time.perf_counter() - start) * 1000.0
         if not bool(np.any(positive)):
             raise ValueError("label line window has no patch-overlapping positive voxels")
+        start = time.perf_counter()
         tangent_xyz = tangent_zyx[..., [2, 1, 0]]
         direction_target_np = encode_lasagna_direction_3x2(tangent_xyz).astype(np.float32)
         direction_weight_np = projection_magnitude_weights_3x2(tangent_xyz).astype(np.float32)
@@ -1795,12 +1840,22 @@ class FiberTrace3DLoader:
         direction_mask = valid_mask & positive_t
 
         presence_target = positive_t.to(dtype=torch.float32).view(1, *patch_shape)
+        if profile_timings_ms is not None:
+            profile_timings_ms["target_encode_tensor_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
+        start = time.perf_counter()
+        presence_mask = self._presence_loss_mask(valid_mask, patch_shape)
+        if profile_timings_ms is not None:
+            profile_timings_ms["target_presence_mask_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
         return (
             direction_target,
             direction_weight,
             direction_mask.view(1, *patch_shape),
             presence_target,
-            self._presence_loss_mask(valid_mask, patch_shape),
+            presence_mask,
         )
 
     def load_sample(
@@ -1809,30 +1864,55 @@ class FiberTrace3DLoader:
         *,
         sample_mode: str = "random",
         device: torch.device | str = "cpu",
+        profile: bool = False,
     ) -> FiberTrace3DSample:
+        total_start = time.perf_counter()
+        cpu_total_start = time.process_time()
+        timings: dict[str, float] | None = {} if profile else None
         resolved_device = torch.device(device)
+        start = time.perf_counter()
         record, record_index, cp_index = self.descriptor_for_sample_index(
             sample_index,
             sample_mode=sample_mode,
         )
+        if timings is not None:
+            timings["descriptor_ms"] = (time.perf_counter() - start) * 1000.0
+        start = time.perf_counter()
         params = self._sample_augment_params(record, cp_index, int(sample_index))
+        if timings is not None:
+            timings["augment_params_ms"] = (time.perf_counter() - start) * 1000.0
+        start = time.perf_counter()
         geometry = self._build_geometry_maps(
             params,
             device=resolved_device,
         )
+        if timings is not None:
+            timings["geometry_ms"] = (time.perf_counter() - start) * 1000.0
+        start = time.perf_counter()
         volume, valid = self._sample_volume_patch(
             record,
             geometry,
             device=resolved_device,
+            profile_timings_ms=timings,
         )
+        if timings is not None:
+            timings["sample_volume_total_ms"] = (time.perf_counter() - start) * 1000.0
+        start = time.perf_counter()
         volume = self._apply_value_augmentation(volume, valid, params)
+        if timings is not None:
+            timings["value_augmentation_ms"] = (time.perf_counter() - start) * 1000.0
+        start = time.perf_counter()
         (
             direction_target,
             direction_weight,
             direction_mask,
             presence_target,
             presence_mask,
-        ) = self._build_targets(record, cp_index, params, geometry, valid)
+        ) = self._build_targets(record, cp_index, params, geometry, valid, timings)
+        if timings is not None:
+            timings["target_total_ms"] = (time.perf_counter() - start) * 1000.0
+            timings["sample_total_ms"] = (time.perf_counter() - total_start) * 1000.0
+            timings["sample_cpu_ms"] = (time.process_time() - cpu_total_start) * 1000.0
         return FiberTrace3DSample(
             sample_index=int(sample_index),
             record_index=int(record_index),
@@ -1851,6 +1931,7 @@ class FiberTrace3DLoader:
                 dtype=torch.float32,
                 device=resolved_device,
             ),
+            profile_timings_ms=timings,
         )
 
     def load_batch(
@@ -1859,15 +1940,34 @@ class FiberTrace3DLoader:
         *,
         sample_mode: str = "random",
         device: torch.device | str = "cpu",
+        profile: bool = False,
     ) -> FiberTrace3DBatch:
+        total_start = time.perf_counter()
+        wall_start_ns = time.time_ns()
+        cpu_total_start = time.process_time()
         samples = [
             self.load_sample(
                 int(start_sample_index) + offset,
                 sample_mode=sample_mode,
                 device=device,
+                profile=profile,
             )
             for offset in range(int(self.config.batch_size))
         ]
+        stack_start = time.perf_counter()
+        timings: dict[str, float] | None = None
+        if profile:
+            timings = {}
+            keys = set().union(
+                *[
+                    set(sample.profile_timings_ms or {})
+                    for sample in samples
+                ]
+            )
+            for key in sorted(keys):
+                timings[key] = float(
+                    sum(float((sample.profile_timings_ms or {}).get(key, 0.0)) for sample in samples)
+                )
         return FiberTrace3DBatch(
             volume=torch.stack([sample.volume for sample in samples], dim=0),
             valid_mask=torch.stack([sample.valid_mask for sample in samples], dim=0),
@@ -1882,6 +1982,17 @@ class FiberTrace3DLoader:
             record_indices=torch.as_tensor([sample.record_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
             control_point_indices=torch.as_tensor([sample.control_point_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
             fiber_paths=tuple(sample.fiber_path for sample in samples),
+            profile_timings_ms={
+                **(timings or {}),
+                "batch_stack_ms": (time.perf_counter() - stack_start) * 1000.0,
+                "batch_total_ms": (time.perf_counter() - total_start) * 1000.0,
+                "batch_cpu_ms": (time.process_time() - cpu_total_start) * 1000.0,
+                "worker_pid": float(os.getpid()),
+                "worker_batch_start_ns": float(wall_start_ns),
+                "worker_batch_end_ns": float(time.time_ns()),
+            }
+            if profile
+            else None,
         )
 
     def chunk_requests_for_sample_index(

@@ -115,6 +115,13 @@ side/top strip input loading.
   main process plus DataLoader worker processes during each benchmark row where
   `/proc/<pid>/stat` is available. `cpu_x=1.0` is roughly one fully occupied
   CPU core for that row.
+- The 3D load-only benchmark also exposes worker-side stage timings when using
+  DataLoader workers: `worker_ms`, `worker_cpu`, `cpu/w`, loader construction,
+  descriptor lookup, augmentation parameter sampling, coordinate-map creation,
+  coordinate conversion/valid-mask generation, VC3D volume sampling, tensor
+  conversion, value augmentation, target rasterization/encoding, and batch
+  stacking. `wait_ms` is the main process blocking on the next DataLoader item;
+  it is distinct from `to_device_ms`, the CPU-to-training-device transfer.
 - When `training.test_trace2cp_enabled` is true, test evaluation builds
   Trace2CP side-strip geometry with the 2D loader, runs tiled dense 3D inference
   blocks over the requested strip coordinates, projects direction/presence into

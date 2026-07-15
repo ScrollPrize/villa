@@ -145,6 +145,24 @@ checked-in S1A NML config:
 - A follow-up run with benchmark `cpu_ms/cpu_x` columns showed post-startup
   weighted `cpu_x=2.44`, median row `cpu_x=3.02`, and mean row `cpu_x=3.02`;
   this is not full CPU utilization on a 32-logical-CPU machine.
+- A diagnostic rerun with worker-stage timings showed the blockage explicitly:
+  the first eight returned rows each carried a worker-local
+  `FiberTrace3DLoader` construction cost of roughly `4.6-5.1 s`, because every
+  DataLoader worker parses/opens the full dataset on its first item. After
+  worker construction, rows 9-10 showed worker patch builds of roughly
+  `2.7-2.8 s` wall and `3.38 s` CPU. The dominant worker stages were target
+  generation (`0.96-0.99 s`), VC3D volume sampling (`0.63-0.65 s`), value
+  augmentation (`0.34-0.38 s`), geometry-map creation (`0.28-0.38 s`), and
+  valid-mask generation (`0.17-0.19 s`). Main-process transfer to CUDA was
+  still visible at about `100-110 ms` on the steady rows.
+- The worker-overlap diagnostic showed `avg_active=6.94`, `max_active=8`, and
+  `worker_cpu_x=5.11` for ten produced items, so DataLoader workers are
+  overlapping, but only up to the configured eight workers and with about five
+  effective CPU cores over the measured window. The target-generation
+  sub-breakdown showed that steady-state `target_ms` is dominated by dense
+  direction target encoding/tensor materialization: rows 9-10 had
+  `target_ms=899.52/932.30 ms`, `raster_ms=19.18/19.57 ms`, and
+  `encode_ms=852.53/887.88 ms`.
 
 ## Fiber Trace 2D Training Prefetch Commands
 

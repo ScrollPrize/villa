@@ -7,7 +7,7 @@ import multiprocessing as mp
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -697,7 +697,7 @@ def run_training(config_path: str | Path) -> None:
     try:
         for step in range(start_step + 1, max_steps + 1):
             sample_index = (step - 1) * loader.config.batch_size
-            batch, load_ms, to_device_ms = _next_training_batch(
+            batch, load_ms, wait_ms, to_device_ms = _next_training_batch(
                 iterator=train_iterator,
                 loader=loader,
                 sample_index=sample_index,
@@ -721,7 +721,8 @@ def run_training(config_path: str | Path) -> None:
                     f"step={step} loss_total={losses['total']:.6f} "
                     f"loss_direction={losses['direction']:.6f} "
                     f"loss_presence={losses['presence']:.6f} "
-                    f"load_ms={load_ms:.1f} to_device_ms={to_device_ms:.1f} "
+                    f"load_ms={load_ms:.1f} wait_ms={wait_ms:.1f} "
+                    f"to_device_ms={to_device_ms:.1f} "
                     f"fw_bw_step_ms={step_ms:.1f}",
                     flush=True,
                 )
@@ -730,7 +731,7 @@ def run_training(config_path: str | Path) -> None:
                 writer.add_scalar("train/loss_direction", losses["direction"], step)
                 writer.add_scalar("train/loss_presence", losses["presence"], step)
                 writer.add_scalar("timing/load_ms", load_ms, step)
-                writer.add_scalar("timing/load_wait_ms", load_ms, step)
+                writer.add_scalar("timing/load_wait_ms", wait_ms, step)
                 writer.add_scalar("timing/batch_to_device_ms", to_device_ms, step)
                 writer.add_scalar("timing/fw_bw_step_ms", step_ms, step)
             if writer is not None and sample_vis_interval > 0 and (
@@ -1198,29 +1199,36 @@ class _FiberTrace3DBatchDataset(Dataset):
         batch_count: int,
         sample_mode: str,
         worker_device: str | torch.device = "cpu",
+        profile: bool = False,
     ) -> None:
         self.config_source = config_source
         self.start_batch_index = int(start_batch_index)
         self.batch_count = int(batch_count)
         self.sample_mode = str(sample_mode)
         self.worker_device = str(worker_device)
+        self.profile = bool(profile)
         self._loader: FiberTrace3DLoader | None = None
+        self._pending_construct_ms = 0.0
 
     def __len__(self) -> int:
         return max(0, int(self.batch_count))
 
     def _get_loader(self) -> FiberTrace3DLoader:
         if self._loader is None:
+            start = time.perf_counter()
             if isinstance(self.config_source, (str, Path)):
                 config = load_config(self.config_source)
             else:
                 config = self.config_source
             self._loader = FiberTrace3DLoader(config)
+            self._pending_construct_ms += (time.perf_counter() - start) * 1000.0
         return self._loader
 
     def __getitem__(self, index: int) -> FiberTrace3DBatch:
         if int(index) < 0 or int(index) >= len(self):
             raise IndexError(index)
+        item_start_ns = time.time_ns()
+        item_cpu_start = time.process_time()
         loader = self._get_loader()
         batch_index = self.start_batch_index + int(index)
         sample_index = batch_index * int(loader.config.batch_size)
@@ -1229,7 +1237,23 @@ class _FiberTrace3DBatchDataset(Dataset):
             sample_index,
             sample_mode=self.sample_mode,
             device=worker_device,
+            profile=self.profile,
         )
+        if self.profile and self._pending_construct_ms > 0.0:
+            timings = dict(batch.profile_timings_ms or {})
+            timings["worker_loader_construct_ms"] = timings.get(
+                "worker_loader_construct_ms",
+                0.0,
+            ) + float(self._pending_construct_ms)
+            self._pending_construct_ms = 0.0
+            batch = replace(batch, profile_timings_ms=timings)
+        if self.profile:
+            timings = dict(batch.profile_timings_ms or {})
+            timings["worker_item_start_ns"] = float(item_start_ns)
+            timings["worker_item_end_ns"] = float(time.time_ns())
+            timings["worker_item_cpu_ms"] = (time.process_time() - item_cpu_start) * 1000.0
+            timings["worker_item_index"] = float(index)
+            batch = replace(batch, profile_timings_ms=timings)
         if worker_device.type == "cuda":
             torch.cuda.synchronize(worker_device)
             batch = batch.to("cpu")
@@ -1294,6 +1318,7 @@ def _make_batch_dataloader(
     start_batch_index: int,
     batch_count: int,
     sample_mode: str,
+    profile: bool = False,
 ) -> DataLoader | None:
     workers = _loader_worker_count(raw_config)
     if workers <= 0 or int(batch_count) <= 0:
@@ -1304,6 +1329,7 @@ def _make_batch_dataloader(
         batch_count=int(batch_count),
         sample_mode=sample_mode,
         worker_device=_loader_worker_device(raw_config),
+        profile=profile,
     )
     context = _loader_multiprocessing_context(raw_config)
     kwargs: dict[str, Any] = {}
@@ -1330,12 +1356,12 @@ def _next_training_batch(
     sample_index: int,
     sample_mode: str,
     device: torch.device,
-) -> tuple[FiberTrace3DBatch, float, float]:
+) -> tuple[FiberTrace3DBatch, float, float, float]:
     wait_start = time.perf_counter()
     if iterator is None:
         batch = loader.load_batch(sample_index, sample_mode=sample_mode, device=device)
         wait_ms = (time.perf_counter() - wait_start) * 1000.0
-        return batch, wait_ms, 0.0
+        return batch, wait_ms, wait_ms, 0.0
 
     batch = next(iterator)
     wait_ms = (time.perf_counter() - wait_start) * 1000.0
@@ -1344,7 +1370,7 @@ def _next_training_batch(
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     to_device_ms = (time.perf_counter() - to_device_start) * 1000.0
-    return batch, wait_ms + to_device_ms, to_device_ms
+    return batch, wait_ms + to_device_ms, wait_ms, to_device_ms
 
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
@@ -1389,6 +1415,46 @@ def _cpu_seconds_for_pids(pids: tuple[int, ...]) -> float | None:
     return total if seen else None
 
 
+def _worker_overlap_summary(rows: list[dict[str, float]]) -> dict[str, float]:
+    intervals: list[tuple[float, float]] = []
+    cpu_ms_total = 0.0
+    for row in rows:
+        start = float(row.get("worker_item_start_ns", 0.0))
+        end = float(row.get("worker_item_end_ns", 0.0))
+        if end > start:
+            intervals.append((start / 1.0e6, end / 1.0e6))
+            cpu_ms_total += float(row.get("worker_item_cpu_ms", 0.0))
+    if not intervals:
+        return {}
+    events: list[tuple[float, int]] = []
+    for start_ms, end_ms in intervals:
+        events.append((start_ms, 1))
+        events.append((end_ms, -1))
+    events.sort(key=lambda item: (item[0], -item[1]))
+    first = min(start for start, _end in intervals)
+    last = max(end for _start, end in intervals)
+    active = 0
+    prev = events[0][0]
+    active_area_ms = 0.0
+    max_active = 0
+    for timestamp, delta in events:
+        if timestamp > prev:
+            active_area_ms += active * (timestamp - prev)
+            prev = timestamp
+        active += delta
+        max_active = max(max_active, active)
+    span_ms = max(last - first, 1.0e-6)
+    construct_rows = sum(1 for row in rows if float(row.get("worker_loader_construct_ms", 0.0)) > 0.0)
+    return {
+        "items": float(len(intervals)),
+        "span_ms": span_ms,
+        "avg_active": active_area_ms / span_ms,
+        "max_active": float(max_active),
+        "worker_cpu_x": cpu_ms_total / span_ms,
+        "construct_items": float(construct_rows),
+    }
+
+
 def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> None:
     raw_config = _load_raw_config(config_path)
     loader = FiberTrace3DLoader(load_config(config_path))
@@ -1408,6 +1474,7 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
         start_batch_index=0,
         batch_count=int(batches),
         sample_mode="random",
+        profile=True,
     )
     iterator = iter(dataloader) if dataloader is not None else None
     cpu_pids = (os.getpid(),) + _dataloader_worker_pids(iterator)
@@ -1419,11 +1486,17 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
         f"device={device} load_only={bool(load_only)}",
         flush=True,
     )
-    print("batch patches total_ms load_ms to_device_ms fw_ms cpu_ms cpu_x")
+    print(
+        "batch patches total_ms load_ms wait_ms to_device_ms fw_ms "
+        "worker_ms worker_cpu cpu/w construct_ms desc_ms params_ms geom_ms coord_ms valid_ms "
+        "sample_ms tensor_ms value_ms target_ms line_ms map_ms raster_ms encode_ms mask_ms "
+        "segs bboxM posK stack_ms cpu_ms cpu_x"
+    )
+    profile_rows: list[dict[str, float]] = []
     for batch_index in range(1, int(batches) + 1):
         start = time.perf_counter()
         cpu_start = _cpu_seconds_for_pids(cpu_pids)
-        batch, load_ms, to_device_ms = _next_training_batch(
+        batch, load_ms, wait_ms, to_device_ms = _next_training_batch(
             iterator=iterator,
             loader=loader,
             sample_index=(batch_index - 1) * loader.config.batch_size,
@@ -1451,10 +1524,45 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
         if cpu_start is not None and cpu_end is not None and cpu_end >= cpu_start:
             cpu_ms = (cpu_end - cpu_start) * 1000.0
             cpu_factor = cpu_ms / max(total_ms, 1.0e-6)
+        timings = batch.profile_timings_ms or {}
+
+        def timing_ms(key: str) -> float:
+            return float(timings.get(key, 0.0))
+
+        profile_rows.append({key: float(value) for key, value in timings.items()})
         print(
             f"{batch_index:5d} {loader.config.batch_size:7d} "
-            f"{total_ms:8.2f} {load_ms:8.2f} {to_device_ms:12.2f} "
-            f"{fw_ms:8.2f} {cpu_ms:8.2f} {cpu_factor:6.2f}",
+            f"{total_ms:8.2f} {load_ms:8.2f} {wait_ms:8.2f} {to_device_ms:12.2f} "
+            f"{fw_ms:8.2f} {timing_ms('batch_total_ms'):9.2f} "
+            f"{timing_ms('batch_cpu_ms'):10.2f} "
+            f"{timing_ms('batch_cpu_ms') / max(timing_ms('batch_total_ms'), 1.0e-6):5.2f} "
+            f"{timing_ms('worker_loader_construct_ms'):12.2f} "
+            f"{timing_ms('descriptor_ms'):8.2f} {timing_ms('augment_params_ms'):9.2f} "
+            f"{timing_ms('geometry_ms'):7.2f} {timing_ms('coord_to_numpy_ms'):8.2f} "
+            f"{timing_ms('coord_valid_ms'):8.2f} {timing_ms('volume_sample_ms'):9.2f} "
+            f"{timing_ms('volume_tensor_ms'):9.2f} "
+            f"{timing_ms('value_augmentation_ms'):8.2f} "
+            f"{timing_ms('target_total_ms'):9.2f} "
+            f"{timing_ms('target_line_window_ms'):7.2f} "
+            f"{timing_ms('target_points_to_output_ms'):6.2f} "
+            f"{timing_ms('target_raster_ms'):9.2f} "
+            f"{timing_ms('target_encode_tensor_ms'):9.2f} "
+            f"{timing_ms('target_presence_mask_ms'):7.2f} "
+            f"{timing_ms('target_raster_segments'):5.0f} "
+            f"{timing_ms('target_raster_bbox_voxels') / 1.0e6:6.2f} "
+            f"{timing_ms('target_positive_voxels') / 1.0e3:5.1f} "
+            f"{timing_ms('batch_stack_ms'):8.2f} "
+            f"{cpu_ms:8.2f} {cpu_factor:6.2f}",
+            flush=True,
+        )
+    overlap = _worker_overlap_summary(profile_rows)
+    if overlap:
+        print(
+            "fiber_trace_3d worker overlap: "
+            f"items={int(overlap['items'])} span_ms={overlap['span_ms']:.1f} "
+            f"avg_active={overlap['avg_active']:.2f} max_active={int(overlap['max_active'])} "
+            f"worker_cpu_x={overlap['worker_cpu_x']:.2f} "
+            f"construct_items={int(overlap['construct_items'])}",
             flush=True,
         )
     iterator = None

@@ -1,225 +1,218 @@
-# 3D Fiber PyTorch DataLoader Parallelism Plan
+# 3D Fiber GPU-Side Target Materialization Plan
 
 ## Scope
 
-This task fixes the missing runtime parallelism from the previous 3D loader
-performance pass. The VC3D coordinate-sampling path and search-free 3D target
-rasterization remain the intended loader semantics. The change here is the
-training/benchmark batch-loading execution model.
+Move full dense 3D direction/presence target construction out of
+DataLoader workers. Workers should return image data plus compact target
+descriptors; the main training process realizes full target tensors on the
+training GPU.
+
+This task does not change model architecture, patch size, sample order,
+augmentation semantics, VC3D volume sampling, or loss definitions.
 
 ## Current Problem
 
-- `fiber_trace_3d.train` currently contains `_OrderedBatchLoadPipeline`, a
-  `ThreadPoolExecutor` wrapper around complete `loader.load_batch(...)` calls.
-- That does not satisfy the requirement to use PyTorch data-loader process
-  parallelism and does not give real process isolation for Python-heavy loader
-  work.
-- The approved load-only benchmark now measures the faster VC3D coordinate
-  sampling path, but still effectively measures one synchronous batch load at a
-  time unless the thread queue happens to overlap work.
+- `FiberTrace3DLoader.load_sample(...)` calls `_build_targets(...)` in the
+  worker process.
+- For NML samples, `_build_targets(...)` currently:
+  - transforms line points to output patch coordinates;
+  - rasterizes segment neighborhoods into full `positive` and tangent volumes;
+  - encodes a dense six-channel Lasagna 3x2 direction target;
+  - builds dense direction/presence masks.
+- Benchmark profiling shows the worker-side encode/tensor target stage can be
+  hundreds of milliseconds per patch and creates large IPC payloads.
 
 ## Implementation Plan
 
-### 1. Remove The Thread Pipeline
+### 1. Split Batch Data From Dense Targets
 
-- Delete `_OrderedBatchLoadPipeline` from `fiber_trace_3d.train`.
-- Remove the `ThreadPoolExecutor` / `Future` imports from `fiber_trace_3d.train`.
-- Do not leave a silent thread fallback behind the same config names.
-- Keep the old single-process synchronous path only for `num_workers <= 0` or
-  an explicit serial/debug configuration.
+- Introduce compact target-spec dataclasses in
+  `fiber_trace_3d.loader`, for example:
+  - `FiberTrace3DTargetSpec`;
+  - `FiberTrace3DDenseLineSpec`;
+  - `FiberTrace3DCpOnlySpec`.
+- Update `FiberTrace3DSample` / `FiberTrace3DBatch` so worker-returned batches
+  carry:
+  - `volume`;
+  - `valid_mask`;
+  - sample/record/control-point metadata;
+  - `cp_local_zyx` and `crop_origin_zyx`;
+  - compact per-sample target descriptors.
+- Do not include worker-built `direction_target`, `direction_weight`,
+  `direction_mask`, `presence_target`, or `presence_mask` in the normal
+  DataLoader batch payload.
 
-### 2. Add A Batch-Level PyTorch Dataset
+### 2. Build Compact Target Metadata In Workers
 
-- Add a small map-style dataset class in `fiber_trace_3d.train`, e.g.
-  `_FiberTrace3DBatchDataset`.
-- Dataset items are whole training batches, not individual CP patches:
-  - `__getitem__(batch_number)` computes
-    `sample_index = (start_step + batch_number) * config.batch_size`;
-  - it calls `worker_loader.load_batch(sample_index, sample_mode="random",
-    device=worker_device)`;
-  - it returns one `FiberTrace3DBatch`.
-- Use `batch_size=None` on `torch.utils.data.DataLoader` so PyTorch does not
-  apply default collation to the custom dataclass.
-- Add a stable `__len__` for finite training/benchmark loops. For normal
-  training, length is the requested number of remaining steps.
+- Replace worker `_build_targets(...)` calls with a compact metadata builder.
+- For NML dense supervision:
+  - reuse `_line_window_for_labels(...)`;
+  - reuse `_source_points_to_output_np(...)`;
+  - return finite transformed output-space `segment_start_zyx` and
+    `segment_end_zyx`;
+  - keep only segments that overlap or may overlap the patch after
+    `presence_radius_voxels` expansion;
+  - fail loudly if no patch-overlapping segment remains.
+- For non-NML CP-only supervision:
+  - return `cp_local_zyx`;
+  - return the transformed local tangent used by the current CP-only path.
+- Preserve all existing invalid-sample/data-failure behavior. This change
+  only moves dense realization; it does not hide malformed fibers.
 
-### 3. Lazy Per-Worker Loader Construction
+### 3. Represent Variable Segment Counts Compactly
 
-- The dataset must store only picklable construction data:
-  - config path or raw config mapping;
-  - sample mode;
-  - worker output device policy;
-  - deterministic start batch index.
-- It must not store an already-open `FiberTrace3DLoader`.
-- In each worker process, lazily create a `FiberTrace3DLoader(load_config(path))`
-  the first time `__getitem__` runs.
-- That ensures each worker opens its own zarr/VC3D volume handles and sampler
-  state inside the worker process.
-- The main process may keep its own loader for metadata, test evaluation, and
-  serial fallback, but worker loaders must be independent process-local objects.
+- In `load_batch(...)`, pack per-sample segment arrays into a padded tensor or
+  flat tensor plus offsets:
+  - preferred: `segment_start_zyx_flat`, `segment_end_zyx_flat`,
+    `segment_offsets`, `segment_counts`;
+  - this avoids Python object lists across the hot training path.
+- Keep the tensors on CPU in worker output.
+- `FiberTrace3DBatch.to(device)` transfers compact segment tensors to the
+  training device together with image data.
 
-### 4. Worker Device And CUDA Boundary
+### 4. Add GPU Target Materializer
 
-- Default worker output is CPU tensors. Main training moves the whole returned
-  `FiberTrace3DBatch` to the training device with `batch.to(device)`.
-- Add config support for worker-side coordinate device only if currently
-  supported by the 3D loader API:
-  - `training.loader_worker_device` or top-level `loader_cuda_device`;
-  - default should be `"cpu"` initially if CUDA worker behavior is not verified;
-  - if set to CUDA, DataLoader must use spawn-compatible multiprocessing and
-    workers must return CPU tensors after synchronizing/copying.
-- Do not pass CUDA tensors from worker processes to the main process.
-- If CUDA-in-worker is not implemented in this task, log it as explicitly
-  deferred; do not imply it exists.
+- Add a GPU-side materializer in `fiber_trace_3d.train` or a small sibling
+  module, e.g. `fiber_trace_3d.targets`.
+- API shape:
 
-### 5. DataLoader Construction
+  `materialize_targets(batch, config, device) -> FiberTrace3DPreparedBatch`
 
-- Add helper `_make_batch_dataloader(...)` in `fiber_trace_3d.train`.
-- Effective worker count:
-  - `training.loader_workers` first;
-  - fallback to top-level `loader_workers` if added;
-  - `0` means serial/debug path or all logical cores only if explicitly
-    documented and implemented;
-  - positive values become `num_workers`.
-- Use:
-  - `persistent_workers=True` when `num_workers > 0`;
-  - `prefetch_factor=training.pipeline_depth` or a new
-    `training.loader_prefetch_factor`;
-  - `multiprocessing_context="spawn"` for CUDA-worker compatibility, otherwise
-    the safest available context for local Linux.
-- Use an identity collate function if needed so a `FiberTrace3DBatch` passes
-  through unchanged.
-- Optional: add `pin_memory=True` only if `FiberTrace3DBatch` supports a
-  `pin_memory()` method or if tests show PyTorch handles the custom dataclass
-  correctly. Otherwise leave it false and document the reason.
+- It returns or attaches:
+  - `direction_target`;
+  - `direction_weight`;
+  - `direction_mask`;
+  - `presence_target`;
+  - `presence_mask`.
+- Cache regular coordinate grids and edge-interior masks by
+  `(patch_shape_zyx, device)` to avoid rebuilding them every batch.
 
-### 6. Integrate Training Loop
+### 5. GPU Dense-Line Rasterization
 
-- Replace the current direct `loader.load_batch(...)` call in `run_training`
-  with an iterator over the DataLoader when worker count is positive.
-- For each step:
-  - get next CPU `FiberTrace3DBatch` from the DataLoader;
-  - move it to `device` in the main process;
-  - run forward/backward/optimizer as before.
-- Preserve all existing scalar/test/snapshot/TensorBoard behavior.
-- Timing:
-  - `load_ms` becomes time spent waiting for the next DataLoader batch plus
-    main-process device transfer;
-  - add separate `batch_to_device_ms` if useful and cheap;
-  - keep `timing/load_ms` for compatibility.
+- Port `_rasterize_segment_targets(...)` semantics to torch on the GPU.
+- Keep the existing search-free segment rasterization logic:
+  - clip each transformed segment to the patch AABB expanded by radius;
+  - compute a local bounding box;
+  - update `min_dist2` and nearest tangent for voxels inside that bbox;
+  - mark positives where `min_dist2 <= radius^2`.
+- The first implementation may loop over samples and their finite segments in
+  Python, but all per-voxel bbox math and tensor writes must run on the GPU.
+- Do not perform a full voxel-by-all-segments dense distance tensor if it
+  explodes memory.
+- If segment-loop launch overhead remains large, batch/vectorize by grouped
+  segment bbox size in a follow-up. Do not silently change semantics.
 
-### 7. Integrate Benchmark / Load-Only
+### 6. GPU CP-Only Target Realization
 
-- `run_benchmark(..., load_only=True)` must use the same DataLoader path and
-  worker settings as training unless explicitly forced serial.
-- This is critical: load-only benchmark is how we validate parallel loader
-  throughput without model work.
-- Report rows using the same existing table shape, but clarify that `load_ms`
-  is DataLoader wait plus batch transfer.
-- Use the exact approved command for comparison:
+- Reimplement `_cp_only_targets(...)` on torch:
+  - distance from cached grid to `cp_local_zyx`;
+  - positive mask within `presence_radius_voxels`;
+  - transformed local tangent broadcast to target voxels;
+  - direction mask gated by `valid_mask & positive`.
+- This path should not create NumPy grids.
 
-  `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_all.json --benchmark --load-only --benchmark-batches 10`
+### 7. Torch Lasagna 3x2 Encoding
 
-### 8. Config Updates
+- Add torch equivalents of:
+  - `encode_lasagna_direction_3x2`;
+  - `projection_magnitude_weights_3x2`.
+- Match the existing NumPy analytic formulas exactly enough for tests.
+- Add focused tests comparing torch outputs with the current NumPy helpers on
+  representative directions, including degenerate projection cases.
 
-- Add checked-in config keys under `training`:
-  - `loader_workers`;
-  - `loader_prefetch_factor`;
-  - optionally `loader_worker_device`.
-- Remove or deprecate the misleading thread-pipeline-only keys if they no
-  longer apply:
-  - `pipeline_workers`;
-  - `pipeline_depth`;
-  - `pipeline_enabled`.
-- If keeping these names for compatibility, redefine them clearly as DataLoader
-  settings and update docs/specs. Do not leave them documented as
-  ThreadPool-based.
-- Set S1A NML 3D defaults conservatively first:
-  - `training.loader_workers`: start with a positive value such as `4` or `8`;
-  - `training.loader_prefetch_factor`: `2`;
-  - keep `batch_size` unchanged.
+### 8. Presence Mask On GPU
 
-### 9. Determinism Guarantees
+- Move `_presence_loss_mask(...)` realization to torch/GPU:
+  - start from `valid_mask`;
+  - apply the same negative edge margin rule;
+  - cache the interior mask by shape/device/margin.
+- Keep positive and negative presence-loss balance unchanged in
+  `compute_losses(...)`.
 
-- Worker count must not affect data order:
-  - DataLoader index `i` maps to the same training batch sample index every
-    time;
-  - DataLoader consumes in index order, even if worker completion is out of
-    order internally;
-  - augmentation seeds remain keyed by the global sample index, not by worker id
-    or completion order.
-- Add a regression test that compares serial and multi-worker batch
-  `sample_indices`, `record_indices`, `control_point_indices`, and a small
-  tensor checksum on synthetic data.
+### 9. Training Integration
 
-### 10. Failure Semantics
+- In `_next_training_batch(...)`:
+  - receive CPU image/valid/metadata batch from DataLoader;
+  - transfer compact batch to training device;
+  - call GPU target materializer;
+  - pass the prepared batch into `_forward_loss(...)`.
+- Keep `compute_losses(...)` compatible with a prepared batch that has dense
+  target tensors.
+- Update TensorBoard visualization and dense test loss to call the same
+  materializer before accessing target tensors.
 
-- Data-quality skips already handled inside loader paths may remain skips where
-  implemented.
-- Infrastructure errors in a DataLoader worker must fail the run loudly with
-  the original exception context.
-- No silent fallback from process DataLoader to thread loading on worker
-  failure.
+### 10. Benchmark/Profile Output
 
-## Spec Update
+- Update `--benchmark --load-only --profile` to report:
+  - DataLoader wait;
+  - batch transfer;
+  - worker image/sample time;
+  - compact target-spec build time;
+  - GPU target materialization time.
+- Remove or rename old worker-side target columns:
+  - old `target_ms`, `raster_ms`, `encode_ms`, `mask_ms` should not imply
+    dense target construction happened in workers.
+- Add a clear `target_gpu_ms` column when profiling is enabled.
 
-- Add to `planning/specs.md` that 3D training runtime parallelism uses
-  `torch.utils.data.DataLoader` worker processes for batch loading.
-- State that each DataLoader worker owns its `FiberTrace3DLoader` and VC3D
-  sampler handles.
-- State that worker outputs are CPU batches and main training transfers to the
-  training device.
-- Clarify that the previous thread-backed ordered pipeline is not the intended
-  3D loader-parallelism implementation.
-- Clarify the semantics of `training.loader_workers` and
-  `training.loader_prefetch_factor`.
-
-## Docs Updates
-
-- Update `docs/code_structure.md`:
-  - replace the thread queue description for `fiber_trace_3d.train` with the
-    PyTorch DataLoader worker process design;
-  - document worker-local loader construction and deterministic whole-batch
-    indexing;
-  - document what `load_ms` means in benchmark/training output.
-- Update `planning/local_development.md` only if the benchmark command changes.
-  The approved 3D benchmark command should not change.
-
-## Testing
+### 11. Tests
 
 - Run syntax check:
   `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/loader.py`
 - Run focused tests:
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-- Add/adjust tests for:
-  - DataLoader serial vs multi-worker deterministic order;
-  - DataLoader item passes a complete `FiberTrace3DBatch` without default
-    collation corruption;
-  - synthetic multi-worker load-only path does not require remote VC3D.
+- Add tests for:
+  - serial worker batch no longer carries dense target tensors before
+    materialization;
+  - materialized CP-only targets match old CPU semantics on a small synthetic
+    patch;
+  - materialized dense-line targets match old CPU semantics on a small
+    synthetic line segment;
+  - torch Lasagna 3x2 encoding matches NumPy helper outputs;
+  - DataLoader multi-worker deterministic sample order remains unchanged.
 
-## Performance Validation
+### 12. Performance Validation
 
-- Rerun the exact approved load-only benchmark command.
-- Compare against the current after-change baseline from the prior task:
-  - median `1359.06 ms` per 192^3 patch;
-  - mean excluding first warmup batch `1359.79 ms`.
-- Report mean, median, min, max for the new DataLoader path.
-- If DataLoader worker startup dominates the first batch, report both full
-  10-batch numbers and post-warmup numbers.
-- If the benchmark does not improve, inspect whether workers are actually
-  active before claiming success.
+- Use the same approved command shape for the 3D loader benchmark:
+
+  `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_all.json --benchmark --load-only --benchmark-batches 40`
+
+- Also run normal benchmark/profile with model work after the load-only path
+  improves enough to matter.
+- Report mean/median/min/max after warmup and include worker overlap plus
+  `target_gpu_ms`.
+
+## Spec Update
+
+- Update `planning/specs.md`:
+  - 3D DataLoader workers return compact target metadata, not dense target
+    tensors;
+  - dense direction/presence targets are realized in the main process on the
+    training GPU;
+  - NML target descriptors are transformed output-space segments;
+  - CP-only descriptors are local CP/tangent metadata;
+  - Lasagna 3x2 encoding must have torch and NumPy-compatible semantics.
+
+## Docs Updates
+
+- Update `docs/code_structure.md`:
+  - describe the split between worker image loading/compact descriptors and
+    GPU target materialization;
+  - document the target materializer module/function;
+  - document updated benchmark columns.
+- Update `planning/local_development.md` only if benchmark command usage or
+  column interpretation changes.
 
 ## Changelog
 
-- Add a 2026-07-15 changelog line that 3D training/benchmark loading now uses
-  PyTorch DataLoader process workers rather than a thread-backed queue.
+- Add a 2026-07-15 changelog entry that 3D training moved dense target
+  materialization from DataLoader workers to the main GPU path.
 
 ## Explicit Non-Goals
 
-- Do not change model architecture, losses, patch size, precision, or
-  augmentation semantics to fake throughput.
-- Do not change the VC3D coordinate-sampling loader semantics from the previous
-  patch.
-- Do not implement a separate custom multiprocessing queue unless PyTorch
-  DataLoader is proven unusable and that deviation is approved/logged first.
-- Do not silently keep the thread-backed pipeline as the default.
+- Do not change label semantics.
+- Do not change model architecture, precision, patch size, or augmentation
+  ranges.
+- Do not remove NML dense-line supervision.
+- Do not hide invalid data as successful samples.
+- Do not reintroduce worker-side dense target tensor construction as a silent
+  fallback.

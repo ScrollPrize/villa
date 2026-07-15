@@ -1,34 +1,34 @@
-# 3D Fiber PyTorch DataLoader Parallelism
+# 3D Fiber GPU-Side Target Materialization
 
-The previous 3D loader optimization did not fulfill the requested runtime
-parallelism requirement. It replaced the slow zarr-crop/grid-sample path with
-VC3D coordinate sampling, but the training overlap path used a
-`ThreadPoolExecutor` around `load_batch` instead of PyTorch data-loader
-parallelism.
+The current 3D fiber DataLoader worker path still materializes full dense
+target tensors inside each worker:
+
+- six-channel Lasagna 3x2 `direction_target`;
+- six-channel `direction_weight`;
+- `direction_mask`;
+- `presence_target`;
+- `presence_mask`.
+
+That creates expensive CPU work, large per-worker tensors, and large IPC
+payloads. The worker should only load/synthesize the image patch and return
+compact metadata needed to build the targets. Full line/direction/presence
+tensors should be realized only in the main training process on the GPU.
 
 Required behavior:
 
-- Replace the thread-backed `_OrderedBatchLoadPipeline` with a real
-  `torch.utils.data.DataLoader` based batch-loading path for
-  `fiber_trace_3d.train`.
-- Use PyTorch worker processes (`num_workers`) for independent batch loading,
-  not Python threads for CPU-heavy work.
-- Each worker must lazily construct/open its own `FiberTrace3DLoader` and VC3D
-  sampler state inside the worker process; opened zarr/VC3D handles must not be
-  pickled from the main process.
-- Preserve deterministic training order exactly. Changing worker count,
-  prefetch factor, batch size, or max steps must not reshuffle the sample-index
-  sequence consumed by training.
-- DataLoader items should represent whole training batches or otherwise avoid
-  nested/default collation that would corrupt `FiberTrace3DBatch` dataclasses.
-- Workers must return CPU tensors only. Any optional worker-side CUDA
-  coordinate generation must use worker-owned CUDA context/stream and must
-  synchronize/copy to CPU before returning data to the main training process.
-- Main training process moves the returned batch to the training device before
-  forward/backward.
-- `--benchmark --load-only` must exercise the same DataLoader path so loader
-  parallelism can be measured directly without model work.
-- Keep the existing VC3D coordinate sampling and search-free segment target
-  generation semantics from the previous patch.
-- Document and test this explicitly. Silent fallback to the old thread-backed
-  path is not acceptable.
+- Keep VC3D coordinate sampling and deterministic sample order unchanged.
+- DataLoader workers return CPU image/valid data plus compact target metadata,
+  not full direction/presence tensors.
+- NML dense supervision returns transformed output-space line segments that
+  overlap or may overlap the patch; it does not rasterize them in workers.
+- Non-NML CP-only supervision returns compact CP/tangent metadata only.
+- Main training process transfers the batch to the training device and then
+  materializes direction/presence targets on GPU before loss/visualization.
+- Target semantics must match the existing CPU path:
+  - NML: dense supervision along overlapping line segments;
+  - non-NML: CP-neighborhood supervision only;
+  - same presence radius, negative edge mask, valid mask handling;
+  - same Lasagna 3x2 ambiguous direction encoding and projection weights.
+- Benchmark/profile output should separate image loading from GPU target
+  materialization so the remaining bottleneck is measurable.
+- No silent fallback to worker-side dense target tensor construction.
