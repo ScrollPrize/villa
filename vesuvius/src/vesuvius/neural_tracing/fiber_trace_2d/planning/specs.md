@@ -76,9 +76,9 @@
   presence.
 - The first 3D model uses direction plus presence losses. Contrastive embedding
   remains unsupported by default in the 3D V0 path.
-- The 3D fiber model disables InstanceNorm, GroupNorm, and BatchNorm. With
-  sparse CP/dense-line supervision, normalization must not let global crop
-  statistics become an implicit classifier.
+- The 3D fiber model defaults to `BatchNorm3d`; configured `batch_size` is the
+  actual BatchNorm batch because the trainer has no internal micro-batching.
+  `model_3d.normalization: "none"` remains supported for explicit ablations.
 - `batch_size` is the actual CP-patch batch passed through the 3D model in one
   forward/backward call. The 3D trainer does not support internal
   micro-batching; any BatchNorm statistics must come from the real configured
@@ -95,8 +95,24 @@
   Shear/skew and ringing remain unsupported and must not appear as enabled
   keys in this config.
 - 3D training TensorBoard visualization logs three principal CP-centered
-  planes at `training.sample_vis_interval`, showing image data, target
-  presence, predicted presence, and direction angular error.
+  planes at `training.sample_vis_interval`. Each row has three columns: volume
+  image with projected GT line and model-predicted/fitted CP direction overlay,
+  target presence, and predicted presence. The GT line overlay includes
+  target-line portions within 2 voxels of the displayed slice plane. The sparse
+  direction angular-error panel is intentionally not shown because it is too
+  sparse to be useful for routine inspection.
+- The 3D target-presence panel in TensorBoard is display-only max-pooled with a
+  `3x3x3` kernel before slicing. This must not modify `presence_target` used by
+  training or test loss.
+- 3D training/test loss logging reports average direction angular error in
+  degrees as `train/angle_mean_deg` and `test/angle_mean_deg`. The scalar is
+  computed over sparse supervised direction samples with Lasagna 3x2 analytic
+  decoding and unoriented `abs(dot)` agreement.
+- 3D presence loss uses equal total class weight when both classes are present:
+  `0.5 * mean(positive BCE) + 0.5 * mean(negative BCE)`.
+- When `training.test_interval > 0`, 3D training runs the configured test
+  evaluation at step 0 before the first optimizer step and logs the same
+  TensorBoard scalars/stdout as interval tests.
 - `python -m vesuvius.neural_tracing.fiber_trace_3d.train` is the 3D training
   entrypoint. It supports normal training, `--benchmark`, `--load-only`, and
   `--prefetch`.
@@ -110,6 +126,11 @@
   `FiberTrace3DBatch` objects; the main training process transfers the whole
   batch to `training.device` immediately before forward/backward. The old
   thread-backed `_OrderedBatchLoadPipeline` is not a supported 3D loading path.
+- In 3D configs, omitted or `null` `volume_cache_memory_mib` means a
+  Python-side default of 512 MiB per VC3D sampler/loader/worker, not VC3D's
+  internal 8 GiB default. Explicit positive values override this cap. The
+  generated 2D Trace2CP geometry loader used by 3D evaluation receives the same
+  default when the 3D raw config leaves the key unset or `null`.
 - 3D DataLoader workers must not materialize full dense direction/presence
   target tensors. Worker batches carry image/valid tensors plus compact target
   descriptors: CP-only samples carry local CP/tangent metadata, and NML
@@ -187,6 +208,10 @@
   as CP-centered volume blocks. For Trace2CP evaluation, dense 3D inference is
   run over tiled axis-aligned blocks covering the requested 2D strip
   coordinates plus configured context, then sampled/projected back to 2D.
+- When a 3D config defines `test_datasets` and `test_trace2cp_enabled` is
+  false, test evaluation runs ordinary 3D sparse direction/presence loss on the
+  held-out CP-centered 3D samples. It must not require Trace2CP geometry or
+  trace loss.
 - When `training.test_trace2cp_enabled` is true, 3D training logs
   `test/trace2cp_error`, raw y-error, valid segment count, and skipped segment
   count. `best.pt` and `current.pt` store `metric_name`; best-checkpoint

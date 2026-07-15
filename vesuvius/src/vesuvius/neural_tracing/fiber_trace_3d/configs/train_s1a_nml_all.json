@@ -38,7 +38,8 @@
     "unet_base_channels": 16,
     "unet_depth": 6,
     "decoder_upsample_mode": "pixelshuffle",
-    "squeeze_excitation": false
+    "squeeze_excitation": false,
+    "normalization": "batch"
   },
   "training": {
     "run_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_3d_runs",
@@ -82,6 +83,14 @@
         [-0.0008390736081137979, 0.004538179336261518, 0.30657436617414124, -9057.070809768327]
       ],
       "transform_invert": true
+    }
+  ],
+  "test_datasets": [
+    {
+      "fiber_glob": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_2026-06-16/test/*.json",
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "lasagna_manifest_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json"
     }
   ]
 }

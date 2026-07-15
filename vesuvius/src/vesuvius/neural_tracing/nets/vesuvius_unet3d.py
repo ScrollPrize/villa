@@ -659,7 +659,7 @@ class Vesuvius3dUnetModel(nn.Module):
     using sinusoidal positional embeddings and FiLM (Feature-wise Linear Modulation).
     
     Architecture features:
-    - 3D convolutions with InstanceNorm3d normalization
+    - 3D convolutions with configurable normalization
     - BasicBlockD residual blocks with squeeze-excitation in both encoder and decoder
     - 6-stage encoder with features: [32, 64, 128, 256, 320, 320]
     - Skip connections between encoder and decoder
@@ -688,9 +688,12 @@ class Vesuvius3dUnetModel(nn.Module):
         elif normalization in {'instance', 'instancenorm', 'instance_norm'}:
             norm_op = nn.InstanceNorm3d
             norm_op_kwargs = {'affine': True, 'eps': 1e-5}
+        elif normalization in {'batch', 'batchnorm', 'batch_norm'}:
+            norm_op = nn.BatchNorm3d
+            norm_op_kwargs = {'eps': 1e-5}
         else:
             raise ValueError(
-                "model_config normalization must be 'instance' or 'none', "
+                "model_config normalization must be 'instance', 'batch', or 'none', "
                 f"got {normalization!r}"
             )
         

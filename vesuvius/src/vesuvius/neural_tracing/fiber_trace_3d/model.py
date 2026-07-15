@@ -21,6 +21,7 @@ class FiberTrace3DModelConfig:
     strides: tuple[tuple[int, int, int], ...] | None = None
     decoder_upsample_mode: str = "pixelshuffle"
     squeeze_excitation: bool = False
+    normalization: str = "batch"
 
 
 class FiberTrace3DNet(nn.Module):
@@ -47,7 +48,7 @@ class FiberTrace3DNet(nn.Module):
             "squeeze_excitation": bool(cfg.squeeze_excitation),
             "decoder_upsample_mode": str(cfg.decoder_upsample_mode),
             "keep_inactive_deep_supervision_layers": False,
-            "normalization": "none",
+            "normalization": str(cfg.normalization),
         }
         self.net = Vesuvius3dUnetModel(
             int(cfg.input_channels),
@@ -93,5 +94,6 @@ def build_fiber_trace_3d_model(config: dict[str, Any]) -> FiberTrace3DNet:
                 model_cfg.get("decoder_upsample_mode", "pixelshuffle")
             ),
             squeeze_excitation=bool(model_cfg.get("squeeze_excitation", False)),
+            normalization=str(model_cfg.get("normalization", "batch")),
         )
     )

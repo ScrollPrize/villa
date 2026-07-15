@@ -19,6 +19,8 @@ from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     encode_lasagna_direction_3x2,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
+    DEFAULT_VOLUME_CACHE_MEMORY_MIB,
+    FiberTrace3DBatch,
     FiberTrace3DLoader,
     _anisotropic_blur_3d,
     config_from_mapping,
@@ -178,6 +180,47 @@ def _loader_with_mapping(raw: dict) -> FiberTrace3DLoader:
     }
     base.update(raw)
     return FiberTrace3DLoader(config_from_mapping(base))
+
+
+def test_3d_config_defaults_volume_cache_to_512_mib() -> None:
+    for extra in ({}, {"volume_cache_memory_mib": None}):
+        raw = {
+            "batch_size": 1,
+            "patch_shape_zyx": [16, 16, 16],
+            "seed": 3,
+            "_array_records": [
+                {
+                    "volume": np.zeros((16, 16, 16), dtype=np.float32),
+                    "fiber": _straight_fiber(),
+                    "volume_path": "synthetic",
+                }
+            ],
+        }
+        raw.update(extra)
+        config = config_from_mapping(raw)
+
+        assert config.volume_cache_memory_mib == DEFAULT_VOLUME_CACHE_MEMORY_MIB
+        assert config.volume_cache_memory_bytes == 512 * 1024 * 1024
+
+
+def test_3d_config_preserves_explicit_volume_cache_budget() -> None:
+    config = config_from_mapping(
+        {
+            "batch_size": 1,
+            "patch_shape_zyx": [16, 16, 16],
+            "volume_cache_memory_mib": 128,
+            "_array_records": [
+                {
+                    "volume": np.zeros((16, 16, 16), dtype=np.float32),
+                    "fiber": _straight_fiber(),
+                    "volume_path": "synthetic",
+                }
+            ],
+        }
+    )
+
+    assert config.volume_cache_memory_mib == 128.0
+    assert config.volume_cache_memory_bytes == 128 * 1024 * 1024
 
 
 def _load_materialized_batch(
@@ -354,7 +397,47 @@ def test_train_sample_3d_sheet_contains_principal_slice_panels() -> None:
     assert sheet.shape[2] == 3
     assert sheet.dtype == np.uint8
     assert sheet.shape[0] > 16
-    assert sheet.shape[1] > 4 * 16
+    assert sheet.shape[1] == 16 * 3 + 2 * 4
+    first_image_panel = sheet[:16, :16]
+    colored = (
+        (first_image_panel[..., 0] != first_image_panel[..., 1])
+        | (first_image_panel[..., 1] != first_image_panel[..., 2])
+    )
+    assert bool(np.any(colored))
+
+
+def test_train_sample_3d_sheet_maxpools_target_presence_for_display() -> None:
+    patch = 8
+    cp = torch.tensor([[4.0, 4.0, 4.0]], dtype=torch.float32)
+    target = torch.zeros((1, 1, patch, patch, patch), dtype=torch.float32)
+    target[0, 0, 5, 5, 4] = 1.0
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((1, 1, patch, patch, patch), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, patch, patch, patch), dtype=torch.bool),
+        cp_local_zyx=cp,
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        sample_indices=torch.zeros((1,), dtype=torch.long),
+        record_indices=torch.zeros((1,), dtype=torch.long),
+        control_point_indices=torch.zeros((1,), dtype=torch.long),
+        fiber_paths=("synthetic.json",),
+        target_modes=torch.ones((1,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((1,), dtype=torch.long),
+        target_segment_counts=torch.zeros((1,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32),
+        presence_target=target,
+        presence_mask=torch.ones((1, 1, patch, patch, patch), dtype=torch.bool),
+    )
+    output = torch.full((1, 7, patch, patch, patch), 0.5, dtype=torch.float32)
+
+    sheet = _make_train_sample_3d_sheet(batch, output)
+    target_panel = sheet[:patch, patch + 4 : patch * 2 + 4]
+    assert target_panel[5, 4, 0] == 255
+    assert target_panel[5, 4, 1] == 255
+    assert target_panel[5, 4, 2] == 255
 
 
 def test_affine_only_forward_map_matches_matrix_transform() -> None:
@@ -434,6 +517,30 @@ def test_local_prefetch_has_no_remote_chunks() -> None:
     summary = loader.prefetch(0, 2)
     assert summary["chunks"] == 0
     assert summary["errors"] == 0
+
+
+def test_train_sample_3d_sheet_has_three_columns_and_line_overlay() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    output = torch.zeros(
+        (
+            int(batch.volume.shape[0]),
+            7,
+            *tuple(int(v) for v in batch.volume.shape[-3:]),
+        ),
+        dtype=batch.volume.dtype,
+    )
+    sheet = _make_train_sample_3d_sheet(batch, output)
+
+    patch = int(batch.volume.shape[-1])
+    gap = 4
+    assert sheet.shape[1] == patch * 3 + 2 * gap
+    first_image_panel = sheet[:patch, :patch]
+    colored = (
+        (first_image_panel[..., 0] != first_image_panel[..., 1])
+        | (first_image_panel[..., 1] != first_image_panel[..., 2])
+    )
+    assert bool(np.any(colored))
 
 
 def test_3d_prefetch_streams_producers_but_downloads_in_sample_order(
@@ -635,9 +742,11 @@ def test_3d_model_and_losses_smoke() -> None:
     losses = compute_losses(output, batch, direction_weight=1.0, presence_weight=1.0)
     assert losses["total"].ndim == 0
     assert torch.isfinite(losses["total"])
+    assert losses["angle_mean_deg"].ndim == 0
+    assert torch.isfinite(losses["angle_mean_deg"])
 
 
-def test_3d_fiber_model_uses_no_normalization_layers() -> None:
+def test_3d_fiber_model_uses_batchnorm_by_default() -> None:
     model = FiberTrace3DNet(
         FiberTrace3DModelConfig(
             input_channels=1,
@@ -647,12 +756,67 @@ def test_3d_fiber_model_uses_no_normalization_layers() -> None:
             decoder_upsample_mode="pixelshuffle",
         )
     )
-    norm_types = (
-        torch.nn.BatchNorm3d,
-        torch.nn.GroupNorm,
-        torch.nn.InstanceNorm3d,
+    assert any(isinstance(module, torch.nn.BatchNorm3d) for module in model.modules())
+    assert not any(
+        isinstance(module, (torch.nn.GroupNorm, torch.nn.InstanceNorm3d))
+        for module in model.modules()
     )
-    assert not any(isinstance(module, norm_types) for module in model.modules())
+
+
+def test_3d_fiber_model_can_disable_normalization_explicitly() -> None:
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+            normalization="none",
+        )
+    )
+    assert not any(
+        isinstance(
+            module,
+            (torch.nn.BatchNorm3d, torch.nn.GroupNorm, torch.nn.InstanceNorm3d),
+        )
+        for module in model.modules()
+    )
+
+
+def test_3d_presence_loss_balances_positive_and_negative_regions() -> None:
+    presence_values = torch.tensor([0.9, 0.2, 0.8, 0.4], dtype=torch.float32)
+    output = torch.zeros((1, 7, 1, 1, 4), dtype=torch.float32)
+    output[0, 6, 0, 0, :] = presence_values
+    presence_target = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32).view(1, 1, 1, 1, 4)
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((1, 1, 1, 1, 4), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, 1, 1, 4), dtype=torch.bool),
+        cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        sample_indices=torch.zeros((1,), dtype=torch.long),
+        record_indices=torch.zeros((1,), dtype=torch.long),
+        control_point_indices=torch.zeros((1,), dtype=torch.long),
+        fiber_paths=("synthetic.json",),
+        target_modes=torch.zeros((1,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((1,), dtype=torch.long),
+        target_segment_counts=torch.zeros((1,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        direction_indices_bzyx=torch.zeros((0, 4), dtype=torch.long),
+        direction_target_sparse=torch.zeros((0, 6), dtype=torch.float32),
+        direction_weight_sparse=torch.zeros((0, 6), dtype=torch.float32),
+        presence_target=presence_target,
+        presence_mask=torch.ones((1, 1, 1, 1, 4), dtype=torch.bool),
+    )
+
+    losses = compute_losses(output, batch, direction_weight=0.0, presence_weight=1.0)
+    pos_expected = -torch.log(torch.tensor(0.9))
+    neg_expected = -torch.log(1.0 - torch.tensor([0.2, 0.8, 0.4])).mean()
+    expected = 0.5 * pos_expected + 0.5 * neg_expected
+    assert torch.allclose(losses["presence"], expected)
 
 
 def test_3d_projection_bridge_recovers_straight_xy_direction() -> None:

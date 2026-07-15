@@ -30,9 +30,10 @@ side/top strip input loading.
 - Config derives `features_per_stage`, `unet_base_channels`, `unet_depth`,
   `strides`, and `decoder_upsample_mode` the same way as the existing 3D fiber
   model helpers.
-- The fiber 3D wrapper disables U-Net normalization layers. It requests no
-  InstanceNorm, GroupNorm, or BatchNorm because sparse supervision should not
-  let crop statistics act as an implicit classifier.
+- The fiber 3D wrapper defaults to `BatchNorm3d` normalization. The trainer has
+  no internal micro-batching, so the configured `batch_size` is the real batch
+  used for BatchNorm statistics. Set `model_3d.normalization: "none"` to disable
+  normalization explicitly.
 
 `fiber_trace_3d/loader.py`
 
@@ -97,9 +98,17 @@ side/top strip input loading.
   and `best.pt`.
 - Logs scalar losses/timings and the full training config JSON to TensorBoard
   when `training.tensorboard_enabled` is true.
+  Direction reporting includes `train/angle_mean_deg` and, when held-out
+  `test_datasets` are configured, `test/angle_mean_deg`.
+- When `test_interval > 0`, configured test evaluation also runs once at step
+  0 before the first optimizer step, so initial performance is visible.
 - Logs `train_sample_3d/principal_slices` at `training.sample_vis_interval`.
-  The sheet uses the sampled CP's three principal planes with columns for image
-  data, target presence, predicted presence, and direction angular error.
+  The sheet uses the sampled CP's three principal planes with three columns:
+  volume image with projected GT line and predicted CP direction overlay, target
+  presence, and predicted presence. The GT line overlay draws target-line
+  portions within 2 voxels of the displayed slice plane. The target-presence
+  panel is max-pooled in 3D for visualization only so one-voxel line targets are
+  easier to see; the loss target is unchanged.
 - `batch_size` is the actual CP-patch batch passed through the 3D U-Net. The
   trainer does not internally micro-batch.
 - Normal training and `--benchmark --load-only` use
@@ -107,6 +116,9 @@ side/top strip input loading.
   `training.loader_workers > 0`. Each worker lazily constructs its own
   `FiberTrace3DLoader` and VC3D coordinate sampler, and each DataLoader item is
   a complete `FiberTrace3DBatch` keyed by deterministic batch index.
+- For 3D loading, omitted or `null` `volume_cache_memory_mib` resolves in
+  Python to a 512 MiB VC3D decoded/hot-cache cap per loader/worker. Explicit
+  positive values override this default.
 - Worker batches are returned on CPU. The main process transfers the complete
   batch to the configured training device before model execution. Console
   `load_ms` includes DataLoader wait plus this main-process transfer;

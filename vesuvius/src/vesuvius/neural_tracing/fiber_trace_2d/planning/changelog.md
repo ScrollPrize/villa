@@ -2,6 +2,19 @@
 
 ## 2026-07-15
 
+- Changed the 3D Python config default for `volume_cache_memory_mib` from
+  falling through to VC3D's internal 8 GiB default to an explicit 512 MiB
+  per-loader/per-worker cap, while preserving explicit positive overrides.
+- Enabled BatchNorm3d by default for the 3D fiber model wrapper without
+  changing configured batch sizes, added visualization-only `3x3x3` target
+  presence max-pooling in the 3D training sample sheet, and made 3D training
+  run configured test evaluation at step 0 before the first optimizer step.
+- Simplified the 3D training TensorBoard sample sheet to image+overlay,
+  target-presence, and predicted-presence columns, drawing the model-predicted
+  CP direction and nearby projected GT line on the volume slice. The S1A 3D
+  configs now include the held-out 2D fiber test split for ordinary 3D
+  direction/presence loss while keeping Trace2CP disabled, and training/test
+  logging now includes average direction angular error in degrees.
 - Reworked 3D prefetch to stream dependency generation and downloads using the
   same producer/download state machine as the 2D prefetcher, including live
   progress, deterministic safe-prefix `idx`, cache-hit / `.empty`
@@ -39,9 +52,9 @@
 - Changed 3D target semantics so NML sources supervise direction/presence
   densely along overlapping fiber-line segments, while non-NML sources
   supervise only the sampled CP neighborhood.
-- Disabled normalization layers in the 3D fiber model wrapper; the shared
-  `Vesuvius3dUnetModel` now accepts `normalization: none` while preserving its
-  legacy InstanceNorm default for other callers.
+- Added explicit `normalization: none` support to the shared
+  `Vesuvius3dUnetModel` while preserving its legacy InstanceNorm default for
+  other callers; the 3D fiber wrapper now defaults to BatchNorm as noted above.
 - Wired 3D Trace2CP evaluation into `fiber_trace_3d.train`: tiled dense 3D
   inference over 2D Trace2CP geometry, TensorBoard/stdout metrics, best
   checkpoint selection by `test/trace2cp_error`, and a compact

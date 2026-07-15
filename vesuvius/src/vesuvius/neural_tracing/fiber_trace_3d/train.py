@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
+    DEFAULT_VOLUME_CACHE_MEMORY_MIB,
     FiberTrace3DBatch,
     FiberTrace3DLoader,
     _normalize_image,
@@ -162,8 +163,13 @@ def compute_losses(
         direction_error = (pred_sparse - batch.direction_target_sparse) ** 2
         direction_error = direction_error * batch.direction_weight_sparse
         direction_loss = direction_error.mean()
+        pred_axis = decode_lasagna_direction_3x2_analytic(pred_sparse)
+        target_axis = decode_lasagna_direction_3x2_analytic(batch.direction_target_sparse)
+        agreement = torch.abs(torch.sum(pred_axis * target_axis, dim=-1)).clamp(0.0, 1.0)
+        angle_mean_deg = torch.rad2deg(torch.acos(agreement)).mean()
     else:
         direction_loss = pred_dir.sum() * 0.0
+        angle_mean_deg = pred_dir.sum() * 0.0
 
     presence_mask = batch.presence_mask.expand_as(pred_presence)
     presence_bce = F.binary_cross_entropy(
@@ -184,6 +190,7 @@ def compute_losses(
         "total": total,
         "direction": direction_loss,
         "presence": presence_loss,
+        "angle_mean_deg": angle_mean_deg,
     }
 
 
@@ -344,7 +351,11 @@ def _make_trace2cp_geometry_loader(raw_config: dict[str, Any], cfg: _Trace2Cp3DC
                 if raw_config.get("volume_cache_dir") is None
                 else str(raw_config.get("volume_cache_dir"))
             ),
-            volume_cache_memory_mib=raw_config.get("volume_cache_memory_mib"),
+            volume_cache_memory_mib=(
+                DEFAULT_VOLUME_CACHE_MEMORY_MIB
+                if raw_config.get("volume_cache_memory_mib") is None
+                else raw_config.get("volume_cache_memory_mib")
+            ),
             volume_io_threads=(
                 None
                 if raw_config.get("volume_io_threads") is None
@@ -579,7 +590,12 @@ def evaluate_dense_loss(
         consumed += take
     model.train()
     if not total_rows:
-        return {"total": math.inf, "direction": math.inf, "presence": math.inf}
+        return {
+            "total": math.inf,
+            "direction": math.inf,
+            "presence": math.inf,
+            "angle_mean_deg": math.inf,
+        }
     return {
         key: float(sum(row[key] for row in total_rows) / len(total_rows))
         for key in total_rows[0]
@@ -725,7 +741,7 @@ def run_training(config_path: str | Path) -> None:
         writer.add_text(
             "train_sample_3d/layout",
             "Rows: yx, zx, zy principal slices through the sampled CP. "
-            "Columns: image, target presence, predicted presence, direction angle error.",
+            "Columns: image with projected GT line and predicted CP direction, target presence, predicted presence.",
             0,
         )
 
@@ -759,6 +775,77 @@ def run_training(config_path: str | Path) -> None:
         f"loader_multiprocessing_context={loader_context or 'default'}",
         flush=True,
     )
+
+    def run_configured_tests(step: int) -> tuple[float | None, str | None]:
+        metric: float | None = None
+        metric_name: str | None = None
+        if test_loader is not None and test_interval > 0:
+            test_losses = evaluate_dense_loss(
+                model,
+                test_loader,
+                device=device,
+                start_sample_index=int(training.get("test_start_sample_index", 0)),
+                sample_count=test_control_points,
+                direction_weight=direction_weight,
+                presence_weight=presence_weight,
+            )
+            metric = float(test_losses["total"])
+            metric_name = "test/loss_total"
+            print(
+                f"test step={step} loss_total={test_losses['total']:.6f} "
+                f"loss_direction={test_losses['direction']:.6f} "
+                f"loss_presence={test_losses['presence']:.6f} "
+                f"angle_mean_deg={test_losses['angle_mean_deg']:.2f}",
+                flush=True,
+            )
+            if writer is not None:
+                writer.add_scalar("test/loss_total", test_losses["total"], step)
+                writer.add_scalar("test/loss_direction", test_losses["direction"], step)
+                writer.add_scalar("test/loss_presence", test_losses["presence"], step)
+                writer.add_scalar("test/angle_mean_deg", test_losses["angle_mean_deg"], step)
+        if trace2cp_loader is not None and test_interval > 0:
+            trace2cp_metric = _evaluate_trace2cp_metric_fixed_set_3d(
+                model,
+                trace2cp_loader,
+                image_normalization=loader.config.image_normalization,
+                cfg=trace2cp_cfg,
+                device=device,
+            )
+            metric = float(trace2cp_metric.error_mean)
+            metric_name = "test/trace2cp_error"
+            print(
+                f"test_trace2cp step={step} trace2cp_error={trace2cp_metric.error_mean:.6f} "
+                f"raw_y_error_mean_px={trace2cp_metric.raw_y_error_mean_px:.3f} "
+                f"segments={trace2cp_metric.segments} skipped={trace2cp_metric.skipped_segments}",
+                flush=True,
+            )
+            if writer is not None:
+                writer.add_scalar("test/trace2cp_error", trace2cp_metric.error_mean, step)
+                writer.add_scalar(
+                    "test/trace2cp_raw_y_error_mean_px",
+                    trace2cp_metric.raw_y_error_mean_px,
+                    step,
+                )
+                writer.add_scalar("test/trace2cp_segments", trace2cp_metric.segments, step)
+                writer.add_scalar(
+                    "test/trace2cp_skipped_segments",
+                    trace2cp_metric.skipped_segments,
+                    step,
+                )
+        return metric, metric_name
+
+    initial_metric, initial_metric_name = run_configured_tests(start_step)
+    if initial_metric is not None and initial_metric_name is not None:
+        best_metric = float(initial_metric)
+        _save_snapshot(
+            snapshot_dir / "best.pt",
+            model=model,
+            optimizer=optimizer,
+            step=start_step,
+            config=raw_config,
+            metric=best_metric,
+            metric_name=initial_metric_name,
+        )
 
     remaining_steps = max(0, int(max_steps) - int(start_step))
     train_dataloader = _make_batch_dataloader(
@@ -796,6 +883,7 @@ def run_training(config_path: str | Path) -> None:
                     f"step={step} loss_total={losses['total']:.6f} "
                     f"loss_direction={losses['direction']:.6f} "
                     f"loss_presence={losses['presence']:.6f} "
+                    f"angle_mean_deg={losses['angle_mean_deg']:.2f} "
                     f"load_ms={load_ms:.1f} wait_ms={wait_ms:.1f} "
                     f"to_device_ms={to_device_ms:.1f} "
                     f"target_ms={target_ms:.1f} "
@@ -806,6 +894,7 @@ def run_training(config_path: str | Path) -> None:
                 writer.add_scalar("train/loss_total", losses["total"], step)
                 writer.add_scalar("train/loss_direction", losses["direction"], step)
                 writer.add_scalar("train/loss_presence", losses["presence"], step)
+                writer.add_scalar("train/angle_mean_deg", losses["angle_mean_deg"], step)
                 writer.add_scalar("timing/load_ms", load_ms, step)
                 writer.add_scalar("timing/load_wait_ms", wait_ms, step)
                 writer.add_scalar("timing/batch_to_device_ms", to_device_ms, step)
@@ -829,57 +918,11 @@ def run_training(config_path: str | Path) -> None:
 
             metric = losses["total"]
             metric_name = "train/loss_total"
-            if test_loader is not None and test_interval > 0 and step % test_interval == 0:
-                test_losses = evaluate_dense_loss(
-                    model,
-                    test_loader,
-                    device=device,
-                    start_sample_index=int(training.get("test_start_sample_index", 0)),
-                    sample_count=test_control_points,
-                    direction_weight=direction_weight,
-                    presence_weight=presence_weight,
-                )
-                metric = test_losses["total"]
-                metric_name = "test/loss_total"
-                print(
-                    f"test step={step} loss_total={test_losses['total']:.6f} "
-                    f"loss_direction={test_losses['direction']:.6f} "
-                    f"loss_presence={test_losses['presence']:.6f}",
-                    flush=True,
-                )
-                if writer is not None:
-                    writer.add_scalar("test/loss_total", test_losses["total"], step)
-                    writer.add_scalar("test/loss_direction", test_losses["direction"], step)
-                    writer.add_scalar("test/loss_presence", test_losses["presence"], step)
-            if trace2cp_loader is not None and test_interval > 0 and step % test_interval == 0:
-                trace2cp_metric = _evaluate_trace2cp_metric_fixed_set_3d(
-                    model,
-                    trace2cp_loader,
-                    image_normalization=loader.config.image_normalization,
-                    cfg=trace2cp_cfg,
-                    device=device,
-                )
-                metric = trace2cp_metric.error_mean
-                metric_name = "test/trace2cp_error"
-                print(
-                    f"test_trace2cp step={step} trace2cp_error={trace2cp_metric.error_mean:.6f} "
-                    f"raw_y_error_mean_px={trace2cp_metric.raw_y_error_mean_px:.3f} "
-                    f"segments={trace2cp_metric.segments} skipped={trace2cp_metric.skipped_segments}",
-                    flush=True,
-                )
-                if writer is not None:
-                    writer.add_scalar("test/trace2cp_error", trace2cp_metric.error_mean, step)
-                    writer.add_scalar(
-                        "test/trace2cp_raw_y_error_mean_px",
-                        trace2cp_metric.raw_y_error_mean_px,
-                        step,
-                    )
-                    writer.add_scalar("test/trace2cp_segments", trace2cp_metric.segments, step)
-                    writer.add_scalar(
-                        "test/trace2cp_skipped_segments",
-                        trace2cp_metric.skipped_segments,
-                        step,
-                    )
+            if test_interval > 0 and step % test_interval == 0:
+                test_metric, test_metric_name = run_configured_tests(step)
+                if test_metric is not None and test_metric_name is not None:
+                    metric = test_metric
+                    metric_name = test_metric_name
 
             if step % checkpoint_interval == 0 or step == max_steps:
                 _save_snapshot(
@@ -937,17 +980,6 @@ def _gray_to_rgb(values: np.ndarray, *, mask: np.ndarray | None = None) -> np.nd
     return out
 
 
-def _angle_error_rgb(angle_degrees: np.ndarray, *, mask: np.ndarray) -> np.ndarray:
-    angle = np.asarray(angle_degrees, dtype=np.float32)
-    valid = np.asarray(mask, dtype=bool) & np.isfinite(angle)
-    scaled = np.clip(angle / 90.0, 0.0, 1.0)
-    out = np.zeros((*angle.shape, 3), dtype=np.uint8)
-    out[..., 0] = np.rint(scaled * 255.0).astype(np.uint8)
-    out[..., 2] = np.rint((1.0 - scaled) * 255.0).astype(np.uint8)
-    out[~valid] = 0
-    return out
-
-
 def _mark_slice_cp(panel: np.ndarray, row: int, col: int) -> None:
     h, w = int(panel.shape[0]), int(panel.shape[1])
     r = int(np.clip(row, 0, max(h - 1, 0)))
@@ -964,58 +996,167 @@ def _mark_slice_cp(panel: np.ndarray, row: int, col: int) -> None:
             panel[r, c + delta] = color
 
 
+def _draw_panel_point(panel: np.ndarray, row: int, col: int, color: tuple[int, int, int]) -> None:
+    h, w = int(panel.shape[0]), int(panel.shape[1])
+    r = int(round(float(row)))
+    c = int(round(float(col)))
+    if not (0 <= r < h and 0 <= c < w):
+        return
+    rgb = np.asarray(color, dtype=np.uint8)
+    panel[r, c] = rgb
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        rr = r + dr
+        cc = c + dc
+        if 0 <= rr < h and 0 <= cc < w:
+            panel[rr, cc] = rgb
+
+
+def _draw_panel_line(
+    panel: np.ndarray,
+    start_rc: np.ndarray,
+    end_rc: np.ndarray,
+    color: tuple[int, int, int],
+) -> None:
+    start = np.asarray(start_rc, dtype=np.float32)
+    end = np.asarray(end_rc, dtype=np.float32)
+    delta = end - start
+    steps = max(1, int(math.ceil(float(np.max(np.abs(delta))))))
+    for index in range(steps + 1):
+        t = float(index) / float(steps)
+        point = start * (1.0 - t) + end * t
+        _draw_panel_point(panel, int(round(float(point[0]))), int(round(float(point[1]))), color)
+
+
+def _draw_projected_gt_line(
+    panel: np.ndarray,
+    segments_start_zyx: np.ndarray,
+    segments_end_zyx: np.ndarray,
+    *,
+    plane_axis: int,
+    plane_coord: int,
+    row_axis: int,
+    col_axis: int,
+    threshold_voxels: float = 2.0,
+) -> None:
+    if segments_start_zyx.size == 0:
+        return
+    threshold = float(threshold_voxels)
+    color = (0, 255, 80)
+    for start, end in zip(segments_start_zyx, segments_end_zyx, strict=False):
+        start = np.asarray(start, dtype=np.float32)
+        end = np.asarray(end, dtype=np.float32)
+        delta = end - start
+        max_delta = float(np.max(np.abs(delta)))
+        steps = max(1, int(math.ceil(max_delta * 2.0)))
+        prev_rc: np.ndarray | None = None
+        for index in range(steps + 1):
+            t = float(index) / float(steps)
+            point = start * (1.0 - t) + end * t
+            if abs(float(point[plane_axis]) - float(plane_coord)) > threshold:
+                prev_rc = None
+                continue
+            rc = np.asarray([point[row_axis], point[col_axis]], dtype=np.float32)
+            if prev_rc is not None:
+                _draw_panel_line(panel, prev_rc, rc, color)
+            else:
+                _draw_panel_point(panel, int(round(float(rc[0]))), int(round(float(rc[1]))), color)
+            prev_rc = rc
+
+
+def _draw_projected_cp_direction(
+    panel: np.ndarray,
+    *,
+    cp_row: int,
+    cp_col: int,
+    direction_zyx: np.ndarray,
+    row_axis: int,
+    col_axis: int,
+) -> None:
+    direction = np.asarray(direction_zyx, dtype=np.float32)
+    projected = np.asarray([direction[row_axis], direction[col_axis]], dtype=np.float32)
+    norm = float(np.linalg.norm(projected))
+    if not math.isfinite(norm) or norm <= 1.0e-6:
+        return
+    projected = projected / norm
+    radius = max(8.0, min(float(panel.shape[0]), float(panel.shape[1])) * 0.08)
+    center = np.asarray([float(cp_row), float(cp_col)], dtype=np.float32)
+    start = center - projected * radius
+    end = center + projected * radius
+    _draw_panel_line(panel, start, end, (255, 80, 0))
+
+
 def _make_train_sample_3d_sheet(
     batch: FiberTrace3DBatch,
     output: torch.Tensor,
 ) -> np.ndarray:
     assert batch.presence_target is not None
-    assert batch.direction_indices_bzyx is not None
-    assert batch.direction_target_sparse is not None
     volume = batch.volume[0, 0].detach().cpu().numpy()
     valid = batch.valid_mask[0, 0].detach().cpu().numpy().astype(bool)
-    target_presence = batch.presence_target[0, 0].detach().cpu().numpy()
+    target_presence = F.max_pool3d(
+        batch.presence_target[0:1],
+        kernel_size=3,
+        stride=1,
+        padding=1,
+    )[0, 0].detach().cpu().numpy()
     pred_presence = presence_output(output)[0, 0].detach().cpu().numpy()
-    direction_mask = np.zeros_like(valid, dtype=bool)
-    angle = np.zeros_like(volume, dtype=np.float32)
-    sparse_indices = batch.direction_indices_bzyx.to(dtype=torch.long)
-    sample_sparse = sparse_indices[:, 0] == 0
-    if bool(sample_sparse.any()):
-        sample_indices = sparse_indices[sample_sparse]
-        target_encoded = batch.direction_target_sparse[sample_sparse]
-        pred_encoded = direction_output(output)[
-            sample_indices[:, 0],
-            :,
-            sample_indices[:, 1],
-            sample_indices[:, 2],
-            sample_indices[:, 3],
-        ]
-        target_dir = decode_lasagna_direction_3x2_analytic(target_encoded)
-        pred_dir = decode_lasagna_direction_3x2_analytic(pred_encoded)
-        agreement = torch.abs(torch.sum(target_dir * pred_dir, dim=-1)).clamp(0.0, 1.0)
-        sparse_angle = torch.rad2deg(torch.acos(agreement)).detach().cpu().numpy()
-        sparse_zyx = sample_indices[:, 1:4].detach().cpu().numpy()
-        angle[sparse_zyx[:, 0], sparse_zyx[:, 1], sparse_zyx[:, 2]] = sparse_angle
-        direction_mask[sparse_zyx[:, 0], sparse_zyx[:, 1], sparse_zyx[:, 2]] = True
 
     cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long).detach().cpu().numpy()
     cp = np.clip(cp, [0, 0, 0], np.asarray(volume.shape, dtype=np.int64) - 1)
     z, y, x = (int(v) for v in cp)
+    cp_encoded = direction_output(output)[0, :, z, y, x].view(1, 6)
+    cp_pred_xyz = decode_lasagna_direction_3x2_analytic(cp_encoded)[0].detach().cpu().numpy()
+    cp_pred_zyx = cp_pred_xyz[[2, 1, 0]].astype(np.float32, copy=False)
+    segment_offset = int(batch.target_segment_offsets[0].detach().cpu())
+    segment_count = int(batch.target_segment_counts[0].detach().cpu())
+    segment_slice = slice(segment_offset, segment_offset + segment_count)
+    segments_start_zyx = batch.target_segment_starts_zyx[segment_slice].detach().cpu().numpy()
+    segments_end_zyx = batch.target_segment_ends_zyx[segment_slice].detach().cpu().numpy()
     slice_specs = (
-        ("yx", volume[z, :, :], valid[z, :, :], target_presence[z, :, :], pred_presence[z, :, :], angle[z, :, :], direction_mask[z, :, :], y, x),
-        ("zx", volume[:, y, :], valid[:, y, :], target_presence[:, y, :], pred_presence[:, y, :], angle[:, y, :], direction_mask[:, y, :], z, x),
-        ("zy", volume[:, :, x], valid[:, :, x], target_presence[:, :, x], pred_presence[:, :, x], angle[:, :, x], direction_mask[:, :, x], z, y),
+        ("yx", volume[z, :, :], valid[z, :, :], target_presence[z, :, :], pred_presence[z, :, :], 0, z, 1, 2, y, x),
+        ("zx", volume[:, y, :], valid[:, y, :], target_presence[:, y, :], pred_presence[:, y, :], 1, y, 0, 2, z, x),
+        ("zy", volume[:, :, x], valid[:, :, x], target_presence[:, :, x], pred_presence[:, :, x], 2, x, 0, 1, z, y),
     )
 
     rows: list[np.ndarray] = []
     gap = 4
-    for _name, image, image_valid, target_p, pred_p, angle_p, angle_mask, cp_row, cp_col in slice_specs:
+    for (
+        _name,
+        image,
+        image_valid,
+        target_p,
+        pred_p,
+        plane_axis,
+        plane_coord,
+        row_axis,
+        col_axis,
+        cp_row,
+        cp_col,
+    ) in slice_specs:
         image_rgb = np.repeat(_image_to_u8(image, image_valid)[..., None], 3, axis=2)
         target_rgb = _gray_to_rgb(target_p, mask=image_valid)
         pred_rgb = _gray_to_rgb(pred_p, mask=image_valid)
-        angle_rgb = _angle_error_rgb(angle_p, mask=angle_mask)
-        panels = [image_rgb, target_rgb, pred_rgb, angle_rgb]
-        for panel in panels:
-            _mark_slice_cp(panel, cp_row, cp_col)
+        _draw_projected_gt_line(
+            image_rgb,
+            segments_start_zyx,
+            segments_end_zyx,
+            plane_axis=int(plane_axis),
+            plane_coord=int(plane_coord),
+            row_axis=int(row_axis),
+            col_axis=int(col_axis),
+            threshold_voxels=2.0,
+        )
+        _draw_projected_cp_direction(
+            image_rgb,
+            cp_row=int(cp_row),
+            cp_col=int(cp_col),
+            direction_zyx=cp_pred_zyx,
+            row_axis=int(row_axis),
+            col_axis=int(col_axis),
+        )
+        _mark_slice_cp(image_rgb, cp_row, cp_col)
+        _mark_slice_cp(target_rgb, cp_row, cp_col)
+        _mark_slice_cp(pred_rgb, cp_row, cp_col)
+        panels = [image_rgb, target_rgb, pred_rgb]
         height = max(int(panel.shape[0]) for panel in panels)
         padded_panels = []
         for panel in panels:

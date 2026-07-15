@@ -48,6 +48,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
 _TARGET_MODE_CP_ONLY = 0
 _TARGET_MODE_DENSE_LINE = 1
+DEFAULT_VOLUME_CACHE_MEMORY_MIB = 512.0
 
 
 @dataclass(frozen=True)
@@ -86,7 +87,7 @@ class FiberTrace3DConfig:
     prefetch_workers: int = 16
     prefetch_sampler_workers: int = 2
     volume_cache_dir: str | None = None
-    volume_cache_memory_mib: float | None = None
+    volume_cache_memory_mib: float | None = DEFAULT_VOLUME_CACHE_MEMORY_MIB
     volume_io_threads: int | None = None
     volume_cache_offline: bool = False
     volume_cache_retry_seconds: float = 0.0
@@ -324,6 +325,15 @@ def _parse_worker_count(value: Any, *, key: str) -> int:
     return count
 
 
+def _parse_volume_cache_memory_mib(value: Any) -> float:
+    if value is None:
+        return float(DEFAULT_VOLUME_CACHE_MEMORY_MIB)
+    cache_memory_mib = float(value)
+    if not math.isfinite(cache_memory_mib) or cache_memory_mib <= 0.0:
+        raise ValueError("volume_cache_memory_mib must be positive when provided")
+    return cache_memory_mib
+
+
 def load_config(path: str | Path) -> FiberTrace3DConfig:
     config_path = Path(path).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as handle:
@@ -335,11 +345,7 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
         datasets = raw.get("datasets", [{"array_records": True}])
     if not isinstance(datasets, list) or not datasets:
         raise ValueError("config must contain a non-empty 'datasets' list")
-    cache_memory_mib = raw.get("volume_cache_memory_mib")
-    if cache_memory_mib is not None:
-        cache_memory_mib = float(cache_memory_mib)
-        if not math.isfinite(cache_memory_mib) or cache_memory_mib <= 0.0:
-            raise ValueError("volume_cache_memory_mib must be positive when provided")
+    cache_memory_mib = _parse_volume_cache_memory_mib(raw.get("volume_cache_memory_mib"))
     smooth_mode = str(raw.get("augment_smooth_displacement_mode", "none")).lower()
     if smooth_mode not in {"none", "1d", "2d", "3d"}:
         raise ValueError("augment_smooth_displacement_mode must be one of none, 1d, 2d, 3d")
@@ -2445,6 +2451,11 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         prefetch_sampler_workers=_parse_worker_count(
             raw.get("prefetch_sampler_workers", 2),
             key="prefetch_sampler_workers",
+        ),
+        volume_cache_dir=None if raw.get("volume_cache_dir") is None else str(raw.get("volume_cache_dir")),
+        volume_cache_memory_mib=_parse_volume_cache_memory_mib(raw.get("volume_cache_memory_mib")),
+        volume_io_threads=(
+            None if raw.get("volume_io_threads") is None else int(raw.get("volume_io_threads"))
         ),
         config_dir=config_dir,
     )
