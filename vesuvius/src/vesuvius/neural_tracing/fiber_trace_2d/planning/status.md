@@ -1,17 +1,19 @@
-# 3D Fiber Follow-Up Status
+# 3D Trace2CP Metric Wiring Status
 
-- [x] Read subproject `AGENTS.md`.
-- [x] Checked current 3D loader/train/projection code.
-- [x] Confirmed current affine augmentation support.
-- [x] Replaced `planning/task.md` with the follow-up task.
-- [x] Replaced `planning/task_plan.md` with the follow-up plan.
-- [x] Corrected the plan to preserve the 2D paired forward/backward map
-  augmentation contract for 3D smooth displacement.
-- [x] Replaced `planning/task_log.md` with current-task planning notes only.
-- [x] Review plan against specs before implementation.
-- [x] Implement smooth displacement coordinate-map refactor.
-- [x] Implement anisotropic blur.
-- [x] Implement 3D Trace2CP projection/scoring bridge.
-- [x] Update specs/docs/changelog after implementation.
-- [x] Run focused 3D tests.
-- [x] Run broader 2D/3D compatibility tests.
+- [x] Read current task request.
+- [x] Confirm current implementation gap in `fiber_trace_3d/train.py`.
+- [x] Replace `planning/task.md` with the current missing-wiring task.
+- [x] Write focused `planning/task_plan.md`.
+- [x] Add explicit no-silent-simplification/no-silent-postponement rule to the
+  local workflow.
+- [x] Add explicit requirement to remove 3D Lasagna grid-search decoding and
+  use analytic decoding/reconstruction.
+- [x] Report other deferred/ignored items from the previous follow-up.
+- [ ] Implement 3D Trace2CP config parsing and evaluator.
+- [ ] Remove 3D grid-search direction decode from Trace2CP projection.
+- [ ] Add torch-vectorized analytic Lasagna 3x2 direction decode tests.
+- [ ] Wire 3D training test metric, TensorBoard, stdout, and best checkpoint
+  selection.
+- [ ] Add 3D Trace2CP CLI visualization.
+- [ ] Update specs/docs/changelog after implementation.
+- [ ] Run focused and regression tests.

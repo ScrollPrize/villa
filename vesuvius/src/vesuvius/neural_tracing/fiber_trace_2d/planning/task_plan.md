@@ -1,246 +1,228 @@
-# 3D Fiber Follow-Up Plan
+# 3D Trace2CP Metric Wiring Plan
 
-## Current State Check
+## Current State
 
-Regular affine augmentation is already present in the 3D loader:
+The previous 3D follow-up implemented the low-level bridge in
+`fiber_trace_3d.trace2cp_bridge`, but stopped before the requested wiring:
 
-- `augment_shift_zyx` chooses the CP location inside the final patch.
-- `augment_rotation_degrees` samples a 3D axis-angle rotation.
-- `augment_scale_min/max` and `augment_flip_probability` are also wired.
-- `_sample_volume_patch` samples the 3D source block with the same
-  output-to-source affine transform.
-- `_build_targets` currently transforms the source fiber line into output patch
-  coordinates with the paired source-to-output affine matrix.
-- Dataset-level fiber-coordinate affine transforms are also supported through
-  `fiber_transform`, `transform`, `fiber_transform_json`, and
-  `transform_invert`.
+- `fiber_trace_3d/train.py` still evaluates only dense 3D direction/presence
+  loss in `evaluate_dense_loss(...)`.
+- `best.pt` is selected from dense test loss, not public Trace2CP error.
+- The checked-in 3D configs have `test_datasets`, but no keys that tell 3D
+  training how to build the 2D Trace2CP metric geometry.
+- There is no 3D CLI path equivalent to the 2D `--trace2cp-vis` command.
+- The bridge is currently covered only by a synthetic projection/scoring test,
+  not by train/CLI integration.
+- `fiber_trace_3d/projection.py` currently decodes 3D Lasagna directions with a
+  unit-sphere candidate grid. That must be removed. The repo already contains
+  analytic two-channel angle decoders and Lasagna 3-plane reconstruction logic.
 
-Shear/skew and ringing are intentionally out of scope. Non-zero 3D shear or
-ringing config keys should continue to fail loudly.
+That was a miss: full Trace2CP metric wiring was explicitly in the task and
+should not have been deferred.
 
 ## Goal
 
-Extend the 3D CP-centered fiber path with the missing planned pieces while
-preserving the simpler non-strip 3D loading model:
+Add minimal, explicit 3D Trace2CP evaluation support:
 
-1. smooth displacement augmentation in 1D, 2D, and full 3D;
-2. anisotropic directional 3D blur as a value augmentation;
-3. Trace2CP evaluation/visualization wiring for real 3D checkpoints.
+1. During 3D test evaluation, project dense 3D checkpoint outputs onto the
+   existing 2D Trace2CP side-strip geometry.
+2. Compute the public bidirectional `trace2cp_error` over fixed test CP pairs.
+3. Use this metric for TensorBoard, stdout, current snapshots, and best
+   checkpoint selection when enabled.
+4. Add a 3D CLI visualization/inspection mode for one CP pair or one fiber.
 
-## Smooth Displacement Design
+Training samples remain ordinary CP-centered 3D blocks. Only evaluation uses
+the 2D Trace2CP geometry.
 
-The 3D path must use the same geometric augmentation contract as the 2D strip
-path. Every geometric transform is represented by paired concrete maps built at
-augmentation construction time:
+## Config/API Changes
 
-- `backward_map_zyx[D,H,W,3]`: output voxel -> source voxel, used for volume
-  sampling;
-- `forward_map_zyx[Dsrc,Hsrc,Wsrc,3]`: source voxel -> output voxel, used for
-  fiber line/control-point lookup and label construction.
+Add these 3D training keys:
 
-Consumers must not derive one direction from the other after the fact. That
-means no dense nearest search, brute-force inversion, iterative solver, or
-runtime formula re-evaluation in training, visualization, or Trace2CP bridge
-paths. If a path needs source-to-output coordinates, it samples the prebuilt
-`forward_map_zyx`, exactly like 2D samples `forward_map_xy`.
+- `training.test_trace2cp_enabled`: default `true` when `test_datasets` exists,
+  otherwise `false`.
+- `training.test_trace2cp_loader_config`: optional path to a 2D loader config
+  used only for Trace2CP geometry. If omitted, build a minimal in-memory 2D
+  metric config from the 3D config and `test_datasets`.
+- `training.test_trace2cp_control_points`: optional override. If omitted, reuse
+  `training.test_control_points`. `0` means all held-out CP samples.
+- `training.test_trace2cp_start_sample_index`: optional override. If omitted,
+  reuse `training.test_start_sample_index`.
+- `training.test_trace2cp_step_px`: default `4.0`.
+- `training.test_trace2cp_rf_margin_px`: default to model depth / receptive
+  margin, matching the 2D training behavior.
+- `training.test_trace2cp_presence_enabled`: default `true` when the 3D output
+  has a presence channel.
 
-This is the correction to the earlier V0 note: labels must not be derived only
-from the output-to-source map. The line/CP geometry is transformed through the
-prebuilt source-to-output map, then labels are generated in output coordinates
-from that transformed line.
+Add these 3D CLI flags to `fiber_trace_3d.train` or a small 3D runner module:
 
-### Smooth Modes
+- `--trace2cp-vis`
+- `--checkpoint <path>`
+- `--sample-index <idx>`
+- `--fiber-json <path>`
+- `--export-dir <path>`
+- `--trace2cp-step-px <float>`
+- `--trace2cp-rf-margin-px <float>`
 
-Add one shared map-building implementation with active component/domain masks:
+The CLI should print `trace2cp_error=...` for single-pair runs and
+`trace2cp_error_mean=...` for whole-fiber runs.
 
-- `none`: current affine-only behavior.
-- `1d`: one smooth displacement component as a function of one coordinate.
-  Example: move `z` as a smooth function of `x`; the paired maps apply the same
-  function with opposite sign in the forward/backward construction.
-- `2d`: one or more displacement components generated from a smooth 2D control
-  lattice and extruded along the third coordinate, again only in forms where
-  both map directions are generated directly.
-- `3d`: paired smooth displacement constructed by an explicitly invertible
-  composition, not by arbitrary dense 3D inverse estimation. The first supported
-  3D mode should be a sequence of smooth coupling/triangular updates whose
-  inverse is known by construction, for example component updates such as
-  `z += f_z(y,x)`, `y += f_y(z,x)`, `x += f_x(z,y)` with the inverse applying
-  the same controls in reverse order and subtracting the offsets. This gives
-  all three axes smooth displacement while preserving a direct paired
-  forward/backward map construction.
+## Implementation Plan
 
-Suggested config keys:
+0. Enforce no-silent-skip reporting for this task.
+   - Any missing, simplified, unsupported, or postponed item must be written in
+     `planning/task_log.md` during implementation.
+   - The final response must include those items plainly, even when tests pass.
+   - Do not convert a requested feature into a "boundary" without user-visible
+     reporting and a concrete follow-up plan.
 
-- `augment_smooth_displacement_mode`: `none | 1d | 2d | 3d`;
-- `augment_smooth_displacement_amplitude_zyx`: max absolute source-voxel
-  displacement per component;
-- `augment_smooth_displacement_control_spacing_zyx`: coarse lattice spacing;
-- `augment_smooth_displacement_probability`: default `0.0` until profiled.
+1. Add a 3D Trace2CP config parser/helper.
+   - Read explicit training keys.
+   - Build or load a 2D `FiberStrip2DLoader` for metric geometry only.
+   - Fail loudly if required geometry keys cannot be derived.
 
-Implementation details:
+2. Add a 3D dense inference helper for arbitrary Trace2CP strip coordinates.
+   - Accept `coords_xyz` and valid mask from the 2D loader.
+   - Convert base-volume XYZ coordinates to selected-level ZYX coordinates
+     using the same `base_volume_scale`/spacing convention as the 3D loader.
+   - Compute one or more axis-aligned 3D blocks that cover the strip coords
+     plus a small interpolation margin.
+   - Run the 3D model on those blocks.
+   - Use `project_3d_output_to_trace2cp_fields(...)` to sample/project
+     direction and presence onto the 2D strip.
 
-- Generate deterministic coarse displacement controls from sample index and
-  seed.
-- Upsample/interpolate controls only during paired map construction.
-- Compose affine and smooth stages into both concrete maps at construction time.
-- Use `backward_map_zyx` for dense 3D `grid_sample`.
-- Use direct trilinear gather against `forward_map_zyx` for source line and CP
-  coordinates.
-- Include max displacement amplitude in `_prefetch_source_bbox` and
-  `_actual_source_bbox`.
-- Keep labels ignored where transformed line/CP lookup is invalid or outside
-  the output patch.
+3. Remove grid-search 3D Lasagna direction decoding.
+   - Delete or stop exposing `decode_lasagna_direction_3x2_grid_search(...)`
+     and the Fibonacci/unit-sphere candidate table path.
+   - Add `decode_lasagna_direction_3x2_analytic(...)` in
+     `fiber_trace_3d.direction` or `fiber_trace_3d.projection`.
+   - Reuse the established analytic two-channel decode:
+     - `fiber_trace_3d.direction.decode_lasagna_direction_2d(...)`;
+     - `fiber_trace_2d.direction.decode_lasagna_direction_xy(...)`;
+     - Lasagna `_decode_dir_angle(...)` / `_estimate_normal(...)` logic in
+       `lasagna/preprocess_cos_omezarr.py`.
+   - The 3D decoder should:
+     - analytically decode each two-channel projection to a 2D ambiguous unit
+       direction using `theta = 0.5 * atan2(sin2theta, cos2theta)`;
+     - reconstruct the 3D ambiguous axis from the three projection directions
+       using the established Lasagna 3-plane reconstruction/sign-alignment
+       logic, not a sampled sphere;
+     - be torch-vectorized so projected Trace2CP inference can stay on GPU;
+     - preserve sign ambiguity: `v` and `-v` remain equivalent.
+   - Add tests that compare the analytic decoder round-trip against
+     `encode_lasagna_direction_3x2(...)` over representative 3D axes,
+     including near-axis/degenerate projections.
 
-## Anisotropic 3D Blur
+4. Add `_evaluate_trace2cp_metric_fixed_set_3d(...)`.
+   - Mirror the 2D fixed-set evaluator.
+   - For each selected held-out sample, use the 2D loader to build the CP-to
+     next-CP Trace2CP segment.
+   - Run 3D block inference/projection.
+   - Score with `score_trace2cp_projected_fields(...)`.
+   - Skip invalid segments with counted skip diagnostics; fail only if no valid
+     segment remains.
 
-Keep blur as a value augmentation after volume sampling and after geometric
-coordinate sampling. It must run on torch tensors, preferably GPU when training
-uses CUDA.
+5. Wire 3D training evaluation.
+   - At each configured test interval, keep dense test loss as diagnostics.
+   - If `test_trace2cp_enabled`, also compute `test/trace2cp_error`,
+     `test/trace2cp_raw_y_error_mean_px`, segment count, and skipped count.
+   - Use `test/trace2cp_error` as the checkpoint metric when available.
+   - Log the metric to TensorBoard and stdout.
+   - Store `metric_name="test/trace2cp_error"` in `current.pt` and `best.pt`.
 
-Add config keys:
+6. Add 3D CLI inspection.
+   - Reuse the same evaluator and projection code path as training.
+   - For single-pair mode, export a compact JPG with:
+     - source side-strip image;
+     - projected 3D direction overlay;
+     - projected 3D presence image;
+     - trace overlay and metric text.
+   - For `--fiber-json`, evaluate each adjacent CP pair and stitch a compact
+     whole-fiber visualization, skipping invalid pairs but reporting counts.
 
-- `augment_anisotropic_blur_probability`;
-- `augment_anisotropic_blur_sigma_along`;
-- `augment_anisotropic_blur_sigma_across`;
-- `augment_anisotropic_blur_orientation`: `fiber | random | axis`;
-- optional `augment_anisotropic_blur_roll_degrees`.
+7. Add integration coverage for the real wiring.
+   - Do not rely only on the synthetic bridge unit test.
+   - Add a small fake-model/fake-loader integration test for metric evaluation
+     and best-metric selection, or a minimal real-loader smoke test if cheap.
+   - Cover `test_trace2cp_control_points: 0` full-held-out-set behavior.
 
-Implementation plan:
+8. Profile/report obvious performance risks.
+   - Report dense block count/size for Trace2CP inference.
+   - Assert/report that Trace2CP projection is using analytic 3x2 decode, not
+     grid search.
+   - If tiling is incomplete or constrained, fail loudly or log the exact
+     limitation; do not silently assume one block is enough.
 
-1. Keep existing `augment_blur_sigma` as isotropic separable 3D Gaussian.
-2. Add anisotropic blur as opt-in and default off.
-3. For axis-aligned blur, use separable `conv3d`.
-4. For arbitrary/fiber-aligned blur, use three sequential oriented 1D
-   Gaussian samples with `grid_sample` along the principal directions, batched
-   over patches where possible.
-5. The default principal direction for `fiber` orientation is the transformed
-   local CP tangent; the two perpendicular axes are built deterministically
-   from that tangent plus optional roll.
-6. Profile before enabling in checked-in configs.
-
-## Trace2CP Metric Wiring
-
-The current `fiber_trace_3d/projection.py` only provides a synthetic-tested
-3D-to-2D direction projection helper. Full wiring should add a 3D model adapter
-that can feed the existing 2D Trace2CP metric.
-
-Plan:
-
-1. Add a 3D Trace2CP adapter module, e.g.
-   `fiber_trace_3d/trace2cp_bridge.py`.
-2. Reuse the existing 2D loader only for Trace2CP geometry construction:
-   CP pair, side-strip coordinates, local strip x/y axes, valid mask, and
-   metric calculation.
-3. For each test CP pair, build ordinary axis-aligned 3D inference blocks that
-   cover the Trace2CP strip coordinates. Do not load strips for 3D training.
-4. Run the 3D model densely on those blocks.
-5. Interpolate the 3D model outputs at the 2D strip coordinates:
-   - six Lasagna 3x2 direction channels;
-   - presence channel.
-6. Decode/project the 3D direction into the local 2D strip frame using the
-   projection helper, but replace the current grid-search decoder if a faster
-   analytic least-squares/direct decode is added.
-7. Feed the projected 2D direction field and projected presence field into the
-   existing Trace2CP bidirectional metric path.
-8. Add optional 3D Trace2CP visualization:
-   - side-strip source image from the existing 2D geometry;
-   - projected 3D direction overlay;
-   - projected 3D presence;
-   - public `trace2cp_error=...` line and whole-fiber
-     `trace2cp_error_mean=...` line.
-9. Add 3D training config keys:
-   - `training.test_trace2cp_enabled`;
-   - `training.test_trace2cp_control_points`;
-   - `training.test_trace2cp_step_px`;
-   - `training.test_trace2cp_rf_margin_px`;
-   - optional 2D metric-loader config path if the 3D config cannot safely
-     contain every 2D strip geometry setting.
-10. Best checkpoint selection should use `test/trace2cp_error` when this
-    metric is enabled; otherwise keep current dense loss selection.
-
-Implementation note for this task: the completed implementation adds the
-low-level 3D-output projection/scoring bridge (`trace2cp_bridge.py`) and tests
-it against the existing 2D scorer. The train-loop best-checkpoint switch is
-deferred until the 2D metric-loader config/coordinate ownership is specified
-explicitly, rather than inferred from the 3D training config.
-
-## Shear And Ringing
-
-Do not implement these in this follow-up:
-
-- keep rejecting non-zero `augment_shear_*`;
-- keep rejecting non-zero `augment_ringing*`;
-- document that no placeholder behavior exists.
+9. Update checked-in 3D configs.
+   - Add explicit Trace2CP keys to `loader_example.json`.
+   - Add explicit Trace2CP keys to `train_s1a_nml_all.json`.
+   - Keep values minimal and deterministic; no augmentations are used by this
+     metric path.
 
 ## Spec Update
 
-Update `planning/specs.md` to add:
+Update `planning/specs.md` to state:
 
-- 3D affine augmentation support status: shift, rotation, scale, flips present;
-- 3D geometric augmentation must follow the 2D paired-map contract:
-  `backward_map_zyx` and `forward_map_zyx` are both concrete tensors built by
-  construction;
-- smooth displacement must be implemented only through paired map construction
-  with direct forward/backward semantics;
-- target generation transforms source line/control-point coordinates by direct
-  lookup against `forward_map_zyx`, then generates output-space labels from the
-  transformed line;
-- anisotropic blur as opt-in value augmentation, not a geometric transform;
-- full 3D Trace2CP bridge semantics and best-checkpoint behavior;
-- shear/ringing explicitly out of scope and rejected.
+- 3D test evaluation supports public Trace2CP by projecting 3D direction and
+  presence outputs onto 2D Trace2CP side-strip coordinates.
+- 3D Trace2CP uses existing 2D loader geometry only for evaluation; 3D training
+  samples remain CP-centered volume patches.
+- When enabled, 3D best checkpoint selection uses averaged
+  `test/trace2cp_error`.
+- `test_trace2cp_control_points: 0` means evaluate the full held-out CP set.
+- The metric path performs no training augmentations.
+- The 3D projection decoder must use analytic Lasagna 3x2 decoding. Unit-sphere
+  candidate/grid-search decoding is not allowed in Trace2CP projection.
+- Any simplified/deferred/unsupported Trace2CP behavior must be reported in the
+  task log and final response.
 
 ## Docs Updates
 
 Update `docs/code_structure.md` with:
 
-- the 3D geometry augmentation object/map flow;
-- where smooth displacement and anisotropic blur live;
-- how 3D checkpoints are projected into the existing 2D Trace2CP metric.
+- where the 3D Trace2CP train/CLI evaluator lives;
+- how the 2D geometry loader and 3D dense block inference interact;
+- which config keys are required.
+- replace the current `fiber_trace_3d/projection.py` grid-search description
+  with the analytic Lasagna 3x2 decode/reconstruction path once implemented.
 
 ## Tests
 
-Add focused tests for:
+Add/extend focused tests:
 
-- affine shift/rotation remains unchanged for identity smooth displacement;
-- 1D/2D/3D smooth displacement source-coordinate maps are deterministic and
-  finite;
-- `backward_map_zyx` and `forward_map_zyx` are both constructed and no lookup
-  path tries to invert one from the other;
-- source line/control-point lookup through `forward_map_zyx` matches the old
-  affine target path for affine-only samples;
-- transformed-line output-space labels give expected direction targets for a
-  known smooth bend;
-- prefetch envelopes include configured displacement amplitude;
-- anisotropic blur changes a synthetic impulse with expected directionality;
-- shear/ringing non-zero keys still raise;
-- synthetic 3D prediction projected onto a simple 2D strip produces the expected
-  Trace2CP error;
-- existing 2D and 3D focused tests continue to pass.
+- 3D Trace2CP config parsing and defaults.
+- Coordinate conversion from 2D Trace2CP `coords_xyz` to 3D selected-level
+  inference coordinates.
+- Synthetic block projection still scores expected `trace2cp_error`.
+- A small fake model/fake loader integration confirms training metric selection
+  prefers `test/trace2cp_error` over dense loss when enabled.
+- CLI smoke test for single-pair projection visualization can run with a small
+  synthetic fixture or mocked loader/model path.
 
 Regression command:
 
 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py vesuvius/tests/neural_tracing/test_fiber_trace.py`
 
-## Implementation Order
+## Other Deferred Or Ignored Items From The Previous Follow-Up
 
-1. Refactor 3D affine sampling into a reusable paired coordinate-map builder
-   while keeping outputs bitwise or numerically close for affine-only tests.
-2. Move label generation to source-line/control-point lookup through
-   `forward_map_zyx`, matching the 2D map contract.
-3. Add smooth displacement modes and prefetch/source envelope inflation.
-4. Add anisotropic blur behind opt-in config.
-5. Add Trace2CP bridge and 3D CLI/train metric wiring.
-6. Update specs/docs/changelog/task log and run tests.
+- Full 3D Trace2CP train-loop wiring: not implemented; this plan fixes it.
+- 3D Trace2CP CLI visualization: not implemented; this plan fixes it.
+- Real-loader integration test for 3D Trace2CP: not implemented; this plan adds
+  at least a focused integration or mocked smoke test.
+- Analytic/direct 3D Lasagna direction decode: not implemented in the 3D bridge
+  yet. Current projection uses an inappropriate deterministic grid-search
+  decoder. This plan requires removing that path and using the established
+  analytic Lasagna projection decoding/reconstruction logic.
+- Anisotropic blur remains opt-in and default off. It was implemented but not
+  profiled enough to enable by default.
+- Shear/skew and ringing remain intentionally unsupported and should continue
+  to fail loudly.
 
 ## Risks
 
-- Full 3D smooth displacement must not be an arbitrary dense field unless a
-  direct paired inverse is also constructed. The first supported 3D mode should
-  use explicitly invertible coupling/triangular stages; if amplitudes make
-  transformed geometry invalid, those samples/voxels should be rejected or
-  ignored rather than silently supervised.
-- Arbitrary anisotropic blur can be expensive. It should stay off by default
-  until benchmarked on the real training path.
-- Trace2CP bridge inference may need tiling for long CP-pair strips; the first
-  implementation should favor correctness and clear profiling over premature
-  batching.
+- Long CP-pair strips may require tiling more than one 3D inference block.
+  Implement this explicitly rather than assuming one block always covers the
+  segment.
+- The 2D Trace2CP loader returns base-volume XYZ coordinates; the 3D bridge
+  must convert to the selected zarr level consistently with `base_volume_scale`.
+- Whole-fiber CLI visualization should skip bad CP pairs, but training metric
+  should fail if all selected pairs are invalid.

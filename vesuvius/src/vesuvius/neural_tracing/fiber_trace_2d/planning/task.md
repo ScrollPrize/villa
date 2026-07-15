@@ -1,13 +1,21 @@
-# 3D Fiber Follow-Up Plan
+# 3D Trace2CP Metric Wiring Fix
 
-Plan the parts left out of the initial 3D fiber CP implementation:
+Finish the explicitly requested 3D Trace2CP metric wiring that was only
+partially implemented in the previous 3D follow-up.
 
-- smooth displacement augmentation in 1D, 2D, and full 3D;
-- anisotropic directional 3D blur;
-- full Trace2CP metric wiring for 3D checkpoints;
-- keep shear and ringing explicitly out of scope;
-- confirm current regular affine augmentation support, especially rotation and
-  shift.
+Required behavior:
 
-The current 2D fiber path must stay supported. The 3D path should keep ordinary
-CP-centered 3D block loading, not fiber-aligned strip loading.
+- 3D training test evaluation must be able to run the public Trace2CP metric by
+  projecting dense 3D model outputs onto the existing 2D Trace2CP side-strip
+  geometry.
+- Best checkpoint selection must use `test/trace2cp_error` when this metric is
+  enabled.
+- TensorBoard and stdout must log the 3D Trace2CP metric clearly.
+- Add the minimal required 3D config keys rather than silently inferring
+  missing 2D Trace2CP geometry settings.
+- Add a 3D CLI inspection path that can run the same projection metric for a
+  checkpoint and export a compact visualization.
+
+The 3D training path must still load ordinary CP-centered 3D blocks for
+training. Trace2CP evaluation may reuse the existing 2D loader only for metric
+geometry and visualization.

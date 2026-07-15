@@ -30,6 +30,10 @@ development is based around the docs in the planning/ subdir
 # some details on execution
 
 - Deviations from the plan but also findings (successes and failures) should be logged in planning/task_log.md.
+- Any simplification, partial implementation, deferred item, unsupported case,
+  or intentionally skipped requirement must be reported explicitly in
+  planning/task_log.md and in the final user response for that task. Silent
+  simplification or silent postponement is not allowed.
 - planning/task_log.md is for the current active task only. When starting a new
   task, replace its contents with that task's implementation notes, deviations,
   validation commands, and results. Do not preserve or append historical logs
