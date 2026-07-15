@@ -30,6 +30,9 @@ side/top strip input loading.
 - Config derives `features_per_stage`, `unet_base_channels`, `unet_depth`,
   `strides`, and `decoder_upsample_mode` the same way as the existing 3D fiber
   model helpers.
+- The fiber 3D wrapper disables U-Net normalization layers. It requests no
+  InstanceNorm, GroupNorm, or BatchNorm because sparse supervision should not
+  let crop statistics act as an implicit classifier.
 
 `fiber_trace_3d/loader.py`
 
@@ -54,14 +57,15 @@ side/top strip input loading.
   separable isotropic Gaussian blur, and opt-in anisotropic blur. Anisotropic
   blur is a torch value operation after volume sampling, not a geometric
   transform.
-- Builds direction and presence targets from the same transformed 3D fiber line
-  used to sample the image. Direction labels use the six Lasagna 3x2 channels;
-  presence positives are near the transformed line and negatives are balanced
-  in the valid interior.
+- Builds direction and presence targets in source-format-specific form.
+  NML records supervise densely along the transformed fiber line; JSON/array
+  records supervise only the sampled CP neighborhood. Direction labels use the
+  six Lasagna 3x2 channels, and presence negatives are balanced in the valid
+  interior.
 - Clips source-space fiber-line segments to the forward-map/source domain
-  before mapping them into the output patch for target generation. Long NML
-  edges that cross the patch are therefore supervised even when their original
-  vertices are outside the patch.
+  before mapping NML dense targets into the output patch. Long NML edges that
+  cross the patch are therefore supervised even when their original vertices
+  are outside the patch.
 - Provides a conservative base-volume prefetch path from the configured
   augmentation envelope.
 

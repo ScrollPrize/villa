@@ -54,7 +54,7 @@ def _straight_fiber() -> Vc3dFiber:
     )
 
 
-def _long_segment_fiber() -> Vc3dFiber:
+def _long_segment_fiber(*, source_format: str | None = None) -> Vc3dFiber:
     points = np.asarray(
         [
             [0.0, 32.0, 32.0],
@@ -69,7 +69,7 @@ def _long_segment_fiber() -> Vc3dFiber:
         line_points_xyz=points,
         control_points_xyz=points[1:2].copy(),
         generation=1,
-        metadata={},
+        metadata={} if source_format is None else {"source_format": source_format},
     )
 
 
@@ -107,7 +107,7 @@ def _loader(*, augment_enabled: bool = False) -> FiberTrace3DLoader:
     return FiberTrace3DLoader(config)
 
 
-def _long_segment_loader() -> FiberTrace3DLoader:
+def _long_segment_loader(*, source_format: str | None = None) -> FiberTrace3DLoader:
     z, y, x = np.meshgrid(
         np.arange(96, dtype=np.float32),
         np.arange(96, dtype=np.float32),
@@ -128,7 +128,7 @@ def _long_segment_loader() -> FiberTrace3DLoader:
             "_array_records": [
                 {
                     "volume": volume,
-                    "fiber": _long_segment_fiber(),
+                    "fiber": _long_segment_fiber(source_format=source_format),
                     "volume_path": "synthetic",
                 }
             ],
@@ -227,13 +227,25 @@ def test_loader_augmented_batch_is_finite() -> None:
 
 
 def test_loader_clips_long_label_segments_to_patch_domain() -> None:
-    loader = _long_segment_loader()
+    loader = _long_segment_loader(source_format="nml")
     batch = loader.load_batch(0, sample_mode="flat")
     assert batch.volume.shape == (1, 1, 16, 16, 16)
     assert bool(batch.direction_mask.any())
     assert bool((batch.presence_target > 0.5).any())
     cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
     assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), int(cp[2])] > 0.5
+    far_on_segment_x = min(int(cp[2]) + 5, 15)
+    assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), far_on_segment_x] > 0.5
+
+
+def test_loader_uses_cp_only_supervision_for_non_nml_fibers() -> None:
+    loader = _long_segment_loader(source_format=None)
+    batch = loader.load_batch(0, sample_mode="flat")
+    cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
+    far_on_segment_x = min(int(cp[2]) + 5, 15)
+    assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), int(cp[2])] > 0.5
+    assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), far_on_segment_x] == 0.0
+    assert not bool(batch.direction_mask[0, 0, int(cp[0]), int(cp[1]), far_on_segment_x])
 
 
 def test_train_sample_3d_sheet_contains_principal_slice_panels() -> None:
@@ -354,6 +366,24 @@ def test_3d_model_and_losses_smoke() -> None:
     losses = compute_losses(output, batch, direction_weight=1.0, presence_weight=1.0)
     assert losses["total"].ndim == 0
     assert torch.isfinite(losses["total"])
+
+
+def test_3d_fiber_model_uses_no_normalization_layers() -> None:
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    norm_types = (
+        torch.nn.BatchNorm3d,
+        torch.nn.GroupNorm,
+        torch.nn.InstanceNorm3d,
+    )
+    assert not any(isinstance(module, norm_types) for module in model.modules())
 
 
 def test_3d_projection_bridge_recovers_straight_xy_direction() -> None:

@@ -6,6 +6,12 @@
   shift, and a six-stage U-Net; fixed 3D target generation to clip long
   source-line segments to the patch/domain, and added principal-slice
   TensorBoard training visualization.
+- Changed 3D target semantics so NML sources supervise direction/presence
+  densely along overlapping fiber-line segments, while non-NML sources
+  supervise only the sampled CP neighborhood.
+- Disabled normalization layers in the 3D fiber model wrapper; the shared
+  `Vesuvius3dUnetModel` now accepts `normalization: none` while preserving its
+  legacy InstanceNorm default for other callers.
 - Wired 3D Trace2CP evaluation into `fiber_trace_3d.train`: tiled dense 3D
   inference over 2D Trace2CP geometry, TensorBoard/stdout metrics, best
   checkpoint selection by `test/trace2cp_error`, and a compact

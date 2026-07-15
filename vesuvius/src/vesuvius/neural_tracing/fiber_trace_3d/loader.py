@@ -812,6 +812,15 @@ def _clip_segment_to_aabb(
     return p0 + t_min * direction, p0 + t_max * direction
 
 
+def _uses_dense_fiber_supervision(record: _Record) -> bool:
+    source_format = str(record.fiber.metadata.get("source_format", "")).lower()
+    if source_format == "nml":
+        return True
+    if record.fiber.path is not None and str(record.fiber.path).lower().endswith(".nml"):
+        return True
+    return False
+
+
 def _read_raw_block(array: Any, start_zyx: np.ndarray, end_zyx: np.ndarray) -> np.ndarray:
     start = np.asarray(start_zyx, dtype=np.int64)
     end = np.asarray(end_zyx, dtype=np.int64)
@@ -1630,6 +1639,103 @@ class FiberTrace3DLoader:
         del params
         return line_points[start:end], line_index - start
 
+    def _presence_loss_mask(
+        self,
+        valid_mask: torch.Tensor,
+        patch_shape: tuple[int, int, int],
+    ) -> torch.Tensor:
+        presence_mask = valid_mask.clone()
+        edge_margin = self.config.presence_negative_edge_margin_voxels
+        if edge_margin is None:
+            edge_margin = int(math.ceil(max(self.config.augment_shift_zyx)))
+        if edge_margin > 0:
+            z = torch.arange(patch_shape[0], device=valid_mask.device)
+            y = torch.arange(patch_shape[1], device=valid_mask.device)
+            x = torch.arange(patch_shape[2], device=valid_mask.device)
+            zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
+            interior = (
+                (zz >= edge_margin)
+                & (zz < patch_shape[0] - edge_margin)
+                & (yy >= edge_margin)
+                & (yy < patch_shape[1] - edge_margin)
+                & (xx >= edge_margin)
+                & (xx < patch_shape[2] - edge_margin)
+            )
+            presence_mask &= interior
+        return presence_mask.view(1, *patch_shape)
+
+    def _cp_only_targets(
+        self,
+        record: _Record,
+        cp_index: int,
+        params: _Augment3DParams,
+        geometry: _GeometryMaps3D,
+        valid_mask: torch.Tensor,
+        patch_shape: tuple[int, int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        grid = np.stack(
+            np.meshgrid(
+                np.arange(patch_shape[0], dtype=np.float32),
+                np.arange(patch_shape[1], dtype=np.float32),
+                np.arange(patch_shape[2], dtype=np.float32),
+                indexing="ij",
+            ),
+            axis=-1,
+        )
+        cp_local = np.asarray(params.cp_local_zyx, dtype=np.float32).reshape(1, 1, 1, 3)
+        dist2 = np.sum((grid - cp_local) ** 2, axis=-1)
+        radius = float(self.config.presence_radius_voxels)
+        positive = dist2 <= np.float32(radius * radius)
+
+        tangent_src = self._line_tangent_volume_zyx(record, cp_index).astype(np.float64)
+        tangent_points = np.stack(
+            [
+                np.asarray(params.cp_volume_zyx, dtype=np.float64) - tangent_src,
+                np.asarray(params.cp_volume_zyx, dtype=np.float64) + tangent_src,
+            ],
+            axis=0,
+        )
+        tangent_out_points, tangent_valid = self._source_points_to_output_np(
+            tangent_points,
+            geometry,
+        )
+        if bool(tangent_valid.all()):
+            tangent_out = tangent_out_points[1] - tangent_out_points[0]
+        else:
+            tangent_out = tangent_src @ np.asarray(params.source_to_output_zyx, dtype=np.float64).T
+        tangent_norm = float(np.linalg.norm(tangent_out))
+        if not math.isfinite(tangent_norm) or tangent_norm <= 1.0e-12:
+            tangent_out = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            tangent_out = tangent_out / tangent_norm
+
+        tangent_xyz = np.broadcast_to(
+            tangent_out.astype(np.float32)[[2, 1, 0]],
+            (*patch_shape, 3),
+        )
+        direction_target_np = encode_lasagna_direction_3x2(tangent_xyz).astype(np.float32)
+        direction_weight_np = projection_magnitude_weights_3x2(tangent_xyz).astype(np.float32)
+        direction_target = torch.as_tensor(
+            direction_target_np.transpose(3, 0, 1, 2),
+            dtype=torch.float32,
+            device=valid_mask.device,
+        )
+        direction_weight = torch.as_tensor(
+            direction_weight_np.transpose(3, 0, 1, 2),
+            dtype=torch.float32,
+            device=valid_mask.device,
+        )
+        positive_t = torch.as_tensor(positive, dtype=torch.bool, device=valid_mask.device)
+        direction_mask = valid_mask & positive_t
+        presence_target = positive_t.to(dtype=torch.float32).view(1, *patch_shape)
+        return (
+            direction_target,
+            direction_weight,
+            direction_mask.view(1, *patch_shape),
+            presence_target,
+            self._presence_loss_mask(valid_mask, patch_shape),
+        )
+
     def _build_targets(
         self,
         record: _Record,
@@ -1639,6 +1745,15 @@ class FiberTrace3DLoader:
         valid_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         patch_shape = tuple(int(v) for v in self.config.patch_shape_zyx)
+        if not _uses_dense_fiber_supervision(record):
+            return self._cp_only_targets(
+                record,
+                cp_index,
+                params,
+                geometry,
+                valid_mask,
+                patch_shape,
+            )
         line_points, _local_line_index = self._line_window_for_labels(
             record,
             cp_index,
@@ -1730,31 +1845,12 @@ class FiberTrace3DLoader:
         direction_mask = valid_mask & positive_t
 
         presence_target = positive_t.to(dtype=torch.float32).view(1, *patch_shape)
-        presence_mask = valid_mask.clone()
-        edge_margin = self.config.presence_negative_edge_margin_voxels
-        if edge_margin is None:
-            edge_margin = int(math.ceil(max(self.config.augment_shift_zyx)))
-        if edge_margin > 0:
-            z = torch.arange(patch_shape[0], device=valid_mask.device)
-            y = torch.arange(patch_shape[1], device=valid_mask.device)
-            x = torch.arange(patch_shape[2], device=valid_mask.device)
-            zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
-            interior = (
-                (zz >= edge_margin)
-                & (zz < patch_shape[0] - edge_margin)
-                & (yy >= edge_margin)
-                & (yy < patch_shape[1] - edge_margin)
-                & (xx >= edge_margin)
-                & (xx < patch_shape[2] - edge_margin)
-            )
-            presence_mask &= interior
-        presence_mask = presence_mask.view(1, *patch_shape)
         return (
             direction_target,
             direction_weight,
             direction_mask.view(1, *patch_shape),
             presence_target,
-            presence_mask,
+            self._presence_loss_mask(valid_mask, patch_shape),
         )
 
     def load_sample(

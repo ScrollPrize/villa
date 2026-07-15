@@ -47,6 +47,7 @@ class FiberTrace3DNet(nn.Module):
             "squeeze_excitation": bool(cfg.squeeze_excitation),
             "decoder_upsample_mode": str(cfg.decoder_upsample_mode),
             "keep_inactive_deep_supervision_layers": False,
+            "normalization": "none",
         }
         self.net = Vesuvius3dUnetModel(
             int(cfg.input_channels),

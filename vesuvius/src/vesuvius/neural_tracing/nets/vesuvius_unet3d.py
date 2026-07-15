@@ -681,7 +681,18 @@ class Vesuvius3dUnetModel(nn.Module):
             self.time_emb_dim = None
         
         conv_op = nn.Conv3d
-        norm_op = nn.InstanceNorm3d
+        normalization = str(model_config.get('normalization', 'instance')).lower()
+        if normalization in {'none', 'off', 'identity'}:
+            norm_op = None
+            norm_op_kwargs = {}
+        elif normalization in {'instance', 'instancenorm', 'instance_norm'}:
+            norm_op = nn.InstanceNorm3d
+            norm_op_kwargs = {'affine': True, 'eps': 1e-5}
+        else:
+            raise ValueError(
+                "model_config normalization must be 'instance' or 'none', "
+                f"got {normalization!r}"
+            )
         
         # Architecture parameters
         self.features_per_stage = model_config.get('features_per_stage', [32, 64, 128, 256, 320, 320])
@@ -712,7 +723,7 @@ class Vesuvius3dUnetModel(nn.Module):
             kernel_sizes=self.kernel_sizes,
             conv_bias=True,
             norm_op=norm_op,
-            norm_op_kwargs={'affine': True, 'eps': 1e-5},
+            norm_op_kwargs=norm_op_kwargs,
             dropout_op=None,
             dropout_op_kwargs=None,
             nonlin=nn.LeakyReLU,

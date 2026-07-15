@@ -46,6 +46,9 @@
     - [ ] no skew?
     - [ ] special load/aug config key - round training patch to chunk boundaries
 - [ ] check the various 3d augmetnations with a contact sheet
+- [ ] multi-dir output for 3d fiber
+    - two fiber dirs can be close together: output two dirs and two presence values, loss selects a choice (for both) that minimizes (something sensible)
+- [ ] multiple laybers per patch : use some roi structure for fibers so we can supervise all fibers within some patch
 
 ## z-search training
 - [ ] Now lets do a modification that re-introduces multiple z-slices again int the training - we see that some difficulty in the embedding is mostly caused by the sample shifting in z

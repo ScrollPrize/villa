@@ -1,20 +1,28 @@
-# 3D CP Training Config And Segment Target Fix
+# 3D Fiber Loader Performance Rewrite
 
-Fix the 3D CP-centered training path after the first S1A NML training run.
+The current 3D CP-centered training path has abysmal loader performance. The
+observed training output shows `load_ms` around 10-15 seconds for a single
+192^3 patch while forward/backward is around 0.5 seconds.
 
 Required behavior:
 
-- The S1A NML 3D training config must use the intended larger 3D patch size:
-  `patch_shape_zyx: [192, 192, 192]`.
-- The configured CP shift must match that patch scale: `augment_shift_zyx:
-  [48, 48, 48]`.
-- The 3D U-Net depth must be fixed to a depth appropriate for 192-voxel
-  patches rather than the shallow 4-stage setup.
-- 3D label generation must not discard a fiber segment only because one of the
-  original line vertices is outside the sampled patch/source-map domain. It
-  must keep segment portions that overlap the crop by clipping to the
-  forward-map/source domain before mapping to output coordinates.
-- This is a training target-generation fix, not a data-skip workaround.
-- 3D training TensorBoard visualization must show the three principal slices
-  through a sampled CP, including image data, presence, and direction/angle
-  information.
+- Establish a current load-only benchmark baseline before changing the loader.
+- Stop using the custom `_read_raw_block` zarr crop path plus torch
+  `grid_sample` as the normal 3D training input loader.
+- Build explicit 3D augmentation coordinate maps in the same spirit as the 2D
+  fiber loader: geometry is represented as concrete output-to-source and
+  source-to-output maps, with no search, brute-force inversion, or iterative
+  inverse solving.
+- Use the VC3D coordinate sampler for 3D patch loading so chunk discovery,
+  blocking chunk fetch/decode, cache use, and sampling go through the same
+  production machinery as the 2D fiber loader.
+- Use sensible runtime parallelization inspired by the 2D fiber loader. Do not
+  rely on `ThreadPoolExecutor` for CPU-heavy Python work that is effectively
+  serialized by the GIL.
+- Ground-truth creation must draw/project the transformed fiber segments and
+  segment mask directly from the coordinate maps. Preprocessing/loading must not
+  require nearest-segment searches over full dense patches, inverse solving, or
+  other search-based geometry recovery.
+- Preserve deterministic random sample ordering: changing batch size or max
+  step count may truncate/extend the deterministic prefix, but must not reshuffle
+  prior samples.

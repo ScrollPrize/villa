@@ -64,13 +64,18 @@
   elsewhere inside the valid/reachable patch interior. Edge voxels that could
   not contain a CP because of shift augmentation are ignored for negative
   presence loss.
-- 3D target generation must clip fiber-line segments to the sampled
-  forward-map/source domain before mapping them into output-patch coordinates.
-  A segment that overlaps the patch must contribute supervision even if one or
-  both original line vertices are outside the patch. Endpoint-inside-only
-  segment validity is invalid for NML fibers with long inter-node spacing.
+- 3D target generation is source-format dependent. NML fibers use dense
+  supervision along all fiber-line segments that overlap the patch. Those
+  segments must be clipped to the sampled forward-map/source domain before
+  mapping into output-patch coordinates, so an overlapping segment contributes
+  supervision even if one or both original line vertices are outside the patch.
+  Non-NML fiber sources supervise only the sampled CP neighborhood for
+  direction and presence.
 - The first 3D model uses direction plus presence losses. Contrastive embedding
   remains unsupported by default in the 3D V0 path.
+- The 3D fiber model disables InstanceNorm, GroupNorm, and BatchNorm. With
+  sparse CP/dense-line supervision, normalization must not let global crop
+  statistics become an implicit classifier.
 - `batch_size` is the actual CP-patch batch passed through the 3D model in one
   forward/backward call. The 3D trainer does not support internal
   micro-batching; any BatchNorm statistics must come from the real configured
