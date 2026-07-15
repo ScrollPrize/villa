@@ -53,14 +53,15 @@ def _decimate_ordered_points_min_spacing(points, min_spacing):
 
 
 def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0):
-    # Fiber JSONs are stored as one vc3d_fiber per file. Their line_points are
-    # x/y/z coordinates at 4x the scale used by the regular PCL JSONs.
+    # Fiber JSONs are stored as one vc3d_fiber per file. Their control_points are
+    # x/y/z coordinates at 4x the scale used by the regular PCL JSONs. line_points
+    # are derived rendering geometry and must not be used as fitting constraints.
     with open(path, 'r') as f:
         data = json.load(f)
 
-    points_xyz = data.get('line_points') or data.get('control_points') or []
+    points_xyz = data.get('control_points') or []
     if not points_xyz:
-        print(f'WARNING: fiber {path} has no line_points/control_points; skipping')
+        print(f'WARNING: fiber {path} has no control_points; skipping')
         return None
 
     points_xyz = np.asarray(points_xyz, dtype=np.float32)
