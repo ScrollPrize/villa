@@ -20,6 +20,18 @@
   covers every configured control point once per pass before repeating. Changing
   batch size or step count may truncate/extend the consumed prefix, but must not
   reshuffle earlier samples.
+- 3D training uses the same raw-stream/data-stream split as 2D:
+  `training.max_sample_index` limits CP/data sample selection only, while
+  geometric and value augmentation parameters are seeded by the unbounded raw
+  training sample index. Reusing a bounded CP/data prefix must not replay the
+  same augmentation transforms on each repeat.
+- Public 3D loader calls use `sample_index` as that raw/global deterministic
+  stream index. There is no separate public augmentation-index mode:
+  `sample_index_limit` is the only mechanism that changes bounded CP/data
+  selection, and augmentation seeding remains tied to the raw `sample_index`.
+- With `training.max_steps = 0`, 3D training repeats the deterministic training
+  stream indefinitely until interrupted. Positive `max_steps` values are
+  absolute target training steps, including for resumed runs.
 - 3D geometric augmentation is represented by explicit coordinate maps before
   the final volume patch is materialized. `backward_source_zyx` maps output
   voxels to selected-level source-volume coordinates for image sampling.
@@ -95,14 +107,21 @@
   Shear/skew and ringing remain unsupported and must not appear as enabled
   keys in this config.
 - 3D training TensorBoard visualization logs three principal CP-centered
-  planes at `training.sample_vis_interval`. Each row has three columns: volume
-  image with projected GT line and model-predicted/fitted CP direction overlay,
-  target presence, and predicted presence. The GT line overlay includes
-  target-line portions within 2 voxels of the displayed slice plane. The sparse
-  direction angular-error panel is intentionally not shown because it is too
-  sparse to be useful for routine inspection. The predicted/fitted CP direction
-  overlay is drawn as a thin anti-aliased line whose length is scaled by the
-  in-slice projection magnitude, so out-of-slice directions are visibly shorter.
+  planes at `training.sample_vis_interval`. By default, up to four batch
+  samples are shown; `training.sample_vis_count` / `train_sample_vis_count`
+  and `training.test_sample_vis_count` control the side-by-side train/test
+  sample counts. Each sample block has three rows and three columns: volume
+  image with projected GT line and
+  model-predicted/fitted CP direction overlay, target/context presence, and
+  predicted presence. The target/context presence panel must visualize the
+  carried transformed fiber-line segment metadata even for JSON/non-NML
+  CP-only samples where loss supervision remains CP-only. The GT line overlay
+  includes target-line portions within 2 voxels of the displayed slice plane.
+  The sparse direction angular-error panel is intentionally not shown because
+  it is too sparse to be useful for routine inspection. The predicted/fitted
+  CP direction overlay is drawn as a thin anti-aliased line whose length is
+  scaled by the in-slice projection magnitude, so out-of-slice directions are
+  visibly shorter.
 - The 3D target-presence panel in TensorBoard is display-only max-pooled with a
   `3x3x3` kernel before slicing. This must not modify `presence_target` used by
   training or test loss.
@@ -115,9 +134,22 @@
 - When `training.test_interval > 0`, 3D training runs the configured test
   evaluation at step 0 before the first optimizer step and logs the same
   TensorBoard scalars/stdout as interval tests.
+- Dense 3D test loaders do not inherit train augmentations by default.
+  `training.test_augment_enabled: true` is the explicit opt-in for augmented
+  dense tests.
+- Dense 3D tests default to evaluating every configured held-out CP once in
+  flat CP order from sample index zero. `training.test_control_points: 0` is
+  the explicit full-test sentinel with the same behavior. Positive values keep
+  the fixed deterministic random test range beginning at
+  `test_start_sample_index`.
 - `python -m vesuvius.neural_tracing.fiber_trace_3d.train` is the 3D training
   entrypoint. It supports normal training, `--benchmark`, `--load-only`, and
   `--prefetch`.
+- Normal 3D training also supports `--resume <snapshot.pt>`. The CLI path
+  overrides config resume keys, restores model and optimizer state, writes a
+  fresh timestamped run directory, and records the effective resume path in
+  TensorBoard config text. If finite `training.max_steps` is not greater than
+  the checkpoint step, training must fail clearly.
 - 3D training and `--benchmark --load-only` runtime loading use
   `torch.utils.data.DataLoader` worker processes when
   `training.loader_workers > 0`. Each DataLoader item is one complete
@@ -149,7 +181,9 @@
   context only. The materializer must filter dense line rasterization by
   `_TARGET_MODE_DENSE_LINE`, so CP-only JSON segments do not create dense
   presence or direction supervision. Their direction target is the transformed
-  CP tangent applied only to the CP neighborhood.
+  CP tangent applied only to the CP neighborhood. TensorBoard visualization may
+  draw those visualization-only segments in the target/context presence panel,
+  but that display-only raster must not be fed back into loss materialization.
 - The GPU target materializer must preserve the existing label semantics:
   NML sources supervise direction/presence by drawing the overlapping clipped
   fiber centerline voxels only, without a radius-expanded distance-to-segment
@@ -175,8 +209,13 @@
   first `loader_workers` benchmark rows can include worker-local loader
   construction and should not be used as steady-state throughput.
 - 3D prefetch computes chunk dependencies from the same explicit coordinate
-  path used by training and the VC3D sampler. `--prefetch-steps 0` means all
-  deterministic CP samples.
+  path used by training and the VC3D sampler. It follows the 2D step-count
+  sentinel rules: omitted `--prefetch-steps` uses `training.max_steps`;
+  positive values override config; explicit `--prefetch-steps 0` means every
+  selected training CP once; negative values fail clearly. A positive
+  `training.max_sample_index` bounds the prefetched training prefix, and
+  full/config-driven prefetch also covers held-out test CPs once in flat order
+  when `test_datasets` is configured.
 - VC3D dependency collection currently accepts 2D coordinate surfaces shaped
   `[H,W,3]`. When 3D prefetch has a regular coordinate volume shaped
   `[Z,Y,X,3]` or another higher-rank `[...,H,W,3]` grid, the sampler wrapper

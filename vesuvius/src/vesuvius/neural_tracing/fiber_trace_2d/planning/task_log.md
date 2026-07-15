@@ -1,24 +1,27 @@
-# 3D Augmentation Stream And 2D Spec Parity Task Log
+# 3D Test Visualization And Raw Index Cleanup Task Log
 
-## Notes
+## Implementation Notes
 
-- Planning only so far.
-- The shared 2D spec already states that `training.max_sample_index` bounds
-  CP/data selection but does not bound augmentation seeding.
-- Current 3D loader uses the same `sample_index` for descriptor lookup and
-  augmentation parameter generation, so it lacks the explicit 2D raw/data index
-  split.
-- Current 3D test-loader construction copies train augmentation settings unless
-  changed.
-- Current 3D training can resume from JSON config keys, but lacks the requested
-  CLI `--resume` path. The 3D `--checkpoint` flag is only for Trace2CP
-  visualization and must not be treated as training resume.
-- Follow-up spec scan found additional non-dimensional 2D parity items to
-  integrate before implementation: `training.max_steps: 0` as unbounded
-  training repetition, dense-test `test_control_points: 0` as full flat-order
-  held-out evaluation, prefetch step-count resolution matching 2D, and console
-  progress wording. The console progress requirement is intentionally changed
-  to first 100 training steps for both 2D and 3D per user instruction.
+- Removed the public alternate augmentation-index loader arguments. Public 3D
+  `load_sample`, `load_batch`, and prefetch dependency generation now treat
+  `sample_index` as the raw/global deterministic stream index, derive data
+  sample identity through `sample_index_limit`, and seed augmentation from the
+  raw index.
+- Added a display-only line-presence raster to the 3D TensorBoard
+  target/context presence panel. It is built from `target_segment_*` metadata
+  and composited with max-pooled `presence_target`, so CP-only JSON/test fibers
+  show the full carried fiber context without changing loss materialization.
+- Added `training.sample_vis_count` / `training.train_sample_vis_count`
+  defaulting to `4`, plus `training.test_sample_vis_count` for test override.
+  Train and dense-test TensorBoard sheets concatenate up to that many batch
+  samples side by side.
+- Removed the stale dense-test visualization slice that forced the test sheet
+  to one sample before writing.
+- Changed omitted dense 3D `training.test_control_points` to resolve like the
+  explicit `0` sentinel: all held-out CPs in flat order from zero. Positive
+  values remain an explicit debugging cap.
+- Updated specs, code-structure docs, task plan/status, and changelog for the
+  corrected visualization and index semantics.
 
 ## Deviations Or Deferrals
 
@@ -26,4 +29,7 @@
 
 ## Validation
 
-- Not run yet; implementation has not started.
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/targets.py`
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+  - Result: `39 passed in 3.59s`
+- `git diff --check`

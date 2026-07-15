@@ -1003,6 +1003,13 @@ def _format_seconds(seconds: float) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
+def _bounded_data_sample_index(sample_index: int, sample_index_limit: int | None) -> int:
+    limit = 0 if sample_index_limit is None else int(sample_index_limit)
+    if limit <= 0:
+        return int(sample_index)
+    return int(sample_index) % limit
+
+
 class FiberTrace3DLoader:
     def __init__(self, config: FiberTrace3DConfig) -> None:
         if config.batch_size <= 0:
@@ -1838,6 +1845,7 @@ class FiberTrace3DLoader:
         self,
         sample_index: int,
         *,
+        sample_index_limit: int | None = None,
         sample_mode: str = "random",
         device: torch.device | str = "cpu",
         profile: bool = False,
@@ -1847,8 +1855,9 @@ class FiberTrace3DLoader:
         timings: dict[str, float] | None = {} if profile else None
         resolved_device = torch.device(device)
         start = time.perf_counter()
+        data_sample_index = _bounded_data_sample_index(sample_index, sample_index_limit)
         record, record_index, cp_index = self.descriptor_for_sample_index(
-            sample_index,
+            data_sample_index,
             sample_mode=sample_mode,
         )
         if timings is not None:
@@ -1896,7 +1905,7 @@ class FiberTrace3DLoader:
             timings["sample_total_ms"] = (time.perf_counter() - total_start) * 1000.0
             timings["sample_cpu_ms"] = (time.process_time() - cpu_total_start) * 1000.0
         return FiberTrace3DSample(
-            sample_index=int(sample_index),
+            sample_index=int(data_sample_index),
             record_index=int(record_index),
             fiber_path="" if record.fiber.path is None else str(record.fiber.path),
             control_point_index=int(cp_index),
@@ -1939,6 +1948,7 @@ class FiberTrace3DLoader:
         self,
         start_sample_index: int,
         *,
+        sample_index_limit: int | None = None,
         sample_mode: str = "random",
         device: torch.device | str = "cpu",
         profile: bool = False,
@@ -1949,6 +1959,7 @@ class FiberTrace3DLoader:
         samples = [
             self.load_sample(
                 int(start_sample_index) + offset,
+                sample_index_limit=sample_index_limit,
                 sample_mode=sample_mode,
                 device=device,
                 profile=profile,
@@ -2042,10 +2053,12 @@ class FiberTrace3DLoader:
         self,
         sample_index: int,
         *,
+        sample_index_limit: int | None = None,
         sample_mode: str = "random",
     ) -> tuple[int, list[ZarrChunkRequest]]:
+        data_sample_index = _bounded_data_sample_index(sample_index, sample_index_limit)
         record, _record_index, cp_index = self.descriptor_for_sample_index(
-            sample_index,
+            data_sample_index,
             sample_mode=sample_mode,
         )
         params = self._sample_augment_params(record, cp_index, int(sample_index))
@@ -2067,10 +2080,12 @@ class FiberTrace3DLoader:
         self,
         sample_index: int,
         *,
+        sample_index_limit: int | None = None,
         sample_mode: str = "random",
     ) -> list[ZarrChunkRequest]:
         _valid_voxels, requests = self._chunk_requests_and_valid_voxels_for_sample_index(
             sample_index,
+            sample_index_limit=sample_index_limit,
             sample_mode=sample_mode,
         )
         return requests
@@ -2081,6 +2096,7 @@ class FiberTrace3DLoader:
         sample_count: int,
         *,
         workers: int | None = None,
+        sample_index_limit: int | None = None,
         sample_mode: str = "random",
     ) -> dict[str, Any]:
         total_samples = int(sample_count)
@@ -2109,6 +2125,7 @@ class FiberTrace3DLoader:
             "fiber_trace_3d prefetch: "
             f"samples={total_samples} workers={worker_count} "
             f"sampler_workers={producer_count} sample_mode={sample_mode} "
+            f"sample_index_limit={0 if sample_index_limit is None else int(sample_index_limit)} "
             "mode=dependency_chunks",
             flush=True,
         )
@@ -2181,6 +2198,7 @@ class FiberTrace3DLoader:
         def build_requests(sample_index: int) -> tuple[int, int, list[ZarrChunkRequest]]:
             valid_voxels, requests = self._chunk_requests_and_valid_voxels_for_sample_index(
                 sample_index,
+                sample_index_limit=sample_index_limit,
                 sample_mode=sample_mode,
             )
             return int(sample_index), int(valid_voxels), requests

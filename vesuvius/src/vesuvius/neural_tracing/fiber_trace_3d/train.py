@@ -130,6 +130,69 @@ def _device_from_training(training: dict[str, Any]) -> torch.device:
     return torch.device(raw)
 
 
+def _training_sample_index_limit(training: dict[str, Any], sample_count: int) -> int:
+    limit = int(training.get("max_sample_index", 0))
+    if limit < 0:
+        raise ValueError("training.max_sample_index must be >= 0")
+    if limit == 0:
+        return 0
+    if limit > int(sample_count):
+        raise ValueError(
+            "training.max_sample_index must be <= configured sample count "
+            f"({sample_count}), got {limit}"
+        )
+    return limit
+
+
+def _bounded_training_sample_count(training: dict[str, Any], sample_count: int) -> int:
+    limit = _training_sample_index_limit(training, sample_count)
+    return int(sample_count) if limit <= 0 else int(limit)
+
+
+def _make_test_loader_raw_config(raw_config: dict[str, Any], training: dict[str, Any]) -> dict[str, Any]:
+    test_raw = dict(raw_config)
+    test_raw["datasets"] = raw_config["test_datasets"]
+    test_raw.pop("test_datasets", None)
+    if not bool(training.get("test_augment_enabled", False)):
+        test_raw["augment_enabled"] = False
+    return test_raw
+
+
+def _resolve_prefetch_sample_count(
+    *,
+    training: dict[str, Any],
+    loader_sample_count: int,
+    batch_size: int,
+    prefetch_steps: int | None,
+) -> int:
+    bounded_count = _bounded_training_sample_count(training, loader_sample_count)
+    if prefetch_steps is None:
+        max_steps = int(training.get("max_steps", 1))
+        if max_steps < 0:
+            raise ValueError("training.max_steps must be >= 0")
+        if max_steps == 0:
+            return bounded_count
+        return min(int(max_steps) * int(batch_size), bounded_count)
+    explicit = int(prefetch_steps)
+    if explicit < 0:
+        raise ValueError("--prefetch-steps must be >= 0")
+    if explicit == 0:
+        return bounded_count
+    return min(explicit * int(batch_size), bounded_count)
+
+
+def _resolve_dense_test_selection(
+    training: dict[str, Any],
+    *,
+    loader_sample_count: int,
+    default_count: int,
+) -> tuple[int, int, str]:
+    raw_count = int(training.get("test_control_points", int(default_count)))
+    if raw_count <= 0:
+        return int(loader_sample_count), 0, "flat"
+    return raw_count, int(training.get("test_start_sample_index", 0)), "random"
+
+
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     mask_f = mask.to(dtype=value.dtype)
     denom = mask_f.sum().clamp_min(1.0)
@@ -563,6 +626,8 @@ def evaluate_dense_loss(
     device: torch.device,
     start_sample_index: int,
     sample_count: int,
+    sample_mode: str = "random",
+    sample_index_limit: int | None = None,
     direction_weight: float,
     presence_weight: float,
 ) -> dict[str, float]:
@@ -572,7 +637,8 @@ def evaluate_dense_loss(
     while consumed < sample_count:
         batch = loader.load_batch(
             start_sample_index + consumed,
-            sample_mode="random",
+            sample_mode=sample_mode,
+            sample_index_limit=sample_index_limit,
             device=device,
         )
         batch = materialize_targets(batch, loader.config)
@@ -694,7 +760,7 @@ def _forward_loss(
     return {key: float(value.detach().cpu()) for key, value in losses.items()}
 
 
-def run_training(config_path: str | Path) -> None:
+def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | None = None) -> None:
     raw_config = _load_raw_config(config_path)
     loader_config = load_config(config_path)
     training = dict(raw_config.get("training", {}))
@@ -702,8 +768,7 @@ def run_training(config_path: str | Path) -> None:
     loader = FiberTrace3DLoader(loader_config)
     test_loader = None
     if raw_config.get("test_datasets"):
-        test_raw = dict(raw_config)
-        test_raw["datasets"] = raw_config["test_datasets"]
+        test_raw = _make_test_loader_raw_config(raw_config, training)
         tmp_path = Path("/tmp") / f"fiber_trace_3d_test_{int(time.time() * 1000)}.json"
         tmp_path.write_text(json.dumps(_json_safe(test_raw)), encoding="utf-8")
         try:
@@ -726,49 +791,78 @@ def run_training(config_path: str | Path) -> None:
         lr=float(training.get("learning_rate", 1.0e-3)),
         weight_decay=float(training.get("weight_decay", 0.0)),
     )
-    resume = training.get("resume") or raw_config.get("resume")
+    resume = (
+        str(resume_checkpoint)
+        if resume_checkpoint is not None
+        else training.get("resume") or raw_config.get("resume")
+    )
     start_step = 0
     if resume:
         start_step = _load_snapshot(resume, model=model, optimizer=optimizer, map_location=device)
 
     run_dir, snapshot_dir = _resolve_run_layout(raw_config)
+    effective_config = _json_safe(raw_config)
+    if resume_checkpoint is not None:
+        effective_config.setdefault("training", {})["resume_cli"] = str(resume_checkpoint)
+        effective_config.setdefault("training", {})["resume_effective"] = str(resume)
     writer = _make_summary_writer(
         run_dir,
         enabled=bool(training.get("tensorboard_enabled", True)),
     )
     if writer is not None:
-        writer.add_text("config/json", json.dumps(_json_safe(raw_config), indent=2, sort_keys=True), 0)
+        writer.add_text("config/json", json.dumps(effective_config, indent=2, sort_keys=True), 0)
+        if resume:
+            writer.add_text("config/resume", f"resume={resume}\ncheckpoint_step={start_step}", 0)
         writer.add_text(
             "train_sample_3d/layout",
             "Rows: yx, zx, zy principal slices through the sampled CP. "
-            "Columns: image with projected GT line and predicted CP direction, target presence, predicted presence.",
+            "Columns: image with projected GT line and predicted CP direction, target/context presence, predicted presence. "
+            "Multiple batch samples are stacked vertically when configured.",
             0,
         )
         writer.add_text(
             "test_sample_3d/layout",
             "Rows: yx, zx, zy principal slices through the sampled test CP. "
-            "Columns: image with projected GT line and predicted CP direction, target presence, predicted presence.",
+            "Columns: image with projected GT line and predicted CP direction, target/context presence, predicted presence. "
+            "Multiple batch samples are stacked vertically when configured.",
             0,
         )
 
-    max_steps = int(training.get("max_steps", 1))
-    if max_steps <= 0:
-        max_steps = max(1, math.ceil(loader.sample_count / max(loader.config.batch_size, 1)))
+    max_steps_raw = int(training.get("max_steps", 1))
+    if max_steps_raw < 0:
+        raise ValueError("training.max_steps must be >= 0")
+    max_steps: int | None = None if max_steps_raw == 0 else max_steps_raw
+    if max_steps is not None and max_steps <= int(start_step):
+        raise ValueError(
+            "training.max_steps must be greater than checkpoint step when resuming: "
+            f"max_steps={max_steps} checkpoint_step={start_step}"
+        )
+    sample_index_limit = _training_sample_index_limit(training, loader.sample_count)
     scalar_interval = int(training.get("scalar_log_interval", 100))
     checkpoint_interval = int(training.get("checkpoint_interval", 100))
     test_interval = int(training.get("test_interval", 0))
     sample_vis_interval = int(
         training.get("sample_vis_interval", training.get("train_sample_vis_interval", 1000))
     )
+    sample_vis_count = int(
+        training.get("sample_vis_count", training.get("train_sample_vis_count", 4))
+    )
+    if sample_vis_count <= 0:
+        raise ValueError("training.sample_vis_count must be > 0")
     test_sample_vis_interval = int(
         training.get(
             "test_sample_vis_interval",
             test_interval if test_interval > 0 else sample_vis_interval,
         )
     )
-    test_control_points = int(training.get("test_control_points", loader.config.batch_size))
-    if test_control_points <= 0:
-        test_control_points = test_loader.sample_count if test_loader is not None else loader.sample_count
+    test_sample_vis_count = int(training.get("test_sample_vis_count", sample_vis_count))
+    if test_sample_vis_count <= 0:
+        raise ValueError("training.test_sample_vis_count must be > 0")
+    test_control_points, test_start_sample_index, test_sample_mode = _resolve_dense_test_selection(
+        training,
+        loader_sample_count=test_loader.sample_count if test_loader is not None else loader.sample_count,
+        default_count=0,
+    )
     direction_weight = float(training.get("direction_weight", 1.0))
     presence_weight = float(training.get("presence_weight", 1.0))
     loader_workers = _loader_worker_count(raw_config)
@@ -780,6 +874,7 @@ def run_training(config_path: str | Path) -> None:
     print(
         "fiber_trace_3d train: "
         f"samples={loader.sample_count} batch_size={loader.config.batch_size} "
+        f"max_sample_index={sample_index_limit} "
         f"patch_shape_zyx={loader.config.patch_shape_zyx} device={device} run_dir={run_dir} "
         f"trace2cp_enabled={bool(trace2cp_loader is not None)} "
         f"loader_workers={loader_workers} loader_prefetch_factor={loader_prefetch_factor} "
@@ -787,6 +882,13 @@ def run_training(config_path: str | Path) -> None:
         f"loader_multiprocessing_context={loader_context or 'default'}",
         flush=True,
     )
+    if resume:
+        print(
+            "fiber_trace_3d resume: "
+            f"checkpoint={resume} checkpoint_step={start_step} next_step={start_step + 1} "
+            f"run_dir={run_dir}",
+            flush=True,
+        )
 
     def run_configured_tests(step: int) -> tuple[float | None, str | None]:
         metric: float | None = None
@@ -796,8 +898,9 @@ def run_training(config_path: str | Path) -> None:
                 model,
                 test_loader,
                 device=device,
-                start_sample_index=int(training.get("test_start_sample_index", 0)),
+                start_sample_index=test_start_sample_index,
                 sample_count=test_control_points,
+                sample_mode=test_sample_mode,
                 direction_weight=direction_weight,
                 presence_weight=presence_weight,
             )
@@ -817,19 +920,18 @@ def run_training(config_path: str | Path) -> None:
                 writer.add_scalar("test/angle_mean_deg", test_losses["angle_mean_deg"], step)
                 if test_sample_vis_interval > 0 and step % test_sample_vis_interval == 0:
                     vis_batch = test_loader.load_batch(
-                        int(training.get("test_start_sample_index", 0)),
-                        sample_mode="random",
+                        test_start_sample_index,
+                        sample_mode=test_sample_mode,
                         device=device,
                     )
                     vis_batch = materialize_targets(vis_batch, test_loader.config)
-                    if int(vis_batch.volume.shape[0]) > 1:
-                        vis_batch = _slice_batch(vis_batch, 0, 1)
                     _write_3d_sample_sheet(
                         writer,
                         "test_sample_3d/principal_slices",
                         model,
                         vis_batch,
                         step,
+                        sample_count=test_sample_vis_count,
                     )
         if trace2cp_loader is not None and test_interval > 0:
             trace2cp_metric = _evaluate_trace2cp_metric_fixed_set_3d(
@@ -877,22 +979,26 @@ def run_training(config_path: str | Path) -> None:
             metric_name=initial_metric_name,
         )
 
-    remaining_steps = max(0, int(max_steps) - int(start_step))
+    remaining_steps = None if max_steps is None else max(0, int(max_steps) - int(start_step))
     train_dataloader = _make_batch_dataloader(
         config_path,
         raw_config=raw_config,
         start_batch_index=start_step,
         batch_count=remaining_steps,
+        sample_index_limit=sample_index_limit,
         sample_mode="random",
     )
     train_iterator = iter(train_dataloader) if train_dataloader is not None else None
     try:
-        for step in range(start_step + 1, max_steps + 1):
+        step = int(start_step)
+        while max_steps is None or step < max_steps:
+            step += 1
             sample_index = (step - 1) * loader.config.batch_size
             batch, load_ms, wait_ms, to_device_ms, target_ms = _next_training_batch(
                 iterator=train_iterator,
                 loader=loader,
                 sample_index=sample_index,
+                sample_index_limit=sample_index_limit,
                 sample_mode="random",
                 device=device,
             )
@@ -939,6 +1045,7 @@ def run_training(config_path: str | Path) -> None:
                     model,
                     batch,
                     step,
+                    sample_count=sample_vis_count,
                 )
 
             metric = losses["total"]
@@ -949,7 +1056,7 @@ def run_training(config_path: str | Path) -> None:
                     metric = test_metric
                     metric_name = test_metric_name
 
-            if step % checkpoint_interval == 0 or step == max_steps:
+            if step % checkpoint_interval == 0 or (max_steps is not None and step == max_steps):
                 _save_snapshot(
                     snapshot_dir / "current.pt",
                     model=model,
@@ -1173,6 +1280,41 @@ def _draw_projected_gt_line(
             prev_rc = rc
 
 
+def _line_presence_for_display(
+    patch_shape: tuple[int, int, int],
+    segments_start_zyx: np.ndarray,
+    segments_end_zyx: np.ndarray,
+) -> np.ndarray:
+    presence = np.zeros(tuple(int(v) for v in patch_shape), dtype=np.float32)
+    if segments_start_zyx.size == 0:
+        return presence
+    shape = np.asarray(patch_shape, dtype=np.int64)
+    for start, end in zip(segments_start_zyx, segments_end_zyx, strict=False):
+        start = np.asarray(start, dtype=np.float32)
+        end = np.asarray(end, dtype=np.float32)
+        if not np.isfinite(start).all() or not np.isfinite(end).all():
+            continue
+        delta = end - start
+        max_delta = float(np.max(np.abs(delta)))
+        if not math.isfinite(max_delta):
+            continue
+        steps = max(1, int(math.ceil(max_delta)))
+        for index in range(steps + 1):
+            t = float(index) / float(steps)
+            coord = np.rint(start * (1.0 - t) + end * t).astype(np.int64)
+            if bool(np.all(coord >= 0) and np.all(coord < shape)):
+                presence[int(coord[0]), int(coord[1]), int(coord[2])] = 1.0
+    if not bool(np.any(presence > 0.0)):
+        return presence
+    pooled = F.max_pool3d(
+        torch.as_tensor(presence).view(1, 1, *patch_shape),
+        kernel_size=3,
+        stride=1,
+        padding=1,
+    )[0, 0]
+    return pooled.numpy()
+
+
 def _draw_projected_cp_direction(
     panel: np.ndarray,
     *,
@@ -1207,7 +1349,7 @@ def _make_train_sample_3d_sheet(
     assert batch.presence_target is not None
     volume = batch.volume[0, 0].detach().cpu().numpy()
     valid = batch.valid_mask[0, 0].detach().cpu().numpy().astype(bool)
-    target_presence = F.max_pool3d(
+    supervised_presence = F.max_pool3d(
         batch.presence_target[0:1],
         kernel_size=3,
         stride=1,
@@ -1226,6 +1368,12 @@ def _make_train_sample_3d_sheet(
     segment_slice = slice(segment_offset, segment_offset + segment_count)
     segments_start_zyx = batch.target_segment_starts_zyx[segment_slice].detach().cpu().numpy()
     segments_end_zyx = batch.target_segment_ends_zyx[segment_slice].detach().cpu().numpy()
+    line_presence = _line_presence_for_display(
+        tuple(int(v) for v in volume.shape),
+        segments_start_zyx,
+        segments_end_zyx,
+    )
+    target_presence = np.maximum(supervised_presence, line_presence)
     slice_specs = (
         ("yx", volume[z, :, :], valid[z, :, :], target_presence[z, :, :], pred_presence[z, :, :], 0, z, 1, 2, y, x),
         ("zx", volume[:, y, :], valid[:, y, :], target_presence[:, y, :], pred_presence[:, y, :], 1, y, 0, 2, z, x),
@@ -1298,22 +1446,57 @@ def _make_train_sample_3d_sheet(
     return sheet
 
 
+def _make_train_sample_3d_contact_sheet(
+    batch: FiberTrace3DBatch,
+    output: torch.Tensor,
+    *,
+    sample_count: int,
+) -> np.ndarray:
+    take = min(max(1, int(sample_count)), int(batch.volume.shape[0]))
+    sheets: list[np.ndarray] = []
+    for sample_index in range(take):
+        sheets.append(
+            _make_train_sample_3d_sheet(
+                _slice_batch(batch, sample_index, sample_index + 1),
+                output[sample_index : sample_index + 1],
+            )
+        )
+    if len(sheets) == 1:
+        return sheets[0]
+    gap = 6
+    height = max(int(sheet.shape[0]) for sheet in sheets)
+    padded: list[np.ndarray] = []
+    for sheet in sheets:
+        if int(sheet.shape[0]) < height:
+            pad = np.zeros((height - int(sheet.shape[0]), int(sheet.shape[1]), 3), dtype=np.uint8)
+            sheet = np.concatenate([sheet, pad], axis=0)
+        padded.append(sheet)
+    sep = np.zeros((height, gap, 3), dtype=np.uint8)
+    out = padded[0]
+    for sheet in padded[1:]:
+        out = np.concatenate([out, sep, sheet], axis=1)
+    return out
+
+
 def _write_3d_sample_sheet(
     writer: Any,
     tag: str,
     model: torch.nn.Module,
     batch: FiberTrace3DBatch,
     step: int,
+    *,
+    sample_count: int = 1,
 ) -> None:
     was_training = bool(model.training)
     model.eval()
+    take = min(max(1, int(sample_count)), int(batch.volume.shape[0]))
     with torch.no_grad():
-        vis_output = model(batch.volume[:1])
+        vis_output = model(batch.volume[:take])
     if was_training:
         model.train()
     writer.add_image(
         tag,
-        _make_train_sample_3d_sheet(batch, vis_output),
+        _make_train_sample_3d_contact_sheet(batch, vis_output, sample_count=take),
         int(step),
         dataformats="HWC",
     )
@@ -1561,19 +1744,25 @@ def _identity_batch_collate(sample: Any) -> Any:
 
 
 class _FiberTrace3DBatchDataset(Dataset):
+    _UNBOUNDED_BATCH_COUNT = 2**60
+
     def __init__(
         self,
         config_source: str | Path | Any,
         *,
         start_batch_index: int,
-        batch_count: int,
+        batch_count: int | None,
+        sample_index_limit: int | None = None,
         sample_mode: str,
         worker_device: str | torch.device = "cpu",
         profile: bool = False,
     ) -> None:
         self.config_source = config_source
         self.start_batch_index = int(start_batch_index)
-        self.batch_count = int(batch_count)
+        self.batch_count = None if batch_count is None else int(batch_count)
+        self.sample_index_limit = 0 if sample_index_limit is None else int(sample_index_limit)
+        if self.sample_index_limit < 0:
+            raise ValueError("sample_index_limit must be >= 0")
         self.sample_mode = str(sample_mode)
         self.worker_device = str(worker_device)
         self.profile = bool(profile)
@@ -1581,6 +1770,8 @@ class _FiberTrace3DBatchDataset(Dataset):
         self._pending_construct_ms = 0.0
 
     def __len__(self) -> int:
+        if self.batch_count is None:
+            return self._UNBOUNDED_BATCH_COUNT
         return max(0, int(self.batch_count))
 
     def _get_loader(self) -> FiberTrace3DLoader:
@@ -1605,6 +1796,7 @@ class _FiberTrace3DBatchDataset(Dataset):
         worker_device = torch.device(self.worker_device)
         batch = loader.load_batch(
             sample_index,
+            sample_index_limit=self.sample_index_limit,
             sample_mode=self.sample_mode,
             device=worker_device,
             profile=self.profile,
@@ -1686,17 +1878,19 @@ def _make_batch_dataloader(
     *,
     raw_config: dict[str, Any],
     start_batch_index: int,
-    batch_count: int,
+    batch_count: int | None,
+    sample_index_limit: int | None = None,
     sample_mode: str,
     profile: bool = False,
 ) -> DataLoader | None:
     workers = _loader_worker_count(raw_config)
-    if workers <= 0 or int(batch_count) <= 0:
+    if workers <= 0 or (batch_count is not None and int(batch_count) <= 0):
         return None
     dataset = _FiberTrace3DBatchDataset(
         config_source,
         start_batch_index=int(start_batch_index),
-        batch_count=int(batch_count),
+        batch_count=None if batch_count is None else int(batch_count),
+        sample_index_limit=sample_index_limit,
         sample_mode=sample_mode,
         worker_device=_loader_worker_device(raw_config),
         profile=profile,
@@ -1724,13 +1918,19 @@ def _next_training_batch(
     iterator: Any | None,
     loader: FiberTrace3DLoader,
     sample_index: int,
+    sample_index_limit: int | None = None,
     sample_mode: str,
     device: torch.device,
     profile_targets: bool = False,
 ) -> tuple[FiberTrace3DBatch, float, float, float, float]:
     wait_start = time.perf_counter()
     if iterator is None:
-        batch = loader.load_batch(sample_index, sample_mode=sample_mode, device=device)
+        batch = loader.load_batch(
+            sample_index,
+            sample_index_limit=sample_index_limit,
+            sample_mode=sample_mode,
+            device=device,
+        )
         wait_ms = (time.perf_counter() - wait_start) * 1000.0
         target_start = time.perf_counter()
         batch = materialize_targets(batch, loader.config, profile=profile_targets)
@@ -1849,11 +2049,13 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
     loader_prefetch_factor = _loader_prefetch_factor(raw_config)
     loader_worker_device = _loader_worker_device(raw_config)
     loader_context = _loader_multiprocessing_context(raw_config)
+    sample_index_limit = _training_sample_index_limit(training, loader.sample_count)
     dataloader = _make_batch_dataloader(
         config_path,
         raw_config=raw_config,
         start_batch_index=0,
         batch_count=int(batches),
+        sample_index_limit=sample_index_limit,
         sample_mode="random",
         profile=True,
     )
@@ -1882,6 +2084,7 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
             iterator=iterator,
             loader=loader,
             sample_index=(batch_index - 1) * loader.config.batch_size,
+            sample_index_limit=sample_index_limit,
             sample_mode="random",
             device=device,
             profile_targets=True,
@@ -1957,21 +2160,56 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
     dataloader = None
 
 
-def run_prefetch(config_path: str | Path, *, prefetch_steps: int, workers: int | None) -> None:
+def run_prefetch(
+    config_path: str | Path,
+    *,
+    prefetch_steps: int | None,
+    workers: int | None,
+) -> None:
+    raw_config = _load_raw_config(config_path)
+    training = dict(raw_config.get("training", {}))
     loader = FiberTrace3DLoader(load_config(config_path))
-    if int(prefetch_steps) == 0:
-        sample_count = loader.sample_count
-    else:
-        sample_count = int(prefetch_steps) * int(loader.config.batch_size)
-    summary = loader.prefetch(0, sample_count, workers=workers)
-    print("fiber_trace_3d prefetch summary: " + json.dumps(summary, sort_keys=True))
+    sample_index_limit = _training_sample_index_limit(training, loader.sample_count)
+    sample_count = _resolve_prefetch_sample_count(
+        training=training,
+        loader_sample_count=loader.sample_count,
+        batch_size=loader.config.batch_size,
+        prefetch_steps=prefetch_steps,
+    )
+    summary = loader.prefetch(
+        0,
+        sample_count,
+        workers=workers,
+        sample_index_limit=sample_index_limit,
+        sample_mode="random",
+    )
+    summaries: dict[str, Any] = {"train": summary}
+    if raw_config.get("test_datasets") and (prefetch_steps == 0 or prefetch_steps is None):
+        test_raw = _make_test_loader_raw_config(raw_config, training)
+        tmp_path = Path("/tmp") / f"fiber_trace_3d_prefetch_test_{int(time.time() * 1000)}.json"
+        tmp_path.write_text(json.dumps(_json_safe(test_raw)), encoding="utf-8")
+        try:
+            test_loader = FiberTrace3DLoader(load_config(tmp_path))
+            summaries["test"] = test_loader.prefetch(
+                0,
+                test_loader.sample_count,
+                workers=workers,
+                sample_index_limit=0,
+                sample_mode="flat",
+            )
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+    print("fiber_trace_3d prefetch summary: " + json.dumps(summaries, sort_keys=True))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
     parser.add_argument("--prefetch", action="store_true")
-    parser.add_argument("--prefetch-steps", type=int, default=1)
+    parser.add_argument("--prefetch-steps", type=int, default=None)
     parser.add_argument("--prefetch-workers", type=int, default=None)
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--benchmark-batches", type=int, default=10)
@@ -1983,11 +2221,12 @@ def main() -> None:
     parser.add_argument("--export-dir", type=Path, default=None)
     parser.add_argument("--trace2cp-step-px", type=float, default=None)
     parser.add_argument("--trace2cp-rf-margin-px", type=float, default=None)
+    parser.add_argument("--resume", type=Path, default=None)
     args = parser.parse_args()
     if args.prefetch:
         run_prefetch(
             args.config,
-            prefetch_steps=int(args.prefetch_steps),
+            prefetch_steps=args.prefetch_steps,
             workers=args.prefetch_workers,
         )
     elif args.trace2cp_vis:
@@ -2011,7 +2250,7 @@ def main() -> None:
             batches=int(args.benchmark_batches),
         )
     else:
-        run_training(args.config)
+        run_training(args.config, resume_checkpoint=args.resume)
 
 
 if __name__ == "__main__":

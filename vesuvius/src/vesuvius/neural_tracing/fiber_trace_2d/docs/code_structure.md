@@ -92,28 +92,50 @@ side/top strip input loading.
   python -m vesuvius.neural_tracing.fiber_trace_3d.train <config.json>
   ```
 
-- Supports `--prefetch`, `--prefetch-steps`, `--benchmark`, `--load-only`, and
-  `--trace2cp-vis`.
+- Supports `--prefetch`, `--prefetch-steps`, `--benchmark`, `--load-only`,
+  `--resume`, and `--trace2cp-vis`.
 - Writes snapshots to `<run_path>/<run_name>_<datestr>/snapshots/current.pt`
   and `best.pt`.
 - Logs scalar losses/timings and the full training config JSON to TensorBoard
   when `training.tensorboard_enabled` is true.
   Direction reporting includes `train/angle_mean_deg` and, when held-out
   `test_datasets` are configured, `test/angle_mean_deg`.
+- Passing `--resume /path/to/current.pt` for normal training restores the
+  model and optimizer state from that snapshot, continues from the stored step,
+  and still creates a fresh timestamped run directory. The TensorBoard config
+  text records the effective CLI resume path.
+- `training.max_steps: 0` means the deterministic training stream repeats
+  indefinitely until interrupted. Positive `max_steps` values remain absolute
+  target steps, including when resuming.
+- `training.max_sample_index` bounds CP/data sample selection to a deterministic
+  prefix. Augmentation parameters are still seeded by the unbounded training
+  stream index, so reused CP/data samples receive fresh deterministic
+  transforms on later repeats.
 - When `test_interval > 0`, configured test evaluation also runs once at step
   0 before the first optimizer step, so initial performance is visible.
 - Logs `train_sample_3d/principal_slices` at `training.sample_vis_interval`.
-  The sheet uses the sampled CP's three principal planes with three columns:
-  volume image with projected GT line and predicted CP direction overlay, target
-  presence, and predicted presence. The GT line overlay draws target-line
-  portions within 2 voxels of the displayed slice plane. The target-presence
-  panel is max-pooled in 3D for visualization only so one-voxel line targets are
-  easier to see; the loss target is unchanged. The predicted CP direction is
-  drawn as a thin anti-aliased line whose length is scaled by the in-slice
-  projection magnitude, so directions pointing out of the slice appear shorter.
+  The sheet concatenates up to `training.sample_vis_count` batch samples side
+  by side, defaulting to four. `training.test_sample_vis_count` controls the
+  corresponding dense test sheet count. Each sample block uses the sampled CP's
+  three principal
+  planes with three columns: volume image with projected GT line and predicted
+  CP direction overlay, target/context presence, and predicted presence. The GT
+  line overlay draws target-line portions within 2 voxels of the displayed
+  slice plane. The target/context presence panel is max-pooled in 3D for
+  visualization only and also draws the carried transformed line segments for
+  CP-only JSON/test fibers; the loss target is unchanged. The predicted CP
+  direction is drawn as a thin anti-aliased line whose length is scaled by the
+  in-slice projection magnitude, so directions pointing out of the slice appear
+  shorter.
 - Configured dense 3D tests write `test_sample_3d/principal_slices` using the
   same sheet layout when they run at step 0 and test intervals. Test scalars and
   images are flushed immediately after configured test logging.
+- Dense 3D test loaders do not inherit training augmentations by default.
+  Set `training.test_augment_enabled: true` only when intentionally evaluating
+  augmented test samples. Dense tests default to every held-out CP once in flat
+  order from sample index zero; `training.test_control_points: 0` is the
+  explicit full-test sentinel, and positive values cap tests to a deterministic
+  random held-out range for debugging.
 - `batch_size` is the actual CP-patch batch passed through the 3D U-Net. The
   trainer does not internally micro-batch.
 - Normal training and `--benchmark --load-only` use
@@ -121,6 +143,10 @@ side/top strip input loading.
   `training.loader_workers > 0`. Each worker lazily constructs its own
   `FiberTrace3DLoader` and VC3D coordinate sampler, and each DataLoader item is
   a complete `FiberTrace3DBatch` keyed by deterministic batch index.
+- Public 3D loader calls interpret `sample_index` as the raw/global
+  deterministic stream index. `sample_index_limit` derives bounded CP/data
+  selection from that raw index; augmentation seeding always remains keyed to
+  the raw index, so bounded-prefix repeats do not replay identical transforms.
 - For 3D loading, omitted or `null` `volume_cache_memory_mib` resolves in
   Python to a 512 MiB VC3D decoded/hot-cache cap per loader/worker. Explicit
   positive values override this default.
@@ -145,7 +171,8 @@ side/top strip input loading.
   Target materialization filters segment metadata by target mode, so these
   CP-only visualization segments do not become dense presence or direction
   supervision. Their loss still uses the transformed local CP tangent over the
-  CP neighborhood.
+  CP neighborhood. The TensorBoard target/context presence column can still
+  render those segments for inspection; that raster is display-only.
 - In `--benchmark` mode, `cpu_ms` and `cpu_x` report sampled CPU time for the
   main process plus DataLoader worker processes during each benchmark row where
   `/proc/<pid>/stat` is available. `cpu_x=1.0` is roughly one fully occupied
@@ -180,6 +207,14 @@ side/top strip input loading.
   dependencies are still being generated. The 3D-only simplification is that
   each sample contributes one CP-centered 3D augmentation-envelope volume; no
   strip-z loop or top-view branch exists in 3D.
+- 3D prefetch follows the 2D step-count sentinels: omitted `--prefetch-steps`
+  uses `training.max_steps`; positive values override config; explicit
+  `--prefetch-steps 0` means every selected training CP once; negative values
+  are rejected. When `training.max_sample_index` is positive, the prefetched
+  training prefix is bounded to that deterministic data prefix. When held-out
+  `test_datasets` are configured and full/config-driven prefetch is requested,
+  the test CPs are prefetched once in flat order with test augmentations
+  disabled unless explicitly enabled.
 
 Example commands:
 
@@ -187,6 +222,7 @@ Example commands:
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --benchmark --load-only
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --prefetch --prefetch-steps 1
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json
+PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --resume /path/to/current.pt
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --trace2cp-vis --checkpoint /path/to/best.pt --sample-index 0 --export-dir /tmp/fiber_trace_3d_trace2cp
 ```
 

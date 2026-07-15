@@ -51,7 +51,12 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _draw_projected_cp_direction,
     _identity_batch_collate,
     _make_batch_dataloader,
+    _make_test_loader_raw_config,
+    _make_train_sample_3d_contact_sheet,
     _make_train_sample_3d_sheet,
+    _resolve_dense_test_selection,
+    _resolve_prefetch_sample_count,
+    _training_sample_index_limit,
     _write_3d_sample_sheet,
 )
 
@@ -351,12 +356,67 @@ def test_3d_batch_dataset_preserves_whole_batch_items() -> None:
         assert torch.allclose(actual.direction_target_sparse, expected.direction_target_sparse)
 
 
+def test_3d_batch_dataset_applies_sample_index_limit_to_data_only() -> None:
+    config = _loader(augment_enabled=True).config
+    dataset = _FiberTrace3DBatchDataset(
+        config,
+        start_batch_index=0,
+        batch_count=2,
+        sample_index_limit=1,
+        sample_mode="random",
+        worker_device="cpu",
+    )
+
+    first = dataset[0]
+    second = dataset[1]
+
+    assert torch.equal(first.sample_indices, torch.zeros_like(first.sample_indices))
+    assert torch.equal(second.sample_indices, torch.zeros_like(second.sample_indices))
+    assert torch.equal(first.control_point_indices, second.control_point_indices)
+    assert not torch.allclose(first.cp_local_zyx, second.cp_local_zyx)
+
+
 def test_loader_augmented_batch_is_finite() -> None:
     loader = _loader(augment_enabled=True)
     batch = _load_materialized_batch(loader, 1)
     assert torch.isfinite(batch.volume).all()
     assert torch.isfinite(batch.direction_target_sparse).all()
     assert batch.volume.shape == (2, 1, 16, 16, 16)
+
+
+def test_3d_augmentation_index_is_separate_from_data_index() -> None:
+    loader = _loader(augment_enabled=True)
+    record, _record_index, cp_index = loader.descriptor_for_sample_index(0, sample_mode="flat")
+
+    params_a = loader._sample_augment_params(record, cp_index, 0)
+    params_a_repeat = loader._sample_augment_params(record, cp_index, 0)
+    params_b = loader._sample_augment_params(record, cp_index, 1000)
+
+    assert np.allclose(params_a.cp_volume_zyx, params_b.cp_volume_zyx)
+    assert np.allclose(params_a.cp_local_zyx, params_a_repeat.cp_local_zyx)
+    assert np.allclose(params_a.source_to_output_zyx, params_a_repeat.source_to_output_zyx)
+    assert not np.allclose(params_a.source_to_output_zyx, params_b.source_to_output_zyx)
+
+
+def test_3d_bounded_data_index_reuses_cp_but_not_augmentation() -> None:
+    loader = _loader(augment_enabled=True)
+
+    batch_a = loader.load_batch(
+        0,
+        sample_mode="random",
+        sample_index_limit=1,
+    )
+    batch_b = loader.load_batch(
+        2,
+        sample_mode="random",
+        sample_index_limit=1,
+    )
+
+    assert torch.equal(batch_a.sample_indices, torch.zeros_like(batch_a.sample_indices))
+    assert torch.equal(batch_b.sample_indices, torch.zeros_like(batch_b.sample_indices))
+    assert torch.equal(batch_a.record_indices, batch_b.record_indices)
+    assert torch.equal(batch_a.control_point_indices, batch_b.control_point_indices)
+    assert not torch.allclose(batch_a.cp_local_zyx, batch_b.cp_local_zyx)
 
 
 def test_loader_clips_long_label_segments_to_patch_domain() -> None:
@@ -387,6 +447,29 @@ def test_loader_uses_cp_only_supervision_for_non_nml_fibers() -> None:
     assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), int(cp[2])] > 0.5
     assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), far_on_segment_x] == 0.0
     assert not _has_sparse_direction_at(batch, 0, int(cp[0]), int(cp[1]), far_on_segment_x)
+
+
+def test_3d_sheet_visualizes_line_context_for_cp_only_presence() -> None:
+    loader = _long_segment_loader(source_format=None)
+    batch = _load_materialized_batch(loader, 0, sample_mode="flat")
+    cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
+    far_on_segment_x = min(int(cp[2]) + 4, 15)
+    assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), far_on_segment_x] == 0.0
+
+    output = torch.zeros(
+        (
+            int(batch.volume.shape[0]),
+            7,
+            *tuple(int(v) for v in batch.volume.shape[-3:]),
+        ),
+        dtype=batch.volume.dtype,
+    )
+    sheet = _make_train_sample_3d_sheet(batch, output)
+    patch = int(batch.volume.shape[-1])
+    gap = 4
+    target_panel = sheet[:patch, patch + gap : patch * 2 + gap]
+
+    assert target_panel[int(cp[1]), far_on_segment_x, 0] > 0
 
 
 def test_train_sample_3d_sheet_contains_principal_slice_panels() -> None:
@@ -530,6 +613,116 @@ def test_local_prefetch_has_no_remote_chunks() -> None:
     assert summary["errors"] == 0
 
 
+def test_3d_training_sample_index_limit_validation() -> None:
+    assert _training_sample_index_limit({}, 10) == 0
+    assert _training_sample_index_limit({"max_sample_index": 4}, 10) == 4
+    try:
+        _training_sample_index_limit({"max_sample_index": -1}, 10)
+    except ValueError as exc:
+        assert "max_sample_index" in str(exc)
+    else:
+        raise AssertionError("negative max_sample_index should fail")
+    try:
+        _training_sample_index_limit({"max_sample_index": 11}, 10)
+    except ValueError as exc:
+        assert "<= configured sample count" in str(exc)
+    else:
+        raise AssertionError("too-large max_sample_index should fail")
+
+
+def test_3d_prefetch_step_count_resolution_matches_2d_sentinels() -> None:
+    assert (
+        _resolve_prefetch_sample_count(
+            training={"max_steps": 3},
+            loader_sample_count=100,
+            batch_size=8,
+            prefetch_steps=None,
+        )
+        == 24
+    )
+    assert (
+        _resolve_prefetch_sample_count(
+            training={"max_steps": 3},
+            loader_sample_count=100,
+            batch_size=8,
+            prefetch_steps=2,
+        )
+        == 16
+    )
+    assert (
+        _resolve_prefetch_sample_count(
+            training={"max_steps": 3, "max_sample_index": 12},
+            loader_sample_count=100,
+            batch_size=8,
+            prefetch_steps=2,
+        )
+        == 12
+    )
+    assert (
+        _resolve_prefetch_sample_count(
+            training={"max_steps": 0},
+            loader_sample_count=100,
+            batch_size=8,
+            prefetch_steps=None,
+        )
+        == 100
+    )
+    assert (
+        _resolve_prefetch_sample_count(
+            training={"max_steps": 3, "max_sample_index": 12},
+            loader_sample_count=100,
+            batch_size=8,
+            prefetch_steps=0,
+        )
+        == 12
+    )
+    try:
+        _resolve_prefetch_sample_count(
+            training={"max_steps": 3},
+            loader_sample_count=100,
+            batch_size=8,
+            prefetch_steps=-1,
+        )
+    except ValueError as exc:
+        assert "--prefetch-steps" in str(exc)
+    else:
+        raise AssertionError("negative prefetch steps should fail")
+
+
+def test_3d_test_loader_raw_config_disables_augmentation_by_default() -> None:
+    raw = {
+        "datasets": [{"name": "train"}],
+        "test_datasets": [{"name": "test"}],
+        "augment_enabled": True,
+    }
+
+    default_test = _make_test_loader_raw_config(raw, {})
+    augmented_test = _make_test_loader_raw_config(raw, {"test_augment_enabled": True})
+
+    assert default_test["datasets"] == [{"name": "test"}]
+    assert default_test["augment_enabled"] is False
+    assert "test_datasets" not in default_test
+    assert augmented_test["augment_enabled"] is True
+
+
+def test_3d_dense_test_control_points_zero_uses_flat_full_set() -> None:
+    assert _resolve_dense_test_selection(
+        {"test_control_points": 0, "test_start_sample_index": 99},
+        loader_sample_count=17,
+        default_count=4,
+    ) == (17, 0, "flat")
+    assert _resolve_dense_test_selection(
+        {"test_start_sample_index": 99},
+        loader_sample_count=17,
+        default_count=0,
+    ) == (17, 0, "flat")
+    assert _resolve_dense_test_selection(
+        {"test_control_points": 5, "test_start_sample_index": 9},
+        loader_sample_count=17,
+        default_count=4,
+    ) == (5, 9, "random")
+
+
 def test_train_sample_3d_sheet_has_three_columns_and_line_overlay() -> None:
     loader = _loader(augment_enabled=False)
     batch = _load_materialized_batch(loader, 0)
@@ -629,6 +822,25 @@ def test_write_3d_sample_sheet_adds_image() -> None:
     assert image.ndim == 3
 
 
+def test_train_sample_3d_contact_sheet_stacks_multiple_samples() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    output = torch.zeros(
+        (
+            int(batch.volume.shape[0]),
+            7,
+            *tuple(int(v) for v in batch.volume.shape[-3:]),
+        ),
+        dtype=batch.volume.dtype,
+    )
+
+    single = _make_train_sample_3d_contact_sheet(batch, output, sample_count=1)
+    multi = _make_train_sample_3d_contact_sheet(batch, output, sample_count=2)
+
+    assert multi.shape[0] == single.shape[0]
+    assert multi.shape[1] > single.shape[1]
+
+
 def test_3d_prefetch_streams_producers_but_downloads_in_sample_order(
     tmp_path,
     monkeypatch,
@@ -660,8 +872,13 @@ def test_3d_prefetch_streams_producers_but_downloads_in_sample_order(
         2: [request("b"), request("c")],
     }
 
-    def fake_requests(sample_index: int, *, sample_mode: str = "random") -> tuple[int, list[ZarrChunkRequest]]:
-        del sample_mode
+    def fake_requests(
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        sample_index_limit: int | None = None,
+    ) -> tuple[int, list[ZarrChunkRequest]]:
+        del sample_mode, sample_index_limit
         if int(sample_index) == 0:
             time.sleep(0.05)
         return 8, list(samples[int(sample_index)])
@@ -712,8 +929,13 @@ def test_3d_prefetch_classifies_cache_hit_empty_and_skip(tmp_path, monkeypatch) 
             cache_payload_format="source_bytes",
         )
 
-    def fake_requests(sample_index: int, *, sample_mode: str = "random") -> tuple[int, list[ZarrChunkRequest]]:
-        del sample_mode
+    def fake_requests(
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        sample_index_limit: int | None = None,
+    ) -> tuple[int, list[ZarrChunkRequest]]:
+        del sample_mode, sample_index_limit
         if int(sample_index) == 1:
             raise ValueError("invalid synthetic sample")
         if int(sample_index) == 0:

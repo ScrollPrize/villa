@@ -2,6 +2,18 @@
 
 ## 2026-07-15
 
+- Fixed 3D train/test TensorBoard target/context presence visualization so
+  CP-only JSON/test samples draw the carried transformed fiber-line context
+  without changing CP-only loss targets, removed the alternate public
+  augmentation-index loader path in favor of raw stream index plus
+  `sample_index_limit`, added multi-sample 3D visualization counts, and made
+  dense 3D tests default to all held-out CPs instead of one batch.
+- Matched 3D training to the 2D deterministic stream semantics: bounded
+  `training.max_sample_index` now limits CP/data selection while augmentation
+  seeds stay on the unbounded raw stream, `max_steps: 0` is indefinite,
+  dense-test `test_control_points: 0` uses full flat held-out order, dense test
+  loaders disable train augmentations by default, 3D prefetch follows the 2D
+  step-count sentinels, and 3D training supports CLI `--resume`.
 - Loaded transformed patch-overlapping line segments for JSON/non-NML 3D
   CP-only samples so train/test sample visualizations can draw approximate line
   context, while filtering dense supervision to NML target mode only.

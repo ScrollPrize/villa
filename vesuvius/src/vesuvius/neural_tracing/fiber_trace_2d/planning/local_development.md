@@ -139,6 +139,21 @@ anisotropic-blur augmentations. Its prefetch path uses the same command shape:
 PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_all_64_sd2.json --prefetch --prefetch-steps 1
 ```
 
+For 3D prefetch, omitting `--prefetch-steps` now uses the config
+`training.max_steps`. Passing a positive value overrides the config, and
+passing `--prefetch-steps 0` means every selected training CP once, bounded by
+`training.max_sample_index` when that key is positive. Held-out
+`test_datasets` CPs are also prefetched once in flat order for full/config
+prefetch modes.
+
+To continue 3D training without editing JSON, pass the current snapshot via
+CLI. The resumed run still creates a fresh timestamped run directory and
+continues from the snapshot step:
+
+```bash
+PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_all_64_sd2.json --resume /path/to/current.pt
+```
+
 Latest 3D DataLoader process-worker validation with that exact command and the
 checked-in S1A NML config:
 
