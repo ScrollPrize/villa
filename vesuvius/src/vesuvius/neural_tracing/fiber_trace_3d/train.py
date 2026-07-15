@@ -529,7 +529,6 @@ def evaluate_dense_loss(
     device: torch.device,
     start_sample_index: int,
     sample_count: int,
-    micro_batch_size: int,
     direction_weight: float,
     presence_weight: float,
 ) -> dict[str, float]:
@@ -545,10 +544,9 @@ def evaluate_dense_loss(
         take = min(int(batch.volume.shape[0]), sample_count - consumed)
         if take < int(batch.volume.shape[0]):
             batch = _slice_batch(batch, 0, take)
-        rows = _forward_loss_microbatched(
+        rows = _forward_loss(
             model,
             batch,
-            micro_batch_size=micro_batch_size,
             direction_weight=direction_weight,
             presence_weight=presence_weight,
             backward=False,
@@ -582,34 +580,24 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
     )
 
 
-def _forward_loss_microbatched(
+def _forward_loss(
     model: torch.nn.Module,
     batch: FiberTrace3DBatch,
     *,
-    micro_batch_size: int,
     direction_weight: float,
     presence_weight: float,
     backward: bool,
 ) -> dict[str, float]:
-    batch_size = int(batch.volume.shape[0])
-    micro = max(1, int(micro_batch_size))
-    totals = {"total": 0.0, "direction": 0.0, "presence": 0.0}
-    for start in range(0, batch_size, micro):
-        stop = min(start + micro, batch_size)
-        sub = _slice_batch(batch, start, stop)
-        output = model(sub.volume)
-        losses = compute_losses(
-            output,
-            sub,
-            direction_weight=direction_weight,
-            presence_weight=presence_weight,
-        )
-        scale = float(stop - start) / float(batch_size)
-        if backward:
-            (losses["total"] * scale).backward()
-        for key in totals:
-            totals[key] += float(losses[key].detach().cpu()) * scale
-    return totals
+    output = model(batch.volume)
+    losses = compute_losses(
+        output,
+        batch,
+        direction_weight=direction_weight,
+        presence_weight=presence_weight,
+    )
+    if backward:
+        losses["total"].backward()
+    return {key: float(value.detach().cpu()) for key, value in losses.items()}
 
 
 def run_training(config_path: str | Path) -> None:
@@ -666,7 +654,6 @@ def run_training(config_path: str | Path) -> None:
     max_steps = int(training.get("max_steps", 1))
     if max_steps <= 0:
         max_steps = max(1, math.ceil(loader.sample_count / max(loader.config.batch_size, 1)))
-    micro_batch_size = int(training.get("model_micro_batch_size", training.get("micro_batch_size", loader.config.batch_size)))
     scalar_interval = int(training.get("scalar_log_interval", 100))
     checkpoint_interval = int(training.get("checkpoint_interval", 100))
     test_interval = int(training.get("test_interval", 0))
@@ -683,7 +670,7 @@ def run_training(config_path: str | Path) -> None:
     print(
         "fiber_trace_3d train: "
         f"samples={loader.sample_count} batch_size={loader.config.batch_size} "
-        f"micro_batch_size={micro_batch_size} device={device} run_dir={run_dir} "
+        f"patch_shape_zyx={loader.config.patch_shape_zyx} device={device} run_dir={run_dir} "
         f"trace2cp_enabled={bool(trace2cp_loader is not None)}",
         flush=True,
     )
@@ -695,10 +682,9 @@ def run_training(config_path: str | Path) -> None:
         load_ms = (time.perf_counter() - load_start) * 1000.0
         optimizer.zero_grad(set_to_none=True)
         fw_start = time.perf_counter()
-        losses = _forward_loss_microbatched(
+        losses = _forward_loss(
             model,
             batch,
-            micro_batch_size=micro_batch_size,
             direction_weight=direction_weight,
             presence_weight=presence_weight,
             backward=True,
@@ -745,7 +731,6 @@ def run_training(config_path: str | Path) -> None:
                 device=device,
                 start_sample_index=int(training.get("test_start_sample_index", 0)),
                 sample_count=test_control_points,
-                micro_batch_size=micro_batch_size,
                 direction_weight=direction_weight,
                 presence_weight=presence_weight,
             )
@@ -1170,7 +1155,6 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
     device = _device_from_training(training)
     model = build_fiber_trace_3d_model(raw_config).to(device)
     model.eval()
-    micro_batch_size = int(training.get("model_micro_batch_size", loader.config.batch_size))
     direction_weight = float(training.get("direction_weight", 1.0))
     presence_weight = float(training.get("presence_weight", 1.0))
     print("batch patches total_ms load_ms fw_ms")
@@ -1186,10 +1170,9 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
         if not load_only:
             fw_start = time.perf_counter()
             with torch.no_grad():
-                _forward_loss_microbatched(
+                _forward_loss(
                     model,
                     batch,
-                    micro_batch_size=micro_batch_size,
                     direction_weight=direction_weight,
                     presence_weight=presence_weight,
                     backward=False,

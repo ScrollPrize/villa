@@ -71,9 +71,10 @@
   segment validity is invalid for NML fibers with long inter-node spacing.
 - The first 3D model uses direction plus presence losses. Contrastive embedding
   remains unsupported by default in the 3D V0 path.
-- Effective `batch_size` is the logical CP-patch batch size. Dense 3D U-Net
-  memory pressure is handled by `training.model_micro_batch_size`, which splits
-  forward/backward passes without changing the deterministic sample stream.
+- `batch_size` is the actual CP-patch batch passed through the 3D model in one
+  forward/backward call. The 3D trainer does not support internal
+  micro-batching; any BatchNorm statistics must come from the real configured
+  batch.
 - The S1A NML 3D training config uses `patch_shape_zyx: [192,192,192]`,
   `augment_shift_zyx: [48,48,48]`, and a fixed six-stage U-Net depth
   (`[16,32,64,128,256,512]`) so the deepest feature map remains appropriate

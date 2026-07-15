@@ -1,6 +1,6 @@
 {
-  "batch_size": 192,
-  "patch_shape_zyx": [32, 32, 32],
+  "batch_size": 1,
+  "patch_shape_zyx": [192, 192, 192],
   "seed": 0,
   "cp_margin_voxels": 4,
   "presence_radius_voxels": 2.0,
@@ -44,7 +44,6 @@
     "run_name": "fiber3d",
     "max_steps": 1000000,
     "learning_rate": 0.001,
-    "model_micro_batch_size": 8,
     "scalar_log_interval": 100,
     "checkpoint_interval": 100,
     "test_interval": 500,

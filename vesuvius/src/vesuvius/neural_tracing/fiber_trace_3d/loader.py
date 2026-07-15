@@ -45,8 +45,8 @@ _REMOTE_PREFIXES = ("http://", "https://", "s3://")
 @dataclass(frozen=True)
 class FiberTrace3DConfig:
     datasets: tuple[dict[str, Any], ...]
-    batch_size: int = 192
-    patch_shape_zyx: tuple[int, int, int] = (32, 32, 32)
+    batch_size: int = 1
+    patch_shape_zyx: tuple[int, int, int] = (192, 192, 192)
     seed: int = 1
     cp_margin_voxels: int = 4
     presence_radius_voxels: float = 2.0
@@ -303,9 +303,9 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
             )
     return FiberTrace3DConfig(
         datasets=tuple(dict(entry) for entry in datasets),
-        batch_size=int(raw.get("batch_size", 192)),
+        batch_size=int(raw.get("batch_size", 1)),
         patch_shape_zyx=_as_zyx3(
-            raw.get("patch_shape_zyx", raw.get("crop_size", [32, 32, 32])),
+            raw.get("patch_shape_zyx", raw.get("crop_size", [192, 192, 192])),
             key="patch_shape_zyx",
         ),
         seed=int(raw.get("seed", 1)),
@@ -1946,8 +1946,8 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         datasets = [{"array_records": True}]
     cfg = FiberTrace3DConfig(
         datasets=tuple(dict(entry) for entry in datasets),
-        batch_size=int(raw.get("batch_size", 192)),
-        patch_shape_zyx=_as_zyx3(raw.get("patch_shape_zyx", [32, 32, 32]), key="patch_shape_zyx"),
+        batch_size=int(raw.get("batch_size", 1)),
+        patch_shape_zyx=_as_zyx3(raw.get("patch_shape_zyx", [192, 192, 192]), key="patch_shape_zyx"),
         seed=int(raw.get("seed", 1)),
         cp_margin_voxels=int(raw.get("cp_margin_voxels", 4)),
         presence_radius_voxels=float(raw.get("presence_radius_voxels", 2.0)),

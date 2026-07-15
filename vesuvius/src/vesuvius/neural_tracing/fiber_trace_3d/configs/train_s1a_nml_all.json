@@ -1,5 +1,5 @@
 {
-  "batch_size": 192,
+  "batch_size": 1,
   "patch_shape_zyx": [192, 192, 192],
   "seed": 0,
   "cp_margin_voxels": 4,
@@ -44,7 +44,6 @@
     "run_name": "s1a_nml_all_3d",
     "max_steps": 1000000,
     "learning_rate": 0.001,
-    "model_micro_batch_size": 8,
     "scalar_log_interval": 100,
     "sample_vis_interval": 1000,
     "checkpoint_interval": 100,
