@@ -3,6 +3,83 @@
 This package implements a loader/debug runner and a V0 training path for 2D
 fiber side-strip patches around VC3D fiber control points.
 
+The sibling package `vesuvius.neural_tracing.fiber_trace_3d` implements the V0
+CP-centered 3D model path. It shares fiber JSON/NML parsing conventions and
+Lasagna-manifest dataset semantics with this package, but it does not use 2D
+side/top strip input loading.
+
+## 3D CP Model Package
+
+`fiber_trace_3d/direction.py`
+
+- Implements Lasagna's 3D direction target layout as three ambiguous 2D
+  double-angle projection pairs:
+  `dir0_z,dir1_z`, `dir0_y,dir1_y`, and `dir0_x,dir1_x`.
+- Provides projection-magnitude weights for directions that are nearly
+  degenerate in one projection plane.
+
+`fiber_trace_3d/model.py`
+
+- Wraps `Vesuvius3dUnetModel` for a seven-channel output layout.
+- The first six channels are sigmoid Lasagna 3x2 direction channels.
+- The seventh channel is sigmoid sheet/fiber presence.
+- Config derives `features_per_stage`, `unet_base_channels`, `unet_depth`,
+  `strides`, and `decoder_upsample_mode` the same way as the existing 3D fiber
+  model helpers.
+
+`fiber_trace_3d/loader.py`
+
+- Parses Vesuvius-style JSON configs into `FiberTrace3DConfig`.
+- Uses `fiber_trace_2d.fiber_json.load_fiber_file`, so VC3D JSON, NML, and
+  dataset-level XYZ affine transforms follow the same rules as the 2D loader.
+- Requires Lasagna manifests for normal dataset entries and validates the base
+  volume shape against the manifest.
+- Samples ordinary CP-centered 3D ZYX source blocks from the selected Zarr
+  level. It does not create fiber-aligned strips or slices for 3D input.
+- Builds the final regular 3D patch with coordinate-space geometric
+  augmentation: CP-local shift, isotropic scale, arbitrary 3D rotation, and
+  independent axis flips.
+- Builds direction and presence targets from the same transformed 3D fiber line
+  used to sample the image. Direction labels use the six Lasagna 3x2 channels;
+  presence positives are near the transformed line and negatives are balanced
+  in the valid interior.
+- Provides a conservative base-volume prefetch path from the configured
+  augmentation envelope.
+
+`fiber_trace_3d/projection.py`
+
+- Provides the initial evaluation bridge from 3D direction predictions to a 2D
+  strip frame. It decodes six-channel Lasagna predictions with a deterministic
+  unit-sphere candidate table and projects the recovered ambiguous 3D axis into
+  caller-provided 2D frame axes.
+- This is for test/metric integration with the existing 2D tracer; 3D loading
+  remains CP-centered block loading.
+
+`fiber_trace_3d/train.py`
+
+- Command-line entry point:
+
+  ```bash
+  python -m vesuvius.neural_tracing.fiber_trace_3d.train <config.json>
+  ```
+
+- Supports `--prefetch`, `--prefetch-steps`, `--benchmark`, and `--load-only`.
+- Writes snapshots to `<run_path>/<run_name>_<datestr>/snapshots/current.pt`
+  and `best.pt`.
+- Logs scalar losses/timings and the full training config JSON to TensorBoard
+  when `training.tensorboard_enabled` is true.
+- Uses `training.model_micro_batch_size` to split dense 3D U-Net forwards while
+  preserving the configured logical CP-patch `batch_size` (default target:
+  around 192).
+
+Example commands:
+
+```bash
+PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --benchmark --load-only
+PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --prefetch --prefetch-steps 1
+PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json
+```
+
 The important behavior is:
 
 - read VC3D fiber JSONs or NML fiber annotations plus Lasagna manifests;

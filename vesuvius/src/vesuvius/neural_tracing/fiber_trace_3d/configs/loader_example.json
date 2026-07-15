@@ -1,0 +1,65 @@
+{
+  "batch_size": 192,
+  "patch_shape_zyx": [32, 32, 32],
+  "seed": 0,
+  "cp_margin_voxels": 4,
+  "presence_radius_voxels": 2.0,
+  "prefetch_workers": 16,
+  "round_source_to_chunk_boundaries": true,
+  "image_normalization": "zscore",
+  "augment_enabled": true,
+  "augment_shift_zyx": [8.0, 8.0, 8.0],
+  "augment_rotation_degrees": 25.0,
+  "augment_scale_min": 0.9,
+  "augment_scale_max": 1.1,
+  "augment_flip_probability": 0.5,
+  "augment_brightness": 0.25,
+  "augment_contrast_min": 0.5,
+  "augment_contrast_max": 2.0,
+  "augment_gamma_min": 0.5,
+  "augment_gamma_max": 2.0,
+  "augment_noise_std": 0.125,
+  "augment_blur_sigma": 0.0,
+  "volume_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/vesuvius_fiber_trace_zarr_cache",
+  "volume_cache_memory_mib": null,
+  "model_3d": {
+    "input_channels": 1,
+    "output_channels": 7,
+    "unet_base_channels": 16,
+    "unet_depth": 4,
+    "decoder_upsample_mode": "pixelshuffle",
+    "squeeze_excitation": false
+  },
+  "training": {
+    "run_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_3d_runs",
+    "run_name": "fiber3d",
+    "max_steps": 1000000,
+    "learning_rate": 0.001,
+    "model_micro_batch_size": 8,
+    "scalar_log_interval": 100,
+    "checkpoint_interval": 100,
+    "test_interval": 500,
+    "test_control_points": 0,
+    "test_start_sample_index": 0,
+    "device": "auto",
+    "tensorboard_enabled": true,
+    "direction_weight": 1.0,
+    "presence_weight": 1.0
+  },
+  "datasets": [
+    {
+      "fiber_glob": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_2026-06-16/train/*.json",
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "lasagna_manifest_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json"
+    }
+  ],
+  "test_datasets": [
+    {
+      "fiber_glob": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_2026-06-16/test/*.json",
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "lasagna_manifest_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json"
+    }
+  ]
+}

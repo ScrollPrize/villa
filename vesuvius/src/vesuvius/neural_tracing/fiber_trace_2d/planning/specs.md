@@ -1,5 +1,70 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## 3D CP-Centered Fiber Model Variant
+
+- The 3D CP model lives in a sibling package,
+  `vesuvius.neural_tracing.fiber_trace_3d`. It must not replace or reinterpret
+  `fiber_trace_2d` configs, strip geometry, Trace2CP tooling, or 2D training.
+- 3D training samples ordinary CP-centered ZYX volume blocks from the selected
+  base-volume Zarr level. It must not build fiber-aligned 3D strips or slices
+  for input loading.
+- Dataset entries use the same Lasagna-manifest-first convention as 2D:
+  `base_volume_path`, `base_volume_scale`, required
+  `lasagna_manifest_path`, and `fiber_paths`/`fiber_glob`.
+- JSON and NML fiber parsing, control-point exactness, and optional
+  dataset-level XYZ affine transforms follow the existing
+  `fiber_trace_2d.fiber_json` semantics.
+- `base_volume_scale` selects both the Zarr level read by the 3D loader and the
+  voxel scale at which CP-centered patches are sampled.
+- The 3D sample stream is deterministic pseudo-random by configured `seed` and
+  covers every configured control point once per pass before repeating. Changing
+  batch size or step count may truncate/extend the consumed prefix, but must not
+  reshuffle earlier samples.
+- 3D geometric augmentation is represented as output-voxel to source-volume
+  coordinate sampling before the final volume patch is materialized. It applies
+  to the image, transformed fiber line, transformed CP, and direction targets
+  together.
+- V0 3D geometric augmentations support CP-local shift, isotropic scale,
+  arbitrary 3D rotation, and independent axis flips. Non-zero 3D shear/skew and
+  ringing artifact keys are rejected until their semantics are specified.
+- The 3D loader may load an oversized axis-aligned source block around the CP,
+  then use torch `grid_sample` to form the final regular 3D patch. Value-only
+  augmentations happen after sampling as torch tensor operations.
+- V0 3D value augmentations support normalization, brightness, contrast, gamma,
+  noise, and separable isotropic Gaussian blur. Directional/anisotropic blur and
+  smooth displacement fields are future extensions unless explicitly enabled by
+  a later task.
+- The 3D model output layout is seven channels by default:
+  six Lasagna 3x2 ambiguous direction channels followed by one sigmoid
+  sheet/fiber-presence channel.
+- The six direction channels use Lasagna's double-angle projection layout:
+  `dir0_z,dir1_z` for `(tx,ty)`, `dir0_y,dir1_y` for `(tx,tz)`, and
+  `dir0_x,dir1_x` for `(ty,tz)`.
+- Direction supervision is computed from the transformed 3D line tangent and is
+  masked to positive fiber-neighborhood voxels. Projection-magnitude weighting
+  may downweight channels whose projection is nearly degenerate.
+- Presence supervision is positive near the transformed fiber line and negative
+  elsewhere inside the valid/reachable patch interior. Edge voxels that could
+  not contain a CP because of shift augmentation are ignored for negative
+  presence loss.
+- The first 3D model uses direction plus presence losses. Contrastive embedding
+  remains unsupported by default in the 3D V0 path.
+- Effective `batch_size` is the logical CP-patch batch size. Dense 3D U-Net
+  memory pressure is handled by `training.model_micro_batch_size`, which splits
+  forward/backward passes without changing the deterministic sample stream.
+- `python -m vesuvius.neural_tracing.fiber_trace_3d.train` is the 3D training
+  entrypoint. It supports normal training, `--benchmark`, `--load-only`, and
+  `--prefetch`.
+- 3D prefetch computes conservative source-block envelopes from CPs and
+  configured augmentation maxima. `--prefetch-steps 0` means all deterministic
+  CP samples.
+- V0 3D prefetch reuses the opened Zarr store/cache path to fetch required base
+  chunks and reports progress. It does not prefetch Lasagna manifest channels.
+- The initial 3D-to-2D evaluation bridge decodes/project predicted 3D direction
+  fields into a requested 2D frame so existing 2D strip tracing/Trace2CP
+  tooling can be reused for tests. This bridge is metric/debug tooling only and
+  does not change 3D input loading into strip loading.
+
 - The initial implementation loads batches of fiber-strip patches around random control points from the fiber dataset.
 - Fiber source parsing accepts existing VC3D fiber JSON files and Knossos /
   WebKnossos `.nml` files. VC3D JSON parsing follows

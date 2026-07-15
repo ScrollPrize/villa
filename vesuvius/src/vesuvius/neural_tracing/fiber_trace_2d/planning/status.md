@@ -9,4 +9,9 @@
 - [x] Adapted plan for non-strip 3D volume-block loading, direction+presence
   training, Lasagna 3x2 direction encoding, and 2D strip-projection testing.
 - [x] Replaced `planning/task_log.md` with current-task planning notes only.
-- [ ] Await user review of the plan before implementation.
+- [x] User approved implementation.
+- [x] Added `fiber_trace_3d` direction/model/loader/projection/train modules.
+- [x] Added 3D example and S1A NML configs.
+- [x] Added focused synthetic 3D tests.
+- [x] Updated specs, code-structure docs, changelog, and task log.
+- [x] Ran focused and compatibility tests after implementation.

@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-07-15
+
+- Added the V0 `fiber_trace_3d` sibling package for CP-centered 3D fiber
+  training: ordinary 3D volume-block loading around control points,
+  coordinate-space 3D augmentation, Lasagna 3x2 direction targets,
+  sheet/fiber-presence supervision, 3D U-Net wrapper, training/prefetch CLI,
+  example configs, and synthetic regression tests.
+- Documented the 3D CP model boundary in the fiber trace specs and code
+  structure docs, including the explicit guarantee that 3D input loading does
+  not use 2D side/top strip slicing.
+
 ## 2026-07-14
 
 - Removed the dense per-control-point `strip_coord_cache_dir` disk cache and
