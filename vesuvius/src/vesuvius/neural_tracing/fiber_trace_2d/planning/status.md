@@ -1,12 +1,9 @@
-# Process-Level Startup Fiber Geometry Preload Status
+# S1A NML All-Data Training Config Status
 
-- [x] Replace task statement with process-level startup preload requirement.
-- [x] Replace task plan and remove thread-local worker-handle direction from the plan.
-- [x] Revert thread-local loader handle experiment from code.
-- [x] Add process-level startup geometry jobs and worker function.
-- [x] Wire `ProcessPoolExecutor` into startup geometry preload.
-- [x] Preserve serial `loader_workers=1` path.
-- [x] Update specs/docs/changelog after implementation.
-- [x] Update tests by removing thread-local assertions and covering process startup.
-- [x] Run focused test suite.
-- [x] Run benchmark command and report startup/load-only results.
+- [x] Read current config and docs references.
+- [x] Confirmed local S1A NML glob resolves to 8 files.
+- [x] Renamed the config to `train_s1a_nml_all.json`.
+- [x] Set `training.run_name` to `s1a_nml_all`.
+- [x] Removed stale non-S1A JSON `test_datasets` from this config.
+- [x] Updated docs/changelog/task log.
+- [x] Validated JSON parsing and `load_config`.

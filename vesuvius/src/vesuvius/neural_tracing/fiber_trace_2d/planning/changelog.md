@@ -19,8 +19,9 @@
 - Added dataset-level fiber-coordinate affine transforms for JSON/NML sources
   via Vesuvius `transform.json`, inline `fiber_transform`, and
   Lasagna-compatible `transform` aliases.
-- Added `configs/loader_example_s1a_nml.json`, an S1A NML training-data variant
-  of the normal PHercParis4 example config.
+- Added `configs/train_s1a_nml_all.json`, an S1A NML training-data config that
+  loads all matching S1A NML files with the existing S1A/source affine
+  transform.
 - Extended `--trace2cp-top-model-dir-vis` with optimized-line diagnostics from
   the yellow top-DP path: optimized top strip, side slice, and matching
   top/side presence panels.

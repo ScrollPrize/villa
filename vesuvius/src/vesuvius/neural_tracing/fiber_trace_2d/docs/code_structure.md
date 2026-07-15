@@ -696,12 +696,15 @@ The important behavior is:
     4 CP-prep workers;
   - current augmentation extrema.
 
-`configs/loader_example_s1a_nml.json`
+`configs/train_s1a_nml_all.json`
 
-- Variant of `loader_example.json` whose training `datasets` entry uses
+- S1A NML training config whose `datasets` entry uses
   `/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fiber_vols/fibers_s1a_*.nml`.
-- Keeps the PHercParis4 78keV base volume, base-volume scale, Lasagna manifest,
-  and JSON held-out test dataset settings from the normal example config.
+- Loads all matching S1A NML files as the training dataset. It intentionally
+  omits `test_datasets`; add a separate S1A held-out config if test evaluation
+  should run on a split of this source.
+- Keeps the PHercParis4 78keV base volume, base-volume scale, and Lasagna
+  manifest settings from the normal example config.
 - Includes the existing S1A/source-to-current PHercParis4 transform from
   `/home/hendrik/business/aiconsulting/vesuviuschallenge/villa2/lasagna/configs/tifxyz_train_s3_dbg.json`:
   inline `transform` plus `transform_invert: true`.

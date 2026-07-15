@@ -43,6 +43,8 @@
     - [ ] smooth distortion (dist field in 1 dim, 2 dims and 3d
     - [ ] blur in isotropic but also anisotropic (directional - 1 dir stronger two others small), and arbitrarily rorated
     - [ ] ringing artifact?
+    - [ ] no shift?
+    - [ ] special load/aug config key - round training patch to chunk boundaries
 
 ## z-search training
 - [ ] Now lets do a modification that re-introduces multiple z-slices again int the training - we see that some difficulty in the embedding is mostly caused by the sample shifting in z
