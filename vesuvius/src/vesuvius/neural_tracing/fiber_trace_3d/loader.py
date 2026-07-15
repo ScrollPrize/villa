@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import glob
+import heapq
 import hashlib
 import itertools
 import json
 import math
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,11 @@ from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import (
     Vc3dFiber,
     load_fiber_file,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.loader import _download_prefetch_request
+from vesuvius.neural_tracing.fiber_trace_2d.loader import (
+    _download_prefetch_request,
+    _empty_marker_path,
+    _existing_data_path,
+)
 from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import (
     CoordinateSampler,
@@ -79,6 +84,7 @@ class FiberTrace3DConfig:
     augment_anisotropic_blur_roll_degrees: float = 0.0
     round_source_to_chunk_boundaries: bool = True
     prefetch_workers: int = 16
+    prefetch_sampler_workers: int = 2
     volume_cache_dir: str | None = None
     volume_cache_memory_mib: float | None = None
     volume_io_threads: int | None = None
@@ -137,6 +143,26 @@ class _Augment3DParams:
 class _GeometryMaps3D:
     backward_source_zyx: torch.Tensor
     params: _Augment3DParams
+
+
+@dataclass
+class _PrefetchCounters3D:
+    samples_done: int = 0
+    samples_skipped: int = 0
+    unique_chunks_seen: int = 0
+    queued_for_download: int = 0
+    download_done: int = 0
+    cache_hits: int = 0
+    known_missing: int = 0
+    downloaded: int = 0
+    newly_missing: int = 0
+    download_errors: int = 0
+    bytes_downloaded: int = 0
+    valid_voxels: int = 0
+    first_error: str = ""
+    first_sample_skip: str = ""
+    queued_download_futures: int = 0
+    max_exclusive_sample_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -398,6 +424,10 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
         ),
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
         prefetch_workers=_parse_worker_count(raw.get("prefetch_workers", 16), key="prefetch_workers"),
+        prefetch_sampler_workers=_parse_worker_count(
+            raw.get("prefetch_sampler_workers", 2),
+            key="prefetch_sampler_workers",
+        ),
         volume_cache_dir=None if raw.get("volume_cache_dir") is None else str(raw.get("volume_cache_dir")),
         volume_cache_memory_mib=cache_memory_mib,
         volume_io_threads=(
@@ -1969,12 +1999,12 @@ class FiberTrace3DLoader:
             else None,
         )
 
-    def chunk_requests_for_sample_index(
+    def _chunk_requests_and_valid_voxels_for_sample_index(
         self,
         sample_index: int,
         *,
         sample_mode: str = "random",
-    ) -> list[ZarrChunkRequest]:
+    ) -> tuple[int, list[ZarrChunkRequest]]:
         record, _record_index, cp_index = self.descriptor_for_sample_index(
             sample_index,
             sample_mode=sample_mode,
@@ -1991,7 +2021,20 @@ class FiberTrace3DLoader:
         valid &= (coords_base[..., 0] >= 0.0) & (coords_base[..., 0] <= float(base_shape[0] - 1.0))
         valid &= (coords_base[..., 1] >= 0.0) & (coords_base[..., 1] <= float(base_shape[1] - 1.0))
         valid &= (coords_base[..., 2] >= 0.0) & (coords_base[..., 2] <= float(base_shape[2] - 1.0))
-        return record.sampler.chunk_requests_for_coords(coords_base, np.ascontiguousarray(valid))
+        valid = np.ascontiguousarray(valid)
+        return int(np.count_nonzero(valid)), record.sampler.chunk_requests_for_coords(coords_base, valid)
+
+    def chunk_requests_for_sample_index(
+        self,
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+    ) -> list[ZarrChunkRequest]:
+        _valid_voxels, requests = self._chunk_requests_and_valid_voxels_for_sample_index(
+            sample_index,
+            sample_mode=sample_mode,
+        )
+        return requests
 
     def prefetch(
         self,
@@ -2001,98 +2044,343 @@ class FiberTrace3DLoader:
         workers: int | None = None,
         sample_mode: str = "random",
     ) -> dict[str, Any]:
-        total = int(sample_count)
-        if total < 0:
+        total_samples = int(sample_count)
+        if total_samples < 0:
             raise ValueError("sample_count must be >= 0")
         worker_count = max(1, int(self.config.prefetch_workers if workers is None else workers))
-        request_by_identity: dict[tuple[str, str], ZarrChunkRequest] = {}
+        producer_count = min(
+            max(1, int(self.config.prefetch_sampler_workers)),
+            max(1, total_samples),
+        )
+        retry_seconds = float(self.config.volume_cache_retry_seconds)
+        if retry_seconds <= 0.0:
+            retry_seconds = 600.0
+        counters = _PrefetchCounters3D()
+        start_sample = int(start_sample_index)
+        end_sample = start_sample + total_samples
+        seen: set[tuple[str, str]] = set()
+        completed_chunks: set[tuple[str, str]] = set()
+        chunk_waiters: dict[tuple[str, str], set[int]] = {}
+        sample_pending: dict[int, set[tuple[str, str]]] = {}
+        sample_requests_closed: set[int] = set()
+        complete_raw_samples: set[int] = set()
+        next_safe_raw_sample = start_sample
+        start = time.perf_counter()
         print(
-            f"fiber_trace_3d prefetch: generating chunk requests samples={total} "
-            f"workers={worker_count} sample_mode={sample_mode}",
+            "fiber_trace_3d prefetch: "
+            f"samples={total_samples} workers={worker_count} "
+            f"sampler_workers={producer_count} sample_mode={sample_mode} "
+            "mode=dependency_chunks",
             flush=True,
         )
-        for sample_index in range(int(start_sample_index), int(start_sample_index) + total):
-            for request in self.chunk_requests_for_sample_index(
+
+        def print_progress(*, final: bool = False) -> None:
+            elapsed = max(time.perf_counter() - start, 1.0e-9)
+            sample_rate = counters.samples_done / elapsed
+            remaining_samples = total_samples - counters.samples_done
+            sample_eta = (
+                remaining_samples / sample_rate
+                if remaining_samples > 0 and sample_rate > 0.0
+                else 0.0
+            )
+            download_rate = counters.download_done / elapsed
+            if counters.samples_done > 0 and counters.samples_done < total_samples:
+                observed_chunks_per_sample = counters.unique_chunks_seen / max(counters.samples_done, 1)
+                observed_download_ratio = counters.queued_for_download / max(counters.unique_chunks_seen, 1)
+                estimated_total_downloads = counters.queued_for_download + int(
+                    math.ceil(remaining_samples * observed_chunks_per_sample * observed_download_ratio)
+                )
+            else:
+                estimated_total_downloads = counters.queued_for_download
+            remaining_downloads = estimated_total_downloads - counters.download_done
+            download_eta = (
+                remaining_downloads / download_rate
+                if remaining_downloads > 0 and download_rate > 0.0
+                else 0.0
+            )
+            mib = counters.bytes_downloaded / (1024.0 * 1024.0)
+            mib_s = mib / elapsed
+            bar_width = 24
+            sample_filled = int(math.floor(bar_width * counters.samples_done / max(total_samples, 1)))
+            sample_bar = "#" * sample_filled + "-" * (bar_width - sample_filled)
+            if counters.queued_for_download > 0:
+                download_filled = int(
+                    math.floor(bar_width * counters.download_done / max(counters.queued_for_download, 1))
+                )
+            else:
+                download_filled = 0
+            download_bar = "#" * download_filled + "-" * (bar_width - download_filled)
+            if counters.samples_done < total_samples:
+                sample_prefix = (
+                    f"fiber_trace_3d prefetch samples[{sample_bar}] "
+                    f"{counters.samples_done}/{total_samples} "
+                    f"eta={_format_seconds(sample_eta)} "
+                )
+            else:
+                sample_prefix = "fiber_trace_3d prefetch "
+            line = (
+                sample_prefix
+                + f"downloads[{download_bar}] {counters.download_done}/{counters.queued_for_download} "
+                f"eta={_format_seconds(download_eta)} "
+                f"idx={counters.max_exclusive_sample_index} "
+                f"chunks={counters.unique_chunks_seen} hits={counters.cache_hits} "
+                f"queued={counters.queued_download_futures} transfers={worker_count} "
+                f"samplers={producer_count} "
+                f"valid_voxels={counters.valid_voxels} "
+                f"skipped={counters.samples_skipped} "
+                f"missing={counters.known_missing + counters.newly_missing} "
+                f"downloaded={counters.downloaded} errors={counters.download_errors} "
+                f"{mib:.1f} MiB {mib_s:.1f} MiB/s"
+            )
+            if counters.first_error:
+                error = counters.first_error
+                if len(error) > 160:
+                    error = error[:157] + "..."
+                line += f" first_error={error!r}"
+            print(line, end="\n" if final else "\r", flush=True)
+
+        def build_requests(sample_index: int) -> tuple[int, int, list[ZarrChunkRequest]]:
+            valid_voxels, requests = self._chunk_requests_and_valid_voxels_for_sample_index(
                 sample_index,
                 sample_mode=sample_mode,
-            ):
-                request_by_identity[(request.store_identity, request.key)] = request
-        requests = list(request_by_identity.values())
-        if not requests:
-            print("fiber_trace_3d prefetch: no remote cached zarr chunk requests", flush=True)
-            return {
-                "samples": total,
-                "chunks": 0,
-                "downloaded": 0,
-                "errors": 0,
-                "elapsed_s": 0.0,
-            }
-
-        start_time = time.perf_counter()
-        done = 0
-        errors = 0
-        downloaded = 0
-        cache_hits = 0
-        missing = 0
-        bytes_read = 0
-        bar_width = 24
-
-        def print_progress(*, force: bool = False) -> None:
-            if not force and done < len(requests) and done % 32 != 0:
-                return
-            elapsed = max(time.perf_counter() - start_time, 1.0e-9)
-            rate = done / elapsed
-            eta = (len(requests) - done) / rate if rate > 0.0 else 0.0
-            filled = int(bar_width * done / max(len(requests), 1))
-            bar = "#" * filled + "-" * (bar_width - filled)
-            mib = bytes_read / (1024.0 * 1024.0)
-            mib_s = mib / elapsed
-            print(
-                "\r"
-                f"fiber_trace_3d prefetch[{bar}] {done}/{len(requests)} "
-                f"eta={_format_seconds(eta)} hits={cache_hits} downloaded={downloaded} "
-                f"missing={missing} errors={errors} {mib:.1f}MiB {mib_s:.1f}MiB/s",
-                end="" if done < len(requests) else "\n",
-                flush=True,
             )
+            return int(sample_index), int(valid_voxels), requests
 
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                executor.submit(
-                    _download_prefetch_request,
-                    request,
-                    retry_seconds=float(self.config.volume_cache_retry_seconds),
+        def advance_safe_prefix() -> None:
+            nonlocal next_safe_raw_sample
+            while next_safe_raw_sample < end_sample and next_safe_raw_sample in complete_raw_samples:
+                counters.max_exclusive_sample_index = max(
+                    counters.max_exclusive_sample_index,
+                    int(next_safe_raw_sample) + 1,
                 )
-                for request in requests
-            ]
-            for future in as_completed(futures):
-                try:
-                    result = dict(future.result())
-                    status = str(result.get("status", "error"))
-                    bytes_read += int(result.get("bytes", 0))
-                    if status == "cache_hit":
-                        cache_hits += 1
-                    elif status == "downloaded":
-                        downloaded += 1
-                    elif status in {"known_missing", "new_missing"}:
-                        missing += 1
+                next_safe_raw_sample += 1
+
+        def mark_sample_complete(raw_sample_index: int) -> None:
+            if raw_sample_index not in sample_requests_closed:
+                return
+            if sample_pending.get(raw_sample_index):
+                return
+            complete_raw_samples.add(raw_sample_index)
+            advance_safe_prefix()
+
+        def close_sample_requests(raw_sample_index: int) -> None:
+            sample_requests_closed.add(raw_sample_index)
+            mark_sample_complete(raw_sample_index)
+
+        def mark_chunk_complete(identity: tuple[str, str]) -> None:
+            if identity in completed_chunks:
+                return
+            completed_chunks.add(identity)
+            for raw_sample_index in chunk_waiters.pop(identity, set()):
+                pending = sample_pending.get(raw_sample_index)
+                if pending is None:
+                    continue
+                pending.discard(identity)
+                mark_sample_complete(raw_sample_index)
+
+        def classify_or_submit(
+            request: ZarrChunkRequest,
+            raw_sample_index: int,
+            download_queue: list[tuple[int, int, tuple[str, str]]],
+            queued_downloads: dict[tuple[str, str], tuple[int, int, ZarrChunkRequest]],
+        ) -> None:
+            nonlocal download_sequence
+            identity = (request.store_identity, request.key)
+            if identity in completed_chunks:
+                return
+            sample_pending.setdefault(raw_sample_index, set()).add(identity)
+            chunk_waiters.setdefault(identity, set()).add(raw_sample_index)
+            if identity in seen:
+                queued = queued_downloads.get(identity)
+                if queued is not None and int(raw_sample_index) < queued[0]:
+                    download_sequence += 1
+                    queued_downloads[identity] = (int(raw_sample_index), download_sequence, queued[2])
+                    heapq.heappush(download_queue, (int(raw_sample_index), download_sequence, identity))
+                return
+            seen.add(identity)
+            counters.unique_chunks_seen += 1
+            if _existing_data_path(request) is not None:
+                counters.cache_hits += 1
+                mark_chunk_complete(identity)
+                return
+            empty_path = _empty_marker_path(request)
+            if empty_path is not None and empty_path.is_file():
+                counters.known_missing += 1
+                mark_chunk_complete(identity)
+                return
+            counters.queued_for_download += 1
+            download_sequence += 1
+            queued_downloads[identity] = (int(raw_sample_index), download_sequence, request)
+            heapq.heappush(download_queue, (int(raw_sample_index), download_sequence, identity))
+
+        def consume_download_result(request: ZarrChunkRequest, result: dict[str, Any]) -> None:
+            counters.download_done += 1
+            status = str(result.get("status", "error"))
+            if status == "cache_hit":
+                counters.cache_hits += 1
+                mark_chunk_complete((request.store_identity, request.key))
+            elif status == "known_missing":
+                counters.known_missing += 1
+                mark_chunk_complete((request.store_identity, request.key))
+            elif status == "new_missing":
+                counters.newly_missing += 1
+                mark_chunk_complete((request.store_identity, request.key))
+            elif status == "downloaded":
+                counters.downloaded += 1
+                counters.bytes_downloaded += int(result.get("bytes", 0))
+                mark_chunk_complete((request.store_identity, request.key))
+            else:
+                counters.download_errors += 1
+                if not counters.first_error:
+                    counters.first_error = str(result.get("error", "prefetch download failed"))
+
+        next_sample = start_sample
+        last_progress = 0.0
+        download_sequence = 0
+        previous_torch_threads = int(torch.get_num_threads())
+        torch_threads_changed = False
+        if previous_torch_threads != 1:
+            torch.set_num_threads(1)
+            torch_threads_changed = True
+        producer_executor = ThreadPoolExecutor(max_workers=producer_count)
+        download_executor = ThreadPoolExecutor(max_workers=worker_count)
+        normal_shutdown = False
+        try:
+            producer_futures: dict[Future[tuple[int, int, list[ZarrChunkRequest]]], int] = {}
+            download_futures: dict[Future[dict[str, Any]], tuple[ZarrChunkRequest, float]] = {}
+            queued_downloads: dict[tuple[str, str], tuple[int, int, ZarrChunkRequest]] = {}
+            download_queue: list[tuple[int, int, tuple[str, str]]] = []
+            producer_results: dict[int, tuple[str, Any]] = {}
+            next_producer_result = start_sample
+
+            def update_download_queue_counters() -> None:
+                counters.queued_download_futures = len(download_futures) + len(queued_downloads)
+
+            def submit_downloads() -> None:
+                while len(download_futures) < worker_count:
+                    request: ZarrChunkRequest | None = None
+                    while download_queue:
+                        priority, sequence, identity = heapq.heappop(download_queue)
+                        queued = queued_downloads.get(identity)
+                        if queued is None:
+                            continue
+                        queued_priority, queued_sequence, queued_request = queued
+                        if priority != queued_priority or sequence != queued_sequence:
+                            continue
+                        queued_downloads.pop(identity, None)
+                        request = queued_request
+                        break
+                    if request is None:
+                        return
+                    future = download_executor.submit(
+                        _download_prefetch_request,
+                        request,
+                        retry_seconds=retry_seconds,
+                    )
+                    download_futures[future] = (request, time.perf_counter())
+
+            def submit_producers() -> None:
+                nonlocal next_sample
+                while next_sample < end_sample and len(producer_futures) < producer_count:
+                    future = producer_executor.submit(build_requests, next_sample)
+                    producer_futures[future] = next_sample
+                    next_sample += 1
+
+            def consume_ready_producer_results() -> None:
+                nonlocal next_producer_result
+                while next_producer_result in producer_results:
+                    status, payload = producer_results.pop(next_producer_result)
+                    sample_index_for_error = next_producer_result
+                    next_producer_result += 1
+                    if status == "error":
+                        exc = payload
+                        counters.samples_done += 1
+                        counters.samples_skipped += 1
+                        if not counters.first_sample_skip:
+                            counters.first_sample_skip = f"sample={sample_index_for_error}: {exc}"
+                        sample_pending.setdefault(sample_index_for_error, set())
+                        close_sample_requests(sample_index_for_error)
+                        submit_producers()
+                        continue
+
+                    _raw_sample_index, sample_valid_voxels, requests = payload
+                    counters.samples_done += 1
+                    sample_pending.setdefault(sample_index_for_error, set())
+                    counters.valid_voxels += int(sample_valid_voxels)
+                    for request in requests:
+                        classify_or_submit(request, sample_index_for_error, download_queue, queued_downloads)
+                    close_sample_requests(sample_index_for_error)
+                    submit_downloads()
+                    submit_producers()
+
+            submit_producers()
+            submit_downloads()
+            update_download_queue_counters()
+            print_progress()
+            while producer_futures or download_futures or queued_downloads:
+                consume_ready_producer_results()
+                submit_downloads()
+                active = set(producer_futures) | set(download_futures)
+                if not active:
+                    break
+                done, _ = wait(active, timeout=0.25, return_when=FIRST_COMPLETED)
+                for future in done:
+                    if future in producer_futures:
+                        sample_index_for_error = producer_futures.pop(future)
+                        try:
+                            producer_results[sample_index_for_error] = ("ok", future.result())
+                        except ValueError as exc:
+                            producer_results[sample_index_for_error] = ("error", exc)
+                        consume_ready_producer_results()
                     else:
-                        errors += 1
-                except Exception:
-                    errors += 1
-                done += 1
-                print_progress()
-        print_progress(force=True)
-        elapsed = time.perf_counter() - start_time
+                        request, _submitted_at = download_futures.pop(future)
+                        consume_download_result(request, future.result())
+                        submit_downloads()
+                now = time.perf_counter()
+                if now - last_progress >= 0.5:
+                    update_download_queue_counters()
+                    print_progress()
+                    last_progress = now
+            update_download_queue_counters()
+            print_progress(final=True)
+            normal_shutdown = True
+        except BaseException:
+            for future in producer_futures:
+                future.cancel()
+            for future in download_futures:
+                future.cancel()
+            producer_executor.shutdown(wait=False, cancel_futures=True)
+            download_executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        finally:
+            if normal_shutdown:
+                producer_executor.shutdown(wait=True)
+                download_executor.shutdown(wait=True)
+            if torch_threads_changed:
+                torch.set_num_threads(previous_torch_threads)
+
+        elapsed = time.perf_counter() - start
         return {
-            "samples": total,
-            "chunks": len(requests),
-            "cache_hits": cache_hits,
-            "downloaded": downloaded,
-            "missing": missing,
-            "errors": errors,
+            "samples": counters.samples_done,
+            "skipped_samples": counters.samples_skipped,
+            "chunks": counters.unique_chunks_seen,
+            "cache_hits": counters.cache_hits,
+            "queued_for_download": counters.queued_for_download,
+            "download_done": counters.download_done,
+            "downloaded": counters.downloaded,
+            "missing": counters.known_missing + counters.newly_missing,
+            "known_missing": counters.known_missing,
+            "new_missing": counters.newly_missing,
+            "errors": counters.download_errors,
             "elapsed_s": elapsed,
-            "mib": bytes_read / (1024.0 * 1024.0),
+            "mib": counters.bytes_downloaded / (1024.0 * 1024.0),
+            "bytes": counters.bytes_downloaded,
+            "workers": worker_count,
+            "producer_workers": producer_count,
+            "valid_voxels": counters.valid_voxels,
+            "first_error": counters.first_error,
+            "first_sample_skip": counters.first_sample_skip,
+            "max_exclusive_sample_index": counters.max_exclusive_sample_index,
         }
 
 
@@ -2154,6 +2442,10 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         image_normalization=str(raw.get("image_normalization", "zscore")),
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
         prefetch_workers=int(raw.get("prefetch_workers", 16)),
+        prefetch_sampler_workers=_parse_worker_count(
+            raw.get("prefetch_sampler_workers", 2),
+            key="prefetch_sampler_workers",
+        ),
         config_dir=config_dir,
     )
     if "_array_records" in raw:

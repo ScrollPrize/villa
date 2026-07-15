@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,7 +10,9 @@ from torch.utils.data import DataLoader
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import FiberStripFrame
+from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import Vc3dCoordinateSampler
+from vesuvius.neural_tracing.fiber_trace_3d import loader as loader3d_module
 from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     decode_lasagna_direction_3x2_analytic,
     encode_lasagna_direction_2d,
@@ -430,6 +434,125 @@ def test_local_prefetch_has_no_remote_chunks() -> None:
     summary = loader.prefetch(0, 2)
     assert summary["chunks"] == 0
     assert summary["errors"] == 0
+
+
+def test_3d_prefetch_streams_producers_but_downloads_in_sample_order(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    loader = FiberTrace3DLoader.__new__(FiberTrace3DLoader)
+    loader.config = SimpleNamespace(
+        prefetch_workers=1,
+        prefetch_sampler_workers=2,
+        volume_cache_retry_seconds=0.0,
+    )
+
+    store = object()
+
+    def request(key: str) -> ZarrChunkRequest:
+        return ZarrChunkRequest(
+            store=store,
+            store_identity="fake-store",
+            key=key,
+            cache_path=tmp_path / f"{key}.bin",
+            empty_path=tmp_path / f"{key}.empty",
+            remote_url=f"https://example.invalid/{key}",
+            remote_chunk_key=key,
+            cache_payload_format="source_bytes",
+        )
+
+    samples = {
+        0: [request("a")],
+        1: [request("b")],
+        2: [request("b"), request("c")],
+    }
+
+    def fake_requests(sample_index: int, *, sample_mode: str = "random") -> tuple[int, list[ZarrChunkRequest]]:
+        del sample_mode
+        if int(sample_index) == 0:
+            time.sleep(0.05)
+        return 8, list(samples[int(sample_index)])
+
+    loader._chunk_requests_and_valid_voxels_for_sample_index = fake_requests
+    download_order: list[str] = []
+
+    def fake_download(request: ZarrChunkRequest, *, retry_seconds: float) -> dict[str, object]:
+        del retry_seconds
+        download_order.append(request.key)
+        return {"status": "downloaded", "bytes": 4}
+
+    monkeypatch.setattr(loader3d_module, "_download_prefetch_request", fake_download)
+    summary = loader.prefetch(0, 3)
+
+    assert download_order == ["a", "b", "c"]
+    assert summary["samples"] == 3
+    assert summary["chunks"] == 3
+    assert summary["downloaded"] == 3
+    assert summary["download_done"] == 3
+    assert summary["max_exclusive_sample_index"] == 3
+    assert summary["valid_voxels"] == 24
+
+
+def test_3d_prefetch_classifies_cache_hit_empty_and_skip(tmp_path, monkeypatch) -> None:
+    loader = FiberTrace3DLoader.__new__(FiberTrace3DLoader)
+    loader.config = SimpleNamespace(
+        prefetch_workers=2,
+        prefetch_sampler_workers=2,
+        volume_cache_retry_seconds=0.0,
+    )
+
+    store = object()
+    hit_path = tmp_path / "hit.bin"
+    hit_path.write_bytes(b"cached")
+    empty_path = tmp_path / "missing.empty"
+    empty_path.write_bytes(b"")
+
+    def request(key: str, *, cache_path: object | None, empty_path_value: object | None) -> ZarrChunkRequest:
+        return ZarrChunkRequest(
+            store=store,
+            store_identity="fake-store",
+            key=key,
+            cache_path=None if cache_path is None else Path(cache_path),
+            empty_path=None if empty_path_value is None else Path(empty_path_value),
+            remote_url=f"https://example.invalid/{key}",
+            remote_chunk_key=key,
+            cache_payload_format="source_bytes",
+        )
+
+    def fake_requests(sample_index: int, *, sample_mode: str = "random") -> tuple[int, list[ZarrChunkRequest]]:
+        del sample_mode
+        if int(sample_index) == 1:
+            raise ValueError("invalid synthetic sample")
+        if int(sample_index) == 0:
+            return 7, [
+                request("hit", cache_path=hit_path, empty_path_value=tmp_path / "hit.empty"),
+                request("missing", cache_path=tmp_path / "missing.bin", empty_path_value=empty_path),
+            ]
+        return 5, [
+            request("download", cache_path=tmp_path / "download.bin", empty_path_value=tmp_path / "download.empty")
+        ]
+
+    loader._chunk_requests_and_valid_voxels_for_sample_index = fake_requests
+    downloaded_keys: list[str] = []
+
+    def fake_download(request: ZarrChunkRequest, *, retry_seconds: float) -> dict[str, object]:
+        del retry_seconds
+        downloaded_keys.append(request.key)
+        return {"status": "downloaded", "bytes": 3}
+
+    monkeypatch.setattr(loader3d_module, "_download_prefetch_request", fake_download)
+    summary = loader.prefetch(0, 3)
+
+    assert downloaded_keys == ["download"]
+    assert summary["samples"] == 3
+    assert summary["skipped_samples"] == 1
+    assert summary["chunks"] == 3
+    assert summary["cache_hits"] == 1
+    assert summary["known_missing"] == 1
+    assert summary["downloaded"] == 1
+    assert summary["errors"] == 0
+    assert summary["max_exclusive_sample_index"] == 3
+    assert "invalid synthetic sample" in summary["first_sample_skip"]
 
 
 def test_vc3d_dependency_prefetch_flattens_3d_coords_like_training_sampling() -> None:

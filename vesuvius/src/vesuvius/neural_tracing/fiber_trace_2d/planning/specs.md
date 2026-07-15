@@ -155,6 +155,18 @@
   sampling (`[Z,Y,X,3] -> [Z*Y,X,3]`), collects dependency metadata once, and
   de-duplicates chunks by `(store_identity, key)`. It must preserve VC3D
   returned metadata rather than reconstructing cache paths in Python.
+- 3D prefetch must follow the same streaming dependency/download state machine
+  as 2D prefetch: bounded dependency producers controlled by
+  `prefetch_sampler_workers`, bounded download workers controlled by
+  `prefetch_workers`, deterministic raw-sample-order producer consumption,
+  global chunk de-duplication, cache-hit / `.empty` classification before
+  downloads, earliest-raw-sample download priority, safe-prefix `idx`
+  tracking, live dependency and download progress, sample skip accounting,
+  fatal cancellation of queued futures, temporary PyTorch CPU intra-op thread
+  pinning, and the shared Python atomic download helper.
+- The only intentional 3D differences from 2D prefetch are that one 3D sample
+  produces one CP-centered 3D augmentation-envelope dependency volume, valid
+  counts are voxels, and there is no strip-z offset loop or top-view branch.
 - V0 3D prefetch uses VC3D chunk dependency metadata and the shared Python
   prefetch writer with atomic cache-file renames and `.empty` marker handling.
   It does not prefetch Lasagna manifest channels.

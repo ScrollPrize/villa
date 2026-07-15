@@ -228,6 +228,9 @@ download workers; `prefetch_sampler_workers` controls the producer threads that
 build CP-local source strips and collect chunk dependencies. Prefetch
 temporarily forces PyTorch CPU intra-op threads to `1` and restores the previous
 value afterward, so each producer does not fan out over the full machine.
+The same split now applies to `fiber_trace_3d --prefetch`; 3D producers build
+one CP-centered augmentation-envelope volume dependency set per sample instead
+of 2D strip-z/top-view dependencies.
 
 The old `strip_coord_cache_dir` CP-local dense source-coordinate cache has been
 removed. The loader now builds a compact in-RAM fiber-line geometry store at

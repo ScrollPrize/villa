@@ -147,8 +147,15 @@ side/top strip input loading.
   VC3D for chunk dependency metadata. Because the VC3D dependency binding
   accepts 2D coordinate surfaces, rank-4 regular patch coordinates such as
   `[Z,Y,X,3]` are flattened to `[Z*Y,X,3]`, matching the regular training
-  sampling adapter. Returned chunk requests are de-duplicated before Python
-  prefetch downloads.
+  sampling adapter.
+- 3D prefetch follows the 2D streaming prefetch architecture: bounded
+  dependency producer workers controlled by `prefetch_sampler_workers`,
+  bounded transfer workers controlled by `prefetch_workers`, immediate
+  cache-hit / `.empty` / download classification, earliest-sample download
+  priority, deterministic safe-prefix `idx`, and live progress while
+  dependencies are still being generated. The 3D-only simplification is that
+  each sample contributes one CP-centered 3D augmentation-envelope volume; no
+  strip-z loop or top-view branch exists in 3D.
 
 Example commands:
 

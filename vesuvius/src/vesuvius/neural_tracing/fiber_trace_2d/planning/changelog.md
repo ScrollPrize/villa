@@ -2,6 +2,11 @@
 
 ## 2026-07-15
 
+- Reworked 3D prefetch to stream dependency generation and downloads using the
+  same producer/download state machine as the 2D prefetcher, including live
+  progress, deterministic safe-prefix `idx`, cache-hit / `.empty`
+  classification, earliest-sample download priority, and separate
+  `prefetch_sampler_workers` controls.
 - Fixed 3D prefetch dependency generation for regular 3D coordinate volumes by
   flattening higher-rank coordinate grids into one VC3D-compatible 2D surface,
   matching the regular training sampling adapter, and de-duplicating returned
