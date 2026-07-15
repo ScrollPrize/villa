@@ -2,6 +2,9 @@
 
 ## 2026-07-15
 
+- Loaded transformed patch-overlapping line segments for JSON/non-NML 3D
+  CP-only samples so train/test sample visualizations can draw approximate line
+  context, while filtering dense supervision to NML target mode only.
 - Corrected 3D train/test sample direction overlays to scale line length by the
   true in-slice projection magnitude, added dense 3D test sample TensorBoard
   images at configured test runs, and flush test scalars/images immediately.

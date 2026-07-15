@@ -153,6 +153,17 @@ def _materialize_dense_line_indices(
             "target segment metadata is inconsistent: "
             f"sample_ids={int(sample_ids.shape[0])} segments={segment_count}"
         )
+    dense_sample = batch.target_modes.to(device=device) == _TARGET_MODE_DENSE_LINE
+    dense_segment = dense_sample[sample_ids]
+    if not bool(dense_segment.any()):
+        empty_indices = torch.zeros((0, 4), dtype=torch.long, device=device)
+        empty_tangents = torch.zeros((0, 3), dtype=torch.float32, device=device)
+        if validate and bool(dense_sample.any()):
+            raise ValueError("dense line target has no patch-overlapping segments")
+        return empty_indices, empty_tangents, 0, 0
+    starts = starts[dense_segment]
+    ends = ends[dense_segment]
+    sample_ids = sample_ids[dense_segment]
 
     delta = ends - starts
     length = torch.linalg.vector_norm(delta, dim=1)

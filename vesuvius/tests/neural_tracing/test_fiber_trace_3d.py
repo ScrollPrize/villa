@@ -22,6 +22,8 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     DEFAULT_VOLUME_CACHE_MEMORY_MIB,
     FiberTrace3DBatch,
     FiberTrace3DLoader,
+    _TARGET_MODE_CP_ONLY,
+    _TARGET_MODE_DENSE_LINE,
     _anisotropic_blur_3d,
     config_from_mapping,
     load_config,
@@ -359,6 +361,9 @@ def test_loader_augmented_batch_is_finite() -> None:
 
 def test_loader_clips_long_label_segments_to_patch_domain() -> None:
     loader = _long_segment_loader(source_format="nml")
+    raw_batch = loader.load_batch(0, sample_mode="flat")
+    assert int(raw_batch.target_modes[0]) == _TARGET_MODE_DENSE_LINE
+    assert int(raw_batch.target_segment_counts[0]) > 0
     batch = _load_materialized_batch(loader, 0, sample_mode="flat")
     assert batch.volume.shape == (1, 1, 16, 16, 16)
     assert int(batch.direction_indices_bzyx.shape[0]) > 0
@@ -373,6 +378,9 @@ def test_loader_clips_long_label_segments_to_patch_domain() -> None:
 
 def test_loader_uses_cp_only_supervision_for_non_nml_fibers() -> None:
     loader = _long_segment_loader(source_format=None)
+    raw_batch = loader.load_batch(0, sample_mode="flat")
+    assert int(raw_batch.target_modes[0]) == _TARGET_MODE_CP_ONLY
+    assert int(raw_batch.target_segment_counts[0]) > 0
     batch = _load_materialized_batch(loader, 0, sample_mode="flat")
     cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
     far_on_segment_x = min(int(cp[2]) + 4, 15)

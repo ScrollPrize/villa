@@ -130,8 +130,9 @@ side/top strip input loading.
   `to_device_ms` reports the transfer portion separately.
 - Worker batches do not include full dense supervision tensors. They carry
   compact target descriptors instead: CP-only samples store local CP/tangent
-  metadata, and NML dense-line samples store transformed output-space segment
-  endpoints plus patch bboxes. The main process calls
+  metadata plus visualization-only transformed line segments, and NML dense-line
+  samples store transformed output-space segment endpoints plus patch bboxes for
+  supervision. The main process calls
   `fiber_trace_3d.targets.materialize_targets(...)` after transfer to create
   dense presence targets/masks on the training device. Direction supervision is
   sparse: the materializer builds `direction_indices_bzyx`,
@@ -139,6 +140,12 @@ side/top strip input loading.
   gathers the predicted six-channel direction output at those supervised
   centerline/CP voxels. The normal training path does not allocate a full
   dense `[B,6,Z,Y,X]` direction target.
+- For JSON/non-NML fibers, line segments in `target_segment_*` are used by
+  train/test visualization to draw the approximate fiber line through the patch.
+  Target materialization filters segment metadata by target mode, so these
+  CP-only visualization segments do not become dense presence or direction
+  supervision. Their loss still uses the transformed local CP tangent over the
+  CP neighborhood.
 - In `--benchmark` mode, `cpu_ms` and `cpu_x` report sampled CPU time for the
   main process plus DataLoader worker processes during each benchmark row where
   `/proc/<pid>/stat` is available. `cpu_x=1.0` is roughly one fully occupied

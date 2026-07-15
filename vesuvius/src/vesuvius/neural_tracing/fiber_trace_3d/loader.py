@@ -1682,6 +1682,10 @@ class FiberTrace3DLoader:
         record: _Record,
         cp_index: int,
         params: _Augment3DParams,
+        segment_starts: np.ndarray,
+        segment_ends: np.ndarray,
+        segment_bbox_lo: np.ndarray,
+        segment_bbox_hi: np.ndarray,
     ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         tangent_src = self._line_tangent_volume_zyx(record, cp_index).astype(np.float64)
         tangent_points = np.stack(
@@ -1706,27 +1710,23 @@ class FiberTrace3DLoader:
             tangent_out = tangent_out / tangent_norm
         return (
             _TARGET_MODE_CP_ONLY,
-            np.zeros((0, 3), dtype=np.float32),
-            np.zeros((0, 3), dtype=np.float32),
-            np.zeros((0, 3), dtype=np.int64),
-            np.zeros((0, 3), dtype=np.int64),
+            segment_starts,
+            segment_ends,
+            segment_bbox_lo,
+            segment_bbox_hi,
             tangent_out.astype(np.float32),
         )
 
-    def _build_target_spec(
+    def _line_segment_spec(
         self,
         record: _Record,
         cp_index: int,
         params: _Augment3DParams,
+        *,
+        patch_shape: tuple[int, int, int],
+        radius: float,
         profile_timings_ms: dict[str, float] | None = None,
-    ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        patch_shape = tuple(int(v) for v in self.config.patch_shape_zyx)
-        if not _uses_dense_fiber_supervision(record):
-            return self._cp_only_target_spec(
-                record,
-                cp_index,
-                params,
-            )
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         start = time.perf_counter()
         line_points, _local_line_index = self._line_window_for_labels(
             record,
@@ -1753,7 +1753,6 @@ class FiberTrace3DLoader:
         if segment_start.shape[0] == 0:
             raise ValueError("label line window has no finite output-space segments")
         start = time.perf_counter()
-        radius = float(self.config.presence_radius_voxels)
         patch_hi = np.asarray(patch_shape, dtype=np.float64) - 1.0
         starts: list[np.ndarray] = []
         ends: list[np.ndarray] = []
@@ -1793,11 +1792,45 @@ class FiberTrace3DLoader:
         if not starts:
             raise ValueError("label line window has no patch-overlapping segments")
         return (
-            _TARGET_MODE_DENSE_LINE,
             np.stack(starts, axis=0).astype(np.float32),
             np.stack(ends, axis=0).astype(np.float32),
             np.stack(bbox_los, axis=0).astype(np.int64),
             np.stack(bbox_his, axis=0).astype(np.int64),
+        )
+
+    def _build_target_spec(
+        self,
+        record: _Record,
+        cp_index: int,
+        params: _Augment3DParams,
+        profile_timings_ms: dict[str, float] | None = None,
+    ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        patch_shape = tuple(int(v) for v in self.config.patch_shape_zyx)
+        radius = float(self.config.presence_radius_voxels)
+        segment_starts, segment_ends, segment_bbox_lo, segment_bbox_hi = self._line_segment_spec(
+            record,
+            cp_index,
+            params,
+            patch_shape=patch_shape,
+            radius=radius,
+            profile_timings_ms=profile_timings_ms,
+        )
+        if not _uses_dense_fiber_supervision(record):
+            return self._cp_only_target_spec(
+                record,
+                cp_index,
+                params,
+                segment_starts,
+                segment_ends,
+                segment_bbox_lo,
+                segment_bbox_hi,
+            )
+        return (
+            _TARGET_MODE_DENSE_LINE,
+            segment_starts,
+            segment_ends,
+            segment_bbox_lo,
+            segment_bbox_hi,
             np.zeros((3,), dtype=np.float32),
         )
 

@@ -135,15 +135,21 @@
   default when the 3D raw config leaves the key unset or `null`.
 - 3D DataLoader workers must not materialize full dense direction/presence
   target tensors. Worker batches carry image/valid tensors plus compact target
-  descriptors: CP-only samples carry local CP/tangent metadata, and NML
-  dense-line samples carry transformed output-space line segments with
-  precomputed patch bboxes. Dense `presence_target` and `presence_mask` are
-  created by `fiber_trace_3d.targets.materialize_targets(...)` in the main
-  training process on the training device. Direction supervision is represented
-  sparsely as `direction_indices_bzyx`, `direction_target_sparse`, and
+  descriptors: CP-only samples carry local CP/tangent metadata plus
+  visualization-only transformed line segments, and NML dense-line samples carry
+  transformed output-space line segments with precomputed patch bboxes for
+  supervision. Dense `presence_target` and `presence_mask` are created by
+  `fiber_trace_3d.targets.materialize_targets(...)` in the main training process
+  on the training device. Direction supervision is represented sparsely as
+  `direction_indices_bzyx`, `direction_target_sparse`, and
   `direction_weight_sparse`; normal training must gather predictions at those
   supervised line/CP voxels instead of creating full-patch dense six-channel
   direction targets.
+- For JSON/non-NML 3D samples, `target_segment_*` metadata is visualization
+  context only. The materializer must filter dense line rasterization by
+  `_TARGET_MODE_DENSE_LINE`, so CP-only JSON segments do not create dense
+  presence or direction supervision. Their direction target is the transformed
+  CP tangent applied only to the CP neighborhood.
 - The GPU target materializer must preserve the existing label semantics:
   NML sources supervise direction/presence by drawing the overlapping clipped
   fiber centerline voxels only, without a radius-expanded distance-to-segment
@@ -645,7 +651,8 @@
   direction/angle/DT scalars and writes top-view image summaries: a GT-line
   plus predicted-direction overlay and a fixed `0..1` DT scalar map for train
   and test batches.
-- Console training progress prints every step covering the first 100 deterministic control-point sample indices, then falls back to `training.scalar_log_interval`.
+- Console training progress prints every one of the first 100 training steps,
+  then falls back to `training.scalar_log_interval`.
 - Prefetch progress includes `idx=<exclusive-index>` showing the largest
   contiguous exclusive deterministic training-stream prefix whose required
   chunks are cache-complete. This index is counted through the seeded shuffled
