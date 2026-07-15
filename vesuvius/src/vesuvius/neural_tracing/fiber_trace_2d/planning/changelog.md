@@ -2,6 +2,11 @@
 
 ## 2026-07-15
 
+- Moved 3D dense direction/presence target materialization out of DataLoader
+  workers. Workers now return compact CP/segment descriptors; the main process
+  materializes dense targets on the training device via
+  `fiber_trace_3d.targets.materialize_targets`, and S1A 3D configs now use
+  `loader_workers: 32`.
 - Replaced the 3D training/benchmark thread-backed batch queue with
   `torch.utils.data.DataLoader` process workers. `training.loader_workers` and
   `training.loader_prefetch_factor` now control the 3D runtime loading path,

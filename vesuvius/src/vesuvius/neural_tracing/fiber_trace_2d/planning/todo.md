@@ -49,7 +49,7 @@
 - [ ] multi-dir output for 3d fiber
     - two fiber dirs can be close together: output two dirs and two presence values, loss selects a choice (for both) that minimizes (something sensible)
 - [ ] multiple laybers per patch : use some roi structure for fibers so we can supervise all fibers within some patch
-- [ ] 3D worker memory/materialization cleanup
+- [x] 3D worker memory/materialization cleanup
     - apart from actual Zarr/VC3D loading and required coordinate generation, do not materialize full patch supervision tensors in DataLoader workers
     - return compact point/line lists or coordinate tensors in the batch and let GPU-side code materialize dense direction/presence targets only if needed
     - preferably delay line rasterization, direction encoding, and other dense target/value modifications to GPU-side batch preparation so worker CPU only loads image data and lightweight metadata

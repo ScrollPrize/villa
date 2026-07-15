@@ -39,13 +39,10 @@ from vesuvius.neural_tracing.fiber_trace_2d.sampling import (
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     control_point_line_index,
 )
-from vesuvius.neural_tracing.fiber_trace_3d.direction import (
-    encode_lasagna_direction_3x2,
-    projection_magnitude_weights_3x2,
-)
-
 
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
+_TARGET_MODE_CP_ONLY = 0
+_TARGET_MODE_DENSE_LINE = 1
 
 
 @dataclass(frozen=True)
@@ -150,13 +147,14 @@ class FiberTrace3DSample:
     control_point_index: int
     volume: torch.Tensor
     valid_mask: torch.Tensor
-    direction_target: torch.Tensor
-    direction_weight: torch.Tensor
-    direction_mask: torch.Tensor
-    presence_target: torch.Tensor
-    presence_mask: torch.Tensor
     cp_local_zyx: torch.Tensor
     crop_origin_zyx: torch.Tensor
+    target_mode: int
+    target_segment_starts_zyx: torch.Tensor
+    target_segment_ends_zyx: torch.Tensor
+    target_segment_bbox_lo_zyx: torch.Tensor
+    target_segment_bbox_hi_zyx: torch.Tensor
+    target_tangent_zyx: torch.Tensor
     profile_timings_ms: dict[str, float] | None = None
 
 
@@ -164,34 +162,56 @@ class FiberTrace3DSample:
 class FiberTrace3DBatch:
     volume: torch.Tensor
     valid_mask: torch.Tensor
-    direction_target: torch.Tensor
-    direction_weight: torch.Tensor
-    direction_mask: torch.Tensor
-    presence_target: torch.Tensor
-    presence_mask: torch.Tensor
     cp_local_zyx: torch.Tensor
     crop_origin_zyx: torch.Tensor
     sample_indices: torch.Tensor
     record_indices: torch.Tensor
     control_point_indices: torch.Tensor
     fiber_paths: tuple[str, ...]
+    target_modes: torch.Tensor
+    target_segment_offsets: torch.Tensor
+    target_segment_counts: torch.Tensor
+    target_segment_starts_zyx: torch.Tensor
+    target_segment_ends_zyx: torch.Tensor
+    target_segment_bbox_lo_zyx: torch.Tensor
+    target_segment_bbox_hi_zyx: torch.Tensor
+    target_tangent_zyx: torch.Tensor
+    direction_target: torch.Tensor | None = None
+    direction_weight: torch.Tensor | None = None
+    direction_mask: torch.Tensor | None = None
+    presence_target: torch.Tensor | None = None
+    presence_mask: torch.Tensor | None = None
     profile_timings_ms: dict[str, float] | None = None
 
     def to(self, device: torch.device | str) -> "FiberTrace3DBatch":
         return FiberTrace3DBatch(
             volume=self.volume.to(device),
             valid_mask=self.valid_mask.to(device),
-            direction_target=self.direction_target.to(device),
-            direction_weight=self.direction_weight.to(device),
-            direction_mask=self.direction_mask.to(device),
-            presence_target=self.presence_target.to(device),
-            presence_mask=self.presence_mask.to(device),
             cp_local_zyx=self.cp_local_zyx.to(device),
             crop_origin_zyx=self.crop_origin_zyx.to(device),
             sample_indices=self.sample_indices.to(device),
             record_indices=self.record_indices.to(device),
             control_point_indices=self.control_point_indices.to(device),
             fiber_paths=self.fiber_paths,
+            target_modes=self.target_modes,
+            target_segment_offsets=self.target_segment_offsets,
+            target_segment_counts=self.target_segment_counts,
+            target_segment_starts_zyx=self.target_segment_starts_zyx.to(device),
+            target_segment_ends_zyx=self.target_segment_ends_zyx.to(device),
+            target_segment_bbox_lo_zyx=self.target_segment_bbox_lo_zyx,
+            target_segment_bbox_hi_zyx=self.target_segment_bbox_hi_zyx,
+            target_tangent_zyx=self.target_tangent_zyx.to(device),
+            direction_target=None
+            if self.direction_target is None
+            else self.direction_target.to(device),
+            direction_weight=None
+            if self.direction_weight is None
+            else self.direction_weight.to(device),
+            direction_mask=None if self.direction_mask is None else self.direction_mask.to(device),
+            presence_target=None
+            if self.presence_target is None
+            else self.presence_target.to(device),
+            presence_mask=None if self.presence_mask is None else self.presence_mask.to(device),
             profile_timings_ms=self.profile_timings_ms,
         )
 
@@ -1605,54 +1625,12 @@ class FiberTrace3DLoader:
         del params
         return line_points[start:end], line_index - start
 
-    def _presence_loss_mask(
-        self,
-        valid_mask: torch.Tensor,
-        patch_shape: tuple[int, int, int],
-    ) -> torch.Tensor:
-        presence_mask = valid_mask.clone()
-        edge_margin = self.config.presence_negative_edge_margin_voxels
-        if edge_margin is None:
-            edge_margin = int(math.ceil(max(self.config.augment_shift_zyx)))
-        if edge_margin > 0:
-            z = torch.arange(patch_shape[0], device=valid_mask.device)
-            y = torch.arange(patch_shape[1], device=valid_mask.device)
-            x = torch.arange(patch_shape[2], device=valid_mask.device)
-            zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
-            interior = (
-                (zz >= edge_margin)
-                & (zz < patch_shape[0] - edge_margin)
-                & (yy >= edge_margin)
-                & (yy < patch_shape[1] - edge_margin)
-                & (xx >= edge_margin)
-                & (xx < patch_shape[2] - edge_margin)
-            )
-            presence_mask &= interior
-        return presence_mask.view(1, *patch_shape)
-
-    def _cp_only_targets(
+    def _cp_only_target_spec(
         self,
         record: _Record,
         cp_index: int,
         params: _Augment3DParams,
-        geometry: _GeometryMaps3D,
-        valid_mask: torch.Tensor,
-        patch_shape: tuple[int, int, int],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        grid = np.stack(
-            np.meshgrid(
-                np.arange(patch_shape[0], dtype=np.float32),
-                np.arange(patch_shape[1], dtype=np.float32),
-                np.arange(patch_shape[2], dtype=np.float32),
-                indexing="ij",
-            ),
-            axis=-1,
-        )
-        cp_local = np.asarray(params.cp_local_zyx, dtype=np.float32).reshape(1, 1, 1, 3)
-        dist2 = np.sum((grid - cp_local) ** 2, axis=-1)
-        radius = float(self.config.presence_radius_voxels)
-        positive = dist2 <= np.float32(radius * radius)
-
+    ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         tangent_src = self._line_tangent_volume_zyx(record, cp_index).astype(np.float64)
         tangent_points = np.stack(
             [
@@ -1674,117 +1652,28 @@ class FiberTrace3DLoader:
             tangent_out = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
         else:
             tangent_out = tangent_out / tangent_norm
-
-        tangent_xyz = np.broadcast_to(
-            tangent_out.astype(np.float32)[[2, 1, 0]],
-            (*patch_shape, 3),
-        )
-        direction_target_np = encode_lasagna_direction_3x2(tangent_xyz).astype(np.float32)
-        direction_weight_np = projection_magnitude_weights_3x2(tangent_xyz).astype(np.float32)
-        direction_target = torch.as_tensor(
-            direction_target_np.transpose(3, 0, 1, 2),
-            dtype=torch.float32,
-            device=valid_mask.device,
-        )
-        direction_weight = torch.as_tensor(
-            direction_weight_np.transpose(3, 0, 1, 2),
-            dtype=torch.float32,
-            device=valid_mask.device,
-        )
-        positive_t = torch.as_tensor(positive, dtype=torch.bool, device=valid_mask.device)
-        direction_mask = valid_mask & positive_t
-        presence_target = positive_t.to(dtype=torch.float32).view(1, *patch_shape)
         return (
-            direction_target,
-            direction_weight,
-            direction_mask.view(1, *patch_shape),
-            presence_target,
-            self._presence_loss_mask(valid_mask, patch_shape),
+            _TARGET_MODE_CP_ONLY,
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.int64),
+            np.zeros((0, 3), dtype=np.int64),
+            tangent_out.astype(np.float32),
         )
 
-    def _rasterize_segment_targets(
-        self,
-        segment_start: np.ndarray,
-        segment_end: np.ndarray,
-        patch_shape: tuple[int, int, int],
-        profile_timings_ms: dict[str, float] | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        radius = float(self.config.presence_radius_voxels)
-        radius2 = np.float32(radius * radius)
-        min_dist2 = np.full(patch_shape, np.inf, dtype=np.float32)
-        nearest_tangent = np.zeros((*patch_shape, 3), dtype=np.float32)
-        patch_hi = np.asarray(patch_shape, dtype=np.float32) - 1.0
-        raster_segments = 0
-        raster_bbox_voxels = 0
-        for p0_raw, p1_raw in zip(segment_start, segment_end, strict=True):
-            clipped = _clip_segment_to_aabb(
-                p0_raw,
-                p1_raw,
-                lo=-np.full((3,), radius, dtype=np.float64),
-                hi=patch_hi.astype(np.float64) + radius,
-            )
-            if clipped is None:
-                continue
-            p0 = clipped[0].astype(np.float32)
-            p1 = clipped[1].astype(np.float32)
-            vec = (p1 - p0).astype(np.float32)
-            length2 = np.float32(np.sum(vec * vec))
-            if not np.isfinite(length2) or float(length2) <= 1.0e-12:
-                continue
-            lo = np.floor(np.minimum(p0, p1) - radius).astype(np.int64)
-            hi = np.ceil(np.maximum(p0, p1) + radius).astype(np.int64) + 1
-            lo = np.maximum(lo, 0)
-            hi = np.minimum(hi, np.asarray(patch_shape, dtype=np.int64))
-            if bool(np.any(hi <= lo)):
-                continue
-            raster_segments += 1
-            raster_bbox_voxels += int(np.prod(hi - lo))
-            z = np.arange(int(lo[0]), int(hi[0]), dtype=np.float32)
-            y = np.arange(int(lo[1]), int(hi[1]), dtype=np.float32)
-            x = np.arange(int(lo[2]), int(hi[2]), dtype=np.float32)
-            zz, yy, xx = np.meshgrid(z, y, x, indexing="ij")
-            grid = np.stack([zz, yy, xx], axis=-1)
-            rel = grid - p0.reshape(1, 1, 1, 3)
-            alpha = np.sum(rel * vec.reshape(1, 1, 1, 3), axis=-1) / length2
-            alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
-            closest = p0.reshape(1, 1, 1, 3) + alpha[..., None] * vec.reshape(1, 1, 1, 3)
-            dist2 = np.sum((grid - closest) ** 2, axis=-1).astype(np.float32)
-            region = min_dist2[int(lo[0]) : int(hi[0]), int(lo[1]) : int(hi[1]), int(lo[2]) : int(hi[2])]
-            replace_mask = dist2 < region
-            if not bool(np.any(replace_mask)):
-                continue
-            region[replace_mask] = dist2[replace_mask]
-            tangent_region = nearest_tangent[
-                int(lo[0]) : int(hi[0]),
-                int(lo[1]) : int(hi[1]),
-                int(lo[2]) : int(hi[2]),
-            ]
-            tangent_region[replace_mask] = vec
-        positive = min_dist2 <= radius2
-        if profile_timings_ms is not None:
-            profile_timings_ms["target_raster_segments"] = float(raster_segments)
-            profile_timings_ms["target_raster_bbox_voxels"] = float(raster_bbox_voxels)
-            profile_timings_ms["target_positive_voxels"] = float(np.count_nonzero(positive))
-        return positive, nearest_tangent
-
-    def _build_targets(
+    def _build_target_spec(
         self,
         record: _Record,
         cp_index: int,
         params: _Augment3DParams,
-        geometry: _GeometryMaps3D,
-        valid_mask: torch.Tensor,
         profile_timings_ms: dict[str, float] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         patch_shape = tuple(int(v) for v in self.config.patch_shape_zyx)
         if not _uses_dense_fiber_supervision(record):
-            return self._cp_only_targets(
+            return self._cp_only_target_spec(
                 record,
                 cp_index,
                 params,
-                geometry,
-                valid_mask,
-                patch_shape,
             )
         start = time.perf_counter()
         line_points, _local_line_index = self._line_window_for_labels(
@@ -1812,50 +1701,52 @@ class FiberTrace3DLoader:
         if segment_start.shape[0] == 0:
             raise ValueError("label line window has no finite output-space segments")
         start = time.perf_counter()
-        positive, tangent_zyx = self._rasterize_segment_targets(
-            segment_start,
-            segment_end,
-            patch_shape,
-            profile_timings_ms,
-        )
+        radius = float(self.config.presence_radius_voxels)
+        patch_hi = np.asarray(patch_shape, dtype=np.float64) - 1.0
+        starts: list[np.ndarray] = []
+        ends: list[np.ndarray] = []
+        bbox_los: list[np.ndarray] = []
+        bbox_his: list[np.ndarray] = []
+        bbox_voxels = 0
+        for p0_raw, p1_raw in zip(segment_start, segment_end, strict=True):
+            clipped = _clip_segment_to_aabb(
+                p0_raw,
+                p1_raw,
+                lo=-np.full((3,), radius, dtype=np.float64),
+                hi=patch_hi + radius,
+            )
+            if clipped is None:
+                continue
+            p0 = clipped[0].astype(np.float32)
+            p1 = clipped[1].astype(np.float32)
+            vec = (p1 - p0).astype(np.float32)
+            length2 = np.float32(np.sum(vec * vec))
+            if not np.isfinite(length2) or float(length2) <= 1.0e-12:
+                continue
+            lo = np.floor(np.minimum(p0, p1) - radius).astype(np.int64)
+            hi = np.ceil(np.maximum(p0, p1) + radius).astype(np.int64) + 1
+            lo = np.maximum(lo, 0)
+            hi = np.minimum(hi, np.asarray(patch_shape, dtype=np.int64))
+            if bool(np.any(hi <= lo)):
+                continue
+            bbox_voxels += int(np.prod(hi - lo))
+            starts.append(p0)
+            ends.append(p1)
+            bbox_los.append(lo.astype(np.int64))
+            bbox_his.append(hi.astype(np.int64))
         if profile_timings_ms is not None:
-            profile_timings_ms["target_raster_ms"] = (time.perf_counter() - start) * 1000.0
-        if not bool(np.any(positive)):
-            raise ValueError("label line window has no patch-overlapping positive voxels")
-        start = time.perf_counter()
-        tangent_xyz = tangent_zyx[..., [2, 1, 0]]
-        direction_target_np = encode_lasagna_direction_3x2(tangent_xyz).astype(np.float32)
-        direction_weight_np = projection_magnitude_weights_3x2(tangent_xyz).astype(np.float32)
-        direction_target = torch.as_tensor(
-            direction_target_np.transpose(3, 0, 1, 2),
-            dtype=torch.float32,
-            device=valid_mask.device,
-        )
-        direction_weight = torch.as_tensor(
-            direction_weight_np.transpose(3, 0, 1, 2),
-            dtype=torch.float32,
-            device=valid_mask.device,
-        )
-        positive_t = torch.as_tensor(positive, dtype=torch.bool, device=valid_mask.device)
-        direction_mask = valid_mask & positive_t
-
-        presence_target = positive_t.to(dtype=torch.float32).view(1, *patch_shape)
-        if profile_timings_ms is not None:
-            profile_timings_ms["target_encode_tensor_ms"] = (
-                time.perf_counter() - start
-            ) * 1000.0
-        start = time.perf_counter()
-        presence_mask = self._presence_loss_mask(valid_mask, patch_shape)
-        if profile_timings_ms is not None:
-            profile_timings_ms["target_presence_mask_ms"] = (
-                time.perf_counter() - start
-            ) * 1000.0
+            profile_timings_ms["target_clip_ms"] = (time.perf_counter() - start) * 1000.0
+            profile_timings_ms["target_spec_segments"] = float(len(starts))
+            profile_timings_ms["target_spec_bbox_voxels"] = float(bbox_voxels)
+        if not starts:
+            raise ValueError("label line window has no patch-overlapping segments")
         return (
-            direction_target,
-            direction_weight,
-            direction_mask.view(1, *patch_shape),
-            presence_target,
-            presence_mask,
+            _TARGET_MODE_DENSE_LINE,
+            np.stack(starts, axis=0).astype(np.float32),
+            np.stack(ends, axis=0).astype(np.float32),
+            np.stack(bbox_los, axis=0).astype(np.int64),
+            np.stack(bbox_his, axis=0).astype(np.int64),
+            np.zeros((3,), dtype=np.float32),
         )
 
     def load_sample(
@@ -1903,14 +1794,20 @@ class FiberTrace3DLoader:
             timings["value_augmentation_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
         (
-            direction_target,
-            direction_weight,
-            direction_mask,
-            presence_target,
-            presence_mask,
-        ) = self._build_targets(record, cp_index, params, geometry, valid, timings)
+            target_mode,
+            segment_starts,
+            segment_ends,
+            segment_bbox_lo,
+            segment_bbox_hi,
+            target_tangent,
+        ) = self._build_target_spec(
+            record,
+            cp_index,
+            params,
+            timings,
+        )
         if timings is not None:
-            timings["target_total_ms"] = (time.perf_counter() - start) * 1000.0
+            timings["target_spec_total_ms"] = (time.perf_counter() - start) * 1000.0
             timings["sample_total_ms"] = (time.perf_counter() - total_start) * 1000.0
             timings["sample_cpu_ms"] = (time.process_time() - cpu_total_start) * 1000.0
         return FiberTrace3DSample(
@@ -1920,14 +1817,33 @@ class FiberTrace3DLoader:
             control_point_index=int(cp_index),
             volume=volume.view(1, *self.config.patch_shape_zyx),
             valid_mask=valid.view(1, *self.config.patch_shape_zyx),
-            direction_target=direction_target,
-            direction_weight=direction_weight,
-            direction_mask=direction_mask,
-            presence_target=presence_target,
-            presence_mask=presence_mask,
             cp_local_zyx=torch.as_tensor(params.cp_local_zyx, dtype=torch.float32, device=resolved_device),
             crop_origin_zyx=torch.as_tensor(
                 np.floor(params.cp_volume_zyx - params.cp_local_zyx).astype(np.float32),
+                dtype=torch.float32,
+                device=resolved_device,
+            ),
+            target_mode=int(target_mode),
+            target_segment_starts_zyx=torch.as_tensor(
+                segment_starts,
+                dtype=torch.float32,
+                device=resolved_device,
+            ),
+            target_segment_ends_zyx=torch.as_tensor(
+                segment_ends,
+                dtype=torch.float32,
+                device=resolved_device,
+            ),
+            target_segment_bbox_lo_zyx=torch.as_tensor(
+                segment_bbox_lo,
+                dtype=torch.long,
+            ),
+            target_segment_bbox_hi_zyx=torch.as_tensor(
+                segment_bbox_hi,
+                dtype=torch.long,
+            ),
+            target_tangent_zyx=torch.as_tensor(
+                target_tangent,
                 dtype=torch.float32,
                 device=resolved_device,
             ),
@@ -1968,20 +1884,62 @@ class FiberTrace3DLoader:
                 timings[key] = float(
                     sum(float((sample.profile_timings_ms or {}).get(key, 0.0)) for sample in samples)
                 )
+        segment_offsets: list[int] = []
+        segment_counts: list[int] = []
+        offset = 0
+        for sample in samples:
+            count = int(sample.target_segment_starts_zyx.shape[0])
+            segment_offsets.append(offset)
+            segment_counts.append(count)
+            offset += count
+        if offset > 0:
+            segment_starts = torch.cat(
+                [sample.target_segment_starts_zyx for sample in samples],
+                dim=0,
+            )
+            segment_ends = torch.cat(
+                [sample.target_segment_ends_zyx for sample in samples],
+                dim=0,
+            )
+            segment_bbox_lo = torch.cat(
+                [sample.target_segment_bbox_lo_zyx for sample in samples],
+                dim=0,
+            )
+            segment_bbox_hi = torch.cat(
+                [sample.target_segment_bbox_hi_zyx for sample in samples],
+                dim=0,
+            )
+        else:
+            segment_starts = torch.zeros((0, 3), dtype=torch.float32, device=samples[0].volume.device)
+            segment_ends = torch.zeros((0, 3), dtype=torch.float32, device=samples[0].volume.device)
+            segment_bbox_lo = torch.zeros((0, 3), dtype=torch.long)
+            segment_bbox_hi = torch.zeros((0, 3), dtype=torch.long)
         return FiberTrace3DBatch(
             volume=torch.stack([sample.volume for sample in samples], dim=0),
             valid_mask=torch.stack([sample.valid_mask for sample in samples], dim=0),
-            direction_target=torch.stack([sample.direction_target for sample in samples], dim=0),
-            direction_weight=torch.stack([sample.direction_weight for sample in samples], dim=0),
-            direction_mask=torch.stack([sample.direction_mask for sample in samples], dim=0),
-            presence_target=torch.stack([sample.presence_target for sample in samples], dim=0),
-            presence_mask=torch.stack([sample.presence_mask for sample in samples], dim=0),
             cp_local_zyx=torch.stack([sample.cp_local_zyx for sample in samples], dim=0),
             crop_origin_zyx=torch.stack([sample.crop_origin_zyx for sample in samples], dim=0),
             sample_indices=torch.as_tensor([sample.sample_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
             record_indices=torch.as_tensor([sample.record_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
             control_point_indices=torch.as_tensor([sample.control_point_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
             fiber_paths=tuple(sample.fiber_path for sample in samples),
+            target_modes=torch.as_tensor(
+                [sample.target_mode for sample in samples],
+                dtype=torch.long,
+            ),
+            target_segment_offsets=torch.as_tensor(
+                segment_offsets,
+                dtype=torch.long,
+            ),
+            target_segment_counts=torch.as_tensor(
+                segment_counts,
+                dtype=torch.long,
+            ),
+            target_segment_starts_zyx=segment_starts,
+            target_segment_ends_zyx=segment_ends,
+            target_segment_bbox_lo_zyx=segment_bbox_lo,
+            target_segment_bbox_hi_zyx=segment_bbox_hi,
+            target_tangent_zyx=torch.stack([sample.target_tangent_zyx for sample in samples], dim=0),
             profile_timings_ms={
                 **(timings or {}),
                 "batch_stack_ms": (time.perf_counter() - stack_start) * 1000.0,

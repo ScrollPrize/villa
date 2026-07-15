@@ -103,6 +103,19 @@
   `FiberTrace3DBatch` objects; the main training process transfers the whole
   batch to `training.device` immediately before forward/backward. The old
   thread-backed `_OrderedBatchLoadPipeline` is not a supported 3D loading path.
+- 3D DataLoader workers must not materialize full dense direction/presence
+  target tensors. Worker batches carry image/valid tensors plus compact target
+  descriptors: CP-only samples carry local CP/tangent metadata, and NML
+  dense-line samples carry transformed output-space line segments with
+  precomputed patch bboxes. Dense `direction_target`, `direction_weight`,
+  `direction_mask`, `presence_target`, and `presence_mask` are created by
+  `fiber_trace_3d.targets.materialize_targets(...)` in the main training
+  process on the training device.
+- The GPU target materializer must preserve the existing label semantics:
+  NML sources supervise direction/presence along overlapping clipped fiber-line
+  segments, non-NML sources supervise only the sampled CP neighborhood, presence
+  negative edge masking is unchanged, and Lasagna 3x2 direction encoding uses
+  the shared NumPy/torch-compatible helper semantics.
 - `training.loader_workers` controls 3D DataLoader worker process count.
   `0` is the explicit serial/debug path. `training.loader_prefetch_factor`
   maps directly to PyTorch DataLoader prefetch factor for worker processes.
@@ -113,8 +126,10 @@
   `wait_ms` from `to_device_ms`. It also reports worker-side profiling columns
   for loader construction, descriptor lookup, augmentation parameters,
   geometry-map creation, coordinate conversion, valid-mask generation, VC3D
-  sampling, tensor conversion, value augmentation, target generation, batch
-  stacking, worker wall time, and worker CPU time.
+  sampling, tensor conversion, value augmentation, compact target-spec
+  generation, batch stacking, worker wall time, and worker CPU time. Dense
+  target work is reported separately as main-process GPU target materialization
+  timings (`target_ms`, `gpu_ms`, `gpu_raster`, `gpu_encode`, `gpu_mask`).
 - 3D prefetch computes chunk dependencies from the same explicit coordinate
   path used by training and the VC3D sampler. `--prefetch-steps 0` means all
   deterministic CP samples.

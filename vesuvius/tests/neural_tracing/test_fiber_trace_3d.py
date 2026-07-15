@@ -25,6 +25,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.model import (
     direction_output,
     presence_output,
 )
+from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets
 from vesuvius.neural_tracing.fiber_trace_3d.projection import (
     project_3d_direction_to_2d_frame,
 )
@@ -174,6 +175,16 @@ def _loader_with_mapping(raw: dict) -> FiberTrace3DLoader:
     return FiberTrace3DLoader(config_from_mapping(base))
 
 
+def _load_materialized_batch(
+    loader: FiberTrace3DLoader,
+    start_sample_index: int,
+    *,
+    sample_mode: str = "random",
+) -> object:
+    batch = loader.load_batch(start_sample_index, sample_mode=sample_mode)
+    return materialize_targets(batch, loader.config, profile=True)
+
+
 def test_lasagna_3x2_encoding_matches_projection_formula() -> None:
     encoded_2d = encode_lasagna_direction_2d(
         np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
@@ -210,8 +221,13 @@ def test_lasagna_3x2_analytic_decode_round_trips_ambiguous_axes() -> None:
 
 def test_loader_builds_deterministic_cp_centered_3d_batch() -> None:
     loader = _loader(augment_enabled=False)
-    batch_a = loader.load_batch(0)
-    batch_b = loader.load_batch(0)
+    raw_batch = loader.load_batch(0)
+    assert raw_batch.direction_target is None
+    assert raw_batch.presence_target is None
+    assert raw_batch.target_modes.shape == (2,)
+    assert raw_batch.target_tangent_zyx.shape == (2, 3)
+    batch_a = _load_materialized_batch(loader, 0)
+    batch_b = _load_materialized_batch(loader, 0)
     assert batch_a.volume.shape == (2, 1, 16, 16, 16)
     assert batch_a.direction_target.shape == (2, 6, 16, 16, 16)
     assert batch_a.presence_target.shape == (2, 1, 16, 16, 16)
@@ -259,6 +275,8 @@ def test_3d_batch_dataset_preserves_whole_batch_items() -> None:
     dataloader_batches = list(dataloader)
     assert len(dataloader_batches) == len(serial_batches)
     for expected, actual in zip(serial_batches, dataloader_batches, strict=True):
+        expected = materialize_targets(expected, config, profile=True)
+        actual = materialize_targets(actual, config, profile=True)
         assert type(actual).__name__ == "FiberTrace3DBatch"
         assert torch.equal(actual.sample_indices, expected.sample_indices)
         assert torch.equal(actual.record_indices, expected.record_indices)
@@ -271,7 +289,7 @@ def test_3d_batch_dataset_preserves_whole_batch_items() -> None:
 
 def test_loader_augmented_batch_is_finite() -> None:
     loader = _loader(augment_enabled=True)
-    batch = loader.load_batch(1)
+    batch = _load_materialized_batch(loader, 1)
     assert torch.isfinite(batch.volume).all()
     assert torch.isfinite(batch.direction_target).all()
     assert batch.volume.shape == (2, 1, 16, 16, 16)
@@ -279,7 +297,7 @@ def test_loader_augmented_batch_is_finite() -> None:
 
 def test_loader_clips_long_label_segments_to_patch_domain() -> None:
     loader = _long_segment_loader(source_format="nml")
-    batch = loader.load_batch(0, sample_mode="flat")
+    batch = _load_materialized_batch(loader, 0, sample_mode="flat")
     assert batch.volume.shape == (1, 1, 16, 16, 16)
     assert bool(batch.direction_mask.any())
     assert bool((batch.presence_target > 0.5).any())
@@ -291,7 +309,7 @@ def test_loader_clips_long_label_segments_to_patch_domain() -> None:
 
 def test_loader_uses_cp_only_supervision_for_non_nml_fibers() -> None:
     loader = _long_segment_loader(source_format=None)
-    batch = loader.load_batch(0, sample_mode="flat")
+    batch = _load_materialized_batch(loader, 0, sample_mode="flat")
     cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
     far_on_segment_x = min(int(cp[2]) + 5, 15)
     assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), int(cp[2])] > 0.5
@@ -301,7 +319,7 @@ def test_loader_uses_cp_only_supervision_for_non_nml_fibers() -> None:
 
 def test_train_sample_3d_sheet_contains_principal_slice_panels() -> None:
     loader = _loader(augment_enabled=False)
-    batch = loader.load_batch(0)
+    batch = _load_materialized_batch(loader, 0)
     model = FiberTrace3DNet(
         FiberTrace3DModelConfig(
             input_channels=1,
@@ -354,8 +372,8 @@ def test_smooth_displacement_modes_are_deterministic_and_finite() -> None:
                 "augment_smooth_displacement_probability": 1.0,
             }
         )
-        batch_a = loader.load_batch(2)
-        batch_b = loader.load_batch(2)
+        batch_a = _load_materialized_batch(loader, 2)
+        batch_b = _load_materialized_batch(loader, 2)
         assert torch.isfinite(batch_a.volume).all()
         assert torch.isfinite(batch_a.direction_target).all()
         assert torch.allclose(batch_a.volume, batch_b.volume)
@@ -401,7 +419,7 @@ def test_local_prefetch_has_no_remote_chunks() -> None:
 
 def test_3d_model_and_losses_smoke() -> None:
     loader = _loader(augment_enabled=False)
-    batch = loader.load_batch(0)
+    batch = _load_materialized_batch(loader, 0)
     model = FiberTrace3DNet(
         FiberTrace3DModelConfig(
             input_channels=1,

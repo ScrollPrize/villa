@@ -111,6 +111,12 @@ side/top strip input loading.
   batch to the configured training device before model execution. Console
   `load_ms` includes DataLoader wait plus this main-process transfer;
   `to_device_ms` reports the transfer portion separately.
+- Worker batches do not include full dense supervision tensors. They carry
+  compact target descriptors instead: CP-only samples store local CP/tangent
+  metadata, and NML dense-line samples store transformed output-space segment
+  endpoints plus patch bboxes. The main process calls
+  `fiber_trace_3d.targets.materialize_targets(...)` after transfer to create
+  dense direction/presence targets on the training device.
 - In `--benchmark` mode, `cpu_ms` and `cpu_x` report sampled CPU time for the
   main process plus DataLoader worker processes during each benchmark row where
   `/proc/<pid>/stat` is available. `cpu_x=1.0` is roughly one fully occupied
@@ -119,9 +125,11 @@ side/top strip input loading.
   DataLoader workers: `worker_ms`, `worker_cpu`, `cpu/w`, loader construction,
   descriptor lookup, augmentation parameter sampling, coordinate-map creation,
   coordinate conversion/valid-mask generation, VC3D volume sampling, tensor
-  conversion, value augmentation, target rasterization/encoding, and batch
-  stacking. `wait_ms` is the main process blocking on the next DataLoader item;
-  it is distinct from `to_device_ms`, the CPU-to-training-device transfer.
+  conversion, value augmentation, compact target-spec generation, and batch
+  stacking. Dense target materialization is reported separately with
+  `target_ms` and the `gpu_*` target columns. `wait_ms` is the main process
+  blocking on the next DataLoader item; it is distinct from `to_device_ms`, the
+  CPU-to-training-device transfer.
 - When `training.test_trace2cp_enabled` is true, test evaluation builds
   Trace2CP side-strip geometry with the 2D loader, runs tiled dense 3D inference
   blocks over the requested strip coordinates, projects direction/presence into

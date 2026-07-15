@@ -32,6 +32,10 @@ from vesuvius.neural_tracing.fiber_trace_3d.model import (
     direction_output,
     presence_output,
 )
+from vesuvius.neural_tracing.fiber_trace_3d.targets import (
+    materialize_targets,
+    require_materialized_targets,
+)
 from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_bridge import (
     Trace2Cp3DProjectedFields,
     project_3d_output_to_trace2cp_fields,
@@ -138,6 +142,12 @@ def compute_losses(
     direction_weight: float,
     presence_weight: float,
 ) -> dict[str, torch.Tensor]:
+    require_materialized_targets(batch)
+    assert batch.direction_target is not None
+    assert batch.direction_weight is not None
+    assert batch.direction_mask is not None
+    assert batch.presence_target is not None
+    assert batch.presence_mask is not None
     pred_dir = direction_output(output)
     pred_presence = presence_output(output)
     direction_mask = batch.direction_mask.expand_as(pred_dir)
@@ -544,6 +554,7 @@ def evaluate_dense_loss(
             sample_mode="random",
             device=device,
         )
+        batch = materialize_targets(batch, loader.config)
         take = min(int(batch.volume.shape[0]), sample_count - consumed)
         if take < int(batch.volume.shape[0]):
             batch = _slice_batch(batch, 0, take)
@@ -566,20 +577,56 @@ def evaluate_dense_loss(
 
 
 def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3DBatch:
+    segment_counts = batch.target_segment_counts[start:stop]
+    if int(segment_counts.numel()) > 0:
+        source_offsets = batch.target_segment_offsets[start:stop]
+        first_segment = int(source_offsets[0])
+        segment_total = int(segment_counts.sum())
+        segment_start = first_segment
+        segment_stop = first_segment + segment_total
+        new_offsets = torch.cumsum(
+            torch.cat(
+                [
+                    torch.zeros((1,), dtype=segment_counts.dtype, device=segment_counts.device),
+                    segment_counts[:-1],
+                ],
+                dim=0,
+            ),
+            dim=0,
+        )
+    else:
+        segment_start = 0
+        segment_stop = 0
+        new_offsets = batch.target_segment_offsets[start:stop]
     return FiberTrace3DBatch(
         volume=batch.volume[start:stop],
         valid_mask=batch.valid_mask[start:stop],
-        direction_target=batch.direction_target[start:stop],
-        direction_weight=batch.direction_weight[start:stop],
-        direction_mask=batch.direction_mask[start:stop],
-        presence_target=batch.presence_target[start:stop],
-        presence_mask=batch.presence_mask[start:stop],
         cp_local_zyx=batch.cp_local_zyx[start:stop],
         crop_origin_zyx=batch.crop_origin_zyx[start:stop],
         sample_indices=batch.sample_indices[start:stop],
         record_indices=batch.record_indices[start:stop],
         control_point_indices=batch.control_point_indices[start:stop],
         fiber_paths=batch.fiber_paths[start:stop],
+        target_modes=batch.target_modes[start:stop],
+        target_segment_offsets=new_offsets,
+        target_segment_counts=segment_counts,
+        target_segment_starts_zyx=batch.target_segment_starts_zyx[segment_start:segment_stop],
+        target_segment_ends_zyx=batch.target_segment_ends_zyx[segment_start:segment_stop],
+        target_segment_bbox_lo_zyx=batch.target_segment_bbox_lo_zyx[segment_start:segment_stop],
+        target_segment_bbox_hi_zyx=batch.target_segment_bbox_hi_zyx[segment_start:segment_stop],
+        target_tangent_zyx=batch.target_tangent_zyx[start:stop],
+        direction_target=None
+        if batch.direction_target is None
+        else batch.direction_target[start:stop],
+        direction_weight=None
+        if batch.direction_weight is None
+        else batch.direction_weight[start:stop],
+        direction_mask=None if batch.direction_mask is None else batch.direction_mask[start:stop],
+        presence_target=None
+        if batch.presence_target is None
+        else batch.presence_target[start:stop],
+        presence_mask=None if batch.presence_mask is None else batch.presence_mask[start:stop],
+        profile_timings_ms=batch.profile_timings_ms,
     )
 
 
@@ -697,7 +744,7 @@ def run_training(config_path: str | Path) -> None:
     try:
         for step in range(start_step + 1, max_steps + 1):
             sample_index = (step - 1) * loader.config.batch_size
-            batch, load_ms, wait_ms, to_device_ms = _next_training_batch(
+            batch, load_ms, wait_ms, to_device_ms, target_ms = _next_training_batch(
                 iterator=train_iterator,
                 loader=loader,
                 sample_index=sample_index,
@@ -723,6 +770,7 @@ def run_training(config_path: str | Path) -> None:
                     f"loss_presence={losses['presence']:.6f} "
                     f"load_ms={load_ms:.1f} wait_ms={wait_ms:.1f} "
                     f"to_device_ms={to_device_ms:.1f} "
+                    f"target_ms={target_ms:.1f} "
                     f"fw_bw_step_ms={step_ms:.1f}",
                     flush=True,
                 )
@@ -733,6 +781,7 @@ def run_training(config_path: str | Path) -> None:
                 writer.add_scalar("timing/load_ms", load_ms, step)
                 writer.add_scalar("timing/load_wait_ms", wait_ms, step)
                 writer.add_scalar("timing/batch_to_device_ms", to_device_ms, step)
+                writer.add_scalar("timing/target_ms", target_ms, step)
                 writer.add_scalar("timing/fw_bw_step_ms", step_ms, step)
             if writer is not None and sample_vis_interval > 0 and (
                 step == 1 or step % sample_vis_interval == 0
@@ -1356,12 +1405,18 @@ def _next_training_batch(
     sample_index: int,
     sample_mode: str,
     device: torch.device,
-) -> tuple[FiberTrace3DBatch, float, float, float]:
+    profile_targets: bool = False,
+) -> tuple[FiberTrace3DBatch, float, float, float, float]:
     wait_start = time.perf_counter()
     if iterator is None:
         batch = loader.load_batch(sample_index, sample_mode=sample_mode, device=device)
         wait_ms = (time.perf_counter() - wait_start) * 1000.0
-        return batch, wait_ms, wait_ms, 0.0
+        target_start = time.perf_counter()
+        batch = materialize_targets(batch, loader.config, profile=profile_targets)
+        if profile_targets and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        target_ms = (time.perf_counter() - target_start) * 1000.0
+        return batch, wait_ms + target_ms, wait_ms, 0.0, target_ms
 
     batch = next(iterator)
     wait_ms = (time.perf_counter() - wait_start) * 1000.0
@@ -1370,7 +1425,12 @@ def _next_training_batch(
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     to_device_ms = (time.perf_counter() - to_device_start) * 1000.0
-    return batch, wait_ms + to_device_ms, wait_ms, to_device_ms
+    target_start = time.perf_counter()
+    batch = materialize_targets(batch, loader.config, profile=profile_targets)
+    if profile_targets and device.type == "cuda":
+        torch.cuda.synchronize(device)
+    target_ms = (time.perf_counter() - target_start) * 1000.0
+    return batch, wait_ms + to_device_ms + target_ms, wait_ms, to_device_ms, target_ms
 
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
@@ -1487,21 +1547,22 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
         flush=True,
     )
     print(
-        "batch patches total_ms load_ms wait_ms to_device_ms fw_ms "
+        "batch patches total_ms load_ms wait_ms to_device_ms target_ms fw_ms "
         "worker_ms worker_cpu cpu/w construct_ms desc_ms params_ms geom_ms coord_ms valid_ms "
-        "sample_ms tensor_ms value_ms target_ms line_ms map_ms raster_ms encode_ms mask_ms "
-        "segs bboxM posK stack_ms cpu_ms cpu_x"
+        "sample_ms tensor_ms value_ms spec_ms line_ms map_ms clip_ms "
+        "gpu_ms gpu_raster gpu_encode gpu_mask segs bboxM posK stack_ms cpu_ms cpu_x"
     )
     profile_rows: list[dict[str, float]] = []
     for batch_index in range(1, int(batches) + 1):
         start = time.perf_counter()
         cpu_start = _cpu_seconds_for_pids(cpu_pids)
-        batch, load_ms, wait_ms, to_device_ms = _next_training_batch(
+        batch, load_ms, wait_ms, to_device_ms, target_ms = _next_training_batch(
             iterator=iterator,
             loader=loader,
             sample_index=(batch_index - 1) * loader.config.batch_size,
             sample_mode="random",
             device=device,
+            profile_targets=True,
         )
         fw_ms = 0.0
         if not load_only:
@@ -1533,7 +1594,7 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
         print(
             f"{batch_index:5d} {loader.config.batch_size:7d} "
             f"{total_ms:8.2f} {load_ms:8.2f} {wait_ms:8.2f} {to_device_ms:12.2f} "
-            f"{fw_ms:8.2f} {timing_ms('batch_total_ms'):9.2f} "
+            f"{target_ms:9.2f} {fw_ms:8.2f} {timing_ms('batch_total_ms'):9.2f} "
             f"{timing_ms('batch_cpu_ms'):10.2f} "
             f"{timing_ms('batch_cpu_ms') / max(timing_ms('batch_total_ms'), 1.0e-6):5.2f} "
             f"{timing_ms('worker_loader_construct_ms'):12.2f} "
@@ -1542,15 +1603,17 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
             f"{timing_ms('coord_valid_ms'):8.2f} {timing_ms('volume_sample_ms'):9.2f} "
             f"{timing_ms('volume_tensor_ms'):9.2f} "
             f"{timing_ms('value_augmentation_ms'):8.2f} "
-            f"{timing_ms('target_total_ms'):9.2f} "
+            f"{timing_ms('target_spec_total_ms'):7.2f} "
             f"{timing_ms('target_line_window_ms'):7.2f} "
             f"{timing_ms('target_points_to_output_ms'):6.2f} "
-            f"{timing_ms('target_raster_ms'):9.2f} "
-            f"{timing_ms('target_encode_tensor_ms'):9.2f} "
-            f"{timing_ms('target_presence_mask_ms'):7.2f} "
-            f"{timing_ms('target_raster_segments'):5.0f} "
-            f"{timing_ms('target_raster_bbox_voxels') / 1.0e6:6.2f} "
-            f"{timing_ms('target_positive_voxels') / 1.0e3:5.1f} "
+            f"{timing_ms('target_clip_ms'):7.2f} "
+            f"{timing_ms('target_gpu_total_ms'):7.2f} "
+            f"{timing_ms('target_gpu_raster_ms'):10.2f} "
+            f"{timing_ms('target_gpu_encode_ms'):10.2f} "
+            f"{timing_ms('target_gpu_mask_ms'):8.2f} "
+            f"{timing_ms('target_gpu_raster_segments'):5.0f} "
+            f"{timing_ms('target_gpu_raster_bbox_voxels') / 1.0e6:6.2f} "
+            f"{timing_ms('target_gpu_positive_voxels') / 1.0e3:5.1f} "
             f"{timing_ms('batch_stack_ms'):8.2f} "
             f"{cpu_ms:8.2f} {cpu_factor:6.2f}",
             flush=True,

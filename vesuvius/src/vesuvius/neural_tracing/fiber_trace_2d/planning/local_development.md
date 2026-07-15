@@ -122,7 +122,7 @@ config filename or extra CLI flags unless the user explicitly approves it.
 For the S1A 3D fiber loader benchmark, reuse this exact command:
 
 ```bash
-PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_all.json --benchmark --load-only --benchmark-batches 10
+PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_3d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_all.json --benchmark --load-only --benchmark-batches 40
 ```
 
 This is the approved load-only comparison command for the current 3D loader
@@ -132,8 +132,16 @@ explicitly asks for a different measurement.
 Latest 3D DataLoader process-worker validation with that exact command and the
 checked-in S1A NML config:
 
-- `training.loader_workers=8`, `training.loader_prefetch_factor=2`,
+- `training.loader_workers=32`, `training.loader_prefetch_factor=2`,
   `training.loader_worker_device=cpu`, multiprocessing context `forkserver`.
+- 2026-07-15 GPU-target-materialization run: after worker startup, rows
+  9-40 were mostly `26-41 ms` with occasional waited rows; dense target
+  realization moved out of workers and is reported as `target_ms`, typically
+  `18-24 ms` after warmup. Worker-side target-spec construction is now
+  `spec_ms`, usually low single-digit ms.
+- Worker overlap for that run: `items=40`, `span_ms=22299.5`,
+  `avg_active=27.49`, `max_active=32`, `worker_cpu_x=18.25`,
+  `construct_items=32`.
 - Previous single-batch VC3D coordinate-sampler baseline after warmup:
   median `1359.06 ms`, post-warmup mean `1359.79 ms`.
 - 2026-07-15 forkserver run: all-batch mean/median/min/max
