@@ -351,6 +351,7 @@ private:
     struct RenderResult;
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
+    void maybeDegradeForCachePressure(const RenderResult& result);
     void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
@@ -427,6 +428,10 @@ private:
     float _scale = 1.0f;
     float _dsScale = 1.0f;
     int _dsScaleIdx = 0;
+    // Extra pyramid levels applied on top of _dsScaleIdx when the shared
+    // chunk cache reports view-protection stalls (live working set larger
+    // than capacity). Reset when the zoom crosses a level boundary.
+    int _cachePressureLevelBias = 0;
     float _zOff = 0.0f;
     float _camSurfX = 0.0f;
     float _camSurfY = 0.0f;
