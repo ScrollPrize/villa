@@ -1,49 +1,30 @@
-# 3D Fiber CP Model Variant Task Log
+# 3D Fiber Follow-Up Task Log
 
-- Implemented the V0 sibling package
-  `vesuvius.neural_tracing.fiber_trace_3d`.
-- Added Lasagna 3x2 direction helpers in `fiber_trace_3d/direction.py`.
-  Channel order is `dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x`.
-- Added `FiberTrace3DNet`, a seven-channel `Vesuvius3dUnetModel` wrapper:
-  six direction channels plus one sheet/fiber-presence channel.
-- Added `FiberTrace3DLoader`:
-  - deterministic pseudo-random CP sample stream;
-  - JSON/NML fiber loading through the existing 2D fiber parser;
-  - dataset-level affine transform support;
-  - Lasagna manifest shape validation for normal dataset entries;
-  - ordinary CP-centered 3D source-block loading, not strip/slice loading;
-  - coordinate-space CP shift, isotropic scale, 3D rotation, and axis flips;
-  - value augmentation with torch operations;
-  - line-derived Lasagna direction and presence targets;
-  - conservative base-volume prefetch from augmentation envelopes.
-- Added `fiber_trace_3d/projection.py`, a V0 3D-to-2D evaluation bridge that
-  decodes six-channel directions with a deterministic unit-sphere candidate
-  table and projects them into a caller-provided 2D frame.
-- Added `fiber_trace_3d/train.py` with training, prefetch, benchmark, load-only,
-  TensorBoard config/scalar logging, micro-batch support, and current/best
-  snapshots.
-- Added checked-in 3D configs:
-  - `fiber_trace_3d/configs/loader_example.json`;
-  - `fiber_trace_3d/configs/train_s1a_nml_all.json`.
-- Added focused tests in
-  `vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`.
+## Planning Notes
 
-## Deviations / V0 Boundaries
-
-- Shared common module extraction was kept minimal for reviewability. The 3D
-  path reuses existing fiber parsing, Lasagna manifest validation, transform
-  loading, U-Net helpers, and Zarr cache behavior, but does not move large 2D
-  loader internals into a new `fiber_trace_common` module yet.
-- Smooth 1D/2D/3D displacement fields, anisotropic arbitrary blur, and ringing
-  artifact augmentation are documented as future work. Non-zero 3D shear/ringing
-  keys are rejected instead of silently accepted.
-- The 3D-to-2D projection bridge is implemented as a helper and covered by a
-  synthetic test. Full Trace2CP metric wiring for real 3D checkpoints remains a
-  later integration step.
+- Current 3D affine augmentation is present:
+  - `augment_shift_zyx` controls CP placement inside the output patch;
+  - `augment_rotation_degrees` samples a 3D axis-angle rotation;
+  - isotropic scale and axis flips are also wired.
+- Current 3D target generation is matrix-based and therefore only general
+  enough for affine transforms.
+- Corrected smooth displacement plan after review: the 3D path must use the
+  same paired-map contract as 2D. It should build both `backward_map_zyx`
+  (output -> source) and `forward_map_zyx` (source -> output) as concrete maps
+  at augmentation construction time. Labels should transform source line/CP
+  coordinates through `forward_map_zyx`; they should not be derived only from
+  the output-to-source map and a Jacobian.
+- Full 3D smooth displacement should be implemented only through an explicitly
+  invertible paired construction, such as smooth coupling/triangular stages,
+  not arbitrary dense inverse estimation.
+- Anisotropic blur should be a torch value augmentation after volume sampling,
+  not a geometric/image-space resampling step.
+- Full Trace2CP wiring still needs a bridge that samples 3D checkpoint outputs
+  at 2D Trace2CP strip coordinates, projects 3D Lasagna directions into the
+  strip frame, and reuses the existing public Trace2CP metric.
+- Shear/skew and ringing stay out of scope and should continue to be rejected
+  when configured non-zero.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/__init__.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/direction.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/model.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/projection.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py`
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py vesuvius/tests/neural_tracing/test_fiber_trace.py`
-  passed: 325 tests.
+- Planning-only task so far; no tests run yet.

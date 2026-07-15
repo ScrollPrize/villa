@@ -1,264 +1,240 @@
-# 3D Fiber CP Model Variant Plan
+# 3D Fiber Follow-Up Plan
+
+## Current State Check
+
+Regular affine augmentation is already present in the 3D loader:
+
+- `augment_shift_zyx` chooses the CP location inside the final patch.
+- `augment_rotation_degrees` samples a 3D axis-angle rotation.
+- `augment_scale_min/max` and `augment_flip_probability` are also wired.
+- `_sample_volume_patch` samples the 3D source block with the same
+  output-to-source affine transform.
+- `_build_targets` currently transforms the source fiber line into output patch
+  coordinates with the paired source-to-output affine matrix.
+- Dataset-level fiber-coordinate affine transforms are also supported through
+  `fiber_transform`, `transform`, `fiber_transform_json`, and
+  `transform_invert`.
+
+Shear/skew and ringing are intentionally out of scope. Non-zero 3D shear or
+ringing config keys should continue to fail loudly.
 
 ## Goal
 
-Add a sibling 3D CP-centered fiber training path that mirrors the current 2D
-fiber model workflow where that makes sense: deterministic CP sampling,
-coordinate-space augmentation before volume sampling, GPU value augmentation,
-TensorBoard/debug visualization, prefetch, and benchmark/profile support.
+Extend the 3D CP-centered fiber path with the missing planned pieces while
+preserving the simpler non-strip 3D loading model:
 
-The 2D fiber path remains supported. Shared code should be extracted only for
-fiber metadata, deterministic sample ordering, and Zarr/chunk I/O; 3D model
-heads, labels, and training should be separate.
+1. smooth displacement augmentation in 1D, 2D, and full 3D;
+2. anisotropic directional 3D blur as a value augmentation;
+3. Trace2CP evaluation/visualization wiring for real 3D checkpoints.
 
-Unlike the 2D path, the 3D loader does not build fiber-aligned strips or slices.
-It loads ordinary CP-centered 3D volume blocks and applies 3D augmentations
-around the CP. That should make loading and inference simpler than the 2D strip
-code: no side/top strip frame construction, no strip-z offset stack, and no
-fiber-aligned coordinate mesh for the input image.
+## Smooth Displacement Design
 
-## Scope
+The 3D path must use the same geometric augmentation contract as the 2D strip
+path. Every geometric transform is represented by paired concrete maps built at
+augmentation construction time:
 
-In scope:
+- `backward_map_zyx[D,H,W,3]`: output voxel -> source voxel, used for volume
+  sampling;
+- `forward_map_zyx[Dsrc,Hsrc,Wsrc,3]`: source voxel -> output voxel, used for
+  fiber line/control-point lookup and label construction.
 
-- New 3D loader/trainer/configs/tests.
-- Shared Zarr chunk loading/prefetch utilities used by both 2D and 3D.
-- CP-centered 3D patch loading from JSON and NML fibers with existing Lasagna
-  manifest and affine transform handling.
-- 3D fiber-direction and fiber-presence supervision.
-- Effective batch size around 192 CP patches per optimizer step.
-- Initial 3D checkpoint evaluation through 2D strip projection and the existing
-  2D tracer/Trace2CP-style test path.
+Consumers must not derive one direction from the other after the fact. That
+means no dense nearest search, brute-force inversion, iterative solver, or
+runtime formula re-evaluation in training, visualization, or Trace2CP bridge
+paths. If a path needs source-to-output coordinates, it samples the prebuilt
+`forward_map_zyx`, exactly like 2D samples `forward_map_xy`.
 
-Out of scope for the first implementation:
+This is the correction to the earlier V0 note: labels must not be derived only
+from the output-to-source map. The line/CP geometry is transformed through the
+prebuilt source-to-output map, then labels are generated in output coordinates
+from that transformed line.
 
-- Replacing the current 2D tracer/Trace2CP path.
-- Full 3D inference/tracing tools.
-- Changing 2D label semantics.
-- Reintroducing 3D contrastive embedding by default.
+### Smooth Modes
 
-## Architecture
+Add one shared map-building implementation with active component/domain masks:
 
-1. Add a new sibling package, tentatively
-   `vesuvius.neural_tracing.fiber_trace_3d`, instead of overloading the current
-   2D package.
-2. Keep the older `vesuvius.neural_tracing.fiber_trace` package available, but
-   do not build new 3D CP code by mutating its crop loader. Reuse its
-   `DirectionConditionedFiberTraceModel`/`Vesuvius3dUnetModel` vocabulary where
-   appropriate.
-3. Extract only the shared pieces from `fiber_trace_2d` into a common module,
-   for example `vesuvius.neural_tracing.fiber_trace_common`:
-   - fiber JSON/NML loading and deterministic CP indexing;
-   - dataset record resolution and affine transform application;
-   - compact in-RAM fiber line geometry;
-   - VC3D/Zarr cache request classification and Python prefetch download;
-   - parallel chunk/block reads from the cached/remote Zarr volume.
-4. Leave compatibility shims in the 2D modules so existing imports and tests
-   continue to work.
+- `none`: current affine-only behavior.
+- `1d`: one smooth displacement component as a function of one coordinate.
+  Example: move `z` as a smooth function of `x`; the paired maps apply the same
+  function with opposite sign in the forward/backward construction.
+- `2d`: one or more displacement components generated from a smooth 2D control
+  lattice and extruded along the third coordinate, again only in forms where
+  both map directions are generated directly.
+- `3d`: paired smooth displacement constructed by an explicitly invertible
+  composition, not by arbitrary dense 3D inverse estimation. The first supported
+  3D mode should be a sequence of smooth coupling/triangular updates whose
+  inverse is known by construction, for example component updates such as
+  `z += f_z(y,x)`, `y += f_y(z,x)`, `x += f_x(z,y)` with the inverse applying
+  the same controls in reverse order and subtracting the offsets. This gives
+  all three axes smooth displacement while preserving a direct paired
+  forward/backward map construction.
 
-## 3D Data Loading
+Suggested config keys:
 
-1. Build one deterministic CP sample stream shared with prefetch and training:
-   sample index -> record -> fiber -> control point -> augmentation seed.
-2. For each selected CP, construct an axis-aligned final 3D output patch shape
-   `patch_shape_zyx`, defaulting to a small enough cube/cuboid to make
-   effective batch size 192 realistic.
-3. Build an oversized axis-aligned 3D source block around the CP that covers
-   the maximum configured geometric augmentation range. This is a plain volume
-   block, not a fiber-aligned strip/slice.
-4. Read the source block from Zarr using shared chunk/block loading:
-   - optionally round source boxes to chunk boundaries;
-   - read chunk-aligned blocks in parallel;
-   - preserve exact selected-level voxel values;
-   - keep prefetch using the same envelope calculation.
-5. Convert the loaded source block to a torch tensor once, then sample final
-   augmented output voxels from the source block with a 3D coordinate grid when
-   geometric augmentation is enabled. With geometric augmentation disabled, the
-   final patch can be a direct crop/view from the loaded block. In both cases
-   this is not strip slicing; the model input remains a regular 3D volume patch.
-   Labels and CP/line points use the same 3D transform parameters.
-6. Reject samples whose transformed CP/fiber supervision cannot be placed
-   inside the final valid patch.
+- `augment_smooth_displacement_mode`: `none | 1d | 2d | 3d`;
+- `augment_smooth_displacement_amplitude_zyx`: max absolute source-voxel
+  displacement per component;
+- `augment_smooth_displacement_control_spacing_zyx`: coarse lattice spacing;
+- `augment_smooth_displacement_probability`: default `0.0` until profiled.
 
-## Model
+Implementation details:
 
-1. Prefer the existing `Vesuvius3dUnetModel` backbone through the same config
-   concepts already used by `fiber_trace.model`:
-   `features_per_stage`, `unet_base_channels`, `unet_depth`, `strides`,
-   `decoder_upsample_mode`, and input channels.
-2. Add a 3D fiber head wrapper if needed:
-   - direction head: 6 channels using Lasagna's 3x2 ambiguous channel encoding;
-   - presence head: 1 sigmoid channel, default enabled;
-   - optional embedding head remains supported but disabled by default.
-3. Support `batch_size: 192` as the effective logical batch. Add
-   `model_micro_batch_size` or equivalent gradient accumulation if dense 3D
-   U-Net memory cannot fit all patches in one forward pass.
+- Generate deterministic coarse displacement controls from sample index and
+  seed.
+- Upsample/interpolate controls only during paired map construction.
+- Compose affine and smooth stages into both concrete maps at construction time.
+- Use `backward_map_zyx` for dense 3D `grid_sample`.
+- Use direct trilinear gather against `forward_map_zyx` for source line and CP
+  coordinates.
+- Include max displacement amplitude in `_prefetch_source_bbox` and
+  `_actual_source_bbox`.
+- Keep labels ignored where transformed line/CP lookup is invalid or outside
+  the output patch.
 
-## 3D Direction Encoding
+## Anisotropic 3D Blur
 
-Use the Lasagna 3D direction layout and formulas, not raw normalized
-`(dx, dy, dz)` output channels. Local references:
+Keep blur as a value augmentation after volume sampling and after geometric
+coordinate sampling. It must run on torch tensors, preferably GPU when training
+uses CUDA.
 
-- `lasagna/tifxyz_labels.py::encode_direction_channels`
-- `lasagna/train_unet_3d.py::_encode_dir`
-- `lasagna/train_unet_3d.py::compute_targets_3d`
+Add config keys:
 
-For a unit fiber tangent `(tx, ty, tz)`, emit three ambiguous 2D double-angle
-pairs:
+- `augment_anisotropic_blur_probability`;
+- `augment_anisotropic_blur_sigma_along`;
+- `augment_anisotropic_blur_sigma_across`;
+- `augment_anisotropic_blur_orientation`: `fiber | random | axis`;
+- optional `augment_anisotropic_blur_roll_degrees`.
 
-- `dir0_z, dir1_z = encode(tx, ty)` for the XY projection / Z slices;
-- `dir0_y, dir1_y = encode(tx, tz)` for the XZ projection / Y slices;
-- `dir0_x, dir1_x = encode(ty, tz)` for the YZ projection / X slices.
+Implementation plan:
 
-Each `encode(a, b)` uses the Lasagna double-angle formula:
+1. Keep existing `augment_blur_sigma` as isotropic separable 3D Gaussian.
+2. Add anisotropic blur as opt-in and default off.
+3. For axis-aligned blur, use separable `conv3d`.
+4. For arbitrary/fiber-aligned blur, use three sequential oriented 1D
+   Gaussian samples with `grid_sample` along the principal directions, batched
+   over patches where possible.
+5. The default principal direction for `fiber` orientation is the transformed
+   local CP tangent; the two perpendicular axes are built deterministically
+   from that tangent plus optional roll.
+6. Profile before enabling in checked-in configs.
 
-- `cos2t = (a*a - b*b) / (a*a + b*b + eps)`
-- `sin2t = 2*a*b / (a*a + b*b + eps)`
-- `dir0 = 0.5 + 0.5*cos2t`
-- `dir1 = 0.5 + 0.5*(cos2t - sin2t)/sqrt(2)`
+## Trace2CP Metric Wiring
 
-The direction loss should compare these six channels directly, with optional
-per-pair projection-magnitude weights as in `train_unet_3d.py` so a direction
-nearly perpendicular to a projection plane does not dominate the loss.
+The current `fiber_trace_3d/projection.py` only provides a synthetic-tested
+3D-to-2D direction projection helper. Full wiring should add a 3D model adapter
+that can feed the existing 2D Trace2CP metric.
 
-## Supervision
+Plan:
 
-1. Transform fiber line points and CP positions through the same 3D geometric
-   augmentation parameters used for image sampling.
-2. Direction targets are derived from the transformed 3D line tangent and
-   encoded into the six Lasagna ambiguous direction channels described above.
-3. Fiber-presence supervision:
-   - positive near transformed fiber-line voxels around the selected CP;
-   - negative outside the configured reachable CP/fiber region, balanced against
-     positives similarly to the 2D presence loss;
-   - ignore patch edges that cannot contain a CP due to configured shift
-     margins, matching the 2D edge-handling principle.
-4. Initial V0 trains direction + presence only. Embedding loss can remain
-   config-supported but off.
+1. Add a 3D Trace2CP adapter module, e.g.
+   `fiber_trace_3d/trace2cp_bridge.py`.
+2. Reuse the existing 2D loader only for Trace2CP geometry construction:
+   CP pair, side-strip coordinates, local strip x/y axes, valid mask, and
+   metric calculation.
+3. For each test CP pair, build ordinary axis-aligned 3D inference blocks that
+   cover the Trace2CP strip coordinates. Do not load strips for 3D training.
+4. Run the 3D model densely on those blocks.
+5. Interpolate the 3D model outputs at the 2D strip coordinates:
+   - six Lasagna 3x2 direction channels;
+   - presence channel.
+6. Decode/project the 3D direction into the local 2D strip frame using the
+   projection helper, but replace the current grid-search decoder if a faster
+   analytic least-squares/direct decode is added.
+7. Feed the projected 2D direction field and projected presence field into the
+   existing Trace2CP bidirectional metric path.
+8. Add optional 3D Trace2CP visualization:
+   - side-strip source image from the existing 2D geometry;
+   - projected 3D direction overlay;
+   - projected 3D presence;
+   - public `trace2cp_error=...` line and whole-fiber
+     `trace2cp_error_mean=...` line.
+9. Add 3D training config keys:
+   - `training.test_trace2cp_enabled`;
+   - `training.test_trace2cp_control_points`;
+   - `training.test_trace2cp_step_px`;
+   - `training.test_trace2cp_rf_margin_px`;
+   - optional 2D metric-loader config path if the 3D config cannot safely
+     contain every 2D strip geometry setting.
+10. Best checkpoint selection should use `test/trace2cp_error` when this
+    metric is enabled; otherwise keep current dense loss selection.
 
-## Initial 3D Evaluation Path
+## Shear And Ringing
 
-1. The first test case should run the 3D model over CP-centered 3D test patches.
-2. To compare against the existing 2D tooling, project/interpolate the predicted
-   3D direction field onto the same 2D fiber side strip used by the test fiber.
-3. Decode/project the six Lasagna direction channels into the side-strip 2D
-   tangent direction at each strip pixel, respecting the local strip frame.
-4. Run the existing 2D strip tracer/Trace2CP metric on that projected direction
-   field.
-5. This evaluation bridge is for testing and metrics only. It must not imply
-   that 3D training loads fiber-aligned strips.
+Do not implement these in this follow-up:
 
-## 3D Augmentation Matrix
-
-All geometric augmentations are represented as coordinate transforms before
-final volume sampling. Value augmentations happen after sampling as batched
-torch tensor operations on the configured device.
-
-| Augmentation | 3D handling |
-| --- | --- |
-| Shift / translation | Extend from 2D `shift_x/y` to `augment_shift_zyx` or `augment_shift_xyz`. Applied as output-space translation of the CP within the final 3D patch. The unreachable border region is ignored for negative supervision. |
-| Rotation | Replace 2D in-plane rotation with 3D rotation around the CP/patch center. Support either random SO(3) or constrained axis-angle ranges via config. Direction vectors and line points are rotated with the same matrix. |
-| Flips | Allow independent x/y/z reflections. Transform direction vectors with the reflection matrix, then apply sign-ambiguous direction loss. |
-| Scale | Support isotropic scale first. Optional anisotropic scale can be added behind explicit config, but default should be conservative because anisotropic scale changes apparent fiber geometry. |
-| Shear/skew | Do not enable by default for 3D. The TODO explicitly questions skew; V0 should reject non-zero 3D shear unless a later experiment defines useful bounds. |
-| Smooth distortion, 1D | Implement as a smooth displacement along one configured volume axis as a function of an independent patch coordinate, with paired point/volume coordinate transforms and no search-based inversion. It is not a strip offset. |
-| Smooth distortion, 2D | Add only if it can be represented by explicit paired coordinate maps over the regular 3D patch. Candidate: smooth 2-component displacement over a plane in patch coordinates. Keep disabled by default until validated. |
-| Smooth distortion, full 3D | Treat as experimental. Use a coarse 3D displacement lattice trilinearly upsampled into the output-to-source sampling grid. If exact paired line/CP mapping is not available, do not use it for supervised training labels. No brute-force inverse/search. |
-| Brightness | Same as 2D, batched torch operation after sampling. |
-| Contrast | Same as 2D, batched torch operation after sampling, centered on valid patch values. |
-| Gamma | Same as 2D, batched torch operation after sampling. |
-| Noise | Same as 2D but 3D tensor-shaped; deterministic per training stream index. |
-| Blur, isotropic | 3D separable Gaussian blur with one sigma for z/y/x, batched on GPU. |
-| Blur, anisotropic directional | Add config for stronger blur along one rotated direction and weaker blur along the two perpendicular directions. Implement as a 3D oriented sampling/filter operation or grouped convolution where kernels are shared. Keep disabled by default until profiled. |
-| Blur, arbitrary rotation | Represent the anisotropic blur covariance in volume coordinates. Use the current fiber tangent as the default principal direction, with optional random roll. |
-| Ringing artifact | Leave as explicit future/experimental augmentation. Do not add a silent placeholder; reject `augment_ringing_*` keys until the artifact model is specified. |
-| Chunk-boundary source rounding | Add `round_source_to_chunk_boundaries` for 3D source boxes. Prefetch and training must compute the same rounded source envelopes. |
-
-## Prefetch
-
-1. Add 3D prefetch mode to the new trainer entrypoint.
-2. Prefetch computes chunk requests from the full source envelope, not from one
-   concrete random augmentation draw.
-3. `--prefetch-steps 0` means all deterministic CP samples, matching current
-   2D semantics.
-4. Progress should report sample progress and download progress separately,
-   preserving the current deterministic shuffled sample order.
-
-## Configs
-
-1. Add a 3D example config near the new package, plus an S1A NML config if the
-   first implementation targets the current S1A dataset.
-2. Recommended first defaults:
-   - `batch_size: 192` effective CP patches;
-   - `model_micro_batch_size` configurable;
-   - `patch_shape_zyx` small enough for smoke training;
-   - `augment_enabled: true`;
-   - `round_source_to_chunk_boundaries: true`;
-   - six-channel Lasagna direction + one-channel presence heads enabled;
-   - embedding disabled.
-3. Keep 2D config keys valid for the 2D loader. Do not reinterpret 2D
-   `patch_shape_hw` or strip-specific keys as 3D settings.
+- keep rejecting non-zero `augment_shear_*`;
+- keep rejecting non-zero `augment_ringing*`;
+- document that no placeholder behavior exists.
 
 ## Spec Update
 
-Update `planning/specs.md` with a new 3D CP model section covering:
+Update `planning/specs.md` to add:
 
-- separate 2D and 3D entrypoints;
-- shared common fiber/Zarr I/O utilities;
-- 3D coordinate-space augmentation semantics;
-- the 3D augmentation matrix above;
-- 3D model output channel layout: six Lasagna direction channels plus one
-  presence channel by default;
-- effective batch size versus micro-batch behavior;
-- 3D prefetch envelope semantics and chunk-boundary rounding;
-- the 2D strip-projection evaluation bridge for initial tests;
-- compatibility guarantee that 2D behavior and configs remain unchanged.
+- 3D affine augmentation support status: shift, rotation, scale, flips present;
+- 3D geometric augmentation must follow the 2D paired-map contract:
+  `backward_map_zyx` and `forward_map_zyx` are both concrete tensors built by
+  construction;
+- smooth displacement must be implemented only through paired map construction
+  with direct forward/backward semantics;
+- target generation transforms source line/control-point coordinates by direct
+  lookup against `forward_map_zyx`, then generates output-space labels from the
+  transformed line;
+- anisotropic blur as opt-in value augmentation, not a geometric transform;
+- full 3D Trace2CP bridge semantics and best-checkpoint behavior;
+- shear/ringing explicitly out of scope and rejected.
 
 ## Docs Updates
 
 Update `docs/code_structure.md` with:
 
-- the new `fiber_trace_common` shared module;
-- the new `fiber_trace_3d` loader/model/train/config modules;
-- how ordinary 3D CP-centered source-block loading differs from 2D strip
-  coordinate sampling;
-- how 3D predictions are projected onto 2D test strips for the initial metric;
-- the run and prefetch commands for 3D smoke/training.
+- the 3D geometry augmentation object/map flow;
+- where smooth displacement and anisotropic blur live;
+- how 3D checkpoints are projected into the existing 2D Trace2CP metric.
 
-## Changelog
+## Tests
 
-When implemented, add one changelog entry for the new 3D CP fiber training path
-and shared I/O extraction.
+Add focused tests for:
 
-## Testing
+- affine shift/rotation remains unchanged for identity smooth displacement;
+- 1D/2D/3D smooth displacement source-coordinate maps are deterministic and
+  finite;
+- `backward_map_zyx` and `forward_map_zyx` are both constructed and no lookup
+  path tries to invert one from the other;
+- source line/control-point lookup through `forward_map_zyx` matches the old
+  affine target path for affine-only samples;
+- transformed-line output-space labels give expected direction targets for a
+  known smooth bend;
+- prefetch envelopes include configured displacement amplitude;
+- anisotropic blur changes a synthetic impulse with expected directionality;
+- shear/ringing non-zero keys still raise;
+- synthetic 3D prediction projected onto a simple 2D strip produces the expected
+  Trace2CP error;
+- existing 2D and 3D focused tests continue to pass.
 
-1. Unit tests:
-   - deterministic CP sample order matches prefetch/training;
-   - 3D affine transforms move CP, line points, and direction targets together;
-   - six-channel Lasagna direction targets match
-     `lasagna/tifxyz_labels.py::encode_direction_channels` on known tangents;
-   - flip/rotation direction targets are sign-ambiguous and finite;
-   - chunk-boundary source envelope calculation is stable;
-   - smooth 1D distortion uses paired direct transforms, no search/inversion;
-   - Zarr fake-array source blocks load the expected values;
-   - 3D-to-2D strip projection produces the expected strip tangent for a
-     synthetic straight fiber;
-   - 2D loader imports and existing tests still pass through compatibility
-     shims.
-2. Smoke tests:
-   - one small synthetic 3D train step on CPU;
-   - one synthetic 3D inference -> 2D strip projection -> 2D trace metric run;
-   - one CUDA `--benchmark --load-only --profile` run when available;
-   - one prefetch dry run on fake/local data.
-3. Regression command:
-   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py vesuvius/tests/neural_tracing/test_fiber_trace.py`
-   plus new `test_fiber_trace_3d_*.py` tests.
+Regression command:
 
-## Open Risks
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py vesuvius/tests/neural_tracing/test_fiber_trace.py`
 
-- Effective batch size 192 may require micro-batching for real 3D U-Net patch
-  sizes. The loader should still produce 192 logical patches per step.
-- Full 3D smooth displacement is only valid for supervised training if paired
-  line/CP mapping is explicit. Otherwise it must remain disabled for training.
-- Arbitrarily rotated anisotropic blur can become expensive; it needs profiling
-  before enabling by default.
+## Implementation Order
+
+1. Refactor 3D affine sampling into a reusable paired coordinate-map builder
+   while keeping outputs bitwise or numerically close for affine-only tests.
+2. Move label generation to source-line/control-point lookup through
+   `forward_map_zyx`, matching the 2D map contract.
+3. Add smooth displacement modes and prefetch/source envelope inflation.
+4. Add anisotropic blur behind opt-in config.
+5. Add Trace2CP bridge and 3D CLI/train metric wiring.
+6. Update specs/docs/changelog/task log and run tests.
+
+## Risks
+
+- Full 3D smooth displacement must not be an arbitrary dense field unless a
+  direct paired inverse is also constructed. The first supported 3D mode should
+  use explicitly invertible coupling/triangular stages; if amplitudes make
+  transformed geometry invalid, those samples/voxels should be rejected or
+  ignored rather than silently supervised.
+- Arbitrary anisotropic blur can be expensive. It should stay off by default
+  until benchmarked on the real training path.
+- Trace2CP bridge inference may need tiling for long CP-pair strips; the first
+  implementation should favor correctness and clear profiling over premature
+  batching.
