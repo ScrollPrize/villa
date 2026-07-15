@@ -117,8 +117,14 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     _pythonOutput->setTitle(tr("Spiral Python stdout / stderr"));
     _pythonOutput->setMaximumBlockCount(10000);
     pythonOutputLayout->addWidget(_pythonOutput);
-    connect(_service, &SpiralServiceManager::logMessage,
-            _pythonOutput, &ConsoleOutputWidget::appendOutput);
+    connect(_service, &SpiralServiceManager::logMessage, _pythonOutput,
+            [this](const QString& message) {
+                const QString line = message.trimmed();
+                const bool routineStatusPoll =
+                    line.startsWith(QStringLiteral("SPIRAL_HTTP \"GET /session/status HTTP/"))
+                    && line.endsWith(QStringLiteral("\" 200 -"));
+                if (!routineStatusPoll) _pythonOutput->appendOutput(message);
+            });
     connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
         statusBar()->showMessage(error, 15000);
         _pythonOutput->appendOutput(tr("Error: %1").arg(error));
