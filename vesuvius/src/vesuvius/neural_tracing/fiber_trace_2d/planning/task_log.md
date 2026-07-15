@@ -1,14 +1,13 @@
-# 3D Default VC3D Cache Budget Task Log
+# 3D Test Visibility And Direction Projection Task Log
 
 ## Notes
 
-- User corrected the target default to 512 MiB, not 1 GiB.
-- The change should be Python-side so existing JSON `null` no longer falls
-  through to VC3D's internal 8 GiB default.
-- `load_config(...)`, `config_from_mapping(...)`, and the generated 2D
-  Trace2CP geometry loader path now resolve missing/`null`
-  `volume_cache_memory_mib` to `512.0`.
-- Explicit positive `volume_cache_memory_mib` values are preserved.
+- Fixed the 3D sample overlay display only: direction loss/error still use the
+  true 3D Lasagna 3x2 decoded axes, while the 2D principal-slice overlay scales
+  line length by the in-slice projection magnitude.
+- Configured dense 3D tests now write `test_sample_3d/principal_slices` at
+  step 0 and interval test runs, and the TensorBoard writer flushes after test
+  logging.
 
 ## Deviations Or Deferrals
 
@@ -17,7 +16,6 @@
 ## Validation
 
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed: 27 tests.
-- Config smoke check showed `loader_example.json`, `train_s1a_nml_all.json`,
-  and `train_s1a_nml_all_64_sd2.json` resolve to `512.0` MiB /
-  `536870912` bytes.
+  passed: 30 tests.
+- Config smoke confirmed `train_s1a_nml_all_64_sd2.json` has one
+  `test_datasets` entry and uses default test sample visualization scheduling.

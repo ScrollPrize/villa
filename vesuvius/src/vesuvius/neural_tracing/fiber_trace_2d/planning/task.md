@@ -1,16 +1,16 @@
-# 3D Default VC3D Cache Budget
+# 3D Test Visibility And Direction Projection
 
-Set the 3D fiber Python-side default VC3D decoded/hot chunk cache budget to
-512 MiB per loader/worker.
+Fix 3D TensorBoard visibility for test metrics/visualization and correct the
+training/test sample direction overlay projection length.
 
-Required behavior:
+Requirements:
 
-- If `volume_cache_memory_mib` is missing or `null` in a 3D config, Python must
-  pass a 512 MiB cache budget to VC3D instead of falling through to VC3D's 8 GiB
-  default.
-- If a positive `volume_cache_memory_mib` is provided explicitly, keep honoring
-  that value.
-- Apply the same default to inline/config-from-mapping 3D configs and the
-  generated 2D Trace2CP geometry loader used by 3D evaluation.
-- Do not change batch size or loader worker counts.
-- Update tests/docs/spec/task log.
+- Keep 3D direction loss/error unchanged.
+- In each principal slice, draw the projected direction line shorter when the
+  3D direction points partly out of that slice.
+- Keep the thin anti-aliased line style.
+- When configured tests run, write a `test_sample_3d/principal_slices`
+  visualization using the same principal-slice sheet as training.
+- Flush TensorBoard after configured test logging so step-0 test scalars/images
+  are visible promptly.
+- Update docs/specs/task log and run focused tests.

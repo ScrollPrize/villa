@@ -744,6 +744,12 @@ def run_training(config_path: str | Path) -> None:
             "Columns: image with projected GT line and predicted CP direction, target presence, predicted presence.",
             0,
         )
+        writer.add_text(
+            "test_sample_3d/layout",
+            "Rows: yx, zx, zy principal slices through the sampled test CP. "
+            "Columns: image with projected GT line and predicted CP direction, target presence, predicted presence.",
+            0,
+        )
 
     max_steps = int(training.get("max_steps", 1))
     if max_steps <= 0:
@@ -753,6 +759,12 @@ def run_training(config_path: str | Path) -> None:
     test_interval = int(training.get("test_interval", 0))
     sample_vis_interval = int(
         training.get("sample_vis_interval", training.get("train_sample_vis_interval", 1000))
+    )
+    test_sample_vis_interval = int(
+        training.get(
+            "test_sample_vis_interval",
+            test_interval if test_interval > 0 else sample_vis_interval,
+        )
     )
     test_control_points = int(training.get("test_control_points", loader.config.batch_size))
     if test_control_points <= 0:
@@ -803,6 +815,22 @@ def run_training(config_path: str | Path) -> None:
                 writer.add_scalar("test/loss_direction", test_losses["direction"], step)
                 writer.add_scalar("test/loss_presence", test_losses["presence"], step)
                 writer.add_scalar("test/angle_mean_deg", test_losses["angle_mean_deg"], step)
+                if test_sample_vis_interval > 0 and step % test_sample_vis_interval == 0:
+                    vis_batch = test_loader.load_batch(
+                        int(training.get("test_start_sample_index", 0)),
+                        sample_mode="random",
+                        device=device,
+                    )
+                    vis_batch = materialize_targets(vis_batch, test_loader.config)
+                    if int(vis_batch.volume.shape[0]) > 1:
+                        vis_batch = _slice_batch(vis_batch, 0, 1)
+                    _write_3d_sample_sheet(
+                        writer,
+                        "test_sample_3d/principal_slices",
+                        model,
+                        vis_batch,
+                        step,
+                    )
         if trace2cp_loader is not None and test_interval > 0:
             trace2cp_metric = _evaluate_trace2cp_metric_fixed_set_3d(
                 model,
@@ -832,6 +860,8 @@ def run_training(config_path: str | Path) -> None:
                     trace2cp_metric.skipped_segments,
                     step,
                 )
+        if writer is not None and metric is not None:
+            writer.flush()
         return metric, metric_name
 
     initial_metric, initial_metric_name = run_configured_tests(start_step)
@@ -903,17 +933,12 @@ def run_training(config_path: str | Path) -> None:
             if writer is not None and sample_vis_interval > 0 and (
                 step == 1 or step % sample_vis_interval == 0
             ):
-                was_training = bool(model.training)
-                model.eval()
-                with torch.no_grad():
-                    vis_output = model(batch.volume[:1])
-                if was_training:
-                    model.train()
-                writer.add_image(
+                _write_3d_sample_sheet(
+                    writer,
                     "train_sample_3d/principal_slices",
-                    _make_train_sample_3d_sheet(batch, vis_output),
+                    model,
+                    batch,
                     step,
-                    dataformats="HWC",
                 )
 
             metric = losses["total"]
@@ -1011,6 +1036,91 @@ def _draw_panel_point(panel: np.ndarray, row: int, col: int, color: tuple[int, i
             panel[rr, cc] = rgb
 
 
+def _blend_panel_pixel(
+    panel: np.ndarray,
+    row: int,
+    col: int,
+    color: tuple[int, int, int],
+    alpha: float,
+) -> None:
+    h, w = int(panel.shape[0]), int(panel.shape[1])
+    if not (0 <= row < h and 0 <= col < w):
+        return
+    opacity = float(np.clip(alpha, 0.0, 1.0))
+    if opacity <= 0.0:
+        return
+    src = np.asarray(color, dtype=np.float32)
+    dst = panel[row, col].astype(np.float32, copy=False)
+    panel[row, col] = np.rint(dst * (1.0 - opacity) + src * opacity).astype(np.uint8)
+
+
+def _draw_panel_line_aa(
+    panel: np.ndarray,
+    start_rc: np.ndarray,
+    end_rc: np.ndarray,
+    color: tuple[int, int, int],
+) -> None:
+    start = np.asarray(start_rc, dtype=np.float32)
+    end = np.asarray(end_rc, dtype=np.float32)
+    x0, y0 = float(start[1]), float(start[0])
+    x1, y1 = float(end[1]), float(end[0])
+
+    def ipart(value: float) -> int:
+        return int(math.floor(value))
+
+    def round_part(value: float) -> int:
+        return int(math.floor(value + 0.5))
+
+    def fpart(value: float) -> float:
+        return value - math.floor(value)
+
+    def rfpart(value: float) -> float:
+        return 1.0 - fpart(value)
+
+    steep = abs(y1 - y0) > abs(x1 - x0)
+    if steep:
+        x0, y0 = y0, x0
+        x1, y1 = y1, x1
+    if x0 > x1:
+        x0, x1 = x1, x0
+        y0, y1 = y1, y0
+    dx = x1 - x0
+    dy = y1 - y0
+    if abs(dx) <= 1.0e-6:
+        _blend_panel_pixel(panel, round_part(y0), round_part(x0), color, 1.0)
+        return
+    gradient = dy / dx
+
+    def plot(x: int, y: int, brightness: float) -> None:
+        if steep:
+            _blend_panel_pixel(panel, x, y, color, brightness)
+        else:
+            _blend_panel_pixel(panel, y, x, color, brightness)
+
+    xend = round_part(x0)
+    yend = y0 + gradient * (xend - x0)
+    xgap = rfpart(x0 + 0.5)
+    xpxl1 = xend
+    ypxl1 = ipart(yend)
+    plot(xpxl1, ypxl1, rfpart(yend) * xgap)
+    plot(xpxl1, ypxl1 + 1, fpart(yend) * xgap)
+    intery = yend + gradient
+
+    xend = round_part(x1)
+    yend = y1 + gradient * (xend - x1)
+    xgap = fpart(x1 + 0.5)
+    xpxl2 = xend
+    ypxl2 = ipart(yend)
+    plot(xpxl2, ypxl2, rfpart(yend) * xgap)
+    plot(xpxl2, ypxl2 + 1, fpart(yend) * xgap)
+
+    for x in range(xpxl1 + 1, xpxl2):
+        y = ipart(intery)
+        plot(x, y, rfpart(intery))
+        plot(x, y + 1, fpart(intery))
+        intery += gradient
+
+
 def _draw_panel_line(
     panel: np.ndarray,
     start_rc: np.ndarray,
@@ -1073,16 +1183,21 @@ def _draw_projected_cp_direction(
     col_axis: int,
 ) -> None:
     direction = np.asarray(direction_zyx, dtype=np.float32)
-    projected = np.asarray([direction[row_axis], direction[col_axis]], dtype=np.float32)
-    norm = float(np.linalg.norm(projected))
-    if not math.isfinite(norm) or norm <= 1.0e-6:
+    full_norm = float(np.linalg.norm(direction))
+    if not math.isfinite(full_norm) or full_norm <= 1.0e-6:
         return
-    projected = projected / norm
-    radius = max(8.0, min(float(panel.shape[0]), float(panel.shape[1])) * 0.08)
+    direction = direction / full_norm
+    projected = np.asarray([direction[row_axis], direction[col_axis]], dtype=np.float32)
+    projection_norm = float(np.linalg.norm(projected))
+    if not math.isfinite(projection_norm) or projection_norm <= 1.0e-6:
+        return
+    projected = projected / projection_norm
+    base_radius = max(8.0, min(float(panel.shape[0]), float(panel.shape[1])) * 0.08)
+    radius = base_radius * projection_norm
     center = np.asarray([float(cp_row), float(cp_col)], dtype=np.float32)
     start = center - projected * radius
     end = center + projected * radius
-    _draw_panel_line(panel, start, end, (255, 80, 0))
+    _draw_panel_line_aa(panel, start, end, (255, 80, 0))
 
 
 def _make_train_sample_3d_sheet(
@@ -1181,6 +1296,27 @@ def _make_train_sample_3d_sheet(
     for row in padded_rows[1:]:
         sheet = np.concatenate([sheet, sep_row, row], axis=0)
     return sheet
+
+
+def _write_3d_sample_sheet(
+    writer: Any,
+    tag: str,
+    model: torch.nn.Module,
+    batch: FiberTrace3DBatch,
+    step: int,
+) -> None:
+    was_training = bool(model.training)
+    model.eval()
+    with torch.no_grad():
+        vis_output = model(batch.volume[:1])
+    if was_training:
+        model.train()
+    writer.add_image(
+        tag,
+        _make_train_sample_3d_sheet(batch, vis_output),
+        int(step),
+        dataformats="HWC",
+    )
 
 
 def _draw_trace2cp_3d_panel(

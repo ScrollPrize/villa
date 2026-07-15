@@ -2,6 +2,12 @@
 
 ## 2026-07-15
 
+- Corrected 3D train/test sample direction overlays to scale line length by the
+  true in-slice projection magnitude, added dense 3D test sample TensorBoard
+  images at configured test runs, and flush test scalars/images immediately.
+- Added the held-out 2D fiber JSON `test_datasets` block to the 64-scale S1A
+  NML 3D config and changed the 3D training sample predicted CP direction
+  overlay to a thin anti-aliased line.
 - Changed the 3D Python config default for `volume_cache_memory_mib` from
   falling through to VC3D's internal 8 GiB default to an explicit 512 MiB
   per-loader/per-worker cap, while preserving explicit positive overrides.

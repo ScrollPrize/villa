@@ -108,7 +108,12 @@ side/top strip input loading.
   presence, and predicted presence. The GT line overlay draws target-line
   portions within 2 voxels of the displayed slice plane. The target-presence
   panel is max-pooled in 3D for visualization only so one-voxel line targets are
-  easier to see; the loss target is unchanged.
+  easier to see; the loss target is unchanged. The predicted CP direction is
+  drawn as a thin anti-aliased line whose length is scaled by the in-slice
+  projection magnitude, so directions pointing out of the slice appear shorter.
+- Configured dense 3D tests write `test_sample_3d/principal_slices` using the
+  same sheet layout when they run at step 0 and test intervals. Test scalars and
+  images are flushed immediately after configured test logging.
 - `batch_size` is the actual CP-patch batch passed through the 3D U-Net. The
   trainer does not internally micro-batch.
 - Normal training and `--benchmark --load-only` use

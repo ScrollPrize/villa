@@ -45,9 +45,12 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _FiberTrace3DBatchDataset,
     _Trace2Cp3DConfig,
     _evaluate_trace2cp_metric_fixed_set_3d,
+    _draw_panel_line_aa,
+    _draw_projected_cp_direction,
     _identity_batch_collate,
     _make_batch_dataloader,
     _make_train_sample_3d_sheet,
+    _write_3d_sample_sheet,
 )
 
 
@@ -541,6 +544,81 @@ def test_train_sample_3d_sheet_has_three_columns_and_line_overlay() -> None:
         | (first_image_panel[..., 1] != first_image_panel[..., 2])
     )
     assert bool(np.any(colored))
+
+
+def test_panel_line_aa_draws_fractional_thin_line() -> None:
+    panel = np.zeros((16, 16, 3), dtype=np.uint8)
+
+    _draw_panel_line_aa(
+        panel,
+        np.asarray([2.25, 1.5], dtype=np.float32),
+        np.asarray([13.25, 10.5], dtype=np.float32),
+        (255, 80, 0),
+    )
+
+    red = panel[..., 0]
+    assert int(np.count_nonzero(red)) > 0
+    assert bool(np.any((red > 0) & (red < 255)))
+    assert int(np.count_nonzero(red)) < 16 * 4
+
+
+def test_projected_cp_direction_shortens_out_of_slice_direction() -> None:
+    full_panel = np.zeros((40, 40, 3), dtype=np.uint8)
+    shortened_panel = np.zeros((40, 40, 3), dtype=np.uint8)
+
+    _draw_projected_cp_direction(
+        full_panel,
+        cp_row=20,
+        cp_col=20,
+        direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        row_axis=1,
+        col_axis=2,
+    )
+    _draw_projected_cp_direction(
+        shortened_panel,
+        cp_row=20,
+        cp_col=20,
+        direction_zyx=np.asarray([np.sqrt(3.0), 0.0, 1.0], dtype=np.float32),
+        row_axis=1,
+        col_axis=2,
+    )
+
+    full_cols = np.nonzero(full_panel[..., 0] > 0)[1]
+    shortened_cols = np.nonzero(shortened_panel[..., 0] > 0)[1]
+    full_extent = int(full_cols.max() - full_cols.min() + 1)
+    shortened_extent = int(shortened_cols.max() - shortened_cols.min() + 1)
+    assert shortened_extent < full_extent
+    assert shortened_extent <= int(round(full_extent * 0.75))
+
+
+def test_write_3d_sample_sheet_adds_image() -> None:
+    class _ZeroModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(
+                (int(volume.shape[0]), 7, *tuple(int(v) for v in volume.shape[-3:])),
+                dtype=volume.dtype,
+                device=volume.device,
+            )
+
+    class _Writer:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, np.ndarray, int, str]] = []
+
+        def add_image(self, tag: str, image: np.ndarray, step: int, *, dataformats: str) -> None:
+            self.calls.append((tag, image, step, dataformats))
+
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    writer = _Writer()
+
+    _write_3d_sample_sheet(writer, "test_sample_3d/principal_slices", _ZeroModel(), batch, 7)
+
+    assert len(writer.calls) == 1
+    tag, image, step, dataformats = writer.calls[0]
+    assert tag == "test_sample_3d/principal_slices"
+    assert step == 7
+    assert dataformats == "HWC"
+    assert image.ndim == 3
 
 
 def test_3d_prefetch_streams_producers_but_downloads_in_sample_order(

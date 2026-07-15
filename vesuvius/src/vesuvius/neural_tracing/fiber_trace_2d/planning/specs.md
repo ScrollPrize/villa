@@ -100,7 +100,9 @@
   target presence, and predicted presence. The GT line overlay includes
   target-line portions within 2 voxels of the displayed slice plane. The sparse
   direction angular-error panel is intentionally not shown because it is too
-  sparse to be useful for routine inspection.
+  sparse to be useful for routine inspection. The predicted/fitted CP direction
+  overlay is drawn as a thin anti-aliased line whose length is scaled by the
+  in-slice projection magnitude, so out-of-slice directions are visibly shorter.
 - The 3D target-presence panel in TensorBoard is display-only max-pooled with a
   `3x3x3` kernel before slicing. This must not modify `presence_target` used by
   training or test loss.
@@ -212,6 +214,13 @@
   false, test evaluation runs ordinary 3D sparse direction/presence loss on the
   held-out CP-centered 3D samples. It must not require Trace2CP geometry or
   trace loss.
+- Configured dense 3D tests log `test_sample_3d/principal_slices` with the same
+  principal-slice sheet layout as training at step 0 and interval test runs.
+  The TensorBoard writer is flushed after configured test logging so initial
+  test scalars and images are visible promptly.
+- The `train_s1a_nml_all_64_sd2.json` 3D config includes the same held-out 2D
+  fiber JSON `test_datasets` block as the full S1A NML 3D config, so step-0 and
+  interval dense 3D test loss run for the fast 64-scale training setup.
 - When `training.test_trace2cp_enabled` is true, 3D training logs
   `test/trace2cp_error`, raw y-error, valid segment count, and skipped segment
   count. `best.pt` and `current.pt` store `metric_name`; best-checkpoint
