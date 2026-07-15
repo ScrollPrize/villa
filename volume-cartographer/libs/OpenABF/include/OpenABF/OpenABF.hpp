@@ -3126,7 +3126,10 @@ static auto icase_compare(const std::string_view a, const std::string_view b)
 static auto trim_left(std::string_view s) -> std::string_view
 {
     const auto& loc = std::locale();
-    const auto* start = std::find_if_not(
+    // NOTE: string_view::iterator is a raw pointer on libstdc++/libc++ but a
+    // class type on MSVC's STL, so deduce the iterator type (const auto), not a
+    // pointer (const auto*), to stay portable.
+    const auto start = std::find_if_not(
         std::begin(s), std::end(s),
         [&loc](auto ch) -> bool { return std::isspace(ch, loc); });
     s.remove_prefix(std::distance(std::begin(s), start));
@@ -3137,7 +3140,7 @@ static auto trim_left(std::string_view s) -> std::string_view
 static auto trim_right(std::string_view s) -> std::string_view
 {
     const auto& loc = std::locale();
-    const auto* start =
+    const auto start =
         std::find_if_not(s.rbegin(), s.rend(), [&loc](auto ch) -> bool {
             return std::isspace(ch, loc);
         }).base();

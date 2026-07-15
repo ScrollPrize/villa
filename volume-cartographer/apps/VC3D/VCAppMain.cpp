@@ -88,7 +88,9 @@ static bool hasCliFlag(int argc, char* argv[], const char* flag)
     return false;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
 __attribute__((visibility("default")))
+#endif
 auto main(int argc, char* argv[]) -> int
 {
 #ifdef _WIN32

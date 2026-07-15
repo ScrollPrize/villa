@@ -6,6 +6,13 @@
 #include <string>
 #include <vector>
 
+// __has_builtin isn't provided by every preprocessor (e.g. pre-16.1 MSVC); fall
+// back so the nt_store_u32 __builtin_nontemporal_store check below degrades to
+// the plain store rather than failing to preprocess.
+#ifndef __has_builtin
+#define __has_builtin(x) 0
+#endif
+
 namespace vc {
 
 enum class OverlayColormapKind { OpenCv, Tint, DiscreteLut };
