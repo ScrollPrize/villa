@@ -17,7 +17,9 @@ from typing import Any, Iterable, Mapping
 import zipfile
 
 
-API_VERSION = 1
+# Version 2 adds bearer authentication, launch-time dataset ownership, the
+# artifact transfer protocol, and session input uploads.
+API_VERSION = 2
 
 
 class PclRole(str, Enum):

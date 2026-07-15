@@ -1200,6 +1200,15 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit copySegmentPathRequested(segmentId);
     });
 
+    QAction* addToSpiralAction = contextMenu.addAction(tr("Add to current spiral fit"));
+    addToSpiralAction->setEnabled(_spiralFitAvailable);
+    addToSpiralAction->setToolTip(_spiralFitAvailable
+        ? tr("Upload this patch to the active Spiral session; it is used on the next run")
+        : tr("No Spiral session is active on the connected service"));
+    connect(addToSpiralAction, &QAction::triggered, this, [this, segmentId]() {
+        emit addSurfaceToSpiralFitRequested(segmentId);
+    });
+
     QMenu* maskMenu = contextMenu.addMenu(tr("Mask"));
     maskMenu->setEnabled(isCurrentFolderSegment);
     QAction* generateMaskAction = maskMenu->addAction(tr("Generate Segment Mask"));

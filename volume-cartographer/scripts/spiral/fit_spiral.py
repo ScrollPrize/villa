@@ -62,6 +62,7 @@ from losses import (
 from spiral_helpers import (
     erode_patch_valid_region,
     load_patches,
+    load_fiber_point_collection,
     load_fiber_point_collections,
     scale_counts_for_z_range,
     _infer_shell_outer_winding_idx,
@@ -403,6 +404,44 @@ class PatchGpuAtlas:
             patch_idx_per_sample,
             ijs,
         )
+
+    def append_patches(self, patches_by_id):
+        """Append new patches without rebuilding the resident atlas.
+
+        Only the new grids are uploaded; the existing flat tensor is
+        concatenated onto, so a resident interactive session can incorporate a
+        handful of added patches in seconds.
+        """
+        if not patches_by_id:
+            return
+        device = self.zyxs_flat.device
+        flat_pieces = []
+        offsets = [int(self.offsets[-1].item())]
+        widths = []
+        heights = []
+        for pid, p in patches_by_id.items():
+            if pid in self.id_to_idx:
+                raise ValueError(f'Patch {pid!r} is already in the atlas')
+            z = p.zyxs
+            H, W = z.shape[:2]
+            flat_pieces.append(z.reshape(-1, 3).to(dtype=torch.float32))
+            offsets.append(offsets[-1] + H * W)
+            widths.append(W)
+            heights.append(H)
+        new_flat = torch.cat(flat_pieces, dim=0).to(device=device)
+        self.zyxs_flat = torch.cat([self.zyxs_flat, new_flat], dim=0)
+        self.offsets = torch.cat([
+            self.offsets,
+            torch.tensor(offsets[1:], device=device, dtype=torch.int64),
+        ])
+        self.widths = torch.cat([
+            self.widths, torch.tensor(widths, device=device, dtype=torch.int64)])
+        self.heights = torch.cat([
+            self.heights, torch.tensor(heights, device=device, dtype=torch.int64)])
+        next_idx = len(self.id_to_idx)
+        for pid in patches_by_id:
+            self.id_to_idx[pid] = next_idx
+            next_idx += 1
 
 
 class _UnattachedPclStripList(list):
@@ -1454,6 +1493,190 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             torch.random.set_rng_state(torch_state)
             torch.cuda.set_rng_state_all(cuda_states)
 
+    def incorporate_interactive_inputs(records):
+        """Append uploaded ephemeral inputs to the resident fit structures.
+
+        Runs on the fitter thread at a pause boundary. Incorporation is
+        append-only: only the new items are loaded and validated, and they are
+        concatenated onto the structures the fitter already holds (the patch
+        GPU atlas, the sampling caches, the PCL strip list). Existing tensors
+        and prepared samplers are reused untouched. The record order is the
+        service's deterministic order, so a multi-rank session would append the
+        same items in the same order on every rank.
+        """
+        nonlocal patch_sampling_probabilities, next_id
+        # Incorporation has its own saved RNG envelope so adding inputs does
+        # not alter the stochastic training sequence (same discipline as the
+        # interactive preview export).
+        numpy_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all()
+        try:
+            new_patches = {}
+            new_collections = {}
+            for record in records:
+                kind = record.get('kind')
+                path = record.get('path')
+                input_id = record.get('id')
+                if kind == 'patch':
+                    if cfg['disable_patches']:
+                        raise RuntimeError('disable_patches=True: this session takes no patches')
+                    if input_id in verified_patches or input_id in new_patches:
+                        raise RuntimeError(f'Patch {input_id!r} is already part of this session')
+                    patch = load_tifxyz(path)
+                    cells_to_erode = int(cfg['erode_patches'])
+                    if cells_to_erode > 0 and not erode_patch_valid_region(patch, cells_to_erode):
+                        raise RuntimeError(f'Patch {input_id!r} has no valid quads after erosion')
+                    if not patch_intersects_z_roi(patch, z_begin, z_end):
+                        raise RuntimeError(
+                            f'Patch {input_id!r} does not intersect the fitted z range '
+                            f'[{z_begin}, {z_end})')
+                    patch.release_derived_caches()
+                    new_patches[input_id] = patch
+                elif kind == 'fiber':
+                    pcl = load_fiber_point_collection(
+                        path, next_id, min_point_spacing=cfg['fiber_min_point_spacing'])
+                    if pcl is None:
+                        raise RuntimeError(f'Fiber {input_id!r} has no usable control points')
+                    pcl['source_file'] = path
+                    pcl.setdefault('metadata', {})['winding_is_absolute'] = False
+                    pcl['metadata']['input_role'] = 'fiber'
+                    new_collections[next_id] = pcl
+                    next_id += 1
+                elif kind == 'pcl':
+                    role = record.get('role')
+                    loaded = load_point_collection(path) or {}
+                    if not loaded:
+                        raise RuntimeError(f'PCL document {input_id!r} contains no collections')
+                    for pcl in loaded.values():
+                        pcl['source_file'] = path
+                        pcl.setdefault('metadata', {})['winding_is_absolute'] = role == 'absolute'
+                        pcl['metadata']['input_role'] = role
+                        new_collections[next_id] = pcl
+                        next_id += 1
+                else:
+                    raise RuntimeError(f'Unknown ephemeral input kind {kind!r}')
+
+            # ---- Patches: sampling caches, probabilities, atlas append ----
+            if new_patches:
+                for patch in new_patches.values():
+                    prepare_patch_sampling_cache([patch])
+                verified_patches.update(new_patches)
+                verified_patches_list.extend(new_patches.values())
+                areas = np.array([float(p.area) for p in verified_patches_list],
+                                 dtype=np.float32)
+                inv_weights = areas ** 0.5
+                patch_sampling_probabilities = inv_weights / inv_weights.sum()
+                patch_atlas.append_patches(new_patches)
+
+            # ---- Point collections: link, classify, strip-materialise ----
+            if new_collections:
+                for pcl in new_collections.values():
+                    for point in pcl['points'].values():
+                        point['zyx'] = np.array(
+                            [point['p'][2], point['p'][1], point['p'][0]],
+                            dtype=np.float32)
+                link_points_to_patches(
+                    verified_patches,
+                    new_collections,
+                    tolerance=link_distance_tolerance,
+                    surface_index_tolerance=link_distance_tolerance,
+                    distance_scale=1.0,
+                    general_hit_policy='largest_area',
+                )
+                new_cross_patch = {}
+                new_unattached = {}
+                for pid, pcl in new_collections.items():
+                    num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
+                    num_unattached = len(pcl['points']) - num_attached
+                    if pcl.get('metadata', {}).get('winding_is_absolute', False):
+                        attached_points = [point for point in pcl['points'].values()
+                                           if 'on_patch' in point]
+                        if any(not np.isfinite(point['winding_annotation'])
+                               or point['winding_annotation'] <= 0
+                               for point in attached_points):
+                            raise RuntimeError(
+                                f'Absolute-winding pcl {pcl.get("name")!r} must annotate every '
+                                f'attached point with a positive winding number')
+                        new_cross_patch[pid] = pcl
+                        continue
+                    if num_attached >= 2:
+                        new_cross_patch[pid] = pcl
+                    if num_unattached >= 1:
+                        new_unattached[pid] = copy.deepcopy(pcl) if num_attached >= 2 else pcl
+
+                z_margin = cfg['patch_loss_z_margin']
+                for pid in list(new_unattached.keys()):
+                    pcl = new_unattached[pid]
+                    sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
+                    best_start, best_end = 0, 0
+                    run_start = 0
+                    for i, (_, point) in enumerate(sorted_items):
+                        z = point['zyx'][0]
+                        if z_begin - z_margin <= z < z_end + z_margin:
+                            if i + 1 - run_start > best_end - best_start:
+                                best_start, best_end = run_start, i + 1
+                        else:
+                            run_start = i + 1
+                    kept_items = sorted_items[best_start:best_end]
+                    if len(kept_items) < 2:
+                        del new_unattached[pid]
+                    else:
+                        pcl['points'] = dict(kept_items)
+
+                normalise_pcl_winding_annotations(new_cross_patch)
+                normalise_pcl_winding_annotations(new_unattached)
+
+                for pcl in new_cross_patch.values():
+                    points_by_patch = {}
+                    for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
+                        if 'on_patch' not in point:
+                            continue
+                        pid = point['on_patch']['id']
+                        if pid not in verified_patches:
+                            continue
+                        points_by_patch.setdefault(pid, []).append(point)
+                    pcl['points_by_patch'] = points_by_patch
+                    cross_patch_pcls.append(pcl)
+
+                min_point_spacing = cfg['unattached_pcl_min_point_spacing']
+                for pcl_id, pcl in new_unattached.items():
+                    sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
+                    if len(sorted_items) < 2:
+                        continue
+                    zyxs = np.stack([point['zyx'] for _, point in sorted_items],
+                                    axis=0).astype(np.float32)
+                    windings = np.array(
+                        [point['winding_annotation'] for _, point in sorted_items],
+                        dtype=np.float32)
+                    if min_point_spacing > 0 and len(zyxs) > 2:
+                        keep = [0]
+                        last_kept = zyxs[0]
+                        for i in range(1, len(zyxs) - 1):
+                            if np.linalg.norm(zyxs[i] - last_kept) >= min_point_spacing:
+                                keep.append(i)
+                                last_kept = zyxs[i]
+                        keep.append(len(zyxs) - 1)
+                        zyxs = zyxs[keep]
+                        windings = windings[keep]
+                    unattached_pcl_strips.append({
+                        'id': pcl_id,
+                        'name': pcl.get('name'),
+                        'source_file': pcl.get('source_file'),
+                        'zyxs': zyxs,
+                        'windings': windings,
+                    })
+                # The flat GPU bundle is derived from the strip list; drop it so
+                # the next consumer rebuilds it including the appended strips.
+                unattached_pcl_strips.flat = None
+
+            print(f'incorporated {len(new_patches)} patches and '
+                  f'{len(new_collections)} point collections into the resident session')
+        finally:
+            np.random.set_state(numpy_state)
+            torch.random.set_rng_state(torch_state)
+            torch.cuda.set_rng_state_all(cuda_states)
+
     if interactive_driver is not None:
         from geometry_snapshot import write_geometry_snapshot
         fiber_root = os.path.abspath(fibers_path) if fibers_path else None
@@ -1478,6 +1701,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             save_checkpoint=save_model_to,
             export_preview=export_interactive_preview,
             geometry_snapshot_manifest=os.path.join(geometry_path, 'manifest.json'),
+            incorporate_inputs=incorporate_interactive_inputs,
         )
 
     # Interactive fits are resident sessions: num_training_steps still defines

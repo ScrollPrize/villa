@@ -135,6 +135,14 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         _pythonOutputDialog->show();
         _pythonOutputDialog->raise();
     });
+    connect(_service, &SpiralServiceManager::inputUploadFinished, this,
+            [this](const QString& inputId, const QString& error) {
+                statusBar()->showMessage(
+                    error.isEmpty()
+                        ? tr("Added %1 to the current spiral fit; it is used on the next run").arg(inputId)
+                        : tr("Adding %1 to the spiral fit failed: %2").arg(inputId, error),
+                    15000);
+            });
 
     _panel = new SpiralPanel(_service, this);
     auto* dock = new QDockWidget(tr("Spiral"), this);
@@ -162,25 +170,34 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         }
     });
     connect(_service, &SpiralServiceManager::previewAvailable, this, &SpiralWorkspace::loadPreview);
-    connect(_service, &SpiralServiceManager::serviceStateChanged, this, [this](const QString& state) {
-        if (state == tr("Starting")) {
-            _requestedPreviewGeneration = -1;
-            _inputSurfaceGeneration = 0;
-            _geometryManifestPath.clear();
-            _overlay->reset();
-        }
-    });
+    connect(_service, &SpiralServiceManager::connectionStateChanged, this,
+            [this](SpiralServiceManager::ConnectionState state, const QString&) {
+                using CS = SpiralServiceManager::ConnectionState;
+                if (state == CS::Starting || state == CS::Connecting) {
+                    _requestedPreviewGeneration = -1;
+                    _inputSurfaceGeneration = 0;
+                    _geometryManifestPath.clear();
+                    _overlay->reset();
+                }
+                if (state == CS::Ready && !_service->ownsProcess())
+                    _pythonOutput->appendOutput(
+                        tr("Connected to a service VC3D does not own; the service's "
+                           "Python logs are available on the service host."));
+            });
+    connect(_service, &SpiralServiceManager::sessionActiveChanged, this,
+            &SpiralWorkspace::spiralSessionActiveChanged);
     connect(_service, &SpiralServiceManager::sessionAccepted, this,
             [this](const QJsonObject& paths, qint64 generation) {
                 loadInputSurfaces(paths, static_cast<quint64>(generation));
             });
-    connect(_service, &SpiralServiceManager::sessionStatusChanged, this, [this](const QJsonObject& status) {
-        const QString path = status.value(QStringLiteral("geometry_snapshot_manifest_path")).toString();
-        if (!path.isEmpty() && path != _geometryManifestPath) {
-            _geometryManifestPath = path;
-            loadGeometrySnapshot(path, static_cast<quint64>(status.value(QStringLiteral("session_generation")).toInteger()));
-        }
-    });
+    // Geometry snapshots arrive as artifacts already transferred to the local
+    // cache; the manager hands over a local manifest path.
+    connect(_service, &SpiralServiceManager::geometryAvailable, this,
+            [this](const QString& manifestPath, quint64 generation) {
+                if (manifestPath.isEmpty() || manifestPath == _geometryManifestPath) return;
+                _geometryManifestPath = manifestPath;
+                loadGeometrySnapshot(manifestPath, generation);
+            });
     if (_mainState) {
         connect(_mainState, &CState::vpkgChanged, this, [this](const std::shared_ptr<VolumePkg>&) { refreshVolumes(); });
         connect(_mainState, &CState::volumeChanged, this, [this](const std::shared_ptr<Volume>& volume, const std::string&) {
@@ -191,10 +208,44 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     refreshVolumes();
 }
 
-void SpiralWorkspace::loadInputSurfaces(const QJsonObject& paths, quint64 generation)
+QString SpiralWorkspace::mapServicePath(const QString& servicePath) const
+{
+    const SpiralServiceProfile& profile = _service->profile();
+    if (profile.isLocalhost()) return servicePath;
+    if (profile.serviceRootPrefix.isEmpty() || profile.localRootPrefix.isEmpty()
+        || !servicePath.startsWith(profile.serviceRootPrefix))
+        return {};
+    // Translate separators as well as prefixes: a Windows viewer may map a
+    // POSIX service root.
+    QString rest = servicePath.mid(profile.serviceRootPrefix.size());
+    rest.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    QString local = profile.localRootPrefix;
+    while (local.endsWith(QLatin1Char('/')) || local.endsWith(QLatin1Char('\\'))) local.chop(1);
+    if (!rest.startsWith(QLatin1Char('/'))) rest.prepend(QLatin1Char('/'));
+    return QDir::toNativeSeparators(local + rest);
+}
+
+void SpiralWorkspace::loadInputSurfaces(const QJsonObject& servicePaths, quint64 generation)
 {
     if (_shuttingDown || generation < _inputSurfaceGeneration) return;
     _inputSurfaceGeneration = generation;
+    // Input surfaces are loaded from viewer-local paths. On a remote profile
+    // they are translated through the optional path mapping; categories with
+    // no local mapping are marked unavailable without blocking the generated
+    // preview or geometry display.
+    QJsonObject paths;
+    QStringList unavailable;
+    for (const char* key : {"verified_patches", "unverified_patches", "outer_shell"}) {
+        const QString servicePath = servicePaths.value(QString::fromLatin1(key)).toString();
+        if (servicePath.isEmpty()) continue;
+        const QString local = mapServicePath(servicePath);
+        if (local.isEmpty()) unavailable.push_back(QString::fromLatin1(key));
+        else paths[QString::fromLatin1(key)] = local;
+    }
+    if (!unavailable.isEmpty())
+        statusBar()->showMessage(
+            tr("Input surface overlays unavailable without a local path mapping: %1")
+                .arg(unavailable.join(QStringLiteral(", "))), 15000);
     auto* watcher = new QFutureWatcher<InputSurfaceLoadResult>(this);
     connect(watcher, &QFutureWatcher<InputSurfaceLoadResult>::finished, this,
             [this, watcher, generation]() {
@@ -306,11 +357,34 @@ void SpiralWorkspace::updateSurfaceIntersections()
     }
 }
 
+bool SpiralWorkspace::hasActiveSpiralSession() const
+{
+    return _service && _service->hasActiveSession();
+}
+
+void SpiralWorkspace::addPatchToCurrentFit(const QString& tifxyzDirectory)
+{
+    if (!_service) return;
+    const QString inputId = QFileInfo(tifxyzDirectory).fileName();
+    statusBar()->showMessage(tr("Uploading patch %1 to the Spiral session…").arg(inputId));
+    _service->uploadPatch(tifxyzDirectory, inputId);
+}
+
+void SpiralWorkspace::addFiberToCurrentFit(const QString& fiberJsonPath)
+{
+    if (!_service) return;
+    const QString inputId = QFileInfo(fiberJsonPath).completeBaseName();
+    statusBar()->showMessage(tr("Uploading fiber %1 to the Spiral session…").arg(inputId));
+    _service->uploadJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
+}
+
 SpiralWorkspace::~SpiralWorkspace()
 {
     _shuttingDown = true;
     if (_viewerManager) _viewerManager->beginShutdown();
-    if (_service) _service->stopService();
+    // Disconnecting never terminates a service VC3D did not launch; only an
+    // owned local process is stopped.
+    if (_service) _service->disconnectFromService();
     if (_state) {
         _state->setVpkg(nullptr); // the package is borrowed from Main; drop it so closeAll() cannot unload Main's surfaces
         _state->closeAll();
@@ -423,9 +497,15 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
         if (manifest.value(QStringLiteral("schema_version")).toInt() != 1
             || manifest.value(QStringLiteral("kind")).toString() != QStringLiteral("spiral_combined_preview"))
             return {{}, {}, QObject::tr("Unsupported Spiral preview manifest")};
-        const QString surfacePath = manifest.value(QStringLiteral("surface_path")).toString();
+        QString surfacePath = manifest.value(QStringLiteral("surface_path")).toString();
         const QString surfaceId = manifest.value(QStringLiteral("surface_id")).toString();
         if (surfacePath.isEmpty() || surfaceId.isEmpty()) return {{}, {}, QObject::tr("Malformed Spiral preview manifest")};
+        // The manifest's surface_path is a service-host path; a cache-resident
+        // artifact keeps the surface directory (named by its id) beside the
+        // manifest, so prefer that local layout when it exists.
+        const QString localSurfacePath = QDir(QFileInfo(manifestPath).absolutePath()).filePath(surfaceId);
+        if (QFileInfo(QDir(localSurfacePath).filePath(QStringLiteral("meta.json"))).isFile())
+            surfacePath = localSurfacePath;
         const QJsonArray components = manifest.value(QStringLiteral("components")).toArray();
         const QJsonArray windingIds = manifest.value(QStringLiteral("winding_ids")).toArray();
         if (components.isEmpty() || components.size() != windingIds.size()

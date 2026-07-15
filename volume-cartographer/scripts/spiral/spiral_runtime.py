@@ -48,6 +48,7 @@ class InteractiveFitSession:
         self._geometry_snapshot_manifest = None
         self._save_checkpoint = None
         self._export_preview = None
+        self._incorporate_inputs = None
         self._idle_actions = []
         self._thread = threading.Thread(target=self._fit_main, name="spiral-fit-worker", daemon=True)
         self._thread.start()
@@ -69,6 +70,7 @@ class InteractiveFitSession:
                 "preview_manifest_path": self._preview_manifest,
                 "preview_generation": self._preview_generation,
                 "geometry_snapshot_manifest_path": self._geometry_snapshot_manifest,
+                "supports_input_incorporation": self._incorporate_inputs is not None,
             }
 
     def _publish_status(self):
@@ -176,12 +178,14 @@ class InteractiveFitSession:
 
     # Fitter-thread callbacks.
     def on_ready(self, *, completed_iterations, output_path,
-                 save_checkpoint, export_preview, geometry_snapshot_manifest=None):
+                 save_checkpoint, export_preview, geometry_snapshot_manifest=None,
+                 incorporate_inputs=None):
         with self._condition:
             self._completed = self._target = completed_iterations
             self._output_path = output_path
             self._save_checkpoint = save_checkpoint
             self._export_preview = export_preview
+            self._incorporate_inputs = incorporate_inputs
             self._geometry_snapshot_manifest = geometry_snapshot_manifest
         if self.paths.checkpoint:
             self._set_state("ExportingPreview", "Exporting restored checkpoint preview")
@@ -193,12 +197,18 @@ class InteractiveFitSession:
             with self._condition:
                 if self._shutdown:
                     raise _SessionShutdown()
-                if self._pending > 0:
-                    return True
+                # Idle actions are drained before the pending check so inputs
+                # queued by run() are incorporated before the next step begins.
                 action = self._idle_actions.pop(0) if self._idle_actions else None
                 if action is None:
+                    if self._pending > 0:
+                        return True
                     self._condition.wait()
                     continue
+            if action[0] == "incorporate":
+                _, records, mark_incorporated = action
+                self._run_incorporation(records, mark_incorporated)
+                continue
             kind, path, done, result = action
             try:
                 if kind == "save":
@@ -209,6 +219,39 @@ class InteractiveFitSession:
                 result["error"] = f"{type(exc).__name__}: {exc}"
             finally:
                 done.set()
+
+    def _run_incorporation(self, records, mark_incorporated):
+        """Append newly uploaded ephemeral inputs to the resident fit.
+
+        Runs on the fitter thread at the pause boundary. A failure cancels the
+        queued run and surfaces a warning instead of tearing down the session.
+        """
+        try:
+            if self._incorporate_inputs is None:
+                raise RuntimeError(
+                    "The resident fitter does not support adding inputs to a running session")
+            with self._condition:
+                self._phase = "Incorporating new session inputs"
+            self._publish_status()
+            self._incorporate_inputs(records)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            with self._condition:
+                self._pending = 0
+                self._target = self._completed
+                self._warnings.append(f"Input incorporation failed: {error}")
+                self._state, self._phase = "Paused", "Paused"
+                self._condition.notify_all()
+            if mark_incorporated is not None:
+                mark_incorporated(records, error=error)
+            self._publish_status()
+        else:
+            if mark_incorporated is not None:
+                mark_incorporated(records)
+            with self._condition:
+                if self._state == "Running":
+                    self._phase = "Optimizing"
+            self._publish_status()
 
     def iteration_completed(self, *, completed_iterations, total_loss, losses, learning_rate, metrics=None):
         with self._condition:
@@ -244,12 +287,18 @@ class InteractiveFitSession:
         raise RuntimeError("Interactive optimizer loop ended unexpectedly")
 
     # Coordinator-thread commands.
-    def run(self, count):
+    def run(self, count, pending_inputs=None, mark_incorporated=None):
         if count < 1:
             raise ValueError("iterations must be at least 1")
         with self._condition:
             if self._state not in {"Ready", "Paused"}:
                 raise RuntimeError(f"Run is not allowed while session state is {self._state}")
+            if pending_inputs:
+                if self._incorporate_inputs is None:
+                    raise RuntimeError(
+                        "The resident fitter does not support adding inputs to a running session")
+                self._idle_actions.append(
+                    ("incorporate", list(pending_inputs), mark_incorporated))
             self._pending = count
             self._target = self._completed + count
             self._state, self._phase = "Running", "Optimizing"

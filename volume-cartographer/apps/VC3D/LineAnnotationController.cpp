@@ -6080,6 +6080,12 @@ fs::path LineAnnotationController::relativeFiberPath(const StoredFiber& fiber) c
     return fs::path("fibers") / (std::to_string(fiber.id) + ".json");
 }
 
+fs::path LineAnnotationController::fiberFilePath(uint64_t fiberId) const
+{
+    const fs::path path = fiberPath(fiberId);
+    return fs::exists(path) ? path : fs::path{};
+}
+
 fs::path LineAnnotationController::fiberPath(uint64_t fiberId) const
 {
     const auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {

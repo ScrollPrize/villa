@@ -182,8 +182,13 @@ set(srcs
     NeuralTraceServiceManager.hpp
     LasagnaServiceManager.cpp
     LasagnaServiceManager.hpp
+    SpiralArtifactCache.cpp
+    SpiralArtifactCache.hpp
     SpiralServiceManager.cpp
     SpiralServiceManager.hpp
+    SpiralServiceProfile.hpp
+    SpiralSshTunnel.cpp
+    SpiralSshTunnel.hpp
     SpiralPanel.cpp
     SpiralPanel.hpp
     SpiralWorkspace.cpp

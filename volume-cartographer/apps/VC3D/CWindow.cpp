@@ -2528,6 +2528,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         _workspaceTabs->insertTab(spiralIndex, _spiralWorkspace, tr("Spiral"));
         if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(spiralIndex, QTabBar::RightSide, nullptr);
         shell->deleteLater();
+        // The "Add to current spiral fit" context actions are greyed out
+        // unless a Spiral session is active on the connected service.
+        connect(_spiralWorkspace, &SpiralWorkspace::spiralSessionActiveChanged, this, [this](bool active) {
+            if (_surfacePanel) _surfacePanel->setSpiralFitAvailable(active);
+            if (_fiberWidget) _fiberWidget->setSpiralFitAvailable(active);
+        });
     }
     _lineAnnotationController = std::make_unique<LineAnnotationController>(_state,
                                                                            _viewerManager.get(),
@@ -6651,6 +6657,21 @@ void CWindow::CreateWidgets(void)
                 QApplication::clipboard()->setText(path);
                 showStatusBarMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::addSurfaceToSpiralFitRequested,
+            this, [this](const QString& segmentId) {
+                if (!_spiralWorkspace) {
+                    return;
+                }
+                auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(segmentId.toStdString()));
+                if (!surf && _state->vpkg()) {
+                    surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                }
+                if (!surf || surf->path.empty()) {
+                    showStatusBarMessage(tr("Cannot resolve an on-disk TIFXYZ directory for %1").arg(segmentId), 5000);
+                    return;
+                }
+                _spiralWorkspace->addPatchToCurrentFit(QString::fromStdString(surf->path.string()));
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::renderSegmentRequested,
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onRenderSegment(segmentId.toStdString());
@@ -7354,6 +7375,22 @@ void CWindow::CreateWidgets(void)
                     &CFiberWidget::addFibersToPointCollectionsRequested,
                     _lineAnnotationController.get(),
                     &LineAnnotationController::addFibersToPointCollections);
+            connect(widget,
+                    &CFiberWidget::addFibersToSpiralFitRequested,
+                    this,
+                    [this](std::vector<uint64_t> fiberIds) {
+                        if (!_spiralWorkspace || !_lineAnnotationController) {
+                            return;
+                        }
+                        for (uint64_t fiberId : fiberIds) {
+                            const auto path = _lineAnnotationController->fiberFilePath(fiberId);
+                            if (path.empty()) {
+                                showStatusBarMessage(tr("Fiber %1 has no saved JSON file yet").arg(fiberId), 5000);
+                                continue;
+                            }
+                            _spiralWorkspace->addFiberToCurrentFit(QString::fromStdString(path.string()));
+                        }
+                    });
             connect(widget,
                     &CFiberWidget::fiberSliceRequested,
                     this,

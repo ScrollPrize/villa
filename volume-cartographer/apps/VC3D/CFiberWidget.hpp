@@ -91,6 +91,7 @@ signals:
     void fiberSpanOpenRequested(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
     void newAtlasFromFiberRequested(uint64_t fiberId);
     void addFibersToPointCollectionsRequested(std::vector<uint64_t> fiberIds);
+    void addFibersToSpiralFitRequested(std::vector<uint64_t> fiberIds);
     void fiberSliceRequested(uint64_t fiberId);
     void renameFiberFileRequested(uint64_t fiberId);
     void importFibersRequested();
@@ -108,7 +109,13 @@ private slots:
     void onHeaderSectionClicked(int section);
     void showContextMenu(const QPoint& pos);
 
+public:
+    // Enables the "Add to current spiral fit" context action while a Spiral
+    // session is active on the connected service.
+    void setSpiralFitAvailable(bool available) { _spiralFitAvailable = available; }
+
 private:
+    bool _spiralFitAvailable = false;
     void setupUi();
     void rebuildModel();
     void sortFibers();

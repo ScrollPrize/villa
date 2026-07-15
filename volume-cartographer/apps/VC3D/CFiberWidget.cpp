@@ -1144,6 +1144,20 @@ void CFiberWidget::showContextMenu(const QPoint& pos)
             emit addFibersToPointCollectionsRequested(ids);
         }
     });
+    auto* addToSpiralAction = menu.addAction(
+        selectedForCollection.size() > 1
+            ? tr("Add %1 lines to current spiral fit").arg(selectedForCollection.size())
+            : tr("Add to current spiral fit"));
+    addToSpiralAction->setEnabled(_spiralFitAvailable && !selectedForCollection.empty());
+    addToSpiralAction->setToolTip(_spiralFitAvailable
+        ? tr("Upload the fiber(s) to the active Spiral session; they are used on the next run")
+        : tr("No Spiral session is active on the connected service"));
+    connect(addToSpiralAction, &QAction::triggered, this, [this]() {
+        const auto ids = selectedFiberIds();
+        if (!ids.empty()) {
+            emit addFibersToSpiralFitRequested(ids);
+        }
+    });
     auto* renameAction = createRenameFiberFileAction(&menu);
     menu.addAction(renameAction);
     menu.addSeparator();

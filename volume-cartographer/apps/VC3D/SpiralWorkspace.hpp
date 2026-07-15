@@ -34,6 +34,14 @@ public:
 
     ViewerManager* viewerManager() const { return _viewerManager.get(); }
 
+    // Cross-panel entry points for "Add to current spiral fit".
+    bool hasActiveSpiralSession() const;
+    void addPatchToCurrentFit(const QString& tifxyzDirectory);
+    void addFiberToCurrentFit(const QString& fiberJsonPath);
+
+signals:
+    void spiralSessionActiveChanged(bool active);
+
 protected:
     void keyPressEvent(QKeyEvent* event) override;
 
@@ -59,6 +67,7 @@ private:
 
     void refreshVolumes();
     void selectVolume(const QString& id);
+    QString mapServicePath(const QString& servicePath) const;
     void loadPreview(const QString& manifestPath, qint64 generation);
     void installPreview(const PreviewLoadResult& result, qint64 generation);
     void installPreviewAliasWhenIndexed(const PreviewLoadResult& result, qint64 generation, int attempt);
