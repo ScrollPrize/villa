@@ -224,6 +224,10 @@ html.docs-doc-id-get_started main .container article {
 /* wide single-line strips (the porphyras crop) read better stacked */
 .vc-gs-demo__panes--stack {
   grid-template-columns: 1fr;
+  /* the phone opening scroll bottom-aligns this stack; the margin leaves a
+     small pad below the last caption. Inert elsewhere (only scrollIntoView
+     reads it, and that's phones-only). */
+  scroll-margin-bottom: 12px;
 }
 .vc-gs-demo__pane {
   margin: 0;
@@ -253,6 +257,89 @@ html.docs-doc-id-get_started main .container article {
    through: the cue is watched, the canvas is touched. */
 .vc-gs-canvaswrap {
   position: relative;
+}
+/* phones: brush / erase / clear as small orange icons pinned to the ink
+   panel's top-right (the labeled tool buttons are hidden on phones — see
+   the JSX — so these don't duplicate them). Desktop shows no icons. A
+   stroke started on the canvas keeps pointer capture, so dragging under
+   these never fires them. */
+.vc-gs-inktools {
+  position: absolute;
+  top: 7px;
+  right: 9px;
+  z-index: 4;
+  display: flex;
+  gap: 10px;
+}
+/* bare glyphs when idle — a little padding for the tap area, a drop shadow
+   to keep orange legible over bright papyrus. The transparent border is
+   reserved so the selected state (below) doesn't shift the row. */
+.vc-gs-inktool {
+  padding: 4px;
+  border: 1.2px solid transparent;
+  border-radius: 8px;
+  background: none;
+  line-height: 0;
+  color: var(--vc-accent, #e5502b);
+  cursor: pointer;
+  opacity: 0.85;
+  -webkit-tap-highlight-color: transparent;
+  /* so the selected box fades in/out — and, on a momentary tap, the active
+     tool's box can recede and return (see the tap flash below) */
+  transition:
+    border-color 0.16s ease,
+    background-color 0.16s ease,
+    opacity 0.16s ease,
+    transform 0.16s ease;
+}
+.vc-gs-inktool svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+  filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.8));
+}
+/* the selected tool gets its box back — accent border + a soft orange fill,
+   the same "on" language as the desktop tool buttons — so the active tool
+   is unmistakable; the others stay bare */
+.vc-gs-inktool--on {
+  opacity: 1;
+  border-color: var(--vc-accent);
+  background: color-mix(in srgb, var(--vc-accent) 22%, rgba(18, 19, 22, 0.8));
+}
+/* clear / hint are momentary — no lasting selection — so a tap flashes the
+   box in and back out on the pressed icon (JS adds --tap for one cycle;
+   meanwhile the active tool's box steps aside and returns) */
+@keyframes vc-gs-inktool-tap {
+  0% {
+    border-color: transparent;
+    background-color: transparent;
+    transform: scale(1);
+  }
+  40% {
+    border-color: var(--vc-accent);
+    background-color: color-mix(
+      in srgb,
+      var(--vc-accent) 22%,
+      rgba(18, 19, 22, 0.8)
+    );
+    transform: scale(1.14);
+  }
+  100% {
+    border-color: transparent;
+    background-color: transparent;
+    transform: scale(1);
+  }
+}
+.vc-gs-inktool--tap {
+  animation: vc-gs-inktool-tap 0.42s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .vc-gs-inktool {
+    transition: none;
+  }
+  .vc-gs-inktool--tap {
+    animation: none;
+  }
 }
 .vc-gs-pinchcue {
   position: absolute;
@@ -469,6 +556,15 @@ html.docs-doc-id-get_started main .container article {
   border-color: var(--vc-accent);
   color: var(--vc-accent);
   background: color-mix(in srgb, var(--vc-accent) 10%, transparent);
+}
+/* phones: the Overlay prediction toggle shares the meter's row (the meter
+   grows to fill what's left of it), so the controls take one fewer row and
+   the whole stack clears the fold */
+.vc-gs-meterrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 100%;
 }
 .vc-gs-meter {
   position: relative;
