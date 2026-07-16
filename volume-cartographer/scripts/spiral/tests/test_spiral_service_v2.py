@@ -46,8 +46,10 @@ class FakeSession:
             "supports_input_incorporation": True,
         }
 
-    def run(self, count, pending_inputs=None, mark_incorporated=None):
-        self.run_calls.append((count, list(pending_inputs or []), mark_incorporated))
+    def run(self, count, pending_inputs=None, mark_incorporated=None,
+            influence_config=None):
+        self.run_calls.append((count, list(pending_inputs or []), mark_incorporated,
+                               dict(influence_config or {})))
         return 5 + count
 
     def save_checkpoint(self, path):
@@ -492,9 +494,10 @@ class UploadTests(unittest.TestCase):
         upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)
         self.state.finalize_upload(upload_id)
         self.state.run({"iterations": 10})
-        count, pending, mark = session.run_calls[-1]
+        count, pending, mark, influence = session.run_calls[-1]
         self.assertEqual(count, 10)
         self.assertEqual([record["id"] for record in pending], ["fiber-1"])
+        self.assertEqual(influence, {})
         mark(pending)
         self.assertEqual(self.state.status()["ephemeral_inputs"][0]["state"],
                          "incorporated")
@@ -657,7 +660,7 @@ class CommitTests(unittest.TestCase):
         with self.assertRaisesRegex(ApiError, "already committed"):
             self.state.commit_inputs()
         self.state.run({"iterations": 3})
-        _, pending, mark = self.session.run_calls[-1]
+        _, pending, mark, _ = self.session.run_calls[-1]
         self.assertEqual([entry["id"] for entry in pending], ["patch-9"])
         # Once incorporated, a committed record is done and leaves the list.
         mark(pending)
@@ -676,7 +679,7 @@ class CommitTests(unittest.TestCase):
     def test_remove_incorporated_input_is_rejected(self):
         self._finalize("patch", "patch-9", PATCH_FILES)
         self.state.run({"iterations": 1})
-        _, pending, mark = self.session.run_calls[-1]
+        _, pending, mark, _ = self.session.run_calls[-1]
         mark(pending)
         with self.assertRaises(ApiError) as caught:
             self.state.remove_input({"kind": "patch", "id": "patch-9"})

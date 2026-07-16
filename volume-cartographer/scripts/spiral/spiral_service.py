@@ -38,7 +38,7 @@ from fit_session import (API_VERSION, PclRole, parse_session_request,
                          validate_session_request)
 
 
-SERVICE_VERSION = "3.0.0"
+SERVICE_VERSION = "4.0.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 TRANSFER_CHUNK_BYTES = 1024 * 1024
@@ -81,6 +81,74 @@ class ApiError(Exception):
         self.status = int(status)
         self.message = message
         self.details = details
+
+
+def _validate_run_influence_config(value):
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "influence_config must be a JSON object")
+    allowed = {
+        "interactive_influence_enabled",
+        "interactive_influence_z",
+        "interactive_influence_windings",
+        "interactive_influence_theta_frac",
+        "interactive_influence_disable_dt_frac",
+        "interactive_influence_sigma",
+        "interactive_influence_footprint_points",
+        "interactive_influence_anchor_lattice_points",
+        "interactive_influence_anchor_geometry_points",
+        "interactive_influence_anchor_samples_per_step",
+        "interactive_influence_anchor_ramp_power",
+        "loss_weight_anchor",
+    }
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       f"Unknown influence configuration keys: {unknown}")
+    result = {}
+    if "interactive_influence_enabled" in value:
+        enabled = value["interactive_influence_enabled"]
+        if not isinstance(enabled, bool):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "interactive_influence_enabled must be boolean")
+        result["interactive_influence_enabled"] = enabled
+    ranges = {
+        "interactive_influence_z": (1.0, 1_000_000.0),
+        "interactive_influence_windings": (0.1, 100.0),
+        "interactive_influence_theta_frac": (0.01, 1.0),
+        "interactive_influence_disable_dt_frac": (0.0, 1.0),
+        "interactive_influence_sigma": (0.000001, 10.0),
+        "interactive_influence_footprint_points": (1.0, 1_000_000.0),
+        "interactive_influence_anchor_lattice_points": (1.0, 1_000_000.0),
+        "interactive_influence_anchor_geometry_points": (1.0, 100_000.0),
+        "interactive_influence_anchor_samples_per_step": (1.0, 1_000_000.0),
+        "interactive_influence_anchor_ramp_power": (0.000001, 100.0),
+        "loss_weight_anchor": (0.0, 10_000.0),
+    }
+    for key, (minimum, maximum) in ranges.items():
+        if key not in value:
+            continue
+        item = value[key]
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be numeric")
+        number = float(item)
+        if not minimum <= number <= maximum:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           f"{key} must be between {minimum} and {maximum}")
+        result[key] = number
+    integer_keys = {
+        "interactive_influence_footprint_points",
+        "interactive_influence_anchor_lattice_points",
+        "interactive_influence_anchor_geometry_points",
+        "interactive_influence_anchor_samples_per_step",
+    }
+    for key in integer_keys & result.keys():
+        if not result[key].is_integer():
+            raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be an integer")
+        result[key] = int(result[key])
+    return result
 
 
 class ServiceLogBuffer:
@@ -750,6 +818,8 @@ class ServiceState:
 
     def run(self, request):
         session = self._require_session()
+        influence_config = _validate_run_influence_config(
+            request.get("influence_config"))
         with self.lock:
             pending = [record for record in self.ephemeral_records
                        if record["state"] == "pending"]
@@ -772,7 +842,8 @@ class ServiceState:
 
         target = session.run(int(request.get("iterations", 0)),
                              pending_inputs=pending,
-                             mark_incorporated=mark_incorporated)
+                             mark_incorporated=mark_incorporated,
+                             influence_config=influence_config)
         with self.lock:
             self.status_generation += 1
         return {**self.status(), "accepted": True, "target_iteration": target}

@@ -38,6 +38,8 @@ private:
                           bool directory);
     void addPclItem(const QString& path, const QString& role, bool required = false);
     QJsonObject sessionRequest() const;
+    QJsonObject influenceConfig() const;
+    QJsonObject durableAdvancedConfig() const;
     void applyResolution(const QJsonObject& resolution, bool force);
     void updateStatus(const QJsonObject& status);
     void markReloadRequired();
@@ -82,6 +84,7 @@ private:
     QSpinBox* _influenceZ = nullptr;
     QDoubleSpinBox* _influenceWindings = nullptr;
     QSpinBox* _influenceThetaPct = nullptr;
+    QSpinBox* _influenceDisableDtPct = nullptr;
     QDoubleSpinBox* _influenceAnchorWeight = nullptr;
     QPlainTextEdit* _advanced = nullptr;
     VolumeSelector* _volumeSelector = nullptr;
@@ -117,6 +120,7 @@ private:
     QPushButton* _removeInput = nullptr;
     QLabel* _commitHint = nullptr;
     QJsonArray _lastEphemeral;
+    QJsonObject _loadedDurableAdvanced;
 
     QString _currentProfileId;
     QStringList _profileIds;

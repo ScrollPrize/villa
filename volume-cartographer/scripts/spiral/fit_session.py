@@ -17,8 +17,8 @@ from typing import Any, Iterable, Mapping
 import zipfile
 
 
-# Version 3 adds incremental service stdout/stderr streaming for remote clients.
-API_VERSION = 3
+# Version 4 makes interactive influence configuration and masks Run-scoped.
+API_VERSION = 4
 
 
 class PclRole(str, Enum):

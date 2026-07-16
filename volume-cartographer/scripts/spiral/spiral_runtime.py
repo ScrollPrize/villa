@@ -49,6 +49,7 @@ class InteractiveFitSession:
         self._save_checkpoint = None
         self._export_preview = None
         self._incorporate_inputs = None
+        self._finish_run = None
         self._idle_actions = []
         self._thread = threading.Thread(target=self._fit_main, name="spiral-fit-worker", daemon=True)
         self._thread.start()
@@ -100,7 +101,15 @@ class InteractiveFitSession:
                 checkpoint_config = load_checkpoint_cpu(self.paths.checkpoint)
                 try:
                     if isinstance(checkpoint_config, dict) and isinstance(checkpoint_config.get('cfg'), Mapping):
-                        config.update(dict(checkpoint_config['cfg']))
+                        # Influence settings describe one interactive Run, not
+                        # durable model configuration. Ignore them even when
+                        # opening checkpoints written by older services.
+                        durable = {
+                            key: value for key, value in checkpoint_config['cfg'].items()
+                            if not key.startswith('interactive_influence_')
+                            and key != 'loss_weight_anchor'
+                        }
+                        config.update(durable)
                 finally:
                     # This first load exists only to resolve configuration.  Do
                     # not retain a complete model + optimiser checkpoint for the
@@ -179,13 +188,14 @@ class InteractiveFitSession:
     # Fitter-thread callbacks.
     def on_ready(self, *, completed_iterations, output_path,
                  save_checkpoint, export_preview, geometry_snapshot_manifest=None,
-                 incorporate_inputs=None):
+                 incorporate_inputs=None, finish_run=None):
         with self._condition:
             self._completed = self._target = completed_iterations
             self._output_path = output_path
             self._save_checkpoint = save_checkpoint
             self._export_preview = export_preview
             self._incorporate_inputs = incorporate_inputs
+            self._finish_run = finish_run
             self._geometry_snapshot_manifest = geometry_snapshot_manifest
         if self.paths.checkpoint:
             self._set_state("ExportingPreview", "Exporting restored checkpoint preview")
@@ -206,8 +216,8 @@ class InteractiveFitSession:
                     self._condition.wait()
                     continue
             if action[0] == "incorporate":
-                _, records, mark_incorporated = action
-                self._run_incorporation(records, mark_incorporated)
+                _, records, mark_incorporated, influence_config = action
+                self._run_incorporation(records, mark_incorporated, influence_config)
                 continue
             kind, path, done, result = action
             try:
@@ -220,7 +230,7 @@ class InteractiveFitSession:
             finally:
                 done.set()
 
-    def _run_incorporation(self, records, mark_incorporated):
+    def _run_incorporation(self, records, mark_incorporated, influence_config):
         """Append newly uploaded ephemeral inputs to the resident fit.
 
         Runs on the fitter thread at the pause boundary. A failure cancels the
@@ -233,7 +243,7 @@ class InteractiveFitSession:
             with self._condition:
                 self._phase = "Incorporating new session inputs"
             self._publish_status()
-            self._incorporate_inputs(records)
+            self._incorporate_inputs(records, influence_config)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             with self._condition:
@@ -265,6 +275,8 @@ class InteractiveFitSession:
             pause = self._pending == 0
         self._publish_status()
         if pause:
+            if self._finish_run is not None:
+                self._finish_run()
             self._set_state("Saving", "Autosaving checkpoint")
             autosave = str(Path(self._output_path) / "checkpoint_autosave.ckpt")
             self._save_checkpoint(autosave, self._completed)
@@ -287,7 +299,8 @@ class InteractiveFitSession:
         raise RuntimeError("Interactive optimizer loop ended unexpectedly")
 
     # Coordinator-thread commands.
-    def run(self, count, pending_inputs=None, mark_incorporated=None):
+    def run(self, count, pending_inputs=None, mark_incorporated=None,
+            influence_config=None):
         if count < 1:
             raise ValueError("iterations must be at least 1")
         with self._condition:
@@ -298,7 +311,8 @@ class InteractiveFitSession:
                     raise RuntimeError(
                         "The resident fitter does not support adding inputs to a running session")
                 self._idle_actions.append(
-                    ("incorporate", list(pending_inputs), mark_incorporated))
+                    ("incorporate", list(pending_inputs), mark_incorporated,
+                     dict(influence_config or {})))
             self._pending = count
             self._target = self._completed + count
             self._state, self._phase = "Running", "Optimizing"

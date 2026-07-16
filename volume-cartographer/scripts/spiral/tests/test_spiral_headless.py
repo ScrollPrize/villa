@@ -142,6 +142,28 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(session._target, 30_250)
         self.assertEqual(session._state, "Running")
 
+    def test_run_finish_callback_precedes_autosave(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Running"
+        session._completed = 9
+        session._pending = 1
+        session._target = 10
+        session._stop_requested = False
+        session._latest_metrics = {}
+        session._output_path = "/tmp"
+        session._status_callback = None
+        calls = []
+        session._finish_run = lambda: calls.append("finish")
+        session._save_checkpoint = lambda *_: calls.append("save")
+        session._publish_preview = lambda: calls.append("preview")
+
+        session.iteration_completed(
+            completed_iterations=10, total_loss=1.0, losses={}, learning_rate=1.e-3)
+
+        self.assertEqual(calls, ["finish", "save", "preview"])
+        self.assertEqual(session._state, "Paused")
+
     def test_mutating_command_is_deduplicated(self):
         service = ServiceState()
         calls = []

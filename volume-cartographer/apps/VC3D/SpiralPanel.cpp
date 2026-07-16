@@ -252,7 +252,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                                      "the running fit; the rest of the fit is held in place. Takes "
                                      "effect when inputs are added to a running session."));
     _influenceZ = new QSpinBox(outputContents);
-    _influenceZ->setRange(0, 1000000); _influenceZ->setValue(3000);
+    _influenceZ->setRange(1, 1000000); _influenceZ->setValue(3000);
     _influenceZ->setToolTip(tr("Max influence half-extent above/below the added input, in voxels"));
     _influenceWindings = new QDoubleSpinBox(outputContents);
     _influenceWindings->setRange(0.1, 100.0); _influenceWindings->setDecimals(1); _influenceWindings->setValue(5.0);
@@ -260,6 +260,13 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _influenceThetaPct = new QSpinBox(outputContents);
     _influenceThetaPct->setRange(1, 100); _influenceThetaPct->setSuffix(tr("% of wrap")); _influenceThetaPct->setValue(50);
     _influenceThetaPct->setToolTip(tr("Max influence half-extent along the wrap, as a fraction of a full turn"));
+    _influenceDisableDtPct = new QSpinBox(outputContents);
+    _influenceDisableDtPct->setRange(0, 100);
+    _influenceDisableDtPct->setSuffix(tr("% of iterations"));
+    _influenceDisableDtPct->setValue(75);
+    _influenceDisableDtPct->setToolTip(
+        tr("Fraction of each requested Run window that keeps directional DT losses disabled "
+           "after pending inputs are incorporated"));
     _influenceAnchorWeight = new QDoubleSpinBox(outputContents);
     _influenceAnchorWeight->setRange(0.0, 10000.0); _influenceAnchorWeight->setDecimals(1); _influenceAnchorWeight->setValue(20.0);
     _influenceAnchorWeight->setToolTip(tr("Weight of the loss holding the fit in place outside the influence region"));
@@ -278,6 +285,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     outputForm->addRow(tr("Influence z extent"), _influenceZ);
     outputForm->addRow(tr("Influence windings"), _influenceWindings);
     outputForm->addRow(tr("Influence theta"), _influenceThetaPct);
+    outputForm->addRow(tr("Disable DT"), _influenceDisableDtPct);
     outputForm->addRow(tr("Influence anchor weight"), _influenceAnchorWeight);
     outputForm->addRow(tr("Advanced config JSON"), _advanced);
 
@@ -414,7 +422,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 case CS::Disconnected: text = tr("Disconnected"); break;
                 case CS::Starting: text = tr("Starting…"); break;
                 case CS::Connecting: text = tr("Connecting…"); break;
-                case CS::Ready: text = tr("Connected — API v2%1")
+                case CS::Ready: text = tr("Connected — API v4%1")
                         .arg(message.isEmpty() ? QString() : QStringLiteral(" — ") + message); break;
                 case CS::Reconnecting: text = tr("Reconnecting… %1").arg(message); break;
                 case CS::Failed: text = tr("Failed: %1").arg(message); break;
@@ -442,6 +450,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             [this](const QJsonObject&, qint64) {
                 _hasSession = true;
                 _reloadRequired = false;
+                _loadedDurableAdvanced = durableAdvancedConfig();
                 for (auto it = _visibilityChecks.begin(); it != _visibilityChecks.end(); ++it)
                     it.value()->setChecked(it.key() == QStringLiteral("output"));
             });
@@ -489,8 +498,18 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         _service->loadSession(sessionRequest());
     });
     connect(_run, &QPushButton::clicked, this, [this]() {
+        QJsonParseError error;
+        const QJsonDocument advanced =
+            QJsonDocument::fromJson(_advanced->toPlainText().toUtf8(), &error);
+        if (error.error != QJsonParseError::NoError || !advanced.isObject()) {
+            QMessageBox::warning(this, tr("Invalid advanced configuration"),
+                                 tr("Advanced config must be a JSON object: %1")
+                                     .arg(error.errorString()));
+            return;
+        }
+        persist();
         emit pythonOutputRequested();
-        _service->runIterations(_iterations->value());
+        _service->runIterations(_iterations->value(), influenceConfig());
     });
     connect(_stop, &QPushButton::clicked, _service, &SpiralServiceManager::stopAfterIteration);
     connect(_save, &QPushButton::clicked, this, [this]() {
@@ -534,10 +553,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     });
     connect(_volumeSelector->comboBox(), qOverload<int>(&QComboBox::currentIndexChanged), this,
             [this](int) { emit volumeSelected(_volumeSelector->selectedVolumeId()); });
-    for (QSpinBox* spin : {_zBegin, _zEnd, _lasagnaScale, _legacyCheckpointStep, _renderVolumeScale,
-                           _influenceZ, _influenceThetaPct})
+    for (QSpinBox* spin : {_zBegin, _zEnd, _lasagnaScale, _legacyCheckpointStep,
+                           _renderVolumeScale})
         connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) { markReloadRequired(); });
-    for (QDoubleSpinBox* spin : {_voxelSize, _influenceWindings, _influenceAnchorWeight})
+    for (QDoubleSpinBox* spin : {_voxelSize})
         connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
                 [this](double) { markReloadRequired(); });
     for (QLineEdit* edit : {_lasagnaGroup, _scrollName, _runTag})
@@ -548,9 +567,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             [this](int) { markReloadRequired(); });
     connect(_savePngVisualizations, &QCheckBox::toggled, this,
             [this](bool) { markReloadRequired(); });
-    connect(_influenceEnabled, &QCheckBox::toggled, this,
-            [this](bool) { markReloadRequired(); });
-    connect(_advanced, &QPlainTextEdit::textChanged, this, &SpiralPanel::markReloadRequired);
+    connect(_advanced, &QPlainTextEdit::textChanged, this, [this]() {
+        if (durableAdvancedConfig() != _loadedDurableAdvanced)
+            markReloadRequired();
+    });
 
     // Profile management
     connect(_profileCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -844,17 +864,8 @@ QJsonObject SpiralPanel::sessionRequest() const
                                 {"required", item->data(Qt::UserRole + 2).toBool()}});
     }
     paths["pcls"] = pcls;
-    QJsonParseError parseError;
-    const QJsonDocument advanced = QJsonDocument::fromJson(_advanced->toPlainText().toUtf8(), &parseError);
-    QJsonObject config = advanced.isObject() ? advanced.object() : QJsonObject{};
+    QJsonObject config = durableAdvancedConfig();
     config[QStringLiteral("save_png_visualizations")] = _savePngVisualizations->isChecked();
-    config[QStringLiteral("interactive_influence_enabled")] = _influenceEnabled->isChecked();
-    if (_influenceEnabled->isChecked()) {
-        config[QStringLiteral("interactive_influence_z")] = static_cast<double>(_influenceZ->value());
-        config[QStringLiteral("interactive_influence_windings")] = _influenceWindings->value();
-        config[QStringLiteral("interactive_influence_theta_frac")] = _influenceThetaPct->value() / 100.0;
-        config[QStringLiteral("loss_weight_anchor")] = _influenceAnchorWeight->value();
-    }
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
                     {"scroll_name", _scrollName->text()}, {"outward_sense", _outwardSense->currentText()},
                     {"voxel_size_um", _voxelSize->value()}, {"lasagna_group", _lasagnaGroup->text()},
@@ -865,6 +876,52 @@ QJsonObject SpiralPanel::sessionRequest() const
                     {"render_volume_scale", _renderVolumeScale->value()},
                     {"config", config}};
     return {{"paths", paths}, {"run", run}, {"preview", QJsonObject{{"first_winding", 10}}}};
+}
+
+QJsonObject SpiralPanel::influenceConfig() const
+{
+    const QJsonDocument advanced =
+        QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
+    QJsonObject config;
+    if (advanced.isObject()) {
+        const QJsonObject all = advanced.object();
+        for (auto it = all.begin(); it != all.end(); ++it) {
+            if (it.key().startsWith(QStringLiteral("interactive_influence_"))
+                || it.key() == QStringLiteral("loss_weight_anchor"))
+                config[it.key()] = it.value();
+        }
+    }
+    config[QStringLiteral("interactive_influence_enabled")] =
+        _influenceEnabled->isChecked();
+    config[QStringLiteral("interactive_influence_disable_dt_frac")] =
+        _influenceDisableDtPct->value() / 100.0;
+    if (_influenceEnabled->isChecked()) {
+        config[QStringLiteral("interactive_influence_z")] =
+            static_cast<double>(_influenceZ->value());
+        config[QStringLiteral("interactive_influence_windings")] =
+            _influenceWindings->value();
+        config[QStringLiteral("interactive_influence_theta_frac")] =
+            _influenceThetaPct->value() / 100.0;
+        config[QStringLiteral("loss_weight_anchor")] =
+            _influenceAnchorWeight->value();
+    }
+    return config;
+}
+
+QJsonObject SpiralPanel::durableAdvancedConfig() const
+{
+    const QJsonDocument advanced =
+        QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
+    if (!advanced.isObject()) return {};
+    QJsonObject config = advanced.object();
+    for (auto it = config.begin(); it != config.end();) {
+        if (it.key().startsWith(QStringLiteral("interactive_influence_"))
+            || it.key() == QStringLiteral("loss_weight_anchor"))
+            it = config.erase(it);
+        else
+            ++it;
+    }
+    return config;
 }
 
 void SpiralPanel::updateStatus(const QJsonObject& status)
@@ -988,6 +1045,7 @@ void SpiralPanel::persist() const
     settings.setValue(prefix + "influence_z", _influenceZ->value());
     settings.setValue(prefix + "influence_windings", _influenceWindings->value());
     settings.setValue(prefix + "influence_theta_pct", _influenceThetaPct->value());
+    settings.setValue(prefix + "influence_disable_dt_pct", _influenceDisableDtPct->value());
     settings.setValue(prefix + "influence_anchor_weight", _influenceAnchorWeight->value());
     settings.setValue(prefix + "iterations", _iterations->value());
     settings.setValue(prefix + "advanced_config", _advanced->toPlainText());
@@ -1047,6 +1105,8 @@ void SpiralPanel::restore()
     _influenceZ->setValue(settings.value(valuePrefix + "influence_z", 3000).toInt());
     _influenceWindings->setValue(settings.value(valuePrefix + "influence_windings", 5.0).toDouble());
     _influenceThetaPct->setValue(settings.value(valuePrefix + "influence_theta_pct", 50).toInt());
+    _influenceDisableDtPct->setValue(
+        settings.value(valuePrefix + "influence_disable_dt_pct", 75).toInt());
     _influenceAnchorWeight->setValue(
         settings.value(valuePrefix + "influence_anchor_weight", 20.0).toDouble());
     _iterations->setValue(settings.value(valuePrefix + "iterations", 100).toInt());
@@ -1055,4 +1115,5 @@ void SpiralPanel::restore()
     _hasManualEdits = false;
     _hasSession = false;
     _reloadRequired = false;
+    _loadedDurableAdvanced = durableAdvancedConfig();
 }

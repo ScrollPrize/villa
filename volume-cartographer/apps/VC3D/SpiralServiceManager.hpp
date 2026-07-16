@@ -54,7 +54,7 @@ public:
 
     void resolveDataset(const QString& root);
     void loadSession(QJsonObject request);
-    void runIterations(int iterations);
+    void runIterations(int iterations, const QJsonObject& influenceConfig);
     void stopAfterIteration();
     // Save on service: writes to a service-host path.
     void saveCheckpoint(const QString& path);

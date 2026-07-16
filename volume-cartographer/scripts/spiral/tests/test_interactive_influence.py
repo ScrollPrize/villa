@@ -324,6 +324,9 @@ class FreezeInvariantTests(unittest.TestCase):
         self.assertTrue((in_region < 1.).all())
         self.assertTrue((out_region == 1.).all())
 
+        state.deactivate_(model, optimiser)
+        self.assertEqual(gap_group['weight_decay'], 1.e-2)
+
 
 class ActivateAndAnchorTests(unittest.TestCase):
     def _make_collection(self, num_points=32):
@@ -389,29 +392,6 @@ class ActivateAndAnchorTests(unittest.TestCase):
         model.flow_field.apply_accumulated_field_grad()
         self.assertTrue(any(flow.grad is not None and flow.grad.abs().sum() > 0
                             for flow in model.flow_field.flows))
-
-    def test_state_dict_round_trip(self):
-        model = make_tiny_model()
-        optimiser = make_optimiser(model)
-        state = self._activate(model, optimiser)
-        payload = state.state_dict()
-        restored = InteractiveInfluenceState.from_state_dict(payload, torch.device('cpu'))
-        restored.assert_matches_model(model)
-        self.assertEqual(restored.num_incorporations, state.num_incorporations)
-        self.assertEqual(restored.saved_gap_weight_decay, state.saved_gap_weight_decay)
-        for key in state.masks:
-            self.assertTrue(torch.equal(restored.masks[key], state.masks[key]))
-        self.assertTrue(torch.equal(restored.anchor_scroll, state.anchor_scroll))
-        self.assertTrue(torch.equal(restored.anchor_target, state.anchor_target))
-        torch.testing.assert_close(restored.anchor_loss_weight, state.anchor_loss_weight)
-        # Resume path re-applies the weight-decay override on a fresh optimizer.
-        fresh_optimiser = make_optimiser(model)
-        restored.reapply_optimizer_overrides_(model, fresh_optimiser)
-        gap_group = restored._find_param_group(fresh_optimiser, model.gap_expander_params.logits)
-        self.assertEqual(gap_group['weight_decay'], 0.0)
-
-    def test_from_state_dict_none_is_none(self):
-        self.assertIsNone(InteractiveInfluenceState.from_state_dict(None, torch.device('cpu')))
 
     def test_second_incorporation_extends_the_union(self):
         model = make_tiny_model()

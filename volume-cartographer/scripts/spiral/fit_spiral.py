@@ -29,7 +29,7 @@ from ddp_helpers import (
 )
 from lasagna_data import prepare_lasagna_volume
 from checkpoint_io import load_checkpoint_cpu
-from influence import InteractiveInfluenceState, make_influence_state, subsample_rows
+from influence import make_influence_state, subsample_rows
 from tifxyz import load_tifxyz
 from geom_utils import bilinear_atlas_lookup, interp1d
 from point_collection import (
@@ -247,6 +247,7 @@ default_config = {
     'interactive_influence_z': 3000.0,        # hard half-extent along z, full-res voxels
     'interactive_influence_windings': 5.0,    # hard half-extent across wraps, windings
     'interactive_influence_theta_frac': 0.5,  # hard half-extent along the wrap, fraction of a full turn (circular; 0.5 = the whole circle is within reach of some point)
+    'interactive_influence_disable_dt_frac': 0.75,  # fraction of each requested run that suppresses DT losses after incorporating inputs
     'interactive_influence_sigma': 0.3333,    # gaussian sigma as a fraction of the hard extent
     'interactive_influence_footprint_points': 2048,  # subsampled per incorporated input
     'loss_weight_anchor': 20.0,
@@ -555,15 +556,18 @@ def get_progressive_dt_max_winding(iteration, dt_start_step, shell_outer_winding
     return w_inner + (w_outer - w_inner) * f_warped
 
 
-def get_interactive_dt_resume_iteration(start_iteration, target_iteration):
+def get_interactive_dt_resume_iteration(start_iteration, target_iteration,
+                                        disabled_fraction=0.75):
     """Return the first iteration that may use DT losses after new inputs.
 
     Input incorporation happens at the start of an interactive run. Keep DT
-    losses disabled for the first 75% of that run so the radius-based losses
-    can settle the newly added geometry before directional constraints resume.
+    losses disabled for the requested fraction of that run so the radius-based
+    losses can settle the newly added geometry before directional constraints
+    resume.
     """
     run_iterations = max(0, int(target_iteration) - int(start_iteration))
-    return int(start_iteration) + 3 * run_iterations // 4
+    fraction = min(1.0, max(0.0, float(disabled_fraction)))
+    return int(start_iteration) + int(run_iterations * fraction)
 
 
 def main(load_only_patches_and_point_collections=False, interactive_driver=None):
@@ -1339,7 +1343,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         {'params': flow_field_params, 'weight_decay': cfg['weight_decay_flow_field']},
     ]
     optimiser = torch.optim.AdamW(param_groups, lr=cfg.learning_rate, betas=(0.9, 0.999), eps=1.e-8, fused=True)
-    influence_state = None  # set on first influence-restricted incorporation, or restored from a checkpoint
+    # Influence masks are scoped to one interactive Run request. They are
+    # created from that run's pending inputs and discarded before its autosave.
+    influence_state = None
+    interactive_influence_loss_weight = 0.0
     if cfg['exp_lr_schedule']:
         gamma = cfg['lr_final_factor'] ** (1.0 / max(1, num_training_steps))
         lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimiser, gamma=gamma)
@@ -1347,15 +1354,23 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lambda step: 1.)
 
     def checkpoint_payload(completed_iterations):
+        def durable_config(value):
+            return {
+                key: item for key, item in dict(value).items()
+                if not key.startswith('interactive_influence_')
+                and key != 'loss_weight_anchor'
+            }
+
         return {
             'schema_version': 2,
             'completed_iterations': int(completed_iterations),
             'spiral_and_transform': spiral_and_transform.state_dict(),
             'optimiser': optimiser.state_dict(),
             'scheduler': lr_scheduler.state_dict(),
-            'cfg': dict(cfg),
-            'requested_config': dict(getattr(interactive_driver, 'requested_config', dict(cfg))),
-            'resolved_config': dict(cfg),
+            'cfg': durable_config(cfg),
+            'requested_config': durable_config(
+                getattr(interactive_driver, 'requested_config', dict(cfg))),
+            'resolved_config': durable_config(cfg),
             'lasagna_scale': lasagna_scale,
             'lasagna_group': normal_zarr_group,
             'z_begin': z_begin,
@@ -1366,10 +1381,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
             'input_manifest': dict(getattr(interactive_driver, 'input_manifest', {})),
             'preview_first_winding': 10,
-            # Optional key: absent/None in checkpoints predating influence
-            # regions. Masks cannot be regenerated (they were evaluated against
-            # transforms at past incorporation times), so persist them in full.
-            'interactive_influence': influence_state.state_dict() if influence_state is not None else None,
         }
 
     def save_model_to(path, completed_iterations):
@@ -1401,6 +1412,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
         spiral_and_transform.load_state_dict(transformed_spiral_state)
         optimiser.load_state_dict(optimiser_state)
+        # Older checkpoints could have been saved while influence masking had
+        # disabled gap weight decay. Influence state is no longer restored, so
+        # restore the session configuration explicitly as well.
+        gap_param = gap_expander_params[0]
+        gap_group = next(group for group in optimiser.param_groups
+                         if any(param is gap_param for param in group['params']))
+        gap_group['weight_decay'] = cfg['weight_decay_gap_expander']
         if checkpoint.get('scheduler') is not None:
             lr_scheduler.load_state_dict(checkpoint['scheduler'])
 
@@ -1410,14 +1428,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             start_iteration = int(embedded_iteration)
         print(f'resuming from {resume_path} at iteration {start_iteration}')
         load_model(resume_checkpoint)
-        if isinstance(resume_checkpoint, dict):
-            influence_state = InteractiveInfluenceState.from_state_dict(
-                resume_checkpoint.get('interactive_influence'), torch.device('cuda'))
-            if influence_state is not None:
-                influence_state.assert_matches_model(spiral_and_transform)
-                influence_state.reapply_optimizer_overrides_(spiral_and_transform, optimiser)
-                print(f'restored interactive influence state '
-                      f'({influence_state.num_incorporations} incorporation(s))')
         if not isinstance(resume_checkpoint, dict) or resume_checkpoint.get('scheduler') is None:
             for _ in range(start_iteration):
                 lr_scheduler.step()
@@ -1479,11 +1489,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             if prepared_main_tracks['flat_zyx_cpu'].shape[0] == input_track_points:
                 preview_extent_tracks = (prepared_main_tracks['flat_zyx_cpu'],)
 
-    # A compact subsample of the trusted cloud seeds the influence anchor bank
-    # if inputs are later incorporated with influence regions enabled. It must
-    # be stashed here because the full cloud is released just below.
+    # A compact subsample of the trusted cloud seeds a future Run's influence
+    # anchor bank. Keep it for every interactive session because influence can
+    # be enabled or disabled independently on each Run request.
     influence_anchor_geometry = None
-    if interactive_driver is not None and cfg['interactive_influence_enabled']:
+    if interactive_driver is not None:
         stash_generator = torch.Generator()
         stash_generator.manual_seed(int(cfg['random_seed']))
         influence_anchor_geometry = subsample_rows(
@@ -1525,6 +1535,18 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in dist_grad_named}
     interactive_dt_resume_iteration = None
 
+    def clear_interactive_influence():
+        """End the current Run request's influence window."""
+        nonlocal influence_state, interactive_influence_loss_weight
+        nonlocal interactive_dt_resume_iteration
+        interactive_dt_resume_iteration = None
+        if influence_state is None:
+            interactive_influence_loss_weight = 0.0
+            return
+        influence_state.deactivate_(spiral_and_transform, optimiser)
+        influence_state = None
+        interactive_influence_loss_weight = 0.0
+
     def export_interactive_preview(generation_path, surface_id):
         # Export has its own saved RNG envelope so pausing does not alter the
         # stochastic training sequence.
@@ -1551,7 +1573,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             torch.random.set_rng_state(torch_state)
             torch.cuda.set_rng_state_all(cuda_states)
 
-    def incorporate_interactive_inputs(records):
+    def incorporate_interactive_inputs(records, influence_config=None):
         """Append uploaded ephemeral inputs to the resident fit structures.
 
         Runs on the fitter thread at a pause boundary. Incorporation is
@@ -1563,6 +1585,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         same items in the same order on every rank.
         """
         nonlocal patch_sampling_probabilities, next_id, influence_state
+        nonlocal interactive_influence_loss_weight
         nonlocal interactive_dt_resume_iteration
         # Incorporation has its own saved RNG envelope so adding inputs does
         # not alter the stochastic training sequence (same discipline as the
@@ -1571,6 +1594,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         torch_state = torch.random.get_rng_state()
         cuda_states = torch.cuda.get_rng_state_all()
         try:
+            # Be defensive about a previously interrupted boundary: a new
+            # batch must never union with an earlier Run request's masks.
+            clear_interactive_influence()
+            run_cfg = dict(cfg)
+            run_cfg.update(dict(influence_config or {}))
             new_patches = {}
             new_collections = {}
             for record in records:
@@ -1729,19 +1757,19 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 # the next consumer rebuilds it including the appended strips.
                 unattached_pcl_strips.flat = None
 
-            if cfg['interactive_influence_enabled'] and (new_patches or new_collections):
-                if influence_state is None:
-                    influence_state = make_influence_state(cfg, torch.device('cuda'))
+            if run_cfg['interactive_influence_enabled'] and (new_patches or new_collections):
+                influence_state = make_influence_state(run_cfg, torch.device('cuda'))
                 influence_state.activate_or_extend_(
                     new_patches=new_patches,
                     new_collections=new_collections,
                     spiral_and_transform=spiral_and_transform,
                     optimiser=optimiser,
-                    cfg=cfg,
+                    cfg=run_cfg,
                     z_begin=z_begin,
                     z_end=z_end,
                     anchor_geometry_zyx=influence_anchor_geometry,
                 )
+                interactive_influence_loss_weight = float(run_cfg['loss_weight_anchor'])
 
             # run() sets the target before this callback is drained at the
             # pause boundary, so this is exactly the iteration window requested
@@ -1751,12 +1779,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             dt_resume_iteration = get_interactive_dt_resume_iteration(
                 interactive_status['current_iteration'],
                 interactive_status['target_iteration'],
+                run_cfg['interactive_influence_disable_dt_frac'],
             )
-            if interactive_dt_resume_iteration is None:
-                interactive_dt_resume_iteration = dt_resume_iteration
-            else:
-                interactive_dt_resume_iteration = max(
-                    interactive_dt_resume_iteration, dt_resume_iteration)
+            interactive_dt_resume_iteration = dt_resume_iteration
 
             print(f'incorporated {len(new_patches)} patches and '
                   f'{len(new_collections)} point collections into the resident session; '
@@ -1791,6 +1816,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             export_preview=export_interactive_preview,
             geometry_snapshot_manifest=os.path.join(geometry_path, 'manifest.json'),
             incorporate_inputs=incorporate_interactive_inputs,
+            finish_run=clear_interactive_influence,
         )
 
     # Interactive fits are resident sessions: num_training_steps still defines
@@ -2009,13 +2035,14 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             })
             del shell_outer_loss
 
-        if influence_state is not None and influence_state.active and cfg['loss_weight_anchor'] > 0:
+        if (influence_state is not None and influence_state.active
+                and interactive_influence_loss_weight > 0):
             backward_family({
                 'anchor': influence_state.get_anchor_loss(
                     slice_to_spiral_transform,
                     dr_per_winding,
                     int(cfg['interactive_influence_anchor_samples_per_step']),
-                ) * cfg['loss_weight_anchor'],
+                ) * interactive_influence_loss_weight,
             })
 
         loss = sum(losses.values())

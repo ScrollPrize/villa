@@ -18,9 +18,9 @@ outside the union of all such regions is held in place by two mechanisms:
    from those targets, weighted by (1 - w) ** ramp_power so it ramps up
    rapidly outside the influence region.
 
-Regions accumulate across incorporations as a pointwise max (union) of the
-per-input weight fields; anchor targets are refreshed to the current state at
-each incorporation.
+For a resident interactive fit, the region is scoped to one requested run. It
+is built as the pointwise-max union of that run's pending inputs and discarded
+when the requested iteration window ends.
 """
 
 import math
@@ -123,12 +123,11 @@ def _gap_logit_zst(gap_params, min_z, max_z, device):
 
 
 class InteractiveInfluenceState:
-    """Union of influence regions plus the machinery enforcing them.
+    """One run's influence region plus the machinery enforcing it.
 
-    Lives on the fitter thread; all tensors on the fit device. Persisted in
-    checkpoints via state_dict()/from_state_dict() -- masks cannot be
-    regenerated later (they were evaluated against transforms at past
-    incorporation times), so they are stored in full (fp16).
+    Lives on the fitter thread with all tensors on the fit device. This state
+    is deliberately transient: checkpoints contain the optimized model, not
+    the masks, footprints, anchors, or influence limits used for one run.
     """
 
     def __init__(self, limits, sigma, ramp_power, device):
@@ -392,6 +391,14 @@ class InteractiveInfluenceState:
             self.saved_gap_weight_decay = float(gap_group['weight_decay'])
         gap_group['weight_decay'] = 0.0
 
+    def deactivate_(self, spiral_and_transform, optimiser):
+        """Restore optimizer settings overridden while this region was active."""
+        if self.saved_gap_weight_decay is None:
+            return
+        gap_logits = spiral_and_transform.gap_expander_params.logits
+        gap_group = self._find_param_group(optimiser, gap_logits)
+        gap_group['weight_decay'] = self.saved_gap_weight_decay
+
     @torch.no_grad()
     def apply_grad_masks_(self, spiral_and_transform):
         lr_flow, hr_flow = spiral_and_transform.flow_field.flows
@@ -423,53 +430,6 @@ class InteractiveInfluenceState:
         current = slice_to_spiral_transform(self.anchor_scroll[idx])
         displacement = torch.linalg.norm(current - self.anchor_target[idx], dim=-1) / dr_per_winding
         return (weight * displacement).sum() / weight.sum().clamp(min=1.)
-
-    # ---------------------------------------------------------- persistence
-
-    def state_dict(self):
-        return {
-            'limits': list(self.limits),
-            'sigma': self.sigma,
-            'ramp_power': self.ramp_power,
-            'masks': {key: mask.cpu() for key, mask in self.masks.items()},
-            'footprints': [{'input_id': f['input_id'], 'kind': f['kind'], 'zst': f['zst']}
-                           for f in self.footprints],
-            'anchor_scroll': self.anchor_scroll.cpu() if self.anchor_scroll is not None else None,
-            'anchor_target': self.anchor_target.cpu() if self.anchor_target is not None else None,
-            'anchor_w': self.anchor_w.cpu() if self.anchor_w is not None else None,
-            'saved_gap_weight_decay': self.saved_gap_weight_decay,
-            'num_incorporations': self.num_incorporations,
-        }
-
-    @classmethod
-    def from_state_dict(cls, payload, device):
-        if payload is None:
-            return None
-        state = cls(payload['limits'], payload['sigma'], payload['ramp_power'], device)
-        state.masks = {key: mask.to(device) for key, mask in payload['masks'].items()}
-        state.footprints = list(payload['footprints'])
-        for key in ('anchor_scroll', 'anchor_target', 'anchor_w'):
-            value = payload[key]
-            setattr(state, key, value.to(device) if value is not None else None)
-        state.saved_gap_weight_decay = payload['saved_gap_weight_decay']
-        state.num_incorporations = int(payload['num_incorporations'])
-        if state.anchor_w is not None:
-            state.anchor_loss_weight = (1. - state.anchor_w).clamp(0., 1.) ** state.ramp_power
-        return state
-
-    def assert_matches_model(self, spiral_and_transform):
-        lr_flow, hr_flow = spiral_and_transform.flow_field.flows
-        expected = {
-            'flow_lr': tuple(lr_flow.shape[2:]),
-            'flow_hr': tuple(hr_flow.shape[2:]),
-            'gap': tuple(spiral_and_transform.gap_expander_params.logits.shape[2:]),
-        }
-        for key, shape in expected.items():
-            if tuple(self.masks[key].shape) != shape:
-                raise RuntimeError(
-                    f'restored influence mask {key!r} has shape {tuple(self.masks[key].shape)}, '
-                    f'expected {shape}; the checkpoint was created with different model-shaping config')
-
 
 def make_influence_state(cfg, device):
     limits = (
