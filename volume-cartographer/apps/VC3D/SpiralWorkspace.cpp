@@ -122,7 +122,12 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 const bool routineStatusPoll =
                     line.startsWith(QStringLiteral("SPIRAL_HTTP \"GET /session/status HTTP/"))
                     && line.endsWith(QStringLiteral("\" 200 -"));
-                if (!routineStatusPoll) _pythonOutput->appendOutput(message);
+                const bool routineLogPoll =
+                    line.startsWith(QStringLiteral("SPIRAL_HTTP \"GET /logs?after="))
+                    && line.contains(QStringLiteral(" HTTP/"))
+                    && line.endsWith(QStringLiteral("\" 200 -"));
+                if (!routineStatusPoll && !routineLogPoll)
+                    _pythonOutput->appendOutput(message);
             });
     connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
         statusBar()->showMessage(error, 15000);
@@ -179,10 +184,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     _overlay->reset();
                     updateSurfaceIntersections();
                 }
-                if (state == CS::Ready && !_service->ownsProcess())
+                if (state == CS::Ready && !_service->ownsProcess()) {
                     _pythonOutput->appendOutput(
-                        tr("Connected to a service VC3D does not own; the service's "
-                           "Python logs are available on the service host."));
+                        tr("Connected to an independently started service; Python "
+                           "stdout / stderr will be relayed every 10 seconds."));
+                }
             });
     connect(_service, &SpiralServiceManager::sessionActiveChanged, this,
             &SpiralWorkspace::spiralSessionActiveChanged);

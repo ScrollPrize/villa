@@ -31,8 +31,9 @@ namespace {
 constexpr int kPollMs = 500;
 constexpr int kPollBackoffMs = 2000;
 constexpr int kPollReconnectMs = 5000;
+constexpr int kRemoteLogPollMs = 10000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 2;
+constexpr int kSupportedApiVersion = 3;
 constexpr int kPreviewCacheKept = 3;
 
 QString stateName(SpiralServiceManager::ConnectionState state)
@@ -58,6 +59,10 @@ SpiralServiceManager::SpiralServiceManager(QObject* parent) : QObject(parent)
     _poll = new QTimer(this);
     _poll->setInterval(kPollMs);
     connect(_poll, &QTimer::timeout, this, &SpiralServiceManager::pollStatus);
+    _remoteLogPoll = new QTimer(this);
+    _remoteLogPoll->setInterval(kRemoteLogPollMs);
+    connect(_remoteLogPoll, &QTimer::timeout, this,
+            &SpiralServiceManager::pollRemoteLogs);
 
     connect(_tunnel, &SpiralSshTunnel::logMessage, this, &SpiralServiceManager::logMessage);
     connect(_tunnel, &SpiralSshTunnel::ready, this, [this](int localPort) {
@@ -163,6 +168,9 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _statusFailures = 0;
     _hasActiveSession = false;
     _serviceOwnsDataset = false;
+    _remoteLogsInFlight = false;
+    _remoteLogFailures = 0;
+    _lastRemoteLogSequence = 0;
     _advertisedDataset = {};
 
     _credential = profile.apiKey;
@@ -323,6 +331,12 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
     _statusFailures = 0;
     _poll->setInterval(kPollMs);
     _poll->start();
+    if (!ownsProcess()) {
+        _remoteLogPoll->start();
+        pollRemoteLogs();
+    } else {
+        _remoteLogPoll->stop();
+    }
     if (_serviceOwnsDataset) fetchAdvertisedDataset();
     pollStatus();
 }
@@ -342,7 +356,9 @@ void SpiralServiceManager::disconnectFromService()
 {
     ++_connectionGeneration;
     _poll->stop();
+    _remoteLogPoll->stop();
     _statusInFlight = false;
+    _remoteLogsInFlight = false;
     _artifactCache->clearEndpoint();
     _tunnel->stop();
     // Disconnecting from an independently started service never shuts the
@@ -391,7 +407,9 @@ QString SpiralServiceManager::commandId()
 QNetworkRequest SpiralServiceManager::makeRequest(const QString& path, int timeoutMs) const
 {
     QUrl url = _baseUrl;
-    url.setPath(path.section(QLatin1Char('?'), 0, 0));
+    const QUrl relative(path);
+    url.setPath(relative.path());
+    url.setQuery(relative.query());
     QNetworkRequest request(url);
     request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
     if (!_credential.isEmpty())
@@ -941,6 +959,44 @@ void SpiralServiceManager::pollStatus()
             _poll->setInterval(_statusFailures >= 3 ? kPollReconnectMs : kPollBackoffMs);
             if (_statusFailures >= 3 && _connectionState == ConnectionState::Ready)
                 setConnectionState(ConnectionState::Reconnecting, error);
+        });
+}
+
+void SpiralServiceManager::pollRemoteLogs()
+{
+    if (_remoteLogsInFlight || ownsProcess()
+        || _connectionState != ConnectionState::Ready)
+        return;
+    _remoteLogsInFlight = true;
+    const quint64 generation = _connectionGeneration;
+    get(QStringLiteral("/logs?after=%1").arg(_lastRemoteLogSequence), Timeout::Quick,
+        [this, generation](const QJsonObject& response) {
+            _remoteLogsInFlight = false;
+            if (generation != _connectionGeneration) return;
+            _remoteLogFailures = 0;
+            if (response.value(QStringLiteral("cursor_reset")).toBool())
+                _lastRemoteLogSequence = 0;
+            const qint64 dropped = response.value(QStringLiteral("dropped")).toInteger();
+            if (dropped > 0)
+                emit logMessage(tr("Remote Python log buffer dropped %1 older line(s).")
+                                    .arg(dropped));
+            const QJsonArray entries = response.value(QStringLiteral("entries")).toArray();
+            for (const QJsonValue& value : entries) {
+                const QJsonObject entry = value.toObject();
+                const qint64 sequence = entry.value(QStringLiteral("sequence")).toInteger();
+                const QString message = entry.value(QStringLiteral("text")).toString();
+                if (sequence <= _lastRemoteLogSequence || message.isEmpty()) continue;
+                _lastRemoteLogSequence = sequence;
+                emit logMessage(message);
+            }
+            _lastRemoteLogSequence = response.value(QStringLiteral("next_sequence"))
+                                         .toInteger(_lastRemoteLogSequence);
+        },
+        [this, generation](const QString& error) {
+            _remoteLogsInFlight = false;
+            if (generation != _connectionGeneration) return;
+            if (++_remoteLogFailures == 1)
+                emit logMessage(tr("Remote Python log polling failed: %1").arg(error));
         });
 }
 

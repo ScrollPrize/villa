@@ -17,9 +17,8 @@ from typing import Any, Iterable, Mapping
 import zipfile
 
 
-# Version 2 adds bearer authentication, launch-time dataset ownership, the
-# artifact transfer protocol, and session input uploads.
-API_VERSION = 2
+# Version 3 adds incremental service stdout/stderr streaming for remote clients.
+API_VERSION = 3
 
 
 class PclRole(str, Enum):

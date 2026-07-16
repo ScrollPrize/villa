@@ -117,6 +117,7 @@ private:
                      std::function<void(const QJsonObject&)> success,
                      std::function<void(const QString&)> failure);
     void pollStatus();
+    void pollRemoteLogs();
     void handleStatus(const QJsonObject& status);
     void syncArtifacts(const QJsonObject& status);
     void fetchAdvertisedDataset();
@@ -138,6 +139,7 @@ private:
     SpiralSshTunnel* _tunnel = nullptr;
     SpiralArtifactCache* _artifactCache = nullptr;
     QTimer* _poll = nullptr;
+    QTimer* _remoteLogPoll = nullptr;
     QUrl _baseUrl;
     QString _credential;
     QString _clientId;
@@ -147,6 +149,9 @@ private:
     int _statusFailures = 0;
     bool _hasActiveSession = false;
     bool _serviceOwnsDataset = false;
+    bool _remoteLogsInFlight = false;
+    int _remoteLogFailures = 0;
+    qint64 _lastRemoteLogSequence = 0;
     QJsonObject _advertisedDataset;
     quint64 _commandCounter = 0;
     qint64 _lastStatusGeneration = -1;

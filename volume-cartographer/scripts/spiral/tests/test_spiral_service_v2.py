@@ -1,4 +1,4 @@
-"""Tests for the version-2 Spiral service protocol.
+"""Tests for the Spiral service protocol.
 
 Covers bearer authentication, API-key auto-generation, launch-time dataset
 ownership, the artifact registry and its HTTP endpoints, session input
@@ -25,7 +25,7 @@ import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import spiral_service
-from spiral_service import (ApiError, ArtifactRegistry, ServiceState,
+from spiral_service import (ApiError, ArtifactRegistry, ServiceLogBuffer, ServiceState,
                             SpiralServer, load_or_create_api_key)
 from fit_session import API_VERSION, SpiralInputPaths, resolve_dataset_root
 
@@ -179,6 +179,60 @@ class AuthenticationTests(HttpServiceFixture):
         self.assertIn("service_name", health)
         self.assertIn("session_generation", health)
         self.assertIn("service_generation", health)
+
+
+class LogStreamingTests(HttpServiceFixture):
+    def test_authenticated_log_reads_are_incremental(self):
+        self.state.logs.write("stdout", "loading inputs\n")
+        self.state.logs.write("stderr", "iteration 1\niteration 2\n")
+
+        status, payload, _ = self.request("GET", "/logs?after=0")
+        self.assertEqual(status, 200)
+        first = json.loads(payload)
+        self.assertEqual(
+            [(entry["stream"], entry["text"]) for entry in first["entries"]],
+            [("stdout", "loading inputs"),
+             ("stderr", "iteration 1"),
+             ("stderr", "iteration 2")])
+        self.assertEqual(first["next_sequence"], 3)
+
+        self.state.logs.write("stdout", "iteration 3\n")
+        status, payload, _ = self.request(
+            "GET", f"/logs?after={first['next_sequence']}")
+        self.assertEqual(status, 200)
+        second = json.loads(payload)
+        self.assertEqual([entry["text"] for entry in second["entries"]],
+                         ["iteration 3"])
+        self.assertEqual(second["next_sequence"], 4)
+
+    def test_log_cursor_validation_and_authentication(self):
+        status, _, _ = self.request("GET", "/logs?after=not-a-number")
+        self.assertEqual(status, 400)
+        status, _, _ = self.request("GET", "/logs?after=-1")
+        self.assertEqual(status, 400)
+        status, _, _ = self.request("GET", "/logs?after=0", token=None)
+        self.assertEqual(status, 401)
+
+    def test_bounded_log_buffer_reports_dropped_entries_and_cursor_reset(self):
+        logs = ServiceLogBuffer(max_entries=2)
+        logs.write("stdout", "one\ntwo\nthree\n")
+        result = logs.read_after(0)
+        self.assertEqual([entry["text"] for entry in result["entries"]],
+                         ["two", "three"])
+        self.assertEqual(result["dropped"], 1)
+
+        restarted_client = logs.read_after(100)
+        self.assertTrue(restarted_client["cursor_reset"])
+        self.assertEqual([entry["text"] for entry in restarted_client["entries"]],
+                         ["two", "three"])
+
+    def test_routine_poll_access_lines_do_not_fill_the_log_buffer(self):
+        logs = ServiceLogBuffer()
+        logs.write("stderr", 'SPIRAL_HTTP "GET /session/status HTTP/1.1" 200 -\n')
+        logs.write("stderr", 'SPIRAL_HTTP "GET /logs?after=4 HTTP/1.1" 200 -\n')
+        logs.write("stderr", "useful fitter warning\n")
+        self.assertEqual([entry["text"] for entry in logs.read_after(0)["entries"]],
+                         ["useful fitter warning"])
 
 
 class ArtifactHttpTests(HttpServiceFixture):
@@ -698,6 +752,13 @@ class ServiceProcessTests(unittest.TestCase):
                 with urllib.request.urlopen(request, timeout=10) as response:
                     health = json.loads(response.read())
                 self.assertEqual(health["api_version"], API_VERSION)
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/logs?after=0",
+                    headers={"Authorization": f"Bearer {key}"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    logs = json.loads(response.read())
+                self.assertIn(
+                    ready, [entry["text"] for entry in logs["entries"]])
             finally:
                 process.terminate()
                 process.wait(10)

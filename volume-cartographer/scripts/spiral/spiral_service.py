@@ -15,7 +15,7 @@ ephemeral folder and later committed into the dataset.
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import hashlib
 import json
 import os
@@ -31,14 +31,14 @@ import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from fit_session import (API_VERSION, PclRole, parse_session_request,
                          resolve_dataset_root, validate_checkpoint_container,
                          validate_session_request)
 
 
-SERVICE_VERSION = "2.0.0"
+SERVICE_VERSION = "3.0.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 TRANSFER_CHUNK_BYTES = 1024 * 1024
@@ -55,6 +55,9 @@ UPLOADED_CHECKPOINTS_KEPT = 3
 MAX_CHECKPOINT_UPLOAD_BYTES = int(os.environ.get(
     "SPIRAL_CHECKPOINT_UPLOAD_MAX_BYTES", 64 * 1024 * 1024 * 1024))
 UPLOADED_CHECKPOINTS_DIRNAME = "uploaded-checkpoints"
+MAX_LOG_ENTRIES = 2000
+MAX_LOG_READ_ENTRIES = 1000
+MAX_LOG_ENTRY_CHARS = 8192
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@ -]{0,127}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -78,6 +81,82 @@ class ApiError(Exception):
         self.status = int(status)
         self.message = message
         self.details = details
+
+
+class ServiceLogBuffer:
+    """Bounded, incremental copy of the service's stdout and stderr lines."""
+
+    def __init__(self, max_entries=MAX_LOG_ENTRIES):
+        self._lock = threading.Lock()
+        self._entries = deque(maxlen=max_entries)
+        self._pending = {"stdout": "", "stderr": ""}
+        self._next_sequence = 1
+
+    def write(self, stream, text):
+        if not text:
+            return
+        # Carriage-return progress displays should still give remote clients
+        # useful snapshots even though they overwrite one terminal line.
+        text = str(text).replace("\r", "\n")
+        with self._lock:
+            parts = (self._pending.get(stream, "") + text).split("\n")
+            self._pending[stream] = parts.pop()
+            for line in parts:
+                if not line:
+                    continue
+                # These high-frequency access lines are still written to the
+                # service terminal, but keeping them out of the relay leaves
+                # the bounded buffer for useful fitter output.
+                if line.startswith('SPIRAL_HTTP "GET /session/status HTTP/') \
+                        or line.startswith('SPIRAL_HTTP "GET /logs?after='):
+                    continue
+                if len(line) > MAX_LOG_ENTRY_CHARS:
+                    line = line[:MAX_LOG_ENTRY_CHARS] + " … [truncated]"
+                self._entries.append({
+                    "sequence": self._next_sequence,
+                    "stream": stream,
+                    "text": line,
+                })
+                self._next_sequence += 1
+
+    def read_after(self, after):
+        with self._lock:
+            latest = self._next_sequence - 1
+            cursor_reset = after > latest
+            if cursor_reset:
+                after = 0
+            oldest = self._entries[0]["sequence"] if self._entries else self._next_sequence
+            dropped = max(0, oldest - max(0, after + 1))
+            entries = [dict(entry) for entry in self._entries
+                       if entry["sequence"] > after][:MAX_LOG_READ_ENTRIES]
+            next_sequence = entries[-1]["sequence"] if entries else min(after, latest)
+        return {
+            "entries": entries,
+            "next_sequence": next_sequence,
+            "latest_sequence": latest,
+            "dropped": dropped,
+            "cursor_reset": cursor_reset,
+        }
+
+
+class _TeeStream:
+    """Preserve normal terminal output while copying complete lines to logs."""
+
+    def __init__(self, stream, logs, name):
+        self._stream = stream
+        self._logs = logs
+        self._name = name
+
+    def write(self, text):
+        written = self._stream.write(text)
+        self._logs.write(self._name, text)
+        return written
+
+    def flush(self):
+        return self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
 def _utc_stamp():
@@ -407,7 +486,7 @@ def _copy_publish(source, destination, keep_source=False):
 
 class ServiceState:
     def __init__(self, dataset_root=None, dataset_resolution=None,
-                 service_name=None):
+                 service_name=None, logs=None):
         self.lock = threading.RLock()
         self.session = None
         self.session_id = None
@@ -424,6 +503,7 @@ class ServiceState:
         self.dataset_root = str(dataset_root) if dataset_root else None
         self.dataset_resolution = dataset_resolution
         self.service_name = service_name or socket.gethostname()
+        self.logs = logs if logs is not None else ServiceLogBuffer()
         self.artifacts = ArtifactRegistry()
         self.uploads = {}
         self.ephemeral_records = []
@@ -1260,7 +1340,8 @@ class SpiralHandler(BaseHTTPRequestHandler):
 
     def _dispatch(self):
         self._authorise()
-        path = unquote(urlparse(self.path).path).rstrip("/") or "/"
+        parsed_url = urlparse(self.path)
+        path = unquote(parsed_url.path).rstrip("/") or "/"
         if "\\" in path or "\x00" in path or "/../" in path + "/":
             raise ApiError(HTTPStatus.FORBIDDEN, "Malformed request path")
         state = self.server.state
@@ -1270,6 +1351,17 @@ class SpiralHandler(BaseHTTPRequestHandler):
                 return state.health()
             if path == "/session/status":
                 return state.status()
+            if path == "/logs":
+                values = parse_qs(parsed_url.query).get("after", ["0"])
+                try:
+                    after = int(values[-1])
+                except (TypeError, ValueError):
+                    raise ApiError(HTTPStatus.BAD_REQUEST,
+                                   "The log cursor must be an integer")
+                if after < 0:
+                    raise ApiError(HTTPStatus.BAD_REQUEST,
+                                   "The log cursor must not be negative")
+                return state.logs.read_after(after)
             if path == "/dataset":
                 return state.dataset()
             match = re.fullmatch(r"/artifacts/([A-Za-z0-9._-]+)/manifest", path)
@@ -1465,9 +1557,14 @@ def main(argv=None):
         for warning in dataset_resolution.warnings:
             print(f"  dataset warning: {warning}", file=sys.stderr, flush=True)
 
+    logs = ServiceLogBuffer()
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    sys.stdout = _TeeStream(original_stdout, logs, "stdout")
+    sys.stderr = _TeeStream(original_stderr, logs, "stderr")
     state = ServiceState(dataset_root=args.dataset,
                          dataset_resolution=dataset_resolution,
-                         service_name=args.service_name)
+                         service_name=args.service_name,
+                         logs=logs)
     # A stable, operator-chosen port must survive TIME_WAIT restarts; an
     # ephemeral port must not reuse an address it did not own.
     SpiralServer.allow_reuse_address = args.port != 0
@@ -1499,6 +1596,7 @@ def main(argv=None):
     finally:
         server.server_close()
         state.close()
+        sys.stdout, sys.stderr = original_stdout, original_stderr
     return 0
 
 
