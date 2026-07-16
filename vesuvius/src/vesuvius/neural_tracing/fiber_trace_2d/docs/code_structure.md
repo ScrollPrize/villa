@@ -84,6 +84,31 @@ side/top strip input loading.
 - This is for test/metric integration with the existing 2D tracer; 3D training
   and loading remain CP-centered block loading.
 
+`fiber_trace_3d/trace2cp_tool.py`
+
+- Provides a separate native 3D Trace2CP inspection CLI:
+
+  ```bash
+  python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool <config.json> --checkpoint <snapshot.pt> --sample-index 0 --export-dir <dir>
+  ```
+
+- Traces directly in selected-level ZYX voxel coordinates, not in a projected
+  2D strip. It lazily runs dense 3D inference blocks around queried points,
+  crops each block to a trusted core, and routes every candidate lookup to the
+  block whose trusted core contains that point.
+- Decodes Lasagna 3x2 direction channels analytically with the shared 3D
+  direction decoder, aligns sign-ambiguous axes to the current trace direction,
+  samples a deterministic cone of candidate steps, and scores candidates by
+  direction agreement plus optional `1 - presence`.
+- Stops when the trace crosses the plane through the target CP with normal
+  from start CP to target CP. The stdout/summary metrics are
+  `native_trace2cp_plane_error` and
+  `native_trace2cp_closest_target_error`; these are tool-local diagnostics and
+  do not replace the projected `test/trace2cp_error` metric used by training.
+- For visualization, converts the fused native 3D trace back to base XYZ and
+  rebuilds side/top Trace2CP strip views through the existing
+  `FiberStrip2DLoader` refined-source path.
+
 `fiber_trace_3d/train.py`
 
 - Command-line entry point:
@@ -225,6 +250,7 @@ PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --resume /path/to/current.pt
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --trace2cp-vis --checkpoint /path/to/best.pt --sample-index 0 --export-dir /tmp/fiber_trace_3d_trace2cp
+PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --checkpoint /path/to/best.pt --sample-index 0 --export-dir /tmp/fiber_trace_3d_native_trace2cp
 ```
 
 The important behavior is:

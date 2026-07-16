@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-16
+
+- Added a separate native 3D Trace2CP inspection CLI with overlapped
+  trusted-core inference blocks, deterministic 3D cone candidate tracing,
+  target-plane stopping, tool-local native trace metrics, and side/top strip
+  visualization through the existing Trace2CP refined-source path.
+
 ## 2026-07-15
 
 - Fixed 3D train/test TensorBoard target/context presence visualization so

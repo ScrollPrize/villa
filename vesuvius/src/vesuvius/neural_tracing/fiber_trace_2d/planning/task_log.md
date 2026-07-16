@@ -1,23 +1,35 @@
 # Native 3D Trace2CP Tool Task Log
 
-## Planning Notes
+## Implementation Notes
 
-- Inspected the current 2D Trace2CP direction and combined
-  direction/presence scorer in `fiber_trace_2d.runner`.
-- Inspected the current 3D Trace2CP bridge in `fiber_trace_3d.trace2cp_bridge`
-  and `fiber_trace_3d.train`.
-- Confirmed that the current 3D path projects 3D model outputs onto a 2D
-  Trace2CP strip and reuses the 2D scorer; it is not a native 3D cone tracer.
-- Replaced `task.md`, `task_plan.md`, and `status.md` with a planning-only
-  task for a separate native 3D Trace2CP tool.
+- Added `vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool` as a separate
+  native 3D Trace2CP inspection CLI.
+- Implemented deterministic cone candidate generation around the current
+  inferred 3D direction.
+- Implemented `NativeTraceFieldCache`, which lazily infers overlapped 3D model
+  output blocks and routes point/candidate lookups through trusted cropped
+  cores.
+- Implemented bidirectional native tracing in selected-level ZYX coordinates
+  with target-plane crossing and simple forward/reverse trace fusion.
+- Implemented tool-local stdout/JSON metrics:
+  `native_trace2cp_plane_error` and
+  `native_trace2cp_closest_target_error`.
+- Implemented visualization export by projecting the fused native 3D trace into
+  the existing Trace2CP source frame and rebuilding side/top strip images with
+  the existing refined 2D strip-source path.
+- Updated `planning/specs.md` and `docs/code_structure.md`.
+- Added focused synthetic tests in `test_fiber_trace_3d.py`.
 
 ## Deviations Or Deferrals
 
-- No implementation was done in this planning step.
-- The native 3D metric is planned as tool-local debug output first and should
-  not replace the existing projected Trace2CP metric or best-checkpoint
-  selection in the first implementation.
+- The native tool is an inspection/debug tool only. It does not replace the
+  existing projected `test/trace2cp_error` metric or best-checkpoint selection.
+- The visualization adapter projects the fused native 3D trace into the
+  existing Trace2CP source frame before calling the refined strip builder. It
+  reuses the existing strip geometry path, but it is not yet exposed as a
+  standalone public loader API for arbitrary volume-space polylines.
 
 ## Validation
 
-- Planning-only; no code tests were run.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - Result: 311 passed in 12.36s.

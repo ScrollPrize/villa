@@ -6,8 +6,20 @@
 - [x] Replace `planning/task.md` with the current planning task.
 - [x] Replace `planning/task_plan.md` with the native 3D implementation plan.
 - [x] Record that this is planning-only and implementation is pending.
-- [ ] Update specs during implementation.
-- [ ] Update docs during implementation.
-- [ ] Implement separate native 3D Trace2CP tool.
-- [ ] Add focused tests.
-- [ ] Run validation commands.
+- [x] Update specs during implementation.
+- [x] Update docs during implementation.
+- [x] Implement separate native 3D Trace2CP tool.
+- [x] Add focused tests.
+- [x] Run validation commands.
+
+## Implemented Scope
+
+- [x] Added `fiber_trace_3d.trace2cp_tool` native CLI.
+- [x] Added overlapped trusted-core inference block cache/router.
+- [x] Added deterministic 3D cone candidate stepping with direction/presence
+  scoring.
+- [x] Added target-plane crossing stop condition.
+- [x] Added side/top Trace2CP strip visualization through the existing refined
+  2D strip source path.
+- [x] Added synthetic tests for cone generation, plane crossing, block routing,
+  and constant-field native tracing.

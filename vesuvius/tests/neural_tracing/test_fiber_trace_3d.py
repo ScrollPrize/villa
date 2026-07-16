@@ -42,6 +42,13 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_bridge import (
     project_3d_output_to_trace2cp_fields,
     score_trace2cp_projected_fields,
 )
+from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
+    NativeTrace2CpConfig,
+    NativeTraceFieldCache,
+    _interpolate_plane_crossing,
+    generate_cone_candidates,
+    trace_native_3d_pair,
+)
 from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _FiberTrace3DBatchDataset,
@@ -1244,3 +1251,118 @@ def test_3d_trace2cp_fixed_set_evaluator_scores_synthetic_source() -> None:
     assert result.error_mean < 0.05
     assert result.segments == 1
     assert result.skipped_segments == 0
+
+
+def test_native_3d_trace2cp_cone_candidates_are_deterministic_and_bounded() -> None:
+    axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    candidates_a = generate_cone_candidates(
+        axis,
+        max_angle_degrees=25.0,
+        rings=2,
+        azimuths=8,
+    )
+    candidates_b = generate_cone_candidates(
+        axis,
+        max_angle_degrees=25.0,
+        rings=2,
+        azimuths=8,
+    )
+
+    assert np.allclose(candidates_a, candidates_b)
+    assert candidates_a.shape == (1 + 2 * 8, 3)
+    assert np.allclose(np.linalg.norm(candidates_a, axis=1), 1.0, atol=1.0e-5)
+    angles = np.rad2deg(np.arccos(np.clip(candidates_a @ axis, -1.0, 1.0)))
+    assert float(np.max(angles)) <= 25.0 + 1.0e-4
+
+
+def test_native_3d_trace2cp_plane_crossing_interpolates() -> None:
+    crossing = _interpolate_plane_crossing(
+        np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        np.asarray([0.0, 0.0, 10.0], dtype=np.float32),
+        plane_point_zyx=np.asarray([0.0, 0.0, 4.0], dtype=np.float32),
+        plane_normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+
+    assert crossing is not None
+    assert np.allclose(crossing, [0.0, 0.0, 4.0])
+
+
+def test_native_3d_trace2cp_block_router_uses_trusted_core() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class ConstantNativeModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6] = 1.0
+            return out
+
+    record = SimpleNamespace(
+        volume=np.ones((32, 32, 32), dtype=np.float32),
+        volume_spacing_base=1.0,
+    )
+    cache = NativeTraceFieldCache(
+        record=record,
+        model=ConstantNativeModel(),
+        config=_loader(augment_enabled=False).config,
+        image_normalization="none",
+        patch_shape_zyx=(16, 16, 16),
+        core_margin_voxels=4,
+        device=torch.device("cpu"),
+    )
+
+    first = cache.block_for_point(np.asarray([8.0, 8.0, 8.0], dtype=np.float32))
+    second = cache.block_for_point(np.asarray([12.25, 8.0, 8.0], dtype=np.float32))
+
+    assert np.allclose(first.origin_zyx, [0, 0, 0])
+    assert np.allclose(second.origin_zyx, [8, 0, 0])
+
+
+def test_native_3d_trace2cp_constant_field_reaches_target_plane() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class ConstantNativeModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6] = 1.0
+            return out
+
+    record = SimpleNamespace(
+        volume=np.ones((32, 32, 32), dtype=np.float32),
+        volume_spacing_base=1.0,
+    )
+    cache = NativeTraceFieldCache(
+        record=record,
+        model=ConstantNativeModel(),
+        config=_loader(augment_enabled=False).config,
+        image_normalization="none",
+        patch_shape_zyx=(16, 16, 16),
+        core_margin_voxels=2,
+        device=torch.device("cpu"),
+    )
+    result = trace_native_3d_pair(
+        cache,
+        start_zyx=np.asarray([8.0, 8.0, 4.0], dtype=np.float32),
+        target_zyx=np.asarray([8.0, 8.0, 20.0], dtype=np.float32),
+        cfg=NativeTrace2CpConfig(
+            step_voxels=2.0,
+            cone_angle_degrees=0.0,
+            cone_rings=0,
+            cone_azimuths=1,
+            max_steps=20,
+            inference_patch_shape_zyx=(16, 16, 16),
+            core_margin_voxels=2,
+        ),
+    )
+
+    assert result.forward.reached_target_plane
+    assert result.reverse.reached_target_plane
+    assert result.plane_error < 1.0e-6
+    assert result.closest_target_error < 1.0e-6
