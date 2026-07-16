@@ -77,9 +77,9 @@ export default function InkDemo() {
   const [mirrored, setMirrored] = useState(false); // phone: pred pane tracks the draw pane's view
   const [doneFrac, setDoneFrac] = useState(AREA_DONE_FRAC); // meter target (phones lower it)
   const [introOn, setIntroOn] = useState(false); // phone: pinch cue is on screen
+  const [pinchStarted, setPinchStarted] = useState(false); // drop the cue once a pinch begins
   const [tapFx, setTapFx] = useState(null); // momentary tool (clear/hint) tap flash
   const cueRef = useRef(null); // the cue element, kept over the first letter
-  const bubbleRef = useRef(null); // the cue's bubble, deformed by a live pinch
   const coarse = useCoarsePointer(); // gesture wording matches the device
 
   const drawRef = useRef(null); // visible surface canvas (top pane)
@@ -1664,6 +1664,7 @@ export default function InkDemo() {
       st.zoomOutPending = false;
       st.doneReveal = false;
       st.introPinched = true; // this gesture is a pinch, not an intro tap
+      if (st.intro) setPinchStarted(true); // the cue's done its job — drop it
       // the second finger of a pan/pinch: whatever the first finger
       // buffered was never a stroke — drop it undrawn
       if (st.pendingPaint) {
@@ -1797,15 +1798,6 @@ export default function InkDemo() {
       v.ty = mid.y - st.pinch0.iy * v.s;
       clampView(v);
       redrawLeft();
-      // the cue's bubble is BEING pinched: stretch it along the finger
-      // axis (and thin it across) until the zoom-in pops it
-      if (st.intro && bubbleRef.current) {
-        const g = Math.max(0.8, Math.min(1.5, d / st.pinch0.d));
-        const th = Math.atan2(p2.y - p1.y, p2.x - p1.x);
-        bubbleRef.current.style.transform = `rotate(${th}rad) scale(${g}, ${
-          1 / Math.sqrt(g)
-        }) rotate(${-th}rad)`;
-      }
       return;
     }
     if (st.painting) stamp(...pointerToImg(e));
@@ -1830,8 +1822,6 @@ export default function InkDemo() {
       // spot they pinched, not at whatever ended up mid-screen
       if (st.pinch0) st.pinchAnchor = { x: st.pinch0.ix, y: st.pinch0.iy };
       st.pinch0 = null;
-      // a pinch that let go without zooming in: the bubble springs back
-      if (bubbleRef.current) bubbleRef.current.style.transform = "";
     }
     if (st.pointers.size === 0) {
       // resolve the intro at gesture end, never mid-gesture: a pinch that
@@ -1904,7 +1894,10 @@ export default function InkDemo() {
       // like pinching the surface
       st.zoomOutPending = false;
       st.doneReveal = false;
-      if (st.intro) st.introPinched = true;
+      if (st.intro) {
+        st.introPinched = true;
+        setPinchStarted(true); // pinching the pred pane drops the cue too
+      }
       const [p1, p2] = [...st.predPointers.values()];
       const off = predVOff();
       const v = st.view;
@@ -1980,7 +1973,9 @@ export default function InkDemo() {
   function tapTool(which, run) {
     run();
     setTapFx(which);
-    setTimeout(() => setTapFx((c) => (c === which ? null : c)), 420);
+    // short: the selected box hops to the tapped icon and is back on the
+    // active tool quickly (matches the CSS flash duration below)
+    setTimeout(() => setTapFx((c) => (c === which ? null : c)), 210);
   }
 
   const meterFill = Math.min(100, (labeledPct / (doneFrac * 100)) * 100);
@@ -2078,10 +2073,10 @@ export default function InkDemo() {
                   fingers (see onPointerMove) until the zoom-in pops it.
                   Pointer events pass through: the cue is watched, the
                   canvas is touched. */}
-              {introOn && phase === "play" && (
+              {introOn && !pinchStarted && phase === "play" && (
                 <div className="vc-gs-pinchcue" aria-hidden="true">
                   <div className="vc-gs-pinchcue__at" ref={cueRef}>
-                    <div className="vc-gs-pinchcue__bubble" ref={bubbleRef}>
+                    <div className="vc-gs-pinchcue__bubble">
                       <svg
                         className="vc-gs-pinchcue__icon"
                         viewBox="0 0 48 48"
