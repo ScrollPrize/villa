@@ -505,6 +505,31 @@ class UploadTests(unittest.TestCase):
         self.state.run({"iterations": 5})
         self.assertEqual(session.run_calls[-1][1], [])
 
+    def test_run_passes_and_validates_transient_influence_config(self):
+        session = self._session()
+        influence = {
+            "interactive_influence_enabled": True,
+            "interactive_influence_z": 1200,
+            "interactive_influence_windings": 2.5,
+            "interactive_influence_theta_frac": 0.2,
+            "interactive_influence_disable_dt_frac": 0.4,
+            "interactive_influence_sigma": 0.25,
+            "interactive_influence_footprint_points": 512,
+            "interactive_influence_anchor_lattice_points": 2000,
+            "interactive_influence_anchor_geometry_points": 1000,
+            "interactive_influence_anchor_samples_per_step": 128,
+            "interactive_influence_anchor_ramp_power": 3.0,
+            "loss_weight_anchor": 15.0,
+        }
+        self.state.run({"iterations": 10, "influence_config": influence})
+        self.assertEqual(session.run_calls[-1][3], influence)
+
+        with self.assertRaises(ApiError) as caught:
+            self.state.run({"iterations": 10, "influence_config": {
+                "interactive_influence_theta_frac": 1.5,
+            }})
+        self.assertEqual(caught.exception.status, 400)
+
     def test_new_session_does_not_see_previous_ephemeral_inputs(self):
         self._session()
         upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)

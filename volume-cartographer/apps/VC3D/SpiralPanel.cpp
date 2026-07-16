@@ -262,7 +262,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _influenceThetaPct->setToolTip(tr("Max influence half-extent along the wrap, as a fraction of a full turn"));
     _influenceDisableDtPct = new QSpinBox(outputContents);
     _influenceDisableDtPct->setRange(0, 100);
-    _influenceDisableDtPct->setSuffix(tr("% of iterations"));
+    _influenceDisableDtPct->setSuffix(tr("%"));
     _influenceDisableDtPct->setValue(75);
     _influenceDisableDtPct->setToolTip(
         tr("Fraction of each requested Run window that keeps directional DT losses disabled "
@@ -285,7 +285,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     outputForm->addRow(tr("Influence z extent"), _influenceZ);
     outputForm->addRow(tr("Influence windings"), _influenceWindings);
     outputForm->addRow(tr("Influence theta"), _influenceThetaPct);
-    outputForm->addRow(tr("Disable DT"), _influenceDisableDtPct);
+    outputForm->addRow(tr("% of iters to disable DT"), _influenceDisableDtPct);
     outputForm->addRow(tr("Influence anchor weight"), _influenceAnchorWeight);
     outputForm->addRow(tr("Advanced config JSON"), _advanced);
 

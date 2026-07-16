@@ -120,6 +120,15 @@ a fiber in the Fibers panel and pick *Add to current spiral fit*. Added inputs
 are uploaded into a session-scoped ephemeral folder, used from the next run
 onward, and can be moved into the dataset with *Commit current inputs*.
 
+Interactive influence settings are scoped to each **Run** request. The fitter
+builds a fresh influence region from only the inputs pending for that run,
+uses it for the requested iteration window, and discards it before autosaving.
+Influence masks, limits, and controls are not checkpoint state. All
+`interactive_influence_*` advanced settings can therefore change between runs
+without reloading the resident session. The **Disable DT** percentage controls
+how much of that run suppresses directional DT losses after incorporating its
+pending inputs.
+
 **Resume checkpoints on a remote profile:** the Checkpoint field accepts a
 service-advertised checkpoint (a `*.ckpt` at the dataset root), a service path
 under the output directory (for example the autosave), or a **client-local

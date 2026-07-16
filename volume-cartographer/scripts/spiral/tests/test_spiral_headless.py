@@ -142,6 +142,25 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(session._target, 30_250)
         self.assertEqual(session._state, "Running")
 
+    def test_run_queues_influence_config_with_only_pending_inputs(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Ready"
+        session._completed = 10
+        session._pending = 0
+        session._target = 10
+        session._incorporate_inputs = lambda *_: None
+        session._idle_actions = []
+        pending = [{"id": "new-patch"}]
+        influence = {"interactive_influence_theta_frac": 0.25}
+
+        session.run(20, pending_inputs=pending, influence_config=influence)
+
+        action = session._idle_actions[0]
+        self.assertEqual(action[0], "incorporate")
+        self.assertEqual(action[1], pending)
+        self.assertEqual(action[3], influence)
+
     def test_run_finish_callback_precedes_autosave(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
