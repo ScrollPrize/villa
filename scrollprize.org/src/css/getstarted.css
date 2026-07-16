@@ -241,6 +241,200 @@ html.docs-doc-id-get_started main .container article {
   touch-action: none;
   cursor: crosshair;
 }
+/* phones: the prediction pane mirrors the surface view, so it takes pinch/
+   drag gestures too (they drive the shared view and never paint). Desktop's
+   pred pane isn't mirrored and keeps its default touch behavior. */
+.vc-gs-demo__canvas--zoom {
+  touch-action: none;
+}
+/* phone intro: the demo opens on the whole strip with the brush off — an
+   animated pinch-out cue (deliberately NOT the paint ring, which means
+   "paint here") invites the zoom-in that arms it. Pointer events pass
+   through: the cue is watched, the canvas is touched. */
+.vc-gs-canvaswrap {
+  position: relative;
+}
+.vc-gs-pinchcue {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+/* the cue sits ON the first letter (positioned from JS as the view moves):
+   a pulsating bubble with a continuous source at its center that spawns
+   arrows drifting outward along the pinch-out diagonal, brightening to
+   a mid-journey peak and dimming out at the rim — a seamless loop.
+   A live pinch stretches the bubble along the finger axis (inline
+   transform set from the pinch handler); letting go snaps it back; the
+   zoom-in pops it. Kin to the breathing paint ring that follows. */
+.vc-gs-pinchcue__at {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  line-height: 0;
+}
+/* the deformable layer — kept separate from the breathing animation
+   below, which would otherwise override the inline pinch transform */
+.vc-gs-pinchcue__bubble {
+  line-height: 0;
+  transition: transform 0.12s ease-out;
+}
+.vc-gs-pinchcue__icon {
+  animation: vc-gs-pinch-breathe 1.6s ease-in-out infinite;
+}
+.vc-gs-pinchcue__skin {
+  fill: none;
+  stroke: #ff6a3d;
+  stroke-width: 2;
+  filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.7));
+  animation: vc-gs-pinch-skin 1.6s ease-in-out infinite;
+}
+/* the flow: pinch batches from the source at the center gap. The three
+   arrows fire as one burst (0.12s apart, all while still at the
+   source), then the batch flies out as one — nothing else spawns
+   mid-flight. Each arrow ACCELERATES toward the rim like a flicked
+   finger (0.75s journey); the trail stretches as it speeds up. Only
+   once the last arrow of the batch has completed to the radius does
+   the next batch fire (cycle 1.1s = 0.24s burst + 0.75s flight + a
+   beat). Opacity only RISES — dim at birth, fully bright just short of
+   the rim, where it vanishes — so the arrows behind the bright head read
+   as its comet trace. */
+.vc-gs-pinchcue__icon path {
+  fill: none;
+  stroke: #ff6a3d;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.7));
+  opacity: 0;
+  animation: 1.1s linear infinite;
+}
+/* direction + stagger. Selectors outmatch the `animation` shorthand
+   above (which resets animation-name and delay at path-selector
+   specificity) */
+.vc-gs-pinchcue__icon .vc-gs-pinchcue__up path {
+  animation-name: vc-gs-pinch-flow-up;
+}
+.vc-gs-pinchcue__icon .vc-gs-pinchcue__dn path {
+  animation-name: vc-gs-pinch-flow-dn;
+}
+.vc-gs-pinchcue__icon path.vc-gs-pinchcue__w2 {
+  animation-delay: 0.12s;
+}
+.vc-gs-pinchcue__icon path.vc-gs-pinchcue__w3 {
+  animation-delay: 0.24s;
+}
+@keyframes vc-gs-pinch-flow-up {
+  0% {
+    opacity: 0.4;
+    transform: translate(0, 0);
+    animation-timing-function: ease-in;
+  }
+  68% {
+    opacity: 1;
+    transform: translate(-7px, -7px);
+  }
+  69%,
+  100% {
+    opacity: 0;
+    transform: translate(-7px, -7px);
+  }
+}
+@keyframes vc-gs-pinch-flow-dn {
+  0% {
+    opacity: 0.4;
+    transform: translate(0, 0);
+    animation-timing-function: ease-in;
+  }
+  68% {
+    opacity: 1;
+    transform: translate(7px, 7px);
+  }
+  69%,
+  100% {
+    opacity: 0;
+    transform: translate(7px, 7px);
+  }
+}
+/* the bubble pulses like a pinch — contracting under, expanding past
+   its resting size */
+@keyframes vc-gs-pinch-breathe {
+  0%,
+  100% {
+    transform: scale(0.96);
+  }
+  50% {
+    transform: scale(1.08);
+  }
+}
+@keyframes vc-gs-pinch-skin {
+  0%,
+  100% {
+    opacity: 0.65;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+/* same dress as the canvas "Tap here" pill next to the paint ring — and
+   it sways with the bubble's breath the way that pill rides the ring */
+.vc-gs-pinchcue__pill {
+  position: absolute;
+  left: 30px;
+  top: 50%;
+  transform: translate(0, -50%);
+  white-space: nowrap;
+  line-height: 1.9;
+  font:
+    600 13px system-ui,
+    -apple-system,
+    sans-serif;
+  color: #ff6a3d;
+  background: rgba(18, 19, 22, 0.92);
+  border: 1.2px solid rgba(229, 80, 43, 0.9);
+  border-radius: 999px;
+  padding: 0 8px;
+  animation: vc-gs-pinch-pill 1.6s ease-in-out infinite;
+}
+@keyframes vc-gs-pinch-pill {
+  0%,
+  100% {
+    transform: translate(0, -50%);
+  }
+  50% {
+    transform: translate(2.5px, -50%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vc-gs-pinchcue__icon,
+  .vc-gs-pinchcue__skin,
+  .vc-gs-pinchcue__icon path,
+  .vc-gs-pinchcue__pill {
+    animation: none;
+  }
+  /* static comet: the journey frozen at three stations — dim at the
+     source, fully bright at the rim */
+  .vc-gs-pinchcue__icon path {
+    opacity: 0.4;
+  }
+  .vc-gs-pinchcue__up path.vc-gs-pinchcue__w2 {
+    transform: translate(-4px, -4px);
+    opacity: 0.7;
+  }
+  .vc-gs-pinchcue__up path.vc-gs-pinchcue__w3 {
+    transform: translate(-7px, -7px);
+    opacity: 1;
+  }
+  .vc-gs-pinchcue__dn path.vc-gs-pinchcue__w2 {
+    transform: translate(4px, 4px);
+    opacity: 0.7;
+  }
+  .vc-gs-pinchcue__dn path.vc-gs-pinchcue__w3 {
+    transform: translate(7px, 7px);
+    opacity: 1;
+  }
+  .vc-gs-pinchcue__skin {
+    opacity: 0.85;
+  }
+}
 .vc-gs-demo__pane figcaption {
   margin-top: 7px;
   font-size: 0.8rem;
