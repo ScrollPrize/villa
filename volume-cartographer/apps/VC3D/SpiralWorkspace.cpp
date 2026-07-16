@@ -1022,11 +1022,6 @@ std::shared_ptr<QuadSurface> SpiralWorkspace::makeDisplayedPreview(
         selected.push_back(component);
     }
     if (selected.empty()) return {};
-    if (selected.size() == _previewComponents.size()) {
-        registrationId = _previewSourceId;
-        return _previewSource;
-    }
-
     const int firstColumn = selected.front().firstColumn;
     const int endColumn = selected.back().endColumn;
     std::vector<std::pair<int, int>> relativeComponents;
@@ -1035,6 +1030,12 @@ std::shared_ptr<QuadSurface> SpiralWorkspace::makeDisplayedPreview(
         relativeComponents.emplace_back(component.firstColumn - firstColumn,
                                         component.endColumn - firstColumn);
     }
+    // Always use the display wrapper, including for the unbounded (-1) range.
+    // load_quad_from_tifxyz() returns an in-memory surface whose protected
+    // component ranges are not populated from meta.json.  Returning that source
+    // directly for the full range therefore loses the disconnected-winding
+    // layout, while every bounded range takes this wrapper path and renders
+    // correctly.  The wrapper installs the selected component ranges explicitly.
     registrationId = QStringLiteral("%1-display-%2")
                          .arg(_previewSourceId)
                          .arg(_previewDisplayRevision);
