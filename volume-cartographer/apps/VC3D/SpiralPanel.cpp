@@ -297,6 +297,42 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     displayGroup->contentLayout()->addWidget(displayContents);
     _volumeSelector = new VolumeSelector(displayContents);
     displayLayout->addWidget(_volumeSelector);
+    auto* windingRange = new QWidget(displayContents);
+    auto* windingRangeLayout = new QHBoxLayout(windingRange);
+    windingRangeLayout->setContentsMargins(0, 0, 0, 0);
+    _minimumDisplayedWinding = new QSpinBox(windingRange);
+    _minimumDisplayedWinding->setObjectName(QStringLiteral("spiralMinimumDisplayedWinding"));
+    _minimumDisplayedWinding->setRange(0, 1000000);
+    _minimumDisplayedWinding->setValue(10);
+    _minimumDisplayedWinding->setToolTip(tr("First winding to display (inclusive)"));
+    _maximumDisplayedWinding = new QSpinBox(windingRange);
+    _maximumDisplayedWinding->setObjectName(QStringLiteral("spiralMaximumDisplayedWinding"));
+    _maximumDisplayedWinding->setRange(-1, 1000000);
+    _maximumDisplayedWinding->setValue(-1);
+    _maximumDisplayedWinding->setToolTip(
+        tr("Last winding to display (inclusive); -1 displays through the final winding"));
+    windingRangeLayout->addWidget(new QLabel(tr("Min winding"), windingRange));
+    windingRangeLayout->addWidget(_minimumDisplayedWinding);
+    windingRangeLayout->addWidget(new QLabel(tr("Max winding"), windingRange));
+    windingRangeLayout->addWidget(_maximumDisplayedWinding);
+    displayLayout->addWidget(windingRange);
+    auto emitWindingRange = [this](int) {
+        emit windingRangeChanged(_minimumDisplayedWinding->value(),
+                                 _maximumDisplayedWinding->value());
+    };
+    connect(_minimumDisplayedWinding, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, emitWindingRange);
+    connect(_maximumDisplayedWinding, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, emitWindingRange);
+
+    _showSurfaceIntersections = new QCheckBox(tr("Show surface intersections"), displayContents);
+    _showSurfaceIntersections->setObjectName(QStringLiteral("spiralShowSurfaceIntersections"));
+    _showSurfaceIntersections->setChecked(true);
+    _showSurfaceIntersections->setToolTip(
+        tr("Show rendered surface intersections on the plane views"));
+    connect(_showSurfaceIntersections, &QCheckBox::toggled,
+            this, &SpiralPanel::surfaceIntersectionsChanged);
+    displayLayout->addWidget(_showSurfaceIntersections);
     for (const auto& item : std::initializer_list<std::pair<const char*, const char*>>{
              {"output", "Output"}, {"fibers", "Fibers"}, {"tracks", "Tracks"},
              {"pcls", "Winding/PCL inputs"}, {"verified", "Verified patches"},

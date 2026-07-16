@@ -40,6 +40,35 @@
 #include <fstream>
 #include <map>
 
+namespace {
+
+class SpiralPreviewRangeSurface final : public QuadSurface
+{
+public:
+    SpiralPreviewRangeSurface(const std::shared_ptr<QuadSurface>& source,
+                              int firstColumn, int endColumn,
+                              const std::vector<std::pair<int, int>>& components,
+                              const std::string& displayId)
+        : QuadSurface(new cv::Mat_<cv::Vec3f>(
+                          (*source->rawPointsPtr())(
+                              cv::Rect(firstColumn, 0, endColumn - firstColumn,
+                                       source->rawPointsPtr()->rows))),
+                      source->scale()),
+          _source(source)
+    {
+        id = displayId;
+        meta = source->meta;
+        _components = components;
+    }
+
+private:
+    // The OpenCV ROI is reference-counted, but retaining the source also makes
+    // the display-only relationship explicit and keeps its metadata available.
+    std::shared_ptr<QuadSurface> _source;
+};
+
+} // namespace
+
 SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     : QMainWindow(parent), _mainState(mainState)
 {
@@ -171,6 +200,16 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         } else if (_surfaceCategoryVisible.contains(category)) {
             setSurfaceCategoryVisible(category, shown);
         }
+    });
+    connect(_panel, &SpiralPanel::windingRangeChanged, this,
+            [this](int minimum, int maximum) {
+                _minimumDisplayedWinding = minimum;
+                _maximumDisplayedWinding = maximum;
+                applyPreviewWindingRange(true);
+            });
+    connect(_panel, &SpiralPanel::surfaceIntersectionsChanged, this, [this](bool shown) {
+        _showSurfaceIntersections = shown;
+        updateSurfaceIntersections();
     });
     connect(_service, &SpiralServiceManager::previewAvailable, this, &SpiralWorkspace::loadPreview);
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
@@ -438,7 +477,8 @@ void SpiralWorkspace::updateSurfaceIntersections()
             viewer->requestRender("Spiral surface overlays changed");
             continue;
         }
-        viewer->setIntersects(intersections);
+        viewer->setIntersects(_showSurfaceIntersections ? intersections
+                                                        : std::set<std::string>{});
         viewer->requestRender("Spiral surface visibility changed");
     }
 }
@@ -595,14 +635,14 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
     });
     watcher->setFuture(QtConcurrent::run([manifestPath]() -> PreviewLoadResult {
         QFile file(manifestPath);
-        if (!file.open(QIODevice::ReadOnly)) return {{}, {}, QObject::tr("Cannot read Spiral preview manifest")};
+        if (!file.open(QIODevice::ReadOnly)) return {{}, {}, {}, QObject::tr("Cannot read Spiral preview manifest")};
         const QJsonObject manifest = QJsonDocument::fromJson(file.readAll()).object();
         if (manifest.value(QStringLiteral("schema_version")).toInt() != 1
             || manifest.value(QStringLiteral("kind")).toString() != QStringLiteral("spiral_combined_preview"))
-            return {{}, {}, QObject::tr("Unsupported Spiral preview manifest")};
+            return {{}, {}, {}, QObject::tr("Unsupported Spiral preview manifest")};
         QString surfacePath = manifest.value(QStringLiteral("surface_path")).toString();
         const QString surfaceId = manifest.value(QStringLiteral("surface_id")).toString();
-        if (surfacePath.isEmpty() || surfaceId.isEmpty()) return {{}, {}, QObject::tr("Malformed Spiral preview manifest")};
+        if (surfacePath.isEmpty() || surfaceId.isEmpty()) return {{}, {}, {}, QObject::tr("Malformed Spiral preview manifest")};
         // The manifest's surface_path is a service-host path; a cache-resident
         // artifact keeps the surface directory (named by its id) beside the
         // manifest, so prefer that local layout when it exists.
@@ -613,31 +653,35 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
         const QJsonArray windingIds = manifest.value(QStringLiteral("winding_ids")).toArray();
         if (components.isEmpty() || components.size() != windingIds.size()
             || windingIds.at(0).toInt() != 10)
-            return {{}, {}, QObject::tr("Invalid Spiral preview components/winding mapping")};
+            return {{}, {}, {}, QObject::tr("Invalid Spiral preview components/winding mapping")};
+        std::vector<PreviewComponent> previewComponents;
+        previewComponents.reserve(components.size());
         int previousEnd = -1;
         for (int index = 0; index < components.size(); ++index) {
             const QJsonArray range = components[index].toArray();
             if (range.size() != 2 || range[0].toInt() <= previousEnd
                 || range[1].toInt() <= range[0].toInt()
                 || windingIds[index].toInt() != 10 + index)
-                return {{}, {}, QObject::tr("Invalid disconnected Spiral component range")};
+                return {{}, {}, {}, QObject::tr("Invalid disconnected Spiral component range")};
+            previewComponents.push_back(
+                {range[0].toInt(), range[1].toInt(), windingIds[index].toInt()});
             previousEnd = range[1].toInt();
         }
         QFile metadata(QDir(surfacePath).filePath(QStringLiteral("meta.json")));
         if (!metadata.open(QIODevice::ReadOnly))
-            return {{}, {}, QObject::tr("Spiral preview surface metadata is missing")};
+            return {{}, {}, {}, QObject::tr("Spiral preview surface metadata is missing")};
         const QJsonObject meta = QJsonDocument::fromJson(metadata.readAll()).object();
         if (meta.value(QStringLiteral("components")) != manifest.value(QStringLiteral("components"))
             || meta.value(QStringLiteral("component_winding_ids")) != manifest.value(QStringLiteral("winding_ids"))
             || meta.value(QStringLiteral("uuid")).toString() != surfaceId)
-            return {{}, {}, QObject::tr("Spiral preview metadata does not match its generation manifest")};
+            return {{}, {}, {}, QObject::tr("Spiral preview metadata does not match its generation manifest")};
         try {
             auto loaded = load_quad_from_tifxyz(surfacePath.toStdString());
             auto surface = std::shared_ptr<QuadSurface>(std::move(loaded));
             surface->id = surfaceId.toStdString();
-            return {surface, surfaceId, {}};
+            return {surface, surfaceId, std::move(previewComponents), {}};
         } catch (const std::exception& error) {
-            return {{}, {}, QString::fromUtf8(error.what())};
+            return {{}, {}, {}, QString::fromUtf8(error.what())};
         }
     }));
 }
@@ -645,30 +689,98 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
 void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 generation)
 {
     if (!result.surface) { statusBar()->showMessage(result.error, 15000); return; }
-    _state->setSurface(result.surfaceId.toStdString(), result.surface);
-    installPreviewAliasWhenIndexed(result, generation, 0);
+    _previewSource = result.surface;
+    _previewSourceId = result.surfaceId;
+    _previewComponents = result.components;
+    applyPreviewWindingRange(false);
 }
 
-void SpiralWorkspace::installPreviewAliasWhenIndexed(const PreviewLoadResult& result,
-                                                      qint64 generation, int attempt)
+std::shared_ptr<QuadSurface> SpiralWorkspace::makeDisplayedPreview(
+    QString& registrationId) const
 {
-    if (_shuttingDown || generation != _requestedPreviewGeneration) return;
+    if (!_previewSource || _previewComponents.empty()) return {};
+
+    std::vector<PreviewComponent> selected;
+    for (const PreviewComponent& component : _previewComponents) {
+        if (component.winding < _minimumDisplayedWinding) continue;
+        if (_maximumDisplayedWinding >= 0 && component.winding > _maximumDisplayedWinding)
+            continue;
+        selected.push_back(component);
+    }
+    if (selected.empty()) return {};
+    if (selected.size() == _previewComponents.size()) {
+        registrationId = _previewSourceId;
+        return _previewSource;
+    }
+
+    const int firstColumn = selected.front().firstColumn;
+    const int endColumn = selected.back().endColumn;
+    std::vector<std::pair<int, int>> relativeComponents;
+    relativeComponents.reserve(selected.size());
+    for (const PreviewComponent& component : selected) {
+        relativeComponents.emplace_back(component.firstColumn - firstColumn,
+                                        component.endColumn - firstColumn);
+    }
+    registrationId = QStringLiteral("%1-display-%2")
+                         .arg(_previewSourceId)
+                         .arg(_previewDisplayRevision);
+    return std::make_shared<SpiralPreviewRangeSurface>(
+        _previewSource, firstColumn, endColumn, relativeComponents,
+        registrationId.toStdString());
+}
+
+void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
+{
+    if (_shuttingDown || !_previewSource) return;
+    const quint64 revision = ++_previewDisplayRevision;
+    QString registrationId;
+    auto preview = makeDisplayedPreview(registrationId);
+    if (!preview) {
+        if (_outputVisible) _state->setSurface("segmentation", nullptr);
+        const QString previousRegistration = _currentPreviewRegistrationId;
+        _currentPreview.reset();
+        _currentPreviewRegistrationId.clear();
+        updateSurfaceIntersections();
+        if (!previousRegistration.isEmpty())
+            _state->setSurface(previousRegistration.toStdString(), nullptr);
+        return;
+    }
+    _state->setSurface(registrationId.toStdString(), preview);
+    installPreviewAliasWhenIndexed(preview, registrationId, _requestedPreviewGeneration,
+                                   revision, preserveFocus, 0);
+}
+
+void SpiralWorkspace::installPreviewAliasWhenIndexed(
+    const std::shared_ptr<QuadSurface>& preview, const QString& registrationId,
+    qint64 generation, quint64 revision, bool preserveFocus, int attempt)
+{
+    const bool stale = _shuttingDown || generation != _requestedPreviewGeneration
+                       || revision != _previewDisplayRevision;
+    if (stale) {
+        if (_state->surface(registrationId.toStdString()) == preview
+            && registrationId != _currentPreviewRegistrationId)
+            _state->setSurface(registrationId.toStdString(), nullptr);
+        return;
+    }
     auto* index = _viewerManager->surfacePatchIndexIfReady();
-    if (!index || !index->containsSurface(result.surface)) {
+    if (!index || !index->containsSurface(preview)) {
         if (attempt >= 600) {
-            _state->setSurface(result.surfaceId.toStdString(), nullptr);
+            if (_state->surface(registrationId.toStdString()) == preview)
+                _state->setSurface(registrationId.toStdString(), nullptr);
             statusBar()->showMessage(tr("Timed out indexing the new Spiral preview; keeping the previous preview"), 15000);
             return;
         }
-        QTimer::singleShot(50, this, [this, result, generation, attempt]() {
-            installPreviewAliasWhenIndexed(result, generation, attempt + 1);
+        QTimer::singleShot(50, this, [this, preview, registrationId, generation,
+                                     revision, preserveFocus, attempt]() {
+            installPreviewAliasWhenIndexed(preview, registrationId, generation, revision,
+                                           preserveFocus, attempt + 1);
         });
         return;
     }
-    auto previous = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
-    if (previous) _retiredPreviews.emplace_back(QString::fromStdString(previous->id), previous);
-    _currentPreview = result.surface;
-    if (_outputVisible) _state->setSurface("segmentation", result.surface);
+    const QString previousRegistration = _currentPreviewRegistrationId;
+    _currentPreview = preview;
+    _currentPreviewRegistrationId = registrationId;
+    if (_outputVisible) _state->setSurface("segmentation", preview, false, preserveFocus);
     // No-op unless the focus is still missing or the automatic default.
     initializePreviewFocus();
     updateSurfaceIntersections();
@@ -676,11 +788,8 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(const PreviewLoadResult& re
         viewer->invalidateIntersect("segmentation");
         viewer->requestRender("Spiral preview installed");
     }
-    while (_retiredPreviews.size() > 2) {
-        const auto retired = _retiredPreviews.front();
-        _retiredPreviews.erase(_retiredPreviews.begin());
-        _state->setSurface(retired.first.toStdString(), nullptr);
-    }
+    if (!previousRegistration.isEmpty() && previousRegistration != registrationId)
+        _state->setSurface(previousRegistration.toStdString(), nullptr);
 }
 
 void SpiralWorkspace::loadGeometrySnapshot(const QString& manifestPath, quint64 generation)

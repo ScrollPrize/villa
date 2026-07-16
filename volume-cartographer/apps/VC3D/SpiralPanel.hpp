@@ -31,6 +31,8 @@ public:
 signals:
     void volumeSelected(const QString& id);
     void visibilityChanged(const QString& category, bool visible);
+    void windingRangeChanged(int minimum, int maximum);
+    void surfaceIntersectionsChanged(bool shown);
     void pythonOutputRequested();
 
 private:
@@ -61,6 +63,9 @@ private:
     QHash<QString, QToolButton*> _pathBrowseButtons;
     QHash<QString, QCheckBox*> _visibilityChecks;
     QHash<QString, bool> _pathDirectories;
+    QSpinBox* _minimumDisplayedWinding = nullptr;
+    QSpinBox* _maximumDisplayedWinding = nullptr;
+    QCheckBox* _showSurfaceIntersections = nullptr;
     QSpinBox* _zBegin = nullptr;
     QSpinBox* _zEnd = nullptr;
     QSpinBox* _iterations = nullptr;

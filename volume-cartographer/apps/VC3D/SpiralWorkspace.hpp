@@ -50,9 +50,15 @@ protected:
     void keyPressEvent(QKeyEvent* event) override;
 
 private:
+    struct PreviewComponent {
+        int firstColumn = 0;
+        int endColumn = 0;
+        int winding = 0;
+    };
     struct PreviewLoadResult {
         std::shared_ptr<QuadSurface> surface;
         QString surfaceId;
+        std::vector<PreviewComponent> components;
         QString error;
     };
     struct GeometryLoadResult {
@@ -75,7 +81,12 @@ private:
     QString mapServicePath(const QString& servicePath) const;
     void loadPreview(const QString& manifestPath, qint64 generation);
     void installPreview(const PreviewLoadResult& result, qint64 generation);
-    void installPreviewAliasWhenIndexed(const PreviewLoadResult& result, qint64 generation, int attempt);
+    void applyPreviewWindingRange(bool preserveFocus);
+    std::shared_ptr<QuadSurface> makeDisplayedPreview(QString& registrationId) const;
+    void installPreviewAliasWhenIndexed(const std::shared_ptr<QuadSurface>& preview,
+                                        const QString& registrationId,
+                                        qint64 generation, quint64 revision,
+                                        bool preserveFocus, int attempt);
     void loadGeometrySnapshot(const QString& manifestPath, quint64 generation);
     void loadInputSurfaces(const QJsonObject& paths, quint64 generation);
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
@@ -99,7 +110,6 @@ private:
     ConsoleOutputWidget* _pythonOutput = nullptr;
     QDialog* _pythonOutputDialog = nullptr;
     ViewerSplitGrid* _grid = nullptr;
-    std::vector<std::pair<QString, std::shared_ptr<QuadSurface>>> _retiredPreviews;
     qint64 _requestedPreviewGeneration = -1;
     QString _geometryManifestPath;
     QHash<QString, QStringList> _surfaceCategoryIds;
@@ -110,8 +120,16 @@ private:
     std::map<std::string, cv::Vec3b> _surfaceOverlayColors;
     std::size_t _nextSurfaceOverlayColorIndex = 0;
     quint64 _inputSurfaceGeneration = 0;
+    std::shared_ptr<QuadSurface> _previewSource;
+    QString _previewSourceId;
+    std::vector<PreviewComponent> _previewComponents;
     std::shared_ptr<QuadSurface> _currentPreview;
+    QString _currentPreviewRegistrationId;
+    quint64 _previewDisplayRevision = 0;
+    int _minimumDisplayedWinding = 10;
+    int _maximumDisplayedWinding = -1;
     bool _outputVisible = true;
+    bool _showSurfaceIntersections = true;
     bool _pendingPatchesOnly = false;
     // True while the focus is the automatic volume-center default (no user
     // interaction and no preview yet); the first preview may then retarget it.
