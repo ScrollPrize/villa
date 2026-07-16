@@ -137,11 +137,11 @@
 - Dense 3D test loaders do not inherit train augmentations by default.
   `training.test_augment_enabled: true` is the explicit opt-in for augmented
   dense tests.
-- Dense 3D tests default to evaluating every configured held-out CP once in
-  flat CP order from sample index zero. `training.test_control_points: 0` is
-  the explicit full-test sentinel with the same behavior. Positive values keep
-  the fixed deterministic random test range beginning at
-  `test_start_sample_index`.
+- Dense 3D tests default to evaluating every configured held-out CP once in the
+  deterministic pseudo-random test stream from sample index zero.
+  `training.test_control_points: 0` is the explicit full-test sentinel with
+  the same behavior. Positive values keep the fixed deterministic random test
+  range beginning at `test_start_sample_index`.
 - `python -m vesuvius.neural_tracing.fiber_trace_3d.train` is the 3D training
   entrypoint. It supports normal training, `--benchmark`, `--load-only`, and
   `--prefetch`.

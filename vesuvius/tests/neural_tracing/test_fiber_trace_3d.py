@@ -705,17 +705,17 @@ def test_3d_test_loader_raw_config_disables_augmentation_by_default() -> None:
     assert augmented_test["augment_enabled"] is True
 
 
-def test_3d_dense_test_control_points_zero_uses_flat_full_set() -> None:
+def test_3d_dense_test_control_points_zero_uses_random_full_set() -> None:
     assert _resolve_dense_test_selection(
         {"test_control_points": 0, "test_start_sample_index": 99},
         loader_sample_count=17,
         default_count=4,
-    ) == (17, 0, "flat")
+    ) == (17, 0, "random")
     assert _resolve_dense_test_selection(
         {"test_start_sample_index": 99},
         loader_sample_count=17,
         default_count=0,
-    ) == (17, 0, "flat")
+    ) == (17, 0, "random")
     assert _resolve_dense_test_selection(
         {"test_control_points": 5, "test_start_sample_index": 9},
         loader_sample_count=17,

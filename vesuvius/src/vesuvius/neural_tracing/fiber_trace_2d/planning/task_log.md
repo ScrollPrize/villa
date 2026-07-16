@@ -1,35 +1,23 @@
-# 3D Test Visualization And Raw Index Cleanup Task Log
+# Native 3D Trace2CP Tool Task Log
 
-## Implementation Notes
+## Planning Notes
 
-- Removed the public alternate augmentation-index loader arguments. Public 3D
-  `load_sample`, `load_batch`, and prefetch dependency generation now treat
-  `sample_index` as the raw/global deterministic stream index, derive data
-  sample identity through `sample_index_limit`, and seed augmentation from the
-  raw index.
-- Added a display-only line-presence raster to the 3D TensorBoard
-  target/context presence panel. It is built from `target_segment_*` metadata
-  and composited with max-pooled `presence_target`, so CP-only JSON/test fibers
-  show the full carried fiber context without changing loss materialization.
-- Added `training.sample_vis_count` / `training.train_sample_vis_count`
-  defaulting to `4`, plus `training.test_sample_vis_count` for test override.
-  Train and dense-test TensorBoard sheets concatenate up to that many batch
-  samples side by side.
-- Removed the stale dense-test visualization slice that forced the test sheet
-  to one sample before writing.
-- Changed omitted dense 3D `training.test_control_points` to resolve like the
-  explicit `0` sentinel: all held-out CPs in flat order from zero. Positive
-  values remain an explicit debugging cap.
-- Updated specs, code-structure docs, task plan/status, and changelog for the
-  corrected visualization and index semantics.
+- Inspected the current 2D Trace2CP direction and combined
+  direction/presence scorer in `fiber_trace_2d.runner`.
+- Inspected the current 3D Trace2CP bridge in `fiber_trace_3d.trace2cp_bridge`
+  and `fiber_trace_3d.train`.
+- Confirmed that the current 3D path projects 3D model outputs onto a 2D
+  Trace2CP strip and reuses the 2D scorer; it is not a native 3D cone tracer.
+- Replaced `task.md`, `task_plan.md`, and `status.md` with a planning-only
+  task for a separate native 3D Trace2CP tool.
 
 ## Deviations Or Deferrals
 
-- None.
+- No implementation was done in this planning step.
+- The native 3D metric is planned as tool-local debug output first and should
+  not replace the existing projected Trace2CP metric or best-checkpoint
+  selection in the first implementation.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/targets.py`
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  - Result: `39 passed in 3.59s`
-- `git diff --check`
+- Planning-only; no code tests were run.

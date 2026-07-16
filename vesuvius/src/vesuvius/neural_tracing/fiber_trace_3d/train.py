@@ -189,7 +189,7 @@ def _resolve_dense_test_selection(
 ) -> tuple[int, int, str]:
     raw_count = int(training.get("test_control_points", int(default_count)))
     if raw_count <= 0:
-        return int(loader_sample_count), 0, "flat"
+        return int(loader_sample_count), 0, "random"
     return raw_count, int(training.get("test_start_sample_index", 0)), "random"
 
 
@@ -817,14 +817,14 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             "train_sample_3d/layout",
             "Rows: yx, zx, zy principal slices through the sampled CP. "
             "Columns: image with projected GT line and predicted CP direction, target/context presence, predicted presence. "
-            "Multiple batch samples are stacked vertically when configured.",
+            "Multiple batch samples are concatenated side by side when configured.",
             0,
         )
         writer.add_text(
             "test_sample_3d/layout",
             "Rows: yx, zx, zy principal slices through the sampled test CP. "
             "Columns: image with projected GT line and predicted CP direction, target/context presence, predicted presence. "
-            "Multiple batch samples are stacked vertically when configured.",
+            "Multiple batch samples are concatenated side by side when configured.",
             0,
         )
 

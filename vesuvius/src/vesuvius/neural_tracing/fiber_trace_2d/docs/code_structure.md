@@ -132,10 +132,11 @@ side/top strip input loading.
   images are flushed immediately after configured test logging.
 - Dense 3D test loaders do not inherit training augmentations by default.
   Set `training.test_augment_enabled: true` only when intentionally evaluating
-  augmented test samples. Dense tests default to every held-out CP once in flat
-  order from sample index zero; `training.test_control_points: 0` is the
-  explicit full-test sentinel, and positive values cap tests to a deterministic
-  random held-out range for debugging.
+  augmented test samples. Dense tests default to every held-out CP once in the
+  deterministic pseudo-random test stream from sample index zero;
+  `training.test_control_points: 0` is the explicit full-test sentinel, and
+  positive values cap tests to a deterministic random held-out range for
+  debugging.
 - `batch_size` is the actual CP-patch batch passed through the 3D U-Net. The
   trainer does not internally micro-batch.
 - Normal training and `--benchmark --load-only` use

@@ -7,7 +7,8 @@
   without changing CP-only loss targets, removed the alternate public
   augmentation-index loader path in favor of raw stream index plus
   `sample_index_limit`, added multi-sample 3D visualization counts, and made
-  dense 3D tests default to all held-out CPs instead of one batch.
+  dense 3D tests default to all held-out CPs in deterministic pseudo-random
+  order instead of one batch.
 - Matched 3D training to the 2D deterministic stream semantics: bounded
   `training.max_sample_index` now limits CP/data selection while augmentation
   seeds stay on the unbounded raw stream, `max_steps: 0` is indefinite,

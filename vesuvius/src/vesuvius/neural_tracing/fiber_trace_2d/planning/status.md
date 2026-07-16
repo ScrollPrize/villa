@@ -1,15 +1,13 @@
-# 3D Test Visualization And Raw Index Cleanup Status
+# Native 3D Trace2CP Tool Status
 
-- [x] Read local AGENTS.md workflow.
-- [x] Replace `planning/task.md` with the current task.
-- [x] Replace `planning/task_plan.md`.
-- [x] Inspect 3D sheet visualization and loader index paths.
-- [x] Remove alternate public augmentation-index loader path.
-- [x] Make public 3D loader `sample_index` consistently mean raw stream index.
-- [x] Add target/context line-presence visualization from segment metadata.
-- [x] Add train/test multi-sample visualization count config.
-- [x] Remove hard one-sample slicing from test visualization.
-- [x] Make dense 3D tests default to full held-out flat-order evaluation.
-- [x] Add/update focused tests.
-- [x] Update specs/docs/changelog/task_log.
-- [x] Run validation commands.
+- [x] Read local `fiber_trace_2d/AGENTS.md` workflow.
+- [x] Inspect current 2D Trace2CP direction/presence scorer.
+- [x] Inspect current 3D projected Trace2CP bridge.
+- [x] Replace `planning/task.md` with the current planning task.
+- [x] Replace `planning/task_plan.md` with the native 3D implementation plan.
+- [x] Record that this is planning-only and implementation is pending.
+- [ ] Update specs during implementation.
+- [ ] Update docs during implementation.
+- [ ] Implement separate native 3D Trace2CP tool.
+- [ ] Add focused tests.
+- [ ] Run validation commands.
