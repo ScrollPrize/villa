@@ -5667,7 +5667,6 @@ void LineAnnotationController::requestFinalizedClose(const std::string& surfaceN
     }
     saveSessionAsFiber(session);
     session.suppressFiberSave = true;
-    waitForFiberSaves();
     pane->dialog->setCloseAfterFinalizationAllowed(true);
     pane->dialog->close();
 }
@@ -6243,9 +6242,32 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
         return;
     }
 
+    auto matchesClosingSurface = [&surfaceName, &generatedSurfaceNames](const std::string& name) {
+        return name == surfaceName ||
+               std::find(generatedSurfaceNames.begin(),
+                         generatedSurfaceNames.end(),
+                         name) != generatedSurfaceNames.end();
+    };
+    if (matchesClosingSurface(_runningSideStripIntersectionSurfaceName)) {
+        const uint64_t cancelToken = ++_nextSideStripIntersectionToken;
+        _latestSideStripIntersectionToken = cancelToken;
+        if (_latestSideStripIntersectionTokenAtomic) {
+            _latestSideStripIntersectionTokenAtomic->store(cancelToken,
+                                                           std::memory_order_relaxed);
+        }
+    }
+    if (_pendingSideStripIntersectionRequest &&
+        matchesClosingSurface(_pendingSideStripIntersectionRequest->surfaceName)) {
+        _pendingSideStripIntersectionRequest.reset();
+    }
+    if (matchesClosingSurface(_lastSideStripIntersectionSurfaceName)) {
+        _lastSideStripIntersectionKey = 0;
+        _lastSideStripIntersectionSurfaceName.clear();
+        _lastSideStripIntersectionMarkers.clear();
+    }
+
     if (sessionToSave) {
         saveSessionAsFiber(*sessionToSave);
-        waitForFiberSaves();
     }
 
     if (_state) {

@@ -489,7 +489,7 @@ int LineAnnotationDialog::maxControlPointDistanceVx() const
 void LineAnnotationDialog::setGeneratedControlPoints(
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints)
 {
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
     _generatedViews.controlPoints = std::move(controlPoints);
@@ -503,7 +503,7 @@ void LineAnnotationDialog::setGeneratedControlPoints(
 void LineAnnotationDialog::setGeneratedBranchLinePoints(
     std::vector<std::vector<cv::Vec3f>> branchLinePoints)
 {
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
     _generatedViews.branchLinePoints = std::move(branchLinePoints);
@@ -513,7 +513,7 @@ void LineAnnotationDialog::setGeneratedBranchLinePoints(
 void LineAnnotationDialog::setGeneratedBranchLinks(
     std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks)
 {
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
     _generatedViews.branchLinks = std::move(branchLinks);
@@ -526,7 +526,7 @@ void LineAnnotationDialog::setGeneratedBranchOverlayData(
     std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks,
     bool requestSideStripIntersections)
 {
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
     _generatedViews.controlPoints = std::move(controlPoints);
@@ -542,7 +542,7 @@ void LineAnnotationDialog::setGeneratedBranchOverlayData(
 void LineAnnotationDialog::setGeneratedFiberIntersectionMarkers(
     std::vector<GeneratedOverlay::FiberIntersectionMarker> markers)
 {
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
     _generatedViews.fiberIntersections = std::move(markers);
@@ -551,7 +551,7 @@ void LineAnnotationDialog::setGeneratedFiberIntersectionMarkers(
 
 void LineAnnotationDialog::setGeneratedSideStripIntersectionBusy(bool busy)
 {
-    if (!_sideStripIntersectionProgress) {
+    if (_closing || !_sideStripIntersectionProgress) {
         return;
     }
     if (busy) {
@@ -569,7 +569,7 @@ void LineAnnotationDialog::setGeneratedSideStripIntersectionProgress(const QStri
                                                                      size_t completed,
                                                                      size_t total)
 {
-    if (!_sideStripIntersectionProgress) {
+    if (_closing || !_sideStripIntersectionProgress) {
         return;
     }
     (void)stage;
@@ -586,7 +586,7 @@ void LineAnnotationDialog::setGeneratedSideStripIntersectionProgress(const QStri
 
 void LineAnnotationDialog::setGeneratedSideStripIntersectionResult(size_t markerCount)
 {
-    if (!_sideStripIntersectionProgress) {
+    if (_closing || !_sideStripIntersectionProgress) {
         return;
     }
     _sideStripIntersectionProgress->setVisible(true);
@@ -598,7 +598,7 @@ void LineAnnotationDialog::setGeneratedSideStripIntersectionResult(size_t marker
 
 void LineAnnotationDialog::setGeneratedSideStripIntersectionError()
 {
-    if (!_sideStripIntersectionProgress) {
+    if (_closing || !_sideStripIntersectionProgress) {
         return;
     }
     _sideStripIntersectionProgress->setVisible(true);
@@ -610,7 +610,7 @@ void LineAnnotationDialog::setGeneratedSideStripIntersectionError()
 void LineAnnotationDialog::setGeneratedPredSnapPoints(
     std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints)
 {
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
     _generatedViews.predSnapPoints = std::move(predSnapPoints);
@@ -620,7 +620,7 @@ void LineAnnotationDialog::setGeneratedPredSnapPoints(
 void LineAnnotationDialog::setGeneratedSpanAlignmentMetrics(
     std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics)
 {
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
     _generatedViews.spanAlignmentMetrics = std::move(spanAlignmentMetrics);
@@ -684,6 +684,12 @@ void LineAnnotationDialog::setWorkspaceEmbedded(bool embedded)
 void LineAnnotationDialog::closeEvent(QCloseEvent* event)
 {
     if (_closeAfterFinalizationAllowed) {
+        _closing = true;
+        clearGeneratedOverlayRefreshConnections();
+        cancelControlPointPreviewAnimation();
+        if (_lineUpdateTimer) {
+            _lineUpdateTimer->stop();
+        }
         saveGeneratedViewStateSettings();
         if (!_workspaceEmbedded) {
             saveWindowGeometry();
@@ -855,11 +861,14 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
     }
     _generatedOverlayRefreshConnections.push_back(
         viewer->connectOverlaysUpdated(this, [this]() {
-            if (_generatedOverlayRefreshQueued) {
+            if (_closing || _generatedOverlayRefreshQueued) {
                 return;
             }
             _generatedOverlayRefreshQueued = true;
             QTimer::singleShot(16, this, [this]() {
+                if (_closing) {
+                    return;
+                }
                 _generatedOverlayRefreshQueued = false;
                 rebuildGeneratedOverlays();
             });
@@ -1592,7 +1601,7 @@ void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
 
 void LineAnnotationDialog::requestGeneratedSideStripIntersections()
 {
-    if (!_hasGeneratedViews || !_generatedViews.lineSideSlice) {
+    if (_closing || !_hasGeneratedViews || !_generatedViews.lineSideSlice) {
         return;
     }
     emit generatedSideStripIntersectionQueryRequested(_generatedViews.lineSideSliceName);
@@ -1831,7 +1840,7 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
     if (!kGeneratedLineAnnotationOverlaysEnabled) {
         return;
     }
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
 
@@ -1863,7 +1872,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     if (!kGeneratedLineAnnotationOverlaysEnabled) {
         return;
     }
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
 
@@ -2190,6 +2199,9 @@ void LineAnnotationDialog::rebuildGeneratedDynamicOverlays(bool updateCurrentCut
 
 void LineAnnotationDialog::rebuildGeneratedOverlays(bool requestSideStripIntersections)
 {
+    if (_closing) {
+        return;
+    }
     rebuildGeneratedStaticStripOverlays();
     rebuildGeneratedDynamicOverlays();
     if (requestSideStripIntersections) {

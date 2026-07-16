@@ -266,6 +266,7 @@ private:
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;
     bool _closeAfterFinalizationAllowed = false;
+    bool _closing = false;
     bool _workspaceEmbedded = false;
     QString _fiberDisplayName;
 
