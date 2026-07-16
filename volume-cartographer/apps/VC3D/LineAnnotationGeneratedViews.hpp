@@ -67,6 +67,41 @@ struct GeneratedOverlay {
         bool manual = false;
     };
 
+    struct BranchLinkMarker {
+        uint64_t linkedFiberId = 0;
+        cv::Vec3f localControlPoint{std::numeric_limits<float>::quiet_NaN(),
+                                    std::numeric_limits<float>::quiet_NaN(),
+                                    std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f linkedControlPoint{std::numeric_limits<float>::quiet_NaN(),
+                                     std::numeric_limits<float>::quiet_NaN(),
+                                     std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f localDirection{std::numeric_limits<float>::quiet_NaN(),
+                                 std::numeric_limits<float>::quiet_NaN(),
+                                 std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f linkedDirection{std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f linkDirection{std::numeric_limits<float>::quiet_NaN(),
+                                std::numeric_limits<float>::quiet_NaN(),
+                                std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f planePoint{std::numeric_limits<float>::quiet_NaN(),
+                             std::numeric_limits<float>::quiet_NaN(),
+                             std::numeric_limits<float>::quiet_NaN()};
+        bool estimated = false;
+    };
+
+    struct FiberIntersectionMarker {
+        cv::Vec3f point{std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN()};
+        uint64_t fiberId = 0;
+        int segmentIndex = -1;
+        double arclength = std::numeric_limits<double>::quiet_NaN();
+        double distance = std::numeric_limits<double>::quiet_NaN();
+        bool projectedBranchLink = false;
+        std::optional<cv::Vec3f> connectorStart;
+    };
+
     std::vector<cv::Vec3f> linePoints;
     std::vector<std::vector<cv::Vec3f>> branchLinePoints;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
@@ -79,6 +114,8 @@ struct GeneratedOverlay {
     std::vector<double> markerLinePositions;
     std::vector<ControlPointMarker> controlPoints;
     std::vector<PredSnapMarker> predSnapPoints;
+    std::vector<BranchLinkMarker> branchLinks;
+    std::vector<FiberIntersectionMarker> fiberIntersections;
     double currentLinePosition = std::numeric_limits<double>::quiet_NaN();
     GeneratedCurrentLineMarkerState currentLineMarkerState =
         GeneratedCurrentLineMarkerState::Neutral;
@@ -104,6 +141,7 @@ struct GeneratedViews {
     QString lineSurfaceTitle;
     std::string lineSideSliceName;
     QString lineSideSliceTitle;
+    std::shared_ptr<QuadSurface> lineSideSlice;
     std::string currentCutName;
     std::shared_ptr<PlaneSurface> currentCutSurface;
     std::string sideCutName;
@@ -123,6 +161,8 @@ struct GeneratedViews {
     bool initialCurrentCutFollowsStripMouse = true;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
     std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints;
+    std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks;
+    std::vector<GeneratedOverlay::FiberIntersectionMarker> fiberIntersections;
     std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics;
 };
 
@@ -816,8 +856,11 @@ struct GeneratedControlPointContextMenuOptions {
     size_t linePointCount = 0;
     double linePosition = std::numeric_limits<double>::quiet_NaN();
     bool stripViewer = false;
+    cv::Vec3f branchLinkDirection{std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN()};
     std::function<void(double, cv::Vec3f)> deleteControlPoint;
-    std::function<void(size_t)> addBranch;
+    std::function<void(size_t, cv::Vec3f, bool, cv::Vec3f)> addBranch;
     std::function<void(uint64_t, int)> openBranch;
 };
 

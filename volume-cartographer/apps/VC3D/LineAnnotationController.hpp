@@ -6,7 +6,9 @@
 #include <QString>
 #include <QFutureWatcher>
 
+#include <atomic>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -110,6 +112,11 @@ public:
         uint64_t branchFiberId = 0;
         int branchControlPointIndex = -1;
         std::string branchFileName;
+        cv::Vec3d linkDirection{0.0, 0.0, 0.0};
+        cv::Vec3d controlPointDirection{0.0, 0.0, 0.0};
+        cv::Vec3d branchControlPointDirection{0.0, 0.0, 0.0};
+        cv::Vec3d controlPointPosition{0.0, 0.0, 0.0};
+        cv::Vec3d branchControlPointPosition{0.0, 0.0, 0.0};
     };
 
     using DatasetPicker =
@@ -133,7 +140,9 @@ public:
 
     bool canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const;
     void launchFromViewer(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
-    void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
+    void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer,
+                                 const QPointF& scenePoint,
+                                 bool replaceOwningAnnotation = true);
     void openFiber(uint64_t fiberId);
     void openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex);
     void openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex);
@@ -236,6 +245,55 @@ private:
         bool needsSave = false;
     };
 
+    struct FiberSaveSnapshot {
+        uint64_t fiberId = 0;
+        uint64_t generation = 0;
+        std::filesystem::path path;
+        StoredFiber fiber;
+        nlohmann::json coordinateIdentity = nlohmann::json::object();
+    };
+
+    struct FiberSaveJob {
+        uint64_t sequence = 0;
+        std::vector<FiberSaveSnapshot> snapshots;
+    };
+
+    struct FiberSaveTaskResult {
+        bool ok = false;
+        std::vector<uint64_t> fiberIds;
+        std::vector<uint64_t> generations;
+        std::vector<std::filesystem::path> recoveryFiles;
+        std::string error;
+    };
+
+    using SideStripMarker =
+        vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker;
+    using SideStripProgressCallback =
+        std::function<void(const std::string& stage, size_t completed, size_t total)>;
+    using SideStripPartialResultCallback =
+        std::function<void(std::vector<SideStripMarker> markers)>;
+    using SideStripCancelCallback = std::function<bool()>;
+
+    struct SideStripIntersectionRequest {
+        uint64_t token = 0;
+        uint64_t cacheKey = 0;
+        std::string surfaceName;
+        uint64_t sourceFiberId = 0;
+        std::vector<uint64_t> excludedFiberIds;
+        cv::Mat_<cv::Vec3f> stripPoints;
+        std::vector<vc::atlas::FiberPolyline> fibers;
+        std::vector<vc::atlas::FiberSideStripLineQuery> branchLinks;
+    };
+
+    struct SideStripIntersectionTaskResult {
+        bool ok = false;
+        uint64_t token = 0;
+        uint64_t cacheKey = 0;
+        std::string surfaceName;
+        std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers;
+        std::string error;
+    };
+
     struct PaneRecord {
         int id = 0;
         SourceKind sourceKind = SourceKind::Plane;
@@ -269,9 +327,13 @@ private:
                                            double linePosition,
                                            cv::Vec3f volumePoint);
     void handleGeneratedControlPointBranch(const std::string& surfaceName,
-                                           size_t controlPointIndex);
+                                           size_t controlPointIndex,
+                                           cv::Vec3f linkedControlPoint,
+                                           bool openAfterCreate,
+                                           cv::Vec3f requestedLinkDirection);
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
+    void handleGeneratedSideStripIntersectionQuery(const std::string& surfaceName);
     bool ensureDatasetForSession(LineAnnotationSession& session);
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     bool finalizeSessionOptimizationSynchronously(LineAnnotationSession& session,
@@ -312,6 +374,8 @@ private:
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
     void loadFibersForCurrentPackage();
+    [[nodiscard]] bool validateLoadedFiberLinks(std::vector<StoredFiber>& fibers,
+                                                std::vector<std::string>& errors) const;
     void emitFiberSummaries();
     void addKnownFiberTags(const std::vector<std::string>& tags);
     [[nodiscard]] std::filesystem::path fibersRootDir() const;
@@ -335,7 +399,32 @@ private:
     [[nodiscard]] std::vector<std::vector<cv::Vec3f>> generatedBranchLinePointsForSession(
         const LineAnnotationSession& session) const;
     void refreshBranchLineViews(uint64_t changedFiberId = 0);
+    [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsForSideStripQuery() const;
+    void startSideStripIntersectionQuery(SideStripIntersectionRequest request);
+    void updateSideStripIntersectionProgress(uint64_t token,
+                                             const std::string& surfaceName,
+                                             const std::string& stage,
+                                             size_t completed,
+                                             size_t total);
+    void applyPartialSideStripIntersectionMarkers(
+        uint64_t token,
+        const std::string& surfaceName,
+        std::vector<SideStripMarker> markers);
+    void finishSideStripIntersectionQuery(SideStripIntersectionTaskResult result);
+    [[nodiscard]] static SideStripIntersectionTaskResult runSideStripIntersectionQuery(
+        const SideStripIntersectionRequest& request,
+        SideStripProgressCallback progressCallback = {},
+        SideStripPartialResultCallback partialResultCallback = {},
+        SideStripCancelCallback cancelCallback = {});
     void syncReciprocalBranchControlPointReferences(const LineAnnotationSession& session);
+    [[nodiscard]] bool confirmLinkedControlPointEdit(const LineAnnotationSession& session,
+                                                     int controlPointIndex,
+                                                     const QString& action) const;
+    [[nodiscard]] bool controlPointHasBranch(const LineAnnotationSession& session,
+                                             int controlPointIndex) const;
+    std::vector<uint64_t> removeLinkedBranchesForControlPoint(LineAnnotationSession& session,
+                                                              int controlPointIndex);
+    std::vector<uint64_t> syncBranchEndpointPositions(LineAnnotationSession& session);
     [[nodiscard]] static double lineLengthVx(const std::vector<cv::Vec3d>& points);
     static void scaleStoredFiber(StoredFiber& fiber, double scale);
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
@@ -343,9 +432,20 @@ private:
         const vc::lasagna::NormalSampler* normalSampler);
     [[nodiscard]] static vc::lasagna::LineModel syntheticLineModelFromPoints(
         const std::vector<cv::Vec3d>& points);
+    [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);
     void saveSessionAsFiber(LineAnnotationSession& session);
     [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
-    void saveFiber(const StoredFiber& fiber) const;
+    void saveFiberNow(const StoredFiber& fiber) const;
+    void scheduleFiberSave(const StoredFiber& fiber);
+    void scheduleFiberPairSave(const StoredFiber& first, const StoredFiber& second);
+    void scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots);
+    void startNextFiberSaveJob();
+    void finishFiberSaveJob(QFutureWatcher<FiberSaveTaskResult>* watcher);
+    void waitForFiberSaves();
+    [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber) const;
+    [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
+        const FiberSaveSnapshot& snapshot,
+        double scale = 1.0);
     [[nodiscard]] std::optional<StoredFiber> loadFiberJson(const nlohmann::json& root,
                                                            const std::filesystem::path& path) const;
     [[nodiscard]] std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path) const;
@@ -415,6 +515,22 @@ private:
     bool _fiberMetricsPending = false;
     std::unique_ptr<IntersectionInspectionSession> _intersectionInspection;
     std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
+    std::deque<FiberSaveJob> _pendingFiberSaveJobs;
+    QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
+    uint64_t _nextFiberSaveSequence = 0;
+    bool _fiberSaveRunning = false;
+    uint64_t _nextSideStripIntersectionToken = 0;
+    uint64_t _latestSideStripIntersectionToken = 0;
+    std::shared_ptr<std::atomic<uint64_t>> _latestSideStripIntersectionTokenAtomic =
+        std::make_shared<std::atomic<uint64_t>>(0);
+    uint64_t _runningSideStripIntersectionToken = 0;
+    uint64_t _runningSideStripIntersectionKey = 0;
+    std::string _runningSideStripIntersectionSurfaceName;
+    uint64_t _lastSideStripIntersectionKey = 0;
+    std::string _lastSideStripIntersectionSurfaceName;
+    std::vector<SideStripMarker> _lastSideStripIntersectionMarkers;
+    bool _sideStripIntersectionRunning = false;
+    std::optional<SideStripIntersectionRequest> _pendingSideStripIntersectionRequest;
     std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;

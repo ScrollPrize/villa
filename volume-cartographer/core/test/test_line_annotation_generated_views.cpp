@@ -535,6 +535,27 @@ TEST_CASE("line annotation generated strip static and dynamic overlays split own
     CHECK(dynamicOverlay.currentLinePosition == doctest::Approx(1.0));
 }
 
+TEST_CASE("line annotation cross-slice overlay does not carry side-strip intersection markers")
+{
+    vc3d::line_annotation::GeneratedViews views;
+    views.linePoints = {
+        {0.0f, 0.0f, 0.0f},
+        {10.0f, 0.0f, 0.0f},
+    };
+    views.fiberIntersections = {
+        {{2.0f, 1.0f, 0.0f}, 42, 3, 12.0, 1.0},
+    };
+
+    const auto overlay = vc3d::line_annotation::makeGeneratedCrossSliceOverlay(
+        views,
+        0.0,
+        false,
+        std::nullopt,
+        {});
+
+    CHECK(overlay.fiberIntersections.empty());
+}
+
 TEST_CASE("line annotation span alignment metric uses control midpoint")
 {
     using vc3d::line_annotation::GeneratedOverlay;

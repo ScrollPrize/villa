@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
 
 namespace vc::lasagna {
@@ -105,6 +106,55 @@ struct FiberIntersectionResult {
     std::string message;
 };
 
+enum class FiberSideStripIntersectionSource {
+    BranchLink,
+    FiberSegment,
+};
+
+enum class FiberSideStripProgressPhase {
+    BuildStripTriangles,
+    BuildTriangleIndex,
+    BranchLinks,
+    FiberSegments,
+    Deduplicate,
+};
+
+struct FiberSideStripLineQuery {
+    uint64_t fiberId = 0;
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    cv::Vec3d direction{0.0, 0.0, 1.0};
+    cv::Vec3d connectorStart{std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::quiet_NaN()};
+};
+
+struct FiberSideStripQueryOptions {
+    cv::Mat_<cv::Vec3f> stripPoints;
+    double deduplicateStripDistance = 1.0e-3;
+    double aabbPadding = 1.0e-6;
+    size_t maxResults = 64;
+    size_t workerThreads = 0;
+    std::vector<uint64_t> excludedFiberIds;
+    std::vector<const FiberPolyline*> queryFibers;
+    std::vector<FiberSideStripLineQuery> branchLinks;
+};
+
+struct FiberSideStripIntersection {
+    uint64_t fiberId = 0;
+    uint64_t generation = 1;
+    int segmentIndex = -1;
+    double arclength = 0.0;
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    double stripRow = std::numeric_limits<double>::quiet_NaN();
+    double stripCol = std::numeric_limits<double>::quiet_NaN();
+    double distance = 0.0;
+    FiberSideStripIntersectionSource source =
+        FiberSideStripIntersectionSource::FiberSegment;
+    cv::Vec3d connectorStart{std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::quiet_NaN()};
+};
+
 enum class AtlasSearchProgressPhase {
     PrepareInputs = 0,
     BuildSpatialIndex = 1,
@@ -120,6 +170,8 @@ enum class AtlasSearchProgressPhase {
 using FiberIntersectionProgressCallback =
     std::function<void(AtlasSearchProgressPhase phase, size_t completed, size_t total)>;
 using FiberIntersectionCancelCallback = std::function<bool()>;
+using FiberSideStripProgressCallback =
+    std::function<void(FiberSideStripProgressPhase phase, size_t completed, size_t total)>;
 
 class FiberSpatialIndex {
 public:
@@ -132,6 +184,10 @@ public:
     [[nodiscard]] std::vector<FiberIntersectionCandidate> candidatesForFiber(
         const FiberPolyline& source,
         const FiberIntersectionBroadPhaseOptions& options,
+        FiberIntersectionCancelCallback cancelCallback = {}) const;
+    [[nodiscard]] std::vector<FiberSideStripIntersection> sideStripIntersections(
+        const FiberSideStripQueryOptions& options,
+        FiberSideStripProgressCallback progressCallback = {},
         FiberIntersectionCancelCallback cancelCallback = {}) const;
 
 private:
