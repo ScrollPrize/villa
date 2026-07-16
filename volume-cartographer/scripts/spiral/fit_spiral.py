@@ -66,6 +66,8 @@ from sdt_losses import (
     aggregate_pair_counts,
     get_crossing_count_spacing_loss,
     get_dense_attachment_loss,
+    get_min_spacing_loss,
+    get_phase_spacing_loss,
 )
 from spiral_helpers import (
     erode_patch_valid_region,
@@ -218,22 +220,45 @@ default_config = {
     'grad_mag_encode_scale': 1000.0,
     'grad_mag_factor': 0.25,
     'spacing_integration_steps': 8,
-    # Dense spacing (docs/spiral_pred_dt_dense_spacing.md): 'crossing_count' is
-    # the soft sheet-crossing count on the surf-SDT store; 'grad_mag' is the
-    # retired density integral, kept behind this flag for one ablation cycle.
+    # Dense spacing: phase is detached complete-band correspondence;
+    # crossing_count is the soft sheet count; grad_mag is the retired density
+    # integral retained for one ablation cycle.
     'dense_spacing_mode': 'crossing_count',
     'dense_spacing_count_source': 'sdt',  # 'surf' = raw-prediction counting fallback
     'dense_spacing_num_pairs': 12_000,
-    'dense_spacing_pair_max_m': 1,
+    # m is a two-range mixture biased short: longer baselines average out
+    # per-gap counting noise (std ~ 0.5 * sqrt(m)) and let rays straddle wide
+    # unsupported regions, but the prediction's ~2-4% per-gap conservatism
+    # biases long counts low, so most pairs stay short; watch
+    # dense_spacing_count_mean before shifting the mixture longer.
+    'dense_spacing_pair_m_short': (3, 7),  # m uniform here for most pairs
+    'dense_spacing_pair_m_long': (5, 15),  # long-tail range for the rest
+    'dense_spacing_pair_long_fraction': 0.15,
     'dense_spacing_count_temperature_wv': 0.5,  # GT-calibrated; 1.0 undercounts ~12%
     'dense_spacing_target_step_wv': 1.0,  # polyline step target (sheets are 4-6 wv wide)
     'dense_spacing_max_step_wv': 2.0,  # mapped adjacent samples above this invalidate the pair
-    'dense_spacing_max_steps': 64,  # pairs needing more steps are rejected and reported
-    'dense_spacing_step_oversample': 1.25,  # chord underestimates curved paths
+    'dense_spacing_max_steps': 1400,  # per-gap allocation; scaled from the measured m=7 budget (640) to cover m=15 rays
+    'dense_spacing_step_oversample': 1.25,  # each mapped gap chord can underestimate curvature
     'dense_spacing_use_support_gate': True,
     'dense_spacing_support_sigma': 4.0,  # working voxels; measured mean endpoint support 0.61
     'dense_spacing_support_floor_alpha': 0.05,  # nominal-mass denominator floor
     'dense_spacing_support_policy': 'product',  # or 'minimum'
+    'dense_spacing_phase_shadow': False,
+    'dense_spacing_phase_shadow_every': 1,
+    'dense_spacing_phase_huber_delta': 0.5,
+    'dense_spacing_phase_extension_windings': 1.0,
+    'dense_spacing_phase_min_center_gap_wv': 4.0,
+    'dense_spacing_phase_anchor_margin': 0.25,
+    'dense_spacing_phase_anchor_max_distance': 0.5,
+    'dense_spacing_phase_graze_dot': 0.4,
+    'dense_spacing_phase_graze_depth_wv': 1.0,
+    'dense_spacing_phase_censor_gap_windings': 2.0,
+    # Native pre-expansion anti-collapse barrier. Its rollout weight starts at
+    # zero until phase-shadow gradient distributions calibrate it.
+    'loss_weight_min_spacing': 0.0,
+    'loss_weight_dense_spacing_count_rollout': 0.0,
+    'min_spacing_d_min_wv': 6.0,
+    'min_spacing_independent_samples': 2_000,
     # SDT attachment: independent of the spacing loss (own weight/enable/counts).
     'loss_weight_dense_attachment': 0.0,
     'dense_attachment_scale': 8.0,  # working voxels; relu(sd) p50/p90 = 2/9 on the shipped store
@@ -921,9 +946,18 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     grad_mag_spacing_enabled = (
         cfg['loss_weight_dense_spacing'] > 0 and cfg['dense_spacing_mode'] == 'grad_mag'
     )
+    phase_spacing_enabled = (
+        cfg['dense_spacing_mode'] == 'phase'
+    )
+    phase_shadow_enabled = (
+        bool(cfg['dense_spacing_phase_shadow'])
+        and cfg['dense_spacing_mode'] != 'phase'
+    )
+    phase_measurement_requested = phase_spacing_enabled or phase_shadow_enabled
     lasagna_volume = prepare_lasagna_volume(
         scroll_zarr,
-        use_normals=cfg['loss_weight_dense_normals'] > 0,
+        use_normals=(cfg['loss_weight_dense_normals'] > 0
+                     or phase_measurement_requested),
         use_spacing=grad_mag_spacing_enabled,
         normal_nx_zarr_path=normal_nx_zarr_path,
         normal_ny_zarr_path=normal_ny_zarr_path,
@@ -947,17 +981,19 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # losses with a warning, but a store that exists yet fails validation
     # (coverage, metadata) is always an error.
     use_crossing_spacing = (
-        cfg['loss_weight_dense_spacing'] > 0
-        and cfg['dense_spacing_mode'] == 'crossing_count'
+        (cfg['loss_weight_dense_spacing'] > 0
+         and cfg['dense_spacing_mode'] == 'crossing_count')
+        or (cfg['dense_spacing_mode'] == 'phase'
+            and cfg['loss_weight_dense_spacing_count_rollout'] > 0)
     )
     use_attachment = cfg['loss_weight_dense_attachment'] > 0
     sdt_volume = None
     count_volume = None
-    if use_crossing_spacing or use_attachment:
+    if use_crossing_spacing or use_attachment or phase_measurement_requested:
         if not surf_sdt_zarr_path or not os.path.exists(surf_sdt_zarr_path):
-            if use_attachment:
+            if use_attachment or phase_measurement_requested:
                 raise RuntimeError(
-                    'loss_weight_dense_attachment > 0 but the surf-SDT store is missing: '
+                    'an enabled phase/attachment measurement requires the surf-SDT store: '
                     f'{surf_sdt_zarr_path!r}')
             print(
                 'WARNING: dense_spacing_mode=crossing_count but the surf-SDT store is '
@@ -974,7 +1010,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 storage_backend=lasagna_storage_backend,
             )
             count_volume = sdt_volume
-            if cfg['dense_spacing_count_source'] == 'surf':
+            if use_crossing_spacing and cfg['dense_spacing_count_source'] == 'surf':
                 if not surf_count_zarr_path:
                     raise RuntimeError(
                         "dense_spacing_count_source = 'surf' requires surf_count_zarr_path")
@@ -999,6 +1035,18 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             and cfg['loss_weight_dense_spacing'] > 0
         )
 
+    def phase_spacing_active():
+        return (
+            sdt_volume is not None and lasagna_volume is not None
+            and cfg['dense_spacing_mode'] == 'phase'
+        )
+
+    def phase_count_rollout_active():
+        return (
+            count_volume is not None and cfg['dense_spacing_mode'] == 'phase'
+            and cfg['loss_weight_dense_spacing_count_rollout'] > 0
+        )
+
     def attachment_active():
         return sdt_volume is not None and cfg['loss_weight_dense_attachment'] > 0
 
@@ -1019,6 +1067,19 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             sdt_inactive_warned.add('spacing')
             print('WARNING: crossing-count spacing is enabled but no surf-SDT store was '
                   'loaded at session start; the dense spacing loss is INACTIVE.')
+        if ((cfg['dense_spacing_mode'] == 'phase'
+             or cfg['dense_spacing_phase_shadow'])
+                and (sdt_volume is None or lasagna_volume is None)
+                and 'phase' not in sdt_inactive_warned):
+            sdt_inactive_warned.add('phase')
+            print('WARNING: phase spacing was requested but its SDT/normal stores were '
+                  'not loaded at session start; phase measurement is INACTIVE.')
+        if (count_volume is None
+                and cfg['loss_weight_dense_spacing_count_rollout'] > 0
+                and 'count_rollout' not in sdt_inactive_warned):
+            sdt_inactive_warned.add('count_rollout')
+            print('WARNING: phase crossing-count rollout weight is enabled but no '
+                  'count store was loaded at session start; the rollout loss is INACTIVE.')
 
     if tracks_dbm_path is not None:
         print(f'loading tracks from {tracks_dbm_path}')
@@ -1754,6 +1815,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     'track_radius', 'track_dt', 'shell_patch_radius',
                 )
             }
+            if phase_spacing_active() or phase_shadow_enabled:
+                diagnostic_weights['dense_spacing_phase'] = max(
+                    float(cfg['loss_weight_dense_spacing']), 1.0)
             transform = spiral_and_transform.get_slice_to_spiral_transform()
             dr = spiral_and_transform.get_dr_per_winding()
             recorder = LossMapRecorder(
@@ -1807,6 +1871,14 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     get_crossing_count_spacing_loss(
                         transform, dr, count_volume, sdt_volume,
                         shell_outer_winding_idx, cfg, z_begin, z_end)
+                if ((phase_spacing_active() or phase_shadow_enabled)
+                        and sdt_volume is not None and lasagna_volume is not None):
+                    preview_generator = torch.Generator(device=dr.device)
+                    preview_generator.manual_seed(0x243F6A88)
+                    get_phase_spacing_loss(
+                        transform, dr, sdt_volume, lasagna_volume,
+                        shell_outer_winding_idx, cfg, z_begin, z_end,
+                        generator=preview_generator)
                 if attachment_active():
                     get_dense_attachment_loss(
                         transform, dr, sdt_volume,
@@ -1828,7 +1900,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             # pair, the measurement behind any future discrete
             # insert/remove/reindex operation (gradient descent cannot perform
             # those). Written next to the loss maps as a preview artifact.
-            if crossing_spacing_active() and shell_outer_winding_idx is not None:
+            if ((crossing_spacing_active() or phase_count_rollout_active())
+                    and shell_outer_winding_idx is not None):
                 try:
                     with torch.no_grad():
                         pair_rows = aggregate_pair_counts(
@@ -2304,6 +2377,117 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     f'sdt_count_{name}': value
                     for name, value in count_volume['store'].last_timings.items()
                 })
+
+        if phase_spacing_active():
+            if cfg['loss_weight_dense_spacing'] > 0:
+                phase_loss, phase_metrics = get_phase_spacing_loss(
+                    slice_to_spiral_transform,
+                    dr_per_winding,
+                    sdt_volume,
+                    lasagna_volume,
+                    shell_outer_winding_idx,
+                    cfg,
+                    z_begin,
+                    z_end,
+                )
+                backward_family({
+                    'dense_spacing': phase_loss * cfg['loss_weight_dense_spacing'],
+                })
+                del phase_loss
+            else:
+                phase_mode_generator = torch.Generator(device=dr_per_winding.device)
+                phase_mode_generator.manual_seed(
+                    0x510E527F + int(iteration) * 1_000_003 + get_rank())
+                with torch.no_grad():
+                    _, phase_metrics = get_phase_spacing_loss(
+                        slice_to_spiral_transform,
+                        dr_per_winding,
+                        sdt_volume,
+                        lasagna_volume,
+                        shell_outer_winding_idx,
+                        cfg,
+                        z_begin,
+                        z_end,
+                        generator=phase_mode_generator,
+                    )
+            log_metrics.update(phase_metrics)
+
+        if phase_count_rollout_active():
+            count_rollout_loss, count_rollout_metrics = get_crossing_count_spacing_loss(
+                slice_to_spiral_transform,
+                dr_per_winding,
+                count_volume,
+                sdt_volume,
+                shell_outer_winding_idx,
+                cfg,
+                z_begin,
+                z_end,
+            )
+            backward_family({
+                'dense_spacing_count_rollout': count_rollout_loss
+                * cfg['loss_weight_dense_spacing_count_rollout'],
+            })
+            del count_rollout_loss
+            log_metrics.update({
+                name.replace('dense_spacing_', 'dense_spacing_count_rollout_', 1): value
+                for name, value in count_rollout_metrics.items()
+            })
+
+        phase_shadow_due = (
+            phase_shadow_enabled
+            and iteration % max(1, int(cfg['dense_spacing_phase_shadow_every'])) == 0
+        )
+        if phase_shadow_due and sdt_volume is not None and lasagna_volume is not None:
+            # A private generator makes shadow mode bitwise-neutral to every
+            # gradient-bearing sampler's global RNG stream.
+            shadow_generator = torch.Generator(device=dr_per_winding.device)
+            shadow_generator.manual_seed(
+                0x5EED5EED + int(iteration) * 1_000_003 + get_rank())
+            with torch.no_grad():
+                _, phase_metrics = get_phase_spacing_loss(
+                    slice_to_spiral_transform,
+                    dr_per_winding,
+                    sdt_volume,
+                    lasagna_volume,
+                    shell_outer_winding_idx,
+                    cfg,
+                    z_begin,
+                    z_end,
+                    generator=shadow_generator,
+                )
+            log_metrics.update(phase_metrics)
+
+        if (phase_spacing_active() or phase_shadow_due):
+            if lasagna_volume['backend'] == 'mmap':
+                log_metrics.update({
+                    f'dense_spacing_phase_normal_{name}': value
+                    for name, value in lasagna_volume['store'].last_timings.items()
+                })
+            if sdt_volume['backend'] == 'mmap':
+                log_metrics.update({
+                    f'dense_spacing_phase_sdt_store_{name}': value
+                    for name, value in sdt_volume['store'].last_timings.items()
+                })
+
+        min_spacing_measured = False
+        if cfg['loss_weight_min_spacing'] > 0:
+            min_spacing_loss, min_spacing_metrics = get_min_spacing_loss(
+                spiral_and_transform, shell_outer_winding_idx, cfg, z_begin, z_end)
+            backward_family({
+                'min_spacing': min_spacing_loss * cfg['loss_weight_min_spacing'],
+            })
+            del min_spacing_loss
+            log_metrics.update(min_spacing_metrics)
+            min_spacing_measured = True
+        if not min_spacing_measured and (phase_spacing_active() or phase_shadow_due):
+            diagnostic_generator = torch.Generator(device=dr_per_winding.device)
+            diagnostic_generator.manual_seed(
+                0x6A09E667 + int(iteration) * 1_000_003 + get_rank())
+            with torch.no_grad():
+                _, min_spacing_metrics = get_min_spacing_loss(
+                    spiral_and_transform, shell_outer_winding_idx, cfg,
+                    z_begin, z_end, generator=diagnostic_generator)
+            log_metrics.update(min_spacing_metrics)
 
         if attachment_active():
             attachment_ramp = get_dense_attachment_ramp(iteration)

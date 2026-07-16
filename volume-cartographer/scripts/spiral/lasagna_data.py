@@ -122,7 +122,7 @@ def prepare_lasagna_volume(
         return None
 
     if use_normals and (not normal_nx_zarr_path or not normal_ny_zarr_path):
-        raise RuntimeError('dense normal loss is enabled, but one of the nx/ny zarr paths is not set')
+        raise RuntimeError('normal sampling is enabled, but one of the nx/ny zarr paths is not set')
     if use_spacing and not grad_mag_zarr_path:
         raise RuntimeError('dense spacing loss is enabled, but grad_mag zarr path is not set')
 
@@ -136,6 +136,10 @@ def prepare_lasagna_volume(
         ny_array = ny_root[normal_zarr_group]
         if nx_array.shape != ny_array.shape:
             raise ValueError(f'nx/ny normal zarr shapes differ: {nx_array.shape} vs {ny_array.shape}')
+        if nx_array.dtype != np.dtype('uint8') or ny_array.dtype != np.dtype('uint8'):
+            raise ValueError(
+                f'nx/ny normal zarrs must use the production uint8 encoding; '
+                f'got {nx_array.dtype} and {ny_array.dtype}')
         reference_shape = nx_array.shape
     if use_spacing:
         grad_mag_root = zarr.open(grad_mag_zarr_path, mode='r')

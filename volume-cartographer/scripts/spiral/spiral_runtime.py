@@ -151,6 +151,7 @@ class InteractiveFitSession:
                 'unattached_pcl_num_per_step', 'track_num_per_step',
                 'dense_normals_num_points', 'dense_spacing_num_pairs',
                 'dense_attachment_num_points',
+                'min_spacing_independent_samples',
                 'regularisation_num_points', 'shell_num_samples',
             )
             scale_counts_for_z_range(

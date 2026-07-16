@@ -102,7 +102,9 @@ class PerfectSpiralToX:
 def spacing_cfg(**overrides):
     cfg = {
         'dense_spacing_num_pairs': 256,
-        'dense_spacing_pair_max_m': 1,
+        'dense_spacing_pair_m_short': (1, 1),
+        'dense_spacing_pair_m_long': (1, 1),
+        'dense_spacing_pair_long_fraction': 0.0,
         'dense_spacing_count_temperature_wv': 0.5,
         'dense_spacing_target_step_wv': 1.0,
         'dense_spacing_max_step_wv': 2.0,
@@ -112,6 +114,14 @@ def spacing_cfg(**overrides):
         'dense_spacing_support_sigma': 4.0,
         'dense_spacing_support_floor_alpha': 0.05,
         'dense_spacing_support_policy': 'product',
+        'dense_spacing_phase_huber_delta': 0.5,
+        'dense_spacing_phase_extension_windings': 1.0,
+        'dense_spacing_phase_min_center_gap_wv': 4.0,
+        'dense_spacing_phase_anchor_margin': 0.25,
+        'dense_spacing_phase_anchor_max_distance': 0.5,
+        'dense_spacing_phase_graze_dot': 0.4,
+        'dense_spacing_phase_graze_depth_wv': 1.0,
+        'dense_spacing_phase_censor_gap_windings': 2.0,
         'dense_attachment_num_points': 512,
         'dense_attachment_scale': 8.0,
     }
@@ -290,6 +300,37 @@ class CrossingCountTests(unittest.TestCase):
         self.assertTrue(bool(result['step_violation'][0]))
         self.assertFalse(bool(result['seg_valid'][0]))
 
+    def test_multi_winding_path_allocates_steps_per_gap(self):
+        # A single endpoint chord sees only the average stretch over this
+        # three-winding path. Uniform radial samples based on that chord make
+        # >2-wv jumps through the 100-wv middle gap; per-gap allocation keeps
+        # the path valid without oversampling both short neighbours.
+        class UnevenGaps:
+            def inv(self, points):
+                winding = spiral_shifted_radius(points) / DR_PER_WINDING
+                mapped_x = torch.where(
+                    winding < 2.0,
+                    10.0 + 5.0 * (winding - 1.0),
+                    torch.where(
+                        winding < 3.0,
+                        15.0 + 100.0 * (winding - 2.0),
+                        115.0 + 5.0 * (winding - 3.0),
+                    ),
+                )
+                return torch.stack([
+                    torch.full_like(mapped_x, 1.5),
+                    torch.full_like(mapped_x, 1.5),
+                    mapped_x,
+                ], dim=-1)
+
+        volume = make_volume(np.full([4, 4, 140], 130, np.uint8))
+        result = pair_counts(
+            UnevenGaps(), volume, k=[1.0], m=3,
+            cfg=spacing_cfg(dense_spacing_max_steps=160))
+        self.assertFalse(bool(result['too_long'][0]))
+        self.assertFalse(bool(result['step_violation'][0]))
+        self.assertTrue(bool(result['seg_valid'][0]))
+
     def test_partial_coverage_invalidates_whole_segment(self):
         # Whole-segment gating: a no-data band along the path invalidates the
         # pair instead of undercounting it.
@@ -398,6 +439,38 @@ class SpacingLossTests(unittest.TestCase):
         loss, metrics = self.loss_and_metrics(faint)
         self.assertEqual(metrics['dense_spacing_floor_active'], 1.0)
         self.assertLess(float(loss), 0.01)
+
+    def test_multi_m_pairs_stay_calibrated(self):
+        # Multi-m pairs: m is drawn from the short range (clamped to the
+        # winding domain), longer rays get proportionally more steps, and
+        # a perfect fit still reads count ~ m for every baseline.
+        volume = sheet_volume(96, [10, 20, 30, 40, 50, 60])
+        loss, metrics = self.loss_and_metrics(
+            volume, dense_spacing_pair_m_short=(1, 4),
+            dense_spacing_max_steps=128)
+        self.assertGreater(metrics['dense_spacing_valid_fraction'], 0.99)
+        self.assertEqual(metrics['dense_spacing_too_long_fraction'], 0.0)
+        # Soft-count conservatism scales with m (~0.96-0.98 per crossing), so
+        # the residual grows with baseline but stays a few percent of m.
+        self.assertLess(metrics['dense_spacing_count_residual_mean'], 0.2)
+        self.assertLess(float(loss), 0.2)
+
+    def test_pair_m_clamped_to_winding_domain(self):
+        # m ranges larger than the fitted domain span must not sample windings
+        # outside [inner, outer]: with outer_winding_idx=4 the domain is
+        # [1, 3], so both mixture ranges clamp to m=2 and every pair stays
+        # in range.
+        volume = sheet_volume(96, [10, 20, 30, 40, 50, 60])
+        loss, metrics = get_crossing_count_spacing_loss(
+            PerfectSpiralToX(), torch.tensor(DR_PER_WINDING), volume, volume,
+            outer_winding_idx=4,
+            cfg=spacing_cfg(dense_spacing_pair_m_short=(3, 7),
+                            dense_spacing_pair_m_long=(5, 15),
+                            dense_spacing_pair_long_fraction=0.15,
+                            dense_spacing_max_steps=128),
+            z_begin=1, z_end=2)
+        self.assertGreater(metrics['dense_spacing_valid_fraction'], 0.99)
+        self.assertLess(metrics['dense_spacing_count_residual_mean'], 0.2)
 
     def test_missing_volume_yields_zero(self):
         loss, metrics = get_crossing_count_spacing_loss(

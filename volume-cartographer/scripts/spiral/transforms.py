@@ -146,21 +146,8 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
 
     def get_transformed_winding_radii(self, theta, z):
         # This returns the sequence of winding radii (true, not shifted) for the radials given by theta and z
-        num_windings = len(self.params.num_by_winding)
-        winding_first_logit_idx = self.params.winding_first_logit_idx
         theta_normalised = theta / (2 * torch.pi)
-        winding_coords = torch.lerp(winding_first_logit_idx[:-1], winding_first_logit_idx[1:], theta_normalised[..., None])
-        winding_coords_normalised = winding_coords / winding_first_logit_idx[-1] * 2 - 1
-        z_normalised = (z - self.min_z) / (self.max_z - self.min_z) * 2 - 1
-        logits = self._get_pinned_scaled_logits()
-        # Note the 0th logit/scale/distance here adjusts the gap directly outside the 0th winding (with the 0th winding being always canonical)
-        logits_by_winding = F.grid_sample(
-            logits,
-            torch.stack([winding_coords_normalised, z_normalised[..., None].expand(*theta.shape, num_windings)], dim=-1).view(1, -1, num_windings, 2),
-            mode='bilinear',
-            padding_mode='border',
-            align_corners=True,
-        ).squeeze(1).squeeze(0).view(*theta.shape, num_windings)
+        logits_by_winding = self.get_logits_by_winding(theta, z)
         scales_by_winding = torch.exp(logits_by_winding * 2.e2)
         if self.truncate_frac is not None:
             scales_by_winding = torch.lerp(torch.ones([], device=scales_by_winding.device), scales_by_winding, self.truncate_frac)
@@ -168,6 +155,49 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         winding_zero_radii = self.dr_per_winding * theta_normalised
         winding_radii = winding_zero_radii[..., None] + torch.cat([torch.zeros_like(inter_winding_distances[..., :1]), torch.cumsum(inter_winding_distances, dim=-1)[..., :-1]], dim=-1)
         return winding_radii
+
+    def get_logits_by_winding(self, theta, z):
+        """Pinned, interpolated native gap logits at ``(theta, z)``.
+
+        The returned values include ``gap_expander_lr_scale`` but deliberately
+        exclude the fixed ``2e2`` exponent scale. Keeping this interpolation in
+        one method makes the minimum-gap barrier use exactly the same pinning,
+        grid coordinates, and bilinear sampling as the forward transform.
+        """
+        num_windings = len(self.params.num_by_winding)
+        winding_first_logit_idx = self.params.winding_first_logit_idx
+        theta_normalised = theta / (2 * torch.pi)
+        winding_coords = torch.lerp(
+            winding_first_logit_idx[:-1], winding_first_logit_idx[1:],
+            theta_normalised[..., None])
+        winding_coords_normalised = (
+            winding_coords / winding_first_logit_idx[-1] * 2 - 1)
+        z_normalised = (z - self.min_z) / (self.max_z - self.min_z) * 2 - 1
+        return F.grid_sample(
+            self._get_pinned_scaled_logits(),
+            torch.stack([winding_coords_normalised, z_normalised[..., None].expand(*theta.shape, num_windings)], dim=-1).view(1, -1, num_windings, 2),
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True,
+        ).squeeze(1).squeeze(0).view(*theta.shape, num_windings)
+
+    def get_native_log_gaps(self, winding_idx, theta, z):
+        """Log native inter-winding distances before exponentiation.
+
+        ``dr_per_winding`` contributes to the value but is detached so a
+        minimum-gap violation can only update the sampled local gap logits.
+        This method is intentionally defined only for the untruncated transform:
+        warm-up truncation interpolates distances after exponentiation and has
+        no equivalent pre-exponentiation log gap.
+        """
+        if self.truncate_frac is not None:
+            raise ValueError('native log gaps are defined only for the untruncated transform')
+        logits_by_winding = self.get_logits_by_winding(theta, z)
+        winding_idx = winding_idx.to(torch.long).clamp(
+            min=0, max=logits_by_winding.shape[-1] - 1)
+        sampled = torch.gather(
+            logits_by_winding, -1, winding_idx[..., None]).squeeze(-1)
+        return torch.log(self.dr_per_winding.detach()) + sampled * 2.e2
 
     def _call(self, input_zyx):
         theta, original_radius, inner_winding, _ = get_bounding_windings(input_zyx[..., 1:], self.dr_per_winding)
@@ -370,6 +400,12 @@ class SpiralAndTransform(nn.Module):
 
     def get_dr_per_winding(self):
         return F.softplus(self.dr_per_winding_logit * self.dr_per_winding_scale)
+
+    def get_native_log_gaps(self, winding_idx, theta, z):
+        """Exact pre-exponentiation log gap for the native gap expander."""
+        gap_expander, _, _, truncate_frac = self._get_transform_parts()
+        assert truncate_frac is None
+        return gap_expander.get_native_log_gaps(winding_idx, theta, z)
 
     def get_spiral_density(self, spiral_zyx, winding_range=None):
         if winding_range is None:

@@ -42,6 +42,7 @@ RUN_MUTABLE_SAMPLING_KEYS = frozenset({
     "dense_normals_num_points",
     "dense_spacing_num_pairs",
     "dense_attachment_num_points",
+    "min_spacing_independent_samples",
     "regularisation_num_points",
     "shell_num_samples",
 })
@@ -397,15 +398,25 @@ def validate_session_request(
     spacing_enabled = float(run.config.get("loss_weight_dense_spacing", 12.0)) > 0
     spacing_mode = str(run.config.get("dense_spacing_mode", "crossing_count"))
     use_grad_mag = spacing_enabled and spacing_mode == "grad_mag"
+    use_phase = (
+        spacing_mode == "phase"
+        or (bool(run.config.get("dense_spacing_phase_shadow", False))
+            and spacing_mode != "phase")
+    )
+    use_count_rollout = (
+        spacing_mode == "phase"
+        and float(run.config.get(
+            "loss_weight_dense_spacing_count_rollout", 0.0)) > 0)
     # A weight above zero for attachment is always an explicit request; the
     # crossing-count spacing default merely warns and disables in the fitter
     # when the store is absent, so it stays optional here.
     use_attachment = float(run.config.get("loss_weight_dense_attachment", 0.0)) > 0
     for value, label, required in (
-        (paths.normal_x, "normal_x", use_normals),
-        (paths.normal_y, "normal_y", use_normals),
+        (paths.normal_x, "normal_x", use_normals or use_phase),
+        (paths.normal_y, "normal_y", use_normals or use_phase),
         (paths.gradient_magnitude, "gradient_magnitude", use_grad_mag),
-        (paths.surf_sdt, "surf_sdt", use_attachment),
+        (paths.surf_sdt, "surf_sdt",
+         use_attachment or use_phase or use_count_rollout),
     ):
         optional_dir(value, label, required=required)
 
@@ -430,7 +441,8 @@ def validate_session_request(
         elif not probe_parent.is_dir() or not os.access(probe_parent, os.W_OK):
             errors.append({"field": "output_directory", "message": "Output directory is not writable"})
 
-    if (use_normals or spacing_enabled or use_attachment) and not paths.cache_directory:
+    if (use_normals or spacing_enabled or use_attachment or use_phase
+            or use_count_rollout) and not paths.cache_directory:
         errors.append({"field": "cache_directory", "message": "Cache directory is required for Lasagna inputs"})
 
     if paths.checkpoint and not Path(paths.checkpoint).is_file():
