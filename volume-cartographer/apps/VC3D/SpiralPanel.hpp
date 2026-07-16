@@ -11,6 +11,7 @@
 
 class QCheckBox;
 class QComboBox;
+class QDialog;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -68,6 +69,7 @@ private:
     QHash<QString, QToolButton*> _pathBrowseButtons;
     QHash<QString, QCheckBox*> _visibilityChecks;
     QHash<QString, bool> _pathDirectories;
+    QDialog* _displayDialog = nullptr;
     QSpinBox* _minimumDisplayedWinding = nullptr;
     QSpinBox* _maximumDisplayedWinding = nullptr;
     QCheckBox* _showSurfaceIntersections = nullptr;

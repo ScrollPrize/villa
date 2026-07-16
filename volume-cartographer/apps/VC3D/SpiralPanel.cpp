@@ -9,6 +9,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDoubleSpinBox>
+#include <QDialog>
 #include <QDir>
 #include <QFileDialog>
 #include <QFormLayout>
@@ -393,29 +394,46 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_maximumDisplayedWinding, QOverload<int>::of(&QSpinBox::valueChanged),
             this, emitWindingRange);
 
-    _showSurfaceIntersections = new QCheckBox(tr("Show surface intersections"), displayContents);
+    auto* displayButton = new QPushButton(tr("Display ->"), displayContents);
+    displayButton->setObjectName(QStringLiteral("spiralDisplayButton"));
+    displayButton->setToolTip(tr("Choose which Spiral overlays are shown"));
+    displayLayout->addWidget(displayButton);
+
+    _displayDialog = new QDialog(this);
+    _displayDialog->setObjectName(QStringLiteral("spiralDisplayDialog"));
+    _displayDialog->setWindowTitle(tr("Display"));
+    _displayDialog->setModal(false);
+    auto* displayDialogLayout = new QVBoxLayout(_displayDialog);
+
+    connect(displayButton, &QPushButton::clicked, this, [this]() {
+        _displayDialog->show();
+        _displayDialog->raise();
+        _displayDialog->activateWindow();
+    });
+
+    _showSurfaceIntersections = new QCheckBox(tr("Show surface intersections"), _displayDialog);
     _showSurfaceIntersections->setObjectName(QStringLiteral("spiralShowSurfaceIntersections"));
     _showSurfaceIntersections->setChecked(true);
     _showSurfaceIntersections->setToolTip(
         tr("Show rendered surface intersections on the plane views"));
     connect(_showSurfaceIntersections, &QCheckBox::toggled,
             this, &SpiralPanel::surfaceIntersectionsChanged);
-    displayLayout->addWidget(_showSurfaceIntersections);
+    displayDialogLayout->addWidget(_showSurfaceIntersections);
 
-    auto* runDiff = new QCheckBox(tr("Run diff"), displayContents);
+    auto* runDiff = new QCheckBox(tr("Run diff"), _displayDialog);
     runDiff->setObjectName(QStringLiteral("spiralRunDiff"));
     runDiff->setToolTip(
         tr("Overlay the XYZ displacement magnitude between the previous and current "
            "completed runs. Brighter red means more movement; the first run has no diff."));
     connect(runDiff, &QCheckBox::toggled, this, &SpiralPanel::runDiffChanged);
-    displayLayout->addWidget(runDiff);
+    displayDialogLayout->addWidget(runDiff);
 
     for (const auto& item : std::initializer_list<std::pair<const char*, const char*>>{
              {"output", "Output"}, {"fibers", "Fibers"}, {"tracks", "Tracks"},
              {"pcls", "Winding/PCL inputs"}, {"verified", "Verified patches"},
              {"unverified", "Unverified patches"}, {"pending_only", "Pending patches only"},
              {"shell", "Shell"}, {"lasagna", "Lasagna inputs"}}) {
-        auto* check = new QCheckBox(tr(item.second), displayContents);
+        auto* check = new QCheckBox(tr(item.second), _displayDialog);
         const QString key = QString::fromLatin1(item.first);
         _visibilityChecks[key] = check;
         if (key == QStringLiteral("pending_only")) {
@@ -427,8 +445,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         connect(check, &QCheckBox::toggled, this, [this, key = QString::fromLatin1(item.first)](bool shown) {
             emit visibilityChanged(key, shown);
         });
-        displayLayout->addWidget(check);
+        displayDialogLayout->addWidget(check);
     }
+    _displayDialog->adjustSize();
 
     auto* runGroup = makeSection(tr("Run and status"),
                                  QStringLiteral("spiralRunStatusGroup"),
