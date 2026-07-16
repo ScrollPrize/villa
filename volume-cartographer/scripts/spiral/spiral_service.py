@@ -379,8 +379,9 @@ def _merge_pcl_documents(existing, incoming):
     return merged
 
 
-def _copy_move(source, destination):
-    """Move across filesystems: copy to a temp sibling, rename, delete source."""
+def _copy_publish(source, destination, keep_source=False):
+    """Publish across filesystems: copy to a temp sibling, rename, and unless
+    keep_source is set delete the source (a move)."""
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp = destination.parent / f".{destination.name}.incoming-{secrets.token_hex(4)}"
@@ -396,6 +397,8 @@ def _copy_move(source, destination):
         elif temp.exists():
             temp.unlink(missing_ok=True)
         raise
+    if keep_source:
+        return
     if Path(source).is_dir():
         shutil.rmtree(source, ignore_errors=True)
     else:
@@ -452,6 +455,10 @@ class ServiceState:
             return False, "No fit session is loaded"
         if not self.ephemeral_records:
             return False, "No ephemeral inputs have been added"
+        if not any(record["state"] in ("pending", "incorporated")
+                   and not record.get("committed")
+                   for record in self.ephemeral_records):
+            return False, "Every added input is already committed"
         dataset_root = self.session_paths.dataset_root
         if not dataset_root or not Path(dataset_root).is_dir():
             return False, "The session has no dataset root directory"
@@ -472,7 +479,8 @@ class ServiceState:
             response["ephemeral_inputs"] = [
                 {"id": record["id"], "kind": record["kind"],
                  "role": record.get("role"), "state": record["state"],
-                 "bytes": record["bytes"]}
+                 "bytes": record["bytes"],
+                 "committed": bool(record.get("committed"))}
                 for record in self.ephemeral_records
             ]
             available, reason = self._commit_availability()
@@ -672,6 +680,14 @@ class ServiceState:
                         record["state"] = "error" if error else "incorporated"
                         if error:
                             record["error"] = error
+                    # Records that are both committed and incorporated are
+                    # fully persisted and part of the fit: nothing is left to
+                    # do with them, so they leave the ephemeral list.
+                    if not error:
+                        self.ephemeral_records = [
+                            record for record in self.ephemeral_records
+                            if not (record.get("committed")
+                                    and record["state"] == "incorporated")]
                     self.status_generation += 1
 
         target = session.run(int(request.get("iterations", 0)),
@@ -1004,7 +1020,8 @@ class ServiceState:
             if not available:
                 raise ApiError(HTTPStatus.CONFLICT, f"Commit is unavailable: {reason}")
             records = [record for record in self.ephemeral_records
-                       if record["state"] in ("pending", "incorporated")]
+                       if record["state"] in ("pending", "incorporated")
+                       and not record.get("committed")]
             paths = self.session_paths
         dataset_root = Path(paths.dataset_root)
         patches_dir = Path(paths.verified_patches) if paths.verified_patches \
@@ -1024,10 +1041,15 @@ class ServiceState:
         committed = []
         for record in records:
             source = Path(record["path"])
+            # A still-pending record keeps its staged copy: it remains the
+            # incorporation source for the next run, so committing never
+            # removes an input from the live session's queue and never races
+            # a concurrent run over the record's path.
+            keep_source = record["state"] == "pending"
             if record["kind"] == "patch":
-                _copy_move(source, patches_dir / record["id"])
+                _copy_publish(source, patches_dir / record["id"], keep_source)
             elif record["kind"] == "fiber":
-                _copy_move(source, fibers_dir / f"{record['id']}.json")
+                _copy_publish(source, fibers_dir / f"{record['id']}.json", keep_source)
             else:
                 target = dataset_root / _PCL_ROLE_FILES[record["role"]]
                 with source.open("r", encoding="utf-8") as stream:
@@ -1046,15 +1068,48 @@ class ServiceState:
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.replace(temp, target)
-                source.unlink(missing_ok=True)
+                if not keep_source:
+                    source.unlink(missing_ok=True)
             committed.append(record["id"])
         with self.lock:
+            for record in records:
+                record["committed"] = True
+            # Committed records that already joined the resident fit are done;
+            # committed-but-pending ones stay queued so they still join the
+            # fit on the next run.
             self.ephemeral_records = [record for record in self.ephemeral_records
-                                      if record not in records]
+                                      if not (record.get("committed")
+                                              and record["state"] == "incorporated")]
             if self.dataset_resolution is not None:
                 self.dataset_resolution = resolve_dataset_root(self.dataset_root)
             self.status_generation += 1
         return {**self.status(), "committed": committed, "accepted": True}
+
+    def remove_input(self, request):
+        kind = str(request.get("kind") or "").strip()
+        input_id = str(request.get("id") or "").strip()
+        with self.lock:
+            self._require_session()
+            record = next((record for record in self.ephemeral_records
+                           if record["id"] == input_id and record["kind"] == kind), None)
+            if record is None:
+                raise ApiError(HTTPStatus.NOT_FOUND,
+                               f"No ephemeral {kind or 'input'} named {input_id!r} exists")
+            if record["state"] == "incorporated":
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "This input already joined the resident fit; removing it "
+                               "requires reloading the session")
+            self.ephemeral_records.remove(record)
+            self.status_generation += 1
+        # The staged copy is only deleted when the dataset holds no committed
+        # copy; a committed record's file is the user's data now.
+        if not record.get("committed"):
+            path = Path(record["path"])
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+        return {**self.status(), "removed": input_id, "accepted": True}
 
     # ------------------------------------------------------------------
     # Command deduplication
@@ -1243,6 +1298,10 @@ class SpiralHandler(BaseHTTPRequestHandler):
             if path == "/session":
                 body = self._body()
                 return state.deduplicated(body.get("command_id"), state.delete)
+            if path == "/session/ephemeral-inputs":
+                body = self._body()
+                return state.deduplicated(body.get("command_id"),
+                                          lambda: state.remove_input(body))
             match = re.fullmatch(r"/session/inputs/([0-9a-f]{32})", path)
             if match:
                 return state.delete_upload(match.group(1))

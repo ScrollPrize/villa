@@ -670,6 +670,22 @@ void SpiralServiceManager::commitInputs()
                   });
 }
 
+void SpiralServiceManager::removeEphemeralInput(const QString& kind, const QString& inputId)
+{
+    if (!isReady()) return;
+    QNetworkRequest request = makeRequest(QStringLiteral("/session/ephemeral-inputs"),
+                                          static_cast<int>(Timeout::Command));
+    const QJsonObject body{{QStringLiteral("command_id"), commandId()},
+                           {QStringLiteral("kind"), kind},
+                           {QStringLiteral("id"), inputId}};
+    auto* reply = _network->sendCustomRequest(request, "DELETE",
+                                              QJsonDocument(body).toJson(QJsonDocument::Compact));
+    const quint64 generation = _connectionGeneration;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
+        handleReply(reply, generation, {}, {});
+    });
+}
+
 void SpiralServiceManager::uploadPatch(const QString& directory, const QString& inputId)
 {
     if (!isReady()) { emit inputUploadFinished(inputId, tr("Spiral service is not connected")); return; }

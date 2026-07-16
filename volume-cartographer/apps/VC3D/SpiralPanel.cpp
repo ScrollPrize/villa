@@ -332,14 +332,19 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _ephemeralList = new QListWidget(runContents);
     _ephemeralList->setObjectName(QStringLiteral("spiralEphemeralList"));
     _ephemeralList->setMaximumHeight(80);
-    _ephemeralList->setSelectionMode(QAbstractItemView::NoSelection);
+    _ephemeralList->setSelectionMode(QAbstractItemView::SingleSelection);
     _commitInputs = new QPushButton(tr("Commit current inputs"), runContents);
     _commitInputs->setEnabled(false);
-    _commitInputs->setToolTip(tr("Move the session's added inputs into their dataset locations"));
+    _commitInputs->setToolTip(tr("Copy the session's added inputs into their dataset locations"));
+    _removeInput = new QPushButton(tr("Remove"), runContents);
+    _removeInput->setEnabled(false);
+    _removeInput->setToolTip(tr("Remove the selected input before it joins the fit; "
+                                "inputs that already joined need a session reload"));
     _commitHint = new QLabel(runContents);
     _commitHint->setWordWrap(true);
     auto* commitRow = new QHBoxLayout;
     commitRow->addWidget(_commitInputs);
+    commitRow->addWidget(_removeInput);
     commitRow->addStretch(1);
     runLayout->addWidget(ephemeralLabel);
     runLayout->addWidget(_ephemeralList);
@@ -416,7 +421,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 // controls are enabled.
                 _load->setEnabled(_connected);
                 if (!_connected) { _run->setEnabled(false); _stop->setEnabled(false);
-                                   _save->setEnabled(false); _downloadCheckpoint->setEnabled(false); }
+                                   _save->setEnabled(false); _downloadCheckpoint->setEnabled(false);
+                                   _removeInput->setEnabled(false); }
                 _state->setText(tr("Service: %1").arg(text));
                 if (_connected && !_remoteMode && !_pendingDatasetRoot.isEmpty())
                     _service->resolveDataset(_pendingDatasetRoot);
@@ -465,11 +471,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                                  tr("Advanced config must be a JSON object: %1").arg(error.errorString()));
             return;
         }
-        if (_ephemeralCount > 0
+        if (_uncommittedCount > 0
             && QMessageBox::question(
                    this, tr("Uncommitted inputs"),
                    tr("The current session has %1 added input(s) that were not committed "
-                      "to the dataset. Reloading discards them. Continue?").arg(_ephemeralCount))
+                      "to the dataset. Reloading discards them. Continue?").arg(_uncommittedCount))
                    != QMessageBox::Yes)
             return;
         persist();
@@ -508,6 +514,17 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                                      "merge into their conventional role file."))
             != QMessageBox::Yes) return;
         _service->commitInputs();
+    });
+    connect(_ephemeralList, &QListWidget::itemSelectionChanged, this, [this]() {
+        const QListWidgetItem* item = _ephemeralList->currentItem();
+        _removeInput->setEnabled(_connected && item
+            && item->data(Qt::UserRole + 2).toString() == QStringLiteral("pending"));
+    });
+    connect(_removeInput, &QPushButton::clicked, this, [this]() {
+        const QListWidgetItem* item = _ephemeralList->currentItem();
+        if (!item) return;
+        _service->removeEphemeralInput(item->data(Qt::UserRole).toString(),
+                                       item->data(Qt::UserRole + 1).toString());
     });
     connect(_volumeSelector->comboBox(), qOverload<int>(&QComboBox::currentIndexChanged), this,
             [this](int) { emit volumeSelected(_volumeSelector->selectedVolumeId()); });
@@ -779,6 +796,7 @@ void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
         if (QMessageBox::question(this, tr("Refill Spiral paths"),
                 tr("Replace manually edited path rows with the Dataset Root proposals?")) != QMessageBox::Yes) return;
     }
+    const QJsonObject before = sessionRequest();
     _applyingResolution = true;
     if (_remoteMode) {
         const QString root = resolution.value(QStringLiteral("root")).toString();
@@ -794,7 +812,10 @@ void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
                    item.value("required").toBool());
     }
     _applyingResolution = false; _hasManualEdits = false;
-    markReloadRequired();
+    // A refreshed resolution that resolves to the very same inputs (e.g. the
+    // re-advertisement after committing ephemeral inputs) must not disable Run
+    // on the live session; only an actual form change requires a reload.
+    if (sessionRequest() != before) markReloadRequired();
     const QStringList missing = resolution.value("missing_required").toVariant().toStringList();
     QStringList notes;
     if (!missing.isEmpty()) notes << tr("Missing required: %1").arg(missing.join(", "));
@@ -843,10 +864,17 @@ QJsonObject SpiralPanel::sessionRequest() const
 void SpiralPanel::updateStatus(const QJsonObject& status)
 {
     const QString state = status.value("state").toString();
-    _state->setText(tr("Session: %1 — %2 — iteration %3/%4")
+    QString stateText = tr("Session: %1 — %2 — iteration %3/%4")
         .arg(state, status.value("phase").toString())
         .arg(status.value("current_iteration").toInteger())
-        .arg(status.value("target_iteration").toInteger()));
+        .arg(status.value("target_iteration").toInteger());
+    // Status polls arrive every second; without this the reload-required
+    // notice set by markReloadRequired() vanishes immediately, leaving an
+    // unexplained disabled Run button.
+    if (_reloadRequired)
+        stateText += QStringLiteral("\n")
+            + tr("Reload required — fit inputs or training configuration changed");
+    _state->setText(stateText);
     const QJsonObject metrics = status.value("latest_metrics").toObject();
     _metrics->setText(metrics.contains("total_loss") ? tr("Loss: %1").arg(metrics.value("total_loss").toDouble()) : QString());
     QStringList diagnostics;
@@ -866,22 +894,51 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     // Ephemeral inputs added to the running fit.
     const QJsonArray ephemeral = status.value(QStringLiteral("ephemeral_inputs")).toArray();
     _ephemeralCount = ephemeral.size();
-    _ephemeralList->clear();
+    int pendingCount = 0;
+    _uncommittedCount = 0;
     for (const QJsonValue& value : ephemeral) {
         const QJsonObject input = value.toObject();
-        QString label = tr("%1 %2 — %3")
-            .arg(input.value(QStringLiteral("kind")).toString(),
-                 input.value(QStringLiteral("id")).toString(),
-                 input.value(QStringLiteral("state")).toString());
-        const QString role = input.value(QStringLiteral("role")).toString();
-        if (!role.isEmpty()) label += tr(" (%1)").arg(role);
-        _ephemeralList->addItem(label);
+        if (input.value(QStringLiteral("state")).toString() == QStringLiteral("pending"))
+            ++pendingCount;
+        if (!input.value(QStringLiteral("committed")).toBool())
+            ++_uncommittedCount;
+    }
+    // Rebuild only on change: the 1 Hz status poll must not wipe the row the
+    // user selected while aiming for Remove.
+    if (ephemeral != _lastEphemeral) {
+        _lastEphemeral = ephemeral;
+        QString selectedKind, selectedId;
+        if (const QListWidgetItem* current = _ephemeralList->currentItem()) {
+            selectedKind = current->data(Qt::UserRole).toString();
+            selectedId = current->data(Qt::UserRole + 1).toString();
+        }
+        _ephemeralList->clear();
+        for (const QJsonValue& value : ephemeral) {
+            const QJsonObject input = value.toObject();
+            const QString kind = input.value(QStringLiteral("kind")).toString();
+            const QString id = input.value(QStringLiteral("id")).toString();
+            QString label = tr("%1 %2 — %3")
+                .arg(kind, id, input.value(QStringLiteral("state")).toString());
+            if (input.value(QStringLiteral("committed")).toBool())
+                label += tr(", committed");
+            const QString role = input.value(QStringLiteral("role")).toString();
+            if (!role.isEmpty()) label += tr(" (%1)").arg(role);
+            auto* item = new QListWidgetItem(label, _ephemeralList);
+            item->setData(Qt::UserRole, kind);
+            item->setData(Qt::UserRole + 1, id);
+            item->setData(Qt::UserRole + 2, input.value(QStringLiteral("state")).toString());
+            if (kind == selectedKind && id == selectedId) _ephemeralList->setCurrentItem(item);
+        }
     }
     const bool commitAvailable = status.value(QStringLiteral("commit_available")).toBool();
     _commitInputs->setEnabled(commitAvailable);
-    if (_ephemeralCount > 0 && !commitAvailable)
+    if (_ephemeralCount > 0 && !commitAvailable && _uncommittedCount > 0)
         _commitHint->setText(tr("Commit unavailable: %1")
                                  .arg(status.value(QStringLiteral("commit_unavailable_reason")).toString()));
+    else if (pendingCount > 0)
+        _commitHint->setText(state == QStringLiteral("Running")
+            ? tr("Pending inputs join the fit when this run pauses and the next run starts")
+            : tr("Pending inputs join the fit on the next run"));
     else
         _commitHint->clear();
 }

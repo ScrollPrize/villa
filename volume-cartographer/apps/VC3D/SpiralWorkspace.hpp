@@ -78,6 +78,7 @@ private:
     void updateSurfaceIntersections();
     void ensureInitialFocus();
     void initializePreviewFocus();
+    void mirrorFocusToMainWorkspace(const cv::Vec3f& position);
 
     CState* _mainState = nullptr;
     CState* _state = nullptr;

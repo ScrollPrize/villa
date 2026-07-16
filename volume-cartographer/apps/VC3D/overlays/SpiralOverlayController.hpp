@@ -23,23 +23,26 @@ protected:
     void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private:
-    // Worker result: tracks stay individual viewport-culled segments; fibers
-    // and pcls are merged back into ordered control-point chains so they can
-    // be drawn as point-collection-style dots + polylines.
-    struct GeometryBatch {
-        std::vector<PathPrimitive> paths;
-        QHash<QString, std::vector<std::vector<cv::Vec3f>>> chains;
-    };
     struct Cache {
         QString requestKey;
         quint64 requestGeneration = 0;
         std::vector<PathPrimitive> paths;
-        QHash<QString, std::vector<std::vector<cv::Vec3f>>> chains;
+    };
+    // One resident entry per fiber/pcl polyline: the whole generation stays
+    // loaded so panning never waits on a viewport query. The points are owned
+    // by _index (immutable once published); the AABB is the per-refresh cull.
+    struct ChainEntry {
+        QString category;
+        const std::vector<cv::Vec3f>* points = nullptr;
+        cv::Vec3f lo{0, 0, 0};
+        cv::Vec3f hi{0, 0, 0};
     };
     void schedule(VolumeViewerBase* viewer, const QString& key,
                   const cv::Vec3f& lo, const cv::Vec3f& hi);
+    void rebuildChains();
 
     std::shared_ptr<const PolylineIndex> _index;
+    std::vector<ChainEntry> _chains;
     quint64 _indexGeneration = 0;
     quint64 _requestGeneration = 0;
     QHash<QString, bool> _visible;

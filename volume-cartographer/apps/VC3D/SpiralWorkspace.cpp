@@ -66,7 +66,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     _slices->setEnabled(true, nullptr, nullptr, false);
     _slices->applyOrientation();
     connect(_viewerManager.get(), &ViewerManager::focusCenteredByUser, this,
-            [this](const cv::Vec3f&) { _focusIsAutoDefault = false; });
+            [this](const cv::Vec3f& position) {
+                _focusIsAutoDefault = false;
+                mirrorFocusToMainWorkspace(position);
+            });
     _overlay = std::make_unique<SpiralOverlayController>(this);
     _overlay->bindToViewerManager(_viewerManager.get());
     _surfaceOverlapOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
@@ -407,6 +410,21 @@ void SpiralWorkspace::keyPressEvent(QKeyEvent* event)
         return;
     }
     QMainWindow::keyPressEvent(event);
+}
+
+void SpiralWorkspace::mirrorFocusToMainWorkspace(const cv::Vec3f& position)
+{
+    // The spiral workspace borrows Main's volume package, so world coordinates
+    // are shared: a user-initiated focus move here (R / Ctrl+click) also moves
+    // Main's focus. Spiral-local surface ids are not forwarded.
+    if (!_mainState) return;
+    POI* focus = _mainState->poi("focus");
+    if (!focus) focus = new POI;
+    focus->p = position;
+    focus->surfacePtr.reset();
+    focus->suppressViewerRecenter = false;
+    focus->suppressTransientPlaneIntersections = true;
+    _mainState->setPOI("focus", focus);
 }
 
 void SpiralWorkspace::ensureInitialFocus()

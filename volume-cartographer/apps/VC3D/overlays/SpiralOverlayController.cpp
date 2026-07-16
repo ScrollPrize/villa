@@ -31,6 +31,7 @@ void SpiralOverlayController::publishIndex(std::shared_ptr<const PolylineIndex> 
     _index = std::move(index);
     _indexGeneration = generation;
     _cache.clear();
+    rebuildChains();
     refreshAll();
 }
 
@@ -40,7 +41,32 @@ void SpiralOverlayController::reset()
     _indexGeneration = 0;
     ++_requestGeneration;
     _cache.clear();
+    _chains.clear();
     refreshAll();
+}
+
+void SpiralOverlayController::rebuildChains()
+{
+    _chains.clear();
+    if (!_index) return;
+    // Fibers and pcls are decimated control-point strips, small enough to
+    // keep resident for the lifetime of the generation; only the dense track
+    // curves go through the viewport-limited spatial query.
+    for (const auto& polyline : _index->polylines()) {
+        const QString category = QString::fromStdString(polyline.category);
+        if (category == QStringLiteral("tracks") || polyline.points.empty()) continue;
+        ChainEntry entry;
+        entry.category = category;
+        entry.points = &polyline.points;
+        entry.lo = entry.hi = polyline.points.front();
+        for (const cv::Vec3f& point : polyline.points) {
+            for (int axis = 0; axis < 3; ++axis) {
+                entry.lo[axis] = std::min(entry.lo[axis], point[axis]);
+                entry.hi[axis] = std::max(entry.hi[axis], point[axis]);
+            }
+        }
+        _chains.push_back(std::move(entry));
+    }
 }
 
 void SpiralOverlayController::setCategoryVisible(const QString& category, bool visible)
@@ -97,17 +123,25 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
         .arg(hi[0], 0, 'f', 1).arg(hi[1], 0, 'f', 1).arg(hi[2], 0, 'f', 1)
         .arg(QString::fromStdString(viewer->surfName()));
     auto& cache = _cache[viewer];
-    if (cache.requestKey != key) schedule(viewer, key, lo, hi);
+    if (_visible.value(QStringLiteral("tracks")) && cache.requestKey != key)
+        schedule(viewer, key, lo, hi);
     // Fibers and pcls are ordered control-point chains: draw them like point
     // collections (dots + polylines joining only consecutive points), fading
-    // out with distance to the pane's plane or surface.
-    for (auto chains = cache.chains.begin(); chains != cache.chains.end(); ++chains) {
+    // out with distance to the pane's plane or surface. They render
+    // synchronously from the resident chain list so panning never waits on
+    // the async viewport query; the viewport box culls whole chains first and
+    // individual points after.
+    const VolumeBounds bounds{lo, hi};
+    for (const auto& entry : _chains) {
+        if (!_visible.value(entry.category)) continue;
+        if (entry.hi[0] < lo[0] || entry.lo[0] > hi[0]
+            || entry.hi[1] < lo[1] || entry.lo[1] > hi[1]
+            || entry.hi[2] < lo[2] || entry.lo[2] > hi[2]) continue;
         PointChainStyle chainStyle;
-        chainStyle.color = categoryColor(chains.key());
+        chainStyle.color = categoryColor(entry.category);
         chainStyle.lineOpacity = 0.75f;
         chainStyle.distanceTolerance = slab;
-        for (const auto& chain : chains.value())
-            renderPointChain(viewer, builder, chain, chainStyle);
+        renderPointChain(viewer, builder, *entry.points, chainStyle, bounds);
     }
     for (const auto& path : cache.paths) {
         if (!surfacePane) {
@@ -138,62 +172,35 @@ void SpiralOverlayController::schedule(VolumeViewerBase* viewer, const QString& 
                                        const cv::Vec3f& lo, const cv::Vec3f& hi)
 {
     auto index = _index;
-    const auto visible = _visible;
     const quint64 request = ++_requestGeneration;
     auto& cache = _cache[viewer];
     cache.requestKey = key;
     cache.requestGeneration = request;
-    auto* watcher = new QFutureWatcher<GeometryBatch>(this);
-    connect(watcher, &QFutureWatcher<GeometryBatch>::finished, this,
+    auto* watcher = new QFutureWatcher<std::vector<PathPrimitive>>(this);
+    connect(watcher, &QFutureWatcher<std::vector<PathPrimitive>>::finished, this,
             [this, watcher, viewer, request]() {
         auto found = _cache.find(viewer);
         if (found != _cache.end() && found->second.requestGeneration == request) {
-            GeometryBatch batch = watcher->result();
-            found->second.paths = std::move(batch.paths);
-            found->second.chains = std::move(batch.chains);
+            found->second.paths = watcher->result();
             refreshViewer(viewer);
         }
         watcher->deleteLater();
     });
-    watcher->setFuture(QtConcurrent::run([index, visible, lo, hi]() {
-        GeometryBatch batch;
+    // Only the dense track curves need the spatial query; fibers/pcls render
+    // synchronously from the resident chain list.
+    watcher->setFuture(QtConcurrent::run([index, lo, hi]() {
+        std::vector<PathPrimitive> paths;
         constexpr std::size_t maximum = 12000;
-        std::size_t used = 0;
-        for (auto it = visible.begin(); it != visible.end() && used < maximum; ++it) {
-            if (!it.value()) continue;
-            const auto segments = index->query(lo, hi, it.key().toStdString(), maximum - used);
-            used += segments.size();
-            if (it.key() == QStringLiteral("tracks")) {
-                for (const auto& segment : segments) {
-                    PathPrimitive path;
-                    path.points = {segment.first, segment.second};
-                    path.color = categoryColor(it.key());
-                    path.lineWidth = 1.0;
-                    path.opacity = 0.9;
-                    path.z = 70.0;
-                    batch.paths.push_back(std::move(path));
-                }
-                continue;
-            }
-            // Merge the viewport-culled segments (sorted by objectId then
-            // segmentIndex) back into ordered control-point chains, breaking
-            // wherever a segment was culled so strips never bridge gaps.
-            auto& chains = batch.chains[it.key()];
-            uint64_t previousObject = 0;
-            uint64_t previousSegment = 0;
-            bool havePrevious = false;
-            for (const auto& segment : segments) {
-                if (havePrevious && segment.objectId == previousObject
-                    && segment.segmentIndex == previousSegment + 1) {
-                    chains.back().push_back(segment.second);
-                } else {
-                    chains.push_back({segment.first, segment.second});
-                }
-                previousObject = segment.objectId;
-                previousSegment = segment.segmentIndex;
-                havePrevious = true;
-            }
+        const auto segments = index->query(lo, hi, "tracks", maximum);
+        for (const auto& segment : segments) {
+            PathPrimitive path;
+            path.points = {segment.first, segment.second};
+            path.color = categoryColor(QStringLiteral("tracks"));
+            path.lineWidth = 1.0;
+            path.opacity = 0.9;
+            path.z = 70.0;
+            paths.push_back(std::move(path));
         }
-        return batch;
+        return paths;
     }));
 }

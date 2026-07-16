@@ -44,6 +44,10 @@ public:
     std::size_t polylineCount() const;
     std::size_t segmentCount() const;
 
+    // The complete generation, in build() order. Valid until the next
+    // build()/clear(); stable for shared_ptr-published immutable indices.
+    const std::vector<Polyline>& polylines() const;
+
     std::vector<SegmentResult> query(
         const cv::Vec3f& minimum,
         const cv::Vec3f& maximum,

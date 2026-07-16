@@ -66,6 +66,8 @@ public:
     void uploadPatch(const QString& directory, const QString& inputId);
     void uploadJsonInput(const QString& kind, const QString& filePath,
                          const QString& inputId, const QString& role = {});
+    // Remove an added input that has not joined the resident fit yet.
+    void removeEphemeralInput(const QString& kind, const QString& inputId);
 
 signals:
     void connectionStateChanged(SpiralServiceManager::ConnectionState state,

@@ -12,6 +12,7 @@
 #include <QGraphicsScene>
 #include <QGraphicsSimpleTextItem>
 #include <QGraphicsTextItem>
+#include <QLineF>
 #include <QPainterPath>
 #include <QPen>
 #include <QBrush>
@@ -541,7 +542,8 @@ ViewerOverlayControllerBase::FilteredPoints
 ViewerOverlayControllerBase::filterPointsNearViewerSurface(VolumeViewerBase* viewer,
                                                            const std::vector<cv::Vec3f>& points,
                                                            float tolerance,
-                                                           std::vector<float>* opacities) const
+                                                           std::vector<float>* opacities,
+                                                           const std::optional<VolumeBounds>& bounds) const
 {
     Surface* surface = viewerSurface(viewer);
     auto* planeSurface = dynamic_cast<PlaneSurface*>(surface);
@@ -553,8 +555,12 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurface(VolumeViewerBase* vie
     filter.clipToSurface = false;
     filter.requireSceneVisibility = true;
     filter.computeScenePoints = true;
-    filter.volumePredicate = [planeSurface, quadSurface, patchIndex, tolerance,
+    filter.volumePredicate = [planeSurface, quadSurface, patchIndex, tolerance, &bounds,
                               &pointOpacities](const cv::Vec3f& point, size_t index) {
+        if (bounds && !bounds->contains(point)) {
+            pointOpacities[index] = 0.0f;
+            return false;
+        }
         auto opacityForDistance = [tolerance](float dist) {
             if (dist < 0.0f) {
                 return 0.0f;
@@ -617,7 +623,8 @@ float ViewerOverlayControllerBase::polylineBreakDistance(const std::vector<cv::V
 void ViewerOverlayControllerBase::addBrokenLineStrips(OverlayBuilder& builder,
                                                       const FilteredPoints& filtered,
                                                       float maxSegmentDistance,
-                                                      const OverlayStyle& style)
+                                                      const OverlayStyle& style,
+                                                      qreal maxScenePerVolume)
 {
     std::vector<QPointF> lineStrip;
     lineStrip.reserve(filtered.scenePoints.size());
@@ -636,7 +643,12 @@ void ViewerOverlayControllerBase::addBrokenLineStrips(OverlayBuilder& builder,
         } else if (hasPreviousSourceIndex && i < filtered.volumePoints.size()) {
             const float segmentDistance =
                 cv::norm(filtered.volumePoints[i] - filtered.volumePoints[i - 1]);
-            if (segmentDistance > maxSegmentDistance) {
+            const qreal sceneDistance =
+                QLineF(filtered.scenePoints[i - 1], filtered.scenePoints[i]).length();
+            // The volume-space floor keeps near-coincident points from
+            // tripping the scene guard on rounding noise.
+            if (segmentDistance > maxSegmentDistance
+                || sceneDistance > std::max<qreal>(segmentDistance, 1.0) * maxScenePerVolume) {
                 flushLineStrip();
             }
         }
@@ -650,14 +662,15 @@ void ViewerOverlayControllerBase::addBrokenLineStrips(OverlayBuilder& builder,
 void ViewerOverlayControllerBase::renderPointChain(VolumeViewerBase* viewer,
                                                    OverlayBuilder& builder,
                                                    const std::vector<cv::Vec3f>& points,
-                                                   const PointChainStyle& style) const
+                                                   const PointChainStyle& style,
+                                                   const std::optional<VolumeBounds>& bounds) const
 {
     if (points.empty()) {
         return;
     }
     std::vector<float> opacities;
     const FilteredPoints filtered =
-        filterPointsNearViewerSurface(viewer, points, style.distanceTolerance, &opacities);
+        filterPointsNearViewerSurface(viewer, points, style.distanceTolerance, &opacities, bounds);
     if (filtered.scenePoints.empty()) {
         return;
     }
@@ -669,7 +682,11 @@ void ViewerOverlayControllerBase::renderPointChain(VolumeViewerBase* viewer,
         lineStyle.penWidth = style.lineWidth;
         lineStyle.brushColor = Qt::transparent;
         lineStyle.z = style.lineZ;
-        addBrokenLineStrips(builder, filtered, polylineBreakDistance(points), lineStyle);
+        const qreal maxScenePerVolume = style.sceneJumpRatio > 0.0f
+            ? static_cast<qreal>(viewer->getCurrentScale()) * style.sceneJumpRatio
+            : std::numeric_limits<qreal>::infinity();
+        addBrokenLineStrips(builder, filtered, polylineBreakDistance(points), lineStyle,
+                            maxScenePerVolume);
     }
 
     if (style.drawPoints) {

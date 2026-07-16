@@ -107,6 +107,7 @@ void PolylineIndex::clear()
 bool PolylineIndex::empty() const { return impl_->segments.empty(); }
 std::size_t PolylineIndex::polylineCount() const { return impl_->polylines.size(); }
 std::size_t PolylineIndex::segmentCount() const { return impl_->segments.size(); }
+const std::vector<PolylineIndex::Polyline>& PolylineIndex::polylines() const { return impl_->polylines; }
 
 std::vector<PolylineIndex::SegmentResult> PolylineIndex::query(
     const cv::Vec3f& minimum,

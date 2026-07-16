@@ -507,6 +507,38 @@ private slots:
         QCOMPARE(second->points.back().x(), 50.0);
     }
 
+    void brokenLineStripsSplitOnSceneSpaceJumps()
+    {
+        FakeViewer viewer;
+        ChainTestController::OverlayBuilder builder(&viewer);
+
+        // Four points evenly spaced in volume space, but the projection of
+        // the third lands far away in scene space (an invalid-region / wrap
+        // discontinuity): the strip must break around that segment even
+        // though every volume-space gap is identical.
+        ViewerOverlayControllerBase::FilteredPoints filtered;
+        filtered.volumePoints = {{0, 0, 0}, {10, 0, 0}, {20, 0, 0}, {30, 0, 0}};
+        filtered.sourceIndices = {0, 1, 2, 3};
+        filtered.scenePoints = {{0.0, 0.0}, {10.0, 0.0}, {900.0, 0.0}, {910.0, 0.0}};
+
+        ViewerOverlayControllerBase::OverlayStyle style;
+        ChainTestController::addBrokenLineStrips(
+            builder, filtered, std::numeric_limits<float>::infinity(), style, 4.0);
+
+        const auto primitives = builder.takePrimitives();
+        QCOMPARE(primitives.size(), std::size_t{2});
+        const auto* first =
+            std::get_if<ViewerOverlayControllerBase::LineStripPrimitive>(&primitives[0]);
+        const auto* second =
+            std::get_if<ViewerOverlayControllerBase::LineStripPrimitive>(&primitives[1]);
+        QVERIFY(first != nullptr);
+        QVERIFY(second != nullptr);
+        QCOMPARE(first->points.size(), std::size_t{2});
+        QCOMPARE(first->points.back().x(), 10.0);
+        QCOMPARE(second->points.size(), std::size_t{2});
+        QCOMPARE(second->points.front().x(), 900.0);
+    }
+
     void renderPointChainEmitsDotsAndOrderedPolyline()
     {
         FakeViewer viewer;
@@ -517,6 +549,10 @@ private slots:
         const std::vector<cv::Vec3f> chain = {
             {1.0f, 1.0f, 0.0f}, {2.0f, 1.0f, 0.0f}, {3.0f, 1.0f, 0.0f}, {4.0f, 1.0f, 0.0f}};
         ViewerOverlayControllerBase::PointChainStyle style;
+        // FakeViewer::volumeToScene applies a 10x mapping while
+        // getCurrentScale() reports 1.0, so widen the discontinuity guard
+        // beyond that mismatch to keep this a pure connectivity test.
+        style.sceneJumpRatio = 20.0f;
         controller.renderPointChain(&viewer, builder, chain, style);
 
         const auto primitives = builder.takePrimitives();
@@ -536,6 +572,47 @@ private slots:
         }
         QCOMPARE(strips, std::size_t{1});
         QCOMPARE(dots, chain.size());
+    }
+
+    void renderPointChainCullsPointsOutsideVolumeBounds()
+    {
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+
+        ChainTestController controller;
+        ChainTestController::OverlayBuilder builder(&viewer);
+        const std::vector<cv::Vec3f> chain = {
+            {1.0f, 1.0f, 0.0f}, {2.0f, 1.0f, 0.0f}, {3.0f, 1.0f, 0.0f},
+            {4.0f, 1.0f, 0.0f}, {5.0f, 1.0f, 0.0f}};
+        ViewerOverlayControllerBase::PointChainStyle style;
+        style.sceneJumpRatio = 20.0f;
+        // The box excludes the middle point, so its dot must disappear and
+        // the polyline must break rather than bridge the culled point.
+        ViewerOverlayControllerBase::VolumeBounds bounds;
+        bounds.lo = {0.0f, 0.0f, -1.0f};
+        bounds.hi = {10.0f, 10.0f, 1.0f};
+        controller.renderPointChain(&viewer, builder, chain, style, bounds);
+        const auto allPrimitives = builder.takePrimitives();
+        QCOMPARE(allPrimitives.size(), std::size_t{1 + chain.size()});
+
+        ChainTestController::OverlayBuilder culledBuilder(&viewer);
+        std::vector<cv::Vec3f> gappedChain = chain;
+        gappedChain[2][2] = 5.0f;  // move the middle point outside the z-bounds
+        controller.renderPointChain(&viewer, culledBuilder, gappedChain, style, bounds);
+        const auto primitives = culledBuilder.takePrimitives();
+        std::size_t strips = 0;
+        std::size_t dots = 0;
+        for (const auto& primitive : primitives) {
+            if (const auto* strip =
+                    std::get_if<ViewerOverlayControllerBase::LineStripPrimitive>(&primitive)) {
+                ++strips;
+                QCOMPARE(strip->points.size(), std::size_t{2});
+            } else if (std::holds_alternative<ViewerOverlayControllerBase::PointPrimitive>(primitive)) {
+                ++dots;
+            }
+        }
+        QCOMPARE(strips, std::size_t{2});
+        QCOMPARE(dots, std::size_t{4});
     }
 };
 

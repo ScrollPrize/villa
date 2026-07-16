@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QHash>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QWidget>
 
@@ -113,7 +114,9 @@ private:
     // Ephemeral inputs
     QListWidget* _ephemeralList = nullptr;
     QPushButton* _commitInputs = nullptr;
+    QPushButton* _removeInput = nullptr;
     QLabel* _commitHint = nullptr;
+    QJsonArray _lastEphemeral;
 
     QString _currentProfileId;
     QStringList _profileIds;
@@ -125,4 +128,5 @@ private:
     bool _remoteMode = false;
     bool _connected = false;
     int _ephemeralCount = 0;
+    int _uncommittedCount = 0;
 };

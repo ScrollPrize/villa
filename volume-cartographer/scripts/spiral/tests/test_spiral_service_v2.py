@@ -569,7 +569,7 @@ class CommitTests(unittest.TestCase):
         upload_id = _upload_input(self.state, kind, input_id, files, role=role)
         return self.state.finalize_upload(upload_id)["input"]
 
-    def test_commit_moves_patches_fibers_and_merges_role_pcls(self):
+    def test_commit_publishes_patches_fibers_and_merges_role_pcls(self):
         self._finalize("patch", "patch-9", PATCH_FILES)
         self._finalize("fiber", "fiber-9", FIBER_FILES)
         existing = {"vc_pointcollections_json_version": "1",
@@ -587,7 +587,53 @@ class CommitTests(unittest.TestCase):
         backups = list(self.dataset.glob("patch-overlap-pcls.json.*.bak"))
         self.assertEqual(len(backups), 1)
         self.assertEqual(json.loads(backups[0].read_text()), existing)
+        # Still-pending inputs stay queued for the next run after a commit.
+        inputs = self.state.status()["ephemeral_inputs"]
+        self.assertEqual({record["id"] for record in inputs},
+                         {"patch-9", "fiber-9", "pcl-9"})
+        self.assertTrue(all(record["committed"] and record["state"] == "pending"
+                            for record in inputs))
+
+    def test_commit_keeps_pending_inputs_queued_and_incorporation_retires_them(self):
+        record = self._finalize("patch", "patch-9", PATCH_FILES)
+        staged = Path(record["path"])
+        self.state.commit_inputs()
+        # The staged copy remains the incorporation source for the next run.
+        self.assertTrue(staged.exists())
+        with self.assertRaisesRegex(ApiError, "already committed"):
+            self.state.commit_inputs()
+        self.state.run({"iterations": 3})
+        _, pending, mark = self.session.run_calls[-1]
+        self.assertEqual([entry["id"] for entry in pending], ["patch-9"])
+        # Once incorporated, a committed record is done and leaves the list.
+        mark(pending)
         self.assertEqual(self.state.status()["ephemeral_inputs"], [])
+
+    def test_remove_pending_input_deletes_the_staged_copy(self):
+        record = self._finalize("fiber", "fiber-9", FIBER_FILES)
+        staged = Path(record["path"])
+        response = self.state.remove_input({"kind": "fiber", "id": "fiber-9"})
+        self.assertEqual(response["removed"], "fiber-9")
+        self.assertEqual(self.state.status()["ephemeral_inputs"], [])
+        self.assertFalse(staged.exists())
+        self.state.run({"iterations": 1})
+        self.assertEqual(self.session.run_calls[-1][1], [])
+
+    def test_remove_incorporated_input_is_rejected(self):
+        self._finalize("patch", "patch-9", PATCH_FILES)
+        self.state.run({"iterations": 1})
+        _, pending, mark = self.session.run_calls[-1]
+        mark(pending)
+        with self.assertRaises(ApiError) as caught:
+            self.state.remove_input({"kind": "patch", "id": "patch-9"})
+        self.assertEqual(caught.exception.status, 409)
+
+    def test_remove_committed_pending_input_keeps_the_dataset_copy(self):
+        self._finalize("patch", "patch-9", PATCH_FILES)
+        self.state.commit_inputs()
+        self.state.remove_input({"kind": "patch", "id": "patch-9"})
+        self.assertEqual(self.state.status()["ephemeral_inputs"], [])
+        self.assertTrue((self.dataset / "verified_patches" / "patch-9" / "meta.json").is_file())
 
     def test_patch_identifier_collision_is_rejected_without_overwrite(self):
         existing = self.dataset / "verified_patches" / "patch-1"

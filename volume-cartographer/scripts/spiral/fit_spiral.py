@@ -555,6 +555,17 @@ def get_progressive_dt_max_winding(iteration, dt_start_step, shell_outer_winding
     return w_inner + (w_outer - w_inner) * f_warped
 
 
+def get_interactive_dt_resume_iteration(start_iteration, target_iteration):
+    """Return the first iteration that may use DT losses after new inputs.
+
+    Input incorporation happens at the start of an interactive run. Keep DT
+    losses disabled for the first 75% of that run so the radius-based losses
+    can settle the newly added geometry before directional constraints resume.
+    """
+    run_iterations = max(0, int(target_iteration) - int(start_iteration))
+    return int(start_iteration) + 3 * run_iterations // 4
+
+
 def main(load_only_patches_and_point_collections=False, interactive_driver=None):
     global _active_lasagna_store
 
@@ -1512,6 +1523,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     )
     nonfinite_grad_steps = torch.zeros((), device=dist_grad_params[0].device)
     nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in dist_grad_named}
+    interactive_dt_resume_iteration = None
 
     def export_interactive_preview(generation_path, surface_id):
         # Export has its own saved RNG envelope so pausing does not alter the
@@ -1551,6 +1563,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         same items in the same order on every rank.
         """
         nonlocal patch_sampling_probabilities, next_id, influence_state
+        nonlocal interactive_dt_resume_iteration
         # Incorporation has its own saved RNG envelope so adding inputs does
         # not alter the stochastic training sequence (same discipline as the
         # interactive preview export).
@@ -1730,8 +1743,24 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     anchor_geometry_zyx=influence_anchor_geometry,
                 )
 
+            # run() sets the target before this callback is drained at the
+            # pause boundary, so this is exactly the iteration window requested
+            # alongside the new inputs. Do not let a later incorporation
+            # shorten an already-active DT-free window.
+            interactive_status = interactive_driver.status()
+            dt_resume_iteration = get_interactive_dt_resume_iteration(
+                interactive_status['current_iteration'],
+                interactive_status['target_iteration'],
+            )
+            if interactive_dt_resume_iteration is None:
+                interactive_dt_resume_iteration = dt_resume_iteration
+            else:
+                interactive_dt_resume_iteration = max(
+                    interactive_dt_resume_iteration, dt_resume_iteration)
+
             print(f'incorporated {len(new_patches)} patches and '
-                  f'{len(new_collections)} point collections into the resident session')
+                  f'{len(new_collections)} point collections into the resident session; '
+                  f'DT losses disabled until iteration {interactive_dt_resume_iteration}')
         finally:
             np.random.set_state(numpy_state)
             torch.random.set_rng_state(torch_state)
@@ -1801,11 +1830,17 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             for name, value in weighted_losses.items():
                 losses[name] = value.detach()
 
-        compute_patch_dt = iteration > cfg['loss_start_patch_dt']
+        interactive_dt_suppressed = (
+            interactive_dt_resume_iteration is not None
+            and iteration < interactive_dt_resume_iteration
+        )
+        log_metrics['interactive_dt_suppressed'] = float(interactive_dt_suppressed)
+
+        compute_patch_dt = not interactive_dt_suppressed and iteration > cfg['loss_start_patch_dt']
         track_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_track_dt'] is None else cfg['loss_start_track_dt']
-        compute_track_dt = iteration > track_dt_start
+        compute_track_dt = not interactive_dt_suppressed and iteration > track_dt_start
         unverified_patch_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_unverified_patch_dt'] is None else cfg['loss_start_unverified_patch_dt']
-        compute_unverified_patch_dt = iteration > unverified_patch_dt_start
+        compute_unverified_patch_dt = not interactive_dt_suppressed and iteration > unverified_patch_dt_start
 
         # Progressive-outward DT gating: winding cutoff that grows from the respective DT start
         # step. Falls back to the configured shell_outer_winding_idx when shell losses are off so
