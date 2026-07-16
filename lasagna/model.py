@@ -3119,9 +3119,6 @@ class Model3D(nn.Module):
 			extra = 0.5 * float(out_w - (int(math.ceil(float(hi[1] - lo[1]))) + 1))
 			lo[1] -= extra
 
-		out_map = np.zeros((out_h, out_w, 2), dtype=np.float32)
-		out_xyz = np.zeros((out_h, out_w, 3), dtype=np.float32)
-		out_mask = np.zeros((out_h, out_w), dtype=bool)
 		centers = 0.25 * (q00 + q10 + q01 + q11)
 		k = max(1, min(int(k_candidates), int(centers.shape[0])))
 		try:
@@ -3134,9 +3131,31 @@ class Model3D(nn.Module):
 			if int(centers.shape[0]) * int(out_h) * int(out_w) > 20_000_000:
 				raise RuntimeError("scipy.spatial.cKDTree is required for large forward-flatten export")
 
+		# Vectorized GPU Newton solve.  Only the KDTree candidate search stays on
+		# CPU.  Math is float64 to match the original (float32 breaks near-ties between
+		# overlapping cells differently).
+		use_cuda = bool(getattr(device, "type", "cpu") == "cuda")
+		es_cell = torch.as_tensor(q10 - q00, dtype=torch.float64, device=device)
+		et_cell = torch.as_tensor(q01 - q00, dtype=torch.float64, device=device)
+		bl_cell = torch.as_tensor(q11 - q10 - q01 + q00, dtype=torch.float64, device=device)
+		q00_c = torch.as_tensor(q00, dtype=torch.float64, device=device)
+		x00_c = torch.as_tensor(x00, dtype=torch.float64, device=device)
+		x10_c = torch.as_tensor(x10, dtype=torch.float64, device=device)
+		x01_c = torch.as_tensor(x01, dtype=torch.float64, device=device)
+		x11_c = torch.as_tensor(x11, dtype=torch.float64, device=device)
+		rows_c = torch.as_tensor(rows.astype(np.float64), device=device)
+		cols_c = torch.as_tensor(cols.astype(np.float64), device=device)
+		if not use_tree:
+			centers_c = torch.as_tensor(centers, dtype=torch.float64, device=device)
+
+		out_map_t = torch.zeros((out_h * out_w, 2), dtype=torch.float32, device=device)
+		out_xyz_t = torch.zeros((out_h * out_w, 3), dtype=torch.float32, device=device)
+		out_mask_t = torch.zeros((out_h * out_w,), dtype=torch.bool, device=device)
+
 		total = int(out_h) * int(out_w)
 		chunk = max(1, int(chunk_points))
-		cell_index_all = np.arange(int(centers.shape[0]), dtype=np.int64)
+		if use_cuda and chunk < (1 << 20):
+			chunk = 1 << 20
 		for start in range(0, total, chunk):
 			stop = min(total, start + chunk)
 			flat_idx = np.arange(start, stop, dtype=np.int64)
@@ -3144,82 +3163,86 @@ class Model3D(nn.Module):
 			ox = flat_idx - oy * int(out_w)
 			points = np.stack([lo[0] + oy.astype(np.float64), lo[1] + ox.astype(np.float64)], axis=-1)
 			if use_tree:
-				_dist, cand = tree.query(points, k=k)
+				_dist, cand = tree.query(points, k=k, workers=-1)
 				cand = np.asarray(cand, dtype=np.int64)
 				if cand.ndim == 1:
 					cand = cand[:, None]
+				cand_t = torch.as_tensor(cand, dtype=torch.long, device=device)
 			else:
-				d2 = ((points[:, None, :] - centers[None, :, :]) ** 2).sum(axis=-1)
-				if k < int(centers.shape[0]):
-					cand = np.argpartition(d2, kth=k - 1, axis=1)[:, :k]
-				else:
-					cand = np.broadcast_to(cell_index_all.reshape(1, -1), (points.shape[0], centers.shape[0]))
+				pts_bf = torch.as_tensor(points, dtype=torch.float64, device=device)
+				d2 = ((pts_bf[:, None, :] - centers_c[None, :, :]) ** 2).sum(dim=-1)
+				cand_t = torch.topk(d2, min(k, int(centers_c.shape[0])), dim=1, largest=False).indices
 
-			Q00 = q00[cand]
-			Q10 = q10[cand]
-			Q01 = q01[cand]
-			Q11 = q11[cand]
-			rhs = points[:, None, :] - Q00
-			es = Q10 - Q00
-			et = Q01 - Q00
-			bilin = Q11 - Q10 - Q01 + Q00
+			pts_t = torch.as_tensor(points, dtype=torch.float64, device=device)
+			rhs = pts_t[:, None, :] - q00_c[cand_t]
+			es = es_cell[cand_t]
+			et = et_cell[cand_t]
+			bl = bl_cell[cand_t]
 			det = es[..., 0] * et[..., 1] - es[..., 1] * et[..., 0]
-			s = np.where(np.abs(det) > 1.0e-12, (rhs[..., 0] * et[..., 1] - et[..., 0] * rhs[..., 1]) / det, 0.5)
-			t = np.where(np.abs(det) > 1.0e-12, (es[..., 0] * rhs[..., 1] - rhs[..., 0] * es[..., 1]) / det, 0.5)
+			half = torch.full_like(det, 0.5)
+			okdet = det.abs() > 1.0e-12
+			s = torch.where(okdet, (rhs[..., 0] * et[..., 1] - et[..., 0] * rhs[..., 1]) / det, half)
+			t = torch.where(okdet, (es[..., 0] * rhs[..., 1] - rhs[..., 0] * es[..., 1]) / det, half)
 			for _ in range(6):
-				P = Q00 + s[..., None] * es + t[..., None] * et + (s * t)[..., None] * bilin
-				resid = P - points[:, None, :]
-				Js = es + t[..., None] * bilin
-				Jt = et + s[..., None] * bilin
+				# resid = P - point = s*es + t*et + s*t*bilin - rhs  (all O(1), no absolute coords)
+				resid = (s[..., None] * es + t[..., None] * et + (s * t)[..., None] * bl) - rhs
+				Js = es + t[..., None] * bl
+				Jt = et + s[..., None] * bl
 				jdet = Js[..., 0] * Jt[..., 1] - Js[..., 1] * Jt[..., 0]
-				ok = np.abs(jdet) > 1.0e-12
-				ds = np.where(ok, (resid[..., 0] * Jt[..., 1] - Jt[..., 0] * resid[..., 1]) / jdet, 0.0)
-				dt = np.where(ok, (Js[..., 0] * resid[..., 1] - resid[..., 0] * Js[..., 1]) / jdet, 0.0)
+				ok = jdet.abs() > 1.0e-12
+				zero = torch.zeros_like(jdet)
+				ds = torch.where(ok, (resid[..., 0] * Jt[..., 1] - Jt[..., 0] * resid[..., 1]) / jdet, zero)
+				dt = torch.where(ok, (Js[..., 0] * resid[..., 1] - resid[..., 0] * Js[..., 1]) / jdet, zero)
 				s = s - ds
 				t = t - dt
-			P = Q00 + s[..., None] * es + t[..., None] * et + (s * t)[..., None] * bilin
-			res2 = ((P - points[:, None, :]) ** 2).sum(axis=-1)
+			resid = (s[..., None] * es + t[..., None] * et + (s * t)[..., None] * bl) - rhs
+			res2 = (resid * resid).sum(dim=-1)
 			inside = (
-				np.isfinite(res2) &
-				(s >= -1.0e-4) & (s <= 1.0 + 1.0e-4) &
-				(t >= -1.0e-4) & (t <= 1.0 + 1.0e-4) &
-				(res2 <= 1.0e-5)
+				torch.isfinite(res2)
+				& (s >= -1.0e-4) & (s <= 1.0 + 1.0e-4)
+				& (t >= -1.0e-4) & (t <= 1.0 + 1.0e-4)
+				& (res2 <= 1.0e-5)
 			)
-			score = np.where(inside, res2, np.inf)
-			best_pos = np.argmin(score, axis=1)
-			best_score = score[np.arange(score.shape[0]), best_pos]
-			good = np.isfinite(best_score)
-			if not good.any():
+			score = torch.where(inside, res2, torch.full_like(res2, float("inf")))
+			# Deterministic argmin matching numpy: lowest candidate position among
+			# minimal scores (torch.min's tie-break is unspecified on CUDA).
+			best_score = score.min(dim=1, keepdim=True).values
+			positions = torch.arange(score.shape[1], device=device)
+			tie_pos = torch.where(score == best_score, positions, score.shape[1])
+			best_pos = tie_pos.min(dim=1).values
+			best_score = best_score.squeeze(1)
+			good = torch.isfinite(best_score)
+			if not bool(good.any()):
 				continue
-			best_cell = cand[np.arange(cand.shape[0]), best_pos][good]
-			best_s = np.clip(s[np.arange(s.shape[0]), best_pos][good], 0.0, 1.0)
-			best_t = np.clip(t[np.arange(t.shape[0]), best_pos][good], 0.0, 1.0)
-			dst_y = oy[good]
-			dst_x = ox[good]
-			src_r = rows[best_cell].astype(np.float64) + best_s
-			src_c = cols[best_cell].astype(np.float64) + best_t
-			X00 = x00[best_cell]
-			X10 = x10[best_cell]
-			X01 = x01[best_cell]
-			X11 = x11[best_cell]
+			ar = torch.arange(cand_t.shape[0], device=device)
+			best_cell = cand_t[ar, best_pos][good]
+			best_s = s[ar, best_pos][good].clamp(0.0, 1.0).to(torch.float64)
+			best_t = t[ar, best_pos][good].clamp(0.0, 1.0).to(torch.float64)
+			flat_out = torch.as_tensor(flat_idx, dtype=torch.long, device=device)[good]
+			src_r = rows_c[best_cell] + best_s
+			src_c = cols_c[best_cell] + best_t
 			S = best_s[:, None]
 			T = best_t[:, None]
 			sampled = (
-				(1.0 - S) * (1.0 - T) * X00
-				+ S * (1.0 - T) * X10
-				+ (1.0 - S) * T * X01
-				+ S * T * X11
+				(1.0 - S) * (1.0 - T) * x00_c[best_cell]
+				+ S * (1.0 - T) * x10_c[best_cell]
+				+ (1.0 - S) * T * x01_c[best_cell]
+				+ S * T * x11_c[best_cell]
 			)
-			out_map[dst_y, dst_x, 0] = src_r.astype(np.float32, copy=False)
-			out_map[dst_y, dst_x, 1] = src_c.astype(np.float32, copy=False)
-			out_xyz[dst_y, dst_x] = sampled.astype(np.float32, copy=False)
-			out_mask[dst_y, dst_x] = True
+			out_map_t[flat_out, 0] = src_r.to(torch.float32)
+			out_map_t[flat_out, 1] = src_c.to(torch.float32)
+			out_xyz_t[flat_out] = sampled.to(torch.float32)
+			out_mask_t[flat_out] = True
 
-		out_xyz = np.where(out_mask[..., None], out_xyz, 0.0).astype(np.float32, copy=False)
+		# out_xyz_t is zero-initialized and written only at filled pixels, so it is
+		# already zero everywhere out_mask is False.
+		out_map = out_map_t.view(out_h, out_w, 2)
+		out_mask = out_mask_t.view(out_h, out_w)
+		out_xyz = out_xyz_t.view(out_h, out_w, 3)
 		return (
-			torch.as_tensor(out_map, device=device, dtype=dtype),
-			torch.as_tensor(out_xyz[None], device=device, dtype=dtype),
-			torch.as_tensor(out_mask, device=device, dtype=torch.bool),
+			out_map.to(device=device, dtype=dtype),
+			out_xyz.unsqueeze(0).to(device=device, dtype=dtype),
+			out_mask.to(device=device, dtype=torch.bool),
 		)
 
 	def _flatten_map_flat(self) -> torch.Tensor:
