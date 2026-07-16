@@ -89,7 +89,7 @@ His team also scanned and photographed detached scroll fragments bearing visible
 
 <figure>
   <img className="w-[500px]" src="/img/tutorials/ml-overview-alpha.webp" alt="Diagram of training a machine learning model on ground truth data from detached scroll fragments." />
-  <figcaption className="mt-0">Training a machine learning model on the ground truth data from the detached fragments. From Stephen Parsons’ <a href="https://uknowledge.uky.edu/cs_etds/138/">PhD dissertation</a>.</figcaption>
+  <figcaption className="mt-0">Training a machine learning model on the ground truth data from the detached fragments. From Stephen Parsons’ <a href="https://uknowledge.uky.edu/cs_etds/138/">PhD dissertation</a>. © Stephen Parsons.</figcaption>
 </figure>
 
 Professor Seales’ graduate student, Stephen Parsons, worked on detecting ink from the CT-scans using machine learning models and <a href="tutorial5">found success with the detached fragments</a>. That success caught the eye of tech entrepreneurs Nat Friedman and Daniel Gross, who started Vesuvius Challenge to accelerate this progress. They launched an open competition March of 2023, and — alongside a \$700,000 Grand Prize — awarded several smaller prizes for the development of open source tools and techniques.

@@ -296,13 +296,13 @@ At high resolutions the field of view of the camera is too small to capture the 
     <video autoPlay playsInline loop muted className="w-[100%] rounded-xl" poster="/img/tutorials/imagej-raw-xrays2.webp">
       <source src="/img/tutorials/imagej-raw-xrays2.webm" type="video/webm"/>
     </video>
-    <figcaption className="mt-0">Raw X-ray photos</figcaption>
+    <figcaption className="mt-0">Raw X-ray photos. © EduceLab/University of Kentucky.</figcaption>
   </figure>
   <figure className="sm:w-[63%]">
     <video autoPlay playsInline loop muted className="w-[100%]" poster="/img/tutorials/fragment-rotating2.webp">
       <source src="/img/tutorials/fragment-rotating2.webm" type="video/webm"/>
     </video>
-    <figcaption className="mt-0">A fragment rotating <a href="https://www.youtube.com/watch?v=fg_08ukGlMw">(source)</a></figcaption>
+    <figcaption className="mt-0">A fragment rotating <a href="https://www.youtube.com/watch?v=fg_08ukGlMw">(source)</a>. © EduceLab/University of Kentucky.</figcaption>
   </figure>
 </div>
 
@@ -313,13 +313,13 @@ From the X-ray photos from different angles we can reconstruct a 3D volume, usin
     <video autoPlay playsInline loop muted className="w-[100%]" poster="/img/tutorials/fragment-volume2.webp">
       <source src="/img/tutorials/fragment-volume2.webm" type="video/webm"/>
     </video>
-    <figcaption className="mt-0">Volumetric representation of a fragment, showing multiple layers of papyrus</figcaption>
+    <figcaption className="mt-0">Volumetric representation of a fragment, showing multiple layers of papyrus. © EduceLab/University of Kentucky.</figcaption>
   </figure>
   <figure className="sm:w-[60%]">
     <video autoPlay playsInline loop muted className="w-[100%]" poster="/img/faq/fragment-pointcloud.webp">
       <source src="/img/faq/fragment-pointcloud.webm" type="video/webm"/>
     </video>
-    <figcaption className="mt-0">Mesh representation of the same fragment</figcaption>
+    <figcaption className="mt-0">Mesh representation of the same fragment. © EduceLab/University of Kentucky.</figcaption>
   </figure>
 </div>
 
