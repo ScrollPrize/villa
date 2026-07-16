@@ -1,42 +1,65 @@
-# Trace2CP Compact Geometry CP-Span Coverage Plan
+# Merge Fiber 3D Extension And Adapt Multi-Dir Config Plan
 
-## Implementation
+## Merge Resolution
 
-- Extend `_required_line_ranges_for_record(...)` so compact geometry samples
-  consecutive CP-to-CP line spans in addition to CP source-window ranges.
-- Keep strict invalid-normal behavior: sampled bad line points remain invalid
-  and Trace2CP fails if the actual segment crosses them.
-- Preserve line-level invalid reasons in `_FiberLineGeometry`.
-- Improve the Trace2CP interval-crossing error to report invalid runs,
-  overlapping valid intervals, stored Lasagna failure reasons, and direct-probe
-  values for any unexpected unsampled invalid point.
+- Merge `fiber-3d-ext` into the active `fiber-3d-multidir` branch with
+  `--no-commit` so the combined changes can be inspected before committing.
+- Keep the branch's requested-level blocking coordinate sampling changes in:
+  - `fiber_trace_2d/loader.py`
+  - `fiber_trace_2d/sampling.py`
+  - `fiber_trace_3d/trace2cp_tool.py`
+  - VC3D sampler bindings and tests under `volume-cartographer/`
+- Reapply the current multi-direction training changes in:
+  - `fiber_trace_3d/model.py`
+  - `fiber_trace_3d/train.py`
+  - 3D training configs
+  - `test_fiber_trace_3d.py`
+- Do not include unrelated old stash changes. If an old stash conflict appears,
+  keep the merge-side file and leave the stash entry intact.
+
+## Config Adaptation
+
+- Update the newly added
+  `fiber_trace_3d/configs/train_s1a_nml_all_64_sd2.json`:
+  - set `model_3d.direction_branch_count` to `2`;
+  - set `model_3d.output_channels` to `14`;
+  - keep BatchNorm explicit with `model_3d.normalization: "batch"`;
+  - give the run a distinct multi-dir name so it cannot accidentally resume or
+    overwrite old 7-channel runs.
 
 ## Spec Update
 
-- Update compact-geometry preload specs to include consecutive CP-to-CP spans,
-  not only CP source windows.
-- Document that unsampled invalid compact-geometry points are a diagnostic bug
-  path and should not occur after preload for requested Trace2CP spans.
+- Keep the existing multi-direction 3D training spec updates.
+- Keep the merged requested-level blocking coordinate sampling spec updates.
+- Add the current 64-scale S1A NML config to the multi-direction config
+  wording where relevant.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` compact-geometry notes to describe CP-span
-  coverage and detailed invalid-interval diagnostics.
+- Keep `docs/code_structure.md` updates from both sides:
+  - strict requested-level blocking sampler behavior;
+  - branch-aware 3D model/loss/visualization behavior.
+- Keep changelog entries for both the blocking sampler merge and multi-dir
+  training/config adaptation.
 
 ## Testing Plan
 
-- Add a unit test proving disjoint CP source windows still produce one required
-  CP-to-CP preload span.
-- Keep tests for trimming invalid margin and rejecting actually invalid
-  CP-to-CP compact geometry.
-- Run focused compact-geometry tests.
+- Python compile check for touched 3D model/train/tests and Trace2CP tooling.
+- Full 3D Python regression file:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+- Focused 2D Trace2CP sampler/render tests from the merged branch:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k "trace2cp_render_sampling"`
+- JSON-load sanity check for all `fiber_trace_3d/configs/*.json`.
+- Run `git diff --check`.
 
 ## Changelog
 
-- Add a changelog line for compact-geometry CP-span preload coverage and
-  improved invalid-interval diagnostics.
+- Update the July 16 changelog entry to note that the 64-scale S1A NML training
+  config was adapted to the two-branch output layout.
 
 ## Deviations Or Deferrals
 
-- No normal interpolation/fill is added. Invalid sampled Lasagna data still
-  invalidates the segment.
+- Do not commit the merge automatically; leave it staged/uncommitted unless the
+  user asks for a commit.
+- C++ rebuilds for the merged VC3D sampler changes may depend on the local
+  CMake/Qt state. Report clearly if not run.

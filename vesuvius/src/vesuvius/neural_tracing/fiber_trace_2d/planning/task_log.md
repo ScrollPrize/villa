@@ -1,37 +1,44 @@
-# Trace2CP Compact Geometry CP-Span Coverage Task Log
-
-## Findings
-
-- The `invalid normal without stored reason` diagnostics came from line points
-  that were marked invalid in compact geometry but had no Lasagna failure
-  reason.
-- The reason is a preload coverage bug: compact geometry sampled CP
-  source-window ranges, but Trace2CP can request the full centerline span
-  between two CPs. Interior points between two disjoint CP windows were never
-  sampled.
-- Strip width is not involved. The affected points are fiber centerline points
-  inside the CP-to-CP span.
+# Merge Fiber 3D Extension And Adapt Multi-Dir Config Task Log
 
 ## Implementation Notes
 
-- `_required_line_ranges_for_record(...)` now includes consecutive CP-to-CP
-  line spans in addition to CP source windows.
-- `_FiberLineGeometry` keeps line-level invalid Lasagna reasons.
-- The Trace2CP invalid-interval error now reports invalid runs, overlapping
-  valid intervals, stored reasons, and for unexpected unsampled points a direct
-  Lasagna probe with grad/nx/ny ranges and principal-axis status.
-- No normal fill-in, propagation, or interpolation fallback was added.
+- Merged `fiber-3d-ext` into `fiber-3d-multidir` with
+  `git merge --no-commit --no-ff --autostash fiber-3d-ext`.
+- The branch merge itself applied cleanly and stopped before commit.
+- An initial `git stash pop` targeted an older unrelated stash entry and
+  produced conflicts in:
+  - `volume-cartographer/apps/VC3D/LineAnnotationController.cpp`
+  - `volume-cartographer/core/test/CMakeLists.txt`
+- Those two conflicts were resolved to the merge-side content. The older stash
+  entry was kept, so unrelated old VC annotation work was not pulled into this
+  merge and was not discarded from the stash list.
+- The intended `MERGE_AUTOSTASH` was then applied explicitly. It conflicted
+  only in active planning docs and was resolved by keeping this current
+  merge/config-adaptation task as the active task.
+- The newly added
+  `fiber_trace_3d/configs/train_s1a_nml_all_64_sd2.json` now uses:
+  - `model_3d.direction_branch_count: 2`
+  - `model_3d.output_channels: 14`
+  - `model_3d.normalization: "batch"`
+  - `training.run_name: "s1a_nml_all_3d_64_2_multidir"`
 
 ## Deviations Or Deferrals
 
-- Existing compact geometry stores built by older code can still show the
-  defensive `not sampled by compact geometry preload` diagnostic until rebuilt.
-  New loader construction should sample the CP-to-CP span and either validate it
-  or report the real sampled Lasagna failure reason.
+- The merge is intentionally left uncommitted.
+- Native/projected Trace2CP inference still uses branch 0 for model output
+  interpretation. Multi-branch inference selection remains deferred.
+- C++ build validation for the merged VC3D requested-level sampler changes has
+  not been run yet in this task.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/sampling.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/model.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
   passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k "compact_geometry or required_line_ranges or trace2cp_segment_trims or trace2cp_segment_rejects"`
-  passed: 7 passed, 266 deselected.
+- `PYTHONPATH=vesuvius/src:. python - <<'PY' ... load_config(...) ...`
+  passed for `loader_example.json`, `train_s1a_nml_all.json`, and
+  `train_s1a_nml_all_64_sd2.json`.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+  passed: 61 passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k "trace2cp_render_sampling"`
+  passed: 2 passed, 271 deselected.
+- `git diff --check` passed.

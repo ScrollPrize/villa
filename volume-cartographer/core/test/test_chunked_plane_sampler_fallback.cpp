@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -233,4 +234,55 @@ TEST_CASE("ChunkedPlaneSampler base and overlay buffers fall back independently"
     CHECK(baseOut(0, 0) == 11);
     CHECK(overlayCoverage(0, 0) == 1);
     CHECK(overlayOut(0, 0) == 99);
+}
+
+TEST_CASE("ChunkedPlaneSampler blocking requested-level does not fall back to coarse level")
+{
+    PyramidChunkedArray array(vc::render::ChunkStatus::Missing, 0,
+                              vc::render::ChunkStatus::Data, 42);
+    cv::Mat_<uint8_t> out(1, 1, uint8_t(123));
+    cv::Mat_<uint8_t> coverage(1, 1, uint8_t(0));
+
+    const auto stats = vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+        array, 0, singleCoord({1.0f, 1.0f, 1.0f}), out, coverage,
+        {vc::Sampling::Nearest, 1});
+
+    CHECK(coverage(0, 0) == 1);
+    CHECK(out(0, 0) == 0);
+    CHECK(stats.requestedLevelOnly);
+    CHECK(stats.fallbackLevels == 0);
+    CHECK(stats.requestedChunks == 1);
+    CHECK(stats.missingChunks == 1);
+}
+
+TEST_CASE("ChunkedPlaneSampler blocking requested-level keeps requested-level data")
+{
+    PyramidChunkedArray array(vc::render::ChunkStatus::Data, 7,
+                              vc::render::ChunkStatus::Data, 42);
+    cv::Mat_<uint8_t> out(1, 1, uint8_t(0));
+    cv::Mat_<uint8_t> coverage(1, 1, uint8_t(0));
+
+    const auto stats = vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+        array, 0, singleCoord({1.0f, 1.0f, 1.0f}), out, coverage,
+        {vc::Sampling::Nearest, 1});
+
+    CHECK(coverage(0, 0) == 1);
+    CHECK(out(0, 0) == 7);
+    CHECK(stats.requestedLevelOnly);
+    CHECK(stats.fallbackLevels == 0);
+    CHECK(stats.missingChunks == 0);
+}
+
+TEST_CASE("ChunkedPlaneSampler blocking requested-level rejects unresolved chunks")
+{
+    PyramidChunkedArray array(vc::render::ChunkStatus::MissQueued, 0,
+                              vc::render::ChunkStatus::Data, 42);
+    cv::Mat_<uint8_t> out(1, 1, uint8_t(0));
+    cv::Mat_<uint8_t> coverage(1, 1, uint8_t(0));
+
+    CHECK_THROWS_AS(
+        vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+            array, 0, singleCoord({1.0f, 1.0f, 1.0f}), out, coverage,
+            {vc::Sampling::Nearest, 1}),
+        std::runtime_error);
 }

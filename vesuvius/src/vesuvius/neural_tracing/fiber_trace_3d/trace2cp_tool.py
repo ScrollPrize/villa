@@ -72,9 +72,24 @@ class NativeTraceResult:
 
 
 @dataclass(frozen=True)
+class NativeTraceFusionResult:
+    fused_zyx: np.ndarray
+    closest_progress: float
+    raw_gap_voxels: float
+    considered_gap_voxels: float
+    center_penalty: float
+    closest_midpoint_zyx: np.ndarray
+    closest_forward_zyx: np.ndarray
+    closest_reverse_zyx: np.ndarray
+    reached_overlap: bool
+    reason: str
+
+
+@dataclass(frozen=True)
 class NativeTracePairResult:
     forward: NativeTraceResult
     reverse: NativeTraceResult
+    fusion: NativeTraceFusionResult
     fused_zyx: np.ndarray
     plane_error: float
     closest_target_error: float
@@ -336,6 +351,24 @@ class NativeTraceFieldCache:
             raise ValueError("native 3D Trace2CP requires blocking coordinate sampling")
         coords_base, valid = self._block_coords_base_and_valid(origin_zyx)
         result = sampler.sample_coord_batch(coords_base, valid)
+        stats = dict(getattr(result, "stats", {}) or {})
+        error_chunks = int(stats.get("error_chunks", 0) or 0)
+        if error_chunks > 0:
+            raise ValueError(
+                "native 3D Trace2CP block sampling encountered chunk errors; "
+                f"stats={stats}"
+            )
+        if "requested_level_only" in stats and not bool(stats.get("requested_level_only")):
+            raise ValueError(
+                "native 3D Trace2CP block sampling did not use requested-level-only mode; "
+                f"stats={stats}"
+            )
+        fallback_levels = int(stats.get("fallback_levels", 0) or 0)
+        if fallback_levels != 0:
+            raise ValueError(
+                "native 3D Trace2CP block sampling used scale fallback; "
+                f"stats={stats}"
+            )
         sampled_np = np.asarray(result.image, dtype=np.float32)
         sampled_valid_np = np.asarray(result.valid_mask, dtype=bool) & valid
         expected_shape = self.patch_shape_zyx
@@ -365,7 +398,13 @@ class NativeTraceFieldCache:
         image = _normalize_image(raw_t, valid, self.image_normalization)
         was_training = bool(self.model.training)
         self.model.eval()
-        output = self.model(image.view(1, 1, *self.patch_shape_zyx))[0].detach()
+        output = (
+            self.model(image.view(1, 1, *self.patch_shape_zyx))[0]
+            .detach()
+            .to(device=torch.device("cpu"), dtype=torch.float32)
+            .contiguous()
+        )
+        valid_cpu = valid.detach().to(device=torch.device("cpu")).contiguous()
         if was_training:
             self.model.train()
         core_lo = origin + int(self.core_margin)
@@ -376,7 +415,7 @@ class NativeTraceFieldCache:
             core_lo_zyx=core_lo.astype(np.float32),
             core_hi_zyx=core_hi.astype(np.float32),
             output_czyx=output,
-            valid_mask_zyx=valid,
+            valid_mask_zyx=valid_cpu,
         )
         self._blocks[key] = block
         return block
@@ -469,15 +508,21 @@ class NativeTraceFieldCache:
                 continue
             usable_indices = indices[usable]
             usable_points = points[usable_indices]
+            block_output = block.output_czyx.to(device=self.device, non_blocking=True)
             sampled = _grid_sample_channels_at_points(
-                block.output_czyx,
+                block_output,
                 usable_points,
                 origin_zyx=block.origin_zyx,
             )
             if int(sampled.shape[1]) < 6:
                 raise ValueError("native 3D Trace2CP model output has fewer than six channels")
+            block_valid = block.valid_mask_zyx.to(
+                device=self.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
             valid_values = _grid_sample_channels_at_points(
-                block.valid_mask_zyx.to(dtype=torch.float32).view(1, *block.shape_zyx),
+                block_valid.view(1, *block.shape_zyx),
                 usable_points,
                 origin_zyx=block.origin_zyx,
             )[:, 0]
@@ -789,29 +834,181 @@ def trace_native_3d_one_way(
     )
 
 
-def _resample_trace_by_progress(
-    trace_zyx: np.ndarray,
+def _trace_progress(
+    points_zyx: np.ndarray,
     *,
     start_zyx: np.ndarray,
-    target_zyx: np.ndarray,
-    count: int,
+    axis_zyx: np.ndarray,
+    span_voxels: float,
 ) -> np.ndarray:
+    points = np.asarray(points_zyx, dtype=np.float32)
+    if points.ndim == 1:
+        points = points[None, :]
+    return (
+        (points - np.asarray(start_zyx, dtype=np.float32)[None, :])
+        @ np.asarray(axis_zyx, dtype=np.float32)
+    ) / np.float32(max(float(span_voxels), _EPS))
+
+
+def _trace_point_at_progress(
+    trace_zyx: np.ndarray,
+    progress_value: float,
+    *,
+    start_zyx: np.ndarray,
+    axis_zyx: np.ndarray,
+    span_voxels: float,
+) -> np.ndarray | None:
     trace = np.asarray(trace_zyx, dtype=np.float32)
-    normal = _unit(np.asarray(target_zyx, dtype=np.float32) - np.asarray(start_zyx, dtype=np.float32))
-    span = float(np.dot(np.asarray(target_zyx, dtype=np.float32) - np.asarray(start_zyx, dtype=np.float32), normal))
-    if span <= _EPS or trace.shape[0] < 2:
-        return np.repeat(trace[:1], max(1, int(count)), axis=0)
-    progress = ((trace - np.asarray(start_zyx, dtype=np.float32)[None, :]) @ normal) / span
-    order = np.argsort(progress)
-    progress = np.clip(progress[order], 0.0, 1.0)
-    values = trace[order]
-    unique_progress, unique_indices = np.unique(progress, return_index=True)
-    values = values[unique_indices]
-    if unique_progress.shape[0] < 2:
-        return np.repeat(values[:1], max(1, int(count)), axis=0)
-    sample_t = np.linspace(0.0, 1.0, max(2, int(count)), dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[1] != 3 or trace.shape[0] == 0:
+        return None
+    if trace.shape[0] == 1:
+        progress = float(
+            _trace_progress(
+                trace[:1],
+                start_zyx=start_zyx,
+                axis_zyx=axis_zyx,
+                span_voxels=span_voxels,
+            )[0]
+        )
+        if abs(progress - float(progress_value)) <= 1.0e-5:
+            return trace[0].astype(np.float32)
+        return None
+    progress = _trace_progress(
+        trace,
+        start_zyx=start_zyx,
+        axis_zyx=axis_zyx,
+        span_voxels=span_voxels,
+    ).astype(np.float64, copy=False)
+    target = float(progress_value)
+    for idx in range(trace.shape[0] - 1):
+        p0 = float(progress[idx])
+        p1 = float(progress[idx + 1])
+        if not (math.isfinite(p0) and math.isfinite(p1)):
+            continue
+        lo = min(p0, p1) - 1.0e-6
+        hi = max(p0, p1) + 1.0e-6
+        if target < lo or target > hi:
+            continue
+        denom = p1 - p0
+        if abs(denom) <= 1.0e-12:
+            alpha = 0.0
+        else:
+            alpha = float(np.clip((target - p0) / denom, 0.0, 1.0))
+        return (
+            trace[idx].astype(np.float64) * (1.0 - alpha)
+            + trace[idx + 1].astype(np.float64) * alpha
+        ).astype(np.float32)
+    nearest_index = int(np.argmin(np.abs(progress - target)))
+    if abs(float(progress[nearest_index]) - target) <= 1.0e-5:
+        return trace[nearest_index].astype(np.float32)
+    return None
+
+
+def _resample_trace_between_progress(
+    trace_zyx: np.ndarray,
+    *,
+    progress_start: float,
+    progress_end: float,
+    anchor_zyx: np.ndarray,
+    start_zyx: np.ndarray,
+    axis_zyx: np.ndarray,
+    span_voxels: float,
+    step_voxels: float,
+) -> np.ndarray:
+    distance = abs(float(progress_end) - float(progress_start)) * max(float(span_voxels), 0.0)
+    count = max(2, int(math.ceil(distance / max(float(step_voxels), _EPS))) + 1)
+    sample_t = np.linspace(float(progress_start), float(progress_end), count, dtype=np.float32)
+    points = [
+        point
+        for point in (
+            _trace_point_at_progress(
+                trace_zyx,
+                float(t),
+                start_zyx=start_zyx,
+                axis_zyx=axis_zyx,
+                span_voxels=span_voxels,
+            )
+            for t in sample_t
+        )
+        if point is not None
+    ]
+    anchor = np.asarray(anchor_zyx, dtype=np.float32)
+    if not points:
+        return anchor[None, :].astype(np.float32)
+    out = np.stack(points, axis=0).astype(np.float32)
+    if float(np.linalg.norm(out[0].astype(np.float64) - anchor.astype(np.float64))) > 1.0e-4:
+        out = np.concatenate([anchor[None, :], out], axis=0)
+    else:
+        out[0] = anchor
+    return out.astype(np.float32)
+
+
+def _warp_partial_trace_to_meet(
+    partial_zyx: np.ndarray,
+    *,
+    anchor_progress: float,
+    meet_progress: float,
+    anchor_zyx: np.ndarray,
+    source_meet_zyx: np.ndarray,
+    target_meet_zyx: np.ndarray,
+    start_zyx: np.ndarray,
+    axis_zyx: np.ndarray,
+    span_voxels: float,
+) -> np.ndarray:
+    partial = np.asarray(partial_zyx, dtype=np.float32)
+    if partial.ndim != 2 or partial.shape[1] != 3 or partial.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    warped = partial.astype(np.float64, copy=True)
+    progress = _trace_progress(
+        warped.astype(np.float32),
+        start_zyx=start_zyx,
+        axis_zyx=axis_zyx,
+        span_voxels=span_voxels,
+    ).astype(np.float64, copy=False)
+    denom = abs(float(meet_progress) - float(anchor_progress))
+    if denom <= 1.0e-8:
+        blend = np.linspace(0.0, 1.0, warped.shape[0], dtype=np.float64)
+    else:
+        blend = np.clip(
+            np.abs(progress - float(anchor_progress)) / denom,
+            0.0,
+            1.0,
+        )
+    delta = (
+        np.asarray(target_meet_zyx, dtype=np.float64)
+        - np.asarray(source_meet_zyx, dtype=np.float64)
+    )
+    warped += blend[:, None] * delta[None, :]
+    warped[0] = np.asarray(anchor_zyx, dtype=np.float64)
+    warped[-1] = np.asarray(target_meet_zyx, dtype=np.float64)
+    return warped.astype(np.float32)
+
+
+def _resample_polyline_by_arclength_zyx(
+    points_zyx: np.ndarray,
+    *,
+    step_voxels: float,
+) -> np.ndarray:
+    points = np.asarray(points_zyx, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points_zyx must have shape N,3")
+    if points.shape[0] <= 2:
+        return points.astype(np.float32, copy=True)
+    deltas = np.diff(points.astype(np.float64), axis=0)
+    lengths = np.linalg.norm(deltas, axis=1)
+    keep = np.concatenate([[True], lengths > 1.0e-8])
+    points = points[keep]
+    if points.shape[0] <= 2:
+        return points.astype(np.float32, copy=True)
+    lengths = np.linalg.norm(np.diff(points.astype(np.float64), axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(lengths)])
+    total = float(cumulative[-1])
+    if not math.isfinite(total) or total <= 1.0e-8:
+        return points[[0, -1]].astype(np.float32)
+    count = max(2, int(math.ceil(total / max(float(step_voxels), _EPS))) + 1)
+    sample_s = np.linspace(0.0, total, count, dtype=np.float64)
     return np.stack(
-        [np.interp(sample_t, unique_progress, values[:, axis]) for axis in range(3)],
+        [np.interp(sample_s, cumulative, points[:, axis]) for axis in range(3)],
         axis=1,
     ).astype(np.float32)
 
@@ -822,21 +1019,216 @@ def fuse_forward_reverse_traces(
     *,
     start_zyx: np.ndarray,
     target_zyx: np.ndarray,
-) -> np.ndarray:
-    count = max(int(forward_zyx.shape[0]), int(reverse_zyx.shape[0]), 2)
-    forward = _resample_trace_by_progress(
-        forward_zyx,
-        start_zyx=start_zyx,
-        target_zyx=target_zyx,
-        count=count,
+    step_voxels: float,
+) -> NativeTraceFusionResult:
+    start = np.asarray(start_zyx, dtype=np.float32)
+    target = np.asarray(target_zyx, dtype=np.float32)
+    axis = _unit(target - start)
+    span = float(np.linalg.norm(target - start))
+    empty = np.zeros((0, 3), dtype=np.float32)
+    empty_point = np.full((3,), np.nan, dtype=np.float32)
+    if span <= _EPS:
+        return NativeTraceFusionResult(
+            fused_zyx=empty,
+            closest_progress=float("nan"),
+            raw_gap_voxels=float("nan"),
+            considered_gap_voxels=float("nan"),
+            center_penalty=float("nan"),
+            closest_midpoint_zyx=empty_point,
+            closest_forward_zyx=empty_point,
+            closest_reverse_zyx=empty_point,
+            reached_overlap=False,
+            reason="degenerate_cp_span",
+        )
+    forward = np.asarray(forward_zyx, dtype=np.float32)
+    reverse = np.asarray(reverse_zyx, dtype=np.float32)
+    if (
+        forward.ndim != 2
+        or reverse.ndim != 2
+        or forward.shape[1:] != (3,)
+        or reverse.shape[1:] != (3,)
+        or forward.shape[0] < 1
+        or reverse.shape[0] < 1
+    ):
+        return NativeTraceFusionResult(
+            fused_zyx=empty,
+            closest_progress=float("nan"),
+            raw_gap_voxels=float("nan"),
+            considered_gap_voxels=float("nan"),
+            center_penalty=float("nan"),
+            closest_midpoint_zyx=empty_point,
+            closest_forward_zyx=empty_point,
+            closest_reverse_zyx=empty_point,
+            reached_overlap=False,
+            reason="invalid_trace_shape",
+        )
+    forward_progress = _trace_progress(
+        forward,
+        start_zyx=start,
+        axis_zyx=axis,
+        span_voxels=span,
     )
-    reverse = _resample_trace_by_progress(
-        reverse_zyx[::-1],
-        start_zyx=start_zyx,
-        target_zyx=target_zyx,
-        count=count,
+    reverse_progress = _trace_progress(
+        reverse,
+        start_zyx=start,
+        axis_zyx=axis,
+        span_voxels=span,
     )
-    return ((forward + reverse) * 0.5).astype(np.float32)
+    finite_forward = forward_progress[np.isfinite(forward_progress)]
+    finite_reverse = reverse_progress[np.isfinite(reverse_progress)]
+    if finite_forward.size == 0 or finite_reverse.size == 0:
+        return NativeTraceFusionResult(
+            fused_zyx=empty,
+            closest_progress=float("nan"),
+            raw_gap_voxels=float("nan"),
+            considered_gap_voxels=float("nan"),
+            center_penalty=float("nan"),
+            closest_midpoint_zyx=empty_point,
+            closest_forward_zyx=empty_point,
+            closest_reverse_zyx=empty_point,
+            reached_overlap=False,
+            reason="nonfinite_trace_progress",
+        )
+    overlap_lo = max(0.0, float(np.min(finite_forward)), float(np.min(finite_reverse)))
+    overlap_hi = min(1.0, float(np.max(finite_forward)), float(np.max(finite_reverse)))
+    if overlap_hi < overlap_lo - 1.0e-6:
+        return NativeTraceFusionResult(
+            fused_zyx=empty,
+            closest_progress=float("nan"),
+            raw_gap_voxels=float("nan"),
+            considered_gap_voxels=float("nan"),
+            center_penalty=float("nan"),
+            closest_midpoint_zyx=empty_point,
+            closest_forward_zyx=empty_point,
+            closest_reverse_zyx=empty_point,
+            reached_overlap=False,
+            reason="no_trace_overlap",
+        )
+    overlap_lo = float(np.clip(overlap_lo, 0.0, 1.0))
+    overlap_hi = float(np.clip(overlap_hi, 0.0, 1.0))
+    sample_count = max(
+        2,
+        int(math.ceil(max(0.0, overlap_hi - overlap_lo) * span / max(float(step_voxels), _EPS)))
+        + 1,
+    )
+    candidate_progress = np.linspace(overlap_lo, overlap_hi, sample_count, dtype=np.float32)
+    best: tuple[float, float, float, np.ndarray, np.ndarray] | None = None
+    for progress_value in candidate_progress:
+        forward_point = _trace_point_at_progress(
+            forward,
+            float(progress_value),
+            start_zyx=start,
+            axis_zyx=axis,
+            span_voxels=span,
+        )
+        reverse_point = _trace_point_at_progress(
+            reverse,
+            float(progress_value),
+            start_zyx=start,
+            axis_zyx=axis,
+            span_voxels=span,
+        )
+        if forward_point is None or reverse_point is None:
+            continue
+        gap = float(np.linalg.norm(forward_point.astype(np.float64) - reverse_point.astype(np.float64)))
+        center_penalty = 1.0 + float(np.clip(abs(float(progress_value) - 0.5) / 0.5, 0.0, 1.0))
+        considered = gap * center_penalty
+        center_tie = abs(float(progress_value) - 0.5)
+        key = (considered, center_tie)
+        if best is None or key < (best[0], best[1]):
+            best = (considered, center_tie, float(progress_value), forward_point, reverse_point)
+    if best is None:
+        return NativeTraceFusionResult(
+            fused_zyx=empty,
+            closest_progress=float("nan"),
+            raw_gap_voxels=float("nan"),
+            considered_gap_voxels=float("nan"),
+            center_penalty=float("nan"),
+            closest_midpoint_zyx=empty_point,
+            closest_forward_zyx=empty_point,
+            closest_reverse_zyx=empty_point,
+            reached_overlap=False,
+            reason="no_interpolated_overlap",
+        )
+    considered_gap, _center_tie, closest_progress, closest_forward, closest_reverse = best
+    raw_gap = float(
+        np.linalg.norm(closest_forward.astype(np.float64) - closest_reverse.astype(np.float64))
+    )
+    center_penalty = float(considered_gap / max(raw_gap, _EPS)) if raw_gap > _EPS else (
+        1.0 + float(np.clip(abs(float(closest_progress) - 0.5) / 0.5, 0.0, 1.0))
+    )
+    midpoint = ((closest_forward.astype(np.float64) + closest_reverse.astype(np.float64)) * 0.5).astype(np.float32)
+    forward_partial = _resample_trace_between_progress(
+        forward,
+        progress_start=0.0,
+        progress_end=closest_progress,
+        anchor_zyx=start,
+        start_zyx=start,
+        axis_zyx=axis,
+        span_voxels=span,
+        step_voxels=step_voxels,
+    )
+    reverse_partial = _resample_trace_between_progress(
+        reverse,
+        progress_start=1.0,
+        progress_end=closest_progress,
+        anchor_zyx=target,
+        start_zyx=start,
+        axis_zyx=axis,
+        span_voxels=span,
+        step_voxels=step_voxels,
+    )
+    forward_warped = _warp_partial_trace_to_meet(
+        forward_partial,
+        anchor_progress=0.0,
+        meet_progress=closest_progress,
+        anchor_zyx=start,
+        source_meet_zyx=closest_forward,
+        target_meet_zyx=midpoint,
+        start_zyx=start,
+        axis_zyx=axis,
+        span_voxels=span,
+    )
+    reverse_warped = _warp_partial_trace_to_meet(
+        reverse_partial,
+        anchor_progress=1.0,
+        meet_progress=closest_progress,
+        anchor_zyx=target,
+        source_meet_zyx=closest_reverse,
+        target_meet_zyx=midpoint,
+        start_zyx=start,
+        axis_zyx=axis,
+        span_voxels=span,
+    )
+    reverse_meet_to_target = reverse_warped[::-1].copy()
+    if forward_warped.shape[0] == 0:
+        fused_dense = reverse_meet_to_target
+    elif reverse_meet_to_target.shape[0] == 0:
+        fused_dense = forward_warped
+    else:
+        fused_dense = np.concatenate([forward_warped, reverse_meet_to_target[1:]], axis=0)
+    if fused_dense.shape[0] >= 1:
+        fused_dense[0] = start
+        fused_dense[-1] = target
+    fused = _resample_polyline_by_arclength_zyx(
+        fused_dense,
+        step_voxels=step_voxels,
+    )
+    if fused.shape[0] >= 1:
+        fused[0] = start
+        fused[-1] = target
+    return NativeTraceFusionResult(
+        fused_zyx=fused.astype(np.float32),
+        closest_progress=float(closest_progress),
+        raw_gap_voxels=float(raw_gap),
+        considered_gap_voxels=float(considered_gap),
+        center_penalty=float(center_penalty),
+        closest_midpoint_zyx=midpoint.astype(np.float32),
+        closest_forward_zyx=closest_forward.astype(np.float32),
+        closest_reverse_zyx=closest_reverse.astype(np.float32),
+        reached_overlap=True,
+        reason="closest_overlap",
+    )
 
 
 def trace_native_3d_pair(
@@ -861,11 +1253,12 @@ def trace_native_3d_pair(
         cfg=cfg,
         progress_label="bw" if progress else None,
     )
-    fused = fuse_forward_reverse_traces(
+    fusion = fuse_forward_reverse_traces(
         forward.trace_zyx,
         reverse.trace_zyx,
         start_zyx=start_zyx,
         target_zyx=target_zyx,
+        step_voxels=float(cfg.step_voxels),
     )
     span = float(np.linalg.norm(np.asarray(target_zyx, dtype=np.float32) - np.asarray(start_zyx, dtype=np.float32)))
     normal = _unit(np.asarray(target_zyx, dtype=np.float32) - np.asarray(start_zyx, dtype=np.float32))
@@ -878,7 +1271,8 @@ def trace_native_3d_pair(
     return NativeTracePairResult(
         forward=forward,
         reverse=reverse,
-        fused_zyx=fused,
+        fusion=fusion,
+        fused_zyx=fusion.fused_zyx,
         plane_error=float(plane_error),
         closest_target_error=float(closest_error),
         span_voxels=float(span),
@@ -1092,6 +1486,55 @@ def _project_trace_to_initial_strip(
     return xy[valid].astype(np.float32, copy=False)
 
 
+def _volume_trace_to_source_trace_xyz(
+    source: _Trace2CpSegmentSource,
+    trace_xyz_base: np.ndarray,
+) -> np.ndarray:
+    trace = np.asarray(trace_xyz_base, dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[1] != 3:
+        raise ValueError("trace_xyz_base must have shape N,3")
+    if int(trace.shape[0]) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    projected_xyz, projected_xy, projected_valid = _closest_source_line_projection(trace, source)
+    row_axes, row_axes_valid = _sample_source_axes_at_xy(
+        source,
+        "offset_axis_xyz",
+        projected_xy,
+    )
+    side_axes, side_axes_valid = _sample_source_axes_at_xy(
+        source,
+        "side_axis_xyz",
+        projected_xy,
+    )
+    spacing = float(source.record.volume_spacing_base)
+    if not np.isfinite(spacing) or spacing <= 0.0:
+        raise ValueError(f"invalid volume spacing for native trace source conversion: {spacing}")
+    delta = trace - projected_xyz
+    y_offsets = np.sum(delta * row_axes, axis=1) / np.float32(spacing)
+    z_offsets = np.sum(delta * side_axes, axis=1) / np.float32(spacing)
+    source_trace = np.stack(
+        [
+            projected_xy[:, 0],
+            projected_xy[:, 1] + y_offsets.astype(np.float32, copy=False),
+            z_offsets.astype(np.float32, copy=False),
+        ],
+        axis=1,
+    )
+    valid = (
+        projected_valid
+        & row_axes_valid
+        & side_axes_valid
+        & np.isfinite(source_trace).all(axis=1)
+    )
+    source_trace = source_trace[valid].astype(np.float32, copy=False)
+    if int(source_trace.shape[0]) < 2:
+        raise ValueError(
+            "native fused trace cannot be converted into source-strip coordinates: "
+            f"valid_points={int(source_trace.shape[0])} total_points={int(trace.shape[0])}"
+        )
+    return source_trace
+
+
 def _trace_overlays_for_view(
     source: _Trace2CpSegmentSource,
     result: NativeTracePairResult,
@@ -1121,6 +1564,39 @@ def _trace_overlays_for_view(
     return tuple(overlays)
 
 
+def _adaptive_trace2cp_cross_strip_height(
+    max_height: int,
+    overlay_groups: tuple[tuple[tuple[np.ndarray, tuple[int, int, int, int]], ...], ...],
+    *,
+    expansion: float = 1.5,
+    padding_px: float = 2.0,
+) -> int:
+    configured = int(max_height)
+    if configured <= 0:
+        raise ValueError(f"invalid maximum trace2cp strip height {max_height!r}")
+    if configured == 1:
+        return 1
+    center_y = (float(configured) - 1.0) * 0.5
+    required_half = 0.0
+    for overlays in overlay_groups:
+        for overlay_xy, _color in overlays:
+            overlay = np.asarray(overlay_xy, dtype=np.float32)
+            if overlay.ndim != 2 or overlay.shape[1] < 2:
+                continue
+            finite = np.isfinite(overlay[:, 1])
+            if not bool(np.any(finite)):
+                continue
+            required_half = max(
+                required_half,
+                float(np.max(np.abs(overlay[finite, 1].astype(np.float64) - center_y))),
+            )
+    half = int(math.ceil(required_half * float(expansion) + float(padding_px)))
+    half = max(1, half)
+    max_half = max(1, (configured - 1) // 2)
+    half = min(half, max_half)
+    return int(2 * half + 1)
+
+
 def _draw_trace_panel(
     image_u8: np.ndarray,
     valid: np.ndarray,
@@ -1130,6 +1606,8 @@ def _draw_trace_panel(
     *,
     title: str,
     overlays: tuple[tuple[np.ndarray, tuple[int, int, int, int]], ...] = (),
+    line_width: int = 2,
+    overlay_width: int = 2,
 ):
     from PIL import Image, ImageDraw
 
@@ -1153,7 +1631,7 @@ def _draw_trace_panel(
     line = np.asarray(line_xy, dtype=np.float32)
     pts = [(float(x), float(y) + text_pad) for x, y in line if np.isfinite(x) and np.isfinite(y)]
     if len(pts) >= 2:
-        draw.line(pts, fill=(0, 255, 128, 170), width=2)
+        draw.line(pts, fill=(0, 255, 128, 170), width=max(1, int(line_width)))
     for overlay_xy, color in overlays:
         overlay = np.asarray(overlay_xy, dtype=np.float32)
         overlay_pts = [
@@ -1162,7 +1640,7 @@ def _draw_trace_panel(
             if np.isfinite(x) and np.isfinite(y)
         ]
         if len(overlay_pts) >= 2:
-            draw.line(overlay_pts, fill=color, width=2)
+            draw.line(overlay_pts, fill=color, width=max(1, int(overlay_width)))
     for xy, color in (
         (start_xy, (0, 255, 255, 255)),
         (target_xy, (255, 64, 220, 255)),
@@ -1184,12 +1662,15 @@ def _make_native_trace_visualization(
     *,
     cache: NativeTraceFieldCache,
     image_normalization: str,
+    partial_output_path: Path | None = None,
 ):
-    from PIL import Image
+    from PIL import Image, ImageDraw
 
     progress_start = time.perf_counter()
-    progress_total = 8
+    has_fused_trace = bool(np.asarray(result.fused_zyx).ndim == 2 and result.fused_zyx.shape[0] >= 2)
+    progress_total = 16 if has_fused_trace else 8
     progress_step = 0
+    panel_rows: list[list[Any | None]] = []
 
     def run_stage(label: str, fn: Any):
         nonlocal progress_step
@@ -1197,6 +1678,7 @@ def _make_native_trace_visualization(
             f"native strip render start stage={progress_step + 1}/{progress_total} {label}",
             flush=True,
         )
+        write_partial(f"stage_start={label}")
         stage_start = time.perf_counter()
         result_value = fn()
         progress_step += 1
@@ -1207,27 +1689,142 @@ def _make_native_trace_visualization(
             progress_start,
             detail=f"stage={label} stage_ms={(time.perf_counter() - stage_start) * 1000.0:.1f}",
         )
+        write_partial(f"stage_done={label}")
         return result_value
 
+    def compose_panel_rows(rows: list[list[Any | None]], *, status_text: str | None = None):
+        left_panels = [row[0] for row in rows if row[0] is not None]
+        right_panels = [row[1] for row in rows if row[1] is not None]
+        if not left_panels and not right_panels:
+            sheet = Image.new("RGBA", (720, 96), (0, 0, 0, 255))
+            draw = ImageDraw.Draw(sheet, "RGBA")
+            draw.text((8, 8), "native 3D Trace2CP render", fill=(255, 255, 255, 255))
+            draw.text(
+                (8, 34),
+                "waiting for first panel",
+                fill=(180, 180, 180, 255),
+            )
+            if status_text:
+                draw.text((8, 60), status_text, fill=(120, 220, 255, 255))
+            return sheet
+        left_width = max((panel.width for panel in left_panels), default=0)
+        right_width = max((panel.width for panel in right_panels), default=0)
+        row_heights = [
+            max(
+                row[0].height if row[0] is not None else 0,
+                row[1].height if row[1] is not None else 0,
+            )
+            for row in rows
+        ]
+        sheet = Image.new(
+            "RGBA",
+            (max(1, left_width + right_width), max(1, int(sum(row_heights)))),
+            (0, 0, 0, 255),
+        )
+        y = 0
+        for row_height, row in zip(row_heights, rows):
+            left, right = row
+            if left is not None:
+                sheet.alpha_composite(left, (0, y))
+            if right is not None:
+                sheet.alpha_composite(right, (left_width, y))
+            y += int(row_height)
+        return sheet
+
+    def write_partial(label: str) -> None:
+        if partial_output_path is None:
+            return
+        path = Path(partial_output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        compose_panel_rows(
+            panel_rows,
+            status_text=f"{progress_step}/{progress_total} {label}",
+        ).convert("RGB").save(path, quality=90)
+        print(f"native strip render partial={path} {label}", flush=True)
+
+    def add_panel(row_index: int, column_index: int, panel: Any, label: str) -> None:
+        while len(panel_rows) <= int(row_index):
+            panel_rows.append([None, None])
+        panel_rows[int(row_index)][int(column_index)] = panel
+        write_partial(f"panel={label}")
+
+    spacing = float(source.record.volume_spacing_base)
+
+    original_side_overlays, original_top_overlays = run_stage(
+        "original-trace-overlays",
+        lambda: (
+            _trace_overlays_for_view(source, result, axis_name="offset_axis_xyz"),
+            _trace_overlays_for_view(source, result, axis_name="side_axis_xyz"),
+        ),
+    )
+    fused_source = None
+    if has_fused_trace:
+        fused_trace_xyz = _trace_zyx_to_base_xyz(result.fused_zyx, spacing)
+        fused_source_trace = run_stage(
+            "fused-source-trace",
+            lambda: _volume_trace_to_source_trace_xyz(source, fused_trace_xyz),
+        )
+        fused_source = run_stage(
+            "fused-source",
+            lambda: geometry_loader.build_trace2cp_refined_segment_source(
+                source,
+                fused_source_trace,
+                device=torch.device("cpu"),
+            ),
+        )
+    else:
+        print(
+            "native strip render skipped fused panels "
+            f"fusion_reason={result.fusion.reason}",
+            flush=True,
+        )
+
     _sample, side_image, side_valid = run_stage(
-        "side-volume",
+        "original-side-volume",
         lambda: geometry_loader.sample_trace2cp_segment_source(source),
     )
+    add_panel(
+        0,
+        0,
+        _draw_trace_panel(
+            _image_to_u8(side_image, side_valid, normalization=image_normalization),
+            side_valid,
+            source.line_xy,
+            source.start_control_point_xy,
+            source.target_control_point_xy,
+            title=f"initial side input ({image_normalization})",
+            overlays=original_side_overlays,
+        ),
+        "initial_side_input",
+    )
     top_image, top_valid = run_stage(
-        "top-volume",
+        "original-top-volume",
         lambda: geometry_loader.sample_trace2cp_top_strip_source(source),
     )
+    add_panel(
+        1,
+        0,
+        _draw_trace_panel(
+            _image_to_u8(top_image, top_valid, normalization=image_normalization),
+            top_valid,
+            source.line_xy,
+            source.start_control_point_xy,
+            source.target_control_point_xy,
+            title=f"initial top input ({image_normalization})",
+            overlays=original_top_overlays,
+        ),
+        "initial_top_input",
+    )
     side_coords_xyz, side_grid_valid = run_stage(
-        "side-coords",
+        "original-side-coords",
         lambda: geometry_loader.trace2cp_segment_coords_xyz(source),
     )
     top_coords_xyz, top_grid_valid = run_stage(
-        "top-coords",
+        "original-top-coords",
         lambda: geometry_loader.trace2cp_top_strip_coords_xyz(source),
     )
-    spacing = float(source.record.volume_spacing_base)
     side_presence, side_presence_valid = run_stage(
-        "side-presence",
+        "original-side-presence",
         lambda: _sample_presence_on_strip(
             cache,
             side_coords_xyz,
@@ -1236,8 +1833,22 @@ def _make_native_trace_visualization(
             progress_label="side",
         ),
     )
+    add_panel(
+        0,
+        1,
+        _draw_trace_panel(
+            _presence_to_u8(side_presence, side_presence_valid),
+            side_presence_valid,
+            source.line_xy,
+            source.start_control_point_xy,
+            source.target_control_point_xy,
+            title="initial side 3D presence",
+            overlays=original_side_overlays,
+        ),
+        "initial_side_presence",
+    )
     top_presence, top_presence_valid = run_stage(
-        "top-presence",
+        "original-top-presence",
         lambda: _sample_presence_on_strip(
             cache,
             top_coords_xyz,
@@ -1246,65 +1857,119 @@ def _make_native_trace_visualization(
             progress_label="top",
         ),
     )
-    side_overlays, top_overlays = run_stage(
-        "trace-overlays",
-        lambda: (
-            _trace_overlays_for_view(source, result, axis_name="offset_axis_xyz"),
-            _trace_overlays_for_view(source, result, axis_name="side_axis_xyz"),
-        ),
-    )
-
-    def compose_sheet():
-        side_panel = _draw_trace_panel(
-            _image_to_u8(side_image, side_valid, normalization=image_normalization),
-            side_valid,
-            source.line_xy,
-            source.start_control_point_xy,
-            source.target_control_point_xy,
-            title=f"initial side input ({image_normalization})",
-            overlays=side_overlays,
-        )
-        side_presence_panel = _draw_trace_panel(
-            _presence_to_u8(side_presence, side_presence_valid),
-            side_presence_valid,
-            source.line_xy,
-            source.start_control_point_xy,
-            source.target_control_point_xy,
-            title="initial side 3D presence",
-            overlays=side_overlays,
-        )
-        top_panel = _draw_trace_panel(
-            _image_to_u8(top_image, top_valid, normalization=image_normalization),
-            top_valid,
-            source.line_xy,
-            source.start_control_point_xy,
-            source.target_control_point_xy,
-            title=f"initial top input ({image_normalization})",
-            overlays=top_overlays,
-        )
-        top_presence_panel = _draw_trace_panel(
+    add_panel(
+        1,
+        1,
+        _draw_trace_panel(
             _presence_to_u8(top_presence, top_presence_valid),
             top_presence_valid,
             source.line_xy,
             source.start_control_point_xy,
             source.target_control_point_xy,
             title="initial top 3D presence",
-            overlays=top_overlays,
+            overlays=original_top_overlays,
+        ),
+        "initial_top_presence",
+    )
+
+    if fused_source is not None:
+        _fused_sample, fused_side_image, fused_side_valid = run_stage(
+            "fused-side-volume",
+            lambda: geometry_loader.sample_trace2cp_segment_source(fused_source),
         )
-        left_width = max(side_panel.width, top_panel.width)
-        right_width = max(side_presence_panel.width, top_presence_panel.width)
-        top_height = max(side_panel.height, side_presence_panel.height)
-        bottom_height = max(top_panel.height, top_presence_panel.height)
-        sheet = Image.new(
-            "RGBA",
-            (left_width + right_width, top_height + bottom_height),
-            (0, 0, 0, 255),
+        add_panel(
+            2,
+            0,
+            _draw_trace_panel(
+                _image_to_u8(fused_side_image, fused_side_valid, normalization=image_normalization),
+                fused_side_valid,
+                fused_source.line_xy,
+                fused_source.start_control_point_xy,
+                fused_source.target_control_point_xy,
+                title=f"fused side input ({image_normalization})",
+                line_width=1,
+            ),
+            "fused_side_input",
         )
-        sheet.alpha_composite(side_panel, (0, 0))
-        sheet.alpha_composite(side_presence_panel, (left_width, 0))
-        sheet.alpha_composite(top_panel, (0, top_height))
-        sheet.alpha_composite(top_presence_panel, (left_width, top_height))
-        return sheet
+        fused_top_image, fused_top_valid = run_stage(
+            "fused-top-volume",
+            lambda: geometry_loader.sample_trace2cp_top_strip_source(fused_source),
+        )
+        add_panel(
+            3,
+            0,
+            _draw_trace_panel(
+                _image_to_u8(fused_top_image, fused_top_valid, normalization=image_normalization),
+                fused_top_valid,
+                fused_source.line_xy,
+                fused_source.start_control_point_xy,
+                fused_source.target_control_point_xy,
+                title=f"fused top input ({image_normalization})",
+                line_width=1,
+            ),
+            "fused_top_input",
+        )
+        fused_side_coords_xyz, fused_side_grid_valid = run_stage(
+            "fused-side-coords",
+            lambda: geometry_loader.trace2cp_segment_coords_xyz(fused_source),
+        )
+        fused_top_coords_xyz, fused_top_grid_valid = run_stage(
+            "fused-top-coords",
+            lambda: geometry_loader.trace2cp_top_strip_coords_xyz(fused_source),
+        )
+        fused_side_presence, fused_side_presence_valid = run_stage(
+            "fused-side-presence",
+            lambda: _sample_presence_on_strip(
+                cache,
+                fused_side_coords_xyz,
+                np.asarray(fused_side_grid_valid, dtype=bool)
+                & np.asarray(fused_side_valid, dtype=bool),
+                spacing_base=spacing,
+                progress_label="fused-side",
+            ),
+        )
+        add_panel(
+            2,
+            1,
+            _draw_trace_panel(
+                _presence_to_u8(fused_side_presence, fused_side_presence_valid),
+                fused_side_presence_valid,
+                fused_source.line_xy,
+                fused_source.start_control_point_xy,
+                fused_source.target_control_point_xy,
+                title="fused side 3D presence",
+                line_width=1,
+            ),
+            "fused_side_presence",
+        )
+        fused_top_presence, fused_top_presence_valid = run_stage(
+            "fused-top-presence",
+            lambda: _sample_presence_on_strip(
+                cache,
+                fused_top_coords_xyz,
+                np.asarray(fused_top_grid_valid, dtype=bool)
+                & np.asarray(fused_top_valid, dtype=bool),
+                spacing_base=spacing,
+                progress_label="fused-top",
+            ),
+        )
+        add_panel(
+            3,
+            1,
+            _draw_trace_panel(
+                _presence_to_u8(fused_top_presence, fused_top_presence_valid),
+                fused_top_presence_valid,
+                fused_source.line_xy,
+                fused_source.start_control_point_xy,
+                fused_source.target_control_point_xy,
+                title="fused top 3D presence",
+                line_width=1,
+            ),
+            "fused_top_presence",
+        )
+
+    def compose_sheet():
+        return compose_panel_rows(panel_rows)
 
     return run_stage("compose", compose_sheet)
 
@@ -1537,26 +2202,50 @@ def run_native_trace2cp(
         cfg=cfg,
         progress=True,
     )
-    source = geometry_loader.build_trace2cp_segment_source(
-        int(selection.sample_index),
-        target_control_point_index=int(selection.target_cp_index)
-        if selection.explicit_segment
-        else None,
-        target_offset=int(target_offset),
-        rf_margin_px=trace2cp_cfg.rf_margin_px,
-        device=torch.device("cpu"),
-        sample_mode=selection.sample_mode,
+    def build_source(cross_strip_height_px: int | None = None) -> _Trace2CpSegmentSource:
+        return geometry_loader.build_trace2cp_segment_source(
+            int(selection.sample_index),
+            target_control_point_index=int(selection.target_cp_index)
+            if selection.explicit_segment
+            else None,
+            target_offset=int(target_offset),
+            rf_margin_px=trace2cp_cfg.rf_margin_px,
+            cross_strip_height_px=cross_strip_height_px,
+            device=torch.device("cpu"),
+            sample_mode=selection.sample_mode,
+        )
+
+    max_source = build_source()
+    max_side_overlays = _trace_overlays_for_view(
+        max_source,
+        result,
+        axis_name="offset_axis_xyz",
+    )
+    max_top_overlays = _trace_overlays_for_view(
+        max_source,
+        result,
+        axis_name="side_axis_xyz",
+    )
+    adaptive_height = _adaptive_trace2cp_cross_strip_height(
+        int(max_source.source_shape_hw[0]),
+        (max_side_overlays, max_top_overlays),
+    )
+    source = (
+        max_source
+        if int(adaptive_height) == int(max_source.source_shape_hw[0])
+        else build_source(cross_strip_height_px=int(adaptive_height))
     )
     out_dir = Path(export_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    image_path = out_dir / "trace2cp_native_3d_vis.jpg"
     sheet = _make_native_trace_visualization(
         geometry_loader,
         source,
         result,
         cache=cache,
         image_normalization=loader_config.image_normalization,
+        partial_output_path=image_path,
     )
-    image_path = out_dir / "trace2cp_native_3d_vis.jpg"
     sheet.convert("RGB").save(image_path, quality=95)
     summary = {
         "sample_index": int(selection.sample_index),
@@ -1576,6 +2265,23 @@ def run_native_trace2cp(
         "max_step_factor": float(cfg.max_step_factor),
         "max_steps": None if cfg.max_steps is None else int(cfg.max_steps),
         "trace_step_limit": None if cfg.trace_step_limit is None else int(cfg.trace_step_limit),
+        "visualization_cross_strip_height_px": int(source.source_shape_hw[0]),
+        "visualization_max_cross_strip_height_px": int(max_source.source_shape_hw[0]),
+        "fusion_reason": result.fusion.reason,
+        "fusion_reached_overlap": bool(result.fusion.reached_overlap),
+        "fusion_closest_progress": float(result.fusion.closest_progress),
+        "fusion_raw_gap_voxels": float(result.fusion.raw_gap_voxels),
+        "fusion_considered_gap_voxels": float(result.fusion.considered_gap_voxels),
+        "fusion_center_penalty": float(result.fusion.center_penalty),
+        "fusion_closest_forward_zyx": [
+            float(v) for v in np.asarray(result.fusion.closest_forward_zyx, dtype=np.float32)
+        ],
+        "fusion_closest_reverse_zyx": [
+            float(v) for v in np.asarray(result.fusion.closest_reverse_zyx, dtype=np.float32)
+        ],
+        "fusion_closest_midpoint_zyx": [
+            float(v) for v in np.asarray(result.fusion.closest_midpoint_zyx, dtype=np.float32)
+        ],
         "inferred_blocks": int(len(cache._blocks)),
         "export": str(image_path),
     }
@@ -1583,6 +2289,16 @@ def run_native_trace2cp(
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(f"native_trace2cp_plane_error={result.plane_error:.8f}", flush=True)
     print(f"native_trace2cp_closest_target_error={result.closest_target_error:.8f}", flush=True)
+    print(
+        "native_trace2cp_fusion "
+        f"reason={result.fusion.reason} "
+        f"overlap={result.fusion.reached_overlap} "
+        f"progress={result.fusion.closest_progress:.6f} "
+        f"raw_gap={result.fusion.raw_gap_voxels:.6f} "
+        f"considered_gap={result.fusion.considered_gap_voxels:.6f} "
+        f"center_penalty={result.fusion.center_penalty:.6f}",
+        flush=True,
+    )
     print(
         "native_trace2cp_3d "
         f"sample_index={selection.sample_index} start_cp={selection.start_cp_index} "

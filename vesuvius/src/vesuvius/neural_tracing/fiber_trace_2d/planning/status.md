@@ -1,12 +1,11 @@
-# Trace2CP Compact Geometry CP-Span Coverage Status
+# Merge Fiber 3D Extension And Adapt Multi-Dir Config Status
 
 - [x] Read local `fiber_trace_2d/AGENTS.md` workflow.
-- [x] Replace `planning/task.md` with the current task.
-- [x] Replace `planning/task_plan.md` with the current implementation plan.
-- [x] Add CP-to-CP span coverage to compact geometry required ranges.
-- [x] Preserve line-level invalid Lasagna reasons.
-- [x] Add defensive direct-probe diagnostics for unexpected unsampled invalid
-  line points.
-- [x] Add/update focused tests.
-- [x] Update specs/docs/changelog and task log.
-- [x] Run validation tests.
+- [x] Inspect current branch state and `fiber-3d-ext` changes.
+- [x] Merge `fiber-3d-ext` with `--no-commit` for reviewable conflict
+  resolution.
+- [x] Reapply the multi-direction 3D training changes from the merge autostash.
+- [x] Exclude unrelated old stash conflicts from this merge.
+- [x] Adapt `train_s1a_nml_all_64_sd2.json` to two direction/presence branches.
+- [x] Resolve active planning doc conflicts.
+- [x] Run validation commands.

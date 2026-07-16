@@ -37,7 +37,9 @@ from vesuvius.neural_tracing.fiber_trace_3d.model import (
     FiberTrace3DModelConfig,
     FiberTrace3DNet,
     direction_output,
+    direction_outputs,
     presence_output,
+    presence_outputs,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets
 from vesuvius.neural_tracing.fiber_trace_3d.projection import (
@@ -50,11 +52,14 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_bridge import (
 from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     NativeTrace2CpConfig,
     NativeTraceFieldCache,
+    _adaptive_trace2cp_cross_strip_height,
     _image_to_u8,
     _interpolate_plane_crossing,
     _project_trace_to_initial_strip,
     _resolve_native_trace2cp_selection,
     _sample_presence_on_strip,
+    _volume_trace_to_source_trace_xyz,
+    fuse_forward_reverse_traces,
     generate_cone_candidates,
     trace_native_3d_pair,
 )
@@ -62,6 +67,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _FiberTrace3DBatchDataset,
     _Trace2Cp3DConfig,
+    _branch_presence_views_from_sampled_output,
     _evaluate_trace2cp_metric_fixed_set_3d,
     _draw_panel_line_aa,
     _draw_projected_cp_direction,
@@ -533,7 +539,7 @@ def test_train_sample_3d_sheet_contains_principal_slice_panels() -> None:
     assert sheet.shape[2] == 3
     assert sheet.dtype == np.uint8
     assert sheet.shape[0] > 16
-    assert sheet.shape[1] == 16 * 3 + 2 * 4
+    assert sheet.shape[1] == 16 * 5 + 4 * 4
     first_image_panel = sheet[:16, :16]
     colored = (
         (first_image_panel[..., 0] != first_image_panel[..., 1])
@@ -765,7 +771,7 @@ def test_3d_dense_test_control_points_zero_uses_random_full_set() -> None:
     ) == (5, 9, "random")
 
 
-def test_train_sample_3d_sheet_has_three_columns_and_line_overlay() -> None:
+def test_train_sample_3d_sheet_has_branch_presence_columns_and_line_overlay() -> None:
     loader = _loader(augment_enabled=False)
     batch = _load_materialized_batch(loader, 0)
     output = torch.zeros(
@@ -780,13 +786,36 @@ def test_train_sample_3d_sheet_has_three_columns_and_line_overlay() -> None:
 
     patch = int(batch.volume.shape[-1])
     gap = 4
-    assert sheet.shape[1] == patch * 3 + 2 * gap
+    assert sheet.shape[1] == patch * 5 + 4 * gap
     first_image_panel = sheet[:patch, :patch]
     colored = (
         (first_image_panel[..., 0] != first_image_panel[..., 1])
         | (first_image_panel[..., 1] != first_image_panel[..., 2])
     )
     assert bool(np.any(colored))
+
+
+def test_branch_presence_view_selects_output_closer_to_slice_normal() -> None:
+    z_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32)
+    )[0]
+    x_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    sampled = torch.zeros((2, 3, 14), dtype=torch.float32)
+    sampled[..., 0:6] = z_dir
+    sampled[..., 6] = 0.25
+    sampled[..., 7:13] = x_dir
+    sampled[..., 13] = 0.75
+
+    close, other, weighted = _branch_presence_views_from_sampled_output(
+        sampled,
+        normal_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    assert np.allclose(close, 0.25)
+    assert np.allclose(other, 0.75)
+    assert np.allclose(weighted, 0.25)
 
 
 def test_panel_line_aa_draws_fractional_thin_line() -> None:
@@ -1096,6 +1125,94 @@ def test_3d_model_and_losses_smoke() -> None:
     assert torch.isfinite(losses["angle_mean_deg"])
 
 
+def test_3d_model_branch_helpers_preserve_branch_zero_layout() -> None:
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            direction_branch_count=2,
+            output_channels=14,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    with torch.no_grad():
+        model_output = model(torch.zeros((2, 1, 8, 8, 8), dtype=torch.float32))
+    assert direction_outputs(model_output).shape == (2, 2, 6, 8, 8, 8)
+    assert presence_outputs(model_output).shape == (2, 2, 1, 8, 8, 8)
+
+    output = torch.zeros((2, 14, 3, 4, 5), dtype=torch.float32)
+    output[:, 0:6] = 0.1
+    output[:, 6:7] = 0.2
+    output[:, 7:13] = 0.3
+    output[:, 13:14] = 0.4
+
+    dirs = direction_outputs(output)
+    presences = presence_outputs(output)
+
+    assert dirs.shape == (2, 2, 6, 3, 4, 5)
+    assert presences.shape == (2, 2, 1, 3, 4, 5)
+    assert torch.allclose(direction_output(output), dirs[:, 0])
+    assert torch.allclose(presence_output(output), presences[:, 0])
+    assert torch.allclose(dirs[:, 1], torch.full_like(dirs[:, 1], 0.3))
+    assert torch.allclose(presences[:, 1], torch.full_like(presences[:, 1], 0.4))
+
+
+def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:
+    target_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    bad_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32)
+    )[0]
+    better_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[0.9, 0.2, 0.0]], dtype=torch.float32)
+    )[0]
+    output = torch.zeros((1, 14, 1, 1, 2), dtype=torch.float32)
+    output[0, 0:6, 0, 0, 0] = bad_dir
+    output[0, 7:13, 0, 0, 0] = better_dir
+    output[0, 6, 0, 0, 0] = 0.95
+    output[0, 13, 0, 0, 0] = 0.55
+    output[0, 6, 0, 0, 1] = 0.40
+    output[0, 13, 0, 0, 1] = 0.30
+    output.requires_grad_()
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((1, 1, 1, 1, 2), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
+        cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        sample_indices=torch.zeros((1,), dtype=torch.long),
+        record_indices=torch.zeros((1,), dtype=torch.long),
+        control_point_indices=torch.zeros((1,), dtype=torch.long),
+        fiber_paths=("synthetic.json",),
+        target_modes=torch.zeros((1,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((1,), dtype=torch.long),
+        target_segment_counts=torch.zeros((1,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        direction_indices_bzyx=torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+        direction_target_sparse=target_dir.view(1, 6),
+        direction_weight_sparse=torch.ones((1, 6), dtype=torch.float32),
+        presence_target=torch.tensor([1.0, 0.0], dtype=torch.float32).view(1, 1, 1, 1, 2),
+        presence_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
+    )
+
+    losses = compute_losses(output, batch, direction_weight=1.0, presence_weight=1.0)
+    losses["total"].backward()
+
+    assert torch.allclose(losses["branch0_fraction"], torch.tensor(0.0))
+    assert torch.allclose(losses["branch1_fraction"], torch.tensor(1.0))
+    assert torch.count_nonzero(output.grad[0, 0:6, 0, 0, 0]) == 0
+    assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, 0]) > 0
+    assert output.grad[0, 6, 0, 0, 0] == 0.0
+    assert output.grad[0, 13, 0, 0, 0] != 0.0
+    assert output.grad[0, 6, 0, 0, 1] != 0.0
+    assert output.grad[0, 13, 0, 0, 1] != 0.0
+
+
 def test_3d_fiber_model_uses_batchnorm_by_default() -> None:
     model = FiberTrace3DNet(
         FiberTrace3DModelConfig(
@@ -1136,6 +1253,9 @@ def test_3d_fiber_model_can_disable_normalization_explicitly() -> None:
 def test_3d_presence_loss_balances_positive_and_negative_regions() -> None:
     presence_values = torch.tensor([0.9, 0.2, 0.8, 0.4], dtype=torch.float32)
     output = torch.zeros((1, 7, 1, 1, 4), dtype=torch.float32)
+    output[0, 0:6, 0, 0, 0] = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
     output[0, 6, 0, 0, :] = presence_values
     presence_target = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32).view(1, 1, 1, 1, 4)
     batch = FiberTrace3DBatch(
@@ -1155,9 +1275,11 @@ def test_3d_presence_loss_balances_positive_and_negative_regions() -> None:
         target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
         target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
         target_tangent_zyx=torch.zeros((1, 3), dtype=torch.float32),
-        direction_indices_bzyx=torch.zeros((0, 4), dtype=torch.long),
-        direction_target_sparse=torch.zeros((0, 6), dtype=torch.float32),
-        direction_weight_sparse=torch.zeros((0, 6), dtype=torch.float32),
+        direction_indices_bzyx=torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+        direction_target_sparse=encode_lasagna_direction_3x2(
+            torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+        ),
+        direction_weight_sparse=torch.zeros((1, 6), dtype=torch.float32),
         presence_target=presence_target,
         presence_mask=torch.ones((1, 1, 1, 1, 4), dtype=torch.bool),
     )
@@ -1489,6 +1611,123 @@ def test_native_3d_trace2cp_projects_trace_to_initial_strip_axis() -> None:
     assert np.allclose(projected, [[2.0, 8.0], [8.0, 3.0]], atol=1.0e-5)
 
 
+def test_native_3d_trace2cp_adaptive_cross_height_expands_and_caps() -> None:
+    centered = (np.asarray([[1.0, 9.5], [4.0, 9.5]], dtype=np.float32), (0, 0, 0, 255))
+    assert _adaptive_trace2cp_cross_strip_height(20, ((centered,),)) == 5
+
+    shifted = (np.asarray([[1.0, 12.5], [4.0, 26.5]], dtype=np.float32), (0, 0, 0, 255))
+    assert _adaptive_trace2cp_cross_strip_height(40, ((shifted,),)) == 27
+
+    far = (np.asarray([[1.0, -100.0], [4.0, 100.0]], dtype=np.float32), (0, 0, 0, 255))
+    assert _adaptive_trace2cp_cross_strip_height(20, ((far,),)) == 19
+
+
+def test_native_3d_trace2cp_converts_volume_trace_to_source_xyz_offsets() -> None:
+    line_points_xyz = np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float32)
+    line_xy = np.asarray([[0.0, 5.0], [10.0, 5.0]], dtype=np.float32)
+    row_axes = np.zeros((16, 16, 3), dtype=np.float32)
+    row_axes[..., 1] = 1.0
+    side_axes = np.zeros((16, 16, 3), dtype=np.float32)
+    side_axes[..., 2] = 1.0
+    source = SimpleNamespace(
+        record=SimpleNamespace(volume_spacing_base=2.0),
+        line_window=SimpleNamespace(line_points_xyz=line_points_xyz),
+        line_xy=line_xy,
+        grid=SimpleNamespace(
+            offset_axis_xyz=row_axes,
+            side_axis_xyz=side_axes,
+            valid_mask=np.ones((16, 16), dtype=bool),
+        ),
+    )
+    trace_xyz = np.asarray(
+        [
+            [2.0, 4.0, 6.0],
+            [8.0, -2.0, -4.0],
+        ],
+        dtype=np.float32,
+    )
+
+    source_trace = _volume_trace_to_source_trace_xyz(source, trace_xyz)
+
+    assert np.allclose(source_trace, [[2.0, 7.0, 3.0], [8.0, 4.0, -2.0]], atol=1.0e-5)
+
+
+def test_native_3d_trace2cp_fusion_uses_centered_closest_overlap() -> None:
+    start = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    target = np.asarray([10.0, 0.0, 0.0], dtype=np.float32)
+    forward = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    reverse = np.asarray(
+        [
+            [10.0, 2.0, 0.0],
+            [5.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    fusion = fuse_forward_reverse_traces(
+        forward,
+        reverse,
+        start_zyx=start,
+        target_zyx=target,
+        step_voxels=1.0,
+    )
+
+    assert fusion.reached_overlap
+    assert fusion.reason == "closest_overlap"
+    assert fusion.closest_progress == pytest.approx(0.5, abs=1.0e-6)
+    assert np.allclose(fusion.closest_midpoint_zyx, [5.0, 1.0, 0.0], atol=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[0], start, atol=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[-1], target, atol=1.0e-6)
+    progress = fusion.fused_zyx[:, 0] / 10.0
+    assert np.all(np.diff(progress) >= -1.0e-5)
+
+
+def test_native_3d_trace2cp_fusion_does_not_sort_wrong_direction_trace() -> None:
+    start = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    target = np.asarray([10.0, 0.0, 0.0], dtype=np.float32)
+    forward = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [6.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    reverse = np.asarray(
+        [
+            [10.0, 10.0, 0.0],
+            [12.0, 10.0, 0.0],
+            [14.0, 10.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    fusion = fuse_forward_reverse_traces(
+        forward,
+        reverse,
+        start_zyx=start,
+        target_zyx=target,
+        step_voxels=1.0,
+    )
+
+    assert fusion.reached_overlap
+    assert fusion.closest_progress == pytest.approx(1.0, abs=1.0e-6)
+    assert np.allclose(fusion.closest_forward_zyx, [10.0, 0.0, 0.0], atol=1.0e-5)
+    assert np.allclose(fusion.closest_reverse_zyx, [10.0, 10.0, 0.0], atol=1.0e-5)
+    assert np.allclose(fusion.closest_midpoint_zyx, [10.0, 5.0, 0.0], atol=1.0e-5)
+    assert np.allclose(fusion.fused_zyx[0], start, atol=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[-1], target, atol=1.0e-6)
+
+
 def test_native_3d_trace2cp_plane_crossing_interpolates() -> None:
     crossing = _interpolate_plane_crossing(
         np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
@@ -1588,6 +1827,8 @@ def test_native_3d_trace2cp_field_cache_uses_sampler_and_base_scale() -> None:
     block = cache._infer_block(np.asarray([1, 2, 3], dtype=np.int64))
 
     assert block.output_czyx.shape == (7, 4, 4, 4)
+    assert block.output_czyx.device.type == "cpu"
+    assert block.valid_mask_zyx.device.type == "cpu"
     assert len(sampler.calls) == 1
     coords, valid = sampler.calls[0]
     assert coords.shape == (4, 4, 4, 3)

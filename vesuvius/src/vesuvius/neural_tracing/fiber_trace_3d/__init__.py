@@ -6,11 +6,22 @@ from .direction import (
     encode_lasagna_direction_2d,
     encode_lasagna_direction_3x2,
 )
-from .model import FiberTrace3DModelConfig, FiberTrace3DNet
+from .model import (
+    FiberTrace3DModelConfig,
+    FiberTrace3DNet,
+    direction_output,
+    direction_outputs,
+    presence_output,
+    presence_outputs,
+)
 
 __all__ = [
     "FiberTrace3DModelConfig",
     "FiberTrace3DNet",
+    "direction_output",
+    "direction_outputs",
+    "presence_output",
+    "presence_outputs",
     "decode_lasagna_direction_3x2_analytic",
     "decode_lasagna_direction_2d",
     "encode_lasagna_direction_2d",

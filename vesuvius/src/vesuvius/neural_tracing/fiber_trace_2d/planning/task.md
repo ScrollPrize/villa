@@ -1,16 +1,19 @@
-# Trace2CP Compact Geometry CP-Span Coverage
+# Merge Fiber 3D Extension And Adapt Multi-Dir Config
 
-Fix Trace2CP segment-source compact geometry so CP-to-CP line spans cannot
-contain unsampled line points.
+Merge the current `fiber-3d-ext` branch into the active multi-direction 3D
+fiber training branch, then adapt the newly added actual 64-scale S1A NML
+training config to the multi-direction model output.
 
 Requirements:
 
-- Compact geometry preload must sample all line points needed by CP source
-  windows and by consecutive CP-to-CP Trace2CP spans.
-- A Trace2CP segment must not fail because an interior line point was simply
-  not sampled by compact geometry preload.
-- If a sampled line point is invalid, keep failing loudly and report the real
-  Lasagna data reason.
-- Defensive diagnostics should identify unexpected unsampled invalid points and
-  include a direct Lasagna probe of the point values.
-- Do not synthesize, propagate, or invent missing Lasagna normals.
+- Preserve the `fiber-3d-ext` requested-level blocking coordinate sampling and
+  native 3D Trace2CP rendering changes.
+- Preserve the current multi-direction 3D fiber direction/presence training
+  implementation.
+- Adapt the newly added
+  `fiber_trace_3d/configs/train_s1a_nml_all_64_sd2.json` config to use two
+  direction/presence branches.
+- Resolve merge conflicts without pulling unrelated old stash work into the
+  branch.
+- Run focused validation for the touched 3D Python training path and the merged
+  Trace2CP/native tests.

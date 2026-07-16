@@ -2,6 +2,29 @@
 
 ## 2026-07-16
 
+- Added two-branch 3D fiber direction/presence training support with routed
+  positive supervision, all-branch negative presence supervision, branch usage
+  diagnostics, and branch-aware train/test slice visualizations including GT
+  tangent and perpendicular oblique rows. The current 64-scale S1A NML training
+  config now uses the two-branch output layout.
+- Changed VC3D `Volume.sample_coords(..., blocking=True)` to use strict
+  requested-level coordinate sampling: required chunks are fetched/decoded and
+  pinned before sampling, scale fallback is disabled, missing requested chunks
+  render black, and blocking stats report
+  `requested_level_only`/`fallback_levels`.
+  The 2D/3D Trace2CP rendering paths now reject non-strict or fallback stats.
+- Fixed native 3D Trace2CP fusion to preserve traced order and use a
+  center-weighted closest-overlap meeting point instead of sorting projected
+  progress and averaging. The native summary/stdout now reports fusion
+  diagnostics, and partial rendering now writes the final JPG path at render
+  start and stage start/end, including a status canvas before the first panel.
+- Changed native 3D Trace2CP visualization to adapt side/top cross-strip height
+  to the projected trace deviation, capped by the configured maximum, and added
+  fused-line-resampled side/top volume and presence panels with thin fused-line
+  overlays.
+- Fixed native 3D Trace2CP inferred block caching to keep block outputs on CPU
+  instead of accumulating CUDA tensors, and made visualization rendering
+  progressively overwrite the regular JPG as panels are rendered.
 - Added a separate native 3D Trace2CP inspection CLI with overlapped
   trusted-core inference blocks, deterministic 3D cone candidate tracing,
   target-plane stopping, and tool-local native trace metrics.

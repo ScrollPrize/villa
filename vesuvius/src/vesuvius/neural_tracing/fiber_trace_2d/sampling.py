@@ -152,6 +152,25 @@ class Vc3dCoordinateSampler(CoordinateSampler):
         )
         image_arr = np.asarray(image, dtype=np.float32)
         valid_arr = np.asarray(sampled_valid, dtype=np.uint8)
+        stats_dict = dict(stats)
+        if self.blocking:
+            if "requested_level_only" not in stats_dict:
+                raise RuntimeError(
+                    "VC3D blocking coordinate sampling did not report requested_level_only; "
+                    "rebuild volume-cartographer so blocking sample_coords uses the "
+                    "strict requested-level sampler"
+                )
+            if not bool(stats_dict.get("requested_level_only")):
+                raise RuntimeError(
+                    f"VC3D blocking coordinate sampling did not use requested-level-only mode: "
+                    f"stats={stats_dict}"
+                )
+            fallback_levels = int(stats_dict.get("fallback_levels", 0) or 0)
+            if fallback_levels != 0:
+                raise RuntimeError(
+                    f"VC3D blocking coordinate sampling reported scale fallback: "
+                    f"stats={stats_dict}"
+                )
         if image_arr.ndim == 3 and image_arr.shape[-1] == 1:
             image_arr = image_arr[..., 0]
         if valid_arr.ndim == 3 and valid_arr.shape[-1] == 1:
@@ -159,7 +178,7 @@ class Vc3dCoordinateSampler(CoordinateSampler):
         return CoordinateSampleResult(
             image=image_arr.astype(np.float32, copy=False),
             valid_mask=valid_arr.astype(bool, copy=False),
-            stats=dict(stats),
+            stats=stats_dict,
         )
 
     def chunk_requests_for_coords(
