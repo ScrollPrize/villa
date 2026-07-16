@@ -285,12 +285,12 @@ html.docs-doc-id-get_started main .container article {
   opacity: 0.85;
   -webkit-tap-highlight-color: transparent;
   /* so the selected box fades in/out — and, on a momentary tap, the active
-     tool's box can recede and return (see the tap flash below) */
+     tool's box can recede and snap back quickly (see the tap flash below) */
   transition:
-    border-color 0.16s ease,
-    background-color 0.16s ease,
-    opacity 0.16s ease,
-    transform 0.16s ease;
+    border-color 0.1s ease,
+    background-color 0.1s ease,
+    opacity 0.1s ease,
+    transform 0.1s ease;
 }
 .vc-gs-inktool svg {
   width: 18px;
@@ -331,7 +331,7 @@ html.docs-doc-id-get_started main .container article {
   }
 }
 .vc-gs-inktool--tap {
-  animation: vc-gs-inktool-tap 0.42s ease;
+  animation: vc-gs-inktool-tap 0.2s ease;
 }
 @media (prefers-reduced-motion: reduce) {
   .vc-gs-inktool {
