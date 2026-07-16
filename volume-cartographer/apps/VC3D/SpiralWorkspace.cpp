@@ -734,8 +734,12 @@ void SpiralWorkspace::loadRunDiff(
             });
     watcher->setFuture(QtConcurrent::run(
         [previous, previousComponents, current, currentComponents]() {
-            return buildRunDiffImage(previous, previousComponents,
-                                     current, currentComponents);
+            try {
+                return buildRunDiffImage(previous, previousComponents,
+                                         current, currentComponents);
+            } catch (const std::exception&) {
+                return QImage{};
+            }
         }));
 }
 
@@ -793,6 +797,7 @@ QImage SpiralWorkspace::buildRunDiffImage(
     }
 
     QImage image(currentPoints->cols, currentPoints->rows, QImage::Format_ARGB32);
+    if (image.isNull()) return {};
     image.fill(Qt::transparent);
     if (changedCount == 0) return image;
 
