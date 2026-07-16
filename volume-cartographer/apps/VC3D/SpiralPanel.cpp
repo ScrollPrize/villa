@@ -426,7 +426,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     runDiff->setObjectName(QStringLiteral("spiralRunDiff"));
     runDiff->setToolTip(
         tr("Overlay the XYZ displacement magnitude between the previous and current "
-           "completed runs. Brighter red means more movement; the first run has no diff."));
+           "completed runs. Magnitude increases from blue through green, yellow, and "
+           "orange to red; the first run has no diff."));
     connect(runDiff, &QCheckBox::toggled, this, &SpiralPanel::runDiffChanged);
     displayDialogLayout->addWidget(runDiff);
 

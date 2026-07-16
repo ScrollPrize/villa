@@ -46,6 +46,42 @@
 
 namespace {
 
+QRgb runDiffMagnitudeColor(float magnitudeFraction)
+{
+    struct ColorStop {
+        float position;
+        int red;
+        int green;
+        int blue;
+    };
+
+    // Keep the low end bright enough to remain legible over grayscale slices.
+    // Linear interpolation between stops avoids visually implying discrete bands.
+    constexpr std::array<ColorStop, 5> stops{{
+        {0.00f,   0,  96, 255}, // blue
+        {0.25f,   0, 200,  80}, // green
+        {0.50f, 255, 224,   0}, // yellow
+        {0.75f, 255, 128,   0}, // orange
+        {1.00f, 255,  24,  16}, // red
+    }};
+
+    const float fraction = std::clamp(magnitudeFraction, 0.0f, 1.0f);
+    for (std::size_t index = 1; index < stops.size(); ++index) {
+        if (fraction > stops[index].position) continue;
+        const ColorStop& lower = stops[index - 1];
+        const ColorStop& upper = stops[index];
+        const float blend = (fraction - lower.position)
+                          / (upper.position - lower.position);
+        const auto interpolate = [blend](int from, int to) {
+            return static_cast<int>(std::lround(from + blend * (to - from)));
+        };
+        return qRgba(interpolate(lower.red, upper.red),
+                     interpolate(lower.green, upper.green),
+                     interpolate(lower.blue, upper.blue), 220);
+    }
+    return qRgba(stops.back().red, stops.back().green, stops.back().blue, 220);
+}
+
 class SpiralPreviewRangeSurface final : public QuadSurface
 {
 public:
@@ -863,8 +899,8 @@ QImage SpiralWorkspace::buildRunDiffImage(
     if (changedCount == 0) return image;
 
     // Use a logarithmic histogram to find a robust upper display bound without
-    // retaining another surface-sized list of magnitudes. The brightest red is
-    // the 95th percentile, so a single outlier cannot wash out the useful diff.
+    // retaining another surface-sized list of magnitudes. Red begins at the
+    // 95th percentile, so a single outlier cannot wash out the useful diff.
     constexpr std::size_t histogramSize = 2048;
     std::array<std::size_t, histogramSize> histogram{};
     const double logMinimum = std::log(static_cast<double>(minimumPositive));
@@ -899,13 +935,18 @@ QImage SpiralWorkspace::buildRunDiffImage(
               + logSpan * static_cast<double>(percentileBin + 1) / histogramSize))
         : maximum;
 
+    const double displayLogMaximum = std::log(static_cast<double>(displayMaximum));
+    const double displayLogSpan = displayLogMaximum - logMinimum;
     for (int row = 0; row < magnitudes.rows; ++row) {
         const float* values = magnitudes.ptr<float>(row);
         QRgb* pixels = reinterpret_cast<QRgb*>(image.scanLine(row));
         for (int col = 0; col < magnitudes.cols; ++col) {
             if (values[col] <= 0.0f) continue;
-            const float intensity = std::clamp(values[col] / displayMaximum, 0.0f, 1.0f);
-            pixels[col] = qRgba(255, 64, 24, static_cast<int>(std::lround(235.0f * intensity)));
+            const float magnitudeFraction = displayLogSpan > 1e-12
+                ? static_cast<float>((std::log(static_cast<double>(values[col])) - logMinimum)
+                                     / displayLogSpan)
+                : 1.0f;
+            pixels[col] = runDiffMagnitudeColor(magnitudeFraction);
         }
     }
     return image;
