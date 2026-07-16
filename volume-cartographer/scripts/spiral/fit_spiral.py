@@ -27,7 +27,7 @@ from ddp_helpers import (
     maybe_init_distributed,
     split_counts_across_ranks,
 )
-from lasagna_data import prepare_lasagna_volume
+from lasagna_data import prepare_lasagna_volume, prepare_surf_sdt_volume
 from checkpoint_io import load_checkpoint_cpu
 from influence import make_influence_state, subsample_rows
 from tifxyz import load_tifxyz
@@ -62,6 +62,11 @@ from losses import (
 )
 from loss_maps import (LossMapRecorder, attach_loss_maps_to_manifest,
                        capture_loss_maps)
+from sdt_losses import (
+    aggregate_pair_counts,
+    get_crossing_count_spacing_loss,
+    get_dense_attachment_loss,
+)
 from spiral_helpers import (
     erode_patch_valid_region,
     load_patches,
@@ -93,6 +98,15 @@ normal_nx_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_nx.ome.zarr'
 normal_ny_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_ny.ome.zarr'
 grad_mag_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_grad_mag.ome.zarr'
 normal_zarr_group = '4'
+# Wide-range capped signed-distance store of the binarized surface prediction
+# (docs/spiral_surf_sdt_generation.md). Its group/scale/encoding are read from
+# the store's own metadata, never from normal_zarr_group/lasagna_scale.
+surf_sdt_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_surf_sdt.ome.zarr'
+surf_sdt_zarr_group = '1'
+# Raw surface-prediction zarr for the flagged crossing-count fallback
+# (dense_spacing_count_source = 'surf'); not loaded otherwise.
+surf_count_zarr_path = None
+surf_count_zarr_group = '1'
 pcl_json_paths = [
     f'{dataset_path}/abs_winding.json',
     f'{dataset_path}/patch-overlap-pcls.json',
@@ -115,9 +129,12 @@ z_begin, z_end = 4000, 17000
 voxel_size_um = 9.6
 cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
 lasagna_scale = 4
-lasagna_storage_backend = 'dense_cuda'
+# mmap is the default everywhere: the SDT store must be mmap-served, and the
+# session API already resolved 'auto' to mmap before this changed.
+lasagna_storage_backend = 'auto'
 render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
 _active_lasagna_store = None
+_active_scalar_stores = []
 
 
 def release_interactive_resources():
@@ -126,6 +143,8 @@ def release_interactive_resources():
     store, _active_lasagna_store = _active_lasagna_store, None
     if store is not None:
         store.close()
+    while _active_scalar_stores:
+        _active_scalar_stores.pop().close()
 
 default_config = {
     'random_seed': 1,
@@ -199,6 +218,28 @@ default_config = {
     'grad_mag_encode_scale': 1000.0,
     'grad_mag_factor': 0.25,
     'spacing_integration_steps': 8,
+    # Dense spacing (docs/spiral_pred_dt_dense_spacing.md): 'crossing_count' is
+    # the soft sheet-crossing count on the surf-SDT store; 'grad_mag' is the
+    # retired density integral, kept behind this flag for one ablation cycle.
+    'dense_spacing_mode': 'crossing_count',
+    'dense_spacing_count_source': 'sdt',  # 'surf' = raw-prediction counting fallback
+    'dense_spacing_num_pairs': 12_000,
+    'dense_spacing_pair_max_m': 1,
+    'dense_spacing_count_temperature_wv': 0.5,  # GT-calibrated; 1.0 undercounts ~12%
+    'dense_spacing_target_step_wv': 1.0,  # polyline step target (sheets are 4-6 wv wide)
+    'dense_spacing_max_step_wv': 2.0,  # mapped adjacent samples above this invalidate the pair
+    'dense_spacing_max_steps': 64,  # pairs needing more steps are rejected and reported
+    'dense_spacing_step_oversample': 1.25,  # chord underestimates curved paths
+    'dense_spacing_use_support_gate': True,
+    'dense_spacing_support_sigma': 4.0,  # working voxels; measured mean endpoint support 0.61
+    'dense_spacing_support_floor_alpha': 0.05,  # nominal-mass denominator floor
+    'dense_spacing_support_policy': 'product',  # or 'minimum'
+    # SDT attachment: independent of the spacing loss (own weight/enable/counts).
+    'loss_weight_dense_attachment': 0.0,
+    'dense_attachment_scale': 8.0,  # working voxels; relu(sd) p50/p90 = 2/9 on the shipped store
+    'dense_attachment_num_points': 20_000,
+    'dense_attachment_warmup_steps': 0,  # measured against durable completed iterations
+    'dense_attachment_ramp_steps': 0,
     'dense_normals_finite_difference_epsilon': 8.0,
     'sym_dirichlet_finite_difference_epsilon': 4.0,
     'loss_weight_patch_radius': 8.e0,
@@ -572,6 +613,19 @@ def get_interactive_dt_resume_iteration(start_iteration, target_iteration,
     return int(start_iteration) + int(run_iterations * fraction)
 
 
+def get_dense_attachment_ramp(iteration):
+    """Warm-up/ramp factor for the attachment weight, measured against the
+    durable completed-iteration count so a resumed run continues the schedule
+    instead of restarting it."""
+    warmup = int(cfg['dense_attachment_warmup_steps'])
+    ramp = int(cfg['dense_attachment_ramp_steps'])
+    if iteration < warmup:
+        return 0.0
+    if ramp <= 0:
+        return 1.0
+    return min(1.0, (iteration - warmup + 1) / ramp)
+
+
 def main(load_only_patches_and_point_collections=False, interactive_driver=None):
     global _active_lasagna_store
 
@@ -864,10 +918,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # lasagna and tracks loading
     # ==========================================================================
 
+    grad_mag_spacing_enabled = (
+        cfg['loss_weight_dense_spacing'] > 0 and cfg['dense_spacing_mode'] == 'grad_mag'
+    )
     lasagna_volume = prepare_lasagna_volume(
         scroll_zarr,
         use_normals=cfg['loss_weight_dense_normals'] > 0,
-        use_spacing=cfg['loss_weight_dense_spacing'] > 0,
+        use_spacing=grad_mag_spacing_enabled,
         normal_nx_zarr_path=normal_nx_zarr_path,
         normal_ny_zarr_path=normal_ny_zarr_path,
         grad_mag_zarr_path=grad_mag_zarr_path,
@@ -880,6 +937,88 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     )
     if interactive_driver is not None and lasagna_volume and lasagna_volume.get('backend') == 'mmap':
         _active_lasagna_store = lasagna_volume['store']
+
+    # Surf-SDT store: one derived input serves both the crossing-count spacing
+    # and the attachment losses. It is resolved when either is enabled at
+    # session start, so their run-mutable weights can then be adjusted (or
+    # zeroed and re-raised) at run boundaries; enabling an SDT loss in a
+    # session that started with both fully disabled requires a session reload
+    # (a one-time warning fires in the loop). A missing store disables these
+    # losses with a warning, but a store that exists yet fails validation
+    # (coverage, metadata) is always an error.
+    use_crossing_spacing = (
+        cfg['loss_weight_dense_spacing'] > 0
+        and cfg['dense_spacing_mode'] == 'crossing_count'
+    )
+    use_attachment = cfg['loss_weight_dense_attachment'] > 0
+    sdt_volume = None
+    count_volume = None
+    if use_crossing_spacing or use_attachment:
+        if not surf_sdt_zarr_path or not os.path.exists(surf_sdt_zarr_path):
+            if use_attachment:
+                raise RuntimeError(
+                    'loss_weight_dense_attachment > 0 but the surf-SDT store is missing: '
+                    f'{surf_sdt_zarr_path!r}')
+            print(
+                'WARNING: dense_spacing_mode=crossing_count but the surf-SDT store is '
+                f'missing at {surf_sdt_zarr_path!r}; the dense spacing loss is DISABLED '
+                'for this run')
+            use_crossing_spacing = False
+        else:
+            sdt_volume = prepare_surf_sdt_volume(
+                surf_sdt_zarr_path,
+                surf_sdt_zarr_group,
+                z_begin=z_begin,
+                z_end=z_end,
+                cache_directory=cache_path,
+                storage_backend=lasagna_storage_backend,
+            )
+            count_volume = sdt_volume
+            if cfg['dense_spacing_count_source'] == 'surf':
+                if not surf_count_zarr_path:
+                    raise RuntimeError(
+                        "dense_spacing_count_source = 'surf' requires surf_count_zarr_path")
+                count_volume = prepare_surf_sdt_volume(
+                    surf_count_zarr_path,
+                    surf_count_zarr_group,
+                    z_begin=z_begin,
+                    z_end=z_end,
+                    cache_directory=cache_path,
+                    storage_backend=lasagna_storage_backend,
+                    expected_kind='surf_count',
+                )
+            if interactive_driver is not None:
+                _active_scalar_stores.append(sdt_volume['store'])
+                if count_volume is not sdt_volume:
+                    _active_scalar_stores.append(count_volume['store'])
+
+    def crossing_spacing_active():
+        return (
+            count_volume is not None
+            and cfg['dense_spacing_mode'] == 'crossing_count'
+            and cfg['loss_weight_dense_spacing'] > 0
+        )
+
+    def attachment_active():
+        return sdt_volume is not None and cfg['loss_weight_dense_attachment'] > 0
+
+    sdt_inactive_warned = set()
+
+    def warn_if_sdt_loss_inactive():
+        # Run-mutable weights can enable an SDT loss mid-session, but the
+        # store only loads at session start; make that a visible no-op.
+        if (sdt_volume is None and cfg['loss_weight_dense_attachment'] > 0
+                and 'attachment' not in sdt_inactive_warned):
+            sdt_inactive_warned.add('attachment')
+            print('WARNING: loss_weight_dense_attachment > 0 but no surf-SDT store was '
+                  'loaded at session start; the attachment loss is INACTIVE. Reload the '
+                  'session with the weight enabled to load the store.')
+        if (count_volume is None and cfg['loss_weight_dense_spacing'] > 0
+                and cfg['dense_spacing_mode'] == 'crossing_count'
+                and 'spacing' not in sdt_inactive_warned):
+            sdt_inactive_warned.add('spacing')
+            print('WARNING: crossing-count spacing is enabled but no surf-SDT store was '
+                  'loaded at session start; the dense spacing loss is INACTIVE.')
 
     if tracks_dbm_path is not None:
         print(f'loading tracks from {tracks_dbm_path}')
@@ -1238,6 +1377,34 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     f'checkpoint outward sense {resume_checkpoint.get("spiral_outward_sense")!r} '
                     f'does not match requested sense {spiral_outward_sense!r}'
                 )
+            # The SDT store is an independent input: the Lasagna group/scale
+            # checks above do not cover it. Reject an unexpected change in its
+            # content fingerprint whenever an SDT-driven loss is enabled.
+            # Paths may legitimately move and coverage may legitimately grow
+            # (--resume extension of an ROI-first build), so only the
+            # content-identity fields compare - 'created'/'git_commit' are
+            # stamped once at store creation and anchor the identity.
+            if use_crossing_spacing or use_attachment:
+                coverage_and_location_keys = (
+                    'path', 'source', 'complete',
+                    'z_range_working', 'built_z_ranges_working',
+                )
+
+                def _comparable_sdt_fingerprint(fingerprint):
+                    if not fingerprint:
+                        return None
+                    return {key: value for key, value in fingerprint.items()
+                            if key not in coverage_and_location_keys}
+                checkpoint_fingerprint = _comparable_sdt_fingerprint(
+                    resume_checkpoint.get('surf_sdt_fingerprint'))
+                current_fingerprint = _comparable_sdt_fingerprint(
+                    sdt_volume['fingerprint'] if sdt_volume is not None else None)
+                if (checkpoint_fingerprint is not None
+                        and checkpoint_fingerprint != current_fingerprint):
+                    raise RuntimeError(
+                        'checkpoint surf-SDT fingerprint does not match the resolved store '
+                        f'while an SDT-driven loss is enabled:\n  checkpoint: '
+                        f'{checkpoint_fingerprint}\n  current:    {current_fingerprint}')
             checkpoint_cfg = resume_checkpoint.get('cfg', {})
             shape_keys = (
                 'num_flow_integration_steps', 'flow_integration_solver', 'num_flow_timesteps',
@@ -1376,6 +1543,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             'resolved_config': durable_config(cfg),
             'lasagna_scale': lasagna_scale,
             'lasagna_group': normal_zarr_group,
+            'surf_sdt_fingerprint': (
+                sdt_volume['fingerprint'] if sdt_volume is not None else None),
             'z_begin': z_begin,
             'z_end': z_end,
             'spiral_outward_sense': spiral_outward_sense,
@@ -1580,7 +1749,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     'patch_radius', 'patch_dt',
                     'unverified_patch_radius', 'unverified_patch_dt',
                     'sym_dirichlet', 'rel_winding', 'abs_winding',
-                    'dense_normals', 'dense_spacing',
+                    'dense_normals', 'dense_spacing', 'dense_attachment',
                     'unattached_pcl_radius', 'unattached_pcl_dt',
                     'track_radius', 'track_dt', 'shell_patch_radius',
                 )
@@ -1631,8 +1800,17 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     for _loss_name, _loss_value in iter_lasagna_losses(
                             transform, dr, lasagna_volume,
                             shell_outer_winding_idx,
-                            cfg['dense_normals_num_points']):
+                            cfg['dense_normals_num_points'],
+                            compute_spacing=grad_mag_spacing_enabled):
                         pass
+                if crossing_spacing_active():
+                    get_crossing_count_spacing_loss(
+                        transform, dr, count_volume, sdt_volume,
+                        shell_outer_winding_idx, cfg, z_begin, z_end)
+                if attachment_active():
+                    get_dense_attachment_loss(
+                        transform, dr, sdt_volume,
+                        shell_outer_winding_idx, cfg, z_begin, z_end)
                 if unattached_pcl_strips:
                     get_unattached_pcl_strip_losses(
                         transform, dr, unattached_pcl_strips,
@@ -1646,6 +1824,25 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                             transform, dr, prepared_main_tracks, cfg,
                             compute_dt=cfg['loss_weight_track_dt'] > 0):
                         pass
+            # Per-pair aggregated crossing counts: mean_count - m per winding
+            # pair, the measurement behind any future discrete
+            # insert/remove/reindex operation (gradient descent cannot perform
+            # those). Written next to the loss maps as a preview artifact.
+            if crossing_spacing_active() and shell_outer_winding_idx is not None:
+                try:
+                    with torch.no_grad():
+                        pair_rows = aggregate_pair_counts(
+                            transform, dr, count_volume, sdt_volume,
+                            shell_outer_winding_idx, cfg, z_begin, z_end)
+                    pair_table_name = 'dense_spacing_pair_counts.json'
+                    with open(os.path.join(generation_path, pair_table_name),
+                              'w', encoding='utf-8') as stream:
+                        json.dump(pair_rows, stream, indent=1)
+                    manifest = dict(manifest)
+                    manifest['dense_spacing_pair_counts'] = pair_table_name
+                except Exception as error:
+                    print('WARNING: could not aggregate per-pair crossing counts: '
+                          f'{type(error).__name__}: {error}')
             if recorder.error is not None:
                 print('WARNING: could not generate Spiral loss overlays: '
                       f'{type(recorder.error).__name__}: {recorder.error}')
@@ -2059,7 +2256,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             })
 
         if (
-            (cfg['loss_weight_dense_normals'] > 0 or cfg['loss_weight_dense_spacing'] > 0)
+            (cfg['loss_weight_dense_normals'] > 0 or grad_mag_spacing_enabled)
             and lasagna_volume is not None
         ):
             for dense_loss_name, dense_loss_value in iter_lasagna_losses(
@@ -2068,6 +2265,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 lasagna_volume,
                 shell_outer_winding_idx,
                 cfg['dense_normals_num_points'],
+                compute_spacing=grad_mag_spacing_enabled,
             ):
                 weight = (
                     cfg['loss_weight_dense_normals']
@@ -2083,6 +2281,49 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     f'lasagna_{name}': value
                     for name, value in lasagna_volume['store'].last_timings.items()
                 })
+
+        warn_if_sdt_loss_inactive()
+        if crossing_spacing_active():
+            spacing_loss, spacing_metrics = get_crossing_count_spacing_loss(
+                slice_to_spiral_transform,
+                dr_per_winding,
+                count_volume,
+                sdt_volume,
+                shell_outer_winding_idx,
+                cfg,
+                z_begin,
+                z_end,
+            )
+            backward_family({
+                'dense_spacing': spacing_loss * cfg['loss_weight_dense_spacing'],
+            })
+            del spacing_loss
+            log_metrics.update(spacing_metrics)
+            if count_volume['backend'] == 'mmap':
+                log_metrics.update({
+                    f'sdt_count_{name}': value
+                    for name, value in count_volume['store'].last_timings.items()
+                })
+
+        if attachment_active():
+            attachment_ramp = get_dense_attachment_ramp(iteration)
+            log_metrics['dense_attachment_ramp'] = attachment_ramp
+            if attachment_ramp > 0:
+                attachment_loss, attachment_metrics = get_dense_attachment_loss(
+                    slice_to_spiral_transform,
+                    dr_per_winding,
+                    sdt_volume,
+                    shell_outer_winding_idx,
+                    cfg,
+                    z_begin,
+                    z_end,
+                )
+                backward_family({
+                    'dense_attachment': attachment_loss
+                    * (cfg['loss_weight_dense_attachment'] * attachment_ramp),
+                })
+                del attachment_loss
+                log_metrics.update(attachment_metrics)
 
         if (
             (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0)
@@ -2288,6 +2529,8 @@ if __name__ == '__main__':
             'unattached_pcl_num_per_step',
             'track_num_per_step',
             'dense_normals_num_points',
+            'dense_spacing_num_pairs',
+            'dense_attachment_num_points',
             'regularisation_num_points',
             'shell_num_samples',
         )

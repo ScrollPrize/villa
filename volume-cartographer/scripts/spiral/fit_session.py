@@ -40,6 +40,8 @@ RUN_MUTABLE_SAMPLING_KEYS = frozenset({
     "track_num_per_step",
     "track_num_points_per_step",
     "dense_normals_num_points",
+    "dense_spacing_num_pairs",
+    "dense_attachment_num_points",
     "regularisation_num_points",
     "shell_num_samples",
 })
@@ -97,6 +99,7 @@ class SpiralInputPaths:
     normal_x: str = ""
     normal_y: str = ""
     gradient_magnitude: str = ""
+    surf_sdt: str = ""
     scroll_zarr: str = ""
     checkpoint: str = ""
     output_directory: str = ""
@@ -194,6 +197,7 @@ _CONVENTIONAL_ENTRIES: tuple[tuple[str, str, str, bool], ...] = (
     ("normal_x", "lasagna_inputs/las_008_nx.ome.zarr", "directory", False),
     ("normal_y", "lasagna_inputs/las_008_ny.ome.zarr", "directory", False),
     ("gradient_magnitude", "lasagna_inputs/las_008_grad_mag.ome.zarr", "directory", False),
+    ("surf_sdt", "lasagna_inputs/las_008_surf_sdt.ome.zarr", "directory", False),
 )
 
 _PCL_ENTRIES: tuple[tuple[PclRole, str, bool], ...] = (
@@ -390,11 +394,18 @@ def validate_session_request(
                 _validate_json_file(path, f"pcls[{index}]", errors)
 
     use_normals = float(run.config.get("loss_weight_dense_normals", 100.0)) > 0
-    use_spacing = float(run.config.get("loss_weight_dense_spacing", 12.0)) > 0
+    spacing_enabled = float(run.config.get("loss_weight_dense_spacing", 12.0)) > 0
+    spacing_mode = str(run.config.get("dense_spacing_mode", "crossing_count"))
+    use_grad_mag = spacing_enabled and spacing_mode == "grad_mag"
+    # A weight above zero for attachment is always an explicit request; the
+    # crossing-count spacing default merely warns and disables in the fitter
+    # when the store is absent, so it stays optional here.
+    use_attachment = float(run.config.get("loss_weight_dense_attachment", 0.0)) > 0
     for value, label, required in (
         (paths.normal_x, "normal_x", use_normals),
         (paths.normal_y, "normal_y", use_normals),
-        (paths.gradient_magnitude, "gradient_magnitude", use_spacing),
+        (paths.gradient_magnitude, "gradient_magnitude", use_grad_mag),
+        (paths.surf_sdt, "surf_sdt", use_attachment),
     ):
         optional_dir(value, label, required=required)
 
@@ -419,7 +430,7 @@ def validate_session_request(
         elif not probe_parent.is_dir() or not os.access(probe_parent, os.W_OK):
             errors.append({"field": "output_directory", "message": "Output directory is not writable"})
 
-    if (use_normals or use_spacing) and not paths.cache_directory:
+    if (use_normals or spacing_enabled or use_attachment) and not paths.cache_directory:
         errors.append({"field": "cache_directory", "message": "Cache directory is required for Lasagna inputs"})
 
     if paths.checkpoint and not Path(paths.checkpoint).is_file():

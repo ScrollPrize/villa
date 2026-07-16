@@ -197,6 +197,220 @@ class LasagnaMmapStore:
         }
         return normal_gpu, grad_gpu
 
+def _scalar_cache_valid(destination, existing, requested, source_array, z_lo):
+    try:
+        if not existing.get("complete") or any(existing.get(k) != v for k, v in requested.items()):
+            return False
+        volume = np.load(destination / "volume.npy", mmap_mode="r")
+        shape = tuple(requested["mmap_shape_zyx"])
+        if volume.shape != shape or volume.dtype != np.uint8:
+            return False
+        probes = existing.get("probes", [])
+        if len(probes) != len(_probe_coordinates(shape)):
+            return False
+        for probe in probes:
+            local = tuple(probe["local_zyx"])
+            source = (local[0] + z_lo, local[1], local[2])
+            expected = int(probe["value"])
+            if int(volume[local]) != expected or int(source_array[source]) != expected:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+class ScalarMmapStore:
+    """Single-channel uint8 volume served from disk with deduplicated sparse gathers.
+
+    Used for the surf-SDT store (and the raw-surf counting fallback), whose
+    group-1 resolution is far too large for dense GPU loading. ``gather``
+    accepts arbitrary voxel indices (already clamped in-bounds by the caller)
+    and returns their values on ``device``; duplicate indices - e.g. shared
+    trilinear corners - are fetched from disk only once.
+    """
+
+    def __init__(self, directory, manifest, *, workers=None):
+        self.directory = Path(directory)
+        self.manifest = manifest
+        shape = tuple(manifest["mmap_shape_zyx"])
+        self.volume = np.load(self.directory / "volume.npy", mmap_mode="r")
+        if self.volume.shape != shape or self.volume.dtype != np.uint8:
+            raise ValueError("Invalid scalar mmap shape/dtype")
+        self._flat = self.volume.reshape(-1)
+        cpu_count = os.cpu_count() or 1
+        self.worker_count = max(1, min(int(workers or min(16, cpu_count)), cpu_count, 32))
+        self._pool = ThreadPoolExecutor(max_workers=self.worker_count, thread_name_prefix="sdt-gather")
+        self._staging_lock = threading.Lock()
+        self._staging = None
+        self.drop_pages_after_gather = os.environ.get(
+            "FIT_SPIRAL_MMAP_DROP_PAGES", "1"
+        ).strip().lower() not in {"0", "false", "no"}
+        if hasattr(mmap, "MADV_RANDOM"):
+            try:
+                self.volume._mmap.madvise(mmap.MADV_RANDOM)
+            except (AttributeError, OSError, ValueError):
+                pass
+        self.last_timings = {}
+
+    @property
+    def shape(self):
+        return tuple(self.manifest["mmap_shape_zyx"])
+
+    @property
+    def z_origin(self):
+        return int(self.manifest["mmap_z_origin"])
+
+    def close(self):
+        self._pool.shutdown(wait=True, cancel_futures=True)
+
+    def _drop_resident_pages(self):
+        if not self.drop_pages_after_gather or not hasattr(mmap, "MADV_DONTNEED"):
+            return
+        try:
+            self.volume._mmap.madvise(mmap.MADV_DONTNEED)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    def gather(self, indices_zyx, device):
+        """Gather uint8 values at integer voxel indices (N, 3) -> (N,) on device.
+
+        Indices must already be clamped in-bounds. Deduplication happens on the
+        source device (typically GPU), so only the sorted unique linear indices
+        cross to the host - trilinear corner batches share most of their pages.
+        """
+        import torch
+        start = time.perf_counter()
+        z_size, y_size, x_size = self.shape
+        indices_zyx = indices_zyx.detach().reshape(-1, 3)
+        linear = (indices_zyx[:, 0] * y_size + indices_zyx[:, 1]) * x_size + indices_zyx[:, 2]
+        unique, inverse = torch.unique(linear, return_inverse=True)
+        unique_cpu = unique.to("cpu", non_blocking=False).numpy()
+        after_indices = time.perf_counter()
+
+        values = np.empty(len(unique_cpu), dtype=np.uint8)
+        if len(unique_cpu):
+            batch = max(1, (len(unique_cpu) + self.worker_count - 1) // self.worker_count)
+
+            def fetch(bounds):
+                lo, hi = bounds
+                values[lo:hi] = self._flat[unique_cpu[lo:hi]]
+
+            list(self._pool.map(fetch, [(lo, min(lo + batch, len(unique_cpu)))
+                                        for lo in range(0, len(unique_cpu), batch)]))
+        after_gather = time.perf_counter()
+        self._drop_resident_pages()
+        with self._staging_lock:
+            pinned = torch.device(device).type == "cuda" and torch.cuda.is_available()
+            if self._staging is None or self._staging.shape != values.shape:
+                self._staging = torch.empty(values.shape, dtype=torch.uint8, pin_memory=pinned)
+            self._staging.numpy()[...] = values
+            unique_gpu = self._staging.to(device=device, non_blocking=True)
+        after_copy = time.perf_counter()
+        self.last_timings = {
+            "index_dedup_seconds": after_indices - start,
+            "gather_seconds": after_gather - after_indices,
+            "staging_and_async_copy_seconds": after_copy - after_gather,
+            "unique_fraction": len(unique_cpu) / max(1, linear.numel()),
+        }
+        return unique_gpu[inverse.to(device)]
+
+
+def prepare_scalar_mmap(*, array, source_path, group, z_lo, z_hi, coordinate_scale,
+                        cache_directory, kind, extra_fingerprint=None,
+                        slab_depth=32, workers=None, progress=None):
+    """Build (or reuse) a disk cache of one uint8 zarr group's z-ROI.
+
+    ``coordinate_scale`` is recorded for provenance only; sampling geometry is
+    owned by the caller (the SDT volume dict), which reads it from the source
+    store's OME metadata.
+    """
+    from lasagna_data import _read_zarr_zslab_chunked
+
+    requested = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "kind": str(kind),
+        "sources": {str(kind): _source_fingerprint(source_path, array)},
+        "zarr_group": str(group),
+        "mmap_z_origin": int(z_lo),
+        "mmap_shape_zyx": [int(z_hi - z_lo), int(array.shape[1]), int(array.shape[2])],
+        "coordinate_scale": coordinate_scale if isinstance(coordinate_scale, (int, float))
+        else list(coordinate_scale),
+        "layout": "ZYX", "dtype": "uint8",
+        "extra": dict(extra_fingerprint or {}),
+    }
+    key = _cache_key(requested)
+    root = Path(cache_directory).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / f"{kind}-{key}"
+    manifest_path = destination / "manifest.json"
+    if manifest_path.is_file():
+        existing = json.loads(manifest_path.read_text())
+        if _scalar_cache_valid(destination, existing, requested, array, z_lo):
+            return ScalarMmapStore(destination, existing, workers=workers)
+
+    shape = tuple(requested["mmap_shape_zyx"])
+    raw_size = int(np.prod(shape, dtype=np.int64))
+    free = shutil.disk_usage(root).free
+    if free < int(raw_size * 1.05):
+        raise RuntimeError(
+            f"Insufficient free space for {kind} mmap cache: need {raw_size}, have {free}")
+
+    lock_path = root / f"{kind}-{key}.lock"
+    lock_stream = lock_path.open("a+b")
+    try:
+        if os.name == "posix":
+            import fcntl
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        if manifest_path.is_file():
+            existing = json.loads(manifest_path.read_text())
+            if _scalar_cache_valid(destination, existing, requested, array, z_lo):
+                return ScalarMmapStore(destination, existing, workers=workers)
+        temporary = Path(tempfile.mkdtemp(prefix=f".{kind}-{key}.", dir=root))
+        started = time.time()
+        try:
+            volume = np.lib.format.open_memmap(
+                temporary / "volume.npy", mode="w+", dtype=np.uint8, shape=shape)
+            for source_lo in range(z_lo, z_hi, slab_depth):
+                source_hi = min(source_lo + slab_depth, z_hi)
+                volume[source_lo - z_lo:source_hi - z_lo] = _read_zarr_zslab_chunked(
+                    array, source_lo, source_hi, max_workers=workers or 16)
+                if progress:
+                    progress(kind, 0, source_hi - z_lo, z_hi - z_lo)
+            volume.flush()
+            del volume
+            with (temporary / "volume.npy").open("rb") as data_stream:
+                os.fsync(data_stream.fileno())
+            volume_read = np.load(temporary / "volume.npy", mmap_mode="r")
+            probes = [{"local_zyx": coordinate, "value": int(volume_read[tuple(coordinate)])}
+                      for coordinate in _probe_coordinates(shape)]
+            del volume_read
+            complete = {**requested, "complete": True, "created_unix_seconds": time.time(),
+                        "preparation_seconds": time.time() - started,
+                        "raw_file_bytes": (temporary / "volume.npy").stat().st_size,
+                        "probes": probes, "slab_depth": slab_depth,
+                        "workers": workers or min(16, os.cpu_count() or 1)}
+            with (temporary / "manifest.json").open("w", encoding="utf-8") as stream:
+                json.dump(complete, stream, indent=2, sort_keys=True); stream.flush(); os.fsync(stream.fileno())
+            if destination.exists():
+                retired = root / f".{destination.name}.retired-{time.time_ns()}"
+                os.replace(destination, retired)
+            os.replace(temporary, destination)
+            temporary = None
+            try:
+                directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+        finally:
+            if temporary is not None: shutil.rmtree(temporary, ignore_errors=True)
+        return ScalarMmapStore(destination, complete, workers=workers)
+    finally:
+        lock_stream.close()
+
+
 def prepare_lasagna_mmap(*, nx_array, ny_array, grad_mag_array, source_paths,
                          group, z_lo, z_hi, lasagna_scale, cache_directory,
                          slab_depth=32, workers=None, progress=None):

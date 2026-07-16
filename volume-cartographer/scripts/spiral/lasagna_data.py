@@ -4,6 +4,36 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 import zarr
+from tqdm import tqdm
+
+
+class _TqdmSlabProgress:
+    """Adapter from the mmap builders' (name, channel, done, total) callback to
+    one tqdm bar per streamed source (auto-disabled on non-TTY output)."""
+
+    def __init__(self, label):
+        self._label = label
+        self._bar = None
+        self._key = None
+        self._done = 0
+
+    def __call__(self, name, channel, done, total):
+        key = (name, channel)
+        if key != self._key:
+            self.close()
+            self._key = key
+            self._done = 0
+            suffix = f'[{channel}]' if name == 'normals' else ''
+            self._bar = tqdm(desc=f'{self._label} {name}{suffix}', total=total,
+                             unit='slice', disable=None)
+        if self._bar is not None:
+            self._bar.update(done - self._done)
+        self._done = done
+
+    def close(self):
+        if self._bar is not None:
+            self._bar.close()
+            self._bar = None
 
 
 def _read_zarr_zslab_chunked(zarr_array, z_lo, z_hi, max_workers=32):
@@ -132,13 +162,18 @@ def prepare_lasagna_volume(
     roi_shape = (z_hi - z_lo, reference_shape[1], reference_shape[2])
     if storage_backend in ('auto', 'mmap'):
         from lasagna_mmap import prepare_lasagna_mmap
-        store = prepare_lasagna_mmap(
-            nx_array=nx_array, ny_array=ny_array, grad_mag_array=grad_mag_array,
-            source_paths={'normal_x': normal_nx_zarr_path, 'normal_y': normal_ny_zarr_path,
-                          'gradient_magnitude': grad_mag_zarr_path},
-            group=normal_zarr_group, z_lo=z_lo, z_hi=z_hi,
-            lasagna_scale=lasagna_scale, cache_directory=cache_directory,
-        )
+        progress = _TqdmSlabProgress('lasagna mmap cache:')
+        try:
+            store = prepare_lasagna_mmap(
+                nx_array=nx_array, ny_array=ny_array, grad_mag_array=grad_mag_array,
+                source_paths={'normal_x': normal_nx_zarr_path, 'normal_y': normal_ny_zarr_path,
+                              'gradient_magnitude': grad_mag_zarr_path},
+                group=normal_zarr_group, z_lo=z_lo, z_hi=z_hi,
+                lasagna_scale=lasagna_scale, cache_directory=cache_directory,
+                progress=progress,
+            )
+        finally:
+            progress.close()
         print(f'lasagna: using mmap cache {store.directory} with {store.worker_count} gather workers')
         return {'backend': 'mmap', 'store': store, 'z_origin': z_lo,
                 'lasagna_scale': lasagna_scale, 'shape': roi_shape}
@@ -161,3 +196,174 @@ def prepare_lasagna_volume(
         'lasagna_scale': lasagna_scale,
         'shape': tuple(volume.shape[1:]),  # z, y, x
     }
+
+
+def _resolve_ome_group_scale(root_attrs, group_name):
+    """Per-axis scale of one OME multiscales dataset, in working voxels per
+    stored grid voxel. Rejects datasets with a nonzero translation: the fitter
+    assumes a shared origin with the working volume."""
+    multiscales = root_attrs.get('multiscales')
+    for dataset in (multiscales[0].get('datasets', []) if multiscales else []):
+        if str(dataset.get('path')) != str(group_name):
+            continue
+        scale = None
+        for transformation in dataset.get('coordinateTransformations', []):
+            if transformation.get('type') == 'scale':
+                scale = tuple(float(s) for s in transformation['scale'])
+            elif transformation.get('type') == 'translation':
+                if any(abs(float(t)) > 1e-9 for t in transformation.get('translation', ())):
+                    raise RuntimeError(
+                        f'OME dataset {group_name!r} carries a nonzero translation; '
+                        'the fitter only supports stores sharing the working-volume origin')
+        return scale
+    return None
+
+
+def _merged_ranges_cover(ranges, lo, hi):
+    """Whether the union of [lo, hi) working-z intervals covers [lo, hi)."""
+    covered_to = lo
+    for range_lo, range_hi in sorted((float(a), float(b)) for a, b in ranges):
+        if range_lo > covered_to:
+            return False
+        covered_to = max(covered_to, range_hi)
+        if covered_to >= hi:
+            return True
+    return covered_to >= hi
+
+
+def prepare_surf_sdt_volume(
+    sdt_zarr_path,
+    sdt_zarr_group,
+    *,
+    z_begin,
+    z_end,
+    cache_directory,
+    storage_backend='auto',
+    expected_kind='surf_sdt',
+    workers=None,
+):
+    """Resolve and validate a surf-SDT (or raw-surf fallback) store as a
+    mmap-served Lasagna input.
+
+    Geometry and encoding are read from the store's own metadata - never from
+    ``normal_zarr_group``/``lasagna_scale``. The scale convention is working
+    voxels per stored grid voxel (group 1 of the standard build = 2.0), so
+    sampling maps ``working_zyx / scale`` into the store grid.
+    """
+    if storage_backend == 'dense_cuda':
+        raise RuntimeError(
+            'the surf-SDT store must be mmap-served: its group-1 z-slab does not fit '
+            'GPU memory. Use storage_backend auto/mmap; do not fall back to dense loading.')
+
+    root = zarr.open_group(sdt_zarr_path, mode='r')
+    attrs = dict(root.attrs)
+    group_name = str(sdt_zarr_group)
+    if group_name not in root:
+        raise RuntimeError(f'group {group_name!r} not found in {sdt_zarr_path}')
+    array = root[group_name]
+
+    scale_zyx = _resolve_ome_group_scale(attrs, group_name)
+    if scale_zyx is None:
+        raise RuntimeError(
+            f'no OME multiscales scale for group {group_name!r} in {sdt_zarr_path}; '
+            'the fitter refuses to infer the store geometry')
+
+    if expected_kind == 'surf_sdt':
+        if attrs.get('kind') != 'surf_sdt':
+            raise RuntimeError(
+                f"{sdt_zarr_path} has kind={attrs.get('kind')!r}, expected 'surf_sdt'")
+        for key in ('unit_working_voxels', 'offset', 'cap_working_voxels'):
+            if key not in attrs:
+                raise RuntimeError(f'{sdt_zarr_path} is missing encoding attribute {key!r}')
+        unit = float(attrs['unit_working_voxels'])
+        offset = int(attrs['offset'])
+        cap = float(attrs['cap_working_voxels'])
+        declared = attrs.get('scale_vs_working')
+        if declared is not None:
+            declared = [declared] * 3 if np.isscalar(declared) else list(declared)
+            base_scale = [s / 2 ** _pyramid_level(attrs, group_name) for s in scale_zyx]
+            if any(abs(a - b) > 1e-6 for a, b in zip(base_scale, declared)):
+                print(f'WARNING: {sdt_zarr_path} attrs scale_vs_working {declared} does not '
+                      f'match the OME scale {scale_zyx} for group {group_name}')
+        # Coverage: the store is trusted only when it is stamped complete or its
+        # embedded built working-z ranges cover the requested fit range. The
+        # done_tiles sidecar is deliberately not consulted - it may not travel
+        # with the zarr.
+        if not attrs.get('complete', False):
+            ranges = attrs.get('built_z_ranges_working')
+            if not ranges and 'z_range_working' in attrs:
+                ranges = [attrs['z_range_working']]
+            if not ranges or not _merged_ranges_cover(ranges, z_begin, z_end):
+                raise RuntimeError(
+                    f'{sdt_zarr_path} is not stamped complete and its built working-z ranges '
+                    f'{ranges!r} do not cover the fit range [{z_begin}, {z_end}); rebuild or '
+                    'extend the store (unbuilt tiles read as no-data and would silently '
+                    'disable the SDT losses there)')
+        volume_kind = 'sdt'
+    else:
+        # Raw-surf counting fallback: uint8 probability, no distance encoding.
+        unit, offset, cap = None, 128, None
+        volume_kind = 'surf'
+
+    z_size = int(array.shape[0])
+    z_lo = max(0, int(np.floor(z_begin / scale_zyx[0])))
+    z_hi = min(z_size, int(np.ceil(z_end / scale_zyx[0])))
+    if z_hi <= z_lo:
+        raise RuntimeError(f'{expected_kind} z-ROI [{z_lo}, {z_hi}) is empty (z size {z_size})')
+
+    fingerprint = {
+        'path': os.path.abspath(sdt_zarr_path),
+        'group': group_name,
+        'kind': attrs.get('kind'),
+        'source': attrs.get('source'),
+        'source_group': attrs.get('source_group'),
+        'threshold': attrs.get('threshold'),
+        'unit_working_voxels': attrs.get('unit_working_voxels'),
+        'offset': attrs.get('offset'),
+        'cap_working_voxels': attrs.get('cap_working_voxels'),
+        'erode_source_voxels': attrs.get('erode_source_voxels'),
+        'ct_mask': (attrs.get('ct_mask') or {}).get('group'),
+        'ct_zero': (attrs.get('ct_zero') or {}).get('group'),
+        'scale_zyx': list(scale_zyx),
+        'complete': bool(attrs.get('complete', False)),
+        'z_range_working': attrs.get('z_range_working'),
+        'built_z_ranges_working': attrs.get('built_z_ranges_working'),
+        'created': attrs.get('created'),
+        'git_commit': attrs.get('git_commit'),
+    }
+
+    from lasagna_mmap import prepare_scalar_mmap
+    progress = _TqdmSlabProgress(f'{expected_kind} mmap cache:')
+    try:
+        store = prepare_scalar_mmap(
+            array=array, source_path=sdt_zarr_path, group=group_name,
+            z_lo=z_lo, z_hi=z_hi, coordinate_scale=list(scale_zyx),
+            cache_directory=cache_directory, kind=expected_kind,
+            extra_fingerprint={'encoding': [unit, offset, cap]},
+            workers=workers, progress=progress,
+        )
+    finally:
+        progress.close()
+    print(f'{expected_kind}: using mmap cache {store.directory} '
+          f'({np.prod(store.shape) / 1e9:.1f} GB, {store.worker_count} gather workers)')
+    return {
+        'backend': 'mmap',
+        'kind': volume_kind,
+        'store': store,
+        'z_origin': z_lo,
+        'scale_zyx': tuple(scale_zyx),
+        'unit': unit,
+        'offset': offset,
+        'cap': cap,
+        'shape': (z_hi - z_lo, int(array.shape[1]), int(array.shape[2])),
+        'fingerprint': fingerprint,
+    }
+
+
+def _pyramid_level(root_attrs, group_name):
+    multiscales = root_attrs.get('multiscales')
+    datasets = multiscales[0].get('datasets', []) if multiscales else []
+    for level, dataset in enumerate(datasets):
+        if str(dataset.get('path')) == str(group_name):
+            return level
+    return 0

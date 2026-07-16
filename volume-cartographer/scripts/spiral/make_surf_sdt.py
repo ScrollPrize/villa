@@ -93,7 +93,8 @@ def _require_edt_version():
 
 
 def _resolve_source_scale(src_root, group_name):
-    """Per-axis grid-voxels-per-working-voxel from the source OME multiscales."""
+    """Per-axis working-voxels-per-source-grid-voxel from the source OME
+    multiscales (e.g. 2.0 for a working/2 group)."""
     ms = src_root.attrs.get('multiscales')
     if not ms:
         return None
@@ -395,6 +396,16 @@ def _load_sidecar(path, params):
     return set(sidecar['done'])
 
 
+def _merge_working_ranges(ranges):
+    merged = []
+    for lo, hi in sorted((float(a), float(b)) for a, b in ranges):
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return merged
+
+
 def _git_commit():
     try:
         return subprocess.run(['git', '-C', os.path.dirname(os.path.abspath(__file__)),
@@ -422,7 +433,8 @@ def _human_bytes(n):
 @click.option('--threshold', required=True, type=int,
               help='binarization threshold (per-volume choice from the histogram plateau)')
 @click.option('--scale', default=None,
-              help='source-grid voxels per working voxel, float or "z,y,x"; '
+              help='working voxels per source-grid voxel, float or "z,y,x" '
+                   '(2.0 for a working/2 group); '
                    'default: read from the source OME multiscales metadata')
 @click.option('--working-voxel-um', default=None, type=float,
               help='working voxel size in um; default: read from the source meta.json')
@@ -761,8 +773,27 @@ def main(surf_path, group_name, out_path, threshold, scale, working_voxel_um, un
                     bar.update(1)
 
     all_tiles = {tile_id for _, _, tiles in passes for tile_id, _, _, _ in tiles}
+
+    # Embedded coverage provenance: the fitter accepts a partial store only via
+    # attributes travelling with the zarr (never the external sidecar), so each
+    # invocation that finishes every base-group tile of its z-range records
+    # that range, and command history accumulates across --resume runs.
+    base_tile_ids = {tile_id for tile_id, _, _, _ in passes[0][2]}
+    if base_tile_ids and base_tile_ids <= done:
+        built = (list(z_range_working) if z_range_working is not None
+                 else [0.0, src.shape[0] * scale_zyx[0]])
+        root.attrs['built_z_ranges_working'] = _merge_working_ranges(
+            list(root.attrs.get('built_z_ranges_working', [])) + [built])
+    root.attrs['command_history'] = list(root.attrs.get('command_history', [])) + [command_line]
+
     if z_range_working is None and all_tiles <= done:
         root.attrs['complete'] = True
+        # A completing resume of an ROI-first store must not keep advertising
+        # the stale creation-time restriction.
+        try:
+            del root.attrs['z_range_working']
+        except KeyError:
+            pass
         print('store complete; stamped "complete": true')
     else:
         missing = 'restricted to a working-z range' if z_range_working is not None \

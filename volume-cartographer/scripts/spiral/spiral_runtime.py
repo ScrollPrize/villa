@@ -149,7 +149,9 @@ class InteractiveFitSession:
                 'unverified_num_patches_per_step', 'unverified_num_patches_per_step_for_dt',
                 'rel_winding_num_pcls', 'abs_winding_num_pcls',
                 'unattached_pcl_num_per_step', 'track_num_per_step',
-                'dense_normals_num_points', 'regularisation_num_points', 'shell_num_samples',
+                'dense_normals_num_points', 'dense_spacing_num_pairs',
+                'dense_attachment_num_points',
+                'regularisation_num_points', 'shell_num_samples',
             )
             scale_counts_for_z_range(
                 config, self.run_config.z_begin, self.run_config.z_end, 9500,
@@ -165,6 +167,7 @@ class InteractiveFitSession:
             fitter.normal_nx_zarr_path = self.paths.normal_x or None
             fitter.normal_ny_zarr_path = self.paths.normal_y or None
             fitter.grad_mag_zarr_path = self.paths.gradient_magnitude or None
+            fitter.surf_sdt_zarr_path = self.paths.surf_sdt or None
             fitter.normal_zarr_group = self.run_config.lasagna_group
             fitter.pcl_input_specs = [(spec.path, spec.role.value) for spec in self.paths.pcls]
             fitter.pcl_json_paths = [spec.path for spec in self.paths.pcls]

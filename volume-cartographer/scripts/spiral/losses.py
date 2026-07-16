@@ -996,24 +996,28 @@ def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points):
 
 
 
-def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=None):
+def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=None, compute_spacing=True):
     # Sample points uniformly over the spiral cylinder (a disk of radius
     # dr_per_winding * outer_winding_idx in spiral yx, over the z-ROI). Two losses are computed:
     #   (normals) the spiral radial covector at each sample is pulled back to scroll space via
     #             central-difference J^T (a normal is a covector, not a finite-length displacement)
     #             and matched in direction to the precomputed nx/ny scroll-space normal.
-    #   (spacing) at each sample, shift inward and outward by dr_per_winding/2 along the spiral
-    #             radial direction (so the two endpoints span exactly one winding in spiral
-    #             space), map both endpoints to scroll space, and integrate the winding-density
-    #             field (grad_mag, windings per voxel) along the scroll-space segment between
-    #             them. grad_mag is a density, not a distance, so the number of windings the
-    #             segment actually crosses is the line integral of that density along it; for a
-    #             correct fit the integral equals 1 (one winding). The density is decoded from
-    #             grad_mag in windings per full-resolution voxel.
+    #   (spacing) [retired grad_mag ablation path; the default spacing loss is the SDT
+    #             crossing count in sdt_losses.py, and compute_spacing=False skips this
+    #             entirely] at each sample, shift inward and outward by dr_per_winding/2
+    #             along the spiral radial direction (so the two endpoints span exactly one
+    #             winding in spiral space), map both endpoints to scroll space, and
+    #             integrate the winding-density field (grad_mag, windings per voxel) along
+    #             the scroll-space segment between them. grad_mag is a density, not a
+    #             distance, so the number of windings the segment actually crosses is the
+    #             line integral of that density along it; for a correct fit the integral
+    #             equals 1 (one winding). The density is decoded from grad_mag in windings
+    #             per full-resolution voxel.
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if lasagna_volume is None or outer_winding_idx is None:
-        yield 'dense_spacing', zero
+        if compute_spacing:
+            yield 'dense_spacing', zero
         yield 'dense_normals', zero
         return
 
@@ -1057,63 +1061,73 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
 
     # Build both sparse requests before touching the mmap backend, so its one
     # bounded pool can schedule normal and spacing page faults together.
-    density_decode = cfg['grad_mag_factor'] / cfg['grad_mag_encode_scale'] * lasagna_scale
-    num_steps = int(cfg['spacing_integration_steps'])
-    step_frac = (torch.arange(num_steps, device=device).float() + 0.5) / num_steps
-    integration_zyx = scroll_inner[:, None, :] + step_frac[None, :, None] * scroll_displacement[:, None, :]
-    int_idx = (integration_zyx.detach() / lasagna_scale).round().long()
-    izi = int_idx[..., 0] - z_origin
-    iyi = int_idx[..., 1]
-    ixi = int_idx[..., 2]
-    int_in_bounds = (izi >= 0) & (izi < z_size) & (iyi >= 0) & (iyi < y_size) & (ixi >= 0) & (ixi < x_size)
-    izi = izi.clamp(0, z_size - 1)
-    iyi = iyi.clamp(0, y_size - 1)
-    ixi = ixi.clamp(0, x_size - 1)
+    if compute_spacing:
+        density_decode = cfg['grad_mag_factor'] / cfg['grad_mag_encode_scale'] * lasagna_scale
+        num_steps = int(cfg['spacing_integration_steps'])
+        step_frac = (torch.arange(num_steps, device=device).float() + 0.5) / num_steps
+        integration_zyx = scroll_inner[:, None, :] + step_frac[None, :, None] * scroll_displacement[:, None, :]
+        int_idx = (integration_zyx.detach() / lasagna_scale).round().long()
+        izi = int_idx[..., 0] - z_origin
+        iyi = int_idx[..., 1]
+        ixi = int_idx[..., 2]
+        int_in_bounds = (izi >= 0) & (izi < z_size) & (iyi >= 0) & (iyi < y_size) & (ixi >= 0) & (ixi < x_size)
+        izi = izi.clamp(0, z_size - 1)
+        iyi = iyi.clamp(0, y_size - 1)
+        ixi = ixi.clamp(0, x_size - 1)
+    else:
+        integration_zyx = None
 
     if backend == 'mmap':
         normal_indices = torch.stack([zi, yi, xi], dim=-1)
-        grad_indices = torch.stack([izi, iyi, ixi], dim=-1)
+        if compute_spacing:
+            grad_indices = torch.stack([izi, iyi, ixi], dim=-1)
+        else:
+            grad_indices = torch.zeros([0, 3], dtype=torch.int64, device=device)
         normal_u8, grad_mag_u8 = lasagna_volume['store'].gather_pair(
             normal_indices, grad_indices, device)
         nx_u8, ny_u8 = normal_u8.unbind(dim=-1)
-        grad_mag_u8 = grad_mag_u8.reshape(izi.shape)
+        if compute_spacing:
+            grad_mag_u8 = grad_mag_u8.reshape(izi.shape)
     else:
         nx_u8 = volume[0, zi, yi, xi]
         ny_u8 = volume[1, zi, yi, xi]
-        grad_mag_u8 = volume[2, izi, iyi, ixi]
+        grad_mag_u8 = volume[2, izi, iyi, ixi] if compute_spacing else None
     normal_weight = (((nx_u8 != 0) | (ny_u8 != 0)) & in_bounds).float()
     nx = _decode_uint8_normal_component(nx_u8.float())
     ny = _decode_uint8_normal_component(ny_u8.float())
     nz = torch.sqrt((1. - nx * nx - ny * ny).clamp(min=0.))
     target_normal = F.normalize(torch.stack([nz, ny, nx], dim=-1), dim=-1)  # zyx
 
-    # grad_mag encodes a winding density (windings per base-volume voxel); the decode factor below
-    # also rescales it to current-grid windings/voxel. The number of windings actually crossed by
-    # the one-winding scroll-space segment (scroll_inner -> scroll_outer) is the line integral of
-    # this density along it, so we sample the density at evenly spaced midpoints along the segment
-    # and accumulate density * dl (a midpoint Riemann sum). For a correct fit the integral equals 1.
-    sample_valid = (grad_mag_u8 != 0) & int_in_bounds
-    density = grad_mag_u8.float() * density_decode  # current-grid windings/voxel
-    # dl is the per-step scroll-space length (current-grid voxels); gradient flows through it so the
-    # loss can stretch/compress the mapping until the integrated winding count matches.
-    dl = scroll_segment_length / num_steps
-    integrated_windings = (density * sample_valid.float()).sum(dim=-1) * dl
-    # Only score samples whose whole segment lies inside the valid field; a partially covered path
-    # would under-integrate and unfairly compare against 1.
-    spacing_weight = sample_valid.all(dim=-1).float()
-    spacing_residual = (integrated_windings - 1.).abs()
-    spacing_loss = (spacing_residual * spacing_weight).sum() / spacing_weight.sum().clamp(min=1)
-    record_loss_samples('dense_spacing', spiral_zyx, spacing_residual,
-                        spacing_weight.bool())
+    if compute_spacing:
+        # grad_mag encodes a winding density (windings per base-volume voxel); the decode factor below
+        # also rescales it to current-grid windings/voxel. The number of windings actually crossed by
+        # the one-winding scroll-space segment (scroll_inner -> scroll_outer) is the line integral of
+        # this density along it, so we sample the density at evenly spaced midpoints along the segment
+        # and accumulate density * dl (a midpoint Riemann sum). For a correct fit the integral equals 1.
+        sample_valid = (grad_mag_u8 != 0) & int_in_bounds
+        density = grad_mag_u8.float() * density_decode  # current-grid windings/voxel
+        # dl is the per-step scroll-space length (current-grid voxels); gradient flows through it so the
+        # loss can stretch/compress the mapping until the integrated winding count matches.
+        dl = scroll_segment_length / num_steps
+        integrated_windings = (density * sample_valid.float()).sum(dim=-1) * dl
+        # Only score samples whose whole segment lies inside the valid field; a partially covered path
+        # would under-integrate and unfairly compare against 1.
+        spacing_weight = sample_valid.all(dim=-1).float()
+        spacing_residual = (integrated_windings - 1.).abs()
+        spacing_loss = (spacing_residual * spacing_weight).sum() / spacing_weight.sum().clamp(min=1)
+        record_loss_samples('dense_spacing', spiral_zyx, spacing_residual,
+                            spacing_weight.bool())
 
     scroll_center_detached = scroll_center.detach()
     spiral_zyx_detached = spiral_zyx.detach()
-    yield 'dense_spacing', spacing_loss
+    if compute_spacing:
+        yield 'dense_spacing', spacing_loss
+        del spacing_loss
 
     # The caller has released the endpoint/integration graph.  Dense normals
     # use detached sample positions and build their own finite-difference graph,
     # so the two large transform graphs never need to coexist.
-    del spacing_loss, scroll_samples, scroll_inner, scroll_outer, scroll_center
+    del scroll_samples, scroll_inner, scroll_outer, scroll_center
     del scroll_displacement, scroll_segment_length, integration_zyx
     scroll_normal = get_radial_normal_in_scroll_space(
         slice_to_spiral_transform,
