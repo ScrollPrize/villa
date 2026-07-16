@@ -45,8 +45,6 @@ class NativeTrace2CpConfig:
     step_voxels: float = 4.0
     cone_angle_degrees: float = 25.0
     cone_grid_size: int = 25
-    direction_weight: float = 1.0
-    presence_weight: float = 1.0
     max_step_factor: float = 3.0
     max_steps: int | None = None
     trace_step_limit: int | None = None
@@ -608,8 +606,6 @@ def _score_candidate_batch(
     current_direction: np.ndarray,
     candidate_directions: np.ndarray,
     next_points: np.ndarray,
-    direction_weight: float,
-    presence_weight: float,
 ) -> tuple[int | None, float, float, float, int]:
     candidates = torch.as_tensor(
         np.asarray(candidate_directions, dtype=np.float32),
@@ -625,22 +621,23 @@ def _score_candidate_batch(
     current = F.normalize(current, p=2.0, dim=1, eps=float(_EPS))
     candidates = _align_axes_torch(candidates, current.expand_as(candidates))
     next_directions, presences, valid = cache.sample_points_torch(next_points)
-    current_aligned = _align_axes_torch(current.expand_as(candidates), candidates)
-    current_loss = 1.0 - torch.sum(current_aligned * candidates, dim=1).clamp(-1.0, 1.0)
+    current_dot = torch.sum(current.expand_as(candidates) * candidates, dim=1).clamp(-1.0, 1.0)
     next_aligned = _align_axes_torch(next_directions, candidates)
-    next_loss = 1.0 - torch.sum(next_aligned * candidates, dim=1).clamp(-1.0, 1.0)
-    direction_loss = 0.5 * (current_loss + next_loss)
-    presence_loss = 1.0 - presences.clamp(0.0, 1.0)
-    total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss
-    total = torch.where(valid, total, torch.full_like(total, torch.inf))
+    next_dot = torch.sum(next_aligned * candidates, dim=1).clamp(-1.0, 1.0)
+    presence = presences.clamp(0.0, 1.0)
+    score = current_dot * next_dot * presence
+    score = torch.where(valid, score, torch.full_like(score, -torch.inf))
+    direction_loss = 1.0 - 0.5 * (current_dot + next_dot)
+    presence_loss = 1.0 - presence
+    total_loss = 1.0 - score
     valid_count = int(torch.count_nonzero(valid).detach().cpu())
     rejected = int(valid.numel()) - valid_count
     if valid_count == 0:
         return None, math.inf, math.inf, math.inf, rejected
-    best_index = int(torch.argmin(total).detach().cpu())
+    best_index = int(torch.argmax(score).detach().cpu())
     return (
         best_index,
-        float(total[best_index].detach().cpu()),
+        float(total_loss[best_index].detach().cpu()),
         float(direction_loss[best_index].detach().cpu()),
         float(presence_loss[best_index].detach().cpu()),
         rejected,
@@ -775,8 +772,6 @@ def trace_native_3d_one_way(
             current_direction=current_direction,
             candidate_directions=candidates_unit,
             next_points=next_points,
-            direction_weight=cfg.direction_weight,
-            presence_weight=cfg.presence_weight,
         )
         if best_index is None:
             emit_progress(current, _step_index, reason="all_candidates_invalid")
@@ -2324,8 +2319,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--step-voxels", type=float, default=4.0)
     parser.add_argument("--cone-angle-degrees", type=float, default=25.0)
     parser.add_argument("--cone-grid-size", type=int, default=25)
-    parser.add_argument("--direction-weight", type=float, default=1.0)
-    parser.add_argument("--presence-weight", type=float, default=1.0)
     parser.add_argument("--max-step-factor", type=float, default=3.0)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--trace-step-limit", type=int, default=None)
@@ -2345,8 +2338,6 @@ def main() -> None:
         step_voxels=float(args.step_voxels),
         cone_angle_degrees=float(args.cone_angle_degrees),
         cone_grid_size=int(args.cone_grid_size),
-        direction_weight=float(args.direction_weight),
-        presence_weight=float(args.presence_weight),
         max_step_factor=float(args.max_step_factor),
         max_steps=None if args.max_steps is None else int(args.max_steps),
         trace_step_limit=None if args.trace_step_limit is None else int(args.trace_step_limit),

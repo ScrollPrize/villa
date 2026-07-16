@@ -118,10 +118,14 @@ side/top strip input loading.
 - Decodes Lasagna 3x2 direction channels analytically with the shared 3D
   direction decoder, aligns sign-ambiguous axes to the current trace direction,
   samples a deterministic 25x25 square angular grid mapped onto the cone disk,
-  and scores candidates by direction agreement plus optional `1 - presence`.
+  and scores candidates by maximizing
+  `dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * candidate_presence`.
+  The sampled axes are sign-aligned before dot products are evaluated; native
+  3D Trace2CP does not expose additive direction/presence candidate-selection
+  weights.
   Candidate selection is batched per step: candidate points are grouped by
   trusted inference block, sampled with batched `grid_sample`, decoded in torch,
-  and reduced with one tensor `argmin`.
+  and reduced with one tensor `argmax`.
 - Uses a distance-derived step guard by default:
   `ceil(max_step_factor * cp_distance_voxels / step_voxels)`, with
   `--max-step-factor 3.0`. `--max-steps` is an optional extra cap, and

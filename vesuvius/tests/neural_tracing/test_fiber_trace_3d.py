@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,6 +57,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _project_trace_to_initial_strip,
     _resolve_native_trace2cp_selection,
     _sample_presence_on_strip,
+    _score_candidate_batch,
     _volume_trace_to_source_trace_xyz,
     fuse_forward_reverse_traces,
     generate_cone_candidates,
@@ -1719,6 +1721,48 @@ def test_native_3d_trace2cp_field_cache_uses_sampler_and_base_scale() -> None:
     assert np.allclose(coords[0, 0, 1], [4.0, 8.0, 16.0])
     assert model.input_volume is not None
     assert float(model.input_volume[0, 0, 0, 0, 0]) == 4.0
+
+
+def test_native_3d_trace2cp_candidate_score_maximizes_dot_product_presence() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_points_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            assert count == 2
+            directions = torch.tensor(
+                [
+                    [-1.0, 0.0, 0.0],  # sign-ambiguous match to candidate 0
+                    [1.0, 0.0, 0.0],
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.tensor([0.51, 1.0], dtype=torch.float32)
+            valid = torch.ones((count,), dtype=torch.bool)
+            return directions, presence, valid
+
+    candidate_b = np.asarray(
+        [0.7, math.sqrt(1.0 - 0.7 * 0.7), 0.0],
+        dtype=np.float32,
+    )
+    best_index, total_loss, direction_loss, presence_loss, rejected = _score_candidate_batch(
+        FakeCache(),
+        current_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        candidate_directions=np.stack(
+            [
+                np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+                candidate_b,
+            ],
+            axis=0,
+        ),
+        next_points=np.zeros((2, 3), dtype=np.float32),
+    )
+
+    assert best_index == 0
+    assert rejected == 0
+    assert total_loss == pytest.approx(0.49, abs=1.0e-6)
+    assert direction_loss == pytest.approx(0.0, abs=1.0e-6)
+    assert presence_loss == pytest.approx(0.49, abs=1.0e-6)
 
 
 def test_native_3d_trace2cp_field_cache_rejects_nonblocking_sampler() -> None:

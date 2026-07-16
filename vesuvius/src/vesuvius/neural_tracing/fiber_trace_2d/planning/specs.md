@@ -349,10 +349,11 @@
 - Native 3D candidate selection is vectorized per trace step. Candidate points
   are grouped by trusted inference block, sampled with batched `grid_sample`,
   decoded with the analytic Lasagna 3x2 torch decoder, and scored as one tensor
-  batch. Candidate loss is weighted direction agreement plus
-  `1 - sigmoid_presence` at the candidate point. Direction agreement includes
-  both the current point's sampled axis and the candidate point's sampled axis,
-  aligned against the candidate step direction.
+  batch. Candidate selection maximizes
+  `dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * candidate_presence`.
+  Both sampled axes are sign-aligned to the candidate step direction before dot
+  products are evaluated. The native 3D tool does not expose additive
+  direction/presence candidate-selection weights.
 - The native 3D CLI prints live progress bars for forward and backward tracing.
   Progress is measured by signed target-plane progress along the initial
   CP-to-CP direction. It includes step count, ETA, and inferred-block count.
