@@ -42,6 +42,22 @@ Vesuvius Challenge has awarded **<AwardedTotal />** in prizes!
 
 This page lists all the prizes awarded so far:
 
+### \$3,000 Progress Prizes (June, 2026)
+
+**Goal:** Improve the tools and training methods needed to read the scrolls.<br/>
+**Announcement:** <a href="https://scrollprize.substack.com/p/a-new-1m-grand-prize-for-2027">Blog post</a>
+
+<div className="flex flex-row flex-wrap">
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/tree/main/vesuvius">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$2,000</div><span className="font-semibold">3D augmentations & ScrollFiesta speedups</span>: Paulo Sergio Camillo / @pscamillo</div>
+    <div className="text-sm text-dim">More CT-scan-artifact-inspired augmentations for training 3D segmentation models, plus performance improvements to ScrollFiesta.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/abundantjoe/vesuvius">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Fiber format converter</span>: Joseph Balmaceda</div>
+    <div className="text-sm text-dim">Converts skeleton-annotated fibers from NML into CSV, JSON, and SWC, with length, branching, and orientation analysis.</div>
+  </a>
+</div>
+
 ### \$12,000 Progress Prizes (May, 2026)
 
 **Goal:** Improve the tools and training methods needed to read the scrolls.<br/>
@@ -49,11 +65,11 @@ This page lists all the prizes awarded so far:
 
 <div className="flex flex-row flex-wrap">
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/Hob3rMallow/scrollfiesta_public">
-    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$10,000</div><span className="font-semibold">Scroll Fiesta</span>: Ben Kyles</div>
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$10,000</div><span className="font-semibold">Scroll Fiesta</span>: Ben Kyles / @hari_seldon</div>
     <div className="text-sm text-dim">An automatic mesher of surface predictions that attempts to fix topological mistakes.</div>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/tree/main/vesuvius">
-    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$2,000</div><span className="font-semibold">3D augmentations</span>: Paulo Sergio Camillo</div>
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$2,000</div><span className="font-semibold">3D augmentations</span>: Paulo Sergio Camillo / @pscamillo</div>
     <div className="text-sm text-dim">Scroll Decohesion, Realistic Warp, and Squeeze transforms for training ML models on CT scans.</div>
   </a>
 </div>
