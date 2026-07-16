@@ -1347,6 +1347,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # created from that run's pending inputs and discarded before its autosave.
     influence_state = None
     interactive_influence_loss_weight = 0.0
+    interactive_influence_anchor_samples = 0
     if cfg['exp_lr_schedule']:
         gamma = cfg['lr_final_factor'] ** (1.0 / max(1, num_training_steps))
         lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimiser, gamma=gamma)
@@ -1538,14 +1539,17 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     def clear_interactive_influence():
         """End the current Run request's influence window."""
         nonlocal influence_state, interactive_influence_loss_weight
+        nonlocal interactive_influence_anchor_samples
         nonlocal interactive_dt_resume_iteration
         interactive_dt_resume_iteration = None
         if influence_state is None:
             interactive_influence_loss_weight = 0.0
+            interactive_influence_anchor_samples = 0
             return
         influence_state.deactivate_(spiral_and_transform, optimiser)
         influence_state = None
         interactive_influence_loss_weight = 0.0
+        interactive_influence_anchor_samples = 0
 
     def export_interactive_preview(generation_path, surface_id):
         # Export has its own saved RNG envelope so pausing does not alter the
@@ -1585,7 +1589,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         same items in the same order on every rank.
         """
         nonlocal patch_sampling_probabilities, next_id, influence_state
-        nonlocal interactive_influence_loss_weight
+        nonlocal interactive_influence_loss_weight, interactive_influence_anchor_samples
         nonlocal interactive_dt_resume_iteration
         # Incorporation has its own saved RNG envelope so adding inputs does
         # not alter the stochastic training sequence (same discipline as the
@@ -1770,6 +1774,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     anchor_geometry_zyx=influence_anchor_geometry,
                 )
                 interactive_influence_loss_weight = float(run_cfg['loss_weight_anchor'])
+                interactive_influence_anchor_samples = int(
+                    run_cfg['interactive_influence_anchor_samples_per_step'])
 
             # run() sets the target before this callback is drained at the
             # pause boundary, so this is exactly the iteration window requested
@@ -2041,7 +2047,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 'anchor': influence_state.get_anchor_loss(
                     slice_to_spiral_transform,
                     dr_per_winding,
-                    int(cfg['interactive_influence_anchor_samples_per_step']),
+                    interactive_influence_anchor_samples,
                 ) * interactive_influence_loss_weight,
             })
 
