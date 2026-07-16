@@ -22,9 +22,8 @@ API_VERSION = 5
 
 
 # Counts which describe how many training objects/points are sampled per
-# optimizer step.  Some of these are scaled for the fitted z range (and split
-# across DDP ranks) by spiral_runtime; the values exposed through the service
-# remain the user's configured, pre-scaling values.
+# optimizer step. The service exposes the post-scaling values actually used by
+# the resident fitter, and Run-scoped edits set those active values directly.
 RUN_MUTABLE_SAMPLING_KEYS = frozenset({
     "num_patches_per_step",
     "num_patches_per_step_for_dt",

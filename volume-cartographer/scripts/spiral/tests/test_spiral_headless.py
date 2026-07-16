@@ -184,12 +184,9 @@ class ProtocolTests(unittest.TestCase):
                          ["configure", "incorporate"])
         self.assertEqual(session._run_config["loss_weight_patch_radius"], 4.0)
 
-    def test_run_configuration_scales_counts_but_not_loss_values(self):
+    def test_run_configuration_applies_active_host_values_exactly(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._configure_run = lambda config: setattr(session, "applied", config)
-        session._scaled_count_keys = frozenset({"num_patches_per_step"})
-        session._z_range_scale = 0.5
-        session._split_divisor = 2
 
         session._run_configuration({
             "num_patches_per_step": 101,
@@ -198,7 +195,7 @@ class ProtocolTests(unittest.TestCase):
         })
 
         self.assertEqual(session.applied, {
-            "num_patches_per_step": 25,
+            "num_patches_per_step": 101,
             "loss_weight_patch_radius": 3.5,
             "loss_start_patch_dt": 123,
         })

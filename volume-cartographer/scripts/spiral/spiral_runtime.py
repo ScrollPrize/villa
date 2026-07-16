@@ -125,11 +125,14 @@ class InteractiveFitSession:
             unknown = sorted(set(self.run_config.config) - set(config))
             if unknown:
                 raise ValueError(f"Unknown advanced config keys: {unknown}")
+            # Explicit sample-count overrides are literal active counts. This
+            # lets VC3D round-trip the host's post-scaling values through a
+            # reload without applying the z-range/DDP transforms twice.
+            explicit_sampling_counts = {
+                key: value for key, value in self.run_config.config.items()
+                if key in RUN_MUTABLE_SAMPLING_KEYS
+            }
             config.update(self.run_config.config)
-            self.requested_config = dict(config)
-            with self._condition:
-                self._run_config = run_mutable_config(config)
-            self._publish_status()
             count_keys = (
                 'num_patches_per_step', 'num_patches_per_step_for_dt',
                 'unverified_num_patches_per_step', 'unverified_num_patches_per_step_for_dt',
@@ -137,11 +140,15 @@ class InteractiveFitSession:
                 'unattached_pcl_num_per_step', 'track_num_per_step',
                 'dense_normals_num_points', 'regularisation_num_points', 'shell_num_samples',
             )
-            self._z_range_scale, _ = scale_counts_for_z_range(
+            scale_counts_for_z_range(
                 config, self.run_config.z_begin, self.run_config.z_end, 9500,
                 count_keys)
-            self._split_divisor = split_counts_across_ranks(config, count_keys)
-            self._scaled_count_keys = frozenset(count_keys)
+            split_counts_across_ranks(config, count_keys)
+            config.update(explicit_sampling_counts)
+            self.requested_config = dict(config)
+            with self._condition:
+                self._run_config = run_mutable_config(config)
+            self._publish_status()
 
             fitter.dataset_path = self.paths.dataset_root
             fitter.normal_nx_zarr_path = self.paths.normal_x or None
@@ -285,14 +292,7 @@ class InteractiveFitSession:
             if self._configure_run is None:
                 raise RuntimeError(
                     "The resident fitter does not support Run configuration changes")
-            resolved = dict(config)
-            for key in RUN_MUTABLE_SAMPLING_KEYS & resolved.keys():
-                if key in self._scaled_count_keys:
-                    scaled = max(1, round(resolved[key] * self._z_range_scale))
-                    if self._split_divisor > 1:
-                        scaled = max(1, -(-scaled // self._split_divisor))
-                    resolved[key] = scaled
-            self._configure_run(resolved)
+            self._configure_run(dict(config))
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             with self._condition:
