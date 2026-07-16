@@ -4,8 +4,11 @@
 #include <QFutureWatcher>
 #include <QHash>
 #include <QJsonObject>
+#include <QSet>
 #include <QStringList>
 #include <opencv2/core/types.hpp>
+#include <cstddef>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -36,7 +39,8 @@ public:
 
     // Cross-panel entry points for "Add to current spiral fit".
     bool hasActiveSpiralSession() const;
-    void addPatchToCurrentFit(const QString& tifxyzDirectory);
+    void addPatchToCurrentFit(const QString& tifxyzDirectory,
+                              const std::shared_ptr<QuadSurface>& surface = {});
     void addFiberToCurrentFit(const QString& fiberJsonPath);
 
 signals:
@@ -58,6 +62,7 @@ private:
     struct InputSurfaceEntry {
         QString category;
         QString id;
+        QString sourceId;
         std::shared_ptr<QuadSurface> surface;
     };
     struct InputSurfaceLoadResult {
@@ -74,7 +79,10 @@ private:
     void loadGeometrySnapshot(const QString& manifestPath, quint64 generation);
     void loadInputSurfaces(const QJsonObject& paths, quint64 generation);
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
+    void registerPendingPatchSurface(const QString& inputId,
+                                     const std::shared_ptr<QuadSurface>& surface);
     void setSurfaceCategoryVisible(const QString& category, bool visible);
+    void updatePendingPatchIds(const QJsonObject& status);
     void updateSurfaceIntersections();
     void ensureInitialFocus();
     void initializePreviewFocus();
@@ -95,10 +103,16 @@ private:
     qint64 _requestedPreviewGeneration = -1;
     QString _geometryManifestPath;
     QHash<QString, QStringList> _surfaceCategoryIds;
+    QHash<QString, QString> _surfaceSourceIds;
     QHash<QString, bool> _surfaceCategoryVisible;
+    QSet<QString> _pendingPatchIds;
+    std::map<std::string, std::size_t> _surfaceOverlayColorAssignments;
+    std::map<std::string, cv::Vec3b> _surfaceOverlayColors;
+    std::size_t _nextSurfaceOverlayColorIndex = 0;
     quint64 _inputSurfaceGeneration = 0;
     std::shared_ptr<QuadSurface> _currentPreview;
     bool _outputVisible = true;
+    bool _pendingPatchesOnly = false;
     // True while the focus is the automatic volume-center default (no user
     // interaction and no preview yet); the first preview may then retarget it.
     bool _focusIsAutoDefault = false;

@@ -151,6 +151,7 @@
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
 #include "SpiralWorkspace.hpp"
+#include "SurfaceOverlayColors.hpp"
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -6670,7 +6671,8 @@ void CWindow::CreateWidgets(void)
                     showStatusBarMessage(tr("Cannot resolve an on-disk TIFXYZ directory for %1").arg(segmentId), 5000);
                     return;
                 }
-                _spiralWorkspace->addPatchToCurrentFit(QString::fromStdString(surf->path.string()));
+                _spiralWorkspace->addPatchToCurrentFit(
+                    QString::fromStdString(surf->path.string()), surf);
             });
     connect(_surfacePanel.get(), &SurfacePanelController::renderSegmentRequested,
             this, [this](const QString& segmentId) {
@@ -10025,27 +10027,12 @@ void CWindow::showSurfaceOverlaySelectionDialog()
 
 QColor CWindow::getOverlayColor(size_t index) const
 {
-    static const std::vector<QColor> palette = {
-        QColor(80, 180, 255),   // sky blue
-        QColor(180, 80, 220),   // violet
-        QColor(80, 220, 200),   // aqua/teal
-        QColor(220, 80, 180),   // magenta
-        QColor(80, 130, 255),   // medium blue
-        QColor(160, 80, 255),   // purple
-        QColor(80, 255, 220),   // cyan
-        QColor(255, 80, 200),   // hot pink
-        QColor(120, 220, 80),   // lime green
-        QColor(80, 180, 120),   // spring green
-        QColor(150, 200, 255),  // light sky blue
-        QColor(200, 150, 230),  // light violet
-    };
-    return palette[index % palette.size()];
+    return vc3d::surfaceOverlayColor(index);
 }
 
 cv::Vec3b CWindow::getOverlayColorBGR(size_t index) const
 {
-    QColor c = getOverlayColor(index);
-    return cv::Vec3b(c.blue(), c.green(), c.red());
+    return vc3d::surfaceOverlayColorBgr(index);
 }
 
 void CWindow::onCopyWithNtRequested()

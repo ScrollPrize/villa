@@ -292,10 +292,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     for (const auto& item : std::initializer_list<std::pair<const char*, const char*>>{
              {"output", "Output"}, {"fibers", "Fibers"}, {"tracks", "Tracks"},
              {"pcls", "Winding/PCL inputs"}, {"verified", "Verified patches"},
-             {"unverified", "Unverified patches"}, {"shell", "Shell"}, {"lasagna", "Lasagna inputs"}}) {
+             {"unverified", "Unverified patches"}, {"pending_only", "Pending patches only"},
+             {"shell", "Shell"}, {"lasagna", "Lasagna inputs"}}) {
         auto* check = new QCheckBox(tr(item.second), displayContents);
         const QString key = QString::fromLatin1(item.first);
         _visibilityChecks[key] = check;
+        if (key == QStringLiteral("pending_only")) {
+            check->setObjectName(QStringLiteral("spiralPendingPatchesOnly"));
+            check->setToolTip(tr("Replace the verified/unverified patch selections with only "
+                                 "interactive-fit patches that are not yet committed to the dataset"));
+        }
         check->setChecked(key == QStringLiteral("output"));
         connect(check, &QCheckBox::toggled, this, [this, key = QString::fromLatin1(item.first)](bool shown) {
             emit visibilityChanged(key, shown);

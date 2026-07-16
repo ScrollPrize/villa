@@ -6,6 +6,7 @@
 #include "Keybinds.hpp"
 #include "SpiralPanel.hpp"
 #include "SpiralServiceManager.hpp"
+#include "SurfaceOverlayColors.hpp"
 #include "ViewerManager.hpp"
 #include "elements/ViewerSplitGrid.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
@@ -38,15 +39,6 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
-
-namespace {
-cv::Vec3b surfaceCategoryColor(const QString& category)
-{
-    if (category == QStringLiteral("verified")) return {80, 220, 80};
-    if (category == QStringLiteral("unverified")) return {60, 180, 255};
-    return {255, 180, 80};
-}
-}
 
 SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     : QMainWindow(parent), _mainState(mainState)
@@ -168,6 +160,9 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             updateSurfaceIntersections();
         } else if (category == QStringLiteral("fibers") || category == QStringLiteral("tracks") || category == QStringLiteral("pcls")) {
             _overlay->setCategoryVisible(category, shown);
+        } else if (category == QStringLiteral("pending_only")) {
+            _pendingPatchesOnly = shown;
+            updateSurfaceIntersections();
         } else if (_surfaceCategoryVisible.contains(category)) {
             setSurfaceCategoryVisible(category, shown);
         }
@@ -180,7 +175,9 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     _requestedPreviewGeneration = -1;
                     _inputSurfaceGeneration = 0;
                     _geometryManifestPath.clear();
+                    _pendingPatchIds.clear();
                     _overlay->reset();
+                    updateSurfaceIntersections();
                 }
                 if (state == CS::Ready && !_service->ownsProcess())
                     _pythonOutput->appendOutput(
@@ -189,6 +186,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
     connect(_service, &SpiralServiceManager::sessionActiveChanged, this,
             &SpiralWorkspace::spiralSessionActiveChanged);
+    connect(_service, &SpiralServiceManager::sessionStatusChanged, this,
+            &SpiralWorkspace::updatePendingPatchIds);
     connect(_service, &SpiralServiceManager::sessionAccepted, this,
             [this](const QJsonObject& paths, qint64 generation) {
                 loadInputSurfaces(paths, static_cast<quint64>(generation));
@@ -292,7 +291,9 @@ void SpiralWorkspace::loadInputSurfaces(const QJsonObject& servicePaths, quint64
                         .arg(category).arg(generation)
                         .arg(QFileInfo(candidates[index]).fileName()).arg(index);
                     surface->id = id.toStdString();
-                    result.surfaces.push_back({category, id, std::move(surface)});
+                    result.surfaces.push_back({category, id,
+                                               QFileInfo(candidates[index]).fileName(),
+                                               std::move(surface)});
                 } catch (const std::exception& error) {
                     result.warnings.push_back(QObject::tr("Failed to load %1: %2")
                                                   .arg(candidates[index], QString::fromUtf8(error.what())));
@@ -310,12 +311,31 @@ void SpiralWorkspace::installInputSurfaces(const InputSurfaceLoadResult& result,
     for (const QString& category : {QStringLiteral("verified"), QStringLiteral("unverified"),
                                     QStringLiteral("shell")})
         replacement[category] = {};
+    QHash<QString, QString> replacementSourceIds;
+    std::map<std::string, cv::Vec3b> replacementColors;
     for (const auto& entry : result.surfaces) {
         _state->setSurface(entry.id.toStdString(), entry.surface);
         replacement[entry.category].push_back(entry.id);
+        replacementSourceIds[entry.id] = entry.sourceId;
+        const std::string colorKey = QStringLiteral("%1/%2")
+                                         .arg(entry.category == QStringLiteral("shell")
+                                                  ? QStringLiteral("shell")
+                                                  : QStringLiteral("patch"),
+                                              entry.sourceId)
+                                         .toStdString();
+        auto assignment = _surfaceOverlayColorAssignments.find(colorKey);
+        if (assignment == _surfaceOverlayColorAssignments.end()) {
+            assignment = _surfaceOverlayColorAssignments
+                             .emplace(colorKey, _nextSurfaceOverlayColorIndex++)
+                             .first;
+        }
+        replacementColors.emplace(entry.id.toStdString(),
+                                   vc3d::surfaceOverlayColorBgr(assignment->second));
     }
     const auto retired = _surfaceCategoryIds;
     _surfaceCategoryIds = replacement;
+    _surfaceSourceIds = std::move(replacementSourceIds);
+    _surfaceOverlayColors = std::move(replacementColors);
     updateSurfaceIntersections();
     QTimer::singleShot(0, this, [this, retired]() {
         if (_shuttingDown) return;
@@ -327,6 +347,31 @@ void SpiralWorkspace::installInputSurfaces(const InputSurfaceLoadResult& result,
         statusBar()->showMessage(result.warnings.join(QStringLiteral("; ")), 15000);
 }
 
+void SpiralWorkspace::registerPendingPatchSurface(
+    const QString& inputId, const std::shared_ptr<QuadSurface>& surface)
+{
+    if (!surface || inputId.isEmpty()) return;
+    for (const QString& id : _surfaceCategoryIds.value(QStringLiteral("ephemeral"))) {
+        if (_surfaceSourceIds.value(id) == inputId) return;
+    }
+    const QString id = QStringLiteral("spiral/ephemeral/g%1/%2")
+                           .arg(_inputSurfaceGeneration)
+                           .arg(inputId);
+    _state->setSurface(id.toStdString(), surface);
+    _surfaceCategoryIds[QStringLiteral("ephemeral")].push_back(id);
+    _surfaceSourceIds[id] = inputId;
+    const std::string colorKey = QStringLiteral("patch/%1").arg(inputId).toStdString();
+    auto assignment = _surfaceOverlayColorAssignments.find(colorKey);
+    if (assignment == _surfaceOverlayColorAssignments.end()) {
+        assignment = _surfaceOverlayColorAssignments
+                         .emplace(colorKey, _nextSurfaceOverlayColorIndex++)
+                         .first;
+    }
+    _surfaceOverlayColors[id.toStdString()] =
+        vc3d::surfaceOverlayColorBgr(assignment->second);
+    if (_pendingPatchesOnly) updateSurfaceIntersections();
+}
+
 void SpiralWorkspace::setSurfaceCategoryVisible(const QString& category, bool visible)
 {
     if (!_surfaceCategoryVisible.contains(category)) return;
@@ -334,17 +379,49 @@ void SpiralWorkspace::setSurfaceCategoryVisible(const QString& category, bool vi
     updateSurfaceIntersections();
 }
 
+void SpiralWorkspace::updatePendingPatchIds(const QJsonObject& status)
+{
+    QSet<QString> pending;
+    for (const QJsonValue& value : status.value(QStringLiteral("ephemeral_inputs")).toArray()) {
+        const QJsonObject input = value.toObject();
+        if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("patch")
+            && !input.value(QStringLiteral("committed")).toBool()) {
+            pending.insert(input.value(QStringLiteral("id")).toString());
+        }
+    }
+    if (pending == _pendingPatchIds) return;
+    _pendingPatchIds = std::move(pending);
+    if (_pendingPatchesOnly) updateSurfaceIntersections();
+}
+
 void SpiralWorkspace::updateSurfaceIntersections()
 {
     std::set<std::string> intersections;
     std::map<std::string, cv::Vec3b> surfaceOverlays;
+    QSet<QString> shownPendingPatchIds;
     if (_outputVisible && _currentPreview) intersections.insert("segmentation");
-    for (auto visible = _surfaceCategoryVisible.begin(); visible != _surfaceCategoryVisible.end(); ++visible) {
-        if (!visible.value()) continue;
-        const cv::Vec3b color = surfaceCategoryColor(visible.key());
-        for (const QString& id : _surfaceCategoryIds.value(visible.key())) {
+    auto addCategory = [this, &intersections, &surfaceOverlays, &shownPendingPatchIds](
+                           const QString& category, bool pendingOnly) {
+        for (const QString& id : _surfaceCategoryIds.value(category)) {
+            const QString sourceId = _surfaceSourceIds.value(id);
+            if (pendingOnly
+                && (!_pendingPatchIds.contains(sourceId)
+                    || shownPendingPatchIds.contains(sourceId))) continue;
+            if (pendingOnly) shownPendingPatchIds.insert(sourceId);
             intersections.insert(id.toStdString());
-            surfaceOverlays.emplace(id.toStdString(), color);
+            const auto color = _surfaceOverlayColors.find(id.toStdString());
+            if (color != _surfaceOverlayColors.end())
+                surfaceOverlays.emplace(color->first, color->second);
+        }
+    };
+    if (_pendingPatchesOnly) {
+        addCategory(QStringLiteral("verified"), true);
+        addCategory(QStringLiteral("unverified"), true);
+        addCategory(QStringLiteral("ephemeral"), true);
+    } else {
+        for (auto visible = _surfaceCategoryVisible.begin();
+             visible != _surfaceCategoryVisible.end(); ++visible) {
+            if (visible.value()) addCategory(visible.key(), false);
         }
     }
     for (auto* viewer : _viewerManager->baseViewers()) {
@@ -365,10 +442,12 @@ bool SpiralWorkspace::hasActiveSpiralSession() const
     return _service && _service->hasActiveSession();
 }
 
-void SpiralWorkspace::addPatchToCurrentFit(const QString& tifxyzDirectory)
+void SpiralWorkspace::addPatchToCurrentFit(
+    const QString& tifxyzDirectory, const std::shared_ptr<QuadSurface>& surface)
 {
     if (!_service) return;
     const QString inputId = QFileInfo(tifxyzDirectory).fileName();
+    registerPendingPatchSurface(inputId, surface);
     statusBar()->showMessage(tr("Uploading patch %1 to the Spiral session…").arg(inputId));
     _service->uploadPatch(tifxyzDirectory, inputId);
 }
