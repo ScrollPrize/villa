@@ -85,11 +85,6 @@ So how did we get here, and how do these models work? Let’s start with a littl
 
 Our story starts in 2019, when professor Brent Seales at the University of Kentucky’s EduceLab <a href="https://www.theguardian.com/science/2019/oct/03/ancient-scrolls-charred-by-vesuvius-could-be-read-once-again">imaged Herculaneum scrolls</a> in a particle accelerator, generating 3D CT-scans at resolutions as high as 4 µm.
 
-<figure>
-  <img className="w-[500px]" src="/img/landing/brent1.webp" alt="Professor Brent Seales and team scanning Herculaneum scrolls at the particle accelerator." />
-  <figcaption className="mt-0">Professor Seales and team scanning at the particle accelerator.</figcaption>
-</figure>
-
 His team also scanned and photographed detached scroll fragments bearing visible ink, thus providing a ground truth dataset.
 
 <figure>
