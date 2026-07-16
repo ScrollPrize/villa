@@ -48,7 +48,19 @@ class DecohesionTransform(ImageOnlyTransform):
         return {'apply': True, 'axis': axis, 'tau': tau, 'strength': strength, 'K': K}
 
     @staticmethod
-    def _causal_smear(img: torch.Tensor, taxis: int, k: torch.Tensor) -> torch.Tensor:
+    def _causal_smear_loop(img: torch.Tensor, taxis: int, k: torch.Tensor) -> torch.Tensor:
+        out = k[0] * img
+        n = img.shape[taxis]
+        for i in range(1, k.shape[0]):
+            dst = [slice(None)] * img.ndim
+            src = [slice(None)] * img.ndim
+            dst[taxis] = slice(i, None)
+            src[taxis] = slice(0, n - i)
+            out[tuple(dst)] += k[i] * img[tuple(src)]
+        return out
+
+    @staticmethod
+    def _causal_smear_conv(img: torch.Tensor, taxis: int, k: torch.Tensor) -> torch.Tensor:
         dim = img.ndim - 1
         K = int(k.shape[0])
 
@@ -86,6 +98,12 @@ class DecohesionTransform(ImageOnlyTransform):
         if permuted:
             y = y.permute(perm).contiguous()
         return y
+
+    @staticmethod
+    def _causal_smear(img: torch.Tensor, taxis: int, k: torch.Tensor) -> torch.Tensor:
+        if not img.is_cuda:
+            return DecohesionTransform._causal_smear_loop(img, taxis, k)
+        return DecohesionTransform._causal_smear_conv(img, taxis, k)
 
     def _density_weight(self, img: torch.Tensor, strength: float) -> torch.Tensor:
         if not self.density_modulated:
