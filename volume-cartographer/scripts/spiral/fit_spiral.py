@@ -46,6 +46,7 @@ from sample_spiral import (
     get_winding_xy,
 )
 from losses import (
+    build_pcl_sampling_strata,
     configure_losses,
     get_lasagna_losses,
     get_patch_abs_winding_loss,
@@ -170,6 +171,10 @@ default_config = {
     'rel_winding_num_pcls': 48,
     'rel_winding_num_patch_pairs_per_pcl': 4,
     'rel_winding_adjacent_patches_only': True,
+    # Stratify the per-step pcl draws (rel-winding and unattached-strip losses) so each
+    # pcl source file, plus fibers split into horizontal/vertical, gets an equal share
+    # of the samples regardless of how many pcls it holds. False = uniform over pcls.
+    'stratified_pcl_sampling': False,
     'abs_winding_num_pcls': 48,
     'abs_winding_num_points_per_pcl': 4,
     'fiber_min_point_spacing': 40.,
@@ -589,6 +594,7 @@ def main(load_only_patches_and_point_collections=False):
             loaded = load_point_collection(path) or {}
             for pcl in loaded.values():
                 pcl['source_file'] = path
+                pcl['sampling_group'] = path
                 # Absolute-winding status is determined solely by the source file:
                 # only pcls loaded from abs_winding.json carry absolute winding
                 # numbers. Any metadata key in another file is ignored.
@@ -603,6 +609,17 @@ def main(load_only_patches_and_point_collections=False):
         next_id,
         min_point_spacing=cfg['fiber_min_point_spacing'],
     )
+    # Fibers form two sampling groups, horizontal and vertical, rather than one
+    # group per source file like the regular pcls.
+    for pcl in fiber_point_collections.values():
+        hv_tag = pcl.get('metadata', {}).get('hv_classification', {}).get('automatic_tag')
+        if hv_tag not in ('H', 'V'):
+            print(
+                f'WARNING: fiber {pcl.get("name")!r} has hv_classification.automatic_tag '
+                f'{hv_tag!r} (expected "H" or "V"); grouping as horizontal'
+            )
+            hv_tag = 'H'
+        pcl['sampling_group'] = f'fibers:{hv_tag}'
     point_collections.update(fiber_point_collections)
 
     for pcl in point_collections.values():
@@ -736,6 +753,7 @@ def main(load_only_patches_and_point_collections=False):
             points_by_patch.setdefault(pid, []).append(point)
         pcl['points_by_patch'] = points_by_patch
     unattached_pcl_strips = _UnattachedPclStripList()
+    unattached_strip_sampling_groups = []  # parallel to unattached_pcl_strips
     min_point_spacing = cfg['unattached_pcl_min_point_spacing']
     # For each unattached pcl, materialise an id-sorted strip of point zyxs and the
     # corresponding winding annotations. Strips with <2 points are dropped.
@@ -768,14 +786,33 @@ def main(load_only_patches_and_point_collections=False):
             'zyxs': zyxs,
             'windings': windings,
         })
+        unattached_strip_sampling_groups.append(pcl['sampling_group'])
 
     cross_patch_pcls = list(cross_patch_point_collections.values())
     print(
         f'pcls: {len(cross_patch_pcls)} cross-patch, '
         f'{len(unattached_pcl_strips)} unattached'
     )
+    if cfg['stratified_pcl_sampling']:
+        def _group_counts(groups):
+            counts = {}
+            for group in groups:
+                counts[group] = counts.get(group, 0) + 1
+            return ', '.join(f'{os.path.basename(str(g))}: {n}' for g, n in sorted(counts.items(), key=lambda kv: str(kv[0])))
+        print(f'  cross-patch sampling groups: {_group_counts(pcl["sampling_group"] for pcl in cross_patch_pcls)}')
+        print(f'  unattached sampling groups: {_group_counts(unattached_strip_sampling_groups)}')
     if load_only_patches_and_point_collections:
         return verified_patches, unverified_patches, shell_patch, cross_patch_pcls, unattached_pcl_strips
+
+    # Precompute the per-step sampling pools for the rel-winding and unattached-strip
+    # losses: pool indices grouped into strata by sampling group. Single-point pcls
+    # (possible only for winding_is_absolute pcls) can't form a cross-patch pair, so
+    # they are excluded from the rel-winding pool here.
+    cross_patch_sampling_strata = build_pcl_sampling_strata(
+        pcl['sampling_group'] if len(pcl['points']) > 1 else None
+        for pcl in cross_patch_pcls
+    )
+    unattached_sampling_strata = build_pcl_sampling_strata(unattached_strip_sampling_groups)
 
     # ==========================================================================
     # lasagna and tracks loading
@@ -1391,6 +1428,7 @@ def main(load_only_patches_and_point_collections=False):
                 verified_patches,
                 patch_atlas,
                 cross_patch_pcls,
+                cross_patch_sampling_strata,
             ) * cfg['loss_weight_rel_winding']
 
         if cfg['loss_weight_abs_winding'] > 0 and cross_patch_pcls:
@@ -1424,6 +1462,7 @@ def main(load_only_patches_and_point_collections=False):
                 slice_to_spiral_transform,
                 dr_per_winding,
                 unattached_pcl_strips,
+                unattached_sampling_strata,
                 get_or_build_unattached_pcl_flat,
                 cfg['unattached_pcl_num_per_step'],
                 cfg['unattached_pcl_num_points_per_step'],

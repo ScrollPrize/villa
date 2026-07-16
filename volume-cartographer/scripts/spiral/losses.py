@@ -33,6 +33,44 @@ def _masked_mean(values, mask):
     return (values * mask_f).sum() / mask_f.sum().clamp(min=1.)
 
 
+def build_pcl_sampling_strata(sampling_groups):
+    # Precompute the per-step sampling pool for _choose_pcl_indices from each pool
+    # member's sampling group (source json file; fibers split into fibers:H /
+    # fibers:V). Members whose group is None are ineligible and excluded. Returns
+    # {'strata': [int64 pool-index array per group], 'all': all eligible indices}.
+    group_to_indices = {}
+    for idx, group in enumerate(sampling_groups):
+        if group is None:
+            continue
+        group_to_indices.setdefault(group, []).append(idx)
+    strata = [np.asarray(indices, dtype=np.int64) for indices in group_to_indices.values()]
+    all_indices = np.concatenate(strata) if strata else np.empty(0, dtype=np.int64)
+    return {'strata': strata, 'all': all_indices}
+
+
+def _choose_pcl_indices(sampling_strata, num_to_sample):
+    # Choose num_to_sample pool indices from a build_pcl_sampling_strata() bundle.
+    # Stratified mode (cfg['stratified_pcl_sampling'], the default) splits the draw
+    # as evenly as possible across the strata regardless of stratum size (remainder
+    # going to a random subset of strata), then samples uniformly within each
+    # stratum, with replacement only when a stratum's share exceeds its size.
+    # Non-stratified mode is the legacy behaviour: uniform over the whole pool
+    # without replacement.
+    if not cfg['stratified_pcl_sampling']:
+        return np.random.choice(sampling_strata['all'], num_to_sample, replace=False)
+    strata = sampling_strata['strata']
+    quotas = np.full(len(strata), num_to_sample // len(strata), dtype=np.int64)
+    remainder = num_to_sample - int(quotas.sum())
+    if remainder > 0:
+        quotas[np.random.choice(len(strata), remainder, replace=False)] += 1
+    chosen = [
+        np.random.choice(stratum, quota, replace=quota > len(stratum))
+        for stratum, quota in zip(strata, quotas)
+        if quota > 0
+    ]
+    return np.concatenate(chosen)
+
+
 
 def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, outer_winding_idx):
     device = dr_per_winding.device
@@ -552,7 +590,7 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
 
 
 
-def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections):
+def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections, sampling_strata):
     # For pairs of annotated PCL points on different patches, constrain the spiral
     # shifted-radius gap to match the annotated winding-number difference. Each
     # cross-patch pcl exposes its attached points grouped by patch
@@ -578,14 +616,14 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # ls* is a list of 4 L-shape ij strips and pcl_chain_zyxs is ordered p1 -> p2.
     strip_pairs = []
 
-    # Single-point pcls (possible only for winding_is_absolute pcls) can't form a
-    # cross-patch pair, so exclude them from the candidate pool before sampling.
-    candidate_pcls = [pcl for pcl in point_collections if len(pcl['points']) > 1]
-    num_pcls_per_step = min(cfg['rel_winding_num_pcls'], len(candidate_pcls))
+    # sampling_strata indexes into point_collections and already excludes single-point
+    # pcls (possible only for winding_is_absolute pcls), which can't form a cross-patch
+    # pair; see the build_pcl_sampling_strata call in fit_spiral.main.
+    num_pcls_per_step = min(cfg['rel_winding_num_pcls'], len(sampling_strata['all']))
     if num_pcls_per_step <= 0:
         return torch.zeros([], device='cuda')
-    selected_idxs = np.random.choice(len(candidate_pcls), num_pcls_per_step, replace=False)
-    selected_pcls = [candidate_pcls[i] for i in selected_idxs]
+    selected_idxs = _choose_pcl_indices(sampling_strata, num_pcls_per_step)
+    selected_pcls = [point_collections[i] for i in selected_idxs]
 
     for pcl in selected_pcls:
         sorted_pcl_points = None
@@ -969,6 +1007,7 @@ def get_unattached_pcl_strip_losses(
     slice_to_spiral_transform,
     dr_per_winding,
     pcl_strips,
+    sampling_strata,
     get_or_build_unattached_pcl_flat,
     num_pcls_per_step,
     num_points_per_pcl,
@@ -987,8 +1026,10 @@ def get_unattached_pcl_strip_losses(
     if not pcl_strips:
         return zero, zero
 
-    num_to_sample = min(num_pcls_per_step, len(pcl_strips))
-    chosen = np.random.choice(len(pcl_strips), num_to_sample, replace=False)
+    num_to_sample = min(num_pcls_per_step, len(sampling_strata['all']))
+    if num_to_sample <= 0:
+        return zero, zero
+    chosen = _choose_pcl_indices(sampling_strata, num_to_sample)
 
     flat = get_or_build_unattached_pcl_flat(pcl_strips, device)
     if flat is None or flat['total'] == 0:
