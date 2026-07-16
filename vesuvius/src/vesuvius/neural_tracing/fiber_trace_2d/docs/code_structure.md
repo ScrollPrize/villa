@@ -73,7 +73,9 @@ side/top strip input loading.
   rounded output-space line voxels; JSON/array records supervise only the
   sampled CP neighborhood. NML line targets are not radius-expanded tubes.
   Direction labels use the six Lasagna 3x2 channels, and presence negatives
-  are balanced in the valid interior.
+  are balanced against routed positives. CP-only samples keep the
+  shift-derived presence edge exclusion; NML dense-line samples supervise
+  presence across the full valid patch.
 - Prefetch uses the same explicit coordinate path as training and collects
   VC3D chunk dependencies instead of conservative zarr crop bboxes.
 
@@ -223,15 +225,18 @@ side/top strip input loading.
   corresponding dense test sheet count. Each sample block uses five rows: the
   sampled CP's three principal planes, a longitudinal slice containing the GT
   CP tangent, and a perpendicular/cross slice whose plane normal is the GT CP
-  tangent. Each row has five columns: volume image with projected GT line and
+  tangent. Each row has seven columns: volume image with projected GT line and
   predicted CP direction overlay where applicable, target/context presence,
   branch presence for the output whose decoded direction is closer to the
-  slice normal, other branch presence, and the closer branch presence scaled by
-  `abs(dot(axis, normal))`. The GT line overlay draws target-line portions
-  within 2 voxels of the displayed principal slice plane. The target/context
-  presence panel is max-pooled in 3D for visualization only and also draws the
-  carried transformed line segments for CP-only JSON/test fibers; the loss
-  target is unchanged. The predicted CP direction is drawn as a thin
+  slice normal, other branch presence, max branch presence, min branch
+  presence, and average branch presence. The GT line overlay draws target-line
+  portions within 2 voxels of the displayed principal slice plane. The two
+  oblique rows project/rasterize the carried transformed line segments into
+  the oblique slice frame for both the image overlay and target/context panel.
+  The target/context presence panel is max-pooled for visualization only;
+  principal rows max-pool in 3D and oblique rows thicken the projected
+  oblique-frame raster in 2D. The loss target is unchanged. The predicted CP
+  direction is drawn as a thin
   anti-aliased line whose length is scaled by the in-slice projection
   magnitude, so directions pointing out of the slice appear shorter.
 - Configured dense 3D tests write `test_sample_3d/principal_slices` using the

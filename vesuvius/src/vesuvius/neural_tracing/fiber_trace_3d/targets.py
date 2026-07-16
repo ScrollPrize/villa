@@ -50,6 +50,7 @@ def _presence_loss_mask(
     *,
     patch_shape: tuple[int, int, int],
     config: FiberTrace3DConfig,
+    target_modes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     presence_mask = valid_mask.clone()
     edge_margin = config.presence_negative_edge_margin_voxels
@@ -69,7 +70,14 @@ def _presence_loss_mask(
             & (xx >= edge_margin)
             & (xx < patch_shape[2] - edge_margin)
         )
-        presence_mask = presence_mask & interior.view(1, 1, *patch_shape)
+        interior = interior.view(1, 1, *patch_shape)
+        if target_modes is None:
+            presence_mask = presence_mask & interior
+        else:
+            edge_limited = (
+                target_modes.to(device=device, dtype=torch.long) == _TARGET_MODE_CP_ONLY
+            ).view(-1, 1, 1, 1, 1)
+            presence_mask = presence_mask & (~edge_limited | interior)
     return presence_mask
 
 
@@ -333,6 +341,7 @@ def materialize_targets(
         batch.valid_mask.to(dtype=torch.bool),
         patch_shape=patch_shape,
         config=config,
+        target_modes=batch.target_modes,
     )
     if profile:
         _sync_if_cuda(device)

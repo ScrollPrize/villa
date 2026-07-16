@@ -1,11 +1,9 @@
-# Merge Fiber 3D Extension And Adapt Multi-Dir Config Status
+# 3D Multi-Dir TensorBoard Presence And Oblique Slice Visualization Status
 
 - [x] Read local `fiber_trace_2d/AGENTS.md` workflow.
-- [x] Inspect current branch state and `fiber-3d-ext` changes.
-- [x] Merge `fiber-3d-ext` with `--no-commit` for reviewable conflict
-  resolution.
-- [x] Reapply the multi-direction 3D training changes from the merge autostash.
-- [x] Exclude unrelated old stash conflicts from this merge.
-- [x] Adapt `train_s1a_nml_all_64_sd2.json` to two direction/presence branches.
-- [x] Resolve active planning doc conflicts.
-- [x] Run validation commands.
+- [x] Inspect 3D sample-sheet and oblique-slice visualization code.
+- [x] Replace normal-weighted presence with max/min/average aggregate columns.
+- [x] Fix dense-line/NML transformed CP tangent metadata.
+- [x] Project/rasterize GT line metadata in oblique slice coordinates.
+- [x] Update specs/docs/changelog/task log.
+- [x] Run focused validation commands.

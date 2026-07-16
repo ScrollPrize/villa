@@ -76,6 +76,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _make_test_loader_raw_config,
     _make_train_sample_3d_contact_sheet,
     _make_train_sample_3d_sheet,
+    _oblique_line_presence_for_display,
     _resolve_dense_test_selection,
     _resolve_prefetch_sample_count,
     _training_sample_index_limit,
@@ -177,7 +178,11 @@ def _native_trace_record(
     )
 
 
-def _long_segment_loader(*, source_format: str | None = None) -> FiberTrace3DLoader:
+def _long_segment_loader(
+    *,
+    source_format: str | None = None,
+    presence_negative_edge_margin_voxels: int | None = None,
+) -> FiberTrace3DLoader:
     z, y, x = np.meshgrid(
         np.arange(96, dtype=np.float32),
         np.arange(96, dtype=np.float32),
@@ -185,25 +190,28 @@ def _long_segment_loader(*, source_format: str | None = None) -> FiberTrace3DLoa
         indexing="ij",
     )
     volume = z * 0.01 + y * 0.1 + x
-    config = config_from_mapping(
-        {
-            "batch_size": 1,
-            "patch_shape_zyx": [16, 16, 16],
-            "seed": 11,
-            "cp_margin_voxels": 3,
-            "presence_radius_voxels": 1.5,
-            "image_normalization": "none",
-            "augment_enabled": False,
-            "round_source_to_chunk_boundaries": False,
-            "_array_records": [
-                {
-                    "volume": volume,
-                    "fiber": _long_segment_fiber(source_format=source_format),
-                    "volume_path": "synthetic",
-                }
-            ],
-        }
-    )
+    raw = {
+        "batch_size": 1,
+        "patch_shape_zyx": [16, 16, 16],
+        "seed": 11,
+        "cp_margin_voxels": 3,
+        "presence_radius_voxels": 1.5,
+        "image_normalization": "none",
+        "augment_enabled": False,
+        "round_source_to_chunk_boundaries": False,
+        "_array_records": [
+            {
+                "volume": volume,
+                "fiber": _long_segment_fiber(source_format=source_format),
+                "volume_path": "synthetic",
+            }
+        ],
+    }
+    if presence_negative_edge_margin_voxels is not None:
+        raw["presence_negative_edge_margin_voxels"] = int(
+            presence_negative_edge_margin_voxels
+        )
+    config = config_from_mapping(raw)
     return FiberTrace3DLoader(config)
 
 
@@ -484,6 +492,48 @@ def test_loader_clips_long_label_segments_to_patch_domain() -> None:
     assert batch.presence_target[0, 0, int(cp[0]), off_line_y, far_on_segment_x] == 0.0
 
 
+def test_nml_dense_line_presence_mask_covers_patch_edges() -> None:
+    loader = _long_segment_loader(
+        source_format="nml",
+        presence_negative_edge_margin_voxels=4,
+    )
+    batch = _load_materialized_batch(loader, 0, sample_mode="flat")
+
+    assert int(batch.target_modes[0]) == _TARGET_MODE_DENSE_LINE
+    cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
+    z = int(cp[0])
+    y = int(cp[1])
+    assert bool(batch.presence_mask[0, 0, z, y, 0])
+    assert batch.presence_target[0, 0, z, y, 0] > 0.5
+    assert bool(batch.presence_mask[0, 0, 0, 0, 0])
+    assert batch.presence_target[0, 0, 0, 0, 0] == 0.0
+
+
+def test_nml_dense_line_batch_keeps_cp_tangent_for_oblique_visuals() -> None:
+    loader = _long_segment_loader(source_format="nml")
+    raw_batch = loader.load_batch(0, sample_mode="flat")
+
+    assert int(raw_batch.target_modes[0]) == _TARGET_MODE_DENSE_LINE
+    assert torch.allclose(
+        raw_batch.target_tangent_zyx[0],
+        torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32),
+        atol=1.0e-5,
+    )
+
+
+def test_cp_only_presence_mask_keeps_edge_exclusion() -> None:
+    loader = _long_segment_loader(
+        source_format=None,
+        presence_negative_edge_margin_voxels=4,
+    )
+    batch = _load_materialized_batch(loader, 0, sample_mode="flat")
+
+    assert int(batch.target_modes[0]) == _TARGET_MODE_CP_ONLY
+    assert not bool(batch.presence_mask[0, 0, 0, 0, 0])
+    cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
+    assert bool(batch.presence_mask[0, 0, int(cp[0]), int(cp[1]), int(cp[2])])
+
+
 def test_loader_uses_cp_only_supervision_for_non_nml_fibers() -> None:
     loader = _long_segment_loader(source_format=None)
     raw_batch = loader.load_batch(0, sample_mode="flat")
@@ -539,7 +589,7 @@ def test_train_sample_3d_sheet_contains_principal_slice_panels() -> None:
     assert sheet.shape[2] == 3
     assert sheet.dtype == np.uint8
     assert sheet.shape[0] > 16
-    assert sheet.shape[1] == 16 * 5 + 4 * 4
+    assert sheet.shape[1] == 16 * 7 + 6 * 4
     first_image_panel = sheet[:16, :16]
     colored = (
         (first_image_panel[..., 0] != first_image_panel[..., 1])
@@ -786,7 +836,7 @@ def test_train_sample_3d_sheet_has_branch_presence_columns_and_line_overlay() ->
 
     patch = int(batch.volume.shape[-1])
     gap = 4
-    assert sheet.shape[1] == patch * 5 + 4 * gap
+    assert sheet.shape[1] == patch * 7 + 6 * gap
     first_image_panel = sheet[:patch, :patch]
     colored = (
         (first_image_panel[..., 0] != first_image_panel[..., 1])
@@ -808,14 +858,50 @@ def test_branch_presence_view_selects_output_closer_to_slice_normal() -> None:
     sampled[..., 7:13] = x_dir
     sampled[..., 13] = 0.75
 
-    close, other, weighted = _branch_presence_views_from_sampled_output(
+    close, other, max_p, min_p, avg_p = _branch_presence_views_from_sampled_output(
         sampled,
         normal_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
     )
 
     assert np.allclose(close, 0.25)
     assert np.allclose(other, 0.75)
-    assert np.allclose(weighted, 0.25)
+    assert np.allclose(max_p, 0.75)
+    assert np.allclose(min_p, 0.25)
+    assert np.allclose(avg_p, 0.5)
+
+
+def test_oblique_line_presence_uses_slice_frame_axes() -> None:
+    center = np.asarray([8.0, 8.0, 8.0], dtype=np.float32)
+    segment_start = np.asarray([[8.0, 8.0, 0.0]], dtype=np.float32)
+    segment_end = np.asarray([[8.0, 8.0, 16.0]], dtype=np.float32)
+
+    cross = _oblique_line_presence_for_display(
+        height=17,
+        width=17,
+        segments_start_zyx=segment_start,
+        segments_end_zyx=segment_end,
+        center_zyx=center,
+        row_axis_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        col_axis_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        threshold_voxels=1.0,
+    )
+    tangent = _oblique_line_presence_for_display(
+        height=17,
+        width=17,
+        segments_start_zyx=segment_start,
+        segments_end_zyx=segment_end,
+        center_zyx=center,
+        row_axis_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        col_axis_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        normal_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        threshold_voxels=1.0,
+    )
+
+    cross_cols = np.nonzero(cross > 0.0)[1]
+    tangent_cols = np.nonzero(tangent > 0.0)[1]
+    assert int(cross_cols.max() - cross_cols.min()) <= 4
+    assert int(tangent_cols.max() - tangent_cols.min()) >= 14
 
 
 def test_panel_line_aa_draws_fractional_thin_line() -> None:
@@ -1209,6 +1295,49 @@ def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:
     assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, 0]) > 0
     assert output.grad[0, 6, 0, 0, 0] == 0.0
     assert output.grad[0, 13, 0, 0, 0] != 0.0
+    assert output.grad[0, 6, 0, 0, 1] != 0.0
+    assert output.grad[0, 13, 0, 0, 1] != 0.0
+
+
+def test_3d_positive_presence_ignores_masked_sparse_points() -> None:
+    target_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    output = torch.zeros((1, 14, 1, 1, 2), dtype=torch.float32)
+    output[0, 0:6, 0, 0, 0] = target_dir
+    output[0, 7:13, 0, 0, 0] = target_dir
+    output[0, 6, 0, 0, :] = torch.tensor([0.8, 0.4], dtype=torch.float32)
+    output[0, 13, 0, 0, :] = torch.tensor([0.9, 0.3], dtype=torch.float32)
+    output.requires_grad_()
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((1, 1, 1, 1, 2), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
+        cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        sample_indices=torch.zeros((1,), dtype=torch.long),
+        record_indices=torch.zeros((1,), dtype=torch.long),
+        control_point_indices=torch.zeros((1,), dtype=torch.long),
+        fiber_paths=("synthetic.json",),
+        target_modes=torch.zeros((1,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((1,), dtype=torch.long),
+        target_segment_counts=torch.zeros((1,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        direction_indices_bzyx=torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+        direction_target_sparse=target_dir.view(1, 6),
+        direction_weight_sparse=torch.ones((1, 6), dtype=torch.float32),
+        presence_target=torch.tensor([1.0, 0.0], dtype=torch.float32).view(1, 1, 1, 1, 2),
+        presence_mask=torch.tensor([False, True], dtype=torch.bool).view(1, 1, 1, 1, 2),
+    )
+
+    losses = compute_losses(output, batch, direction_weight=0.0, presence_weight=1.0)
+    losses["total"].backward()
+
+    assert output.grad[0, 6, 0, 0, 0] == 0.0
+    assert output.grad[0, 13, 0, 0, 0] == 0.0
     assert output.grad[0, 6, 0, 0, 1] != 0.0
     assert output.grad[0, 13, 0, 0, 1] != 0.0
 

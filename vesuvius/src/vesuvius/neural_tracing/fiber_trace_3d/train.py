@@ -258,12 +258,22 @@ def compute_losses(
         agreement = torch.abs(torch.sum(selected_axis * target_axis, dim=-1)).clamp(0.0, 1.0)
         angle_mean_deg = torch.rad2deg(torch.acos(agreement)).mean()
         selected_presence = pred_presence_sparse[row_index, selected_branch]
+        positive_presence_mask = batch.presence_mask[
+            indices[:, 0],
+            0,
+            indices[:, 1],
+            indices[:, 2],
+            indices[:, 3],
+        ]
         positive_presence_bce = F.binary_cross_entropy(
             selected_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
             torch.ones_like(selected_presence),
             reduction="none",
         )
-        positive_presence_loss = positive_presence_bce.mean()
+        positive_presence_loss = _masked_mean(
+            positive_presence_bce,
+            positive_presence_mask,
+        )
         selected_score_mean = score[row_index, selected_branch].mean()
         branch0_fraction = (selected_branch == 0).to(dtype=torch.float32).mean()
         branch1_fraction = (
@@ -288,6 +298,8 @@ def compute_losses(
         reduction="none",
     )
     has_positive = int(indices.shape[0]) > 0
+    if int(indices.shape[0]) > 0:
+        has_positive = bool(positive_presence_mask.any())
     has_negative = bool(negative_mask.any())
     if has_positive and has_negative:
         presence_loss = 0.5 * positive_presence_loss + 0.5 * _masked_mean(
@@ -877,7 +889,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             "then GT-tangent and GT-perpendicular oblique slices. "
             "Columns: image with projected GT line and predicted CP direction where applicable, "
             "target/context presence, branch presence closer to the slice normal, other branch presence, "
-            "and normal-weighted closer-branch presence. "
+            "max branch presence, min branch presence, and average branch presence. "
             "Multiple batch samples are concatenated side by side when configured.",
             0,
         )
@@ -887,7 +899,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             "then GT-tangent and GT-perpendicular oblique slices. "
             "Columns: image with projected GT line and predicted CP direction where applicable, "
             "target/context presence, branch presence closer to the slice normal, other branch presence, "
-            "and normal-weighted closer-branch presence. "
+            "max branch presence, min branch presence, and average branch presence. "
             "Multiple batch samples are concatenated side by side when configured.",
             0,
         )
@@ -1356,6 +1368,115 @@ def _draw_projected_gt_line(
             prev_rc = rc
 
 
+def _project_oblique_point_rc_dist(
+    point_zyx: np.ndarray,
+    *,
+    center_zyx: np.ndarray,
+    row_axis_zyx: np.ndarray,
+    col_axis_zyx: np.ndarray,
+    normal_zyx: np.ndarray,
+    height: int,
+    width: int,
+) -> tuple[np.ndarray, float]:
+    rel = np.asarray(point_zyx, dtype=np.float32) - np.asarray(center_zyx, dtype=np.float32)
+    row_axis = _unit_np(row_axis_zyx, fallback=(0.0, 1.0, 0.0))
+    col_axis = _unit_np(col_axis_zyx, fallback=(0.0, 0.0, 1.0))
+    normal = _unit_np(normal_zyx, fallback=(1.0, 0.0, 0.0))
+    rc = np.asarray(
+        [
+            float(np.dot(rel, row_axis)) + float(height - 1) * 0.5,
+            float(np.dot(rel, col_axis)) + float(width - 1) * 0.5,
+        ],
+        dtype=np.float32,
+    )
+    distance = float(np.dot(rel, normal))
+    return rc, distance
+
+
+def _draw_projected_oblique_gt_line(
+    panel: np.ndarray,
+    segments_start_zyx: np.ndarray,
+    segments_end_zyx: np.ndarray,
+    *,
+    center_zyx: np.ndarray,
+    row_axis_zyx: np.ndarray,
+    col_axis_zyx: np.ndarray,
+    normal_zyx: np.ndarray,
+    threshold_voxels: float = 2.0,
+    color: tuple[int, int, int] = (0, 255, 80),
+) -> None:
+    if segments_start_zyx.size == 0:
+        return
+    height = int(panel.shape[0])
+    width = int(panel.shape[1])
+    threshold = float(threshold_voxels)
+    for start, end in zip(segments_start_zyx, segments_end_zyx, strict=False):
+        start = np.asarray(start, dtype=np.float32)
+        end = np.asarray(end, dtype=np.float32)
+        delta = end - start
+        max_delta = float(np.max(np.abs(delta)))
+        if not math.isfinite(max_delta):
+            continue
+        steps = max(1, int(math.ceil(max_delta * 2.0)))
+        prev_rc: np.ndarray | None = None
+        for index in range(steps + 1):
+            t = float(index) / float(steps)
+            point = start * (1.0 - t) + end * t
+            rc, distance = _project_oblique_point_rc_dist(
+                point,
+                center_zyx=center_zyx,
+                row_axis_zyx=row_axis_zyx,
+                col_axis_zyx=col_axis_zyx,
+                normal_zyx=normal_zyx,
+                height=height,
+                width=width,
+            )
+            if abs(distance) > threshold:
+                prev_rc = None
+                continue
+            if prev_rc is not None:
+                _draw_panel_line(panel, prev_rc, rc, color)
+            else:
+                _draw_panel_point(panel, int(round(float(rc[0]))), int(round(float(rc[1]))), color)
+            prev_rc = rc
+
+
+def _oblique_line_presence_for_display(
+    *,
+    height: int,
+    width: int,
+    segments_start_zyx: np.ndarray,
+    segments_end_zyx: np.ndarray,
+    center_zyx: np.ndarray,
+    row_axis_zyx: np.ndarray,
+    col_axis_zyx: np.ndarray,
+    normal_zyx: np.ndarray,
+    threshold_voxels: float = 2.0,
+) -> np.ndarray:
+    panel = np.zeros((int(height), int(width), 3), dtype=np.uint8)
+    _draw_projected_oblique_gt_line(
+        panel,
+        segments_start_zyx,
+        segments_end_zyx,
+        center_zyx=center_zyx,
+        row_axis_zyx=row_axis_zyx,
+        col_axis_zyx=col_axis_zyx,
+        normal_zyx=normal_zyx,
+        threshold_voxels=threshold_voxels,
+        color=(255, 255, 255),
+    )
+    presence = (panel[..., 0] > 0).astype(np.float32)
+    if not bool(np.any(presence > 0.0)):
+        return presence
+    pooled = F.max_pool2d(
+        torch.as_tensor(presence).view(1, 1, int(height), int(width)),
+        kernel_size=3,
+        stride=1,
+        padding=1,
+    )[0, 0]
+    return pooled.numpy()
+
+
 def _line_presence_for_display(
     patch_shape: tuple[int, int, int],
     segments_start_zyx: np.ndarray,
@@ -1502,7 +1623,7 @@ def _branch_presence_views(
     presence_khw: np.ndarray,
     *,
     normal_zyx: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     axes = np.asarray(axes_xyz_khw3, dtype=np.float32)
     presence = np.asarray(presence_khw, dtype=np.float32)
     if axes.ndim != 4 or axes.shape[-1] != 3:
@@ -1522,15 +1643,19 @@ def _branch_presence_views(
     rr = np.arange(h).reshape(h, 1)
     cc = np.arange(w).reshape(1, w)
     close = presence[close_index, rr, cc]
-    close_dot = dots[close_index, rr, cc]
     if branch_count > 1:
         other = presence[other_index, rr, cc]
     else:
         other = np.zeros_like(close, dtype=np.float32)
+    max_presence = np.max(presence, axis=0)
+    min_presence = np.min(presence, axis=0)
+    avg_presence = np.mean(presence, axis=0, dtype=np.float32)
     return (
         close.astype(np.float32, copy=False),
         other.astype(np.float32, copy=False),
-        (close * close_dot).astype(np.float32, copy=False),
+        max_presence.astype(np.float32, copy=False),
+        min_presence.astype(np.float32, copy=False),
+        avg_presence.astype(np.float32, copy=False),
     )
 
 
@@ -1538,7 +1663,7 @@ def _branch_presence_views_from_sampled_output(
     sampled_hwc: torch.Tensor,
     *,
     normal_zyx: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     values = sampled_hwc.to(dtype=torch.float32)
     channels = int(values.shape[-1])
     if channels < 7 or channels % 7 != 0:
@@ -1581,8 +1706,10 @@ def _make_oblique_sample_row(
     *,
     volume_czyx: torch.Tensor,
     valid_czyx: torch.Tensor,
-    target_czyx: torch.Tensor,
+    target_czyx: torch.Tensor | None,
     output_czyx: torch.Tensor,
+    segments_start_zyx: np.ndarray,
+    segments_end_zyx: np.ndarray,
     cp_zyx: np.ndarray,
     row_axis_zyx: np.ndarray,
     col_axis_zyx: np.ndarray,
@@ -1607,9 +1734,21 @@ def _make_oblique_sample_row(
         .numpy()
         > 0.5
     )
-    target_p = _sample_czyx_at_coords(target_czyx, coords)[..., 0].detach().cpu().numpy()
+    target_p = _oblique_line_presence_for_display(
+        height=height,
+        width=width,
+        segments_start_zyx=segments_start_zyx,
+        segments_end_zyx=segments_end_zyx,
+        center_zyx=cp_zyx,
+        row_axis_zyx=row_axis_zyx,
+        col_axis_zyx=col_axis_zyx,
+        normal_zyx=normal_zyx,
+        threshold_voxels=2.0,
+    )
+    if not bool(np.any(target_p > 0.0)) and target_czyx is not None:
+        target_p = _sample_czyx_at_coords(target_czyx, coords)[..., 0].detach().cpu().numpy()
     sampled_output = _sample_czyx_at_coords(output_czyx, coords)
-    close_p, other_p, weighted_p = _branch_presence_views_from_sampled_output(
+    close_p, other_p, max_p, min_p, avg_p = _branch_presence_views_from_sampled_output(
         sampled_output,
         normal_zyx=normal_zyx,
     )
@@ -1617,13 +1756,25 @@ def _make_oblique_sample_row(
     target_rgb = _gray_to_rgb(target_p, mask=image_valid)
     close_rgb = _gray_to_rgb(close_p, mask=image_valid)
     other_rgb = _gray_to_rgb(other_p, mask=image_valid)
-    weighted_rgb = _gray_to_rgb(weighted_p, mask=image_valid)
+    max_rgb = _gray_to_rgb(max_p, mask=image_valid)
+    min_rgb = _gray_to_rgb(min_p, mask=image_valid)
+    avg_rgb = _gray_to_rgb(avg_p, mask=image_valid)
     cp_row = int(round(float(height - 1) * 0.5))
     cp_col = int(round(float(width - 1) * 0.5))
-    for panel in (image_rgb, target_rgb, close_rgb, other_rgb, weighted_rgb):
+    _draw_projected_oblique_gt_line(
+        image_rgb,
+        segments_start_zyx,
+        segments_end_zyx,
+        center_zyx=cp_zyx,
+        row_axis_zyx=row_axis_zyx,
+        col_axis_zyx=col_axis_zyx,
+        normal_zyx=normal_zyx,
+        threshold_voxels=2.0,
+    )
+    for panel in (image_rgb, target_rgb, close_rgb, other_rgb, max_rgb, min_rgb, avg_rgb):
         _mark_slice_cp(panel, cp_row, cp_col)
     return _make_sample_sheet_row(
-        [image_rgb, target_rgb, close_rgb, other_rgb, weighted_rgb],
+        [image_rgb, target_rgb, close_rgb, other_rgb, max_rgb, min_rgb, avg_rgb],
         gap=gap,
     )
 
@@ -1726,7 +1877,7 @@ def _make_train_sample_3d_sheet(
         cp_row,
         cp_col,
     ) in slice_specs:
-        close_p, other_p, weighted_p = _branch_presence_views_from_sampled_output(
+        close_p, other_p, max_p, min_p, avg_p = _branch_presence_views_from_sampled_output(
             sampled_output,
             normal_zyx=normal_zyx,
         )
@@ -1734,7 +1885,9 @@ def _make_train_sample_3d_sheet(
         target_rgb = _gray_to_rgb(target_p, mask=image_valid)
         close_rgb = _gray_to_rgb(close_p, mask=image_valid)
         other_rgb = _gray_to_rgb(other_p, mask=image_valid)
-        weighted_rgb = _gray_to_rgb(weighted_p, mask=image_valid)
+        max_rgb = _gray_to_rgb(max_p, mask=image_valid)
+        min_rgb = _gray_to_rgb(min_p, mask=image_valid)
+        avg_rgb = _gray_to_rgb(avg_p, mask=image_valid)
         _draw_projected_gt_line(
             image_rgb,
             segments_start_zyx,
@@ -1757,10 +1910,12 @@ def _make_train_sample_3d_sheet(
         _mark_slice_cp(target_rgb, cp_row, cp_col)
         _mark_slice_cp(close_rgb, cp_row, cp_col)
         _mark_slice_cp(other_rgb, cp_row, cp_col)
-        _mark_slice_cp(weighted_rgb, cp_row, cp_col)
+        _mark_slice_cp(max_rgb, cp_row, cp_col)
+        _mark_slice_cp(min_rgb, cp_row, cp_col)
+        _mark_slice_cp(avg_rgb, cp_row, cp_col)
         rows.append(
             _make_sample_sheet_row(
-                [image_rgb, target_rgb, close_rgb, other_rgb, weighted_rgb],
+                [image_rgb, target_rgb, close_rgb, other_rgb, max_rgb, min_rgb, avg_rgb],
                 gap=gap,
             )
         )
@@ -1781,6 +1936,8 @@ def _make_train_sample_3d_sheet(
             valid_czyx=batch.valid_mask[0],
             target_czyx=target_czyx,
             output_czyx=output_sample,
+            segments_start_zyx=segments_start_zyx,
+            segments_end_zyx=segments_end_zyx,
             cp_zyx=cp_float,
             row_axis_zyx=tangent_row_axis,
             col_axis_zyx=tangent_col_axis,
@@ -1796,6 +1953,8 @@ def _make_train_sample_3d_sheet(
             valid_czyx=batch.valid_mask[0],
             target_czyx=target_czyx,
             output_czyx=output_sample,
+            segments_start_zyx=segments_start_zyx,
+            segments_end_zyx=segments_end_zyx,
             cp_zyx=cp_float,
             row_axis_zyx=cross_row_axis,
             col_axis_zyx=cross_col_axis,

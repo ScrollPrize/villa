@@ -1,65 +1,50 @@
-# Merge Fiber 3D Extension And Adapt Multi-Dir Config Plan
+# 3D Multi-Dir TensorBoard Presence And Oblique Slice Visualization Plan
 
-## Merge Resolution
+## Implementation
 
-- Merge `fiber-3d-ext` into the active `fiber-3d-multidir` branch with
-  `--no-commit` so the combined changes can be inspected before committing.
-- Keep the branch's requested-level blocking coordinate sampling changes in:
-  - `fiber_trace_2d/loader.py`
-  - `fiber_trace_2d/sampling.py`
-  - `fiber_trace_3d/trace2cp_tool.py`
-  - VC3D sampler bindings and tests under `volume-cartographer/`
-- Reapply the current multi-direction training changes in:
-  - `fiber_trace_3d/model.py`
-  - `fiber_trace_3d/train.py`
-  - 3D training configs
-  - `test_fiber_trace_3d.py`
-- Do not include unrelated old stash changes. If an old stash conflict appears,
-  keep the merge-side file and leave the stash entry intact.
-
-## Config Adaptation
-
-- Update the newly added
-  `fiber_trace_3d/configs/train_s1a_nml_all_64_sd2.json`:
-  - set `model_3d.direction_branch_count` to `2`;
-  - set `model_3d.output_channels` to `14`;
-  - keep BatchNorm explicit with `model_3d.normalization: "batch"`;
-  - give the run a distinct multi-dir name so it cannot accidentally resume or
-    overwrite old 7-channel runs.
+- Change branch-presence visualization helpers to return close-to-normal raw
+  presence, other-branch raw presence, max branch presence, min branch
+  presence, and average branch presence.
+- Update train/test TensorBoard layout text and sample-sheet assembly to use
+  seven columns: image, target/context, close, other, max, min, average.
+- Compute and store transformed CP tangents for dense-line/NML samples, not
+  only CP-only samples.
+- Project transformed line segments into oblique row/column coordinates for
+  the GT-tangent and perpendicular/cross rows.
+- Use the oblique-frame line raster for oblique target/context panels, with
+  sampled target volume only as a fallback when no segment metadata exists.
 
 ## Spec Update
 
-- Keep the existing multi-direction 3D training spec updates.
-- Keep the merged requested-level blocking coordinate sampling spec updates.
-- Add the current 64-scale S1A NML config to the multi-direction config
-  wording where relevant.
+- Document the seven-column 3D TensorBoard sheet layout.
+- Document that oblique GT overlays and target/context panels are projected in
+  the oblique slice frame.
+- Document that dense-line/NML samples carry transformed CP tangents for
+  oblique visualization construction.
 
 ## Docs Updates
 
-- Keep `docs/code_structure.md` updates from both sides:
-  - strict requested-level blocking sampler behavior;
-  - branch-aware 3D model/loss/visualization behavior.
-- Keep changelog entries for both the blocking sampler merge and multi-dir
-  training/config adaptation.
+- Update `docs/code_structure.md` 3D training visualization notes.
+- Add a changelog entry for the TensorBoard layout and oblique slice fixes.
 
 ## Testing Plan
 
-- Python compile check for touched 3D model/train/tests and Trace2CP tooling.
-- Full 3D Python regression file:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-- Focused 2D Trace2CP sampler/render tests from the merged branch:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k "trace2cp_render_sampling"`
-- JSON-load sanity check for all `fiber_trace_3d/configs/*.json`.
-- Run `git diff --check`.
+- Update existing sheet-width and branch-presence helper tests for the new
+  aggregate columns.
+- Add a regression test that NML dense-line samples keep a transformed CP
+  tangent for oblique visuals.
+- Add a regression test that oblique line presence uses row/column/normal
+  axes rather than an axis-aligned slice assumption.
+- Run:
+  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "branch_presence_view or train_sample_3d_sheet or oblique_line_presence or dense_line_batch_keeps_cp_tangent"`
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
 
 ## Changelog
 
-- Update the July 16 changelog entry to note that the 64-scale S1A NML training
-  config was adapted to the two-branch output layout.
+- Record the 3D TensorBoard presence-column update and oblique slice GT
+  projection/tangent fix.
 
 ## Deviations Or Deferrals
 
-- Do not commit the merge automatically; leave it staged/uncommitted unless the
-  user asks for a commit.
-- C++ rebuilds for the merged VC3D sampler changes may depend on the local
-  CMake/Qt state. Report clearly if not run.
+- None planned.

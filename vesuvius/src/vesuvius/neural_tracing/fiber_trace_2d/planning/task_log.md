@@ -1,44 +1,43 @@
-# Merge Fiber 3D Extension And Adapt Multi-Dir Config Task Log
+# 3D Multi-Dir TensorBoard Presence And Oblique Slice Visualization Task Log
+
+## Findings
+
+- The TensorBoard branch-presence helper returned close-to-normal raw
+  presence, other raw presence, and a normal-weighted close-presence view.
+- The two oblique rows did not draw the GT line overlay in the oblique image
+  panel.
+- Oblique target/context panels sampled the already rasterized 3D target
+  volume instead of projecting transformed line segments into the oblique
+  frame, which could make the cross slice look like it had sideways line
+  motion.
+- Dense-line/NML samples returned a zero `target_tangent_zyx`, so oblique row
+  construction fell back to a fixed default tangent instead of the local GT CP
+  tangent.
 
 ## Implementation Notes
 
-- Merged `fiber-3d-ext` into `fiber-3d-multidir` with
-  `git merge --no-commit --no-ff --autostash fiber-3d-ext`.
-- The branch merge itself applied cleanly and stopped before commit.
-- An initial `git stash pop` targeted an older unrelated stash entry and
-  produced conflicts in:
-  - `volume-cartographer/apps/VC3D/LineAnnotationController.cpp`
-  - `volume-cartographer/core/test/CMakeLists.txt`
-- Those two conflicts were resolved to the merge-side content. The older stash
-  entry was kept, so unrelated old VC annotation work was not pulled into this
-  merge and was not discarded from the stash list.
-- The intended `MERGE_AUTOSTASH` was then applied explicitly. It conflicted
-  only in active planning docs and was resolved by keeping this current
-  merge/config-adaptation task as the active task.
-- The newly added
-  `fiber_trace_3d/configs/train_s1a_nml_all_64_sd2.json` now uses:
-  - `model_3d.direction_branch_count: 2`
-  - `model_3d.output_channels: 14`
-  - `model_3d.normalization: "batch"`
-  - `training.run_name: "s1a_nml_all_3d_64_2_multidir"`
+- Branch-presence visualization now returns raw close/other branch presence
+  plus raw max/min/average branch presence aggregates.
+- Train/test sample sheets now use seven columns: image, target/context,
+  close, other, max, min, average.
+- Dense-line/NML target specs now compute the transformed CP tangent using the
+  same source-to-output tangent mapping as CP-only specs.
+- Oblique rows now project transformed line segments into their row/column
+  axes and gate by distance to the oblique plane normal. The same projection is
+  used for image overlays and target/context panels.
+- Oblique target/context panels fall back to sampled target volume only when no
+  transformed segment metadata produces a visible projected line.
 
 ## Deviations Or Deferrals
 
-- The merge is intentionally left uncommitted.
-- Native/projected Trace2CP inference still uses branch 0 for model output
-  interpretation. Multi-branch inference selection remains deferred.
-- C++ build validation for the merged VC3D requested-level sampler changes has
-  not been run yet in this task.
+- None.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/sampling.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/model.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
   passed.
-- `PYTHONPATH=vesuvius/src:. python - <<'PY' ... load_config(...) ...`
-  passed for `loader_example.json`, `train_s1a_nml_all.json`, and
-  `train_s1a_nml_all_64_sd2.json`.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "branch_presence_view or train_sample_3d_sheet or oblique_line_presence or dense_line_batch_keeps_cp_tangent"`
+  passed: 6 passed, 60 deselected.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed: 61 passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k "trace2cp_render_sampling"`
-  passed: 2 passed, 271 deselected.
+  passed: 66 passed.
 - `git diff --check` passed.

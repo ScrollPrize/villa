@@ -1,19 +1,12 @@
-# Merge Fiber 3D Extension And Adapt Multi-Dir Config
+# 3D Multi-Dir TensorBoard Presence And Oblique Slice Visualization
 
-Merge the current `fiber-3d-ext` branch into the active multi-direction 3D
-fiber training branch, then adapt the newly added actual 64-scale S1A NML
-training config to the multi-direction model output.
+Update the 3D multi-direction training/test TensorBoard sample sheet:
 
-Requirements:
-
-- Preserve the `fiber-3d-ext` requested-level blocking coordinate sampling and
-  native 3D Trace2CP rendering changes.
-- Preserve the current multi-direction 3D fiber direction/presence training
-  implementation.
-- Adapt the newly added
-  `fiber_trace_3d/configs/train_s1a_nml_all_64_sd2.json` config to use two
-  direction/presence branches.
-- Resolve merge conflicts without pulling unrelated old stash work into the
-  branch.
-- Run focused validation for the touched 3D Python training path and the merged
-  Trace2CP/native tests.
+- Remove the normal-weighted closer-branch presence column.
+- Add raw aggregate branch-presence columns for max, min, and average
+  presence.
+- Keep the close-to-slice-normal branch and other-branch raw presence columns.
+- Fix the two additional oblique rows so GT line overlays and target/context
+  panels are projected/rasterized in the actual oblique slice frame.
+- Ensure dense-line/NML samples carry the transformed CP tangent needed to
+  construct the GT-tangent and perpendicular/cross oblique rows.
