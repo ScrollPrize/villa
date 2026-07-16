@@ -746,7 +746,7 @@ def _select_nearest_band(bands, target_phase, num_pairs, margin, max_distance):
     no_band = ~torch.isfinite(minimum)
     ambiguity = ~no_band & ((second - minimum) < margin)
     too_far = ~no_band & (minimum > max_distance)
-    return candidate, minimum, no_band, ambiguity, too_far
+    return candidate, minimum, second, no_band, ambiguity, too_far
 
 
 def _sample_spacing_pairs(
@@ -826,9 +826,11 @@ def get_phase_spacing_loss(
     n_bands = pair.numel()
     margin = float(cfg['dense_spacing_phase_anchor_margin'])
     max_distance = float(cfg['dense_spacing_phase_anchor_max_distance'])
-    anchor, _, no_band, anchor_ambiguous, anchor_far = _select_nearest_band(
+    (anchor, anchor_distance, anchor_second_distance, no_band,
+     anchor_ambiguous, anchor_far) = _select_nearest_band(
         bands, k, num_pairs, margin, max_distance)
-    outer_candidate, _, outer_no_band, outer_ambiguous, outer_far = _select_nearest_band(
+    (outer_candidate, outer_distance, outer_second_distance, outer_no_band,
+     outer_ambiguous, outer_far) = _select_nearest_band(
         bands, k + pair_m, num_pairs, margin, max_distance)
 
     ray_rejected = ray['too_long'] | ray['step_violation']
@@ -966,6 +968,32 @@ def get_phase_spacing_loss(
             'dense_spacing_phase_mean_enumerated_ordinals': float(
                 pair_corr_count.mean().item()),
         }
+        for label, distance, second_distance in (
+            ('anchor', anchor_distance, anchor_second_distance),
+            ('outer', outer_distance, outer_second_distance),
+        ):
+            finite = torch.isfinite(distance)
+            if finite.any():
+                distance_q = torch.quantile(
+                    distance[finite], torch.tensor([0.5, 0.9, 0.95], device=device))
+                metrics[f'dense_spacing_phase_{label}_distance_p50'] = float(
+                    distance_q[0].item())
+                metrics[f'dense_spacing_phase_{label}_distance_p90'] = float(
+                    distance_q[1].item())
+                metrics[f'dense_spacing_phase_{label}_distance_p95'] = float(
+                    distance_q[2].item())
+            finite_clearance = finite & torch.isfinite(second_distance)
+            if finite_clearance.any():
+                clearance = (
+                    second_distance[finite_clearance] - distance[finite_clearance])
+                clearance_q = torch.quantile(
+                    clearance, torch.tensor([0.1, 0.5, 0.9], device=device))
+                metrics[f'dense_spacing_phase_{label}_clearance_p10'] = float(
+                    clearance_q[0].item())
+                metrics[f'dense_spacing_phase_{label}_clearance_p50'] = float(
+                    clearance_q[1].item())
+                metrics[f'dense_spacing_phase_{label}_clearance_p90'] = float(
+                    clearance_q[2].item())
         if n_bands:
             graze_fraction = float(graze.float().mean().item())
             normal_bad_fraction = float((~bands['normal_valid']).float().mean().item())
@@ -998,6 +1026,11 @@ def get_phase_spacing_loss(
         if rho.numel():
             abs_rho = rho.abs()
             metrics['dense_spacing_phase_residual_mean_abs'] = float(abs_rho.mean().item())
+            rho_q = torch.quantile(
+                abs_rho, torch.tensor([0.5, 0.9, 0.95], device=device))
+            metrics['dense_spacing_phase_residual_abs_p50'] = float(rho_q[0].item())
+            metrics['dense_spacing_phase_residual_abs_p90'] = float(rho_q[1].item())
+            metrics['dense_spacing_phase_residual_abs_p95'] = float(rho_q[2].item())
             corr_j = j[corr_index]
             for ordinal in torch.unique(corr_j).tolist():
                 ordinal_mask = corr_j == ordinal

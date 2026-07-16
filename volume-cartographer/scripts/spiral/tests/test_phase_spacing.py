@@ -390,22 +390,24 @@ class TestProductionNormalConvention:
         nx_root = zarr.open(f'{base}/las_008_nx.ome.zarr', mode='r')
         ny_root = zarr.open(f'{base}/las_008_ny.ome.zarr', mode='r')
         sdt_root = zarr.open(f'{base}/las_008_surf_sdt.ome.zarr', mode='r')
-        nx, ny, sdt = nx_root['4'], ny_root['4'], sdt_root['3']
+        nx, ny, sdt = nx_root['4'], ny_root['4'], sdt_root['1']
         assert nx.dtype == ny.dtype == np.dtype('uint8')
         assert nx.shape == ny.shape
-        # Normal group 4 is 16-wv; SDT group 3 is 8-wv.
+        # Normal group 4 is 16 source voxels = 4 working voxels after the
+        # lasagna scale conversion. SDT group 1 is 2 working voxels, hence the
+        # 2:1 index mapping below.
         assert nx_root.attrs['multiscales'][0]['datasets'][0][
             'coordinateTransformations'][0]['scale'] == [16.0, 16.0, 16.0]
+        assert sdt_root.attrs['multiscales'][0]['datasets'][0][
+            'coordinateTransformations'][0]['scale'] == [2.0, 2.0, 2.0]
         assert sdt_root.attrs['nodata_value'] == 0
         assert sdt_root.attrs['sign'] == 'positive_outside'
 
         plus_scores, flipped_scores = [], []
-        encoded_nodata = 0
-        for zn, y0, x0 in ((600, 180, 180), (800, 220, 220)):
+        for zn, y0, x0 in ((2000, 769, 961), (2200, 1249, 1201)):
             size = 96
             nx_u8 = np.asarray(nx[zn, y0:y0 + size, x0:x0 + size])
             ny_u8 = np.asarray(ny[zn, y0:y0 + size, x0:x0 + size])
-            encoded_nodata += int(((nx_u8 == 0) & (ny_u8 == 0)).sum())
             zs, ys, xs = zn * 2, y0 * 2, x0 * 2
             slab = np.asarray(
                 sdt[zs - 1:zs + 2,
@@ -434,5 +436,7 @@ class TestProductionNormalConvention:
             plus_scores.extend(plus[valid].tolist())
             flipped_scores.extend(flipped[valid].tolist())
         assert len(plus_scores) >= 100
-        assert encoded_nodata > 0
+        nodata_nx = np.asarray(nx[2000, :96, :96])
+        nodata_ny = np.asarray(ny[2000, :96, :96])
+        assert ((nodata_nx == 0) & (nodata_ny == 0)).any()
         assert np.mean(plus_scores) > np.mean(flipped_scores) + 0.05
