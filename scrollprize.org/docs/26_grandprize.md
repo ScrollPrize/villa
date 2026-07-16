@@ -70,8 +70,7 @@ In the 18th century the scrolls were discovered. Hundreds of them are now stored
 On March 15th, 2023, Nat Friedman, Daniel Gross, and Brent Seales launched the <a href="https://scrollprize.org">Vesuvius Challenge</a> to answer this question. Scrolls from the Institut de France were imaged at the Diamond Light Source particle accelerator near Oxford. We released these high-resolution CT scans of the scrolls, and we offered more than \$1M in prizes, put forward by many generous donors.
 
 <div className="flex flex-wrap mb-4">
-  <div className="w-[41%] mr-4 mb-2"><img src="/img/grandprize/seth-diamond.webp" className="w-[100%]" alt="Seth Parker scanning a scroll at the Diamond Light Source particle accelerator."/><figcaption className="mt-[-6px]">Seth Parker <a href="https://scrollprize.substack.com/p/new-scans-of-herculaneum-papyri-at">scanning</a> a scroll at the <a href="https://www.diamond.ac.uk/">Diamond Light Source</a> particle accelerator.</figcaption></div>
-  <div className="w-[54%]">
+  <div className="w-[100%] max-w-[500px]">
     <video autoPlay playsInline loop muted className="w-[100%]" poster="/img/tutorials/scanning2.webp">
       <source src="/img/tutorials/scanning2.webm" type="video/webm"/>
     </video>
@@ -367,11 +366,6 @@ With Vesuvius Challenge, we hope not only to solve the problem of reading the He
 </div>
 
 2. **A solid starting point.** The foundation was laid by <a href="https://www2.cs.uky.edu/dri/">Dr. Seales and his team</a>. They spent two decades making the first scroll scans, building <a href="community_projects#volume-cartographer">Volume Cartographer</a>, demonstrating the <a href="https://www2.cs.uky.edu/dri/the-scroll-from-en-gedi/">first success</a> in virtual unwrapping, and <a href="https://uknowledge.uky.edu/cs_etds/138/">proving</a> that Herculaneum ink can be detected in CT.
-
-<div className="mb-4 ml-8">
-  <img src="/img/landing/brent1.webp" className="w-[100%] max-w-[600px]" alt="Brent Seales, Seth Parker, and Michael Drakopoulos at the particle accelerator."/>
-  <figcaption className="mt-[-6px]">Brent Seales, Seth Parker, and Michael Drakopoulos at the particle accelerator.</figcaption>
-</div>
 
 3. **Blending competition and cooperation.** A Grand Prize on its own would suffer from information “hoarding”: no one would share their intermediate work, because others could take it and use it to beat them to the finish line. Without information sharing, the probability of a single team solving all the puzzle pieces to win the Grand Prize would be dramatically lower.
 
