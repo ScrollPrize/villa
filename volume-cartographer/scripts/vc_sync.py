@@ -15,6 +15,15 @@ Automatically ignores:
 - Files matching backup patterns (see BACKUP_PATTERNS)
 - Directories named 'backups' (unless --sync-backups is specified)
 
+Change detection compares file size and mtime locally (1-second tolerance)
+and size + ETag on S3, so a local edit that preserves both size and mtime is
+invisible until the file changes again.
+
+'update' refreshes tracking non-destructively (records files already in sync,
+prunes entries for files gone from both sides) and never hides a pending
+difference. 'reset' stamps the current state as the synced baseline, which
+discards pending differences — it asks for confirmation.
+
 Usage:
     python s3_sync.py init <directory> <s3_bucket> <s3_prefix> [--profile=<aws_profile>]
     python s3_sync.py status <directory> [--verbose] [--sync-backups]
@@ -75,6 +84,28 @@ class SyncAction(Enum):
 def is_backup_file(filename):
     """Check if a file matches backup patterns"""
     return any(pattern in filename.lower() for pattern in BACKUP_PATTERNS)
+
+
+def prompt_choice(message, choices):
+    """Prompt until the user enters one of `choices`; EOF (Ctrl-D) returns None"""
+    while True:
+        try:
+            response = input(message).strip().lower()
+        except EOFError:
+            print()
+            return None
+        if response in choices:
+            return response
+        print(f"Invalid choice. Please enter one of: {', '.join(choices)}.")
+
+
+def confirm(message):
+    """[y/N]-style confirmation; anything but 'y' (including EOF) is no"""
+    try:
+        return input(message).strip().lower() == 'y'
+    except EOFError:
+        print()
+        return False
 
 
 class S3SyncManager:
@@ -174,8 +205,9 @@ class S3SyncManager:
                      )
                      ''')
 
-        # Create index for faster lookups
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_path ON files(path)')
+        # path is the PRIMARY KEY and therefore already indexed; drop the
+        # redundant secondary index older versions of this script created
+        conn.execute('DROP INDEX IF EXISTS idx_path')
         conn.commit()
         conn.close()
 
@@ -184,14 +216,40 @@ class S3SyncManager:
         """Context manager for database connections"""
         conn = sqlite3.connect(self.db_file)
         conn.row_factory = sqlite3.Row
-        yield conn
-        conn.commit()
-        conn.close()
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            # Roll back explicitly (and loudly, via re-raise) so an interrupted
+            # transaction can't silently discard a whole tracking update
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _track_file(conn, path, local_info, s3_info):
+        """Record a file's synced state (the single writer for tracking rows).
+
+        local_info needs 'local_size'/'local_mtime', s3_info needs
+        's3_size'/'s3_mtime' (+ optional 's3_etag'); either may be None for a
+        file that only exists on one side.
+        """
+        conn.execute('''
+            INSERT OR REPLACE INTO files
+            (path, local_size, local_mtime, s3_size, s3_mtime, s3_etag)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (path,
+              local_info['local_size'] if local_info else None,
+              local_info['local_mtime'] if local_info else None,
+              s3_info['s3_size'] if s3_info else None,
+              s3_info['s3_mtime'] if s3_info else None,
+              s3_info.get('s3_etag') if s3_info else None))
 
     def _run_aws_command(self, cmd):
         """Run AWS CLI command with optional profile and better error handling"""
         if self.aws_profile:
-            cmd.extend(['--profile', self.aws_profile])
+            cmd = cmd + ['--profile', self.aws_profile]
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -232,32 +290,45 @@ class S3SyncManager:
             except OSError:
                 break
 
+    @staticmethod
+    def _is_ignored(relative_path, include_backups=False):
+        """Shared ignore rules for local and S3 scans (POSIX-style path).
+
+        Both scans MUST agree on these rules: transfer verification compares
+        upload/delete candidates against a fresh S3 listing, so a file one
+        scan sees and the other skips would never verify.
+        """
+        parts = relative_path.split('/')
+        filename = parts[-1]
+
+        if filename.startswith('.') or filename.endswith('.obj'):
+            return True
+
+        for part in parts[:-1]:
+            if part.startswith('.') or 'layers' in part.lower():
+                return True
+            if not include_backups and part == 'backups':
+                return True
+
+        return False
+
     def scan_local_files(self, include_backups=False):
         """Scan local directory for files"""
         print(f"Scanning local directory: {self.local_dir}")
         files = {}
 
         for root, dirs, filenames in os.walk(self.local_dir):
-            # Skip hidden directories, directories containing 'layers', and backups (unless requested)
+            # Prune ignored directories early so huge layers/ trees aren't walked;
+            # _is_ignored below stays the authority on what counts as ignored
             dirs[:] = [d for d in dirs if not d.startswith('.') and
                        'layers' not in d.lower() and
                        (include_backups or d != 'backups')]
 
             for filename in filenames:
-                # Skip hidden files, sync config, and database
-                if filename.startswith('.') or filename in ['.s3sync.json', '.s3sync.db'] or filename.endswith('.obj'):
-                    continue
-
                 filepath = os.path.join(root, filename)
-                relative_path = os.path.relpath(filepath, self.local_dir)
+                relative_path = os.path.relpath(filepath, self.local_dir).replace(os.sep, '/')
 
-                # Skip files in directories containing 'layers'
-                path_parts = relative_path.split(os.sep)
-                if any('layers' in part.lower() for part in path_parts[:-1]):
-                    continue
-
-                # Skip files in backups directories unless explicitly requested
-                if not include_backups and 'backups' in path_parts[:-1]:
+                if self._is_ignored(relative_path, include_backups):
                     continue
 
                 stat = os.stat(filepath)
@@ -311,20 +382,7 @@ class S3SyncManager:
 
                 relative_path = obj['Key'][len(list_prefix):]
 
-                # Skip hidden files
-                filename = os.path.basename(relative_path)
-                if filename.startswith('.') or filename.endswith('.obj'):
-                    continue
-
-                # Skip files in hidden directories or directories containing 'layers'
-                path_parts = relative_path.split('/')
-                if any(part.startswith('.') for part in path_parts[:-1]):
-                    continue
-                if any('layers' in part.lower() for part in path_parts[:-1]):
-                    continue
-
-                # Skip backups directories unless explicitly requested
-                if not include_backups and 'backups' in path_parts[:-1]:
+                if self._is_ignored(relative_path, include_backups):
                     continue
 
                 files[relative_path] = {
@@ -332,7 +390,7 @@ class S3SyncManager:
                     's3_size': obj['Size'],
                     's3_mtime': self._parse_timestamp(obj['LastModified']),
                     's3_etag': obj.get('ETag', '').strip('"'),
-                    'is_backup': is_backup_file(filename)
+                    'is_backup': is_backup_file(os.path.basename(relative_path))
                 }
 
             page_count += 1
@@ -350,44 +408,68 @@ class S3SyncManager:
         print(f"Found {len(files)} S3 files")
         return files
 
-    def update_files(self, include_backups=False):
-        """Update file tracking with current state"""
-        print("\nUpdating file tracking...")
+    def _prune_stale_tracking(self, current_paths, include_backups=False):
+        """Drop tracking rows for paths that no longer exist locally or on S3.
+
+        Rows that are invisible to this run's scans only because backups/
+        directories were excluded are left alone — the scans carry no
+        information about them. Rows for permanently ignored paths (hidden,
+        layers, .obj) are still pruned.
+        """
+        def invisible_backup(path):
+            return (not include_backups and
+                    self._is_ignored(path) and
+                    not self._is_ignored(path, include_backups=True))
+
+        with self._get_db() as conn:
+            cursor = conn.execute('SELECT path FROM files')
+            stale = [row['path'] for row in cursor
+                     if row['path'] not in current_paths
+                     and not invisible_backup(row['path'])]
+            for path in stale:
+                conn.execute('DELETE FROM files WHERE path = ?', (path,))
+
+        if stale:
+            print(f"Pruned {len(stale)} tracking entries for files that no longer exist anywhere")
+        return len(stale)
+
+    def refresh_tracking(self, include_backups=False):
+        """Non-destructive tracking refresh (the 'update' command).
+
+        Records files that are already identical on both sides and prunes
+        entries for files gone from both. Tracking for files with pending
+        differences is left untouched, so 'sync' still proposes them.
+        """
+        print("\nRefreshing file tracking...")
 
         local_files = self.scan_local_files(include_backups)
         s3_files = self.scan_s3_files(include_backups)
 
+        self._record_untracked_synced(local_files, s3_files)
+        self._prune_stale_tracking(set(local_files) | set(s3_files), include_backups)
+
+        print("File tracking refreshed")
+
+    def reset_tracking(self, include_backups=False):
+        """Stamp the current local and S3 state as the synced baseline.
+
+        Destructive: files that currently differ between local and S3 are
+        recorded as in sync, so their pending differences will never be
+        proposed. The 'reset' command confirms before calling this.
+        """
+        print("\nResetting file tracking...")
+
+        local_files = self.scan_local_files(include_backups)
+        s3_files = self.scan_s3_files(include_backups)
+        current_paths = set(local_files) | set(s3_files)
+
         with self._get_db() as conn:
-            # Get all tracked paths
-            cursor = conn.execute('SELECT path FROM files')
-            tracked_paths = set(row['path'] for row in cursor)
-
-            # Get all current paths
-            current_paths = set(local_files.keys()) | set(s3_files.keys())
-
-            # Update or insert files
             for path in current_paths:
-                local_info = local_files.get(path)
-                s3_info = s3_files.get(path)
+                self._track_file(conn, path, local_files.get(path), s3_files.get(path))
 
-                conn.execute('''
-                    INSERT OR REPLACE INTO files 
-                    (path, local_size, local_mtime, s3_size, s3_mtime, s3_etag)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (
-                    path,
-                    local_info['local_size'] if local_info else None,
-                    local_info['local_mtime'] if local_info else None,
-                    s3_info['s3_size'] if s3_info else None,
-                    s3_info['s3_mtime'] if s3_info else None,
-                    s3_info.get('s3_etag') if s3_info else None
-                ))
+        self._prune_stale_tracking(current_paths, include_backups)
 
-            # Remove files that no longer exist anywhere
-            for path in tracked_paths - current_paths:
-                conn.execute('DELETE FROM files WHERE path = ?', (path,))
-
-        print("File tracking updated successfully")
+        print("File tracking reset")
 
     def analyze_changes(self, local_files, s3_files):
         """Analyze what needs to be synced and detect conflicts"""
@@ -475,6 +557,31 @@ class S3SyncManager:
 
         return actions
 
+    def _record_untracked_synced(self, local_files, s3_files):
+        """Record tracking for size-matched files that have no sync history.
+
+        Without a tracking row, a file later deleted locally looks like a new
+        S3 file and gets re-downloaded instead of proposed for remote
+        deletion. This self-heals tracking lost to an interrupted init/update.
+        """
+        with self._get_db() as conn:
+            cursor = conn.execute('SELECT path FROM files')
+            tracked = {row['path'] for row in cursor}
+
+            # Backup-pattern files are excluded: they are upload-only, and
+            # analyze_changes deliberately re-uploads them when untracked
+            # (even on a size match). The upload itself records tracking.
+            healed = [path for path in local_files.keys() & s3_files.keys()
+                      if path not in tracked and
+                      not local_files[path].get('is_backup') and
+                      local_files[path]['local_size'] == s3_files[path]['s3_size']]
+
+            for path in healed:
+                self._track_file(conn, path, local_files[path], s3_files[path])
+
+        if healed:
+            print(f"Recorded {len(healed)} in-sync file(s) that had no tracking history")
+
     def resolve_conflict(self, path, reason, local_info, s3_info):
         """Interactively resolve a conflict"""
         print(f"\n⚠️  CONFLICT: {path}")
@@ -489,16 +596,11 @@ class S3SyncManager:
             if "both" in reason.lower():
                 print("  ⚠️  Both files have been modified since last sync!")
 
-            while True:
-                response = input("\nChoose: [l]ocal → remote, [r]emote → local, [s]kip? ").strip().lower()
-                if response == 'l':
-                    return SyncAction.UPLOAD
-                elif response == 'r':
-                    return SyncAction.DOWNLOAD
-                elif response == 's':
-                    return SyncAction.SKIP
-                else:
-                    print("Invalid choice. Please enter 'l', 'r', or 's'.")
+            response = prompt_choice(
+                "\nChoose: [l]ocal → remote, [r]emote → local, [s]kip? ",
+                ('l', 'r', 's'))
+            return {'l': SyncAction.UPLOAD,
+                    'r': SyncAction.DOWNLOAD}.get(response, SyncAction.SKIP)
 
         return SyncAction.SKIP
 
@@ -529,24 +631,19 @@ class S3SyncManager:
         result = self._run_aws_command(cmd)
 
         data = json.loads(result.stdout)
-        s3_mtime = self._parse_timestamp(data['LastModified'])
-        s3_etag = data.get('ETag', '').strip('"')
+        s3_info = {
+            's3_size': data['ContentLength'],
+            's3_mtime': self._parse_timestamp(data['LastModified']),
+            's3_etag': data.get('ETag', '').strip('"'),
+        }
 
         # Track the pre-upload stats: if the file changed during upload, the next
         # scan will see a local difference and schedule a re-upload
         with self._get_db() as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO files
-                (path, local_size, local_mtime, s3_size, s3_mtime, s3_etag)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                path,
-                pre_stat.st_size,
-                pre_stat.st_mtime,
-                pre_stat.st_size,
-                s3_mtime,
-                s3_etag
-            ))
+            self._track_file(conn, path,
+                             {'local_size': pre_stat.st_size,
+                              'local_mtime': pre_stat.st_mtime},
+                             s3_info)
 
         return True
 
@@ -565,25 +662,13 @@ class S3SyncManager:
 
         print(f"  ✓ Downloaded: {path}")
 
-        # Get the actual mtime of the downloaded file
+        # Update database with the downloaded file's actual stats
         stat = os.stat(local_path)
-        actual_local_mtime = stat.st_mtime
-        actual_local_size = stat.st_size
-
-        # Update database with actual file stats
         with self._get_db() as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO files 
-                (path, local_size, local_mtime, s3_size, s3_mtime, s3_etag)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                path,
-                actual_local_size,
-                actual_local_mtime,  # Use actual mtime from filesystem
-                s3_files[path]['s3_size'],
-                s3_files[path]['s3_mtime'],
-                s3_files[path].get('s3_etag')
-            ))
+            self._track_file(conn, path,
+                             {'local_size': stat.st_size,
+                              'local_mtime': stat.st_mtime},
+                             s3_files[path])
 
         return True
 
@@ -666,6 +751,49 @@ class S3SyncManager:
             except OSError:
                 pass
 
+    # Verify batches up to this size with per-file head-object calls; larger
+    # batches use one full prefix listing instead
+    VERIFY_HEAD_MAX = 8
+
+    def _fetch_s3_info(self, paths, include_backups=False):
+        """Fresh S3 metadata for the given paths, for post-transfer verification.
+
+        Returns {path: s3_info} containing only paths that exist remotely.
+        Small batches use per-file head-object calls (cheaper than listing a
+        large prefix); anything bigger reuses the full listing scan. Errors
+        other than a clean 404 keep the path in the result with unknown size,
+        so callers treat it conservatively (upload unverified / delete not
+        confirmed) rather than concluding the file is gone.
+        """
+        if len(paths) > self.VERIFY_HEAD_MAX:
+            print("  Verifying against a fresh S3 listing...")
+            return self.scan_s3_files(include_backups)
+
+        print(f"  Verifying {len(paths)} file(s) against S3...")
+        info = {}
+        for path in paths:
+            cmd = ['aws', 's3api', 'head-object', '--bucket', self.s3_bucket,
+                   '--key', f"{self.s3_prefix}/{path}"]
+            if self.aws_profile:
+                cmd += ['--profile', self.aws_profile]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                if '404' in (result.stderr or ''):
+                    continue  # confirmed absent
+                print(f"  ⚠️  Could not verify {path}: {(result.stderr or '').strip()}")
+                info[path] = {'path': path, 's3_size': None, 's3_mtime': None}
+                continue
+
+            data = json.loads(result.stdout)
+            info[path] = {
+                'path': path,
+                's3_size': data['ContentLength'],
+                's3_mtime': self._parse_timestamp(data['LastModified']),
+                's3_etag': data.get('ETag', '').strip('"'),
+            }
+        return info
+
     def perform_uploads_batch(self, paths, include_backups=False):
         """Upload files to S3 in one parallel rclone run and update tracking"""
         if not paths:
@@ -705,8 +833,7 @@ class S3SyncManager:
             except OSError:
                 print(f"  ⚠️  {path} disappeared during upload")
 
-        # One listing pass for fresh S3 metadata instead of a head-object per file
-        fresh_s3 = self.scan_s3_files(include_backups)
+        fresh_s3 = self._fetch_s3_info(list(pre_stats), include_backups)
 
         success_count = 0
         with self._get_db() as conn:
@@ -715,12 +842,9 @@ class S3SyncManager:
                 if not s3_info or s3_info['s3_size'] != size:
                     print(f"  ❌ Upload not verified for {path}; will retry on next sync")
                     continue
-                conn.execute('''
-                    INSERT OR REPLACE INTO files
-                    (path, local_size, local_mtime, s3_size, s3_mtime, s3_etag)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (path, size, mtime,
-                      s3_info['s3_size'], s3_info['s3_mtime'], s3_info.get('s3_etag')))
+                self._track_file(conn, path,
+                                 {'local_size': size, 'local_mtime': mtime},
+                                 s3_info)
                 success_count += 1
 
         print(f"  ✓ Uploaded {success_count}/{len(paths)} files")
@@ -753,19 +877,16 @@ class S3SyncManager:
                 if stat.st_size != s3_files[path]['s3_size']:
                     print(f"  ❌ Size mismatch for {path}; will retry on next sync")
                     continue
-                conn.execute('''
-                    INSERT OR REPLACE INTO files
-                    (path, local_size, local_mtime, s3_size, s3_mtime, s3_etag)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (path, stat.st_size, stat.st_mtime,
-                      s3_files[path]['s3_size'], s3_files[path]['s3_mtime'],
-                      s3_files[path].get('s3_etag')))
+                self._track_file(conn, path,
+                                 {'local_size': stat.st_size,
+                                  'local_mtime': stat.st_mtime},
+                                 s3_files[path])
                 success_count += 1
 
         print(f"  ✓ Downloaded {success_count}/{len(paths)} files")
         return success_count
 
-    def perform_deletes_remote_batch(self, paths):
+    def perform_deletes_remote_batch(self, paths, include_backups=False):
         """Delete files from S3 in one rclone run and update tracking"""
         if not paths:
             return 0
@@ -773,15 +894,26 @@ class S3SyncManager:
         print(f"  Deleting {len(paths)} files from S3...")
         ok = self._run_rclone(['delete', self._rclone_remote()], paths)
         if not ok:
-            print("  ❌ rclone reported errors during deletion; tracking left unchanged, will retry on next sync")
-            return 0
+            print("  ⚠️  rclone reported errors during deletion; verifying what was deleted")
 
+        # rclone delete exits 0 even when --files-from matched nothing on the
+        # remote, so the exit code alone can't confirm deletion. Verify against
+        # fresh S3 metadata and only drop tracking for files that are actually
+        # gone — a cleared row for a still-present file would make the next
+        # sync propose re-downloading it instead of retrying the delete.
+        fresh_s3 = self._fetch_s3_info(paths, include_backups)
+
+        success_count = 0
         with self._get_db() as conn:
             for path in paths:
+                if path in fresh_s3:
+                    print(f"  ❌ {path} is still present on S3; will retry on next sync")
+                    continue
                 conn.execute('DELETE FROM files WHERE path = ?', (path,))
+                success_count += 1
 
-        print(f"  ✓ Deleted {len(paths)} files from S3")
-        return len(paths)
+        print(f"  ✓ Deleted {success_count}/{len(paths)} files from S3")
+        return success_count
 
     def _print_file_preview(self, files, title, max_files=50):
         """Print preview of files to be processed"""
@@ -832,6 +964,11 @@ class S3SyncManager:
         s3_files = self.scan_s3_files(include_backups)
 
         actions = self.analyze_changes(local_files, s3_files)
+
+        # Self-heal tracking so a future local deletion of these files is
+        # proposed as a remote delete rather than a re-download
+        if not dry_run:
+            self._record_untracked_synced(local_files, s3_files)
 
         # Separate actions by type
         uploads = []
@@ -903,15 +1040,10 @@ class S3SyncManager:
 
             skip_paths = set()
             for path, problem in invalid_uploads:
-                while True:
-                    response = input(f"\n{path} ({problem}) — [u]pload anyway, [s]kip? ").strip().lower()
-                    if response == 'u':
-                        break
-                    elif response == 's':
-                        skip_paths.add(path)
-                        break
-                    else:
-                        print("Invalid choice. Please enter 'u' or 's'.")
+                response = prompt_choice(
+                    f"\n{path} ({problem}) — [u]pload anyway, [s]kip? ", ('u', 's'))
+                if response != 'u':
+                    skip_paths.add(path)
 
             if skip_paths:
                 uploads = [(p, r) for p, r in uploads if p not in skip_paths]
@@ -923,9 +1055,7 @@ class S3SyncManager:
                             len(deletes_remote) + len(resolved_actions))
 
         print(f"\n{total_operations} operations will be performed.")
-        response = input("Continue? [y/N]: ").strip().lower()
-
-        if response != 'y':
+        if not confirm("Continue? [y/N]: "):
             print("Sync cancelled.")
             return
 
@@ -973,7 +1103,7 @@ class S3SyncManager:
 
         # Process remote deletions
         if self.use_rclone:
-            success_count += self.perform_deletes_remote_batch([p for p, _ in deletes_remote])
+            success_count += self.perform_deletes_remote_batch([p for p, _ in deletes_remote], include_backups)
         else:
             for path, reason in deletes_remote:
                 try:
@@ -1201,12 +1331,17 @@ def main():
     sync_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in sync')
 
     # Update command
-    update_parser = subparsers.add_parser('update', help='Update file tracking with current state')
+    update_parser = subparsers.add_parser(
+        'update',
+        help='Refresh file tracking without hiding pending changes '
+             '(records in-sync files, prunes stale entries)')
     update_parser.add_argument('directory', help='Local directory')
     update_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in tracking')
 
     # Reset command
-    reset_parser = subparsers.add_parser('reset', help='Reset sync tracking (mark all as synced)')
+    reset_parser = subparsers.add_parser(
+        'reset',
+        help='Reset sync tracking (marks ALL files as synced, discarding pending differences)')
     reset_parser.add_argument('directory', help='Local directory')
     reset_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in reset')
 
@@ -1224,63 +1359,28 @@ def main():
         sys.exit(1)
 
     if args.command == 'init':
-        # Initialize new sync configuration
+        # Initialize new sync configuration. No transfers happen here: files
+        # identical on both sides are recorded as in sync, and everything else
+        # (S3-only, local-only, size mismatches) is left for 'sync' to resolve.
         manager = S3SyncManager(args.directory, args.s3_bucket, args.s3_prefix, args.profile)
         print(f"Initialized sync configuration in {args.directory}")
         print(f"S3 location: s3://{args.s3_bucket}/{args.s3_prefix}/")
 
-        # Initial sync: download any S3 files that don't exist locally
-        print("\nChecking for files to download from S3...")
-        local_files = manager.scan_local_files(include_backups=False)  # Don't include backups by default
+        print("\nScanning initial state...")
+        local_files = manager.scan_local_files(include_backups=False)
         s3_files = manager.scan_s3_files(include_backups=False)
 
-        # Find files that exist in S3 but not locally
-        files_to_download = []
-        for path in s3_files:
-            if path not in local_files:
-                files_to_download.append(path)
+        manager._record_untracked_synced(local_files, s3_files)
 
-        if files_to_download:
-            print(f"\nFound {len(files_to_download)} files in S3 that don't exist locally.")
-            print("Note: Excluding backups/ directories. Use --sync-backups if needed.")
-            response = input("Download all files? [y/N]: ").strip().lower()
-
-            if response == 'y':
-                print(f"\nDownloading {len(files_to_download)} files using aws s3 sync (this is much faster)...")
-                print(f"S3 location: s3://{args.s3_bucket}/{args.s3_prefix}/")
-                print(f"Local directory: {args.directory}\n")
-
-                # Use aws s3 sync for bulk download - much faster!
-                cmd = [
-                    'aws', 's3', 'sync',
-                    f"s3://{args.s3_bucket}/{args.s3_prefix}/",
-                    args.directory,
-                    '--exclude', '.*',  # Exclude hidden files
-                    '--exclude', '*.obj',  # Exclude .obj files
-                ]
-
-                # Add excludes for layers and backups directories
-                cmd.extend(['--exclude', '*layers*/*'])
-                cmd.extend(['--exclude', '*/backups/*'])
-
-                if args.profile:
-                    cmd.extend(['--profile', args.profile])
-
-                # Run without capture_output so we see live progress
-                try:
-                    subprocess.run(cmd, check=True)
-                    print(f"\n✓ Download complete!")
-                except subprocess.CalledProcessError as e:
-                    print(f"\n❌ Download failed with exit code {e.returncode}")
-                    sys.exit(1)
-        else:
-            print("✓ All S3 files already exist locally")
-
-        # Do initial tracking update after downloads (exclude backups by default)
-        manager.update_files(include_backups=False)
+        s3_only = sum(1 for path in s3_files if path not in local_files)
+        local_only = sum(1 for path in local_files if path not in s3_files)
+        if s3_only:
+            print(f"{s3_only} file(s) exist only on S3 and can be downloaded with 'sync'")
+        if local_only:
+            print(f"{local_only} file(s) exist only locally and can be uploaded with 'sync'")
 
         print("\n✓ Initialization complete!")
-        print("Use 'status' command to see current sync state")
+        print("Use 'sync' to transfer differences and 'status' to see current sync state")
 
     elif args.command == 'hfsync':
         # Independent of the S3 sync configuration; gated only on .hfsync.json
@@ -1298,23 +1398,22 @@ def main():
         manager = S3SyncManager(args.directory)
 
         if args.command == 'status':
-            manager.show_status(args.verbose, getattr(args, 'sync_backups', False))
+            manager.show_status(args.verbose, args.sync_backups)
 
         elif args.command == 'sync':
-            manager.sync(args.dry_run, getattr(args, 'sync_backups', False))
+            manager.sync(args.dry_run, args.sync_backups)
 
         elif args.command == 'update':
-            manager.update_files(getattr(args, 'sync_backups', False))
+            manager.refresh_tracking(args.sync_backups)
 
         elif args.command == 'reset':
             print("Resetting sync tracking...")
-            print("This will mark all current files as synced.")
-            if not getattr(args, 'sync_backups', False):
+            print("This will mark ALL current files as synced, discarding any pending differences.")
+            if not args.sync_backups:
                 print("Note: Excluding backups/ directories (use --sync-backups to include them)")
-            response = input("Continue? [y/N]: ").strip().lower()
 
-            if response == 'y':
-                manager.update_files(getattr(args, 'sync_backups', False))
+            if confirm("Continue? [y/N]: "):
+                manager.reset_tracking(args.sync_backups)
                 print("✓ Sync tracking reset. All files marked as in sync.")
             else:
                 print("Reset cancelled.")
