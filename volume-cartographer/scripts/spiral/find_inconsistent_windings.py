@@ -104,8 +104,11 @@ from scipy.optimize import milp, LinearConstraint, Bounds
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 import fit_spiral as fs
-from sample_spiral import get_theta_and_radii
-from tracks import _unwrap_track_shifted_radii
+from sample_spiral import (
+    get_theta_and_radii,
+    get_theta_crossing_step_adjustments,
+    unwrap_shifted_radii,
+)
 # Reuse connect_overlapping_patches' valid-quad graph + path reconstruction so a
 # within-patch strip follows a fringe-avoiding path through valid quads only
 # (never slicing through invalid regions, where theta would jump and the unwrap
@@ -326,15 +329,14 @@ def strip_winding_delta(transform, dr, graph, from_ij, to_ij, step_size):
 
     spiral = transform(zyx)
     theta, _, shifted = get_theta_and_radii(spiral[..., 1:], dr)
-    theta_diffs = theta.detach()[1:] - theta.detach()[:-1]
     step_adjustment_windings = (
-        (theta_diffs > np.pi).to(shifted.dtype)
-        - (theta_diffs < -np.pi).to(shifted.dtype)
+        get_theta_crossing_step_adjustments(theta, dr) / dr.detach()
     )
     cumulative_adjustment_windings = step_adjustment_windings.sum()
     delta_windings = int(round(float((-cumulative_adjustment_windings).item())))
 
-    shifted_uw = _unwrap_track_shifted_radii(theta[None], shifted[None], dr)[0]
+    shifted_uw, _ = unwrap_shifted_radii(theta[None], shifted[None], dr)
+    shifted_uw = shifted_uw[0]
     residual_windings = float(((shifted_uw[-1] - shifted_uw[0]) / dr).item())
     return {
         'delta_windings': delta_windings,
@@ -413,7 +415,8 @@ def pcl_edge_unwrap_adjustment_windings(transform, dr, pa, pb):
         spiral = transform(zyx)
         theta, _, _ = get_theta_and_radii(spiral[..., 1:], dr)
         zero_shifted = torch.zeros_like(theta)
-        adjustments = _unwrap_track_shifted_radii(theta[None], zero_shifted[None], dr)[0]
+        _, adjustments = unwrap_shifted_radii(theta[None], zero_shifted[None], dr)
+        adjustments = adjustments[0]
     return int(round(float((adjustments[-1] / dr).item())))
 
 

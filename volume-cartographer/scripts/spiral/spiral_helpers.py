@@ -663,8 +663,17 @@ def save_mesh(
     scroll_zyxs[out_of_roi] = -1.0
 
     spliced_scroll_zyxs = scroll_zyxs.clone()
+    # Splicing is deliberately more permissive than the reported satisfaction
+    # metrics: it should accept a mostly aligned patch without relabelling that
+    # patch as fully satisfied in the user-facing metrics.
+    splicing_metrics_overrides = {
+        'satisfaction_radius_tolerance': 0.495,
+        'satisfaction_distance_tolerance': 12.0,
+        'satisfied_patch_quad_fraction': 0.90,
+    }
     satisfied_patches, _, _, _, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(
         slice_to_spiral_transform, dr_per_winding, patches,
+        metrics_overrides=splicing_metrics_overrides,
     )
     _build_spliced_overlay(
         spliced_scroll_zyxs, num_thetas_by_winding, z0, grid_spacing,
