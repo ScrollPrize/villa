@@ -6,6 +6,9 @@ requires-python = ">=3.14"
 dependencies = [
     "click>=8.4.2",
     "crackle-codec>=0.42.0",
+    # 3.1.1 (kimimaro's lock) mishandles boundary-free scanlines: inf poisons the
+    # Felzenszwalb passes and corrupts long air runs; make_surf_sdt refuses < 3.1.2.
+    "edt>=3.1.2",
     "einops>=0.8.2",
     "imageio>=2.37.3",
     "kimimaro[all]>=5.8.1",
