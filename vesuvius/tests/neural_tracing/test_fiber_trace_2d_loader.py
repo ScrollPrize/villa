@@ -61,6 +61,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.model import (
     embedding_output,
     presence_output,
 )
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import CoordinateSampleResult
 from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _benchmark_stage_totals,
     _draw_predicted_cp_direction,
@@ -2503,6 +2504,61 @@ def test_trace2cp_segment_side_z_offsets_use_out_of_plane_axis(tmp_path: Path) -
     assert np.allclose(delta[grid_valid], expected[grid_valid], atol=1.0e-5)
     row_side_dot = np.sum(row_axis_xyz[grid_valid] * side_axis_xyz[grid_valid], axis=1)
     assert np.max(np.abs(row_side_dot)) < 1.0e-4
+
+
+def test_trace2cp_render_sampling_rejects_chunk_errors() -> None:
+    class ErrorSampler:
+        blocking = True
+
+        def sample_coords(
+            self,
+            coords_zyx_base: np.ndarray,
+            valid_mask: np.ndarray,
+        ) -> CoordinateSampleResult:
+            return CoordinateSampleResult(
+                image=np.zeros(valid_mask.shape, dtype=np.float32),
+                valid_mask=np.asarray(valid_mask, dtype=bool),
+                stats={"error_chunks": 1},
+            )
+
+    source = SimpleNamespace(record=SimpleNamespace(sampler=ErrorSampler()))
+    coords = np.zeros((3, 4, 3), dtype=np.float32)
+    valid = np.ones((3, 4), dtype=bool)
+
+    with pytest.raises(ValueError, match="mixed fine/coarse fallback"):
+        FiberStrip2DLoader._sample_trace2cp_coords_blocking(
+            object(),
+            source,
+            coords,
+            valid,
+            context="test",
+        )
+
+
+def test_trace2cp_render_sampling_rejects_nonblocking_sampler() -> None:
+    class NonBlockingSampler:
+        blocking = False
+
+        def sample_coords(
+            self,
+            coords_zyx_base: np.ndarray,
+            valid_mask: np.ndarray,
+        ) -> CoordinateSampleResult:
+            del coords_zyx_base, valid_mask
+            raise AssertionError("non-blocking sampler should be rejected before sampling")
+
+    source = SimpleNamespace(record=SimpleNamespace(sampler=NonBlockingSampler()))
+    coords = np.zeros((3, 4, 3), dtype=np.float32)
+    valid = np.ones((3, 4), dtype=bool)
+
+    with pytest.raises(ValueError, match="blocking coordinate sampling"):
+        FiberStrip2DLoader._sample_trace2cp_coords_blocking(
+            object(),
+            source,
+            coords,
+            valid,
+            context="test",
+        )
 
 
 def test_trace2cp_refined_segment_source_samples_from_fused_trace(tmp_path: Path) -> None:

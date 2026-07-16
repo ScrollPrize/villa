@@ -9,6 +9,20 @@
 - Changed native 3D Trace2CP to default inference patches to `64,64,64`, print
   live forward/backward progress bars, and avoid treating the original 2D
   Trace2CP source strip as a hard visualization domain.
+- Replaced native 3D Trace2CP's sparse ring/azimuth candidate set with a
+  grid-only 25x25 cone-disk candidate set and vectorized candidate
+  sampling/decoding/scoring per trace step.
+- Changed native 3D Trace2CP's default trace guard from fixed `4096` steps to
+  a distance-derived `--max-step-factor` limit, added `--trace-step-limit` for
+  partial debug traces, and made progress report target-plane progress plus
+  ETA.
+- Changed native 3D Trace2CP inference-block loading to use the configured
+  blocking coordinate sampler and selected-level to base-coordinate conversion
+  from 3D training instead of direct raw zarr block slicing.
+- Changed native 3D Trace2CP exported strip panels to raw clipped `0..255`
+  brightness and made Trace2CP strip render sampling reject non-blocking
+  samplers or VC3D chunk-error fallback instead of silently showing mixed
+  fine/coarse imagery.
 
 ## 2026-07-15
 

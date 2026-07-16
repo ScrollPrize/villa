@@ -1,32 +1,18 @@
-# Native 3D Trace2CP Tool Plan
+# Native 3D Trace2CP Render Brightness And Blocking Guard
 
-Plan a separate native 3D Trace2CP inspection tool for the 3D fiber tracer.
+Fix the basic native 3D Trace2CP rendering/loading behavior before working on
+the strip geometry itself.
 
 Requirements:
 
-- Add a separate 3D Trace2CP tool path, distinct from the current 3D-to-2D
-  projected Trace2CP bridge.
-- Native tracing should operate in 3D volume coordinates, not in a precomputed
-  side-strip 2D direction field.
-- The tracer should step through candidate directions sampled in a cone centered
-  on the inferred 3D direction.
-- Candidate selection should maximize direction agreement and fiber presence,
-  matching the spirit of the 2D combined Trace2CP direction/presence scorer.
-- Stop tracing when the step crosses the target plane around the other CP, not
-  by hitting a target image column.
-- 3D model inference should be cached in an inferred-block structure:
-  - model input patch size and trusted output/core size may differ;
-  - crop away an output border from each inferred patch to avoid edge artifacts;
-  - overlapping inferred blocks should route point/candidate lookups to the
-    block whose trusted core contains the queried point.
-- After tracing, create side and top strips from the resulting 3D trace line.
-  Reuse existing strip geometry semantics where possible; do not invent a
-  simplified planar replacement.
-- The native visualization must not fail because the trace is outside the
-  original 2D Trace2CP source strip. Build the visualization source directly
-  from the traced 3D polyline and use the original source only for record/CP
-  metadata and sizing defaults.
-- The native tool defaults to 64-voxel inference patches and prints live
-  progress for forward and backward traces.
-- Produce visualization and stdout metrics from the new native 3D tool.
-- Update specs/docs/tests plan before implementation.
+- Native 3D Trace2CP exported strip images must display raw volume brightness,
+  clipped to `0..255`, not per-panel percentile or min/max normalized
+  brightness.
+- Report what scaling the 3D training input uses. For the current fast config
+  this is `image_normalization: "zscore"` before model inference.
+- Trace2CP strip rendering must use blocking coordinate sampling and must not
+  silently render mixed fine/coarse fallback data when fine chunks fail.
+- If the VC3D sampler reports chunk errors during Trace2CP side/top strip
+  rendering, fail loudly instead of producing a misleading image.
+- The strip geometry/orientation problems are explicitly out of scope for this
+  task and will be handled after the basic loading/rendering path is correct.

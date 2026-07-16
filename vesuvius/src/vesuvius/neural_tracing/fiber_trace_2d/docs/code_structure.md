@@ -96,10 +96,34 @@ side/top strip input loading.
   2D strip. It lazily runs dense 3D inference blocks around queried points,
   crops each block to a trusted core, and routes every candidate lookup to the
   block whose trusted core contains that point.
+- Inference block inputs use the same sampler-backed loading convention as 3D
+  training: regular selected-level block grids are multiplied by the dataset
+  `volume_spacing_base`, validated against the base-volume shape, and sampled
+  with the configured blocking `CoordinateSampler`. The native tool does not
+  directly slice zarr/raw blocks for real configured volumes.
+- Model input normalization is the configured 3D `image_normalization` value.
+  With the current fast 3D config this is `zscore`: mean/std over valid voxels
+  before model inference.
+- Exported native Trace2CP strip JPG panels render raw sampled volume values:
+  valid finite values are rounded/clipped to `0..255`, and invalid pixels stay
+  black. They do not use percentile or per-panel min/max scaling.
+- The side/top strip render calls go through the 2D Trace2CP coordinate
+  sampler path. Those render calls require a blocking sampler and raise if the
+  VC3D sampler reports chunk errors, because `sampleCoordsFineToCoarse` can
+  otherwise silently show coarse fallback data where fine chunks failed.
 - Decodes Lasagna 3x2 direction channels analytically with the shared 3D
   direction decoder, aligns sign-ambiguous axes to the current trace direction,
-  samples a deterministic cone of candidate steps, and scores candidates by
-  direction agreement plus optional `1 - presence`.
+  samples a deterministic 25x25 square angular grid mapped onto the cone disk,
+  and scores candidates by direction agreement plus optional `1 - presence`.
+  Candidate selection is batched per step: candidate points are grouped by
+  trusted inference block, sampled with batched `grid_sample`, decoded in torch,
+  and reduced with one tensor `argmin`.
+- Uses a distance-derived step guard by default:
+  `ceil(max_step_factor * cp_distance_voxels / step_voxels)`, with
+  `--max-step-factor 3.0`. `--max-steps` is an optional extra cap, and
+  `--trace-step-limit` intentionally produces partial traces for debugging.
+  Forward/backward progress bars report signed target-plane progress along the
+  initial CP-to-CP direction, ETA, step count, and inferred-block count.
 - Stops when the trace crosses the plane through the target CP with normal
   from start CP to target CP. The stdout/summary metrics are
   `native_trace2cp_plane_error` and

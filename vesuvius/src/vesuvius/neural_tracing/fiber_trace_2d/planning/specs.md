@@ -297,17 +297,51 @@
   lookups must route to a block whose trusted core contains the queried point.
   The tool must not silently score candidates from cropped-away model-output
   borders.
+- Native 3D Trace2CP inference blocks are sampled through the configured
+  `CoordinateSampler` using the same selected-level to base-coordinate
+  conversion as 3D training: selected-level block grids are multiplied by
+  `record.volume_spacing_base`, validated against `record.base_shape_zyx`, and
+  passed to blocking `sample_coord_batch(...)`. Real configured volumes must
+  not be read by direct zarr/raw block slicing in the native tool.
+- Native 3D Trace2CP applies only the configured 3D model-input normalization
+  before inference. Visualization brightness is handled separately and must
+  not affect model input or metric/tracing scores.
+- Native 3D Trace2CP exported strip volume panels use raw clipped brightness:
+  valid finite sampled volume values are rounded and clipped to `0..255`, and
+  invalid pixels render black. Per-panel percentile/min-max display scaling is
+  not allowed for native Trace2CP volume panels because it hides loading and
+  brightness problems.
+- Trace2CP strip rendering must reject non-blocking coordinate samplers and
+  VC3D sampler results with reported chunk errors. The VC3D renderer may
+  otherwise produce fine-to-coarse fallback imagery after failed fine-chunk
+  reads; that must fail loudly for debugging renders instead of being shown as
+  a valid full-resolution strip.
 - Native 3D Trace2CP defaults to `--inference-patch-shape-zyx 64 64 64`,
   matching the current fast 3D training/debug patch size. Larger patch shapes
   remain explicit CLI overrides.
-- Native 3D candidate stepping samples a deterministic cone around the current
-  inferred 3D direction. Candidate loss is weighted direction agreement plus
+- Native 3D Trace2CP does not default to a fixed large step count. The default
+  trace guard is distance-derived:
+  `ceil(max_step_factor * cp_distance_voxels / step_voxels)`, with
+  `--max-step-factor 3.0`. `--max-steps N` is only an optional additional
+  safety cap.
+- Native 3D candidate stepping samples a deterministic square angular grid
+  mapped onto the cone disk around the current inferred 3D direction. The
+  default candidate grid is `--cone-grid-size 25`, giving 625 candidates per
+  step. Ring/azimuth candidate generation is not supported.
+- Native 3D candidate selection is vectorized per trace step. Candidate points
+  are grouped by trusted inference block, sampled with batched `grid_sample`,
+  decoded with the analytic Lasagna 3x2 torch decoder, and scored as one tensor
+  batch. Candidate loss is weighted direction agreement plus
   `1 - sigmoid_presence` at the candidate point. Direction agreement includes
   both the current point's sampled axis and the candidate point's sampled axis,
   aligned against the candidate step direction.
 - The native 3D CLI prints live progress bars for forward and backward tracing.
-  Progress is measured by normalized distance to the target CP plane and should
-  include step count and inferred-block count.
+  Progress is measured by signed target-plane progress along the initial
+  CP-to-CP direction. It includes step count, ETA, and inferred-block count.
+- `--trace-step-limit N` is a debug-only cap on accepted trace steps per
+  direction. When set, native tracing can intentionally return a partial trace
+  with `reason=trace_step_limit`; this is distinct from the safety guard
+  `--max-steps`.
 - Native 3D tracing stops by intersecting the plane through the target CP with
   normal from start CP to target CP. The returned trace appends the exact
   linear interpolation point on that target plane when crossing occurs.

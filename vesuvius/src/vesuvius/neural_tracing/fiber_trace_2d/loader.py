@@ -4159,10 +4159,12 @@ class FiberStrip2DLoader:
             normal_offsets_by_column=normal_offsets_by_column,
         )
         coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32, copy=False)
-        result = source.record.sampler.sample_coords(coords_zyx, grid_valid)
-        image = np.asarray(result.image, dtype=np.float32)
-        valid_mask = np.asarray(result.valid_mask, dtype=bool)
-        return image, valid_mask
+        return self._sample_trace2cp_coords_blocking(
+            source,
+            coords_zyx,
+            grid_valid,
+            context="top-strip",
+        )
 
     def trace2cp_segment_coords_xyz(
         self,
@@ -4206,6 +4208,32 @@ class FiberStrip2DLoader:
         grid_valid = _as_numpy_bool(grid.valid_mask)
         return coords_xyz, grid_valid
 
+    def _sample_trace2cp_coords_blocking(
+        self,
+        source: _Trace2CpSegmentSource,
+        coords_zyx: np.ndarray,
+        grid_valid: np.ndarray,
+        *,
+        context: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        sampler = source.record.sampler
+        if hasattr(sampler, "blocking") and not bool(getattr(sampler, "blocking")):
+            raise ValueError(
+                f"Trace2CP {context} rendering requires blocking coordinate sampling"
+            )
+        result = sampler.sample_coords(coords_zyx, grid_valid)
+        stats = dict(result.stats)
+        error_chunks = int(stats.get("error_chunks", 0) or 0)
+        if error_chunks > 0:
+            raise ValueError(
+                f"Trace2CP {context} rendering encountered {error_chunks} chunk errors; "
+                "refusing to render mixed fine/coarse fallback data "
+                f"stats={stats}"
+            )
+        image = np.asarray(result.image, dtype=np.float32)
+        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        return image, valid_mask
+
     def sample_trace2cp_traced_top_strip_source(
         self,
         source: _Trace2CpSegmentSource,
@@ -4219,10 +4247,12 @@ class FiberStrip2DLoader:
             top_offsets_by_column=top_offsets_by_column,
         )
         coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32, copy=False)
-        result = source.record.sampler.sample_coords(coords_zyx, grid_valid)
-        image = np.asarray(result.image, dtype=np.float32)
-        valid_mask = np.asarray(result.valid_mask, dtype=bool)
-        return image, valid_mask
+        return self._sample_trace2cp_coords_blocking(
+            source,
+            coords_zyx,
+            grid_valid,
+            context="traced top-strip",
+        )
 
     def trace2cp_traced_top_strip_coords_xyz(
         self,
@@ -4325,9 +4355,12 @@ class FiberStrip2DLoader:
         grid = self._offset_grid_from_source(source, offset)
         coords_zyx = _as_numpy_float32(grid.coords_zyx)
         grid_valid = _as_numpy_bool(grid.valid_mask)
-        result = source.record.sampler.sample_coords(coords_zyx, grid_valid)
-        image = np.asarray(result.image, dtype=np.float32)
-        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        image, valid_mask = self._sample_trace2cp_coords_blocking(
+            source,
+            coords_zyx,
+            grid_valid,
+            context="side-strip",
+        )
         sample = FiberStripSegmentSample(
             record_index=int(source.record_index),
             fiber_path=str(source.record.fiber.path) if source.record.fiber.path is not None else "",
@@ -4362,9 +4395,12 @@ class FiberStrip2DLoader:
         grid = self._trace2cp_side_z_grid_from_source(source, float(side_z_offset_voxels))
         coords_zyx = _as_numpy_float32(grid.coords_zyx)
         grid_valid = _as_numpy_bool(grid.valid_mask)
-        result = source.record.sampler.sample_coords(coords_zyx, grid_valid)
-        image = np.asarray(result.image, dtype=np.float32)
-        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        image, valid_mask = self._sample_trace2cp_coords_blocking(
+            source,
+            coords_zyx,
+            grid_valid,
+            context="side-z strip",
+        )
         sample = FiberStripSegmentSample(
             record_index=int(source.record_index),
             fiber_path=str(source.record.fiber.path) if source.record.fiber.path is not None else "",
