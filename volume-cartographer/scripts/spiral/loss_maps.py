@@ -26,10 +26,22 @@ def diagnostics_enabled() -> bool:
     return _active_recorder is not None
 
 
-def record_loss_samples(name, spiral_zyx, residual, mask=None) -> None:
+def record_loss_samples(
+    name, spiral_zyx, residual, mask=None, *, display_spiral_zyx=None,
+) -> None:
+    """Record residuals at explicit preview-display coordinates when supplied.
+
+    ``spiral_zyx`` remains the location supporting the loss.  Target-based
+    losses should pass ``display_spiral_zyx`` so their heatmap is painted on
+    the output winding that the optimiser is pulling towards instead of on a
+    nearest-winding projection of the source sample.
+    """
     recorder = _active_recorder
     if recorder is not None:
-        recorder.record(name, spiral_zyx, residual, mask)
+        recorder.record(
+            name, spiral_zyx, residual, mask,
+            display_spiral_zyx=display_spiral_zyx,
+        )
 
 
 @contextmanager
@@ -67,7 +79,12 @@ class LossMapRecorder:
         surface = self.generation_path / preview_manifest["surface_id"] / "x.tif"
         with Image.open(surface) as image:
             self.width, self.height = image.size
+            # Combined previews use the exact -1 sentinel for every coordinate
+            # of an invalid vertex.  One channel is sufficient to recover the
+            # validity mask and avoids painting splats into black preview gaps.
+            self.surface_valid = np.asarray(image).copy() != -1.0
         self._maps = {}
+        self._stats = {}
 
     @staticmethod
     def _numpy(value):
@@ -75,18 +92,29 @@ class LossMapRecorder:
             value = value.detach().float().cpu().numpy()
         return np.asarray(value)
 
-    def record(self, name, spiral_zyx, residual, mask=None):
+    def record(
+        self, name, spiral_zyx, residual, mask=None, *, display_spiral_zyx=None,
+    ):
         if name not in self.weights or self.weights[name] == 0:
             return
-        points = self._numpy(spiral_zyx).reshape(-1, 3)
+        source_shape = (np.asarray(spiral_zyx).shape[:-1]
+                        if not hasattr(spiral_zyx, "detach")
+                        else tuple(spiral_zyx.shape[:-1]))
+        display_value = spiral_zyx if display_spiral_zyx is None else display_spiral_zyx
+        display_shape = (np.asarray(display_value).shape[:-1]
+                         if not hasattr(display_value, "detach")
+                         else tuple(display_value.shape[:-1]))
+        if display_shape != source_shape:
+            raise ValueError(
+                f"Loss map {name}: source/display coordinate shape mismatch"
+            )
+        points = self._numpy(display_value).reshape(-1, 3)
         values = self._numpy(residual)
         if values.size == 1:
             values = np.full(points.shape[0], float(values.reshape(-1)[0]),
                              dtype=np.float32)
         else:
-            values = np.broadcast_to(values, np.asarray(spiral_zyx).shape[:-1]
-                                     if not hasattr(spiral_zyx, "detach")
-                                     else tuple(spiral_zyx.shape[:-1])).reshape(-1)
+            values = np.broadcast_to(values, source_shape).reshape(-1)
         if points.shape[0] != values.shape[0]:
             raise ValueError(f"Loss map {name}: point/residual shape mismatch")
 
@@ -96,12 +124,19 @@ class LossMapRecorder:
             if mask_np.size == 1:
                 valid &= bool(mask_np.reshape(-1)[0])
             else:
-                valid &= np.broadcast_to(mask_np, tuple(spiral_zyx.shape[:-1])).reshape(-1).astype(bool)
+                valid &= np.broadcast_to(mask_np, source_shape).reshape(-1).astype(bool)
         if not valid.any():
             return
 
         points = points[valid]
         values = np.maximum(values[valid].astype(np.float64, copy=False), 0.0)
+        stats = self._stats.setdefault(name, {
+            "eligible": 0,
+            "projected": 0,
+            "off_surface": 0,
+            "displayed": 0,
+        })
+        stats["eligible"] += int(len(points))
         theta = np.mod(np.arctan2(points[:, 1], points[:, 2]), 2.0 * np.pi)
         radius = np.linalg.norm(points[:, 1:], axis=1)
         shifted = np.maximum(radius - theta / (2.0 * np.pi) * self.dr_per_winding, 0.0)
@@ -125,12 +160,21 @@ class LossMapRecorder:
                          & (selected_cols >= first) & (selected_cols < end))
             if not in_bounds.any():
                 continue
-            index_chunks.append(
-                selected_rows[in_bounds] * self.width + selected_cols[in_bounds])
-            value_chunks.append(values[selected][in_bounds])
+            projected_rows = selected_rows[in_bounds]
+            projected_cols = selected_cols[in_bounds]
+            projected_values = values[selected][in_bounds]
+            on_surface = self.surface_valid[projected_rows, projected_cols]
+            stats["projected"] += int(len(projected_rows))
+            stats["off_surface"] += int((~on_surface).sum())
+            stats["displayed"] += int(on_surface.sum())
+            if on_surface.any():
+                index_chunks.append(
+                    projected_rows[on_surface] * self.width
+                    + projected_cols[on_surface])
+                value_chunks.append(projected_values[on_surface])
 
     @staticmethod
-    def _splat(indices, values, height, width):
+    def _splat(indices, values, height, width, surface_valid):
         # One-pixel splat makes sparse patch/PCL/track samples visible without
         # implying support over unsampled parts of the surface.  Keep this
         # sparse until the final RGBA allocation: preview images can be large.
@@ -144,7 +188,12 @@ class LossMapRecorder:
                 shifted_cols = cols + dx
                 valid = ((shifted_rows >= 0) & (shifted_rows < height)
                          & (shifted_cols >= 0) & (shifted_cols < width))
-                splat_indices.append(shifted_rows[valid] * width + shifted_cols[valid])
+                in_image_rows = shifted_rows[valid]
+                in_image_cols = shifted_cols[valid]
+                valid_indices = np.flatnonzero(valid)
+                valid[valid_indices] &= surface_valid[in_image_rows, in_image_cols]
+                splat_indices.append(
+                    shifted_rows[valid] * width + shifted_cols[valid])
                 splat_values.append(values[valid])
         splat_indices = np.concatenate(splat_indices)
         splat_values = np.concatenate(splat_values)
@@ -176,23 +225,35 @@ class LossMapRecorder:
         output = self.generation_path / "loss-maps"
         output.mkdir(exist_ok=True)
         entries = []
-        for name in sorted(self._maps):
-            index_chunks, value_chunks = self._maps[name]
-            if not index_chunks:
+        for name in sorted(self._stats):
+            stats = self._stats[name]
+            if stats["eligible"] <= 0:
                 continue
-            sample_indices = np.concatenate(index_chunks)
-            sample_values = np.concatenate(value_chunks)
-            unique_indices, inverse = np.unique(sample_indices, return_inverse=True)
-            sums = np.bincount(inverse, weights=sample_values)
-            counts = np.bincount(inverse)
-            raw = sums / counts
-            weighted = raw * abs(self.weights[name])
+            index_chunks, value_chunks = self._maps.get(name, ([], []))
+            if index_chunks:
+                sample_indices = np.concatenate(index_chunks)
+                sample_values = np.concatenate(value_chunks)
+                unique_indices, inverse = np.unique(sample_indices, return_inverse=True)
+                sums = np.bincount(inverse, weights=sample_values)
+                counts = np.bincount(inverse)
+                raw = sums / counts
+                weighted = raw * abs(self.weights[name])
+            else:
+                sample_indices = np.empty([0], dtype=np.int64)
+                unique_indices = np.empty([0], dtype=np.int64)
+                weighted = np.empty([0], dtype=np.float64)
             positive = weighted[weighted > 0]
             display_maximum = float(np.percentile(positive, 95)) if positive.size else 0.0
             if not math.isfinite(display_maximum) or display_maximum <= 0:
                 display_maximum = float(weighted.max(initial=0.0))
-            display_indices, display_values = self._splat(
-                unique_indices, weighted, self.height, self.width)
+            if unique_indices.size:
+                display_indices, display_values = self._splat(
+                    unique_indices, weighted, self.height, self.width,
+                    self.surface_valid,
+                )
+            else:
+                display_indices = np.empty([0], dtype=np.int64)
+                display_values = np.empty([0], dtype=np.float64)
             rgba = np.zeros((self.height * self.width, 4), dtype=np.uint8)
             rgba[display_indices] = self._rgba(display_values, display_maximum)
             rgba = rgba.reshape(self.height, self.width, 4)
@@ -203,11 +264,15 @@ class LossMapRecorder:
                 "name": name,
                 "path": relative_path,
                 "weight": self.weights[name],
-                "sample_count": int(len(sample_indices)),
+                "sample_count": stats["displayed"],
+                "eligible_sample_count": stats["eligible"],
+                "projected_sample_count": stats["projected"],
+                "off_surface_sample_count": stats["off_surface"],
+                "omitted_sample_count": stats["eligible"] - stats["projected"],
                 "supported_pixels": int(len(unique_indices)),
-                "p50": float(np.percentile(weighted, 50)),
-                "p95": float(np.percentile(weighted, 95)),
-                "maximum": float(weighted.max()),
+                "p50": float(np.percentile(weighted, 50)) if weighted.size else 0.0,
+                "p95": float(np.percentile(weighted, 95)) if weighted.size else 0.0,
+                "maximum": float(weighted.max()) if weighted.size else 0.0,
                 "display_maximum": display_maximum,
                 "values": "weighted_per_sample_residual",
             })

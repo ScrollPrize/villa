@@ -774,6 +774,16 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
                 map.maximum = entry.value(QStringLiteral("maximum")).toDouble();
                 map.displayMaximum = entry.value(QStringLiteral("display_maximum")).toDouble();
                 map.sampleCount = entry.value(QStringLiteral("sample_count")).toInteger();
+                map.eligibleSampleCount = entry.contains(QStringLiteral("eligible_sample_count"))
+                    ? entry.value(QStringLiteral("eligible_sample_count")).toInteger()
+                    : map.sampleCount;
+                map.projectedSampleCount = entry.contains(QStringLiteral("projected_sample_count"))
+                    ? entry.value(QStringLiteral("projected_sample_count")).toInteger()
+                    : map.sampleCount;
+                map.offSurfaceSampleCount =
+                    entry.value(QStringLiteral("off_surface_sample_count")).toInteger();
+                map.omittedSampleCount =
+                    entry.value(QStringLiteral("omitted_sample_count")).toInteger();
                 map.supportedPixels = entry.value(QStringLiteral("supported_pixels")).toInteger();
                 lossMaps.push_back(std::move(map));
             }
@@ -1012,14 +1022,20 @@ void SpiralWorkspace::updateLossMapOverlay()
     }
     _panel->setLossMapLegend(
         tr("%1 — weighted residual (weight %2)\n"
-           "p50 %3   p95 %4   max %5   %6 samples / %7 pixels")
+           "p50 %3   p95 %4   max %5\n"
+           "%6 displayed samples / %7 pixels   %8 projected   "
+           "%9 off-surface   %10 omitted   %11 eligible")
             .arg(map.name)
             .arg(map.weight, 0, 'g', 5)
             .arg(map.p50, 0, 'g', 5)
             .arg(map.p95, 0, 'g', 5)
             .arg(map.maximum, 0, 'g', 5)
             .arg(map.sampleCount)
-            .arg(map.supportedPixels));
+            .arg(map.supportedPixels)
+            .arg(map.projectedSampleCount)
+            .arg(map.offSurfaceSampleCount)
+            .arg(map.omittedSampleCount)
+            .arg(map.eligibleSampleCount));
     if (_currentPreview == _previewSource) {
         _overlay->publishLossMap(_currentPreview, _loadedLossMapImage, _lossMapOpacity);
         return;

@@ -70,6 +70,10 @@ private:
             double maximum = 0.0;
             double displayMaximum = 0.0;
             qint64 sampleCount = 0;
+            qint64 eligibleSampleCount = 0;
+            qint64 projectedSampleCount = 0;
+            qint64 offSurfaceSampleCount = 0;
+            qint64 omittedSampleCount = 0;
             qint64 supportedPixels = 0;
         };
         std::vector<LossMap> lossMaps;

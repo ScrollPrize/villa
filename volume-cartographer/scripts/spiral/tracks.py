@@ -538,7 +538,19 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
         diagnostic_radius = F.relu(
             (shifted_radii - diagnostic_radius_target).abs()
             - dr_per_winding.detach() * cfg['track_radius_loss_margin'])
-        record_loss_samples('track_radius', sampled_spiral, diagnostic_radius)
+        diagnostic_target_radii = radius_from_unwrapped_shifted(
+            theta, diagnostic_radius_target, crossing_adjustments,
+            dr_per_winding,
+        )
+        diagnostic_target_spiral = torch.stack([
+            sampled_spiral[..., 0],
+            torch.sin(theta) * diagnostic_target_radii,
+            torch.cos(theta) * diagnostic_target_radii,
+        ], dim=-1).detach()
+        record_loss_samples(
+            'track_radius', sampled_spiral, diagnostic_radius,
+            display_spiral_zyx=diagnostic_target_spiral,
+        )
 
     if not compute_dt:
         yield 'track_radius', radius_loss
