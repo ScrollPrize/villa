@@ -87,7 +87,7 @@ Stephen then _carbonized_ the scroll through a process that is similar to that o
     <img className="max-h-[250px]" src="/img/tutorials/campfire-scanning.webp"/>
     <img className="max-h-[250px]" src="/img/tutorials/campfire-scanning2.webp"/>
   </div>
-  <figcaption className="mt-1">Making of the campfire scroll</figcaption>
+  <figcaption className="mt-1">Making of the campfire scroll. © EduceLab/University of Kentucky.</figcaption>
 </figure>
 
 ### Fiji

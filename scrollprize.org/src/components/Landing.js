@@ -82,6 +82,9 @@ const stories = ({ unrollVideo }) => [
           Greek. More than six hundred remain unopened and unreadable.
         </p>
         {storyImage("/img/landing/scroll.webp", "Carbonized Herculaneum scroll")}
+        <p className="text-sm opacity-60 mt-2">
+          © EduceLab/University of Kentucky.
+        </p>
       </>
     ),
   },
@@ -115,6 +118,9 @@ const stories = ({ unrollVideo }) => [
         >
           <source src="/img/landing/engedi5.webm" type="video/webm" />
         </video>
+        <p className="text-sm opacity-60 mt-2">
+          Virtual unwrapping of the En-Gedi scroll. © EduceLab/University of Kentucky.
+        </p>
       </>
     ),
   },

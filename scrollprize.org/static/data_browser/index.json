@@ -6340,7 +6340,12 @@
       "locations": [],
       "scans": [],
       "hasS3": true,
-      "licenses": [],
+      "licenses": [
+        {
+          "name": "EduceLab Data License",
+          "url": "https://dl.ash2txt.org/LICENSE.txt"
+        }
+      ],
       "volumeZarr": null,
       "display": "PHerc51Cr4Fr8",
       "label": "PHerc. 51Cr4Fr8",
@@ -6368,7 +6373,9 @@
       },
       "readings": null,
       "legalNotice": null,
-      "licenseScope": null,
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "volume": null,
       "mesh": null,
       "inkSegments": [],
@@ -6393,7 +6400,12 @@
       "locations": [],
       "scans": [],
       "hasS3": true,
-      "licenses": [],
+      "licenses": [
+        {
+          "name": "EduceLab Data License",
+          "url": "https://dl.ash2txt.org/LICENSE.txt"
+        }
+      ],
       "volumeZarr": null,
       "display": "PHerc1667Cr1Fr3",
       "label": "PHerc. 1667Cr1Fr3",
@@ -6421,7 +6433,9 @@
       },
       "readings": null,
       "legalNotice": null,
-      "licenseScope": null,
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "volume": null,
       "mesh": null,
       "inkSegments": [],

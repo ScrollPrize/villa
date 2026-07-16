@@ -478,19 +478,14 @@ export const team = {
       href: "https://www.linkedin.com/in/davidsjosey/",
     },
     {
-      name: "Eric Thvedt",
-      title: "Annotation Specialist",
-      href: "https://www.linkedin.com/in/eric-thvedt/",
-    },
-    {
       name: "Kendra Brown",
       title: "Annotation Specialist",
       href: "https://darthkendraresearch.wordpress.com/",
     },
     {
-      name: "Sarah Morejohn",
+      name: "Laura Trojak",
       title: "Annotation Specialist",
-      href: "https://www.linkedin.com/in/sarah-morejohn-1140b049/",
+      href: "https://www.linkedin.com/in/laura-trojak-726784195/",
     },
   ],
   educe: [
@@ -567,19 +562,29 @@ export const team = {
       href: "https://twitter.com/Meadowsnax1",
     },
     {
-      name: "Konrad Rosenberg",
-      title: "Annotation Specialist",
-      href: "https://twitter.com/germanicgems",
-    },
-    {
       name: "Cooper Miller",
       title: "Annotation Specialist",
       href: "https://kcm.sh/",
     },
     {
+      name: "Eric Thvedt",
+      title: "Annotation Specialist",
+      href: "https://www.linkedin.com/in/eric-thvedt/",
+    },
+    {
+      name: "Konrad Rosenberg",
+      title: "Annotation Specialist",
+      href: "https://twitter.com/germanicgems",
+    },
+    {
       name: "Raymond Gasper",
       title: "Annotation Specialist",
       href: "https://www.linkedin.com/in/raymond-james-gasper/",
+    },
+    {
+      name: "Sarah Morejohn",
+      title: "Annotation Specialist",
+      href: "https://www.linkedin.com/in/sarah-morejohn-1140b049/",
     },
     {
       name: "Sergei Pnev",

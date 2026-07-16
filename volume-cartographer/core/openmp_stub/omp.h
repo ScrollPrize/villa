@@ -70,7 +70,13 @@ static inline int omp_test_nest_lock(omp_nest_lock_t* lock) {
 /* Timing functions */
 static inline double omp_get_wtime(void) {
     struct timespec ts;
+#if defined(_WIN32)
+    /* clock_gettime/CLOCK_MONOTONIC are POSIX and absent on MSVC; the C11
+     * timespec_get is available on both and needs no extra headers. */
+    timespec_get(&ts, TIME_UTC);
+#else
     clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 

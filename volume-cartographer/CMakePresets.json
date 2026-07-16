@@ -158,6 +158,23 @@
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },
     {
+      "name": "windows-msvc",
+      "displayName": "Windows (MSVC + vcpkg, RelWithDebInfo)",
+      "description": "Native Windows build with the Visual Studio 2022 MSVC toolchain and vcpkg-provided dependencies. Requires VCPKG_ROOT to point at a bootstrapped vcpkg checkout; run from a VS x64 developer environment (or VS2022's CMake integration) so cl.exe and Ninja are on PATH. flatboi (PaStiX) is unavailable on Windows and defaults off.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-msvc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-rel",
+        "VCPKG_HOST_TRIPLET": "x64-windows-rel",
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/triplets",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "VC_TESTING": "OFF"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
       "name": "macos-homebrew-llvm",
       "displayName": "macOS Homebrew LLVM",
       "description": "Native macOS build using Homebrew LLVM/Clang, lld, and Homebrew binutils. The only Apple-toolchain pieces in the loop are SDKROOT (system headers/frameworks) and libSystem, because there is no Homebrew alternative for those.",
@@ -220,7 +237,8 @@
     { "name": "ci-strict-warnings-clang", "configurePreset": "ci-strict-warnings-clang" },
     { "name": "ci-dead-code-gcc",         "configurePreset": "ci-dead-code-gcc" },
     { "name": "ci-dead-code-clang",       "configurePreset": "ci-dead-code-clang" },
-    { "name": "ci-windows-mingw",         "configurePreset": "ci-windows-mingw" }
+    { "name": "ci-windows-mingw",         "configurePreset": "ci-windows-mingw" },
+    { "name": "windows-msvc",             "configurePreset": "windows-msvc" }
   ],
 
   "testPresets": [

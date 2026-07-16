@@ -48,7 +48,10 @@ static std::thread g_logFlushThread;
 // Log to file if active, otherwise to the given default stream.
 // When logging to a shared file in multi-part mode, each line is prefixed with the part id.
 static void logPrintf(FILE* defaultStream, const char* fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 2, 3)))
+#endif
+    ;
 static void logPrintf(FILE* defaultStream, const char* fmt, ...)
 {
     FILE* out = g_logFile ? g_logFile : defaultStream;
