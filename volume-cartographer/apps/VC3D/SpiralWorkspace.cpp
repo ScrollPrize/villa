@@ -33,12 +33,15 @@
 #include <QtEndian>
 #include <QtConcurrent/QtConcurrent>
 
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
+#include <unordered_map>
 
 namespace {
 
@@ -211,6 +214,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         _showSurfaceIntersections = shown;
         updateSurfaceIntersections();
     });
+    connect(_panel, &SpiralPanel::runDiffChanged,
+            _overlay.get(), &SpiralOverlayController::setRunDiffVisible);
     connect(_service, &SpiralServiceManager::previewAvailable, this, &SpiralWorkspace::loadPreview);
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
             [this](SpiralServiceManager::ConnectionState state, const QString&) {
@@ -220,6 +225,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     _inputSurfaceGeneration = 0;
                     _geometryManifestPath.clear();
                     _pendingPatchIds.clear();
+                    _haveRunDiffBaseline = false;
+                    _previewRunDiffImage = {};
                     _overlay->reset();
                     updateSurfaceIntersections();
                 }
@@ -235,6 +242,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             &SpiralWorkspace::updatePendingPatchIds);
     connect(_service, &SpiralServiceManager::sessionAccepted, this,
             [this](const QJsonObject& paths, qint64 generation) {
+                // A newly loaded fit starts a new comparison sequence even when
+                // it reuses the existing service connection.
+                _haveRunDiffBaseline = false;
+                _previewRunDiffImage = {};
+                _overlay->publishRunDiff({}, {});
                 loadInputSurfaces(paths, static_cast<quint64>(generation));
             });
     // Geometry snapshots arrive as artifacts already transferred to the local
@@ -689,10 +701,183 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
 void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 generation)
 {
     if (!result.surface) { statusBar()->showMessage(result.error, 15000); return; }
+    const auto previous = _haveRunDiffBaseline ? _previewSource : nullptr;
+    const auto previousComponents = _previewComponents;
     _previewSource = result.surface;
     _previewSourceId = result.surfaceId;
     _previewComponents = result.components;
+    _previewRunDiffImage = {};
+    _overlay->publishRunDiff({}, {});
     applyPreviewWindingRange(false);
+    _haveRunDiffBaseline = true;
+    if (previous)
+        loadRunDiff(previous, previousComponents, result.surface, result.components, generation);
+}
+
+void SpiralWorkspace::loadRunDiff(
+    const std::shared_ptr<QuadSurface>& previous,
+    const std::vector<PreviewComponent>& previousComponents,
+    const std::shared_ptr<QuadSurface>& current,
+    const std::vector<PreviewComponent>& currentComponents,
+    qint64 generation)
+{
+    auto* watcher = new QFutureWatcher<QImage>(this);
+    connect(watcher, &QFutureWatcher<QImage>::finished, this,
+            [this, watcher, current, generation]() {
+                const QImage image = watcher->result();
+                watcher->deleteLater();
+                if (_shuttingDown || generation != _requestedPreviewGeneration
+                    || current != _previewSource)
+                    return;
+                _previewRunDiffImage = image;
+                updateRunDiffOverlay();
+            });
+    watcher->setFuture(QtConcurrent::run(
+        [previous, previousComponents, current, currentComponents]() {
+            return buildRunDiffImage(previous, previousComponents,
+                                     current, currentComponents);
+        }));
+}
+
+QImage SpiralWorkspace::buildRunDiffImage(
+    const std::shared_ptr<QuadSurface>& previous,
+    const std::vector<PreviewComponent>& previousComponents,
+    const std::shared_ptr<QuadSurface>& current,
+    const std::vector<PreviewComponent>& currentComponents)
+{
+    if (!previous || !current) return {};
+    const cv::Mat_<cv::Vec3f>* previousPoints = previous->rawPointsPtr();
+    const cv::Mat_<cv::Vec3f>* currentPoints = current->rawPointsPtr();
+    if (!previousPoints || !currentPoints || previousPoints->empty() || currentPoints->empty())
+        return {};
+
+    cv::Mat_<float> magnitudes(currentPoints->rows, currentPoints->cols, 0.0f);
+    std::unordered_map<int, PreviewComponent> previousByWinding;
+    previousByWinding.reserve(previousComponents.size());
+    for (const PreviewComponent& component : previousComponents)
+        previousByWinding.emplace(component.winding, component);
+
+    float minimumPositive = std::numeric_limits<float>::infinity();
+    float maximum = 0.0f;
+    std::size_t changedCount = 0;
+    const int commonRows = std::min(previousPoints->rows, currentPoints->rows);
+    for (const PreviewComponent& currentComponent : currentComponents) {
+        const auto found = previousByWinding.find(currentComponent.winding);
+        if (found == previousByWinding.end()) continue;
+        const PreviewComponent& previousComponent = found->second;
+        const int width = std::min(currentComponent.endColumn - currentComponent.firstColumn,
+                                   previousComponent.endColumn - previousComponent.firstColumn);
+        for (int row = 0; row < commonRows; ++row) {
+            for (int offset = 0; offset < width; ++offset) {
+                const int currentColumn = currentComponent.firstColumn + offset;
+                const int previousColumn = previousComponent.firstColumn + offset;
+                if (currentColumn < 0 || currentColumn >= currentPoints->cols
+                    || previousColumn < 0 || previousColumn >= previousPoints->cols)
+                    continue;
+                const cv::Vec3f& before = (*previousPoints)(row, previousColumn);
+                const cv::Vec3f& after = (*currentPoints)(row, currentColumn);
+                if (before[0] == -1.0f || after[0] == -1.0f
+                    || !std::isfinite(before[0]) || !std::isfinite(before[1])
+                    || !std::isfinite(before[2]) || !std::isfinite(after[0])
+                    || !std::isfinite(after[1]) || !std::isfinite(after[2]))
+                    continue;
+                const cv::Vec3f delta = after - before;
+                const float magnitude = std::sqrt(delta.dot(delta));
+                if (!(magnitude > 1e-6f) || !std::isfinite(magnitude)) continue;
+                magnitudes(row, currentColumn) = magnitude;
+                minimumPositive = std::min(minimumPositive, magnitude);
+                maximum = std::max(maximum, magnitude);
+                ++changedCount;
+            }
+        }
+    }
+
+    QImage image(currentPoints->cols, currentPoints->rows, QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    if (changedCount == 0) return image;
+
+    // Use a logarithmic histogram to find a robust upper display bound without
+    // retaining another surface-sized list of magnitudes. The brightest red is
+    // the 95th percentile, so a single outlier cannot wash out the useful diff.
+    constexpr std::size_t histogramSize = 2048;
+    std::array<std::size_t, histogramSize> histogram{};
+    const double logMinimum = std::log(static_cast<double>(minimumPositive));
+    const double logMaximum = std::log(static_cast<double>(maximum));
+    const double logSpan = logMaximum - logMinimum;
+    for (int row = 0; row < magnitudes.rows; ++row) {
+        const float* values = magnitudes.ptr<float>(row);
+        for (int col = 0; col < magnitudes.cols; ++col) {
+            if (values[col] <= 0.0f) continue;
+            std::size_t bin = 0;
+            if (logSpan > 1e-12) {
+                const double fraction = (std::log(static_cast<double>(values[col])) - logMinimum)
+                                        / logSpan;
+                bin = std::min(histogramSize - 1,
+                               static_cast<std::size_t>(fraction * histogramSize));
+            }
+            ++histogram[bin];
+        }
+    }
+    const std::size_t percentileTarget = (changedCount * 95 + 99) / 100;
+    std::size_t accumulated = 0;
+    std::size_t percentileBin = histogramSize - 1;
+    for (std::size_t bin = 0; bin < histogramSize; ++bin) {
+        accumulated += histogram[bin];
+        if (accumulated >= percentileTarget) {
+            percentileBin = bin;
+            break;
+        }
+    }
+    const float displayMaximum = logSpan > 1e-12
+        ? static_cast<float>(std::exp(logMinimum
+              + logSpan * static_cast<double>(percentileBin + 1) / histogramSize))
+        : maximum;
+
+    for (int row = 0; row < magnitudes.rows; ++row) {
+        const float* values = magnitudes.ptr<float>(row);
+        QRgb* pixels = reinterpret_cast<QRgb*>(image.scanLine(row));
+        for (int col = 0; col < magnitudes.cols; ++col) {
+            if (values[col] <= 0.0f) continue;
+            const float intensity = std::clamp(values[col] / displayMaximum, 0.0f, 1.0f);
+            pixels[col] = qRgba(255, 64, 24, static_cast<int>(std::lround(235.0f * intensity)));
+        }
+    }
+    return image;
+}
+
+void SpiralWorkspace::updateRunDiffOverlay()
+{
+    if (!_currentPreview || _previewRunDiffImage.isNull()) {
+        _overlay->publishRunDiff({}, {});
+        return;
+    }
+    if (_currentPreview == _previewSource) {
+        _overlay->publishRunDiff(_currentPreview, _previewRunDiffImage);
+        return;
+    }
+
+    std::vector<PreviewComponent> selected;
+    for (const PreviewComponent& component : _previewComponents) {
+        if (component.winding < _minimumDisplayedWinding) continue;
+        if (_maximumDisplayedWinding >= 0 && component.winding > _maximumDisplayedWinding)
+            continue;
+        selected.push_back(component);
+    }
+    if (selected.empty()) {
+        _overlay->publishRunDiff({}, {});
+        return;
+    }
+    const int firstColumn = selected.front().firstColumn;
+    const int endColumn = selected.back().endColumn;
+    if (firstColumn < 0 || endColumn > _previewRunDiffImage.width()
+        || firstColumn >= endColumn) {
+        _overlay->publishRunDiff({}, {});
+        return;
+    }
+    _overlay->publishRunDiff(
+        _currentPreview,
+        _previewRunDiffImage.copy(firstColumn, 0, endColumn - firstColumn,
+                                  _previewRunDiffImage.height()));
 }
 
 std::shared_ptr<QuadSurface> SpiralWorkspace::makeDisplayedPreview(
@@ -740,6 +925,7 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
         const QString previousRegistration = _currentPreviewRegistrationId;
         _currentPreview.reset();
         _currentPreviewRegistrationId.clear();
+        _overlay->publishRunDiff({}, {});
         updateSurfaceIntersections();
         if (!previousRegistration.isEmpty())
             _state->setSurface(previousRegistration.toStdString(), nullptr);
@@ -781,6 +967,7 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
     _currentPreview = preview;
     _currentPreviewRegistrationId = registrationId;
     if (_outputVisible) _state->setSurface("segmentation", preview, false, preserveFocus);
+    updateRunDiffOverlay();
     // No-op unless the focus is still missing or the automatic default.
     initializePreviewFocus();
     updateSurfaceIntersections();

@@ -32,6 +32,7 @@ public:
 signals:
     void volumeSelected(const QString& id);
     void visibilityChanged(const QString& category, bool visible);
+    void runDiffChanged(bool visible);
     void windingRangeChanged(int minimum, int maximum);
     void surfaceIntersectionsChanged(bool shown);
     void pythonOutputRequested();

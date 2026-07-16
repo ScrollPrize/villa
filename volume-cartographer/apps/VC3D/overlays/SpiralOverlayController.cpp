@@ -35,6 +35,20 @@ void SpiralOverlayController::publishIndex(std::shared_ptr<const PolylineIndex> 
     refreshAll();
 }
 
+void SpiralOverlayController::publishRunDiff(std::shared_ptr<QuadSurface> surface, QImage image)
+{
+    _runDiffSurface = std::move(surface);
+    _runDiffImage = std::move(image);
+    refreshAll();
+}
+
+void SpiralOverlayController::setRunDiffVisible(bool visible)
+{
+    if (_runDiffVisible == visible) return;
+    _runDiffVisible = visible;
+    refreshAll();
+}
+
 void SpiralOverlayController::reset()
 {
     _index.reset();
@@ -42,6 +56,8 @@ void SpiralOverlayController::reset()
     ++_requestGeneration;
     _cache.clear();
     _chains.clear();
+    _runDiffSurface.reset();
+    _runDiffImage = {};
     refreshAll();
 }
 
@@ -85,13 +101,43 @@ void SpiralOverlayController::detachViewer(VolumeViewerBase* viewer)
 
 bool SpiralOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
-    return viewer && _index && !_index->empty()
+    const bool geometryVisible = viewer && _index && !_index->empty()
         && std::any_of(_visible.begin(), _visible.end(), [](bool value) { return value; });
+    return geometryVisible || hasRunDiffFor(viewer);
+}
+
+bool SpiralOverlayController::hasRunDiffFor(VolumeViewerBase* viewer) const
+{
+    return _runDiffVisible && viewer && _runDiffSurface && !_runDiffImage.isNull()
+        && viewer->currentSurface() == _runDiffSurface.get();
 }
 
 void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder)
 {
     if (!isOverlayEnabledFor(viewer)) return;
+
+    if (hasRunDiffFor(viewer)) {
+        const cv::Vec2f scale = _runDiffSurface->scale();
+        const cv::Vec3f center = _runDiffSurface->center();
+        if (std::abs(scale[0]) > 1e-6f && std::abs(scale[1]) > 1e-6f) {
+            auto gridToScene = [viewer, scale, center](int row, int col) {
+                const float surfaceX = static_cast<float>(col) / scale[0] - center[0];
+                const float surfaceY = static_cast<float>(row) / scale[1] - center[1];
+                return viewer->surfaceCoordsToScene(surfaceX, surfaceY);
+            };
+            const QPointF origin = gridToScene(0, 0);
+            const QPointF columnStep = gridToScene(0, 1) - origin;
+            const QPointF rowStep = gridToScene(1, 0) - origin;
+            const qreal scaleX = std::hypot(columnStep.x(), columnStep.y());
+            const qreal scaleY = std::hypot(rowStep.x(), rowStep.y());
+            if (scaleX > 1e-6 && scaleY > 1e-6)
+                builder.addImage(_runDiffImage, origin, scaleX, scaleY, 1.0, 65.0);
+        }
+    }
+
+    const bool geometryVisible = _index && !_index->empty()
+        && std::any_of(_visible.begin(), _visible.end(), [](bool value) { return value; });
+    if (!geometryVisible) return;
     const QRectF rect = visibleSceneRect(viewer);
     const bool surfacePane = dynamic_cast<QuadSurface*>(viewer->currentSurface()) != nullptr;
     const int samplesPerAxis = surfacePane ? 5 : 2;

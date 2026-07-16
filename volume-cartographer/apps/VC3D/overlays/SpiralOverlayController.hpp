@@ -3,10 +3,13 @@
 #include "ViewerOverlayControllerBase.hpp"
 
 #include <QHash>
+#include <QImage>
 #include <memory>
 #include <unordered_map>
 
 #include "vc/core/util/PolylineIndex.hpp"
+
+class QuadSurface;
 
 class SpiralOverlayController : public ViewerOverlayControllerBase
 {
@@ -14,6 +17,8 @@ class SpiralOverlayController : public ViewerOverlayControllerBase
 public:
     explicit SpiralOverlayController(QObject* parent = nullptr);
     void publishIndex(std::shared_ptr<const PolylineIndex> index, quint64 generation);
+    void publishRunDiff(std::shared_ptr<QuadSurface> surface, QImage image);
+    void setRunDiffVisible(bool visible);
     void reset();
     void setCategoryVisible(const QString& category, bool visible);
     void detachViewer(VolumeViewerBase* viewer) override;
@@ -40,6 +45,7 @@ private:
     void schedule(VolumeViewerBase* viewer, const QString& key,
                   const cv::Vec3f& lo, const cv::Vec3f& hi);
     void rebuildChains();
+    bool hasRunDiffFor(VolumeViewerBase* viewer) const;
 
     std::shared_ptr<const PolylineIndex> _index;
     std::vector<ChainEntry> _chains;
@@ -47,4 +53,7 @@ private:
     quint64 _requestGeneration = 0;
     QHash<QString, bool> _visible;
     std::unordered_map<VolumeViewerBase*, Cache> _cache;
+    std::shared_ptr<QuadSurface> _runDiffSurface;
+    QImage _runDiffImage;
+    bool _runDiffVisible = false;
 };

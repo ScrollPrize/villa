@@ -401,6 +401,15 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_showSurfaceIntersections, &QCheckBox::toggled,
             this, &SpiralPanel::surfaceIntersectionsChanged);
     displayLayout->addWidget(_showSurfaceIntersections);
+
+    auto* runDiff = new QCheckBox(tr("Run diff"), displayContents);
+    runDiff->setObjectName(QStringLiteral("spiralRunDiff"));
+    runDiff->setToolTip(
+        tr("Overlay the XYZ displacement magnitude between the previous and current "
+           "completed runs. Brighter red means more movement; the first run has no diff."));
+    connect(runDiff, &QCheckBox::toggled, this, &SpiralPanel::runDiffChanged);
+    displayLayout->addWidget(runDiff);
+
     for (const auto& item : std::initializer_list<std::pair<const char*, const char*>>{
              {"output", "Output"}, {"fibers", "Fibers"}, {"tracks", "Tracks"},
              {"pcls", "Winding/PCL inputs"}, {"verified", "Verified patches"},

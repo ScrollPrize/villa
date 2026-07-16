@@ -3,6 +3,7 @@
 #include <QMainWindow>
 #include <QFutureWatcher>
 #include <QHash>
+#include <QImage>
 #include <QJsonObject>
 #include <QSet>
 #include <QStringList>
@@ -82,6 +83,17 @@ private:
     void loadPreview(const QString& manifestPath, qint64 generation);
     void installPreview(const PreviewLoadResult& result, qint64 generation);
     void applyPreviewWindingRange(bool preserveFocus);
+    void loadRunDiff(const std::shared_ptr<QuadSurface>& previous,
+                     const std::vector<PreviewComponent>& previousComponents,
+                     const std::shared_ptr<QuadSurface>& current,
+                     const std::vector<PreviewComponent>& currentComponents,
+                     qint64 generation);
+    static QImage buildRunDiffImage(
+        const std::shared_ptr<QuadSurface>& previous,
+        const std::vector<PreviewComponent>& previousComponents,
+        const std::shared_ptr<QuadSurface>& current,
+        const std::vector<PreviewComponent>& currentComponents);
+    void updateRunDiffOverlay();
     std::shared_ptr<QuadSurface> makeDisplayedPreview(QString& registrationId) const;
     void installPreviewAliasWhenIndexed(const std::shared_ptr<QuadSurface>& preview,
                                         const QString& registrationId,
@@ -125,12 +137,14 @@ private:
     std::vector<PreviewComponent> _previewComponents;
     std::shared_ptr<QuadSurface> _currentPreview;
     QString _currentPreviewRegistrationId;
+    QImage _previewRunDiffImage;
     quint64 _previewDisplayRevision = 0;
     int _minimumDisplayedWinding = 10;
     int _maximumDisplayedWinding = -1;
     bool _outputVisible = true;
     bool _showSurfaceIntersections = true;
     bool _pendingPatchesOnly = false;
+    bool _haveRunDiffBaseline = false;
     // True while the focus is the automatic volume-center default (no user
     // interaction and no preview yet); the first preview may then retarget it.
     bool _focusIsAutoDefault = false;
