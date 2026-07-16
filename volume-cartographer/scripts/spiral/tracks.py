@@ -10,7 +10,12 @@ from PIL import Image, ImageDraw
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
-from sample_spiral import get_theta_and_radii
+from sample_spiral import (
+    get_theta_and_radii,
+    get_theta_crossing_step_adjustments,
+    radius_from_unwrapped_shifted,
+    unwrap_shifted_radii,
+)
 
 
 def load_tracks_from_dbm(path, z_lo, z_hi):
@@ -39,22 +44,6 @@ def load_tracks_from_dbm(path, z_lo, z_hi):
             for j in np.nonzero(keep)[0]:
                 tracks.append(entries[idx[j]].astype(np.float32))
     return tracks
-
-
-def _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding):
-    if theta.shape[-1] <= 1:
-        return shifted_radii
-
-    theta_diffs = theta.detach()[..., 1:] - theta.detach()[..., :-1]
-    step_adjustments = (
-        (theta_diffs > np.pi).to(shifted_radii.dtype)
-        - (theta_diffs < -np.pi).to(shifted_radii.dtype)
-    ) * dr_per_winding.detach()
-    adjustments = torch.cat([
-        torch.zeros([*theta.shape[:-1], 1], device=shifted_radii.device, dtype=shifted_radii.dtype),
-        torch.cumsum(step_adjustments, dim=-1),
-    ], dim=-1)
-    return shifted_radii + adjustments
 
 
 def _aggregate_dt_track_losses(track_losses, across_p, active_mask=None):
@@ -140,13 +129,8 @@ def _build_track_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
 
         if total > 1:
-            theta_d = theta.detach()
-            diffs = theta_d[1:] - theta_d[:-1]
             same_track = track_id[1:] == track_id[:-1]
-            step_adj = (
-                (diffs > np.pi).to(shifted_radii.dtype)
-                - (diffs < -np.pi).to(shifted_radii.dtype)
-            ) * dr
+            step_adj = get_theta_crossing_step_adjustments(theta, dr)
             step_adj = torch.where(same_track, step_adj, torch.zeros_like(step_adj))
             cumsum_inner = torch.cumsum(step_adj, dim=0)
             cumsum_flat = torch.cat([
@@ -236,7 +220,9 @@ def _track_satisfaction_from_target(ctx, target_normalised_per_track):
         target_shifted = target_normalised + windings * dr
         spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
 
-        target_radii = target_shifted - adjustments + theta / (2 * np.pi) * dr
+        target_radii = radius_from_unwrapped_shifted(
+            theta, target_shifted, adjustments, dr,
+        )
         target_spiral_zyxs = torch.stack([
             spiral_zyxs[..., 0],
             torch.sin(theta) * target_radii,
@@ -432,7 +418,7 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     num_points = sampled_scroll.shape[1]
     sampled_spiral = slice_to_spiral_transform(sampled_scroll.reshape(-1, 3)).reshape(k, num_points, 3)
     theta, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
-    shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
+    shifted_radii, crossing_adjustments = unwrap_shifted_radii(theta, shifted_radii, dr_per_winding)
     dt_hinge_margin = dr_per_winding.detach() * cfg['track_dt_loss_margin']
     radius_loss = _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding, cfg)
 
@@ -440,7 +426,9 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
         return radius_loss, zero
 
     target_shifted_radii = torch.round(shifted_radii.median(dim=-1, keepdim=True).values / dr_per_winding) * dr_per_winding
-    target_radii = target_shifted_radii + theta / (2 * np.pi) * dr_per_winding
+    target_radii = radius_from_unwrapped_shifted(
+        theta, target_shifted_radii, crossing_adjustments, dr_per_winding,
+    )
     target_spiral_zyxs = torch.stack([
         sampled_spiral[..., 0],
         torch.sin(theta) * target_radii,
