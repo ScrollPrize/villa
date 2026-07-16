@@ -287,6 +287,12 @@
   separate native 3D Trace2CP inspection tool. It must not replace the
   projected `test/trace2cp_error` training metric or best-checkpoint selection
   unless that migration is explicitly requested.
+- Native 3D Trace2CP selection supports both the existing
+  `--sample-index`/`--target-offset` mode and explicit fiber segment mode:
+  `--fiber-json <path> --start-cp-index A --target-cp-index B`. Explicit CP
+  index mode requires `--fiber-json`, requires both CP indices, uses flat
+  single-fiber CP ordering, and must reuse the existing 2D Trace2CP segment
+  source builder with `target_control_point_index`.
 - The native 3D tool traces in selected-level ZYX voxel coordinates. It loads
   the same dataset/test-dataset CP pair as the visualization geometry loader,
   decodes six Lasagna 3x2 direction channels analytically, treats predicted
@@ -303,14 +309,14 @@
   `record.volume_spacing_base`, validated against `record.base_shape_zyx`, and
   passed to blocking `sample_coord_batch(...)`. Real configured volumes must
   not be read by direct zarr/raw block slicing in the native tool.
-- Native 3D Trace2CP applies only the configured 3D model-input normalization
-  before inference. Visualization brightness is handled separately and must
-  not affect model input or metric/tracing scores.
-- Native 3D Trace2CP exported strip volume panels use raw clipped brightness:
-  valid finite sampled volume values are rounded and clipped to `0..255`, and
-  invalid pixels render black. Per-panel percentile/min-max display scaling is
-  not allowed for native Trace2CP volume panels because it hides loading and
-  brightness problems.
+- Native 3D Trace2CP applies the configured 3D model-input normalization before
+  inference. Exported native strip volume panels must display that same
+  normalized input domain so the visualization shows what inference sees. For
+  `image_normalization: "zscore"`, display maps a fixed normalized `[-3, 3]`
+  window to `0..255`; for `minmax`, display maps normalized `0..1`; for
+  raw/none modes, display clips raw `0..255`. Per-panel percentile display
+  scaling is not allowed for native Trace2CP volume panels because it hides
+  loading and brightness problems.
 - Trace2CP strip rendering must reject non-blocking coordinate samplers and
   VC3D sampler results with reported chunk errors. The VC3D renderer may
   otherwise produce fine-to-coarse fallback imagery after failed fine-chunk
@@ -338,6 +344,12 @@
 - The native 3D CLI prints live progress bars for forward and backward tracing.
   Progress is measured by signed target-plane progress along the initial
   CP-to-CP direction. It includes step count, ETA, and inferred-block count.
+- Native 3D strip visualization prints live progress for rendering stages and
+  for side/top presence-strip sampling. Presence progress must report
+  processed inference blocks, total unique inference blocks, sampled strip
+  points, valid output points, newly inferred blocks, cached blocks, and total
+  cache block count. Regular trace candidate sampling remains quiet unless a
+  caller explicitly supplies a progress label.
 - `--trace-step-limit N` is a debug-only cap on accepted trace steps per
   direction. When set, native tracing can intentionally return a partial trace
   with `reason=trace_step_limit`; this is distinct from the safety guard
@@ -349,11 +361,22 @@
   `native_trace2cp_plane_error` and
   `native_trace2cp_closest_target_error`. These are not the public 2D
   `trace2cp_error`.
-- Native 3D visualization converts the fused traced 3D line back to base XYZ,
-  samples Lasagna normals at those traced coordinates, and builds a fresh
-  Trace2CP-style side/top strip source directly from the traced 3D polyline.
-  The old source strip is not a hard spatial domain for native 3D tracing; it
-  only supplies the record, CP metadata, and visual sizing defaults.
+- Native 3D visualization uses the initial side/top strip source built by the
+  existing 2D Trace2CP geometry loader for the input CP pair. It must not build
+  a fresh side/top strip source from the fitted native 3D trace for this debug
+  view.
+- Trace2CP segment-source construction may trim extra line-window margin to the
+  valid compact-geometry interval that contains both start and target control
+  points. It must not synthesize missing normals. If the actual CP-to-CP line
+  range crosses an invalid compact-geometry gap, source construction must fail
+  loudly.
+- Native 3D visualization includes side/top strip panels of the inferred 3D
+  presence signal sampled on the initial side/top strip coordinates from the
+  native inference cache. Presence sampling should batch strip coordinates per
+  strip rather than call model inference per pixel.
+- Native forward, reverse, and fused 3D traces are projected onto the initial
+  side and top strip coordinate systems for overlay only. These overlays must
+  not regenerate the sampled strip image or define a new strip geometry.
 
 - The initial implementation loads batches of fiber-strip patches around random control points from the fiber dataset.
 - Fiber source parsing accepts existing VC3D fiber JSON files and Knossos /
@@ -372,9 +395,15 @@
 - Lasagna normals are used where needed to construct aligned strip frames.
 - At loader startup, the loader builds one shared compact in-RAM fiber-line
   geometry store for all configured records. It computes the line-index ranges
-  that can affect configured CP source windows, samples Lasagna normals only
-  for those required ranges, builds valid contiguous frame intervals, and keeps
-  compact per-line/frame arrays read-only for the rest of the process.
+  that can affect configured CP source windows and consecutive CP-to-CP
+  Trace2CP spans, samples Lasagna normals only for those required ranges,
+  builds valid contiguous frame intervals, and keeps compact per-line/frame
+  arrays read-only for the rest of the process.
+- A requested Trace2CP CP-to-CP span must not fail because an interior
+  centerline point was omitted from compact-geometry preload. If compact
+  geometry reports an invalid unsampled point inside such a span, that is a
+  diagnostic bug path and the error must say so explicitly with a direct
+  Lasagna value probe.
 - Startup compact geometry construction may parallelize across independent
   records with process workers controlled by `loader_workers`.
   `loader_workers=0` means all logical CPU cores, and `loader_workers=1` is

@@ -5680,6 +5680,7 @@ def test_parallel_startup_geometry_matches_serial(tmp_path: Path) -> None:
         np.testing.assert_array_equal(serial_geometry.cp_interval_indices, parallel_geometry.cp_interval_indices)
         np.testing.assert_array_equal(serial_geometry.normal_valid, parallel_geometry.normal_valid)
         np.testing.assert_allclose(serial_geometry.normals_xyz, parallel_geometry.normals_xyz, equal_nan=True)
+        assert serial_geometry.invalid_line_reasons == parallel_geometry.invalid_line_reasons
         assert serial_geometry.invalid_cp_reasons == parallel_geometry.invalid_cp_reasons
 
 
@@ -6155,6 +6156,120 @@ def test_compact_geometry_source_shapes_are_generated_directly(tmp_path: Path) -
         _as_test_numpy(small_source.source_control_point_xy),
         np.asarray([1.0, 1.0], dtype=np.float32),
     )
+
+
+def test_trace2cp_segment_trims_invalid_compact_geometry_margin() -> None:
+    loader = object.__new__(FiberStrip2DLoader)
+    interval = loader_module._FiberLineGeometryInterval(
+        start_index=10,
+        end_index=21,
+        start_arc=0.0,
+        frame_arrays=None,
+    )
+    geometry = loader_module._FiberLineGeometry(
+        record_index=0,
+        cumulative=np.arange(30, dtype=np.float64),
+        control_line_indices=np.asarray([12, 18], dtype=np.int64),
+        normals_xyz=np.zeros((30, 3), dtype=np.float32),
+        normal_valid=np.asarray([10 <= idx < 21 for idx in range(30)], dtype=bool),
+        invalid_line_reasons={},
+        intervals=(interval,),
+        cp_interval_indices=np.asarray([0, 0], dtype=np.int64),
+        cp_valid=np.asarray([True, True], dtype=bool),
+        invalid_cp_reasons=("", ""),
+    )
+    loader._geometry_store = loader_module._FiberLineGeometryStore(
+        by_record_index=[geometry],
+        by_fiber_identity={"fiber": geometry},
+        lock=threading.Lock(),
+        memory_bytes=0,
+        valid_control_points=2,
+        skipped_control_points=0,
+    )
+    record = SimpleNamespace(fiber_identity="fiber")
+    line_window = loader_module.FiberStripLineWindow(
+        line_points_xyz=np.arange(8, 23, dtype=np.float64)[:, None].repeat(3, axis=1),
+        original_line_indices=np.arange(8, 23, dtype=np.int64),
+        local_control_point_index=4,
+    )
+
+    trimmed = loader._trim_line_window_to_valid_compact_interval(
+        record,
+        line_window,
+        start_line_index=12,
+        target_line_index=18,
+    )
+
+    np.testing.assert_array_equal(trimmed.original_line_indices, np.arange(10, 21))
+    assert trimmed.local_control_point_index == 2
+
+
+def test_required_line_ranges_include_control_point_to_control_point_span(tmp_path: Path) -> None:
+    fiber_path = _write_fiber(
+        tmp_path / "fiber.json",
+        points=[[float(index), 0.0, 0.0] for index in range(100)],
+        control_points=[[10.0, 0.0, 0.0], [80.0, 0.0, 0.0]],
+    )
+    fiber = load_vc3d_fiber(fiber_path)
+    record = SimpleNamespace(fiber=fiber)
+    loader = object.__new__(FiberStrip2DLoader)
+
+    def line_window_bounds(_record, *, control_point_index: int, source_shape_hw: tuple[int, int]):
+        del _record, source_shape_hw
+        return (10, 12) if int(control_point_index) == 0 else (78, 80)
+
+    loader._line_window_bounds_for_control_point = line_window_bounds
+
+    required = loader._required_line_ranges_for_record(
+        record,
+        source_shape_hw=(3, 3),
+    )
+
+    assert (10, 81) in required.merged_ranges
+
+
+def test_trace2cp_segment_rejects_invalid_compact_geometry_between_cps() -> None:
+    loader = object.__new__(FiberStrip2DLoader)
+    interval = loader_module._FiberLineGeometryInterval(
+        start_index=10,
+        end_index=16,
+        start_arc=0.0,
+        frame_arrays=None,
+    )
+    geometry = loader_module._FiberLineGeometry(
+        record_index=0,
+        cumulative=np.arange(30, dtype=np.float64),
+        control_line_indices=np.asarray([12, 18], dtype=np.int64),
+        normals_xyz=np.zeros((30, 3), dtype=np.float32),
+        normal_valid=np.asarray([10 <= idx < 16 for idx in range(30)], dtype=bool),
+        invalid_line_reasons={16: "Lasagna grad_mag sample is zero at fiber line point value=0"},
+        intervals=(interval,),
+        cp_interval_indices=np.asarray([0, -1], dtype=np.int64),
+        cp_valid=np.asarray([True, False], dtype=bool),
+        invalid_cp_reasons=("", "invalid"),
+    )
+    loader._geometry_store = loader_module._FiberLineGeometryStore(
+        by_record_index=[geometry],
+        by_fiber_identity={"fiber": geometry},
+        lock=threading.Lock(),
+        memory_bytes=0,
+        valid_control_points=1,
+        skipped_control_points=1,
+    )
+    record = SimpleNamespace(fiber_identity="fiber")
+    line_window = loader_module.FiberStripLineWindow(
+        line_points_xyz=np.arange(10, 20, dtype=np.float64)[:, None].repeat(3, axis=1),
+        original_line_indices=np.arange(10, 20, dtype=np.int64),
+        local_control_point_index=2,
+    )
+
+    with pytest.raises(ValueError, match="first_invalid=16.*Lasagna grad_mag sample is zero"):
+        loader._trim_line_window_to_valid_compact_interval(
+            record,
+            line_window,
+            start_line_index=12,
+            target_line_index=18,
+        )
 
 
 def test_top_source_uses_compact_geometry_without_resampling_normals(

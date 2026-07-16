@@ -4,8 +4,7 @@
 
 - Added a separate native 3D Trace2CP inspection CLI with overlapped
   trusted-core inference blocks, deterministic 3D cone candidate tracing,
-  target-plane stopping, tool-local native trace metrics, and side/top strip
-  visualization built directly from the traced 3D polyline.
+  target-plane stopping, and tool-local native trace metrics.
 - Changed native 3D Trace2CP to default inference patches to `64,64,64`, print
   live forward/backward progress bars, and avoid treating the original 2D
   Trace2CP source strip as a hard visualization domain.
@@ -19,10 +18,24 @@
 - Changed native 3D Trace2CP inference-block loading to use the configured
   blocking coordinate sampler and selected-level to base-coordinate conversion
   from 3D training instead of direct raw zarr block slicing.
-- Changed native 3D Trace2CP exported strip panels to raw clipped `0..255`
-  brightness and made Trace2CP strip render sampling reject non-blocking
-  samplers or VC3D chunk-error fallback instead of silently showing mixed
-  fine/coarse imagery.
+- Made native 3D Trace2CP strip render sampling reject non-blocking samplers
+  or VC3D chunk-error fallback instead of silently showing mixed fine/coarse
+  imagery.
+- Changed native 3D Trace2CP visualization to display the initial 2D
+  Trace2CP side/top strips in the same normalized value domain used for model
+  inference, add side/top 3D presence panels sampled from the native inference
+  cache, and project forward/reverse/fused native traces onto those initial
+  strips instead of rebuilding strips from the fitted trace.
+- Added native 3D Trace2CP strip-render progress rows, including per-stage
+  rendering progress and block-level side/top presence sampling counters.
+- Added native 3D Trace2CP explicit fiber segment selection with
+  `--fiber-json`, `--start-cp-index`, and `--target-cp-index`.
+- Changed Trace2CP segment-source construction to trim invalid compact-geometry
+  margin points when both CPs remain inside one valid interval, while still
+  failing when the actual CP-to-CP range crosses an invalid-normal gap.
+- Extended compact-geometry preload to include consecutive CP-to-CP Trace2CP
+  spans and added direct Lasagna value probes for unexpected unsampled
+  invalid-normal diagnostics.
 
 ## 2026-07-15
 

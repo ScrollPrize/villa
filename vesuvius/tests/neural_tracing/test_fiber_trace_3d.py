@@ -52,6 +52,9 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     NativeTraceFieldCache,
     _image_to_u8,
     _interpolate_plane_crossing,
+    _project_trace_to_initial_strip,
+    _resolve_native_trace2cp_selection,
+    _sample_presence_on_strip,
     generate_cone_candidates,
     trace_native_3d_pair,
 )
@@ -1313,32 +1316,177 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().max_steps is None
 
 
-def test_native_3d_trace2cp_image_to_u8_uses_raw_clipped_values() -> None:
+def test_native_3d_trace2cp_explicit_segment_selection_uses_fiber_cp_indices() -> None:
+    record = SimpleNamespace(
+        fiber=SimpleNamespace(
+            control_points_zyx=np.zeros((5, 3), dtype=np.float32),
+        ),
+    )
+    loader = SimpleNamespace(records=[record])
+
+    selection = _resolve_native_trace2cp_selection(
+        loader,
+        sample_index=99,
+        fiber_json=Path("fiber.json"),
+        start_cp_index=3,
+        target_cp_index=1,
+        target_offset=1,
+        sample_mode=None,
+    )
+
+    assert selection.record is record
+    assert selection.sample_index == 3
+    assert selection.sample_mode == "flat"
+    assert selection.start_cp_index == 3
+    assert selection.target_cp_index == 1
+    assert selection.explicit_segment is True
+
+
+def test_native_3d_trace2cp_explicit_segment_selection_requires_fiber_json() -> None:
+    loader = SimpleNamespace(
+        records=[
+            SimpleNamespace(
+                fiber=SimpleNamespace(control_points_zyx=np.zeros((3, 3), dtype=np.float32))
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="require --fiber-json"):
+        _resolve_native_trace2cp_selection(
+            loader,
+            sample_index=0,
+            fiber_json=None,
+            start_cp_index=0,
+            target_cp_index=1,
+            target_offset=1,
+            sample_mode=None,
+        )
+
+
+def test_native_3d_trace2cp_sample_index_selection_stays_unchanged() -> None:
+    record = SimpleNamespace(
+        fiber=SimpleNamespace(
+            control_points_zyx=np.zeros((5, 3), dtype=np.float32),
+        ),
+    )
+
+    class FakeLoader:
+        def descriptor_for_sample_index(self, sample_index: int, *, sample_mode: str):
+            assert sample_index == 11
+            assert sample_mode == "random"
+            return record, 7, 2
+
+    selection = _resolve_native_trace2cp_selection(
+        FakeLoader(),
+        sample_index=11,
+        fiber_json=None,
+        start_cp_index=None,
+        target_cp_index=None,
+        target_offset=2,
+        sample_mode=None,
+    )
+
+    assert selection.record is record
+    assert selection.record_index == 7
+    assert selection.sample_index == 11
+    assert selection.sample_mode == "random"
+    assert selection.start_cp_index == 2
+    assert selection.target_cp_index == 4
+    assert selection.explicit_segment is False
+
+
+def test_native_3d_trace2cp_image_to_u8_uses_inference_zscore_values() -> None:
     image = np.asarray(
         [
-            [-10.0, 0.0, 12.0, 255.0],
-            [300.0, 128.0, np.nan, 42.4],
+            [0.0, 1.0, 2.0],
+            [np.nan, 1.0, 1.0],
         ],
         dtype=np.float32,
     )
     valid = np.asarray(
         [
-            [True, True, True, True],
-            [True, True, True, False],
+            [True, True, True],
+            [True, False, False],
         ],
         dtype=bool,
     )
 
-    rendered = _image_to_u8(image, valid)
+    rendered = _image_to_u8(image, valid, normalization="zscore")
 
-    expected = np.asarray(
+    assert rendered[0, 1] == 128
+    assert rendered[0, 0] < rendered[0, 1] < rendered[0, 2]
+    assert rendered[1, 0] == 0
+    assert rendered[1, 1] == 0
+
+
+def test_native_3d_trace2cp_strip_presence_samples_cache_in_one_batch() -> None:
+    class FakeCache:
+        def __init__(self) -> None:
+            self.points_zyx: np.ndarray | None = None
+
+        def sample_points_torch(
+            self,
+            points_zyx: np.ndarray,
+            *,
+            progress_label: str | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            assert progress_label is None
+            self.points_zyx = np.asarray(points_zyx, dtype=np.float32).copy()
+            count = int(points_zyx.shape[0])
+            directions = torch.zeros((count, 3), dtype=torch.float32)
+            presence = torch.arange(count, dtype=torch.float32) / max(1, count - 1)
+            valid = torch.ones((count,), dtype=torch.bool)
+            return directions, presence, valid
+
+    coords_xyz = np.asarray(
         [
-            [0, 0, 12, 255],
-            [255, 128, 0, 0],
+            [[2.0, 4.0, 6.0], [4.0, 6.0, 8.0]],
+            [[6.0, 8.0, 10.0], [8.0, 10.0, 12.0]],
         ],
-        dtype=np.uint8,
+        dtype=np.float32,
     )
-    assert np.array_equal(rendered, expected)
+    grid_valid = np.asarray([[True, False], [True, True]], dtype=bool)
+    cache = FakeCache()
+
+    presence, valid = _sample_presence_on_strip(
+        cache,
+        coords_xyz,
+        grid_valid,
+        spacing_base=2.0,
+    )
+
+    assert cache.points_zyx is not None
+    expected_points = coords_xyz[grid_valid][:, [2, 1, 0]] / np.float32(2.0)
+    assert np.allclose(cache.points_zyx, expected_points)
+    assert presence.shape == (2, 2)
+    assert valid.tolist() == [[True, False], [True, True]]
+    assert presence[0, 0] == pytest.approx(0.0)
+    assert presence[1, 1] == pytest.approx(1.0)
+
+
+def test_native_3d_trace2cp_projects_trace_to_initial_strip_axis() -> None:
+    line_points_xyz = np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float32)
+    line_xy = np.asarray([[0.0, 5.0], [10.0, 5.0]], dtype=np.float32)
+    axes = np.zeros((16, 16, 3), dtype=np.float32)
+    axes[..., 1] = 1.0
+    source = SimpleNamespace(
+        record=SimpleNamespace(volume_spacing_base=1.0),
+        line_window=SimpleNamespace(line_points_xyz=line_points_xyz),
+        line_xy=line_xy,
+        grid=SimpleNamespace(
+            offset_axis_xyz=axes,
+            valid_mask=np.ones((16, 16), dtype=bool),
+        ),
+    )
+    trace_xyz = np.asarray([[2.0, 3.0, 0.0], [8.0, -2.0, 0.0]], dtype=np.float32)
+
+    projected = _project_trace_to_initial_strip(
+        source,
+        trace_xyz,
+        axis_name="offset_axis_xyz",
+    )
+
+    assert np.allclose(projected, [[2.0, 8.0], [8.0, 3.0]], atol=1.0e-5)
 
 
 def test_native_3d_trace2cp_plane_crossing_interpolates() -> None:

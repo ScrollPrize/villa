@@ -33,11 +33,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     dataclass_replace,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.loader import _Trace2CpSegmentSource
-from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
-    FiberStripLineWindow,
-    build_side_strip_patch_grid_tensor_from_line_window,
-    source_line_xy_from_line_window,
-)
+from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_line_index
 
 
 _EPS = 1.0e-12
@@ -93,6 +89,17 @@ class _InferredBlock:
     core_hi_zyx: np.ndarray
     output_czyx: torch.Tensor
     valid_mask_zyx: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _NativeTrace2CpSelection:
+    record: Any
+    record_index: int
+    sample_index: int
+    sample_mode: str
+    start_cp_index: int
+    target_cp_index: int
+    explicit_segment: bool
 
 
 def _resolve_config_relative_path(path: str | Path, raw_config: dict[str, Any]) -> str:
@@ -391,6 +398,8 @@ class NativeTraceFieldCache:
     def sample_points_torch(
         self,
         points_zyx: np.ndarray,
+        *,
+        progress_label: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         points = np.asarray(points_zyx, dtype=np.float32)
         if points.ndim != 2 or points.shape[1] != 3:
@@ -405,11 +414,45 @@ class NativeTraceFieldCache:
         origins = self._block_origins_for_points(points)
         unique_origins, inverse = np.unique(origins, axis=0, return_inverse=True)
         shape = np.asarray(self.patch_shape_zyx, dtype=np.float32)
+        progress_start = time.perf_counter()
+        last_progress_time = 0.0
+        new_blocks = 0
+        cached_blocks = 0
+        valid_done = 0
+
+        def emit_progress(block_index: int, *, force: bool = False) -> None:
+            nonlocal last_progress_time
+            if progress_label is None:
+                return
+            now = time.perf_counter()
+            if not force and now - last_progress_time < 0.25:
+                return
+            last_progress_time = now
+            _emit_native_progress(
+                f"strip presence {progress_label}",
+                block_index,
+                int(unique_origins.shape[0]),
+                progress_start,
+                detail=(
+                    f"points={count} valid={valid_done} "
+                    f"new={new_blocks} cached={cached_blocks} "
+                    f"cache_blocks={len(self._blocks)}"
+                ),
+            )
+
+        emit_progress(0, force=True)
         for unique_index, origin in enumerate(unique_origins):
             indices = np.flatnonzero(inverse == int(unique_index))
             if indices.size == 0:
+                emit_progress(int(unique_index) + 1)
                 continue
+            key = tuple(int(v) for v in np.asarray(origin, dtype=np.int64))
+            was_cached = key in self._blocks
             block = self._infer_block(origin)
+            if was_cached:
+                cached_blocks += 1
+            else:
+                new_blocks += 1
             group_points = points[indices]
             local = group_points - block.origin_zyx.astype(np.float32)
             inside_core = np.all(group_points >= block.core_lo_zyx, axis=1) & np.all(
@@ -422,6 +465,7 @@ class NativeTraceFieldCache:
             )
             usable = inside_core & inside_block
             if not bool(np.any(usable)):
+                emit_progress(int(unique_index) + 1)
                 continue
             usable_indices = indices[usable]
             usable_points = points[usable_indices]
@@ -446,10 +490,13 @@ class NativeTraceFieldCache:
                 else torch.ones((int(sampled.shape[0]),), dtype=torch.float32, device=self.device)
             )
             group_valid = (valid_values > 0.5) & torch.isfinite(axis_zyx).all(dim=1)
+            valid_done += int(torch.count_nonzero(group_valid).detach().cpu())
             index_t = torch.as_tensor(usable_indices, dtype=torch.long, device=self.device)
             directions[index_t] = axis_zyx
             presence[index_t] = group_presence
             valid[index_t] = group_valid
+            emit_progress(int(unique_index) + 1)
+        emit_progress(int(unique_origins.shape[0]), force=True)
         return directions, presence, valid
 
     def sample_point(self, point_zyx: np.ndarray) -> tuple[np.ndarray, float, bool]:
@@ -484,6 +531,30 @@ def _format_eta(seconds: float | None) -> str:
     if minutes > 0:
         return f"{minutes}m{secs:02d}s"
     return f"{secs}s"
+
+
+def _emit_native_progress(
+    label: str,
+    current: int,
+    total: int,
+    start_time: float,
+    *,
+    detail: str = "",
+) -> None:
+    total_i = max(1, int(total))
+    current_i = max(0, min(int(current), total_i))
+    progress = float(current_i) / float(total_i)
+    elapsed = max(0.0, time.perf_counter() - float(start_time))
+    eta = None if progress <= 1.0e-6 else elapsed * (1.0 - progress) / progress
+    width = 24
+    filled = int(math.floor(width * progress))
+    bar = "#" * filled + "-" * (width - filled)
+    suffix = "" if not detail else f" {detail}"
+    print(
+        f"native {label} [{bar}] {current_i}/{total_i} "
+        f"elapsed={_format_eta(elapsed)} eta={_format_eta(eta)}{suffix}",
+        flush=True,
+    )
 
 
 def _score_candidate_batch(
@@ -814,185 +885,265 @@ def trace_native_3d_pair(
     )
 
 
-def _arc_lengths(points_xyz: np.ndarray) -> np.ndarray:
-    points = np.asarray(points_xyz, dtype=np.float64)
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError("points_xyz must have shape [N,3]")
-    if int(points.shape[0]) == 0:
-        return np.zeros((0,), dtype=np.float64)
-    if int(points.shape[0]) == 1:
-        return np.zeros((1,), dtype=np.float64)
-    deltas = np.diff(points, axis=0)
-    distances = np.linalg.norm(deltas, axis=1)
-    return np.concatenate([[0.0], np.cumsum(distances)]).astype(np.float64)
-
-
-def _deduplicate_trace_xyz(trace_xyz_base: np.ndarray) -> np.ndarray:
-    trace = np.asarray(trace_xyz_base, dtype=np.float32)
-    if trace.ndim != 2 or trace.shape[1] != 3 or int(trace.shape[0]) < 2:
-        raise ValueError("trace_xyz_base must have shape [N,3] with N >= 2")
-    if not bool(np.isfinite(trace).all()):
-        raise ValueError("native 3D Trace2CP trace contains non-finite coordinates")
-    keep = [0]
-    for idx in range(1, int(trace.shape[0]) - 1):
-        if float(np.linalg.norm(trace[idx] - trace[keep[-1]])) > 1.0e-4:
-            keep.append(idx)
-    if keep[-1] != int(trace.shape[0]) - 1:
-        keep.append(int(trace.shape[0]) - 1)
-    deduped = trace[np.asarray(keep, dtype=np.int64)]
-    if int(deduped.shape[0]) < 2:
-        raise ValueError("native 3D Trace2CP trace degenerates to fewer than two points")
-    return deduped.astype(np.float32, copy=False)
-
-
-def _sequentially_align_normals(normals_xyz: np.ndarray, reference_xyz: np.ndarray) -> np.ndarray:
-    normals = np.asarray(normals_xyz, dtype=np.float32).copy()
-    if int(normals.shape[0]) == 0:
-        return normals
-    reference = np.asarray(reference_xyz, dtype=np.float32).reshape(-1)
-    if reference.shape == (3,) and float(np.linalg.norm(reference)) > _EPS:
-        if float(np.dot(_unit(normals[0]), _unit(reference))) < 0.0:
-            normals *= np.float32(-1.0)
-    for idx in range(1, int(normals.shape[0])):
-        if float(np.dot(_unit(normals[idx - 1]), _unit(normals[idx]))) < 0.0:
-            normals[idx:] *= np.float32(-1.0)
-    return normals.astype(np.float32, copy=False)
-
-
-def _sample_lasagna_normals_for_trace(
-    geometry_loader: Any,
-    source: _Trace2CpSegmentSource,
-    trace_xyz_base: np.ndarray,
+def _image_to_u8(
+    image: np.ndarray,
+    valid: np.ndarray,
+    *,
+    normalization: str,
 ) -> np.ndarray:
-    line_indices = np.arange(int(trace_xyz_base.shape[0]), dtype=np.int64)
-    normals, valid, invalid_by_line = geometry_loader._lasagna_normals_at_zyx_batch(
-        source.record,
-        np.asarray(trace_xyz_base, dtype=np.float64)[:, [2, 1, 0]],
-        line_indices=line_indices,
-    )
-    if not bool(np.all(valid)):
-        bad = np.flatnonzero(~valid)
-        first = int(bad[0]) if bad.size else -1
-        reason = invalid_by_line.get(first, "unknown invalid Lasagna normal")
-        raise ValueError(
-            "native 3D Trace2CP traced-line Lasagna normal is invalid while "
-            "building strip visualization: "
-            f"invalid_points={int(bad.size)} first_invalid={first}: {reason}"
-        )
-    return _sequentially_align_normals(normals, source.start_row_axis_xyz)
-
-
-def _endpoint_margin_from_source(source: _Trace2CpSegmentSource) -> float:
-    width = float(int(source.source_shape_hw[1]))
-    sx = float(np.asarray(source.start_control_point_xy, dtype=np.float32)[0])
-    tx = float(np.asarray(source.target_control_point_xy, dtype=np.float32)[0])
-    margins = [sx, width - 1.0 - sx, tx, width - 1.0 - tx]
-    finite = [value for value in margins if np.isfinite(value) and value >= 0.0]
-    return max(4.0, min(finite) if finite else 4.0)
-
-
-def build_native_trace_segment_source(
-    geometry_loader: Any,
-    source: _Trace2CpSegmentSource,
-    trace_xyz_base: np.ndarray,
-) -> _Trace2CpSegmentSource:
-    """Build a Trace2CP strip source directly from native volume-space points."""
-
-    trace_xyz = _deduplicate_trace_xyz(trace_xyz_base)
-    spacing = float(source.record.volume_spacing_base)
-    if not np.isfinite(spacing) or spacing <= 0.0:
-        raise ValueError(f"invalid volume spacing for native trace visualization: {spacing}")
-    height = int(source.source_shape_hw[0])
-    margin = _endpoint_margin_from_source(source)
-    cumulative = _arc_lengths(trace_xyz)
-    distance_px = float(cumulative[-1] - cumulative[0]) / spacing
-    width = max(
-        int(source.source_shape_hw[1]),
-        int(math.ceil(distance_px + 2.0 * margin + 1.0)),
-    )
-    if height <= 0 or width <= 0:
-        raise ValueError(f"invalid native trace strip shape {(height, width)}")
-
-    sampled_normals = _sample_lasagna_normals_for_trace(geometry_loader, source, trace_xyz)
-    original_indices = np.arange(int(trace_xyz.shape[0]), dtype=np.int64)
-    line_window = FiberStripLineWindow(
-        line_points_xyz=np.asarray(trace_xyz, dtype=np.float64),
-        original_line_indices=original_indices,
-        local_control_point_index=0,
-    )
-    line_xy = source_line_xy_from_line_window(
-        line_window,
-        patch_shape_hw=(height, width),
-        anchor_column_px=margin,
-        pixel_spacing_base=spacing,
-    )
-    start_xy = np.asarray(line_xy[0], dtype=np.float32)
-    target_xy = np.asarray(line_xy[-1], dtype=np.float32)
-    center_offset = float(source.center_offset)
-
-    def build_grid(normals: np.ndarray):
-        return build_side_strip_patch_grid_tensor_from_line_window(
-            line_window,
-            patch_shape_hw=(height, width),
-            strip_z_offset=center_offset,
-            sampled_normals=normals,
-            pixel_spacing_base=spacing,
-            anchor_column_px=margin,
-            device=source.grid.coords_zyx.device,
-        )
-
-    grid = build_grid(sampled_normals)
-    reference_axis = np.asarray(source.start_row_axis_xyz, dtype=np.float32).reshape(-1)
-    if reference_axis.shape == (3,) and float(np.linalg.norm(reference_axis)) > _EPS:
-        start_axis = geometry_loader._row_axis_at_xy(grid, start_xy)
-        if float(np.dot(_unit(start_axis), _unit(reference_axis))) < 0.0:
-            sampled_normals = (-sampled_normals).astype(np.float32, copy=False)
-            grid = build_grid(sampled_normals)
-
-    start_row_axis = geometry_loader._row_axis_at_xy(grid, start_xy)
-    target_row_axis = geometry_loader._row_axis_at_xy(grid, target_xy)
-    return _Trace2CpSegmentSource(
-        record=source.record,
-        record_index=int(source.record_index),
-        start_control_point_index=int(source.start_control_point_index),
-        target_control_point_index=int(source.target_control_point_index),
-        center_offset=center_offset,
-        source_shape_hw=(height, width),
-        grid=grid,
-        line_window=line_window,
-        anchor_column_px=float(margin),
-        line_xy=np.asarray(line_xy, dtype=np.float32),
-        start_control_point_xy=start_xy.astype(np.float32, copy=False),
-        target_control_point_xy=target_xy.astype(np.float32, copy=False),
-        line_point_indices=original_indices,
-        line_normals_xyz=np.asarray(sampled_normals, dtype=np.float32),
-        start_row_axis_xyz=start_row_axis,
-        target_row_axis_xyz=target_row_axis,
-    )
-
-
-def _image_to_u8(image: np.ndarray, valid: np.ndarray) -> np.ndarray:
     arr = np.asarray(image, dtype=np.float32)
     mask = np.asarray(valid, dtype=bool) & np.isfinite(arr)
     out = np.zeros(arr.shape, dtype=np.uint8)
     if not bool(mask.any()):
         return out
-    out[mask] = np.rint(np.clip(arr[mask], 0.0, 255.0)).astype(np.uint8)
+    norm_t = _normalize_image(
+        torch.as_tensor(arr, dtype=torch.float32),
+        torch.as_tensor(mask, dtype=torch.bool),
+        normalization,
+    )
+    norm = norm_t.detach().cpu().numpy().astype(np.float32, copy=False)
+    mode = str(normalization).lower()
+    if mode == "zscore":
+        scaled = (np.clip(norm, -3.0, 3.0) + 3.0) * (255.0 / 6.0)
+    elif mode == "minmax":
+        scaled = np.clip(norm, 0.0, 1.0) * 255.0
+    elif mode in {"none", "raw", "identity"}:
+        scaled = np.clip(norm, 0.0, 255.0)
+    else:
+        raise ValueError(f"unsupported image_normalization {normalization!r}")
+    out[mask] = np.rint(scaled[mask]).astype(np.uint8)
     return out
 
 
+def _presence_to_u8(presence: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    arr = np.asarray(presence, dtype=np.float32)
+    mask = np.asarray(valid, dtype=bool) & np.isfinite(arr)
+    out = np.zeros(arr.shape, dtype=np.uint8)
+    if bool(mask.any()):
+        out[mask] = np.rint(np.clip(arr[mask], 0.0, 1.0) * 255.0).astype(np.uint8)
+    return out
+
+
+def _as_numpy_array(value: Any, *, dtype: np.dtype) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy().astype(dtype, copy=False)
+    return np.asarray(value, dtype=dtype)
+
+
+def _sample_presence_on_strip(
+    cache: NativeTraceFieldCache,
+    coords_xyz_base: np.ndarray,
+    grid_valid: np.ndarray,
+    *,
+    spacing_base: float,
+    progress_label: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    coords = np.asarray(coords_xyz_base, dtype=np.float32)
+    if coords.ndim != 3 or coords.shape[2] != 3:
+        raise ValueError("coords_xyz_base must have shape H,W,3")
+    valid = np.asarray(grid_valid, dtype=bool)
+    if valid.shape != coords.shape[:2]:
+        raise ValueError(
+            "grid_valid shape must match coords: "
+            f"valid={valid.shape} coords={coords.shape[:2]}"
+        )
+    spacing = float(spacing_base)
+    if not np.isfinite(spacing) or spacing <= 0.0:
+        raise ValueError(f"invalid spacing_base {spacing_base!r}")
+
+    flat_coords = coords.reshape(-1, 3)
+    flat_valid = valid.reshape(-1) & np.isfinite(flat_coords).all(axis=1)
+    presence = np.zeros((flat_coords.shape[0],), dtype=np.float32)
+    out_valid = np.zeros((flat_coords.shape[0],), dtype=bool)
+    if bool(np.any(flat_valid)):
+        points_zyx_selected = (
+            flat_coords[flat_valid][:, [2, 1, 0]].astype(np.float32, copy=False)
+            / np.float32(spacing)
+        )
+        _directions, sampled_presence, sampled_valid = cache.sample_points_torch(
+            points_zyx_selected,
+            progress_label=progress_label,
+        )
+        presence_values = sampled_presence.detach().cpu().numpy().astype(np.float32, copy=False)
+        valid_values = sampled_valid.detach().cpu().numpy().astype(bool, copy=False)
+        flat_indices = np.flatnonzero(flat_valid)
+        presence[flat_indices] = presence_values
+        out_valid[flat_indices] = valid_values
+    return (
+        presence.reshape(coords.shape[:2]).astype(np.float32, copy=False),
+        out_valid.reshape(coords.shape[:2]),
+    )
+
+
+def _closest_source_line_projection(
+    trace_xyz_base: np.ndarray,
+    source: _Trace2CpSegmentSource,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    trace = np.asarray(trace_xyz_base, dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[1] != 3:
+        raise ValueError("trace_xyz_base must have shape N,3")
+    line_xyz = np.asarray(source.line_window.line_points_xyz, dtype=np.float32)
+    line_xy = np.asarray(source.line_xy, dtype=np.float32)
+    if line_xyz.ndim != 2 or line_xyz.shape[1] != 3 or int(line_xyz.shape[0]) < 2:
+        raise ValueError("source line must have at least two XYZ points")
+    if line_xy.ndim != 2 or line_xy.shape[1] != 2 or line_xy.shape[0] != line_xyz.shape[0]:
+        raise ValueError("source line_xy must match source line points")
+
+    seg_start = line_xyz[:-1]
+    seg_vec = line_xyz[1:] - line_xyz[:-1]
+    seg_xy_start = line_xy[:-1]
+    seg_xy_vec = line_xy[1:] - line_xy[:-1]
+    seg_len2 = np.sum(seg_vec * seg_vec, axis=1)
+    seg_valid = np.isfinite(seg_len2) & (seg_len2 > np.float32(_EPS))
+    seg_valid &= np.isfinite(seg_start).all(axis=1) & np.isfinite(seg_vec).all(axis=1)
+    seg_valid &= np.isfinite(seg_xy_start).all(axis=1) & np.isfinite(seg_xy_vec).all(axis=1)
+    if not bool(np.any(seg_valid)):
+        raise ValueError("source line has no finite non-degenerate segments")
+
+    seg_start = seg_start[seg_valid]
+    seg_vec = seg_vec[seg_valid]
+    seg_xy_start = seg_xy_start[seg_valid]
+    seg_xy_vec = seg_xy_vec[seg_valid]
+    seg_len2 = seg_len2[seg_valid]
+
+    projected_xyz = np.full_like(trace, np.nan, dtype=np.float32)
+    projected_xy = np.full((trace.shape[0], 2), np.nan, dtype=np.float32)
+    projected_valid = np.isfinite(trace).all(axis=1)
+    chunk = 512
+    for start in range(0, int(trace.shape[0]), chunk):
+        stop = min(int(trace.shape[0]), start + chunk)
+        points = trace[start:stop]
+        finite = projected_valid[start:stop]
+        if not bool(np.any(finite)):
+            continue
+        diff = points[:, None, :] - seg_start[None, :, :]
+        t = np.sum(diff * seg_vec[None, :, :], axis=2) / seg_len2[None, :]
+        t = np.clip(t, 0.0, 1.0)
+        closest = seg_start[None, :, :] + t[:, :, None] * seg_vec[None, :, :]
+        dist2 = np.sum((points[:, None, :] - closest) ** 2, axis=2)
+        dist2[~finite, :] = np.inf
+        best = np.argmin(dist2, axis=1)
+        best_t = t[np.arange(stop - start), best].astype(np.float32, copy=False)
+        projected_xyz[start:stop] = (
+            seg_start[best] + best_t[:, None] * seg_vec[best]
+        ).astype(np.float32, copy=False)
+        projected_xy[start:stop] = (
+            seg_xy_start[best] + best_t[:, None] * seg_xy_vec[best]
+        ).astype(np.float32, copy=False)
+        projected_valid[start:stop] &= np.isfinite(dist2[np.arange(stop - start), best])
+    return projected_xyz, projected_xy, projected_valid
+
+
+def _sample_source_axes_at_xy(
+    source: _Trace2CpSegmentSource,
+    axis_name: str,
+    points_xy: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    axes_value = getattr(source.grid, axis_name)
+    if axes_value is None:
+        raise ValueError(f"source grid missing {axis_name}")
+    axes = _as_numpy_array(axes_value, dtype=np.float32)
+    valid = _as_numpy_array(source.grid.valid_mask, dtype=bool)
+    points = np.asarray(points_xy, dtype=np.float32)
+    if axes.ndim != 3 or axes.shape[2] != 3:
+        raise ValueError(f"{axis_name} must have shape H,W,3")
+    if valid.shape != axes.shape[:2]:
+        raise ValueError("source grid valid mask shape does not match axis grid")
+    height, width = axes.shape[:2]
+    finite_points = np.isfinite(points).all(axis=1)
+    x = np.zeros((points.shape[0],), dtype=np.int64)
+    y = np.zeros((points.shape[0],), dtype=np.int64)
+    if bool(np.any(finite_points)):
+        x[finite_points] = np.rint(points[finite_points, 0]).astype(np.int64)
+        y[finite_points] = np.rint(points[finite_points, 1]).astype(np.int64)
+    in_bounds = finite_points & (x >= 0) & (x < width) & (y >= 0) & (y < height)
+    sampled = np.zeros((points.shape[0], 3), dtype=np.float32)
+    sampled_valid = np.zeros((points.shape[0],), dtype=bool)
+    if bool(np.any(in_bounds)):
+        indices = np.flatnonzero(in_bounds)
+        sampled[indices] = axes[y[indices], x[indices]]
+        sampled_valid[indices] = valid[y[indices], x[indices]]
+    norms = np.linalg.norm(sampled, axis=1)
+    finite = np.isfinite(sampled).all(axis=1) & np.isfinite(norms) & (norms > np.float32(_EPS))
+    ok = sampled_valid & finite
+    sampled[ok] = sampled[ok] / norms[ok, None].astype(np.float32)
+    sampled[~ok] = 0.0
+    return sampled, ok
+
+
+def _project_trace_to_initial_strip(
+    source: _Trace2CpSegmentSource,
+    trace_xyz_base: np.ndarray,
+    *,
+    axis_name: str,
+) -> np.ndarray:
+    trace = np.asarray(trace_xyz_base, dtype=np.float32)
+    if int(trace.shape[0]) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    projected_xyz, projected_xy, projected_valid = _closest_source_line_projection(trace, source)
+    axes, axes_valid = _sample_source_axes_at_xy(source, axis_name, projected_xy)
+    spacing = float(source.record.volume_spacing_base)
+    if not np.isfinite(spacing) or spacing <= 0.0:
+        raise ValueError(f"invalid volume spacing for native trace projection: {spacing}")
+    offsets = np.sum((trace - projected_xyz) * axes, axis=1) / np.float32(spacing)
+    xy = projected_xy.copy()
+    xy[:, 1] += offsets.astype(np.float32, copy=False)
+    valid = projected_valid & axes_valid & np.isfinite(xy).all(axis=1)
+    return xy[valid].astype(np.float32, copy=False)
+
+
+def _trace_overlays_for_view(
+    source: _Trace2CpSegmentSource,
+    result: NativeTracePairResult,
+    *,
+    axis_name: str,
+) -> tuple[tuple[np.ndarray, tuple[int, int, int, int]], ...]:
+    spacing = float(source.record.volume_spacing_base)
+    traces = (
+        (
+            _trace_zyx_to_base_xyz(result.forward.trace_zyx, spacing),
+            (64, 170, 255, 220),
+        ),
+        (
+            _trace_zyx_to_base_xyz(result.reverse.trace_zyx, spacing),
+            (255, 80, 220, 220),
+        ),
+        (
+            _trace_zyx_to_base_xyz(result.fused_zyx, spacing),
+            (255, 220, 0, 235),
+        ),
+    )
+    overlays: list[tuple[np.ndarray, tuple[int, int, int, int]]] = []
+    for trace_xyz, color in traces:
+        xy = _project_trace_to_initial_strip(source, trace_xyz, axis_name=axis_name)
+        if int(xy.shape[0]) >= 2:
+            overlays.append((xy, color))
+    return tuple(overlays)
+
+
 def _draw_trace_panel(
-    image: np.ndarray,
+    image_u8: np.ndarray,
     valid: np.ndarray,
     line_xy: np.ndarray,
     start_xy: np.ndarray,
     target_xy: np.ndarray,
     *,
     title: str,
+    overlays: tuple[tuple[np.ndarray, tuple[int, int, int, int]], ...] = (),
 ):
     from PIL import Image, ImageDraw
 
-    base = np.repeat(_image_to_u8(image, valid)[..., None], 3, axis=2)
+    img = np.asarray(image_u8, dtype=np.uint8)
+    if img.ndim == 2:
+        base = np.repeat(img[..., None], 3, axis=2)
+    elif img.ndim == 3 and img.shape[2] == 3:
+        base = img
+    else:
+        raise ValueError("image_u8 must have shape H,W or H,W,3")
+    mask = np.asarray(valid, dtype=bool)
+    if mask.shape == base.shape[:2]:
+        base = base.copy()
+        base[~mask] = 0
     canvas = Image.fromarray(base, mode="RGB").convert("RGBA")
     text_pad = 24
     padded = Image.new("RGBA", (canvas.width, canvas.height + text_pad), (0, 0, 0, 255))
@@ -1003,6 +1154,15 @@ def _draw_trace_panel(
     pts = [(float(x), float(y) + text_pad) for x, y in line if np.isfinite(x) and np.isfinite(y)]
     if len(pts) >= 2:
         draw.line(pts, fill=(0, 255, 128, 170), width=2)
+    for overlay_xy, color in overlays:
+        overlay = np.asarray(overlay_xy, dtype=np.float32)
+        overlay_pts = [
+            (float(x), float(y) + text_pad)
+            for x, y in overlay
+            if np.isfinite(x) and np.isfinite(y)
+        ]
+        if len(overlay_pts) >= 2:
+            draw.line(overlay_pts, fill=color, width=2)
     for xy, color in (
         (start_xy, (0, 255, 255, 255)),
         (target_xy, (255, 64, 220, 255)),
@@ -1019,39 +1179,134 @@ def _trace_zyx_to_base_xyz(trace_zyx: np.ndarray, spacing_base: float) -> np.nda
 
 def _make_native_trace_visualization(
     geometry_loader: Any,
-    source: Any,
+    source: _Trace2CpSegmentSource,
     result: NativeTracePairResult,
+    *,
+    cache: NativeTraceFieldCache,
+    image_normalization: str,
 ):
     from PIL import Image
 
-    fused_xyz = _trace_zyx_to_base_xyz(
-        result.fused_zyx,
-        float(source.record.volume_spacing_base),
+    progress_start = time.perf_counter()
+    progress_total = 8
+    progress_step = 0
+
+    def run_stage(label: str, fn: Any):
+        nonlocal progress_step
+        print(
+            f"native strip render start stage={progress_step + 1}/{progress_total} {label}",
+            flush=True,
+        )
+        stage_start = time.perf_counter()
+        result_value = fn()
+        progress_step += 1
+        _emit_native_progress(
+            "strip render",
+            progress_step,
+            progress_total,
+            progress_start,
+            detail=f"stage={label} stage_ms={(time.perf_counter() - stage_start) * 1000.0:.1f}",
+        )
+        return result_value
+
+    _sample, side_image, side_valid = run_stage(
+        "side-volume",
+        lambda: geometry_loader.sample_trace2cp_segment_source(source),
     )
-    refined = build_native_trace_segment_source(geometry_loader, source, fused_xyz)
-    _sample, side_image, side_valid = geometry_loader.sample_trace2cp_segment_source(refined)
-    top_image, top_valid = geometry_loader.sample_trace2cp_top_strip_source(refined)
-    side_panel = _draw_trace_panel(
-        side_image,
-        side_valid,
-        refined.line_xy,
-        refined.start_control_point_xy,
-        refined.target_control_point_xy,
-        title="native 3D Trace2CP side strip",
+    top_image, top_valid = run_stage(
+        "top-volume",
+        lambda: geometry_loader.sample_trace2cp_top_strip_source(source),
     )
-    top_panel = _draw_trace_panel(
-        top_image,
-        top_valid,
-        refined.line_xy,
-        refined.start_control_point_xy,
-        refined.target_control_point_xy,
-        title="native 3D Trace2CP top strip",
+    side_coords_xyz, side_grid_valid = run_stage(
+        "side-coords",
+        lambda: geometry_loader.trace2cp_segment_coords_xyz(source),
     )
-    width = max(side_panel.width, top_panel.width)
-    sheet = Image.new("RGBA", (width, side_panel.height + top_panel.height), (0, 0, 0, 255))
-    sheet.alpha_composite(side_panel, (0, 0))
-    sheet.alpha_composite(top_panel, (0, side_panel.height))
-    return sheet
+    top_coords_xyz, top_grid_valid = run_stage(
+        "top-coords",
+        lambda: geometry_loader.trace2cp_top_strip_coords_xyz(source),
+    )
+    spacing = float(source.record.volume_spacing_base)
+    side_presence, side_presence_valid = run_stage(
+        "side-presence",
+        lambda: _sample_presence_on_strip(
+            cache,
+            side_coords_xyz,
+            np.asarray(side_grid_valid, dtype=bool) & np.asarray(side_valid, dtype=bool),
+            spacing_base=spacing,
+            progress_label="side",
+        ),
+    )
+    top_presence, top_presence_valid = run_stage(
+        "top-presence",
+        lambda: _sample_presence_on_strip(
+            cache,
+            top_coords_xyz,
+            np.asarray(top_grid_valid, dtype=bool) & np.asarray(top_valid, dtype=bool),
+            spacing_base=spacing,
+            progress_label="top",
+        ),
+    )
+    side_overlays, top_overlays = run_stage(
+        "trace-overlays",
+        lambda: (
+            _trace_overlays_for_view(source, result, axis_name="offset_axis_xyz"),
+            _trace_overlays_for_view(source, result, axis_name="side_axis_xyz"),
+        ),
+    )
+
+    def compose_sheet():
+        side_panel = _draw_trace_panel(
+            _image_to_u8(side_image, side_valid, normalization=image_normalization),
+            side_valid,
+            source.line_xy,
+            source.start_control_point_xy,
+            source.target_control_point_xy,
+            title=f"initial side input ({image_normalization})",
+            overlays=side_overlays,
+        )
+        side_presence_panel = _draw_trace_panel(
+            _presence_to_u8(side_presence, side_presence_valid),
+            side_presence_valid,
+            source.line_xy,
+            source.start_control_point_xy,
+            source.target_control_point_xy,
+            title="initial side 3D presence",
+            overlays=side_overlays,
+        )
+        top_panel = _draw_trace_panel(
+            _image_to_u8(top_image, top_valid, normalization=image_normalization),
+            top_valid,
+            source.line_xy,
+            source.start_control_point_xy,
+            source.target_control_point_xy,
+            title=f"initial top input ({image_normalization})",
+            overlays=top_overlays,
+        )
+        top_presence_panel = _draw_trace_panel(
+            _presence_to_u8(top_presence, top_presence_valid),
+            top_presence_valid,
+            source.line_xy,
+            source.start_control_point_xy,
+            source.target_control_point_xy,
+            title="initial top 3D presence",
+            overlays=top_overlays,
+        )
+        left_width = max(side_panel.width, top_panel.width)
+        right_width = max(side_presence_panel.width, top_presence_panel.width)
+        top_height = max(side_panel.height, side_presence_panel.height)
+        bottom_height = max(top_panel.height, top_presence_panel.height)
+        sheet = Image.new(
+            "RGBA",
+            (left_width + right_width, top_height + bottom_height),
+            (0, 0, 0, 255),
+        )
+        sheet.alpha_composite(side_panel, (0, 0))
+        sheet.alpha_composite(side_presence_panel, (left_width, 0))
+        sheet.alpha_composite(top_panel, (0, top_height))
+        sheet.alpha_composite(top_presence_panel, (left_width, top_height))
+        return sheet
+
+    return run_stage("compose", compose_sheet)
 
 
 def _tool_raw_config(raw_config: dict[str, Any], *, fiber_json: Path | None) -> dict[str, Any]:
@@ -1091,6 +1346,120 @@ def _native_trace2cp_geometry_config(raw_config: dict[str, Any]):
     return _trace2cp_3d_config(patched)
 
 
+def _resolve_native_trace2cp_selection(
+    loader: Any,
+    *,
+    sample_index: int,
+    fiber_json: Path | None,
+    start_cp_index: int | None,
+    target_cp_index: int | None,
+    target_offset: int,
+    sample_mode: str | None,
+) -> _NativeTrace2CpSelection:
+    explicit_segment = start_cp_index is not None or target_cp_index is not None
+    if explicit_segment:
+        if start_cp_index is None or target_cp_index is None:
+            raise ValueError("--start-cp-index and --target-cp-index must be provided together")
+        if fiber_json is None:
+            raise ValueError("--start-cp-index/--target-cp-index require --fiber-json")
+        if sample_mode is not None and str(sample_mode) != "flat":
+            raise ValueError("explicit CP segment selection requires --sample-mode flat or omitted")
+        records = getattr(loader, "records", ())
+        if len(records) != 1:
+            raise ValueError("explicit CP segment selection requires exactly one loaded fiber")
+        record = records[0]
+        record_index = 0
+        mode = "flat"
+        resolved_start_cp_index = int(start_cp_index)
+        resolved_target_cp_index = int(target_cp_index)
+        selected_sample_index = int(resolved_start_cp_index)
+    else:
+        mode = ("flat" if fiber_json is not None else "random") if sample_mode is None else str(sample_mode)
+        record, record_index, resolved_start_cp_index = loader.descriptor_for_sample_index(
+            int(sample_index),
+            sample_mode=mode,
+        )
+        selected_sample_index = int(sample_index)
+        resolved_target_cp_index = int(resolved_start_cp_index) + int(target_offset)
+
+    cp_count = int(record.fiber.control_points_zyx.shape[0])
+    if resolved_start_cp_index < 0 or resolved_start_cp_index >= cp_count:
+        raise ValueError(
+            f"start CP index {resolved_start_cp_index} out of range for {cp_count} control points"
+        )
+    if resolved_target_cp_index < 0 or resolved_target_cp_index >= cp_count:
+        raise ValueError(
+            f"target CP index {resolved_target_cp_index} out of range for {cp_count} control points"
+        )
+    if int(resolved_start_cp_index) == int(resolved_target_cp_index):
+        raise ValueError("native Trace2CP start and target CP indices must differ")
+
+    return _NativeTrace2CpSelection(
+        record=record,
+        record_index=int(record_index),
+        sample_index=int(selected_sample_index),
+        sample_mode=mode,
+        start_cp_index=int(resolved_start_cp_index),
+        target_cp_index=int(resolved_target_cp_index),
+        explicit_segment=bool(explicit_segment),
+    )
+
+
+def _line_arc_lengths(points_xyz: np.ndarray) -> np.ndarray:
+    points = np.asarray(points_xyz, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("line points must have shape [N, 3]")
+    if points.shape[0] <= 1:
+        return np.zeros((points.shape[0],), dtype=np.float64)
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    return np.concatenate([[0.0], np.cumsum(segment_lengths)])
+
+
+def _format_triplet(values: np.ndarray) -> str:
+    arr = np.asarray(values, dtype=np.float64).reshape(3)
+    return f"({arr[0]:.3f}, {arr[1]:.3f}, {arr[2]:.3f})"
+
+
+def _print_native_trace_segment_debug(selection: _NativeTrace2CpSelection) -> None:
+    record = selection.record
+    fiber = record.fiber
+    line_points_xyz = np.asarray(fiber.line_points_xyz, dtype=np.float64)
+    start_line_index = control_point_line_index(fiber, int(selection.start_cp_index))
+    target_line_index = control_point_line_index(fiber, int(selection.target_cp_index))
+    lo = min(int(start_line_index), int(target_line_index))
+    hi = max(int(start_line_index), int(target_line_index))
+    segment_xyz = line_points_xyz[lo : hi + 1]
+    if segment_xyz.size == 0:
+        raise ValueError(f"empty native Trace2CP line segment range {lo}:{hi}")
+    cumulative = _line_arc_lengths(line_points_xyz)
+    length_base = abs(float(cumulative[int(target_line_index)] - cumulative[int(start_line_index)]))
+    spacing = float(getattr(record, "volume_spacing_base", 1.0))
+    bbox_min_xyz = np.min(segment_xyz, axis=0)
+    bbox_max_xyz = np.max(segment_xyz, axis=0)
+    bbox_min_zyx = bbox_min_xyz[[2, 1, 0]]
+    bbox_max_zyx = bbox_max_xyz[[2, 1, 0]]
+    bbox_size_zyx = bbox_max_zyx - bbox_min_zyx
+    start_zyx = np.asarray(fiber.control_points_zyx[int(selection.start_cp_index)], dtype=np.float64)
+    target_zyx = np.asarray(fiber.control_points_zyx[int(selection.target_cp_index)], dtype=np.float64)
+    print(
+        "native_trace2cp_3d segment "
+        f"sample_mode={selection.sample_mode} sample_index={int(selection.sample_index)} "
+        f"record_index={int(selection.record_index)} explicit_segment={selection.explicit_segment} "
+        f"start_cp={int(selection.start_cp_index)} target_cp={int(selection.target_cp_index)} "
+        f"start_line={int(start_line_index)} target_line={int(target_line_index)} "
+        f"line_range={lo}:{hi + 1} points={int(segment_xyz.shape[0])} "
+        f"length_base={length_base:.3f} length_scaled={length_base / spacing:.3f} "
+        f"bbox_min_zyx_base={_format_triplet(bbox_min_zyx)} "
+        f"bbox_max_zyx_base={_format_triplet(bbox_max_zyx)} "
+        f"bbox_size_zyx_base={_format_triplet(bbox_size_zyx)} "
+        f"bbox_min_zyx_scaled={_format_triplet(bbox_min_zyx / spacing)} "
+        f"bbox_max_zyx_scaled={_format_triplet(bbox_max_zyx / spacing)} "
+        f"start_cp_zyx_base={_format_triplet(start_zyx)} "
+        f"target_cp_zyx_base={_format_triplet(target_zyx)}",
+        flush=True,
+    )
+
+
 def run_native_trace2cp(
     config_path: str | Path,
     *,
@@ -1098,6 +1467,8 @@ def run_native_trace2cp(
     export_dir: str | Path,
     sample_index: int,
     fiber_json: str | Path | None = None,
+    start_cp_index: int | None = None,
+    target_cp_index: int | None = None,
     target_offset: int = 1,
     sample_mode: str | None = None,
     native_cfg: NativeTrace2CpConfig | None = None,
@@ -1117,23 +1488,23 @@ def run_native_trace2cp(
         tool_raw_config,
         trace2cp_cfg,
     )
-    mode = ("flat" if fiber_path is not None else "random") if sample_mode is None else str(sample_mode)
-    record, _record_index, start_cp_index = loader.descriptor_for_sample_index(
-        int(sample_index),
-        sample_mode=mode,
+    selection = _resolve_native_trace2cp_selection(
+        loader,
+        sample_index=int(sample_index),
+        fiber_json=fiber_path,
+        start_cp_index=start_cp_index,
+        target_cp_index=target_cp_index,
+        target_offset=int(target_offset),
+        sample_mode=sample_mode,
     )
-    target_cp_index = int(start_cp_index) + int(target_offset)
-    cp_count = int(record.fiber.control_points_zyx.shape[0])
-    if target_cp_index < 0 or target_cp_index >= cp_count:
-        raise ValueError(
-            f"target CP index {target_cp_index} out of range for {cp_count} control points"
-        )
+    _print_native_trace_segment_debug(selection)
+    record = selection.record
     start_zyx = (
-        np.asarray(record.fiber.control_points_zyx[int(start_cp_index)], dtype=np.float32)
+        np.asarray(record.fiber.control_points_zyx[int(selection.start_cp_index)], dtype=np.float32)
         / np.float32(record.volume_spacing_base)
     )
     target_zyx = (
-        np.asarray(record.fiber.control_points_zyx[int(target_cp_index)], dtype=np.float32)
+        np.asarray(record.fiber.control_points_zyx[int(selection.target_cp_index)], dtype=np.float32)
         / np.float32(record.volume_spacing_base)
     )
     training = dict(raw_config.get("training", {}))
@@ -1167,22 +1538,31 @@ def run_native_trace2cp(
         progress=True,
     )
     source = geometry_loader.build_trace2cp_segment_source(
-        int(sample_index),
+        int(selection.sample_index),
+        target_control_point_index=int(selection.target_cp_index)
+        if selection.explicit_segment
+        else None,
         target_offset=int(target_offset),
         rf_margin_px=trace2cp_cfg.rf_margin_px,
         device=torch.device("cpu"),
-        sample_mode=mode,
+        sample_mode=selection.sample_mode,
     )
     out_dir = Path(export_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    sheet = _make_native_trace_visualization(geometry_loader, source, result)
+    sheet = _make_native_trace_visualization(
+        geometry_loader,
+        source,
+        result,
+        cache=cache,
+        image_normalization=loader_config.image_normalization,
+    )
     image_path = out_dir / "trace2cp_native_3d_vis.jpg"
     sheet.convert("RGB").save(image_path, quality=95)
     summary = {
-        "sample_index": int(sample_index),
+        "sample_index": int(selection.sample_index),
         "fiber_path": "" if record.fiber.path is None else str(record.fiber.path),
-        "start_control_point_index": int(start_cp_index),
-        "target_control_point_index": int(target_cp_index),
+        "start_control_point_index": int(selection.start_cp_index),
+        "target_control_point_index": int(selection.target_cp_index),
         "native_trace2cp_plane_error": float(result.plane_error),
         "native_trace2cp_closest_target_error": float(result.closest_target_error),
         "span_voxels": float(result.span_voxels),
@@ -1205,7 +1585,8 @@ def run_native_trace2cp(
     print(f"native_trace2cp_closest_target_error={result.closest_target_error:.8f}", flush=True)
     print(
         "native_trace2cp_3d "
-        f"sample_index={sample_index} start_cp={start_cp_index} target_cp={target_cp_index} "
+        f"sample_index={selection.sample_index} start_cp={selection.start_cp_index} "
+        f"target_cp={selection.target_cp_index} "
         f"forward_reached={result.forward.reached_target_plane} reverse_reached={result.reverse.reached_target_plane} "
         f"blocks={len(cache._blocks)} export={image_path}",
         flush=True,
@@ -1220,6 +1601,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--export-dir", type=Path, required=True)
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--fiber-json", type=Path, default=None)
+    parser.add_argument("--start-cp-index", type=int, default=None)
+    parser.add_argument("--target-cp-index", type=int, default=None)
     parser.add_argument("--target-offset", type=int, default=1)
     parser.add_argument("--sample-mode", choices=("random", "flat"), default=None)
     parser.add_argument("--step-voxels", type=float, default=4.0)
@@ -1260,6 +1643,8 @@ def main() -> None:
         export_dir=args.export_dir,
         sample_index=int(args.sample_index),
         fiber_json=args.fiber_json,
+        start_cp_index=args.start_cp_index,
+        target_cp_index=args.target_cp_index,
         target_offset=int(args.target_offset),
         sample_mode=args.sample_mode,
         native_cfg=native_cfg,

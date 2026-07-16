@@ -212,6 +212,7 @@ class _FiberLineGeometry:
     control_line_indices: np.ndarray
     normals_xyz: np.ndarray
     normal_valid: np.ndarray
+    invalid_line_reasons: dict[int, str]
     intervals: tuple[_FiberLineGeometryInterval, ...]
     cp_interval_indices: np.ndarray
     cp_valid: np.ndarray
@@ -1446,6 +1447,187 @@ class FiberStrip2DLoader:
                 return int(interval_index)
         return -1
 
+    @staticmethod
+    def _finite_range_string(values: np.ndarray) -> str:
+        arr = np.asarray(values, dtype=np.float64)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return "none"
+        return f"{float(np.min(finite)):.6g}..{float(np.max(finite)):.6g}"
+
+    def _normal_value_debug_summary(
+        self,
+        record: _Record,
+        *,
+        line_index: int,
+    ) -> str:
+        try:
+            line_points = np.asarray(record.fiber.line_points_xyz, dtype=np.float64)
+            if line_index < 0 or line_index >= int(line_points.shape[0]):
+                return f"direct_probe_error=line_index {line_index} out of range"
+            point_zyx = line_points[int(line_index), [2, 1, 0]]
+            grad_request = self._interpolation_cube(
+                record.grad_mag,
+                point_zyx,
+                array_spacing_base=record.grad_mag_spacing_base,
+            )
+            grad_in_bounds = grad_request is not None
+            grad_value = float("nan")
+            if grad_request is not None:
+                grad_value = self._trilinear_cube(*grad_request)
+            nx_request = (
+                None
+                if record.nx is None or record.nx_spacing_base is None
+                else self._interpolation_cube(
+                    record.nx,
+                    point_zyx,
+                    array_spacing_base=record.nx_spacing_base,
+                )
+            )
+            ny_request = (
+                None
+                if record.ny is None or record.ny_spacing_base is None
+                else self._interpolation_cube(
+                    record.ny,
+                    point_zyx,
+                    array_spacing_base=record.ny_spacing_base,
+                )
+            )
+            nx_in_bounds = nx_request is not None
+            ny_in_bounds = ny_request is not None
+            if nx_request is None or ny_request is None:
+                return (
+                    f"direct_probe grad_in_bounds={grad_in_bounds} "
+                    f"grad_value={grad_value:.6g} nx_in_bounds={nx_in_bounds} "
+                    f"ny_in_bounds={ny_in_bounds} "
+                    + self._normal_sample_context(
+                        record,
+                        point_zyx,
+                        channel="nx",
+                        spacing_base=record.nx_spacing_base or record.grad_mag_spacing_base,
+                        line_point_index=int(line_index),
+                        control_point_index=None,
+                    )
+                )
+            nx_cube, nx_frac = nx_request
+            ny_cube, _ny_frac = ny_request
+            decoded = _decode_normal_components(nx_cube[None, ...], ny_cube[None, ...])[0]
+            corner_norm = np.linalg.norm(decoded, axis=-1)
+            corner_valid = np.isfinite(corner_norm) & (corner_norm > 1.0e-12)
+            fz = nx_frac[0]
+            fy = nx_frac[1]
+            fx = nx_frac[2]
+            wz = np.asarray([1.0 - fz, fz], dtype=np.float64)
+            wy = np.asarray([1.0 - fy, fy], dtype=np.float64)
+            wx = np.asarray([1.0 - fx, fx], dtype=np.float64)
+            weights = wz[:, None, None] * wy[None, :, None] * wx[None, None, :]
+            weights = np.where(corner_valid, weights, 0.0)
+            total_weight = float(np.sum(weights))
+            hint = np.sum(decoded * weights[..., None], axis=(0, 1, 2))
+            tensor = np.einsum("abc,abci,abcj->ij", weights, decoded, decoded, optimize=True)
+            candidate_valid = (
+                grad_in_bounds
+                and np.isfinite(grad_value)
+                and grad_value > 0.0
+                and nx_in_bounds
+                and ny_in_bounds
+                and np.isfinite(total_weight)
+                and total_weight > 1.0e-12
+            )
+            axis_norm = float("nan")
+            axis = np.zeros((3,), dtype=np.float64)
+            if candidate_valid:
+                axis = _principal_tensor_axis(tensor, hint)
+                axis_norm = float(np.linalg.norm(axis))
+            return (
+                f"direct_probe grad_in_bounds={grad_in_bounds} "
+                f"grad_value={grad_value:.6g} nx_in_bounds={nx_in_bounds} "
+                f"ny_in_bounds={ny_in_bounds} "
+                f"nx_raw_range={self._finite_range_string(nx_cube)} "
+                f"ny_raw_range={self._finite_range_string(ny_cube)} "
+                f"decoded_norm_range={self._finite_range_string(corner_norm)} "
+                f"valid_normal_corners={int(np.count_nonzero(corner_valid))}/8 "
+                f"total_weight={total_weight:.6g} candidate_valid={candidate_valid} "
+                f"axis_norm={axis_norm:.6g} "
+                f"axis_xyz=({axis[0]:.6g}, {axis[1]:.6g}, {axis[2]:.6g}) "
+                + self._normal_sample_context(
+                    record,
+                    point_zyx,
+                    channel="nx",
+                    spacing_base=record.nx_spacing_base or record.grad_mag_spacing_base,
+                    line_point_index=int(line_index),
+                    control_point_index=None,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive diagnostics only
+            return f"direct_probe_exception={type(exc).__name__}: {exc}"
+
+    def _compact_geometry_invalid_context(
+        self,
+        record: _Record,
+        geometry: _FiberLineGeometry,
+        *,
+        start_index: int,
+        end_index: int,
+        max_reasons: int = 3,
+    ) -> str:
+        normal_valid = np.asarray(geometry.normal_valid, dtype=bool)
+        if normal_valid.ndim != 1 or normal_valid.size == 0:
+            return "normal_valid is empty"
+        start = max(0, int(start_index))
+        end = min(int(end_index), int(normal_valid.shape[0]) - 1)
+        if end < start:
+            return (
+                "requested line range is outside compact geometry normal_valid array: "
+                f"requested={int(start_index)}:{int(end_index)} "
+                f"normal_count={int(normal_valid.shape[0])}"
+            )
+        requested = np.arange(start, end + 1, dtype=np.int64)
+        invalid = requested[~normal_valid[requested]]
+        overlapping_intervals = [
+            f"{int(interval.start_index)}:{int(interval.end_index)}"
+            for interval in geometry.intervals
+            if int(interval.end_index) > start and int(interval.start_index) <= end
+        ]
+        if invalid.size == 0:
+            return (
+                "no invalid normal_valid entries inside requested inclusive range; "
+                "range is split across compact geometry intervals. "
+                f"overlapping_valid_intervals={overlapping_intervals or 'none'}"
+            )
+        first = int(invalid[0])
+        runs: list[tuple[int, int]] = []
+        run_start = first
+        previous = first
+        for value in invalid[1:]:
+            idx = int(value)
+            if idx == previous + 1:
+                previous = idx
+                continue
+            runs.append((run_start, previous + 1))
+            run_start = idx
+            previous = idx
+        runs.append((run_start, previous + 1))
+        reason_parts: list[str] = []
+        for idx in invalid[: max(0, int(max_reasons))]:
+            line_index = int(idx)
+            reason = geometry.invalid_line_reasons.get(line_index)
+            if not reason:
+                reason = (
+                    "not sampled by compact geometry preload; "
+                    + self._normal_value_debug_summary(record, line_index=line_index)
+                )
+            reason_parts.append(
+                f"{line_index}: {reason}"
+            )
+        return (
+            f"invalid_count={int(invalid.size)} "
+            f"first_invalid={first} "
+            f"invalid_runs={runs[:5]} "
+            f"overlapping_valid_intervals={overlapping_intervals or 'none'} "
+            f"invalid_reasons={reason_parts}"
+        )
+
     def _required_line_ranges_for_record(
         self,
         record: _Record,
@@ -1473,6 +1655,15 @@ class FiberStrip2DLoader:
                 ranges.append((int(start_index), int(end_index) + 1))
             except (IndexError, ValueError) as exc:
                 invalid_reasons[cp_index] = str(exc)
+
+        valid_control_indices = np.flatnonzero(control_line_indices >= 0)
+        for left_cp, right_cp in zip(valid_control_indices[:-1], valid_control_indices[1:]):
+            left_line = int(control_line_indices[int(left_cp)])
+            right_line = int(control_line_indices[int(right_cp)])
+            start_index = min(left_line, right_line)
+            end_index = max(left_line, right_line) + 1
+            if end_index > start_index:
+                ranges.append((start_index, end_index))
 
         merged: list[tuple[int, int]] = []
         for start_index, end_index in sorted(ranges):
@@ -1668,6 +1859,7 @@ class FiberStrip2DLoader:
             control_line_indices=control_line_indices,
             normals_xyz=normals,
             normal_valid=normal_valid,
+            invalid_line_reasons=dict(invalid_by_line),
             intervals=intervals,
             cp_interval_indices=cp_interval_indices,
             cp_valid=cp_valid,
@@ -2474,6 +2666,71 @@ class FiberStrip2DLoader:
                 )
             )
         return np.stack(normals, axis=0).astype(np.float32)
+
+    def _trim_line_window_to_valid_compact_interval(
+        self,
+        record: _Record,
+        line_window: FiberStripLineWindow,
+        *,
+        start_line_index: int,
+        target_line_index: int,
+    ) -> FiberStripLineWindow:
+        geometry = getattr(self, "_geometry_store", None)
+        if geometry is None:
+            return line_window
+        cached = geometry.by_fiber_identity.get(record.fiber_identity)
+        if cached is None:
+            return line_window
+        required_start = min(int(start_line_index), int(target_line_index))
+        required_end = max(int(start_line_index), int(target_line_index))
+        interval_index = self._interval_index_for_line_range(
+            cached.intervals,
+            start_index=required_start,
+            end_index=required_end,
+        )
+        if interval_index < 0:
+            detail = self._compact_geometry_invalid_context(
+                record,
+                cached,
+                start_index=required_start,
+                end_index=required_end,
+            )
+            raise ValueError(
+                "Trace2CP segment crosses invalid compact geometry interval: "
+                f"line_range={required_start}:{required_end} "
+                f"detail=({detail})"
+            )
+        interval = cached.intervals[int(interval_index)]
+        indices = np.asarray(line_window.original_line_indices, dtype=np.int64)
+        if int(indices[0]) >= int(interval.start_index) and int(indices[-1]) < int(interval.end_index):
+            return line_window
+        keep = (indices >= int(interval.start_index)) & (indices < int(interval.end_index))
+        if not bool(np.any(keep)):
+            raise ValueError(
+                "Trace2CP line window has no overlap with valid compact geometry interval: "
+                f"window={int(indices[0])}:{int(indices[-1])} "
+                f"interval={int(interval.start_index)}:{int(interval.end_index)}"
+            )
+        kept_indices = indices[keep]
+        if not (
+            bool(np.any(kept_indices == int(start_line_index)))
+            and bool(np.any(kept_indices == int(target_line_index)))
+        ):
+            raise ValueError(
+                "Trace2CP valid compact geometry interval does not contain both CPs: "
+                f"start_line_index={int(start_line_index)} "
+                f"target_line_index={int(target_line_index)} "
+                f"interval={int(interval.start_index)}:{int(interval.end_index)}"
+            )
+        kept_points = np.asarray(line_window.line_points_xyz, dtype=np.float64)[keep]
+        local_start_matches = np.flatnonzero(kept_indices == int(start_line_index))
+        if local_start_matches.size == 0:
+            raise ValueError("trimmed Trace2CP line window lost the start control point")
+        return FiberStripLineWindow(
+            line_points_xyz=kept_points.astype(np.float64, copy=False),
+            original_line_indices=kept_indices.astype(np.int64, copy=False),
+            local_control_point_index=int(local_start_matches[0]),
+        )
 
     @staticmethod
     def _prealign_lasagna_normals_to_row_axis_reference(
@@ -3842,6 +4099,12 @@ class FiberStrip2DLoader:
             target_control_point_index=target_cp_index,
             margin_px=margin,
             pixel_spacing_base=record.volume_spacing_base,
+        )
+        line_window = self._trim_line_window_to_valid_compact_interval(
+            record,
+            line_window,
+            start_line_index=start_line_index,
+            target_line_index=target_line_index,
         )
         line_xy = source_line_xy_from_line_window(
             line_window,

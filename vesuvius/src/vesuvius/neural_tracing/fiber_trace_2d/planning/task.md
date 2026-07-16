@@ -1,18 +1,16 @@
-# Native 3D Trace2CP Render Brightness And Blocking Guard
+# Trace2CP Compact Geometry CP-Span Coverage
 
-Fix the basic native 3D Trace2CP rendering/loading behavior before working on
-the strip geometry itself.
+Fix Trace2CP segment-source compact geometry so CP-to-CP line spans cannot
+contain unsampled line points.
 
 Requirements:
 
-- Native 3D Trace2CP exported strip images must display raw volume brightness,
-  clipped to `0..255`, not per-panel percentile or min/max normalized
-  brightness.
-- Report what scaling the 3D training input uses. For the current fast config
-  this is `image_normalization: "zscore"` before model inference.
-- Trace2CP strip rendering must use blocking coordinate sampling and must not
-  silently render mixed fine/coarse fallback data when fine chunks fail.
-- If the VC3D sampler reports chunk errors during Trace2CP side/top strip
-  rendering, fail loudly instead of producing a misleading image.
-- The strip geometry/orientation problems are explicitly out of scope for this
-  task and will be handled after the basic loading/rendering path is correct.
+- Compact geometry preload must sample all line points needed by CP source
+  windows and by consecutive CP-to-CP Trace2CP spans.
+- A Trace2CP segment must not fail because an interior line point was simply
+  not sampled by compact geometry preload.
+- If a sampled line point is invalid, keep failing loudly and report the real
+  Lasagna data reason.
+- Defensive diagnostics should identify unexpected unsampled invalid points and
+  include a direct Lasagna probe of the point values.
+- Do not synthesize, propagate, or invent missing Lasagna normals.

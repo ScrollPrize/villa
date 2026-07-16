@@ -92,6 +92,9 @@ side/top strip input loading.
   python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool <config.json> --checkpoint <snapshot.pt> --sample-index 0 --export-dir <dir>
   ```
 
+- `--fiber-json <path> --start-cp-index A --target-cp-index B` runs the native
+  tool on an explicit CP segment from one fiber JSON. Existing
+  `--sample-index` plus `--target-offset` selection remains available.
 - Traces directly in selected-level ZYX voxel coordinates, not in a projected
   2D strip. It lazily runs dense 3D inference blocks around queried points,
   crops each block to a trusted core, and routes every candidate lookup to the
@@ -103,10 +106,9 @@ side/top strip input loading.
   directly slice zarr/raw blocks for real configured volumes.
 - Model input normalization is the configured 3D `image_normalization` value.
   With the current fast 3D config this is `zscore`: mean/std over valid voxels
-  before model inference.
-- Exported native Trace2CP strip JPG panels render raw sampled volume values:
-  valid finite values are rounded/clipped to `0..255`, and invalid pixels stay
-  black. They do not use percentile or per-panel min/max scaling.
+  before model inference. Exported native Trace2CP volume panels show that same
+  normalized input view: `zscore` uses a fixed `[-3, 3]` display window,
+  `minmax` uses `0..1`, and raw/none modes clip raw `0..255`.
 - The side/top strip render calls go through the 2D Trace2CP coordinate
   sampler path. Those render calls require a blocking sampler and raise if the
   VC3D sampler reports chunk errors, because `sampleCoordsFineToCoarse` can
@@ -124,16 +126,32 @@ side/top strip input loading.
   `--trace-step-limit` intentionally produces partial traces for debugging.
   Forward/backward progress bars report signed target-plane progress along the
   initial CP-to-CP direction, ETA, step count, and inferred-block count.
+- Native strip rendering prints coarse stage progress for side/top volume
+  rendering, coordinate extraction, side/top presence sampling, trace overlay
+  projection, and image composition. Presence sampling also prints block-level
+  progress with sampled points, valid outputs, newly inferred blocks, cached
+  blocks, and total cache blocks.
 - Stops when the trace crosses the plane through the target CP with normal
   from start CP to target CP. The stdout/summary metrics are
   `native_trace2cp_plane_error` and
   `native_trace2cp_closest_target_error`; these are tool-local diagnostics and
   do not replace the projected `test/trace2cp_error` metric used by training.
-- For visualization, converts the fused native 3D trace back to base XYZ and
-  builds a fresh Trace2CP-style side/top strip source directly from that traced
-  3D polyline. It samples Lasagna normals at the traced coordinates and reuses
-  the existing VC3D/Lasagna strip grid and sampler semantics; the original
-  2D source strip is not used as a hard domain constraint.
+- For visualization, uses the initial side/top Trace2CP source built by the
+  existing 2D geometry loader for the input CP pair. It does not regenerate a
+  side/top strip source from the fitted native trace. The JPG includes four
+  panels: normalized initial side input, 3D presence sampled on the initial
+  side coordinates, normalized initial top input, and 3D presence sampled on
+  the initial top coordinates.
+- Trace2CP segment-source construction trims extra margin points to the valid
+  compact-geometry interval containing both CPs. Compact-geometry preload covers
+  consecutive CP-to-CP spans as well as CP source windows, so an interior
+  Trace2CP span point should not be invalid merely because it was never sampled.
+  It still fails if the actual CP-to-CP line range crosses sampled invalid
+  Lasagna normal data; no missing normal fill-in is performed.
+- Forward, reverse, and fused native 3D traces are converted back to base XYZ
+  and projected onto the initial side/top strip coordinate systems for overlay
+  only. Presence sampling is batched per strip through the native 3D inference
+  cache rather than running per-pixel model calls.
 
 `fiber_trace_3d/train.py`
 

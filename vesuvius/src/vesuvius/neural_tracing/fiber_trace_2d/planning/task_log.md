@@ -1,51 +1,37 @@
-# Native 3D Trace2CP Render Brightness And Blocking Guard Task Log
+# Trace2CP Compact Geometry CP-Span Coverage Task Log
 
 ## Findings
 
-- Native 3D Trace2CP strip panels used per-panel `1..99` percentile scaling in
-  `_image_to_u8(...)`. That changes brightness and can hide raw loading
-  problems.
-- 3D training model input uses `fiber_trace_3d.loader._normalize_image(...)`
-  with the configured `image_normalization`. The current fast 3D config uses
-  `image_normalization: "zscore"`, meaning mean/std over valid voxels before
-  inference.
-- Native strip visualization delegates image sampling to
-  `FiberStrip2DLoader.sample_trace2cp_segment_source(...)` and
-  `sample_trace2cp_top_strip_source(...)`.
-- Those functions already call the coordinate sampler, but they did not reject
-  non-blocking samplers or VC3D sampler chunk errors.
-- The VC3D binding's `sample_coords` uses `sampleCoordsFineToCoarse` after
-  blocking dependency prefetch. If fine chunks fail, the call can produce a
-  coarser fallback image unless Python rejects the error stats.
+- The `invalid normal without stored reason` diagnostics came from line points
+  that were marked invalid in compact geometry but had no Lasagna failure
+  reason.
+- The reason is a preload coverage bug: compact geometry sampled CP
+  source-window ranges, but Trace2CP can request the full centerline span
+  between two CPs. Interior points between two disjoint CP windows were never
+  sampled.
+- Strip width is not involved. The affected points are fiber centerline points
+  inside the CP-to-CP span.
 
-## Implementation
+## Implementation Notes
 
-- Changed native 3D Trace2CP `_image_to_u8(...)` to raw clipped rendering:
-  valid finite values are rounded/clipped to `0..255`; invalid pixels stay
-  black.
-- Added `FiberStrip2DLoader._sample_trace2cp_coords_blocking(...)`.
-- Routed Trace2CP side strip, top strip, traced top strip, and side-z strip
-  image sampling through that helper.
-- The helper rejects samplers with `blocking=False` and raises on
-  `error_chunks > 0` to avoid silently rendering fine-to-coarse fallback data.
-- Added tests for raw native render brightness and the Trace2CP render sampler
-  guard.
-- Updated `planning/specs.md`, `docs/code_structure.md`, and
-  `planning/changelog.md`.
+- `_required_line_ranges_for_record(...)` now includes consecutive CP-to-CP
+  line spans in addition to CP source windows.
+- `_FiberLineGeometry` keeps line-level invalid Lasagna reasons.
+- The Trace2CP invalid-interval error now reports invalid runs, overlapping
+  valid intervals, stored reasons, and for unexpected unsampled points a direct
+  Lasagna probe with grad/nx/ny ranges and principal-axis status.
+- No normal fill-in, propagation, or interpolation fallback was added.
 
 ## Deviations Or Deferrals
 
-- The strip geometry/orientation issues are intentionally not fixed in this
-  task per the user note. This only addresses raw brightness and strict
-  full-resolution/blocking render sampling behavior.
+- Existing compact geometry stores built by older code can still show the
+  defensive `not sampled by compact geometry preload` diagnostic until rebuilt.
+  New loader construction should sample the CP-to-CP span and either validate it
+  or report the real sampled Lasagna failure reason.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
   passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k native_3d_trace2cp`
-  passed: 10 passed, 39 deselected.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k "trace2cp_render_sampling or trace2cp_segment_source_offsets_each_pixel_axis or trace2cp_traced_top_strip_samples_from_fused_trace"`
-  passed: 4 passed, 266 deselected.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: 319 passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k "compact_geometry or required_line_ranges or trace2cp_segment_trims or trace2cp_segment_rejects"`
+  passed: 7 passed, 266 deselected.
