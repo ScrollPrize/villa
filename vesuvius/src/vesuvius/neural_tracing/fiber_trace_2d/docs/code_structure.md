@@ -106,8 +106,10 @@ side/top strip input loading.
   `native_trace2cp_closest_target_error`; these are tool-local diagnostics and
   do not replace the projected `test/trace2cp_error` metric used by training.
 - For visualization, converts the fused native 3D trace back to base XYZ and
-  rebuilds side/top Trace2CP strip views through the existing
-  `FiberStrip2DLoader` refined-source path.
+  builds a fresh Trace2CP-style side/top strip source directly from that traced
+  3D polyline. It samples Lasagna normals at the traced coordinates and reuses
+  the existing VC3D/Lasagna strip grid and sampler semantics; the original
+  2D source strip is not used as a hard domain constraint.
 
 `fiber_trace_3d/train.py`
 

@@ -1275,6 +1275,10 @@ def test_native_3d_trace2cp_cone_candidates_are_deterministic_and_bounded() -> N
     assert float(np.max(angles)) <= 25.0 + 1.0e-4
 
 
+def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
+    assert NativeTrace2CpConfig().inference_patch_shape_zyx == (64, 64, 64)
+
+
 def test_native_3d_trace2cp_plane_crossing_interpolates() -> None:
     crossing = _interpolate_plane_crossing(
         np.asarray([0.0, 0.0, 0.0], dtype=np.float32),

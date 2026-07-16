@@ -22,5 +22,11 @@ Requirements:
 - After tracing, create side and top strips from the resulting 3D trace line.
   Reuse existing strip geometry semantics where possible; do not invent a
   simplified planar replacement.
+- The native visualization must not fail because the trace is outside the
+  original 2D Trace2CP source strip. Build the visualization source directly
+  from the traced 3D polyline and use the original source only for record/CP
+  metadata and sizing defaults.
+- The native tool defaults to 64-voxel inference patches and prints live
+  progress for forward and backward traces.
 - Produce visualization and stdout metrics from the new native 3D tool.
 - Update specs/docs/tests plan before implementation.

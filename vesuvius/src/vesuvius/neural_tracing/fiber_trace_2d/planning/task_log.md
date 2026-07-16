@@ -14,9 +14,11 @@
 - Implemented tool-local stdout/JSON metrics:
   `native_trace2cp_plane_error` and
   `native_trace2cp_closest_target_error`.
-- Implemented visualization export by projecting the fused native 3D trace into
-  the existing Trace2CP source frame and rebuilding side/top strip images with
-  the existing refined 2D strip-source path.
+- Implemented visualization export by converting the fused native 3D trace to
+  base XYZ, sampling Lasagna normals at those traced coordinates, and building
+  a fresh Trace2CP-style side/top strip source from the traced 3D polyline.
+- Added live forward/backward native trace progress bars and changed the native
+  inference patch default to `64,64,64`, matching the fast 3D training config.
 - Updated `planning/specs.md` and `docs/code_structure.md`.
 - Added focused synthetic tests in `test_fiber_trace_3d.py`.
 
@@ -24,12 +26,13 @@
 
 - The native tool is an inspection/debug tool only. It does not replace the
   existing projected `test/trace2cp_error` metric or best-checkpoint selection.
-- The visualization adapter projects the fused native 3D trace into the
-  existing Trace2CP source frame before calling the refined strip builder. It
-  reuses the existing strip geometry path, but it is not yet exposed as a
-  standalone public loader API for arbitrary volume-space polylines.
+- The native visualization helper is still local to
+  `fiber_trace_3d.trace2cp_tool`; it is not yet exposed as a standalone public
+  loader API for arbitrary volume-space polylines.
 
 ## Validation
 
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py`
+  - Result: passed.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  - Result: 311 passed in 12.36s.
+  - Result: 312 passed in 13.32s.

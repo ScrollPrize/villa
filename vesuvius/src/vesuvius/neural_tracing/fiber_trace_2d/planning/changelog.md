@@ -5,7 +5,10 @@
 - Added a separate native 3D Trace2CP inspection CLI with overlapped
   trusted-core inference blocks, deterministic 3D cone candidate tracing,
   target-plane stopping, tool-local native trace metrics, and side/top strip
-  visualization through the existing Trace2CP refined-source path.
+  visualization built directly from the traced 3D polyline.
+- Changed native 3D Trace2CP to default inference patches to `64,64,64`, print
+  live forward/backward progress bars, and avoid treating the original 2D
+  Trace2CP source strip as a hard visualization domain.
 
 ## 2026-07-15
 

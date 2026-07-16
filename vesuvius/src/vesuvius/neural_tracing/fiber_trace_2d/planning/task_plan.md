@@ -95,13 +95,16 @@
 
 7. Reuse strip creation for visualization.
    - Convert traced selected-level points back to base XYZ.
-   - Add or expose a small adapter that creates a Trace2CP-style side/top strip
-     source from an arbitrary traced 3D line:
-     - sample Lasagna normals along the traced line;
+   - Add a local adapter that creates a Trace2CP-style side/top strip source
+     directly from an arbitrary traced 3D line:
+     - sample Lasagna normals at traced line coordinates;
      - build VC3D-equivalent side and top strip grids from the traced line;
      - sample the volume with the existing VC3D sampler.
-   - This should be an adapter around existing strip geometry semantics. It may
-     add a helper, but should not change current 2D Trace2CP behavior.
+   - The original 2D Trace2CP source strip must not be used as a hard spatial
+     domain for native 3D trace visualization. It may only supply record/CP
+     metadata and visual sizing defaults.
+   - This should be an adapter around existing strip geometry semantics and
+     should not change current 2D Trace2CP behavior.
    - Render side strip, top strip, projected forward/reverse/fused traces, CPs,
      presence/debug panels, and a concise summary text.
 
@@ -121,7 +124,8 @@
 - Document that native 3D Trace2CP does not replace the existing public 2D
   `trace2cp_error` or best-checkpoint selection until explicitly enabled.
 - Document that native 3D strip visualization reuses VC3D/Lasagna strip
-  semantics from traced 3D coordinates.
+  semantics from traced 3D coordinates and is not clipped to the original
+  Trace2CP source strip.
 
 ## Docs Updates
 

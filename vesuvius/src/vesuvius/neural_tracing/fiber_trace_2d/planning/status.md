@@ -19,7 +19,9 @@
 - [x] Added deterministic 3D cone candidate stepping with direction/presence
   scoring.
 - [x] Added target-plane crossing stop condition.
-- [x] Added side/top Trace2CP strip visualization through the existing refined
-  2D strip source path.
+- [x] Added side/top Trace2CP strip visualization built directly from the
+  traced native 3D polyline.
+- [x] Added native fw/bw trace progress bars.
+- [x] Changed native inference patch default to 64 voxels per axis.
 - [x] Added synthetic tests for cone generation, plane crossing, block routing,
   and constant-field native tracing.

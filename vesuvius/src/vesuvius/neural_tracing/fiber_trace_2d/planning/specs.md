@@ -297,11 +297,17 @@
   lookups must route to a block whose trusted core contains the queried point.
   The tool must not silently score candidates from cropped-away model-output
   borders.
+- Native 3D Trace2CP defaults to `--inference-patch-shape-zyx 64 64 64`,
+  matching the current fast 3D training/debug patch size. Larger patch shapes
+  remain explicit CLI overrides.
 - Native 3D candidate stepping samples a deterministic cone around the current
   inferred 3D direction. Candidate loss is weighted direction agreement plus
   `1 - sigmoid_presence` at the candidate point. Direction agreement includes
   both the current point's sampled axis and the candidate point's sampled axis,
   aligned against the candidate step direction.
+- The native 3D CLI prints live progress bars for forward and backward tracing.
+  Progress is measured by normalized distance to the target CP plane and should
+  include step count and inferred-block count.
 - Native 3D tracing stops by intersecting the plane through the target CP with
   normal from start CP to target CP. The returned trace appends the exact
   linear interpolation point on that target plane when crossing occurs.
@@ -309,10 +315,11 @@
   `native_trace2cp_plane_error` and
   `native_trace2cp_closest_target_error`. These are not the public 2D
   `trace2cp_error`.
-- Native 3D visualization converts the fused traced 3D line back to base XYZ
-  and rebuilds Trace2CP side/top strip images through the existing
-  VC3D/Lasagna strip geometry path, so strip rendering remains comparable to
-  existing Trace2CP views.
+- Native 3D visualization converts the fused traced 3D line back to base XYZ,
+  samples Lasagna normals at those traced coordinates, and builds a fresh
+  Trace2CP-style side/top strip source directly from the traced 3D polyline.
+  The old source strip is not a hard spatial domain for native 3D tracing; it
+  only supplies the record, CP metadata, and visual sizing defaults.
 
 - The initial implementation loads batches of fiber-strip patches around random control points from the fiber dataset.
 - Fiber source parsing accepts existing VC3D fiber JSON files and Knossos /
