@@ -7,6 +7,7 @@
 - [x] Include docs update plan.
 - [x] Include testing plan.
 - [x] Implement product candidate scoring.
+- [x] Seed first native 3D search step from the CP-local adjacent fiber tangent.
 - [x] Remove obsolete native 3D candidate-selection weight knobs.
 - [x] Update specs/docs/changelog/task log.
 - [x] Run validation.

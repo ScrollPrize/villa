@@ -150,6 +150,14 @@ def _unit(vector: np.ndarray, *, fallback: np.ndarray | None = None) -> np.ndarr
     return _unit(fallback)
 
 
+def _require_unit(vector: np.ndarray, *, label: str) -> np.ndarray:
+    arr = np.asarray(vector, dtype=np.float64)
+    norm = float(np.linalg.norm(arr))
+    if not math.isfinite(norm) or norm <= _EPS:
+        raise ValueError(f"{label} must be finite and non-zero")
+    return (arr / norm).astype(np.float32)
+
+
 def _align_axis(axis: np.ndarray, reference: np.ndarray) -> np.ndarray:
     aligned = _unit(axis)
     ref = _unit(reference)
@@ -671,11 +679,47 @@ def _interpolate_plane_crossing(
     ).astype(np.float32)
 
 
+def _fiber_line_tangent_zyx_toward_target(
+    record: Any,
+    *,
+    start_control_point_index: int,
+    target_control_point_index: int,
+) -> np.ndarray:
+    fiber = record.fiber
+    line_points_xyz = np.asarray(fiber.line_points_xyz, dtype=np.float64)
+    if line_points_xyz.ndim != 2 or line_points_xyz.shape[1] != 3:
+        raise ValueError("fiber line_points_xyz must have shape [N, 3]")
+    start_line_index = control_point_line_index(fiber, int(start_control_point_index))
+    target_line_index = control_point_line_index(fiber, int(target_control_point_index))
+    if int(start_line_index) == int(target_line_index):
+        raise ValueError("native 3D Trace2CP start and target line indices must differ")
+    step = 1 if int(target_line_index) > int(start_line_index) else -1
+    next_line_index = int(start_line_index) + step
+    if next_line_index < 0 or next_line_index >= int(line_points_xyz.shape[0]):
+        raise ValueError(
+            "native 3D Trace2CP cannot derive CP-local tangent: "
+            f"start_line_index={int(start_line_index)} target_line_index={int(target_line_index)}"
+        )
+    tangent_xyz = line_points_xyz[next_line_index] - line_points_xyz[int(start_line_index)]
+    spacing = float(getattr(record, "volume_spacing_base", 1.0))
+    if not math.isfinite(spacing) or spacing <= 0.0:
+        raise ValueError(f"invalid volume_spacing_base for native 3D tangent: {spacing!r}")
+    tangent_zyx = tangent_xyz[[2, 1, 0]] / spacing
+    return _require_unit(
+        tangent_zyx,
+        label=(
+            "native 3D Trace2CP CP-local fiber tangent "
+            f"{int(start_control_point_index)}->{int(target_control_point_index)}"
+        ),
+    )
+
+
 def trace_native_3d_one_way(
     cache: NativeTraceFieldCache,
     *,
     start_zyx: np.ndarray,
     target_zyx: np.ndarray,
+    initial_direction_zyx: np.ndarray,
     cfg: NativeTrace2CpConfig,
     progress_label: str | None = None,
 ) -> NativeTraceResult:
@@ -736,10 +780,14 @@ def trace_native_3d_one_way(
         )
 
     emit_progress(start, 0)
-    initial_direction, _presence, valid = cache.sample_point(start)
+    initial_sampled_direction, _presence, valid = cache.sample_point(start)
     if not valid:
         raise ValueError(f"native 3D Trace2CP start point is invalid: {start.tolist()}")
-    previous_direction = _align_axis(initial_direction, plane_normal)
+    initial_direction = _require_unit(
+        initial_direction_zyx,
+        label="native 3D Trace2CP initial_direction_zyx",
+    )
+    previous_direction = initial_direction.astype(np.float32, copy=False)
     candidates_unit = generate_cone_candidates(
         previous_direction,
         max_angle_degrees=cfg.cone_angle_degrees,
@@ -749,7 +797,11 @@ def trace_native_3d_one_way(
     steps: list[NativeTraceStep] = []
     current = start.astype(np.float32)
     for _step_index in range(step_limit):
-        current_direction, _presence, valid = cache.sample_point(current)
+        if _step_index == 0:
+            sampled_direction = initial_sampled_direction
+            valid = True
+        else:
+            sampled_direction, _presence, valid = cache.sample_point(current)
         if not valid:
             emit_progress(current, _step_index, reason="invalid_current_point")
             return NativeTraceResult(
@@ -758,7 +810,10 @@ def trace_native_3d_one_way(
                 reason="invalid_current_point",
                 steps=tuple(steps),
             )
-        current_direction = _align_axis(current_direction, previous_direction)
+        if _step_index == 0:
+            current_direction = initial_direction.astype(np.float32, copy=False)
+        else:
+            current_direction = _align_axis(sampled_direction, previous_direction)
         candidates = generate_cone_candidates(
             current_direction,
             max_angle_degrees=cfg.cone_angle_degrees,
@@ -1231,6 +1286,8 @@ def trace_native_3d_pair(
     *,
     start_zyx: np.ndarray,
     target_zyx: np.ndarray,
+    forward_initial_direction_zyx: np.ndarray,
+    reverse_initial_direction_zyx: np.ndarray,
     cfg: NativeTrace2CpConfig,
     progress: bool = False,
 ) -> NativeTracePairResult:
@@ -1238,6 +1295,7 @@ def trace_native_3d_pair(
         cache,
         start_zyx=start_zyx,
         target_zyx=target_zyx,
+        initial_direction_zyx=forward_initial_direction_zyx,
         cfg=cfg,
         progress_label="fw" if progress else None,
     )
@@ -1245,6 +1303,7 @@ def trace_native_3d_pair(
         cache,
         start_zyx=target_zyx,
         target_zyx=start_zyx,
+        initial_direction_zyx=reverse_initial_direction_zyx,
         cfg=cfg,
         progress_label="bw" if progress else None,
     )
@@ -2167,6 +2226,16 @@ def run_native_trace2cp(
         np.asarray(record.fiber.control_points_zyx[int(selection.target_cp_index)], dtype=np.float32)
         / np.float32(record.volume_spacing_base)
     )
+    forward_initial_direction = _fiber_line_tangent_zyx_toward_target(
+        record,
+        start_control_point_index=int(selection.start_cp_index),
+        target_control_point_index=int(selection.target_cp_index),
+    )
+    reverse_initial_direction = _fiber_line_tangent_zyx_toward_target(
+        record,
+        start_control_point_index=int(selection.target_cp_index),
+        target_control_point_index=int(selection.start_cp_index),
+    )
     training = dict(raw_config.get("training", {}))
     device = _device_from_training(training)
     model = build_fiber_trace_3d_model(raw_config).to(device)
@@ -2194,6 +2263,8 @@ def run_native_trace2cp(
         cache,
         start_zyx=start_zyx,
         target_zyx=target_zyx,
+        forward_initial_direction_zyx=forward_initial_direction,
+        reverse_initial_direction_zyx=reverse_initial_direction,
         cfg=cfg,
         progress=True,
     )

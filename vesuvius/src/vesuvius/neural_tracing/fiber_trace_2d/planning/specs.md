@@ -354,6 +354,13 @@
   Both sampled axes are sign-aligned to the candidate step direction before dot
   products are evaluated. The native 3D tool does not expose additive
   direction/presence candidate-selection weights.
+- The first native 3D Trace2CP search step is seeded from the adjacent
+  CP-local fiber-line tangent in the direction of the target CP's line index.
+  It must not use the straight CP-to-CP chord and must not use the sampled
+  model direction at the start CP. Forward and backward traces receive their
+  respective initial directions from their start/target order. Later steps use
+  the sampled model direction at the current trace point, sign-aligned to the
+  previous accepted step.
 - The native 3D CLI prints live progress bars for forward and backward tracing.
   Progress is measured by signed target-plane progress along the initial
   CP-to-CP direction. It includes step count, ETA, and inferred-block count.

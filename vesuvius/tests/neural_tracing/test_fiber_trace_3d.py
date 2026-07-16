@@ -52,6 +52,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     NativeTrace2CpConfig,
     NativeTraceFieldCache,
     _adaptive_trace2cp_cross_strip_height,
+    _fiber_line_tangent_zyx_toward_target,
     _image_to_u8,
     _interpolate_plane_crossing,
     _project_trace_to_initial_strip,
@@ -61,6 +62,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _volume_trace_to_source_trace_xyz,
     fuse_forward_reverse_traces,
     generate_cone_candidates,
+    trace_native_3d_one_way,
     trace_native_3d_pair,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses
@@ -1765,6 +1767,83 @@ def test_native_3d_trace2cp_candidate_score_maximizes_dot_product_presence() -> 
     assert presence_loss == pytest.approx(0.49, abs=1.0e-6)
 
 
+def test_native_3d_trace2cp_fiber_line_tangent_uses_adjacent_segment_not_chord() -> None:
+    fiber = Vc3dFiber(
+        path=None,
+        version=1,
+        line_points_xyz=np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.0, 0.0, 5.0],
+            ],
+            dtype=np.float32,
+        ),
+        control_points_xyz=np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 5.0],
+            ],
+            dtype=np.float32,
+        ),
+        generation=1,
+        metadata={},
+    )
+    record = SimpleNamespace(fiber=fiber, volume_spacing_base=2.0)
+
+    forward = _fiber_line_tangent_zyx_toward_target(
+        record,
+        start_control_point_index=0,
+        target_control_point_index=1,
+    )
+    reverse = _fiber_line_tangent_zyx_toward_target(
+        record,
+        start_control_point_index=1,
+        target_control_point_index=0,
+    )
+
+    assert np.allclose(forward, [0.0, 0.0, 1.0])
+    assert np.allclose(reverse, [-1.0, 0.0, 0.0])
+
+
+def test_native_3d_trace2cp_first_step_uses_supplied_line_tangent() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point(self, _point_zyx: np.ndarray):
+            return (
+                np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+                1.0,
+                True,
+            )
+
+        def sample_points_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            norms = np.linalg.norm(points, axis=1, keepdims=True)
+            directions = points / np.maximum(norms, np.float32(1.0e-6))
+            return (
+                torch.as_tensor(directions, dtype=torch.float32),
+                torch.ones((points.shape[0],), dtype=torch.float32),
+                torch.ones((points.shape[0],), dtype=torch.bool),
+            )
+
+    result = trace_native_3d_one_way(
+        FakeCache(),
+        start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        target_zyx=np.asarray([10.0, 0.0, 10.0], dtype=np.float32),
+        initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        cfg=NativeTrace2CpConfig(
+            step_voxels=2.0,
+            cone_angle_degrees=0.0,
+            cone_grid_size=1,
+            trace_step_limit=1,
+        ),
+    )
+
+    assert result.reason == "trace_step_limit"
+    assert np.allclose(result.trace_zyx[1], [0.0, 0.0, 2.0])
+
+
 def test_native_3d_trace2cp_field_cache_rejects_nonblocking_sampler() -> None:
     class NonBlockingSampler:
         blocking = False
@@ -1824,6 +1903,8 @@ def test_native_3d_trace2cp_constant_field_reaches_target_plane() -> None:
         cache,
         start_zyx=np.asarray([8.0, 8.0, 4.0], dtype=np.float32),
         target_zyx=np.asarray([8.0, 8.0, 20.0], dtype=np.float32),
+        forward_initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        reverse_initial_direction_zyx=np.asarray([0.0, 0.0, -1.0], dtype=np.float32),
         cfg=NativeTrace2CpConfig(
             step_voxels=2.0,
             cone_angle_degrees=25.0,
@@ -1868,6 +1949,8 @@ def test_native_3d_trace2cp_trace_step_limit_stops_partial_trace() -> None:
         cache,
         start_zyx=np.asarray([8.0, 8.0, 4.0], dtype=np.float32),
         target_zyx=np.asarray([8.0, 8.0, 20.0], dtype=np.float32),
+        forward_initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        reverse_initial_direction_zyx=np.asarray([0.0, 0.0, -1.0], dtype=np.float32),
         cfg=NativeTrace2CpConfig(
             step_voxels=2.0,
             cone_angle_degrees=25.0,
@@ -1915,6 +1998,8 @@ def test_native_3d_trace2cp_max_step_factor_limits_trace() -> None:
         cache,
         start_zyx=np.asarray([8.0, 8.0, 4.0], dtype=np.float32),
         target_zyx=np.asarray([8.0, 8.0, 20.0], dtype=np.float32),
+        forward_initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        reverse_initial_direction_zyx=np.asarray([0.0, 0.0, -1.0], dtype=np.float32),
         cfg=NativeTrace2CpConfig(
             step_voxels=2.0,
             cone_angle_degrees=25.0,

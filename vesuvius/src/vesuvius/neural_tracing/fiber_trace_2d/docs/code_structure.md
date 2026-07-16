@@ -123,6 +123,10 @@ side/top strip input loading.
   The sampled axes are sign-aligned before dot products are evaluated; native
   3D Trace2CP does not expose additive direction/presence candidate-selection
   weights.
+- The first search step uses the adjacent CP-local fiber-line tangent in the
+  direction of the target CP's line index. It does not use the straight CP-to-CP
+  chord. Later steps use the sampled model direction at the current point,
+  aligned to the previous accepted trace step.
   Candidate selection is batched per step: candidate points are grouped by
   trusted inference block, sampled with batched `grid_sample`, decoded in torch,
   and reduced with one tensor `argmax`.

@@ -11,6 +11,10 @@ Requirements:
 - Match the candidate sampled direction against the candidate step direction,
   respecting the model's sign-ambiguous direction encoding by aligning signs
   before the dot product.
+- Seed the first search step from the adjacent CP-local fiber-line tangent in
+  the direction of the target CP's line index, not from the straight CP-to-CP
+  chord and not from the sampled model direction at the start CP. Forward and
+  backward traces get their respective direction from their start/target order.
 - Maximize:
   `dot(current_dir, candidate_step_dir) * dot(candidate_sampled_dir, candidate_step_dir) * candidate_presence`.
 - Invalid candidate points must remain rejected.

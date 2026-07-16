@@ -5,7 +5,10 @@
 - Changed native 3D Trace2CP candidate selection to maximize the product of
   current-direction agreement, candidate-direction agreement, and candidate
   presence. Removed the obsolete native 3D candidate-selection
-  `--direction-weight`/`--presence-weight` CLI knobs.
+  `--direction-weight`/`--presence-weight` CLI knobs. The first native 3D
+  search step now starts from the adjacent CP-local fiber-line tangent toward
+  the target CP's line index instead of the straight CP-to-CP chord or sampled
+  model direction at the start CP.
 - Changed VC3D `Volume.sample_coords(..., blocking=True)` to use strict
   requested-level coordinate sampling: required chunks are fetched/decoded and
   pinned before sampling, scale fallback is disabled, missing requested chunks
