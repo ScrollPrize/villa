@@ -27,7 +27,9 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSpinBox>
+#include <QSlider>
 #include <QToolButton>
 #include <QUuid>
 #include <QVBoxLayout>
@@ -427,6 +429,36 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
            "completed runs. Brighter red means more movement; the first run has no diff."));
     connect(runDiff, &QCheckBox::toggled, this, &SpiralPanel::runDiffChanged);
     displayDialogLayout->addWidget(runDiff);
+
+    auto* lossMapRow = new QWidget(_displayDialog);
+    auto* lossMapLayout = new QHBoxLayout(lossMapRow);
+    lossMapLayout->setContentsMargins(0, 0, 0, 0);
+    _lossMap = new QComboBox(lossMapRow);
+    _lossMap->setObjectName(QStringLiteral("spiralLossMap"));
+    _lossMap->addItem(tr("No loss overlay"), QString());
+    _lossMap->setToolTip(
+        tr("Overlay a weighted per-sample loss residual on the flattened output"));
+    _lossMapOpacity = new QSlider(Qt::Horizontal, lossMapRow);
+    _lossMapOpacity->setObjectName(QStringLiteral("spiralLossMapOpacity"));
+    _lossMapOpacity->setRange(0, 100);
+    _lossMapOpacity->setValue(80);
+    _lossMapOpacity->setToolTip(tr("Loss overlay opacity"));
+    lossMapLayout->addWidget(_lossMap, 1);
+    lossMapLayout->addWidget(new QLabel(tr("Opacity"), lossMapRow));
+    lossMapLayout->addWidget(_lossMapOpacity);
+    displayDialogLayout->addWidget(lossMapRow);
+    _lossMapLegend = new QLabel(_displayDialog);
+    _lossMapLegend->setWordWrap(true);
+    _lossMapLegend->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    displayDialogLayout->addWidget(_lossMapLegend);
+    auto emitLossMap = [this]() {
+        emit lossMapChanged(_lossMap->currentData().toString(),
+                            _lossMapOpacity->value() / 100.0);
+    };
+    connect(_lossMap, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [emitLossMap](int) { emitLossMap(); });
+    connect(_lossMapOpacity, &QSlider::valueChanged,
+            this, [emitLossMap](int) { emitLossMap(); });
 
     for (const auto& item : std::initializer_list<std::pair<const char*, const char*>>{
              {"output", "Output"}, {"fibers", "Fibers"}, {"tracks", "Tracks"},
@@ -948,6 +980,28 @@ void SpiralPanel::addPclItem(const QString& path, const QString& role, bool requ
 void SpiralPanel::setVolumes(const QVector<VolumeSelector::VolumeOption>& volumes, const QString& selectedId)
 {
     _volumeSelector->setVolumes(volumes, selectedId);
+}
+
+void SpiralPanel::setLossMapOptions(const QStringList& names)
+{
+    const QString selected = _lossMap ? _lossMap->currentData().toString() : QString();
+    if (!_lossMap) return;
+    const QSignalBlocker blocker(_lossMap);
+    _lossMap->clear();
+    _lossMap->addItem(tr("No loss overlay"), QString());
+    for (const QString& name : names)
+        _lossMap->addItem(name, name);
+    const int selectedIndex = _lossMap->findData(selected);
+    _lossMap->setCurrentIndex(selectedIndex >= 0 ? selectedIndex : 0);
+    if (selectedIndex < 0) {
+        _lossMapLegend->clear();
+        emit lossMapChanged({}, _lossMapOpacity->value() / 100.0);
+    }
+}
+
+void SpiralPanel::setLossMapLegend(const QString& text)
+{
+    if (_lossMapLegend) _lossMapLegend->setText(text);
 }
 
 void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)

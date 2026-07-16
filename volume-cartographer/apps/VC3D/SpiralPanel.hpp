@@ -19,6 +19,7 @@ class QPushButton;
 class QSpinBox;
 class QDoubleSpinBox;
 class QPlainTextEdit;
+class QSlider;
 class QToolButton;
 class SpiralServiceManager;
 class QFormLayout;
@@ -29,11 +30,14 @@ class SpiralPanel : public QWidget
 public:
     explicit SpiralPanel(SpiralServiceManager* service, QWidget* parent = nullptr);
     void setVolumes(const QVector<VolumeSelector::VolumeOption>& volumes, const QString& selectedId);
+    void setLossMapOptions(const QStringList& names);
+    void setLossMapLegend(const QString& text);
 
 signals:
     void volumeSelected(const QString& id);
     void visibilityChanged(const QString& category, bool visible);
     void runDiffChanged(bool visible);
+    void lossMapChanged(const QString& name, qreal opacity);
     void windingRangeChanged(int minimum, int maximum);
     void surfaceIntersectionsChanged(bool shown);
     void pythonOutputRequested();
@@ -73,6 +77,9 @@ private:
     QSpinBox* _minimumDisplayedWinding = nullptr;
     QSpinBox* _maximumDisplayedWinding = nullptr;
     QCheckBox* _showSurfaceIntersections = nullptr;
+    QComboBox* _lossMap = nullptr;
+    QSlider* _lossMapOpacity = nullptr;
+    QLabel* _lossMapLegend = nullptr;
     QSpinBox* _zBegin = nullptr;
     QSpinBox* _zEnd = nullptr;
     QSpinBox* _iterations = nullptr;

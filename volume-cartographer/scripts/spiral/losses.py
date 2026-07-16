@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 import geom_utils
 import prefetch
+from loss_maps import diagnostics_enabled, record_loss_samples
 from sample_spiral import (
     canonical_winding_samples,
     get_theta_and_radii,
@@ -301,6 +302,7 @@ def _patch_radius_and_dt_losses(
     num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
     radius_loss_margin, radius_loss_inv, radius_within_norm_p,
     dt_loss_margin, dt_norm_p, dt_within_patch_norm_p,
+    diagnostic_prefix='patch',
 ):
     # Shared radius + DT patch losses, operating on pre-sampled row/column tracks
     # (all_*; see _sample_patch_tracks). Pulled out of get_patch_and_umbilicus_losses so the
@@ -337,7 +339,10 @@ def _patch_radius_and_dt_losses(
         radius_target_scroll_zyxs = slice_to_spiral_transform.inv(radius_target_spiral_zyxs.reshape(-1, 3)).reshape(*radius_target_spiral_zyxs.shape)
 
         radius_point_distances = torch.linalg.norm(radius_slice_zyxs - radius_target_scroll_zyxs, dim=-1)
-        mean_radius_deviation = F.relu(radius_point_distances - radius_hinge_margin).mean()
+        radius_point_residuals = F.relu(radius_point_distances - radius_hinge_margin)
+        mean_radius_deviation = radius_point_residuals.mean()
+        record_loss_samples(f'{diagnostic_prefix}_radius', radius_spiral_zyxs,
+                            radius_point_residuals)
     else:
         # Penalise deviation from the track's mean shifted-radius directly in spiral space.
         mean_radii = radius_shifted_radii.mean(dim=-1, keepdim=True)
@@ -349,6 +354,9 @@ def _patch_radius_and_dt_losses(
             d = radius_deviations_hinge + 1.e-5
             per_track = (d ** radius_within_norm_p).mean(dim=-1) ** (1.0 / radius_within_norm_p)
             mean_radius_deviation = per_track.mean()
+        record_loss_samples(f'{diagnostic_prefix}_radius',
+                            all_spiral_zyxs[:, :num_patches_for_radius],
+                            radius_deviations_hinge)
 
     if compute_dt:
         dt_slice_zyxs = all_slice_zyxs[:, :num_patches_for_dt]
@@ -382,6 +390,9 @@ def _patch_radius_and_dt_losses(
         # Progressive DT: only patches whose snapped winding is within the current cutoff contribute.
         active_mask = _progressive_dt_active_mask(target_shifted_radii.squeeze(-1), dr_per_winding, dt_max_winding)
         patch_dt_loss = _aggregate_dt_track_losses(track_losses, dt_norm_p, active_mask)
+        diagnostic_mask = (active_mask[..., None] if active_mask is not None else None)
+        record_loss_samples(f'{diagnostic_prefix}_dt', dt_spiral_zyxs,
+                            point_distances, diagnostic_mask)
     else:
         patch_dt_loss = torch.zeros([], device=dr_per_winding.device)
 
@@ -431,6 +442,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
         cfg['patch_radius_loss_margin'], cfg['patch_radius_loss_inv'], cfg['patch_radius_within_norm_p'],
         cfg['patch_dt_loss_margin'], cfg['patch_dt_norm_p'], cfg['patch_dt_within_patch_norm_p'],
+        diagnostic_prefix='patch',
     )
 
     # Umbilicus should map to the spiral origin (yx ≈ 0)
@@ -440,7 +452,13 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         radius_hinge_margin = dr_per_winding.detach() * cfg['patch_radius_loss_margin']
         _, _, shell_shifted_radii = get_theta_and_radii(shell_spiral_zyxs[..., 1:], dr_per_winding)
         shell_target = dr_per_winding * float(shell_outer_winding_idx)
-        shell_patch_radius_loss = F.relu((shell_shifted_radii - shell_target).abs() - radius_hinge_margin).mean()
+        shell_patch_radius_residual = F.relu(
+            (shell_shifted_radii - shell_target).abs() - radius_hinge_margin)
+        shell_patch_radius_loss = shell_patch_radius_residual.mean()
+        record_loss_samples(
+            'shell_patch_radius', shell_spiral_zyxs,
+            shell_patch_radius_residual,
+        )
     else:
         shell_patch_radius_loss = torch.zeros([], device=dr_per_winding.device)
 
@@ -482,6 +500,7 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
         num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
         cfg['unverified_patch_radius_loss_margin'], cfg['unverified_patch_radius_loss_inv'], cfg['unverified_patch_radius_within_norm_p'],
         cfg['unverified_patch_dt_loss_margin'], cfg['unverified_patch_dt_norm_p'], cfg['unverified_patch_dt_within_patch_norm_p'],
+        diagnostic_prefix='unverified_patch',
     )
 
 
@@ -754,6 +773,25 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
         [strip_pair[5] for strip_pair in strip_pairs],
     )
     expected_diff = (winding_diffs * dr_per_winding) - pcl_seam_adjustments
+    if diagnostics_enabled():
+        # Attribute each pair's exact masked all-pairs residual uniformly to
+        # the samples on both supporting patch strips.
+        pair_residuals = []
+        for pair_index in range(len(strip_pairs)):
+            pair_residuals.append(_masked_all_pairs_l1(
+                p1_r[pair_index:pair_index + 1],
+                p2_r[pair_index:pair_index + 1],
+                m1[pair_index:pair_index + 1],
+                m2[pair_index:pair_index + 1],
+                expected_diff[pair_index:pair_index + 1],
+            ))
+        pair_residuals = torch.stack(pair_residuals)
+        diagnostic_spiral = flat_spiral.reshape(
+            len(strip_pairs), num_strips_per_pair, num_points_per_strip, 3)
+        record_loss_samples(
+            'rel_winding', diagnostic_spiral,
+            pair_residuals[:, None, None], z_mask,
+        )
     return _masked_all_pairs_l1(p1_r, p2_r, m1, m2, expected_diff)
 
 
@@ -849,6 +887,13 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     target_shifted = (winding_annotations * dr_per_winding)[:, None]
 
     err = (shifted_radii - target_shifted).abs()
+    record_loss_samples(
+        'abs_winding',
+        flat_spiral.reshape(len(strips), num_strips_per_point,
+                            num_points_per_strip, 3),
+        err.reshape(len(strips), num_strips_per_point, num_points_per_strip),
+        mask.reshape(len(strips), num_strips_per_point, num_points_per_strip),
+    )
     return (err * mask).sum() / mask.sum().clamp(min=1)
 
 
@@ -1025,6 +1070,8 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     spacing_weight = sample_valid.all(dim=-1).float()
     spacing_residual = (integrated_windings - 1.).abs()
     spacing_loss = (spacing_residual * spacing_weight).sum() / spacing_weight.sum().clamp(min=1)
+    record_loss_samples('dense_spacing', spiral_zyx, spacing_residual,
+                        spacing_weight.bool())
 
     scroll_center_detached = scroll_center.detach()
     spiral_zyx_detached = spiral_zyx.detach()
@@ -1043,6 +1090,8 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     )
     normals_residual = 1. - (scroll_normal * target_normal).sum(dim=-1).abs()
     normals_loss = (normals_residual * normal_weight).sum() / normal_weight.sum().clamp(min=1)
+    record_loss_samples('dense_normals', spiral_zyx_detached, normals_residual,
+                        normal_weight.bool())
     yield 'dense_normals', normals_loss
 
 
@@ -1102,7 +1151,10 @@ def get_unattached_pcl_strip_losses(
 
     mean_radii = normalised_radii.mean(dim=-1, keepdim=True)
     radius_deviations = (normalised_radii - mean_radii).abs()
-    radius_loss = F.relu(radius_deviations - radius_hinge_margin).mean()
+    radius_point_residuals = F.relu(radius_deviations - radius_hinge_margin)
+    radius_loss = radius_point_residuals.mean()
+    record_loss_samples('unattached_pcl_radius', spiral_zyxs,
+                        radius_point_residuals)
 
     if not compute_dt:
         return radius_loss, zero
@@ -1129,6 +1181,10 @@ def get_unattached_pcl_strip_losses(
     strip_snapped_winding = torch.round(shifted_radii.median(dim=-1).values / dr_per_winding) * dr_per_winding
     active_mask = _progressive_dt_active_mask(strip_snapped_winding, dr_per_winding, dt_max_winding)
     dt_loss = _aggregate_dt_track_losses(track_losses, across_p, active_mask)
+    record_loss_samples(
+        'unattached_pcl_dt', spiral_zyxs, point_distances,
+        active_mask[..., None] if active_mask is not None else None,
+    )
 
     return radius_loss, dt_loss
 
@@ -1174,4 +1230,5 @@ def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, oute
     energy = (trace_g + inverse_term - 4.0).clamp(min=0.0)
     # Per-sample cap so a single near-degenerate sample doesn't dominate the batch mean / gradient.
     energy = energy.clamp(max=1.e2)
+    record_loss_samples('sym_dirichlet', spiral_zyx, energy)
     return energy.mean()

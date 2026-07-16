@@ -61,6 +61,18 @@ private:
         QString surfaceId;
         std::vector<PreviewComponent> components;
         QString error;
+        struct LossMap {
+            QString name;
+            QString imagePath;
+            double weight = 0.0;
+            double p50 = 0.0;
+            double p95 = 0.0;
+            double maximum = 0.0;
+            double displayMaximum = 0.0;
+            qint64 sampleCount = 0;
+            qint64 supportedPixels = 0;
+        };
+        std::vector<LossMap> lossMaps;
     };
     struct GeometryLoadResult {
         std::shared_ptr<PolylineIndex> index;
@@ -94,6 +106,7 @@ private:
         const std::shared_ptr<QuadSurface>& current,
         const std::vector<PreviewComponent>& currentComponents);
     void updateRunDiffOverlay();
+    void updateLossMapOverlay();
     std::shared_ptr<QuadSurface> makeDisplayedPreview(QString& registrationId) const;
     void installPreviewAliasWhenIndexed(const std::shared_ptr<QuadSurface>& preview,
                                         const QString& registrationId,
@@ -138,6 +151,11 @@ private:
     std::shared_ptr<QuadSurface> _currentPreview;
     QString _currentPreviewRegistrationId;
     QImage _previewRunDiffImage;
+    QHash<QString, PreviewLoadResult::LossMap> _previewLossMaps;
+    QString _selectedLossMap;
+    QString _loadedLossMap;
+    QImage _loadedLossMapImage;
+    qreal _lossMapOpacity = 0.8;
     quint64 _previewDisplayRevision = 0;
     int _minimumDisplayedWinding = 10;
     int _maximumDisplayedWinding = -1;

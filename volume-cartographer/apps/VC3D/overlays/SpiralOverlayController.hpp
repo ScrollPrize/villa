@@ -18,6 +18,8 @@ public:
     explicit SpiralOverlayController(QObject* parent = nullptr);
     void publishIndex(std::shared_ptr<const PolylineIndex> index, quint64 generation);
     void publishRunDiff(std::shared_ptr<QuadSurface> surface, QImage image);
+    void publishLossMap(std::shared_ptr<QuadSurface> surface, QImage image,
+                        qreal opacity);
     void setRunDiffVisible(bool visible);
     void reset();
     void setCategoryVisible(const QString& category, bool visible);
@@ -56,4 +58,7 @@ private:
     std::shared_ptr<QuadSurface> _runDiffSurface;
     QImage _runDiffImage;
     bool _runDiffVisible = false;
+    std::shared_ptr<QuadSurface> _lossMapSurface;
+    QImage _lossMapImage;
+    qreal _lossMapOpacity = 0.8;
 };

@@ -21,6 +21,7 @@
 #include <QDockWidget>
 #include <QDir>
 #include <QFile>
+#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -216,6 +217,12 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     });
     connect(_panel, &SpiralPanel::runDiffChanged,
             _overlay.get(), &SpiralOverlayController::setRunDiffVisible);
+    connect(_panel, &SpiralPanel::lossMapChanged, this,
+            [this](const QString& name, qreal opacity) {
+                _selectedLossMap = name;
+                _lossMapOpacity = opacity;
+                updateLossMapOverlay();
+            });
     connect(_service, &SpiralServiceManager::previewAvailable, this, &SpiralWorkspace::loadPreview);
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
             [this](SpiralServiceManager::ConnectionState state, const QString&) {
@@ -227,6 +234,12 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     _pendingPatchIds.clear();
                     _haveRunDiffBaseline = false;
                     _previewRunDiffImage = {};
+                    _previewLossMaps.clear();
+                    _loadedLossMap.clear();
+                    _loadedLossMapImage = {};
+                    _selectedLossMap.clear();
+                    _panel->setLossMapOptions({});
+                    _panel->setLossMapLegend({});
                     _overlay->reset();
                     updateSurfaceIntersections();
                 }
@@ -246,7 +259,14 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 // it reuses the existing service connection.
                 _haveRunDiffBaseline = false;
                 _previewRunDiffImage = {};
+                _previewLossMaps.clear();
+                _loadedLossMap.clear();
+                _loadedLossMapImage = {};
+                _selectedLossMap.clear();
+                _panel->setLossMapOptions({});
+                _panel->setLossMapLegend({});
                 _overlay->publishRunDiff({}, {});
+                _overlay->publishLossMap({}, {}, _lossMapOpacity);
                 loadInputSurfaces(paths, static_cast<quint64>(generation));
             });
     // Geometry snapshots arrive as artifacts already transferred to the local
@@ -691,7 +711,38 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             auto loaded = load_quad_from_tifxyz(surfacePath.toStdString());
             auto surface = std::shared_ptr<QuadSurface>(std::move(loaded));
             surface->id = surfaceId.toStdString();
-            return {surface, surfaceId, std::move(previewComponents), {}};
+            std::vector<PreviewLoadResult::LossMap> lossMaps;
+            const QString artifactRoot = QFileInfo(manifestPath).absolutePath();
+            for (const QJsonValue& value : manifest.value(QStringLiteral("loss_maps")).toArray()) {
+                const QJsonObject entry = value.toObject();
+                const QString name = entry.value(QStringLiteral("name")).toString();
+                const QString relativePath = QDir::cleanPath(
+                    entry.value(QStringLiteral("path")).toString());
+                if (name.isEmpty() || relativePath.isEmpty()
+                    || QDir::isAbsolutePath(relativePath)
+                    || relativePath == QStringLiteral("..")
+                    || relativePath.startsWith(QStringLiteral("../")))
+                    continue;
+                const QString imagePath = QDir(artifactRoot).filePath(relativePath);
+                QImageReader reader(imagePath);
+                if (!reader.canRead()
+                    || reader.size().width() != surface->rawPointsPtr()->cols
+                    || reader.size().height() != surface->rawPointsPtr()->rows)
+                    continue;
+                PreviewLoadResult::LossMap map;
+                map.name = name;
+                map.imagePath = imagePath;
+                map.weight = entry.value(QStringLiteral("weight")).toDouble();
+                map.p50 = entry.value(QStringLiteral("p50")).toDouble();
+                map.p95 = entry.value(QStringLiteral("p95")).toDouble();
+                map.maximum = entry.value(QStringLiteral("maximum")).toDouble();
+                map.displayMaximum = entry.value(QStringLiteral("display_maximum")).toDouble();
+                map.sampleCount = entry.value(QStringLiteral("sample_count")).toInteger();
+                map.supportedPixels = entry.value(QStringLiteral("supported_pixels")).toInteger();
+                lossMaps.push_back(std::move(map));
+            }
+            return {surface, surfaceId, std::move(previewComponents), {},
+                    std::move(lossMaps)};
         } catch (const std::exception& error) {
             return {{}, {}, {}, QString::fromUtf8(error.what())};
         }
@@ -707,8 +758,18 @@ void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 gen
     _previewSourceId = result.surfaceId;
     _previewComponents = result.components;
     _previewRunDiffImage = {};
+    _previewLossMaps.clear();
+    _loadedLossMap.clear();
+    _loadedLossMapImage = {};
+    QStringList lossMapNames;
+    for (const auto& map : result.lossMaps) {
+        _previewLossMaps.insert(map.name, map);
+        lossMapNames.push_back(map.name);
+    }
+    _panel->setLossMapOptions(lossMapNames);
     _overlay->publishRunDiff({}, {});
     applyPreviewWindingRange(false);
+    updateLossMapOverlay();
     _haveRunDiffBaseline = true;
     if (previous)
         loadRunDiff(previous, previousComponents, result.surface, result.components, generation);
@@ -885,6 +946,69 @@ void SpiralWorkspace::updateRunDiffOverlay()
                                   _previewRunDiffImage.height()));
 }
 
+void SpiralWorkspace::updateLossMapOverlay()
+{
+    const auto found = _previewLossMaps.constFind(_selectedLossMap);
+    if (_selectedLossMap.isEmpty() || found == _previewLossMaps.constEnd()
+        || !_currentPreview || found->imagePath.isEmpty()) {
+        _overlay->publishLossMap({}, {}, _lossMapOpacity);
+        _panel->setLossMapLegend({});
+        return;
+    }
+
+    const auto& map = found.value();
+    if (_loadedLossMap != map.name) {
+        QImage image(map.imagePath);
+        if (image.isNull()) {
+            _loadedLossMap.clear();
+            _loadedLossMapImage = {};
+            _overlay->publishLossMap({}, {}, _lossMapOpacity);
+            _panel->setLossMapLegend(tr("Could not load loss overlay %1").arg(map.name));
+            return;
+        }
+        _loadedLossMap = map.name;
+        _loadedLossMapImage = image.convertToFormat(QImage::Format_ARGB32);
+    }
+    _panel->setLossMapLegend(
+        tr("%1 — weighted residual (weight %2)\n"
+           "p50 %3   p95 %4   max %5   %6 samples / %7 pixels")
+            .arg(map.name)
+            .arg(map.weight, 0, 'g', 5)
+            .arg(map.p50, 0, 'g', 5)
+            .arg(map.p95, 0, 'g', 5)
+            .arg(map.maximum, 0, 'g', 5)
+            .arg(map.sampleCount)
+            .arg(map.supportedPixels));
+    if (_currentPreview == _previewSource) {
+        _overlay->publishLossMap(_currentPreview, _loadedLossMapImage, _lossMapOpacity);
+        return;
+    }
+
+    std::vector<PreviewComponent> selected;
+    for (const PreviewComponent& component : _previewComponents) {
+        if (component.winding < _minimumDisplayedWinding) continue;
+        if (_maximumDisplayedWinding >= 0 && component.winding > _maximumDisplayedWinding)
+            continue;
+        selected.push_back(component);
+    }
+    if (selected.empty()) {
+        _overlay->publishLossMap({}, {}, _lossMapOpacity);
+        return;
+    }
+    const int firstColumn = selected.front().firstColumn;
+    const int endColumn = selected.back().endColumn;
+    if (firstColumn < 0 || endColumn > _loadedLossMapImage.width()
+        || firstColumn >= endColumn) {
+        _overlay->publishLossMap({}, {}, _lossMapOpacity);
+        return;
+    }
+    _overlay->publishLossMap(
+        _currentPreview,
+        _loadedLossMapImage.copy(firstColumn, 0, endColumn - firstColumn,
+                                 _loadedLossMapImage.height()),
+        _lossMapOpacity);
+}
+
 std::shared_ptr<QuadSurface> SpiralWorkspace::makeDisplayedPreview(
     QString& registrationId) const
 {
@@ -931,6 +1055,7 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
         _currentPreview.reset();
         _currentPreviewRegistrationId.clear();
         _overlay->publishRunDiff({}, {});
+        _overlay->publishLossMap({}, {}, _lossMapOpacity);
         updateSurfaceIntersections();
         if (!previousRegistration.isEmpty())
             _state->setSurface(previousRegistration.toStdString(), nullptr);
@@ -973,6 +1098,7 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
     _currentPreviewRegistrationId = registrationId;
     if (_outputVisible) _state->setSurface("segmentation", preview, false, preserveFocus);
     updateRunDiffOverlay();
+    updateLossMapOverlay();
     // No-op unless the focus is still missing or the automatic default.
     initializePreviewFocus();
     updateSurfaceIntersections();

@@ -11,6 +11,7 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 import prefetch
+from loss_maps import diagnostics_enabled, record_loss_samples
 import geom_utils
 from sample_spiral import (
     get_theta_and_radii,
@@ -529,6 +530,15 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
     )
     dt_hinge_margin = dr_per_winding.detach() * cfg['track_dt_loss_margin']
     radius_loss = _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding, cfg)
+    if diagnostics_enabled():
+        if cfg['track_radius_target'] == 'median':
+            diagnostic_radius_target = shifted_radii.median(dim=-1, keepdim=True).values
+        else:
+            diagnostic_radius_target = shifted_radii.mean(dim=-1, keepdim=True)
+        diagnostic_radius = F.relu(
+            (shifted_radii - diagnostic_radius_target).abs()
+            - dr_per_winding.detach() * cfg['track_radius_loss_margin'])
+        record_loss_samples('track_radius', sampled_spiral, diagnostic_radius)
 
     if not compute_dt:
         yield 'track_radius', radius_loss
@@ -560,6 +570,10 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
     point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5
     track_losses = (point_distances ** within_p).mean(dim=-1) ** (1 / within_p)
     dt_loss = _aggregate_dt_track_losses(track_losses, across_p, active_mask)
+    record_loss_samples(
+        'track_dt', target_spiral_zyxs, point_distances,
+        active_mask[..., None] if active_mask is not None else None,
+    )
 
     yield 'track_dt', dt_loss
 

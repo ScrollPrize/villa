@@ -60,6 +60,8 @@ from losses import (
     get_unattached_pcl_strip_losses,
     get_unverified_patch_losses,
 )
+from loss_maps import (LossMapRecorder, attach_loss_maps_to_manifest,
+                       capture_loss_maps)
 from spiral_helpers import (
     erode_patch_valid_region,
     load_patches,
@@ -1558,7 +1560,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         torch_state = torch.random.get_rng_state()
         cuda_states = torch.cuda.get_rng_state_all()
         try:
-            return save_combined_preview(
+            manifest = save_combined_preview(
                 spiral_and_transform.get_slice_to_spiral_transform(),
                 spiral_and_transform.get_dr_per_winding(),
                 verified_patches_list,
@@ -1572,6 +1574,89 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 tracks=preview_extent_tracks,
                 surface_id=surface_id,
             )
+            diagnostic_weights = {
+                name: cfg.get(f'loss_weight_{name}', 0.0)
+                for name in (
+                    'patch_radius', 'patch_dt',
+                    'unverified_patch_radius', 'unverified_patch_dt',
+                    'sym_dirichlet', 'rel_winding', 'abs_winding',
+                    'dense_normals', 'dense_spacing',
+                    'unattached_pcl_radius', 'unattached_pcl_dt',
+                    'track_radius', 'track_dt', 'shell_patch_radius',
+                )
+            }
+            transform = spiral_and_transform.get_slice_to_spiral_transform()
+            dr = spiral_and_transform.get_dr_per_winding()
+            recorder = LossMapRecorder(
+                manifest,
+                generation_path,
+                z0=z_begin - int(cfg['flow_bounds_z_margin']),
+                grid_spacing=int(cfg['output_step_size']),
+                dr_per_winding=dr,
+                weights=diagnostic_weights,
+            )
+            with torch.no_grad(), capture_loss_maps(recorder, suppress_errors=True):
+                get_patch_and_umbilicus_losses(
+                    transform, dr,
+                    cfg['num_patches_per_step'],
+                    cfg['num_patches_per_step_for_dt'],
+                    verified_patches_list, patch_atlas,
+                    patch_sampling_probabilities, umbilicus_zyx,
+                    compute_dt=cfg['loss_weight_patch_dt'] > 0,
+                    shell_valid_zyxs=shell_valid_zyxs_gpu,
+                    shell_outer_winding_idx=shell_outer_winding_idx,
+                )
+                if unverified_patch_atlas is not None:
+                    get_unverified_patch_losses(
+                        transform, dr,
+                        cfg['unverified_num_patches_per_step'],
+                        cfg['unverified_num_patches_per_step_for_dt'],
+                        unverified_patches_list, unverified_patch_atlas,
+                        unverified_patch_sampling_probabilities,
+                        compute_dt=cfg['loss_weight_unverified_patch_dt'] > 0,
+                    )
+                if cfg['loss_weight_sym_dirichlet'] > 0:
+                    get_symmetric_dirichlet_loss(
+                        transform, dr, shell_outer_winding_idx,
+                        cfg['regularisation_num_points'])
+                if cfg['loss_weight_rel_winding'] > 0 and cross_patch_pcls:
+                    get_patch_rel_winding_loss(
+                        transform, dr, verified_patches, patch_atlas,
+                        cross_patch_pcls)
+                if cfg['loss_weight_abs_winding'] > 0 and cross_patch_pcls:
+                    get_patch_abs_winding_loss(
+                        transform, dr, verified_patches, patch_atlas,
+                        cross_patch_pcls)
+                if lasagna_volume is not None:
+                    for _loss_name, _loss_value in iter_lasagna_losses(
+                            transform, dr, lasagna_volume,
+                            shell_outer_winding_idx,
+                            cfg['dense_normals_num_points']):
+                        pass
+                if unattached_pcl_strips:
+                    get_unattached_pcl_strip_losses(
+                        transform, dr, unattached_pcl_strips,
+                        get_or_build_unattached_pcl_flat,
+                        cfg['unattached_pcl_num_per_step'],
+                        cfg['unattached_pcl_num_points_per_step'],
+                        compute_dt=cfg['loss_weight_unattached_pcl_dt'] > 0,
+                    )
+                if prepared_main_tracks is not None:
+                    for _loss_name, _loss_value in iter_track_losses(
+                            transform, dr, prepared_main_tracks, cfg,
+                            compute_dt=cfg['loss_weight_track_dt'] > 0):
+                        pass
+            if recorder.error is not None:
+                print('WARNING: could not generate Spiral loss overlays: '
+                      f'{type(recorder.error).__name__}: {recorder.error}')
+                return manifest
+            try:
+                entries = recorder.finish()
+                return attach_loss_maps_to_manifest(manifest, generation_path, entries)
+            except Exception as error:
+                print('WARNING: could not publish Spiral loss overlays: '
+                      f'{type(error).__name__}: {error}')
+                return manifest
         finally:
             np.random.set_state(numpy_state)
             torch.random.set_rng_state(torch_state)
