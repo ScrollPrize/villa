@@ -1890,17 +1890,20 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             # pause boundary. These settings are read afresh by every step.
             cfg.update(config, allow_val_change=True)
 
-        fiber_root = os.path.abspath(fibers_path) if fibers_path else None
-        snapshot_categories = {'fibers': [], 'pcls': [], 'tracks': []}
-        for strip in unattached_pcl_strips:
-            source = os.path.abspath(strip.get('source_file') or '')
-            category = 'fibers' if fiber_root and os.path.commonpath([fiber_root, source]) == fiber_root else 'pcls'
-            snapshot_categories[category].append(strip['zyxs'])
-        if tracks:
-            snapshot_categories['tracks'] = [np.asarray(track, dtype=np.float32) for track in tracks if len(track)]
-        geometry_path = os.path.join(out_path, '.spiral-geometry', f'generation-{time.time_ns()}')
-        write_geometry_snapshot(geometry_path, snapshot_categories, input_order='ZYX')
-        del snapshot_categories
+        geometry_manifest = None
+        if getattr(interactive_driver, 'publishes_outputs', True):
+            fiber_root = os.path.abspath(fibers_path) if fibers_path else None
+            snapshot_categories = {'fibers': [], 'pcls': [], 'tracks': []}
+            for strip in unattached_pcl_strips:
+                source = os.path.abspath(strip.get('source_file') or '')
+                category = 'fibers' if fiber_root and os.path.commonpath([fiber_root, source]) == fiber_root else 'pcls'
+                snapshot_categories[category].append(strip['zyxs'])
+            if tracks:
+                snapshot_categories['tracks'] = [np.asarray(track, dtype=np.float32) for track in tracks if len(track)]
+            geometry_path = os.path.join(out_path, '.spiral-geometry', f'generation-{time.time_ns()}')
+            write_geometry_snapshot(geometry_path, snapshot_categories, input_order='ZYX')
+            geometry_manifest = os.path.join(geometry_path, 'manifest.json')
+            del snapshot_categories
         # In the usual zero-exclusion case preview bounds reuse the prepared
         # flat tensor, so the original list of per-track arrays is no longer
         # needed after the one-time VC3D geometry handoff.
@@ -1911,7 +1914,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             output_path=out_path,
             save_checkpoint=save_model_to,
             export_preview=export_interactive_preview,
-            geometry_snapshot_manifest=os.path.join(geometry_path, 'manifest.json'),
+            geometry_snapshot_manifest=geometry_manifest,
             incorporate_inputs=incorporate_interactive_inputs,
             finish_run=clear_interactive_influence,
             configure_run=configure_interactive_run,

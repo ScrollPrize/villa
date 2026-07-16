@@ -40,7 +40,7 @@ from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_SAMPLING_KEYS,
                          validate_session_request)
 
 
-SERVICE_VERSION = "5.0.0"
+SERVICE_VERSION = "5.1.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 TRANSFER_CHUNK_BYTES = 1024 * 1024
@@ -83,6 +83,25 @@ class ApiError(Exception):
         self.status = int(status)
         self.message = message
         self.details = details
+
+
+def parse_gpu_ids(value):
+    """Parse a comma-separated list of physical CUDA device indices."""
+    parts = [part.strip() for part in str(value).split(",")]
+    if not parts or any(not part for part in parts):
+        raise argparse.ArgumentTypeError(
+            "--gpus must be a comma-separated list such as 0 or 0,1,2,3")
+    try:
+        gpu_ids = tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--gpus entries must be non-negative integer device indices") from exc
+    if any(gpu_id < 0 for gpu_id in gpu_ids):
+        raise argparse.ArgumentTypeError(
+            "--gpus entries must be non-negative integer device indices")
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise argparse.ArgumentTypeError("--gpus cannot contain duplicate devices")
+    return gpu_ids
 
 
 def _validate_run_influence_config(value):
@@ -596,7 +615,7 @@ def _copy_publish(source, destination, keep_source=False):
 
 class ServiceState:
     def __init__(self, dataset_root=None, dataset_resolution=None,
-                 service_name=None, logs=None):
+                 service_name=None, logs=None, gpu_ids=(0,)):
         self.lock = threading.RLock()
         self.session = None
         self.session_id = None
@@ -614,6 +633,7 @@ class ServiceState:
         self.dataset_resolution = dataset_resolution
         self.service_name = service_name or socket.gethostname()
         self.logs = logs if logs is not None else ServiceLogBuffer()
+        self.gpu_ids = tuple(gpu_ids)
         self.artifacts = ArtifactRegistry()
         self.uploads = {}
         self.ephemeral_records = []
@@ -638,6 +658,7 @@ class ServiceState:
             "generation": self.status_generation,
             "session_replacement_in_progress": self.replacing,
             "replacement_old_session_released": self.replacement_old_session_released,
+            "gpus": list(self.gpu_ids),
         }
 
     def _commit_availability(self):
@@ -799,7 +820,9 @@ class ServiceState:
                 self.session_id = f"spiral-{self.session_generation}-{secrets.token_hex(5)}"
                 self.session_paths = paths
                 self._reset_session_scope()
-                self.session = create_session(paths, run, preview, self._status_changed)
+                self.session = create_session(
+                    paths, run, preview, self._status_changed,
+                    gpu_ids=self.gpu_ids)
                 self.status_generation += 1
                 response = self.status()
                 response["accepted"] = True
@@ -1636,7 +1659,15 @@ def main(argv=None):
                         help="Dataset root owned by this service; required for a "
                              "non-loopback bind. Clients cannot repoint base inputs.")
     parser.add_argument("--service-name", default=None)
+    parser.add_argument(
+        "--gpus", type=parse_gpu_ids, default=(0,), metavar="DEVICE[,DEVICE...]",
+        help="Physical CUDA device indices to use (default: 0; example: 0,1,2,3)")
     args = parser.parse_args(argv)
+
+    # fit_spiral and Torch are imported lazily when a session is loaded. Narrow
+    # visibility now so even the single-process path consistently uses the
+    # operator-selected physical device as its local cuda:0.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in args.gpus)
 
     loopback = _is_loopback(args.bind)
     if not loopback and not args.dataset:
@@ -1680,7 +1711,8 @@ def main(argv=None):
     state = ServiceState(dataset_root=args.dataset,
                          dataset_resolution=dataset_resolution,
                          service_name=args.service_name,
-                         logs=logs)
+                         logs=logs,
+                         gpu_ids=args.gpus)
     # A stable, operator-chosen port must survive TIME_WAIT restarts; an
     # ephemeral port must not reuse an address it did not own.
     SpiralServer.allow_reuse_address = args.port != 0
@@ -1704,6 +1736,8 @@ def main(argv=None):
     # The ready line intentionally carries only the port. Clients learn the API
     # version from the authenticated /health handshake so local launch and
     # remote attach validate compatibility through one code path.
+    print(f"Spiral CUDA devices: {','.join(str(gpu_id) for gpu_id in args.gpus)}",
+          flush=True)
     print(f"SPIRAL_SERVICE_READY port={server.server_port}", flush=True)
     server.timeout = 0.5
     try:

@@ -6,6 +6,7 @@ uploads with ephemeral staging, and dataset commits. The resident fitter is
 faked; these tests exercise the service plumbing only.
 """
 
+import argparse
 import io
 import hashlib
 import json
@@ -26,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import spiral_service
 from spiral_service import (ApiError, ArtifactRegistry, ServiceLogBuffer, ServiceState,
-                            SpiralServer, load_or_create_api_key)
+                            SpiralServer, load_or_create_api_key, parse_gpu_ids)
 from fit_session import API_VERSION, SpiralInputPaths, resolve_dataset_root
 
 
@@ -125,6 +126,20 @@ class ApiKeyTests(unittest.TestCase):
             again, created_again = load_or_create_api_key(path)
             self.assertFalse(created_again)
             self.assertEqual(key, again)
+
+
+class GpuSelectionTests(unittest.TestCase):
+    def test_single_gpu_zero_is_the_default_service_state(self):
+        self.assertEqual(ServiceState().health()["gpus"], [0])
+
+    def test_comma_separated_gpu_ids_are_parsed_in_order(self):
+        self.assertEqual(parse_gpu_ids("0,1,2,3"), (0, 1, 2, 3))
+        self.assertEqual(parse_gpu_ids(" 3, 1 "), (3, 1))
+
+    def test_invalid_gpu_lists_are_rejected(self):
+        for value in ("", "0,", "-1", "gpu0", "1,1"):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                parse_gpu_ids(value)
 
 
 class HttpServiceFixture(unittest.TestCase):
@@ -817,6 +832,30 @@ class ServiceProcessTests(unittest.TestCase):
                     logs = json.loads(response.read())
                 self.assertIn(
                     ready, [entry["text"] for entry in logs["entries"]])
+            finally:
+                process.terminate()
+                process.wait(10)
+
+    def test_selected_gpus_are_reported_by_health(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            key_file = Path(temporary) / "key"
+            process = self._launch([
+                "--port", "0", "--api-key-file", str(key_file),
+                "--gpus", "3,1",
+            ], temporary)
+            try:
+                lines = self._read_until_ready(process)
+                ready = next(line for line in lines
+                             if line.startswith("SPIRAL_SERVICE_READY"))
+                port = int(ready.split("port=")[1].split()[0])
+                key = key_file.read_text().strip()
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/health",
+                    headers={"Authorization": f"Bearer {key}"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    health = json.loads(response.read())
+                self.assertEqual(health["gpus"], [3, 1])
+                self.assertIn("Spiral CUDA devices: 3,1", lines)
             finally:
                 process.terminate()
                 process.wait(10)

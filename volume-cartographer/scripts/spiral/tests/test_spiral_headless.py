@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import queue
 import tempfile
 import threading
 import time
@@ -11,7 +12,7 @@ import torch
 from fit_session import (PclInputSpec, PclRole, resolve_dataset_root,
                          resolve_logical_dbm, validate_checkpoint_container)
 from geometry_snapshot import validate_geometry_snapshot, write_geometry_snapshot
-from spiral_runtime import InteractiveFitSession
+from spiral_runtime import DistributedInteractiveFitSession, InteractiveFitSession
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
 from tifxyz import save_combined_tifxyz
@@ -127,6 +128,40 @@ class PreviewRangeTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_distributed_session_waits_for_every_rank_before_ready(self):
+        session = DistributedInteractiveFitSession.__new__(DistributedInteractiveFitSession)
+        session._gpu_ids = (0, 1)
+        session._condition = threading.Condition()
+        session._events = queue.Queue()
+        session._rank_statuses = {}
+        session._acks = {}
+        session._incorporation_callbacks = {}
+        session._failed_error = None
+        session._status = {"state": "Loading", "warnings": []}
+        published = []
+        session._status_callback = lambda status: published.append(status)
+        listener = threading.Thread(target=session._listen)
+        listener.start()
+        ready = {
+            "state": "Ready", "phase": "Ready", "warnings": [],
+            "error": None, "current_iteration": 0, "target_iteration": 0,
+        }
+        session._events.put(("status", 0, ready))
+        session._events.put(("status", 1, {**ready, "state": "Loading"}))
+        deadline = time.time() + 2
+        while len(published) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(published[-1]["state"], "Loading")
+        self.assertEqual(published[-1]["phase"], "Waiting for all GPU workers")
+
+        session._events.put(("status", 1, ready))
+        deadline = time.time() + 2
+        while published[-1]["state"] != "Ready" and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(published[-1]["state"], "Ready")
+        session._events.put(None)
+        listener.join(2)
+
     def test_interactive_run_can_continue_past_checkpoint_training_steps(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
@@ -220,6 +255,28 @@ class ProtocolTests(unittest.TestCase):
             completed_iterations=10, total_loss=1.0, losses={}, learning_rate=1.e-3)
 
         self.assertEqual(calls, ["finish", "save", "preview"])
+        self.assertEqual(session._state, "Paused")
+
+    def test_secondary_gpu_rank_pauses_without_publishing_outputs(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Running"
+        session._completed = 9
+        session._pending = 1
+        session._target = 10
+        session._stop_requested = False
+        session._latest_metrics = {}
+        session._status_callback = None
+        session.publishes_outputs = False
+        calls = []
+        session._finish_run = lambda: calls.append("finish")
+        session._save_checkpoint = lambda *_: calls.append("save")
+        session._publish_preview = lambda: calls.append("preview")
+
+        session.iteration_completed(
+            completed_iterations=10, total_loss=1.0, losses={}, learning_rate=1.e-3)
+
+        self.assertEqual(calls, ["finish"])
         self.assertEqual(session._state, "Paused")
 
     def test_mutating_command_is_deduplicated(self):

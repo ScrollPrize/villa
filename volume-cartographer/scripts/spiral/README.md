@@ -47,8 +47,21 @@ is exposed on the network; VC3D tunnels to it over SSH:
 
 ```sh
 tmux new -s spiral 'python scripts/spiral/spiral_service.py --port 8765 \
-    --dataset /data/scrolls/s1'
+    --dataset /data/scrolls/s1 --gpus 0'
 ```
+
+The service uses only physical CUDA device `0` by default. Select a different
+device or enable distributed fitting across several GPUs with a comma-separated
+host-side list:
+
+```sh
+python scripts/spiral/spiral_service.py --port 8765 \
+    --dataset /data/scrolls/s1 --gpus 0,1,2,3
+```
+
+Multi-GPU sessions run one fitter rank per listed device and split the configured
+per-step sample counts across those ranks by default. The device list is fixed for
+the lifetime of the service; restart it to change the selection.
 
 On first start the service generates a strong API key at
 `~/.config/vc3d/spiral_api_key` (mode `0600`) and prints it to the console.
@@ -161,7 +174,7 @@ Description=VC3D Spiral fitting service
 WorkingDirectory=%h/volume-cartographer
 ExecStart=%h/volume-cartographer/scripts/spiral/.venv/bin/python \
     %h/volume-cartographer/scripts/spiral/spiral_service.py \
-    --port 8765 --dataset /data/scrolls/s1
+    --port 8765 --dataset /data/scrolls/s1 --gpus 0
 Restart=on-failure
 
 [Install]
