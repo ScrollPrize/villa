@@ -1,37 +1,78 @@
-# Trace2CP Compact Geometry CP-Span Coverage Task Log
+# VC3D Requested-Level Blocking Coordinate Sampling Task Log
 
-## Findings
+Current task log only.
 
-- The `invalid normal without stored reason` diagnostics came from line points
-  that were marked invalid in compact geometry but had no Lasagna failure
-  reason.
-- The reason is a preload coverage bug: compact geometry sampled CP
-  source-window ranges, but Trace2CP can request the full centerline span
-  between two CPs. Interior points between two disjoint CP windows were never
-  sampled.
-- Strip width is not involved. The affected points are fiber centerline points
-  inside the CP-to-CP span.
+## Planning
 
-## Implementation Notes
+- Replaced the previous native 3D fusion task with the current requested-level
+  VC3D blocking coordinate sampling task.
+- Planned the fix at the VC3D coordinate sampler/binding layer so native 3D
+  Trace2CP raw volume panels and prediction/presence sampling share the same
+  strict requested-level behavior.
+- Planned no changes to tracing score, fusion, model inference, normalization,
+  or strip geometry.
 
-- `_required_line_ranges_for_record(...)` now includes consecutive CP-to-CP
-  line spans in addition to CP source windows.
-- `_FiberLineGeometry` keeps line-level invalid Lasagna reasons.
-- The Trace2CP invalid-interval error now reports invalid runs, overlapping
-  valid intervals, stored reasons, and for unexpected unsampled points a direct
-  Lasagna probe with grad/nx/ny ranges and principal-axis status.
-- No normal fill-in, propagation, or interpolation fallback was added.
+## Implementation
 
-## Deviations Or Deferrals
-
-- Existing compact geometry stores built by older code can still show the
-  defensive `not sampled by compact geometry preload` diagnostic until rebuilt.
-  New loader construction should sample the CP-to-CP span and either validate it
-  or report the real sampled Lasagna failure reason.
+- Added `ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(...)` for
+  strict requested-level coordinate sampling.
+- The strict sampler collects requested-level dependencies, queues them,
+  fetches each dependency through `getChunkBlocking`, stores the returned
+  `ChunkResult`s in a local pinned map, and samples only from that pinned map.
+- Missing requested-level chunks render as black covered pixels. `Error` and
+  post-blocking `MissQueued` statuses throw instead of falling back.
+- `Volume.sample_coords(..., blocking=True)` now calls the strict sampler.
+  Nonblocking `sample_coords` still uses the existing progressive
+  fine-to-coarse path.
+- Added sampler stats: `missing_chunks`, `fallback_levels`, and
+  `requested_level_only`. `blocking_prefetch_chunks` remains a blocking-only
+  count.
+- `Vc3dCoordinateSampler` now rejects blocking results that do not report
+  `requested_level_only` or that report nonzero fallback levels, so stale
+  bindings fail loudly.
+- 2D Trace2CP strip rendering and native 3D Trace2CP block sampling now reject
+  chunk errors and fallback stats.
+- Updated specs, code-structure docs, changelog, and task status for the
+  requested-level blocking contract.
+- Renamed the public stat from the misleading `full_res_only` wording to
+  `requested_level_only`. The sampler still samples the configured/requested
+  zarr level, e.g. `base_volume_scale: 2` stays group 2 / 4x scale.
+- Updated the installed editable `volume-cartographer` package with
+  `python -m pip install -e volume-cartographer --no-deps --break-system-packages`
+  as documented in `planning/local_development.md`.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k "compact_geometry or required_line_ranges or trace2cp_segment_trims or trace2cp_segment_rejects"`
-  passed: 7 passed, 266 deselected.
+- `cmake --build volume-cartographer/build/python-bindings -j 4`
+  - Passed. Rebuilt `vc_core` and `vc.volume` with the strict requested-level
+    sampler.
+- `python -m pip install -e volume-cartographer --no-deps --break-system-packages`
+  - Passed. Installed rebuilt editable `vc.volume` into the user site without
+    changing zarr/numcodecs dependencies.
+- `python -c "import vc.volume, zarr, numcodecs; ..."`
+  - Passed. Active import is
+    `/home/hendrik/.local/lib/python3.14/site-packages/vc/volume.cpython-314-x86_64-linux-gnu.so`,
+    with `zarr==2.18.7` and `numcodecs==0.15.1`.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k "trace2cp_render_sampling"`
+  - Passed: `2 passed, 271 deselected`.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "native_3d_trace2cp"`
+  - Passed: `19 passed, 39 deselected`.
+- `PYTHONPATH=volume-cartographer/build/python-bindings/python:vesuvius/src:. python - <<'PY' ...`
+  - Passed: imported rebuilt `vc.volume`.
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/sampling.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py`
+  - Passed.
+- `cmake --build volume-cartographer/build/ci-coverage-clang-systemdeps --target test_chunked_plane_sampler_fallback -j 4`
+  - Did not reach compilation. The existing build tree failed during CMake
+    regeneration because `Qt6::Concurrent` was not found for
+    `test_segmentation_lasagna_panel_ui`.
+
+## Deviations Or Deferrals
+
+- Persistent `.empty` marker cache corruption is identified as a separate
+  possible cause of black requested-level chunks. This task will remove scale
+  fallback and pin decoded requested-level chunks, but does not yet add a
+  remote revalidation mode for stale `.empty` markers.
+- Added C++ regression tests for strict requested-level sampling behavior, but
+  could not execute that C++ test binary because the local CMake test build
+  tree currently fails before compiling the touched target due to the unrelated
+  Qt6::Concurrent configuration issue above.

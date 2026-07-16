@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <future>
 #include <limits>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -55,6 +56,30 @@ struct LocalChunkCache {
     std::unordered_set<ChunkKey, ChunkKeyHash> errorKeys;
     ChunkKey lastKey{};
     const ChunkResult* lastResult = nullptr;
+};
+
+struct PinnedChunkCache {
+    explicit PinnedChunkCache(std::size_t expectedChunks = 0)
+    {
+        if (expectedChunks > 0)
+            chunks.reserve(expectedChunks);
+    }
+
+    const ChunkResult* get(const ChunkKey& key) const
+    {
+        auto it = chunks.find(key);
+        if (it == chunks.end())
+            return nullptr;
+        return &it->second;
+    }
+
+    std::unordered_map<ChunkKey, ChunkResult, ChunkKeyHash> chunks;
+};
+
+enum class StrictSampleStatus {
+    Ready,
+    Missing,
+    Error
 };
 
 constexpr int kParallelMinPixels = 128 * 128;
@@ -240,6 +265,74 @@ bool readVoxel(IChunkedArray& array,
 
     out = std::to_integer<uint8_t>((*result.bytes)[offset]);
     return true;
+}
+
+StrictSampleStatus readPinnedVoxel(const PinnedChunkCache& cache,
+                                   const LevelAccess& access,
+                                   int level,
+                                   int iz,
+                                   int iy,
+                                   int ix,
+                                   uint8_t& out,
+                                   std::string& error)
+{
+    const auto& shape = access.shape;
+    if (unsigned(iz) >= unsigned(shape[0])
+        || unsigned(iy) >= unsigned(shape[1])
+        || unsigned(ix) >= unsigned(shape[2])) {
+        out = access.fill;
+        return StrictSampleStatus::Ready;
+    }
+
+    const auto& chunkShape = access.chunkShape;
+    if (chunkShape[0] <= 0 || chunkShape[1] <= 0 || chunkShape[2] <= 0) {
+        error = "invalid chunk shape while sampling pinned chunk";
+        return StrictSampleStatus::Error;
+    }
+
+    const int cz = iz / chunkShape[0];
+    const int cy = iy / chunkShape[1];
+    const int cx = ix / chunkShape[2];
+    const ChunkKey key{level, cz, cy, cx};
+    const ChunkResult* result = cache.get(key);
+    if (!result) {
+        error = "required chunk was not pinned before requested-level sampling";
+        return StrictSampleStatus::Error;
+    }
+    if (result->status == ChunkStatus::Missing)
+        return StrictSampleStatus::Missing;
+    if (result->status == ChunkStatus::MissQueued) {
+        error = "blocking requested-level sampling encountered an unresolved chunk";
+        return StrictSampleStatus::Error;
+    }
+    if (result->status == ChunkStatus::Error) {
+        error = result->error.empty() ? "chunk fetch failed" : result->error;
+        return StrictSampleStatus::Error;
+    }
+
+    if (result->status == ChunkStatus::AllFill) {
+        out = access.fill;
+        return StrictSampleStatus::Ready;
+    }
+
+    if (result->status != ChunkStatus::Data || !result->bytes) {
+        error = "chunk resolved without payload";
+        return StrictSampleStatus::Error;
+    }
+
+    const int lz = iz - cz * chunkShape[0];
+    const int ly = iy - cy * chunkShape[1];
+    const int lx = ix - cx * chunkShape[2];
+    const std::size_t offset = (std::size_t(lz) * std::size_t(chunkShape[1])
+                              + std::size_t(ly)) * std::size_t(chunkShape[2])
+                              + std::size_t(lx);
+    if (offset >= result->bytes->size()) {
+        error = "chunk payload is smaller than expected";
+        return StrictSampleStatus::Error;
+    }
+
+    out = std::to_integer<uint8_t>((*result->bytes)[offset]);
+    return StrictSampleStatus::Ready;
 }
 
 bool addVoxelDependency(IChunkedArray& array,
@@ -566,6 +659,102 @@ bool sampleTrilinear(IChunkedArray& array,
     return true;
 }
 
+StrictSampleStatus samplePinnedNearest(const PinnedChunkCache& cache,
+                                       const LevelAccess& access,
+                                       int level,
+                                       const cv::Vec3f& p,
+                                       uint8_t& out,
+                                       std::string& error)
+{
+    const auto& shape = access.shape;
+    const float x = p[0], y = p[1], z = p[2];
+    if (!inLevelBounds(shape, z, y, x)) {
+        out = access.fill;
+        return StrictSampleStatus::Ready;
+    }
+
+    int ix = int(x + 0.5f);
+    int iy = int(y + 0.5f);
+    int iz = int(z + 0.5f);
+    ix = std::clamp(ix, 0, shape[2] - 1);
+    iy = std::clamp(iy, 0, shape[1] - 1);
+    iz = std::clamp(iz, 0, shape[0] - 1);
+    return readPinnedVoxel(cache, access, level, iz, iy, ix, out, error);
+}
+
+StrictSampleStatus samplePinnedTrilinear(const PinnedChunkCache& cache,
+                                         const LevelAccess& access,
+                                         int level,
+                                         const cv::Vec3f& p,
+                                         uint8_t& out,
+                                         std::string& error)
+{
+    const auto& shape = access.shape;
+    const float x = p[0], y = p[1], z = p[2];
+    if (!inLevelBounds(shape, z, y, x)) {
+        out = access.fill;
+        return StrictSampleStatus::Ready;
+    }
+
+    const int ix = int(std::floor(x));
+    const int iy = int(std::floor(y));
+    const int iz = int(std::floor(z));
+    const float fx = x - float(ix);
+    const float fy = y - float(iy);
+    const float fz = z - float(iz);
+
+    uint8_t v000 = 0, v001 = 0, v010 = 0, v011 = 0;
+    uint8_t v100 = 0, v101 = 0, v110 = 0, v111 = 0;
+    std::array<StrictSampleStatus, 8> statuses{};
+    statuses[0] = readPinnedVoxel(cache, access, level, iz,     iy,     ix,     v000, error);
+    statuses[1] = readPinnedVoxel(cache, access, level, iz,     iy,     ix + 1, v001, error);
+    statuses[2] = readPinnedVoxel(cache, access, level, iz,     iy + 1, ix,     v010, error);
+    statuses[3] = readPinnedVoxel(cache, access, level, iz,     iy + 1, ix + 1, v011, error);
+    statuses[4] = readPinnedVoxel(cache, access, level, iz + 1, iy,     ix,     v100, error);
+    statuses[5] = readPinnedVoxel(cache, access, level, iz + 1, iy,     ix + 1, v101, error);
+    statuses[6] = readPinnedVoxel(cache, access, level, iz + 1, iy + 1, ix,     v110, error);
+    statuses[7] = readPinnedVoxel(cache, access, level, iz + 1, iy + 1, ix + 1, v111, error);
+    for (StrictSampleStatus status : statuses) {
+        if (status == StrictSampleStatus::Error)
+            return StrictSampleStatus::Error;
+        if (status == StrictSampleStatus::Missing)
+            return StrictSampleStatus::Missing;
+    }
+
+    const float c00 = std::fma(fx, float(v001) - float(v000), float(v000));
+    const float c01 = std::fma(fx, float(v011) - float(v010), float(v010));
+    const float c10 = std::fma(fx, float(v101) - float(v100), float(v100));
+    const float c11 = std::fma(fx, float(v111) - float(v110), float(v110));
+    const float c0 = std::fma(fy, c01 - c00, c00);
+    const float c1 = std::fma(fy, c11 - c10, c10);
+    const float value = std::clamp(std::fma(fz, c1 - c0, c0), 0.0f, 255.0f);
+    out = static_cast<uint8_t>(value);
+    return StrictSampleStatus::Ready;
+}
+
+StrictSampleStatus samplePinnedPoint(const PinnedChunkCache& cache,
+                                     const LevelAccess& access,
+                                     int level,
+                                     const cv::Vec3f& p0,
+                                     vc::Sampling sampling,
+                                     bool zeroIsSentinel,
+                                     uint8_t& out,
+                                     std::string& error)
+{
+    if (!finiteCoord(p0) || (zeroIsSentinel && surfaceSentinel(p0))) {
+        if (zeroIsSentinel)
+            return StrictSampleStatus::Error;
+        out = access.fill;
+        return StrictSampleStatus::Ready;
+    }
+
+    const cv::Vec3f p = toLevelCoord(access, p0);
+    if (sampling == vc::Sampling::Nearest)
+        return samplePinnedNearest(cache, access, level, p, out, error);
+
+    return samplePinnedTrilinear(cache, access, level, p, out, error);
+}
+
 bool samplePoint(IChunkedArray& array,
                  LocalChunkCache& cache,
                  const LevelAccess& access,
@@ -614,6 +803,9 @@ void addStats(ChunkedPlaneSampler::Stats& dst, const ChunkedPlaneSampler::Stats&
     dst.coveredPixels += src.coveredPixels;
     dst.requestedChunks += src.requestedChunks;
     dst.errorChunks += src.errorChunks;
+    dst.missingChunks += src.missingChunks;
+    dst.fallbackLevels += src.fallbackLevels;
+    dst.requestedLevelOnly = dst.requestedLevelOnly || src.requestedLevelOnly;
 }
 
 int countUncovered(const cv::Mat_<uint8_t>& coverage)
@@ -1112,6 +1304,125 @@ ChunkedPlaneSampler::Stats sampleCoordsLevelImpl(
     return stats;
 }
 
+ChunkedPlaneSampler::Stats sampleCoordsLevelBlockingRequestedLevelImpl(
+    IChunkedArray& array,
+    int level,
+    const cv::Mat_<cv::Vec3f>& coords,
+    cv::Mat_<uint8_t>& out,
+    cv::Mat_<uint8_t>& coverage,
+    const ChunkedPlaneSampler::Options& options)
+{
+    ChunkedPlaneSampler::Stats stats;
+    stats.requestedLevelOnly = true;
+    stats.fallbackLevels = 0;
+    if (level < 0 || level >= array.numLevels() || coords.empty() || out.empty() || coverage.empty())
+        return stats;
+
+    const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return stats;
+
+    const std::vector<ChunkKey> keys = ChunkedPlaneSampler::collectCoordsDependencies(
+        array, level, coords, coverage, options);
+    stats.requestedChunks = static_cast<int>(keys.size());
+
+    if (!keys.empty())
+        array.prefetchChunks(keys, false);
+
+    PinnedChunkCache pinned(keys.size());
+    for (const ChunkKey& key : keys) {
+        ChunkResult result = array.getChunkBlocking(key.level, key.iz, key.iy, key.ix);
+        if (result.status == ChunkStatus::Error) {
+            ++stats.errorChunks;
+            const std::string message = result.error.empty()
+                ? "chunk fetch failed during blocking requested-level sampling"
+                : result.error;
+            throw std::runtime_error(message);
+        }
+        if (result.status == ChunkStatus::MissQueued) {
+            ++stats.errorChunks;
+            throw std::runtime_error(
+                "blocking requested-level sampling received unresolved chunk after getChunkBlocking");
+        }
+        if (result.status == ChunkStatus::Missing)
+            ++stats.missingChunks;
+        pinned.chunks.emplace(key, std::move(result));
+    }
+
+    const int tile = std::max(1, options.tileSize);
+    const int h = std::min({coords.rows, out.rows, coverage.rows});
+    const int w = std::min({coords.cols, out.cols, coverage.cols});
+    std::vector<SampleTile> tiles;
+    tiles.reserve(std::size_t((h + tile - 1) / tile) *
+                  std::size_t((w + tile - 1) / tile));
+    for (int ty = 0; ty < h; ty += tile) {
+        const int yEnd = std::min(ty + tile, h);
+        for (int tx = 0; tx < w; tx += tile) {
+            const int xEnd = std::min(tx + tile, w);
+            tiles.push_back({tx, ty, xEnd, yEnd});
+        }
+    }
+
+    auto processTileRange = [&](std::size_t begin, std::size_t end) {
+        ChunkedPlaneSampler::Stats localStats;
+        localStats.requestedLevelOnly = true;
+        for (std::size_t i = begin; i < end; ++i) {
+            const SampleTile& sampleTile = tiles[i];
+            for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
+                const cv::Vec3f* coordRow = coords.ptr<cv::Vec3f>(y);
+                uint8_t* outRow = out.ptr<uint8_t>(y);
+                uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
+                for (int x = sampleTile.tx; x < sampleTile.xEnd; ++x) {
+                    if (coverageRow[x] || surfaceSentinel(coordRow[x]))
+                        continue;
+
+                    uint8_t value = 0;
+                    std::string error;
+                    const StrictSampleStatus status = samplePinnedPoint(
+                        pinned, access, level, coordRow[x], options.sampling,
+                        false, value, error);
+                    if (status == StrictSampleStatus::Error) {
+                        throw std::runtime_error(
+                            error.empty()
+                                ? "blocking requested-level sampling failed"
+                                : error);
+                    }
+
+                    const bool wasCovered = coverageRow[x] != 0;
+                    outRow[x] = status == StrictSampleStatus::Missing ? uint8_t{0} : value;
+                    coverageRow[x] = 1;
+                    if (!wasCovered)
+                        ++localStats.coveredPixels;
+                }
+            }
+        }
+        return localStats;
+    };
+
+    if (!shouldParallelizeSamples(h, w) || tiles.size() <= 1) {
+        addStats(stats, processTileRange(0, tiles.size()));
+        return stats;
+    }
+
+    const std::size_t workerCount = std::min<std::size_t>(
+        renderSamplerPool().worker_count(), tiles.size());
+    const std::size_t tilesPerWorker = (tiles.size() + workerCount - 1) / workerCount;
+    std::vector<std::future<ChunkedPlaneSampler::Stats>> futures;
+    futures.reserve(workerCount);
+    for (std::size_t worker = 0; worker < workerCount; ++worker) {
+        const std::size_t begin = worker * tilesPerWorker;
+        const std::size_t end = std::min(begin + tilesPerWorker, tiles.size());
+        if (begin >= end)
+            break;
+        futures.push_back(renderSamplerPool().submit([&, begin, end] {
+            return processTileRange(begin, end);
+        }));
+    }
+    for (auto& future : futures)
+        addStats(stats, future.get());
+    return stats;
+}
+
 ChunkedPlaneSampler::Stats ChunkedPlaneSampler::samplePlaneLevel(
     IChunkedArray& array,
     int level,
@@ -1135,6 +1446,18 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsLevel(
     const Options& options)
 {
     return sampleCoordsLevelImpl(array, level, coords, out, coverage, options, false);
+}
+
+ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+    IChunkedArray& array,
+    int level,
+    const cv::Mat_<cv::Vec3f>& coords,
+    cv::Mat_<uint8_t>& out,
+    cv::Mat_<uint8_t>& coverage,
+    const Options& options)
+{
+    return sampleCoordsLevelBlockingRequestedLevelImpl(
+        array, level, coords, out, coverage, options);
 }
 
 ChunkedPlaneSampler::Stats ChunkedPlaneSampler::samplePlaneFineToCoarse(

@@ -50,11 +50,14 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_bridge import (
 from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     NativeTrace2CpConfig,
     NativeTraceFieldCache,
+    _adaptive_trace2cp_cross_strip_height,
     _image_to_u8,
     _interpolate_plane_crossing,
     _project_trace_to_initial_strip,
     _resolve_native_trace2cp_selection,
     _sample_presence_on_strip,
+    _volume_trace_to_source_trace_xyz,
+    fuse_forward_reverse_traces,
     generate_cone_candidates,
     trace_native_3d_pair,
 )
@@ -1489,6 +1492,123 @@ def test_native_3d_trace2cp_projects_trace_to_initial_strip_axis() -> None:
     assert np.allclose(projected, [[2.0, 8.0], [8.0, 3.0]], atol=1.0e-5)
 
 
+def test_native_3d_trace2cp_adaptive_cross_height_expands_and_caps() -> None:
+    centered = (np.asarray([[1.0, 9.5], [4.0, 9.5]], dtype=np.float32), (0, 0, 0, 255))
+    assert _adaptive_trace2cp_cross_strip_height(20, ((centered,),)) == 5
+
+    shifted = (np.asarray([[1.0, 12.5], [4.0, 26.5]], dtype=np.float32), (0, 0, 0, 255))
+    assert _adaptive_trace2cp_cross_strip_height(40, ((shifted,),)) == 27
+
+    far = (np.asarray([[1.0, -100.0], [4.0, 100.0]], dtype=np.float32), (0, 0, 0, 255))
+    assert _adaptive_trace2cp_cross_strip_height(20, ((far,),)) == 19
+
+
+def test_native_3d_trace2cp_converts_volume_trace_to_source_xyz_offsets() -> None:
+    line_points_xyz = np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float32)
+    line_xy = np.asarray([[0.0, 5.0], [10.0, 5.0]], dtype=np.float32)
+    row_axes = np.zeros((16, 16, 3), dtype=np.float32)
+    row_axes[..., 1] = 1.0
+    side_axes = np.zeros((16, 16, 3), dtype=np.float32)
+    side_axes[..., 2] = 1.0
+    source = SimpleNamespace(
+        record=SimpleNamespace(volume_spacing_base=2.0),
+        line_window=SimpleNamespace(line_points_xyz=line_points_xyz),
+        line_xy=line_xy,
+        grid=SimpleNamespace(
+            offset_axis_xyz=row_axes,
+            side_axis_xyz=side_axes,
+            valid_mask=np.ones((16, 16), dtype=bool),
+        ),
+    )
+    trace_xyz = np.asarray(
+        [
+            [2.0, 4.0, 6.0],
+            [8.0, -2.0, -4.0],
+        ],
+        dtype=np.float32,
+    )
+
+    source_trace = _volume_trace_to_source_trace_xyz(source, trace_xyz)
+
+    assert np.allclose(source_trace, [[2.0, 7.0, 3.0], [8.0, 4.0, -2.0]], atol=1.0e-5)
+
+
+def test_native_3d_trace2cp_fusion_uses_centered_closest_overlap() -> None:
+    start = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    target = np.asarray([10.0, 0.0, 0.0], dtype=np.float32)
+    forward = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    reverse = np.asarray(
+        [
+            [10.0, 2.0, 0.0],
+            [5.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    fusion = fuse_forward_reverse_traces(
+        forward,
+        reverse,
+        start_zyx=start,
+        target_zyx=target,
+        step_voxels=1.0,
+    )
+
+    assert fusion.reached_overlap
+    assert fusion.reason == "closest_overlap"
+    assert fusion.closest_progress == pytest.approx(0.5, abs=1.0e-6)
+    assert np.allclose(fusion.closest_midpoint_zyx, [5.0, 1.0, 0.0], atol=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[0], start, atol=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[-1], target, atol=1.0e-6)
+    progress = fusion.fused_zyx[:, 0] / 10.0
+    assert np.all(np.diff(progress) >= -1.0e-5)
+
+
+def test_native_3d_trace2cp_fusion_does_not_sort_wrong_direction_trace() -> None:
+    start = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    target = np.asarray([10.0, 0.0, 0.0], dtype=np.float32)
+    forward = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [6.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    reverse = np.asarray(
+        [
+            [10.0, 10.0, 0.0],
+            [12.0, 10.0, 0.0],
+            [14.0, 10.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    fusion = fuse_forward_reverse_traces(
+        forward,
+        reverse,
+        start_zyx=start,
+        target_zyx=target,
+        step_voxels=1.0,
+    )
+
+    assert fusion.reached_overlap
+    assert fusion.closest_progress == pytest.approx(1.0, abs=1.0e-6)
+    assert np.allclose(fusion.closest_forward_zyx, [10.0, 0.0, 0.0], atol=1.0e-5)
+    assert np.allclose(fusion.closest_reverse_zyx, [10.0, 10.0, 0.0], atol=1.0e-5)
+    assert np.allclose(fusion.closest_midpoint_zyx, [10.0, 5.0, 0.0], atol=1.0e-5)
+    assert np.allclose(fusion.fused_zyx[0], start, atol=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[-1], target, atol=1.0e-6)
+
+
 def test_native_3d_trace2cp_plane_crossing_interpolates() -> None:
     crossing = _interpolate_plane_crossing(
         np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
@@ -1588,6 +1708,8 @@ def test_native_3d_trace2cp_field_cache_uses_sampler_and_base_scale() -> None:
     block = cache._infer_block(np.asarray([1, 2, 3], dtype=np.int64))
 
     assert block.output_czyx.shape == (7, 4, 4, 4)
+    assert block.output_czyx.device.type == "cpu"
+    assert block.valid_mask_zyx.device.type == "cpu"
     assert len(sampler.calls) == 1
     coords, valid = sampler.calls[0]
     assert coords.shape == (4, 4, 4, 3)

@@ -110,9 +110,11 @@ side/top strip input loading.
   normalized input view: `zscore` uses a fixed `[-3, 3]` display window,
   `minmax` uses `0..1`, and raw/none modes clip raw `0..255`.
 - The side/top strip render calls go through the 2D Trace2CP coordinate
-  sampler path. Those render calls require a blocking sampler and raise if the
-  VC3D sampler reports chunk errors, because `sampleCoordsFineToCoarse` can
-  otherwise silently show coarse fallback data where fine chunks failed.
+  sampler path. Those render calls require a blocking sampler. In VC3D,
+  `Volume.sample_coords(..., blocking=True)` now uses strict requested-level
+  sampling: all required chunks are fetched/decoded and pinned before sampling,
+  scale fallback is disabled, and the returned stats must report
+  `requested_level_only=true` plus `fallback_levels=0`.
 - Decodes Lasagna 3x2 direction channels analytically with the shared 3D
   direction decoder, aligns sign-ambiguous axes to the current trace direction,
   samples a deterministic 25x25 square angular grid mapped onto the cone disk,
@@ -131,17 +133,35 @@ side/top strip input loading.
   projection, and image composition. Presence sampling also prints block-level
   progress with sampled points, valid outputs, newly inferred blocks, cached
   blocks, and total cache blocks.
+- Inferred block outputs are cached on CPU. The tool moves one cached block at
+  a time back to the active device for point sampling, so long traces and
+  presence-strip renders do not retain all block outputs on the GPU.
+- During visualization, the regular `trace2cp_native_3d_vis.jpg` path is
+  overwritten at render start, each stage start/end, and after each panel is
+  added to the sheet. Before the first panel exists, the file contains a small
+  status canvas, so there is always one current status/partial/final image to
+  inspect during long renders.
 - Stops when the trace crosses the plane through the target CP with normal
   from start CP to target CP. The stdout/summary metrics are
   `native_trace2cp_plane_error` and
   `native_trace2cp_closest_target_error`; these are tool-local diagnostics and
   do not replace the projected `test/trace2cp_error` metric used by training.
-- For visualization, uses the initial side/top Trace2CP source built by the
-  existing 2D geometry loader for the input CP pair. It does not regenerate a
-  side/top strip source from the fitted native trace. The JPG includes four
-  panels: normalized initial side input, 3D presence sampled on the initial
-  side coordinates, normalized initial top input, and 3D presence sampled on
-  the initial top coordinates.
+- Fuses forward and reverse traces with the same center-weighted
+  closest-overlap semantics as 2D Trace2CP, but in selected-level 3D ZYX
+  coordinates. The tool keeps traced order, interpolates both traces across
+  their overlapping CP-axis progress, picks the best meeting point by
+  `3D_gap * center_penalty`, warps both partial traces to the shared midpoint,
+  and arc-length-resamples the fused CP-to-CP line. It does not sort trace
+  points by progress or fabricate a fused line when no overlap exists.
+  Stdout and the JSON summary include the selected progress, raw gap,
+  considered gap, center penalty, and fusion reason.
+- For visualization, first builds a maximum-height initial side/top Trace2CP
+  source to project the native forward, backward, and fused traces. The rendered
+  cross-strip height is then reduced to the odd centered size that covers those
+  projected traces with 50% extra margin, capped by the configured maximum. The
+  JPG includes initial side/top volume and 3D-presence panels with projected
+  forward/reverse/fused traces, plus fused-line-resampled side/top volume and
+  presence panels with only the fused line drawn thinly.
 - Trace2CP segment-source construction trims extra margin points to the valid
   compact-geometry interval containing both CPs. Compact-geometry preload covers
   consecutive CP-to-CP spans as well as CP source windows, so an interior
@@ -370,8 +390,10 @@ The important behavior is:
   - opens local paths with `vc.volume.Volume.open`;
   - converts `s3://bucket/key` to the matching public HTTPS URL;
   - opens remote paths with `Volume.open_url`;
-  - calls `Volume.sample_coords(..., blocking=True)` so missing chunks are
-    fetched/decoded before sampling returns;
+  - calls `Volume.sample_coords(..., blocking=True)` so requested-level chunks
+    are fetched/decoded and pinned before sampling starts;
+  - rejects blocking results that do not report strict requested-level sampling
+    (`requested_level_only=true`, `fallback_levels=0`);
   - uses `Volume.collect_coords_dependencies(...)` for prefetch dependency
     discovery, without sampling image values;
   - exposes VC3D persistent-cache data and `.empty` marker paths for Python

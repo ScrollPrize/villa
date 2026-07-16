@@ -31,6 +31,9 @@ public:
         int coveredPixels = 0;
         int requestedChunks = 0;
         int errorChunks = 0;
+        int missingChunks = 0;
+        int fallbackLevels = 0;
+        bool requestedLevelOnly = false;
     };
 
     // Queue chunk dependencies for pixels not already covered. The viewer can
@@ -80,6 +83,17 @@ public:
                                    cv::Mat_<uint8_t>& out,
                                    cv::Mat_<uint8_t>& coverage,
                                    const Options& options = Options());
+
+    // Blocking requested-level sampling for batch/CLI paths. This samples only
+    // the requested level: required chunks are fetched and pinned before
+    // sampling starts, scale fallback is disabled, and chunk I/O errors throw.
+    // Known-missing requested-level chunks render as black covered pixels.
+    static Stats sampleCoordsLevelBlockingRequestedLevel(IChunkedArray& array,
+                                                         int level,
+                                                         const cv::Mat_<cv::Vec3f>& coords,
+                                                         cv::Mat_<uint8_t>& out,
+                                                         cv::Mat_<uint8_t>& coverage,
+                                                         const Options& options = Options());
 
     // Fine-to-coarse fallback. Finer covered pixels are never overwritten by
     // coarser levels.

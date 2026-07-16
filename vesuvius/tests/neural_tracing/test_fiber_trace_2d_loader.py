@@ -2525,7 +2525,7 @@ def test_trace2cp_render_sampling_rejects_chunk_errors() -> None:
     coords = np.zeros((3, 4, 3), dtype=np.float32)
     valid = np.ones((3, 4), dtype=bool)
 
-    with pytest.raises(ValueError, match="mixed fine/coarse fallback"):
+    with pytest.raises(ValueError, match="incomplete requested-level data"):
         FiberStrip2DLoader._sample_trace2cp_coords_blocking(
             object(),
             source,

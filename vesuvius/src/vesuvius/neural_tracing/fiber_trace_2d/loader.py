@@ -4048,6 +4048,7 @@ class FiberStrip2DLoader:
         strip_z_offset: float | None = None,
         row_axis_alignment_line_index: int | None = None,
         row_axis_alignment_xyz: np.ndarray | None = None,
+        cross_strip_height_px: int | None = None,
         device: torch.device | None = None,
         sample_mode: str = "random",
     ) -> _Trace2CpSegmentSource:
@@ -4082,7 +4083,13 @@ class FiberStrip2DLoader:
             int(math.ceil(distance_px + 2.0 * margin + 1.0)),
         )
         trace2cp_height_multiplier = 8
-        height = int(self.config.patch_shape_hw[0]) * trace2cp_height_multiplier
+        max_height = int(self.config.patch_shape_hw[0]) * trace2cp_height_multiplier
+        height = max_height if cross_strip_height_px is None else int(cross_strip_height_px)
+        if cross_strip_height_px is not None and height > max_height:
+            raise ValueError(
+                "trace2cp cross strip height override exceeds configured maximum: "
+                f"height={height} max_height={max_height}"
+            )
         if height <= 0 or width <= 0:
             raise ValueError(f"invalid trace2cp segment shape {(height, width)}")
         start_col = margin if signed_distance_px >= 0.0 else float(width - 1) - margin
@@ -4490,8 +4497,18 @@ class FiberStrip2DLoader:
         if error_chunks > 0:
             raise ValueError(
                 f"Trace2CP {context} rendering encountered {error_chunks} chunk errors; "
-                "refusing to render mixed fine/coarse fallback data "
+                "refusing to render incomplete requested-level data "
                 f"stats={stats}"
+            )
+        if "requested_level_only" in stats and not bool(stats.get("requested_level_only")):
+            raise ValueError(
+                f"Trace2CP {context} rendering did not use requested-level-only sampling; "
+                f"stats={stats}"
+            )
+        fallback_levels = int(stats.get("fallback_levels", 0) or 0)
+        if fallback_levels != 0:
+            raise ValueError(
+                f"Trace2CP {context} rendering used scale fallback; stats={stats}"
             )
         image = np.asarray(result.image, dtype=np.float32)
         valid_mask = np.asarray(result.valid_mask, dtype=bool)

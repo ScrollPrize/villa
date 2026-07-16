@@ -58,6 +58,14 @@
   `grid_sample` for normal training. Array-backed tests may use the
   NumPy/trilinear fallback sampler. Value-only augmentations happen after
   sampling as torch tensor operations.
+- VC3D blocking coordinate sampling means strict requested-level sampling:
+  every required requested-level chunk is fetched/decoded and locally pinned
+  before sampling starts, scale fallback is disabled, and returned stats report
+  `requested_level_only: true`, `fallback_levels: 0`, and `missing_chunks` for
+  genuinely absent requested-level chunks. Only those truly missing
+  requested-level chunks may render black. Chunk I/O/decode errors must fail
+  loudly. The returned sampler `valid_mask` is only geometry/sample coverage;
+  it must not be treated as proof that requested-level data was used.
 - V0 3D value augmentations support normalization, brightness, contrast, gamma,
   noise, and separable isotropic Gaussian blur. Opt-in anisotropic blur is
   configured with `augment_anisotropic_blur_probability`,
@@ -303,12 +311,17 @@
   lookups must route to a block whose trusted core contains the queried point.
   The tool must not silently score candidates from cropped-away model-output
   borders.
+- Native 3D Trace2CP cached inferred blocks must be CPU-resident. CUDA is used
+  for model inference and transient block sampling, but the cache must not keep
+  all inferred block output tensors on GPU across a long trace or strip render.
 - Native 3D Trace2CP inference blocks are sampled through the configured
   `CoordinateSampler` using the same selected-level to base-coordinate
   conversion as 3D training: selected-level block grids are multiplied by
   `record.volume_spacing_base`, validated against `record.base_shape_zyx`, and
   passed to blocking `sample_coord_batch(...)`. Real configured volumes must
-  not be read by direct zarr/raw block slicing in the native tool.
+  not be read by direct zarr/raw block slicing in the native tool. These
+  native block samples must use the strict requested-level VC3D blocking
+  semantics above and reject reported fallback or chunk-error stats.
 - Native 3D Trace2CP applies the configured 3D model-input normalization before
   inference. Exported native strip volume panels must display that same
   normalized input domain so the visualization shows what inference sees. For
@@ -318,10 +331,9 @@
   scaling is not allowed for native Trace2CP volume panels because it hides
   loading and brightness problems.
 - Trace2CP strip rendering must reject non-blocking coordinate samplers and
-  VC3D sampler results with reported chunk errors. The VC3D renderer may
-  otherwise produce fine-to-coarse fallback imagery after failed fine-chunk
-  reads; that must fail loudly for debugging renders instead of being shown as
-  a valid full-resolution strip.
+  VC3D sampler results that do not report strict requested-level blocking
+  semantics. Scale fallback, unresolved requested chunks, or chunk errors must
+  fail loudly for debugging renders instead of being shown as valid strips.
 - Native 3D Trace2CP defaults to `--inference-patch-shape-zyx 64 64 64`,
   matching the current fast 3D training/debug patch size. Larger patch shapes
   remain explicit CLI overrides.
@@ -350,6 +362,12 @@
   points, valid output points, newly inferred blocks, cached blocks, and total
   cache block count. Regular trace candidate sampling remains quiet unless a
   caller explicitly supplies a progress label.
+- Native 3D strip visualization progressively overwrites the regular
+  `trace2cp_native_3d_vis.jpg` output at render start, stage start/end, and as
+  panels are rendered and added to the sheet. Before the first panel is
+  available, the file must contain a status canvas rather than being absent.
+  There must not be separate partial snapshot filenames; the same output path
+  should always show the latest available status, partial sheet, or final sheet.
 - `--trace-step-limit N` is a debug-only cap on accepted trace steps per
   direction. When set, native tracing can intentionally return a partial trace
   with `reason=trace_step_limit`; this is distinct from the safety guard
@@ -357,26 +375,42 @@
 - Native 3D tracing stops by intersecting the plane through the target CP with
   normal from start CP to target CP. The returned trace appends the exact
   linear interpolation point on that target plane when crossing occurs.
+- Native 3D forward/reverse fusion must preserve each trace's traced order.
+  It must not sort points by CP-axis progress and average them. Fusion uses
+  the same center-weighted closest-overlap idea as 2D Trace2CP: find the
+  overlapping CP-axis progress range, interpolate each trace in traced order,
+  choose the candidate minimizing 3D trace gap times the center penalty, warp
+  the forward start-to-meeting and reverse target-to-meeting partial traces to
+  the shared midpoint, then concatenate and arc-length-resample the CP-to-CP
+  fused line. If the traces have no progress overlap, native Trace2CP must
+  report that explicitly and must not invent a direct/fake fused line.
 - Native 3D Trace2CP reports tool-local debug metrics:
   `native_trace2cp_plane_error` and
-  `native_trace2cp_closest_target_error`. These are not the public 2D
-  `trace2cp_error`.
-- Native 3D visualization uses the initial side/top strip source built by the
-  existing 2D Trace2CP geometry loader for the input CP pair. It must not build
-  a fresh side/top strip source from the fitted native 3D trace for this debug
-  view.
+  `native_trace2cp_closest_target_error`, plus fusion diagnostics such as
+  selected progress, raw gap, considered gap, and center penalty. These are
+  not the public 2D `trace2cp_error`.
+- Native 3D visualization first builds the initial side/top strip source from
+  the existing 2D Trace2CP geometry loader for the input CP pair. The configured
+  cross-strip height is a maximum cap: the rendered cross height is the odd
+  centered size needed to cover the projected forward, backward, and fused
+  traces with 50% extra margin, capped by that configured maximum. This
+  adaptive render height is visualization-only and must not affect tracing or
+  metric values.
 - Trace2CP segment-source construction may trim extra line-window margin to the
   valid compact-geometry interval that contains both start and target control
   points. It must not synthesize missing normals. If the actual CP-to-CP line
   range crosses an invalid compact-geometry gap, source construction must fail
   loudly.
 - Native 3D visualization includes side/top strip panels of the inferred 3D
-  presence signal sampled on the initial side/top strip coordinates from the
+  presence signal sampled on the displayed side/top strip coordinates from the
   native inference cache. Presence sampling should batch strip coordinates per
   strip rather than call model inference per pixel.
 - Native forward, reverse, and fused 3D traces are projected onto the initial
-  side and top strip coordinate systems for overlay only. These overlays must
-  not regenerate the sampled strip image or define a new strip geometry.
+  side and top strip coordinate systems for overlay. The same visualization
+  also rebuilds side/top strip geometry from the fused native 3D line and
+  renders fused-line volume/presence panels with only the fused line overlaid
+  thinly. The fused-line panels are debug visualization only; they do not define
+  a new scoring path.
 
 - The initial implementation loads batches of fiber-strip patches around random control points from the fiber dataset.
 - Fiber source parsing accepts existing VC3D fiber JSON files and Knossos /

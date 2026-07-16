@@ -1,16 +1,22 @@
-# Trace2CP Compact Geometry CP-Span Coverage
+# VC3D Requested-Level Blocking Coordinate Sampling
 
-Fix Trace2CP segment-source compact geometry so CP-to-CP line spans cannot
-contain unsampled line points.
+Fix native 3D Trace2CP rendering and inference-block loading so blocking VC3D
+coordinate sampling really means strict requested-level sampling.
 
 Requirements:
 
-- Compact geometry preload must sample all line points needed by CP source
-  windows and by consecutive CP-to-CP Trace2CP spans.
-- A Trace2CP segment must not fail because an interior line point was simply
-  not sampled by compact geometry preload.
-- If a sampled line point is invalid, keep failing loudly and report the real
-  Lasagna data reason.
-- Defensive diagnostics should identify unexpected unsampled invalid points and
-  include a direct Lasagna probe of the point values.
-- Do not synthesize, propagate, or invent missing Lasagna normals.
+- `blocking=True` coordinate sampling must wait for every required requested
+  zarr-level chunk to be fetched and decoded before image sampling begins.
+- Required chunk decoded data must stay referenced/pinned for the duration of
+  the sampling call so it cannot be evicted from the decoded chunk cache while
+  rendering.
+- Scale fallback must be disabled in blocking mode. A requested-level sample
+  must never silently use a coarser zarr level.
+- A chunk that is genuinely absent from the requested level may render as black
+  fill. That is the only allowed black fallback.
+- I/O or decode errors must fail loudly; they must not render as valid black or
+  coarse data.
+- Native 3D Trace2CP raw volume panels and prediction/presence panels must use
+  the same fixed blocking semantics.
+- Avoid using the returned sampler `valid_mask` as evidence of requested-level
+  data. It is only a geometry/sample-coverage mask.

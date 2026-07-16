@@ -512,6 +512,9 @@ nb::dict statsToDict(const vc::render::ChunkedPlaneSampler::Stats& stats)
     out["covered_pixels"] = stats.coveredPixels;
     out["requested_chunks"] = stats.requestedChunks;
     out["error_chunks"] = stats.errorChunks;
+    out["missing_chunks"] = stats.missingChunks;
+    out["fallback_levels"] = stats.fallbackLevels;
+    out["requested_level_only"] = stats.requestedLevelOnly;
     return out;
 }
 
@@ -527,28 +530,27 @@ nb::tuple sampleCoords(Volume& volume,
     auto coverage = skipCoverageFromValidMask(validMask, coords.rows, coords.cols);
     cv::Mat_<uint8_t> out(coords.rows, coords.cols, uint8_t{0});
     vc::render::ChunkedPlaneSampler::Stats stats;
-    int blockingPrefetchChunks = 0;
     {
         nb::gil_scoped_release release;
+        const vc::render::ChunkedPlaneSampler::Options options(
+            parseSampling(sampling), tileSize);
         if (blocking) {
-            std::vector<vc::render::ChunkKey> keys =
-                vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
-                    *volume.chunkedCache(),
-                    level,
-                    coords,
-                    coverage,
-                    vc::render::ChunkedPlaneSampler::Options(parseSampling(sampling), tileSize));
-            blockingPrefetchChunks = static_cast<int>(keys.size());
-            if (!keys.empty())
-                volume.chunkedCache()->prefetchChunks(keys, true);
+            stats = vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+                *volume.chunkedCache(),
+                level,
+                coords,
+                out,
+                coverage,
+                options);
+        } else {
+            stats = vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+                *volume.chunkedCache(),
+                level,
+                coords,
+                out,
+                coverage,
+                options);
         }
-        stats = vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-            *volume.chunkedCache(),
-            level,
-            coords,
-            out,
-            coverage,
-            vc::render::ChunkedPlaneSampler::Options(parseSampling(sampling), tileSize));
     }
 
     std::vector<uint8_t> image(static_cast<size_t>(coords.rows) * static_cast<size_t>(coords.cols));
@@ -569,7 +571,7 @@ nb::tuple sampleCoords(Volume& volume,
     auto validArr = makeNumpyArray<uint8_t>(std::move(sampledValid), {
         static_cast<size_t>(coords.rows), static_cast<size_t>(coords.cols), size_t{1}});
     nb::dict statsDict = statsToDict(stats);
-    statsDict["blocking_prefetch_chunks"] = blockingPrefetchChunks;
+    statsDict["blocking_prefetch_chunks"] = blocking ? stats.requestedChunks : 0;
     return nb::make_tuple(imageArr, validArr, statsDict);
 }
 
