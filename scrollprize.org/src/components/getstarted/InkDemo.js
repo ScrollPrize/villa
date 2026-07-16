@@ -77,6 +77,7 @@ export default function InkDemo() {
   const [mirrored, setMirrored] = useState(false); // phone: pred pane tracks the draw pane's view
   const [doneFrac, setDoneFrac] = useState(AREA_DONE_FRAC); // meter target (phones lower it)
   const [introOn, setIntroOn] = useState(false); // phone: pinch cue is on screen
+  const [tapFx, setTapFx] = useState(null); // momentary tool (clear/hint) tap flash
   const cueRef = useRef(null); // the cue element, kept over the first letter
   const bubbleRef = useRef(null); // the cue's bubble, deformed by a live pinch
   const coarse = useCoarsePointer(); // gesture wording matches the device
@@ -105,8 +106,8 @@ export default function InkDemo() {
       ]);
       const { width: W, height: H } = m;
       // on phones the draw pane becomes a TALL viewport onto the strip
-      // (roughly half the screen; the prediction pane below mirrors it in
-      // a shorter window — the surface is where the work happens, the
+      // (a bit under half the screen; the prediction pane below mirrors it
+      // in a shorter window — the surface is where the work happens, the
       // prediction only needs to be read). It OPENS on the whole strip —
       // the word uncut, letterboxed — with a pinch cue: painting on an
       // 80px-tall full-strip view is hopeless, so the intro's one job is
@@ -117,7 +118,11 @@ export default function InkDemo() {
           (W * window.innerHeight * f) / Math.max(280, window.innerWidth - 34),
         );
       const dcW = W;
-      const dcH = narrow ? screenFrac(0.5) : H;
+      // the draw pane is kept a bit under half the screen (was half) so the
+      // whole stack — both panes and both captions — clears the fold; the
+      // opening scroll pins the bottom caption just off the screen's bottom
+      // edge (see scrollIntoView below), the rest stacking up from there
+      const dcH = narrow ? screenFrac(0.45) : H;
       const pcH = narrow ? screenFrac(0.3) : H;
       const minS = Math.max(1, dcH / H);
       const labelData = imageToGray(label, W, H);
@@ -342,15 +347,19 @@ export default function InkDemo() {
       redrawLeft();
       setPhase("play");
       composite();
-      // the stage is far taller than the poster it replaces: on phones the
-      // prediction pane would open below the fold, so center the two-pane
-      // stack — surface AND prediction on screen from the first stroke
+      // the stage is far taller than the poster it replaces: on phones,
+      // align the BOTTOM of the two-pane stack to the bottom of the screen
+      // (a small pad via scroll-margin-bottom), so its last caption sits
+      // just off the bottom edge and everything above — both panes, both
+      // captions — stacks up fully on screen from the first stroke. The
+      // controls tuck just under; the core tools are icons on the pane
+      // itself, so they stay reachable.
       if (narrow)
         setTimeout(
           () =>
             panesRef.current?.scrollIntoView({
               behavior: "smooth",
-              block: "center",
+              block: "end",
             }),
           60,
         );
@@ -1963,7 +1972,44 @@ export default function InkDemo() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [overlay]);
 
+  // clear and hint are momentary — no lasting selected state — so a tap
+  // gives no feedback on its own. Flash the pressed icon's box in-and-out
+  // (the CSS --tap animation), and while it plays, the active tool's box
+  // steps aside and then returns (tapFx suppresses its --on) — so tapping a
+  // momentary tool reads as the "selected" box hopping over and back.
+  function tapTool(which, run) {
+    run();
+    setTapFx(which);
+    setTimeout(() => setTapFx((c) => (c === which ? null : c)), 420);
+  }
+
   const meterFill = Math.min(100, (labeledPct / (doneFrac * 100)) * 100);
+
+  // rendered in the tool bar on desktop, but on phones the Overlay toggle
+  // rides the meter's row and the meter is what it grows to fill — so both
+  // are defined once and placed by layout below
+  const overlayBtn = (
+    <button
+      className={`vc-gs-tool ${overlay ? "vc-gs-tool--on" : ""}`}
+      onClick={() => setOverlay((v) => !v)}
+      aria-pressed={overlay}
+    >
+      Overlay prediction
+    </button>
+  );
+  const meterEl = (
+    <div
+      className="vc-gs-meter"
+      role="progressbar"
+      aria-valuenow={labeledPct}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-label="Ink labeled"
+    >
+      <div className="vc-gs-meter__fill" style={{ width: `${meterFill}%` }} />
+      <span className="vc-gs-meter__label">ink labeled {labeledPct}%</span>
+    </div>
+  );
 
   return (
     <div className="vc-gs-demo" id="ink-demo">
@@ -2073,6 +2119,115 @@ export default function InkDemo() {
                   </div>
                 </div>
               )}
+              {/* phones: quick-access tool icons on the panel's top-right,
+                  under the thumb without leaving the canvas. Same handlers
+                  and state as the (desktop-only) labeled tool buttons, so the
+                  active tool stays in sync. Hidden under the pinch cue. */}
+              {mirrored &&
+                !introOn &&
+                (phase === "play" || phase === "done") && (
+                  <div
+                    className="vc-gs-inktools"
+                    role="group"
+                    aria-label="Ink tools"
+                  >
+                    <button
+                      type="button"
+                      className={`vc-gs-inktool${
+                        tool === "brush" && !tapFx ? " vc-gs-inktool--on" : ""
+                      }`}
+                      onClick={() => setTool("brush")}
+                      aria-pressed={tool === "brush"}
+                      aria-label="Ink brush"
+                      title="Ink brush"
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="m9.06 11.9 8.07-8.06a2.85 2.85 0 1 1 4.03 4.03l-8.06 8.08" />
+                        <path d="M7.07 14.94c-1.66 0-3 1.35-3 3.02 0 1.33-2.5 1.52-2 2.02 1.08 1.1 2.49 2.02 4 2.02 2.2 0 4-1.8 4-4.04a3.01 3.01 0 0 0-3-3.02z" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      className={`vc-gs-inktool${
+                        tool === "eraser" && !tapFx ? " vc-gs-inktool--on" : ""
+                      }`}
+                      onClick={() => setTool("eraser")}
+                      aria-pressed={tool === "eraser"}
+                      aria-label="Erase"
+                      title="Erase"
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.3-9.3c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" />
+                        <path d="M22 21H7" />
+                        <path d="m5 11 9 9" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      className={`vc-gs-inktool${
+                        tapFx === "clear" ? " vc-gs-inktool--tap" : ""
+                      }`}
+                      onClick={() => tapTool("clear", clearAll)}
+                      aria-label="Clear labels"
+                      title="Clear labels"
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M3 6h18" />
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                        <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                        <path d="M10 11v6" />
+                        <path d="M14 11v6" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      className={`vc-gs-inktool${
+                        tapFx === "hint" ? " vc-gs-inktool--tap" : ""
+                      }`}
+                      onClick={() => tapTool("hint", () => hint())}
+                      aria-label="Hint"
+                      title="Hint"
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1.3.5 2.6 1.5 3.5.8.8 1.3 1.5 1.5 2.5" />
+                        <path d="M9 18h6" />
+                        <path d="M10 22h4" />
+                      </svg>
+                    </button>
+                  </div>
+                )}
             </div>
             <figcaption>
               Papyrus surface: paint the ink{" "}
@@ -2109,8 +2264,7 @@ export default function InkDemo() {
               {mirrored && (
                 <span className="vc-gs-dim">
                   {" "}
-                  Shows the same spot as the surface above — pinch it to zoom
-                  out and back.
+                  Same spot as above — pinch to zoom out.
                 </span>
               )}
             </figcaption>
@@ -2119,31 +2273,37 @@ export default function InkDemo() {
 
         <div className="vc-gs-demo__bar">
           <div className="vc-gs-demo__tools" role="group" aria-label="Tools">
-            <button
-              className={`vc-gs-tool ${tool === "brush" ? "vc-gs-tool--on" : ""}`}
-              onClick={() => setTool("brush")}
-            >
-              Ink brush
-            </button>
-            <button
-              className={`vc-gs-tool ${tool === "eraser" ? "vc-gs-tool--on" : ""}`}
-              onClick={() => setTool("eraser")}
-            >
-              Erase
-            </button>
-            <button className="vc-gs-tool" onClick={clearAll}>
-              Clear labels
-            </button>
-            <button
-              className={`vc-gs-tool ${overlay ? "vc-gs-tool--on" : ""}`}
-              onClick={() => setOverlay((v) => !v)}
-              aria-pressed={overlay}
-            >
-              Overlay prediction
-            </button>
-            <button className="vc-gs-tool" onClick={() => hint()}>
-              Hint
-            </button>
+            {/* on phones brush / erase / clear live as icons on the ink
+                panel's top-right (vc-gs-inktools); keep the labeled buttons
+                for desktop only, so the two never duplicate each other */}
+            {!mirrored && (
+              <>
+                <button
+                  className={`vc-gs-tool ${tool === "brush" ? "vc-gs-tool--on" : ""}`}
+                  onClick={() => setTool("brush")}
+                >
+                  Ink brush
+                </button>
+                <button
+                  className={`vc-gs-tool ${tool === "eraser" ? "vc-gs-tool--on" : ""}`}
+                  onClick={() => setTool("eraser")}
+                >
+                  Erase
+                </button>
+                <button className="vc-gs-tool" onClick={clearAll}>
+                  Clear labels
+                </button>
+              </>
+            )}
+            {/* desktop keeps Overlay + Hint in this row; on phones Overlay
+                moves down beside the meter (below) and Hint lives on the
+                ink panel's icon strip, so this row is just "Finish" there */}
+            {!mirrored && overlayBtn}
+            {!mirrored && (
+              <button className="vc-gs-tool" onClick={() => hint()}>
+                Hint
+              </button>
+            )}
             {/* only offered once they've genuinely tried: the point of the
                 demo is doing it, not watching it */}
             {phase === "play" && labeledPct >= 2 && !autoBusy && (
@@ -2152,22 +2312,14 @@ export default function InkDemo() {
               </button>
             )}
           </div>
-          <div
-            className="vc-gs-meter"
-            role="progressbar"
-            aria-valuenow={labeledPct}
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-label="Ink labeled"
-          >
-            <div
-              className="vc-gs-meter__fill"
-              style={{ width: `${meterFill}%` }}
-            />
-            <span className="vc-gs-meter__label">
-              ink labeled {labeledPct}%
-            </span>
-          </div>
+          {mirrored ? (
+            <div className="vc-gs-meterrow">
+              {overlayBtn}
+              {meterEl}
+            </div>
+          ) : (
+            meterEl
+          )}
         </div>
         <p className="vc-gs-demo__status" aria-live="polite" ref={statusRef}>
           {status}
