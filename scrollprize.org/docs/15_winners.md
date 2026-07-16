@@ -1025,21 +1025,21 @@ Before and during the competition, EduceLab has put out various works. With thes
 
 <div className="flex flex-row flex-wrap">
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/educelab/quick-segment">
-    <div className="mb-4"><span className="font-semibold">Quick Segment</span> by Bruno, Sydney, and Drew</div>
+    <div className="mb-4"><span className="font-semibold">Quick Segment</span> by Bruno, Sydney, and Drew. © EduceLab/University of Kentucky.</div>
     <video autoPlay playsInline muted loop className="w-[100%]">
       <source src="/img/progress/quicksegment.webm" type="video/webm"/>
     </video>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://uknowledge.uky.edu/cs_etds/138/">
-    <div className="mb-4"><span className="font-semibold">Hard-Hearted Scrolls (PhD dissertation)</span> by Stephen Parsons</div>
+    <div className="mb-4"><span className="font-semibold">Hard-Hearted Scrolls (PhD dissertation)</span> by Stephen Parsons. © Stephen Parsons.</div>
     <div className="bg-white"><img alt="Hard-Hearted Scrolls PhD dissertation by Stephen Parsons" src="/img/tutorials/ml-overview-alpha.webp"/></div>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/educelab/volume-cartographer">
-    <div className="mb-4"><span className="font-semibold">Volume Cartographer</span> by Seth Parker and many others</div>
+    <div className="mb-4"><span className="font-semibold">Volume Cartographer</span> by Seth Parker and many others. © EduceLab/University of Kentucky.</div>
     <div className="bg-white"><img alt="Volume Cartographer by Seth Parker and many others" src="/img/tutorials/vc-initial.webp"/></div>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/educelab/ink-id">
-    <div className="mb-4"><span className="font-semibold">ink-id</span> by Stephen Parsons</div>
+    <div className="mb-4"><span className="font-semibold">ink-id</span> by Stephen Parsons. © EduceLab/University of Kentucky.</div>
     <video autoPlay playsInline loop muted className="w-[100%] max-h-[150px]" poster="/img/landing/fragment-training2.webp">
       <source src="/img/landing/fragment-training2.webm" type="video/webm"/>
     </video>

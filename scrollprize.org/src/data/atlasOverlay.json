@@ -1138,6 +1138,15 @@
     },
     "PHerc1667Cr1Fr3": {
       "display": "PHerc1667Cr1Fr3",
+      "licenses": [
+        {
+          "name": "EduceLab Data License",
+          "url": "https://dl.ash2txt.org/LICENSE.txt"
+        }
+      ],
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1667Cr1Fr3/photos/PHerc1667Cr1Fr3_photo.jpg",
@@ -1164,6 +1173,15 @@
     },
     "PHerc51Cr4Fr8": {
       "display": "PHerc51Cr4Fr8",
+      "licenses": [
+        {
+          "name": "EduceLab Data License",
+          "url": "https://dl.ash2txt.org/LICENSE.txt"
+        }
+      ],
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc51Cr4Fr8/photos/PHerc51Cr4Fr8_photo.jpg",
