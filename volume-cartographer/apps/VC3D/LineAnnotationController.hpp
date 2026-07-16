@@ -107,6 +107,11 @@ public:
         std::vector<std::string> tags;
     };
 
+    // Persisted branch-link metadata. Live branch refs are coupled to
+    // LineAnnotationSession::controlPoints, reciprocal refs in linked fibers, and
+    // saved-fiber control-point ordering. Any live mutation of control points or
+    // branches must go through the private session paths that call
+    // syncLinkedBranchMetadataAfterFiberModification().
     struct FiberBranchRef {
         int controlPointIndex = -1;
         uint64_t branchFiberId = 0;
@@ -213,6 +218,9 @@ private:
         Optimized,
     };
 
+    // Intentionally opaque outside LineAnnotationController.cpp. Keeping session
+    // state private prevents external code from mutating controlPoints/branches
+    // without the branch metadata synchronization hook.
     struct LineAnnotationSession;
     struct IntersectionInspectionSession;
     struct FiberMetricsTaskResult;
@@ -238,6 +246,9 @@ private:
         uint64_t generation = 1;
         std::vector<cv::Vec3d> controlPoints;
         std::vector<cv::Vec3d> linePoints;
+        // Stored snapshots only. Live-session branch metadata must be converted
+        // through storedFiberFromSession()/saveSessionAsFiber() so the central
+        // hook can remap linked control-point indices before serialization.
         std::vector<FiberBranchRef> branches;
         vc3d::line_annotation::FiberHvClassification hvClassification;
         std::string manualHvTag;
@@ -264,6 +275,10 @@ private:
         std::vector<uint64_t> generations;
         std::vector<std::filesystem::path> recoveryFiles;
         std::string error;
+    };
+
+    struct BranchMetadataSyncResult {
+        std::vector<uint64_t> affectedFiberIds;
     };
 
     using SideStripMarker =
@@ -416,14 +431,26 @@ private:
         SideStripProgressCallback progressCallback = {},
         SideStripPartialResultCallback partialResultCallback = {},
         SideStripCancelCallback cancelCallback = {});
+    // Central hook after any live LineAnnotationSession control-point or branch
+    // mutation. Pass previous controls/branches when indices or links may have
+    // changed, then schedule saves for returned linked fibers as needed.
+    BranchMetadataSyncResult syncLinkedBranchMetadataAfterFiberModification(
+        LineAnnotationSession& session,
+        const std::vector<vc::lasagna::LineControlPoint>* previousControlPoints = nullptr,
+        const std::vector<FiberBranchRef>* previousBranches = nullptr);
+    void scheduleBranchMetadataSaves(const std::vector<uint64_t>& fiberIds,
+                                     uint64_t excludedFiberId = 0);
+    void syncBranchFiberFileRename(uint64_t fiberId,
+                                   const std::string& oldFileName,
+                                   const std::string& newFileName);
+    void removeBranchLinksToFiber(uint64_t fiberId, const std::string& fileName);
+    // Hook internals; do not call directly from mutation sites.
     void syncReciprocalBranchControlPointReferences(const LineAnnotationSession& session);
     [[nodiscard]] bool confirmLinkedControlPointEdit(const LineAnnotationSession& session,
                                                      int controlPointIndex,
                                                      const QString& action) const;
     [[nodiscard]] bool controlPointHasBranch(const LineAnnotationSession& session,
                                              int controlPointIndex) const;
-    std::vector<uint64_t> removeLinkedBranchesForControlPoint(LineAnnotationSession& session,
-                                                              int controlPointIndex);
     std::vector<uint64_t> syncBranchEndpointPositions(LineAnnotationSession& session);
     [[nodiscard]] static double lineLengthVx(const std::vector<cv::Vec3d>& points);
     static void scaleStoredFiber(StoredFiber& fiber, double scale);
@@ -432,6 +459,8 @@ private:
         const vc::lasagna::NormalSampler* normalSampler);
     [[nodiscard]] static vc::lasagna::LineModel syntheticLineModelFromPoints(
         const std::vector<cv::Vec3d>& points);
+    [[nodiscard]] std::optional<int> storedBranchTargetControlPointIndex(
+        const FiberBranchRef& branch) const;
     [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);
     void saveSessionAsFiber(LineAnnotationSession& session);
     [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
