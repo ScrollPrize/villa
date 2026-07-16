@@ -408,11 +408,24 @@ class S3SyncManager:
         print(f"Found {len(files)} S3 files")
         return files
 
-    def _prune_stale_tracking(self, current_paths):
-        """Drop tracking rows for paths that no longer exist locally or on S3"""
+    def _prune_stale_tracking(self, current_paths, include_backups=False):
+        """Drop tracking rows for paths that no longer exist locally or on S3.
+
+        Rows that are invisible to this run's scans only because backups/
+        directories were excluded are left alone — the scans carry no
+        information about them. Rows for permanently ignored paths (hidden,
+        layers, .obj) are still pruned.
+        """
+        def invisible_backup(path):
+            return (not include_backups and
+                    self._is_ignored(path) and
+                    not self._is_ignored(path, include_backups=True))
+
         with self._get_db() as conn:
             cursor = conn.execute('SELECT path FROM files')
-            stale = [row['path'] for row in cursor if row['path'] not in current_paths]
+            stale = [row['path'] for row in cursor
+                     if row['path'] not in current_paths
+                     and not invisible_backup(row['path'])]
             for path in stale:
                 conn.execute('DELETE FROM files WHERE path = ?', (path,))
 
@@ -433,7 +446,7 @@ class S3SyncManager:
         s3_files = self.scan_s3_files(include_backups)
 
         self._record_untracked_synced(local_files, s3_files)
-        self._prune_stale_tracking(set(local_files) | set(s3_files))
+        self._prune_stale_tracking(set(local_files) | set(s3_files), include_backups)
 
         print("File tracking refreshed")
 
@@ -454,7 +467,7 @@ class S3SyncManager:
             for path in current_paths:
                 self._track_file(conn, path, local_files.get(path), s3_files.get(path))
 
-        self._prune_stale_tracking(current_paths)
+        self._prune_stale_tracking(current_paths, include_backups)
 
         print("File tracking reset")
 
@@ -555,8 +568,12 @@ class S3SyncManager:
             cursor = conn.execute('SELECT path FROM files')
             tracked = {row['path'] for row in cursor}
 
+            # Backup-pattern files are excluded: they are upload-only, and
+            # analyze_changes deliberately re-uploads them when untracked
+            # (even on a size match). The upload itself records tracking.
             healed = [path for path in local_files.keys() & s3_files.keys()
                       if path not in tracked and
+                      not local_files[path].get('is_backup') and
                       local_files[path]['local_size'] == s3_files[path]['s3_size']]
 
             for path in healed:
