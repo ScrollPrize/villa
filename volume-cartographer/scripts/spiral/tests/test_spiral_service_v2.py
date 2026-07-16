@@ -34,6 +34,12 @@ class FakeSession:
     def __init__(self):
         self.state = "Paused"
         self.run_calls = []
+        self.run_config = {
+            "num_patches_per_step": 360,
+            "loss_weight_patch_radius": 8.0,
+            "loss_start_patch_dt": 25_000,
+            "loss_start_track_dt": 10_000,
+        }
         self.saved = []
         self.closed = False
 
@@ -44,12 +50,14 @@ class FakeSession:
             "error": None, "preview_manifest_path": None, "preview_generation": 0,
             "geometry_snapshot_manifest_path": None,
             "supports_input_incorporation": True,
+            "run_config": dict(self.run_config),
         }
 
     def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None):
+            influence_config=None, run_config=None):
         self.run_calls.append((count, list(pending_inputs or []), mark_incorporated,
-                               dict(influence_config or {})))
+                               dict(influence_config or {}), dict(run_config or {})))
+        self.run_config.update(run_config or {})
         return 5 + count
 
     def save_checkpoint(self, path):
@@ -494,7 +502,7 @@ class UploadTests(unittest.TestCase):
         upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)
         self.state.finalize_upload(upload_id)
         self.state.run({"iterations": 10})
-        count, pending, mark, influence = session.run_calls[-1]
+        count, pending, mark, influence, _ = session.run_calls[-1]
         self.assertEqual(count, 10)
         self.assertEqual([record["id"] for record in pending], ["fiber-1"])
         self.assertEqual(influence, {})
@@ -529,6 +537,28 @@ class UploadTests(unittest.TestCase):
                 "interactive_influence_theta_frac": 1.5,
             }})
         self.assertEqual(caught.exception.status, 400)
+
+    def test_run_passes_and_validates_mutable_training_config(self):
+        session = self._session()
+        config = {
+            "num_patches_per_step": 240,
+            "loss_weight_patch_radius": 3.5,
+            "loss_start_track_dt": None,
+        }
+
+        response = self.state.run({"iterations": 10, "run_config": config})
+
+        self.assertEqual(session.run_calls[-1][4], config)
+        self.assertEqual(response["run_config"]["num_patches_per_step"], 240)
+
+        with self.assertRaisesRegex(ApiError, "non-mutable"):
+            self.state.run({"iterations": 10, "run_config": {
+                "learning_rate": 1e-4,
+            }})
+        with self.assertRaisesRegex(ApiError, "at least 1"):
+            self.state.run({"iterations": 10, "run_config": {
+                "num_patches_per_step": 0,
+            }})
 
     def test_new_session_does_not_see_previous_ephemeral_inputs(self):
         self._session()
@@ -685,7 +715,7 @@ class CommitTests(unittest.TestCase):
         with self.assertRaisesRegex(ApiError, "already committed"):
             self.state.commit_inputs()
         self.state.run({"iterations": 3})
-        _, pending, mark, _ = self.session.run_calls[-1]
+        _, pending, mark, _, _ = self.session.run_calls[-1]
         self.assertEqual([entry["id"] for entry in pending], ["patch-9"])
         # Once incorporated, a committed record is done and leaves the list.
         mark(pending)
@@ -704,7 +734,7 @@ class CommitTests(unittest.TestCase):
     def test_remove_incorporated_input_is_rejected(self):
         self._finalize("patch", "patch-9", PATCH_FILES)
         self.state.run({"iterations": 1})
-        _, pending, mark, _ = self.session.run_calls[-1]
+        _, pending, mark, _, _ = self.session.run_calls[-1]
         mark(pending)
         with self.assertRaises(ApiError) as caught:
             self.state.remove_input({"kind": "patch", "id": "patch-9"})

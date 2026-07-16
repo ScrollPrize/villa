@@ -161,6 +161,48 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(action[1], pending)
         self.assertEqual(action[3], influence)
 
+    def test_run_configuration_is_queued_before_input_incorporation(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Ready"
+        session._completed = 10
+        session._pending = 0
+        session._target = 10
+        session._incorporate_inputs = lambda *_: None
+        session._configure_run = lambda *_: None
+        session._idle_actions = []
+        session.requested_config = {"loss_weight_patch_radius": 8.0}
+        session._run_config = {"loss_weight_patch_radius": 8.0}
+
+        session.run(
+            20,
+            pending_inputs=[{"id": "new-patch"}],
+            run_config={"loss_weight_patch_radius": 4.0},
+        )
+
+        self.assertEqual([action[0] for action in session._idle_actions],
+                         ["configure", "incorporate"])
+        self.assertEqual(session._run_config["loss_weight_patch_radius"], 4.0)
+
+    def test_run_configuration_scales_counts_but_not_loss_values(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._configure_run = lambda config: setattr(session, "applied", config)
+        session._scaled_count_keys = frozenset({"num_patches_per_step"})
+        session._z_range_scale = 0.5
+        session._split_divisor = 2
+
+        session._run_configuration({
+            "num_patches_per_step": 101,
+            "loss_weight_patch_radius": 3.5,
+            "loss_start_patch_dt": 123,
+        })
+
+        self.assertEqual(session.applied, {
+            "num_patches_per_step": 25,
+            "loss_weight_patch_radius": 3.5,
+            "loss_start_patch_dt": 123,
+        })
+
     def test_run_finish_callback_precedes_autosave(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()

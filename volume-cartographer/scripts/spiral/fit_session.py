@@ -17,8 +17,50 @@ from typing import Any, Iterable, Mapping
 import zipfile
 
 
-# Version 4 makes interactive influence configuration and masks Run-scoped.
-API_VERSION = 4
+# Version 5 makes sampling counts, loss weights, and loss start steps Run-scoped.
+API_VERSION = 5
+
+
+# Counts which describe how many training objects/points are sampled per
+# optimizer step.  Some of these are scaled for the fitted z range (and split
+# across DDP ranks) by spiral_runtime; the values exposed through the service
+# remain the user's configured, pre-scaling values.
+RUN_MUTABLE_SAMPLING_KEYS = frozenset({
+    "num_patches_per_step",
+    "num_patches_per_step_for_dt",
+    "num_points_per_patch",
+    "unverified_num_patches_per_step",
+    "unverified_num_patches_per_step_for_dt",
+    "unverified_num_points_per_patch",
+    "rel_winding_num_pcls",
+    "rel_winding_num_patch_pairs_per_pcl",
+    "abs_winding_num_pcls",
+    "abs_winding_num_points_per_pcl",
+    "unattached_pcl_num_per_step",
+    "unattached_pcl_num_points_per_step",
+    "track_num_per_step",
+    "track_num_points_per_step",
+    "dense_normals_num_points",
+    "regularisation_num_points",
+    "shell_num_samples",
+})
+
+
+def is_run_mutable_config_key(key: str) -> bool:
+    """Return whether an advanced setting may change at a Run boundary."""
+    return (
+        key in RUN_MUTABLE_SAMPLING_KEYS
+        or (key.startswith("loss_weight_") and key != "loss_weight_anchor")
+        or key.startswith("loss_start_")
+    )
+
+
+def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Select the Run-scoped editor fields from a complete fitter config."""
+    return {
+        key: value for key, value in config.items()
+        if is_run_mutable_config_key(key)
+    }
 
 
 class PclRole(str, Enum):

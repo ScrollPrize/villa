@@ -14,7 +14,9 @@ import traceback
 from typing import Any, Callable, Mapping
 import uuid
 
-from fit_session import SpiralInputPaths, SpiralPreviewConfig, SpiralRunConfig
+from fit_session import (RUN_MUTABLE_SAMPLING_KEYS, SpiralInputPaths,
+                         SpiralPreviewConfig, SpiralRunConfig,
+                         run_mutable_config)
 
 
 class _SessionShutdown(BaseException):
@@ -29,6 +31,7 @@ class InteractiveFitSession:
         self.preview_config = preview
         self.input_manifest = paths.manifest()
         self.requested_config = dict(run.config)
+        self._run_config = None
         self._status_callback = status_callback
         self._condition = threading.Condition()
         self._state = "Loading"
@@ -50,6 +53,7 @@ class InteractiveFitSession:
         self._export_preview = None
         self._incorporate_inputs = None
         self._finish_run = None
+        self._configure_run = None
         self._idle_actions = []
         self._thread = threading.Thread(target=self._fit_main, name="spiral-fit-worker", daemon=True)
         self._thread.start()
@@ -61,7 +65,7 @@ class InteractiveFitSession:
 
     def status(self):
         with self._condition:
-            return {
+            result = {
                 "state": self._state, "phase": self._phase,
                 "current_iteration": self._completed,
                 "target_iteration": self._target,
@@ -73,6 +77,9 @@ class InteractiveFitSession:
                 "geometry_snapshot_manifest_path": self._geometry_snapshot_manifest,
                 "supports_input_incorporation": self._incorporate_inputs is not None,
             }
+            if self._run_config is not None:
+                result["run_config"] = copy.deepcopy(self._run_config)
+            return result
 
     def _publish_status(self):
         if self._status_callback is not None:
@@ -120,6 +127,9 @@ class InteractiveFitSession:
                 raise ValueError(f"Unknown advanced config keys: {unknown}")
             config.update(self.run_config.config)
             self.requested_config = dict(config)
+            with self._condition:
+                self._run_config = run_mutable_config(config)
+            self._publish_status()
             count_keys = (
                 'num_patches_per_step', 'num_patches_per_step_for_dt',
                 'unverified_num_patches_per_step', 'unverified_num_patches_per_step_for_dt',
@@ -127,9 +137,11 @@ class InteractiveFitSession:
                 'unattached_pcl_num_per_step', 'track_num_per_step',
                 'dense_normals_num_points', 'regularisation_num_points', 'shell_num_samples',
             )
-            scale_counts_for_z_range(config, self.run_config.z_begin,
-                                     self.run_config.z_end, 9500, count_keys)
-            split_counts_across_ranks(config, count_keys)
+            self._z_range_scale, _ = scale_counts_for_z_range(
+                config, self.run_config.z_begin, self.run_config.z_end, 9500,
+                count_keys)
+            self._split_divisor = split_counts_across_ranks(config, count_keys)
+            self._scaled_count_keys = frozenset(count_keys)
 
             fitter.dataset_path = self.paths.dataset_root
             fitter.normal_nx_zarr_path = self.paths.normal_x or None
@@ -188,7 +200,7 @@ class InteractiveFitSession:
     # Fitter-thread callbacks.
     def on_ready(self, *, completed_iterations, output_path,
                  save_checkpoint, export_preview, geometry_snapshot_manifest=None,
-                 incorporate_inputs=None, finish_run=None):
+                 incorporate_inputs=None, finish_run=None, configure_run=None):
         with self._condition:
             self._completed = self._target = completed_iterations
             self._output_path = output_path
@@ -196,6 +208,7 @@ class InteractiveFitSession:
             self._export_preview = export_preview
             self._incorporate_inputs = incorporate_inputs
             self._finish_run = finish_run
+            self._configure_run = configure_run
             self._geometry_snapshot_manifest = geometry_snapshot_manifest
         if self.paths.checkpoint:
             self._set_state("ExportingPreview", "Exporting restored checkpoint preview")
@@ -218,6 +231,9 @@ class InteractiveFitSession:
             if action[0] == "incorporate":
                 _, records, mark_incorporated, influence_config = action
                 self._run_incorporation(records, mark_incorporated, influence_config)
+                continue
+            if action[0] == "configure":
+                self._run_configuration(action[1])
                 continue
             kind, path, done, result = action
             try:
@@ -263,6 +279,35 @@ class InteractiveFitSession:
                     self._phase = "Optimizing"
             self._publish_status()
 
+    def _run_configuration(self, config):
+        """Apply validated Run-scoped settings on the fitter thread."""
+        try:
+            if self._configure_run is None:
+                raise RuntimeError(
+                    "The resident fitter does not support Run configuration changes")
+            resolved = dict(config)
+            for key in RUN_MUTABLE_SAMPLING_KEYS & resolved.keys():
+                if key in self._scaled_count_keys:
+                    scaled = max(1, round(resolved[key] * self._z_range_scale))
+                    if self._split_divisor > 1:
+                        scaled = max(1, -(-scaled // self._split_divisor))
+                    resolved[key] = scaled
+            self._configure_run(resolved)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            with self._condition:
+                self._pending = 0
+                self._target = self._completed
+                # Leave newly uploaded inputs pending for a later valid Run.
+                self._idle_actions = [
+                    action for action in self._idle_actions
+                    if action[0] != "incorporate"
+                ]
+                self._warnings.append(f"Run configuration failed: {error}")
+                self._state, self._phase = "Paused", "Paused"
+                self._condition.notify_all()
+            self._publish_status()
+
     def iteration_completed(self, *, completed_iterations, total_loss, losses, learning_rate, metrics=None):
         with self._condition:
             self._completed = completed_iterations
@@ -300,12 +345,20 @@ class InteractiveFitSession:
 
     # Coordinator-thread commands.
     def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None):
+            influence_config=None, run_config=None):
         if count < 1:
             raise ValueError("iterations must be at least 1")
         with self._condition:
             if self._state not in {"Ready", "Paused"}:
                 raise RuntimeError(f"Run is not allowed while session state is {self._state}")
+            run_config = dict(run_config or {})
+            if run_config:
+                if self._configure_run is None:
+                    raise RuntimeError(
+                        "The resident fitter does not support Run configuration changes")
+                self._idle_actions.append(("configure", run_config))
+                self.requested_config.update(run_config)
+                self._run_config.update(run_config)
             if pending_inputs:
                 if self._incorporate_inputs is None:
                     raise RuntimeError(

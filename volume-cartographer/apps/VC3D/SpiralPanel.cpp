@@ -21,6 +21,7 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollArea>
@@ -32,6 +33,71 @@
 
 namespace {
 const QString kLocalhostProfileId = QStringLiteral("localhost");
+
+class VerticallyResizablePlainTextEdit final : public QPlainTextEdit
+{
+public:
+    explicit VerticallyResizablePlainTextEdit(const QString& text, QWidget* parent = nullptr)
+        : QPlainTextEdit(text, parent)
+    {
+        setMouseTracking(true);
+        setMinimumHeight(72);
+    }
+
+    QSize sizeHint() const override
+    {
+        QSize result = QPlainTextEdit::sizeHint();
+        result.setHeight(120);
+        return result;
+    }
+
+protected:
+    void mousePressEvent(QMouseEvent* event) override
+    {
+        if (event->button() == Qt::LeftButton && onResizeEdge(event->position())) {
+            _resizing = true;
+            _dragStartY = event->globalPosition().y();
+            _dragStartHeight = height();
+            event->accept();
+            return;
+        }
+        QPlainTextEdit::mousePressEvent(event);
+    }
+
+    void mouseMoveEvent(QMouseEvent* event) override
+    {
+        if (_resizing) {
+            const int requested = _dragStartHeight
+                + qRound(event->globalPosition().y() - _dragStartY);
+            setFixedHeight(qMax(72, requested));
+            event->accept();
+            return;
+        }
+        viewport()->setCursor(onResizeEdge(event->position())
+                                  ? Qt::SizeVerCursor : Qt::IBeamCursor);
+        QPlainTextEdit::mouseMoveEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override
+    {
+        if (_resizing && event->button() == Qt::LeftButton) {
+            _resizing = false;
+            event->accept();
+            return;
+        }
+        QPlainTextEdit::mouseReleaseEvent(event);
+    }
+
+private:
+    bool onResizeEdge(const QPointF& position) const
+    {
+        return position.y() >= viewport()->height() - 7;
+    }
+
+    bool _resizing = false;
+    qreal _dragStartY = 0;
+    int _dragStartHeight = 0;
+};
 }
 
 SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
@@ -271,7 +337,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _influenceAnchorWeight->setRange(0.0, 10000.0); _influenceAnchorWeight->setDecimals(1); _influenceAnchorWeight->setValue(20.0);
     _influenceAnchorWeight->setToolTip(tr("Weight of the loss holding the fit in place outside the influence region"));
     _runTag = new QLineEdit(outputContents);
-    _advanced = new QPlainTextEdit(QStringLiteral("{}"), outputContents); _advanced->setMaximumHeight(90);
+    _advanced = new VerticallyResizablePlainTextEdit(QStringLiteral("{}"), outputContents);
+    _advanced->setToolTip(tr("Sampling counts, loss weights, and loss start steps apply to the next Run. "
+                             "Drag the bottom edge to resize this editor vertically."));
     outputForm->addRow(tr("z begin"), _zBegin);
     outputForm->addRow(tr("z end"), _zEnd);
     outputForm->addRow(tr("Scroll name"), _scrollName);
@@ -458,7 +526,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 case CS::Disconnected: text = tr("Disconnected"); break;
                 case CS::Starting: text = tr("Starting…"); break;
                 case CS::Connecting: text = tr("Connecting…"); break;
-                case CS::Ready: text = tr("Connected — API v4%1")
+                case CS::Ready: text = tr("Connected — API v5%1")
                         .arg(message.isEmpty() ? QString() : QStringLiteral(" — ") + message); break;
                 case CS::Reconnecting: text = tr("Reconnecting… %1").arg(message); break;
                 case CS::Failed: text = tr("Failed: %1").arg(message); break;
@@ -486,6 +554,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             [this](const QJsonObject&, qint64) {
                 _hasSession = true;
                 _reloadRequired = false;
+                _advancedSessionGeneration = -1;
                 _loadedDurableAdvanced = durableAdvancedConfig();
                 for (auto it = _visibilityChecks.begin(); it != _visibilityChecks.end(); ++it)
                     it.value()->setChecked(it.key() == QStringLiteral("output"));
@@ -545,7 +614,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         }
         persist();
         emit pythonOutputRequested();
-        _service->runIterations(_iterations->value(), influenceConfig());
+        _service->runIterations(_iterations->value(), influenceConfig(),
+                                runAdvancedConfig());
     });
     connect(_stop, &QPushButton::clicked, _service, &SpiralServiceManager::stopAfterIteration);
     connect(_save, &QPushButton::clicked, this, [this]() {
@@ -900,7 +970,7 @@ QJsonObject SpiralPanel::sessionRequest() const
                                 {"required", item->data(Qt::UserRole + 2).toBool()}});
     }
     paths["pcls"] = pcls;
-    QJsonObject config = durableAdvancedConfig();
+    QJsonObject config = sessionAdvancedConfig();
     config[QStringLiteral("save_png_visualizations")] = _savePngVisualizations->isChecked();
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
                     {"scroll_name", _scrollName->text()}, {"outward_sense", _outwardSense->currentText()},
@@ -946,6 +1016,14 @@ QJsonObject SpiralPanel::influenceConfig() const
 
 QJsonObject SpiralPanel::durableAdvancedConfig() const
 {
+    QJsonObject config = sessionAdvancedConfig();
+    for (const QString& key : _runConfigKeys)
+        config.remove(key);
+    return config;
+}
+
+QJsonObject SpiralPanel::sessionAdvancedConfig() const
+{
     const QJsonDocument advanced =
         QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
     if (!advanced.isObject()) return {};
@@ -960,8 +1038,48 @@ QJsonObject SpiralPanel::durableAdvancedConfig() const
     return config;
 }
 
+QJsonObject SpiralPanel::runAdvancedConfig() const
+{
+    const QJsonDocument advanced =
+        QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
+    QJsonObject config;
+    if (!advanced.isObject()) return config;
+    const QJsonObject all = advanced.object();
+    for (const QString& key : _runConfigKeys) {
+        if (all.contains(key)) config.insert(key, all.value(key));
+    }
+    return config;
+}
+
+void SpiralPanel::applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration)
+{
+    QJsonDocument document = QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
+    QJsonObject merged = document.isObject() ? document.object() : QJsonObject{};
+    for (const QString& key : _runConfigKeys)
+        merged.remove(key);
+    _runConfigKeys.clear();
+    for (auto it = config.begin(); it != config.end(); ++it) {
+        _runConfigKeys.insert(it.key());
+        merged.insert(it.key(), it.value());
+    }
+    {
+        const QSignalBlocker blocker(_advanced);
+        _advanced->setPlainText(QString::fromUtf8(
+            QJsonDocument(merged).toJson(QJsonDocument::Indented)).trimmed());
+    }
+    _advancedSessionGeneration = sessionGeneration;
+    _loadedDurableAdvanced = durableAdvancedConfig();
+}
+
 void SpiralPanel::updateStatus(const QJsonObject& status)
 {
+    const qint64 sessionGeneration =
+        status.value(QStringLiteral("session_generation")).toInteger(-1);
+    const QJsonObject runConfig = status.value(QStringLiteral("run_config")).toObject();
+    if (sessionGeneration >= 0 && sessionGeneration != _advancedSessionGeneration
+        && !runConfig.isEmpty())
+        applySessionRunConfig(runConfig, sessionGeneration);
+
     const QString state = status.value("state").toString();
     QString stateText = tr("Session: %1 — %2 — iteration %3/%4")
         .arg(state, status.value("phase").toString())
@@ -1146,10 +1264,17 @@ void SpiralPanel::restore()
     _influenceAnchorWeight->setValue(
         settings.value(valuePrefix + "influence_anchor_weight", 20.0).toDouble());
     _iterations->setValue(settings.value(valuePrefix + "iterations", 100).toInt());
-    _advanced->setPlainText(settings.value(valuePrefix + "advanced_config", "{}").toString());
+    const QString savedAdvanced =
+        settings.value(valuePrefix + "advanced_config", "{}").toString();
+    const QJsonDocument advancedDocument = QJsonDocument::fromJson(savedAdvanced.toUtf8());
+    _advanced->setPlainText(advancedDocument.isObject()
+        ? QString::fromUtf8(advancedDocument.toJson(QJsonDocument::Indented)).trimmed()
+        : savedAdvanced);
     _applyingResolution = false;
     _hasManualEdits = false;
     _hasSession = false;
     _reloadRequired = false;
+    _advancedSessionGeneration = -1;
+    _runConfigKeys.clear();
     _loadedDurableAdvanced = durableAdvancedConfig();
 }

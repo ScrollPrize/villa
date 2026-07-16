@@ -33,7 +33,7 @@ constexpr int kPollBackoffMs = 2000;
 constexpr int kPollReconnectMs = 5000;
 constexpr int kRemoteLogPollMs = 10000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 4;
+constexpr int kSupportedApiVersion = 5;
 constexpr int kPreviewCacheKept = 3;
 
 QString stateName(SpiralServiceManager::ConnectionState state)
@@ -599,12 +599,14 @@ QJsonObject SpiralServiceManager::remoteInputPaths() const
 }
 
 void SpiralServiceManager::runIterations(int iterations,
-                                         const QJsonObject& influenceConfig)
+                                         const QJsonObject& influenceConfig,
+                                         const QJsonObject& runConfig)
 {
     postWithRetry(QStringLiteral("/session/run"),
                   {{QStringLiteral("command_id"), commandId()},
                    {QStringLiteral("iterations"), iterations},
-                   {QStringLiteral("influence_config"), influenceConfig}},
+                   {QStringLiteral("influence_config"), influenceConfig},
+                   {QStringLiteral("run_config"), runConfig}},
                   Timeout::Command, kMutationRetries, {});
 }
 

@@ -3,6 +3,7 @@
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QSet>
 #include <QWidget>
 
 #include "SpiralServiceProfile.hpp"
@@ -41,7 +42,10 @@ private:
     void addPclItem(const QString& path, const QString& role, bool required = false);
     QJsonObject sessionRequest() const;
     QJsonObject influenceConfig() const;
+    QJsonObject sessionAdvancedConfig() const;
+    QJsonObject runAdvancedConfig() const;
     QJsonObject durableAdvancedConfig() const;
+    void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
     void applyResolution(const QJsonObject& resolution, bool force);
     void updateStatus(const QJsonObject& status);
     void markReloadRequired();
@@ -126,6 +130,8 @@ private:
     QLabel* _commitHint = nullptr;
     QJsonArray _lastEphemeral;
     QJsonObject _loadedDurableAdvanced;
+    QSet<QString> _runConfigKeys;
+    qint64 _advancedSessionGeneration = -1;
 
     QString _currentProfileId;
     QStringList _profileIds;

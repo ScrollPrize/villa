@@ -1799,6 +1799,12 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
 
     if interactive_driver is not None:
         from geometry_snapshot import write_geometry_snapshot
+
+        def configure_interactive_run(config):
+            # Only called by the resident driver on the fitter thread at a
+            # pause boundary. These settings are read afresh by every step.
+            cfg.update(config, allow_val_change=True)
+
         fiber_root = os.path.abspath(fibers_path) if fibers_path else None
         snapshot_categories = {'fibers': [], 'pcls': [], 'tracks': []}
         for strip in unattached_pcl_strips:
@@ -1823,6 +1829,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             geometry_snapshot_manifest=os.path.join(geometry_path, 'manifest.json'),
             incorporate_inputs=incorporate_interactive_inputs,
             finish_run=clear_interactive_influence,
+            configure_run=configure_interactive_run,
         )
 
     # Interactive fits are resident sessions: num_training_steps still defines

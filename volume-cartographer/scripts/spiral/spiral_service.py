@@ -18,6 +18,7 @@ import argparse
 from collections import OrderedDict, deque
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -33,12 +34,13 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from fit_session import (API_VERSION, PclRole, parse_session_request,
+from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_SAMPLING_KEYS,
+                         parse_session_request,
                          resolve_dataset_root, validate_checkpoint_container,
                          validate_session_request)
 
 
-SERVICE_VERSION = "4.0.0"
+SERVICE_VERSION = "5.0.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 TRANSFER_CHUNK_BYTES = 1024 * 1024
@@ -148,6 +150,46 @@ def _validate_run_influence_config(value):
         if not result[key].is_integer():
             raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be an integer")
         result[key] = int(result[key])
+    return result
+
+
+def _validate_run_config(value, current):
+    """Validate settings which the resident fitter can change between Runs."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "run_config must be a JSON object")
+    current = current if isinstance(current, dict) else {}
+    unknown = sorted(set(value) - set(current))
+    if unknown:
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       f"Unknown or non-mutable Run configuration keys: {unknown}")
+
+    result = {}
+    for key, item in value.items():
+        if key.startswith("loss_start_") and item is None:
+            if key == "loss_start_patch_dt":
+                raise ApiError(HTTPStatus.BAD_REQUEST,
+                               "loss_start_patch_dt cannot be null")
+            result[key] = None
+            continue
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           f"{key} must be numeric")
+        number = float(item)
+        if not math.isfinite(number) or number < 0:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           f"{key} must be a finite non-negative number")
+        if key in RUN_MUTABLE_SAMPLING_KEYS or key.startswith("loss_start_"):
+            if not number.is_integer():
+                raise ApiError(HTTPStatus.BAD_REQUEST,
+                               f"{key} must be an integer")
+            number = int(number)
+            if key in RUN_MUTABLE_SAMPLING_KEYS and number < 1:
+                raise ApiError(HTTPStatus.BAD_REQUEST,
+                               f"{key} must be at least 1")
+        result[key] = number
     return result
 
 
@@ -820,6 +862,8 @@ class ServiceState:
         session = self._require_session()
         influence_config = _validate_run_influence_config(
             request.get("influence_config"))
+        run_config = _validate_run_config(
+            request.get("run_config"), session.status().get("run_config"))
         with self.lock:
             pending = [record for record in self.ephemeral_records
                        if record["state"] == "pending"]
@@ -843,7 +887,8 @@ class ServiceState:
         target = session.run(int(request.get("iterations", 0)),
                              pending_inputs=pending,
                              mark_incorporated=mark_incorporated,
-                             influence_config=influence_config)
+                             influence_config=influence_config,
+                             run_config=run_config)
         with self.lock:
             self.status_generation += 1
         return {**self.status(), "accepted": True, "target_iteration": target}
