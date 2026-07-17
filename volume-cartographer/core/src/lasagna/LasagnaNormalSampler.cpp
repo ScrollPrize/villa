@@ -200,14 +200,26 @@ struct ChannelBinding {
     }
 
     const auto source = array.read_chunk(chunkPathIndicesForKey(binding, key));
-    if (!source.has_value()) {
-        return nullptr;
-    }
-
     auto cached = std::make_shared<CachedChunk>();
     cached->dimsZYX = binding.chunksZYX;
-    cached->values.resize(source->size());
-    std::memcpy(cached->values.data(), source->data(), source->size());
+    if (source.has_value()) {
+        cached->values.resize(source->size());
+        std::memcpy(cached->values.data(), source->data(), source->size());
+    } else {
+        const auto fillValue = array.metadata().fill_value;
+        if (!fillValue.has_value()) {
+            return nullptr;
+        }
+        if (!std::isfinite(*fillValue) ||
+            *fillValue < 0.0 ||
+            *fillValue > 255.0 ||
+            std::trunc(*fillValue) != *fillValue) {
+            throw std::runtime_error(
+                "Lasagna uint8 Zarr has an invalid fill_value: " + binding.path.string());
+        }
+        cached->values.assign(
+            array.metadata().chunk_byte_size(), static_cast<uint8_t>(*fillValue));
+    }
 
     return cached;
 }

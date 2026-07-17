@@ -34,7 +34,8 @@ void createU8Zarr(
     const fs::path& path,
     std::vector<size_t> shape,
     std::vector<size_t> chunks,
-    const std::vector<uint8_t>* payload)
+    const std::vector<uint8_t>* payload,
+    double fillValue = 0.0)
 {
     utils::ZarrMetadata meta;
     meta.version = utils::ZarrVersion::v2;
@@ -42,7 +43,7 @@ void createU8Zarr(
     meta.chunks = std::move(chunks);
     meta.dtype = utils::ZarrDtype::uint8;
     meta.compressor_id.clear();
-    meta.fill_value = 0.0;
+    meta.fill_value = fillValue;
     auto array = utils::ZarrArray::create(path, meta);
     if (payload == nullptr) {
         return;
@@ -386,6 +387,37 @@ TEST_CASE("LasagnaNormalSampler reports invalid samples for missing chunks and z
     vc::lasagna::LasagnaNormalSampler missingSampler(missingDataset);
     CHECK_FALSE(missingSampler.sampleNormal({1.0, 1.0, 1.0}).valid);
 
+    fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaNormalSampler reads absent chunks from the Zarr fill value")
+{
+    const auto dir = tmpDir("fill_value");
+    std::vector<uint8_t> gradMag(2 * 2 * 2, 255);
+    createU8Zarr(dir / "grad_mag.zarr", {2, 2, 2}, {2, 2, 2}, &gradMag);
+    createU8Zarr(dir / "nx.zarr", {2, 2, 2}, {2, 2, 2}, nullptr, 128.0);
+    createU8Zarr(dir / "ny.zarr", {2, 2, 2}, {2, 2, 2}, nullptr, 128.0);
+
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    writeText(manifestPath, R"({
+        "version": 2,
+        "grad_mag_encode_scale": 255.0,
+        "grad_mag_factor": 1.0,
+        "groups": {
+            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]}
+        }
+    })");
+
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+    const auto sample = sampler.sampleNormal({1.0, 1.0, 1.0});
+
+    REQUIRE(sample.valid);
+    CHECK(sample.normal[0] == doctest::Approx(0.0));
+    CHECK(sample.normal[1] == doctest::Approx(0.0));
+    CHECK(sample.normal[2] == doctest::Approx(1.0));
     fs::remove_all(dir);
 }
 
