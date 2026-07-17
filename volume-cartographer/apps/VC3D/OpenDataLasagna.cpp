@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cmath>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <set>
 #include <sstream>
@@ -198,10 +199,18 @@ void validatePrepared(const OpenDataLasagnaInfo& info,
             throw std::runtime_error("Open-data Lasagna artifact is missing required channel '" +
                                      std::string(channel) + "'");
     }
-    std::set<std::string> validated;
+    std::set<std::string> scheduled;
+    std::vector<std::future<void>> validations;
     for (const auto& group : manifest.groups) {
-        if (validated.insert(group.relativeZarrKey).second)
-            validateGroupDescriptor(manifest, group);
+        if (scheduled.insert(group.relativeZarrKey).second) {
+            const auto* groupPtr = &group;
+            validations.push_back(std::async(std::launch::async, [&manifest, groupPtr]() {
+                validateGroupDescriptor(manifest, *groupPtr);
+            }));
+        }
+    }
+    for (auto& validation : validations) {
+        validation.get();
     }
 }
 

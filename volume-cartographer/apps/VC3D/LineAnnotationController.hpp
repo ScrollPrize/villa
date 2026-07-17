@@ -121,6 +121,7 @@ public:
                                              std::vector<cv::Vec3d>,
                                              cv::Vec3d,
                                              InitialDirectionMode,
+                                             int,
                                              bool,
                                              int,
                                              int)>;
@@ -308,6 +309,7 @@ private:
                                                              std::vector<cv::Vec3d> initialLinePoints,
                                                              cv::Vec3d sourceSliceNormal,
                                                              InitialDirectionMode directionMode,
+                                                             int initialCenterlineLengthVx,
                                                              bool fullOptimization = false,
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;

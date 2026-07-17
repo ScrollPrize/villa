@@ -221,6 +221,19 @@ constexpr double kLineSegmentLength = 32.0;
 constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
 using Clock = std::chrono::steady_clock;
 
+struct InitialLineDiscretization {
+    int segmentsPerSide = 1;
+    double segmentLength = kLineSegmentLength;
+};
+
+InitialLineDiscretization initialLineDiscretization(int totalLengthVx)
+{
+    const double halfLength = std::max(1, totalLengthVx) * 0.5;
+    const int segmentsPerSide = std::max(
+        1, static_cast<int>(std::ceil(halfLength / kLineSegmentLength)));
+    return {segmentsPerSide, halfLength / static_cast<double>(segmentsPerSide)};
+}
+
 struct FiberJsonPathOptions {
     fs::path path;
     double scale = 1.0;
@@ -1174,6 +1187,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode,
+    int initialCenterlineLengthVx,
     bool forceFullOptimization,
     int activeStart,
     int activeEnd,
@@ -1185,6 +1199,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode,
+    int initialCenterlineLengthVx,
     bool forceFullOptimization,
     int activeStart,
     int activeEnd)
@@ -1197,6 +1212,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
                                    std::move(initialLinePoints),
                                    sourceSliceNormal,
                                    directionMode,
+                                   initialCenterlineLengthVx,
                                    forceFullOptimization,
                                    activeStart,
                                    activeEnd,
@@ -1209,6 +1225,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode,
+    int initialCenterlineLengthVx,
     bool forceFullOptimization,
     int activeStart,
     int activeEnd,
@@ -1235,14 +1252,16 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     try {
         vc::lasagna::LineOptimizer optimizer(sampler);
         vc::lasagna::LineOptimizationConfig config;
-        config.segmentsPerSide = 200;
-        config.segmentLength = kLineSegmentLength;
+        const auto discretization = initialLineDiscretization(initialCenterlineLengthVx);
+        config.segmentsPerSide = discretization.segmentsPerSide;
+        config.segmentLength = discretization.segmentLength;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
         config.samplesPerSegment = 1;
         config.maxIterations = 1000;
         config.differentiableNormalSampling = true;
         config.printSolverProgress = false;
+        (void)sampler.prefetchNormalSamples({task.seedPoint}, false);
         config.initialTangent = initialTangentForMode(
             directionMode,
             sourceSliceNormal,
@@ -1342,6 +1361,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
                                   std::vector<cv::Vec3d> initialLinePoints,
                                   cv::Vec3d sourceSliceNormal,
                                   InitialDirectionMode directionMode,
+                                  int initialCenterlineLengthVx,
                                   bool forceFullOptimization,
                                   int activeStart,
                                   int activeEnd) {
@@ -1350,6 +1370,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
                                         std::move(initialLinePoints),
                                         sourceSliceNormal,
                                         directionMode,
+                                        initialCenterlineLengthVx,
                                         forceFullOptimization,
                                         activeStart,
                                         activeEnd);
@@ -4745,8 +4766,12 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     const auto updateStart = Clock::now();
     try {
         vc::lasagna::LineOptimizationConfig updateConfig;
-        updateConfig.segmentsPerSide = 200;
-        updateConfig.segmentLength = kLineSegmentLength;
+        const int initialCenterlineLengthVx = pane->dialog
+            ? pane->dialog->initialCenterlineLengthVx()
+            : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
+        const auto discretization = initialLineDiscretization(initialCenterlineLengthVx);
+        updateConfig.segmentsPerSide = discretization.segmentsPerSide;
+        updateConfig.segmentLength = discretization.segmentLength;
         update = vc::lasagna::updateExistingLineControlPoint(std::move(currentLinePoints),
                                                              std::move(session.controlPoints),
                                                              changedControlIndex,
@@ -5258,11 +5283,16 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
     for (const auto& point : session.optimizedLine.points) {
         initialLinePoints.push_back(point.position);
     }
+    const auto* pane = paneForSurface(session.surfaceName);
+    const int initialCenterlineLengthVx = pane && pane->dialog
+        ? pane->dialog->initialCenterlineLengthVx()
+        : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
     OptimizationTaskResult task = optimizeLineWithSampler(session.selectedManifestPath,
                                                           session.controlPoints,
                                                           std::move(initialLinePoints),
                                                           session.sourceSliceNormal,
                                                           session.initialDirectionMode,
+                                                          initialCenterlineLengthVx,
                                                           false,
                                                           -1,
                                                           -1,
@@ -5362,6 +5392,10 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     }
     const cv::Vec3d sourceSliceNormal = session.sourceSliceNormal;
     const InitialDirectionMode directionMode = session.initialDirectionMode;
+    const auto* pane = paneForSurface(surfaceName);
+    const int initialCenterlineLengthVx = pane && pane->dialog
+        ? pane->dialog->initialCenterlineLengthVx()
+        : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
     auto dataset = session.dataset;
     auto normalSampler = session.normalSampler;
     watcher->setFuture(QtConcurrent::run([factory,
@@ -5370,6 +5404,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            initialLinePoints,
                                            sourceSliceNormal,
                                            directionMode,
+                                           initialCenterlineLengthVx,
                                            forceFullOptimization,
                                            activeStart,
                                            activeEnd,
@@ -5381,6 +5416,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                            std::move(initialLinePoints),
                            sourceSliceNormal,
                            directionMode,
+                           initialCenterlineLengthVx,
                            forceFullOptimization,
                            activeStart,
                            activeEnd);
@@ -5392,6 +5428,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            std::move(initialLinePoints),
                                            sourceSliceNormal,
                                            directionMode,
+                                           initialCenterlineLengthVx,
                                            forceFullOptimization,
                                            activeStart,
                                            activeEnd,
@@ -5402,6 +5439,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                         std::move(initialLinePoints),
                                         sourceSliceNormal,
                                         directionMode,
+                                        initialCenterlineLengthVx,
                                         forceFullOptimization,
                                         activeStart,
                                         activeEnd);
@@ -5939,6 +5977,7 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     InitialDirectionMode directionMode,
+    int initialCenterlineLengthVx,
     bool forceFullOptimization,
     int activeStart,
     int activeEnd) const
@@ -5949,6 +5988,7 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
                                         std::move(initialLinePoints),
                                         sourceSliceNormal,
                                         directionMode,
+                                        initialCenterlineLengthVx,
                                         forceFullOptimization,
                                         activeStart,
                                         activeEnd);
@@ -5958,6 +5998,7 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
                                     std::move(initialLinePoints),
                                     sourceSliceNormal,
                                     directionMode,
+                                    initialCenterlineLengthVx,
                                     forceFullOptimization,
                                     activeStart,
                                     activeEnd);

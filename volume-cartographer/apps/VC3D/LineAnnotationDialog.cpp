@@ -345,6 +345,32 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
             [this](int) {
                 handleShiftScrollModeChanged();
             });
+    _initialCenterlineLengthSpin = new QSpinBox(buttonRow);
+    _initialCenterlineLengthSpin->setObjectName(
+        QStringLiteral("lineAnnotationInitialCenterlineLengthSpinBox"));
+    _initialCenterlineLengthSpin->setRange(100, 1000000);
+    _initialCenterlineLengthSpin->setSingleStep(100);
+    _initialCenterlineLengthSpin->setPrefix(tr("Length "));
+    _initialCenterlineLengthSpin->setSuffix(tr(" vx"));
+    _initialCenterlineLengthSpin->setToolTip(
+        tr("Total length of a newly generated centerline, split equally around the seed."));
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _initialCenterlineLengthSpin->setValue(
+            settings.value(vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX,
+                           vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT)
+                .toInt());
+    }
+    _initialCenterlineLengthSpin->installEventFilter(this);
+    buttonLayout->addWidget(_initialCenterlineLengthSpin);
+    connect(_initialCenterlineLengthSpin,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            [](int value) {
+                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                settings.setValue(
+                    vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX, value);
+            });
     auto* maxDistanceLabel = new QLabel(tr("Max CP dist"), buttonRow);
     maxDistanceLabel->installEventFilter(this);
     buttonLayout->addWidget(maxDistanceLabel);
@@ -460,6 +486,13 @@ LineAnnotationDialog::ReoptimizationMode LineAnnotationDialog::reoptimizationMod
         return ReoptimizationMode::AutoReoptimize;
     }
     return static_cast<ReoptimizationMode>(_reoptimizationCombo->currentData().toInt());
+}
+
+int LineAnnotationDialog::initialCenterlineLengthVx() const
+{
+    return _initialCenterlineLengthSpin
+        ? _initialCenterlineLengthSpin->value()
+        : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
 }
 
 LineAnnotationDialog::ShiftScrollMode LineAnnotationDialog::shiftScrollMode() const

@@ -5,25 +5,45 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cmath>
+#include <exception>
 #include <fstream>
+#include <iostream>
+#include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <span>
 
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace vc::lasagna {
 namespace {
 
+// Lasagna values drive geometry and must never pass through the configurable
+// lossy volume-cache encoder. This store is deliberately an object-for-object
+// read-through cache: publish() persists the exact bytes returned by the Zarr
+// origin, whose own compressor remains responsible for lossless decoding.
 class PersistentHttpStore final : public utils::Store {
 public:
     PersistentHttpStore(std::string baseUrl, std::filesystem::path cacheRoot)
-        : remote_(std::move(baseUrl)), cacheRoot_(std::move(cacheRoot)) {}
+        : remote_(baseUrl), baseUrl_(std::move(baseUrl)), cacheRoot_(std::move(cacheRoot)) {}
 
     bool exists(const std::string& key) const override
     {
+        const auto relative = checkedRelativePath(key);
+        const auto filename = relative.filename().string();
+        if (filename == "zarr.json" &&
+            metadataExists(relative.parent_path() / ".zarray")) {
+            return false;
+        }
+        if (filename == ".zarray" &&
+            metadataExists(relative.parent_path() / "zarr.json")) {
+            return false;
+        }
         return get_if_exists(key).has_value();
     }
 
@@ -37,20 +57,84 @@ public:
 
     std::optional<std::vector<std::byte>> get_if_exists(const std::string& key) const override
     {
-        const auto path = safePath(key);
+        const auto relative = checkedRelativePath(key);
+        const auto path = cachePath(relative);
+        if (std::filesystem::is_regular_file(path))
+            return read(path);
+        if (isMetadataPath(relative)) {
+            const auto legacyPath = cacheRoot_ / relative;
+            if (std::filesystem::is_regular_file(legacyPath)) {
+                auto bytes = read(legacyPath);
+                publish(path, bytes);
+                return bytes;
+            }
+        }
+
+        const std::string artifactKey =
+            baseUrl_ + '\n' + cacheRoot_.lexically_normal().string();
+        const std::string requestKey = artifactKey + '\n' + key;
+        std::shared_ptr<InFlightRequest> request;
+        bool ownsRequest = false;
+        bool announceStreaming = false;
         {
-            std::lock_guard<std::mutex> lock(ioMutex_);
+            std::lock_guard<std::mutex> lock(inFlightMutex_);
             if (std::filesystem::is_regular_file(path))
                 return read(path);
+            if (auto it = inFlight_.find(requestKey); it != inFlight_.end()) {
+                request = it->second;
+            } else {
+                request = std::make_shared<InFlightRequest>();
+                inFlight_.emplace(requestKey, request);
+                ownsRequest = true;
+                announceStreaming = announcedArtifacts_.insert(artifactKey).second;
+            }
         }
-        auto bytes = remote_.get_if_exists(key);
-        if (!bytes) return std::nullopt;
+
+        if (announceStreaming) {
+            std::clog << "[lasagna] streaming uncached data into "
+                      << cacheRoot_.string() << std::endl;
+        }
+
+        if (!ownsRequest) {
+            std::unique_lock<std::mutex> lock(inFlightMutex_);
+            request->finished.wait(lock, [&]() { return request->done; });
+            const auto error = request->error;
+            const bool found = request->found;
+            lock.unlock();
+            if (error)
+                std::rethrow_exception(error);
+            return found ? std::optional<std::vector<std::byte>>(read(path)) : std::nullopt;
+        }
+
+        std::optional<std::vector<std::byte>> bytes;
+        std::exception_ptr error;
+        try {
+            bytes = remote_.get_if_exists(key);
+            if (bytes)
+                // Preserve the source object byte-for-byte. Do not decode and
+                // re-encode it through the remote volume cache.
+                publish(path, *bytes);
+        } catch (...) {
+            error = std::current_exception();
+        }
+
+        size_t cachedCount = 0;
         {
-            std::lock_guard<std::mutex> lock(ioMutex_);
-            if (std::filesystem::is_regular_file(path))
-                return read(path);
-            publish(path, *bytes);
+            std::lock_guard<std::mutex> lock(inFlightMutex_);
+            request->found = bytes.has_value();
+            request->error = error;
+            request->done = true;
+            inFlight_.erase(requestKey);
+            if (bytes)
+                cachedCount = ++cachedObjectCounts_[artifactKey];
         }
+        request->finished.notify_all();
+        if (cachedCount != 0 && cachedCount % 64 == 0) {
+            std::clog << "[lasagna] cached " << cachedCount
+                      << " remote objects in " << cacheRoot_.string() << std::endl;
+        }
+        if (error)
+            std::rethrow_exception(error);
         return bytes;
     }
 
@@ -75,7 +159,20 @@ public:
     }
 
 private:
-    std::filesystem::path safePath(const std::string& key) const
+    struct InFlightRequest {
+        std::condition_variable finished;
+        bool done = false;
+        bool found = false;
+        std::exception_ptr error;
+    };
+
+    [[nodiscard]] static bool isMetadataPath(const std::filesystem::path& relative)
+    {
+        const auto filename = relative.filename().string();
+        return filename == ".zarray" || filename == "zarr.json";
+    }
+
+    [[nodiscard]] std::filesystem::path checkedRelativePath(const std::string& key) const
     {
         const std::filesystem::path relative(key);
         if (relative.empty() || relative.is_absolute())
@@ -83,7 +180,26 @@ private:
         const auto normalized = relative.lexically_normal();
         if (normalized.empty() || *normalized.begin() == "..")
             throw std::runtime_error("Remote Lasagna Zarr key escapes cache root: " + key);
-        return cacheRoot_ / normalized;
+        return normalized;
+    }
+
+    [[nodiscard]] std::filesystem::path metadataPath(
+        const std::filesystem::path& relative) const
+    {
+        return cacheRoot_ / ".lasagna-zarr-metadata" / relative;
+    }
+
+    [[nodiscard]] std::filesystem::path cachePath(
+        const std::filesystem::path& relative) const
+    {
+        return isMetadataPath(relative) ? metadataPath(relative)
+                                        : cacheRoot_ / relative;
+    }
+
+    [[nodiscard]] bool metadataExists(const std::filesystem::path& relative) const
+    {
+        return std::filesystem::is_regular_file(metadataPath(relative)) ||
+               std::filesystem::is_regular_file(cacheRoot_ / relative);
     }
 
     static std::vector<std::byte> read(const std::filesystem::path& path)
@@ -129,11 +245,19 @@ private:
     }
 
     utils::HttpStore remote_;
+    std::string baseUrl_;
     std::filesystem::path cacheRoot_;
-    static std::mutex ioMutex_;
+    static std::mutex inFlightMutex_;
+    static std::unordered_map<std::string, std::shared_ptr<InFlightRequest>> inFlight_;
+    static std::unordered_set<std::string> announcedArtifacts_;
+    static std::unordered_map<std::string, size_t> cachedObjectCounts_;
 };
 
-std::mutex PersistentHttpStore::ioMutex_;
+std::mutex PersistentHttpStore::inFlightMutex_;
+std::unordered_map<std::string, std::shared_ptr<PersistentHttpStore::InFlightRequest>>
+    PersistentHttpStore::inFlight_;
+std::unordered_set<std::string> PersistentHttpStore::announcedArtifacts_;
+std::unordered_map<std::string, size_t> PersistentHttpStore::cachedObjectCounts_;
 
 void loadRemoteMarker(LasagnaDatasetManifest& manifest)
 {

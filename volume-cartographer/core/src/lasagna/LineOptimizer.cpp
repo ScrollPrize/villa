@@ -1630,6 +1630,9 @@ using Clock = std::chrono::steady_clock;
     forward.reserve(static_cast<size_t>(config.segmentsPerSide));
 
     auto grow = [&](int sign, std::vector<std::array<double, 3>>& out) {
+        constexpr int kPrefetchLookaheadSteps = 12;
+        constexpr int kPrefetchRefreshSteps = 8;
+        std::vector<std::future<NormalPrefetchReport>> pendingPrefetches;
         cv::Vec3d point = seedPoint;
         cv::Vec3d direction = normalizedOrZero(seedTangent) * static_cast<double>(sign);
         NormalSample previousSample = sampler.sampleNormal(point);
@@ -1638,6 +1641,29 @@ using Clock = std::chrono::steady_clock;
             previousNormal = {0.0, 0.0, 0.0};
         }
         for (int i = 0; i < config.segmentsPerSide; ++i) {
+            if (i % kPrefetchRefreshSteps == 0) {
+                const int lookahead = std::min(
+                    kPrefetchLookaheadSteps, config.segmentsPerSide - i);
+                std::vector<cv::Vec3d> predictedPoints;
+                predictedPoints.reserve(static_cast<size_t>(lookahead));
+                for (int step = 1; step <= lookahead; ++step) {
+                    predictedPoints.push_back(
+                        point + direction * (config.segmentLength * static_cast<double>(step)));
+                }
+                if (sampler.supportsConcurrentSampling()) {
+                    pendingPrefetches.push_back(std::async(
+                        std::launch::async,
+                        [&sampler,
+                         predictedPoints = std::move(predictedPoints),
+                         withDerivative = config.differentiableNormalSampling]() {
+                            return sampler.prefetchNormalSamples(
+                                predictedPoints, withDerivative);
+                        }));
+                } else {
+                    (void)sampler.prefetchNormalSamples(
+                        predictedPoints, config.differentiableNormalSampling);
+                }
+            }
             const cv::Vec3d predicted = point + direction * config.segmentLength;
             const NormalSample sample = sampler.sampleNormal(predicted);
             cv::Vec3d normal = normalizedOrZero(sample.normal);
@@ -1651,10 +1677,22 @@ using Clock = std::chrono::steady_clock;
             point += direction * config.segmentLength;
             out.push_back(toArray(point));
         }
+        for (auto& prefetch : pendingPrefetches) {
+            (void)prefetch.get();
+        }
     };
 
-    grow(1, forward);
-    grow(-1, backward);
+    // Both halves depend on the seed but not on each other. Concurrent-capable
+    // samplers can construct them together while sharing the fixed-size read
+    // pool; simple/custom samplers retain the historical serial contract.
+    if (sampler.supportsConcurrentSampling()) {
+        auto forwardFuture = std::async(std::launch::async, [&]() { grow(1, forward); });
+        grow(-1, backward);
+        forwardFuture.get();
+    } else {
+        grow(1, forward);
+        grow(-1, backward);
+    }
 
     std::vector<std::array<double, 3>> points;
     points.reserve(backward.size() + 1 + forward.size());
@@ -1895,26 +1933,50 @@ struct OptimizedControlSpan {
     const cv::Vec3d& start,
     const cv::Vec3d& target,
     const NormalSampler& sampler,
-    const LineOptimizationConfig& config)
+    const LineOptimizationConfig& config,
+    std::optional<double> knownPathBudget = std::nullopt)
 {
-    const double budget = std::max(2.0 * length(target - start), 1000.0);
+    const double minimumBudget = knownPathBudget.value_or(1000.0);
+    const double budget = std::max(2.0 * length(target - start), minimumBudget);
     const int steps = std::max(1, static_cast<int>(std::ceil(budget / config.segmentLength)));
     const cv::Vec3d unsignedTangent = projectedChordTangentAtStart(start, target, sampler);
 
-    SpanRolloutResult positive = signedSpanRolloutCandidate(start,
-                                                            target,
-                                                            unsignedTangent,
-                                                            1,
-                                                            sampler,
-                                                            config,
-                                                            steps);
-    SpanRolloutResult negative = signedSpanRolloutCandidate(start,
-                                                            target,
-                                                            unsignedTangent,
-                                                            -1,
-                                                            sampler,
-                                                            config,
-                                                            steps);
+    SpanRolloutResult positive;
+    SpanRolloutResult negative;
+    if (sampler.supportsConcurrentSampling()) {
+        auto negativeFuture = std::async(std::launch::async, [&]() {
+            return signedSpanRolloutCandidate(start,
+                                              target,
+                                              unsignedTangent,
+                                              -1,
+                                              sampler,
+                                              config,
+                                              steps);
+        });
+        positive = signedSpanRolloutCandidate(start,
+                                              target,
+                                              unsignedTangent,
+                                              1,
+                                              sampler,
+                                              config,
+                                              steps);
+        negative = negativeFuture.get();
+    } else {
+        positive = signedSpanRolloutCandidate(start,
+                                              target,
+                                              unsignedTangent,
+                                              1,
+                                              sampler,
+                                              config,
+                                              steps);
+        negative = signedSpanRolloutCandidate(start,
+                                              target,
+                                              unsignedTangent,
+                                              -1,
+                                              sampler,
+                                              config,
+                                              steps);
+    }
     if (negative.closestTargetDistance < positive.closestTargetDistance) {
         return negative;
     }
@@ -1926,9 +1988,11 @@ struct OptimizedControlSpan {
     const cv::Vec3d& target,
     const cv::Vec3d& startDirection,
     const NormalSampler& sampler,
-    const LineOptimizationConfig& config)
+    const LineOptimizationConfig& config,
+    std::optional<double> knownPathBudget = std::nullopt)
 {
-    const double budget = std::max(2.0 * length(target - start), 1000.0);
+    const double minimumBudget = knownPathBudget.value_or(1000.0);
+    const double budget = std::max(2.0 * length(target - start), minimumBudget);
     const int steps = std::max(1, static_cast<int>(std::ceil(budget / config.segmentLength)));
     const cv::Vec3d tangent = projectedDirectionAtStart(start, startDirection, sampler);
     return signedSpanRolloutCandidate(start,
@@ -2006,6 +2070,9 @@ void growNormalConstructedExtension(
     const LineOptimizationConfig& config,
     std::vector<std::array<double, 3>>& out)
 {
+    constexpr int kPrefetchLookaheadSteps = 12;
+    constexpr int kPrefetchRefreshSteps = 8;
+    std::vector<std::future<NormalPrefetchReport>> pendingPrefetches;
     cv::Vec3d point = startPoint;
     direction = normalizedOrZero(direction);
     if (length(direction) <= kEpsilon) {
@@ -2018,6 +2085,29 @@ void growNormalConstructedExtension(
     }
     out.reserve(static_cast<size_t>(config.segmentsPerSide));
     for (int i = 0; i < config.segmentsPerSide; ++i) {
+        if (i % kPrefetchRefreshSteps == 0) {
+            const int lookahead = std::min(
+                kPrefetchLookaheadSteps, config.segmentsPerSide - i);
+            std::vector<cv::Vec3d> predictedPoints;
+            predictedPoints.reserve(static_cast<size_t>(lookahead));
+            for (int step = 1; step <= lookahead; ++step) {
+                predictedPoints.push_back(
+                    point + direction * (config.segmentLength * static_cast<double>(step)));
+            }
+            if (sampler.supportsConcurrentSampling()) {
+                pendingPrefetches.push_back(std::async(
+                    std::launch::async,
+                    [&sampler,
+                     predictedPoints = std::move(predictedPoints),
+                     withDerivative = config.differentiableNormalSampling]() {
+                        return sampler.prefetchNormalSamples(
+                            predictedPoints, withDerivative);
+                    }));
+            } else {
+                (void)sampler.prefetchNormalSamples(
+                    predictedPoints, config.differentiableNormalSampling);
+            }
+        }
         const cv::Vec3d predicted = point + direction * config.segmentLength;
         const NormalSample sample = sampler.sampleNormal(predicted);
         cv::Vec3d normal = normalizedOrZero(sample.normal);
@@ -2030,6 +2120,9 @@ void growNormalConstructedExtension(
         }
         point += direction * config.segmentLength;
         out.push_back(toArray(point));
+    }
+    for (auto& prefetch : pendingPrefetches) {
+        (void)prefetch.get();
     }
 }
 
@@ -2740,17 +2833,41 @@ struct LineDifference {
     std::string candidatePrefix,
     std::optional<SpanRolloutResult> existingRollout = std::nullopt,
     std::optional<cv::Vec3d> leftContinuationDirection = std::nullopt,
-    std::optional<cv::Vec3d> rightContinuationDirection = std::nullopt)
+    std::optional<cv::Vec3d> rightContinuationDirection = std::nullopt,
+    std::optional<double> knownPathBudget = std::nullopt)
 {
     if (length(rightPoint - leftPoint) <= kEpsilon) {
         throw std::invalid_argument("Adjacent reinitialization control points are coincident");
     }
 
-    const SpanRolloutResult leftRollout =
-        spanRolloutCandidate(leftPoint, rightPoint, sampler, config);
-
-    SpanRolloutResult rightRollout =
-        spanRolloutCandidate(rightPoint, leftPoint, sampler, config);
+    SpanRolloutResult leftRollout;
+    SpanRolloutResult rightRollout;
+    if (sampler.supportsConcurrentSampling()) {
+        auto rightRolloutFuture = std::async(std::launch::async, [&]() {
+            return spanRolloutCandidate(rightPoint,
+                                        leftPoint,
+                                        sampler,
+                                        config,
+                                        knownPathBudget);
+        });
+        leftRollout = spanRolloutCandidate(leftPoint,
+                                           rightPoint,
+                                           sampler,
+                                           config,
+                                           knownPathBudget);
+        rightRollout = rightRolloutFuture.get();
+    } else {
+        leftRollout = spanRolloutCandidate(leftPoint,
+                                           rightPoint,
+                                           sampler,
+                                           config,
+                                           knownPathBudget);
+        rightRollout = spanRolloutCandidate(rightPoint,
+                                            leftPoint,
+                                            sampler,
+                                            config,
+                                            knownPathBudget);
+    }
     std::reverse(rightRollout.points.begin(), rightRollout.points.end());
     if (!rightRollout.points.empty()) {
         rightRollout.points.front() = leftPoint;
@@ -2774,10 +2891,22 @@ struct LineDifference {
                                     spanStart);
     };
 
-    GlobalSolveResult leftSolved =
-        solveRollout(candidatePrefix + "-left-" + std::to_string(segmentIndex), leftRollout);
-    GlobalSolveResult rightSolved =
-        solveRollout(candidatePrefix + "-right-" + std::to_string(segmentIndex), rightRollout);
+    GlobalSolveResult leftSolved;
+    GlobalSolveResult rightSolved;
+    if (sampler.supportsConcurrentSampling()) {
+        auto rightSolveFuture = std::async(std::launch::async, [&]() {
+            return solveRollout(candidatePrefix + "-right-" + std::to_string(segmentIndex),
+                                rightRollout);
+        });
+        leftSolved = solveRollout(candidatePrefix + "-left-" + std::to_string(segmentIndex),
+                                  leftRollout);
+        rightSolved = rightSolveFuture.get();
+    } else {
+        leftSolved = solveRollout(candidatePrefix + "-left-" + std::to_string(segmentIndex),
+                                  leftRollout);
+        rightSolved = solveRollout(candidatePrefix + "-right-" + std::to_string(segmentIndex),
+                                   rightRollout);
+    }
 
     std::optional<GlobalSolveResult> existingSolved;
     if (existingRollout.has_value()) {
@@ -2794,7 +2923,8 @@ struct LineDifference {
                                                            rightPoint,
                                                            *leftContinuationDirection,
                                                            sampler,
-                                                           config);
+                                                           config,
+                                                           knownPathBudget);
         continueLeftSolved =
             solveRollout(candidatePrefix + "-continue-left-" + std::to_string(segmentIndex),
                          *continueLeftRollout);
@@ -2808,7 +2938,8 @@ struct LineDifference {
                                                             leftPoint,
                                                             *rightContinuationDirection,
                                                             sampler,
-                                                            config);
+                                                            config,
+                                                            knownPathBudget);
         std::reverse(continueRightRollout->points.begin(), continueRightRollout->points.end());
         if (!continueRightRollout->points.empty()) {
             continueRightRollout->points.front() = leftPoint;
@@ -3565,6 +3696,27 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
         ? controlPoints[static_cast<size_t>(changedSortedIndex + 1)].linePosition
         : controlPoints[static_cast<size_t>(changedSortedIndex)].linePosition;
 
+    const auto knownPathBudget = [&](const LineControlPoint& left,
+                                     const LineControlPoint& right) {
+        const double startPosition = std::min(left.linePosition, right.linePosition);
+        const double endPosition = std::max(left.linePosition, right.linePosition);
+        std::vector<cv::Vec3d> existingSpan;
+        existingSpan.push_back(interpolateInitialLinePoint(linePoints, startPosition));
+        for (int index = static_cast<int>(std::floor(startPosition)) + 1;
+             static_cast<double>(index) < endPosition;
+             ++index) {
+            if (index >= 0 && index < static_cast<int>(linePoints.size())) {
+                existingSpan.push_back(linePoints[static_cast<size_t>(index)]);
+            }
+        }
+        existingSpan.push_back(interpolateInitialLinePoint(linePoints, endPosition));
+        const double existingArcLength = polylineLength(existingSpan);
+        const double endpointDistance = length(right.volumePoint - left.volumePoint);
+        return 2.0 * std::max({existingArcLength,
+                               endpointDistance,
+                               2.0 * config.segmentLength});
+    };
+
     std::vector<cv::Vec3d> replacement;
     std::vector<LineReinitializationSpanReport> initializedSpans;
     if (hasLeft) {
@@ -3577,7 +3729,13 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
                                  leftIndex,
                                  leftIndex,
                                  changedSortedIndex,
-                                 "control-update-span");
+                                 "control-update-span",
+                                 std::nullopt,
+                                 std::nullopt,
+                                 std::nullopt,
+                                 knownPathBudget(
+                                     controlPoints[static_cast<size_t>(leftIndex)],
+                                     controlPoints[static_cast<size_t>(changedSortedIndex)]));
         initializedSpans.push_back(leftSpan.report);
         replacement.reserve(leftSpan.points.size());
         for (const auto& point : leftSpan.points) {
@@ -3594,7 +3752,13 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
                                  changedSortedIndex,
                                  changedSortedIndex,
                                  rightIndex,
-                                 "control-update-span");
+                                 "control-update-span",
+                                 std::nullopt,
+                                 std::nullopt,
+                                 std::nullopt,
+                                 knownPathBudget(
+                                     controlPoints[static_cast<size_t>(changedSortedIndex)],
+                                     controlPoints[static_cast<size_t>(rightIndex)]));
         initializedSpans.push_back(rightSpan.report);
         if (!replacement.empty()) {
             for (size_t i = 1; i < rightSpan.points.size(); ++i) {
@@ -3727,6 +3891,7 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
     const LineOptimizationConfig& rawConfig) const
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
+    (void)normalSampler_.prefetchNormalSamples({seedPoint}, false);
     const NormalSample seedNormal = normalSampler_.sampleNormal(seedPoint);
     const cv::Vec3d tangent = initialTangentFromConfig(seedNormal, config);
 

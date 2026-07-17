@@ -1,11 +1,13 @@
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
+#include "utils/thread_pool.hpp"
 #include "utils/zarr.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -28,6 +30,22 @@ namespace vc::lasagna {
 namespace {
 
 constexpr double kEpsilon = 1.0e-12;
+
+[[nodiscard]] size_t normalReadWorkersPerChannel()
+{
+    const unsigned hardwareThreads = std::thread::hardware_concurrency();
+    return std::clamp<size_t>(
+        hardwareThreads == 0 ? 4 : static_cast<size_t>(hardwareThreads), 1, 8);
+}
+
+[[nodiscard]] utils::ThreadPool& normalReadPool()
+{
+    // The three channel groups were already allowed this aggregate concurrency
+    // (multiple readers per group). Keeping those workers alive lets
+    // libcurl reuse their S3 connections between short prefetch batches.
+    static auto* pool = new utils::ThreadPool(normalReadWorkersPerChannel() * 3);
+    return *pool;
+}
 
 [[nodiscard]] double length(const cv::Vec3d& v)
 {
@@ -167,112 +185,29 @@ struct ChannelBinding {
     return (localZ * binding.chunksZYX[1] + localY) * binding.chunksZYX[2] + localX;
 }
 
-[[nodiscard]] std::shared_ptr<const CachedChunk> buildHaloChunk(
+[[nodiscard]] std::shared_ptr<const CachedChunk> readSourceChunk(
     const ChannelBinding& binding,
     const utils::ZarrArray& array,
     const ChunkKey& key)
 {
-    const size_t chunkZIndex = key.z;
-    const size_t chunkYIndex = key.y;
-    const size_t chunkXIndex = key.x;
-    const size_t originZ = chunkZIndex * binding.chunksZYX[0];
-    const size_t originY = chunkYIndex * binding.chunksZYX[1];
-    const size_t originX = chunkXIndex * binding.chunksZYX[2];
+    const size_t originZ = static_cast<size_t>(key.z) * binding.chunksZYX[0];
+    const size_t originY = static_cast<size_t>(key.y) * binding.chunksZYX[1];
+    const size_t originX = static_cast<size_t>(key.x) * binding.chunksZYX[2];
     if (originZ >= binding.shapeZYX[0] ||
         originY >= binding.shapeZYX[1] ||
         originX >= binding.shapeZYX[2]) {
         return nullptr;
     }
 
+    const auto source = array.read_chunk(chunkPathIndicesForKey(binding, key));
+    if (!source.has_value()) {
+        return nullptr;
+    }
+
     auto cached = std::make_shared<CachedChunk>();
-    cached->dimsZYX = {
-        binding.chunksZYX[0] + 2,
-        binding.chunksZYX[1] + 2,
-        binding.chunksZYX[2] + 2,
-    };
-    cached->values.resize(cached->dimsZYX[0] * cached->dimsZYX[1] * cached->dimsZYX[2], 0);
-
-    std::unordered_map<ChunkKey, std::optional<std::vector<std::byte>>, ChunkKeyHash> sourceChunks;
-    sourceChunks.reserve(27);
-    for (int dz = -1; dz <= 1; ++dz) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                const int64_t nz = static_cast<int64_t>(chunkZIndex) + dz;
-                const int64_t ny = static_cast<int64_t>(chunkYIndex) + dy;
-                const int64_t nx = static_cast<int64_t>(chunkXIndex) + dx;
-                if (nz < 0 || ny < 0 || nx < 0) {
-                    continue;
-                }
-                const size_t neighborOriginZ = static_cast<size_t>(nz) * binding.chunksZYX[0];
-                const size_t neighborOriginY = static_cast<size_t>(ny) * binding.chunksZYX[1];
-                const size_t neighborOriginX = static_cast<size_t>(nx) * binding.chunksZYX[2];
-                if (neighborOriginZ >= binding.shapeZYX[0] ||
-                    neighborOriginY >= binding.shapeZYX[1] ||
-                    neighborOriginX >= binding.shapeZYX[2]) {
-                    continue;
-                }
-                std::vector<size_t> indices;
-                if (binding.hasChannelDimension) {
-                    const auto& chunks = binding.array->metadata().chunks;
-                    indices = {
-                        binding.channelIndex / chunks[0],
-                        static_cast<size_t>(nz),
-                        static_cast<size_t>(ny),
-                        static_cast<size_t>(nx),
-                    };
-                } else {
-                    indices = {
-                        static_cast<size_t>(nz),
-                        static_cast<size_t>(ny),
-                        static_cast<size_t>(nx),
-                    };
-                }
-                ChunkKey neighborKey{
-                    binding.arrayId,
-                    static_cast<uint32_t>(binding.channelIndex),
-                    checkedChunkIndex(static_cast<size_t>(nz)),
-                    checkedChunkIndex(static_cast<size_t>(ny)),
-                    checkedChunkIndex(static_cast<size_t>(nx)),
-                };
-                sourceChunks.emplace(neighborKey, array.read_chunk(indices));
-            }
-        }
-    }
-
-    const auto readSourceVoxel = [&](size_t gz, size_t gy, size_t gx) -> uint8_t {
-        gz = std::min(gz, binding.shapeZYX[0] - 1);
-        gy = std::min(gy, binding.shapeZYX[1] - 1);
-        gx = std::min(gx, binding.shapeZYX[2] - 1);
-        const ChunkKey sourceKey = chunkKeyForVoxel(binding, gz, gy, gx);
-        auto it = sourceChunks.find(sourceKey);
-        if (it == sourceChunks.end() || !it->second.has_value()) {
-            return 0;
-        }
-        const size_t localZ = gz % binding.chunksZYX[0];
-        const size_t localY = gy % binding.chunksZYX[1];
-        const size_t localX = gx % binding.chunksZYX[2];
-        const size_t offset = originalChunkOffset(binding, localZ, localY, localX);
-        if (offset >= it->second->size()) {
-            throw std::runtime_error("Lasagna zarr chunk is smaller than expected at chunk " +
-                                     chunkKeyToString(sourceKey));
-        }
-        return static_cast<uint8_t>((*it->second)[offset]);
-    };
-
-    for (size_t hz = 0; hz < cached->dimsZYX[0]; ++hz) {
-        const int64_t gzSigned = static_cast<int64_t>(originZ) + static_cast<int64_t>(hz) - 1;
-        const size_t gz = gzSigned < 0 ? 0 : static_cast<size_t>(gzSigned);
-        for (size_t hy = 0; hy < cached->dimsZYX[1]; ++hy) {
-            const int64_t gySigned = static_cast<int64_t>(originY) + static_cast<int64_t>(hy) - 1;
-            const size_t gy = gySigned < 0 ? 0 : static_cast<size_t>(gySigned);
-            for (size_t hx = 0; hx < cached->dimsZYX[2]; ++hx) {
-                const int64_t gxSigned = static_cast<int64_t>(originX) + static_cast<int64_t>(hx) - 1;
-                const size_t gx = gxSigned < 0 ? 0 : static_cast<size_t>(gxSigned);
-                cached->values[(hz * cached->dimsZYX[1] + hy) * cached->dimsZYX[2] + hx] =
-                    readSourceVoxel(gz, gy, gx);
-            }
-        }
-    }
+    cached->dimsZYX = binding.chunksZYX;
+    cached->values.resize(source->size());
+    std::memcpy(cached->values.data(), source->data(), source->size());
 
     return cached;
 }
@@ -281,6 +216,7 @@ class ChunkCache {
 public:
     using ResolvedChunkMap =
         std::unordered_map<ChunkKey, std::shared_ptr<const CachedChunk>, ChunkKeyHash>;
+    using PrefetchRequest = std::pair<const ChannelBinding*, ChunkKey>;
 
     explicit ChunkCache(size_t capacityBytes)
         : capacityBytes_(std::max<size_t>(1, capacityBytes))
@@ -292,16 +228,7 @@ public:
         const utils::ZarrArray& array,
         const ChunkKey& key) const
     {
-        {
-            std::unique_lock<std::shared_mutex> lock(mutex_);
-            if (auto it = entries_.find(key); it != entries_.end()) {
-                lru_.splice(lru_.begin(), lru_, it->second.lruIt);
-                return it->second.bytes;
-            }
-        }
-
-        store(key, buildHaloChunk(binding, array, key));
-        return getCached(key);
+        return load(binding, array, key);
     }
 
     [[nodiscard]] NormalPrefetchReport prefetchResolved(
@@ -313,18 +240,17 @@ public:
     {
         NormalPrefetchReport report;
         resolved.clear();
-        std::unordered_set<ChunkKey, ChunkKeyHash> uniqueKeys;
-        uniqueKeys.reserve(keys.size());
-        for (const auto& key : keys) {
-            uniqueKeys.insert(key);
-        }
-        report.requestedChunks = uniqueKeys.size();
-
         std::vector<ChunkKey> missing;
-        missing.reserve(uniqueKeys.size());
+        missing.reserve(keys.size());
+        std::unordered_set<ChunkKey, ChunkKeyHash> seen;
+        seen.reserve(keys.size());
         {
             std::shared_lock<std::shared_mutex> lock(mutex_);
-            for (const auto& key : uniqueKeys) {
+            for (const auto& key : keys) {
+                if (!seen.insert(key).second) {
+                    continue;
+                }
+                ++report.requestedChunks;
                 if (auto it = entries_.find(key); it != entries_.end()) {
                     resolved.emplace(key, it->second.bytes);
                 } else {
@@ -339,17 +265,14 @@ public:
             futures.reserve(maxWorkers);
             std::atomic<size_t> next{0};
             for (size_t worker = 0; worker < maxWorkers; ++worker) {
-                futures.push_back(std::async(std::launch::async, [this, &binding, &array, &missing, &next]() {
+                futures.push_back(normalReadPool().submit([this, &binding, &array, &missing, &next]() {
                     while (true) {
                         const size_t index = next.fetch_add(1);
                         if (index >= missing.size()) {
                             return;
                         }
                         const ChunkKey key = missing[index];
-                        if (getCached(key)) {
-                            continue;
-                        }
-                        store(key, buildHaloChunk(binding, array, key));
+                        (void)load(binding, array, key);
                     }
                 }));
             }
@@ -366,55 +289,38 @@ public:
         return report;
     }
 
-    [[nodiscard]] NormalPrefetchReport prefetch(
-        const ChannelBinding& binding,
-        const utils::ZarrArray& array,
-        const std::vector<ChunkKey>& keys,
-        size_t maxWorkers) const
+    [[nodiscard]] NormalPrefetchReport prefetchInterleaved(
+        const std::vector<PrefetchRequest>& requests) const
     {
+        // Requests arrive as nearest-first spatial channel groups. Queue one
+        // object per task so the fixed-size pool starts all components of a
+        // useful normal together, while still capping aggregate HTTP work.
         NormalPrefetchReport report;
-        std::vector<ChunkKey> missing;
-        missing.reserve(keys.size());
+        std::vector<PrefetchRequest> missing;
+        missing.reserve(requests.size());
         std::unordered_set<ChunkKey, ChunkKeyHash> seen;
-        seen.reserve(keys.size());
-        for (const auto& key : keys) {
-            if (seen.insert(key).second) {
-                ++report.requestedChunks;
-            }
-        }
+        seen.reserve(requests.size());
         {
             std::shared_lock<std::shared_mutex> lock(mutex_);
-            for (const auto& key : seen) {
-                if (entries_.find(key) != entries_.end()) {
+            for (const auto& request : requests) {
+                if (!seen.insert(request.second).second) {
                     continue;
                 }
-                missing.push_back(key);
+                ++report.requestedChunks;
+                if (entries_.find(request.second) == entries_.end()) {
+                    missing.push_back(request);
+                }
             }
         }
         report.chunksRead = missing.size();
 
-        if (missing.empty()) {
-            return report;
-        }
-
-        maxWorkers = std::clamp<size_t>(maxWorkers, 1, missing.size());
         std::vector<std::future<void>> futures;
-        futures.reserve(maxWorkers);
-        std::atomic<size_t> next{0};
-        for (size_t worker = 0; worker < maxWorkers; ++worker) {
-            futures.push_back(std::async(std::launch::async, [this, &binding, &array, &missing, &next]() {
-                while (true) {
-                    const size_t index = next.fetch_add(1);
-                    if (index >= missing.size()) {
-                        return;
-                    }
-                    const ChunkKey key = missing[index];
-                    if (getCached(key)) {
-                        continue;
-                    }
-                    store(key, buildHaloChunk(binding, array, key));
-                }
-            }));
+        futures.reserve(missing.size());
+        for (const auto& request : missing) {
+            futures.push_back(normalReadPool().submit(
+                [this, binding = request.first, key = request.second]() {
+                    (void)load(*binding, *binding->array, key);
+                }));
         }
         for (auto& future : futures) {
             future.get();
@@ -423,6 +329,73 @@ public:
     }
 
 private:
+    struct InFlightLoad {
+        std::mutex mutex;
+        std::condition_variable finished;
+        bool done = false;
+        std::shared_ptr<const CachedChunk> bytes;
+        std::exception_ptr error;
+    };
+
+    [[nodiscard]] std::shared_ptr<const CachedChunk> load(
+        const ChannelBinding& binding,
+        const utils::ZarrArray& array,
+        const ChunkKey& key) const
+    {
+        std::shared_ptr<InFlightLoad> request;
+        bool ownsRequest = false;
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            if (auto it = entries_.find(key); it != entries_.end()) {
+                lru_.splice(lru_.begin(), lru_, it->second.lruIt);
+                return it->second.bytes;
+            }
+            if (auto it = inFlight_.find(key); it != inFlight_.end()) {
+                request = it->second;
+            } else {
+                request = std::make_shared<InFlightLoad>();
+                inFlight_.emplace(key, request);
+                ownsRequest = true;
+            }
+        }
+
+        if (!ownsRequest) {
+            std::unique_lock<std::mutex> lock(request->mutex);
+            request->finished.wait(lock, [&]() { return request->done; });
+            if (request->error) {
+                std::rethrow_exception(request->error);
+            }
+            return request->bytes;
+        }
+
+        std::shared_ptr<const CachedChunk> bytes;
+        std::exception_ptr error;
+        try {
+            bytes = readSourceChunk(binding, array, key);
+            store(key, bytes);
+        } catch (...) {
+            error = std::current_exception();
+        }
+        {
+            std::lock_guard<std::mutex> lock(request->mutex);
+            request->bytes = bytes;
+            request->error = error;
+            request->done = true;
+        }
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            if (auto it = inFlight_.find(key);
+                it != inFlight_.end() && it->second == request) {
+                inFlight_.erase(it);
+            }
+        }
+        request->finished.notify_all();
+        if (error) {
+            std::rethrow_exception(error);
+        }
+        return bytes;
+    }
+
     [[nodiscard]] std::shared_ptr<const CachedChunk> getCached(const ChunkKey& key) const
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -480,6 +453,7 @@ private:
     mutable std::shared_mutex mutex_;
     mutable std::list<ChunkKey> lru_;
     mutable std::unordered_map<ChunkKey, Entry, ChunkKeyHash> entries_;
+    mutable std::unordered_map<ChunkKey, std::shared_ptr<InFlightLoad>, ChunkKeyHash> inFlight_;
 };
 
 [[nodiscard]] std::shared_ptr<ChunkCache> sharedNormalChunkCache(size_t capacityBytes)
@@ -586,12 +560,12 @@ private:
         return std::nullopt;
     }
 
-    const size_t localZ = (z % binding.chunksZYX[0]) + 1;
-    const size_t localY = (y % binding.chunksZYX[1]) + 1;
-    const size_t localX = (x % binding.chunksZYX[2]) + 1;
-    const size_t offset = (localZ * chunk->dimsZYX[1] + localY) * chunk->dimsZYX[2] + localX;
+    const size_t localZ = z % binding.chunksZYX[0];
+    const size_t localY = y % binding.chunksZYX[1];
+    const size_t localX = x % binding.chunksZYX[2];
+    const size_t offset = originalChunkOffset(binding, localZ, localY, localX);
     if (offset >= chunk->values.size()) {
-        throw std::runtime_error("Lasagna cached halo chunk is smaller than expected at chunk " +
+        throw std::runtime_error("Lasagna cached source chunk is smaller than expected at chunk " +
                                  chunkKeyToString(key));
     }
     return chunk->values[offset];
@@ -616,8 +590,8 @@ struct CubeRequest {
     double fx = 0.0;
     double fy = 0.0;
     double fz = 0.0;
-    ChunkKey key{};
-    std::shared_ptr<const CachedChunk> chunk;
+    std::array<ChunkKey, 8> keys{};
+    std::array<std::shared_ptr<const CachedChunk>, 8> chunks{};
 };
 
 struct PreparedNormalPoint {
@@ -650,47 +624,71 @@ struct PreparedNormalPoint {
     request.fx = x - static_cast<double>(request.x0);
     request.fy = y - static_cast<double>(request.y0);
     request.fz = z - static_cast<double>(request.z0);
-    request.key = chunkKeyForVoxel(binding, request.z0, request.y0, request.x0);
+    size_t cubeIndex = 0;
+    for (size_t dz = 0; dz <= 1; ++dz) {
+        const size_t gz = std::min(request.z0 + dz, binding.shapeZYX[0] - 1);
+        for (size_t dy = 0; dy <= 1; ++dy) {
+            const size_t gy = std::min(request.y0 + dy, binding.shapeZYX[1] - 1);
+            for (size_t dx = 0; dx <= 1; ++dx) {
+                const size_t gx = std::min(request.x0 + dx, binding.shapeZYX[2] - 1);
+                request.keys[cubeIndex++] = chunkKeyForVoxel(binding, gz, gy, gx);
+            }
+        }
+    }
     request.valid = true;
     return request;
 }
 
-[[nodiscard]] std::optional<CubeValues> readInterpolationCube(
+[[nodiscard]] std::optional<double> readSourceVoxel(
     const ChannelBinding& binding,
     const ChunkKey& key,
     const std::shared_ptr<const CachedChunk>& chunk,
-    size_t z0,
-    size_t y0,
-    size_t x0)
+    size_t z,
+    size_t y,
+    size_t x)
 {
     if (chunk == nullptr) {
         return std::nullopt;
     }
+    const size_t offset = originalChunkOffset(
+        binding,
+        z % binding.chunksZYX[0],
+        y % binding.chunksZYX[1],
+        x % binding.chunksZYX[2]);
+    if (offset >= chunk->values.size()) {
+        throw std::runtime_error("Lasagna cached source chunk is smaller than expected at chunk " +
+                                 chunkKeyToString(key));
+    }
+    return static_cast<double>(chunk->values[offset]);
+}
 
-    const size_t localZ = (z0 % binding.chunksZYX[0]) + 1;
-    const size_t localY = (y0 % binding.chunksZYX[1]) + 1;
-    const size_t localX = (x0 % binding.chunksZYX[2]) + 1;
-    const auto value = [&](size_t dz, size_t dy, size_t dx) -> double {
-        const size_t offset = ((localZ + dz) * chunk->dimsZYX[1] + (localY + dy)) *
-                                  chunk->dimsZYX[2] +
-                              (localX + dx);
-        if (offset >= chunk->values.size()) {
-            throw std::runtime_error("Lasagna cached halo chunk is smaller than expected at chunk " +
-                                     chunkKeyToString(key));
+[[nodiscard]] std::optional<CubeValues> readInterpolationCube(
+    const ChannelBinding& binding,
+    const CubeRequest& request)
+{
+    if (!request.valid) {
+        return std::nullopt;
+    }
+
+    std::array<double, 8> values{};
+    size_t cubeIndex = 0;
+    for (size_t dz = 0; dz <= 1; ++dz) {
+        const size_t z = std::min(request.z0 + dz, binding.shapeZYX[0] - 1);
+        for (size_t dy = 0; dy <= 1; ++dy) {
+            const size_t y = std::min(request.y0 + dy, binding.shapeZYX[1] - 1);
+            for (size_t dx = 0; dx <= 1; ++dx) {
+                const size_t x = std::min(request.x0 + dx, binding.shapeZYX[2] - 1);
+                const auto value = readSourceVoxel(
+                    binding, request.keys[cubeIndex], request.chunks[cubeIndex], z, y, x);
+                if (!value.has_value()) {
+                    return std::nullopt;
+                }
+                values[cubeIndex++] = *value;
+            }
         }
-        return static_cast<double>(chunk->values[offset]);
-    };
-
-    return CubeValues{
-        value(0, 0, 0),
-        value(0, 0, 1),
-        value(0, 1, 0),
-        value(0, 1, 1),
-        value(1, 0, 0),
-        value(1, 0, 1),
-        value(1, 1, 0),
-        value(1, 1, 1),
-    };
+    }
+    return CubeValues{values[0], values[1], values[2], values[3],
+                      values[4], values[5], values[6], values[7]};
 }
 
 [[nodiscard]] std::optional<CubeValues> readInterpolationCube(
@@ -700,8 +698,26 @@ struct PreparedNormalPoint {
     size_t y0,
     size_t x0)
 {
-    const ChunkKey key = chunkKeyForVoxel(binding, z0, y0, x0);
-    return readInterpolationCube(binding, key, cache.get(binding, *binding.array, key), z0, y0, x0);
+    CubeRequest request;
+    request.valid = true;
+    request.z0 = z0;
+    request.y0 = y0;
+    request.x0 = x0;
+    size_t cubeIndex = 0;
+    for (size_t dz = 0; dz <= 1; ++dz) {
+        const size_t z = std::min(z0 + dz, binding.shapeZYX[0] - 1);
+        for (size_t dy = 0; dy <= 1; ++dy) {
+            const size_t y = std::min(y0 + dy, binding.shapeZYX[1] - 1);
+            for (size_t dx = 0; dx <= 1; ++dx) {
+                const size_t x = std::min(x0 + dx, binding.shapeZYX[2] - 1);
+                request.keys[cubeIndex] = chunkKeyForVoxel(binding, z, y, x);
+                request.chunks[cubeIndex] = cache.get(
+                    binding, *binding.array, request.keys[cubeIndex]);
+                ++cubeIndex;
+            }
+        }
+    }
+    return readInterpolationCube(binding, request);
 }
 
 void appendInterpolationChunkKeys(
@@ -725,7 +741,16 @@ void appendInterpolationChunkKeys(
     const size_t x0 = static_cast<size_t>(std::floor(x));
     const size_t y0 = static_cast<size_t>(std::floor(y));
     const size_t z0 = static_cast<size_t>(std::floor(z));
-    keys.push_back(chunkKeyForVoxel(binding, z0, y0, x0));
+    for (size_t dz = 0; dz <= 1; ++dz) {
+        const size_t gz = std::min(z0 + dz, binding.shapeZYX[0] - 1);
+        for (size_t dy = 0; dy <= 1; ++dy) {
+            const size_t gy = std::min(y0 + dy, binding.shapeZYX[1] - 1);
+            for (size_t dx = 0; dx <= 1; ++dx) {
+                const size_t gx = std::min(x0 + dx, binding.shapeZYX[2] - 1);
+                keys.push_back(chunkKeyForVoxel(binding, gz, gy, gx));
+            }
+        }
+    }
 }
 
 [[nodiscard]] std::optional<double> sampleChannel(
@@ -774,8 +799,7 @@ void appendInterpolationChunkKeys(
     if (!request.valid) {
         return std::nullopt;
     }
-    const auto cube = readInterpolationCube(
-        binding, request.key, request.chunk, request.z0, request.y0, request.x0);
+    const auto cube = readInterpolationCube(binding, request);
     if (!cube.has_value()) {
         return std::nullopt;
     }
@@ -946,10 +970,8 @@ void appendInterpolationChunkKeys(
     if (!nxRequest.valid || !nyRequest.valid) {
         return std::nullopt;
     }
-    const auto nxCube = readInterpolationCube(
-        nxBinding, nxRequest.key, nxRequest.chunk, nxRequest.z0, nxRequest.y0, nxRequest.x0);
-    const auto nyCube = readInterpolationCube(
-        nyBinding, nyRequest.key, nyRequest.chunk, nyRequest.z0, nyRequest.y0, nyRequest.x0);
+    const auto nxCube = readInterpolationCube(nxBinding, nxRequest);
+    const auto nyCube = readInterpolationCube(nyBinding, nyRequest);
     if (!nxCube.has_value() || !nyCube.has_value()) {
         return std::nullopt;
     }
@@ -1040,20 +1062,28 @@ double requiredPositiveManifestDouble(
 class LasagnaNormalSampler::Impl {
 public:
     Impl(const LasagnaDataset& dataset, LasagnaNormalSamplerOptions options)
-        : nx_(bindChannel(dataset.manifest(), "nx"))
-        , ny_(bindChannel(dataset.manifest(), "ny"))
-        , gradMag_(bindChannel(dataset.manifest(), "grad_mag"))
-        , gradMagDecodeScale_(
+        : gradMagDecodeScale_(
               requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_encode_scale") /
               requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_factor"))
         , options_(options)
         , cache_(sharedNormalChunkCache(options.maxCachedBytes))
     {
+        const LasagnaDatasetManifest& manifest = dataset.manifest();
+        auto nxFuture = normalReadPool().submit(
+            [&manifest]() { return bindChannel(manifest, "nx"); });
+        auto nyFuture = normalReadPool().submit(
+            [&manifest]() { return bindChannel(manifest, "ny"); });
+        auto gradMagFuture = normalReadPool().submit(
+            [&manifest]() { return bindChannel(manifest, "grad_mag"); });
+        nx_ = nxFuture.get();
+        ny_ = nyFuture.get();
+        gradMag_ = gradMagFuture.get();
+
         if (nx_.shapeZYX != ny_.shapeZYX) {
             throw std::runtime_error("Lasagna nx and ny channels must have matching spatial shapes");
         }
-        if (dataset.manifest().groupForChannel("pred_dt") != nullptr) {
-            predDt_ = bindChannel(dataset.manifest(), "pred_dt");
+        if (manifest.groupForChannel("pred_dt") != nullptr) {
+            predDt_ = bindChannel(manifest, "pred_dt");
         }
     }
 
@@ -1183,33 +1213,23 @@ public:
             appendInterpolationChunkKeys(ny_, point, nyKeys);
         }
 
-        const unsigned hardwareThreads = std::thread::hardware_concurrency();
-        const size_t workers = std::clamp<size_t>(
-            hardwareThreads == 0 ? 4 : static_cast<size_t>(hardwareThreads),
-            1,
-            8);
-
-        auto gradMagPrefetch = std::async(std::launch::async, [&]() {
-            return cache_->prefetch(gradMag_, *gradMag_.array, gradMagKeys, workers);
-        });
-        auto nxPrefetch = std::async(std::launch::async, [&]() {
-            return cache_->prefetch(nx_, *nx_.array, nxKeys, workers);
-        });
-        auto nyPrefetch = std::async(std::launch::async, [&]() {
-            return cache_->prefetch(ny_, *ny_.array, nyKeys, workers);
-        });
-        NormalPrefetchReport report;
-        const NormalPrefetchReport gradMagReport = gradMagPrefetch.get();
-        const NormalPrefetchReport nxReport = nxPrefetch.get();
-        const NormalPrefetchReport nyReport = nyPrefetch.get();
-        report.requestedChunks = gradMagReport.requestedChunks +
-                                 nxReport.requestedChunks +
-                                 nyReport.requestedChunks;
-        report.chunksRead = gradMagReport.chunksRead +
-                            nxReport.chunksRead +
-                            nyReport.chunksRead;
+        std::vector<ChunkCache::PrefetchRequest> requests;
+        requests.reserve(gradMagKeys.size() + nxKeys.size() + nyKeys.size());
+        const size_t keyCount = std::max({
+            gradMagKeys.size(), nxKeys.size(), nyKeys.size()});
+        for (size_t index = 0; index < keyCount; ++index) {
+            if (index < gradMagKeys.size()) {
+                requests.emplace_back(&gradMag_, gradMagKeys[index]);
+            }
+            if (index < nxKeys.size()) {
+                requests.emplace_back(&nx_, nxKeys[index]);
+            }
+            if (index < nyKeys.size()) {
+                requests.emplace_back(&ny_, nyKeys[index]);
+            }
+        }
         (void)withDerivative;
-        return report;
+        return cache_->prefetchInterleaved(requests);
     }
 
     [[nodiscard]] NormalBatchReport sampleNormalBatch(
@@ -1230,30 +1250,27 @@ public:
         std::vector<ChunkKey> gradMagKeys;
         std::vector<ChunkKey> nxKeys;
         std::vector<ChunkKey> nyKeys;
-        gradMagKeys.reserve(volumePoints.size());
-        nxKeys.reserve(volumePoints.size());
-        nyKeys.reserve(volumePoints.size());
+        gradMagKeys.reserve(volumePoints.size() * 8);
+        nxKeys.reserve(volumePoints.size() * 8);
+        nyKeys.reserve(volumePoints.size() * 8);
         for (size_t index = 0; index < volumePoints.size(); ++index) {
             auto& point = prepared[index];
             point.gradMag = prepareCubeRequest(gradMag_, volumePoints[index]);
             point.nx = prepareCubeRequest(nx_, volumePoints[index]);
             point.ny = prepareCubeRequest(ny_, volumePoints[index]);
             if (point.gradMag.valid) {
-                gradMagKeys.push_back(point.gradMag.key);
+                gradMagKeys.insert(
+                    gradMagKeys.end(), point.gradMag.keys.begin(), point.gradMag.keys.end());
             }
             if (point.nx.valid) {
-                nxKeys.push_back(point.nx.key);
+                nxKeys.insert(nxKeys.end(), point.nx.keys.begin(), point.nx.keys.end());
             }
             if (point.ny.valid) {
-                nyKeys.push_back(point.ny.key);
+                nyKeys.insert(nyKeys.end(), point.ny.keys.begin(), point.ny.keys.end());
             }
         }
 
-        const unsigned hardwareThreads = std::thread::hardware_concurrency();
-        const size_t workers = std::clamp<size_t>(
-            hardwareThreads == 0 ? 4 : static_cast<size_t>(hardwareThreads),
-            1,
-            8);
+        const size_t workers = normalReadWorkersPerChannel();
 
         ChunkCache::ResolvedChunkMap gradMagChunks;
         ChunkCache::ResolvedChunkMap nxChunks;
@@ -1281,25 +1298,17 @@ public:
         const auto assignChunks = [](std::vector<PreparedNormalPoint>& points,
                                      const ChunkCache::ResolvedChunkMap& chunks,
                                      CubeRequest PreparedNormalPoint::*member) {
-            ChunkKey lastKey{};
-            std::shared_ptr<const CachedChunk> lastChunk;
-            bool hasLast = false;
             for (auto& point : points) {
                 CubeRequest& request = point.*member;
                 if (!request.valid) {
                     continue;
                 }
-                if (hasLast && request.key == lastKey) {
-                    request.chunk = lastChunk;
-                    continue;
+                for (size_t cubeIndex = 0; cubeIndex < request.keys.size(); ++cubeIndex) {
+                    auto it = chunks.find(request.keys[cubeIndex]);
+                    if (it != chunks.end()) {
+                        request.chunks[cubeIndex] = it->second;
+                    }
                 }
-                auto it = chunks.find(request.key);
-                if (it != chunks.end()) {
-                    request.chunk = it->second;
-                }
-                lastKey = request.key;
-                lastChunk = request.chunk;
-                hasLast = true;
             }
         };
         assignChunks(prepared, gradMagChunks, &PreparedNormalPoint::gradMag);
