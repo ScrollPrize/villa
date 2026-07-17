@@ -35,3 +35,7 @@ yarn-error.log*
 # Generated chat corpus (built by scripts/genChatCorpus.js)
 static/llms-full.txt
 api/_lib/corpus.json
+
+# Playwright's own local output dirs
+/test-results/
+/playwright-report/
