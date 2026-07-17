@@ -68,13 +68,12 @@ public:
     {
         const auto relative = checkedRelativePath(key);
         const auto path = cachePath(relative);
-        if (std::filesystem::is_regular_file(path))
-            return read(path, !isMetadataPath(relative));
+        if (auto bytes = readIfExists(path, !isMetadataPath(relative)))
+            return bytes;
         if (isMetadataPath(relative)) {
             const auto legacyPath = cacheRoot_ / relative;
-            if (std::filesystem::is_regular_file(legacyPath)) {
-                auto bytes = read(legacyPath, false);
-                publish(path, bytes, false);
+            if (auto bytes = readIfExists(legacyPath, false)) {
+                publish(path, *bytes, false);
                 return bytes;
             }
         }
@@ -87,8 +86,8 @@ public:
         bool announceStreaming = false;
         {
             std::lock_guard<std::mutex> lock(inFlightMutex_);
-            if (std::filesystem::is_regular_file(path))
-                return read(path, !isMetadataPath(relative));
+            if (auto bytes = readIfExists(path, !isMetadataPath(relative)))
+                return bytes;
             if (auto it = inFlight_.find(requestKey); it != inFlight_.end()) {
                 request = it->second;
             } else {
@@ -215,11 +214,14 @@ private:
                std::filesystem::is_regular_file(cacheRoot_ / relative);
     }
 
-    std::vector<std::byte> read(const std::filesystem::path& path, bool managed) const
+    std::optional<std::vector<std::byte>> readIfExists(
+        const std::filesystem::path& path, bool managed) const
     {
         auto pin = managed && budget_
             ? budget_->pinRead(path)
             : vc::render::PersistentZarrCacheBudget::ReadPin{};
+        if (!std::filesystem::is_regular_file(path))
+            return std::nullopt;
         std::ifstream in(path, std::ios::binary);
         if (!in)
             throw std::runtime_error("Failed to read cached Lasagna object: " + path.string());

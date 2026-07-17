@@ -65,8 +65,8 @@ public:
         ~WriteReservation();
 
         explicit operator bool() const noexcept { return owner_ != nullptr; }
-        // Call only after the target has been atomically published and any
-        // replacement paths have been removed.
+        // Refresh accounting after a write attempt changed any reserved path,
+        // including a failed replacement that removed its destination.
         void commit();
         void cancel();
 

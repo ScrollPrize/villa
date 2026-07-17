@@ -937,6 +937,13 @@ bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
     }
     if (ec) {
         std::filesystem::remove(tmp, ec);
+        const auto finalSize = regularFileSize(path).value_or(0);
+        addPersistentCacheBytesDelta(
+            state,
+            static_cast<std::int64_t>(finalSize) - static_cast<std::int64_t>(oldSize));
+        // The overwrite fallback may have removed the tracked destination even
+        // though publishing failed. Refresh all reserved paths from disk.
+        reservation.commit();
         return false;
     }
     std::int64_t removedCounterpart = 0;
@@ -994,6 +1001,13 @@ bool ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
     }
     if (ec) {
         std::filesystem::remove(tmp, ec);
+        const auto finalSize = regularFileSize(path).value_or(0);
+        addPersistentCacheBytesDelta(
+            state,
+            static_cast<std::int64_t>(finalSize) - static_cast<std::int64_t>(oldSize));
+        // The overwrite fallback may have removed the tracked destination even
+        // though publishing failed. Refresh the reservation from disk.
+        reservation.commit();
         return false;
     }
     const auto newSize = regularFileSize(path).value_or(std::size_t{1});

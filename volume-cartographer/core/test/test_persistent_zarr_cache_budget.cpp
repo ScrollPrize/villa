@@ -268,6 +268,24 @@ TEST_CASE("format replacement commits refresh all affected accounting")
     fs::remove_all(root);
 }
 
+TEST_CASE("failed replacement refreshes accounting after removing its target")
+{
+    const auto root = tempRoot("failed_replacement");
+    const auto target = volumeChunk(root, 0);
+    writeBytes(target, 10);
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    REQUIRE(budget->stats().managedBytes == 10);
+
+    auto reservation = budget->reserveWrite(target, 10);
+    REQUIRE(static_cast<bool>(reservation));
+    fs::remove(target);
+    reservation.commit();
+    CHECK(budget->stats().managedBytes == 0);
+    fs::remove_all(root);
+}
+
 TEST_CASE("cancelled and failed writes do not change accounting")
 {
     const auto root = tempRoot("failure");
