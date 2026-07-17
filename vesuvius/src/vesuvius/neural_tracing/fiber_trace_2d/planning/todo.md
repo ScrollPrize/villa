@@ -51,6 +51,11 @@
 - [ ] multiple laybers per patch : use some roi structure for fibers so we can supervise all fibers within some patch
 - [ ] when evalutationg multi-dir& multi-presence outputs: can just do dot product against the reference angel (e.g. when tracing, slicing)
 
+# multidir
+- [ ] test a loss on multi-dir outputs being perpendicular
+    - [ ] and the cross product being the surface normal?
+    - [ ] maybe even do three direction, perpendicular, at least one presence should be zero (that should be supervised with surface normal!)
+
 ## z-search training
 - [ ] Now lets do a modification that re-introduces multiple z-slices again int the training - we see that some difficulty in the embedding is mostly caused by the sample shifting in z
   so we enable z-steps again in the config lets do for a step of 4vx and the pos loss is now not all in-fiber cps against each other but for each pair we only require the best similarity between any of the pairs offsets to be supervised. in addition given the set of cps for each fiber (8 per batch?) we also choose just the best over all cps - so the only positive supervision per cp in the batch is the most similar other cp + z slice from any other cp in the fiber in the batch (this way we should have a higher chance of actually loooking at similiar points not very different ones)

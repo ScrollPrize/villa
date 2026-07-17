@@ -34,7 +34,8 @@
   "volume_cache_memory_mib": null,
   "model_3d": {
     "input_channels": 1,
-    "output_channels": 7,
+    "direction_branch_count": 2,
+    "output_channels": 14,
     "unet_base_channels": 16,
     "unet_depth": 6,
     "decoder_upsample_mode": "pixelshuffle",

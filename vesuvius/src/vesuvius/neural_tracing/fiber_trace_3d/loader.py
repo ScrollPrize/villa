@@ -1694,6 +1694,22 @@ class FiberTrace3DLoader:
         segment_bbox_lo: np.ndarray,
         segment_bbox_hi: np.ndarray,
     ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        tangent_out = self._target_tangent_output_zyx(record, cp_index, params)
+        return (
+            _TARGET_MODE_CP_ONLY,
+            segment_starts,
+            segment_ends,
+            segment_bbox_lo,
+            segment_bbox_hi,
+            tangent_out.astype(np.float32),
+        )
+
+    def _target_tangent_output_zyx(
+        self,
+        record: _Record,
+        cp_index: int,
+        params: _Augment3DParams,
+    ) -> np.ndarray:
         tangent_src = self._line_tangent_volume_zyx(record, cp_index).astype(np.float64)
         tangent_points = np.stack(
             [
@@ -1715,14 +1731,7 @@ class FiberTrace3DLoader:
             tangent_out = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
         else:
             tangent_out = tangent_out / tangent_norm
-        return (
-            _TARGET_MODE_CP_ONLY,
-            segment_starts,
-            segment_ends,
-            segment_bbox_lo,
-            segment_bbox_hi,
-            tangent_out.astype(np.float32),
-        )
+        return tangent_out.astype(np.float32)
 
     def _line_segment_spec(
         self,
@@ -1838,7 +1847,7 @@ class FiberTrace3DLoader:
             segment_ends,
             segment_bbox_lo,
             segment_bbox_hi,
-            np.zeros((3,), dtype=np.float32),
+            self._target_tangent_output_zyx(record, cp_index, params),
         )
 
     def load_sample(
@@ -2454,6 +2463,11 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         seed=int(raw.get("seed", 1)),
         cp_margin_voxels=int(raw.get("cp_margin_voxels", 4)),
         presence_radius_voxels=float(raw.get("presence_radius_voxels", 2.0)),
+        presence_negative_edge_margin_voxels=(
+            None
+            if raw.get("presence_negative_edge_margin_voxels") is None
+            else int(raw.get("presence_negative_edge_margin_voxels"))
+        ),
         augment_enabled=bool(raw.get("augment_enabled", True)),
         augment_shift_zyx=_as_float_zyx3(raw.get("augment_shift_zyx", [0.0, 0.0, 0.0]), key="augment_shift_zyx"),
         augment_rotation_degrees=float(raw.get("augment_rotation_degrees", 0.0)),

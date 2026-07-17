@@ -24,9 +24,17 @@ side/top strip input loading.
 
 `fiber_trace_3d/model.py`
 
-- Wraps `Vesuvius3dUnetModel` for a seven-channel output layout.
-- The first six channels are sigmoid Lasagna 3x2 direction channels.
-- The seventh channel is sigmoid sheet/fiber presence.
+- Wraps `Vesuvius3dUnetModel` for grouped direction/presence output branches.
+- Each branch has seven sigmoid channels: six Lasagna 3x2 direction channels
+  and one sheet/fiber presence channel.
+- Single-branch legacy configs still use seven output channels. Active
+  multi-direction 3D configs use `model_3d.direction_branch_count: 2` and
+  fourteen output channels.
+- Branch 0 preserves the legacy channel layout (`0:6` direction, `6`
+  presence), so existing first-branch Trace2CP projection paths remain usable.
+- `direction_outputs(...)` returns `B,K,6,D,H,W` and `presence_outputs(...)`
+  returns `B,K,1,D,H,W`; the older `direction_output(...)` and
+  `presence_output(...)` wrappers return branch 0.
 - Config derives `features_per_stage`, `unet_base_channels`, `unet_depth`,
   `strides`, and `decoder_upsample_mode` the same way as the existing 3D fiber
   model helpers.
@@ -65,7 +73,9 @@ side/top strip input loading.
   rounded output-space line voxels; JSON/array records supervise only the
   sampled CP neighborhood. NML line targets are not radius-expanded tubes.
   Direction labels use the six Lasagna 3x2 channels, and presence negatives
-  are balanced in the valid interior.
+  are balanced against routed positives. CP-only samples keep the
+  shift-derived presence edge exclusion; NML dense-line samples supervise
+  presence across the full valid patch.
 - Prefetch uses the same explicit coordinate path as training and collects
   VC3D chunk dependencies instead of conservative zarr crop bboxes.
 
@@ -195,8 +205,15 @@ side/top strip input loading.
   and `best.pt`.
 - Logs scalar losses/timings and the full training config JSON to TensorBoard
   when `training.tensorboard_enabled` is true.
-  Direction reporting includes `train/angle_mean_deg` and, when held-out
-  `test_datasets` are configured, `test/angle_mean_deg`.
+  Direction reporting includes selected-branch `train/angle_mean_deg` and,
+  when held-out `test_datasets` are configured, `test/angle_mean_deg`. Branch
+  routing diagnostics log branch usage fractions and selected score means.
+- For multi-direction outputs, positive sparse direction/presence supervision
+  chooses one branch per supervised point with
+  `abs(dot(decoded_predicted_axis, target_axis)) * predicted_presence`.
+  Direction loss and positive presence BCE apply only to that selected branch.
+  Dense negative presence supervision applies to every branch at global
+  negative voxels.
 - Passing `--resume /path/to/current.pt` for normal training restores the
   model and optimizer state from that snapshot, continues from the stored step,
   and still creates a fresh timestamped run directory. The TensorBoard config
@@ -213,17 +230,23 @@ side/top strip input loading.
 - Logs `train_sample_3d/principal_slices` at `training.sample_vis_interval`.
   The sheet concatenates up to `training.sample_vis_count` batch samples side
   by side, defaulting to four. `training.test_sample_vis_count` controls the
-  corresponding dense test sheet count. Each sample block uses the sampled CP's
-  three principal
-  planes with three columns: volume image with projected GT line and predicted
-  CP direction overlay, target/context presence, and predicted presence. The GT
-  line overlay draws target-line portions within 2 voxels of the displayed
-  slice plane. The target/context presence panel is max-pooled in 3D for
-  visualization only and also draws the carried transformed line segments for
-  CP-only JSON/test fibers; the loss target is unchanged. The predicted CP
-  direction is drawn as a thin anti-aliased line whose length is scaled by the
-  in-slice projection magnitude, so directions pointing out of the slice appear
-  shorter.
+  corresponding dense test sheet count. Each sample block uses five rows: the
+  sampled CP's three principal planes, a longitudinal slice containing the GT
+  CP tangent, and a perpendicular/cross slice whose plane normal is the GT CP
+  tangent. Each row has seven columns: volume image with projected GT line and
+  predicted CP direction overlay where applicable, target/context presence,
+  branch presence for the output whose decoded direction is closer to the
+  slice normal, other branch presence, max branch presence, min branch
+  presence, and average branch presence. The GT line overlay draws target-line
+  portions within 2 voxels of the displayed principal slice plane. The two
+  oblique rows project/rasterize the carried transformed line segments into
+  the oblique slice frame for both the image overlay and target/context panel.
+  The target/context presence panel is max-pooled for visualization only;
+  principal rows max-pool in 3D and oblique rows thicken the projected
+  oblique-frame raster in 2D. The loss target is unchanged. The predicted CP
+  direction is drawn as a thin
+  anti-aliased line whose length is scaled by the in-slice projection
+  magnitude, so directions pointing out of the slice appear shorter.
 - Configured dense 3D tests write `test_sample_3d/principal_slices` using the
   same sheet layout when they run at step 0 and test intervals. Test scalars and
   images are flushed immediately after configured test logging.

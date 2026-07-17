@@ -74,19 +74,33 @@
   `augment_anisotropic_blur_orientation`, and
   `augment_anisotropic_blur_roll_degrees`. It is a value augmentation after
   coordinate sampling, not a geometric transform.
-- The 3D model output layout is seven channels by default:
-  six Lasagna 3x2 ambiguous direction channels followed by one sigmoid
-  sheet/fiber-presence channel.
-- The six direction channels use Lasagna's double-angle projection layout:
+- The 3D model output layout is grouped by direction branch. Each branch has
+  seven channels: six Lasagna 3x2 ambiguous direction channels followed by one
+  sigmoid sheet/fiber-presence channel. Legacy/single-branch configs use one
+  group (`7` channels); active multi-direction training configs use
+  `model_3d.direction_branch_count: 2` and `14` output channels.
+- Branch 0 preserves the legacy channel positions: channels `0:6` are
+  direction and channel `6` is presence. Branch 1 uses channels `7:13` and
+  channel `13`.
+- Each branch's six direction channels use Lasagna's double-angle projection layout:
   `dir0_z,dir1_z` for `(tx,ty)`, `dir0_y,dir1_y` for `(tx,tz)`, and
   `dir0_x,dir1_x` for `(ty,tz)`.
 - Direction supervision is computed from the transformed 3D line tangent and is
   masked to positive fiber-neighborhood voxels. Projection-magnitude weighting
   may downweight channels whose projection is nearly degenerate.
-- Presence supervision is positive near the transformed fiber line and negative
-  elsewhere inside the valid/reachable patch interior. Edge voxels that could
-  not contain a CP because of shift augmentation are ignored for negative
-  presence loss.
+- Positive direction/presence supervision chooses exactly one branch per sparse
+  positive supervision point. The chosen branch is
+  `argmax(abs(dot(decoded_predicted_axis, target_axis)) * predicted_presence)`,
+  using a detached score for the discrete routing decision. Direction loss and
+  positive presence BCE apply only to the selected branch at points included by
+  `presence_mask`. The unselected positive branch is not trained as negative at
+  that positive point.
+- Negative presence supervision remains global: all branches are supervised as
+  negative where the dense presence target is negative inside the valid/reachable
+  patch interior. For CP-only samples, edge voxels that could not contain a CP
+  because of shift augmentation are ignored for presence loss. For NML
+  dense-line samples, presence supervision uses the full valid patch because the
+  centerline can provide positives and negatives in that region.
 - 3D target generation is source-format dependent. NML fibers use dense
   supervision along all fiber-line segments that overlap the patch. The
   transformed output-space segments are clipped/rasterized directly into the
@@ -94,8 +108,8 @@
   nearest search or by inverting sampled image coordinates. Non-NML fiber
   sources supervise only the sampled CP neighborhood for direction and
   presence.
-- The first 3D model uses direction plus presence losses. Contrastive embedding
-  remains unsupported by default in the 3D V0 path.
+- The first 3D model uses branch-routed direction plus presence losses.
+  Contrastive embedding remains unsupported by default in the 3D V0 path.
 - The 3D fiber model defaults to `BatchNorm3d`; configured `batch_size` is the
   actual BatchNorm batch because the trainer has no internal micro-batching.
   `model_3d.normalization: "none"` remains supported for explicit ablations.
@@ -114,31 +128,43 @@
   gamma/noise, isotropic blur, smooth displacement, and anisotropic blur.
   Shear/skew and ringing remain unsupported and must not appear as enabled
   keys in this config.
-- 3D training TensorBoard visualization logs three principal CP-centered
-  planes at `training.sample_vis_interval`. By default, up to four batch
-  samples are shown; `training.sample_vis_count` / `train_sample_vis_count`
-  and `training.test_sample_vis_count` control the side-by-side train/test
-  sample counts. Each sample block has three rows and three columns: volume
-  image with projected GT line and
-  model-predicted/fitted CP direction overlay, target/context presence, and
-  predicted presence. The target/context presence panel must visualize the
-  carried transformed fiber-line segment metadata even for JSON/non-NML
-  CP-only samples where loss supervision remains CP-only. The GT line overlay
-  includes target-line portions within 2 voxels of the displayed slice plane.
-  The sparse direction angular-error panel is intentionally not shown because
-  it is too sparse to be useful for routine inspection. The predicted/fitted
-  CP direction overlay is drawn as a thin anti-aliased line whose length is
-  scaled by the in-slice projection magnitude, so out-of-slice directions are
-  visibly shorter.
+- 3D training TensorBoard visualization logs CP-centered slice sheets at
+  `training.sample_vis_interval`. By default, up to four batch samples are
+  shown; `training.sample_vis_count` / `train_sample_vis_count` and
+  `training.test_sample_vis_count` control the side-by-side train/test sample
+  counts. Each sample block has five rows: the `yx`, `zx`, and `zy` principal
+  planes, a longitudinal slice containing the GT CP tangent, and a
+  perpendicular/cross slice whose plane normal is the GT CP tangent. Each row
+  has seven columns: volume image with projected GT line and model-predicted/
+  fitted CP direction overlay where applicable, target/context presence,
+  branch presence for the output whose decoded direction is closer to the slice
+  normal by `abs(dot(axis, normal))`, the other branch presence, max branch
+  presence, min branch presence, and average branch presence. The target/context
+  presence panel must visualize the carried transformed fiber-line segment
+  metadata even for JSON/non-NML CP-only samples where loss supervision remains
+  CP-only. The two oblique rows must project/rasterize transformed line
+  segments into their oblique slice frame for both image overlay and
+  target/context presence. Dense-line/NML samples must carry the transformed CP
+  tangent so the GT-tangent and perpendicular rows are constructed from the
+  actual local target tangent. The GT line overlay includes target-line
+  portions within 2 voxels of the displayed principal slice plane or oblique
+  slice plane. The sparse direction angular-error panel
+  is intentionally not shown because it is too sparse to be useful for routine
+  inspection. The predicted/fitted CP direction overlay is drawn as a thin
+  anti-aliased line whose length is scaled by the in-slice projection magnitude,
+  so out-of-slice directions are visibly shorter.
 - The 3D target-presence panel in TensorBoard is display-only max-pooled with a
   `3x3x3` kernel before slicing. This must not modify `presence_target` used by
   training or test loss.
-- 3D training/test loss logging reports average direction angular error in
-  degrees as `train/angle_mean_deg` and `test/angle_mean_deg`. The scalar is
-  computed over sparse supervised direction samples with Lasagna 3x2 analytic
-  decoding and unoriented `abs(dot)` agreement.
-- 3D presence loss uses equal total class weight when both classes are present:
-  `0.5 * mean(positive BCE) + 0.5 * mean(negative BCE)`.
+- 3D training/test loss logging reports average selected-branch direction
+  angular error in degrees as `train/angle_mean_deg` and
+  `test/angle_mean_deg`. The scalar is computed over sparse supervised
+  direction samples with Lasagna 3x2 analytic decoding and unoriented
+  `abs(dot)` agreement. Branch routing diagnostics include branch usage
+  fractions and selected score means.
+- 3D presence loss uses equal total class weight when routed positives and
+  global negatives are both present:
+  `0.5 * mean(selected positive BCE) + 0.5 * mean(all-branch negative BCE)`.
 - When `training.test_interval > 0`, 3D training runs the configured test
   evaluation at step 0 before the first optimizer step and logs the same
   TensorBoard scalars/stdout as interval tests.
@@ -197,8 +223,9 @@
   fiber centerline voxels only, without a radius-expanded distance-to-segment
   tube. Non-NML sources supervise only the sampled CP neighborhood using
   `presence_radius_voxels`; that radius does not apply to NML centerline
-  targets. Presence negative edge masking is unchanged, and Lasagna 3x2
-  direction encoding uses the shared NumPy/torch-compatible helper semantics.
+  targets. Presence edge masking applies only to CP-only samples; NML dense-line
+  samples supervise presence over the full valid patch. Lasagna 3x2 direction
+  encoding uses the shared NumPy/torch-compatible helper semantics.
 - `training.loader_workers` controls 3D DataLoader worker process count.
   `0` is the explicit serial/debug path. `training.loader_prefetch_factor`
   maps directly to PyTorch DataLoader prefetch factor for worker processes.

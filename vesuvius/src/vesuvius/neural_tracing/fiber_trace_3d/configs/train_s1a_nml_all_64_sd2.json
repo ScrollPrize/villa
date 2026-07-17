@@ -33,15 +33,17 @@
   "volume_cache_memory_mib": null,
   "model_3d": {
     "input_channels": 1,
-    "output_channels": 7,
+    "direction_branch_count": 2,
+    "output_channels": 14,
     "unet_base_channels": 16,
     "unet_depth": 5,
     "decoder_upsample_mode": "pixelshuffle",
-    "squeeze_excitation": false
+    "squeeze_excitation": false,
+    "normalization": "batch"
   },
   "training": {
     "run_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_3d_runs",
-    "run_name": "s1a_nml_all_3d_64_2",
+    "run_name": "s1a_nml_all_3d_64_2_multidir",
     "max_steps": 1000000,
     "learning_rate": 0.001,
     "scalar_log_interval": 100,

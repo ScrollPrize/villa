@@ -9,6 +9,19 @@
   search step now starts from the adjacent CP-local fiber-line tangent toward
   the target CP's line index instead of the straight CP-to-CP chord or sampled
   model direction at the start CP.
+- Updated 3D multi-direction train/test TensorBoard sample sheets to replace
+  the normal-weighted close-presence column with max/min/average branch
+  presence columns, and fixed the two oblique rows to use transformed CP
+  tangents plus oblique-frame projected GT line overlays/target panels.
+- Fixed multi-direction 3D presence supervision so routed positive presence
+  respects `presence_mask`; NML dense-line samples now supervise presence over
+  the full valid patch while CP-only samples keep the shift-derived edge
+  exclusion.
+- Added two-branch 3D fiber direction/presence training support with routed
+  positive supervision, all-branch negative presence supervision, branch usage
+  diagnostics, and branch-aware train/test slice visualizations including GT
+  tangent and perpendicular oblique rows. The current 64-scale S1A NML training
+  config now uses the two-branch output layout.
 - Changed VC3D `Volume.sample_coords(..., blocking=True)` to use strict
   requested-level coordinate sampling: required chunks are fetched/decoded and
   pinned before sampling, scale fallback is disabled, missing requested chunks

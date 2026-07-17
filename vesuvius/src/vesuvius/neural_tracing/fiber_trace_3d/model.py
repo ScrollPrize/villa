@@ -17,6 +17,7 @@ from vesuvius.neural_tracing.nets.vesuvius_unet3d import Vesuvius3dUnetModel
 class FiberTrace3DModelConfig:
     input_channels: int = 1
     output_channels: int = 7
+    direction_branch_count: int = 1
     features_per_stage: tuple[int, ...] = (16, 32, 64, 128)
     strides: tuple[tuple[int, int, int], ...] | None = None
     decoder_upsample_mode: str = "pixelshuffle"
@@ -32,8 +33,13 @@ class FiberTrace3DNet(nn.Module):
         cfg = FiberTrace3DModelConfig() if config is None else config
         if cfg.input_channels <= 0:
             raise ValueError("input_channels must be > 0")
-        if cfg.output_channels < 7:
-            raise ValueError("output_channels must contain 6 direction + 1 presence channels")
+        if cfg.direction_branch_count <= 0:
+            raise ValueError("direction_branch_count must be > 0")
+        if cfg.output_channels != int(cfg.direction_branch_count) * 7:
+            raise ValueError(
+                "output_channels must equal direction_branch_count * "
+                "(6 direction + 1 presence channels)"
+            )
         if not cfg.features_per_stage:
             raise ValueError("features_per_stage must not be empty")
         strides = cfg.strides
@@ -56,6 +62,7 @@ class FiberTrace3DNet(nn.Module):
             {"model_config": backbone_config},
         )
         self.output_channels = int(cfg.output_channels)
+        self.direction_branch_count = int(cfg.direction_branch_count)
 
     def forward(self, volume: torch.Tensor) -> torch.Tensor:
         if volume.ndim != 5:
@@ -76,6 +83,33 @@ def presence_output(output: torch.Tensor) -> torch.Tensor:
     return output[:, 6:7]
 
 
+def direction_outputs(output: torch.Tensor) -> torch.Tensor:
+    if output.ndim != 5:
+        raise ValueError("model output must have shape B,C,D,H,W")
+    channels = int(output.shape[1])
+    if channels < 7 or channels % 7 != 0:
+        raise ValueError("model output channels must be a positive multiple of 7")
+    branch_count = channels // 7
+    dirs = []
+    for branch in range(branch_count):
+        start = branch * 7
+        dirs.append(output[:, start : start + 6])
+    return torch.stack(dirs, dim=1)
+
+
+def presence_outputs(output: torch.Tensor) -> torch.Tensor:
+    if output.ndim != 5:
+        raise ValueError("model output must have shape B,C,D,H,W")
+    channels = int(output.shape[1])
+    if channels < 7 or channels % 7 != 0:
+        raise ValueError("model output channels must be a positive multiple of 7")
+    branch_count = channels // 7
+    presences = []
+    for branch in range(branch_count):
+        presences.append(output[:, branch * 7 + 6 : branch * 7 + 7])
+    return torch.stack(presences, dim=1)
+
+
 def build_fiber_trace_3d_model(config: dict[str, Any]) -> FiberTrace3DNet:
     model_cfg = dict(config.get("model_3d", config.get("model", {})))
     features_per_stage = _derive_features_per_stage(model_cfg)
@@ -84,10 +118,22 @@ def build_fiber_trace_3d_model(config: dict[str, Any]) -> FiberTrace3DNet:
         model_cfg,
         crop_size=config.get("patch_shape_zyx", config.get("crop_size")),
     )
+    if "output_channels" in model_cfg:
+        output_channels = int(model_cfg["output_channels"])
+        if "direction_branch_count" in model_cfg:
+            direction_branch_count = int(model_cfg["direction_branch_count"])
+        else:
+            if output_channels % 7 != 0:
+                raise ValueError("model_3d.output_channels must be a multiple of 7")
+            direction_branch_count = output_channels // 7
+    else:
+        direction_branch_count = int(model_cfg.get("direction_branch_count", 1))
+        output_channels = direction_branch_count * 7
     return FiberTrace3DNet(
         FiberTrace3DModelConfig(
             input_channels=int(model_cfg.get("input_channels", 1)),
-            output_channels=int(model_cfg.get("output_channels", 7)),
+            output_channels=output_channels,
+            direction_branch_count=direction_branch_count,
             features_per_stage=features_per_stage,
             strides=strides,
             decoder_upsample_mode=str(
