@@ -1,13 +1,15 @@
-# Native 3D Trace2CP Vectorized Beam Lookahead Status
+# Native 3D Trace2CP Normal-Aware Smoothness Status
 
-- [x] Inspect current beam/scoring/cache vectorization boundaries.
-- [x] Write task and implementation plan.
-- [x] Implement GPU candidate generation.
-- [x] Implement batched current-point lookup.
-- [x] Implement batched candidate scoring over frontier states.
-- [x] Implement tensor frontier/lookahead expansion.
-- [x] Implement target-plane crossing and pruning in batched form.
-- [x] Update specs/docs/changelog.
-- [x] Add regression and equivalence tests.
-- [x] Run focused 3D fiber trace tests.
-- [x] Record validation and deviations in `task_log.md`.
+- [x] Read current native 3D Trace2CP scorer/tracing code.
+- [x] Confirm existing batched Lasagna normal sampler can be reused for native
+  candidate coordinates.
+- [x] Replace `task.md` with the normal-aware smoothness planning task.
+- [x] Write `task_plan.md` with target behavior, implementation plan, specs,
+  docs, and tests.
+- [x] Replace `task_log.md` with current planning notes.
+- [x] Implement direct candidate-point Lasagna normal sampling.
+- [x] Implement split tangent/normal smoothness scorer.
+- [x] Add CLI/config summary fields.
+- [x] Update specs/docs/changelog after implementation.
+- [x] Add focused regression tests.
+- [x] Run focused tests.

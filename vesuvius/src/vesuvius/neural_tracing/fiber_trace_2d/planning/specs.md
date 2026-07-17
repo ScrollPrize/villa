@@ -430,12 +430,35 @@
   minimizes a cost. The base cost is
   `1 - dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * candidate_presence`.
   Both sampled axes are sign-aligned to the candidate step direction before dot
-  products are evaluated. Optional search smoothness adds
-  `smoothness_weight * max(0, angle(previous_step_dir, step_dir) - free_angle)^2`,
-  using radians. The defaults are `--smoothness-weight 2.0` and
-  `--smoothness-free-angle-degrees 10.0`, so native 3D tracing penalizes
-  abrupt branch switches by default while still allowing CLI override. The
-  native 3D tool does not expose additive direction/presence
+  products are evaluated. `--candidate-substeps 1` is the default and preserves
+  this endpoint-only candidate scoring. With `--candidate-substeps S` for
+  `S > 1`, candidate scoring samples the segment at
+  `t = 1/S, 2/S, ..., 1`, evaluates all branches at every substep, takes the
+  best branch score `dot(substep_dir, step_dir) * substep_presence` per
+  substep, averages those substep scores, and then applies the current-point
+  direction gate. A multi-substep candidate is valid only when every substep has
+  at least one valid branch. Search smoothness defaults to normal-aware split
+  smoothness in the native 3D CLI. Candidate Lasagna normals are sampled
+  directly at the candidate trace coordinates by converting selected-level ZYX
+  points to base ZYX with `record.volume_spacing_base` and calling the existing
+  batched Lasagna normal sampler/decoder used by the 2D geometry loader. The
+  implementation must not interpolate normals by reference-line progress and
+  must not reimplement Lasagna normal decoding in the candidate scorer. With a
+  valid candidate normal, smoothness is split into tangent-plane turn and
+  normal-tilt turn: tangent-plane turn is the angle between previous and
+  candidate step directions after projection into the plane perpendicular to
+  the Lasagna normal, while normal-tilt turn is the absolute elevation change
+  against that normal. Both components use
+  `max(0, angle - smoothness_free_angle)^2`, in radians. The Lasagna normal
+  sign ambiguity must not affect this penalty. The CLI flags
+  `--smoothness-tangent-weight` and `--smoothness-normal-weight` override the
+  component weights independently; when omitted and native candidate-normal
+  sampling is active, both component weights default to
+  `--smoothness-weight` (`2.0`). If candidate normal sampling is unavailable or
+  invalid for one candidate, that candidate falls back to the previous
+  isotropic smoothness term
+  `smoothness_weight * max(0, angle(previous_step_dir, step_dir) - free_angle)^2`.
+  The native 3D tool does not expose additive direction/presence
   candidate-selection weights.
 - The first native 3D Trace2CP search step is seeded from the adjacent
   CP-local fiber-line tangent in the direction of the target CP's line index.

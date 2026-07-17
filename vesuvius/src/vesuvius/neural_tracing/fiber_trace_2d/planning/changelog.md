@@ -2,6 +2,14 @@
 
 ## 2026-07-17
 
+- Added native 3D Trace2CP normal-aware smoothness: candidate Lasagna normals
+  are sampled directly at candidate trace points through the existing batched
+  2D geometry-loader decoder, then smoothness is split into tangent-plane and
+  normal-tilt penalties with `--smoothness-tangent-weight` and
+  `--smoothness-normal-weight`.
+- Added native 3D Trace2CP `--candidate-substeps`: the default keeps
+  endpoint-only scoring, while higher values score evenly spaced points along
+  each candidate segment and require every substep to be valid.
 - Vectorized native 3D Trace2CP beam lookahead across active frontier states:
   cone candidates, current-point branch lookup, candidate scoring, plane
   crossing, and pruning now run as batched torch operations around the

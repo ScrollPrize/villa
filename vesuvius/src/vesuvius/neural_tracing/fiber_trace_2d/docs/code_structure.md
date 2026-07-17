@@ -138,15 +138,30 @@ side/top strip input loading.
   giving 81 candidate directions including the center direction. The legacy
   `--cone-grid-size` square-grid path is only used when
   `--cone-angle-step-degrees <= 0`.
+  `--candidate-substeps` defaults to `1`, which keeps that endpoint-only score.
+  Higher values score each candidate segment at evenly spaced substeps, reduce
+  branches independently at every substep, require all substeps valid, and
+  average the selected substep scores before applying the current-direction
+  gate. Beam mode batches this as `[frontier, candidate, substep, branch]`
+  around the existing inferred-block cache.
   The sampled axes are sign-aligned before dot products are evaluated.
   For `7*K` grouped outputs, `NativeTraceFieldCache` decodes all `K`
   direction/presence branches. The current-point branch is selected by
   `dot(branch_dir, previous_step_dir) * branch_presence`, and each candidate
   point evaluates all branches before reducing to the best branch score.
-  `--smoothness-weight` defaults to `2.0` and adds a hinge-squared cost against
-  the previous accepted step direction after
-  `--smoothness-free-angle-degrees`; native 3D Trace2CP does not expose
-  additive direction/presence candidate-selection weights.
+  Smoothness uses Lasagna normals sampled directly at candidate trace points:
+  selected-level ZYX candidate coordinates are converted to base ZYX with
+  `record.volume_spacing_base` and passed through the existing batched
+  Lasagna normal sampler/decoder in the 2D geometry loader. The scorer does
+  not interpolate reference-line normals or reimplement normal decoding.
+  With a valid candidate normal, `--smoothness-tangent-weight` penalizes turns
+  within the tangent plane perpendicular to the normal and
+  `--smoothness-normal-weight` penalizes elevation change into/out of the
+  normal direction. Omitted component weights default to
+  `--smoothness-weight` (`2.0`) in the native CLI, and invalid candidate
+  normals fall back to the older isotropic previous-step smoothness. Native 3D
+  Trace2CP does not expose additive direction/presence candidate-selection
+  weights.
 - The first search step uses the adjacent CP-local fiber-line tangent in the
   direction of the target CP's line index. It does not use the straight CP-to-CP
   chord. Later steps use the sampled model direction at the current point,

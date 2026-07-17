@@ -58,7 +58,10 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _fiber_line_tangent_zyx_toward_target,
     _image_to_u8,
     _interpolate_plane_crossing,
+    _NativeLasagnaNormalSampler,
     _native_trace2cp_whole_fiber_mode,
+    _native_smoothness_loss_torch,
+    _native_trace_geometry_normal_record,
     _project_trace_to_initial_strip,
     _resolve_native_trace2cp_selection,
     _sample_presence_on_strip,
@@ -1770,9 +1773,12 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().beam_width == 8
     assert NativeTrace2CpConfig().beam_prune_distance_voxels == 1.0
     assert NativeTrace2CpConfig().beam_lookahead_steps == 3
+    assert NativeTrace2CpConfig().candidate_substeps == 1
     assert NativeTrace2CpConfig().max_step_factor == 3.0
     assert NativeTrace2CpConfig().max_steps is None
     assert NativeTrace2CpConfig().smoothness_weight == 2.0
+    assert NativeTrace2CpConfig().smoothness_tangent_weight is None
+    assert NativeTrace2CpConfig().smoothness_normal_weight is None
     assert NativeTrace2CpConfig().smoothness_free_angle_degrees == 10.0
     assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 100.0
 
@@ -2598,6 +2604,290 @@ def test_native_3d_trace2cp_batched_candidate_score_couples_branches() -> None:
     assert int(torch.count_nonzero(smoothness_loss).item()) == 0
 
 
+def test_native_3d_trace2cp_candidate_substeps_reject_invalid_midpoint() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def __init__(self) -> None:
+            self.call_sizes: list[int] = []
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            self.call_sizes.append(int(points.shape[0]))
+            directions: list[list[list[float]]] = []
+            presence: list[list[float]] = []
+            valid: list[list[bool]] = []
+            for point in points:
+                if abs(float(point[0])) > abs(float(point[1])):
+                    directions.append([[1.0, 0.0, 0.0]])
+                    presence.append([1.0])
+                    valid.append([abs(float(point[0]) - 1.0) > 1.0e-4])
+                else:
+                    directions.append([[0.0, 1.0, 0.0]])
+                    presence.append([0.7])
+                    valid.append([True])
+            return (
+                torch.tensor(directions, dtype=torch.float32),
+                torch.tensor(presence, dtype=torch.float32),
+                torch.tensor(valid, dtype=torch.bool),
+            )
+
+    current = np.zeros((3,), dtype=np.float32)
+    candidates = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    next_points = current[None, :] + candidates * np.float32(2.0)
+
+    endpoint_cache = FakeCache()
+    best_endpoint, endpoint_loss, *_endpoint_rest = _score_candidate_batch(
+        endpoint_cache,
+        current_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        previous_step_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        candidate_directions=candidates,
+        next_points=next_points,
+        smoothness_weight=0.0,
+    )
+
+    substep_cache = FakeCache()
+    best_substep, substep_loss, _dir_loss, _presence_loss, _smoothness_loss, rejected = (
+        _score_candidate_batch(
+            substep_cache,
+            current_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            previous_step_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            candidate_directions=candidates,
+            next_points=next_points,
+            current_point=current,
+            step_voxels=2.0,
+            candidate_substeps=2,
+            smoothness_weight=0.0,
+        )
+    )
+
+    assert endpoint_cache.call_sizes == [2]
+    assert best_endpoint == 0
+    assert endpoint_loss == pytest.approx(0.0, abs=1.0e-6)
+    assert substep_cache.call_sizes == [4]
+    assert best_substep == 1
+    assert rejected == 1
+    assert substep_loss == pytest.approx(1.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_normal_aware_smoothness_splits_turn_components() -> None:
+    previous = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    tangent_turn = torch.tensor([[[0.0, 1.0, 0.0]]], dtype=torch.float32)
+    normal_tilt = torch.tensor(
+        [[[1.0 / math.sqrt(2.0), 0.0, 1.0 / math.sqrt(2.0)]]],
+        dtype=torch.float32,
+    )
+    normal = torch.tensor([[[0.0, 0.0, 1.0]]], dtype=torch.float32)
+    valid = torch.ones((1, 1), dtype=torch.bool)
+
+    tangent_only = _native_smoothness_loss_torch(
+        previous,
+        tangent_turn,
+        candidate_normals=normal,
+        candidate_normals_valid=valid,
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=1.0,
+        smoothness_normal_weight=0.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+    tangent_ignored = _native_smoothness_loss_torch(
+        previous,
+        tangent_turn,
+        candidate_normals=normal,
+        candidate_normals_valid=valid,
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=0.0,
+        smoothness_normal_weight=1.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+    normal_only = _native_smoothness_loss_torch(
+        previous,
+        normal_tilt,
+        candidate_normals=normal,
+        candidate_normals_valid=valid,
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=0.0,
+        smoothness_normal_weight=1.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+    normal_ignored = _native_smoothness_loss_torch(
+        previous,
+        normal_tilt,
+        candidate_normals=normal,
+        candidate_normals_valid=valid,
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=1.0,
+        smoothness_normal_weight=0.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+
+    assert float(tangent_only[0, 0]) == pytest.approx((math.pi / 2.0) ** 2, abs=1.0e-6)
+    assert float(tangent_ignored[0, 0]) == pytest.approx(0.0, abs=1.0e-6)
+    assert float(normal_only[0, 0]) == pytest.approx((math.pi / 4.0) ** 2, abs=1.0e-6)
+    assert float(normal_ignored[0, 0]) == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_normal_aware_smoothness_is_normal_sign_ambiguous() -> None:
+    previous = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    candidate = torch.tensor(
+        [[[0.5, 0.5, math.sqrt(0.5)]]],
+        dtype=torch.float32,
+    )
+    normal = torch.tensor([[[0.0, 0.0, 1.0]]], dtype=torch.float32)
+    valid = torch.ones((1, 1), dtype=torch.bool)
+
+    positive = _native_smoothness_loss_torch(
+        previous,
+        candidate,
+        candidate_normals=normal,
+        candidate_normals_valid=valid,
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=1.0,
+        smoothness_normal_weight=1.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+    negative = _native_smoothness_loss_torch(
+        previous,
+        candidate,
+        candidate_normals=-normal,
+        candidate_normals_valid=valid,
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=1.0,
+        smoothness_normal_weight=1.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+
+    assert float(positive[0, 0]) == pytest.approx(float(negative[0, 0]), abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_normal_aware_smoothness_changes_candidate_choice() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            assert count == 2
+            directions = torch.tensor(
+                [
+                    [[0.0, 1.0, 0.0]],
+                    [[1.0, 0.0, 0.0]],
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.ones((count, 1), dtype=torch.float32)
+            valid = torch.ones((count, 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    candidates = np.asarray(
+        [
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    best_without, *_ = _score_candidate_batch(
+        FakeCache(),
+        current_direction=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        previous_step_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        candidate_directions=candidates,
+        next_points=np.zeros((2, 3), dtype=np.float32),
+        smoothness_weight=0.0,
+    )
+    best_with, total_loss, _direction_loss, _presence_loss, smoothness_loss, _rejected = (
+        _score_candidate_batch(
+            FakeCache(),
+            current_direction=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            previous_step_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            candidate_directions=candidates,
+            next_points=np.zeros((2, 3), dtype=np.float32),
+            smoothness_weight=0.0,
+            smoothness_tangent_weight=2.0,
+            smoothness_normal_weight=0.0,
+            smoothness_free_angle_degrees=0.0,
+            candidate_normals=np.asarray(
+                [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            ),
+            candidate_normals_valid=np.asarray([True, True]),
+        )
+    )
+
+    assert best_without == 0
+    assert best_with == 1
+    assert total_loss == pytest.approx(1.0, abs=1.0e-6)
+    assert smoothness_loss == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_lasagna_normal_sampler_uses_geometry_record() -> None:
+    fiber = Vc3dFiber(
+        path=Path("same.json"),
+        version=1,
+        line_points_xyz=np.asarray(
+            [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            dtype=np.float32,
+        ),
+        control_points_xyz=np.asarray(
+            [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            dtype=np.float32,
+        ),
+        generation=1,
+        metadata={},
+    )
+    trace_record = SimpleNamespace(
+        fiber=fiber,
+        volume_path="vol.zarr",
+        volume_scale=2,
+        volume_spacing_base=4.0,
+    )
+    normal_record = SimpleNamespace(
+        fiber=fiber,
+        volume_path="vol.zarr",
+        volume_scale=2,
+        volume_spacing_base=4.0,
+        grad_mag=object(),
+    )
+
+    class FakeGeometryLoader:
+        records = [normal_record]
+
+        def __init__(self) -> None:
+            self.used_record = None
+            self.points_base = None
+
+        def _lasagna_normals_at_zyx_batch(self, record, points_zyx_base, *, line_indices):
+            self.used_record = record
+            self.points_base = np.asarray(points_zyx_base, dtype=np.float64).copy()
+            assert hasattr(record, "grad_mag")
+            assert line_indices.tolist() == [0]
+            return (
+                np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+                np.asarray([True]),
+                {},
+            )
+
+    geometry_loader = FakeGeometryLoader()
+    resolved = _native_trace_geometry_normal_record(geometry_loader, trace_record)
+    sampler = _NativeLasagnaNormalSampler(
+        geometry_loader=geometry_loader,
+        trace_record=trace_record,
+        normal_record=resolved,
+    )
+
+    normals_zyx, valid = sampler(np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32))
+
+    assert resolved is normal_record
+    assert geometry_loader.used_record is normal_record
+    assert np.allclose(geometry_loader.points_base, [[4.0, 8.0, 12.0]])
+    assert valid.tolist() == [True]
+    assert torch.allclose(normals_zyx, torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32))
+
+
 def test_native_3d_trace2cp_current_point_direction_uses_best_branch() -> None:
     class FakeCache:
         device = torch.device("cpu")
@@ -2748,6 +3038,58 @@ def test_native_3d_trace2cp_first_step_uses_supplied_line_tangent() -> None:
 
     assert result.reason == "trace_step_limit"
     assert np.allclose(result.trace_zyx[1], [0.0, 0.0, 2.0])
+
+
+def test_native_3d_trace2cp_trace_paths_sample_candidate_normals() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            directions = torch.zeros((count, 1, 3), dtype=torch.float32)
+            directions[:, 0, 2] = 1.0
+            presence = torch.ones((count, 1), dtype=torch.float32)
+            valid = torch.ones((count, 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    def run_with_beam_width(width: int) -> list[np.ndarray]:
+        calls: list[np.ndarray] = []
+
+        def normal_sampler(points_zyx):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            calls.append(points.copy())
+            normals = np.zeros((points.shape[0], 3), dtype=np.float32)
+            normals[:, 0] = 1.0
+            valid = np.ones((points.shape[0],), dtype=bool)
+            return normals, valid
+
+        result = trace_native_3d_one_way(
+            FakeCache(),
+            start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+            target_zyx=np.asarray([0.0, 0.0, 4.0], dtype=np.float32),
+            initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+            cfg=NativeTrace2CpConfig(
+                step_voxels=1.0,
+                cone_angle_degrees=0.0,
+                cone_angle_step_degrees=5.0,
+                beam_width=width,
+                trace_step_limit=1,
+                smoothness_weight=0.5,
+            ),
+            normal_sampler=normal_sampler,
+        )
+        assert result.reason == "trace_step_limit"
+        return calls
+
+    greedy_calls = run_with_beam_width(1)
+    beam_calls = run_with_beam_width(2)
+
+    assert len(greedy_calls) == 1
+    assert greedy_calls[0].shape == (1, 3)
+    assert np.allclose(greedy_calls[0][0], [0.0, 0.0, 1.0])
+    assert len(beam_calls) == 1
+    assert beam_calls[0].shape == (1, 3)
+    assert np.allclose(beam_calls[0][0], [0.0, 0.0, 1.0])
 
 
 def test_native_3d_trace2cp_beam_lookahead_keeps_initially_worse_valid_path() -> None:

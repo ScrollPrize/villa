@@ -1,36 +1,44 @@
-# Native 3D Trace2CP Vectorized Beam Lookahead Log
+# Native 3D Trace2CP Normal-Aware Smoothness Log
 
 ## Implementation
 
-- Added torch cone-candidate generation for both angle-step candidates and the
-  legacy square-grid fallback. The public NumPy candidate helpers remain for
-  compatibility and tests.
-- Added batched current-point branch selection. Real native caches use
-  `sample_point_choices_torch(...)` across all active states; legacy/fake
-  caches without branch choices keep the previous `sample_point(...)` fallback
-  behavior.
-- Generalized candidate scoring to evaluate `[frontier, candidate, branch]`
-  tensors in one call. The existing single-state scorer now wraps the batched
-  scorer, so greedy tracing and focused tests keep the same API.
-- Replaced the beam lookahead inner loop with tensor frontier expansion:
-  candidate generation, candidate scoring, target-plane crossing, cumulative
-  loss, and near-duplicate pruning operate on tensors. Only the selected
-  pruned frontier nodes or target-reaching path are reconstructed as Python
-  `NativeTraceStep` chains.
+- Added a native candidate normal sampler wrapper in
+  `fiber_trace_3d.trace2cp_tool` that converts selected-level ZYX candidate
+  points to base ZYX and calls the existing batched Lasagna normal sampler in
+  the 2D geometry loader. The wrapper converts returned XYZ normals to native
+  ZYX for trace scoring.
+- Fixed the wrapper to use the matching 2D geometry-loader record for Lasagna
+  `grad_mag/nx/ny`, while using the 3D trace record only for selected-level to
+  base-coordinate scaling. This avoids passing a 3D `_Record` without Lasagna
+  channels into the 2D normal sampler.
+- Added split smoothness scoring:
+  - tangent-plane turn around the Lasagna normal axis;
+  - normal-tilt turn into/out of the Lasagna normal direction;
+  - normal sign ambiguity is invariant by construction;
+  - invalid candidate normals fall back to the previous isotropic smoothness
+    term for that candidate.
+- Threaded the normal sampler through greedy, beam, pair, and whole-fiber
+  native 3D Trace2CP paths.
+- Added CLI/config fields:
+  `--smoothness-tangent-weight` and `--smoothness-normal-weight`. In the
+  native CLI, omitted split weights default to `--smoothness-weight` when the
+  Lasagna normal sampler is active.
+- Added summary JSON fields for the effective smoothness weights and whether
+  normal-aware smoothness was active.
+- Updated `planning/specs.md`, `docs/code_structure.md`, and
+  `planning/changelog.md`.
 
 ## Validation
 
-- Ran:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-- Result: `85 passed in 7.18s`.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+  - Result: `91 passed in 8.19s`.
+- `git diff --check`
+  - Result: clean.
 
 ## Deviations / Deferred
 
-- The lazy inferred-block cache is still CPU-resident by design. Beam expansion
-  batches point lookup calls, but routing points to inferred blocks and
-  constructing missing blocks still crosses through CPU/NumPy before sampled
-  tensors return to `cache.device`.
-- Final path reconstruction remains Python object work because only the chosen
-  path or the small pruned live frontier is reconstructed.
-- I did not add a wall-clock benchmark command/harness in this task; validation
-  is focused regression coverage plus the existing 3D test suite.
+- Candidate-substep scoring still uses the final candidate endpoint normal for
+  the one-per-step smoothness term. Direction/presence scoring still samples
+  all configured substeps.
+- Candidate normals are not used to generate candidate directions yet; they
+  only affect the smoothness penalty.

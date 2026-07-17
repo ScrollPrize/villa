@@ -1,9 +1,12 @@
-# Native 3D Trace2CP Vectorized Beam Lookahead
+# Native 3D Trace2CP Normal-Aware Smoothness Planning
 
-Plan how to vectorize native 3D Trace2CP beam lookahead as much as possible on
-GPU. Current candidate scoring is tensorized per beam state, but beam frontier
-expansion, lookahead depth handling, and child bookkeeping still loop in Python.
-The next implementation should batch all active beam/frontier states for each
-lookahead depth, generate candidates on GPU, score them in one call, and prune
-with torch operations before converting the selected final path back to Python
-objects for reporting/visualization.
+Plan a native 3D Trace2CP smoothness change that uses the available Lasagna
+normal to split turn penalties into:
+
+- tangential/surface turn: direction change around the Lasagna normal axis;
+- normal/out-of-surface turn: direction change around
+  `current_line_dir x Lasagna normal`.
+
+The goal is to allow different smoothness weights for bends that stay on the
+local sheet/fiber surface versus bends that tip into/out of the normal
+direction.

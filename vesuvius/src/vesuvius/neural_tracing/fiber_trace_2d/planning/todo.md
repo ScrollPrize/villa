@@ -50,6 +50,7 @@
     - two fiber dirs can be close together: output two dirs and two presence values, loss selects a choice (for both) that minimizes (something sensible)
 - [ ] multiple laybers per patch : use some roi structure for fibers so we can supervise all fibers within some patch
 - [ ] when evalutationg multi-dir& multi-presence outputs: can just do dot product against the reference angel (e.g. when tracing, slicing)
+- [ ] if fibers in dense areas are randoly on top of each other we can still confuse them - use more defined fiber-center & edges to improve tracing
 
 # beam-search
 - [ ] beamsearch
