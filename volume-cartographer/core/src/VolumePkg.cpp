@@ -485,6 +485,7 @@ int VolumePkg::version() const { return version_; }
 const std::vector<vc::project::Entry>& VolumePkg::volumeEntries() const { return volumes_; }
 const std::vector<vc::project::Entry>& VolumePkg::segmentEntries() const { return segments_; }
 const std::vector<vc::project::Entry>& VolumePkg::normalGridEntries() const { return normalGrids_; }
+const std::vector<vc::project::Entry>& VolumePkg::lasagnaDatasetEntries() const { return lasagnaDatasets_; }
 
 bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::string> tags)
 {
@@ -784,6 +785,45 @@ bool VolumePkg::relocateNormalGridEntry(const std::string& oldLocation,
     return false;
 }
 
+bool VolumePkg::addLasagnaDatasetEntry(const std::string& location,
+                                       std::vector<std::string> tags)
+{
+    if (location.empty()) return false;
+    for (const auto& entry : lasagnaDatasets_)
+        if (entry.location == location) return false;
+    lasagnaDatasets_.push_back({location, std::move(tags)});
+    persistProjectState();
+    return true;
+}
+
+bool VolumePkg::reconcileLasagnaDatasetEntryTags(
+    const std::string& location,
+    const std::vector<std::string>& tags,
+    const std::vector<std::string>& singletonPrefixes)
+{
+    for (auto& entry : lasagnaDatasets_) {
+        if (entry.location != location) continue;
+        auto reconciled = entry.tags;
+        for (const auto& prefix : singletonPrefixes) {
+            reconciled.erase(
+                std::remove_if(reconciled.begin(), reconciled.end(), [&](const auto& tag) {
+                    return tag.rfind(prefix, 0) == 0;
+                }),
+                reconciled.end());
+        }
+        for (const auto& tag : tags) {
+            if (!tag.empty() &&
+                std::find(reconciled.begin(), reconciled.end(), tag) == reconciled.end())
+                reconciled.push_back(tag);
+        }
+        if (reconciled == entry.tags) return false;
+        entry.tags = std::move(reconciled);
+        persistProjectState();
+        return true;
+    }
+    return false;
+}
+
 bool VolumePkg::removeEntry(const std::string& location)
 {
     auto eraseFrom = [&](std::vector<vc::project::Entry>& v) {
@@ -797,6 +837,7 @@ bool VolumePkg::removeEntry(const std::string& location)
     if (eraseFrom(volumes_)) removed = true;
     if (eraseFrom(segments_)) removed = true;
     if (eraseFrom(normalGrids_)) removed = true;
+    if (eraseFrom(lasagnaDatasets_)) removed = true;
     if (removed) {
         if (outputSegments_ && *outputSegments_ == location) outputSegments_.reset();
         if (!opts_.deferResolution) resolveAll();
@@ -1591,6 +1632,7 @@ utils::Json VolumePkg::toJson() const
     j["volumes"] = entriesToJson(volumes_);
     j["segments"] = entriesToJson(segments_);
     j["normal_grids"] = entriesToJson(normalGrids_);
+    j["lasagna_datasets"] = entriesToJson(lasagnaDatasets_);
     if (!remoteCacheRoot_.empty()) j["remote_cache_root"] = remoteCacheRoot_.string();
     if (outputSegments_) j["output_segments"] = *outputSegments_;
     if (selectedLasagnaDataset_) j["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
@@ -1604,6 +1646,8 @@ void VolumePkg::fromJson(const utils::Json& j)
     if (j.contains("volumes")) volumes_ = entriesFromJson(j.at("volumes"));
     if (j.contains("segments")) segments_ = entriesFromJson(j.at("segments"));
     if (j.contains("normal_grids")) normalGrids_ = entriesFromJson(j.at("normal_grids"));
+    if (j.contains("lasagna_datasets"))
+        lasagnaDatasets_ = entriesFromJson(j.at("lasagna_datasets"));
     if (j.contains("remote_cache_root")) {
         remoteCacheRoot_ = j.at("remote_cache_root").get_string();
         if (!remoteCacheRoot_.empty()) {

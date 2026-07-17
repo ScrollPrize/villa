@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "OpenDataManifest.hpp"
+#include "OpenDataLasagna.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "OpenDataSegmentCache.hpp"
@@ -203,6 +204,106 @@ TEST_CASE("OpenDataManifest strictly parses coordinate-bearing artifact paramete
     CHECK_FALSE(artifacts[2].levelParameterPresent);
     CHECK_FALSE(artifacts[2].sourceCoordinateLevel.has_value());
     CHECK(artifacts[3].targetVolumeId == "target");
+}
+
+TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "metadata":{"samples":{"sample":{"volumes":{"volume":{
+        "properties":{"shape":[100,200,300]},
+        "data":[{
+          "type":"lasagna",
+          "parameters":{"model_id":"model-7"},
+          "creation_info":{"lasagna_version":2,"source_to_base":1.0},
+          "origins":[{"path":"lasagna/volume/","access_roots":[{
+            "type":"https","url":"https://example.test/","usage":"public-read"
+          }]}]
+        }]
+      }}}}}
+    })");
+    const auto& sample = manifest.samples.front();
+    const auto& volume = sample.volumes.front();
+    REQUIRE(volume.shapeZYX.has_value());
+    CHECK(*volume.shapeZYX == std::array<std::size_t, 3>{100, 200, 300});
+
+    const auto artifacts = lasagnaArtifacts(sample.id, volume);
+    REQUIRE(artifacts.size() == 1);
+    CHECK(artifacts.front().volumeId == "volume");
+    CHECK(artifacts.front().artifactUrl == "https://example.test/lasagna/volume");
+    CHECK(artifacts.front().modelId == "model-7");
+    CHECK(artifacts.front().lasagnaVersion == 2);
+    CHECK(artifacts.front().sourceToBase == doctest::Approx(1.0));
+    CHECK(artifacts.front().baseShapeZYX == volume.shapeZYX);
+}
+
+TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic level")
+{
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addLasagnaDatasetEntry(
+        "/cache/sample/vol-a/data.lasagna.json",
+        {"vc-open-data-lasagna",
+         "vc-open-data-sample-id:sample",
+         "vc-open-data-volume-id:vol-a",
+         "vc-open-data-lasagna-artifact:https://example.test/vol-a"}));
+
+    const auto resolved = resolveLasagnaForCoordinateTags(
+        *pkg,
+        {"vc-open-data-sample-id:sample",
+         "vc-open-data-volume-id:vol-a",
+         "vc-open-data-source-coordinate-level:3",
+         "vc-open-data-lasagna-artifact:https://example.test/vol-a"});
+    REQUIRE(resolved.has_value());
+    CHECK(resolved->manifestBacked);
+    CHECK(resolved->workingToBaseScale == doctest::Approx(8.0));
+    CHECK(resolved->coordinateSpace == "sample/vol-a@L3");
+
+    CHECK_THROWS(resolveLasagnaForCoordinateTags(
+        *pkg,
+        {"vc-open-data-sample-id:sample",
+         "vc-open-data-volume-id:vol-b",
+         "vc-open-data-source-coordinate-level:0",
+         "vc-open-data-lasagna-artifact:https://example.test/vol-b"}));
+    CHECK_THROWS(resolveLasagnaForCoordinateTags(
+        *pkg,
+        {"vc-open-data-sample-id:sample",
+         "vc-open-data-volume-id:vol-a",
+         "vc-open-data-source-coordinate-level:6",
+         "vc-open-data-lasagna-artifact:https://example.test/vol-a"}));
+}
+
+TEST_CASE("Open-data Lasagna derives and verifies coordinate scale from volume shape")
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_open_data_lasagna_shape_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(root);
+    const auto manifestPath = root / "data.lasagna.json";
+    writeFile(manifestPath, R"({
+      "version":2,
+      "source_to_base":1,
+      "base_shape_zyx":[100,200,300],
+      "groups":{}
+    })");
+
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addLasagnaDatasetEntry(
+        manifestPath.string(),
+        {"vc-open-data-lasagna",
+         "vc-open-data-sample-id:sample",
+         "vc-open-data-volume-id:vol-a"}));
+    const std::vector<std::string> tags{
+        "vc-open-data-sample-id:sample",
+        "vc-open-data-volume-id:vol-a",
+        "vc-open-data-source-coordinate-level:3"};
+    const auto resolved = resolveLasagnaForCoordinateShape(
+        *pkg, tags, std::array<int, 3>{13, 25, 38});
+    REQUIRE(resolved.has_value());
+    CHECK(resolved->workingToBaseScale == doctest::Approx(8.0));
+
+    auto inconsistentTags = tags;
+    inconsistentTags.back() = "vc-open-data-source-coordinate-level:2";
+    CHECK_THROWS(resolveLasagnaForCoordinateShape(
+        *pkg, inconsistentTags, std::array<int, 3>{13, 25, 38}));
+    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache identities")

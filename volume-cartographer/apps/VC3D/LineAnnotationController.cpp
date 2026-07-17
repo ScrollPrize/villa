@@ -3,6 +3,7 @@
 #include "CState.hpp"
 #include "FiberNameDisplay.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
+#include "OpenDataLasagna.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -95,6 +96,7 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string surfaceName;
     std::string selectedDatasetLocation;
     fs::path selectedManifestPath;
+    double workingToBaseScale = 1.0;
     std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normalSampler;
     TaskState taskState = TaskState::Idle;
@@ -2357,19 +2359,15 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
             throw std::runtime_error("Selected fiber has no line points");
         }
 
-        fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-        if (manifestPath.empty()) {
-            const auto picked = pickDataset(_parentWidget.data(), volpkgRoot);
-            if (!picked) {
-                throw std::runtime_error("No Lasagna normal dataset selected");
-            }
-            vpkg->setSelectedLasagnaDataset(*picked);
-            manifestPath = vpkg->selectedLasagnaDatasetPath();
-        }
+        const auto resolvedLasagna = resolveAlignmentMetricsManifestPath();
+        if (!resolvedLasagna)
+            throw std::runtime_error("No Lasagna dataset selected");
+        const fs::path manifestPath = resolvedLasagna->first;
         if (manifestPath.empty() || !fs::exists(manifestPath)) {
-            throw std::runtime_error("Selected Lasagna normal dataset does not exist");
+            throw std::runtime_error("Selected Lasagna dataset does not exist");
         }
-        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
+            manifestPath, {resolvedLasagna->second});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         const fs::path initShellDir =
             vc::atlas::initShellDirectoryFromManifest(dataset.manifest());
@@ -2706,14 +2704,15 @@ bool LineAnnotationController::acceptIntersectionSameWindingChoice()
                 "An atlas must be seeded from one inspected object before linked objects can be added");
         }
 
-        fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-        if (manifestPath.empty()) {
-            throw std::runtime_error("No Lasagna normal dataset selected");
-        }
+        const auto resolvedLasagna = resolveAlignmentMetricsManifestPath();
+        if (!resolvedLasagna)
+            throw std::runtime_error("No Lasagna dataset selected");
+        const fs::path manifestPath = resolvedLasagna->first;
         if (!fs::exists(manifestPath)) {
-            throw std::runtime_error("Selected Lasagna normal dataset does not exist");
+            throw std::runtime_error("Selected Lasagna dataset does not exist");
         }
-        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
+            manifestPath, {resolvedLasagna->second});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
 
         const fs::path basePath = *_intersectionInspection->atlasDir / atlas.metadata.baseMeshPath;
@@ -3172,7 +3171,7 @@ void LineAnnotationController::rebuildIntersectionInspection()
             }
             if (!ensureDatasetForSession(*side.editSession)) {
                 throw std::runtime_error(
-                    "Intersection side strips require a selected Lasagna normal dataset; "
+                    "Intersection side strips require a selected Lasagna dataset; "
                     "not showing a synthetic strip");
             }
             side.editSession->optimizedLine =
@@ -4171,7 +4170,8 @@ bool LineAnnotationController::isAlignmentPendingForFiber(uint64_t fiberId,
            isAlignmentPendingForFiber(fiberId);
 }
 
-std::optional<fs::path> LineAnnotationController::resolveAlignmentMetricsManifestPath()
+std::optional<std::pair<fs::path, double>>
+LineAnnotationController::resolveAlignmentMetricsManifestPath()
 {
     if (!_state || !_state->vpkg()) {
         showError(tr("No volume package loaded."));
@@ -4179,10 +4179,20 @@ std::optional<fs::path> LineAnnotationController::resolveAlignmentMetricsManifes
     }
 
     auto vpkg = _state->vpkg();
+    try {
+        if (const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
+                *vpkg, _state->currentVolumeId())) {
+            return std::pair{resolved->manifestPath, resolved->workingToBaseScale};
+        }
+    } catch (const std::exception& ex) {
+        showError(tr("Cannot resolve Lasagna for the active volume: %1")
+                      .arg(QString::fromStdString(ex.what())));
+        return std::nullopt;
+    }
     std::string selected = vpkg->selectedLasagnaDataset();
     fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
     if (!selected.empty() && !manifestPath.empty()) {
-        return manifestPath;
+        return std::pair{manifestPath, 1.0};
     }
 
     const fs::path startDir = vpkg->path().empty()
@@ -4196,7 +4206,7 @@ std::optional<fs::path> LineAnnotationController::resolveAlignmentMetricsManifes
     selected = *picked;
     manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
     vpkg->setSelectedLasagnaDataset(selected);
-    return manifestPath;
+    return std::pair{manifestPath, 1.0};
 }
 
 void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds)
@@ -4273,7 +4283,8 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
     QPointer<LineAnnotationController> self(this);
     watcher->setFuture(QtConcurrent::run([generation,
                                            self,
-                                           resolvedManifestPath = *manifestPath,
+                                           resolvedManifestPath = manifestPath->first,
+                                           workingToBaseScale = manifestPath->second,
                                            fibers = std::move(fibers),
                                            requestTokens = std::move(requestTokens)]() mutable {
         FiberMetricsTaskResult result;
@@ -4301,7 +4312,8 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
 
         try {
             vc::lasagna::LasagnaDataset dataset =
-                vc::lasagna::LasagnaDataset::open(resolvedManifestPath);
+                vc::lasagna::LasagnaDataset::open(
+                    resolvedManifestPath, {workingToBaseScale});
             vc::lasagna::LasagnaNormalSampler sampler(dataset);
             result.metrics.reserve(fibers.size());
             for (size_t i = 0; i < fibers.size(); ++i) {
@@ -4805,6 +4817,7 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
     childSession->initialDirectionMode = parentSession.initialDirectionMode;
     childSession->selectedDatasetLocation = parentSession.selectedDatasetLocation;
     childSession->selectedManifestPath = parentSession.selectedManifestPath;
+    childSession->workingToBaseScale = parentSession.workingToBaseScale;
     childSession->dataset = parentSession.dataset;
     childSession->normalSampler = parentSession.normalSampler;
     ensureSessionFiberIdentity(*childSession);
@@ -5043,8 +5056,23 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     }
 
     auto vpkg = _state->vpkg();
-    std::string selected = vpkg->selectedLasagnaDataset();
-    fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
+    std::string selected;
+    fs::path manifestPath;
+    double workingToBaseScale = 1.0;
+    try {
+        if (const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
+                *vpkg, _state->currentVolumeId())) {
+            manifestPath = resolved->manifestPath;
+            selected = resolved->manifestBacked
+                ? manifestPath.string()
+                : vpkg->selectedLasagnaDataset();
+            workingToBaseScale = resolved->workingToBaseScale;
+        }
+    } catch (const std::exception& ex) {
+        showError(tr("Cannot resolve Lasagna for the active volume: %1")
+                      .arg(QString::fromStdString(ex.what())));
+        return false;
+    }
 
     if (selected.empty()) {
         const fs::path startDir = vpkg->path().empty()
@@ -5059,7 +5087,8 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         try {
             auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
-                vc::lasagna::LasagnaDataset::open(manifestPath));
+                vc::lasagna::LasagnaDataset::open(
+                    manifestPath, {workingToBaseScale}));
             auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
             session.dataset = std::move(dataset);
             session.normalSampler = std::move(sampler);
@@ -5069,10 +5098,12 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         }
         vpkg->setSelectedLasagnaDataset(selected);
     } else {
-        if (!session.normalSampler || session.selectedManifestPath != manifestPath) {
+        if (!session.normalSampler || session.selectedManifestPath != manifestPath ||
+            session.workingToBaseScale != workingToBaseScale) {
             try {
                 auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
-                    vc::lasagna::LasagnaDataset::open(manifestPath));
+                    vc::lasagna::LasagnaDataset::open(
+                        manifestPath, {workingToBaseScale}));
                 auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
                 session.dataset = std::move(dataset);
                 session.normalSampler = std::move(sampler);
@@ -5086,6 +5117,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
 
     session.selectedDatasetLocation = selected;
     session.selectedManifestPath = manifestPath;
+    session.workingToBaseScale = workingToBaseScale;
     return true;
 }
 

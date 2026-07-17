@@ -52,7 +52,7 @@ bool finiteDirection(const cv::Vec3d& v)
 
 void printUsage(const char* argv0)
 {
-    std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--benchmark-threads] [--trace-init] [--segments-per-side=N] [--seed=x,y,z] [--verbose]\n"
+    std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--working-to-base-scale N] [--constant-normal-jacobian] [--benchmark-solvers] [--benchmark-threads] [--trace-init] [--segments-per-side=N] [--seed=x,y,z] [--verbose]\n"
               << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> [--reopt|--reinit-reopt] [--output <fiber.json>] [--obj-output-dir <dir>] [--reinit-debug-obj-output-dir <dir>] [--strip-output-dir <dir>] [--texture-zarr <zarr>] [--texture-level N] [--strip-render-scale N] [--constant-normal-jacobian] [--verbose]\n"
               << "Runs line annotation optimization at seed "
               << "[17955,15141,37891] with initial z-axis mode, or loads/reoptimizes a saved VC3D fiber.\n";
@@ -82,6 +82,20 @@ int parsePositiveInt(const std::string& value, const char* name)
     if (consumed != value.size() || parsed <= 0) {
         throw std::invalid_argument(std::string(name) + " must be a positive integer");
     }
+    return parsed;
+}
+
+double parsePositiveDouble(const std::string& value, const char* name)
+{
+    size_t consumed = 0;
+    double parsed = 0.0;
+    try {
+        parsed = std::stod(value, &consumed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(std::string(name) + " must be a positive number");
+    }
+    if (consumed != value.size() || !std::isfinite(parsed) || parsed <= 0.0)
+        throw std::invalid_argument(std::string(name) + " must be a positive number");
     return parsed;
 }
 
@@ -1606,6 +1620,7 @@ int main(int argc, char** argv)
     int textureLevel = 0;
     int stripRenderScale = 4;
     int segmentsPerSide = 200;
+    double workingToBaseScale = 1.0;
     cv::Vec3d seedPoint{17955.0, 15141.0, 37891.0};
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -1663,6 +1678,11 @@ int main(int argc, char** argv)
                 throw std::invalid_argument("--strip-render-scale requires a positive integer");
             }
             stripRenderScale = parsePositiveInt(argv[++i], "strip-render-scale");
+        } else if (arg == "--working-to-base-scale") {
+            if (i + 1 >= argc)
+                throw std::invalid_argument("--working-to-base-scale requires a number");
+            workingToBaseScale = parsePositiveDouble(
+                argv[++i], "working-to-base-scale");
         } else if (arg.rfind("--segments-per-side=", 0) == 0) {
             segmentsPerSide = parsePositiveInt(arg.substr(20), "segments-per-side");
         } else if (arg.rfind("--seed=", 0) == 0) {
@@ -1724,7 +1744,8 @@ int main(int argc, char** argv)
         }
 
         const std::filesystem::path manifestPath = argv[1];
-        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
+            manifestPath, {workingToBaseScale});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         vc::lasagna::LineOptimizer optimizer(sampler);
         std::shared_ptr<Volume> textureVolume;

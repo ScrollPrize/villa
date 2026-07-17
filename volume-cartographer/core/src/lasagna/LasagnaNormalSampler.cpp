@@ -528,8 +528,9 @@ private:
     binding.path = group->zarrPath;
     binding.arrayId = arrayIdForPath(binding.path);
     binding.array = std::make_shared<utils::ZarrArray>(
-        utils::ZarrArray::open(group->zarrPath, vc::buildZarrCodecRegistry(1)));
-    binding.spacing = static_cast<double>(group->scaleFactor()) * manifest.sourceToBase;
+        openLasagnaChannelArray(manifest, *group, 1));
+    binding.spacing = static_cast<double>(group->scaleFactor()) *
+                      manifest.sourceToBase / manifest.workingToBaseScale;
 
     const auto& meta = binding.array->metadata();
     if (meta.dtype != utils::ZarrDtype::uint8) {

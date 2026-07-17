@@ -40,6 +40,8 @@ set(srcs
     OpenDataCatalogWindow.cpp
     OpenDataCatalogWindow.hpp
     OpenDataManifest.cpp
+    OpenDataLasagna.cpp
+    OpenDataLasagna.hpp
     OpenDataManifest.hpp
     OpenDataSampleProject.cpp
     OpenDataSampleProject.hpp

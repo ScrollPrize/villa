@@ -363,7 +363,8 @@ private:
     [[nodiscard]] bool isAlignmentPendingForFiber(uint64_t fiberId) const;
     [[nodiscard]] bool isAlignmentPendingForFiber(uint64_t fiberId,
                                                   uint64_t requestToken) const;
-    [[nodiscard]] std::optional<std::filesystem::path> resolveAlignmentMetricsManifestPath();
+    [[nodiscard]] std::optional<std::pair<std::filesystem::path, double>>
+        resolveAlignmentMetricsManifestPath();
     void requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds);
     void publishFiberAlignmentMetrics(uint64_t fiberId,
                                       CachedFiberAlignmentMetrics metrics);
