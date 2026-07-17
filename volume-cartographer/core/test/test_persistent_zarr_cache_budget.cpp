@@ -79,6 +79,46 @@ TEST_CASE("budget discovers only remote-volume and Lasagna Zarr data")
     fs::remove_all(root);
 }
 
+TEST_CASE("volume chunk exclusions are relative to the managed root")
+{
+    const auto base = tempRoot("relative");
+    const auto root = base / "projects" / "user-cache";
+    writeBytes(volumeChunk(root, 0), 17);
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 17);
+    fs::remove_all(base);
+}
+
+TEST_CASE("nested cache roots share one budget")
+{
+    Budget::resetRegistryForTesting();
+    const auto root = tempRoot("nested");
+    const auto nested = root / "project" / "volume";
+    auto free = std::make_shared<std::atomic<std::uint64_t>>(900);
+    auto parentBudget = Budget::configure(root, {}, spaceWith(free));
+    auto nestedBudget = Budget::configure(nested, {}, spaceWith(free));
+    CHECK(parentBudget == nestedBudget);
+    CHECK(Budget::findForPath(volumeChunk(nested, 0)) == parentBudget);
+    parentBudget->waitForIdle();
+    fs::remove_all(root);
+    Budget::resetRegistryForTesting();
+}
+
+TEST_CASE("a containing root cannot be registered after its nested root")
+{
+    Budget::resetRegistryForTesting();
+    const auto root = tempRoot("nested_rejected");
+    const auto nested = root / "project" / "volume";
+    auto free = std::make_shared<std::atomic<std::uint64_t>>(900);
+    auto nestedBudget = Budget::configure(nested, {}, spaceWith(free));
+    CHECK_THROWS(Budget::configure(root, {}, spaceWith(free)));
+    nestedBudget->waitForIdle();
+    fs::remove_all(root);
+    Budget::resetRegistryForTesting();
+}
+
 TEST_CASE("successful reads touch LRU and the oldest unpinned entry is evicted")
 {
     const auto root = tempRoot("lru");
@@ -164,6 +204,67 @@ TEST_CASE("oversized writes and concurrent reservations cannot exceed a maximum"
     CHECK_FALSE(static_cast<bool>(budget->reserveWrite(volumeChunk(root, 1), 50)));
     first.cancel();
     CHECK(static_cast<bool>(budget->reserveWrite(volumeChunk(root, 1), 50)));
+    fs::remove_all(root);
+}
+
+TEST_CASE("outstanding reservations count against the free-space reserve")
+{
+    const auto root = tempRoot("free_concurrent");
+    auto free = std::make_shared<std::atomic<std::uint64_t>>(55);
+    auto budget = Budget::configure(root, {std::nullopt, 50}, spaceWith(free));
+    budget->waitForIdle();
+    auto first = budget->reserveWrite(volumeChunk(root, 0), 4);
+    REQUIRE(static_cast<bool>(first));
+    CHECK_FALSE(static_cast<bool>(budget->reserveWrite(volumeChunk(root, 1), 2)));
+    first.cancel();
+    CHECK(static_cast<bool>(budget->reserveWrite(volumeChunk(root, 1), 2)));
+    fs::remove_all(root);
+}
+
+TEST_CASE("reads wait for an active write reservation")
+{
+    const auto root = tempRoot("read_write");
+    const auto target = volumeChunk(root, 0);
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    auto write = budget->reserveWrite(target, 10);
+    REQUIRE(static_cast<bool>(write));
+
+    std::atomic<bool> started{false};
+    std::atomic<bool> acquired{false};
+    std::thread reader([&] {
+        started = true;
+        auto pin = budget->pinRead(target);
+        acquired = true;
+    });
+    while (!started.load())
+        std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK_FALSE(acquired.load());
+    write.cancel();
+    reader.join();
+    CHECK(acquired.load());
+    fs::remove_all(root);
+}
+
+TEST_CASE("format replacement commits refresh all affected accounting")
+{
+    const auto root = tempRoot("replacement");
+    const auto raw = volumeChunk(root, 0);
+    auto compressed = raw;
+    compressed.replace_extension(".zst");
+    writeBytes(raw, 10);
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+
+    auto reservation = budget->reserveWrite(compressed, 7, {raw});
+    REQUIRE(static_cast<bool>(reservation));
+    writeBytes(compressed, 7);
+    fs::remove(raw);
+    reservation.commit();
+    CHECK(budget->stats().managedBytes == 7);
     fs::remove_all(root);
 }
 

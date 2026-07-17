@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -45,7 +47,7 @@ bool isUnsignedNumber(const std::string& value)
            });
 }
 
-bool isVolumeChunk(const fs::path& path)
+bool isVolumeChunk(const fs::path& path, const fs::path& root)
 {
     const auto ext = path.extension().string();
     if (ext != ".bin" && ext != ".zst" && ext != ".c3d" && ext != ".empty")
@@ -53,7 +55,11 @@ bool isVolumeChunk(const fs::path& path)
     auto y = path.parent_path();
     auto z = y.parent_path();
     auto level = z.parent_path();
-    for (const auto& component : path) {
+    const auto relative = path.lexically_relative(root);
+    if (relative.empty() ||
+        (relative.begin() != relative.end() && *relative.begin() == ".."))
+        return false;
+    for (const auto& component : relative) {
         const auto value = component.string();
         if (value == "segments" || value == "normal_grids" ||
             value == "normal-grid" || value == "projects")
@@ -151,12 +157,22 @@ std::shared_ptr<PersistentZarrCacheBudget> PersistentZarrCacheBudget::configure(
     bool created = false;
     {
         std::lock_guard lock(r.mutex);
-        auto& slot = r.budgets[key];
-        if (!slot) {
-            slot.reset(new PersistentZarrCacheBudget(key, limits, std::move(provider)));
+        for (const auto& [registeredRoot, budget] : r.budgets) {
+            if (isWithin(key, registeredRoot)) {
+                result = budget;
+                break;
+            }
+            if (isWithin(registeredRoot, key)) {
+                throw std::invalid_argument(
+                    "A persistent Zarr cache budget is already configured beneath " +
+                    key.string());
+            }
+        }
+        if (!result) {
+            result.reset(new PersistentZarrCacheBudget(key, limits, std::move(provider)));
+            r.budgets.emplace(key, result);
             created = true;
         }
-        result = slot;
     }
     if (created)
         result->startScan();
@@ -227,7 +243,8 @@ void PersistentZarrCacheBudget::startScan()
         std::unordered_map<std::string, Impl::Entry> found;
         std::uint64_t total = 0;
         for (const auto& path : files) {
-            if (!isVolumeChunk(path) && !isLasagnaData(path, artifacts))
+            if (!isVolumeChunk(path, self->impl_->root) &&
+                !isLasagnaData(path, artifacts))
                 continue;
             std::error_code fileEc;
             const auto size = fs::file_size(path, fileEc);
@@ -352,7 +369,10 @@ PersistentZarrCacheBudget::ReadPin PersistentZarrCacheBudget::pinRead(const fs::
 {
     const auto normalized = normalizedPath(path);
     {
-        std::lock_guard lock(impl_->mutex);
+        std::unique_lock lock(impl_->mutex);
+        impl_->cv.wait(lock, [&] {
+            return !impl_->writePins.contains(normalized.string());
+        });
         ++impl_->readPins[normalized.string()];
     }
     return ReadPin(shared_from_this(), normalized);
@@ -402,11 +422,15 @@ PersistentZarrCacheBudget::WriteReservation PersistentZarrCacheBudget::reserveWr
             needed = projected - *impl_->limits.maximumBytes;
     }
     if (impl_->limits.minimumFreeBytes > 0) {
+        const auto pendingGrowth =
+            impl_->reservedGrowth > std::numeric_limits<std::uint64_t>::max() - netGrowth
+                ? std::numeric_limits<std::uint64_t>::max()
+                : impl_->reservedGrowth + netGrowth;
         if (free < impl_->limits.minimumFreeBytes)
-            needed = std::max(needed, netGrowth);
-        else if (netGrowth > free - impl_->limits.minimumFreeBytes)
+            needed = std::max(needed, pendingGrowth);
+        else if (pendingGrowth > free - impl_->limits.minimumFreeBytes)
             needed = std::max(needed,
-                              netGrowth - (free - impl_->limits.minimumFreeBytes));
+                              pendingGrowth - (free - impl_->limits.minimumFreeBytes));
     }
 
     std::set<std::string> protectedPaths{normalizedTarget.string()};

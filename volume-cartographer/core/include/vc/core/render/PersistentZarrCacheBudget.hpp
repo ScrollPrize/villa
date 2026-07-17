@@ -82,6 +82,8 @@ public:
         std::uint64_t reservedGrowth_ = 0;
     };
 
+    // Nested roots reuse an existing containing budget. Configuring a broader
+    // root after a nested budget is already active is rejected.
     static std::shared_ptr<PersistentZarrCacheBudget> configure(
         const std::filesystem::path& root,
         Limits limits,
