@@ -114,6 +114,7 @@ public:
     InitialDirectionMode initialDirectionMode() const;
     ReoptimizationMode reoptimizationMode() const;
     ShiftScrollMode shiftScrollMode() const;
+    int initialCenterlineLengthVx() const;
     int maxControlPointDistanceVx() const;
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedBranchLinePoints(std::vector<std::vector<cv::Vec3f>> branchLinePoints);
@@ -261,6 +262,7 @@ private:
     QComboBox* _initialDirectionCombo = nullptr;
     QComboBox* _reoptimizationCombo = nullptr;
     QComboBox* _shiftScrollCombo = nullptr;
+    QSpinBox* _initialCenterlineLengthSpin = nullptr;
     QSpinBox* _maxControlPointDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QLabel* _sliceStepLabel = nullptr;

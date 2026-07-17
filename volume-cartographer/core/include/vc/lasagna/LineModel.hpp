@@ -36,6 +36,10 @@ struct NormalBatchReport {
 class NormalSampler {
 public:
     virtual ~NormalSampler() = default;
+    [[nodiscard]] virtual bool supportsConcurrentSampling() const noexcept
+    {
+        return false;
+    }
     [[nodiscard]] virtual NormalSample sampleNormal(const cv::Vec3d& volumePoint) const = 0;
     [[nodiscard]] virtual NormalSampleWithDerivative sampleNormalWithDerivative(
         const cv::Vec3d& volumePoint) const

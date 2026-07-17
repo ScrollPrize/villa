@@ -3,6 +3,7 @@
 #include "CState.hpp"
 #include "FiberNameDisplay.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
+#include "OpenDataLasagna.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
@@ -103,6 +104,7 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string surfaceName;
     std::string selectedDatasetLocation;
     fs::path selectedManifestPath;
+    double workingToBaseScale = 1.0;
     std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normalSampler;
     TaskState taskState = TaskState::Idle;
@@ -231,6 +233,19 @@ constexpr double kEpsilon = 1.0e-12;
 constexpr double kLineSegmentLength = 32.0;
 constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
 using Clock = std::chrono::steady_clock;
+
+struct InitialLineDiscretization {
+    int segmentsPerSide = 1;
+    double segmentLength = kLineSegmentLength;
+};
+
+InitialLineDiscretization initialLineDiscretization(int totalLengthVx)
+{
+    const double halfLength = std::max(1, totalLengthVx) * 0.5;
+    const int segmentsPerSide = std::max(
+        1, static_cast<int>(std::ceil(halfLength / kLineSegmentLength)));
+    return {segmentsPerSide, halfLength / static_cast<double>(segmentsPerSide)};
+}
 
 void closeLineAnnotationDialogAfterFinalization(LineAnnotationDialog* dialog)
 {
@@ -1526,6 +1541,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode,
+    int initialCenterlineLengthVx,
     bool forceFullOptimization,
     int activeStart,
     int activeEnd,
@@ -1537,6 +1553,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode,
+    int initialCenterlineLengthVx,
     bool forceFullOptimization,
     int activeStart,
     int activeEnd)
@@ -1549,6 +1566,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
                                    std::move(initialLinePoints),
                                    sourceSliceNormal,
                                    directionMode,
+                                   initialCenterlineLengthVx,
                                    forceFullOptimization,
                                    activeStart,
                                    activeEnd,
@@ -1561,6 +1579,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode,
+    int initialCenterlineLengthVx,
     bool forceFullOptimization,
     int activeStart,
     int activeEnd,
@@ -1587,14 +1606,16 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     try {
         vc::lasagna::LineOptimizer optimizer(sampler);
         vc::lasagna::LineOptimizationConfig config;
-        config.segmentsPerSide = 200;
-        config.segmentLength = kLineSegmentLength;
+        const auto discretization = initialLineDiscretization(initialCenterlineLengthVx);
+        config.segmentsPerSide = discretization.segmentsPerSide;
+        config.segmentLength = discretization.segmentLength;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
         config.samplesPerSegment = 1;
         config.maxIterations = 1000;
         config.differentiableNormalSampling = true;
         config.printSolverProgress = false;
+        (void)sampler.prefetchNormalSamples({task.seedPoint}, false);
         config.initialTangent = initialTangentForMode(
             directionMode,
             sourceSliceNormal,
@@ -1694,6 +1715,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
                                   std::vector<cv::Vec3d> initialLinePoints,
                                   cv::Vec3d sourceSliceNormal,
                                   InitialDirectionMode directionMode,
+                                  int initialCenterlineLengthVx,
                                   bool forceFullOptimization,
                                   int activeStart,
                                   int activeEnd) {
@@ -1702,6 +1724,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
                                         std::move(initialLinePoints),
                                         sourceSliceNormal,
                                         directionMode,
+                                        initialCenterlineLengthVx,
                                         forceFullOptimization,
                                         activeStart,
                                         activeEnd);
@@ -2842,19 +2865,15 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
             throw std::runtime_error("Selected fiber has no line points");
         }
 
-        fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-        if (manifestPath.empty()) {
-            const auto picked = pickDataset(_parentWidget.data(), volpkgRoot);
-            if (!picked) {
-                throw std::runtime_error("No Lasagna normal dataset selected");
-            }
-            vpkg->setSelectedLasagnaDataset(*picked);
-            manifestPath = vpkg->selectedLasagnaDatasetPath();
-        }
+        const auto resolvedLasagna = resolveAlignmentMetricsManifestPath();
+        if (!resolvedLasagna)
+            throw std::runtime_error("No Lasagna dataset selected");
+        const fs::path manifestPath = resolvedLasagna->first;
         if (manifestPath.empty() || !fs::exists(manifestPath)) {
-            throw std::runtime_error("Selected Lasagna normal dataset does not exist");
+            throw std::runtime_error("Selected Lasagna dataset does not exist");
         }
-        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
+            manifestPath, {resolvedLasagna->second});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         const fs::path initShellDir =
             vc::atlas::initShellDirectoryFromManifest(dataset.manifest());
@@ -3191,14 +3210,15 @@ bool LineAnnotationController::acceptIntersectionSameWindingChoice()
                 "An atlas must be seeded from one inspected object before linked objects can be added");
         }
 
-        fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-        if (manifestPath.empty()) {
-            throw std::runtime_error("No Lasagna normal dataset selected");
-        }
+        const auto resolvedLasagna = resolveAlignmentMetricsManifestPath();
+        if (!resolvedLasagna)
+            throw std::runtime_error("No Lasagna dataset selected");
+        const fs::path manifestPath = resolvedLasagna->first;
         if (!fs::exists(manifestPath)) {
-            throw std::runtime_error("Selected Lasagna normal dataset does not exist");
+            throw std::runtime_error("Selected Lasagna dataset does not exist");
         }
-        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
+            manifestPath, {resolvedLasagna->second});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
 
         const fs::path basePath = *_intersectionInspection->atlasDir / atlas.metadata.baseMeshPath;
@@ -3657,7 +3677,7 @@ void LineAnnotationController::rebuildIntersectionInspection()
             }
             if (!ensureDatasetForSession(*side.editSession)) {
                 throw std::runtime_error(
-                    "Intersection side strips require a selected Lasagna normal dataset; "
+                    "Intersection side strips require a selected Lasagna dataset; "
                     "not showing a synthetic strip");
             }
             side.editSession->optimizedLine =
@@ -4673,7 +4693,8 @@ bool LineAnnotationController::isAlignmentPendingForFiber(uint64_t fiberId,
            isAlignmentPendingForFiber(fiberId);
 }
 
-std::optional<fs::path> LineAnnotationController::resolveAlignmentMetricsManifestPath()
+std::optional<std::pair<fs::path, double>>
+LineAnnotationController::resolveAlignmentMetricsManifestPath()
 {
     if (!_state || !_state->vpkg()) {
         showError(tr("No volume package loaded."));
@@ -4681,10 +4702,20 @@ std::optional<fs::path> LineAnnotationController::resolveAlignmentMetricsManifes
     }
 
     auto vpkg = _state->vpkg();
+    try {
+        if (const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
+                *vpkg, _state->currentVolumeId())) {
+            return std::pair{resolved->manifestPath, resolved->workingToBaseScale};
+        }
+    } catch (const std::exception& ex) {
+        showError(tr("Cannot resolve Lasagna for the active volume: %1")
+                      .arg(QString::fromStdString(ex.what())));
+        return std::nullopt;
+    }
     std::string selected = vpkg->selectedLasagnaDataset();
     fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
     if (!selected.empty() && !manifestPath.empty()) {
-        return manifestPath;
+        return std::pair{manifestPath, 1.0};
     }
 
     const fs::path startDir = vpkg->path().empty()
@@ -4698,7 +4729,7 @@ std::optional<fs::path> LineAnnotationController::resolveAlignmentMetricsManifes
     selected = *picked;
     manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
     vpkg->setSelectedLasagnaDataset(selected);
-    return manifestPath;
+    return std::pair{manifestPath, 1.0};
 }
 
 void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds)
@@ -4775,7 +4806,8 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
     QPointer<LineAnnotationController> self(this);
     watcher->setFuture(QtConcurrent::run([generation,
                                            self,
-                                           resolvedManifestPath = *manifestPath,
+                                           resolvedManifestPath = manifestPath->first,
+                                           workingToBaseScale = manifestPath->second,
                                            fibers = std::move(fibers),
                                            requestTokens = std::move(requestTokens)]() mutable {
         FiberMetricsTaskResult result;
@@ -4803,7 +4835,8 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
 
         try {
             vc::lasagna::LasagnaDataset dataset =
-                vc::lasagna::LasagnaDataset::open(resolvedManifestPath);
+                vc::lasagna::LasagnaDataset::open(
+                    resolvedManifestPath, {workingToBaseScale});
             vc::lasagna::LasagnaNormalSampler sampler(dataset);
             result.metrics.reserve(fibers.size());
             for (size_t i = 0; i < fibers.size(); ++i) {
@@ -5246,8 +5279,12 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     const auto updateStart = Clock::now();
     try {
         vc::lasagna::LineOptimizationConfig updateConfig;
-        updateConfig.segmentsPerSide = 200;
-        updateConfig.segmentLength = kLineSegmentLength;
+        const int initialCenterlineLengthVx = pane->dialog
+            ? pane->dialog->initialCenterlineLengthVx()
+            : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
+        const auto discretization = initialLineDiscretization(initialCenterlineLengthVx);
+        updateConfig.segmentsPerSide = discretization.segmentsPerSide;
+        updateConfig.segmentLength = discretization.segmentLength;
         update = vc::lasagna::updateExistingLineControlPoint(std::move(currentLinePoints),
                                                              std::move(session.controlPoints),
                                                              changedControlIndex,
@@ -5339,6 +5376,7 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
     linkedSeedRecord->initialDirectionMode = InitialDirectionMode::ZInOut;
     linkedSeedRecord->selectedDatasetLocation = parentSession.selectedDatasetLocation;
     linkedSeedRecord->selectedManifestPath = parentSession.selectedManifestPath;
+    linkedSeedRecord->workingToBaseScale = parentSession.workingToBaseScale;
     linkedSeedRecord->dataset = parentSession.dataset;
     linkedSeedRecord->normalSampler = parentSession.normalSampler;
     ensureSessionFiberIdentity(*linkedSeedRecord);
@@ -5655,8 +5693,23 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     }
 
     auto vpkg = _state->vpkg();
-    std::string selected = vpkg->selectedLasagnaDataset();
-    fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
+    std::string selected;
+    fs::path manifestPath;
+    double workingToBaseScale = 1.0;
+    try {
+        if (const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
+                *vpkg, _state->currentVolumeId())) {
+            manifestPath = resolved->manifestPath;
+            selected = resolved->manifestBacked
+                ? manifestPath.string()
+                : vpkg->selectedLasagnaDataset();
+            workingToBaseScale = resolved->workingToBaseScale;
+        }
+    } catch (const std::exception& ex) {
+        showError(tr("Cannot resolve Lasagna for the active volume: %1")
+                      .arg(QString::fromStdString(ex.what())));
+        return false;
+    }
 
     if (selected.empty()) {
         const fs::path startDir = vpkg->path().empty()
@@ -5671,7 +5724,8 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         try {
             auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
-                vc::lasagna::LasagnaDataset::open(manifestPath));
+                vc::lasagna::LasagnaDataset::open(
+                    manifestPath, {workingToBaseScale}));
             auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
             session.dataset = std::move(dataset);
             session.normalSampler = std::move(sampler);
@@ -5681,10 +5735,12 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         }
         vpkg->setSelectedLasagnaDataset(selected);
     } else {
-        if (!session.normalSampler || session.selectedManifestPath != manifestPath) {
+        if (!session.normalSampler || session.selectedManifestPath != manifestPath ||
+            session.workingToBaseScale != workingToBaseScale) {
             try {
                 auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
-                    vc::lasagna::LasagnaDataset::open(manifestPath));
+                    vc::lasagna::LasagnaDataset::open(
+                        manifestPath, {workingToBaseScale}));
                 auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
                 session.dataset = std::move(dataset);
                 session.normalSampler = std::move(sampler);
@@ -5698,6 +5754,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
 
     session.selectedDatasetLocation = selected;
     session.selectedManifestPath = manifestPath;
+    session.workingToBaseScale = workingToBaseScale;
     return true;
 }
 
@@ -5848,11 +5905,16 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
     for (const auto& point : session.optimizedLine.points) {
         initialLinePoints.push_back(point.position);
     }
+    const auto* pane = paneForSurface(session.surfaceName);
+    const int initialCenterlineLengthVx = pane && pane->dialog
+        ? pane->dialog->initialCenterlineLengthVx()
+        : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
     OptimizationTaskResult task = optimizeLineWithSampler(session.selectedManifestPath,
                                                           session.controlPoints,
                                                           std::move(initialLinePoints),
                                                           session.sourceSliceNormal,
                                                           session.initialDirectionMode,
+                                                          initialCenterlineLengthVx,
                                                           false,
                                                           -1,
                                                           -1,
@@ -5949,6 +6011,10 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     }
     const cv::Vec3d sourceSliceNormal = session.sourceSliceNormal;
     const InitialDirectionMode directionMode = session.initialDirectionMode;
+    const auto* pane = paneForSurface(surfaceName);
+    const int initialCenterlineLengthVx = pane && pane->dialog
+        ? pane->dialog->initialCenterlineLengthVx()
+        : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
     auto dataset = session.dataset;
     auto normalSampler = session.normalSampler;
     watcher->setFuture(QtConcurrent::run([factory,
@@ -5957,6 +6023,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            initialLinePoints,
                                            sourceSliceNormal,
                                            directionMode,
+                                           initialCenterlineLengthVx,
                                            forceFullOptimization,
                                            activeStart,
                                            activeEnd,
@@ -5968,6 +6035,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                            std::move(initialLinePoints),
                            sourceSliceNormal,
                            directionMode,
+                           initialCenterlineLengthVx,
                            forceFullOptimization,
                            activeStart,
                            activeEnd);
@@ -5979,6 +6047,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            std::move(initialLinePoints),
                                            sourceSliceNormal,
                                            directionMode,
+                                           initialCenterlineLengthVx,
                                            forceFullOptimization,
                                            activeStart,
                                            activeEnd,
@@ -5989,6 +6058,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                         std::move(initialLinePoints),
                                         sourceSliceNormal,
                                         directionMode,
+                                        initialCenterlineLengthVx,
                                         forceFullOptimization,
                                         activeStart,
                                         activeEnd);
@@ -6552,6 +6622,7 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     InitialDirectionMode directionMode,
+    int initialCenterlineLengthVx,
     bool forceFullOptimization,
     int activeStart,
     int activeEnd) const
@@ -6562,6 +6633,7 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
                                         std::move(initialLinePoints),
                                         sourceSliceNormal,
                                         directionMode,
+                                        initialCenterlineLengthVx,
                                         forceFullOptimization,
                                         activeStart,
                                         activeEnd);
@@ -6571,6 +6643,7 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
                                     std::move(initialLinePoints),
                                     sourceSliceNormal,
                                     directionMode,
+                                    initialCenterlineLengthVx,
                                     forceFullOptimization,
                                     activeStart,
                                     activeEnd);

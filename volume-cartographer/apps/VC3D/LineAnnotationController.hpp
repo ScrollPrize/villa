@@ -132,6 +132,7 @@ public:
                                              std::vector<cv::Vec3d>,
                                              cv::Vec3d,
                                              InitialDirectionMode,
+                                             int,
                                              bool,
                                              int,
                                              int)>;
@@ -396,6 +397,7 @@ private:
                                                              std::vector<cv::Vec3d> initialLinePoints,
                                                              cv::Vec3d sourceSliceNormal,
                                                              InitialDirectionMode directionMode,
+                                                             int initialCenterlineLengthVx,
                                                              bool fullOptimization = false,
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
@@ -519,7 +521,8 @@ private:
     [[nodiscard]] bool isAlignmentPendingForFiber(uint64_t fiberId) const;
     [[nodiscard]] bool isAlignmentPendingForFiber(uint64_t fiberId,
                                                   uint64_t requestToken) const;
-    [[nodiscard]] std::optional<std::filesystem::path> resolveAlignmentMetricsManifestPath();
+    [[nodiscard]] std::optional<std::pair<std::filesystem::path, double>>
+        resolveAlignmentMetricsManifestPath();
     void requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds);
     void publishFiberAlignmentMetrics(uint64_t fiberId,
                                       CachedFiberAlignmentMetrics metrics);

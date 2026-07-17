@@ -1,6 +1,7 @@
 #include "OpenDataSampleProject.hpp"
 
 #include "OpenDataNormalGrids.hpp"
+#include "OpenDataLasagna.hpp"
 #include "OpenDataSegmentCache.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
@@ -137,6 +138,13 @@ std::vector<std::string> volumeTags(const OpenDataSample& sample,
     }
     if (const auto normalGridsUrl = normalGridsArtifactUrl(volume); !normalGridsUrl.empty()) {
         addUnique(std::string(kOpenDataNormalGridsTagPrefix) + normalGridsUrl);
+    }
+    const auto lasagna = lasagnaArtifacts(sample.id, volume);
+    if (lasagna.size() == 1) {
+        addUnique(std::string(kOpenDataLasagnaArtifactTagPrefix) +
+                  lasagna.front().artifactUrl);
+    } else if (lasagna.size() > 1) {
+        addUnique(std::string(kOpenDataLasagnaArtifactTagPrefix) + "ambiguous");
     }
     if (preferredNativeSource && !coordinateLevel)
         coordinateLevel = 0;
@@ -400,6 +408,13 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
             result.messages.push_back("Attached " + std::to_string(attachedNormalGrids) +
                                       " streaming normal grid store(s).");
         }
+        result.attachedLasagnaDatasets = attachOpenDataLasagna(
+            *pkg, sample, remoteCacheRoot, &result.messages);
+        if (result.attachedLasagnaDatasets > 0) {
+            result.messages.push_back(
+                "Attached " + std::to_string(result.attachedLasagnaDatasets) +
+                " manifest-backed Lasagna dataset(s).");
+        }
     }
     // Reconcile against the current manifest on every open. This is metadata-
     // only for lazy segments and also removes stale layout entries from older
@@ -645,6 +660,14 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             sample, volume, level, effectiveVoxelSize, candidate.sourceUrl);
         tags.push_back(std::string(kOpenDataSampleIdTagPrefix) + sample.id);
         tags.push_back("vc-open-data-volume-id:" + volume.id);
+        const auto lasagna = lasagnaArtifacts(sample.id, volume);
+        if (lasagna.size() == 1) {
+            tags.push_back(std::string(kOpenDataLasagnaArtifactTagPrefix) +
+                           lasagna.front().artifactUrl);
+        } else if (lasagna.size() > 1) {
+            tags.push_back(
+                std::string(kOpenDataLasagnaArtifactTagPrefix) + "ambiguous");
+        }
         tags.push_back("vc-open-data-virtual-source");
         const std::string sourceName = volume.suffix.empty() ? volumeLabel(volume) : volume.suffix;
         tags.push_back("vc-open-data-name:" + sourceName + " [source L" +
