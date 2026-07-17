@@ -1,5 +1,6 @@
 ---
 title: "$1000 Private Progress Pics Prize (Dec 15th)"
+sidebar_label: "Progress Prize (closed)"
 hide_table_of_contents: true
 ---
 
@@ -35,6 +36,12 @@ hide_table_of_contents: true
     content="https://scrollprize.org/img/social/opengraph.jpg"
   />
 </head>
+
+:::warning[ARCHIVED]
+
+This page has been archived and is kept for historical reference: the prizes it describes have concluded. See [Winners](winners) for the results and [Prizes](prizes) for what is open today.
+
+:::
 
 We’re extremely curious about everyone’s progress, and want to be optimally prepared for reviewing the Grand Prize. That’s why we’re awarding a tiny prize:
 

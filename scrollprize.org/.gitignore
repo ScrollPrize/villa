@@ -1,6 +1,15 @@
 # Dependencies
 /node_modules
 
+# Yarn (Berry) — node-modules linker + global cache
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+.pnp.*
+
 # Production
 /build
 
@@ -22,3 +31,11 @@ yarn-error.log*
 
 # Generated build-time image dimension manifest
 .image-dimensions.json
+
+# Generated chat corpus (built by scripts/genChatCorpus.js)
+static/llms-full.txt
+api/_lib/corpus.json
+
+# Playwright's own local output dirs
+/test-results/
+/playwright-report/

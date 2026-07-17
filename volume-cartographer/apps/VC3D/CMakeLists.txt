@@ -16,6 +16,8 @@ set(srcs
     Keybinds.hpp
     CWindow.cpp
     CWindowContextMenu.cpp
+    StatusDockPanelHost.cpp
+    StatusDockPanelHost.hpp
     RenderBenchRecorder.cpp
     RenderBenchRecorder.hpp
     RenderBenchReplay.cpp
@@ -25,6 +27,10 @@ set(srcs
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
     LineAnnotationFiberClassification.hpp
+    LineAnnotationFiberSaveJob.cpp
+    LineAnnotationFiberSaveJob.hpp
+    FiberNameDisplay.cpp
+    FiberNameDisplay.hpp
     FiberSliceGeometry.cpp
     FiberSliceGeometry.hpp
     LineAnnotationController.cpp
@@ -33,6 +39,22 @@ set(srcs
     LineAnnotationDialog.hpp
     LineAnnotationGeneratedViews.cpp
     LineAnnotationGeneratedViews.hpp
+    OpenDataCatalogWindow.cpp
+    OpenDataCatalogWindow.hpp
+    OpenDataManifest.cpp
+    OpenDataLasagna.cpp
+    OpenDataLasagna.hpp
+    OpenDataManifest.hpp
+    OpenDataSampleProject.cpp
+    OpenDataSampleProject.hpp
+    OpenDataVolumePrefill.cpp
+    OpenDataVolumePrefill.hpp
+    OpenDataNormalGrids.cpp
+    OpenDataNormalGrids.hpp
+    OpenDataSegmentCache.cpp
+    OpenDataSegmentCache.hpp
+    OpenDataSegmentCacheIO.cpp
+    OpenDataSegmentCacheIO.hpp
     SurfaceAffineTransformController.cpp
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp
@@ -65,9 +87,12 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    RemoteVolumeCachePaths.cpp
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
+    SurfaceDisplayName.hpp
+    SurfaceTimestamp.hpp
     SeedingWidget.cpp
     SeedingWidget.hpp
     segmentation/SegmentationCommon.hpp
@@ -136,6 +161,8 @@ set(srcs
     overlays/AtlasControlPointsOverlayController.hpp
     overlays/FiberSliceOverlayController.cpp
     overlays/FiberSliceOverlayController.hpp
+    overlays/InkDetectionOverlayController.cpp
+    overlays/InkDetectionOverlayController.hpp
     overlays/VolumeOverlayController.cpp
     overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp
@@ -165,14 +192,12 @@ set(srcs
     viewer_controls/ViewerControlsPanel.hpp
     viewer_controls/panels/ViewerCompositePanel.cpp
     viewer_controls/panels/ViewerCompositePanel.hpp
+    viewer_controls/panels/ViewerInkDetectionPanel.cpp
+    viewer_controls/panels/ViewerInkDetectionPanel.hpp
     viewer_controls/panels/ViewerNavigationPanel.cpp
     viewer_controls/panels/ViewerNavigationPanel.hpp
     viewer_controls/panels/ViewerNormalVisualizationPanel.cpp
     viewer_controls/panels/ViewerNormalVisualizationPanel.hpp
-    viewer_controls/panels/ViewerPostprocessingPanel.cpp
-    viewer_controls/panels/ViewerPostprocessingPanel.hpp
-    viewer_controls/panels/ViewerPreprocessingPanel.cpp
-    viewer_controls/panels/ViewerPreprocessingPanel.hpp
     viewer_controls/panels/ViewerTransformsPanel.cpp
     viewer_controls/panels/ViewerTransformsPanel.hpp
     viewer_controls/panels/ViewerViewExtrasPanel.cpp
@@ -204,6 +229,13 @@ endif()
 
 
 add_executable(VC3D ${srcs} resources.qrc)
+
+if(WIN32)
+    # GUI subsystem so double-click launch doesn't open a console window.
+    set_target_properties(VC3D PROPERTIES WIN32_EXECUTABLE ON)
+    # Embed the app icon (windres compiles the .rc).
+    target_sources(VC3D PRIVATE VC3D.rc)
+endif()
 
 target_include_directories(VC3D
     PRIVATE
@@ -252,6 +284,45 @@ target_link_libraries(VC3D
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
     Blosc::blosc
 )
+
+# Build-tree Qt plugin deployment (MSVC/vcpkg). vcpkg copies the Qt DLLs next to
+# the executable but not the plugin tree, so a freshly built VC3D.exe cannot find
+# platforms/qwindows.dll and aborts on startup. Copy the plugin folders next to
+# VC3D.exe after each link so it runs straight from the build directory without a
+# separate windeployqt step. (Packaging/install deployment is handled separately
+# in cmake/WindowsPackaging.cmake.)
+if(WIN32 AND MSVC)
+    set(_vc_qwin_loc "")
+    if(TARGET Qt6::QWindowsIntegrationPlugin)
+        foreach(_cfg IMPORTED_LOCATION_RELEASE IMPORTED_LOCATION_RELWITHDEBINFO
+                     IMPORTED_LOCATION_DEBUG IMPORTED_LOCATION)
+            get_target_property(_vc_qwin_loc Qt6::QWindowsIntegrationPlugin ${_cfg})
+            if(_vc_qwin_loc)
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(_vc_qwin_loc)
+        # _vc_qwin_loc = <qt>/plugins/platforms/qwindows.dll; go up twice.
+        get_filename_component(_vc_qt_plugins "${_vc_qwin_loc}" DIRECTORY)
+        get_filename_component(_vc_qt_plugins "${_vc_qt_plugins}" DIRECTORY)
+        foreach(_pd platforms styles imageformats iconengines tls generic
+                    networkinformation)
+            if(EXISTS "${_vc_qt_plugins}/${_pd}")
+                add_custom_command(TARGET VC3D POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+                        "${_vc_qt_plugins}/${_pd}"
+                        "$<TARGET_FILE_DIR:VC3D>/${_pd}"
+                    COMMENT "Deploying Qt ${_pd} plugins next to VC3D.exe"
+                    VERBATIM)
+            endif()
+        endforeach()
+    else()
+        message(WARNING
+            "Qt platform plugin not located; VC3D.exe may not launch from the "
+            "build tree without a manual windeployqt/plugin copy.")
+    endif()
+endif()
 
 if(VC_USE_PCH)
     # VC3D gets its own PCH = vc_core's common headers + the heavy Qt umbrella

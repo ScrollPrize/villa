@@ -21,9 +21,60 @@ Due to a complex set of dependencies, it is *highly* recommended to use the dock
 docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
 
-If you want to install vc3d from source, the easiest path is to look at the [Dockerfile](Dockerfile) (and the shared [scripts/install_build_deps.sh](scripts/install_build_deps.sh) it uses) and adapt for your environment. Building from source presently requires a *nix like environment for atomic rename support. If you are on Windows, either use the docker image or WSL. 
+To install VC3D and all command-line tools from source on a recent Debian-family
+Linux distribution using APT:
 
-On macOS, use the Homebrew LLVM build helper:
+```bash
+./build_from_src_debian.sh
+```
+
+The script installs build dependencies from system packages, builds VC3D and
+flatboi, and installs the runtime under `/usr/local` so commands such as
+`VC3D` and `vc_grow_seg_from_seed` are available from the terminal. The
+distribution must provide CMake 3.28 or newer; Ubuntu 24.04+ and Debian 13+
+meet that requirement. Set `JOBS`, `BUILD_DIR`, or `PREFIX` to override the
+corresponding defaults.
+
+#### Windows
+
+A self-contained Windows 10/11 installer (`VC3D-<version>-win64.exe`, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases) — download, run, and launch VC3D from the Start menu. A portable `.zip` of the same tree is published alongside it.
+
+To build natively from source on Windows, use an [MSYS2](https://www.msys2.org/) UCRT64 shell (see [.github/workflows/vc3d-windows.yml](../.github/workflows/vc3d-windows.yml) for the package list), then:
+
+```bash
+cmake --preset ci-windows-mingw
+cmake --build --preset ci-windows-mingw
+cpack --config build/ci-windows-mingw/CPackConfig.cmake
+```
+
+Alternatively, VC3D builds with the **native MSVC / Visual Studio 2022 toolchain**
+using [vcpkg](https://github.com/microsoft/vcpkg) for dependencies, via the
+`windows-msvc` preset. Bootstrap a vcpkg checkout, then from an *x64 Native Tools
+Command Prompt for VS 2022* (so `cl.exe`/Ninja are on `PATH`):
+
+```bat
+set VCPKG_ROOT=C:\path\to\vcpkg
+cmake --preset windows-msvc
+cmake --build build\windows-msvc
+```
+
+The first configure builds the dependency closure (Qt, OpenCV, Ceres, CGAL, ...)
+from source via vcpkg — this takes a while, but later configures restore it from
+vcpkg's binary cache. The result is `build\windows-msvc\bin\VC3D.exe` with the Qt
+plugins and dependency DLLs deployed alongside it, runnable in place. To work in
+the VS2022 IDE, *Open Folder* on `volume-cartographer/`. Note that the VS
+developer environment forces `VCPKG_ROOT` to the port-less bundled vcpkg, so
+create a `CMakeUserPresets.json` (gitignored) that pins `CMAKE_TOOLCHAIN_FILE` to
+your vcpkg and select the resulting local preset — otherwise VS reconfigures
+against the wrong vcpkg and rebuilds every dependency.
+
+Note: the flatboi SLIM flattening tool (PaStiX-based) is not available on Windows; Docker or WSL still covers that workflow.
+
+#### macOS
+
+A self-contained `VC3D.app` for Apple Silicon (`VC3D-<version>-macos-arm64.dmg`, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases) — drag it to Applications. The app is not notarized, so the first launch is right-click → Open (or `xattr -dr com.apple.quarantine /Applications/VC3D.app`). The `vc_*` command-line tools ship inside the bundle at `VC3D.app/Contents/MacOS/`.
+
+To build from source on macOS, use the Homebrew LLVM build helper:
 
 ```bash
 scripts/build_macos.sh --install-deps
@@ -70,6 +121,48 @@ From source :
 
 ### Data 
 VC3D requires a few changes to the data you may already have downloaded. All data must be in OME-Zarr format, of dtype uint8, and contain a meta.json file. To check if your zarr is in uint8 already, open a resolution group zarray file (located at /path/to.zarr/0/.zarray) look at the dtype field. "|u1" is uint8, and "|u2" is uint16. 
+
+### Remote virtual-volume locators
+
+VC3D can expose a public remote pyramid group as logical level 0 without
+copying or renumbering the source Zarr. Append the portable fragment selector
+`#vc-base-scale=N`, where `N` is an integer from 0 through 5:
+
+```text
+https://example.org/volume.zarr#vc-base-scale=2
+s3://bucket/volume.zarr#vc-base-scale=2
+```
+
+Level 0 canonicalizes to the ordinary selector-free locator. For a base-2
+view, source groups `/2`, `/3`, ... become logical levels 0, 1, ...; voxel
+coordinates and voxel size are therefore those of physical `/2`. The source
+must be a contiguous numeric, isotropic dyadic ZYX pyramid with zero coordinate
+translations. Query parameters remain part of the network URL and must precede
+the fragment, for example `volume.zarr?token=abc#vc-base-scale=2`.
+
+Coordinate-bearing artifacts created by VC3D retain the selected source view
+in their JSON metadata (`meta.json`, point collections, fibers, and atlas
+`metadata.json`). For example:
+
+```json
+{
+  "vc_open_data_coordinate_space": "PHerc1451/20260319101107@L2",
+  "vc_open_data_source_path": "s3://path/to/the/source/volume",
+  "vc_open_data_source_coordinate_level": 2,
+  "vc_open_data_source_coordinate_scale_factor": 4,
+  "vc_open_data_source_original_resolution": 2.4
+}
+```
+
+The source path identifies the native volume without the `#vc-base-scale`
+selector. The scale factor is `2^level`, and the original resolution is the
+native level-0 voxel size in micrometers.
+
+The selector is part of persistent volume identity but is never sent in HTTP
+requests. Tools that support remote volumes receive the complete portable
+locator. Local-only tools reject it instead of silently discarding the
+selector. Catalog surfaces, normal grids, and overlays are automatically paired
+only when their explicit coordinate-space tags match the selected view.
 
 The meta.json contains the following information. The only real change from a standard VC meta.json is the inclusion of the `format:"zarr"` key.
 ```json

@@ -1,6 +1,7 @@
 #include "vc/core/util/Tiff.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -11,7 +12,33 @@
 
 #include <opencv2/imgcodecs.hpp>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
+
+void replaceFile(const std::filesystem::path& source,
+                 const std::filesystem::path& destination)
+{
+#if defined(_WIN32)
+    if (!::MoveFileExW(source.c_str(), destination.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const std::error_code ec(static_cast<int>(::GetLastError()),
+                                 std::system_category());
+        throw std::filesystem::filesystem_error(
+            "cannot replace TIFF", source, destination, ec);
+    }
+#else
+    std::filesystem::rename(source, destination);
+#endif
+}
 
 // Get TIFF parameters for a given OpenCV type
 struct TiffParams {
@@ -96,12 +123,15 @@ void writeTiff(const std::filesystem::path& outPath, const cv::Mat& img, int cvT
 
     const auto params = getTiffParams(outType);
 
-    TIFF* tf = TIFFOpen(outPath.string().c_str(), "w");
-    if (!tf)
-        throw std::runtime_error("Failed to open TIFF for writing: " + outPath.string());
-
     const uint32_t W = static_cast<uint32_t>(outImg.cols);
     const uint32_t H = static_cast<uint32_t>(outImg.rows);
+    const std::uint64_t pixelBytes =
+        static_cast<std::uint64_t>(W) * H * params.elemSize;
+    const char* mode = pixelBytes > 0xffff0000ULL ? "w8" : "w";
+
+    TIFF* tf = TIFFOpen(outPath.string().c_str(), mode);
+    if (!tf)
+        throw std::runtime_error("Failed to open TIFF for writing: " + outPath.string());
 
     TIFFSetField(tf, TIFFTAG_IMAGEWIDTH,      W);
     TIFFSetField(tf, TIFFTAG_IMAGELENGTH,     H);
@@ -309,24 +339,37 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
     size_t failures = 0;
     for (auto& [finalPath, partFiles] : groups) {
         std::sort(partFiles.begin(), partFiles.end());
-        TIFF* first = TIFFOpen(partFiles[0].c_str(), "r");
+        TIFF* first = TIFFOpen(partFiles[0].string().c_str(), "r");
         if (!first) { std::cerr << "Cannot open " << partFiles[0] << "\n"; failures++; continue; }
-        uint32_t w, h, tw, th; uint16_t bps, spp, sf, comp;
-        TIFFGetField(first, TIFFTAG_IMAGEWIDTH, &w);
-        TIFFGetField(first, TIFFTAG_IMAGELENGTH, &h);
-        TIFFGetField(first, TIFFTAG_TILEWIDTH, &tw);
-        TIFFGetField(first, TIFFTAG_TILELENGTH, &th);
+        // Initialize and check TIFFGetField: a part file from a killed/corrupt
+        // render job may be missing tags. Reading an unset tag leaves the
+        // variable uninitialized, and a missing TILEWIDTH/TILELENGTH makes tw/th
+        // zero -> the (w + tw - 1) / tw tiling below is a divide-by-zero. Skip
+        // such a group cleanly instead of crashing.
+        uint32_t w = 0, h = 0, tw = 0, th = 0; uint16_t bps = 0, spp = 0, sf = 0, comp = 0;
+        const bool haveGeom =
+            TIFFGetField(first, TIFFTAG_IMAGEWIDTH, &w)
+            && TIFFGetField(first, TIFFTAG_IMAGELENGTH, &h)
+            && TIFFGetField(first, TIFFTAG_TILEWIDTH, &tw)
+            && TIFFGetField(first, TIFFTAG_TILELENGTH, &th);
         TIFFGetField(first, TIFFTAG_BITSPERSAMPLE, &bps);
         TIFFGetField(first, TIFFTAG_SAMPLESPERPIXEL, &spp);
         TIFFGetField(first, TIFFTAG_SAMPLEFORMAT, &sf);
         TIFFGetField(first, TIFFTAG_COMPRESSION, &comp);
+        if (!haveGeom || w == 0 || h == 0 || tw == 0 || th == 0) {
+            std::cerr << "Skipping " << finalPath
+                      << ": first part missing/zero geometry tags\n";
+            TIFFClose(first);
+            failures++;
+            continue;
+        }
         uint16_t resUnit = 0;
         float xRes = 0, yRes = 0;
         bool hasRes = TIFFGetField(first, TIFFTAG_RESOLUTIONUNIT, &resUnit) && TIFFGetField(first, TIFFTAG_XRESOLUTION, &xRes) &&
                       TIFFGetField(first, TIFFTAG_YRESOLUTION, &yRes);
         TIFFClose(first);
 
-        TIFF* out = TIFFOpen(finalPath.c_str(), "w");
+        TIFF* out = TIFFOpen(finalPath.string().c_str(), "w");
         if (!out) { std::cerr << "Cannot create " << finalPath << "\n"; failures++; continue; }
         TIFFSetField(out, TIFFTAG_IMAGEWIDTH, w); TIFFSetField(out, TIFFTAG_IMAGELENGTH, h);
         TIFFSetField(out, TIFFTAG_TILEWIDTH, tw); TIFFSetField(out, TIFFTAG_TILELENGTH, th);
@@ -347,7 +390,7 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
             for (uint32_t tx = 0; tx < tilesX; tx++) {
                 bool found = false;
                 for (auto& pf : partFiles) {
-                    TIFF* pt = TIFFOpen(pf.c_str(), "r");
+                    TIFF* pt = TIFFOpen(pf.string().c_str(), "r");
                     if (!pt) continue;
                     tmsize_t r = TIFFReadEncodedTile(pt, TIFFComputeTile(pt, tx*tw, ty*th, 0, 0), buf.data(), tileBytes);
                     TIFFClose(pt);
@@ -398,11 +441,10 @@ void atomicImwriteMulti(const std::filesystem::path& outPath,
                                  tmpPath.string());
     }
 
-    std::filesystem::rename(tmpPath, outPath, ec);
-    if (ec) {
-        std::filesystem::remove(tmpPath);
-        throw std::runtime_error("atomicImwriteMulti: rename " + tmpPath.string() +
-                                 " -> " + outPath.string() + " failed: " +
-                                 ec.message());
+    try {
+        replaceFile(tmpPath, outPath);
+    } catch (...) {
+        std::filesystem::remove(tmpPath, ec);
+        throw;
     }
 }

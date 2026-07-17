@@ -11,8 +11,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <filesystem>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -317,4 +319,229 @@ TEST_CASE("ChunkCache: ctor without options uses defaults")
                  std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
                  0.0, ChunkDtype::UInt8);
     CHECK(c.numLevels() == 1);
+}
+
+namespace {
+
+std::shared_ptr<ChunkCache> makeTinyCapacityCache(std::shared_ptr<CountingFetcher> f,
+                                                  std::chrono::milliseconds protection)
+{
+    // 8x8x8 volume of 4x4x4 chunks: 8 chunks of 64 decoded bytes each.
+    // Capacity of 128 bytes holds two chunks; the eviction hard ceiling
+    // (2x capacity) holds four.
+    std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
+    ChunkCache::Options opts;
+    opts.maxConcurrentReads = 1;
+    opts.detectAllFillChunks = true;
+    opts.decodedByteCapacity = 128;
+    opts.evictionProtectionWindow = protection;
+    return std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
+        0.0, ChunkDtype::UInt8, opts);
+}
+
+void cannedDataChunks(CountingFetcher& f, int count)
+{
+    int i = 0;
+    for (int iz : {0, 1})
+        for (int iy : {0, 1})
+            for (int ix : {0, 1}) {
+                if (i++ >= count)
+                    return;
+                ChunkFetchResult fr;
+                fr.status = ChunkFetchStatus::Found;
+                fr.bytes = makeBytes(64, std::byte{99});
+                f.setCanned({0, iz, iy, ix}, fr);
+            }
+}
+
+} // namespace
+
+TEST_CASE("ChunkCache: recently touched entries survive over-budget stores")
+{
+    auto f = std::make_shared<CountingFetcher>();
+    cannedDataChunks(*f, 4);
+    auto c = makeTinyCapacityCache(f, std::chrono::minutes{10});
+
+    // Chunk order: (0,0,0), (0,0,1), (0,1,0), (0,1,1).
+    CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
+
+    // 4 x 64 = 256 bytes cached against a 128-byte budget: all four are
+    // inside the protection window and under the hard ceiling, so none may
+    // be evicted even though the cache is over budget.
+    CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(c->tryGetChunk(0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(c->tryGetChunk(0, 0, 1, 0).status == ChunkStatus::Data);
+    CHECK(c->tryGetChunk(0, 0, 1, 1).status == ChunkStatus::Data);
+    CHECK(f->fetchCalls.load() == 4);
+    CHECK(c->stats().decodedBytes == 256);
+}
+
+TEST_CASE("ChunkCache: hard ceiling still evicts protected entries")
+{
+    auto f = std::make_shared<CountingFetcher>();
+    cannedDataChunks(*f, 5);
+    auto c = makeTinyCapacityCache(f, std::chrono::minutes{10});
+
+    CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
+    // Fifth store pushes decoded bytes past the 256-byte hard ceiling; the
+    // LRU tail is reclaimed despite protection, back down to the ceiling.
+    CHECK(waitForResolved(*c, 0, 1, 0, 0).status == ChunkStatus::Data);
+
+    CHECK(c->stats().decodedBytes == 256);
+    CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    CHECK(c->tryGetChunk(0, 1, 0, 0).status == ChunkStatus::Data);
+}
+
+TEST_CASE("ChunkCache: zero protection window restores strict-capacity LRU")
+{
+    auto f = std::make_shared<CountingFetcher>();
+    cannedDataChunks(*f, 4);
+    auto c = makeTinyCapacityCache(f, std::chrono::milliseconds{0});
+
+    CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
+
+    // Strict LRU: only the two most recent chunks fit the 128-byte budget.
+    CHECK(c->stats().decodedBytes <= 128);
+    CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+}
+
+namespace {
+
+// Records fetch order; the first fetch blocks until release() so later
+// requests pile up in the priority queue behind it.
+class BlockingOrderFetcher : public IChunkFetcher {
+public:
+    ChunkFetchResult fetch(const ChunkKey& key) override
+    {
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            order_.push_back(key);
+            first = order_.size() == 1;
+        }
+        if (first) {
+            started_.count_down();
+            std::unique_lock<std::mutex> lk(m_);
+            cv_.wait(lk, [&] { return released_; });
+        }
+        ChunkFetchResult r;
+        r.status = ChunkFetchStatus::Found;
+        r.bytes = makeBytes(64, std::byte{7});
+        return r;
+    }
+
+    void waitFirstStarted() { started_.wait(); }
+
+    void release()
+    {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            released_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    std::vector<ChunkKey> order()
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        return order_;
+    }
+
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::latch started_{1};
+    bool released_ = false;
+    std::vector<ChunkKey> order_;
+};
+
+} // namespace
+
+TEST_CASE("ChunkCache: coarser levels are fetched before finer ones")
+{
+    auto f = std::make_shared<BlockingOrderFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{8, 8, 8}, {4, 4, 4}, {}},
+        {{4, 4, 4}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options opts;
+    opts.maxConcurrentReads = 1; // single worker => strict priority order
+    opts.detectAllFillChunks = false;
+    auto c = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f, f},
+        0.0, ChunkDtype::UInt8, opts);
+
+    // Occupy the single worker, then queue a fine and a coarse chunk.
+    (void)c->tryGetChunk(0, 0, 0, 0);
+    f->waitFirstStarted();
+    (void)c->tryGetChunk(0, 0, 0, 1); // fine (level 0)
+    (void)c->tryGetChunk(1, 0, 0, 0); // coarse (level 1)
+    f->release();
+
+    CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 1, 0, 0, 0).status == ChunkStatus::Data);
+
+    const auto order = f->order();
+    REQUIRE(order.size() == 3);
+    CHECK(order[1].level == 1); // coarse chunk jumped the fine one
+    CHECK(order[2].level == 0);
+}
+
+TEST_CASE("ChunkCache: disk-cached chunks resolve without touching the fetcher pool")
+{
+    std::mt19937_64 rng(std::random_device{}());
+    const auto dir = fs::temp_directory_path() /
+                     ("vc_chunk_probe_" + std::to_string(rng()));
+    fs::create_directories(dir);
+
+    ChunkFetchResult fr;
+    fr.status = ChunkFetchStatus::Found;
+    fr.bytes = makeBytes(64, std::byte{123});
+
+    {
+        // Warm the persistent cache.
+        auto f = std::make_shared<CountingFetcher>();
+        f->setCanned({0, 0, 0, 0}, fr);
+        std::vector<ChunkCache::LevelInfo> levels = {{{4, 4, 4}, {4, 4, 4}, {}}};
+        ChunkCache::Options opts;
+        opts.persistentCachePath = dir;
+        ChunkCache c(std::move(levels),
+                     std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
+                     0.0, ChunkDtype::UInt8, opts);
+        CHECK(waitForResolved(c, 0, 0, 0, 0).status == ChunkStatus::Data);
+        c.waitForPersistentWrites();
+    }
+
+    {
+        // A fetcher that would only produce errors: the chunk must come
+        // from the disk probe, never from the remote pool.
+        auto f = std::make_shared<CountingFetcher>();
+        ChunkFetchResult err;
+        err.status = ChunkFetchStatus::HttpError;
+        err.httpStatus = 500;
+        f->setCanned({0, 0, 0, 0}, err);
+        std::vector<ChunkCache::LevelInfo> levels = {{{4, 4, 4}, {4, 4, 4}, {}}};
+        ChunkCache::Options opts;
+        opts.persistentCachePath = dir;
+        ChunkCache c(std::move(levels),
+                     std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
+                     0.0, ChunkDtype::UInt8, opts);
+        auto r = waitForResolved(c, 0, 0, 0, 0);
+        CHECK(r.status == ChunkStatus::Data);
+        CHECK(f->fetchCalls.load() == 0);
+    }
+
+    fs::remove_all(dir);
 }

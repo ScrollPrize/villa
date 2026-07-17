@@ -1,6 +1,5 @@
 ---
 title: "Community Projects"
-hide_table_of_contents: true
 hide_title: true
 ---
 
@@ -57,17 +56,19 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [vesuvius](https://github.com/scrollprize/vesuvius): Python library for accessing Vesuvius Challenge data. Allows direct access to scroll data without managing download scripts or storing terabytes of CT scans locally.
 
+- [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer): the team’s interactive tool for viewing, segmenting, and virtually unwrapping scroll volumes.
+
 - [Segment browser](https://github.com/jrudolph/vesuvius-browser) is a web-based tool to browse layers and open source ink detection results of all released segments. By Johannes Rudolph
 
 ### 🛠️ Tools
 
-- [vesuvius-c](https://github.com/ScrollPrize/villa/tree/main/vesuvius-c): C library for accessing Vesuvius Challenge data. Allows direct access to scroll data without managing download scripts or storing terabytes of CT scans locally.
+- [vesuvius-c](https://github.com/ScrollPrize/villa/tree/main/vesuvius-c): C library for accessing Vesuvius Challenge data (deprecated — prefer the [`vesuvius`](https://github.com/scrollprize/vesuvius) Python library or VC3D).
 
 - [vesuvius-gui](https://github.com/jrudolph/vesuvius-gui) is a single binary GUI to render volumes and segments on-the-fly. By Johannes Rudolph
 
 - [vesuvius-phalanx](https://github.com/mvrcii/phalanx): Python library / CLI for accessing Vesuvius data. Allows flexible access to volume and fragment scroll data. By Marcel Roth
 
-- [llfio-chunkloader](https://github.com/climbmax123/LLFIOCunkloadingTestingAndBenching): A Methode to access Data in chunks of (x,y,z) that is by lot faster and compute efficient than Zarr. (Written in C++ but it is possible to integrate in Python).
+- [llfio-chunkloader](https://github.com/climbmax123/LLFIOCunkloadingTestingAndBenching): A method to access data in chunks of (x,y,z) that is much faster and more compute-efficient than Zarr. (Written in C++ but it is possible to integrate in Python).
 
 - [preprocessed-data](https://github.com/usc-caisplusplus/scroll-data-preprocessing): Data preprocessing code and a fully processed version of the dataset in .zarr format to allow for faster training of ink detection models. 
 
@@ -79,7 +80,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🛠️ Tools
 
-- [Scroll-specific augmentations](https://github.com/ScrollPrize/villa/pull/999) by pscamillo. Three GPU-native augmentations for the segmentation training pipeline, addressing #201: Squeeze (compression, [#997](https://github.com/ScrollPrize/villa/pull/997)), Decohesion (beam-scatter blur) and Warp (coherent warping). Each models a real scroll distortion rather than generic elastic noise, and is validated with a controlled ablation and a real-data demo to improve segmentation in compressed/warped/scattered regions.
+- [Scroll-specific augmentations](https://github.com/ScrollPrize/villa/pull/999) by pscamillo. GPU-native augmentations for the segmentation training pipeline, addressing #201: Squeeze (compression, [#997](https://github.com/ScrollPrize/villa/pull/997)), Decohesion (beam-scatter blur) and Warp (coherent warping), plus CT-reconstruction artifacts — Ring ([#1020](https://github.com/ScrollPrize/villa/pull/1020)) and Streak ([#1021](https://github.com/ScrollPrize/villa/pull/1021)). Each models a real scroll/CT distortion rather than generic noise, and is validated with a controlled ablation and a speed benchmark to improve segmentation robustness in degraded regions.
 
 - [Volume Cartographer](https://github.com/educelab/volume-cartographer): the OG virtual unwrapping toolkit. Includes a graphical interface to annotate scroll segments. First built by [EduceLab](https://educelab.engr.uky.edu/); an [active fork](https://github.com/spacegaier/volume-cartographer) by Philip Allgaier contains many community contributions and is currently used by the segmentation team.
   
@@ -95,7 +96,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Segment2Voxel](https://github.com/giorgioangel/vesuvius-segment2voxel) by Giorgio Angelotti. Tool to create 1-voxel thick volumetric segment labels starting from mesh .obj files.
 
-- [Volumetric Instance Labels to obj](https://github.com/JamesDarby345/Volumetric_Instance_to_Mesh/tree/main) by James darby. Tools to create .obj mesh files from volumetric instance labels.
+- [Volumetric Instance Labels to obj](https://github.com/JamesDarby345/Volumetric_Instance_to_Mesh/tree/main) by James Darby. Tools to create .obj mesh files from volumetric instance labels.
 
 - [Hraun](https://github.com/SuperOptimizer/Hraun) is a collection of python tools for handling volumetric scroll data by Forrest McDonald.
 
@@ -163,7 +164,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Gabor Filter for surface prediction](https://www.kaggle.com/code/bluetriad/scroll4-gaborfilters/notebook?scriptVersionId=265957590) by Ayush Mishra
   
 - [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
-
+    - [GPU-accelerated MLS projection for ScrollFiesta](https://github.com/pscamillo/scrollfiesta_public/blob/cuda-mls/BENCHMARKS.md) by pscamillo — OpenMP + CUDA FP32 acceleration, byte-identical, ~6x throughput.
+      
 ### 📦 Materials
 
 #### 🌟 Highlighted

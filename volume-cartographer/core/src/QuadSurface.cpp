@@ -27,19 +27,218 @@
 #include <iomanip>
 #include <chrono>
 #include <atomic>
+#include <exception>
+#include <set>
+#include <unordered_map>
 
+#include <stdio.h>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+#ifdef __linux__
+// renameat2(RENAME_EXCHANGE) in save() needs the GNU prototypes.
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #include <fcntl.h>
-#include <stdio.h>
 #include <unistd.h>
+#endif
+
+#include "vc/core/util/MemMap.hpp"
 
 // Use libtiff for BigTIFF
 #include <tiffio.h>
 
+// GCC/Clang spell the restrict qualifier __restrict__; MSVC only has __restrict.
+#if defined(_MSC_VER)
+#define __restrict__ __restrict
+#endif
+
 namespace {
 
+void replaceFile(const std::filesystem::path& source,
+                 const std::filesystem::path& destination)
+{
+#ifdef _WIN32
+    if (!MoveFileExW(source.wstring().c_str(),
+                     destination.wstring().c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const std::error_code ec(static_cast<int>(GetLastError()),
+                                 std::system_category());
+        throw std::filesystem::filesystem_error(
+            "cannot replace file", source, destination, ec);
+    }
+#else
+    std::filesystem::rename(source, destination);
+#endif
+}
+
+constexpr auto kSaveRollbackDir = ".vc-save-rollback";
+constexpr auto kSaveRollbackReady = ".ready";
+
+std::recursive_mutex& surfaceDirWriteMutex(const std::filesystem::path& dir)
+{
+    // Keyed by normalized dir string so separate QuadSurface objects pointing
+    // at the same segment dir share one lock. Recursive because saveOverwrite
+    // holds it across nested saveSnapshot()/save() calls, and Windows
+    // publication performs recovery while the save lock is already held.
+    static std::mutex mapMutex;
+    static std::unordered_map<std::string, std::recursive_mutex> locks;
+    const std::string key = dir.lexically_normal().string();
+    std::lock_guard<std::mutex> guard(mapMutex);
+    return locks[key];
+}
+
+void recoverIncompleteSave(const std::filesystem::path& destination)
+{
+    // Loading and publication must be mutually exclusive. In particular, a
+    // loader must not mistake an active Windows rollback journal for one left
+    // by an interrupted process and restore it while files are being replaced.
+    std::lock_guard<std::recursive_mutex> dirLock(
+        surfaceDirWriteMutex(destination));
+
+    const auto rollback = destination / kSaveRollbackDir;
+    if (!std::filesystem::exists(rollback)) {
+        return;
+    }
+
+    const auto ready = rollback / kSaveRollbackReady;
+    if (!std::filesystem::exists(ready)) {
+        // Publication never began, or it committed and only cleanup was
+        // interrupted. In either case the destination is already coherent.
+        std::filesystem::remove_all(rollback);
+        return;
+    }
+
+    std::vector<std::filesystem::path> backups;
+    std::set<std::filesystem::path> originalNames;
+    for (const auto& entry : std::filesystem::directory_iterator(rollback)) {
+        if (entry.is_regular_file() && entry.path().filename() != kSaveRollbackReady) {
+            backups.push_back(entry.path());
+            originalNames.insert(entry.path().filename());
+        }
+    }
+
+    // Remove files introduced by the interrupted generation before restoring
+    // every original. Keep the backups intact until recovery is complete so a
+    // second interruption can safely retry the same recovery.
+    for (const auto& entry : std::filesystem::directory_iterator(destination)) {
+        if (entry.is_regular_file() && !originalNames.contains(entry.path().filename())) {
+            std::filesystem::remove(entry.path());
+        }
+    }
+
+    const auto restoreDir = rollback / ".restore";
+    std::filesystem::create_directories(restoreDir);
+    for (const auto& backup : backups) {
+        const auto staged = restoreDir / backup.filename();
+        std::filesystem::copy_file(
+            backup, staged, std::filesystem::copy_options::overwrite_existing);
+        replaceFile(staged, destination / backup.filename());
+    }
+    std::filesystem::remove_all(rollback);
+}
+
+#ifdef _WIN32
+void createRollbackBackup(const std::filesystem::path& original,
+                          const std::filesystem::path& backup)
+{
+    // A same-volume hard link preserves the old file object when the live name
+    // is replaced, without copying multi-gigabyte TIFFs on every autosave.
+    // Fall back to a copy on filesystems that do not support hard links.
+    if (::CreateHardLinkW(backup.wstring().c_str(), original.wstring().c_str(), nullptr)) {
+        return;
+    }
+    std::filesystem::copy_file(
+        original, backup, std::filesystem::copy_options::overwrite_existing);
+}
+
+void replaceDirectoryContents(const std::filesystem::path& source,
+                              const std::filesystem::path& destination)
+{
+    std::filesystem::create_directories(destination);
+
+    // If a previous process stopped during publication, restore its complete
+    // prior generation before beginning another save.
+    recoverIncompleteSave(destination);
+
+    const auto rollback = destination / kSaveRollbackDir;
+    std::filesystem::create_directories(rollback);
+    for (const auto& entry : std::filesystem::directory_iterator(destination)) {
+        if (entry.is_regular_file()) {
+            createRollbackBackup(entry.path(), rollback / entry.path().filename());
+        }
+    }
+
+    // This marker is created only after every original file is durable in the
+    // rollback directory. Its presence means publication may have begun.
+    const auto ready = rollback / kSaveRollbackReady;
+    {
+        std::ofstream marker(ready, std::ios::binary);
+        marker << "ready\n";
+        if (!marker) {
+            throw std::runtime_error("failed to prepare save rollback journal: " +
+                                     ready.string());
+        }
+    }
+
+    // Windows cannot reliably remove a directory while files from it are
+    // mapped by another QuadSurface. The mappings opt into FILE_SHARE_DELETE,
+    // so replace the completed files individually instead. The temporary
+    // directory already contains newly written x/y/z/meta files plus copies of
+    // every regular auxiliary file from the destination.
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::directory_iterator(source)) {
+        if (entry.is_regular_file()) {
+            files.push_back(entry.path());
+        }
+    }
+    // Do not mutate a directory while iterating it: directory_iterator may
+    // otherwise skip entries on Windows. Publish metadata last so readers do
+    // not observe it before the corresponding data files are replaced.
+    std::sort(files.begin(), files.end(), [](const auto& lhs, const auto& rhs) {
+        const bool lhsMeta = lhs.filename() == "meta.json";
+        const bool rhsMeta = rhs.filename() == "meta.json";
+        return lhsMeta != rhsMeta ? !lhsMeta : lhs.filename() < rhs.filename();
+    });
+    try {
+        for (const auto& file : files) {
+            replaceFile(file, destination / file.filename());
+        }
+
+        // Removing the marker commits the complete new generation. If cleanup
+        // is interrupted after this point, recovery keeps the new files.
+        std::filesystem::remove(ready);
+    } catch (...) {
+        const auto error = std::current_exception();
+        try {
+            recoverIncompleteSave(destination);
+        } catch (const std::exception& recoveryError) {
+            Logger()->error("failed to roll back interrupted save for {}: {}",
+                            destination.string(), recoveryError.what());
+        }
+        std::rethrow_exception(error);
+    }
+
+    std::error_code cleanupEc;
+    std::filesystem::remove_all(rollback, cleanupEc);
+    if (cleanupEc) {
+        Logger()->warn("could not remove save rollback directory {}: {}",
+                       rollback.string(), cleanupEc.message());
+    }
+    cleanupEc.clear();
+    std::filesystem::remove_all(source, cleanupEc);
+    if (cleanupEc) {
+        Logger()->warn("could not remove completed save temp directory {}: {}",
+                       source.string(), cleanupEc.message());
+    }
+}
+#endif
 
 void normalizeMaskChannel(cv::Mat& mask)
 {
@@ -399,6 +598,7 @@ static Rect3D rect_from_json(const utils::Json &json)
 
 QuadSurface::QuadSurface(const std::filesystem::path &path_)
 {
+    recoverIncompleteSave(path_);
     path = path_;
     id = path_.filename().string();
     auto metaPath = path_ / "meta.json";
@@ -420,6 +620,7 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
 
 QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &json)
 {
+    recoverIncompleteSave(path_);
     path = path_;
     id = path_.filename().string();
     meta = json;
@@ -670,6 +871,11 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
         return cv::Mat_<uint8_t>();
     }
 
+    // Guard the lazy build: gen() calls this concurrently from the renderer's
+    // OMP tile loop, so an unguarded build would race on _validMaskCache (the
+    // cv::Mat assignment is not atomic) and on _validMaskAllValid.
+    std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+
     if (!_validMaskCache.empty() &&
         _validMaskCache.rows == _points->rows &&
         _validMaskCache.cols == _points->cols) {
@@ -777,8 +983,14 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     bool skipValidity = _validMaskAllValid;
 
     // --- warp coords and validity ----------------------------------------
-    cv::Mat_<cv::Vec3f>& coords_big = _genCoordsScratch;
-    cv::Mat_<uint8_t>& valid_big = _genValidScratch;
+    // Per-call scratch is thread_local: gen() runs concurrently per-tile from
+    // the renderer's OMP loop, and the returned coords/normals are views into
+    // these buffers (see crop step below). Sharing them across threads raced
+    // on realloc -> SIGSEGV. thread_local keeps the per-frame reuse per-thread.
+    thread_local cv::Mat_<cv::Vec3f> coords_scratch_tls;
+    thread_local cv::Mat_<uint8_t>  valid_scratch_tls;
+    cv::Mat_<cv::Vec3f>& coords_big = coords_scratch_tls;
+    cv::Mat_<uint8_t>& valid_big = valid_scratch_tls;
 
     if (!_components.empty()) {
         // Multi-component surface: warp each component separately with
@@ -832,35 +1044,41 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     }
 
     // --- normals: warp cached source-grid normals -------------------
-    cv::Mat_<cv::Vec3f>& normals_big = _genNormalsScratch;
+    thread_local cv::Mat_<cv::Vec3f> normals_scratch_tls;
+    cv::Mat_<cv::Vec3f>& normals_big = normals_scratch_tls;
     if (need_normals) {
         // Build source-grid normal cache once per surface. Subsequent gen()
         // calls (panning, zooming) reuse it. Cleared by unloadCaches() when
-        // a different surface becomes active.
-        if (_normalCache.empty() || _normalCache.size() != _points->size()) {
-            _normalCache.create(_points->rows, _points->cols);
-            const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::quiet_NaN());
-            const int rows = _points->rows;
-            const int cols = _points->cols;
-            // Border rows/cols: no ±1 neighbors, fill with NaN sentinel.
-            if (rows > 0) {
-                cv::Vec3f* top = _normalCache[0];
-                cv::Vec3f* bot = _normalCache[rows - 1];
-                for (int c = 0; c < cols; c++) { top[c] = qn; bot[c] = qn; }
-            }
-            #pragma omp parallel for schedule(dynamic, 16)
-            for (int r = 1; r < rows - 1; r++) {
-                cv::Vec3f* dst = _normalCache[r];
-                const cv::Vec3f* row = (*_points)[r];
-                dst[0] = qn;
-                dst[cols - 1] = qn;
-                for (int c = 1; c < cols - 1; c++) {
-                    if (row[c][0] == -1.f) {
-                        dst[c] = qn;
-                    } else {
-                        dst[c] = grid_normal_int(*_points, r, c);
+        // a different surface becomes active. Guarded by _cacheMutex so the
+        // renderer's concurrent OMP tile calls build it exactly once; reads
+        // below run lock-free since the cache is immutable once built.
+        {
+            std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+            if (_normalCache.empty() || _normalCache.size() != _points->size()) {
+                _normalCache.create(_points->rows, _points->cols);
+                const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::quiet_NaN());
+                const int rows = _points->rows;
+                const int cols = _points->cols;
+                // Border rows/cols: no ±1 neighbors, fill with NaN sentinel.
+                if (rows > 0) {
+                    cv::Vec3f* top = _normalCache[0];
+                    cv::Vec3f* bot = _normalCache[rows - 1];
+                    for (int c = 0; c < cols; c++) { top[c] = qn; bot[c] = qn; }
+                }
+                #pragma omp parallel for schedule(dynamic, 16)
+                for (int r = 1; r < rows - 1; r++) {
+                    cv::Vec3f* dst = _normalCache[r];
+                    const cv::Vec3f* row = (*_points)[r];
+                    dst[0] = qn;
+                    dst[cols - 1] = qn;
+                    for (int c = 1; c < cols - 1; c++) {
+                        if (row[c][0] == -1.f) {
+                            dst[c] = qn;
+                        } else {
+                            dst[c] = grid_normal_int(*_points, r, c);
+                        }
                     }
                 }
             }
@@ -1207,21 +1425,14 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
 void QuadSurface::save(const std::filesystem::path &path_, bool force_overwrite)
 {
     if (path_.filename().empty())
-        save(path_, path_.parent_path().filename(), force_overwrite);
+        save(path_, path_.parent_path().filename().string(), force_overwrite);
     else
-        save(path_, path_.filename(), force_overwrite);
+        save(path_, path_.filename().string(), force_overwrite);
 }
 
 std::recursive_mutex& QuadSurface::dirWriteMutex(const std::filesystem::path& dir)
 {
-    // Keyed by normalized dir string so separate QuadSurface objects pointing at
-    // the same segment dir share one lock. Grows by one entry per distinct dir
-    // touched this session (tiny, never pruned); a mutex guards the map itself.
-    static std::mutex mapMutex;
-    static std::unordered_map<std::string, std::recursive_mutex> locks;
-    const std::string key = dir.lexically_normal().string();
-    std::lock_guard<std::mutex> g(mapMutex);
-    return locks[key];
+    return surfaceDirWriteMutex(dir);
 }
 
 void QuadSurface::saveOverwrite()
@@ -1326,16 +1537,17 @@ void QuadSurface::saveChannel(const std::string& name)
     // overlapping saves don't reuse a name; non-throwing rename so a lost race
     // degrades to a logged warning instead of std::terminate.
     static std::atomic<uint64_t> tmpCounter{0};
-    const std::string tmpStem = "." + name + ".tmp" + std::to_string(::getpid())
+    const std::string tmpStem = "." + name + ".tmp" + std::to_string(vc::memmap::pid())
         + "_" + std::to_string(tmpCounter.fetch_add(1, std::memory_order_relaxed));
     writeChannelFile(path, tmpStem, it->second);
-    std::error_code ec;
-    std::filesystem::rename(path / (tmpStem + ".tif"), path / (name + ".tif"), ec);
-    if (ec) {
+    const auto tmpPath = path / (tmpStem + ".tif");
+    try {
+        replaceFile(tmpPath, path / (name + ".tif"));
+    } catch (const std::filesystem::filesystem_error& error) {
         Logger()->warn("saveChannel: rename {}.tif -> {}.tif failed: {}",
-                       tmpStem, name, ec.message());
+                       tmpStem, name, error.code().message());
         std::error_code rmEc;
-        std::filesystem::remove(path / (tmpStem + ".tif"), rmEc);
+        std::filesystem::remove(tmpPath, rmEc);
     }
 }
 
@@ -1510,7 +1722,7 @@ void QuadSurface::saveSnapshot(int maxBackups, bool force)
 }
 
 
-void QuadSurface::save(const std::string &path_, const std::string &uuid, bool force_overwrite)
+void QuadSurface::save(const std::filesystem::path &path_, const std::string &uuid, bool force_overwrite)
 {
     std::filesystem::path target_path = path_;
     std::filesystem::path final_path = path_;
@@ -1629,6 +1841,14 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
             }
             replacedExisting = true;
         }
+#elif defined(_WIN32)
+        try {
+            replaceDirectoryContents(temp_path, final_path);
+        } catch (...) {
+            path = original_path;
+            throw;
+        }
+        replacedExisting = true;
 #else
         // renameat2/RENAME_EXCHANGE is Linux-only; use remove + rename fallback
         std::filesystem::remove_all(final_path);
@@ -1687,11 +1907,19 @@ void QuadSurface::save_meta()
         meta["scale"] = std::move(sc);
     }
 
-    std::ofstream o(path/"meta.json.tmp");
-    o << meta.dump(4) << std::endl;
+    const auto tempMetaPath = path / "meta.json.tmp";
+    const auto metaPath = path / "meta.json";
+    {
+        std::ofstream o(tempMetaPath);
+        o << meta.dump(4) << std::endl;
+        if (!o) {
+            throw std::runtime_error("failed to write metadata: " + tempMetaPath.string());
+        }
+    }
 
-    //rename to make creation atomic
-    std::filesystem::rename(path/"meta.json.tmp", path/"meta.json");
+    // Rename to make replacement atomic. Windows requires the source handle to
+    // be closed and an explicit replace-existing operation.
+    replaceFile(tempMetaPath, metaPath);
 }
 
 Rect3D QuadSurface::bbox()
@@ -1712,8 +1940,10 @@ Rect3D QuadSurface::bbox()
     return _bbox;
 }
 
-std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int flags)
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &path, int flags)
 {
+    recoverIncompleteSave(path);
+
     auto read_band_into = [](const std::filesystem::path& fpath,
                              cv::Mat_<cv::Vec3f>& points,
                              int channel,

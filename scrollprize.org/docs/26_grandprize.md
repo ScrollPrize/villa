@@ -1,7 +1,6 @@
 ---
 title: "Vesuvius Challenge 2023 Grand Prize awarded: we can read the scrolls!"
 sidebar_label: "2023 Grand Prize"
-hide_table_of_contents: true
 hide_title: true
 ---
 
@@ -27,16 +26,15 @@ import JsonLd from '@site/src/components/JsonLd';
 
 <JsonLd data={{"@context":"https://schema.org","@type":"NewsArticle","headline":"Vesuvius Challenge 2023 Grand Prize awarded: we can read the scrolls","datePublished":"2024-02-05","dateModified":"2024-02-05","author":{"@type":"Organization","name":"Vesuvius Challenge"},"publisher":{"@type":"Organization","name":"Vesuvius Challenge","logo":{"@type":"ImageObject","url":"https://scrollprize.org/img/social/opengraph.jpg"}},"image":"https://scrollprize.org/img/social/opengraph.jpg","mainEntityOfPage":"https://scrollprize.org/grandprize"}} />
 
-<h1 className="color-white text-4xl md:text-7xl font-black !mb-2 leading-none tracking-tighter">Vesuvius Challenge 2023 Grand Prize awarded: <span style={{
-  background:
-    "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
-  WebkitBackgroundClip: "text",
-  WebkitTextFillColor: "transparent",
-  backgroundClip: "text",
-  textFillColor: "transparent",
-}}>we can read the first scroll!</span></h1>
+:::info[HISTORICAL MILESTONE]
 
-<div className="md:text-2xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none tracking-tight">The 2000-year-old scroll discusses music, food, and how to enjoy life’s pleasures.</div>
+This announcement is from February 2024. The 2023 Grand Prize it describes has been awarded; see [Prizes](prizes) for what is open today.
+
+:::
+
+<h1 className="color-white text-4xl md:text-7xl !mb-2 leading-none">Vesuvius Challenge 2023 Grand Prize awarded: <span className="text-accent">we can read the first scroll!</span></h1>
+
+<div className="md:text-2xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none">The 2000-year-old scroll discusses music, food, and how to enjoy life’s pleasures.</div>
 
 <div className="opacity-60 mb-8 italic">February 5th, 2024</div>
 
@@ -72,8 +70,7 @@ In the 18th century the scrolls were discovered. Hundreds of them are now stored
 On March 15th, 2023, Nat Friedman, Daniel Gross, and Brent Seales launched the <a href="https://scrollprize.org">Vesuvius Challenge</a> to answer this question. Scrolls from the Institut de France were imaged at the Diamond Light Source particle accelerator near Oxford. We released these high-resolution CT scans of the scrolls, and we offered more than \$1M in prizes, put forward by many generous donors.
 
 <div className="flex flex-wrap mb-4">
-  <div className="w-[41%] mr-4 mb-2"><img src="/img/grandprize/seth-diamond.webp" className="w-[100%]" alt="Seth Parker scanning a scroll at the Diamond Light Source particle accelerator."/><figcaption className="mt-[-6px]">Seth Parker <a href="https://scrollprize.substack.com/p/new-scans-of-herculaneum-papyri-at">scanning</a> a scroll at the <a href="https://www.diamond.ac.uk/">Diamond Light Source</a> particle accelerator.</figcaption></div>
-  <div className="w-[54%]">
+  <div className="w-[100%] max-w-[500px]">
     <video autoPlay playsInline loop muted className="w-[100%]" poster="/img/tutorials/scanning2.webp">
       <source src="/img/tutorials/scanning2.webm" type="video/webm"/>
     </video>
@@ -120,7 +117,7 @@ For the Grand Prize, they assembled into a superteam, crushing it by creating wh
 The submission contains results from three different model architectures, each supporting the findings of the others, with the strongest images often coming from a [TimeSformer](https://arxiv.org/abs/2102.05095)-based model. Multiple measures prevent overfitting and hallucination, including results from multiple architectures, a study across input/output window sizes, label smoothing, and varying validation folds. Like with all our prizes, this ink detection code has been made public as open source (on [GitHub](https://github.com/younader/Vesuvius-Grandprize-Winner)), leveling up everyone in the community.
 
 <div className="mb-4">
-  <a target="_blank" href="/img/grandprize/youssef_text_wbb.png"><img src="/img/grandprize/youssef_text_wbb-smaller.webp" className="w-[100%]" alt="The winners' main Grand Prize submission image, recovered text from a TimeSformer 64x64 model."/></a>
+  <a target="_blank" href="/img/grandprize/youssef_text_wbb-hq.webp"><img src="/img/grandprize/youssef_text_wbb-smaller.webp" className="w-[100%]" alt="The winners' main Grand Prize submission image, recovered text from a TimeSformer 64x64 model."/></a>
   <figcaption className="mt-[-6px]">The winners’ main submission image (TimeSformer 64x64).</figcaption>
 </div>
 
@@ -157,7 +154,7 @@ Of the remaining submissions, the scores from our team of papyrologists identify
   <figcaption className="mt-[-6px]">Louis Schlessinger and Arefeh Sherafati. <a href="https://github.com/lschlessinger1/vesuvius-grand-prize-submission">GitHub</a></figcaption>
 </div>
 
-These teams each brought to the table new approaches to the subtleties of ink labeling and sampling. Be sure to check out their methods at the links above. Other teams may also now choose to share their approaches, so be sure to follow our [Discord community](https://discord.com/invite/uTfNwwecCQ) for updates. Joining our community also provides access to the CT data and more images under our data agreement, as well as a front-row seat to daily discovery and collaboration!
+These teams each brought to the table new approaches to the subtleties of ink labeling and sampling. Be sure to check out their methods at the links above. Other teams may also now choose to share their approaches, so be sure to follow our [Discord community](https://discord.gg/V4fJhvtaQn) for updates. Joining our community also provides access to the CT data and more images under our data agreement, as well as a front-row seat to daily discovery and collaboration!
 
 ## What does the scroll say?
 
@@ -318,7 +315,7 @@ Machine learning models are infamous for “hallucinating”: making up text or 
 These scrolls were scanned at Diamond Light Source, a particle accelerator near Oxford, England. The facility produces a parallel beam of X-rays at high flux, allowing for fast, accurate, and high-resolution imaging. The X-ray photos are turned into a 3D volume of voxels using tomographic reconstruction algorithms, resulting in a stack of slice images.
 
 <figure>
-  <video autoPlay playsInline loop muted className="w-[100%] max-w-[600px]" poster="/img/grandprize/.webp">
+  <video autoPlay playsInline loop muted className="w-[100%] max-w-[600px]">
     <source src="/img/grandprize/scroll1.webm" type="video/webm"/>
   </video>
   <figcaption className="mt-[-6px]">Scrubbing through the slice images of the scroll.</figcaption>
@@ -349,9 +346,9 @@ Finally, ink detection. Stephen Parsons at Brent’s lab had [shown](https://ukn
 2. **Kaggle competition.** Separately, <a href="https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection">hundreds of teams</a> tried building the best machine learning model for detecting ink in open fragments — pieces that had broken off during the physical unrolling process of scrolls, hundreds of years ago. Instead of labeling crackle (which wasn’t known yet), they had the benefit of ground truth data directly from photos of these fragments.
 
 <div className="flex flex-wrap ml-8">
-  <div className="sm:w-[32%] mb-2 mr-2" style={{ maxWidth: "calc(33% - 8px)" }}><img src="/img/data/fr1.webp" className="w-[100%]" alt="Photo of detached scroll Fragment 1."/><figcaption className="mt-[-6px]">Photo of Fragment 1</figcaption></div>
-  <div className="sm:w-[30%] mb-2 mr-2" style={{ maxWidth: "calc(33% - 8px)" }}><img src="/img/data/ir-fr1.webp" className="w-[100%]" alt="Aligned infrared photo of Fragment 1 showing visible ink."/><figcaption className="mt-[-6px]">Aligned infrared</figcaption></div>
-  <div className="sm:w-[30%] mb-2 mr-2" style={{ maxWidth: "calc(33% - 8px)" }}><img src="/img/data/inklabels-fr1.webp" className="w-[100%]" alt="Aligned binary ink labels for Fragment 1."/><figcaption className="mt-[-6px]">Aligned binary ink labels</figcaption></div>
+  <div className="sm:w-[32%] mb-2 mr-2" style={{ maxWidth: "calc(33% - 8px)" }}><img src="/img/data/fr1.webp" className="w-[100%]" alt="Photo of detached scroll Fragment 1."/><figcaption className="mt-[-6px]">Photo of Fragment 1. © EduceLab/University of Kentucky.</figcaption></div>
+  <div className="sm:w-[30%] mb-2 mr-2" style={{ maxWidth: "calc(33% - 8px)" }}><img src="/img/data/ir-fr1.webp" className="w-[100%]" alt="Aligned infrared photo of Fragment 1 showing visible ink."/><figcaption className="mt-[-6px]">Aligned infrared. © EduceLab/University of Kentucky.</figcaption></div>
+  <div className="sm:w-[30%] mb-2 mr-2" style={{ maxWidth: "calc(33% - 8px)" }}><img src="/img/data/inklabels-fr1.webp" className="w-[100%]" alt="Aligned binary ink labels for Fragment 1."/><figcaption className="mt-[-6px]">Aligned binary ink labels. © EduceLab/University of Kentucky.</figcaption></div>
 </div>
 
 <div className="ml-8 mb-4">This resulted in excellent models, but they did not seem to work on the flattened segments which the segmentation team produced. That was, until Youssef Nader (Grand Prize winner) used domain adaptation techniques on them, the start of a technique that ultimately won him the second place First Letters Prize.</div>
@@ -369,11 +366,6 @@ With Vesuvius Challenge, we hope not only to solve the problem of reading the He
 </div>
 
 2. **A solid starting point.** The foundation was laid by <a href="https://www2.cs.uky.edu/dri/">Dr. Seales and his team</a>. They spent two decades making the first scroll scans, building <a href="community_projects#volume-cartographer">Volume Cartographer</a>, demonstrating the <a href="https://www2.cs.uky.edu/dri/the-scroll-from-en-gedi/">first success</a> in virtual unwrapping, and <a href="https://uknowledge.uky.edu/cs_etds/138/">proving</a> that Herculaneum ink can be detected in CT.
-
-<div className="mb-4 ml-8">
-  <img src="/img/landing/brent1.webp" className="w-[100%] max-w-[600px]" alt="Brent Seales, Seth Parker, and Michael Drakopoulos at the particle accelerator."/>
-  <figcaption className="mt-[-6px]">Brent Seales, Seth Parker, and Michael Drakopoulos at the particle accelerator.</figcaption>
-</div>
 
 3. **Blending competition and cooperation.** A Grand Prize on its own would suffer from information “hoarding”: no one would share their intermediate work, because others could take it and use it to beat them to the finish line. Without information sharing, the probability of a single team solving all the puzzle pieces to win the Grand Prize would be dramatically lower.
 
@@ -438,7 +430,7 @@ After that, we will scan and read every scroll. We estimate that the scrolls we 
 
 And as if the prospect of reading hundreds of scrolls isn’t good enough, there might be an even bigger payoff at the end of all of this (as Nat said on the [Dwarkesh podcast](https://youtu.be/qcvMjoJdck4?t=646): <em>“there is gold in this mud”</em>).
 
-<div>Dr. Garrett Ryan (<a href="https://www.youtube.com/@toldinstone">toldinstone</a>) writes it best on our <a href="background">History page</a>:</div>
+<div>Dr. Garrett Ryan (<a href="https://www.youtube.com/@toldinstone">toldinstone</a>) writes it best:</div>
 
 <div className="italic ml-8 mb-4">“The scrolls we have now may be just the beginning. When part of the Villa of the Papyri was cleared in the 1990s, archaeologists realized that the building was much larger than previously thought, with two unexcavated levels. At the very least, these floors likely contain more papyri in cabinets and carrying cases. And it’s probable that they conceal a far greater treasure.</div>
 
@@ -449,7 +441,8 @@ The potential of tens of thousands of scrolls, still buried, waiting to be disco
 Read more detail about what comes next in our [Master Plan](master_plan).
 
 <div className="mb-4">
-  <img src="/img/landing/rocio-espin-pinar-villa-papyri-small.webp" className="w-[100%] max-w-[600px]" alt="Artist's reconstruction of the Villa of the Papyri by Rocio Espin Pinar."/>
+  <img src="/img/landing/rocio-espin-pinar-villa-papyri-small.webp" className="w-[100%] max-w-[600px]" alt="Artist's reconstruction of the Villa of the Papyri by Rocío Espín Pinar."/>
+  <figcaption className="mt-[-6px]">Artist's reconstruction of the Villa of the Papyri by <a href="https://www.artstation.com/rocioespin">Rocío Espín Pinar</a>.</figcaption>
 </div>
 
 ## Thank you

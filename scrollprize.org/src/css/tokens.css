@@ -1,0 +1,32 @@
+/* ==========================================================================
+   tokens.css — "Obsidian Minimal" design tokens (WP0 foundation)
+   The ONLY place raw color/size values live. Everything else references
+   var(--vc-*). Loaded first in the customCss chain (before utilities/custom).
+   The Infima bridge (--ifm-* -> --vc-*) lives in custom.css alongside the
+   existing Infima :root overrides — see custom.css §"Infima bridge".
+   ========================================================================== */
+
+:root {
+  /* color */
+  --vc-bg: #0E0F11;            /* page background */
+  --vc-surface: #16181B;       /* cards, admonitions, table headers */
+  --vc-raised: #1C1F23;        /* hover surface, active rows */
+  --vc-code-bg: #131518;       /* code blocks */
+  --vc-line: rgba(255,255,255,.08);      /* ALL borders */
+  --vc-line-strong: rgba(255,255,255,.16); /* hover borders */
+  --vc-text: #E6E8EA;
+  --vc-text-dim: #B7BCC2;      /* sidebar items, secondary text */
+  --vc-text-faint: rgba(255,255,255,.55); /* metadata, captions, labels */
+  --vc-text-ghost: rgba(255,255,255,.35); /* anchors, disabled */
+  --vc-accent: #E5502B;        /* THE accent. Ember. Use sparingly */
+  --vc-accent-underline: rgba(229,80,43,.55); /* body-link underlines */
+  --vc-gold: #c9a24b;          /* LEGACY: atlas only. Never in new work */
+  /* type */
+  --vc-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --vc-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* radii */
+  --vc-r-card: 8px; --vc-r-btn: 6px; --vc-r-full: 999px; /* avatars only */
+  /* spacing scale: 4 8 12 16 24 32 48 64 96 (use directly; no odd values) */
+  --vc-section-pad: 96px;      /* landing section rhythm; 64px under 768px */
+  --vc-card-pad: 20px;         /* 24px for hero-level cards */
+}

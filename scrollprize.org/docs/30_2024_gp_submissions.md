@@ -1,5 +1,6 @@
 ---
 title: "2024 Grand Prize Submission Instructions"
+sidebar_label: "2024 GP Instructions (closed)"
 hide_table_of_contents: true
 slug: "2024_gp_submissions"
 ---
@@ -36,6 +37,12 @@ slug: "2024_gp_submissions"
     content="https://scrollprize.org/img/social/opengraph.jpg"
   />
 </head>
+
+:::warning[ARCHIVED]
+
+This page has been archived: submissions for the 2024 Grand Prize are closed. See [Prizes](prizes) for what is open today.
+
+:::
 
 
 ### Submitting your result

@@ -1,0 +1,9 @@
+# Real run configs hold machine-specific absolute paths + dataset URLs.
+# Only the sanitized template (configs/*.example.json) is committed.
+configs/*.json
+!configs/*.example.json
+
+# Local debug/preview dumps and caches.
+*.png
+__pycache__/
+*.pyc

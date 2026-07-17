@@ -38,6 +38,32 @@ namespace {
 constexpr double kEpsilon = 1.0e-9;
 constexpr double kControlPointMatchEpsilon = 1.0e-8;
 constexpr int kAtlasMetadataVersion = 5;
+constexpr std::array<const char*, 5> kCoordinateMetadataKeys{
+    "vc_open_data_coordinate_space",
+    "vc_open_data_source_path",
+    "vc_open_data_source_coordinate_level",
+    "vc_open_data_source_coordinate_scale_factor",
+    "vc_open_data_source_original_resolution",
+};
+
+void loadCoordinateMetadata(const nlohmann::json& source, AtlasMetadata& target)
+{
+    target.coordinateMetadata = nlohmann::json::object();
+    for (const char* key : kCoordinateMetadataKeys) {
+        if (source.contains(key))
+            target.coordinateMetadata[key] = source.at(key);
+    }
+}
+
+void saveCoordinateMetadata(const AtlasMetadata& source, nlohmann::json& target)
+{
+    if (!source.coordinateMetadata.is_object())
+        return;
+    for (const char* key : kCoordinateMetadataKeys) {
+        if (source.coordinateMetadata.contains(key))
+            target[key] = source.coordinateMetadata.at(key);
+    }
+}
 constexpr int kFiberMappingVersion = 4;
 
 bool atlasDebugEnabled()
@@ -410,6 +436,7 @@ Atlas loadAtlasContextForRebuild(const fs::path& atlasDir)
         atlas.metadata.seedAtlasU = metadata["seed_atlas"][0].get<double>();
         atlas.metadata.seedAtlasV = metadata["seed_atlas"][1].get<double>();
     }
+    loadCoordinateMetadata(metadata, atlas.metadata);
 
     const fs::path linksPath = atlasDir / "links.json";
     if (fs::exists(linksPath)) {
@@ -1004,6 +1031,7 @@ void Atlas::save(const fs::path& atlasDir) const
         {"seed_line_index", metadata.seedLineIndex},
         {"seed_atlas", nlohmann::json::array({metadata.seedAtlasU, metadata.seedAtlasV})},
     };
+    saveCoordinateMetadata(metadata, metadataJson);
     writeJsonFile(atlasDir / "metadata.json", metadataJson);
 
     nlohmann::json linksJson;
@@ -1073,6 +1101,7 @@ Atlas Atlas::load(const fs::path& atlasDir,
         atlas.metadata.seedAtlasU = metadata["seed_atlas"][0].get<double>();
         atlas.metadata.seedAtlasV = metadata["seed_atlas"][1].get<double>();
     }
+    loadCoordinateMetadata(metadata, atlas.metadata);
 
     const fs::path linksPath = atlasDir / "links.json";
     if (fs::exists(linksPath)) {
@@ -3944,6 +3973,7 @@ void saveAtlasBaseMeshCopy(const QuadSurface& surface,
         throw std::runtime_error("base surface has no point grid");
     }
     QuadSurface copy(*points, surface.scale());
+    copy.meta = surface.meta;
     auto& mutableSurface = const_cast<QuadSurface&>(surface);
     for (const auto& name : mutableSurface.channelNames()) {
         cv::Mat channel = mutableSurface.channel(name, SURF_CHANNEL_NORESIZE);

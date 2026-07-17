@@ -41,13 +41,17 @@ using Json = utils::Json;
 
 static FILE* g_logFile = nullptr;       // non-null when --log-path active
 static std::string g_logPrefix;         // e.g. "[part 2/8] " — prepended when logging to file
+static bool g_flipNormals = false;      // negate surface normals (--flip-normals); reverses slice ordering along the normal
 static std::atomic<bool> g_logRunning{false};
 static std::thread g_logFlushThread;
 
 // Log to file if active, otherwise to the given default stream.
 // When logging to a shared file in multi-part mode, each line is prefixed with the part id.
 static void logPrintf(FILE* defaultStream, const char* fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 2, 3)))
+#endif
+    ;
 static void logPrintf(FILE* defaultStream, const char* fmt, ...)
 {
     FILE* out = g_logFile ? g_logFile : defaultStream;
@@ -263,6 +267,10 @@ static void genTile(QuadSurface* surf, const cv::Size& size, float render_scale,
                     float u0, float v0, cv::Mat_<cv::Vec3f>& points, cv::Mat_<cv::Vec3f>& normals)
 {
     surf->gen(&points, &normals, size, cv::Vec3f(0,0,0), render_scale, cv::Vec3f(u0, v0, 0));
+    // NOTE: do NOT mutate `normals` here. gen() returns a view into a scratch
+    // buffer it reuses across calls (thread_local per worker), so the next
+    // gen() on this thread overwrites it. --flip-normals is applied later in
+    // prepareBaseAndDirs() on the thread-private clone instead.
 }
 
 static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv::Vec3f>& nrm,
@@ -272,6 +280,11 @@ static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv
 {
     base = pts.clone(); base *= scale_seg;
     dirs = nrm.clone();
+    // --flip-normals: negate on the private clone (safe under OpenMP), never on
+    // gen()'s shared scratch view. Negation commutes with the affine + the
+    // subsequent normalization, so applying it here is identical to flipping
+    // the raw geometric normal. (-NaN stays NaN, so invalid pixels are intact.)
+    if (g_flipNormals) dirs *= -1.0f;
     if (hasAffine) applyAffineTransform(base, dirs, aff);
     normalizeNormals(dirs);
     base *= ds_scale;
@@ -318,8 +331,13 @@ static cv::Mat accumulate(const std::vector<cv::Mat>& samples, size_t start, siz
 // Unified band rendering
 // ============================================================
 
-// Build the flat offset vector used by readMultiSlice
-static std::vector<float> buildOffsetList(int numSlices, double sliceStep, double dsScale,
+// Build the flat offset vector used by readMultiSlice. Offsets are distances along the
+// unit surface normal, in level-g voxels: base points are already scaled into level-g
+// index space (prepareBaseAndDirs) and dirs are unit length, so a step of sliceStep
+// advances exactly one level-g voxel. (Do NOT scale by ds_scale here — that would make
+// the through-normal spacing the native/level-0 resolution while the in-plane spacing is
+// level-g, yielding an anisotropic stack that mismatches the isotropic .zattrs scale.)
+static std::vector<float> buildOffsetList(int numSlices, double sliceStep,
                                            const std::vector<float>& accumOffsets)
 {
     double center = 0.5 * (std::max(1, numSlices) - 1.0);
@@ -329,21 +347,21 @@ static std::vector<float> buildOffsetList(int numSlices, double sliceStep, doubl
     for (int zi = 0; zi < numSlices; zi++) {
         float base = float((zi - center) * sliceStep);
         if (accumOffsets.empty())
-            out.push_back(base * float(dsScale));
+            out.push_back(base);
         else
             for (float ao : accumOffsets)
-                out.push_back((base + ao) * float(dsScale));
+                out.push_back(base + ao);
     }
     return out;
 }
 
 static std::vector<float> buildCompositeOffsetList(
-    int compositeStart, int compositeEnd, double sliceStep, double dsScale)
+    int compositeStart, int compositeEnd, double sliceStep)
 {
     std::vector<float> out;
     out.reserve(std::max(0, compositeEnd - compositeStart + 1));
     for (int zi = compositeStart; zi <= compositeEnd; zi++)
-        out.push_back(float(double(zi) * sliceStep * dsScale));
+        out.push_back(float(double(zi) * sliceStep));
     return out;
 }
 
@@ -475,8 +493,8 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
 {
     std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> uniq;
     std::vector<float> offsets = isComposite
-        ? buildCompositeOffsetList(compositeStart, compositeEnd, sliceStep, dsScale)
-        : buildOffsetList(numSlices, sliceStep, dsScale, accumOffsets);
+        ? buildCompositeOffsetList(compositeStart, compositeEnd, sliceStep)
+        : buildOffsetList(numSlices, sliceStep, accumOffsets);
 
     auto wallStart = std::chrono::steady_clock::now();
     auto lastPrint = wallStart;
@@ -592,7 +610,7 @@ static void renderBands(
     const uint32_t numBands = (uint32_t(tgtSize.height) + bandH - 1) / bandH;
 
     // Build offset list for readMultiSlice
-    auto allOffsets = buildOffsetList(numSlices, sliceStep, dsScale, accumOffsets);
+    auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
 
     auto wallStart = std::chrono::steady_clock::now();
     auto lastPrint = wallStart;
@@ -619,11 +637,13 @@ static void renderBands(
         std::vector<cv::Mat> slices;
 
         if (isComposite) {
-            // Composite mode: always u8 — callers always instantiate with T=uint8_t
-            cv::Mat_<uint8_t> compOut;
+            // Composite mode: always u8 — callers always instantiate with T=uint8_t.
+            // readCompositeFast writes into a pre-allocated buffer (it never calls create), and
+            // skips non-finite pixels, so size + zero it here.
+            cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
             if constexpr (std::is_same_v<T, uint8_t>) {
                 readCompositeFast(compOut, cache, level, base, dirs,
-                                  float(sliceStep * dsScale),
+                                  float(sliceStep),
                                   compositeStart, compositeEnd,
                                   compositeParams);
             }
@@ -720,7 +740,7 @@ static void renderTiles(
     surf->validMask();
 
     // Build offset list
-    auto allOffsets = buildOffsetList(numSlices, sliceStep, dsScale, accumOffsets);
+    auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
 
     const bool wantTif = tifWriters && !tifWriters->empty();
     const bool useU16 = (cvType == CV_16UC1);
@@ -828,9 +848,11 @@ static void renderTiles(
             std::vector<cv::Mat_<T>> raw;
             if (isComposite) {
                 if constexpr (std::is_same_v<T, uint8_t>) {
-                    cv::Mat_<uint8_t> compOut;
+                    // readCompositeFast writes into a pre-allocated buffer (it never calls create),
+                    // and skips non-finite pixels, so size + zero it here.
+                    cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
                     readCompositeFast(compOut, cache, level, base, dirs,
-                                      float(sliceStep * dsScale),
+                                      float(sliceStep),
                                       compositeStart, compositeEnd,
                                       compositeParams);
                     raw.resize(1);
@@ -876,8 +898,8 @@ static void renderTiles(
                         std::memcpy(&chunkBuf[sliceOff + yy * chunkX], row, dx_actual * sizeof(T));
                     }
                 }
-                dsOut->writeChunk(0, size_t(dstTy), size_t(dstTx),
-                                  chunkBuf.data(), chunkBuf.size() * sizeof(T));
+                dsOut->writeChunkSkipEmpty(0, size_t(dstTy), size_t(dstTx),
+                                           chunkBuf.data(), chunkBuf.size() * sizeof(T));
 
                 // Scatter L0 tile into L1 pyramid accumulation buffer
                 // No rotation when inline pyramid is active, so tx/ty == dstTx/dstTy.
@@ -952,8 +974,8 @@ static void renderTiles(
 
                 // Write each column's accumulation buffer as a zarr chunk
                 for (size_t cx = 0; cx < pa.bufs.size(); cx++) {
-                    pyramidDs[li]->writeChunk(0, pyrChunkRow, cx,
-                                              pa.bufs[cx].data(), pa.bufs[cx].size() * sizeof(T));
+                    pyramidDs[li]->writeChunkSkipEmpty(0, pyrChunkRow, cx,
+                                                       pa.bufs[cx].data(), pa.bufs[cx].size() * sizeof(T));
                 }
 
                 // Cascade: scatter this level's buffers into the next level's accum
@@ -1063,7 +1085,19 @@ int main(int argc, char *argv[])
         ("scale-segmentation", po::value<float>()->default_value(1.0), "Scale segmentation")
         ("rotate", po::value<double>()->default_value(0.0), "Rotate output (0/90/180/270)")
         ("flip", po::value<int>()->default_value(-1), "Flip: 0=V, 1=H, 2=Both")
+        // The geometric normal is N = dP/dU x dP/dV (see grid_normal in Geometry.cpp),
+        // so (U, V, N) is right-handed. With the standard segment orientation (V down-screen
+        // aligned with +z, text readable, U winding outside->inside) that normal points toward
+        // the OUTSIDE of the scroll, i.e. behind the surface as the reader views it. Our
+        // convention is the opposite: w / layer number should increase going IN FRONT of the
+        // surface (toward the viewer / toward the scroll center), which makes (U, V, w) a
+        // left-handed frame. So --flip-normals is usually what we want: it negates N so the
+        // slice stack grows in front of the sheet rather than behind it.
+        ("flip-normals", po::bool_switch()->default_value(false), "Negate surface normals (reverses slice ordering along the normal)")
         ("zarr-output", po::value<std::string>(), "Output path for .zarr (optional)")
+        ("zarr-compressor", po::value<std::string>()->default_value("blosc"), "Zarr compressor: blosc, zstd, gzip, lz4, none")
+        ("zarr-compression-level", po::value<int>()->default_value(-1), "Zarr compression level (<=0 = compressor default)")
+        ("zarr-separator", po::value<std::string>()->default_value("/"), "Zarr chunk dimension separator: / or .")
         ("tif-output", po::value<std::string>(), "Output path for per-slice TIFFs (optional)")
         ("quick-tif", po::bool_switch()->default_value(false), "Fast TIF: PACKBITS + zero low nibble")
         ("flatten", po::bool_switch()->default_value(false), "ABF++ flattening")
@@ -1079,6 +1113,14 @@ int main(int argc, char *argv[])
         ("iso-cutoff", po::value<int>()->default_value(0), "Highpass (0-255)")
         ("composite-start", po::value<int>(), "Composite start offset")
         ("composite-end", po::value<int>(), "Composite end offset")
+        // Named '--composite-collapse' rather than '--composite' so it is not an abbreviation
+        // prefix of --composite-start/--composite-end under boost's allow_guessing.
+        ("composite-collapse", po::bool_switch()->default_value(false),
+            "Collapse the sampled band into a single image using --accum-type as the reducer "
+            "(max/mean/median, in addition to the implicit alpha/beerlambert). The band spans "
+            "[--composite-start, --composite-end] layers along the normal at --slice-step spacing; "
+            "use a symmetric range (e.g. --composite-start=-54 --composite-end=54) for a centered "
+            "projection.")
         ("num-parts", po::value<int>()->default_value(1), "Parts for multi-VM")
         ("part-id", po::value<int>()->default_value(0), "Part ID (0-indexed)")
         ("merge-tiff-parts", po::bool_switch()->default_value(false), "Merge partial TIFFs from multi-VM render")
@@ -1138,6 +1180,22 @@ int main(int argc, char *argv[])
     const std::string zarrOutputArg = wantZarr ? parsed["zarr-output"].as<std::string>() : "";
     const std::string tifOutputArg = wantTif ? parsed["tif-output"].as<std::string>() : "";
 
+    // Zarr output codec / layout
+    std::string zarrCompressor = parsed["zarr-compressor"].as<std::string>();
+    const int zarrCompressionLevel = parsed["zarr-compression-level"].as<int>();
+    const std::string zarrSeparator = parsed["zarr-separator"].as<std::string>();
+    {
+        static const std::set<std::string> kComp{"blosc", "zstd", "gzip", "lz4", "none"};
+        if (kComp.find(zarrCompressor) == kComp.end()) {
+            logPrintf(stderr, "Error: --zarr-compressor must be one of blosc, zstd, gzip, lz4, none\n");
+            return EXIT_FAILURE;
+        }
+        if (zarrSeparator != "/" && zarrSeparator != ".") {
+            logPrintf(stderr, "Error: --zarr-separator must be \"/\" or \".\"\n");
+            return EXIT_FAILURE;
+        }
+    }
+
     const bool mergeTiffFlag = parsed["merge-tiff-parts"].as<bool>();
     if (mergeTiffFlag) {
         if (numParts < 2) { logPrintf(stderr, "Error: --merge-tiff-parts needs --num-parts >= 2\n"); return EXIT_FAILURE; }
@@ -1183,12 +1241,23 @@ int main(int argc, char *argv[])
     else if (accum_type_str == "beerlam" || accum_type_str == "beerlambert") accumType = AccumType::BeerLambert;
     else { logPrintf(stderr, "Error: invalid --accum-type\n"); return EXIT_FAILURE; }
 
-    const bool isCompositeMode = (accumType == AccumType::Alpha || accumType == AccumType::BeerLambert);
+    // alpha/beerlambert reducers only make sense over a collapsed band, so they always imply
+    // composite mode. --composite-collapse extends the same band-collapsing path to max/mean/median,
+    // which the core compositor (readCompositeFastImpl) already implements.
+    const bool requestComposite = parsed["composite-collapse"].as<bool>();
+    const bool isCompositeMode = requestComposite
+        || accumType == AccumType::Alpha || accumType == AccumType::BeerLambert;
     int compositeStart = 0, compositeEnd = num_slices - 1;
 
     CompositeParams compositeParams;
     if (isCompositeMode) {
-        compositeParams.method = (accumType == AccumType::Alpha) ? "alpha" : "beerLambert";
+        switch (accumType) {
+            case AccumType::Alpha:       compositeParams.method = "alpha"; break;
+            case AccumType::BeerLambert: compositeParams.method = "beerLambert"; break;
+            case AccumType::Max:         compositeParams.method = "max"; break;
+            case AccumType::Mean:        compositeParams.method = "mean"; break;
+            case AccumType::Median:      compositeParams.method = "median"; break;
+        }
         compositeParams.alphaMin = parsed["alpha-min"].as<float>() / 255.0f;
         compositeParams.alphaMax = parsed["alpha-max"].as<float>() / 255.0f;
         compositeParams.alphaOpacity = parsed["alpha-opacity"].as<float>() / 255.0f;
@@ -1206,7 +1275,7 @@ int main(int argc, char *argv[])
             logPrintf(stdout, "  alpha: min=%.0f max=%.0f opacity=%.0f cutoff=%.0f\n",
                       compositeParams.alphaMin*255, compositeParams.alphaMax*255,
                       compositeParams.alphaOpacity*255, compositeParams.alphaCutoff*10000);
-        else
+        else if (compositeParams.method == "beerLambert")
             logPrintf(stdout, "  BL: ext=%.1f em=%.1f amb=%.1f\n",
                       compositeParams.blExtinction, compositeParams.blEmission, compositeParams.blAmbient);
         if (compositeParams.isoCutoff > 0) logPrintf(stdout, "  iso cutoff: %d\n", int(compositeParams.isoCutoff));
@@ -1228,6 +1297,7 @@ int main(int argc, char *argv[])
     float scale_seg = parsed["scale-segmentation"].as<float>();
     double rotate_angle = parsed["rotate"].as<double>();
     int flip_axis = parsed["flip"].as<int>();
+    g_flipNormals = parsed["flip-normals"].as<bool>();
     const bool quickTif = parsed["quick-tif"].as<bool>();
 
     // --- Load affines ---
@@ -1265,28 +1335,8 @@ int main(int argc, char *argv[])
         printMat4x4(affineTransform.matrix, "Final composed affine:");
     }
 
-    // Try to read voxelsize from meta.json to set TIFF DPI.
-    // meta.json stores the level-0 voxel size; renders at --group-idx > 0
-    // come from a 2^group_idx-downsampled pyramid, so each output pixel
-    // covers (voxelsize / ds_scale) µm. Account for that so the DPI tag
-    // matches the actual pixel grid.
+    // Resolved below from the same CLI/metadata value used for OME-Zarr.
     float tifDpi = 0.f;
-    {
-        auto metaPath = vol_path / "meta.json";
-        if (std::filesystem::exists(metaPath)) {
-            try {
-                auto meta = Json::parse_file(metaPath);
-                if (meta.contains("voxelsize")) {
-                    const double vs = meta["voxelsize"].get_double();
-                    const double vsLevel = ds_scale > 0
-                                               ? vs / double(ds_scale)
-                                               : vs;
-                    tifDpi = voxelSizeToDpi(vsLevel);
-                }
-            } catch (...) {
-            }
-        }
-    }
 
     // --- Open source volume ---
     const int cacheLevel = group_idx;
@@ -1335,6 +1385,13 @@ int main(int argc, char *argv[])
 
     const bool output_is_u16 = (chunk_cache->dtype() == vc::render::ChunkDtype::UInt16);
     logPrintf(stdout, "Source dtype: %s\n", output_is_u16 ? "uint16" : "uint8");
+
+    // The composite path is u8-only (renderBands/renderTiles run it under if constexpr T==uint8_t),
+    // so on a uint16 source it would silently emit empty output. Fail fast instead.
+    if (isCompositeMode && output_is_u16) {
+        logPrintf(stderr, "Error: composite/alpha rendering requires a uint8 volume (source is uint16)\n");
+        return EXIT_FAILURE;
+    }
     if (output_is_u16 && isCompositeMode)
         logPrintf(stderr, "Warning: composite forces 8-bit output (source is 16-bit)\n");
     {
@@ -1346,22 +1403,48 @@ int main(int argc, char *argv[])
     // --- Resolve voxel size for OME-Zarr metadata ---
     const std::string voxel_unit = parsed["voxel-unit"].as<std::string>();
     double base_voxel_size = 1.0;
+    bool hasPhysicalVoxelSize = false;
+    bool voxelSizeFromCli = false;
     if (parsed.count("voxel-size")) {
         base_voxel_size = parsed["voxel-size"].as<double>();
         if (!std::isfinite(base_voxel_size) || base_voxel_size <= 0.0) {
             logPrintf(stderr, "Error: --voxel-size must be a positive finite number\n");
             return EXIT_FAILURE;
         }
+        hasPhysicalVoxelSize = true;
+        voxelSizeFromCli = true;
         logPrintf(stdout, "Voxel size (from CLI): %g %s\n", base_voxel_size, voxel_unit.c_str());
     } else if (auto mv = readVolumeVoxelSize(vol_path); mv.has_value()) {
         if (std::isfinite(*mv) && *mv > 0.0) {
             base_voxel_size = *mv;
+            hasPhysicalVoxelSize = true;
             logPrintf(stdout, "Voxel size (from volume metadata): %g %s\n", base_voxel_size, voxel_unit.c_str());
         } else {
             logPrintf(stderr, "Warning: ignoring invalid metadata voxelsize; using default 1.0\n");
         }
     } else {
         logPrintf(stdout, "Voxel size: 1.0 (no metadata found; override with --voxel-size)\n");
+    }
+    if (hasPhysicalVoxelSize) {
+        double voxelSizeUm = base_voxel_size;
+        if (voxelSizeFromCli) {
+            if (voxel_unit == "nanometer" || voxel_unit == "nanometre" || voxel_unit == "nm")
+                voxelSizeUm *= 0.001;
+            else if (voxel_unit == "millimeter" || voxel_unit == "millimetre" || voxel_unit == "mm")
+                voxelSizeUm *= 1000.0;
+            else if (voxel_unit == "meter" || voxel_unit == "metre" || voxel_unit == "m")
+                voxelSizeUm *= 1000000.0;
+            else if (voxel_unit != "micrometer" && voxel_unit != "micrometre" &&
+                     voxel_unit != "um" && voxel_unit != "µm") {
+                logPrintf(stderr, "Error: unsupported --voxel-unit for TIFF resolution: %s\n",
+                          voxel_unit.c_str());
+                return EXIT_FAILURE;
+            }
+        }
+        const double voxelSizeAtRenderLevelUm = ds_scale > 0
+            ? voxelSizeUm / double(ds_scale)
+            : voxelSizeUm;
+        tifDpi = voxelSizeToDpi(voxelSizeAtRenderLevelUm);
     }
 
     int rotQuadGlobal = -1;
@@ -1372,6 +1455,7 @@ int main(int argc, char *argv[])
         logPrintf(stdout, "Rotation: %.0f degrees\n", rotate_angle);
     }
     if (flip_axis >= 0) logPrintf(stdout, "Flip: %s\n", flip_axis == 0 ? "V" : flip_axis == 1 ? "H" : "Both");
+    if (g_flipNormals) logPrintf(stdout, "Flip normals: on\n");
 
     if (wantZarr) {
         if (auto p = std::filesystem::path(zarrOutputArg).parent_path(); !p.empty())
@@ -1505,10 +1589,12 @@ int main(int argc, char *argv[])
             if (pre_flag) {
                 logPrintf(stdout, "[pre] creating zarr + all levels...\n");
                 std::filesystem::create_directories(outFilePath);
-                vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype, "blosc");
+                vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype,
+                                      zarrCompressor, zarrSeparator, 0, zarrCompressionLevel);
                 logPrintf(stdout, "[pre] L0 shape: [%zu,%zu,%zu]\n", shape0[0], shape0[1], shape0[2]);
                 if (wantPyramid)
-                    createPyramidDatasets(outFilePath, shape0, CH, CW, useU16);
+                    createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
+                                          zarrCompressor, zarrCompressionLevel, zarrSeparator);
 
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
@@ -1526,7 +1612,8 @@ int main(int argc, char *argv[])
                 logPrintf(stdout, "[resume] opening existing zarr\n");
             } else {
                 std::filesystem::create_directories(outFilePath);
-                dsOut = vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype, "blosc");
+                dsOut = vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype,
+                                              zarrCompressor, zarrSeparator, 0, zarrCompressionLevel);
             }
 
             tilesYSrc = (tgt_size.height + CH - 1) / CH;
@@ -1586,7 +1673,8 @@ int main(int argc, char *argv[])
                 cv::Size zarrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(zarrXY.width, zarrXY.height);
                 std::vector<size_t> shape0 = {baseZ, size_t(zarrXY.height), size_t(zarrXY.width)};
-                createPyramidDatasets(outFilePath, shape0, CH, CW, useU16);
+                createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
+                                      zarrCompressor, zarrCompressionLevel, zarrSeparator);
             }
             if (inlinePyramid) {
                 for (int level = 1; level <= 5; level++) {

@@ -15,13 +15,33 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # OFF locally for PaStiX.)
 set(BUILD_SHARED_LIBS ON CACHE BOOL "Build vc_* and FetchContent deps as .so")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# GCC/MinGW export every symbol from a shared library by default, which is what
+# the vc_* .so/.dll split relies on. MSVC exports nothing unless asked, so a
+# shared lib with no __declspec(dllexport) yields no import .lib and downstream
+# links fail (LNK1181). Auto-generate the export table for every shared target
+# to match the GCC behavior the codebase assumes.
+if(MSVC)
+    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
 # Exes default to -fPIE; force -fPIC to match the shared libs' PCH. -no-pie
-# only on exe links (mold/lld reject it on a .so).
-add_compile_options(-fPIC)
-add_link_options($<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-no-pie>)
+# only on exe links (mold/lld reject it on a .so). PE/COFF has no PIC/PIE
+# distinction, so skip both on Windows.
+if(NOT WIN32)
+    add_compile_options(-fPIC)
+    add_link_options($<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-no-pie>)
+endif()
 # Find the .so via $ORIGIN without LD_LIBRARY_PATH.
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
-set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+if(APPLE)
+    # Packaged layout (cmake/MacPackaging.cmake): executables live in
+    # VC3D.app/Contents/MacOS, every dylib in ../Frameworks. Mach-O has no
+    # $ORIGIN; @loader_path is its equivalent and covers both the executables
+    # and dylib->dylib references (Frameworks/../Frameworks resolves to
+    # itself).
+    set(CMAKE_INSTALL_RPATH "@loader_path/../Frameworks")
+else()
+    set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+endif()
 set(CMAKE_BUILD_WITH_INSTALL_RPATH OFF)
 
 option(VC_MARCH_NATIVE     "Tune for the host CPU (-march=native)"        OFF)
@@ -37,11 +57,21 @@ option(VC_ENABLE_COVERAGE "Code coverage instrumentation"                OFF)
 option(VC_TESTING         "Build and run unit tests"                     OFF)
 option(VC_DEAD_CODE_REPORT "Enable dead-code reporting (curated -Wunused* + linker --print-gc-sections; use a Debug build to avoid LTO)" OFF)
 option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
-option(VC_BUILD_FLATBOI    "Build the flatboi SLIM flattening tool"      ON)
+# flatboi drags in PaStiX (Fortran + autotools + Scotch), which has no
+# practical Windows build — default it off there.
+if(WIN32)
+    option(VC_BUILD_FLATBOI "Build the flatboi SLIM flattening tool"      OFF)
+else()
+    option(VC_BUILD_FLATBOI "Build the flatboi SLIM flattening tool"      ON)
+endif()
 option(VC_BUILD_PYTHON     "Build Python bindings"                       OFF)
 option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
+option(VC_LIBBACKTRACE_UPDATE_DISCONNECTED
+    "Avoid network update checks for vendored libbacktrace during ordinary builds"
+    ON)
 option(VC_USE_PCH "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" OFF)
 option(VC_USE_CCACHE "Route the compiler through ccache" OFF)
+option(VC_USE_SCCACHE "Route the compiler through sccache" OFF)
 option(VC_ENABLE_ECL_MAXFLOW "Build CUDA ECL-MaxFlow integration for Lasagna maxflow" OFF)
 option(VC_ENABLE_AMGX "Build external AMGX-backed Lasagna screened-Laplace solver" OFF)
 set(AMGX_ROOT "" CACHE PATH "External AMGX installation prefix")
@@ -75,6 +105,10 @@ if(CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     message(STATUS "QuickBuild: -O1, PCH enabled, LTO disabled")
 endif()
 
+if(VC_USE_CCACHE AND VC_USE_SCCACHE)
+    message(FATAL_ERROR "VC_USE_CCACHE and VC_USE_SCCACHE are mutually exclusive.")
+endif()
+
 if(VC_USE_CCACHE)
     find_program(CCACHE_PROGRAM ccache)
     if(NOT CCACHE_PROGRAM)
@@ -91,6 +125,16 @@ if(VC_USE_CCACHE)
     set(CMAKE_CXX_COMPILER_LAUNCHER "${_vc_ccache_launcher}" CACHE STRING "Compiler launcher for CXX" FORCE)
 endif()
 
+if(VC_USE_SCCACHE)
+    find_program(SCCACHE_PROGRAM sccache)
+    if(NOT SCCACHE_PROGRAM)
+        message(FATAL_ERROR "VC_USE_SCCACHE=ON but sccache was not found on PATH.")
+    endif()
+    set(CMAKE_C_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}" CACHE STRING "Compiler launcher for C" FORCE)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}" CACHE STRING "Compiler launcher for CXX" FORCE)
+    message(STATUS "Compiler cache: sccache (${SCCACHE_PROGRAM})")
+endif()
+
 # Skip building app executables (vc_*, VC3D) when generating coverage:
 # the apps add ~3 GB of debug+coverage-instrumented binaries to the
 # build dir and aren't exercised by the unit tests, so they only inflate
@@ -103,6 +147,7 @@ if(VC_ENABLE_COVERAGE)
 else()
     option(VC_BUILD_APPS  "Build app executables (vc_*, VC3D)"           ON)
 endif()
+option(VC_BUILD_UI_TRACER  "Build Qt UI/tracer helper libraries"         ${VC_BUILD_APPS})
 
 # ---- Toolchain --------------------------------------------------------------
 foreach(_path "$ENV{HOME}/miniconda3" "$ENV{HOME}/anaconda3")
@@ -112,12 +157,24 @@ foreach(_path "$ENV{HOME}/miniconda3" "$ENV{HOME}/anaconda3")
 endforeach()
 
 # ---- Git revision (used for ProjectInfo::VersionString) ---------------------
+# Query git in the source tree. Build contexts with no .git (e.g. the Docker
+# AppImage build, whose context is only the volume-cartographer/ subtree) can
+# inject the revision via -DVC_GIT_SHA1=/-DVC_GIT_COMMIT_DATE=.
+set(VC_GIT_SHA1 "" CACHE STRING "Full commit SHA fallback when the tree has no .git")
+set(VC_GIT_COMMIT_DATE "" CACHE STRING "Commit date (YYYY-MM-DD) paired with VC_GIT_SHA1")
 find_package(Git QUIET)
 if(Git_FOUND)
     execute_process(COMMAND ${GIT_EXECUTABLE} -C "${CMAKE_SOURCE_DIR}" rev-parse HEAD
         OUTPUT_VARIABLE GIT_SHA1 OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
     execute_process(COMMAND ${GIT_EXECUTABLE} -C "${CMAKE_SOURCE_DIR}" log -1 --format=%cs HEAD
         OUTPUT_VARIABLE GIT_COMMIT_DATE OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+# The git query wins whenever it succeeds, so a stale cached VC_GIT_SHA1 can
+# never mask the real revision in a normal checkout; the injected value is used
+# only when the tree has no .git (or git is unavailable).
+if(NOT GIT_SHA1)
+    set(GIT_SHA1 "${VC_GIT_SHA1}")
+    set(GIT_COMMIT_DATE "${VC_GIT_COMMIT_DATE}")
 endif()
 if(GIT_SHA1)
     string(SUBSTRING ${GIT_SHA1} 0 7 GIT_SHA1_SHORT)
@@ -140,19 +197,52 @@ if(VC_BUILD_PYTHON)
 endif()
 
 # Portable shippable defaults; VC_MARCH_NATIVE=ON (set by dev-* presets) opts
-# into host tuning. armv8.2-a floor avoids SVE so Apple M1-M3 + Qualcomm Oryon
-# work alongside Graviton.
-if(VC_MARCH_NATIVE)
+# into host tuning. Windows installers use the general x86-64 baseline so they
+# run on all supported amd64 CPUs; Linux retains the existing x86-64-v3 floor.
+# armv8.2-a avoids SVE so Apple M1-M3 + Qualcomm Oryon work alongside Graviton.
+if(MSVC)
+    # MSVC has no -march/-pipe. It targets the portable x86-64 (SSE2) baseline
+    # by default, matching the Windows floor used on the GCC path below;
+    # VC_MARCH_NATIVE opts into AVX2 host tuning.
+    if(VC_MARCH_NATIVE)
+        add_compile_options(/arch:AVX2)
+    endif()
+elseif(VC_MARCH_NATIVE)
     add_compile_options(-pipe -march=native)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-    add_compile_options(-pipe -march=x86-64-v3)
+    if(WIN32)
+        add_compile_options(-pipe -march=x86-64)
+    else()
+        add_compile_options(-pipe -march=x86-64-v3)
+    endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     add_compile_options(-pipe -march=armv8.2-a)
 else()
     add_compile_options(-pipe)
 endif()
 
-if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+if(MSVC)
+    # MSVC toolchain equivalents of the GCC/Clang setup below:
+    #   /Zi   PDB debug info (moral equivalent of -g3; kept in every config so
+    #         release crash dumps still symbolize)
+    #   /Gy /Gw  function/data-level linking so /OPT:REF,ICF can strip unused
+    #         code (~ -ffunction-sections/-fdata-sections + --gc-sections)
+    #   /bigobj  lift the COFF 32k-section limit (~ -Wa,-mbig-obj)
+    #   /permissive- /Zc:__cplusplus /Zc:preprocessor  standards conformance
+    #   /utf-8   treat sources as UTF-8 (the GCC/Clang default)
+    #   /MP      parallel TU compilation
+    #   /wd4068  ignore the unknown `#pragma omp` (OpenMP is stubbed, see below)
+    set(_dbg "")
+    set(_lto "")
+    set(_link "")
+    add_compile_options(/Zi /Gy /Gw /bigobj /permissive- /Zc:__cplusplus
+                        /Zc:preprocessor /utf-8 /MP /wd4068)
+    add_link_options(/DEBUG /OPT:REF /OPT:ICF)
+    # Windows.h hygiene + the libm-style math constants (M_PI, ...) that
+    # MinGW/GCC expose by default but MSVC gates behind these macros.
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES
+                            _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(_dbg -g3 -fno-omit-frame-pointer -fasynchronous-unwind-tables -fstandalone-debug)
     set(_lto -flto=thin)
     if(APPLE)
@@ -185,6 +275,9 @@ else()
     set(_lto -flto=auto)
     if(APPLE)
         set(_link "")
+    elseif(WIN32)
+        # binutils PE linker: --gc-sections works, mold/lld are not options.
+        set(_link -Wl,--gc-sections -Wl,--as-needed)
     else()
         find_program(VC_MOLD_BINARY mold)
         if(VC_MOLD_BINARY)
@@ -194,8 +287,19 @@ else()
         endif()
     endif()
 endif()
-add_compile_options(${_dbg} -ffunction-sections -fdata-sections)
+if(MSVC)
+    add_compile_options(${_dbg})
+else()
+    add_compile_options(${_dbg} -ffunction-sections -fdata-sections)
+endif()
 add_link_options(${_link})
+
+if(WIN32 AND NOT MSVC)
+    # Several large TUs (Qt-heavy VC3D sources, template-dense core) exceed
+    # the default COFF 32k-section limit; -mbig-obj lifts it for the binutils
+    # assembler. (MSVC gets /bigobj in the compiler-family block above.)
+    add_compile_options(-Wa,-mbig-obj)
+endif()
 
 # ---- Sanitizers + coverage --------------------------------------------------
 if(VC_ENABLE_ASAN AND VC_ENABLE_TSAN)
@@ -256,24 +360,44 @@ endif()
 # Sanitizer/coverage flags applied below, after libs/ — see that block.
 
 # ---- Optimization + LTO -----------------------------------------------------
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_compile_options(-O0)
-elseif(CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
-    add_compile_options(-O1)
-elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-    add_compile_options(-O3)
-elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    add_compile_options(-O2)
-elseif(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
-    add_compile_options(-Os)
+# GCC/Clang optimization levels. MSVC takes its optimization from CMake's
+# per-config flags (/O2 for Release/RelWithDebInfo, /Od for Debug), so it is
+# intentionally left out of this block.
+if(NOT MSVC)
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        add_compile_options(-O0)
+    elseif(CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
+        add_compile_options(-O1)
+    elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
+        add_compile_options(-O3)
+    elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+        add_compile_options(-O2)
+    elseif(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+        add_compile_options(-Os)
+    endif()
 endif()
-if(NOT _san AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
+# LTO stays off on Windows: GCC LTO across DLLs interacts badly with PE
+# auto-import/export-all, and link times on the CI runners balloon.
+if(NOT _san AND NOT WIN32 AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     add_compile_options(${_lto})
     add_link_options(${_lto})
 endif()
 
+# ---- PIC for python bindings -----------------------------------------------------
+# Python bindings link the static libs (vc_core, utils, ...) into .so modules,
+# which requires every translation unit to be -fPIC (otherwise thread_local
+# statics emit local-exec TPOFF32 relocations that ld rejects).
+if(VC_BUILD_PYTHON)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # ---- Warnings ---------------------------------------------------------------
-if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+if(MSVC)
+    # Highest-volume MSVC-only warnings that GCC/Clang never emit for this
+    # code: narrowing/precision conversions, signed/unsigned compares, and the
+    # CRT "deprecation" of standard/POSIX names. Noise, not bugs.
+    add_compile_options(/wd4244 /wd4267 /wd4305 /wd4018 /wd4146 /wd4996)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     add_compile_options(-Wno-unknown-warning-option)
 else()
     add_compile_options(-Wno-psabi -Wno-ignored-attributes -Wno-narrowing)
@@ -302,7 +426,7 @@ if(VC_WARNINGS AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         -Wno-pre-c++20-compat -Wno-pre-c++23-compat -Wno-pre-c++26-compat
         -Wno-nested-anon-types -Wno-gnu-anonymous-struct
     )
-elseif(VC_WARNINGS)
+elseif(VC_WARNINGS AND NOT MSVC)
     add_compile_options(
         -Wall -Wextra -pedantic
         -Wattributes -Wcast-align -Wcast-qual -Wchar-subscripts -Wcomment
@@ -316,18 +440,25 @@ elseif(VC_WARNINGS)
     )
 endif()
 if(VC_WERROR)
-    add_compile_options(-Werror)
+    if(MSVC)
+        add_compile_options(/WX)
+    else()
+        add_compile_options(-Werror)
+    endif()
 endif()
 
 if(VC_PROFILE_COMPILE)
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    if(MSVC)
+        # MSVC has no stable per-TU timing flag; leave compile profiling to the
+        # GCC/Clang builds.
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         add_compile_options(-ftime-trace -ftime-trace-granularity=200)
     else()
         add_compile_options(-ftime-report)
     endif()
 endif()
 
-if(VC_DEAD_CODE_REPORT)
+if(VC_DEAD_CODE_REPORT AND NOT MSVC)
     add_compile_options(
         -Wunused -Wunused-function -Wunused-variable -Wunused-parameter
         -Wunused-value -Wunused-result
@@ -348,20 +479,75 @@ if(VC_DEAD_CODE_REPORT)
 endif()
 
 # ---- Dependencies -----------------------------------------------------------
-find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent OpenGLWidgets)
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-set(CMAKE_AUTOUIC ON)
+if(VC_BUILD_UI_TRACER OR VC_BUILD_APPS)
+    find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent OpenGLWidgets)
+    set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTORCC ON)
+    set(CMAKE_AUTOUIC ON)
 
+    find_package(Boost CONFIG REQUIRED COMPONENTS program_options)
+endif()
+# Ceres is required unconditionally: core/CMakeLists.txt always builds
+# vc_inpaint, vc_lasagna, vc_atlas and vc_tracer, all of which link
+# Ceres::ceres (vc_lasagna is also pulled into the Python bindings via
+# vc_lasagna_amgx).
 find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
+# OpenCV 5 split calib3d into geometry/calib/stereo/ptcloud. VC uses
+# Rodrigues (calib) and estimateAffine3D (geometry), so select both new
+# modules there while retaining the OpenCV 4 module name elsewhere.
+if(OpenCV_VERSION_MAJOR GREATER_EQUAL 5)
+    set(VC_OPENCV_CALIB_TARGETS opencv_calib opencv_geometry)
+else()
+    set(VC_OPENCV_CALIB_TARGETS opencv_calib3d)
+endif()
+
+# Homebrew's OpenCV package can occasionally report module names without
+# defining corresponding imported targets. Normalize any such module to an
+# absolute dylib path so it never degrades into a bare, unresolvable -l flag.
+if(APPLE)
+    set(_vc_opencv_modules
+        core imgproc imgcodecs video videoio flann ximgproc)
+    if(OpenCV_VERSION_MAJOR GREATER_EQUAL 5)
+        list(APPEND _vc_opencv_modules calib geometry)
+    else()
+        list(APPEND _vc_opencv_modules calib3d)
+    endif()
+    foreach(_vc_opencv_module IN LISTS _vc_opencv_modules)
+        set(_vc_opencv_target "opencv_${_vc_opencv_module}")
+        if(NOT TARGET ${_vc_opencv_target})
+            unset(_vc_opencv_library)
+            find_library(_vc_opencv_library
+                NAMES ${_vc_opencv_target}
+                HINTS
+                    "$ENV{HOMEBREW_PREFIX}/opt/opencv/lib"
+                    "${OpenCV_DIR}/../.."
+                NO_CACHE)
+            if(NOT _vc_opencv_library)
+                message(FATAL_ERROR
+                    "OpenCV module ${_vc_opencv_target} was not provided as a target and its library was not found")
+            endif()
+            add_library(${_vc_opencv_target} SHARED IMPORTED GLOBAL)
+            set_target_properties(${_vc_opencv_target} PROPERTIES
+                IMPORTED_LOCATION "${_vc_opencv_library}"
+                INTERFACE_INCLUDE_DIRECTORIES "${OpenCV_INCLUDE_DIRS}")
+        endif()
+    endforeach()
+    unset(_vc_opencv_library)
+endif()
 find_package(nlohmann_json REQUIRED)
 find_package(CURL REQUIRED)
 find_package(TIFF REQUIRED)
 find_package(ZLIB REQUIRED)
-find_package(Boost CONFIG REQUIRED COMPONENTS program_options)
-find_package(PkgConfig REQUIRED)
+if(MSVC)
+    # On MSVC, zstd/lz4 come from vcpkg CMake configs (below), and the
+    # pkg-config-only consumers (vendored libbacktrace, avahi) are Linux-only,
+    # so pkg-config is optional rather than required.
+    find_package(PkgConfig)
+else()
+    find_package(PkgConfig REQUIRED)
+endif()
 # Blosc1 (libblosc-dev on Debian/Ubuntu; c-blosc on Homebrew). No upstream
 # CMake config is shipped, so locate by header+lib and wrap in an imported
 # target consumers link as Blosc::blosc.
@@ -415,17 +601,57 @@ if(VC_ENABLE_AMGX)
     endif()
     message(STATUS "Using AMGX include=${AMGX_INCLUDE_DIR} library=${AMGX_LIBRARY}")
 endif()
-pkg_check_modules(zstd REQUIRED IMPORTED_TARGET libzstd)
-pkg_check_modules(lz4 REQUIRED IMPORTED_TARGET liblz4)
-if(NOT TARGET zstd::libzstd)
-    add_library(zstd::libzstd ALIAS PkgConfig::zstd)
+if(MSVC)
+    # vcpkg ships CMake configs for these (no .pc/pkg-config on MSVC). Normalize
+    # whatever target each exports to the names the tree consumes: utils links
+    # zstd::libzstd and LZ4::lz4.
+    find_package(zstd CONFIG REQUIRED)
+    find_package(lz4 CONFIG REQUIRED)
+    if(NOT TARGET zstd::libzstd)
+        if(TARGET zstd::libzstd_shared)
+            add_library(zstd::libzstd ALIAS zstd::libzstd_shared)
+        elseif(TARGET zstd::libzstd_static)
+            add_library(zstd::libzstd ALIAS zstd::libzstd_static)
+        endif()
+    endif()
+    if(NOT TARGET LZ4::lz4 AND TARGET lz4::lz4)
+        add_library(LZ4::lz4 ALIAS lz4::lz4)
+    endif()
+else()
+    pkg_check_modules(zstd REQUIRED IMPORTED_TARGET libzstd)
+    pkg_check_modules(lz4 REQUIRED IMPORTED_TARGET liblz4)
+    if(NOT TARGET zstd::libzstd)
+        add_library(zstd::libzstd ALIAS PkgConfig::zstd)
+    endif()
+    if(NOT TARGET LZ4::lz4)
+        add_library(LZ4::lz4 ALIAS PkgConfig::lz4)
+    endif()
 endif()
-if(NOT TARGET LZ4::lz4)
-    add_library(LZ4::lz4 ALIAS PkgConfig::lz4)
+if(VC_BUILD_APPS)
+    find_package(CGAL REQUIRED)
 endif()
-find_package(CGAL REQUIRED)
+if(VC_BUILD_PYTHON)
+    find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+    execute_process(
+        COMMAND ${Python_EXECUTABLE} -m nanobind --cmake_dir
+        OUTPUT_VARIABLE VC_NANOBIND_CMAKE_DIR
+        RESULT_VARIABLE VC_NANOBIND_CMAKE_DIR_RESULT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(VC_NANOBIND_CMAKE_DIR_RESULT EQUAL 0 AND VC_NANOBIND_CMAKE_DIR)
+        list(APPEND CMAKE_PREFIX_PATH "${VC_NANOBIND_CMAKE_DIR}")
+    endif()
+    find_package(nanobind CONFIG REQUIRED)
+endif()
 
-if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR MSVC)
+    # Clang and MSVC both use the no-op OpenMP shim: -fopenmp / -openmp is never
+    # enabled, so every `#pragma omp` is ignored and the omp_*() runtime calls
+    # resolve to the inline stubs in core/openmp_stub/omp.h. These builds run the
+    # parallel regions serially, which is why the ignored `critical`/`atomic`
+    # pragmas remain correct. Only the GCC build links real OpenMP. (MSVC
+    # silences the resulting unknown-pragma C4068 in the compiler-family block.)
     include_directories(${CMAKE_SOURCE_DIR}/core/openmp_stub)
     add_library(openmp_stub INTERFACE)
     add_library(OpenMP::OpenMP_CXX ALIAS openmp_stub)
@@ -435,14 +661,16 @@ else()
 endif()
 
 set(VC_LIBBACKTRACE "")
-if(VC_USE_SYSTEM_LIBBACKTRACE)
+if(VC_USE_SYSTEM_LIBBACKTRACE AND NOT WIN32)
     pkg_check_modules(LIBBACKTRACE QUIET IMPORTED_TARGET libbacktrace)
     if(TARGET PkgConfig::LIBBACKTRACE)
         set(VC_LIBBACKTRACE PkgConfig::LIBBACKTRACE)
         message(STATUS "Using system libbacktrace")
     endif()
 endif()
-if(NOT VC_LIBBACKTRACE)
+# The crash handler (sole libbacktrace consumer) is Linux-only, and the
+# vendored build is autotools — skip it entirely on Windows.
+if(NOT VC_LIBBACKTRACE AND NOT WIN32)
     include(ExternalProject)
     include(ProcessorCount)
     ProcessorCount(_nproc)
@@ -456,6 +684,7 @@ if(NOT VC_LIBBACKTRACE)
         GIT_REPOSITORY https://github.com/ianlancetaylor/libbacktrace.git
         GIT_TAG master
         GIT_SHALLOW TRUE
+        UPDATE_DISCONNECTED ${VC_LIBBACKTRACE_UPDATE_DISCONNECTED}
         PREFIX ${CMAKE_BINARY_DIR}/_deps/libbacktrace
         CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=${_libbt_install} --enable-static --disable-shared --with-pic
         BUILD_COMMAND make -j${_nproc}
@@ -474,6 +703,12 @@ include_directories(core/include)
 
 add_subdirectory(libs/OpenABF)
 add_subdirectory(libs/c3d)
+# igl::core is needed by flatboi (SLIM) and by apps/vc_obj_uv_lift; fetch it
+# here — before the sanitizer flags below — so both consumers see the target
+# even when flatboi is off (Windows).
+if(VC_BUILD_FLATBOI OR VC_BUILD_APPS)
+    include(cmake/FetchLibigl.cmake)
+endif()
 if(VC_BUILD_FLATBOI)
     add_subdirectory(libs/flatboi)
 endif()
@@ -491,6 +726,62 @@ add_subdirectory(apps)
 if(VC_BUILD_PYTHON)
     add_subdirectory(python)
 endif()
+
+# ---- Install rules ----------------------------------------------------------
+# `cmake --install <build> --prefix <p> --component vc_runtime` lays the tree
+# out as <p>/bin (executables) + <p>/lib (their internal .so), which the apps
+# resolve via CMAKE_INSTALL_RPATH ($ORIGIN/../lib, set above) — no
+# LD_LIBRARY_PATH or ldconfig needed. Used by the Docker image.
+#
+# Rather than enumerate ~35 executables and the vc_* libs by hand, walk each
+# subdirectory's targets and install every EXECUTABLE and SHARED_LIBRARY
+# (static/interface/PCH helper targets are skipped — they aren't needed at
+# runtime). The vc_runtime component keeps this isolated from unrelated
+# dependency install rules (e.g. libigl's CMake config exports).
+set(_vc_install_dirs core utils libs/c3d)
+if(VC_BUILD_APPS)
+    list(APPEND _vc_install_dirs apps apps/VC3D)
+endif()
+if(VC_BUILD_FLATBOI)
+    list(APPEND _vc_install_dirs libs/flatboi)
+endif()
+foreach(_dir IN LISTS _vc_install_dirs)
+    get_property(_dir_targets DIRECTORY "${CMAKE_SOURCE_DIR}/${_dir}"
+                 PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_tgt IN LISTS _dir_targets)
+        get_target_property(_tgt_type ${_tgt} TYPE)
+        if(_tgt_type STREQUAL "EXECUTABLE" OR _tgt_type STREQUAL "SHARED_LIBRARY")
+            if(WIN32)
+                # Register each binary in a dependency set so the packaging
+                # step (cmake/WindowsPackaging.cmake) can bundle the full DLL
+                # closure. DLLs land in bin next to the executables — Windows
+                # has no RPATH.
+                install(TARGETS ${_tgt}
+                    COMPONENT vc_runtime
+                    RUNTIME_DEPENDENCY_SET vc_runtime_deps
+                    RUNTIME DESTINATION bin
+                    LIBRARY DESTINATION lib)
+            elseif(APPLE AND VC_BUILD_APPS)
+                # Everything ships inside the app bundle
+                # (cmake/MacPackaging.cmake): CLI tools next to VC3D in
+                # Contents/MacOS, vc_* dylibs in Contents/Frameworks, both
+                # wired up via the @loader_path rpath set above.
+                install(TARGETS ${_tgt}
+                    COMPONENT vc_runtime
+                    RUNTIME DESTINATION "VC3D.app/Contents/MacOS"
+                    LIBRARY DESTINATION "VC3D.app/Contents/Frameworks")
+            else()
+                install(TARGETS ${_tgt}
+                    COMPONENT vc_runtime
+                    RUNTIME DESTINATION bin
+                    LIBRARY DESTINATION lib)
+            endif()
+        endif()
+    endforeach()
+endforeach()
+
+include(${CMAKE_SOURCE_DIR}/cmake/WindowsPackaging.cmake)
+include(${CMAKE_SOURCE_DIR}/cmake/MacPackaging.cmake)
 
 if(VC_TESTING)
     enable_testing()

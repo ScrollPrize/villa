@@ -29,6 +29,7 @@ enum class Category { Volumes, Segments, NormalGrids };
 struct LoadOptions {
     std::filesystem::path remoteCacheRoot;
     bool failOnRemoteError = false;
+    bool deferResolution = false;
 };
 
 bool isLocationRemote(const std::string& location);
@@ -43,6 +44,8 @@ class VolumePkg : public std::enable_shared_from_this<VolumePkg>
 {
 public:
     static std::shared_ptr<VolumePkg> newEmpty();
+    static std::shared_ptr<VolumePkg> newEmpty(
+        const vc::project::LoadOptions& opts);
     static std::shared_ptr<VolumePkg> load(const std::filesystem::path& jsonFile,
                                            const vc::project::LoadOptions& opts = {});
     static std::shared_ptr<VolumePkg> loadAutosave(const vc::project::LoadOptions& opts = {});
@@ -67,10 +70,36 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& volumeEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& segmentEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& normalGridEntries() const;
+    [[nodiscard]] const std::vector<vc::project::Entry>& lasagnaDatasetEntries() const;
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
+    bool mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags);
+    // Replace singleton keyed tags and merge ordinary tags in one operation,
+    // refreshing a loaded remote volume at most once.
+    bool reconcileVolumeEntryTags(
+        const std::string& location,
+        const std::vector<std::string>& tags,
+        const std::vector<std::string>& singletonPrefixes);
+    bool reconcileSegmentsEntryTags(
+        const std::string& location,
+        const std::vector<std::string>& tags,
+        const std::vector<std::string>& singletonPrefixes);
+    bool reconcileNormalGridEntryTags(
+        const std::string& location,
+        const std::vector<std::string>& tags,
+        const std::vector<std::string>& singletonPrefixes);
+    bool relocateSegmentsEntry(const std::string& oldLocation,
+                               const std::string& newLocation);
+    bool relocateNormalGridEntry(const std::string& oldLocation,
+                                 const std::string& newLocation);
     bool addSegmentsEntry(const std::string& location, std::vector<std::string> tags = {});
     bool addNormalGridEntry(const std::string& location, std::vector<std::string> tags = {});
+    bool addLasagnaDatasetEntry(const std::string& location,
+                                std::vector<std::string> tags = {});
+    bool reconcileLasagnaDatasetEntryTags(
+        const std::string& location,
+        const std::vector<std::string>& tags,
+        const std::vector<std::string>& singletonPrefixes);
     bool removeEntry(const std::string& location);
 
     void setOutputSegments(const std::string& location);
@@ -87,8 +116,12 @@ public:
     [[nodiscard]] bool hasVolume(const std::string& id) const;
     [[nodiscard]] std::size_t numberOfVolumes() const;
     [[nodiscard]] std::vector<std::string> volumeIDs() const;
-    std::shared_ptr<Volume> volume();
-    std::shared_ptr<Volume> volume(const std::string& id);
+    [[nodiscard]] bool entryResolutionDeferred() const noexcept {
+        return opts_.deferResolution;
+    }
+    [[nodiscard]] bool hasLoadedVolumeEntry(const std::string& location) const;
+    std::shared_ptr<Volume> volume() const;
+    std::shared_ptr<Volume> volume(const std::string& id) const;
     bool addVolume(const std::shared_ptr<Volume>& volume);
     bool addSingleVolume(const std::string& volumeDirName);
     bool removeSingleVolume(const std::string& volumeIdOrDirName);
@@ -120,6 +153,8 @@ public:
     [[nodiscard]] bool hasRemoteCacheRoot() const;
     [[nodiscard]] std::string remoteCacheRootOrEmpty() const;
     void setRemoteCacheRoot(const std::filesystem::path& dir);
+    // Completes a deferred load. Ordinary load() callers remain eager.
+    void resolveDeferredEntries();
 
     [[nodiscard]] std::string getVolpkgDirectory() const;
     [[nodiscard]] std::string getSegmentationDirectory() const;
@@ -144,12 +179,20 @@ private:
     std::vector<vc::project::Entry> volumes_;
     std::vector<vc::project::Entry> segments_;
     std::vector<vc::project::Entry> normalGrids_;
+    std::vector<vc::project::Entry> lasagnaDatasets_;
     std::optional<std::string> outputSegments_;
     std::optional<std::string> selectedLasagnaDataset_;
 
     std::map<std::string, std::shared_ptr<Volume>> loadedVolumes_;
     std::map<std::string, std::vector<std::string>> volumeTagsByID_;
     std::map<std::string, std::shared_ptr<Segmentation>> loadedSegmentations_;
+    // Segmentations previously resolved for a segments entry, keyed by entry
+    // location. Retained across setSegmentationDirectory() switches so
+    // returning to a directory reuses the same Segmentation objects (and any
+    // surfaces they have loaded) instead of redoing that work from disk.
+    std::map<std::string, std::map<std::string, std::shared_ptr<Segmentation>>>
+        segmentationsByLocation_;
+    std::string activeSegmentsLocation_;
     std::map<std::string, std::vector<std::string>> segmentationTagsByID_;
     std::vector<std::filesystem::path> resolvedNormalGridPaths_;
 

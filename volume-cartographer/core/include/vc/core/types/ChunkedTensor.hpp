@@ -11,6 +11,7 @@
 #include "vc/core/types/VcDataset.hpp"
 
 #include <array>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <set>
@@ -18,11 +19,7 @@
 #include <thread>
 #include <unordered_map>
 
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#include "vc/core/util/MemMap.hpp"
 #include <cerrno>
 #include <cstring>
 #include <sstream>
@@ -84,7 +81,7 @@ inline std::unique_ptr<vc::render::ChunkCache> openChunkedArrayCache(
 static std::string tmp_name_proc_thread()
 {
     std::stringstream ss;
-    ss << "tmp_" << getpid() << "_" << std::this_thread::get_id();
+    ss << "tmp_" << vc::memmap::pid() << "_" << std::this_thread::get_id();
     return ss.str();
 }
 
@@ -107,8 +104,33 @@ public:
     };
     ~Chunked3d()
     {
-        if (!_persistent)
-            remove_all(_cache_dir);
+        // _cache_dir selects the storage strategy for every entry: an empty
+        // path uses malloc, while a configured cache stores shared mappings.
+        // Release the backing memory before removing transient cache files;
+        // Windows cannot delete a file while this process still maps it.
+        if (_cache_dir.empty()) {
+            for (const auto& [id, chunk] : _chunks) {
+                (void)id;
+                std::free(chunk);
+            }
+        }
+        else {
+            constexpr std::size_t chunkElements =
+                static_cast<std::size_t>(C::CHUNK_SIZE) * C::CHUNK_SIZE * C::CHUNK_SIZE;
+            constexpr std::size_t chunkBytes = chunkElements * sizeof(T);
+            for (const auto& [id, chunk] : _chunks) {
+                (void)id;
+                vc::memmap::unmapRW(chunk, chunkBytes);
+            }
+        }
+        _chunks.clear();
+
+        if (!_persistent) {
+            // Best effort in a noexcept destructor. Mapping cleanup above
+            // makes the normal Windows removal path succeed.
+            std::error_code ec;
+            std::filesystem::remove_all(_cache_dir, ec);
+        }
     };
     Chunked3d(C &compute_f, vc::VcDataset *ds, vc::render::IChunkedArray *cache, int level, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
     {
@@ -136,7 +158,7 @@ public:
             if (_persistent) {
                 for (auto const& entry : std::filesystem::directory_iterator(root))
                     if (std::filesystem::is_directory(entry) && std::filesystem::exists(entry.path()/"meta.json") && std::filesystem::is_regular_file(entry.path()/"meta.json")) {
-                        paths.insert(entry.path());
+                        paths.insert(entry.path().string());
                         auto src = read_cache_meta_dataset_path(entry.path()/"meta.json");
                         if (src.empty())
                             continue;
@@ -258,51 +280,34 @@ public:
         size_t len_bytes = len*sizeof(T);
 
         if (std::filesystem::exists(tgt_path)) {
-            int fd = open(tgt_path.string().c_str(), O_RDWR);
-            T *chunk = (T*)mmap(NULL, len_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            close(fd);
+            T *chunk = (T*)vc::memmap::mapFileRW(tgt_path, len_bytes);
 
-            _mutex.lock();
-            if (!_chunks.count(id)) {
-                _chunks[id] = chunk;
-            }
-            else {
+            {
+                std::unique_lock<std::shared_mutex> lock(_mutex);
+                if (!_chunks.count(id)) {
+                    _chunks[id] = chunk;
+                }
+                else {
 #pragma omp atomic
-                chunk_compute_collisions++;
-                munmap(chunk, len_bytes);
-                chunk = _chunks[id];
-            }
+                    chunk_compute_collisions++;
+                    vc::memmap::unmapRW(chunk, len_bytes);
+                    chunk = _chunks[id];
+                }
 #pragma omp atomic
-            chunk_compute_total++;
-            _mutex.unlock();
+                chunk_compute_total++;
+            }
 
             return chunk;
         }
 
         std::filesystem::path tmp_path;
-        _mutex.lock();
-        std::stringstream ss;
-        ss << this << "_" << std::this_thread::get_id() << "_" << _tmp_counter++;
-        tmp_path = std::filesystem::path(_cache_dir) / ss.str();
-        _mutex.unlock();
-        int fd = open(tmp_path.string().c_str(), O_RDWR | O_CREAT | O_TRUNC, (mode_t)0600);
-        if (fd == -1) {
-            const int err = errno;
-            std::stringstream msg;
-            msg << "Chunked3d: open failed for " << tmp_path << ": " << std::strerror(err);
-            throw std::runtime_error(msg.str());
+        {
+            std::unique_lock<std::shared_mutex> lock(_mutex);
+            std::stringstream ss;
+            ss << this << "_" << std::this_thread::get_id() << "_" << _tmp_counter++;
+            tmp_path = std::filesystem::path(_cache_dir) / ss.str();
         }
-        int ret = ftruncate(fd, len_bytes);
-        if (ret != 0) {
-            const int err = errno;
-            close(fd);
-            std::stringstream msg;
-            msg << "Chunked3d: ftruncate failed for " << tmp_path
-                << " (" << len_bytes << " bytes): " << std::strerror(err);
-            throw std::runtime_error(msg.str());
-        }
-        T *chunk = (T*)mmap(NULL, len_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        close(fd);
+        T *chunk = (T*)vc::memmap::mapFileRW(tmp_path, len_bytes);
         
         cv::Vec3i offset =
         {static_cast<int>(id[0]*s-_border),
@@ -327,24 +332,34 @@ public:
         for(int i=0;i<len;i++)
             chunk[i] = (small.data())[i];
 
-        _mutex.lock();
-        if (!_chunks.count(id)) {
-            _chunks[id] = chunk;
-            int ret = rename(tmp_path.string().c_str(), tgt_path.string().c_str());
+        {
+            std::unique_lock<std::shared_mutex> lock(_mutex);
+            if (!_chunks.count(id)) {
+                std::error_code rename_ec;
+                std::filesystem::rename(tmp_path, tgt_path, rename_ec);
 
-            if (ret)
-                throw std::runtime_error("oops rename failed!");
-        }
-        else {
+                if (rename_ec) {
+                    const std::string message =
+                        "Chunked3d: rename failed from " + tmp_path.string() +
+                        " to " + tgt_path.string() + ": " + rename_ec.message();
+                    vc::memmap::unmapRW(chunk, len_bytes);
+                    std::error_code rm_ec;
+                    std::filesystem::remove(tmp_path, rm_ec);
+                    throw std::runtime_error(message);
+                }
+                _chunks[id] = chunk;
+            }
+            else {
 #pragma omp atomic
-            chunk_compute_collisions++;
-            munmap(chunk, len_bytes);
-            unlink(tmp_path.string().c_str());
-            chunk = _chunks[id];
-        }
+                chunk_compute_collisions++;
+                vc::memmap::unmapRW(chunk, len_bytes);
+                std::error_code rm_ec;
+                std::filesystem::remove(tmp_path, rm_ec);
+                chunk = _chunks[id];
+            }
 #pragma omp atomic
-        chunk_compute_total++;
-        _mutex.unlock();
+            chunk_compute_total++;
+        }
 
         return chunk;
     }
@@ -376,20 +391,21 @@ public:
 
         T *chunk = nullptr;
 
-        _mutex.lock();
-        if (!_chunks.count(id)) {
-            chunk = (T*)malloc(s*s*s*sizeof(T));
-            memcpy(chunk, small.data(), s*s*s*sizeof(T));
-            _chunks[id] = chunk;
-        }
-        else {
+        {
+            std::unique_lock<std::shared_mutex> lock(_mutex);
+            if (!_chunks.count(id)) {
+                chunk = (T*)malloc(s*s*s*sizeof(T));
+                memcpy(chunk, small.data(), s*s*s*sizeof(T));
+                _chunks[id] = chunk;
+            }
+            else {
 #pragma omp atomic
-            chunk_compute_collisions++;
-            chunk = _chunks[id];
-        }
+                chunk_compute_collisions++;
+                chunk = _chunks[id];
+            }
 #pragma omp atomic
-        chunk_compute_total++;
-        _mutex.unlock();
+            chunk_compute_total++;
+        }
 
         return chunk;
     }
@@ -415,18 +431,13 @@ public:
     }
 
     T *chunk_safe(const cv::Vec3i &id) {
-        T *chunk = nullptr;
-        _mutex.lock_shared();
-        if (_chunks.count(id)) {
-            chunk = _chunks[id];
-            _mutex.unlock();
+        {
+            std::shared_lock<std::shared_mutex> lock(_mutex);
+            if (auto it = _chunks.find(id); it != _chunks.end()) {
+                return it->second;
+            }
         }
-        else {
-            _mutex.unlock();
-            chunk = cache_chunk_safe(id);
-        }
-
-        return chunk;
+        return cache_chunk_safe(id);
     }
     
     std::vector<int> shape() {
@@ -662,7 +673,7 @@ private:
 
 struct Chunked3dFloatFromUint8
 {
-    Chunked3dFloatFromUint8(std::unique_ptr<vc::VcDataset> &&ds, float scale, std::string const &cache_root, std::string const &unique_id) :
+    Chunked3dFloatFromUint8(std::unique_ptr<vc::VcDataset> &&ds, float scale, std::filesystem::path const &cache_root, std::string const &unique_id) :
         _passthrough{unique_id},
         _ownedCache(openChunkedArrayCache(ds->path(), 128ULL << 20)),
         _x(_passthrough, ds.get(), _ownedCache.get(), 0, cache_root),
@@ -694,7 +705,7 @@ struct Chunked3dFloatFromUint8
 
 struct Chunked3dVec3fFromUint8
 {
-    Chunked3dVec3fFromUint8(std::vector<std::unique_ptr<vc::VcDataset>> &&dss, float scale, std::string const &cache_root, std::string const &unique_id) :
+    Chunked3dVec3fFromUint8(std::vector<std::unique_ptr<vc::VcDataset>> &&dss, float scale, std::filesystem::path const &cache_root, std::string const &unique_id) :
         _passthrough_x{unique_id + "_x"},
         _passthrough_y{unique_id + "_y"},
         _passthrough_z{unique_id + "_z"},

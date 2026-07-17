@@ -17,7 +17,7 @@ constexpr const char* kSectionSegGrowth = "Segmentation Growth";
 constexpr const char* kSectionPushPull = "Push/Pull";
 constexpr const char* kSectionPointCollection = "Point Collection";
 constexpr const char* kSectionMouseControls = "Mouse Controls";
-constexpr const char* kSectionSliceStep = "Slice Step Size";
+constexpr const char* kSectionSliceStep = "Z-Scroll Sensitivity";
 
 enum class HelpKeyType {
     Shortcut,
@@ -208,7 +208,7 @@ const KeyPressDef RecenterFocus{
 const KeyPressDef SliceStepDecrease{
     "slice_step_decrease",
     kSectionSliceStep,
-    "Decrease slice step size",
+    "Decrease Z-scroll sensitivity",
     Qt::Key_G,
     Qt::ShiftModifier,
     false
@@ -216,7 +216,7 @@ const KeyPressDef SliceStepDecrease{
 const KeyPressDef SliceStepIncrease{
     "slice_step_increase",
     kSectionSliceStep,
-    "Increase slice step size",
+    "Increase Z-scroll sensitivity",
     Qt::Key_H,
     Qt::ShiftModifier,
     false

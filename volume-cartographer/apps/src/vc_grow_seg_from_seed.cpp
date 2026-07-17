@@ -126,7 +126,7 @@ bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec
             continue;
         }
 
-        std::string name = entry.path().filename();
+        std::string name = entry.path().filename().string();
         if (name.compare(0, name_prefix.size(), name_prefix)) {
             continue;
         }
@@ -326,8 +326,12 @@ int main(int argc, char *argv[])
 
     const std::string volume_arg = vol_path.string();
     const bool remote_volume = is_remote_volume_path(volume_arg);
+    const double requested_voxelsize = params.value("voxelsize", 0.0);
+    utils::Json remote_metadata;
+    if (std::isfinite(requested_voxelsize) && requested_voxelsize > 0.0)
+        remote_metadata["voxelsize"] = requested_voxelsize;
     auto volume = remote_volume
-        ? Volume::NewFromUrl(volume_arg)
+        ? Volume::NewFromUrl(volume_arg, {}, {}, remote_metadata)
         : Volume::New(vol_path);
     volume->setCacheBudget(size_t(params.value("cache_size", 1e9)));
     auto* chunk_cache = volume->chunkedCache();
@@ -358,7 +362,11 @@ int main(int argc, char *argv[])
     int search_effort = params.value("search_effort", 10);
     int thread_limit = params.value("thread_limit", 0);
 
-    const float voxelsize = static_cast<float>(volume->voxelSize());
+    float voxelsize = static_cast<float>(volume->voxelSize());
+    const double params_voxelsize = params.value("voxelsize", 0.0);
+    if (std::isfinite(params_voxelsize) && params_voxelsize > 0.0) {
+        voxelsize = static_cast<float>(params_voxelsize);
+    }
     
     std::filesystem::path cache_root;
     if (params.contains("cache_root") && params["cache_root"].is_string()) {
@@ -372,6 +380,7 @@ int main(int argc, char *argv[])
     std::cout << "mode: " << mode << std::endl;
     std::cout << "step size: " << params.value("step_size", 20.0f) << std::endl;
     std::cout << "min_area_cm: " << min_area_cm << std::endl;
+    std::cout << "voxelsize: " << voxelsize << std::endl;
     std::cout << "tgt_overlap_count: " << tgt_overlap_count << std::endl;
 
     auto direction_fields = load_direction_fields(params, cache_root);
@@ -395,7 +404,7 @@ int main(int argc, char *argv[])
 
         for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
             if (std::filesystem::is_directory(entry)) {
-                std::string name = entry.path().filename();
+                std::string name = entry.path().filename().string();
                 if (name.compare(0, name_prefix.size(), name_prefix))
                     continue;
 
@@ -1399,17 +1408,26 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
 
-    QuadSurface *surf = tracer(*volume, 1.0, 0, origin, params, cache_root, voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+    QuadSurface *surf = tracer(*volume, 1.0, 0, origin, params, cache_root.string(), voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
 
     double area_cm2 = surf->meta["area_cm2"].get_double();
     if (area_cm2 < min_area_cm) {
+        std::cout << "discarding generated surface because area_cm2 " << area_cm2
+                  << " is below min_area_cm " << min_area_cm << std::endl;
         if (std::filesystem::exists(seg_dir)) {
             std::filesystem::remove_all(seg_dir);
         }
+#if defined(_WIN32)
+        // See end of main(): skip CRT teardown, worker threads deadlock it.
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(EXIT_SUCCESS);
+#else
         return EXIT_SUCCESS;
+#endif
     }
 
-    std::cout << "saving " << seg_dir << std::endl;
+    std::cout << "saving " << seg_dir.string() << std::endl;
     surf->save(seg_dir, uuid, true);
     surf->path = seg_dir;
 
@@ -1437,9 +1455,9 @@ int main(int argc, char *argv[])
 
         // Check for additional surfaces in target directory
         for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
-            if (std::filesystem::is_directory(entry) && !surfs.count(entry.path().filename()))
+            if (std::filesystem::is_directory(entry) && !surfs.count(entry.path().filename().string()))
             {
-                std::string name = entry.path().filename();
+                std::string name = entry.path().filename().string();
                 if (name.compare(0, name_prefix.size(), name_prefix))
                     continue;
 
@@ -1478,5 +1496,15 @@ int main(int argc, char *argv[])
         delete sm;
     }
 
+#if defined(_WIN32)
+    // Skip CRT shutdown: live worker threads (ChunkCache IO pool, OpenMP)
+    // deadlock Windows DLL-detach/static-destructor teardown, leaving the
+    // process alive after main() returns — VC3D then never sees the tool
+    // finish. Same approach as VC3D's own main().
+    std::cout.flush();
+    std::cerr.flush();
+    std::_Exit(EXIT_SUCCESS);
+#else
     return EXIT_SUCCESS;
+#endif
 }
