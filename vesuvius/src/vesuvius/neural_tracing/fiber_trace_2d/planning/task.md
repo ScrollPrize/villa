@@ -1,12 +1,13 @@
-# Native 3D Trace2CP Cumulative Tangent Smoothness
+# Native 3D Trace2CP All-Pairs Direction Product
 
-Add a cumulative smoothness penalty to native 3D Trace2CP so several small
-tangent-plane turns cannot combine into a large unwanted turn. The penalty is
-smoothness-only and tangent-only:
+Update native 3D Trace2CP candidate scoring to consider all four relevant
+directions:
 
-- keep the existing local smoothness term;
-- keep the normal/elevation behavior unchanged;
-- add a short-history tangent-plane direction term;
-- penalize candidate tangent-plane turn against that short-history direction;
-- do not apply this as a direction/presence gate;
-- do not add a cumulative normal/elevation term.
+- last step direction: last accepted point to current point;
+- last sampled direction: model direction sampled at the current point;
+- current candidate step direction: current point to candidate point;
+- candidate sampled direction: model direction sampled at the candidate point.
+
+The new scoring mode should multiply all pairwise aligned dot products so any
+individual outlier direction penalizes the candidate. Put this behind a switch,
+but enable it by default for testing.

@@ -56,6 +56,7 @@ class NativeTrace2CpConfig:
     smoothness_free_angle_degrees: float = 0.0
     cumulative_smoothness_steps: int = 4
     cumulative_smoothness_tangent_weight: float = 2.0
+    all_pairs_direction_product: bool = True
     max_step_factor: float = 3.0
     max_steps: int | None = None
     trace_step_limit: int | None = None
@@ -1576,6 +1577,7 @@ def _score_candidate_loss_tensors(
     smoothness_normal_weight: float | None = None,
     smoothness_free_angle_degrees: float = 0.0,
     cumulative_smoothness_tangent_weight: float = 2.0,
+    all_pairs_direction_product: bool = True,
     candidate_normals: torch.Tensor | np.ndarray | None = None,
     candidate_normals_valid: torch.Tensor | np.ndarray | None = None,
     history_direction: torch.Tensor | np.ndarray | None = None,
@@ -1630,6 +1632,7 @@ def _score_candidate_loss_tensors(
         smoothness_normal_weight=smoothness_normal_weight,
         smoothness_free_angle_degrees=smoothness_free_angle_degrees,
         cumulative_smoothness_tangent_weight=cumulative_smoothness_tangent_weight,
+        all_pairs_direction_product=bool(all_pairs_direction_product),
         candidate_normals=None
         if candidate_normals is None
         else torch.as_tensor(candidate_normals, dtype=torch.float32, device=device),
@@ -1672,6 +1675,7 @@ def _score_candidate_loss_tensors_batched(
     smoothness_normal_weight: float | None = None,
     smoothness_free_angle_degrees: float = 0.0,
     cumulative_smoothness_tangent_weight: float = 2.0,
+    all_pairs_direction_product: bool = True,
     candidate_normals: torch.Tensor | None = None,
     candidate_normals_valid: torch.Tensor | None = None,
     history_directions: torch.Tensor | None = None,
@@ -1731,6 +1735,10 @@ def _score_candidate_loss_tensors_batched(
         current[:, None, :].expand_as(candidates),
     )
     current_dot = torch.sum(current[:, None, :] * candidates, dim=2).clamp(-1.0, 1.0)
+    previous_dot = torch.sum(previous[:, None, :] * candidates, dim=2).clamp(
+        0.0,
+        1.0,
+    )
     normals_t = (
         None
         if candidate_normals is None
@@ -1750,6 +1758,12 @@ def _score_candidate_loss_tensors_batched(
         )
         use_normal_gate = first_step_t[:, None] & normal_gate_valid
         current_dot = torch.where(use_normal_gate, normal_gate, current_dot)
+    if bool(torch.any(first_step_t).detach().cpu()):
+        previous_dot = torch.where(
+            first_step_t[:, None],
+            torch.ones_like(previous_dot),
+            previous_dot,
+        )
     smoothness_loss = _native_smoothness_loss_torch(
         previous,
         candidates,
@@ -1806,7 +1820,49 @@ def _score_candidate_loss_tensors_batched(
         next_aligned = _align_axes_torch(next_direction_choices, candidate_choices)
         next_dot = torch.sum(next_aligned * candidate_choices, dim=3).clamp(-1.0, 1.0)
         presence = presence_choices.clamp(0.0, 1.0)
-        score = current_dot[:, :, None] * next_dot * presence
+        if bool(all_pairs_direction_product):
+            previous_choices = previous[:, None, None, :].expand_as(next_aligned)
+            current_choices = current[:, None, None, :].expand_as(next_aligned)
+            previous_current_dot = torch.sum(
+                previous_choices * current_choices,
+                dim=3,
+            ).clamp(0.0, 1.0)
+            previous_next_dot = torch.sum(previous_choices * next_aligned, dim=3).clamp(
+                0.0,
+                1.0,
+            )
+            current_next_dot = torch.sum(current_choices * next_aligned, dim=3).clamp(
+                0.0,
+                1.0,
+            )
+            if bool(torch.any(first_step_t).detach().cpu()):
+                neutral = first_step_t[:, None, None]
+                previous_current_dot = torch.where(
+                    neutral,
+                    torch.ones_like(previous_current_dot),
+                    previous_current_dot,
+                )
+                previous_next_dot = torch.where(
+                    neutral,
+                    torch.ones_like(previous_next_dot),
+                    previous_next_dot,
+                )
+                current_next_dot = torch.where(
+                    neutral,
+                    torch.ones_like(current_next_dot),
+                    current_next_dot,
+                )
+            score = (
+                previous_dot[:, :, None]
+                * current_dot[:, :, None]
+                * next_dot
+                * previous_current_dot
+                * previous_next_dot
+                * current_next_dot
+                * presence
+            )
+        else:
+            score = current_dot[:, :, None] * next_dot * presence
         direction_loss = 1.0 - 0.5 * (current_dot[:, :, None] + next_dot)
         presence_loss = 1.0 - presence
         total_loss = 1.0 - score
@@ -1874,9 +1930,52 @@ def _score_candidate_loss_tensors_batched(
     next_aligned = _align_axes_torch(next_direction_choices, candidate_choices)
     next_dot = torch.sum(next_aligned * candidate_choices, dim=4).clamp(-1.0, 1.0)
     presence = presence_choices.clamp(0.0, 1.0)
+    if bool(all_pairs_direction_product):
+        previous_choices = previous[:, None, None, None, :].expand_as(next_aligned)
+        current_choices = current[:, None, None, None, :].expand_as(next_aligned)
+        previous_current_dot = torch.sum(previous_choices * current_choices, dim=4).clamp(
+            0.0,
+            1.0,
+        )
+        previous_next_dot = torch.sum(previous_choices * next_aligned, dim=4).clamp(
+            0.0,
+            1.0,
+        )
+        current_next_dot = torch.sum(current_choices * next_aligned, dim=4).clamp(
+            0.0,
+            1.0,
+        )
+        if bool(torch.any(first_step_t).detach().cpu()):
+            neutral = first_step_t[:, None, None, None]
+            previous_current_dot = torch.where(
+                neutral,
+                torch.ones_like(previous_current_dot),
+                previous_current_dot,
+            )
+            previous_next_dot = torch.where(
+                neutral,
+                torch.ones_like(previous_next_dot),
+                previous_next_dot,
+            )
+            current_next_dot = torch.where(
+                neutral,
+                torch.ones_like(current_next_dot),
+                current_next_dot,
+            )
+        substep_raw_score = (
+            previous_dot[:, :, None, None]
+            * current_dot[:, :, None, None]
+            * next_dot
+            * previous_current_dot
+            * previous_next_dot
+            * current_next_dot
+            * presence
+        )
+    else:
+        substep_raw_score = next_dot * presence
     substep_score = torch.where(
         valid_choices,
-        next_dot * presence,
+        substep_raw_score,
         torch.full_like(presence, -torch.inf),
     )
     best_substep_score, best_substep_branch = torch.max(substep_score, dim=3)
@@ -1895,7 +1994,10 @@ def _score_candidate_loss_tensors_batched(
         dim=2,
     )
     presence_loss_2d = torch.mean(1.0 - best_substep_presence, dim=2)
-    total_loss_2d = 1.0 - current_dot * segment_score
+    if bool(all_pairs_direction_product):
+        total_loss_2d = 1.0 - segment_score
+    else:
+        total_loss_2d = 1.0 - current_dot * segment_score
     total_loss_2d = total_loss_2d + smoothness_loss
     candidate_valid = substep_valid.all(dim=2)
     total_loss_2d = torch.where(
@@ -1929,6 +2031,7 @@ def _score_candidate_batch(
     smoothness_normal_weight: float | None = None,
     smoothness_free_angle_degrees: float = 0.0,
     cumulative_smoothness_tangent_weight: float = 2.0,
+    all_pairs_direction_product: bool = True,
     candidate_normals: torch.Tensor | np.ndarray | None = None,
     candidate_normals_valid: torch.Tensor | np.ndarray | None = None,
     history_direction: torch.Tensor | np.ndarray | None = None,
@@ -1967,6 +2070,7 @@ def _score_candidate_batch(
         smoothness_normal_weight=smoothness_normal_weight,
         smoothness_free_angle_degrees=smoothness_free_angle_degrees,
         cumulative_smoothness_tangent_weight=cumulative_smoothness_tangent_weight,
+        all_pairs_direction_product=bool(all_pairs_direction_product),
         candidate_normals=candidate_normals_batched,
         candidate_normals_valid=candidate_normals_valid_batched,
         history_direction=history_direction,
@@ -2250,6 +2354,7 @@ def _trace_native_3d_one_way_greedy(
                 cumulative_smoothness_tangent_weight=float(
                     cfg.cumulative_smoothness_tangent_weight
                 ),
+                all_pairs_direction_product=bool(cfg.all_pairs_direction_product),
                 candidate_normals=candidate_normals,
                 candidate_normals_valid=candidate_normals_valid,
                 history_direction=history_direction,
@@ -2717,6 +2822,7 @@ def _trace_native_3d_one_way_beam(
                 cumulative_smoothness_tangent_weight=float(
                     cfg.cumulative_smoothness_tangent_weight
                 ),
+                all_pairs_direction_product=bool(cfg.all_pairs_direction_product),
                 candidate_normals=candidate_normals_t,
                 candidate_normals_valid=candidate_normals_valid_t,
                 history_directions=history_directions_v,
@@ -4562,6 +4668,7 @@ def _native_trace_smoothness_summary(cfg: NativeTrace2CpConfig) -> dict[str, Any
         "cumulative_smoothness_tangent_weight": float(
             cfg.cumulative_smoothness_tangent_weight
         ),
+        "all_pairs_direction_product": bool(cfg.all_pairs_direction_product),
         "first_step_cp_tangent_relaxed": True,
     }
 
@@ -4951,6 +5058,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--smoothness-free-angle-degrees", type=float, default=0.0)
     parser.add_argument("--cumulative-smoothness-steps", type=int, default=4)
     parser.add_argument("--cumulative-smoothness-tangent-weight", type=float, default=2.0)
+    parser.add_argument(
+        "--no-all-pairs-direction-product",
+        action="store_true",
+        help="Use the legacy current/candidate two-dot direction product.",
+    )
     parser.add_argument("--max-step-factor", type=float, default=3.0)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--trace-step-limit", type=int, default=None)
@@ -4988,6 +5100,7 @@ def main() -> None:
         cumulative_smoothness_tangent_weight=float(
             args.cumulative_smoothness_tangent_weight
         ),
+        all_pairs_direction_product=not bool(args.no_all_pairs_direction_product),
         max_step_factor=float(args.max_step_factor),
         max_steps=None if args.max_steps is None else int(args.max_steps),
         trace_step_limit=None if args.trace_step_limit is None else int(args.trace_step_limit),

@@ -34,3 +34,6 @@
 - fixed side-view normal being identical to side-view y axis now:
 time PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_2d.runner $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --export-dir ./ --checkpoint $VES/data/fiber_trace_2d_runs/top_20260713_004411/snapshots/best.pt --trace2cp-vis --sample-index 12 --trace2cp-combined --trace2cp-use-presence --line-trace-step 1 --trace2cp-z-max-layer 40 --trace2cp-z-step-voxels 0.5 --trace2cp-dp  --trace2cp-z-search  --trace2cp-combined-direction-weight 0.5
 - gives nearly perfect results!
+
+-time PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/train_s1a_nml_all_64_sd2.json --checkpoint $VES/data/fiber_trace_3d_runs/s1a_nml_all_3d_64_2_multidir_b4_20260717_121412/snapshots/best.pt --export-dir ./ --fiber-json $VES/data/train_fibers/fibers_test_paul_4/kb_202606*001.json --beam-lookahead-steps 1 --beam-width 8 --smoothness-normal-weight 0.1 --smoothness-tangent-weight 100.0 --sample-index 13
+on 4e0de37ac02817835eab6b903ea4eb211b560015 is very good

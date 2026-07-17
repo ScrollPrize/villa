@@ -148,7 +148,16 @@ side/top strip input loading.
   For `7*K` grouped outputs, `NativeTraceFieldCache` decodes all `K`
   direction/presence branches. The current-point branch is selected by
   `dot(branch_dir, previous_step_dir) * branch_presence`, and each candidate
-  point evaluates all branches before reducing to the best branch score.
+  point evaluates all branches before reducing to the best branch score. Native
+  3D Trace2CP defaults to all-pairs direction product scoring: it compares the
+  previous step direction, current-point sampled direction, candidate step
+  direction, and candidate-point sampled direction with six clamped pairwise
+  dot products, then multiplies that direction product by candidate presence.
+  `--no-all-pairs-direction-product` restores the older
+  `dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * presence` score.
+  For the first CP-root step, previous/current tangent-plane pair terms are
+  neutralized so the first-step normal/elevation-only relaxation remains in
+  effect.
   Smoothness uses Lasagna normals sampled directly at candidate trace points:
   selected-level ZYX candidate coordinates are converted to base ZYX with
   `record.volume_spacing_base` and passed through the existing batched

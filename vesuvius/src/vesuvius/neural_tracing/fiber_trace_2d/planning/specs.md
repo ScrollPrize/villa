@@ -427,17 +427,21 @@
   the sampled tensors return to `cache.device`.
   For multi-branch outputs, every candidate evaluates every branch at the
   candidate point and uses the branch with the best score. Candidate selection
-  minimizes a cost. The base cost is
-  `1 - dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * candidate_presence`.
-  Both sampled axes are sign-aligned to the candidate step direction before dot
-  products are evaluated. `--candidate-substeps 1` is the default and preserves
-  this endpoint-only candidate scoring. With `--candidate-substeps S` for
-  `S > 1`, candidate scoring samples the segment at
-  `t = 1/S, 2/S, ..., 1`, evaluates all branches at every substep, takes the
-  best branch score `dot(substep_dir, step_dir) * substep_presence` per
-  substep, averages those substep scores, and then applies the current-point
-  direction gate. A multi-substep candidate is valid only when every substep has
-  at least one valid branch. Search smoothness defaults to normal-aware split
+  minimizes a cost. By default, the direction score uses all-pairs product
+  scoring over four signed/aligned directions: previous step direction,
+  current-point sampled direction, candidate step direction, and candidate-point
+  sampled direction. Candidate-sampled axes are sign-aligned to the candidate
+  step direction, pairwise dots are clamped to `[0, 1]`, and the score is
+  `presence * product(six pairwise dots)`. `--no-all-pairs-direction-product`
+  restores the older two-dot score
+  `dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * presence`.
+  `--candidate-substeps 1` is the default and preserves endpoint-only candidate
+  scoring. With `--candidate-substeps S` for `S > 1`, candidate scoring samples
+  the segment at `t = 1/S, 2/S, ..., 1`, evaluates all branches at every
+  substep, takes the best branch score per substep, averages those substep
+  scores, and then applies the current-point direction gate when legacy
+  two-dot scoring is enabled. A multi-substep candidate is valid only when
+  every substep has at least one valid branch. Search smoothness defaults to normal-aware split
   smoothness in the native 3D CLI. Candidate Lasagna normals are sampled
   directly at the candidate trace coordinates by converting selected-level ZYX
   points to base ZYX with `record.volume_spacing_base` and calling the existing
@@ -480,6 +484,10 @@
   accepted step disables smoothness and evaluates the CP-tangent agreement only
   by the Lasagna-normal/elevation component at the candidate point; tangent
   plane rotation away from the CP tangent is ignored for that root expansion.
+  In default all-pairs scoring, root-step pair terms involving the previous
+  step/current CP tangent and candidate-sampled direction are neutralized so
+  they do not reintroduce a tangent-plane CP-tangent penalty; the candidate
+  sampled direction is still compared to the candidate step direction.
   The normal/elevation gate must be invariant to the Lasagna normal sign
   ambiguity. If the candidate normal is invalid or unavailable, that candidate
   falls back to the regular full `dot(current_dir, step_dir)` gate. Later

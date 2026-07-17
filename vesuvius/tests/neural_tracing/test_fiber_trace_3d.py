@@ -1784,6 +1784,7 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().smoothness_free_angle_degrees == 0.0
     assert NativeTrace2CpConfig().cumulative_smoothness_steps == 4
     assert NativeTrace2CpConfig().cumulative_smoothness_tangent_weight == 2.0
+    assert NativeTrace2CpConfig().all_pairs_direction_product is True
     assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 100.0
 
 
@@ -2606,6 +2607,81 @@ def test_native_3d_trace2cp_batched_candidate_score_couples_branches() -> None:
     assert float(direction_loss[0, 0, 1]) == pytest.approx(0.0, abs=1.0e-6)
     assert float(presence_loss[0, 0, 1]) == pytest.approx(0.1, abs=1.0e-6)
     assert int(torch.count_nonzero(smoothness_loss).item()) == 0
+
+
+def test_native_3d_trace2cp_all_pairs_direction_product_penalizes_previous_outlier() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            directions = torch.as_tensor(points[:, None, :], dtype=torch.float32)
+            presence = torch.tensor([[1.0], [0.95]], dtype=torch.float32)
+            valid = torch.ones((points.shape[0], 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+    candidates = torch.tensor(
+        [[[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    kwargs = dict(
+        cache=FakeCache(),
+        current_directions=torch.tensor([[inv_sqrt2, inv_sqrt2, 0.0]], dtype=torch.float32),
+        previous_step_directions=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+        candidate_directions=candidates,
+        next_points=candidates.clone(),
+        smoothness_weight=0.0,
+        cumulative_smoothness_tangent_weight=0.0,
+    )
+
+    legacy_total, *_ = _score_candidate_loss_tensors_batched(
+        **kwargs,
+        all_pairs_direction_product=False,
+    )
+    all_pairs_total, *_ = _score_candidate_loss_tensors_batched(
+        **kwargs,
+        all_pairs_direction_product=True,
+    )
+
+    assert int(torch.argmin(legacy_total[0, :, 0])) == 0
+    assert int(torch.argmin(all_pairs_total[0, :, 0])) == 1
+
+
+def test_native_3d_trace2cp_all_pairs_first_step_keeps_tangent_plane_relaxed() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            directions = torch.as_tensor(points[:, None, :], dtype=torch.float32)
+            presence = torch.ones((points.shape[0], 1), dtype=torch.float32)
+            valid = torch.ones((points.shape[0], 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    candidates = torch.tensor(
+        [[[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    total_loss, *_ = _score_candidate_loss_tensors_batched(
+        FakeCache(),
+        current_directions=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+        previous_step_directions=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+        candidate_directions=candidates,
+        next_points=candidates.clone(),
+        smoothness_weight=0.0,
+        cumulative_smoothness_tangent_weight=0.0,
+        candidate_normals=torch.tensor(
+            [[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]],
+            dtype=torch.float32,
+        ),
+        candidate_normals_valid=torch.ones((1, 2), dtype=torch.bool),
+        first_step_mask=torch.tensor([True]),
+        all_pairs_direction_product=True,
+    )
+
+    assert float(total_loss[0, 0, 0]) == pytest.approx(0.0, abs=1.0e-6)
+    assert float(total_loss[0, 1, 0]) == pytest.approx(0.0, abs=1.0e-6)
 
 
 def test_native_3d_trace2cp_candidate_substeps_reject_invalid_midpoint() -> None:

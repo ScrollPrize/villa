@@ -51,7 +51,8 @@
 - [ ] multiple laybers per patch : use some roi structure for fibers so we can supervise all fibers within some patch
 - [ ] when evalutationg multi-dir& multi-presence outputs: can just do dot product against the reference angel (e.g. when tracing, slicing)
 - [ ] if fibers in dense areas are randoly on top of each other we can still confuse them - use more defined fiber-center & edges to improve tracing
-- [ ] cp dirs are wrong especially in tangent so beam out at additional angles in tangent initially
+- [ ] cp dirs are wrong especially in tangent so beam out at additional angles in tangent initially -> can enable stronger tangent loss!
+    - [ ] also test slight cp offsets along tangent - given that it might first need centering for optimal trace
 
 # beam-search
 - [ ] beamsearch

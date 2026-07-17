@@ -2,6 +2,10 @@
 
 ## 2026-07-17
 
+- Changed native 3D Trace2CP candidate scoring to default to all-pairs
+  direction product over previous step, current sampled direction, candidate
+  step, and candidate sampled direction, with
+  `--no-all-pairs-direction-product` for legacy two-dot scoring.
 - Added native 3D Trace2CP cumulative tangent-only smoothness: trace states
   carry a short-history heading and candidates receive an additive tangent
   smoothness penalty via `--cumulative-smoothness-steps` and
