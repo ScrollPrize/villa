@@ -1,8 +1,12 @@
-# Native 3D Trace Smoothness Weight Status
+# Native 3D Trace2CP Beam Search Status
 
-- [x] Read current native 3D smoothing implementation.
-- [x] Replace `planning/task.md` with the current task.
-- [x] Replace `planning/task_plan.md` with the implementation plan.
-- [x] Change config and CLI smoothing default to `2.0`.
-- [x] Update specs, docs, changelog, and default assertion.
-- [x] Run validation.
+- [x] Read local workflow and current native 3D tracing config.
+- [x] Write current task and implementation plan.
+- [ ] Review plan against current specs/docs before implementation.
+- [ ] Implement angular-step cone candidate generation.
+- [ ] Implement beam-state native one-way tracing.
+- [ ] Add CLI/config flags and defaults.
+- [ ] Update specs/docs/changelog.
+- [ ] Add regression tests.
+- [ ] Run focused 3D fiber trace tests.
+- [ ] Record validation and deviations in `task_log.md`.

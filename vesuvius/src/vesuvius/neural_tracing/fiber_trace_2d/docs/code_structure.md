@@ -135,6 +135,10 @@ side/top strip input loading.
   and chooses candidates by minimizing
   `1 - dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * candidate_presence`.
   The sampled axes are sign-aligned before dot products are evaluated.
+  For `7*K` grouped outputs, `NativeTraceFieldCache` decodes all `K`
+  direction/presence branches. The current-point branch is selected by
+  `dot(branch_dir, previous_step_dir) * branch_presence`, and each candidate
+  point evaluates all branches before reducing to the best branch score.
   `--smoothness-weight` defaults to `2.0` and adds a hinge-squared cost against
   the previous accepted step direction after
   `--smoothness-free-angle-degrees`; native 3D Trace2CP does not expose

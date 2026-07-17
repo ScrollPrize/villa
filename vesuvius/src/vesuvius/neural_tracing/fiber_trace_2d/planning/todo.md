@@ -55,6 +55,7 @@
 - [ ] test a loss on multi-dir outputs being perpendicular
     - [ ] and the cross product being the surface normal?
     - [ ] maybe even do three direction, perpendicular, at least one presence should be zero (that should be supervised with surface normal!)
+- [ ] estimate normal (with orthongal req above?) then penalize normal curve less than tangential in the tracer!
 
 ## z-search training
 - [ ] Now lets do a modification that re-introduces multiple z-slices again int the training - we see that some difficulty in the embedding is mostly caused by the sample shifting in z

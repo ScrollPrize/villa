@@ -2,6 +2,10 @@
 
 ## 2026-07-17
 
+- Made native 3D Trace2CP branch-aware for grouped multi-direction checkpoints:
+  inferred blocks decode all direction/presence branches, current-point lookup
+  selects the branch best aligned with the previous trace step, and candidate
+  scoring reduces over all branch choices instead of using branch 0 only.
 - Changed native 3D Trace2CP forward/reverse fusion to select the meeting by
   pairwise traced-arc score (`2 * gap + forward length + reverse length`)
   instead of straight-axis overlap progress. `closest_progress` is now

@@ -62,6 +62,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _project_trace_to_initial_strip,
     _resolve_native_trace2cp_selection,
     _sample_presence_on_strip,
+    _sample_trace_point_aligned,
     _score_candidate_batch,
     _target_plane_in_plane_error_voxels,
     _volume_trace_to_source_trace_xyz,
@@ -2413,6 +2414,94 @@ def test_native_3d_trace2cp_candidate_score_maximizes_dot_product_presence() -> 
     assert direction_loss == pytest.approx(0.0, abs=1.0e-6)
     assert presence_loss == pytest.approx(0.49, abs=1.0e-6)
     assert smoothness_loss == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_candidate_score_evaluates_all_branches() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            assert count == 2
+            directions = torch.tensor(
+                [
+                    [
+                        [0.0, 1.0, 0.0],
+                        [1.0, 0.0, 0.0],
+                    ],
+                    [
+                        [0.7, 0.71414286, 0.0],
+                        [0.0, 1.0, 0.0],
+                    ],
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.tensor(
+                [
+                    [0.10, 0.95],
+                    [1.00, 0.20],
+                ],
+                dtype=torch.float32,
+            )
+            valid = torch.ones((count, 2), dtype=torch.bool)
+            return directions, presence, valid
+
+    candidate_b = np.asarray(
+        [0.7, math.sqrt(1.0 - 0.7 * 0.7), 0.0],
+        dtype=np.float32,
+    )
+    best_index, total_loss, direction_loss, presence_loss, smoothness_loss, rejected = (
+        _score_candidate_batch(
+            FakeCache(),
+            current_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            previous_step_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            candidate_directions=np.stack(
+                [
+                    np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+                    candidate_b,
+                ],
+                axis=0,
+            ),
+            next_points=np.zeros((2, 3), dtype=np.float32),
+        )
+    )
+
+    assert best_index == 0
+    assert rejected == 0
+    assert total_loss == pytest.approx(0.05, abs=1.0e-6)
+    assert direction_loss == pytest.approx(0.0, abs=1.0e-6)
+    assert presence_loss == pytest.approx(0.05, abs=1.0e-6)
+    assert smoothness_loss == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_current_point_direction_uses_best_branch() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            assert int(np.asarray(points_zyx).shape[0]) == 1
+            directions = torch.tensor(
+                [
+                    [
+                        [0.0, 1.0, 0.0],
+                        [-1.0, 0.0, 0.0],
+                    ]
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.tensor([[1.0, 0.75]], dtype=torch.float32)
+            valid = torch.ones((1, 2), dtype=torch.bool)
+            return directions, presence, valid
+
+    direction, presence, valid = _sample_trace_point_aligned(
+        FakeCache(),
+        np.zeros((3,), dtype=np.float32),
+        reference_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    assert valid
+    assert presence == pytest.approx(0.75)
+    assert np.allclose(direction, [1.0, 0.0, 0.0])
 
 
 def test_native_3d_trace2cp_candidate_smoothness_can_reject_branch_switch() -> None:

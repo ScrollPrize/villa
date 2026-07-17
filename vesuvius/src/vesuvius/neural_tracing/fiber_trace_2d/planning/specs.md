@@ -361,6 +361,11 @@
   lookups must route to a block whose trusted core contains the queried point.
   The tool must not silently score candidates from cropped-away model-output
   borders.
+- When the native 3D Trace2CP checkpoint output has grouped
+  direction/presence branches (`7*K` channels), inferred block sampling decodes
+  all `K` Lasagna 3x2 direction branches plus their branch-local presence
+  values. Branch 0 remains the compatibility layout for single-branch callers,
+  but native tracing must not be branch-0-only for grouped outputs.
 - Native 3D Trace2CP cached inferred blocks must be CPU-resident. CUDA is used
   for model inference and transient block sampling, but the cache must not keep
   all inferred block output tensors on GPU across a long trace or strip render.
@@ -399,7 +404,9 @@
 - Native 3D candidate selection is vectorized per trace step. Candidate points
   are grouped by trusted inference block, sampled with batched `grid_sample`,
   decoded with the analytic Lasagna 3x2 torch decoder, and scored as one tensor
-  batch. Candidate selection minimizes a cost. The base cost is
+  batch. For multi-branch outputs, every candidate evaluates every branch at
+  the candidate point and uses the branch with the best score. Candidate
+  selection minimizes a cost. The base cost is
   `1 - dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * candidate_presence`.
   Both sampled axes are sign-aligned to the candidate step direction before dot
   products are evaluated. Optional search smoothness adds
@@ -415,7 +422,8 @@
   model direction at the start CP. Forward and backward traces receive their
   respective initial directions from their start/target order. Later steps use
   the sampled model direction at the current trace point, sign-aligned to the
-  previous accepted step.
+  previous accepted step. For multi-branch outputs, the current-point branch is
+  chosen by best `dot(branch_dir, previous_step_dir) * branch_presence`.
 - The native 3D CLI prints live progress bars for forward and backward tracing.
   Progress is measured by signed target-plane progress along the initial
   CP-to-CP direction. It includes step count, ETA, and inferred-block count.

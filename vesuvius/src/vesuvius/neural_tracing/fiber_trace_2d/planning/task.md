@@ -1,10 +1,6 @@
-# Native 3D Trace Smoothness Weight
+# Native 3D Trace2CP Beam Search
 
-Increase native 3D Trace2CP search smoothness so abrupt branch switches are
-penalized by default.
-
-Required behavior:
-
-- Raise the default smoothing loss weight used by native 3D Trace2CP.
-- Keep the CLI override so experiments can still set a different value.
-- Update specs/docs/tests to reflect the new default.
+Replace the native 3D Trace2CP greedy one-step candidate choice with a small
+beam search so tracing can keep multiple plausible continuations over several
+steps. Reduce the native cone candidate density from the current opaque
+`25x25` grid to explicit 5-degree angular steps inside the configured cone.

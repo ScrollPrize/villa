@@ -1,19 +1,18 @@
-# Native 3D Trace Smoothness Weight Log
+# Native 3D Trace2CP Beam Search Log
 
-## Implementation Notes
+## Notes
 
-- Raised `NativeTrace2CpConfig.smoothness_weight` default from `0.0` to `2.0`.
-- Raised the CLI `--smoothness-weight` default from `0.0` to `2.0`.
-- Kept the smoothing formula unchanged:
-  `smoothness_weight * max(0, angle(previous_step_dir, step_dir) - free_angle)^2`
-  in radians.
-- Kept `--smoothness-free-angle-degrees` default at `10.0`.
+- Planning only so far.
+- Current native 3D tracing commits greedily to one candidate per step.
+- Current candidate density is `25x25 = 625` cone-disk samples, not an explicit
+  one-degree angular sweep.
+- Planned replacement uses explicit `5.0` degree tangent-plane angular steps
+  inside the `25.0` degree cone, plus beam search over multiple step histories.
 
 ## Deviations / Deferred Items
 
-- No requested implementation item was deferred.
+- None so far.
 
 ## Validation
 
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed: 79 tests.
+- Pending implementation.
