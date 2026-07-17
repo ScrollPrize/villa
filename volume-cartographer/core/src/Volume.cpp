@@ -25,6 +25,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/PostProcess.hpp"
@@ -1612,6 +1613,10 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
 {
     if (isRemote_ && !remoteCacheRoot_.empty())
         options.persistentCachePath = remotePersistentCachePath();
+    if (options.persistentCachePath &&
+        vc::render::PersistentZarrCacheBudget::findForPath(*options.persistentCachePath)) {
+        options.persistentCacheBudgetRoot = remoteCacheRoot_;
+    }
 
     vc::render::OpenedChunkedZarr opened = isRemote_
         ? (baseScaleLevel_ > 0

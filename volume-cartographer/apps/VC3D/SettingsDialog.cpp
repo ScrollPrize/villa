@@ -1,6 +1,7 @@
 #include "SettingsDialog.hpp"
 
 #include "VCSettings.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -110,8 +111,14 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
     {
         const QString stored =
             settings.value(viewer::REMOTE_CACHE_DIR).toString();
-        edtRemoteCachePath->setText(vc3d::remoteCachePath(stored));
+        const QString active = vc3d::remoteCachePath(stored);
+        edtRemoteCachePath->setText(active);
+        _activeRemoteCacheRoot = active.toStdString();
     }
+    spinRemoteCacheMaximumGiB->setValue(static_cast<int>(settings.value(
+        perf::REMOTE_CACHE_MAX_GIB, perf::REMOTE_CACHE_MAX_GIB_DEFAULT).toULongLong()));
+    spinRemoteCacheMinimumFreeGiB->setValue(static_cast<int>(settings.value(
+        perf::REMOTE_CACHE_MIN_FREE_GIB, perf::REMOTE_CACHE_MIN_FREE_GIB_DEFAULT).toULongLong()));
 
     // Per-segment rotating-backup count.
     if (spinSegmentBackupCount) {
@@ -324,6 +331,16 @@ void SettingsDialog::accept()
     settings.setValue(perf::REMOTE_CACHE_COMPRESSION, chkCompressRemoteCache->isChecked());
     settings.setValue(perf::REMOTE_CACHE_QUANTIZATION,
                       cmbCacheQuantization->currentData().toInt());
+    settings.setValue(perf::REMOTE_CACHE_MAX_GIB, spinRemoteCacheMaximumGiB->value());
+    settings.setValue(perf::REMOTE_CACHE_MIN_FREE_GIB, spinRemoteCacheMinimumFreeGiB->value());
+    constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
+    vc::render::PersistentZarrCacheBudget::Limits limits;
+    if (spinRemoteCacheMaximumGiB->value() > 0)
+        limits.maximumBytes = static_cast<std::uint64_t>(spinRemoteCacheMaximumGiB->value()) * gib;
+    limits.minimumFreeBytes =
+        static_cast<std::uint64_t>(spinRemoteCacheMinimumFreeGiB->value()) * gib;
+    vc::render::PersistentZarrCacheBudget::configure(_activeRemoteCacheRoot, limits);
+    vc::render::PersistentZarrCacheBudget::updateAllConfiguredLimits(limits);
 
     // Per-segment backup count: persist and apply live (no restart needed).
     if (spinSegmentBackupCount) {

@@ -1,6 +1,7 @@
 #include "vc/lasagna/Dataset.hpp"
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "utils/zarr.hpp"
 
 #include <algorithm>
@@ -30,7 +31,8 @@ namespace {
 class PersistentHttpStore final : public utils::Store {
 public:
     PersistentHttpStore(std::string baseUrl, std::filesystem::path cacheRoot)
-        : remote_(baseUrl), baseUrl_(std::move(baseUrl)), cacheRoot_(std::move(cacheRoot)) {}
+        : remote_(baseUrl), baseUrl_(std::move(baseUrl)), cacheRoot_(std::move(cacheRoot)),
+          budget_(vc::render::PersistentZarrCacheBudget::findForPath(cacheRoot_)) {}
 
     bool exists(const std::string& key) const override
     {
@@ -67,12 +69,12 @@ public:
         const auto relative = checkedRelativePath(key);
         const auto path = cachePath(relative);
         if (std::filesystem::is_regular_file(path))
-            return read(path);
+            return read(path, !isMetadataPath(relative));
         if (isMetadataPath(relative)) {
             const auto legacyPath = cacheRoot_ / relative;
             if (std::filesystem::is_regular_file(legacyPath)) {
-                auto bytes = read(legacyPath);
-                publish(path, bytes);
+                auto bytes = read(legacyPath, false);
+                publish(path, bytes, false);
                 return bytes;
             }
         }
@@ -86,7 +88,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(inFlightMutex_);
             if (std::filesystem::is_regular_file(path))
-                return read(path);
+                return read(path, !isMetadataPath(relative));
             if (auto it = inFlight_.find(requestKey); it != inFlight_.end()) {
                 request = it->second;
             } else {
@@ -107,10 +109,11 @@ public:
             request->finished.wait(lock, [&]() { return request->done; });
             const auto error = request->error;
             const bool found = request->found;
+            auto sharedBytes = request->bytes;
             lock.unlock();
             if (error)
                 std::rethrow_exception(error);
-            return found ? std::optional<std::vector<std::byte>>(read(path)) : std::nullopt;
+            return found ? std::move(sharedBytes) : std::nullopt;
         }
 
         std::optional<std::vector<std::byte>> bytes;
@@ -120,7 +123,7 @@ public:
             if (bytes)
                 // Preserve the source object byte-for-byte. Do not decode and
                 // re-encode it through the remote volume cache.
-                publish(path, *bytes);
+                publish(path, *bytes, !isMetadataPath(relative));
         } catch (...) {
             error = std::current_exception();
         }
@@ -129,6 +132,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(inFlightMutex_);
             request->found = bytes.has_value();
+            request->bytes = bytes;
             request->error = error;
             request->done = true;
             inFlight_.erase(requestKey);
@@ -170,13 +174,15 @@ private:
         std::condition_variable finished;
         bool done = false;
         bool found = false;
+        std::optional<std::vector<std::byte>> bytes;
         std::exception_ptr error;
     };
 
     [[nodiscard]] static bool isMetadataPath(const std::filesystem::path& relative)
     {
         const auto filename = relative.filename().string();
-        return filename == ".zarray" || filename == "zarr.json";
+        return filename == ".zarray" || filename == ".zattrs" ||
+               filename == ".zgroup" || filename == "zarr.json";
     }
 
     [[nodiscard]] std::filesystem::path checkedRelativePath(const std::string& key) const
@@ -209,8 +215,11 @@ private:
                std::filesystem::is_regular_file(cacheRoot_ / relative);
     }
 
-    static std::vector<std::byte> read(const std::filesystem::path& path)
+    std::vector<std::byte> read(const std::filesystem::path& path, bool managed) const
     {
+        auto pin = managed && budget_
+            ? budget_->pinRead(path)
+            : vc::render::PersistentZarrCacheBudget::ReadPin{};
         std::ifstream in(path, std::ios::binary);
         if (!in)
             throw std::runtime_error("Failed to read cached Lasagna object: " + path.string());
@@ -221,12 +230,19 @@ private:
         if (!out.empty())
             in.read(reinterpret_cast<char*>(out.data()),
                     static_cast<std::streamsize>(size));
+        pin.complete(true);
         return out;
     }
 
-    static void publish(const std::filesystem::path& path,
-                        std::span<const std::byte> bytes)
+    bool publish(const std::filesystem::path& path,
+                 std::span<const std::byte> bytes,
+                 bool managed) const
     {
+        auto reservation = managed && budget_
+            ? budget_->reserveWrite(path, bytes.size())
+            : vc::render::PersistentZarrCacheBudget::WriteReservation{};
+        if (managed && budget_ && !reservation)
+            return false;
         static std::atomic<std::uint64_t> serial{0};
         std::filesystem::create_directories(path.parent_path());
         const auto tmp = std::filesystem::path(
@@ -249,11 +265,14 @@ private:
             throw std::runtime_error("Failed to publish Lasagna cache file: " + ec.message());
         }
         std::filesystem::remove(tmp, ec);
+        reservation.commit();
+        return true;
     }
 
     utils::HttpStore remote_;
     std::string baseUrl_;
     std::filesystem::path cacheRoot_;
+    std::shared_ptr<vc::render::PersistentZarrCacheBudget> budget_;
     static std::mutex inFlightMutex_;
     static std::unordered_map<std::string, std::shared_ptr<InFlightRequest>> inFlight_;
     static std::unordered_set<std::string> announcedArtifacts_;

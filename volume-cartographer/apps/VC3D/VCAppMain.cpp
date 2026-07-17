@@ -13,6 +13,7 @@
 #include "vc/core/Version.hpp"
 #include <QSettings>
 #include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/CrashHandler.hpp"
@@ -349,6 +350,18 @@ auto main(int argc, char* argv[]) -> int
         vc::render::ChunkCache::setPersistentQuantizationDefault(
             settings.value(perf::REMOTE_CACHE_QUANTIZATION,
                            perf::REMOTE_CACHE_QUANTIZATION_DEFAULT).toInt());
+        constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
+        vc::render::PersistentZarrCacheBudget::Limits limits;
+        const auto maximumGiB = settings.value(
+            perf::REMOTE_CACHE_MAX_GIB, perf::REMOTE_CACHE_MAX_GIB_DEFAULT).toULongLong();
+        if (maximumGiB > 0)
+            limits.maximumBytes = maximumGiB * gib;
+        limits.minimumFreeBytes = settings.value(
+            perf::REMOTE_CACHE_MIN_FREE_GIB,
+            perf::REMOTE_CACHE_MIN_FREE_GIB_DEFAULT).toULongLong() * gib;
+        const auto cacheRoot = vc3d::remoteCachePath(
+            settings.value(viewer::REMOTE_CACHE_DIR).toString()).toStdString();
+        vc::render::PersistentZarrCacheBudget::configure(cacheRoot, limits);
     }
     if (parser.isSet(cacheSizeOption)) {
         bool ok = false;

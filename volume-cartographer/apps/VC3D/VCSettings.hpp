@@ -248,6 +248,13 @@ namespace perf {
     constexpr auto REMOTE_CACHE_QUANTIZATION = "perf/remote_cache_quantization";
     constexpr int REMOTE_CACHE_QUANTIZATION_DEFAULT = 1;
 
+    // Shared budget for every managed remote Zarr chunk beneath the resolved
+    // vc3d cache root. Zero maximum means unlimited.
+    constexpr auto REMOTE_CACHE_MAX_GIB = "perf/remote_cache_max_gib";
+    constexpr qulonglong REMOTE_CACHE_MAX_GIB_DEFAULT = 0;
+    constexpr auto REMOTE_CACHE_MIN_FREE_GIB = "perf/remote_cache_min_free_gib";
+    constexpr qulonglong REMOTE_CACHE_MIN_FREE_GIB_DEFAULT = 20;
+
     // LOD synthesis method.  Selects how c3d chunks are decoded when a
     // downscaled view is requested.  Value is one of:
     //   "codec_synthesis"   — call c3d_chunk_decode_lod; codec-native filter.
