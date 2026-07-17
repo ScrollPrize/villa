@@ -419,6 +419,43 @@ TEST_CASE("line annotation fiber h/v classification scores endpoint z distance")
     CHECK(invalid.automaticTag == FiberHvTag::Unknown);
 }
 
+TEST_CASE("line annotation stored single point fiber seed accepts seed-only geometry")
+{
+    const cv::Vec3d seed{1.0, 2.0, 3.0};
+
+    const auto controlAndLine =
+        vc3d::line_annotation::storedSinglePointFiberSeed({seed}, {seed});
+    REQUIRE(controlAndLine.has_value());
+    CHECK((*controlAndLine)[0] == doctest::Approx(1.0));
+    CHECK((*controlAndLine)[1] == doctest::Approx(2.0));
+    CHECK((*controlAndLine)[2] == doctest::Approx(3.0));
+
+    const auto controlOnly =
+        vc3d::line_annotation::storedSinglePointFiberSeed({seed}, {});
+    REQUIRE(controlOnly.has_value());
+    CHECK((*controlOnly)[2] == doctest::Approx(3.0));
+
+    const auto lineOnly =
+        vc3d::line_annotation::storedSinglePointFiberSeed({}, {seed});
+    REQUIRE(lineOnly.has_value());
+    CHECK((*lineOnly)[0] == doctest::Approx(1.0));
+}
+
+TEST_CASE("line annotation stored single point fiber seed rejects real or conflicting fibers")
+{
+    const cv::Vec3d seed{1.0, 2.0, 3.0};
+
+    CHECK_FALSE(vc3d::line_annotation::storedSinglePointFiberSeed(
+        {seed},
+        {seed, {2.0, 2.0, 3.0}}).has_value());
+    CHECK_FALSE(vc3d::line_annotation::storedSinglePointFiberSeed(
+        {seed, {1.5, 2.0, 3.0}},
+        {seed}).has_value());
+    CHECK_FALSE(vc3d::line_annotation::storedSinglePointFiberSeed(
+        {{9.0, 2.0, 3.0}},
+        {seed}).has_value());
+}
+
 TEST_CASE("line annotation intersection display h side uses manual tags before scores")
 {
     using vc3d::line_annotation::FiberHvClassification;

@@ -1639,7 +1639,6 @@ void LineAnnotationController::launchFromViewer(CChunkedVolumeViewer* viewer, co
         return;
     }
 
-    auto surfaceName = nextSurfaceName();
     auto camera = viewer->cameraState();
     SourceKind sourceKind = SourceKind::Plane;
     std::shared_ptr<Surface> sourceSurface;
@@ -1666,12 +1665,13 @@ void LineAnnotationController::launchFromViewer(CChunkedVolumeViewer* viewer, co
     }
 
     auto session = std::make_shared<LineAnnotationSession>();
-    launchSession(sourceKind,
-                  surfaceName,
-                  std::move(sourceSurface),
-                  camera,
-                  sourceSliceNormal,
-                  std::move(session));
+    const std::string surfaceName = nextSurfaceName();
+    (void)launchSession(sourceKind,
+                        surfaceName,
+                        std::move(sourceSurface),
+                        camera,
+                        sourceSliceNormal,
+                        std::move(session));
 }
 
 void LineAnnotationController::launchFromViewerAtPoint(CChunkedVolumeViewer* viewer,
@@ -1686,8 +1686,6 @@ void LineAnnotationController::launchFromViewerAtPoint(CChunkedVolumeViewer* vie
     if (!sample) {
         return;
     }
-    const std::string clickedSurfaceName = viewer->surfName();
-
     cv::Vec3f normal = sample->normal;
     if (!std::isfinite(normal[0]) ||
         !std::isfinite(normal[1]) ||
@@ -1697,34 +1695,86 @@ void LineAnnotationController::launchFromViewerAtPoint(CChunkedVolumeViewer* vie
     }
     normal *= 1.0f / cv::norm(normal);
 
-    std::string owningSurfaceName;
-    QPointer<LineAnnotationDialog> owningDialog;
-    if (auto* owner = paneForSurface(clickedSurfaceName)) {
-        owningSurfaceName = owner->surfaceName;
-        owningDialog = owner->dialog;
-    }
-    if (replaceOwningAnnotation && !owningSurfaceName.empty()) {
-        cleanupSurfaceName(owningSurfaceName);
-        if (owningDialog) {
-            owningDialog->close();
-        }
-    }
+    (void)replaceOwningAnnotation;
 
     auto surfaceName = nextSurfaceName();
     CChunkedVolumeViewer::CameraState camera;
     auto sourceSurface = std::make_shared<PlaneSurface>(sample->position, normal);
     auto session = std::make_shared<LineAnnotationSession>();
-    launchSession(SourceKind::Plane,
-                  surfaceName,
-                  std::move(sourceSurface),
-                  camera,
-                  cv::Vec3d{normal[0], normal[1], normal[2]},
-                  session,
-                  true);
+    if (!launchSession(SourceKind::Plane,
+                       surfaceName,
+                       std::move(sourceSurface),
+                       camera,
+                       cv::Vec3d{normal[0], normal[1], normal[2]},
+                       session,
+                       true)) {
+        return;
+    }
     handleLineSeed(surfaceName, sample->position, InitialDirectionMode::ZInOut);
 }
 
-void LineAnnotationController::launchSession(LineAnnotationController::SourceKind sourceKind,
+bool LineAnnotationController::prepareForUserFacingLineAnnotationOpen()
+{
+    struct DialogRecord {
+        std::string surfaceName;
+        QPointer<LineAnnotationDialog> dialog;
+        std::shared_ptr<LineAnnotationSession> session;
+    };
+
+    std::vector<DialogRecord> dialogs;
+    dialogs.reserve(_panes.size());
+    for (const auto& pane : _panes) {
+        if (!pane.dialog) {
+            continue;
+        }
+        dialogs.push_back({pane.surfaceName, pane.dialog, pane.session});
+    }
+    if (dialogs.empty()) {
+        return true;
+    }
+
+    for (const auto& record : dialogs) {
+        if (record.session &&
+            record.session->taskState == LineAnnotationSession::TaskState::Running) {
+            showError(tr("Line optimization is already running."));
+            return false;
+        }
+    }
+
+    for (const auto& record : dialogs) {
+        if (!record.session) {
+            continue;
+        }
+        auto& session = *record.session;
+        const bool suppressBeforeFinalize = session.suppressFiberSave;
+        if (!suppressBeforeFinalize && needsFinalOptimization(session)) {
+            session.suppressFiberSave = true;
+        }
+        if (!finalizeSessionOptimizationSynchronously(session, false)) {
+            session.suppressFiberSave = suppressBeforeFinalize;
+            return false;
+        }
+        session.suppressFiberSave = suppressBeforeFinalize;
+        if (!session.suppressFiberSave &&
+            session.taskState == LineAnnotationSession::TaskState::Succeeded &&
+            !session.optimizedLine.points.empty() &&
+            !session.controlPoints.empty()) {
+            saveSessionAsFiber(session);
+            session.suppressFiberSave = true;
+        }
+    }
+
+    for (const auto& record : dialogs) {
+        if (record.dialog) {
+            record.dialog->setCloseAfterFinalizationAllowed(true);
+            record.dialog->close();
+        }
+        cleanupSurfaceName(record.surfaceName);
+    }
+    return true;
+}
+
+bool LineAnnotationController::launchSession(LineAnnotationController::SourceKind sourceKind,
                                              const std::string& surfaceName,
                                              std::shared_ptr<Surface> sourceSurface,
                                              const CChunkedVolumeViewer::CameraState& camera,
@@ -1733,7 +1783,10 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                                              bool deferShowUntilGenerated)
 {
     if (!_state || !session) {
-        return;
+        return false;
+    }
+    if (!prepareForUserFacingLineAnnotationOpen()) {
+        return false;
     }
 
     session->deferShowUntilGenerated = deferShowUntilGenerated;
@@ -1743,7 +1796,7 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     if (!dialog->addPane(surfaceName, tr("Line Annotation Slice"), camera)) {
         dialog->deleteLater();
         _state->setSurface(surfaceName, nullptr);
-        return;
+        return false;
     }
     session->surfaceName = surfaceName;
     session->sourceAnnotationSurfaceName = surfaceName;
@@ -1882,6 +1935,7 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         dialog->raise();
         dialog->activateWindow();
     }
+    return true;
 }
 
 void LineAnnotationController::openFiber(uint64_t fiberId)
@@ -1921,7 +1975,9 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         showError(tr("Fiber %1 is not loaded.").arg(fiberId));
         return;
     }
-    if (it->linePoints.empty()) {
+    const std::optional<cv::Vec3d> seedOnlyPoint =
+        vc3d::line_annotation::storedSinglePointFiberSeed(it->controlPoints, it->linePoints);
+    if (!seedOnlyPoint && it->linePoints.empty()) {
         showError(tr("Fiber %1 has no line points.").arg(fiberId));
         return;
     }
@@ -1938,6 +1994,39 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->disableInitialGeneratedHoverFollow =
         controlPointIndex.has_value() || linePointIndex.has_value() ||
         spanControlIndices.has_value();
+
+    if (seedOnlyPoint) {
+        const cv::Vec3d seedPoint = *seedOnlyPoint;
+        session->seedPoint = seedPoint;
+        session->focusedLinePosition = 0.0;
+        session->focusedControlPoint = seedPoint;
+        session->initialDirectionMode = InitialDirectionMode::ZInOut;
+        const cv::Vec3d sourceSliceNormal =
+            seedTraceSourceNormalForStoredFiber(*it, controlPointIndex, seedPoint);
+
+        if (!ensureDatasetForSession(*session)) {
+            return;
+        }
+
+        CChunkedVolumeViewer::CameraState camera;
+        camera.scale = 1.0f;
+        auto sourcePlane = std::make_shared<PlaneSurface>(
+            toVec3f(seedPoint),
+            toVec3f(sourceSliceNormal));
+        const std::string surfaceName = nextSurfaceName();
+        if (!launchSession(SourceKind::Plane,
+                           surfaceName,
+                           std::move(sourcePlane),
+                           camera,
+                           sourceSliceNormal,
+                           session,
+                           true)) {
+            return;
+        }
+        handleLineSeed(surfaceName, toVec3f(seedPoint), InitialDirectionMode::ZInOut);
+        return;
+    }
+
     session->focusedLinePosition = static_cast<double>(it->linePoints.size() / 2);
     session->focusedControlPoint = it->controlPoints.empty()
         ? std::optional<cv::Vec3d>{}
@@ -2075,12 +2164,12 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
                   static_cast<float>(origin[1]),
                   static_cast<float>(origin[2])},
         cv::Vec3f{0.0f, 0.0f, 1.0f});
-    launchSession(SourceKind::Plane,
-                  nextSurfaceName(),
-                  sourcePlane,
-                  camera,
-                  {0.0, 0.0, 1.0},
-                  std::move(session));
+    (void)launchSession(SourceKind::Plane,
+                        nextSurfaceName(),
+                        sourcePlane,
+                        camera,
+                        {0.0, 0.0, 1.0},
+                        std::move(session));
 }
 
 void LineAnnotationController::deleteFiber(uint64_t fiberId)
@@ -5147,13 +5236,26 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
         camera.scale = 1.0f;
         auto sourcePlane =
             std::make_shared<PlaneSurface>(linkedPointf, toVec3f(linkDirection));
-        launchSession(SourceKind::Plane,
-                      childSurfaceName,
-                      std::move(sourcePlane),
-                      camera,
-                      linkDirection,
-                      childSession,
-                      true);
+        if (!launchSession(SourceKind::Plane,
+                           childSurfaceName,
+                           std::move(sourcePlane),
+                           camera,
+                           linkDirection,
+                           childSession,
+                           true)) {
+            parentSession.branches.erase(
+                std::remove_if(parentSession.branches.begin(),
+                               parentSession.branches.end(),
+                               [&parentToChild](const FiberBranchRef& branch) {
+                                   return branch.branchFiberId == parentToChild.branchFiberId &&
+                                          branch.controlPointIndex ==
+                                              parentToChild.controlPointIndex &&
+                                          branch.branchControlPointIndex ==
+                                              parentToChild.branchControlPointIndex;
+                               }),
+                parentSession.branches.end());
+            return;
+        }
         handleLineSeed(childSurfaceName, linkedPointf, parentSession.initialDirectionMode);
     } else {
         childSession->surfaceName = "linked_fiber_create_only";
@@ -5225,7 +5327,9 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
         }
         return;
     }
-    saveSessionAsFiber(parentSession);
+    if (!parentSession.suppressFiberSave) {
+        saveSessionAsFiber(parentSession);
+    }
     refreshBranchLineViews(parentFiberId);
 }
 
@@ -7972,6 +8076,55 @@ vc::lasagna::LineModel LineAnnotationController::syntheticLineModelFromPoints(
     return model;
 }
 
+cv::Vec3d LineAnnotationController::seedTraceSourceNormalForStoredFiber(
+    const StoredFiber& fiber,
+    std::optional<int> controlPointIndex,
+    const cv::Vec3d& seedPoint)
+{
+    std::optional<int> preferredControlIndex = controlPointIndex;
+    if (!preferredControlIndex) {
+        int seedControlIndex = -1;
+        for (size_t i = 0; i < fiber.controlPoints.size(); ++i) {
+            if (pointsApproximatelyEqual(fiber.controlPoints[i], seedPoint)) {
+                seedControlIndex = static_cast<int>(i);
+                break;
+            }
+        }
+        if (seedControlIndex >= 0) {
+            preferredControlIndex = seedControlIndex;
+        }
+    }
+
+    auto branchMatchesSeed = [&](const FiberBranchRef& branch) {
+        if (preferredControlIndex && branch.controlPointIndex == *preferredControlIndex) {
+            return true;
+        }
+        return pointsApproximatelyEqual(branch.controlPointPosition, seedPoint);
+    };
+
+    for (const auto& branch : fiber.branches) {
+        if (branchMatchesSeed(branch) && finiteDirection(branch.controlPointDirection)) {
+            return normalizedOrZero(branch.controlPointDirection);
+        }
+    }
+    for (const auto& branch : fiber.branches) {
+        if (branchMatchesSeed(branch) && finiteDirection(branch.linkDirection)) {
+            return normalizedOrZero(branch.linkDirection);
+        }
+    }
+    for (const auto& branch : fiber.branches) {
+        if (finiteDirection(branch.controlPointDirection)) {
+            return normalizedOrZero(branch.controlPointDirection);
+        }
+    }
+    for (const auto& branch : fiber.branches) {
+        if (finiteDirection(branch.linkDirection)) {
+            return normalizedOrZero(branch.linkDirection);
+        }
+    }
+    return {0.0, 0.0, 1.0};
+}
+
 std::shared_ptr<LineAnnotationController::LineAnnotationSession>
 LineAnnotationController::makeIntersectionLineSession(
     const StoredFiber& fiber,
@@ -8843,7 +8996,9 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
     vc::atlas::FiberInput atlasFiberInput;
     atlasFiberInput.controlPoints = fiber.controlPoints;
     atlasFiberInput.linePoints = fiber.linePoints;
-    vc::atlas::validateFiberInputControlPoints(atlasFiberInput);
+    if (!(fiber.linePoints.empty() && fiber.controlPoints.size() == 1)) {
+        vc::atlas::validateFiberInputControlPoints(atlasFiberInput);
+    }
 
     if (root.contains("tags")) {
         fiber.tags = normalizedFiberTagsFromJson(root.at("tags"));

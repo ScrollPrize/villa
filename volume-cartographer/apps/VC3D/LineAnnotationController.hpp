@@ -321,7 +321,8 @@ private:
 
     std::string nextSurfaceName();
     void cleanupSurfaceName(const std::string& surfaceName);
-    void launchSession(SourceKind sourceKind,
+    bool prepareForUserFacingLineAnnotationOpen();
+    bool launchSession(SourceKind sourceKind,
                        const std::string& surfaceName,
                        std::shared_ptr<Surface> sourceSurface,
                        const CChunkedVolumeViewer::CameraState& camera,
@@ -459,6 +460,10 @@ private:
         const vc::lasagna::NormalSampler* normalSampler);
     [[nodiscard]] static vc::lasagna::LineModel syntheticLineModelFromPoints(
         const std::vector<cv::Vec3d>& points);
+    [[nodiscard]] static cv::Vec3d seedTraceSourceNormalForStoredFiber(
+        const StoredFiber& fiber,
+        std::optional<int> controlPointIndex,
+        const cv::Vec3d& seedPoint);
     [[nodiscard]] std::optional<int> storedBranchTargetControlPointIndex(
         const FiberBranchRef& branch) const;
     [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);

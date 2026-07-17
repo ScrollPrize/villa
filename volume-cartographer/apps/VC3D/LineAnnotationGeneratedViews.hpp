@@ -200,6 +200,63 @@ inline bool finiteGeneratedPoint(const cv::Vec3f& point)
     return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
 }
 
+inline bool finiteStoredPoint(const cv::Vec3d& point)
+{
+    return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
+inline bool storedPointsApproximatelyEqual(const cv::Vec3d& a,
+                                           const cv::Vec3d& b,
+                                           double tolerance = 1.0e-6)
+{
+    if (!finiteStoredPoint(a) || !finiteStoredPoint(b)) {
+        return false;
+    }
+    const cv::Vec3d delta = a - b;
+    return delta.dot(delta) <= tolerance * tolerance;
+}
+
+inline std::optional<cv::Vec3d> storedSinglePointFiberSeed(
+    const std::vector<cv::Vec3d>& controlPoints,
+    const std::vector<cv::Vec3d>& linePoints)
+{
+    std::optional<cv::Vec3d> controlSeed;
+    size_t finiteControlCount = 0;
+    for (const cv::Vec3d& point : controlPoints) {
+        if (!finiteStoredPoint(point)) {
+            continue;
+        }
+        ++finiteControlCount;
+        if (finiteControlCount == 1) {
+            controlSeed = point;
+        }
+    }
+
+    std::optional<cv::Vec3d> lineSeed;
+    size_t finiteLineCount = 0;
+    for (const cv::Vec3d& point : linePoints) {
+        if (!finiteStoredPoint(point)) {
+            continue;
+        }
+        ++finiteLineCount;
+        if (finiteLineCount == 1) {
+            lineSeed = point;
+        }
+    }
+
+    if (finiteControlCount > 1 || finiteLineCount > 1) {
+        return std::nullopt;
+    }
+    if (!controlSeed && !lineSeed) {
+        return std::nullopt;
+    }
+    if (controlSeed && lineSeed &&
+        !storedPointsApproximatelyEqual(*controlSeed, *lineSeed)) {
+        return std::nullopt;
+    }
+    return controlSeed ? controlSeed : lineSeed;
+}
+
 inline cv::Vec3f normalizedGeneratedVectorOrNan(const cv::Vec3f& vector)
 {
     const float n = cv::norm(vector);
