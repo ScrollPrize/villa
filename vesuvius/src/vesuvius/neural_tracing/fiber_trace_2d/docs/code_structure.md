@@ -164,8 +164,14 @@ side/top strip input loading.
   weights.
 - The first search step uses the adjacent CP-local fiber-line tangent in the
   direction of the target CP's line index. It does not use the straight CP-to-CP
-  chord. Later steps use the sampled model direction at the current point,
-  aligned to the previous accepted trace step.
+  chord. That CP tangent still orients the root cone, but the first accepted
+  step is scored specially: smoothness is zero and the current-direction gate
+  compares only the Lasagna-normal/elevation component at the candidate point,
+  so tangent-plane mismatch against the CP tangent is ignored. The normal sign
+  ambiguity is folded out; invalid or unavailable candidate normals fall back
+  to the regular full current-direction dot gate. Later steps use the sampled
+  model direction at the current point, aligned to the previous accepted trace
+  step, with the normal-aware smoothness described above.
   Native Trace2CP now uses beam search by default (`--beam-width 8`) instead of
   committing greedily at every step. Each beam expands the same branch-aware
   candidate score for `--beam-lookahead-steps` future steps before pruning

@@ -1,48 +1,37 @@
-# Native 3D Trace2CP Normal-Aware Smoothness Log
+# Native 3D Trace2CP First-Step CP-Tangent Relaxation Log
 
-## Implementation
+## Planning
 
-- Added a native candidate normal sampler wrapper in
-  `fiber_trace_3d.trace2cp_tool` that converts selected-level ZYX candidate
-  points to base ZYX and calls the existing batched Lasagna normal sampler in
-  the 2D geometry loader. The wrapper converts returned XYZ normals to native
-  ZYX for trace scoring.
-- Fixed the wrapper to use the matching 2D geometry-loader record for Lasagna
-  `grad_mag/nx/ny`, while using the 3D trace record only for selected-level to
-  base-coordinate scaling. This avoids passing a 3D `_Record` without Lasagna
-  channels into the 2D normal sampler.
-- Added split smoothness scoring:
-  - tangent-plane turn around the Lasagna normal axis;
-  - normal-tilt turn into/out of the Lasagna normal direction;
-  - normal sign ambiguity is invariant by construction;
-  - invalid candidate normals fall back to the previous isotropic smoothness
-    term for that candidate.
-- Threaded the normal sampler through greedy, beam, pair, and whole-fiber
-  native 3D Trace2CP paths.
-- Added CLI/config fields:
-  `--smoothness-tangent-weight` and `--smoothness-normal-weight`. In the
-  native CLI, omitted split weights default to `--smoothness-weight` when the
-  Lasagna normal sampler is active.
-- Added summary JSON fields for the effective smoothness weights and whether
-  normal-aware smoothness was active.
-- Changed the native 3D Trace2CP free-angle default from `10` degrees to `0`
-  degrees in the config dataclass, CLI default, and helper defaults, so tangent
-  and normal smoothness penalties apply immediately unless explicitly
-  overridden.
-- Updated `planning/specs.md`, `docs/code_structure.md`, and
-  `planning/changelog.md`.
+- Replaced `planning/task.md` with the current user task: relax native 3D
+  Trace2CP first-step CP tangent scoring.
+- Replaced `planning/task_plan.md` with a detailed plan following
+  `fiber_trace_2d/AGENTS.md`.
+- Replaced `planning/status.md` with a current-task checklist.
+- Reviewed the current native 3D Trace2CP spec section and preserved the
+  existing requirements:
+  - CP-local tangent seeding remains;
+  - candidate Lasagna normals are sampled directly at trace candidate points;
+  - no reference-line normal interpolation;
+  - regular direction/presence/smoothness scoring resumes after the first step.
+
+## Deviations / Deferred
+
+None.
 
 ## Validation
 
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  - Result: `91 passed in 7.53s`.
-- `git diff --check`
+  - Result: `96 passed in 8.93s`.
+- `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/specs.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/code_structure.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/changelog.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/status.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task_log.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task_plan.md`
   - Result: clean.
 
-## Deviations / Deferred
+## Implementation Notes
 
-- Candidate-substep scoring still uses the final candidate endpoint normal for
-  the one-per-step smoothness term. Direction/presence scoring still samples
-  all configured substeps.
-- Candidate normals are not used to generate candidate directions yet; they
-  only affect the smoothness penalty.
+- Added `first_step_mask` to the native 3D candidate scorer.
+- Added a normal/elevation-only first-step gate using candidate-point Lasagna
+  normals and preserving normal sign ambiguity.
+- First-step candidates now have zero smoothness loss.
+- Greedy tracing passes the mask for `_step_index == 0`; beam tracing passes
+  it for root-depth frontier states.
+- Native Trace2CP summaries include `first_step_cp_tangent_relaxed: true`.
+- Added focused scorer tests plus a greedy/beam trace-path regression.

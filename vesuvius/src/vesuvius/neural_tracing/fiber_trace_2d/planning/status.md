@@ -1,15 +1,20 @@
-# Native 3D Trace2CP Normal-Aware Smoothness Status
+# Native 3D Trace2CP First-Step CP-Tangent Relaxation Status
 
-- [x] Read current native 3D Trace2CP scorer/tracing code.
-- [x] Confirm existing batched Lasagna normal sampler can be reused for native
-  candidate coordinates.
-- [x] Replace `task.md` with the normal-aware smoothness planning task.
-- [x] Write `task_plan.md` with target behavior, implementation plan, specs,
-  docs, and tests.
-- [x] Replace `task_log.md` with current planning notes.
-- [x] Implement direct candidate-point Lasagna normal sampling.
-- [x] Implement split tangent/normal smoothness scorer.
-- [x] Add CLI/config summary fields.
-- [x] Update specs/docs/changelog after implementation.
-- [x] Add focused regression tests.
+- [x] Read subproject `AGENTS.md`.
+- [x] Read current task/spec context for native 3D Trace2CP scoring.
+- [x] Replace `planning/task.md` with the current task.
+- [x] Replace `planning/task_plan.md` with a detailed implementation plan.
+- [x] Include spec update plan.
+- [x] Include docs update plan.
+- [x] Include test plan.
+- [x] Include changelog plan.
+- [x] Add independent plan review notes.
+- [x] Replace `planning/task_log.md` with current-task notes.
+- [x] Implement scorer first-step mask.
+- [x] Implement first-step normal-only gate.
+- [x] Wire beam tracing.
+- [x] Wire greedy tracing.
+- [x] Update specs/docs/changelog.
+- [x] Add focused tests.
 - [x] Run focused tests.
+- [x] Run `git diff --check`.

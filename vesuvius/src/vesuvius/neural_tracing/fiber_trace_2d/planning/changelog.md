@@ -2,6 +2,10 @@
 
 ## 2026-07-17
 
+- Relaxed native 3D Trace2CP's first CP step: the root step now disables
+  smoothness and scores CP-tangent agreement only by the candidate-point
+  Lasagna-normal/elevation component, while later steps keep normal-aware
+  smoothness.
 - Added native 3D Trace2CP normal-aware smoothness: candidate Lasagna normals
   are sampled directly at candidate trace points through the existing batched
   2D geometry-loader decoder, then smoothness is split into tangent-plane and

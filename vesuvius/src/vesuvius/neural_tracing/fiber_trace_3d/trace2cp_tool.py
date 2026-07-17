@@ -1355,6 +1355,52 @@ def _native_smoothness_loss_torch(
     return torch.where(finite_normal, split, isotropic)
 
 
+def _native_first_step_normal_gate_torch(
+    current: torch.Tensor,
+    candidates: torch.Tensor,
+    *,
+    candidate_normals: torch.Tensor,
+    candidate_normals_valid: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if candidate_normals.ndim == 4:
+        normals = candidate_normals[:, :, -1, :]
+        if candidate_normals_valid is None:
+            normals_valid = None
+        elif candidate_normals_valid.ndim == 3:
+            normals_valid = candidate_normals_valid[:, :, -1]
+        else:
+            normals_valid = candidate_normals_valid
+    else:
+        normals = candidate_normals
+        normals_valid = candidate_normals_valid
+    normals = normals.to(device=candidates.device, dtype=torch.float32)
+    if normals_valid is not None:
+        normals_valid = normals_valid.to(device=candidates.device, dtype=torch.bool)
+    if candidates.ndim != 3 or int(candidates.shape[2]) != 3:
+        raise ValueError("candidates must have shape [N,M,3]")
+    if current.shape != (int(candidates.shape[0]), 3):
+        raise ValueError("current must have shape [N,3]")
+    if normals.shape != candidates.shape:
+        raise ValueError("candidate_normals must have shape [N,M,3] or [N,M,S,3]")
+    if normals_valid is not None and normals_valid.shape != candidates.shape[:2]:
+        raise ValueError("candidate_normals_valid must have shape [N,M] or [N,M,S]")
+
+    normal_norm = torch.linalg.norm(normals, dim=2)
+    gate_valid = torch.isfinite(normals).all(dim=2) & torch.isfinite(normal_norm)
+    gate_valid = gate_valid & (normal_norm > float(_EPS))
+    if normals_valid is not None:
+        gate_valid = gate_valid & normals_valid
+
+    unit_normal = F.normalize(normals, p=2.0, dim=2, eps=float(_EPS))
+    current_expand = current[:, None, :].expand_as(candidates)
+    current_normal = torch.sum(current_expand * unit_normal, dim=2).clamp(-1.0, 1.0)
+    candidate_normal = torch.sum(candidates * unit_normal, dim=2).clamp(-1.0, 1.0)
+    normal_angle = torch.abs(torch.asin(candidate_normal) - torch.asin(current_normal))
+    gate = torch.cos(normal_angle).clamp(0.0, 1.0)
+    gate_valid = gate_valid & torch.isfinite(gate)
+    return gate, gate_valid
+
+
 def _format_eta(seconds: float | None) -> str:
     if seconds is None or not math.isfinite(float(seconds)) or float(seconds) < 0.0:
         return "?"
@@ -1408,6 +1454,7 @@ def _score_candidate_loss_tensors(
     smoothness_free_angle_degrees: float = 0.0,
     candidate_normals: torch.Tensor | np.ndarray | None = None,
     candidate_normals_valid: torch.Tensor | np.ndarray | None = None,
+    first_step_mask: torch.Tensor | np.ndarray | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     device = _cache_device(cache)
     current_points_t = None
@@ -1463,6 +1510,9 @@ def _score_candidate_loss_tensors(
         candidate_normals_valid=None
         if candidate_normals_valid is None
         else torch.as_tensor(candidate_normals_valid, dtype=torch.bool, device=device),
+        first_step_mask=None
+        if first_step_mask is None
+        else torch.as_tensor(first_step_mask, dtype=torch.bool, device=device),
     )
     return (
         total_loss[0],
@@ -1490,6 +1540,7 @@ def _score_candidate_loss_tensors_batched(
     smoothness_free_angle_degrees: float = 0.0,
     candidate_normals: torch.Tensor | None = None,
     candidate_normals_valid: torch.Tensor | None = None,
+    first_step_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     substeps = int(candidate_substeps)
     if substeps < 1:
@@ -1524,6 +1575,12 @@ def _score_candidate_loss_tensors_batched(
         raise ValueError("current_directions must have shape [N,3]")
     if previous.shape != (state_count, 3):
         raise ValueError("previous_step_directions must have shape [N,3]")
+    if first_step_mask is None:
+        first_step_t = torch.zeros((state_count,), dtype=torch.bool, device=device)
+    else:
+        first_step_t = first_step_mask.to(device=device, dtype=torch.bool)
+        if first_step_t.shape != (state_count,):
+            raise ValueError("first_step_mask must have shape [N]")
     candidates = _align_axes_torch(
         candidates,
         current[:, None, :].expand_as(candidates),
@@ -1539,6 +1596,15 @@ def _score_candidate_loss_tensors_batched(
         if candidate_normals_valid is None
         else candidate_normals_valid.to(device=device, dtype=torch.bool)
     )
+    if normals_t is not None and bool(torch.any(first_step_t).detach().cpu()):
+        normal_gate, normal_gate_valid = _native_first_step_normal_gate_torch(
+            current,
+            candidates,
+            candidate_normals=normals_t,
+            candidate_normals_valid=normals_valid_t,
+        )
+        use_normal_gate = first_step_t[:, None] & normal_gate_valid
+        current_dot = torch.where(use_normal_gate, normal_gate, current_dot)
     smoothness_loss = _native_smoothness_loss_torch(
         previous,
         candidates,
@@ -1549,6 +1615,12 @@ def _score_candidate_loss_tensors_batched(
         smoothness_normal_weight=smoothness_normal_weight,
         smoothness_free_angle_degrees=float(smoothness_free_angle_degrees),
     )
+    if bool(torch.any(first_step_t).detach().cpu()):
+        smoothness_loss = torch.where(
+            first_step_t[:, None],
+            torch.zeros_like(smoothness_loss),
+            smoothness_loss,
+        )
 
     if substeps == 1:
         flat_points = points.reshape(state_count * candidate_count, 3)
@@ -1695,6 +1767,7 @@ def _score_candidate_batch(
     smoothness_free_angle_degrees: float = 0.0,
     candidate_normals: torch.Tensor | np.ndarray | None = None,
     candidate_normals_valid: torch.Tensor | np.ndarray | None = None,
+    first_step: bool = False,
 ) -> tuple[int | None, float, float, float, float, int]:
     if candidate_normals is None:
         candidate_normals_batched = None
@@ -1730,6 +1803,7 @@ def _score_candidate_batch(
         smoothness_free_angle_degrees=smoothness_free_angle_degrees,
         candidate_normals=candidate_normals_batched,
         candidate_normals_valid=candidate_normals_valid_batched,
+        first_step_mask=np.asarray([bool(first_step)], dtype=bool),
     )
     valid_count = int(torch.count_nonzero(candidate_valid).detach().cpu())
     if valid_count == 0:
@@ -2001,6 +2075,7 @@ def _trace_native_3d_one_way_greedy(
                 smoothness_free_angle_degrees=float(cfg.smoothness_free_angle_degrees),
                 candidate_normals=candidate_normals,
                 candidate_normals_valid=candidate_normals_valid,
+                first_step=(_step_index == 0),
             )
         )
         if best_index is None:
@@ -2408,6 +2483,7 @@ def _trace_native_3d_one_way_beam(
             )
             candidate_normals_t = None if sampled_normals is None else sampled_normals[0]
             candidate_normals_valid_t = None if sampled_normals is None else sampled_normals[1]
+            first_step_mask_t = frontier_gen.depth[valid_state_indices] == 0
             (
                 total_loss_t,
                 direction_loss_t,
@@ -2430,6 +2506,7 @@ def _trace_native_3d_one_way_beam(
                 smoothness_free_angle_degrees=float(cfg.smoothness_free_angle_degrees),
                 candidate_normals=candidate_normals_t,
                 candidate_normals_valid=candidate_normals_valid_t,
+                first_step_mask=first_step_mask_t,
             )
             candidate_best_loss_t, candidate_best_branch_t = torch.min(total_loss_t, dim=2)
             candidate_valid_t = candidate_valid_t & torch.isfinite(candidate_best_loss_t)
@@ -4260,6 +4337,7 @@ def _native_trace_smoothness_summary(cfg: NativeTrace2CpConfig) -> dict[str, Any
             or cfg.smoothness_normal_weight is not None
         ),
         "smoothness_free_angle_degrees": float(cfg.smoothness_free_angle_degrees),
+        "first_step_cp_tangent_relaxed": True,
     }
 
 
