@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
+from dt_targets import strip_dt_target_in_sample_frame
 from sample_spiral import (
     get_theta_and_radii,
     get_theta_crossing_step_adjustments,
@@ -381,7 +382,7 @@ def _sample_prepared_track_points(prepared_tracks, num_tracks_per_step, num_poin
     point_idx_within, _ = torch.sort(point_idx_within, dim=-1)
     flat_idx = (track_offsets_sample[:, None] + point_idx_within).reshape(-1)
     sampled_scroll = flat_zyx[flat_idx].view(k, num_points_per_track, 3)
-    return track_idx, flat_idx, sampled_scroll
+    return track_idx, point_idx_within, sampled_scroll
 
 
 def _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding, cfg):
@@ -401,7 +402,7 @@ def _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding, cfg):
     return per_track.mean()
 
 
-def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_max_winding=None):
+def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_max_winding=None, dt_target_cache=None):
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if prepared_tracks is None:
@@ -413,7 +414,7 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     )
     if sample is None:
         return zero, zero
-    _, _, sampled_scroll = sample
+    track_idx, sample_local_idx, sampled_scroll = sample
     k = sampled_scroll.shape[0]
     num_points = sampled_scroll.shape[1]
     sampled_spiral = slice_to_spiral_transform(sampled_scroll.reshape(-1, 3)).reshape(k, num_points, 3)
@@ -425,7 +426,10 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     if not compute_dt:
         return radius_loss, zero
 
-    target_shifted_radii = torch.round(shifted_radii.median(dim=-1, keepdim=True).values / dr_per_winding) * dr_per_winding
+    target_shifted_radii = strip_dt_target_in_sample_frame(
+        shifted_radii, sample_local_idx, theta, crossing_adjustments,
+        dr_per_winding, dt_target_cache, track_idx,
+    )
     target_radii = radius_from_unwrapped_shifted(
         theta, target_shifted_radii, crossing_adjustments, dr_per_winding,
     )

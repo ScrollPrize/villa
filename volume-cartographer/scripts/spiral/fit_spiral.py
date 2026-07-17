@@ -39,6 +39,12 @@ from tracks import (
     load_tracks_from_dbm,
     prepare_main_phase_tracks,
 )
+from dt_targets import (
+    DtTargetCacheManager,
+    compute_patch_dt_target_cache,
+    compute_strip_dt_target_cache,
+    prepare_patch_dt_target_samples,
+)
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 from sample_spiral import (
     get_spiral_points,
@@ -210,6 +216,15 @@ default_config = {
     'dt_progressive_inner_winding': 20,   # outer-winding cutoff when each DT loss first turns on
     'dt_progressive_steps': 50_000,  # steps to grow the cutoff from start_winding to shell_outer_winding_idx
     'dt_progressive_exponent': 1.0,  # warp on the time fraction; 1.0 = linear in winding, <1 = slower later (~0.5 ≈ constant area rate)
+    # Whole-object DT targeting (see dt_targets.py): determine each object's DT target
+    # from a sparse no-grad sample. Objects attached to a winding use their median's
+    # nearest winding; objects whose majority is floating in a gap grab the outer one.
+    'dt_target_mode': 'whole_object_quantile',  # 'whole_object_quantile' | 'strip_median'
+    'dt_target_floating_threshold': 0.25,  # median point-to-nearest-sheet distance, in windings, required to grab the outer sheet
+    'dt_target_update_interval': 100,  # steps between whole-object target recomputations (1 = every step)
+    'patch_dt_target_num_points': 256,  # per-patch whole-grid samples for target determination
+    'dt_target_max_stride': 128,  # max gap between target-determination samples, in voxels (patches convert to grid cells via patch.scale; strip points are nominally at ~voxel spacing, so applied directly as an index stride)
+    'dt_target_num_points_per_strip': 512,  # target samples per track / pcl strip
     'output_first_winding': 10,
     'output_winding_margin': 4,
     'output_step_size': 20,
@@ -1311,6 +1326,37 @@ def main(load_only_patches_and_point_collections=False):
     dr_per_winding = spiral_and_transform.get_dr_per_winding()
 
     # ==========================================================================
+    # Whole-object DT target caches (see dt_targets.py)
+    # ==========================================================================
+
+    if cfg['dt_target_mode'] not in ('strip_median', 'whole_object_quantile'):
+        raise ValueError(f"dt_target_mode must be 'strip_median' or 'whole_object_quantile', got {cfg['dt_target_mode']!r}")
+    dt_target_whole_object = cfg['dt_target_mode'] == 'whole_object_quantile'
+    if dt_target_whole_object:
+        prepare_patch_dt_target_samples(
+            verified_patches_list, cfg['patch_dt_target_num_points'], cfg['dt_target_max_stride'],
+        )
+        if unverified_patches_list:
+            prepare_patch_dt_target_samples(
+                unverified_patches_list, cfg['patch_dt_target_num_points'], cfg['dt_target_max_stride'],
+            )
+    # Caches are recomputed lazily once the corresponding DT loss is active.
+    # Updates are deterministic given the transform, so DDP ranks stay consistent.
+    def report_first_dt_target_cache(kind, cache):
+        if is_main_process():
+            message = (
+                f'dt-target[{kind}]: {int(cache["valid"].numel())} objects, '
+                f'{cache.get("num_points", 0)} points'
+            )
+            if 'main_component_fraction' in cache:
+                message += f', main-component fraction {cache["main_component_fraction"]:.3f}'
+            print(message)
+
+    dt_target_cache_manager = DtTargetCacheManager(
+        cfg['dt_target_update_interval'], report_first_dt_target_cache,
+    )
+
+    # ==========================================================================
     # Training loop
     # ==========================================================================
 
@@ -1363,6 +1409,42 @@ def main(load_only_patches_and_point_collections=False):
         if track_dt_max_winding is not None:
             log_metrics['track_dt_max_winding'] = track_dt_max_winding
 
+        patch_dt_target_cache = None
+        unverified_patch_dt_target_cache = None
+        unattached_pcl_dt_target_cache = None
+        track_dt_target_cache = None
+        if dt_target_whole_object:
+            if compute_patch_dt and cfg['loss_weight_patch_dt'] > 0 and verified_patches_list:
+                patch_dt_target_cache = dt_target_cache_manager.get('patch', iteration, lambda: compute_patch_dt_target_cache(
+                    slice_to_spiral_transform, dr_per_winding,
+                    verified_patches_list, patch_atlas, cfg['dt_target_floating_threshold'],
+                ))
+            if compute_unverified_patch_dt and cfg['loss_weight_unverified_patch_dt'] > 0 and unverified_patch_atlas is not None:
+                unverified_patch_dt_target_cache = dt_target_cache_manager.get('unverified_patch', iteration, lambda: compute_patch_dt_target_cache(
+                    slice_to_spiral_transform, dr_per_winding,
+                    unverified_patches_list, unverified_patch_atlas, cfg['dt_target_floating_threshold'],
+                ))
+            if compute_patch_dt and cfg['loss_weight_unattached_pcl_dt'] > 0 and unattached_pcl_strips:
+                pcl_flat = get_or_build_unattached_pcl_flat(unattached_pcl_strips, device)
+                if pcl_flat is not None:
+                    unattached_pcl_dt_target_cache = dt_target_cache_manager.get('unattached_pcl', iteration, lambda: compute_strip_dt_target_cache(
+                        slice_to_spiral_transform, dr_per_winding,
+                        pcl_flat['zyxs'], pcl_flat['starts'],
+                        windings=pcl_flat['windings'],
+                        floating_threshold=cfg['dt_target_floating_threshold'],
+                        num_points_per_strip=cfg['dt_target_num_points_per_strip'],
+                        max_stride=cfg['dt_target_max_stride'],
+                    ))
+            if compute_track_dt and cfg['loss_weight_track_dt'] > 0 and prepared_main_tracks is not None:
+                track_dt_target_cache = dt_target_cache_manager.get('track', iteration, lambda: compute_strip_dt_target_cache(
+                    slice_to_spiral_transform, dr_per_winding,
+                    prepared_main_tracks['flat_zyx'], prepared_main_tracks['offsets'],
+                    windings=None,
+                    floating_threshold=cfg['dt_target_floating_threshold'],
+                    num_points_per_strip=cfg['dt_target_num_points_per_strip'],
+                    max_stride=cfg['dt_target_max_stride'],
+                ))
+
         patch_radius_loss, umbilicus_loss, patch_dt_loss, shell_patch_radius_loss = get_patch_and_umbilicus_losses(
             slice_to_spiral_transform,
             dr_per_winding,
@@ -1376,6 +1458,7 @@ def main(load_only_patches_and_point_collections=False):
             shell_valid_zyxs=shell_valid_zyxs_gpu,
             shell_outer_winding_idx=shell_outer_winding_idx,
             dt_max_winding=patch_dt_max_winding,
+            dt_target_cache=patch_dt_target_cache,
         )
         losses['patch_radius'] = patch_radius_loss * cfg['loss_weight_patch_radius']
         losses['patch_dt'] = patch_dt_loss * cfg['loss_weight_patch_dt']
@@ -1396,6 +1479,7 @@ def main(load_only_patches_and_point_collections=False):
                 unverified_patch_sampling_probabilities,
                 compute_dt=compute_unverified_patch_dt,
                 dt_max_winding=unverified_patch_dt_max_winding,
+                dt_target_cache=unverified_patch_dt_target_cache,
             )
             losses['unverified_patch_radius'] = unverified_patch_radius_loss * cfg['loss_weight_unverified_patch_radius']
             losses['unverified_patch_dt'] = unverified_patch_dt_loss * cfg['loss_weight_unverified_patch_dt']
@@ -1456,6 +1540,7 @@ def main(load_only_patches_and_point_collections=False):
                 cfg['unattached_pcl_num_points_per_step'],
                 compute_dt=compute_patch_dt,
                 dt_max_winding=patch_dt_max_winding,
+                dt_target_cache=unattached_pcl_dt_target_cache,
             )
             losses['unattached_pcl_radius'] = unattached_pcl_radius_loss * cfg['loss_weight_unattached_pcl_radius']
             losses['unattached_pcl_dt'] = unattached_pcl_dt_loss * cfg['loss_weight_unattached_pcl_dt']
@@ -1468,6 +1553,7 @@ def main(load_only_patches_and_point_collections=False):
                 cfg,
                 compute_dt=compute_track_dt,
                 dt_max_winding=track_dt_max_winding,
+                dt_target_cache=track_dt_target_cache,
             )
             losses['track_radius'] = track_radius_loss * cfg['loss_weight_track_radius']
             losses['track_dt'] = track_dt_loss * cfg['loss_weight_track_dt']
