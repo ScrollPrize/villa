@@ -44,7 +44,14 @@ public:
             metadataExists(relative.parent_path() / "zarr.json")) {
             return false;
         }
-        return get_if_exists(key).has_value();
+        const auto path = cachePath(relative);
+        if (std::filesystem::is_regular_file(path))
+            return true;
+        if (isMetadataPath(relative) &&
+            std::filesystem::is_regular_file(cacheRoot_ / relative)) {
+            return true;
+        }
+        return remote_.exists(key);
     }
 
     std::vector<std::byte> get(const std::string& key) const override

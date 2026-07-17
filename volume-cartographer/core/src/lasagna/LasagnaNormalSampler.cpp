@@ -314,13 +314,22 @@ public:
         }
         report.chunksRead = missing.size();
 
+        const size_t maxWorkers = std::min(
+            normalReadPool().worker_count(), missing.size());
         std::vector<std::future<void>> futures;
-        futures.reserve(missing.size());
-        for (const auto& request : missing) {
-            futures.push_back(normalReadPool().submit(
-                [this, binding = request.first, key = request.second]() {
-                    (void)load(*binding, *binding->array, key);
-                }));
+        futures.reserve(maxWorkers);
+        std::atomic<size_t> next{0};
+        for (size_t worker = 0; worker < maxWorkers; ++worker) {
+            futures.push_back(normalReadPool().submit([this, &missing, &next]() {
+                while (true) {
+                    const size_t index = next.fetch_add(1);
+                    if (index >= missing.size()) {
+                        return;
+                    }
+                    const auto& request = missing[index];
+                    (void)load(*request.first, *request.first->array, request.second);
+                }
+            }));
         }
         for (auto& future : futures) {
             future.get();

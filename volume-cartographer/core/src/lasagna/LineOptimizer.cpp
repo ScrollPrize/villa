@@ -1618,6 +1618,35 @@ using Clock = std::chrono::steady_clock;
     return transported;
 }
 
+using NormalPrefetchFuture = std::future<NormalPrefetchReport>;
+
+void enqueueNormalPrefetch(
+    const NormalSampler& sampler,
+    std::vector<cv::Vec3d> predictedPoints,
+    bool withDerivative,
+    std::vector<NormalPrefetchFuture>& pendingPrefetches)
+{
+    constexpr size_t kMaxPendingPrefetches = 2;
+    if (pendingPrefetches.size() >= kMaxPendingPrefetches) {
+        (void)pendingPrefetches.front().get();
+        pendingPrefetches.erase(pendingPrefetches.begin());
+    }
+    pendingPrefetches.push_back(std::async(
+        std::launch::async,
+        [&sampler,
+         predictedPoints = std::move(predictedPoints),
+         withDerivative]() {
+            return sampler.prefetchNormalSamples(predictedPoints, withDerivative);
+        }));
+}
+
+void waitForNormalPrefetches(std::vector<NormalPrefetchFuture>& pendingPrefetches)
+{
+    for (auto& prefetch : pendingPrefetches) {
+        (void)prefetch.get();
+    }
+}
+
 [[nodiscard]] std::vector<std::array<double, 3>> directNormalConstructedPoints(
     const cv::Vec3d& seedPoint,
     const cv::Vec3d& seedTangent,
@@ -1632,7 +1661,7 @@ using Clock = std::chrono::steady_clock;
     auto grow = [&](int sign, std::vector<std::array<double, 3>>& out) {
         constexpr int kPrefetchLookaheadSteps = 12;
         constexpr int kPrefetchRefreshSteps = 8;
-        std::vector<std::future<NormalPrefetchReport>> pendingPrefetches;
+        std::vector<NormalPrefetchFuture> pendingPrefetches;
         cv::Vec3d point = seedPoint;
         cv::Vec3d direction = normalizedOrZero(seedTangent) * static_cast<double>(sign);
         NormalSample previousSample = sampler.sampleNormal(point);
@@ -1651,14 +1680,11 @@ using Clock = std::chrono::steady_clock;
                         point + direction * (config.segmentLength * static_cast<double>(step)));
                 }
                 if (sampler.supportsConcurrentSampling()) {
-                    pendingPrefetches.push_back(std::async(
-                        std::launch::async,
-                        [&sampler,
-                         predictedPoints = std::move(predictedPoints),
-                         withDerivative = config.differentiableNormalSampling]() {
-                            return sampler.prefetchNormalSamples(
-                                predictedPoints, withDerivative);
-                        }));
+                    enqueueNormalPrefetch(
+                        sampler,
+                        std::move(predictedPoints),
+                        config.differentiableNormalSampling,
+                        pendingPrefetches);
                 } else {
                     (void)sampler.prefetchNormalSamples(
                         predictedPoints, config.differentiableNormalSampling);
@@ -1677,9 +1703,7 @@ using Clock = std::chrono::steady_clock;
             point += direction * config.segmentLength;
             out.push_back(toArray(point));
         }
-        for (auto& prefetch : pendingPrefetches) {
-            (void)prefetch.get();
-        }
+        waitForNormalPrefetches(pendingPrefetches);
     };
 
     // Both halves depend on the seed but not on each other. Concurrent-capable
@@ -2072,7 +2096,7 @@ void growNormalConstructedExtension(
 {
     constexpr int kPrefetchLookaheadSteps = 12;
     constexpr int kPrefetchRefreshSteps = 8;
-    std::vector<std::future<NormalPrefetchReport>> pendingPrefetches;
+    std::vector<NormalPrefetchFuture> pendingPrefetches;
     cv::Vec3d point = startPoint;
     direction = normalizedOrZero(direction);
     if (length(direction) <= kEpsilon) {
@@ -2095,14 +2119,11 @@ void growNormalConstructedExtension(
                     point + direction * (config.segmentLength * static_cast<double>(step)));
             }
             if (sampler.supportsConcurrentSampling()) {
-                pendingPrefetches.push_back(std::async(
-                    std::launch::async,
-                    [&sampler,
-                     predictedPoints = std::move(predictedPoints),
-                     withDerivative = config.differentiableNormalSampling]() {
-                        return sampler.prefetchNormalSamples(
-                            predictedPoints, withDerivative);
-                    }));
+                enqueueNormalPrefetch(
+                    sampler,
+                    std::move(predictedPoints),
+                    config.differentiableNormalSampling,
+                    pendingPrefetches);
             } else {
                 (void)sampler.prefetchNormalSamples(
                     predictedPoints, config.differentiableNormalSampling);
@@ -2121,9 +2142,7 @@ void growNormalConstructedExtension(
         point += direction * config.segmentLength;
         out.push_back(toArray(point));
     }
-    for (auto& prefetch : pendingPrefetches) {
-        (void)prefetch.get();
-    }
+    waitForNormalPrefetches(pendingPrefetches);
 }
 
 [[nodiscard]] cv::Vec3d interpolateInitialLinePoint(
