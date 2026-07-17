@@ -201,12 +201,115 @@ def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (value * mask_f).sum() / denom
 
 
+def _mean_over_nonempty_groups(
+    group_sum: torch.Tensor,
+    group_count: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    valid = group_count > 0.0
+    group_mean = torch.where(
+        valid,
+        group_sum / group_count.clamp_min(1.0),
+        torch.zeros_like(group_sum),
+    )
+    valid_count = valid.to(dtype=group_sum.dtype).sum()
+    mean = group_mean.sum() / valid_count.clamp_min(1.0)
+    return mean, valid_count
+
+
+def _enforce_two_branch_min_fraction(
+    selected_branch: torch.Tensor,
+    score: torch.Tensor,
+    *,
+    min_fraction: float = 0.10,
+) -> torch.Tensor:
+    """Repair two-branch positive routing when one branch falls below quota."""
+    if int(score.shape[1]) != 2 or int(selected_branch.numel()) == 0:
+        return selected_branch
+    sample_count = int(selected_branch.numel())
+    min_count = min(sample_count // 2, int(math.ceil(float(sample_count) * float(min_fraction))))
+    if min_count <= 0:
+        return selected_branch
+
+    score_detached = score.detach()
+    min_count_t = torch.as_tensor(min_count, dtype=torch.long, device=selected_branch.device)
+    branch0_count = (selected_branch == 0).sum()
+    branch1_count = (selected_branch == 1).sum()
+    under0 = branch0_count < min_count_t
+    under1 = branch1_count < min_count_t
+
+    def top_missing_mask(branch: int, missing: torch.Tensor) -> torch.Tensor:
+        candidate_mask = selected_branch != branch
+        branch_score = score_detached[:, branch]
+        masked_score = torch.where(
+            candidate_mask,
+            branch_score,
+            torch.full_like(branch_score, -torch.inf),
+        )
+        order = torch.argsort(masked_score, descending=True, stable=True)
+        rank = torch.empty_like(order)
+        rank[order] = torch.arange(sample_count, dtype=order.dtype, device=order.device)
+        return rank < missing.clamp_min(0)
+
+    repair0 = under0 & top_missing_mask(0, min_count_t - branch0_count)
+    repair1 = (~under0) & under1 & top_missing_mask(1, min_count_t - branch1_count)
+    return torch.where(
+        repair0,
+        torch.zeros_like(selected_branch),
+        torch.where(repair1, torch.ones_like(selected_branch), selected_branch),
+    )
+
+
+def _select_branch_by_chunked_min_fraction(
+    score: torch.Tensor,
+    indices_bzyx: torch.Tensor,
+    *,
+    chunk_size: int = 2,
+    min_fraction: float = 0.10,
+) -> torch.Tensor:
+    if int(score.shape[1]) != 2 or int(score.shape[0]) == 0:
+        return torch.argmax(score.detach(), dim=1)
+    if int(chunk_size) <= 1:
+        selected_branch = torch.argmax(score.detach(), dim=1)
+        return _enforce_two_branch_min_fraction(
+            selected_branch,
+            score,
+            min_fraction=min_fraction,
+        )
+
+    coarse = indices_bzyx.clone()
+    coarse[:, 1:] = torch.div(coarse[:, 1:], int(chunk_size), rounding_mode="floor")
+    unique_chunks, inverse = torch.unique(coarse, dim=0, sorted=True, return_inverse=True)
+    chunk_count = int(unique_chunks.shape[0])
+    score_detached = score.detach()
+    chunk_sum = torch.zeros(
+        (chunk_count, 2),
+        dtype=score_detached.dtype,
+        device=score_detached.device,
+    )
+    chunk_items = torch.zeros((chunk_count,), dtype=score_detached.dtype, device=score_detached.device)
+    chunk_sum.scatter_add_(0, inverse.view(-1, 1).expand(-1, 2), score_detached)
+    chunk_items.scatter_add_(
+        0,
+        inverse,
+        torch.ones((int(inverse.numel()),), dtype=score_detached.dtype, device=score_detached.device),
+    )
+    chunk_score = chunk_sum / chunk_items.clamp_min(1.0).view(-1, 1)
+    selected_chunk_branch = torch.argmax(chunk_score, dim=1)
+    selected_chunk_branch = _enforce_two_branch_min_fraction(
+        selected_chunk_branch,
+        chunk_score,
+        min_fraction=min_fraction,
+    )
+    return selected_chunk_branch[inverse]
+
+
 def compute_losses(
     output: torch.Tensor,
     batch: FiberTrace3DBatch,
     *,
     direction_weight: float,
     presence_weight: float,
+    enforce_branch_min_fraction: bool = False,
 ) -> dict[str, torch.Tensor]:
     require_materialized_targets(batch)
     assert batch.direction_indices_bzyx is not None
@@ -245,6 +348,13 @@ def compute_losses(
             torch.sum(pred_axis * target_axis[:, None, :], dim=-1)
         ).clamp(0.0, 1.0) * pred_presence_sparse.clamp(0.0, 1.0)
         selected_branch = torch.argmax(score.detach(), dim=1)
+        if enforce_branch_min_fraction:
+            selected_branch = _select_branch_by_chunked_min_fraction(
+                score,
+                indices,
+                chunk_size=2,
+                min_fraction=0.10,
+            )
         row_index = torch.arange(
             int(indices.shape[0]),
             dtype=torch.long,
@@ -270,9 +380,24 @@ def compute_losses(
             torch.ones_like(selected_presence),
             reduction="none",
         )
-        positive_presence_loss = _masked_mean(
-            positive_presence_bce,
-            positive_presence_mask,
+        branch_patch_count = int(pred_presences.shape[0]) * branch_count
+        positive_group_index = indices[:, 0] * branch_count + selected_branch
+        positive_mask_f = positive_presence_mask.to(dtype=positive_presence_bce.dtype)
+        positive_group_sum = torch.zeros(
+            (branch_patch_count,),
+            dtype=positive_presence_bce.dtype,
+            device=positive_presence_bce.device,
+        )
+        positive_group_count = torch.zeros_like(positive_group_sum)
+        positive_group_sum.scatter_add_(
+            0,
+            positive_group_index,
+            positive_presence_bce * positive_mask_f,
+        )
+        positive_group_count.scatter_add_(0, positive_group_index, positive_mask_f)
+        positive_presence_loss, positive_presence_group_count = _mean_over_nonempty_groups(
+            positive_group_sum,
+            positive_group_count,
         )
         selected_score_mean = score[row_index, selected_branch].mean()
         branch0_fraction = (selected_branch == 0).to(dtype=torch.float32).mean()
@@ -285,6 +410,11 @@ def compute_losses(
         direction_loss = pred_dirs.sum() * 0.0
         angle_mean_deg = pred_dirs.sum() * 0.0
         positive_presence_loss = pred_presences.sum() * 0.0
+        positive_presence_group_count = torch.zeros(
+            (),
+            dtype=pred_presences.dtype,
+            device=pred_presences.device,
+        )
         selected_score_mean = pred_presences.sum() * 0.0
         branch0_fraction = pred_presences.sum() * 0.0
         branch1_fraction = pred_presences.sum() * 0.0
@@ -297,21 +427,21 @@ def compute_losses(
         torch.zeros_like(pred_presences),
         reduction="none",
     )
-    has_positive = int(indices.shape[0]) > 0
-    if int(indices.shape[0]) > 0:
-        has_positive = bool(positive_presence_mask.any())
-    has_negative = bool(negative_mask.any())
-    if has_positive and has_negative:
-        presence_loss = 0.5 * positive_presence_loss + 0.5 * _masked_mean(
-            negative_presence_bce,
-            negative_mask,
-        )
-    elif has_positive:
-        presence_loss = positive_presence_loss
-    elif has_negative:
-        presence_loss = _masked_mean(negative_presence_bce, negative_mask)
-    else:
-        presence_loss = pred_presences.sum() * 0.0
+    negative_mask_f = negative_mask.to(dtype=negative_presence_bce.dtype)
+    negative_group_sum = (negative_presence_bce * negative_mask_f).sum(
+        dim=(2, 3, 4, 5)
+    ).reshape(-1)
+    negative_group_count = negative_mask_f.sum(dim=(2, 3, 4, 5)).reshape(-1)
+    negative_presence_loss, negative_presence_group_count = _mean_over_nonempty_groups(
+        negative_group_sum,
+        negative_group_count,
+    )
+    has_positive = (positive_presence_group_count > 0.0).to(dtype=pred_presences.dtype)
+    has_negative = (negative_presence_group_count > 0.0).to(dtype=pred_presences.dtype)
+    presence_loss = (
+        positive_presence_loss * has_positive
+        + negative_presence_loss * has_negative
+    )
     total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss
     return {
         "total": total,
@@ -824,6 +954,7 @@ def _forward_loss(
         batch,
         direction_weight=direction_weight,
         presence_weight=presence_weight,
+        enforce_branch_min_fraction=backward,
     )
     if backward:
         losses["total"].backward()
@@ -916,6 +1047,9 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     sample_index_limit = _training_sample_index_limit(training, loader.sample_count)
     scalar_interval = int(training.get("scalar_log_interval", 100))
     checkpoint_interval = int(training.get("checkpoint_interval", 100))
+    kept_snapshot_interval = int(training.get("kept_snapshot_interval", 10000))
+    if kept_snapshot_interval < 0:
+        raise ValueError("training.kept_snapshot_interval must be >= 0")
     test_interval = int(training.get("test_interval", 0))
     sample_vis_interval = int(
         training.get("sample_vis_interval", training.get("train_sample_vis_interval", 1000))
@@ -939,7 +1073,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         loader_sample_count=test_loader.sample_count if test_loader is not None else loader.sample_count,
         default_count=0,
     )
-    direction_weight = float(training.get("direction_weight", 1.0))
+    direction_weight = float(training.get("direction_weight", 10.0))
     presence_weight = float(training.get("presence_weight", 1.0))
     loader_workers = _loader_worker_count(raw_config)
     loader_prefetch_factor = _loader_prefetch_factor(raw_config)
@@ -955,7 +1089,8 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         f"trace2cp_enabled={bool(trace2cp_loader is not None)} "
         f"loader_workers={loader_workers} loader_prefetch_factor={loader_prefetch_factor} "
         f"loader_worker_device={loader_worker_device} "
-        f"loader_multiprocessing_context={loader_context or 'default'}",
+        f"loader_multiprocessing_context={loader_context or 'default'} "
+        f"kept_snapshot_interval={kept_snapshot_interval}",
         flush=True,
     )
     if resume:
@@ -1147,6 +1282,16 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             if step % checkpoint_interval == 0 or (max_steps is not None and step == max_steps):
                 _save_snapshot(
                     snapshot_dir / "current.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    step=step,
+                    config=raw_config,
+                    metric=metric,
+                    metric_name=metric_name,
+                )
+            if kept_snapshot_interval > 0 and step % kept_snapshot_interval == 0:
+                _save_snapshot(
+                    snapshot_dir / f"step_{step:08d}.pt",
                     model=model,
                     optimizer=optimizer,
                     step=step,
@@ -2575,7 +2720,7 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
     device = _device_from_training(training)
     model = build_fiber_trace_3d_model(raw_config).to(device)
     model.eval()
-    direction_weight = float(training.get("direction_weight", 1.0))
+    direction_weight = float(training.get("direction_weight", 10.0))
     presence_weight = float(training.get("presence_weight", 1.0))
     loader_workers = _loader_worker_count(raw_config)
     loader_prefetch_factor = _loader_prefetch_factor(raw_config)

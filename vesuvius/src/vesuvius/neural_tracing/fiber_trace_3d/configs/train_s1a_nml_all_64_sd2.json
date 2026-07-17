@@ -49,6 +49,7 @@
     "scalar_log_interval": 100,
     "sample_vis_interval": 100,
     "checkpoint_interval": 100,
+    "kept_snapshot_interval": 10000,
     "test_interval": 100,
     "test_control_points": 0,
     "test_start_sample_index": 0,
@@ -68,7 +69,7 @@
     "loader_prefetch_factor": 2,
     "loader_worker_device": "cpu",
     "tensorboard_enabled": true,
-    "direction_weight": 1.0,
+    "direction_weight": 10.0,
     "presence_weight": 1.0
   },
   "datasets": [

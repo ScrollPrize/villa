@@ -95,12 +95,30 @@
   positive presence BCE apply only to the selected branch at points included by
   `presence_mask`. The unselected positive branch is not trained as negative at
   that positive point.
+- During two-branch 3D training, positive routing includes a batch-local
+  anti-collapse repair over 2x2x2 voxel groups within each patch. Training first
+  averages detached branch choice scores per `(patch, 2x2x2 chunk)`. If either
+  branch receives fewer than 10% of grouped positive supervision, the
+  underrepresented branch takes the missing quota from groups currently assigned
+  to the other branch, sorted by the underrepresented branch's grouped detached
+  choice score. The chosen group branch is broadcast back to all sparse positive
+  points in that group. If both branches already meet the floor, routing is
+  unchanged. Test/eval metrics do not apply this repair; they use the raw
+  detached argmax routing.
 - Negative presence supervision remains global: all branches are supervised as
   negative where the dense presence target is negative inside the valid/reachable
   patch interior. For CP-only samples, edge voxels that could not contain a CP
   because of shift augmentation are ignored for presence loss. For NML
   dense-line samples, presence supervision uses the full valid patch because the
   centerline can provide positives and negatives in that region.
+- Presence loss is normalized by patch and branch before aggregation. Sparse
+  positive presence BCE is averaged per selected `(patch, branch)` group; dense
+  negative presence BCE is averaged per `(patch, branch)` group. The available
+  positive and negative group-normalized terms are then summed directly, without
+  an additional global positive/negative balancing factor.
+- 3D training defaults `training.direction_weight` to `10.0` and
+  `training.presence_weight` to `1.0`, so direction loss is 10x stronger than
+  presence loss unless the config overrides it.
 - 3D target generation is source-format dependent. NML fibers use dense
   supervision along all fiber-line segments that overlap the patch. The
   transformed output-space segments are clipped/rasterized directly into the
@@ -875,7 +893,7 @@
   includes the top-view strip envelope in addition to all side-strip z-offset
   envelopes, and both views must be complete before that sample can advance the
   prefix.
-- Training writes snapshots under `<run_dir>/snapshots/current.pt` and `<run_dir>/snapshots/best.pt`. With `test_datasets`, current snapshots are written at the test evaluation cadence and best is selected by lowest observed averaged `test/trace2cp_error`. Without `test_datasets`, current snapshots use `training.checkpoint_interval` and best is selected by lowest observed training loss. A resumed run writes its own fresh `current.pt` and `best.pt` under the newly created resumed run directory.
+- Training writes snapshots under `<run_dir>/snapshots/current.pt` and `<run_dir>/snapshots/best.pt`. With `test_datasets`, current snapshots are written at the test evaluation cadence and best is selected by lowest observed averaged `test/trace2cp_error`. Without `test_datasets`, current snapshots use `training.checkpoint_interval` and best is selected by lowest observed training loss. `training.kept_snapshot_interval` defaults to `10000` and writes retained numbered snapshots named `step_<iteration>.pt`; `0` disables retained numbered snapshots. A resumed run writes its own fresh `current.pt`, `best.pt`, and retained numbered snapshots under the newly created resumed run directory.
 - The runner is `python -m vesuvius.neural_tracing.fiber_trace_2d.runner`.
 - Augment contact sheets are exported with `--augment-vis --export-dir <dir>`. Add `--augment-profile` to print cold and warm augment timing tables.
 - Direction-field inspection is exported with `--dir-vis --checkpoint <snapshot> --export-dir <dir>`.

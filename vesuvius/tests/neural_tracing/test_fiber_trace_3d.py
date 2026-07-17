@@ -1290,7 +1290,17 @@ def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:
         presence_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
     )
 
-    losses = compute_losses(output, batch, direction_weight=1.0, presence_weight=1.0)
+    eval_losses = compute_losses(output, batch, direction_weight=1.0, presence_weight=1.0)
+    assert torch.allclose(eval_losses["branch0_fraction"], torch.tensor(0.0))
+    assert torch.allclose(eval_losses["branch1_fraction"], torch.tensor(1.0))
+
+    losses = compute_losses(
+        output,
+        batch,
+        direction_weight=1.0,
+        presence_weight=1.0,
+        enforce_branch_min_fraction=True,
+    )
     losses["total"].backward()
 
     assert torch.allclose(losses["branch0_fraction"], torch.tensor(0.0))
@@ -1301,6 +1311,79 @@ def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:
     assert output.grad[0, 13, 0, 0, 0] != 0.0
     assert output.grad[0, 6, 0, 0, 1] != 0.0
     assert output.grad[0, 13, 0, 0, 1] != 0.0
+
+
+def test_3d_two_branch_positive_supervision_enforces_minority_floor() -> None:
+    target_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    weaker_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[0.95, 0.25, 0.0]], dtype=torch.float32)
+    )[0]
+    output = torch.zeros((1, 14, 1, 1, 10), dtype=torch.float32)
+    output[0, 0:6, 0, 0, :] = target_dir.view(6, 1)
+    output[0, 7:13, 0, 0, :] = weaker_dir.view(6, 1)
+    output[0, 6, 0, 0, :] = 0.95
+    output[0, 13, 0, 0, :] = torch.tensor(
+        [0.10, 0.20, 0.20, 0.30, 0.30, 0.40, 0.40, 0.50, 0.80, 0.70],
+        dtype=torch.float32,
+    )
+    output.requires_grad_()
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((1, 1, 1, 1, 10), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, 1, 1, 10), dtype=torch.bool),
+        cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        sample_indices=torch.zeros((1,), dtype=torch.long),
+        record_indices=torch.zeros((1,), dtype=torch.long),
+        control_point_indices=torch.zeros((1,), dtype=torch.long),
+        fiber_paths=("synthetic.json",),
+        target_modes=torch.zeros((1,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((1,), dtype=torch.long),
+        target_segment_counts=torch.zeros((1,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        direction_indices_bzyx=torch.stack(
+            [
+                torch.zeros((10,), dtype=torch.long),
+                torch.zeros((10,), dtype=torch.long),
+                torch.zeros((10,), dtype=torch.long),
+                torch.arange(10, dtype=torch.long),
+            ],
+            dim=1,
+        ),
+        direction_target_sparse=target_dir.view(1, 6).expand(10, 6),
+        direction_weight_sparse=torch.ones((10, 6), dtype=torch.float32),
+        presence_target=torch.ones((1, 1, 1, 1, 10), dtype=torch.float32),
+        presence_mask=torch.ones((1, 1, 1, 1, 10), dtype=torch.bool),
+    )
+
+    eval_losses = compute_losses(output, batch, direction_weight=1.0, presence_weight=1.0)
+    assert torch.allclose(eval_losses["branch0_fraction"], torch.tensor(1.0))
+    assert torch.allclose(eval_losses["branch1_fraction"], torch.tensor(0.0))
+
+    losses = compute_losses(
+        output,
+        batch,
+        direction_weight=1.0,
+        presence_weight=1.0,
+        enforce_branch_min_fraction=True,
+    )
+    losses["total"].backward()
+
+    assert torch.allclose(losses["branch0_fraction"], torch.tensor(0.8))
+    assert torch.allclose(losses["branch1_fraction"], torch.tensor(0.2))
+    assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, 9]) > 0
+    assert output.grad[0, 13, 0, 0, 9] != 0.0
+    assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, 8]) > 0
+    assert output.grad[0, 13, 0, 0, 8] != 0.0
+    assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, 7]) == 0
+    assert output.grad[0, 13, 0, 0, 7] == 0.0
+    assert torch.count_nonzero(output.grad[0, 0:6, 0, 0, 9]) == 0
+    assert output.grad[0, 6, 0, 0, 9] == 0.0
 
 
 def test_3d_positive_presence_ignores_masked_sparse_points() -> None:
@@ -1420,8 +1503,61 @@ def test_3d_presence_loss_balances_positive_and_negative_regions() -> None:
     losses = compute_losses(output, batch, direction_weight=0.0, presence_weight=1.0)
     pos_expected = -torch.log(torch.tensor(0.9))
     neg_expected = -torch.log(1.0 - torch.tensor([0.2, 0.8, 0.4])).mean()
-    expected = 0.5 * pos_expected + 0.5 * neg_expected
+    expected = pos_expected + neg_expected
     assert torch.allclose(losses["presence"], expected)
+
+
+def test_3d_negative_presence_loss_normalizes_per_patch_and_branch() -> None:
+    output = torch.zeros((2, 14, 1, 1, 3), dtype=torch.float32)
+    output[0, 6, 0, 0, :] = torch.tensor([0.2, 0.8, 0.4], dtype=torch.float32)
+    output[0, 13, 0, 0, :] = torch.tensor([0.1, 0.1, 0.1], dtype=torch.float32)
+    output[1, 6, 0, 0, :] = torch.tensor([0.7, 0.0, 0.0], dtype=torch.float32)
+    output[1, 13, 0, 0, :] = torch.tensor([0.6, 0.0, 0.0], dtype=torch.float32)
+    presence_mask = torch.tensor(
+        [
+            [True, True, True],
+            [True, False, False],
+        ],
+        dtype=torch.bool,
+    ).view(2, 1, 1, 1, 3)
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((2, 1, 1, 1, 3), dtype=torch.float32),
+        valid_mask=torch.ones((2, 1, 1, 1, 3), dtype=torch.bool),
+        cp_local_zyx=torch.zeros((2, 3), dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((2, 3), dtype=torch.float32),
+        sample_indices=torch.zeros((2,), dtype=torch.long),
+        record_indices=torch.zeros((2,), dtype=torch.long),
+        control_point_indices=torch.zeros((2,), dtype=torch.long),
+        fiber_paths=("synthetic0.json", "synthetic1.json"),
+        target_modes=torch.zeros((2,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((2,), dtype=torch.long),
+        target_segment_counts=torch.zeros((2,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.zeros((2, 3), dtype=torch.float32),
+        direction_indices_bzyx=torch.zeros((0, 4), dtype=torch.long),
+        direction_target_sparse=torch.zeros((0, 6), dtype=torch.float32),
+        direction_weight_sparse=torch.zeros((0, 6), dtype=torch.float32),
+        presence_target=torch.zeros((2, 1, 1, 1, 3), dtype=torch.float32),
+        presence_mask=presence_mask,
+    )
+
+    losses = compute_losses(output, batch, direction_weight=0.0, presence_weight=1.0)
+    expected = torch.stack(
+        [
+            -torch.log(1.0 - torch.tensor([0.2, 0.8, 0.4])).mean(),
+            -torch.log(1.0 - torch.tensor([0.1, 0.1, 0.1])).mean(),
+            -torch.log(1.0 - torch.tensor(0.7)),
+            -torch.log(1.0 - torch.tensor(0.6)),
+        ]
+    ).mean()
+    global_mean = -torch.log(
+        1.0 - torch.tensor([0.2, 0.8, 0.4, 0.1, 0.1, 0.1, 0.7, 0.6])
+    ).mean()
+    assert torch.allclose(losses["presence"], expected)
+    assert not torch.allclose(losses["presence"], global_mean)
 
 
 def test_3d_projection_bridge_recovers_straight_xy_direction() -> None:

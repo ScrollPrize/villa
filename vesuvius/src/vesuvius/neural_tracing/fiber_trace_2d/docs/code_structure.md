@@ -202,7 +202,8 @@ side/top strip input loading.
 - Supports `--prefetch`, `--prefetch-steps`, `--benchmark`, `--load-only`,
   `--resume`, and `--trace2cp-vis`.
 - Writes snapshots to `<run_path>/<run_name>_<datestr>/snapshots/current.pt`
-  and `best.pt`.
+  and `best.pt`. `training.kept_snapshot_interval` additionally keeps numbered
+  snapshots as `snapshots/step_<iteration>.pt` and defaults to `10000`.
 - Logs scalar losses/timings and the full training config JSON to TensorBoard
   when `training.tensorboard_enabled` is true.
   Direction reporting includes selected-branch `train/angle_mean_deg` and,
@@ -212,8 +213,17 @@ side/top strip input loading.
   chooses one branch per supervised point with
   `abs(dot(decoded_predicted_axis, target_axis)) * predicted_presence`.
   Direction loss and positive presence BCE apply only to that selected branch.
-  Dense negative presence supervision applies to every branch at global
-  negative voxels.
+  During training in two-branch configs, routing is grouped by 2x2x2 voxel
+  chunks within each patch. If one branch falls below 10% of grouped positive
+  sparse supervision in a batch, the best missing quota for that branch is
+  force-routed to it by grouped detached choice score, then broadcast to every
+  sparse positive point in the chosen chunk. Test/eval metrics keep the raw
+  detached argmax routing. Dense negative presence supervision applies to every
+  branch at global negative voxels. Presence BCE is normalized per `(patch,
+  branch)` for sparse positives and dense negatives, and the resulting
+  positive/negative terms are summed without an extra global balancing factor.
+  The default 3D loss weights are `direction_weight: 10.0` and
+  `presence_weight: 1.0`.
 - Passing `--resume /path/to/current.pt` for normal training restores the
   model and optimizer state from that snapshot, continues from the stored step,
   and still creates a fresh timestamped run directory. The TensorBoard config

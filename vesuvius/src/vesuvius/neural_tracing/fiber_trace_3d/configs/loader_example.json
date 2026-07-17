@@ -49,6 +49,7 @@
     "learning_rate": 0.001,
     "scalar_log_interval": 100,
     "checkpoint_interval": 100,
+    "kept_snapshot_interval": 10000,
     "test_interval": 500,
     "test_control_points": 0,
     "test_start_sample_index": 0,
@@ -65,7 +66,7 @@
     "test_trace2cp_block_context_voxels": 4,
     "device": "auto",
     "tensorboard_enabled": true,
-    "direction_weight": 1.0,
+    "direction_weight": 10.0,
     "presence_weight": 1.0
   },
   "datasets": [
