@@ -2,6 +2,10 @@
 
 ## 2026-07-17
 
+- Changed native 3D Trace2CP whole-fiber visualization from four rows to
+  eight rows by adding regenerated/fused side and top strip volume/presence
+  panels for every restart-delimited span, with span control-point markers
+  and CP-plane trace-distance labels drawn on all rows.
 - Reworked native 3D Trace2CP whole-fiber visualization to render
   restart-delimited continuous long strips with fixed 64 px cross-strip width
   while preserving progressive overwrite of `trace2cp_native_3d_vis.jpg`.
@@ -55,7 +59,7 @@
   single-segment inspection while bare `--fiber-json` runs whole-fiber tracing.
 - Added native 3D Trace2CP whole-fiber mode: `--fiber-json` without explicit
   CP indices now traces consecutive CP planes through the full fiber, reports a
-  restart-rate metric, and progressively overwrites the four-row native JPG
+  restart-rate metric, and progressively overwrites the native JPG
   after each completed segment.
 
 ## 2026-07-16

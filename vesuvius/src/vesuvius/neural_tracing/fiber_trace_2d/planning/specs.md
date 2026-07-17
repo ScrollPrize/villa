@@ -569,19 +569,28 @@
   presence signal sampled on the displayed side/top strip coordinates from the
   native inference cache. Presence sampling should batch strip coordinates per
   strip rather than call model inference per pixel.
-- Native 3D whole-fiber visualization uses four stitched panel rows: side
-  volume, side 3D presence, top volume, and top 3D presence. Whole-fiber mode
-  renders restart-delimited continuous long strips instead of one visual column
-  per CP segment. Each visual span starts at the first CP after a restart and
-  ends at the latest traced target CP in that span. Failed segment overlays are
-  cut before they overlap the next CP region, then the displayed trace resumes
-  from the restart CP in the next visual span. Whole-fiber visualization always
-  uses a fixed 64 px cross-strip width; this width is visualization-only, and a
-  traced path leaving the 64 px strip must only clip the drawn overlay, not
-  invalidate tracing, metric calculation, or 3D sampling. The regular
-  `trace2cp_native_3d_vis.jpg` path must be overwritten after every completed
-  segment so long whole-fiber runs show partial visual progress at the final
-  output filename.
+- Native 3D whole-fiber visualization uses eight stitched panel rows: initial
+  side volume, initial side 3D presence, initial top volume, initial top 3D
+  presence, regenerated/fused side volume, regenerated/fused side 3D presence,
+  regenerated/fused top volume, and regenerated/fused top 3D presence.
+  Whole-fiber mode renders restart-delimited continuous long strips instead of
+  one visual column per CP segment. Each visual span starts at the first CP
+  after a restart and ends at the latest traced target CP in that span. Failed
+  segment overlays are cut before they overlap the next CP region, then the
+  displayed trace resumes from the restart CP in the next visual span.
+  Whole-fiber visualization always uses a fixed 64 px cross-strip width; this
+  width is visualization-only, and a traced path leaving the 64 px strip must
+  only clip the drawn overlay, not invalidate tracing, metric calculation, or
+  3D sampling. The regenerated/fused rows rebuild side/top strip geometry from
+  the traced span line using the same refined-source path as single-pair
+  rendering. The regular `trace2cp_native_3d_vis.jpg` path must be overwritten
+  after every completed segment so long whole-fiber runs show partial visual
+  progress at the final output filename. The control points covered by each
+  visual span must be projected into the displayed initial and regenerated
+  side/top strip frames and drawn as markers on all eight rows. Each marker
+  must also show that CP's native trace distance at the CP plane: the span
+  start CP is `d=0.0`, reached target planes show the segment's
+  `in_plane_error_voxels`, and unreached target planes show `miss`.
 - Native forward, reverse, and fused 3D traces are projected onto the initial
   side and top strip coordinate systems for overlay. The same visualization
   also rebuilds side/top strip geometry from the fused native 3D line and

@@ -6,7 +6,7 @@ import math
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
@@ -3716,6 +3716,28 @@ def _project_trace_to_initial_strip(
     return xy[valid].astype(np.float32, copy=False)
 
 
+def _project_points_to_source_strip_preserve_slots(
+    source: _Trace2CpSegmentSource,
+    points_xyz_base: np.ndarray,
+    *,
+    axis_name: str,
+) -> np.ndarray:
+    points = np.asarray(points_xyz_base, dtype=np.float32)
+    if int(points.shape[0]) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    projected_xyz, projected_xy, projected_valid = _closest_source_line_projection(points, source)
+    axes, axes_valid = _sample_source_axes_at_xy(source, axis_name, projected_xy)
+    spacing = float(source.record.volume_spacing_base)
+    if not np.isfinite(spacing) or spacing <= 0.0:
+        raise ValueError(f"invalid volume spacing for native point projection: {spacing}")
+    offsets = np.sum((points - projected_xyz) * axes, axis=1) / np.float32(spacing)
+    xy = projected_xy.copy()
+    xy[:, 1] += offsets.astype(np.float32, copy=False)
+    valid = projected_valid & axes_valid & np.isfinite(xy).all(axis=1)
+    xy[~valid] = np.nan
+    return xy.astype(np.float32, copy=False)
+
+
 def _volume_trace_to_source_trace_xyz(
     source: _Trace2CpSegmentSource,
     trace_xyz_base: np.ndarray,
@@ -3835,6 +3857,8 @@ def _draw_trace_panel(
     target_xy: np.ndarray,
     *,
     title: str,
+    control_points_xy: np.ndarray | None = None,
+    control_point_labels: Sequence[str] | None = None,
     overlays: tuple[tuple[np.ndarray, tuple[int, int, int, int]], ...] = (),
     line_width: int = 2,
     overlay_width: int = 2,
@@ -3871,6 +3895,44 @@ def _draw_trace_panel(
         ]
         if len(overlay_pts) >= 2:
             draw.line(overlay_pts, fill=color, width=max(1, int(overlay_width)))
+    if control_points_xy is not None:
+        cp_points = np.asarray(control_points_xy, dtype=np.float32)
+        if cp_points.ndim == 2 and cp_points.shape[1] == 2:
+            labels = list(control_point_labels or ())
+            for cp_index, (x_f, y_f) in enumerate(cp_points):
+                if not (np.isfinite(x_f) and np.isfinite(y_f)):
+                    continue
+                x, y = float(x_f), float(y_f) + text_pad
+                draw.ellipse(
+                    (x - 2.5, y - 2.5, x + 2.5, y + 2.5),
+                    fill=(255, 255, 0, 210),
+                    outline=(0, 0, 0, 180),
+                    width=1,
+                )
+                if cp_index < len(labels):
+                    label = str(labels[cp_index])
+                    if label:
+                        text_x = x + 4.0
+                        text_y = y - 9.0
+                        try:
+                            bbox = draw.textbbox((text_x, text_y), label)
+                        except AttributeError:
+                            bbox = (
+                                int(text_x),
+                                int(text_y),
+                                int(text_x + 6 * len(label)),
+                                int(text_y + 10),
+                            )
+                        draw.rectangle(
+                            (
+                                float(bbox[0]) - 1.0,
+                                float(bbox[1]) - 1.0,
+                                float(bbox[2]) + 1.0,
+                                float(bbox[3]) + 1.0,
+                            ),
+                            fill=(0, 0, 0, 150),
+                        )
+                        draw.text((text_x, text_y), label, fill=(255, 255, 255, 240))
     for xy, color in (
         (start_xy, (0, 255, 255, 255)),
         (target_xy, (255, 64, 220, 255)),
@@ -4293,6 +4355,55 @@ def _whole_fiber_segment_group_overlays_for_view(
     return tuple(overlays)
 
 
+def _whole_fiber_span_control_points_xyz_base(
+    source: _Trace2CpSegmentSource,
+    span: _NativeWholeFiberVisualSpan,
+) -> np.ndarray:
+    start = int(span.start_cp_index)
+    end = int(span.end_cp_index)
+    step = 1 if end >= start else -1
+    indices = np.arange(start, end + step, step, dtype=np.int64)
+    cps_zyx = np.asarray(source.record.fiber.control_points_zyx, dtype=np.float32)
+    valid = (indices >= 0) & (indices < int(cps_zyx.shape[0]))
+    indices = indices[valid]
+    if int(indices.size) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    return cps_zyx[indices][:, [2, 1, 0]].astype(np.float32, copy=False)
+
+
+def _whole_fiber_span_control_points_for_view(
+    source: _Trace2CpSegmentSource,
+    span: _NativeWholeFiberVisualSpan,
+    *,
+    axis_name: str,
+) -> np.ndarray:
+    cps_xyz = _whole_fiber_span_control_points_xyz_base(source, span)
+    if int(cps_xyz.shape[0]) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    return _project_points_to_source_strip_preserve_slots(source, cps_xyz, axis_name=axis_name)
+
+
+def _whole_fiber_span_control_point_labels(
+    span: _NativeWholeFiberVisualSpan,
+) -> tuple[str, ...]:
+    start = int(span.start_cp_index)
+    end = int(span.end_cp_index)
+    step = 1 if end >= start else -1
+    cp_indices = np.arange(start, end + step, step, dtype=np.int64)
+    labels_by_cp: dict[int, str] = {start: "d=0.0"}
+    for segment in span.segments:
+        cp_index = int(segment.target_cp_index)
+        if not bool(segment.reached_target_plane):
+            labels_by_cp[cp_index] = "miss"
+            continue
+        distance = float(segment.in_plane_error_voxels)
+        if not math.isfinite(distance):
+            labels_by_cp[cp_index] = "d=inf"
+        else:
+            labels_by_cp[cp_index] = f"d={distance:.1f}"
+    return tuple(labels_by_cp.get(int(cp_index), "") for cp_index in cp_indices)
+
+
 def _native_whole_fiber_visual_spans(
     segments: tuple[NativeWholeFiberSegmentResult, ...] | list[NativeWholeFiberSegmentResult],
 ) -> tuple[_NativeWholeFiberVisualSpan, ...]:
@@ -4332,7 +4443,7 @@ def _native_whole_fiber_visual_spans(
 
 
 def _compose_whole_fiber_panel_blocks(
-    panel_blocks: list[tuple[Any, Any, Any, Any]],
+    panel_blocks: list[tuple[Any, ...]],
     *,
     status_text: str | None = None,
 ):
@@ -4346,9 +4457,9 @@ def _compose_whole_fiber_panel_blocks(
         if status_text:
             draw.text((8, 60), status_text, fill=(120, 220, 255, 255))
         return sheet
-    row_count = 4
+    row_count = max(int(len(block)) for block in panel_blocks)
     row_heights = [
-        max(int(block[row].height) for block in panel_blocks)
+        max(int(block[row].height) for block in panel_blocks if row < int(len(block)))
         for row in range(row_count)
     ]
     separator_width = 12
@@ -4359,8 +4470,9 @@ def _compose_whole_fiber_panel_blocks(
     x = 0
     for block_index, (block, block_width) in enumerate(zip(panel_blocks, block_widths)):
         y = 0
-        for row, panel in enumerate(block):
-            sheet.alpha_composite(panel, (x, y))
+        for row in range(row_count):
+            if row < int(len(block)):
+                sheet.alpha_composite(block[row], (x, y))
             y += row_heights[row]
         x += int(block_width)
         if block_index + 1 < len(panel_blocks):
@@ -4391,6 +4503,69 @@ def _build_native_whole_fiber_span_source(
     )
 
 
+def _trim_failed_source_trace_before_target(
+    source_trace: np.ndarray,
+    *,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    margin_px: float = 8.0,
+) -> np.ndarray:
+    trace = np.asarray(source_trace, dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[1] != 3 or trace.shape[0] <= 1:
+        return trace.astype(np.float32, copy=True)
+    start_x = float(np.asarray(start_xy, dtype=np.float32)[0])
+    target_x = float(np.asarray(target_xy, dtype=np.float32)[0])
+    sign = 1.0 if target_x >= start_x else -1.0
+    cutoff = target_x - sign * max(0.0, float(margin_px))
+    if sign >= 0.0:
+        keep = trace[:, 0] <= cutoff
+    else:
+        keep = trace[:, 0] >= cutoff
+    keep &= np.isfinite(trace).all(axis=1)
+    if int(np.count_nonzero(keep)) >= 2:
+        return trace[keep].astype(np.float32, copy=False)
+    finite = trace[np.isfinite(trace).all(axis=1)]
+    return finite[: min(2, int(finite.shape[0]))].astype(np.float32, copy=False)
+
+
+def _native_whole_fiber_span_source_trace(
+    source: _Trace2CpSegmentSource,
+    span: _NativeWholeFiberVisualSpan,
+) -> np.ndarray:
+    spacing = float(source.record.volume_spacing_base)
+    parts: list[np.ndarray] = []
+    previous_success = False
+    for segment in span.segments:
+        trace_xyz = _trace_zyx_to_base_xyz(segment.trace_zyx, spacing)
+        source_trace = _volume_trace_to_source_trace_xyz(source, trace_xyz)
+        if not bool(segment.success):
+            source_trace = _trim_failed_source_trace_before_target(
+                source_trace,
+                start_xy=_trace2cp_source_control_point_xy(source, int(segment.start_cp_index)),
+                target_xy=_trace2cp_source_control_point_xy(source, int(segment.target_cp_index)),
+            )
+        if int(source_trace.shape[0]) < 2:
+            continue
+        if parts and previous_success and bool(segment.success):
+            parts.append(source_trace[1:].copy())
+        else:
+            parts.append(source_trace.copy())
+        previous_success = bool(segment.success)
+    if not any(part.size for part in parts):
+        raise ValueError(
+            "native whole-fiber regenerated strip has no usable traced points: "
+            f"start_cp={span.start_cp_index} end_cp={span.end_cp_index}"
+        )
+    trace = np.concatenate([part for part in parts if part.size], axis=0).astype(np.float32)
+    if int(trace.shape[0]) < 2:
+        raise ValueError(
+            "native whole-fiber regenerated strip needs at least two traced points: "
+            f"points={int(trace.shape[0])} start_cp={span.start_cp_index} "
+            f"end_cp={span.end_cp_index}"
+        )
+    return trace
+
+
 def _render_native_whole_fiber_span_panels(
     geometry_loader: Any,
     *,
@@ -4399,7 +4574,7 @@ def _render_native_whole_fiber_span_panels(
     cache: NativeTraceFieldCache,
     image_normalization: str,
     strip_cross_width_px: int = 64,
-) -> tuple[Any, Any, Any, Any]:
+) -> tuple[Any, ...]:
     source = _build_native_whole_fiber_span_source(
         geometry_loader,
         start_cp_index=int(span.start_cp_index),
@@ -4417,6 +4592,17 @@ def _render_native_whole_fiber_span_panels(
         span.segments,
         axis_name="side_axis_xyz",
     )
+    side_control_points = _whole_fiber_span_control_points_for_view(
+        source,
+        span,
+        axis_name="offset_axis_xyz",
+    )
+    top_control_points = _whole_fiber_span_control_points_for_view(
+        source,
+        span,
+        axis_name="side_axis_xyz",
+    )
+    control_point_labels = _whole_fiber_span_control_point_labels(span)
     _sample, side_image, side_valid = geometry_loader.sample_trace2cp_segment_source(source)
     top_image, top_valid = geometry_loader.sample_trace2cp_top_strip_source(source)
     side_coords_xyz, side_grid_valid = geometry_loader.trace2cp_segment_coords_xyz(source)
@@ -4436,6 +4622,50 @@ def _render_native_whole_fiber_span_panels(
         spacing_base=spacing,
         progress_label=f"span{span.start_cp_index}-{span.end_cp_index}-top",
     )
+    regenerated_source_trace = _native_whole_fiber_span_source_trace(source, span)
+    regenerated_source = geometry_loader.build_trace2cp_refined_segment_source(
+        source,
+        regenerated_source_trace,
+        device=torch.device("cpu"),
+    )
+    regenerated_side_control_points = _whole_fiber_span_control_points_for_view(
+        regenerated_source,
+        span,
+        axis_name="offset_axis_xyz",
+    )
+    regenerated_top_control_points = _whole_fiber_span_control_points_for_view(
+        regenerated_source,
+        span,
+        axis_name="side_axis_xyz",
+    )
+    _regenerated_sample, regenerated_side_image, regenerated_side_valid = (
+        geometry_loader.sample_trace2cp_segment_source(regenerated_source)
+    )
+    regenerated_top_image, regenerated_top_valid = geometry_loader.sample_trace2cp_top_strip_source(
+        regenerated_source
+    )
+    regenerated_side_coords_xyz, regenerated_side_grid_valid = (
+        geometry_loader.trace2cp_segment_coords_xyz(regenerated_source)
+    )
+    regenerated_top_coords_xyz, regenerated_top_grid_valid = (
+        geometry_loader.trace2cp_top_strip_coords_xyz(regenerated_source)
+    )
+    regenerated_side_presence, regenerated_side_presence_valid = _sample_presence_on_strip(
+        cache,
+        regenerated_side_coords_xyz,
+        np.asarray(regenerated_side_grid_valid, dtype=bool)
+        & np.asarray(regenerated_side_valid, dtype=bool),
+        spacing_base=spacing,
+        progress_label=f"span{span.start_cp_index}-{span.end_cp_index}-regenerated-side",
+    )
+    regenerated_top_presence, regenerated_top_presence_valid = _sample_presence_on_strip(
+        cache,
+        regenerated_top_coords_xyz,
+        np.asarray(regenerated_top_grid_valid, dtype=bool)
+        & np.asarray(regenerated_top_valid, dtype=bool),
+        spacing_base=spacing,
+        progress_label=f"span{span.start_cp_index}-{span.end_cp_index}-regenerated-top",
+    )
     failed = any(not bool(segment.success) for segment in span.segments)
     title_suffix = (
         f"cp {span.start_cp_index}->{span.end_cp_index} "
@@ -4449,6 +4679,8 @@ def _render_native_whole_fiber_span_panels(
             source.start_control_point_xy,
             source.target_control_point_xy,
             title=f"side input {title_suffix}",
+            control_points_xy=side_control_points,
+            control_point_labels=control_point_labels,
             overlays=side_overlays,
         ),
         _draw_trace_panel(
@@ -4458,6 +4690,8 @@ def _render_native_whole_fiber_span_panels(
             source.start_control_point_xy,
             source.target_control_point_xy,
             title=f"side 3D presence {title_suffix}",
+            control_points_xy=side_control_points,
+            control_point_labels=control_point_labels,
             overlays=side_overlays,
         ),
         _draw_trace_panel(
@@ -4467,6 +4701,8 @@ def _render_native_whole_fiber_span_panels(
             source.start_control_point_xy,
             source.target_control_point_xy,
             title=f"top input {title_suffix}",
+            control_points_xy=top_control_points,
+            control_point_labels=control_point_labels,
             overlays=top_overlays,
         ),
         _draw_trace_panel(
@@ -4476,7 +4712,61 @@ def _render_native_whole_fiber_span_panels(
             source.start_control_point_xy,
             source.target_control_point_xy,
             title=f"top 3D presence {title_suffix}",
+            control_points_xy=top_control_points,
+            control_point_labels=control_point_labels,
             overlays=top_overlays,
+        ),
+        _draw_trace_panel(
+            _image_to_u8(
+                regenerated_side_image,
+                regenerated_side_valid,
+                normalization=image_normalization,
+            ),
+            regenerated_side_valid,
+            regenerated_source.line_xy,
+            regenerated_source.start_control_point_xy,
+            regenerated_source.target_control_point_xy,
+            title=f"regenerated side input {title_suffix}",
+            control_points_xy=regenerated_side_control_points,
+            control_point_labels=control_point_labels,
+            line_width=1,
+        ),
+        _draw_trace_panel(
+            _presence_to_u8(regenerated_side_presence, regenerated_side_presence_valid),
+            regenerated_side_presence_valid,
+            regenerated_source.line_xy,
+            regenerated_source.start_control_point_xy,
+            regenerated_source.target_control_point_xy,
+            title=f"regenerated side 3D presence {title_suffix}",
+            control_points_xy=regenerated_side_control_points,
+            control_point_labels=control_point_labels,
+            line_width=1,
+        ),
+        _draw_trace_panel(
+            _image_to_u8(
+                regenerated_top_image,
+                regenerated_top_valid,
+                normalization=image_normalization,
+            ),
+            regenerated_top_valid,
+            regenerated_source.line_xy,
+            regenerated_source.start_control_point_xy,
+            regenerated_source.target_control_point_xy,
+            title=f"regenerated top input {title_suffix}",
+            control_points_xy=regenerated_top_control_points,
+            control_point_labels=control_point_labels,
+            line_width=1,
+        ),
+        _draw_trace_panel(
+            _presence_to_u8(regenerated_top_presence, regenerated_top_presence_valid),
+            regenerated_top_presence_valid,
+            regenerated_source.line_xy,
+            regenerated_source.start_control_point_xy,
+            regenerated_source.target_control_point_xy,
+            title=f"regenerated top 3D presence {title_suffix}",
+            control_points_xy=regenerated_top_control_points,
+            control_point_labels=control_point_labels,
+            line_width=1,
         ),
     )
 
@@ -4764,7 +5054,7 @@ def run_native_trace2cp(
         out_dir = Path(export_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         image_path = out_dir / "trace2cp_native_3d_vis.jpg"
-        closed_panel_blocks: list[tuple[Any, Any, Any, Any]] = []
+        closed_panel_blocks: list[tuple[Any, ...]] = []
         active_segments: list[NativeWholeFiberSegmentResult] = []
         active_start_cp_index = 0
         _compose_whole_fiber_panel_blocks(

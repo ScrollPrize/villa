@@ -46,6 +46,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets
 from vesuvius.neural_tracing.fiber_trace_3d.projection import (
     project_3d_direction_to_2d_frame,
 )
+from vesuvius.neural_tracing.fiber_trace_3d import trace2cp_tool as trace2cp_tool_module
 from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_bridge import (
     project_3d_output_to_trace2cp_fields,
     score_trace2cp_projected_fields,
@@ -56,6 +57,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     NativeTraceResult,
     _adaptive_trace2cp_cross_strip_height,
     _build_native_whole_fiber_span_source,
+    _compose_whole_fiber_panel_blocks,
     _fiber_line_tangent_zyx_toward_target,
     _image_to_u8,
     _interpolate_plane_crossing,
@@ -65,6 +67,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _native_whole_fiber_visual_spans,
     _native_smoothness_loss_torch,
     _parse_args,
+    _render_native_whole_fiber_span_panels,
     _native_trace_geometry_normal_record,
     _project_trace_to_initial_strip,
     _resolve_native_trace2cp_selection,
@@ -2437,6 +2440,140 @@ def test_native_3d_whole_fiber_span_source_uses_fixed_cross_width() -> None:
     assert kwargs["rf_margin_px"] == pytest.approx(17.5)
     assert kwargs["cross_strip_height_px"] == 64
     assert kwargs["sample_mode"] == "flat"
+
+
+def test_native_3d_whole_fiber_span_panels_include_regenerated_rows(monkeypatch) -> None:
+    from PIL import Image
+
+    def make_source(tag: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            tag=tag,
+            record=SimpleNamespace(volume_spacing_base=1.0),
+            line_xy=np.asarray([[0.0, 1.0], [3.0, 1.0]], dtype=np.float32),
+            start_control_point_xy=np.asarray([0.0, 1.0], dtype=np.float32),
+            target_control_point_xy=np.asarray([3.0, 1.0], dtype=np.float32),
+        )
+
+    class FakeGeometryLoader:
+        def __init__(self) -> None:
+            self.source = make_source("initial")
+            self.regenerated_source = make_source("regenerated")
+            self.refined_calls: list[np.ndarray] = []
+
+        def build_trace2cp_segment_source(self, *args, **kwargs):
+            return self.source
+
+        def build_trace2cp_refined_segment_source(self, source, trace, *, device):
+            assert source is self.source
+            assert device == torch.device("cpu")
+            self.refined_calls.append(np.asarray(trace, dtype=np.float32))
+            return self.regenerated_source
+
+        def sample_trace2cp_segment_source(self, source):
+            value = 32.0 if source.tag == "initial" else 96.0
+            image = np.full((3, 4), value, dtype=np.float32)
+            valid = np.ones((3, 4), dtype=bool)
+            return None, image, valid
+
+        def sample_trace2cp_top_strip_source(self, source):
+            value = 64.0 if source.tag == "initial" else 128.0
+            image = np.full((3, 4), value, dtype=np.float32)
+            valid = np.ones((3, 4), dtype=bool)
+            return image, valid
+
+        def trace2cp_segment_coords_xyz(self, _source):
+            return np.zeros((3, 4, 3), dtype=np.float32), np.ones((3, 4), dtype=bool)
+
+        def trace2cp_top_strip_coords_xyz(self, _source):
+            return np.zeros((3, 4, 3), dtype=np.float32), np.ones((3, 4), dtype=bool)
+
+    monkeypatch.setattr(
+        trace2cp_tool_module,
+        "_whole_fiber_segment_group_overlays_for_view",
+        lambda *args, **kwargs: (),
+    )
+    monkeypatch.setattr(
+        trace2cp_tool_module,
+        "_volume_trace_to_source_trace_xyz",
+        lambda _source, _trace_xyz: np.asarray(
+            [[0.0, 1.0, 0.0], [1.5, 1.2, 0.0], [3.0, 1.0, 0.0]],
+            dtype=np.float32,
+        ),
+    )
+    monkeypatch.setattr(
+        trace2cp_tool_module,
+        "_sample_presence_on_strip",
+        lambda *args, **kwargs: (
+            np.full((3, 4), 0.75, dtype=np.float32),
+            np.ones((3, 4), dtype=bool),
+        ),
+    )
+    monkeypatch.setattr(
+        trace2cp_tool_module,
+        "_trace2cp_source_control_point_xy",
+        lambda _source, cp_index: np.asarray(
+            [1.5 * float(cp_index), 1.0],
+            dtype=np.float32,
+        ),
+    )
+    cp_marker_calls: list[tuple[str, str]] = []
+
+    def fake_control_points_for_view(source, _span, *, axis_name):
+        cp_marker_calls.append((str(source.tag), str(axis_name)))
+        return np.asarray([[0.0, 1.0], [1.5, 1.0], [3.0, 1.0]], dtype=np.float32)
+
+    draw_control_points: list[np.ndarray] = []
+    draw_control_point_labels: list[tuple[str, ...]] = []
+
+    def fake_draw_trace_panel(
+        *args,
+        control_points_xy=None,
+        control_point_labels=None,
+        **kwargs,
+    ):
+        draw_control_points.append(np.asarray(control_points_xy, dtype=np.float32))
+        draw_control_point_labels.append(tuple(control_point_labels or ()))
+        return Image.new("RGBA", (4, 3), (0, 0, 0, 255))
+
+    monkeypatch.setattr(
+        trace2cp_tool_module,
+        "_whole_fiber_span_control_points_for_view",
+        fake_control_points_for_view,
+    )
+    monkeypatch.setattr(trace2cp_tool_module, "_draw_trace_panel", fake_draw_trace_panel)
+    segment_01 = _native_whole_fiber_segment(0, 1, success=True)
+    segment_01.in_plane_error_voxels = 3.25
+    segment_12 = _native_whole_fiber_segment(1, 2, success=False)
+    span = SimpleNamespace(
+        start_cp_index=0,
+        end_cp_index=2,
+        segments=(segment_01, segment_12),
+        restart_after=False,
+    )
+    loader = FakeGeometryLoader()
+
+    panels = _render_native_whole_fiber_span_panels(
+        loader,
+        span=span,
+        trace2cp_rf_margin_px=0.0,
+        cache=object(),
+        image_normalization="none",
+    )
+    sheet = _compose_whole_fiber_panel_blocks([panels])
+
+    assert len(panels) == 8
+    assert len(loader.refined_calls) == 1
+    assert loader.refined_calls[0].shape == (5, 3)
+    assert sheet.height == sum(panel.height for panel in panels)
+    assert cp_marker_calls == [
+        ("initial", "offset_axis_xyz"),
+        ("initial", "side_axis_xyz"),
+        ("regenerated", "offset_axis_xyz"),
+        ("regenerated", "side_axis_xyz"),
+    ]
+    assert len(draw_control_points) == 8
+    assert all(points.shape == (3, 2) for points in draw_control_points)
+    assert draw_control_point_labels == [("d=0.0", "d=3.2", "miss")] * 8
 
 
 def test_native_3d_trace2cp_block_router_uses_trusted_core() -> None:
