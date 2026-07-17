@@ -153,12 +153,14 @@ side/top strip input loading.
   aligned to the previous accepted trace step.
   Native Trace2CP now uses beam search by default (`--beam-width 8`) instead of
   committing greedily at every step. Each beam expands the same branch-aware
-  candidate score, cumulative loss selects the best target-plane-reaching
-  state, and `--beam-prune-distance-voxels` merges near-duplicate live states.
-  `--beam-width 1` preserves the previous greedy control flow. Candidate
-  selection is batched per beam state: candidate points are grouped by trusted
-  inference block, sampled with batched `grid_sample`, decoded in torch, and
-  reduced with tensor operations.
+  candidate score for `--beam-lookahead-steps` future steps before pruning
+  (default `3`), cumulative loss selects the best target-plane-reaching state,
+  and `--beam-prune-distance-voxels` merges near-duplicate live states after
+  the lookahead expansion. `--beam-width 1` preserves the previous greedy
+  control flow and does not use lookahead. Candidate selection is batched per
+  beam state: candidate points are grouped by trusted inference block, sampled
+  with batched `grid_sample`, decoded in torch, and reduced with tensor
+  operations.
 - Uses a distance-derived step guard by default:
   `ceil(max_step_factor * cp_distance_voxels / step_voxels)`, with
   `--max-step-factor 3.0`. `--max-steps` is an optional extra cap, and

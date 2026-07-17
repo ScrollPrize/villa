@@ -1,6 +1,7 @@
-# Native 3D Trace2CP Beam Search
+# Native 3D Trace2CP Beam Lookahead
 
-Replace the native 3D Trace2CP greedy one-step candidate choice with a small
-beam search so tracing can keep multiple plausible continuations over several
-steps. Reduce the native cone candidate density from the current opaque
-`25x25` grid to explicit 5-degree angular steps inside the configured cone.
+Extend native 3D Trace2CP beam search so pruning can happen after a short
+brute-force future expansion instead of after every single step. The goal is to
+survive difficult regions where one or more locally suboptimal steps are needed
+before the trace returns to a better path. Start with a default lookahead depth
+of `3` steps.

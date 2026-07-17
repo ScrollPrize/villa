@@ -51,6 +51,10 @@
 - [ ] multiple laybers per patch : use some roi structure for fibers so we can supervise all fibers within some patch
 - [ ] when evalutationg multi-dir& multi-presence outputs: can just do dot product against the reference angel (e.g. when tracing, slicing)
 
+# beam-search
+- [ ] beamsearch
+- [ ] short brute-forcce lookahead
+
 # multidir
 - [ ] test a loss on multi-dir outputs being perpendicular
     - [ ] and the cross product being the surface normal?

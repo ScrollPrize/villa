@@ -407,11 +407,14 @@
   not supported.
 - Native 3D Trace2CP uses beam search by default. `--beam-width 8` keeps
   multiple cumulative candidate histories, `--beam-prune-distance-voxels 1.0`
-  merges near-duplicate live beam states, and `--beam-width 1` preserves the
-  previous greedy one-step-commit control flow. When target-plane candidates
-  are found, the reached beam with the lowest cumulative score is selected; if
-  no beam reaches the target plane before the step guard, the best live state is
-  returned with the same failure reason semantics as greedy tracing.
+  merges near-duplicate live beam states, and `--beam-lookahead-steps 3`
+  expands short future trees before pruning. Pruning happens after the
+  configured lookahead expansion, not after every single candidate step.
+  `--beam-width 1` preserves the previous greedy one-step-commit control flow
+  and bypasses lookahead. When target-plane candidates are found, the reached
+  beam with the lowest cumulative score is selected; if no beam reaches the
+  target plane before the step guard, the best live state is returned with the
+  same failure reason semantics as greedy tracing.
 - Native 3D candidate selection is vectorized per beam state. Candidate points
   are grouped by trusted inference block, sampled with batched `grid_sample`,
   decoded with the analytic Lasagna 3x2 torch decoder, and scored as tensors.

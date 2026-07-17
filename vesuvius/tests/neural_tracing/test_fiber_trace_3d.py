@@ -1734,6 +1734,7 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().cone_angle_step_degrees == 5.0
     assert NativeTrace2CpConfig().beam_width == 8
     assert NativeTrace2CpConfig().beam_prune_distance_voxels == 1.0
+    assert NativeTrace2CpConfig().beam_lookahead_steps == 3
     assert NativeTrace2CpConfig().max_step_factor == 3.0
     assert NativeTrace2CpConfig().max_steps is None
     assert NativeTrace2CpConfig().smoothness_weight == 2.0
@@ -2651,14 +2652,14 @@ def test_native_3d_trace2cp_first_step_uses_supplied_line_tangent() -> None:
     assert np.allclose(result.trace_zyx[1], [0.0, 0.0, 2.0])
 
 
-def test_native_3d_trace2cp_beam_keeps_initially_worse_valid_path() -> None:
+def test_native_3d_trace2cp_beam_lookahead_keeps_initially_worse_valid_path() -> None:
     class FakeCache:
         device = torch.device("cpu")
 
         def sample_point(self, point_zyx: np.ndarray):
             point = np.asarray(point_zyx, dtype=np.float32)
             radial_offset = float(np.linalg.norm(point[:2]))
-            if float(point[2]) > 0.5 and radial_offset < 0.1:
+            if float(point[2]) > 0.5 and (radial_offset < 0.1 or float(point[1]) < -0.1):
                 return (
                     np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
                     0.0,
@@ -2676,7 +2677,10 @@ def test_native_3d_trace2cp_beam_keeps_initially_worse_valid_path() -> None:
             directions = np.zeros((count, 3), dtype=np.float32)
             directions[:, 2] = 1.0
             radial_offset = np.linalg.norm(points[:, :2], axis=1)
-            presence = np.where(radial_offset < 0.1, 1.0, 0.8).astype(np.float32)
+            presence = np.full((count,), 0.6, dtype=np.float32)
+            presence = np.where(points[:, 1] > 0.1, 0.7, presence)
+            presence = np.where(points[:, 1] < -0.1, 0.95, presence)
+            presence = np.where(radial_offset < 0.1, 1.0, presence).astype(np.float32)
             valid = np.ones((count,), dtype=bool)
             return (
                 torch.as_tensor(directions, dtype=torch.float32),
@@ -2701,7 +2705,7 @@ def test_native_3d_trace2cp_beam_keeps_initially_worse_valid_path() -> None:
             smoothness_weight=0.0,
         ),
     )
-    beam = trace_native_3d_one_way(
+    one_step_beam = trace_native_3d_one_way(
         **kwargs,
         cfg=NativeTrace2CpConfig(
             step_voxels=1.0,
@@ -2709,6 +2713,20 @@ def test_native_3d_trace2cp_beam_keeps_initially_worse_valid_path() -> None:
             cone_angle_step_degrees=25.0,
             beam_width=2,
             beam_prune_distance_voxels=0.0,
+            beam_lookahead_steps=1,
+            trace_step_limit=6,
+            smoothness_weight=0.0,
+        ),
+    )
+    lookahead_beam = trace_native_3d_one_way(
+        **kwargs,
+        cfg=NativeTrace2CpConfig(
+            step_voxels=1.0,
+            cone_angle_degrees=25.0,
+            cone_angle_step_degrees=25.0,
+            beam_width=2,
+            beam_prune_distance_voxels=0.0,
+            beam_lookahead_steps=3,
             trace_step_limit=6,
             smoothness_weight=0.0,
         ),
@@ -2716,9 +2734,11 @@ def test_native_3d_trace2cp_beam_keeps_initially_worse_valid_path() -> None:
 
     assert not greedy.reached_target_plane
     assert greedy.reason == "invalid_current_point"
-    assert beam.reached_target_plane
-    assert beam.reason == "target_plane"
-    assert np.max(np.linalg.norm(beam.trace_zyx[:, :2], axis=1)) > 0.1
+    assert not one_step_beam.reached_target_plane
+    assert one_step_beam.reason == "all_candidates_invalid"
+    assert lookahead_beam.reached_target_plane
+    assert lookahead_beam.reason == "target_plane"
+    assert np.max(np.linalg.norm(lookahead_beam.trace_zyx[:, :2], axis=1)) > 0.1
 
 
 def test_native_3d_trace2cp_field_cache_rejects_nonblocking_sampler() -> None:
@@ -2786,6 +2806,7 @@ def test_native_3d_trace2cp_constant_field_reaches_target_plane() -> None:
             step_voxels=2.0,
             cone_angle_degrees=25.0,
             cone_grid_size=5,
+            beam_width=1,
             max_steps=20,
             inference_patch_shape_zyx=(16, 16, 16),
             core_margin_voxels=2,
@@ -2832,6 +2853,7 @@ def test_native_3d_trace2cp_trace_step_limit_stops_partial_trace() -> None:
             step_voxels=2.0,
             cone_angle_degrees=25.0,
             cone_grid_size=5,
+            beam_width=1,
             max_steps=20,
             trace_step_limit=3,
             inference_patch_shape_zyx=(16, 16, 16),
@@ -2881,6 +2903,7 @@ def test_native_3d_trace2cp_max_step_factor_limits_trace() -> None:
             step_voxels=2.0,
             cone_angle_degrees=25.0,
             cone_grid_size=5,
+            beam_width=1,
             max_step_factor=0.25,
             inference_patch_shape_zyx=(16, 16, 16),
             core_margin_voxels=2,

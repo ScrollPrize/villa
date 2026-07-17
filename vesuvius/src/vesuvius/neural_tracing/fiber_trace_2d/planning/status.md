@@ -1,11 +1,9 @@
-# Native 3D Trace2CP Beam Search Status
+# Native 3D Trace2CP Beam Lookahead Status
 
-- [x] Read local workflow and current native 3D tracing config.
-- [x] Write current task and implementation plan.
-- [x] Review plan against current specs/docs before implementation.
-- [x] Implement angular-step cone candidate generation.
-- [x] Implement beam-state native one-way tracing.
-- [x] Add CLI/config flags and defaults.
+- [x] Read local workflow and define current task.
+- [x] Write task plan.
+- [x] Implement lookahead config and CLI.
+- [x] Implement N-step beam expansion before pruning.
 - [x] Update specs/docs/changelog.
 - [x] Add regression tests.
 - [x] Run focused 3D fiber trace tests.

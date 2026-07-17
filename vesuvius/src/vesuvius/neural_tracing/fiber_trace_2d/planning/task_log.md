@@ -1,32 +1,33 @@
-# Native 3D Trace2CP Beam Search Log
+# Native 3D Trace2CP Beam Lookahead Log
 
 ## Implemented
 
-- Added `cone_angle_step_degrees`, `beam_width`, and
-  `beam_prune_distance_voxels` to `NativeTrace2CpConfig` and the native 3D
-  Trace2CP CLI.
-- Added deterministic tangent-plane angular candidate generation. The default
-  `25` degree cone with `5` degree steps produces 81 unit candidates including
-  the center direction.
-- Kept the legacy `cone_grid_size` square-grid generator as an explicit
-  fallback when `cone_angle_step_degrees <= 0`.
-- Refactored candidate scoring so greedy and beam tracing share the same
-  branch-aware candidate-by-branch loss tensor.
-- Added beam-state native one-way tracing. `beam_width <= 1` keeps the existing
-  greedy control flow; wider beams accumulate local candidate losses, prune
-  near-duplicate live states, and select the lowest-loss target-plane-reaching
-  state.
-- Updated native Trace2CP summary JSON with beam and cone-step settings.
+- Added `beam_lookahead_steps` to `NativeTrace2CpConfig` and CLI flag
+  `--beam-lookahead-steps`, defaulting to `3`.
+- Changed the native 3D beam tracer so it expands up to
+  `beam_lookahead_steps` future steps before pruning back to `beam_width`.
+- Kept `beam_width <= 1` on the greedy compatibility path, so lookahead is not
+  used for explicit greedy runs.
+- Added `beam_lookahead_steps` to native Trace2CP summary JSON and progress
+  text.
+- Added a fake-cache regression where one-step beam pruning drops the needed
+  branch but three-step lookahead reaches the target plane.
+- Pinned older constant-field native Trace2CP tests to `beam_width=1` because
+  they validate trace guards/geometry, not default beam runtime.
 - Updated specs, code-structure docs, changelog, and status.
 
 ## Validation
 
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  - Result: `83 passed in 7.49s`
+- First focused test run was interrupted after it became slow: legacy
+  constant-field tests were accidentally exercising default beam lookahead.
+- After pinning those compatibility tests to greedy:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+  - Result: `83 passed in 8.36s`
 
 ## Deviations / Deferred
 
 - No planned requirement was intentionally skipped.
-- The legacy `--cone-grid-size` CLI remains accepted for compatibility, but it
-  is ignored by default while `--cone-angle-step-degrees` is positive. Set
-  `--cone-angle-step-degrees 0` to use the old grid path.
+- Runtime cost is intentionally higher for default beam tracing: with
+  `beam_width=8`, 81 default candidates, and lookahead `3`, the frontier can be
+  much larger before pruning. The depth is configurable with
+  `--beam-lookahead-steps`.
