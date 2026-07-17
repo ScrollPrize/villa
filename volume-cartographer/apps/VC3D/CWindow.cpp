@@ -3622,6 +3622,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 // Destructor
 CWindow::~CWindow()
 {
+    _destroyingWindow = true;
     if (qApp) {
         qApp->removeEventFilter(this);
     }
@@ -4744,13 +4745,19 @@ void CWindow::openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QS
         connect(escapeShortcut, &QShortcut::activated, dialog, &QWidget::close);
         QWidget* tabWidget = dialog;
         connect(dialog, &QObject::destroyed, this, [this, tabWidget]() {
+            if (_destroyingWindow) {
+                return;
+            }
             if (!_workspaceTabs) {
                 return;
             }
             for (int i = 0; i < _workspaceTabs->count(); ++i) {
                 if (_workspaceTabs->widget(i) == tabWidget) {
+                    const bool wasCurrent = _workspaceTabs->currentIndex() == i;
                     _workspaceTabs->removeTab(i);
-                    switchToMainWorkspace();
+                    if (wasCurrent) {
+                        switchToMainWorkspace();
+                    }
                     break;
                 }
             }
@@ -8644,6 +8651,7 @@ void CWindow::saveWindowState()
 
 void CWindow::closeEvent(QCloseEvent* event)
 {
+    _destroyingWindow = true;
     // Flush a render-bench recording (if any) before teardown.
     if (_benchRecorder && _benchRecorder->attached()) {
         _benchRecorder->save();

@@ -327,6 +327,7 @@ private:
 
 
     Ui_VCMainWindow ui;
+    bool _destroyingWindow{false};
     QTabWidget* _workspaceTabs{nullptr};
     QMainWindow* _segmentWorkspaceWindow{nullptr};
     StatusDockPanelHost* _statusDockPanelHost{nullptr};

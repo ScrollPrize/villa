@@ -67,6 +67,38 @@ struct GeneratedOverlay {
         bool manual = false;
     };
 
+    struct BranchLinkMarker {
+        uint64_t linkedFiberId = 0;
+        cv::Vec3f localControlPoint{std::numeric_limits<float>::quiet_NaN(),
+                                    std::numeric_limits<float>::quiet_NaN(),
+                                    std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f linkedControlPoint{std::numeric_limits<float>::quiet_NaN(),
+                                     std::numeric_limits<float>::quiet_NaN(),
+                                     std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f localDirection{std::numeric_limits<float>::quiet_NaN(),
+                                 std::numeric_limits<float>::quiet_NaN(),
+                                 std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f linkedDirection{std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f planePoint{std::numeric_limits<float>::quiet_NaN(),
+                             std::numeric_limits<float>::quiet_NaN(),
+                             std::numeric_limits<float>::quiet_NaN()};
+        bool estimated = false;
+    };
+
+    struct FiberIntersectionMarker {
+        cv::Vec3f point{std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN()};
+        uint64_t fiberId = 0;
+        int segmentIndex = -1;
+        double arclength = std::numeric_limits<double>::quiet_NaN();
+        double distance = std::numeric_limits<double>::quiet_NaN();
+        bool projectedBranchLink = false;
+        std::optional<cv::Vec3f> connectorStart;
+    };
+
     std::vector<cv::Vec3f> linePoints;
     std::vector<std::vector<cv::Vec3f>> branchLinePoints;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
@@ -79,6 +111,8 @@ struct GeneratedOverlay {
     std::vector<double> markerLinePositions;
     std::vector<ControlPointMarker> controlPoints;
     std::vector<PredSnapMarker> predSnapPoints;
+    std::vector<BranchLinkMarker> branchLinks;
+    std::vector<FiberIntersectionMarker> fiberIntersections;
     double currentLinePosition = std::numeric_limits<double>::quiet_NaN();
     GeneratedCurrentLineMarkerState currentLineMarkerState =
         GeneratedCurrentLineMarkerState::Neutral;
@@ -104,6 +138,7 @@ struct GeneratedViews {
     QString lineSurfaceTitle;
     std::string lineSideSliceName;
     QString lineSideSliceTitle;
+    std::shared_ptr<QuadSurface> lineSideSlice;
     std::string currentCutName;
     std::shared_ptr<PlaneSurface> currentCutSurface;
     std::string sideCutName;
@@ -123,6 +158,8 @@ struct GeneratedViews {
     bool initialCurrentCutFollowsStripMouse = true;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
     std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints;
+    std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks;
+    std::vector<GeneratedOverlay::FiberIntersectionMarker> fiberIntersections;
     std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics;
 };
 
@@ -158,6 +195,63 @@ struct GeneratedLineViewNavigationState {
 inline bool finiteGeneratedPoint(const cv::Vec3f& point)
 {
     return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
+inline bool finiteStoredPoint(const cv::Vec3d& point)
+{
+    return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
+inline bool storedPointsApproximatelyEqual(const cv::Vec3d& a,
+                                           const cv::Vec3d& b,
+                                           double tolerance = 1.0e-6)
+{
+    if (!finiteStoredPoint(a) || !finiteStoredPoint(b)) {
+        return false;
+    }
+    const cv::Vec3d delta = a - b;
+    return delta.dot(delta) <= tolerance * tolerance;
+}
+
+inline std::optional<cv::Vec3d> storedSinglePointFiberSeed(
+    const std::vector<cv::Vec3d>& controlPoints,
+    const std::vector<cv::Vec3d>& linePoints)
+{
+    std::optional<cv::Vec3d> controlSeed;
+    size_t finiteControlCount = 0;
+    for (const cv::Vec3d& point : controlPoints) {
+        if (!finiteStoredPoint(point)) {
+            continue;
+        }
+        ++finiteControlCount;
+        if (finiteControlCount == 1) {
+            controlSeed = point;
+        }
+    }
+
+    std::optional<cv::Vec3d> lineSeed;
+    size_t finiteLineCount = 0;
+    for (const cv::Vec3d& point : linePoints) {
+        if (!finiteStoredPoint(point)) {
+            continue;
+        }
+        ++finiteLineCount;
+        if (finiteLineCount == 1) {
+            lineSeed = point;
+        }
+    }
+
+    if (finiteControlCount > 1 || finiteLineCount > 1) {
+        return std::nullopt;
+    }
+    if (!controlSeed && !lineSeed) {
+        return std::nullopt;
+    }
+    if (controlSeed && lineSeed &&
+        !storedPointsApproximatelyEqual(*controlSeed, *lineSeed)) {
+        return std::nullopt;
+    }
+    return controlSeed ? controlSeed : lineSeed;
 }
 
 inline cv::Vec3f normalizedGeneratedVectorOrNan(const cv::Vec3f& vector)
@@ -816,8 +910,11 @@ struct GeneratedControlPointContextMenuOptions {
     size_t linePointCount = 0;
     double linePosition = std::numeric_limits<double>::quiet_NaN();
     bool stripViewer = false;
+    cv::Vec3f branchLinkDirection{std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN()};
     std::function<void(double, cv::Vec3f)> deleteControlPoint;
-    std::function<void(size_t)> addBranch;
+    std::function<void(size_t, cv::Vec3f, bool, cv::Vec3f)> addBranch;
     std::function<void(uint64_t, int)> openBranch;
 };
 
