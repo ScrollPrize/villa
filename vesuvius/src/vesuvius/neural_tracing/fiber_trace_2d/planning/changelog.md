@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-07-17
+
+- Added optional native 3D Trace2CP smoothness cost:
+  `--smoothness-weight` adds a hinge-squared previous-step direction penalty to
+  the candidate cost, and `--fiber-json --sample-index` remains single-segment
+  inspection while bare `--fiber-json` runs whole-fiber tracing.
+- Added native 3D Trace2CP whole-fiber mode: `--fiber-json` without explicit
+  CP indices now traces consecutive CP planes through the full fiber, reports a
+  restart-rate metric, and progressively overwrites the four-row native JPG
+  after each completed segment.
+
 ## 2026-07-16
 
 - Changed native 3D Trace2CP candidate selection to maximize the product of

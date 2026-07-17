@@ -102,9 +102,13 @@ side/top strip input loading.
   python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool <config.json> --checkpoint <snapshot.pt> --sample-index 0 --export-dir <dir>
   ```
 
-- `--fiber-json <path> --start-cp-index A --target-cp-index B` runs the native
-  tool on an explicit CP segment from one fiber JSON. Existing
-  `--sample-index` plus `--target-offset` selection remains available.
+- `--fiber-json <path>` without sample or CP selectors runs native whole-fiber
+  tracing over all consecutive CP pairs from that fiber. Supplying
+  `--fiber-json <path> --sample-index N` keeps deterministic flat
+  single-segment inspection, and
+  `--fiber-json <path> --start-cp-index A --target-cp-index B` keeps explicit
+  single-segment debug mode. Existing `--sample-index` plus `--target-offset`
+  selection remains available when no fiber JSON is supplied.
 - Traces directly in selected-level ZYX voxel coordinates, not in a projected
   2D strip. It lazily runs dense 3D inference blocks around queried points,
   crops each block to a trusted core, and routes every candidate lookup to the
@@ -128,18 +132,19 @@ side/top strip input loading.
 - Decodes Lasagna 3x2 direction channels analytically with the shared 3D
   direction decoder, aligns sign-ambiguous axes to the current trace direction,
   samples a deterministic 25x25 square angular grid mapped onto the cone disk,
-  and scores candidates by maximizing
-  `dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * candidate_presence`.
-  The sampled axes are sign-aligned before dot products are evaluated; native
-  3D Trace2CP does not expose additive direction/presence candidate-selection
-  weights.
+  and chooses candidates by minimizing
+  `1 - dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * candidate_presence`.
+  The sampled axes are sign-aligned before dot products are evaluated. Optional
+  `--smoothness-weight` adds a hinge-squared cost against the previous accepted
+  step direction after `--smoothness-free-angle-degrees`; native 3D Trace2CP
+  does not expose additive direction/presence candidate-selection weights.
 - The first search step uses the adjacent CP-local fiber-line tangent in the
   direction of the target CP's line index. It does not use the straight CP-to-CP
   chord. Later steps use the sampled model direction at the current point,
   aligned to the previous accepted trace step.
   Candidate selection is batched per step: candidate points are grouped by
   trusted inference block, sampled with batched `grid_sample`, decoded in torch,
-  and reduced with one tensor `argmax`.
+  and reduced with one tensor `argmin`.
 - Uses a distance-derived step guard by default:
   `ceil(max_step_factor * cp_distance_voxels / step_voxels)`, with
   `--max-step-factor 3.0`. `--max-steps` is an optional extra cap, and
@@ -159,11 +164,24 @@ side/top strip input loading.
   added to the sheet. Before the first panel exists, the file contains a small
   status canvas, so there is always one current status/partial/final image to
   inspect during long renders.
+- In whole-fiber mode, `trace2cp_native_3d_vis.jpg` is also overwritten after
+  every completed CP segment. The whole-fiber sheet has four stitched rows:
+  side volume, side 3D presence, top volume, and top 3D presence. Each segment
+  becomes the next column; failed segment overlays are cut before the next CP
+  region and the displayed trace resumes from the restart CP.
 - Stops when the trace crosses the plane through the target CP with normal
   from start CP to target CP. The stdout/summary metrics are
   `native_trace2cp_plane_error` and
   `native_trace2cp_closest_target_error`; these are tool-local diagnostics and
   do not replace the projected `test/trace2cp_error` metric used by training.
+- Whole-fiber mode traces continuously from CP plane to CP plane. A segment
+  succeeds when it reaches the next CP plane within the segment budget and its
+  in-plane selected-voxel error to the target CP is below
+  `--whole-fiber-error-threshold-voxels` (default `100`). Failures count one
+  restart and resume from the failed target CP. Stdout prints the whole-fiber
+  metric as `native_trace2cp_fiber_restart_rate=... restarts=... segments=...`;
+  the JSON summary includes per-segment status, errors, step counts, restart
+  points, and the last successful reference arc distance.
 - Fuses forward and reverse traces with the same center-weighted
   closest-overlap semantics as 2D Trace2CP, but in selected-level 3D ZYX
   coordinates. The tool keeps traced order, interpolates both traces across

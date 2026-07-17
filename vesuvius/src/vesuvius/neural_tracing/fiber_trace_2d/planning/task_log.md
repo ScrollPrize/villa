@@ -1,16 +1,21 @@
-# Native 3D Whole-Fiber Trace2CP Task Log
+# Native 3D Trace Fusion Pairwise Meeting Log
 
-## Planning
+## Planning Notes
 
-- Created `planning/task.md` for whole-fiber native 3D Trace2CP.
-- Created `planning/task_plan.md` with behavior, spec/docs updates, tests,
-  changelog, and non-goals.
-- Added the requirement that whole-fiber visualization overwrites the regular
-  output JPG after every completed segment, so partial visual progress is
-  visible during long runs.
-- No tracer implementation changes were made in this planning step.
+- Current native 3D fusion still searches over straight CP-axis progress and
+  interpolates each trace at that progress.
+- The requested change replaces that primary meeting search with pairwise
+  scoring over traced arc length.
+- The plan keeps `gap_factor = 1.0` exactly as requested for the first
+  implementation.
+- The previous accidental native Trace2CP startup stdout change should be
+  removed during implementation because it was not part of the requested image
+  behavior fix.
 
-## Deviations Or Deferred Items
+## Deviations / Deferred Items
 
-- None for planning. Implementation, docs updates, and tests are intentionally
-  left for the next step after plan review.
+- No implementation has been done for this task yet.
+
+## Validation
+
+- Pending implementation.

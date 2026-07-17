@@ -346,6 +346,11 @@
   index mode requires `--fiber-json`, requires both CP indices, uses flat
   single-fiber CP ordering, and must reuse the existing 2D Trace2CP segment
   source builder with `target_control_point_index`.
+- When `--fiber-json <path>` is supplied without explicit CP indices, native
+  3D Trace2CP defaults to whole-fiber mode. Whole-fiber mode traces
+  consecutive CP pairs from CP `0` to the last CP. Supplying both explicit CP
+  indices keeps the single-segment debug mode; supplying only one CP index
+  must fail loudly.
 - The native 3D tool traces in selected-level ZYX voxel coordinates. It loads
   the same dataset/test-dataset CP pair as the visualization geometry loader,
   decodes six Lasagna 3x2 direction channels analytically, treats predicted
@@ -394,10 +399,14 @@
 - Native 3D candidate selection is vectorized per trace step. Candidate points
   are grouped by trusted inference block, sampled with batched `grid_sample`,
   decoded with the analytic Lasagna 3x2 torch decoder, and scored as one tensor
-  batch. Candidate selection maximizes
-  `dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * candidate_presence`.
+  batch. Candidate selection minimizes a cost. The base cost is
+  `1 - dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * candidate_presence`.
   Both sampled axes are sign-aligned to the candidate step direction before dot
-  products are evaluated. The native 3D tool does not expose additive
+  products are evaluated. Optional search smoothness adds
+  `smoothness_weight * max(0, angle(previous_step_dir, step_dir) - free_angle)^2`,
+  using radians. The defaults are `--smoothness-weight 0.0` and
+  `--smoothness-free-angle-degrees 10.0`, so smoothness is opt-in and the base
+  behavior remains unchanged. The native 3D tool does not expose additive
   direction/presence candidate-selection weights.
 - The first native 3D Trace2CP search step is seeded from the adjacent
   CP-local fiber-line tangent in the direction of the target CP's line index.
@@ -428,6 +437,19 @@
 - Native 3D tracing stops by intersecting the plane through the target CP with
   normal from start CP to target CP. The returned trace appends the exact
   linear interpolation point on that target plane when crossing occurs.
+- In native 3D whole-fiber mode, `--fiber-json <path>` without sample or CP
+  selectors traces the entire fiber. `--fiber-json <path> --sample-index N`
+  remains single-segment inspection using deterministic flat sample selection,
+  and explicit `--start-cp-index/--target-cp-index` remains explicit
+  single-segment inspection.
+- In native 3D whole-fiber mode, each segment targets the plane through the
+  next CP with the local CP-to-CP segment direction as plane normal. A segment
+  succeeds only when the trace reaches that plane within the segment's step
+  budget and the in-plane selected-voxel error to the target CP is at most
+  `--whole-fiber-error-threshold-voxels` (default `100`). Successful segments
+  continue from the reached crossing and carry the accepted trace direction.
+  Failed segments count one restart and resume tracing from the failed target
+  CP with a fresh CP-local fiber tangent.
 - Native 3D forward/reverse fusion must preserve each trace's traced order.
   It must not sort points by CP-axis progress and average them. Fusion uses
   the same center-weighted closest-overlap idea as 2D Trace2CP: find the
@@ -442,6 +464,11 @@
   `native_trace2cp_closest_target_error`, plus fusion diagnostics such as
   selected progress, raw gap, considered gap, and center penalty. These are
   not the public 2D `trace2cp_error`.
+- Native 3D whole-fiber mode reports its tool-local metric on a single line as
+  `native_trace2cp_fiber_restart_rate=... restarts=... segments=...`, where
+  the restart rate is `restart_count / segment_count`. Its JSON summary stores
+  per-segment status, reason, reached-plane flag, in-plane error, step count,
+  restart point, and reference arc distance at the last successful CP plane.
 - Native 3D visualization first builds the initial side/top strip source from
   the existing 2D Trace2CP geometry loader for the input CP pair. The configured
   cross-strip height is a maximum cap: the rendered cross height is the odd
@@ -458,6 +485,13 @@
   presence signal sampled on the displayed side/top strip coordinates from the
   native inference cache. Presence sampling should batch strip coordinates per
   strip rather than call model inference per pixel.
+- Native 3D whole-fiber visualization uses four stitched panel rows: side
+  volume, side 3D presence, top volume, and top 3D presence. Each CP segment is
+  rendered as the next column. Failed segment overlays are cut before they
+  overlap the next CP region, then the displayed trace resumes from the
+  restart CP. The regular `trace2cp_native_3d_vis.jpg` path must be overwritten
+  after every completed segment so long whole-fiber runs show partial visual
+  progress at the final output filename.
 - Native forward, reverse, and fused 3D traces are projected onto the initial
   side and top strip coordinate systems for overlay. The same visualization
   also rebuilds side/top strip geometry from the fused native 3D line and

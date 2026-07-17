@@ -53,19 +53,23 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_bridge import (
 from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     NativeTrace2CpConfig,
     NativeTraceFieldCache,
+    NativeTraceResult,
     _adaptive_trace2cp_cross_strip_height,
     _fiber_line_tangent_zyx_toward_target,
     _image_to_u8,
     _interpolate_plane_crossing,
+    _native_trace2cp_whole_fiber_mode,
     _project_trace_to_initial_strip,
     _resolve_native_trace2cp_selection,
     _sample_presence_on_strip,
     _score_candidate_batch,
+    _target_plane_in_plane_error_voxels,
     _volume_trace_to_source_trace_xyz,
     fuse_forward_reverse_traces,
     generate_cone_candidates,
     trace_native_3d_one_way,
     trace_native_3d_pair,
+    trace_native_3d_whole_fiber,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
@@ -1706,6 +1710,43 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().cone_grid_size == 25
     assert NativeTrace2CpConfig().max_step_factor == 3.0
     assert NativeTrace2CpConfig().max_steps is None
+    assert NativeTrace2CpConfig().smoothness_weight == 0.0
+    assert NativeTrace2CpConfig().smoothness_free_angle_degrees == 10.0
+    assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 100.0
+
+
+def test_native_3d_trace2cp_mode_routes_only_unselected_fiber_json_to_whole_fiber() -> None:
+    assert _native_trace2cp_whole_fiber_mode(
+        fiber_json=Path("fiber.json"),
+        sample_index=None,
+        start_cp_index=None,
+        target_cp_index=None,
+    )
+    assert not _native_trace2cp_whole_fiber_mode(
+        fiber_json=Path("fiber.json"),
+        sample_index=0,
+        start_cp_index=None,
+        target_cp_index=None,
+    )
+    assert not _native_trace2cp_whole_fiber_mode(
+        fiber_json=Path("fiber.json"),
+        sample_index=None,
+        start_cp_index=0,
+        target_cp_index=1,
+    )
+    assert not _native_trace2cp_whole_fiber_mode(
+        fiber_json=None,
+        sample_index=None,
+        start_cp_index=None,
+        target_cp_index=None,
+    )
+    with pytest.raises(ValueError, match="provided together"):
+        _native_trace2cp_whole_fiber_mode(
+            fiber_json=Path("fiber.json"),
+            sample_index=None,
+            start_cp_index=0,
+            target_cp_index=None,
+        )
 
 
 def test_native_3d_trace2cp_explicit_segment_selection_uses_fiber_cp_indices() -> None:
@@ -2010,6 +2051,178 @@ def test_native_3d_trace2cp_plane_crossing_interpolates() -> None:
     assert np.allclose(crossing, [0.0, 0.0, 4.0])
 
 
+def test_native_3d_trace2cp_target_plane_error_uses_in_plane_distance() -> None:
+    error = _target_plane_in_plane_error_voxels(
+        np.asarray([3.0, 4.0, 12.0], dtype=np.float32),
+        target_zyx=np.asarray([0.0, 0.0, 10.0], dtype=np.float32),
+        plane_normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+
+    assert error == pytest.approx(5.0, abs=1.0e-6)
+
+
+def _whole_native_trace_record() -> SimpleNamespace:
+    points = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [20.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    fiber = Vc3dFiber(
+        path=Path("fiber.json"),
+        version=1,
+        line_points_xyz=points,
+        control_points_xyz=points.copy(),
+        generation=1,
+        metadata={},
+    )
+    return SimpleNamespace(fiber=fiber, volume_spacing_base=1.0)
+
+
+def test_native_3d_whole_fiber_trace_all_success_has_zero_restart_rate() -> None:
+    record = _whole_native_trace_record()
+    cache = SimpleNamespace(_blocks={})
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, target_zyx], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_voxels=1.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.segment_count == 2
+    assert result.restart_count == 0
+    assert result.restart_rate == pytest.approx(0.0)
+    assert [segment.success for segment in result.segments] == [True, True]
+    assert np.allclose(result.stitched_trace_zyx[[0, -1]], [[0.0, 0.0, 0.0], [0.0, 0.0, 20.0]])
+
+
+def test_native_3d_whole_fiber_trace_restarts_after_plane_miss() -> None:
+    record = _whole_native_trace_record()
+    cache = SimpleNamespace(_blocks={})
+    starts: list[np.ndarray] = []
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        starts.append(np.asarray(start_zyx, dtype=np.float32).copy())
+        if len(starts) == 1:
+            return NativeTraceResult(
+                trace_zyx=np.stack(
+                    [
+                        start_zyx,
+                        np.asarray(start_zyx, dtype=np.float32) + np.asarray([0.0, 0.0, 2.0], dtype=np.float32),
+                    ],
+                    axis=0,
+                ).astype(np.float32),
+                reached_target_plane=False,
+                reason="max_step_factor",
+                steps=(),
+            )
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, target_zyx], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_voxels=1.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.restart_count == 1
+    assert result.restart_rate == pytest.approx(0.5)
+    assert result.segments[0].reason == "max_step_factor"
+    assert result.segments[0].restart
+    assert np.allclose(starts[1], [0.0, 0.0, 10.0])
+
+
+def test_native_3d_whole_fiber_trace_restarts_after_large_in_plane_error() -> None:
+    record = _whole_native_trace_record()
+    cache = SimpleNamespace(_blocks={})
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        if np.allclose(target_zyx, [0.0, 0.0, 10.0]):
+            crossing = np.asarray(target_zyx, dtype=np.float32) + np.asarray([0.0, 5.0, 0.0], dtype=np.float32)
+            return NativeTraceResult(
+                trace_zyx=np.stack([start_zyx, crossing], axis=0).astype(np.float32),
+                reached_target_plane=True,
+                reason="target_plane",
+                steps=(),
+            )
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, target_zyx], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_voxels=1.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.restart_count == 1
+    assert result.segments[0].reached_target_plane
+    assert result.segments[0].reason == "in_plane_error"
+    assert result.segments[0].in_plane_error_voxels == pytest.approx(5.0, abs=1.0e-6)
+
+
+def test_native_3d_whole_fiber_trace_last_segment_failure_finishes() -> None:
+    points = np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float32)
+    record = SimpleNamespace(
+        fiber=Vc3dFiber(
+            path=Path("fiber.json"),
+            version=1,
+            line_points_xyz=points,
+            control_points_xyz=points.copy(),
+            generation=1,
+            metadata={},
+        ),
+        volume_spacing_base=1.0,
+    )
+    cache = SimpleNamespace(_blocks={})
+
+    def fake_trace(_cache, *, start_zyx, **_kwargs):
+        return NativeTraceResult(
+            trace_zyx=np.stack(
+                [start_zyx, np.asarray(start_zyx, dtype=np.float32) + np.asarray([0.0, 0.0, 1.0], dtype=np.float32)],
+                axis=0,
+            ).astype(np.float32),
+            reached_target_plane=False,
+            reason="trace_step_limit",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_voxels=1.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.segment_count == 1
+    assert result.restart_count == 1
+    assert result.segments[0].reason == "trace_step_limit"
+
+
 def test_native_3d_trace2cp_block_router_uses_trusted_core() -> None:
     encoded = encode_lasagna_direction_3x2(
         torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
@@ -2132,17 +2345,20 @@ def test_native_3d_trace2cp_candidate_score_maximizes_dot_product_presence() -> 
         [0.7, math.sqrt(1.0 - 0.7 * 0.7), 0.0],
         dtype=np.float32,
     )
-    best_index, total_loss, direction_loss, presence_loss, rejected = _score_candidate_batch(
-        FakeCache(),
-        current_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
-        candidate_directions=np.stack(
-            [
-                np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
-                candidate_b,
-            ],
-            axis=0,
-        ),
-        next_points=np.zeros((2, 3), dtype=np.float32),
+    best_index, total_loss, direction_loss, presence_loss, smoothness_loss, rejected = (
+        _score_candidate_batch(
+            FakeCache(),
+            current_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            previous_step_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            candidate_directions=np.stack(
+                [
+                    np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+                    candidate_b,
+                ],
+                axis=0,
+            ),
+            next_points=np.zeros((2, 3), dtype=np.float32),
+        )
     )
 
     assert best_index == 0
@@ -2150,6 +2366,51 @@ def test_native_3d_trace2cp_candidate_score_maximizes_dot_product_presence() -> 
     assert total_loss == pytest.approx(0.49, abs=1.0e-6)
     assert direction_loss == pytest.approx(0.0, abs=1.0e-6)
     assert presence_loss == pytest.approx(0.49, abs=1.0e-6)
+    assert smoothness_loss == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_candidate_smoothness_can_reject_branch_switch() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_points_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            assert count == 2
+            directions = torch.tensor(
+                [
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.ones((count,), dtype=torch.float32)
+            valid = torch.ones((count,), dtype=torch.bool)
+            return directions, presence, valid
+
+    branch_direction = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+    previous_direction = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    candidates = np.stack([branch_direction, previous_direction], axis=0)
+
+    best_index_without_smoothness, *_ = _score_candidate_batch(
+        FakeCache(),
+        current_direction=branch_direction,
+        previous_step_direction=previous_direction,
+        candidate_directions=candidates,
+        next_points=np.zeros((2, 3), dtype=np.float32),
+    )
+    best_index_with_smoothness, total_loss, *_rest = _score_candidate_batch(
+        FakeCache(),
+        current_direction=branch_direction,
+        previous_step_direction=previous_direction,
+        candidate_directions=candidates,
+        next_points=np.zeros((2, 3), dtype=np.float32),
+        smoothness_weight=2.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+
+    assert best_index_without_smoothness == 0
+    assert best_index_with_smoothness == 1
+    assert total_loss == pytest.approx(1.0, abs=1.0e-6)
 
 
 def test_native_3d_trace2cp_fiber_line_tangent_uses_adjacent_segment_not_chord() -> None:

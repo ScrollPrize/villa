@@ -1,29 +1,23 @@
-# Native 3D Whole-Fiber Trace2CP
+# Native 3D Trace Fusion Pairwise Meeting
 
-Extend the native 3D Trace2CP tool so `--fiber-json` defaults to tracing the
-entire fiber when no explicit `--start-cp-index/--target-cp-index` is given.
+Change native 3D Trace2CP forward/reverse fusion so it no longer depends on
+straight CP-axis progress as the primary meeting-coordinate.
 
 Required behavior:
 
-- Start tracing at the first control point.
-- Trace continuously from CP plane to CP plane through consecutive fiber
-  segments.
-- For each segment, require the trace to reach the target CP plane within that
-  segment's step budget.
-- When the target CP plane is reached, compute the in-plane error from the
-  traced crossing to the target CP.
-- Continue tracing if the in-plane error is within a threshold, defaulting to
-  100 selected-scale voxels.
-- On failure, record the traced reference-line distance up to the last
-  successful CP plane, count one restart, and resume tracing from the failed
-  target CP.
-- Report the whole-fiber error as
-  `restart_count / segment_count`.
-- Keep explicit single-segment mode for debugging when both CP indices are
-  supplied.
-- For whole-fiber rendering, keep the four useful panel types: side volume,
-  side 3D presence, top volume, and top 3D presence.
-- Update the output image segment by segment while tracing/rendering so partial
-  fiber progress is visible during long whole-fiber runs.
-- When a restart happens, cut off the failed trace before it overlaps the next
-  CP region, then stitch the displayed trace again from the restart CP.
+- Build the fused line from the best pair of points on the forward and reverse
+  traces.
+- Score each candidate point pair by:
+  - Euclidean distance between the two points, times a factor of `1.0` for now;
+  - plus the traced arc length from the forward trace start to the forward
+    candidate;
+  - plus the traced arc length from the reverse trace start to the reverse
+    candidate.
+- Pick the candidate point pair with the lowest score.
+- Use the midpoint of that pair as the fusion meeting point.
+- Lerp/warp the forward partial trace from start to the forward meeting point
+  and the reverse partial trace from target to the reverse meeting point toward
+  the shared midpoint, then concatenate and arc-length resample.
+- Preserve existing single-pair and whole-fiber native 3D Trace2CP interfaces.
+- Add tests that catch cases where straight-axis progress fusion picks the
+  wrong meeting point.

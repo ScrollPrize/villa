@@ -6,7 +6,7 @@ import math
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -45,11 +45,14 @@ class NativeTrace2CpConfig:
     step_voxels: float = 4.0
     cone_angle_degrees: float = 25.0
     cone_grid_size: int = 25
+    smoothness_weight: float = 0.0
+    smoothness_free_angle_degrees: float = 10.0
     max_step_factor: float = 3.0
     max_steps: int | None = None
     trace_step_limit: int | None = None
     inference_patch_shape_zyx: tuple[int, int, int] = (64, 64, 64)
     core_margin_voxels: int = 8
+    whole_fiber_error_threshold_voxels: float = 100.0
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,7 @@ class NativeTraceStep:
     presence_loss: float
     total_loss: float
     rejected_candidates: int
+    smoothness_loss: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -95,6 +99,32 @@ class NativeTracePairResult:
 
 
 @dataclass(frozen=True)
+class NativeWholeFiberSegmentResult:
+    start_cp_index: int
+    target_cp_index: int
+    trace_zyx: np.ndarray
+    start_zyx: np.ndarray
+    target_zyx: np.ndarray
+    reached_target_plane: bool
+    success: bool
+    restart: bool
+    reason: str
+    in_plane_error_voxels: float
+    reference_arc_distance_voxels: float
+    step_count: int
+
+
+@dataclass(frozen=True)
+class NativeWholeFiberResult:
+    segments: tuple[NativeWholeFiberSegmentResult, ...]
+    restart_count: int
+    restart_rate: float
+    segment_count: int
+    stitched_trace_zyx: np.ndarray
+    inferred_blocks: int
+
+
+@dataclass(frozen=True)
 class _InferredBlock:
     origin_zyx: np.ndarray
     shape_zyx: tuple[int, int, int]
@@ -113,6 +143,23 @@ class _NativeTrace2CpSelection:
     start_cp_index: int
     target_cp_index: int
     explicit_segment: bool
+
+
+def _native_trace2cp_whole_fiber_mode(
+    *,
+    fiber_json: Path | None,
+    sample_index: int | None,
+    start_cp_index: int | None,
+    target_cp_index: int | None,
+) -> bool:
+    if (start_cp_index is None) != (target_cp_index is None):
+        raise ValueError("--start-cp-index and --target-cp-index must be provided together")
+    return (
+        fiber_json is not None
+        and sample_index is None
+        and start_cp_index is None
+        and target_cp_index is None
+    )
 
 
 def _resolve_config_relative_path(path: str | Path, raw_config: dict[str, Any]) -> str:
@@ -612,9 +659,19 @@ def _score_candidate_batch(
     cache: NativeTraceFieldCache,
     *,
     current_direction: np.ndarray,
+    previous_step_direction: np.ndarray,
     candidate_directions: np.ndarray,
     next_points: np.ndarray,
-) -> tuple[int | None, float, float, float, int]:
+    smoothness_weight: float = 0.0,
+    smoothness_free_angle_degrees: float = 10.0,
+) -> tuple[int | None, float, float, float, float, int]:
+    if not math.isfinite(float(smoothness_weight)) or float(smoothness_weight) < 0.0:
+        raise ValueError("smoothness_weight must be finite and non-negative")
+    if (
+        not math.isfinite(float(smoothness_free_angle_degrees))
+        or float(smoothness_free_angle_degrees) < 0.0
+    ):
+        raise ValueError("smoothness_free_angle_degrees must be finite and non-negative")
     candidates = torch.as_tensor(
         np.asarray(candidate_directions, dtype=np.float32),
         dtype=torch.float32,
@@ -628,32 +685,87 @@ def _score_candidate_batch(
     )
     current = F.normalize(current, p=2.0, dim=1, eps=float(_EPS))
     candidates = _align_axes_torch(candidates, current.expand_as(candidates))
+    previous = torch.as_tensor(
+        np.asarray(previous_step_direction, dtype=np.float32).reshape(1, 3),
+        dtype=torch.float32,
+        device=cache.device,
+    )
+    previous = F.normalize(previous, p=2.0, dim=1, eps=float(_EPS))
     next_directions, presences, valid = cache.sample_points_torch(next_points)
     current_dot = torch.sum(current.expand_as(candidates) * candidates, dim=1).clamp(-1.0, 1.0)
     next_aligned = _align_axes_torch(next_directions, candidates)
     next_dot = torch.sum(next_aligned * candidates, dim=1).clamp(-1.0, 1.0)
     presence = presences.clamp(0.0, 1.0)
     score = current_dot * next_dot * presence
-    score = torch.where(valid, score, torch.full_like(score, -torch.inf))
     direction_loss = 1.0 - 0.5 * (current_dot + next_dot)
     presence_loss = 1.0 - presence
     total_loss = 1.0 - score
+    if float(smoothness_weight) > 0.0:
+        smooth_dot = torch.sum(previous.expand_as(candidates) * candidates, dim=1).clamp(-1.0, 1.0)
+        smooth_angle = torch.acos(smooth_dot)
+        free_angle = math.radians(float(smoothness_free_angle_degrees))
+        smoothness_loss = (
+            torch.clamp(smooth_angle - float(free_angle), min=0.0).square()
+            * float(smoothness_weight)
+        )
+        total_loss = total_loss + smoothness_loss
+    else:
+        smoothness_loss = torch.zeros_like(total_loss)
+    total_loss = torch.where(valid, total_loss, torch.full_like(total_loss, torch.inf))
     valid_count = int(torch.count_nonzero(valid).detach().cpu())
     rejected = int(valid.numel()) - valid_count
     if valid_count == 0:
-        return None, math.inf, math.inf, math.inf, rejected
-    best_index = int(torch.argmax(score).detach().cpu())
+        return None, math.inf, math.inf, math.inf, math.inf, rejected
+    best_index = int(torch.argmin(total_loss).detach().cpu())
     return (
         best_index,
         float(total_loss[best_index].detach().cpu()),
         float(direction_loss[best_index].detach().cpu()),
         float(presence_loss[best_index].detach().cpu()),
+        float(smoothness_loss[best_index].detach().cpu()),
         rejected,
     )
 
 
 def _plane_distance(point_zyx: np.ndarray, plane_point_zyx: np.ndarray, normal_zyx: np.ndarray) -> float:
     return float(np.dot(np.asarray(point_zyx, dtype=np.float64) - plane_point_zyx, normal_zyx))
+
+
+def _target_plane_in_plane_error_voxels(
+    point_zyx: np.ndarray,
+    *,
+    target_zyx: np.ndarray,
+    plane_normal_zyx: np.ndarray,
+) -> float:
+    normal = _unit(np.asarray(plane_normal_zyx, dtype=np.float32))
+    delta = np.asarray(point_zyx, dtype=np.float64) - np.asarray(target_zyx, dtype=np.float64)
+    in_plane = delta - float(np.dot(delta, normal.astype(np.float64))) * normal.astype(np.float64)
+    return float(np.linalg.norm(in_plane))
+
+
+def _native_trace_step_limit(
+    *,
+    span_voxels: float,
+    cfg: NativeTrace2CpConfig,
+) -> tuple[int, str]:
+    if not math.isfinite(float(cfg.step_voxels)) or float(cfg.step_voxels) <= 0.0:
+        raise ValueError("step_voxels must be positive")
+    if not math.isfinite(float(cfg.max_step_factor)) or float(cfg.max_step_factor) <= 0.0:
+        raise ValueError("max_step_factor must be positive")
+    if cfg.max_steps is not None and int(cfg.max_steps) <= 0:
+        raise ValueError("max_steps must be positive when set")
+    if cfg.trace_step_limit is not None and int(cfg.trace_step_limit) <= 0:
+        raise ValueError("trace_step_limit must be positive when set")
+    dynamic_limit = max(
+        1,
+        int(math.ceil(float(cfg.max_step_factor) * float(span_voxels) / float(cfg.step_voxels))),
+    )
+    limit_candidates: list[tuple[int, str]] = [(dynamic_limit, "max_step_factor")]
+    if cfg.max_steps is not None:
+        limit_candidates.append((int(cfg.max_steps), "max_steps"))
+    if cfg.trace_step_limit is not None:
+        limit_candidates.append((int(cfg.trace_step_limit), "trace_step_limit"))
+    return min(limit_candidates, key=lambda item: item[0])
 
 
 def _interpolate_plane_crossing(
@@ -721,32 +833,27 @@ def trace_native_3d_one_way(
     target_zyx: np.ndarray,
     initial_direction_zyx: np.ndarray,
     cfg: NativeTrace2CpConfig,
+    target_plane_normal_zyx: np.ndarray | None = None,
+    budget_span_voxels: float | None = None,
     progress_label: str | None = None,
 ) -> NativeTraceResult:
     start = np.asarray(start_zyx, dtype=np.float32)
     target = np.asarray(target_zyx, dtype=np.float32)
-    plane_normal = _unit(target - start)
+    plane_normal = (
+        _unit(target - start)
+        if target_plane_normal_zyx is None
+        else _require_unit(target_plane_normal_zyx, label="target_plane_normal_zyx")
+    )
     span = float(np.linalg.norm(target - start))
     if span <= _EPS:
         raise ValueError("native 3D Trace2CP start and target CPs must differ")
-    if not math.isfinite(float(cfg.step_voxels)) or float(cfg.step_voxels) <= 0.0:
-        raise ValueError("step_voxels must be positive")
-    if not math.isfinite(float(cfg.max_step_factor)) or float(cfg.max_step_factor) <= 0.0:
-        raise ValueError("max_step_factor must be positive")
-    if cfg.max_steps is not None and int(cfg.max_steps) <= 0:
-        raise ValueError("max_steps must be positive when set")
-    if cfg.trace_step_limit is not None and int(cfg.trace_step_limit) <= 0:
-        raise ValueError("trace_step_limit must be positive when set")
-    dynamic_limit = max(
-        1,
-        int(math.ceil(float(cfg.max_step_factor) * span / float(cfg.step_voxels))),
+    budget_span = span if budget_span_voxels is None else float(budget_span_voxels)
+    if not math.isfinite(budget_span) or budget_span <= _EPS:
+        raise ValueError("budget_span_voxels must be positive when set")
+    step_limit, limit_reason = _native_trace_step_limit(
+        span_voxels=budget_span,
+        cfg=cfg,
     )
-    limit_candidates: list[tuple[int, str]] = [(dynamic_limit, "max_step_factor")]
-    if cfg.max_steps is not None:
-        limit_candidates.append((int(cfg.max_steps), "max_steps"))
-    if cfg.trace_step_limit is not None:
-        limit_candidates.append((int(cfg.trace_step_limit), "trace_step_limit"))
-    step_limit, limit_reason = min(limit_candidates, key=lambda item: item[0])
     progress_max = max(1, step_limit)
     last_progress_time = 0.0
     trace_start_time = time.perf_counter()
@@ -822,11 +929,16 @@ def trace_native_3d_one_way(
         if candidates.shape == candidates_unit.shape:
             candidates_unit = candidates
         next_points = current[None, :] + candidates_unit * np.float32(cfg.step_voxels)
-        best_index, _total, direction_loss, presence_loss, rejected = _score_candidate_batch(
-            cache,
-            current_direction=current_direction,
-            candidate_directions=candidates_unit,
-            next_points=next_points,
+        best_index, _total, direction_loss, presence_loss, smoothness_loss, rejected = (
+            _score_candidate_batch(
+                cache,
+                current_direction=current_direction,
+                previous_step_direction=previous_direction,
+                candidate_directions=candidates_unit,
+                next_points=next_points,
+                smoothness_weight=float(cfg.smoothness_weight),
+                smoothness_free_angle_degrees=float(cfg.smoothness_free_angle_degrees),
+            )
         )
         if best_index is None:
             emit_progress(current, _step_index, reason="all_candidates_invalid")
@@ -853,6 +965,7 @@ def trace_native_3d_one_way(
                     presence_loss=float(presence_loss),
                     total_loss=float(_total),
                     rejected_candidates=int(rejected),
+                    smoothness_loss=float(smoothness_loss),
                 )
             )
             emit_progress(crossing, _step_index + 1, reason="target_plane")
@@ -870,6 +983,7 @@ def trace_native_3d_one_way(
                 presence_loss=float(presence_loss),
                 total_loss=float(_total),
                 rejected_candidates=int(rejected),
+                smoothness_loss=float(smoothness_loss),
             )
         )
         previous_direction = chosen_direction.astype(np.float32)
@@ -1330,6 +1444,199 @@ def trace_native_3d_pair(
         plane_error=float(plane_error),
         closest_target_error=float(closest_error),
         span_voxels=float(span),
+    )
+
+
+def _terminal_trace_direction(trace_zyx: np.ndarray, *, fallback: np.ndarray) -> np.ndarray:
+    trace = np.asarray(trace_zyx, dtype=np.float32)
+    if trace.ndim == 2 and trace.shape[1] == 3 and trace.shape[0] >= 2:
+        for index in range(int(trace.shape[0]) - 1, 0, -1):
+            delta = trace[index] - trace[index - 1]
+            if float(np.linalg.norm(delta.astype(np.float64))) > _EPS:
+                return _unit(delta, fallback=fallback)
+    return _unit(fallback)
+
+
+def _record_control_points_selected_zyx(record: Any) -> np.ndarray:
+    spacing = float(getattr(record, "volume_spacing_base", 1.0))
+    if not math.isfinite(spacing) or spacing <= 0.0:
+        raise ValueError(f"invalid volume_spacing_base for native whole-fiber trace: {spacing!r}")
+    cps = np.asarray(record.fiber.control_points_zyx, dtype=np.float32)
+    if cps.ndim != 2 or cps.shape[1] != 3:
+        raise ValueError("fiber control_points_zyx must have shape [N,3]")
+    return (cps / np.float32(spacing)).astype(np.float32, copy=False)
+
+
+def _reference_line_arc_lengths_selected(record: Any) -> np.ndarray:
+    spacing = float(getattr(record, "volume_spacing_base", 1.0))
+    if not math.isfinite(spacing) or spacing <= 0.0:
+        raise ValueError(f"invalid volume_spacing_base for native whole-fiber arcs: {spacing!r}")
+    return (_line_arc_lengths(np.asarray(record.fiber.line_points_xyz, dtype=np.float32)) / spacing).astype(
+        np.float64,
+        copy=False,
+    )
+
+
+def _control_point_reference_arc_voxels(record: Any) -> np.ndarray:
+    cumulative = _reference_line_arc_lengths_selected(record)
+    arcs = []
+    for cp_index in range(int(record.fiber.control_points_zyx.shape[0])):
+        line_index = control_point_line_index(record.fiber, int(cp_index))
+        arcs.append(float(cumulative[int(line_index)]))
+    return np.asarray(arcs, dtype=np.float64)
+
+
+def trace_native_3d_whole_fiber(
+    cache: NativeTraceFieldCache,
+    *,
+    record: Any,
+    cfg: NativeTrace2CpConfig,
+    error_threshold_voxels: float,
+    progress: bool = False,
+    segment_callback: Callable[[NativeWholeFiberSegmentResult, NativeWholeFiberResult | None], None] | None = None,
+    trace_segment_fn: Callable[..., NativeTraceResult] | None = None,
+) -> NativeWholeFiberResult:
+    cp_points = _record_control_points_selected_zyx(record)
+    cp_count = int(cp_points.shape[0])
+    if cp_count < 2:
+        raise ValueError("native whole-fiber Trace2CP requires at least two control points")
+    threshold = float(error_threshold_voxels)
+    if not math.isfinite(threshold) or threshold < 0.0:
+        raise ValueError("whole-fiber error threshold must be finite and >= 0")
+    arc_by_cp = _control_point_reference_arc_voxels(record)
+    segment_count = cp_count - 1
+    tracer = trace_native_3d_one_way if trace_segment_fn is None else trace_segment_fn
+    run_start = time.perf_counter()
+    segments: list[NativeWholeFiberSegmentResult] = []
+    stitched_parts: list[np.ndarray] = []
+    restart_count = 0
+    last_success_cp_index = 0
+    current_point = cp_points[0].astype(np.float32)
+    current_direction = _fiber_line_tangent_zyx_toward_target(
+        record,
+        start_control_point_index=0,
+        target_control_point_index=1,
+    )
+
+    def emit_progress(segment_index: int, segment: NativeWholeFiberSegmentResult | None = None) -> None:
+        if not progress:
+            return
+        done = int(segment_index)
+        elapsed = max(0.0, time.perf_counter() - run_start)
+        frac = float(done) / float(max(1, segment_count))
+        eta = None if frac <= 1.0e-6 else elapsed * (1.0 - frac) / frac
+        status = "pending" if segment is None else ("ok" if segment.success else f"restart:{segment.reason}")
+        _emit_native_progress(
+            "whole fiber",
+            done,
+            segment_count,
+            run_start,
+            detail=(
+                f"segment={min(done + 1, segment_count)}/{segment_count} "
+                f"status={status} restarts={restart_count} "
+                f"rate={restart_count / max(1, done):.6f} "
+                f"eta={_format_eta(eta)} blocks={len(cache._blocks)}"
+            ),
+        )
+
+    emit_progress(0)
+    for segment_index in range(segment_count):
+        start_cp = int(segment_index)
+        target_cp = int(segment_index + 1)
+        previous_segment_success = bool(segments and segments[-1].success)
+        target_point = cp_points[target_cp].astype(np.float32)
+        reference_start = cp_points[start_cp].astype(np.float32)
+        segment_axis = _unit(target_point - reference_start, fallback=current_direction)
+        segment_span = float(np.linalg.norm(target_point - reference_start))
+        if segment_span <= _EPS:
+            raise ValueError(f"degenerate native whole-fiber CP span {start_cp}->{target_cp}")
+        result = tracer(
+            cache,
+            start_zyx=current_point.astype(np.float32),
+            target_zyx=target_point,
+            initial_direction_zyx=current_direction,
+            cfg=cfg,
+            target_plane_normal_zyx=segment_axis,
+            budget_span_voxels=segment_span,
+            progress_label=None,
+        )
+        crossing = result.trace_zyx[-1].astype(np.float32)
+        in_plane_error = (
+            _target_plane_in_plane_error_voxels(
+                crossing,
+                target_zyx=target_point,
+                plane_normal_zyx=segment_axis,
+            )
+            if bool(result.reached_target_plane)
+            else float("inf")
+        )
+        success = bool(result.reached_target_plane) and in_plane_error <= threshold
+        if success:
+            reason = result.reason
+            restart = False
+            reference_arc = float(arc_by_cp[target_cp])
+            current_point = crossing
+            current_direction = _terminal_trace_direction(result.trace_zyx, fallback=current_direction)
+            last_success_cp_index = target_cp
+        else:
+            reason = result.reason if not bool(result.reached_target_plane) else "in_plane_error"
+            restart = True
+            restart_count += 1
+            reference_arc = float(arc_by_cp[last_success_cp_index])
+            current_point = target_point
+            if target_cp < cp_count - 1:
+                current_direction = _fiber_line_tangent_zyx_toward_target(
+                    record,
+                    start_control_point_index=target_cp,
+                    target_control_point_index=target_cp + 1,
+                )
+        trace = np.asarray(result.trace_zyx, dtype=np.float32)
+        if stitched_parts and trace.shape[0] > 0 and previous_segment_success and success:
+            stitched_parts.append(trace[1:].copy())
+        else:
+            stitched_parts.append(trace.copy())
+        segment = NativeWholeFiberSegmentResult(
+            start_cp_index=start_cp,
+            target_cp_index=target_cp,
+            trace_zyx=trace,
+            start_zyx=np.asarray(result.trace_zyx[0], dtype=np.float32),
+            target_zyx=target_point.astype(np.float32),
+            reached_target_plane=bool(result.reached_target_plane),
+            success=bool(success),
+            restart=bool(restart),
+            reason=str(reason),
+            in_plane_error_voxels=float(in_plane_error),
+            reference_arc_distance_voxels=float(reference_arc),
+            step_count=int(len(result.steps)),
+        )
+        segments.append(segment)
+        partial = NativeWholeFiberResult(
+            segments=tuple(segments),
+            restart_count=int(restart_count),
+            restart_rate=float(restart_count / max(1, len(segments))),
+            segment_count=int(segment_count),
+            stitched_trace_zyx=(
+                np.concatenate([part for part in stitched_parts if part.size], axis=0).astype(np.float32)
+                if any(part.size for part in stitched_parts)
+                else np.zeros((0, 3), dtype=np.float32)
+            ),
+            inferred_blocks=int(len(cache._blocks)),
+        )
+        if segment_callback is not None:
+            segment_callback(segment, partial)
+        emit_progress(segment_index + 1, segment)
+    stitched = (
+        np.concatenate([part for part in stitched_parts if part.size], axis=0).astype(np.float32)
+        if any(part.size for part in stitched_parts)
+        else np.zeros((0, 3), dtype=np.float32)
+    )
+    return NativeWholeFiberResult(
+        segments=tuple(segments),
+        restart_count=int(restart_count),
+        restart_rate=float(restart_count / max(1, segment_count)),
+        segment_count=int(segment_count),
+        stitched_trace_zyx=stitched,
+        inferred_blocks=int(len(cache._blocks)),
     )
 
 
@@ -2028,6 +2335,207 @@ def _make_native_trace_visualization(
     return run_stage("compose", compose_sheet)
 
 
+def _trim_failed_overlay_before_target(
+    overlay_xy: np.ndarray,
+    *,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    margin_px: float = 8.0,
+) -> np.ndarray:
+    overlay = np.asarray(overlay_xy, dtype=np.float32)
+    if overlay.ndim != 2 or overlay.shape[1] != 2 or overlay.shape[0] <= 1:
+        return overlay.astype(np.float32, copy=True)
+    start_x = float(np.asarray(start_xy, dtype=np.float32)[0])
+    target_x = float(np.asarray(target_xy, dtype=np.float32)[0])
+    sign = 1.0 if target_x >= start_x else -1.0
+    cutoff = target_x - sign * max(0.0, float(margin_px))
+    if sign >= 0.0:
+        keep = overlay[:, 0] <= cutoff
+    else:
+        keep = overlay[:, 0] >= cutoff
+    keep &= np.isfinite(overlay).all(axis=1)
+    if int(np.count_nonzero(keep)) >= 2:
+        return overlay[keep].astype(np.float32, copy=False)
+    finite = overlay[np.isfinite(overlay).all(axis=1)]
+    return finite[: min(2, int(finite.shape[0]))].astype(np.float32, copy=False)
+
+
+def _whole_fiber_segment_overlays_for_view(
+    source: _Trace2CpSegmentSource,
+    segment: NativeWholeFiberSegmentResult,
+    *,
+    axis_name: str,
+) -> tuple[tuple[np.ndarray, tuple[int, int, int, int]], ...]:
+    spacing = float(source.record.volume_spacing_base)
+    trace_xyz = _trace_zyx_to_base_xyz(segment.trace_zyx, spacing)
+    xy = _project_trace_to_initial_strip(source, trace_xyz, axis_name=axis_name)
+    if int(xy.shape[0]) < 2:
+        return ()
+    if not segment.success:
+        xy = _trim_failed_overlay_before_target(
+            xy,
+            start_xy=source.start_control_point_xy,
+            target_xy=source.target_control_point_xy,
+        )
+    if int(xy.shape[0]) < 2:
+        return ()
+    color = (255, 220, 0, 235) if segment.success else (255, 80, 64, 235)
+    return ((xy.astype(np.float32, copy=False), color),)
+
+
+def _compose_whole_fiber_panel_columns(
+    panel_columns: list[tuple[Any, Any, Any, Any]],
+    *,
+    status_text: str | None = None,
+):
+    from PIL import Image, ImageDraw
+
+    if not panel_columns:
+        sheet = Image.new("RGBA", (760, 96), (0, 0, 0, 255))
+        draw = ImageDraw.Draw(sheet, "RGBA")
+        draw.text((8, 8), "native 3D whole-fiber Trace2CP", fill=(255, 255, 255, 255))
+        draw.text((8, 34), "waiting for first segment", fill=(180, 180, 180, 255))
+        if status_text:
+            draw.text((8, 60), status_text, fill=(120, 220, 255, 255))
+        return sheet
+    row_count = 4
+    row_heights = [
+        max(int(column[row].height) for column in panel_columns)
+        for row in range(row_count)
+    ]
+    column_widths = [
+        max(int(panel.width) for panel in column)
+        for column in panel_columns
+    ]
+    width = int(sum(column_widths))
+    height = int(sum(row_heights))
+    sheet = Image.new("RGBA", (max(1, width), max(1, height)), (0, 0, 0, 255))
+    x = 0
+    for column, column_width in zip(panel_columns, column_widths):
+        y = 0
+        for row, panel in enumerate(column):
+            sheet.alpha_composite(panel, (x, y))
+            y += row_heights[row]
+        x += int(column_width)
+    return sheet
+
+
+def _render_native_whole_fiber_segment_panels(
+    geometry_loader: Any,
+    *,
+    sample_index: int,
+    target_cp_index: int,
+    trace2cp_rf_margin_px: float,
+    segment: NativeWholeFiberSegmentResult,
+    cache: NativeTraceFieldCache,
+    image_normalization: str,
+) -> tuple[Any, Any, Any, Any]:
+    max_source = geometry_loader.build_trace2cp_segment_source(
+        int(sample_index),
+        target_control_point_index=int(target_cp_index),
+        rf_margin_px=float(trace2cp_rf_margin_px),
+        device=torch.device("cpu"),
+        sample_mode="flat",
+    )
+    max_side_overlays = _whole_fiber_segment_overlays_for_view(
+        max_source,
+        segment,
+        axis_name="offset_axis_xyz",
+    )
+    max_top_overlays = _whole_fiber_segment_overlays_for_view(
+        max_source,
+        segment,
+        axis_name="side_axis_xyz",
+    )
+    adaptive_height = _adaptive_trace2cp_cross_strip_height(
+        int(max_source.source_shape_hw[0]),
+        (max_side_overlays, max_top_overlays),
+    )
+    source = (
+        max_source
+        if int(adaptive_height) == int(max_source.source_shape_hw[0])
+        else geometry_loader.build_trace2cp_segment_source(
+            int(sample_index),
+            target_control_point_index=int(target_cp_index),
+            rf_margin_px=float(trace2cp_rf_margin_px),
+            cross_strip_height_px=int(adaptive_height),
+            device=torch.device("cpu"),
+            sample_mode="flat",
+        )
+    )
+    side_overlays = _whole_fiber_segment_overlays_for_view(
+        source,
+        segment,
+        axis_name="offset_axis_xyz",
+    )
+    top_overlays = _whole_fiber_segment_overlays_for_view(
+        source,
+        segment,
+        axis_name="side_axis_xyz",
+    )
+    _sample, side_image, side_valid = geometry_loader.sample_trace2cp_segment_source(source)
+    top_image, top_valid = geometry_loader.sample_trace2cp_top_strip_source(source)
+    side_coords_xyz, side_grid_valid = geometry_loader.trace2cp_segment_coords_xyz(source)
+    top_coords_xyz, top_grid_valid = geometry_loader.trace2cp_top_strip_coords_xyz(source)
+    spacing = float(source.record.volume_spacing_base)
+    side_presence, side_presence_valid = _sample_presence_on_strip(
+        cache,
+        side_coords_xyz,
+        np.asarray(side_grid_valid, dtype=bool) & np.asarray(side_valid, dtype=bool),
+        spacing_base=spacing,
+        progress_label=f"seg{segment.start_cp_index}-side",
+    )
+    top_presence, top_presence_valid = _sample_presence_on_strip(
+        cache,
+        top_coords_xyz,
+        np.asarray(top_grid_valid, dtype=bool) & np.asarray(top_valid, dtype=bool),
+        spacing_base=spacing,
+        progress_label=f"seg{segment.start_cp_index}-top",
+    )
+    title_suffix = (
+        f"cp {segment.start_cp_index}->{segment.target_cp_index} "
+        f"{'ok' if segment.success else 'restart'} err={segment.in_plane_error_voxels:.2f}"
+    )
+    return (
+        _draw_trace_panel(
+            _image_to_u8(side_image, side_valid, normalization=image_normalization),
+            side_valid,
+            source.line_xy,
+            source.start_control_point_xy,
+            source.target_control_point_xy,
+            title=f"side input {title_suffix}",
+            overlays=side_overlays,
+        ),
+        _draw_trace_panel(
+            _presence_to_u8(side_presence, side_presence_valid),
+            side_presence_valid,
+            source.line_xy,
+            source.start_control_point_xy,
+            source.target_control_point_xy,
+            title=f"side 3D presence {title_suffix}",
+            overlays=side_overlays,
+        ),
+        _draw_trace_panel(
+            _image_to_u8(top_image, top_valid, normalization=image_normalization),
+            top_valid,
+            source.line_xy,
+            source.start_control_point_xy,
+            source.target_control_point_xy,
+            title=f"top input {title_suffix}",
+            overlays=top_overlays,
+        ),
+        _draw_trace_panel(
+            _presence_to_u8(top_presence, top_presence_valid),
+            top_presence_valid,
+            source.line_xy,
+            source.start_control_point_xy,
+            source.target_control_point_xy,
+            title=f"top 3D presence {title_suffix}",
+            overlays=top_overlays,
+        ),
+    )
+
+
 def _tool_raw_config(raw_config: dict[str, Any], *, fiber_json: Path | None) -> dict[str, Any]:
     source_datasets = raw_config.get("test_datasets") or raw_config.get("datasets")
     if not isinstance(source_datasets, list) or not source_datasets:
@@ -2184,58 +2692,110 @@ def run_native_trace2cp(
     *,
     checkpoint: str | Path,
     export_dir: str | Path,
-    sample_index: int,
+    sample_index: int | None,
     fiber_json: str | Path | None = None,
     start_cp_index: int | None = None,
     target_cp_index: int | None = None,
     target_offset: int = 1,
     sample_mode: str | None = None,
     native_cfg: NativeTrace2CpConfig | None = None,
-) -> NativeTracePairResult:
+) -> NativeTracePairResult | NativeWholeFiberResult:
+    startup_t0 = time.perf_counter()
+    print(
+        "native_trace2cp_3d startup begin "
+        f"config={config_path} checkpoint={checkpoint} export_dir={export_dir} "
+        f"fiber_json={fiber_json} sample_index={sample_index} "
+        f"start_cp={start_cp_index} target_cp={target_cp_index}",
+        flush=True,
+    )
     raw_config = _load_raw_config(config_path)
+    config_t1 = time.perf_counter()
     cfg = NativeTrace2CpConfig() if native_cfg is None else native_cfg
     fiber_path = None if fiber_json is None else Path(fiber_json)
+    whole_mode = _native_trace2cp_whole_fiber_mode(
+        fiber_json=fiber_path,
+        sample_index=sample_index,
+        start_cp_index=start_cp_index,
+        target_cp_index=target_cp_index,
+    )
+    mode_label = "whole_fiber" if whole_mode else "single_segment"
+    print(
+        "native_trace2cp_3d startup config_loaded "
+        f"elapsed_ms={(config_t1 - startup_t0) * 1000.0:.1f} mode={mode_label}",
+        flush=True,
+    )
     tool_raw_config = _tool_raw_config(raw_config, fiber_json=fiber_path)
     loader_config = _load_tool_config(config_path, raw_config, fiber_json=fiber_path)
+    loader_t0 = time.perf_counter()
+    print("native_trace2cp_3d startup constructing_3d_loader", flush=True)
     loader = FiberTrace3DLoader(loader_config)
+    loader_t1 = time.perf_counter()
+    print(
+        "native_trace2cp_3d startup 3d_loader_ready "
+        f"elapsed_ms={(loader_t1 - loader_t0) * 1000.0:.1f} "
+        f"total_ms={(loader_t1 - startup_t0) * 1000.0:.1f}",
+        flush=True,
+    )
     trace2cp_cfg = _native_trace2cp_geometry_config(raw_config)
     trace2cp_cfg = dataclass_replace(
         trace2cp_cfg,
         rf_margin_px=max(float(trace2cp_cfg.rf_margin_px), float(cfg.core_margin_voxels)),
     )
+    geometry_t0 = time.perf_counter()
+    print("native_trace2cp_3d startup constructing_geometry_loader", flush=True)
     geometry_loader = _make_trace2cp_geometry_loader(
         tool_raw_config,
         trace2cp_cfg,
     )
-    selection = _resolve_native_trace2cp_selection(
-        loader,
-        sample_index=int(sample_index),
-        fiber_json=fiber_path,
-        start_cp_index=start_cp_index,
-        target_cp_index=target_cp_index,
-        target_offset=int(target_offset),
-        sample_mode=sample_mode,
+    geometry_t1 = time.perf_counter()
+    print(
+        "native_trace2cp_3d startup geometry_loader_ready "
+        f"elapsed_ms={(geometry_t1 - geometry_t0) * 1000.0:.1f} "
+        f"total_ms={(geometry_t1 - startup_t0) * 1000.0:.1f}",
+        flush=True,
     )
-    _print_native_trace_segment_debug(selection)
-    record = selection.record
-    start_zyx = (
-        np.asarray(record.fiber.control_points_zyx[int(selection.start_cp_index)], dtype=np.float32)
-        / np.float32(record.volume_spacing_base)
-    )
-    target_zyx = (
-        np.asarray(record.fiber.control_points_zyx[int(selection.target_cp_index)], dtype=np.float32)
-        / np.float32(record.volume_spacing_base)
-    )
-    forward_initial_direction = _fiber_line_tangent_zyx_toward_target(
-        record,
-        start_control_point_index=int(selection.start_cp_index),
-        target_control_point_index=int(selection.target_cp_index),
-    )
-    reverse_initial_direction = _fiber_line_tangent_zyx_toward_target(
-        record,
-        start_control_point_index=int(selection.target_cp_index),
-        target_control_point_index=int(selection.start_cp_index),
-    )
+    selection: _NativeTrace2CpSelection | None = None
+    start_zyx: np.ndarray | None = None
+    target_zyx: np.ndarray | None = None
+    forward_initial_direction: np.ndarray | None = None
+    reverse_initial_direction: np.ndarray | None = None
+    if whole_mode:
+        if sample_mode is not None and str(sample_mode) != "flat":
+            raise ValueError("whole-fiber --fiber-json mode requires --sample-mode flat or omitted")
+        records = getattr(loader, "records", ())
+        if len(records) != 1:
+            raise ValueError("whole-fiber --fiber-json mode requires exactly one loaded fiber")
+        record = records[0]
+    else:
+        selection = _resolve_native_trace2cp_selection(
+            loader,
+            sample_index=0 if sample_index is None else int(sample_index),
+            fiber_json=fiber_path,
+            start_cp_index=start_cp_index,
+            target_cp_index=target_cp_index,
+            target_offset=int(target_offset),
+            sample_mode=sample_mode,
+        )
+        _print_native_trace_segment_debug(selection)
+        record = selection.record
+        start_zyx = (
+            np.asarray(record.fiber.control_points_zyx[int(selection.start_cp_index)], dtype=np.float32)
+            / np.float32(record.volume_spacing_base)
+        )
+        target_zyx = (
+            np.asarray(record.fiber.control_points_zyx[int(selection.target_cp_index)], dtype=np.float32)
+            / np.float32(record.volume_spacing_base)
+        )
+        forward_initial_direction = _fiber_line_tangent_zyx_toward_target(
+            record,
+            start_control_point_index=int(selection.start_cp_index),
+            target_control_point_index=int(selection.target_cp_index),
+        )
+        reverse_initial_direction = _fiber_line_tangent_zyx_toward_target(
+            record,
+            start_control_point_index=int(selection.target_cp_index),
+            target_control_point_index=int(selection.start_cp_index),
+        )
     training = dict(raw_config.get("training", {}))
     device = _device_from_training(training)
     model = build_fiber_trace_3d_model(raw_config).to(device)
@@ -2259,6 +2819,128 @@ def run_native_trace2cp(
         f"blocking={getattr(getattr(record, 'sampler', None), 'blocking', 'n/a')}",
         flush=True,
     )
+    if whole_mode:
+        out_dir = Path(export_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        image_path = out_dir / "trace2cp_native_3d_vis.jpg"
+        panel_columns: list[tuple[Any, Any, Any, Any]] = []
+        _compose_whole_fiber_panel_columns(
+            panel_columns,
+            status_text="initializing whole-fiber trace",
+        ).convert("RGB").save(image_path, quality=90)
+        print(f"native whole-fiber partial={image_path} initializing", flush=True)
+
+        def on_segment(
+            segment: NativeWholeFiberSegmentResult,
+            partial: NativeWholeFiberResult | None,
+        ) -> None:
+            print(
+                "native whole-fiber render segment "
+                f"{segment.start_cp_index}->{segment.target_cp_index} "
+                f"success={segment.success} reason={segment.reason} "
+                f"error={segment.in_plane_error_voxels:.3f}",
+                flush=True,
+            )
+            panels = _render_native_whole_fiber_segment_panels(
+                geometry_loader,
+                sample_index=int(segment.start_cp_index),
+                target_cp_index=int(segment.target_cp_index),
+                trace2cp_rf_margin_px=float(trace2cp_cfg.rf_margin_px),
+                segment=segment,
+                cache=cache,
+                image_normalization=loader_config.image_normalization,
+            )
+            panel_columns.append(panels)
+            restarts = 0 if partial is None else int(partial.restart_count)
+            rate = 0.0 if partial is None else float(partial.restart_rate)
+            _compose_whole_fiber_panel_columns(
+                panel_columns,
+                status_text=(
+                    f"segments={len(panel_columns)} restarts={restarts} "
+                    f"rate={rate:.6f}"
+                ),
+            ).convert("RGB").save(image_path, quality=90)
+            print(
+                "native whole-fiber partial="
+                f"{image_path} segment={segment.start_cp_index}->{segment.target_cp_index}",
+                flush=True,
+            )
+
+        cp_count = int(record.fiber.control_points_zyx.shape[0])
+        print(
+            "native_trace2cp_3d whole_fiber "
+            f"fiber_path={'' if record.fiber.path is None else record.fiber.path} "
+            f"control_points={cp_count} segments={max(0, cp_count - 1)} "
+            f"threshold_voxels={float(cfg.whole_fiber_error_threshold_voxels):.3f}",
+            flush=True,
+        )
+        whole = trace_native_3d_whole_fiber(
+            cache,
+            record=record,
+            cfg=cfg,
+            error_threshold_voxels=float(cfg.whole_fiber_error_threshold_voxels),
+            progress=True,
+            segment_callback=on_segment,
+        )
+        summary = {
+            "mode": "whole_fiber",
+            "fiber_path": "" if record.fiber.path is None else str(record.fiber.path),
+            "control_point_count": int(cp_count),
+            "segment_count": int(whole.segment_count),
+            "restart_count": int(whole.restart_count),
+            "native_trace2cp_fiber_restart_rate": float(whole.restart_rate),
+            "whole_fiber_error_threshold_voxels": float(cfg.whole_fiber_error_threshold_voxels),
+            "step_voxels": float(cfg.step_voxels),
+            "max_step_factor": float(cfg.max_step_factor),
+            "smoothness_weight": float(cfg.smoothness_weight),
+            "smoothness_free_angle_degrees": float(cfg.smoothness_free_angle_degrees),
+            "max_steps": None if cfg.max_steps is None else int(cfg.max_steps),
+            "trace_step_limit": None if cfg.trace_step_limit is None else int(cfg.trace_step_limit),
+            "inferred_blocks": int(len(cache._blocks)),
+            "export": str(image_path),
+            "segments": [
+                {
+                    "start_control_point_index": int(segment.start_cp_index),
+                    "target_control_point_index": int(segment.target_cp_index),
+                    "success": bool(segment.success),
+                    "restart": bool(segment.restart),
+                    "reason": segment.reason,
+                    "reached_target_plane": bool(segment.reached_target_plane),
+                    "in_plane_error_voxels": float(segment.in_plane_error_voxels),
+                    "reference_arc_distance_voxels": float(segment.reference_arc_distance_voxels),
+                    "step_count": int(segment.step_count),
+                    "restart_point_zyx": [
+                        float(v) for v in np.asarray(segment.target_zyx, dtype=np.float32)
+                    ]
+                    if segment.restart
+                    else None,
+                }
+                for segment in whole.segments
+            ],
+        }
+        summary_path = out_dir / "trace2cp_native_3d_summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        print(
+            "native_trace2cp_fiber_restart_rate="
+            f"{whole.restart_rate:.8f} restarts={whole.restart_count} "
+            f"segments={whole.segment_count}",
+            flush=True,
+        )
+        print(
+            "native_trace2cp_3d whole_fiber "
+            f"blocks={len(cache._blocks)} export={image_path}",
+            flush=True,
+        )
+        return whole
+
+    if (
+        selection is None
+        or start_zyx is None
+        or target_zyx is None
+        or forward_initial_direction is None
+        or reverse_initial_direction is None
+    ):
+        raise RuntimeError("native 3D Trace2CP single-pair selection was not initialized")
     result = trace_native_3d_pair(
         cache,
         start_zyx=start_zyx,
@@ -2329,6 +3011,8 @@ def run_native_trace2cp(
         "reverse_steps": int(len(result.reverse.steps)),
         "step_voxels": float(cfg.step_voxels),
         "max_step_factor": float(cfg.max_step_factor),
+        "smoothness_weight": float(cfg.smoothness_weight),
+        "smoothness_free_angle_degrees": float(cfg.smoothness_free_angle_degrees),
         "max_steps": None if cfg.max_steps is None else int(cfg.max_steps),
         "trace_step_limit": None if cfg.trace_step_limit is None else int(cfg.trace_step_limit),
         "visualization_cross_strip_height_px": int(source.source_shape_hw[0]),
@@ -2381,7 +3065,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("config", type=Path)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--export-dir", type=Path, required=True)
-    parser.add_argument("--sample-index", type=int, default=0)
+    parser.add_argument("--sample-index", type=int, default=None)
     parser.add_argument("--fiber-json", type=Path, default=None)
     parser.add_argument("--start-cp-index", type=int, default=None)
     parser.add_argument("--target-cp-index", type=int, default=None)
@@ -2390,11 +3074,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--step-voxels", type=float, default=4.0)
     parser.add_argument("--cone-angle-degrees", type=float, default=25.0)
     parser.add_argument("--cone-grid-size", type=int, default=25)
+    parser.add_argument("--smoothness-weight", type=float, default=0.0)
+    parser.add_argument("--smoothness-free-angle-degrees", type=float, default=10.0)
     parser.add_argument("--max-step-factor", type=float, default=3.0)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--trace-step-limit", type=int, default=None)
     parser.add_argument("--inference-patch-shape-zyx", nargs=3, type=int, default=None)
     parser.add_argument("--core-margin-voxels", type=int, default=8)
+    parser.add_argument("--whole-fiber-error-threshold-voxels", type=float, default=100.0)
     return parser.parse_args()
 
 
@@ -2409,17 +3096,20 @@ def main() -> None:
         step_voxels=float(args.step_voxels),
         cone_angle_degrees=float(args.cone_angle_degrees),
         cone_grid_size=int(args.cone_grid_size),
+        smoothness_weight=float(args.smoothness_weight),
+        smoothness_free_angle_degrees=float(args.smoothness_free_angle_degrees),
         max_step_factor=float(args.max_step_factor),
         max_steps=None if args.max_steps is None else int(args.max_steps),
         trace_step_limit=None if args.trace_step_limit is None else int(args.trace_step_limit),
         inference_patch_shape_zyx=patch_shape,
         core_margin_voxels=int(args.core_margin_voxels),
+        whole_fiber_error_threshold_voxels=float(args.whole_fiber_error_threshold_voxels),
     )
     run_native_trace2cp(
         args.config,
         checkpoint=args.checkpoint,
         export_dir=args.export_dir,
-        sample_index=int(args.sample_index),
+        sample_index=None if args.sample_index is None else int(args.sample_index),
         fiber_json=args.fiber_json,
         start_cp_index=args.start_cp_index,
         target_cp_index=args.target_cp_index,
