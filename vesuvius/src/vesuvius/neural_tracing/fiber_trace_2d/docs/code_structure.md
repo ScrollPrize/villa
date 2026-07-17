@@ -224,9 +224,12 @@ side/top strip input loading.
   inspect during long renders.
 - In whole-fiber mode, `trace2cp_native_3d_vis.jpg` is also overwritten after
   every completed CP segment. The whole-fiber sheet has four stitched rows:
-  side volume, side 3D presence, top volume, and top 3D presence. Each segment
-  becomes the next column; failed segment overlays are cut before the next CP
-  region and the displayed trace resumes from the restart CP.
+  side volume, side 3D presence, top volume, and top 3D presence. Those rows
+  are rendered as restart-delimited continuous long strips rather than one
+  visual column per CP segment. Failed segment overlays are cut before the next
+  CP region and the displayed trace resumes from the restart CP in the next
+  long-strip span. Whole-fiber visualization uses a fixed 64 px cross-strip
+  width; paths leaving that strip are clipped visually only.
 - Stops when the trace crosses the plane through the target CP with normal
   from start CP to target CP. The stdout/summary metrics are
   `native_trace2cp_plane_error` and
@@ -251,13 +254,14 @@ side/top strip input loading.
   JSON as a diagnostic projection of that midpoint onto the straight CP axis,
   while the considered gap field is the full pair score and center penalty is
   fixed to `1.0`.
-- For visualization, first builds a maximum-height initial side/top Trace2CP
-  source to project the native forward, backward, and fused traces. The rendered
-  cross-strip height is then reduced to the odd centered size that covers those
-  projected traces with 50% extra margin, capped by the configured maximum. The
-  JPG includes initial side/top volume and 3D-presence panels with projected
-  forward/reverse/fused traces, plus fused-line-resampled side/top volume and
-  presence panels with only the fused line drawn thinly.
+- For single-pair visualization, first builds a maximum-height initial side/top
+  Trace2CP source to project the native forward, backward, and fused traces.
+  The rendered cross-strip height is then reduced to the odd centered size that
+  covers those projected traces with 50% extra margin, capped by the configured
+  maximum. The JPG includes initial side/top volume and 3D-presence panels with
+  projected forward/reverse/fused traces, plus fused-line-resampled side/top
+  volume and presence panels with only the fused line drawn thinly. Whole-fiber
+  mode does not use this adaptive height path.
 - Trace2CP segment-source construction trims extra margin points to the valid
   compact-geometry interval containing both CPs. Compact-geometry preload covers
   consecutive CP-to-CP spans as well as CP source windows, so an interior

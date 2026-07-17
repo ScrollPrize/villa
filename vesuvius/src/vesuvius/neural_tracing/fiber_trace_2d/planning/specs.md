@@ -558,13 +558,13 @@
   the restart rate is `restart_count / segment_count`. Its JSON summary stores
   per-segment status, reason, reached-plane flag, in-plane error, step count,
   restart point, and reference arc distance at the last successful CP plane.
-- Native 3D visualization first builds the initial side/top strip source from
-  the existing 2D Trace2CP geometry loader for the input CP pair. The configured
-  cross-strip height is a maximum cap: the rendered cross height is the odd
-  centered size needed to cover the projected forward, backward, and fused
-  traces with 50% extra margin, capped by that configured maximum. This
-  adaptive render height is visualization-only and must not affect tracing or
-  metric values.
+- Native 3D single-pair visualization first builds the initial side/top strip
+  source from the existing 2D Trace2CP geometry loader for the input CP pair.
+  In single-pair mode, the configured cross-strip height is a maximum cap: the
+  rendered cross height is the odd centered size needed to cover the projected
+  forward, backward, and fused traces with 50% extra margin, capped by that
+  configured maximum. This adaptive render height is visualization-only and
+  must not affect tracing or metric values.
 - Trace2CP segment-source construction may trim extra line-window margin to the
   valid compact-geometry interval that contains both start and target control
   points. It must not synthesize missing normals. If the actual CP-to-CP line
@@ -575,12 +575,18 @@
   native inference cache. Presence sampling should batch strip coordinates per
   strip rather than call model inference per pixel.
 - Native 3D whole-fiber visualization uses four stitched panel rows: side
-  volume, side 3D presence, top volume, and top 3D presence. Each CP segment is
-  rendered as the next column. Failed segment overlays are cut before they
-  overlap the next CP region, then the displayed trace resumes from the
-  restart CP. The regular `trace2cp_native_3d_vis.jpg` path must be overwritten
-  after every completed segment so long whole-fiber runs show partial visual
-  progress at the final output filename.
+  volume, side 3D presence, top volume, and top 3D presence. Whole-fiber mode
+  renders restart-delimited continuous long strips instead of one visual column
+  per CP segment. Each visual span starts at the first CP after a restart and
+  ends at the latest traced target CP in that span. Failed segment overlays are
+  cut before they overlap the next CP region, then the displayed trace resumes
+  from the restart CP in the next visual span. Whole-fiber visualization always
+  uses a fixed 64 px cross-strip width; this width is visualization-only, and a
+  traced path leaving the 64 px strip must only clip the drawn overlay, not
+  invalidate tracing, metric calculation, or 3D sampling. The regular
+  `trace2cp_native_3d_vis.jpg` path must be overwritten after every completed
+  segment so long whole-fiber runs show partial visual progress at the final
+  output filename.
 - Native forward, reverse, and fused 3D traces are projected onto the initial
   side and top strip coordinate systems for overlay. The same visualization
   also rebuilds side/top strip geometry from the fused native 3D line and

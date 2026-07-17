@@ -55,6 +55,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     NativeTraceFieldCache,
     NativeTraceResult,
     _adaptive_trace2cp_cross_strip_height,
+    _build_native_whole_fiber_span_source,
     _fiber_line_tangent_zyx_toward_target,
     _image_to_u8,
     _interpolate_plane_crossing,
@@ -62,6 +63,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _native_cumulative_tangent_smoothness_loss_torch,
     _native_first_step_normal_gate_torch,
     _native_trace2cp_whole_fiber_mode,
+    _native_whole_fiber_visual_spans,
     _native_smoothness_loss_torch,
     _parse_args,
     _native_trace_geometry_normal_record,
@@ -2365,6 +2367,76 @@ def test_native_3d_whole_fiber_trace_last_segment_failure_finishes() -> None:
     assert result.segment_count == 1
     assert result.restart_count == 1
     assert result.segments[0].reason == "trace_step_limit"
+
+
+def _native_whole_fiber_segment(
+    start_cp: int,
+    target_cp: int,
+    *,
+    success: bool,
+) -> object:
+    return SimpleNamespace(
+        start_cp_index=int(start_cp),
+        target_cp_index=int(target_cp),
+        trace_zyx=np.asarray(
+            [[0.0, 0.0, float(start_cp)], [0.0, 0.0, float(target_cp)]],
+            dtype=np.float32,
+        ),
+        start_zyx=np.asarray([0.0, 0.0, float(start_cp)], dtype=np.float32),
+        target_zyx=np.asarray([0.0, 0.0, float(target_cp)], dtype=np.float32),
+        reached_target_plane=bool(success),
+        success=bool(success),
+        restart=not bool(success),
+        reason="target_plane" if success else "trace_step_limit",
+        in_plane_error_voxels=0.0 if success else float("inf"),
+        reference_arc_distance_voxels=float(target_cp),
+        step_count=1,
+    )
+
+
+def test_native_3d_whole_fiber_visual_spans_are_restart_delimited() -> None:
+    segments = [
+        _native_whole_fiber_segment(0, 1, success=True),
+        _native_whole_fiber_segment(1, 2, success=False),
+        _native_whole_fiber_segment(2, 3, success=True),
+        _native_whole_fiber_segment(3, 4, success=True),
+    ]
+
+    spans = _native_whole_fiber_visual_spans(segments)
+
+    assert [(span.start_cp_index, span.end_cp_index, span.restart_after) for span in spans] == [
+        (0, 2, True),
+        (2, 4, False),
+    ]
+    assert [len(span.segments) for span in spans] == [2, 2]
+
+
+def test_native_3d_whole_fiber_span_source_uses_fixed_cross_width() -> None:
+    class FakeGeometryLoader:
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def build_trace2cp_segment_source(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return "source"
+
+    loader = FakeGeometryLoader()
+
+    source = _build_native_whole_fiber_span_source(
+        loader,
+        start_cp_index=3,
+        end_cp_index=9,
+        trace2cp_rf_margin_px=17.5,
+    )
+
+    assert source == "source"
+    assert len(loader.calls) == 1
+    args, kwargs = loader.calls[0]
+    assert args == (3,)
+    assert kwargs["target_control_point_index"] == 9
+    assert kwargs["rf_margin_px"] == pytest.approx(17.5)
+    assert kwargs["cross_strip_height_px"] == 64
+    assert kwargs["sample_mode"] == "flat"
 
 
 def test_native_3d_trace2cp_block_router_uses_trusted_core() -> None:

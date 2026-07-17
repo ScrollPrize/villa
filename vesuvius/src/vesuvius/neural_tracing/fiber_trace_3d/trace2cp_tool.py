@@ -135,6 +135,14 @@ class NativeWholeFiberResult:
 
 
 @dataclass(frozen=True)
+class _NativeWholeFiberVisualSpan:
+    start_cp_index: int
+    end_cp_index: int
+    segments: tuple[NativeWholeFiberSegmentResult, ...]
+    restart_after: bool
+
+
+@dataclass(frozen=True)
 class _InferredBlock:
     origin_zyx: np.ndarray
     shape_zyx: tuple[int, int, int]
@@ -4319,6 +4327,27 @@ def _trim_failed_overlay_before_target(
     return finite[: min(2, int(finite.shape[0]))].astype(np.float32, copy=False)
 
 
+def _trace2cp_source_control_point_xy(
+    source: _Trace2CpSegmentSource,
+    control_point_index: int,
+) -> np.ndarray:
+    cp_index = int(control_point_index)
+    if cp_index == int(source.start_control_point_index):
+        return np.asarray(source.start_control_point_xy, dtype=np.float32)
+    if cp_index == int(source.target_control_point_index):
+        return np.asarray(source.target_control_point_xy, dtype=np.float32)
+    line_index = control_point_line_index(source.record.fiber, cp_index)
+    matches = np.flatnonzero(np.asarray(source.line_point_indices, dtype=np.int64) == int(line_index))
+    if matches.size == 0:
+        raise ValueError(
+            "Trace2CP source does not contain requested control point line index: "
+            f"control_point_index={cp_index} line_index={int(line_index)} "
+            f"source_start_cp={int(source.start_control_point_index)} "
+            f"source_target_cp={int(source.target_control_point_index)}"
+        )
+    return np.asarray(source.line_xy[int(matches[0])], dtype=np.float32)
+
+
 def _whole_fiber_segment_overlays_for_view(
     source: _Trace2CpSegmentSource,
     segment: NativeWholeFiberSegmentResult,
@@ -4331,10 +4360,12 @@ def _whole_fiber_segment_overlays_for_view(
     if int(xy.shape[0]) < 2:
         return ()
     if not segment.success:
+        start_xy = _trace2cp_source_control_point_xy(source, int(segment.start_cp_index))
+        target_xy = _trace2cp_source_control_point_xy(source, int(segment.target_cp_index))
         xy = _trim_failed_overlay_before_target(
             xy,
-            start_xy=source.start_control_point_xy,
-            target_xy=source.target_control_point_xy,
+            start_xy=start_xy,
+            target_xy=target_xy,
         )
     if int(xy.shape[0]) < 2:
         return ()
@@ -4342,14 +4373,70 @@ def _whole_fiber_segment_overlays_for_view(
     return ((xy.astype(np.float32, copy=False), color),)
 
 
-def _compose_whole_fiber_panel_columns(
-    panel_columns: list[tuple[Any, Any, Any, Any]],
+def _whole_fiber_segment_group_overlays_for_view(
+    source: _Trace2CpSegmentSource,
+    segments: tuple[NativeWholeFiberSegmentResult, ...],
+    *,
+    axis_name: str,
+) -> tuple[tuple[np.ndarray, tuple[int, int, int, int]], ...]:
+    overlays: list[tuple[np.ndarray, tuple[int, int, int, int]]] = []
+    for segment in segments:
+        overlays.extend(
+            _whole_fiber_segment_overlays_for_view(
+                source,
+                segment,
+                axis_name=axis_name,
+            )
+        )
+    return tuple(overlays)
+
+
+def _native_whole_fiber_visual_spans(
+    segments: tuple[NativeWholeFiberSegmentResult, ...] | list[NativeWholeFiberSegmentResult],
+) -> tuple[_NativeWholeFiberVisualSpan, ...]:
+    spans: list[_NativeWholeFiberVisualSpan] = []
+    active: list[NativeWholeFiberSegmentResult] = []
+    active_start: int | None = None
+    for segment in segments:
+        if active_start is None:
+            active_start = int(segment.start_cp_index)
+        active.append(segment)
+        if not bool(segment.success):
+            spans.append(
+                _NativeWholeFiberVisualSpan(
+                    start_cp_index=int(active_start),
+                    end_cp_index=int(segment.target_cp_index),
+                    segments=tuple(active),
+                    restart_after=True,
+                )
+            )
+            active = []
+            active_start = int(segment.target_cp_index)
+    if active:
+        assert active_start is not None
+        spans.append(
+            _NativeWholeFiberVisualSpan(
+                start_cp_index=int(active_start),
+                end_cp_index=int(active[-1].target_cp_index),
+                segments=tuple(active),
+                restart_after=False,
+            )
+        )
+    return tuple(
+        span
+        for span in spans
+        if int(span.start_cp_index) != int(span.end_cp_index) and span.segments
+    )
+
+
+def _compose_whole_fiber_panel_blocks(
+    panel_blocks: list[tuple[Any, Any, Any, Any]],
     *,
     status_text: str | None = None,
 ):
     from PIL import Image, ImageDraw
 
-    if not panel_columns:
+    if not panel_blocks:
         sheet = Image.new("RGBA", (760, 96), (0, 0, 0, 255))
         draw = ImageDraw.Draw(sheet, "RGBA")
         draw.text((8, 8), "native 3D whole-fiber Trace2CP", fill=(255, 255, 255, 255))
@@ -4359,77 +4446,73 @@ def _compose_whole_fiber_panel_columns(
         return sheet
     row_count = 4
     row_heights = [
-        max(int(column[row].height) for column in panel_columns)
+        max(int(block[row].height) for block in panel_blocks)
         for row in range(row_count)
     ]
-    column_widths = [
-        max(int(panel.width) for panel in column)
-        for column in panel_columns
-    ]
-    width = int(sum(column_widths))
+    separator_width = 12
+    block_widths = [max(int(panel.width) for panel in block) for block in panel_blocks]
+    width = int(sum(block_widths) + separator_width * max(0, len(panel_blocks) - 1))
     height = int(sum(row_heights))
     sheet = Image.new("RGBA", (max(1, width), max(1, height)), (0, 0, 0, 255))
     x = 0
-    for column, column_width in zip(panel_columns, column_widths):
+    for block_index, (block, block_width) in enumerate(zip(panel_blocks, block_widths)):
         y = 0
-        for row, panel in enumerate(column):
+        for row, panel in enumerate(block):
             sheet.alpha_composite(panel, (x, y))
             y += row_heights[row]
-        x += int(column_width)
+        x += int(block_width)
+        if block_index + 1 < len(panel_blocks):
+            x += separator_width
     return sheet
 
 
-def _render_native_whole_fiber_segment_panels(
+def _build_native_whole_fiber_span_source(
     geometry_loader: Any,
     *,
-    sample_index: int,
-    target_cp_index: int,
+    start_cp_index: int,
+    end_cp_index: int,
     trace2cp_rf_margin_px: float,
-    segment: NativeWholeFiberSegmentResult,
-    cache: NativeTraceFieldCache,
-    image_normalization: str,
-) -> tuple[Any, Any, Any, Any]:
-    max_source = geometry_loader.build_trace2cp_segment_source(
-        int(sample_index),
-        target_control_point_index=int(target_cp_index),
+    strip_cross_width_px: int = 64,
+):
+    if int(start_cp_index) == int(end_cp_index):
+        raise ValueError(
+            "native whole-fiber visual span must contain at least one CP segment: "
+            f"start_cp={int(start_cp_index)} end_cp={int(end_cp_index)}"
+        )
+    return geometry_loader.build_trace2cp_segment_source(
+        int(start_cp_index),
+        target_control_point_index=int(end_cp_index),
         rf_margin_px=float(trace2cp_rf_margin_px),
+        cross_strip_height_px=int(strip_cross_width_px),
         device=torch.device("cpu"),
         sample_mode="flat",
     )
-    max_side_overlays = _whole_fiber_segment_overlays_for_view(
-        max_source,
-        segment,
+
+
+def _render_native_whole_fiber_span_panels(
+    geometry_loader: Any,
+    *,
+    span: _NativeWholeFiberVisualSpan,
+    trace2cp_rf_margin_px: float,
+    cache: NativeTraceFieldCache,
+    image_normalization: str,
+    strip_cross_width_px: int = 64,
+) -> tuple[Any, Any, Any, Any]:
+    source = _build_native_whole_fiber_span_source(
+        geometry_loader,
+        start_cp_index=int(span.start_cp_index),
+        end_cp_index=int(span.end_cp_index),
+        trace2cp_rf_margin_px=float(trace2cp_rf_margin_px),
+        strip_cross_width_px=int(strip_cross_width_px),
+    )
+    side_overlays = _whole_fiber_segment_group_overlays_for_view(
+        source,
+        span.segments,
         axis_name="offset_axis_xyz",
     )
-    max_top_overlays = _whole_fiber_segment_overlays_for_view(
-        max_source,
-        segment,
-        axis_name="side_axis_xyz",
-    )
-    adaptive_height = _adaptive_trace2cp_cross_strip_height(
-        int(max_source.source_shape_hw[0]),
-        (max_side_overlays, max_top_overlays),
-    )
-    source = (
-        max_source
-        if int(adaptive_height) == int(max_source.source_shape_hw[0])
-        else geometry_loader.build_trace2cp_segment_source(
-            int(sample_index),
-            target_control_point_index=int(target_cp_index),
-            rf_margin_px=float(trace2cp_rf_margin_px),
-            cross_strip_height_px=int(adaptive_height),
-            device=torch.device("cpu"),
-            sample_mode="flat",
-        )
-    )
-    side_overlays = _whole_fiber_segment_overlays_for_view(
+    top_overlays = _whole_fiber_segment_group_overlays_for_view(
         source,
-        segment,
-        axis_name="offset_axis_xyz",
-    )
-    top_overlays = _whole_fiber_segment_overlays_for_view(
-        source,
-        segment,
+        span.segments,
         axis_name="side_axis_xyz",
     )
     _sample, side_image, side_valid = geometry_loader.sample_trace2cp_segment_source(source)
@@ -4442,18 +4525,19 @@ def _render_native_whole_fiber_segment_panels(
         side_coords_xyz,
         np.asarray(side_grid_valid, dtype=bool) & np.asarray(side_valid, dtype=bool),
         spacing_base=spacing,
-        progress_label=f"seg{segment.start_cp_index}-side",
+        progress_label=f"span{span.start_cp_index}-{span.end_cp_index}-side",
     )
     top_presence, top_presence_valid = _sample_presence_on_strip(
         cache,
         top_coords_xyz,
         np.asarray(top_grid_valid, dtype=bool) & np.asarray(top_valid, dtype=bool),
         spacing_base=spacing,
-        progress_label=f"seg{segment.start_cp_index}-top",
+        progress_label=f"span{span.start_cp_index}-{span.end_cp_index}-top",
     )
+    failed = any(not bool(segment.success) for segment in span.segments)
     title_suffix = (
-        f"cp {segment.start_cp_index}->{segment.target_cp_index} "
-        f"{'ok' if segment.success else 'restart'} err={segment.in_plane_error_voxels:.2f}"
+        f"cp {span.start_cp_index}->{span.end_cp_index} "
+        f"segments={len(span.segments)} {'restart' if span.restart_after or failed else 'ok'}"
     )
     return (
         _draw_trace_panel(
@@ -4778,9 +4862,11 @@ def run_native_trace2cp(
         out_dir = Path(export_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         image_path = out_dir / "trace2cp_native_3d_vis.jpg"
-        panel_columns: list[tuple[Any, Any, Any, Any]] = []
-        _compose_whole_fiber_panel_columns(
-            panel_columns,
+        closed_panel_blocks: list[tuple[Any, Any, Any, Any]] = []
+        active_segments: list[NativeWholeFiberSegmentResult] = []
+        active_start_cp_index = 0
+        _compose_whole_fiber_panel_blocks(
+            closed_panel_blocks,
             status_text="initializing whole-fiber trace",
         ).convert("RGB").save(image_path, quality=90)
         print(f"native whole-fiber partial={image_path} initializing", flush=True)
@@ -4789,6 +4875,7 @@ def run_native_trace2cp(
             segment: NativeWholeFiberSegmentResult,
             partial: NativeWholeFiberResult | None,
         ) -> None:
+            nonlocal active_start_cp_index, active_segments
             print(
                 "native whole-fiber render segment "
                 f"{segment.start_cp_index}->{segment.target_cp_index} "
@@ -4796,22 +4883,31 @@ def run_native_trace2cp(
                 f"error={segment.in_plane_error_voxels:.3f}",
                 flush=True,
             )
-            panels = _render_native_whole_fiber_segment_panels(
+            if not active_segments:
+                active_start_cp_index = int(segment.start_cp_index)
+            active_segments.append(segment)
+            active_span = _NativeWholeFiberVisualSpan(
+                start_cp_index=int(active_start_cp_index),
+                end_cp_index=int(segment.target_cp_index),
+                segments=tuple(active_segments),
+                restart_after=not bool(segment.success),
+            )
+            panels = _render_native_whole_fiber_span_panels(
                 geometry_loader,
-                sample_index=int(segment.start_cp_index),
-                target_cp_index=int(segment.target_cp_index),
+                span=active_span,
                 trace2cp_rf_margin_px=float(trace2cp_cfg.rf_margin_px),
-                segment=segment,
                 cache=cache,
                 image_normalization=loader_config.image_normalization,
+                strip_cross_width_px=64,
             )
-            panel_columns.append(panels)
+            current_blocks = [*closed_panel_blocks, panels]
             restarts = 0 if partial is None else int(partial.restart_count)
             rate = 0.0 if partial is None else float(partial.restart_rate)
-            _compose_whole_fiber_panel_columns(
-                panel_columns,
+            _compose_whole_fiber_panel_blocks(
+                current_blocks,
                 status_text=(
-                    f"segments={len(panel_columns)} restarts={restarts} "
+                    f"segments={len(partial.segments) if partial is not None else 0} "
+                    f"spans={len(current_blocks)} restarts={restarts} "
                     f"rate={rate:.6f}"
                 ),
             ).convert("RGB").save(image_path, quality=90)
@@ -4820,6 +4916,10 @@ def run_native_trace2cp(
                 f"{image_path} segment={segment.start_cp_index}->{segment.target_cp_index}",
                 flush=True,
             )
+            if not bool(segment.success):
+                closed_panel_blocks.append(panels)
+                active_segments = []
+                active_start_cp_index = int(segment.target_cp_index)
 
         cp_count = int(record.fiber.control_points_zyx.shape[0])
         print(

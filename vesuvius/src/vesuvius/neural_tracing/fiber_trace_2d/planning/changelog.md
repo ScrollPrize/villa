@@ -2,6 +2,9 @@
 
 ## 2026-07-17
 
+- Reworked native 3D Trace2CP whole-fiber visualization to render
+  restart-delimited continuous long strips with fixed 64 px cross-strip width
+  while preserving progressive overwrite of `trace2cp_native_3d_vis.jpg`.
 - Changed native 3D Trace2CP CLI/config defaults for current tracing
   experiments: sample-index fallback 13 for ordinary single-sample mode,
   `--beam-lookahead-steps 1`, `--beam-width 8`,
