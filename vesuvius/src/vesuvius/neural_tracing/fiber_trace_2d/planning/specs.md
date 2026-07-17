@@ -404,10 +404,11 @@
   Both sampled axes are sign-aligned to the candidate step direction before dot
   products are evaluated. Optional search smoothness adds
   `smoothness_weight * max(0, angle(previous_step_dir, step_dir) - free_angle)^2`,
-  using radians. The defaults are `--smoothness-weight 0.0` and
-  `--smoothness-free-angle-degrees 10.0`, so smoothness is opt-in and the base
-  behavior remains unchanged. The native 3D tool does not expose additive
-  direction/presence candidate-selection weights.
+  using radians. The defaults are `--smoothness-weight 2.0` and
+  `--smoothness-free-angle-degrees 10.0`, so native 3D tracing penalizes
+  abrupt branch switches by default while still allowing CLI override. The
+  native 3D tool does not expose additive direction/presence
+  candidate-selection weights.
 - The first native 3D Trace2CP search step is seeded from the adjacent
   CP-local fiber-line tangent in the direction of the target CP's line index.
   It must not use the straight CP-to-CP chord and must not use the sampled
@@ -451,19 +452,24 @@
   Failed segments count one restart and resume tracing from the failed target
   CP with a fresh CP-local fiber tangent.
 - Native 3D forward/reverse fusion must preserve each trace's traced order.
-  It must not sort points by CP-axis progress and average them. Fusion uses
-  the same center-weighted closest-overlap idea as 2D Trace2CP: find the
-  overlapping CP-axis progress range, interpolate each trace in traced order,
-  choose the candidate minimizing 3D trace gap times the center penalty, warp
-  the forward start-to-meeting and reverse target-to-meeting partial traces to
-  the shared midpoint, then concatenate and arc-length-resample the CP-to-CP
-  fused line. If the traces have no progress overlap, native Trace2CP must
-  report that explicitly and must not invent a direct/fake fused line.
+  It must not sort points by CP-axis progress and average them. Fusion selects
+  a forward/reverse point pair over traced arc length, not straight CP-axis
+  overlap progress. Candidate score is
+  `3D_pair_gap * 2.0 + forward_arc_length_to_pair + reverse_arc_length_to_pair`.
+  Exact ties prefer smaller pair gap, then a more balanced/later meeting where
+  both traces have traveled farther. The selected pair midpoint is the fusion
+  meeting point: the forward start-to-meeting and reverse target-to-meeting
+  partial traces are warped to that midpoint by traced arc-length fraction,
+  concatenated, then arc-length-resampled as the CP-to-CP fused line.
+  `closest_progress` is only a diagnostic projection of the selected midpoint
+  onto the straight CP axis. Native Trace2CP reports failure only when no
+  finite forward/reverse pair can be selected.
 - Native 3D Trace2CP reports tool-local debug metrics:
   `native_trace2cp_plane_error` and
   `native_trace2cp_closest_target_error`, plus fusion diagnostics such as
-  selected progress, raw gap, considered gap, and center penalty. These are
-  not the public 2D `trace2cp_error`.
+  selected diagnostic progress, raw gap, considered pair score, and center
+  penalty. For pairwise traced-arc fusion the center penalty is fixed to `1.0`.
+  These are not the public 2D `trace2cp_error`.
 - Native 3D whole-fiber mode reports its tool-local metric on a single line as
   `native_trace2cp_fiber_restart_rate=... restarts=... segments=...`, where
   the restart rate is `restart_count / segment_count`. Its JSON summary stores

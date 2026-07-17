@@ -45,7 +45,7 @@ class NativeTrace2CpConfig:
     step_voxels: float = 4.0
     cone_angle_degrees: float = 25.0
     cone_grid_size: int = 25
-    smoothness_weight: float = 0.0
+    smoothness_weight: float = 2.0
     smoothness_free_angle_degrees: float = 10.0
     max_step_factor: float = 3.0
     max_steps: int | None = None
@@ -662,7 +662,7 @@ def _score_candidate_batch(
     previous_step_direction: np.ndarray,
     candidate_directions: np.ndarray,
     next_points: np.ndarray,
-    smoothness_weight: float = 0.0,
+    smoothness_weight: float = 2.0,
     smoothness_free_angle_degrees: float = 10.0,
 ) -> tuple[int | None, float, float, float, float, int]:
     if not math.isfinite(float(smoothness_weight)) or float(smoothness_weight) < 0.0:
@@ -1014,137 +1014,89 @@ def _trace_progress(
     ) / np.float32(max(float(span_voxels), _EPS))
 
 
-def _trace_point_at_progress(
-    trace_zyx: np.ndarray,
-    progress_value: float,
-    *,
-    start_zyx: np.ndarray,
-    axis_zyx: np.ndarray,
-    span_voxels: float,
-) -> np.ndarray | None:
-    trace = np.asarray(trace_zyx, dtype=np.float32)
-    if trace.ndim != 2 or trace.shape[1] != 3 or trace.shape[0] == 0:
-        return None
-    if trace.shape[0] == 1:
-        progress = float(
-            _trace_progress(
-                trace[:1],
-                start_zyx=start_zyx,
-                axis_zyx=axis_zyx,
-                span_voxels=span_voxels,
-            )[0]
-        )
-        if abs(progress - float(progress_value)) <= 1.0e-5:
-            return trace[0].astype(np.float32)
-        return None
-    progress = _trace_progress(
-        trace,
-        start_zyx=start_zyx,
-        axis_zyx=axis_zyx,
-        span_voxels=span_voxels,
-    ).astype(np.float64, copy=False)
-    target = float(progress_value)
-    for idx in range(trace.shape[0] - 1):
-        p0 = float(progress[idx])
-        p1 = float(progress[idx + 1])
-        if not (math.isfinite(p0) and math.isfinite(p1)):
-            continue
-        lo = min(p0, p1) - 1.0e-6
-        hi = max(p0, p1) + 1.0e-6
-        if target < lo or target > hi:
-            continue
-        denom = p1 - p0
-        if abs(denom) <= 1.0e-12:
-            alpha = 0.0
-        else:
-            alpha = float(np.clip((target - p0) / denom, 0.0, 1.0))
-        return (
-            trace[idx].astype(np.float64) * (1.0 - alpha)
-            + trace[idx + 1].astype(np.float64) * alpha
-        ).astype(np.float32)
-    nearest_index = int(np.argmin(np.abs(progress - target)))
-    if abs(float(progress[nearest_index]) - target) <= 1.0e-5:
-        return trace[nearest_index].astype(np.float32)
-    return None
+def _polyline_cumulative_arclengths_zyx(points_zyx: np.ndarray) -> np.ndarray:
+    points = np.asarray(points_zyx, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points_zyx must have shape N,3")
+    if points.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float64)
+    if points.shape[0] == 1:
+        return np.zeros((1,), dtype=np.float64)
+    deltas = np.diff(points.astype(np.float64), axis=0)
+    lengths = np.linalg.norm(deltas, axis=1)
+    return np.concatenate([[0.0], np.cumsum(lengths)]).astype(np.float64)
 
 
-def _resample_trace_between_progress(
-    trace_zyx: np.ndarray,
+def _deduplicate_polyline_zyx(points_zyx: np.ndarray) -> np.ndarray:
+    points = np.asarray(points_zyx, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points_zyx must have shape N,3")
+    if points.shape[0] <= 1:
+        return points.astype(np.float32, copy=True)
+    lengths = np.linalg.norm(np.diff(points.astype(np.float64), axis=0), axis=1)
+    keep = np.concatenate([[True], lengths > 1.0e-8])
+    return points[keep].astype(np.float32, copy=True)
+
+
+def _resample_polyline_with_lengths_zyx(
+    points_zyx: np.ndarray,
     *,
-    progress_start: float,
-    progress_end: float,
-    anchor_zyx: np.ndarray,
-    start_zyx: np.ndarray,
-    axis_zyx: np.ndarray,
-    span_voxels: float,
     step_voxels: float,
-) -> np.ndarray:
-    distance = abs(float(progress_end) - float(progress_start)) * max(float(span_voxels), 0.0)
-    count = max(2, int(math.ceil(distance / max(float(step_voxels), _EPS))) + 1)
-    sample_t = np.linspace(float(progress_start), float(progress_end), count, dtype=np.float32)
-    points = [
-        point
-        for point in (
-            _trace_point_at_progress(
-                trace_zyx,
-                float(t),
-                start_zyx=start_zyx,
-                axis_zyx=axis_zyx,
-                span_voxels=span_voxels,
-            )
-            for t in sample_t
-        )
-        if point is not None
-    ]
-    anchor = np.asarray(anchor_zyx, dtype=np.float32)
-    if not points:
-        return anchor[None, :].astype(np.float32)
-    out = np.stack(points, axis=0).astype(np.float32)
-    if float(np.linalg.norm(out[0].astype(np.float64) - anchor.astype(np.float64))) > 1.0e-4:
-        out = np.concatenate([anchor[None, :], out], axis=0)
+) -> tuple[np.ndarray, np.ndarray]:
+    points = _deduplicate_polyline_zyx(points_zyx)
+    if points.shape[0] == 0:
+        return points.astype(np.float32), np.zeros((0,), dtype=np.float64)
+    cumulative = _polyline_cumulative_arclengths_zyx(points)
+    total = float(cumulative[-1])
+    if points.shape[0] <= 2 or not math.isfinite(total) or total <= 1.0e-8:
+        return points.astype(np.float32, copy=True), cumulative.astype(np.float64, copy=True)
+    stride = max(float(step_voxels), _EPS)
+    sample_s = np.arange(0.0, total, stride, dtype=np.float64)
+    if sample_s.size == 0 or abs(float(sample_s[-1]) - total) > 1.0e-8:
+        sample_s = np.concatenate([sample_s, np.asarray([total], dtype=np.float64)])
     else:
-        out[0] = anchor
-    return out.astype(np.float32)
+        sample_s[-1] = total
+    sampled = np.stack(
+        [np.interp(sample_s, cumulative, points[:, axis]) for axis in range(3)],
+        axis=1,
+    ).astype(np.float32)
+    sampled[0] = points[0]
+    sampled[-1] = points[-1]
+    return sampled, sample_s.astype(np.float64, copy=False)
 
 
-def _warp_partial_trace_to_meet(
+def _warp_partial_trace_to_midpoint_by_arclength(
     partial_zyx: np.ndarray,
     *,
-    anchor_progress: float,
-    meet_progress: float,
     anchor_zyx: np.ndarray,
     source_meet_zyx: np.ndarray,
-    target_meet_zyx: np.ndarray,
-    start_zyx: np.ndarray,
-    axis_zyx: np.ndarray,
-    span_voxels: float,
+    target_midpoint_zyx: np.ndarray,
 ) -> np.ndarray:
     partial = np.asarray(partial_zyx, dtype=np.float32)
     if partial.ndim != 2 or partial.shape[1] != 3 or partial.shape[0] == 0:
         return np.zeros((0, 3), dtype=np.float32)
+    if partial.shape[0] == 1:
+        partial = np.stack(
+            [
+                np.asarray(anchor_zyx, dtype=np.float32),
+                np.asarray(source_meet_zyx, dtype=np.float32),
+            ],
+            axis=0,
+        )
     warped = partial.astype(np.float64, copy=True)
-    progress = _trace_progress(
-        warped.astype(np.float32),
-        start_zyx=start_zyx,
-        axis_zyx=axis_zyx,
-        span_voxels=span_voxels,
-    ).astype(np.float64, copy=False)
-    denom = abs(float(meet_progress) - float(anchor_progress))
-    if denom <= 1.0e-8:
+    arclengths = _polyline_cumulative_arclengths_zyx(warped.astype(np.float32))
+    total = float(arclengths[-1]) if arclengths.size else 0.0
+    if total <= 1.0e-8:
         blend = np.linspace(0.0, 1.0, warped.shape[0], dtype=np.float64)
     else:
-        blend = np.clip(
-            np.abs(progress - float(anchor_progress)) / denom,
-            0.0,
-            1.0,
-        )
+        blend = np.clip(arclengths / total, 0.0, 1.0)
     delta = (
-        np.asarray(target_meet_zyx, dtype=np.float64)
+        np.asarray(target_midpoint_zyx, dtype=np.float64)
         - np.asarray(source_meet_zyx, dtype=np.float64)
     )
     warped += blend[:, None] * delta[None, :]
     warped[0] = np.asarray(anchor_zyx, dtype=np.float64)
-    warped[-1] = np.asarray(target_meet_zyx, dtype=np.float64)
+    warped[-1] = np.asarray(target_midpoint_zyx, dtype=np.float64)
     return warped.astype(np.float32)
 
 
@@ -1158,14 +1110,10 @@ def _resample_polyline_by_arclength_zyx(
         raise ValueError("points_zyx must have shape N,3")
     if points.shape[0] <= 2:
         return points.astype(np.float32, copy=True)
-    deltas = np.diff(points.astype(np.float64), axis=0)
-    lengths = np.linalg.norm(deltas, axis=1)
-    keep = np.concatenate([[True], lengths > 1.0e-8])
-    points = points[keep]
+    points = _deduplicate_polyline_zyx(points)
     if points.shape[0] <= 2:
         return points.astype(np.float32, copy=True)
-    lengths = np.linalg.norm(np.diff(points.astype(np.float64), axis=0), axis=1)
-    cumulative = np.concatenate([[0.0], np.cumsum(lengths)])
+    cumulative = _polyline_cumulative_arclengths_zyx(points)
     total = float(cumulative[-1])
     if not math.isfinite(total) or total <= 1.0e-8:
         return points[[0, -1]].astype(np.float32)
@@ -1226,21 +1174,17 @@ def fuse_forward_reverse_traces(
             reached_overlap=False,
             reason="invalid_trace_shape",
         )
-    forward_progress = _trace_progress(
+    forward_dense, forward_arclengths = _resample_polyline_with_lengths_zyx(
         forward,
-        start_zyx=start,
-        axis_zyx=axis,
-        span_voxels=span,
+        step_voxels=step_voxels,
     )
-    reverse_progress = _trace_progress(
+    reverse_dense, reverse_arclengths = _resample_polyline_with_lengths_zyx(
         reverse,
-        start_zyx=start,
-        axis_zyx=axis,
-        span_voxels=span,
+        step_voxels=step_voxels,
     )
-    finite_forward = forward_progress[np.isfinite(forward_progress)]
-    finite_reverse = reverse_progress[np.isfinite(reverse_progress)]
-    if finite_forward.size == 0 or finite_reverse.size == 0:
+    finite_forward = np.isfinite(forward_dense).all(axis=1) & np.isfinite(forward_arclengths)
+    finite_reverse = np.isfinite(reverse_dense).all(axis=1) & np.isfinite(reverse_arclengths)
+    if not bool(np.any(finite_forward)) or not bool(np.any(finite_reverse)):
         return NativeTraceFusionResult(
             fused_zyx=empty,
             closest_progress=float("nan"),
@@ -1251,56 +1195,59 @@ def fuse_forward_reverse_traces(
             closest_forward_zyx=empty_point,
             closest_reverse_zyx=empty_point,
             reached_overlap=False,
-            reason="nonfinite_trace_progress",
+            reason="nonfinite_trace_points",
         )
-    overlap_lo = max(0.0, float(np.min(finite_forward)), float(np.min(finite_reverse)))
-    overlap_hi = min(1.0, float(np.max(finite_forward)), float(np.max(finite_reverse)))
-    if overlap_hi < overlap_lo - 1.0e-6:
-        return NativeTraceFusionResult(
-            fused_zyx=empty,
-            closest_progress=float("nan"),
-            raw_gap_voxels=float("nan"),
-            considered_gap_voxels=float("nan"),
-            center_penalty=float("nan"),
-            closest_midpoint_zyx=empty_point,
-            closest_forward_zyx=empty_point,
-            closest_reverse_zyx=empty_point,
-            reached_overlap=False,
-            reason="no_trace_overlap",
+
+    forward_valid_indices = np.nonzero(finite_forward)[0]
+    reverse_valid_indices = np.nonzero(finite_reverse)[0]
+    forward_points = forward_dense[forward_valid_indices].astype(np.float64, copy=False)
+    reverse_points = reverse_dense[reverse_valid_indices].astype(np.float64, copy=False)
+    forward_lengths = forward_arclengths[forward_valid_indices].astype(np.float64, copy=False)
+    reverse_lengths = reverse_arclengths[reverse_valid_indices].astype(np.float64, copy=False)
+
+    gap_factor = 2.0
+    best: tuple[float, float, float, float, int, int] | None = None
+    # Keep the pairwise gap matrix bounded while still vectorizing each chunk.
+    max_gap_values = 2_000_000
+    chunk_size = max(1, int(max_gap_values // max(int(reverse_points.shape[0]), 1)))
+    for chunk_start in range(0, int(forward_points.shape[0]), chunk_size):
+        chunk_end = min(chunk_start + chunk_size, int(forward_points.shape[0]))
+        forward_chunk = forward_points[chunk_start:chunk_end]
+        forward_length_chunk = forward_lengths[chunk_start:chunk_end]
+        gaps = np.linalg.norm(
+            forward_chunk[:, None, :] - reverse_points[None, :, :],
+            axis=2,
         )
-    overlap_lo = float(np.clip(overlap_lo, 0.0, 1.0))
-    overlap_hi = float(np.clip(overlap_hi, 0.0, 1.0))
-    sample_count = max(
-        2,
-        int(math.ceil(max(0.0, overlap_hi - overlap_lo) * span / max(float(step_voxels), _EPS)))
-        + 1,
-    )
-    candidate_progress = np.linspace(overlap_lo, overlap_hi, sample_count, dtype=np.float32)
-    best: tuple[float, float, float, np.ndarray, np.ndarray] | None = None
-    for progress_value in candidate_progress:
-        forward_point = _trace_point_at_progress(
-            forward,
-            float(progress_value),
-            start_zyx=start,
-            axis_zyx=axis,
-            span_voxels=span,
-        )
-        reverse_point = _trace_point_at_progress(
-            reverse,
-            float(progress_value),
-            start_zyx=start,
-            axis_zyx=axis,
-            span_voxels=span,
-        )
-        if forward_point is None or reverse_point is None:
+        combined_lengths = forward_length_chunk[:, None] + reverse_lengths[None, :]
+        scores = gap_factor * gaps + combined_lengths
+        finite_scores = np.isfinite(scores)
+        if not bool(np.any(finite_scores)):
             continue
-        gap = float(np.linalg.norm(forward_point.astype(np.float64) - reverse_point.astype(np.float64)))
-        center_penalty = 1.0 + float(np.clip(abs(float(progress_value) - 0.5) / 0.5, 0.0, 1.0))
-        considered = gap * center_penalty
-        center_tie = abs(float(progress_value) - 0.5)
-        key = (considered, center_tie)
-        if best is None or key < (best[0], best[1]):
-            best = (considered, center_tie, float(progress_value), forward_point, reverse_point)
+        min_score = float(np.min(scores[finite_scores]))
+        flat_candidates = np.flatnonzero(
+            np.isclose(scores.reshape(-1), min_score, rtol=0.0, atol=1.0e-9)
+        )
+        if flat_candidates.size == 0:
+            flat_candidates = np.asarray([int(np.argmin(scores.reshape(-1)))], dtype=np.int64)
+        flat_scores = scores.reshape(-1)[flat_candidates]
+        flat_gaps = gaps.reshape(-1)[flat_candidates]
+        flat_lengths = combined_lengths.reshape(-1)[flat_candidates]
+        min_lengths = np.minimum(forward_length_chunk[:, None], reverse_lengths[None, :])
+        flat_min_lengths = min_lengths.reshape(-1)[flat_candidates]
+        local_choice = int(
+            np.lexsort((-flat_lengths, -flat_min_lengths, flat_gaps, flat_scores))[0]
+        )
+        flat_index = int(flat_candidates[local_choice])
+        local_forward_index, local_reverse_index = np.unravel_index(flat_index, scores.shape)
+        score = float(scores[local_forward_index, local_reverse_index])
+        gap = float(gaps[local_forward_index, local_reverse_index])
+        combined_length = float(combined_lengths[local_forward_index, local_reverse_index])
+        min_length = float(min_lengths[local_forward_index, local_reverse_index])
+        forward_index = int(forward_valid_indices[chunk_start + int(local_forward_index)])
+        reverse_index = int(reverse_valid_indices[int(local_reverse_index)])
+        key = (score, gap, -min_length, -combined_length)
+        if best is None or key < (best[0], best[1], -best[2], -best[3]):
+            best = (score, gap, min_length, combined_length, forward_index, reverse_index)
     if best is None:
         return NativeTraceFusionResult(
             fused_zyx=empty,
@@ -1312,57 +1259,41 @@ def fuse_forward_reverse_traces(
             closest_forward_zyx=empty_point,
             closest_reverse_zyx=empty_point,
             reached_overlap=False,
-            reason="no_interpolated_overlap",
+            reason="no_pairwise_trace_meeting",
         )
-    considered_gap, _center_tie, closest_progress, closest_forward, closest_reverse = best
-    raw_gap = float(
-        np.linalg.norm(closest_forward.astype(np.float64) - closest_reverse.astype(np.float64))
-    )
-    center_penalty = float(considered_gap / max(raw_gap, _EPS)) if raw_gap > _EPS else (
-        1.0 + float(np.clip(abs(float(closest_progress) - 0.5) / 0.5, 0.0, 1.0))
-    )
+    considered_gap, raw_gap, _min_length, _combined_length, forward_index, reverse_index = best
+    closest_forward = forward_dense[int(forward_index)].astype(np.float32)
+    closest_reverse = reverse_dense[int(reverse_index)].astype(np.float32)
     midpoint = ((closest_forward.astype(np.float64) + closest_reverse.astype(np.float64)) * 0.5).astype(np.float32)
-    forward_partial = _resample_trace_between_progress(
-        forward,
-        progress_start=0.0,
-        progress_end=closest_progress,
-        anchor_zyx=start,
-        start_zyx=start,
-        axis_zyx=axis,
-        span_voxels=span,
-        step_voxels=step_voxels,
+    closest_progress = float(
+        _trace_progress(
+            midpoint[None, :],
+            start_zyx=start,
+            axis_zyx=axis,
+            span_voxels=span,
+        )[0]
     )
-    reverse_partial = _resample_trace_between_progress(
-        reverse,
-        progress_start=1.0,
-        progress_end=closest_progress,
-        anchor_zyx=target,
-        start_zyx=start,
-        axis_zyx=axis,
-        span_voxels=span,
-        step_voxels=step_voxels,
-    )
-    forward_warped = _warp_partial_trace_to_meet(
+    forward_partial = forward_dense[: int(forward_index) + 1].astype(np.float32, copy=True)
+    reverse_partial = reverse_dense[: int(reverse_index) + 1].astype(np.float32, copy=True)
+    if forward_partial.shape[0] == 0:
+        forward_partial = start[None, :].astype(np.float32)
+    if reverse_partial.shape[0] == 0:
+        reverse_partial = target[None, :].astype(np.float32)
+    forward_partial[0] = start
+    forward_partial[-1] = closest_forward
+    reverse_partial[0] = target
+    reverse_partial[-1] = closest_reverse
+    forward_warped = _warp_partial_trace_to_midpoint_by_arclength(
         forward_partial,
-        anchor_progress=0.0,
-        meet_progress=closest_progress,
         anchor_zyx=start,
         source_meet_zyx=closest_forward,
-        target_meet_zyx=midpoint,
-        start_zyx=start,
-        axis_zyx=axis,
-        span_voxels=span,
+        target_midpoint_zyx=midpoint,
     )
-    reverse_warped = _warp_partial_trace_to_meet(
+    reverse_warped = _warp_partial_trace_to_midpoint_by_arclength(
         reverse_partial,
-        anchor_progress=1.0,
-        meet_progress=closest_progress,
         anchor_zyx=target,
         source_meet_zyx=closest_reverse,
-        target_meet_zyx=midpoint,
-        start_zyx=start,
-        axis_zyx=axis,
-        span_voxels=span,
+        target_midpoint_zyx=midpoint,
     )
     reverse_meet_to_target = reverse_warped[::-1].copy()
     if forward_warped.shape[0] == 0:
@@ -1386,12 +1317,12 @@ def fuse_forward_reverse_traces(
         closest_progress=float(closest_progress),
         raw_gap_voxels=float(raw_gap),
         considered_gap_voxels=float(considered_gap),
-        center_penalty=float(center_penalty),
+        center_penalty=1.0,
         closest_midpoint_zyx=midpoint.astype(np.float32),
         closest_forward_zyx=closest_forward.astype(np.float32),
         closest_reverse_zyx=closest_reverse.astype(np.float32),
         reached_overlap=True,
-        reason="closest_overlap",
+        reason="pairwise_arc_length_meeting",
     )
 
 
@@ -2700,16 +2631,7 @@ def run_native_trace2cp(
     sample_mode: str | None = None,
     native_cfg: NativeTrace2CpConfig | None = None,
 ) -> NativeTracePairResult | NativeWholeFiberResult:
-    startup_t0 = time.perf_counter()
-    print(
-        "native_trace2cp_3d startup begin "
-        f"config={config_path} checkpoint={checkpoint} export_dir={export_dir} "
-        f"fiber_json={fiber_json} sample_index={sample_index} "
-        f"start_cp={start_cp_index} target_cp={target_cp_index}",
-        flush=True,
-    )
     raw_config = _load_raw_config(config_path)
-    config_t1 = time.perf_counter()
     cfg = NativeTrace2CpConfig() if native_cfg is None else native_cfg
     fiber_path = None if fiber_json is None else Path(fiber_json)
     whole_mode = _native_trace2cp_whole_fiber_mode(
@@ -2718,41 +2640,17 @@ def run_native_trace2cp(
         start_cp_index=start_cp_index,
         target_cp_index=target_cp_index,
     )
-    mode_label = "whole_fiber" if whole_mode else "single_segment"
-    print(
-        "native_trace2cp_3d startup config_loaded "
-        f"elapsed_ms={(config_t1 - startup_t0) * 1000.0:.1f} mode={mode_label}",
-        flush=True,
-    )
     tool_raw_config = _tool_raw_config(raw_config, fiber_json=fiber_path)
     loader_config = _load_tool_config(config_path, raw_config, fiber_json=fiber_path)
-    loader_t0 = time.perf_counter()
-    print("native_trace2cp_3d startup constructing_3d_loader", flush=True)
     loader = FiberTrace3DLoader(loader_config)
-    loader_t1 = time.perf_counter()
-    print(
-        "native_trace2cp_3d startup 3d_loader_ready "
-        f"elapsed_ms={(loader_t1 - loader_t0) * 1000.0:.1f} "
-        f"total_ms={(loader_t1 - startup_t0) * 1000.0:.1f}",
-        flush=True,
-    )
     trace2cp_cfg = _native_trace2cp_geometry_config(raw_config)
     trace2cp_cfg = dataclass_replace(
         trace2cp_cfg,
         rf_margin_px=max(float(trace2cp_cfg.rf_margin_px), float(cfg.core_margin_voxels)),
     )
-    geometry_t0 = time.perf_counter()
-    print("native_trace2cp_3d startup constructing_geometry_loader", flush=True)
     geometry_loader = _make_trace2cp_geometry_loader(
         tool_raw_config,
         trace2cp_cfg,
-    )
-    geometry_t1 = time.perf_counter()
-    print(
-        "native_trace2cp_3d startup geometry_loader_ready "
-        f"elapsed_ms={(geometry_t1 - geometry_t0) * 1000.0:.1f} "
-        f"total_ms={(geometry_t1 - startup_t0) * 1000.0:.1f}",
-        flush=True,
     )
     selection: _NativeTrace2CpSelection | None = None
     start_zyx: np.ndarray | None = None
@@ -3074,7 +2972,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--step-voxels", type=float, default=4.0)
     parser.add_argument("--cone-angle-degrees", type=float, default=25.0)
     parser.add_argument("--cone-grid-size", type=int, default=25)
-    parser.add_argument("--smoothness-weight", type=float, default=0.0)
+    parser.add_argument("--smoothness-weight", type=float, default=2.0)
     parser.add_argument("--smoothness-free-angle-degrees", type=float, default=10.0)
     parser.add_argument("--max-step-factor", type=float, default=3.0)
     parser.add_argument("--max-steps", type=int, default=None)

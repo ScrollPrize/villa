@@ -2,10 +2,14 @@
 
 ## 2026-07-17
 
-- Added optional native 3D Trace2CP smoothness cost:
-  `--smoothness-weight` adds a hinge-squared previous-step direction penalty to
-  the candidate cost, and `--fiber-json --sample-index` remains single-segment
-  inspection while bare `--fiber-json` runs whole-fiber tracing.
+- Changed native 3D Trace2CP forward/reverse fusion to select the meeting by
+  pairwise traced-arc score (`2 * gap + forward length + reverse length`)
+  instead of straight-axis overlap progress. `closest_progress` is now
+  diagnostic, and the fusion reason reports `pairwise_arc_length_meeting`.
+- Raised native 3D Trace2CP's default `--smoothness-weight` to `2.0`, adding a
+  hinge-squared previous-step direction penalty by default. The CLI flag can
+  still override the value, and `--fiber-json --sample-index` remains
+  single-segment inspection while bare `--fiber-json` runs whole-fiber tracing.
 - Added native 3D Trace2CP whole-fiber mode: `--fiber-json` without explicit
   CP indices now traces consecutive CP planes through the full fiber, reports a
   restart-rate metric, and progressively overwrites the four-row native JPG

@@ -1710,7 +1710,7 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().cone_grid_size == 25
     assert NativeTrace2CpConfig().max_step_factor == 3.0
     assert NativeTrace2CpConfig().max_steps is None
-    assert NativeTrace2CpConfig().smoothness_weight == 0.0
+    assert NativeTrace2CpConfig().smoothness_weight == 2.0
     assert NativeTrace2CpConfig().smoothness_free_angle_degrees == 10.0
     assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 100.0
 
@@ -1963,7 +1963,7 @@ def test_native_3d_trace2cp_converts_volume_trace_to_source_xyz_offsets() -> Non
     assert np.allclose(source_trace, [[2.0, 7.0, 3.0], [8.0, 4.0, -2.0]], atol=1.0e-5)
 
 
-def test_native_3d_trace2cp_fusion_uses_centered_closest_overlap() -> None:
+def test_native_3d_trace2cp_fusion_uses_pairwise_arc_length_score() -> None:
     start = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
     target = np.asarray([10.0, 0.0, 0.0], dtype=np.float32)
     forward = np.asarray(
@@ -1992,16 +1992,61 @@ def test_native_3d_trace2cp_fusion_uses_centered_closest_overlap() -> None:
     )
 
     assert fusion.reached_overlap
-    assert fusion.reason == "closest_overlap"
-    assert fusion.closest_progress == pytest.approx(0.5, abs=1.0e-6)
-    assert np.allclose(fusion.closest_midpoint_zyx, [5.0, 1.0, 0.0], atol=1.0e-6)
+    assert fusion.reason == "pairwise_arc_length_meeting"
+    assert fusion.closest_progress == pytest.approx(0.45, abs=1.0e-6)
+    assert np.allclose(fusion.closest_forward_zyx, [4.0, 0.0, 0.0], atol=1.0e-6)
+    assert np.allclose(fusion.closest_reverse_zyx, [5.0, 2.0, 0.0], atol=1.0e-6)
+    assert np.allclose(fusion.closest_midpoint_zyx, [4.5, 1.0, 0.0], atol=1.0e-6)
+    assert fusion.raw_gap_voxels == pytest.approx(math.sqrt(5.0), abs=1.0e-6)
+    assert fusion.considered_gap_voxels == pytest.approx(9.0 + 2.0 * math.sqrt(5.0), abs=1.0e-6)
+    assert fusion.center_penalty == pytest.approx(1.0, abs=1.0e-6)
     assert np.allclose(fusion.fused_zyx[0], start, atol=1.0e-6)
     assert np.allclose(fusion.fused_zyx[-1], target, atol=1.0e-6)
     progress = fusion.fused_zyx[:, 0] / 10.0
     assert np.all(np.diff(progress) >= -1.0e-5)
 
 
-def test_native_3d_trace2cp_fusion_does_not_sort_wrong_direction_trace() -> None:
+def test_native_3d_trace2cp_fusion_tie_prefers_balanced_meeting() -> None:
+    start = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    target = np.asarray([10.0, 0.0, 0.0], dtype=np.float32)
+    forward = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    reverse = np.asarray(
+        [
+            [10.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    fusion = fuse_forward_reverse_traces(
+        forward,
+        reverse,
+        start_zyx=start,
+        target_zyx=target,
+        step_voxels=1.0,
+    )
+
+    assert fusion.reached_overlap
+    assert fusion.reason == "pairwise_arc_length_meeting"
+    assert fusion.closest_progress == pytest.approx(0.5, abs=1.0e-6)
+    assert fusion.raw_gap_voxels == pytest.approx(0.0, abs=1.0e-6)
+    assert fusion.considered_gap_voxels == pytest.approx(10.0, abs=1.0e-6)
+    assert np.allclose(fusion.closest_forward_zyx, [5.0, 0.0, 0.0], atol=1.0e-6)
+    assert np.allclose(fusion.closest_reverse_zyx, [5.0, 0.0, 0.0], atol=1.0e-6)
+    assert np.allclose(fusion.closest_midpoint_zyx, [5.0, 0.0, 0.0], atol=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[0], start, atol=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[-1], target, atol=1.0e-6)
+
+
+def test_native_3d_trace2cp_fusion_preserves_wrong_direction_trace_order() -> None:
     start = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
     target = np.asarray([10.0, 0.0, 0.0], dtype=np.float32)
     forward = np.asarray(
@@ -2031,10 +2076,11 @@ def test_native_3d_trace2cp_fusion_does_not_sort_wrong_direction_trace() -> None
     )
 
     assert fusion.reached_overlap
-    assert fusion.closest_progress == pytest.approx(1.0, abs=1.0e-6)
-    assert np.allclose(fusion.closest_forward_zyx, [10.0, 0.0, 0.0], atol=1.0e-5)
+    assert fusion.reason == "pairwise_arc_length_meeting"
+    assert fusion.closest_progress == pytest.approx(0.7, abs=1.0e-6)
+    assert np.allclose(fusion.closest_forward_zyx, [4.0, 0.0, 0.0], atol=1.0e-5)
     assert np.allclose(fusion.closest_reverse_zyx, [10.0, 10.0, 0.0], atol=1.0e-5)
-    assert np.allclose(fusion.closest_midpoint_zyx, [10.0, 5.0, 0.0], atol=1.0e-5)
+    assert np.allclose(fusion.closest_midpoint_zyx, [7.0, 5.0, 0.0], atol=1.0e-5)
     assert np.allclose(fusion.fused_zyx[0], start, atol=1.0e-6)
     assert np.allclose(fusion.fused_zyx[-1], target, atol=1.0e-6)
 
@@ -2397,6 +2443,7 @@ def test_native_3d_trace2cp_candidate_smoothness_can_reject_branch_switch() -> N
         previous_step_direction=previous_direction,
         candidate_directions=candidates,
         next_points=np.zeros((2, 3), dtype=np.float32),
+        smoothness_weight=0.0,
     )
     best_index_with_smoothness, total_loss, *_rest = _score_candidate_batch(
         FakeCache(),

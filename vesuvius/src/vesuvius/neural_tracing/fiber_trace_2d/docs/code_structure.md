@@ -134,10 +134,11 @@ side/top strip input loading.
   samples a deterministic 25x25 square angular grid mapped onto the cone disk,
   and chooses candidates by minimizing
   `1 - dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * candidate_presence`.
-  The sampled axes are sign-aligned before dot products are evaluated. Optional
-  `--smoothness-weight` adds a hinge-squared cost against the previous accepted
-  step direction after `--smoothness-free-angle-degrees`; native 3D Trace2CP
-  does not expose additive direction/presence candidate-selection weights.
+  The sampled axes are sign-aligned before dot products are evaluated.
+  `--smoothness-weight` defaults to `2.0` and adds a hinge-squared cost against
+  the previous accepted step direction after
+  `--smoothness-free-angle-degrees`; native 3D Trace2CP does not expose
+  additive direction/presence candidate-selection weights.
 - The first search step uses the adjacent CP-local fiber-line tangent in the
   direction of the target CP's line index. It does not use the straight CP-to-CP
   chord. Later steps use the sampled model direction at the current point,
@@ -182,15 +183,17 @@ side/top strip input loading.
   metric as `native_trace2cp_fiber_restart_rate=... restarts=... segments=...`;
   the JSON summary includes per-segment status, errors, step counts, restart
   points, and the last successful reference arc distance.
-- Fuses forward and reverse traces with the same center-weighted
-  closest-overlap semantics as 2D Trace2CP, but in selected-level 3D ZYX
-  coordinates. The tool keeps traced order, interpolates both traces across
-  their overlapping CP-axis progress, picks the best meeting point by
-  `3D_gap * center_penalty`, warps both partial traces to the shared midpoint,
-  and arc-length-resamples the fused CP-to-CP line. It does not sort trace
-  points by progress or fabricate a fused line when no overlap exists.
-  Stdout and the JSON summary include the selected progress, raw gap,
-  considered gap, center penalty, and fusion reason.
+- Fuses forward and reverse traces in selected-level 3D ZYX coordinates by
+  preserving traced order and selecting a pairwise traced-arc meeting, not a
+  straight-axis overlap progress. The score is
+  `2 * 3D_pair_gap + forward_arc_length + reverse_arc_length` with exact ties
+  preferring smaller gap and then a more balanced/later meeting. The selected
+  pair midpoint becomes the shared meeting point; both partial traces are
+  warped to it by traced arc-length fraction and the concatenated CP-to-CP
+  fused line is arc-length-resampled. `closest_progress` remains in stdout and
+  JSON as a diagnostic projection of that midpoint onto the straight CP axis,
+  while the considered gap field is the full pair score and center penalty is
+  fixed to `1.0`.
 - For visualization, first builds a maximum-height initial side/top Trace2CP
   source to project the native forward, backward, and fused traces. The rendered
   cross-strip height is then reduced to the odd centered size that covers those

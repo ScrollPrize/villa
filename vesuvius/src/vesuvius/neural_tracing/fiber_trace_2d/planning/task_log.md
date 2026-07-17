@@ -1,21 +1,19 @@
-# Native 3D Trace Fusion Pairwise Meeting Log
+# Native 3D Trace Smoothness Weight Log
 
-## Planning Notes
+## Implementation Notes
 
-- Current native 3D fusion still searches over straight CP-axis progress and
-  interpolates each trace at that progress.
-- The requested change replaces that primary meeting search with pairwise
-  scoring over traced arc length.
-- The plan keeps `gap_factor = 1.0` exactly as requested for the first
-  implementation.
-- The previous accidental native Trace2CP startup stdout change should be
-  removed during implementation because it was not part of the requested image
-  behavior fix.
+- Raised `NativeTrace2CpConfig.smoothness_weight` default from `0.0` to `2.0`.
+- Raised the CLI `--smoothness-weight` default from `0.0` to `2.0`.
+- Kept the smoothing formula unchanged:
+  `smoothness_weight * max(0, angle(previous_step_dir, step_dir) - free_angle)^2`
+  in radians.
+- Kept `--smoothness-free-angle-degrees` default at `10.0`.
 
 ## Deviations / Deferred Items
 
-- No implementation has been done for this task yet.
+- No requested implementation item was deferred.
 
 ## Validation
 
-- Pending implementation.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+  passed: 79 tests.
