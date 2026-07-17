@@ -1,31 +1,25 @@
-# Native 3D Whole-Fiber Continuous Strip Visualization Log
+# Native 3D Trace2CP Sampled CP Start Direction Log
 
-## Implementation
+## Implementation Notes
 
-- Replaced the native 3D whole-fiber segment-column renderer with
-  restart-delimited visual spans.
-- Whole-fiber spans are rendered through the existing Trace2CP strip source
-  builder with `cross_strip_height_px=64`.
-- Whole-fiber mode no longer calls `_adaptive_trace2cp_cross_strip_height(...)`;
-  the adaptive-height path remains for single-pair native visualization only.
-- The whole-fiber callback still overwrites `trace2cp_native_3d_vis.jpg` after
-  each completed CP segment. The active span is re-rendered as it grows, and
-  completed restart spans are kept in the composed sheet.
-- Failed overlays are clipped using that segment's own start/target CP
-  coordinates inside the long span, not the span endpoints.
-
-## Docs And Specs
-
-- Updated `planning/specs.md` to describe restart-delimited long strips and
-  fixed 64 px whole-fiber cross-strip width.
-- Updated `docs/code_structure.md` with the same behavior.
-- Added a 2026-07-17 changelog entry.
+- Task started from `planning/todo.md` item:
+  "for cp start: lets actually _not_ use the cp dir but the sampled dir that
+  most closely aligns with the cp dir. The do apply smoothness and dir
+  supervision directly as applicable".
+- Added a native 3D Trace2CP start-specific branch sampler that chooses by
+  pure angular agreement to the CP-local tangent and ignores branch presence.
+- Greedy and beam search now initialize current/previous/history direction from
+  that sampled CP direction.
+- Removed the first-step relaxation/gate path from production candidate
+  scoring, including zeroed first-step smoothness and all-pairs neutralization.
+- Updated focused tests, specs, docs, changelog, and marked the todo complete.
 
 ## Validation
 
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py`
+  passed.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed: `104 passed in 3.34s`.
-- `git diff --check` over touched files passed.
+  passed: `103 passed in 3.40s`.
 
 ## Deviations
 

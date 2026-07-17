@@ -54,7 +54,7 @@
 - [ ] cp dirs are wrong especially in tangent so beam out at additional angles in tangent initially -> can enable stronger tangent loss!
     - [ ] also test slight cp offsets along tangent - given that it might first need centering for optimal trace
 - [ ] currently need significant margin (20) for artifact free processing (from patch size 64!)
-- [ ] for cp start: lets actually _not_ use the cp dir but the sampled dir that most closely aligns with the cp dir. The do apply smoothness and dir supervision directly as applicable
+- [x] for cp start: lets actually _not_ use the cp dir but the sampled dir that most closely aligns with the cp dir. The do apply smoothness and dir supervision directly as applicable
     
 # beam-search
 - [ ] beamsearch

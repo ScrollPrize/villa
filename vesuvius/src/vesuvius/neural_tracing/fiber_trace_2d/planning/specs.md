@@ -480,25 +480,20 @@
   that candidate.
   The native 3D tool does not expose additive direction/presence
   candidate-selection weights.
-- The first native 3D Trace2CP search step is seeded from the adjacent
-  CP-local fiber-line tangent in the direction of the target CP's line index.
-  It must not use the straight CP-to-CP chord and must not use the sampled
-  model direction at the start CP. Forward and backward traces receive their
-  respective initial directions from their start/target order. The first
-  accepted step disables smoothness and evaluates the CP-tangent agreement only
-  by the Lasagna-normal/elevation component at the candidate point; tangent
-  plane rotation away from the CP tangent is ignored for that root expansion.
-  In default all-pairs scoring, root-step pair terms involving the previous
-  step/current CP tangent and candidate-sampled direction are neutralized so
-  they do not reintroduce a tangent-plane CP-tangent penalty; the candidate
-  sampled direction is still compared to the candidate step direction.
-  The normal/elevation gate must be invariant to the Lasagna normal sign
-  ambiguity. If the candidate normal is invalid or unavailable, that candidate
-  falls back to the regular full `dot(current_dir, step_dir)` gate. Later
-  steps use the sampled model direction at the current trace point,
-  sign-aligned to the previous accepted step, and keep the full direction gate
-  plus normal-aware smoothness. For multi-branch outputs, the current-point
-  branch is chosen by best `dot(branch_dir, previous_step_dir) * branch_presence`.
+- The native 3D Trace2CP start direction is sampled from the model at the
+  start CP. The adjacent CP-local fiber-line tangent toward the target CP's
+  line index is only a reference used to sign-align and choose the start
+  direction branch. It must not use the straight CP-to-CP chord. For
+  multi-branch outputs, the start branch is the valid branch with the highest
+  directional agreement to that CP-local tangent; start-branch selection is
+  not weighted by branch presence. The selected sampled direction becomes both
+  the current direction and previous/history direction for the first candidate
+  step, so direction scoring and normal-aware/cumulative smoothness apply to
+  the first step exactly as they do to later steps. Later steps sample the
+  model direction at the current trace point, sign-aligned to the previous
+  accepted step, and keep the full direction gate plus normal-aware smoothness.
+  For ordinary current-point lookup after the start CP, the branch is chosen by
+  best `dot(branch_dir, previous_step_dir) * branch_presence`.
 - The native 3D CLI prints live progress bars for forward and backward tracing.
   Progress is measured by signed target-plane progress along the initial
   CP-to-CP direction. It includes step count, ETA, and inferred-block count.

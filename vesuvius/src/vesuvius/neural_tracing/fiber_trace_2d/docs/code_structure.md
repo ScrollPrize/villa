@@ -155,9 +155,6 @@ side/top strip input loading.
   dot products, then multiplies that direction product by candidate presence.
   `--no-all-pairs-direction-product` restores the older
   `dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * presence` score.
-  For the first CP-root step, previous/current tangent-plane pair terms are
-  neutralized so the first-step normal/elevation-only relaxation remains in
-  effect.
   Smoothness uses Lasagna normals sampled directly at candidate trace points:
   selected-level ZYX candidate coordinates are converted to base ZYX with
   `record.volume_spacing_base` and passed through the existing batched
@@ -178,16 +175,18 @@ side/top strip input loading.
   does not affect normal/elevation or direction/presence gates. Native 3D
   Trace2CP does not expose additive direction/presence candidate-selection
   weights.
-- The first search step uses the adjacent CP-local fiber-line tangent in the
-  direction of the target CP's line index. It does not use the straight CP-to-CP
-  chord. That CP tangent still orients the root cone, but the first accepted
-  step is scored specially: smoothness is zero and the current-direction gate
-  compares only the Lasagna-normal/elevation component at the candidate point,
-  so tangent-plane mismatch against the CP tangent is ignored. The normal sign
-  ambiguity is folded out; invalid or unavailable candidate normals fall back
-  to the regular full current-direction dot gate. Later steps use the sampled
-  model direction at the current point, aligned to the previous accepted trace
-  step, with the normal-aware smoothness described above.
+- The first search step samples the model direction at the start CP. The
+  adjacent CP-local fiber-line tangent toward the target CP's line index is
+  only the reference used to choose and sign-align that sampled start branch;
+  it does not become the trace direction itself and the straight CP-to-CP chord
+  is not used. For grouped multi-direction outputs, this start selection uses
+  pure angular agreement to the CP-local tangent and ignores branch presence.
+  The selected sampled start direction is then treated as the current,
+  previous, and history direction for the first candidate step, so regular
+  direction scoring and normal-aware/cumulative smoothness apply immediately.
+  Later steps use the sampled model direction at the current point, aligned to
+  the previous accepted trace step, with the normal-aware smoothness described
+  above.
   Native Trace2CP now uses beam search by default (`--beam-width 8`) instead of
   committing greedily at every step. Each beam expands the same branch-aware
   candidate score for `--beam-lookahead-steps` future steps before pruning
