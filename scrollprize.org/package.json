@@ -6,6 +6,7 @@
   "scripts": {
     "preinstall": "[ \"${AGENTS_AGENT_MODE:-0}\" != \"1\" ] || [ \"${AGENTS_ALLOW_INSTALL:-0}\" = \"1\" ] || { echo \"Install is disabled by default in agent mode. Set AGENTS_ALLOW_INSTALL=1 to install dependencies.\"; exit 1; }",
     "docusaurus": "docusaurus",
+    "test": "node --test \"src/components/atlas/**/*.test.js\"",
     "gen:imgdims": "node scripts/genImageDimensions.js",
     "gen:atlas": "node scripts/genAtlasData.js",
     "gen:chatcorpus": "node scripts/genChatCorpus.js",

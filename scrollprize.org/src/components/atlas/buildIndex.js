@@ -120,22 +120,83 @@ function inkSegmentLabel(raw) {
   return v ? `${base} · ${v[1]}` : base;
 }
 
+// Resolve one full-resolution render `data` entry (ink-detection / alpha-render)
+// to its public URL plus joined per-variant metadata. um/energy come
+// AUTHORITATIVELY from the target volume's own properties (pixel_size_um /
+// energy_keV) when this sample's `volumes` map carries that volume; um falls
+// back to parsing the filename (umFromName) for the should-not-happen case of
+// a target_volume the sample doesn't list — energy has no such fallback (no
+// filename signal to parse it from) and simply stays null.
+function toRenderMeta(d, s3ToHttp, volumes) {
+  const o = (d.origins || [])[0] || {};
+  const root = ((o.access_roots || [])[0] || {}).url || "";
+  const p = o.path || "";
+  const targetVolume = d.parameters?.target_volume ?? null;
+  const volProps =
+    (targetVolume != null && volumes[targetVolume] && volumes[targetVolume].properties) || null;
+  return {
+    url: s3ToHttp(`${root}/${p}`),
+    um: volProps?.pixel_size_um ?? umFromName(p),
+    energy: volProps?.energy_keV ?? null,
+    targetVolume,
+    modelId: d.parameters?.model_id ?? null,
+    modelName: d.creation_info?.provenance?.parameters?.model ?? null,
+    renderLevel: d.parameters?.render_level ?? null,
+  };
+}
+
+// Collapse a list of toRenderMeta() entries to (at most) one per target
+// volume. Entries with no target_volume (data that predates the field) each
+// keep their own bucket — they must never collide into a shared "null volume"
+// bucket. The one genuine same-volume collision seen in the wild is duplicate
+// model runs (e.g. PHerc0172 segment 20251107110950: 2 target_volumes x 2
+// model_ids each) — model ids are timestamp strings, so keeping the
+// lexicographically largest one picks the newest run, deterministically.
+// Returns the surviving one-per-volume list sorted finest um first.
+function groupRendersByVolume(entries) {
+  const buckets = new Map();
+  let anon = 0;
+  for (const e of entries) {
+    const key = e.targetVolume != null ? `v:${e.targetVolume}` : `_:${anon++}`;
+    const cur = buckets.get(key);
+    if (!cur || String(e.modelId || "") > String(cur.modelId || "")) buckets.set(key, e);
+  }
+  return [...buckets.values()].sort((a, b) => (a.um ?? 1e9) - (b.um ?? 1e9));
+}
+
+// Generic per-segment render-variant extractor shared by the 2D ink-detection
+// and 3D alpha-render sides: filter `data` by `type`, resolve + collapse to
+// one surviving entry per target volume, then join each survivor's matching
+// downsampled counterpart (`downType`, same target_volume) as a thumbUrl.
+// `one` is the finest variant — today's exact full/alpha semantics, unchanged
+// for the (overwhelmingly common) single-variant case; `variants` is the
+// complete list and is only set when there's more than one to compare.
+function extractRenderVariants(data, type, downType, s3ToHttp, volumes) {
+  const fulls = data.filter((d) => d.type === type).map((d) => toRenderMeta(d, s3ToHttp, volumes));
+  const downs = data
+    .filter((d) => d.type === downType)
+    .map((d) => toRenderMeta(d, s3ToHttp, volumes));
+  const variants = groupRendersByVolume(fulls).map((g) => {
+    const down = downs.find((dw) => dw.targetVolume === g.targetVolume) || null;
+    return { ...g, thumbUrl: down ? down.url : null };
+  });
+  const result = { one: variants[0] || null };
+  if (variants.length > 1) result.variants = variants;
+  return result;
+}
+
 // Per-segment ink-detection predictions for a sample, as public HTTPS links —
 // the per-segment list the old atlas exposed. One entry per segment (its
 // finest-resolution run) with a downsampled preview for thumbnailing. Embargoed
 // scrolls expose nothing. `s3ToHttp` maps a segment's s3:// access-root to a
-// public https URL via the dataAccess rewrites.
+// public https URL via the dataAccess rewrites. Segments with more than one
+// multi-volume render variant additionally get `renders`/`alphaRenders`
+// arrays (see extractRenderVariants) so a future UI can offer a compare view;
+// the pre-existing fields keep pointing at the finest variant either way.
 function extractInkSegments(sample, id, s3ToHttp) {
   if (EMBARGOED.has(id)) return [];
   const segs = (sample && sample.segments) || {};
-  const toUrls = (entries) =>
-    entries.map((d) => {
-      const o = (d.origins || [])[0] || {};
-      const root = ((o.access_roots || [])[0] || {}).url || "";
-      const p = o.path || "";
-      return { url: s3ToHttp(`${root}/${p}`), um: umFromName(p) };
-    });
-  const byUm = (a, b) => (a.um ?? 1e9) - (b.um ?? 1e9);
+  const volumes = (sample && sample.volumes) || {};
   const out = [];
   for (const key of Object.keys(segs)) {
     const seg = segs[key];
@@ -146,21 +207,31 @@ function extractInkSegments(sample, id, s3ToHttp) {
       const o = d && (d.origins || [])[0];
       return o && o.path ? `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}` : null;
     };
-    // 2D ink-detection: the flattened prediction image + a downsampled preview.
-    const fulls = toUrls(data.filter((d) => d.type === "ink-detection"));
-    const downs = toUrls(data.filter((d) => d.type === "ink-detection-downsampled"));
-    const full = fulls.length ? fulls.sort(byUm)[0] : null;
-    const down = downs.sort(byUm)[0] || null;
-    // 3D ink (alpha-render): ink painted on the rendered surface. The full .tif
-    // is tens of MB (download only); the ds8 .jpg is the Thumbor thumbnail src.
-    // s3ToHttp so the jpg matches the thumbnail prefix and the tif is clickable.
-    const alphaEntry = data.find((d) => d.type === "alpha-render");
-    const alphaDsEntry = data.find((d) => d.type === "alpha-render-downsampled");
-    const alpha = alphaEntry ? s3ToHttp(oneUrl(alphaEntry)) : null;
-    const alphaPrev = alphaDsEntry ? s3ToHttp(oneUrl(alphaDsEntry)) : null;
+    // 2D ink-detection: the flattened prediction image(s) + downsampled
+    // preview(s), one variant per target volume.
+    const inkX = extractRenderVariants(
+      data,
+      "ink-detection",
+      "ink-detection-downsampled",
+      s3ToHttp,
+      volumes
+    );
+    // 3D ink (alpha-render): ink painted on the rendered surface, same shape.
+    // The full .tif is tens of MB (download only); the ds8 .jpg is the
+    // Thumbor thumbnail src. s3ToHttp so the jpg matches the thumbnail prefix
+    // and the tif is clickable.
+    const alphaX = extractRenderVariants(
+      data,
+      "alpha-render",
+      "alpha-render-downsampled",
+      s3ToHttp,
+      volumes
+    );
+    const full = inkX.one;
+    const alphaOne = alphaX.one;
     // Emit a segment if it has EITHER a 2D ink prediction OR a 3D-ink preview
     // (so the 3 alpha-only PHercParis4 segments still appear).
-    if (!full && !alphaPrev) continue;
+    if (!full && !(alphaOne && alphaOne.thumbUrl)) continue;
     const layers = oneUrl(data.find((d) => d.type === "layers-zarr"));
     // Segment root folder (holds tifxyz/, surface-volumes/, ink-detection/…),
     // derived from any of the segment's URLs and kept as an s3:// URI. The
@@ -175,18 +246,20 @@ function extractInkSegments(sample, id, s3ToHttp) {
       segFolder(oneUrl(data.find((d) => d.type === "obj-flattened" || d.type === "obj"))) ||
       segFolder(layers) ||
       segFolder(oneUrl(data.find((d) => d.type === "ink-detection"))) ||
-      segFolder(alphaEntry ? oneUrl(alphaEntry) : null);
+      segFolder(oneUrl(data.find((d) => d.type === "alpha-render")));
     out.push({
       id: key,
       label: inkSegmentLabel(sid),
       um: full ? full.um : null,
       full: full ? full.url : null,
-      down: down ? down.url : null,
-      preview: full ? (down ? down.url : full.url) : null,
-      alpha,
-      alphaPrev,
+      down: full ? full.thumbUrl : null,
+      preview: full ? full.thumbUrl || full.url : null,
+      alpha: alphaOne ? alphaOne.url : null,
+      alphaPrev: alphaOne ? alphaOne.thumbUrl : null,
       layers,
       folder,
+      ...(inkX.variants ? { renders: inkX.variants } : {}),
+      ...(alphaX.variants ? { alphaRenders: alphaX.variants } : {}),
     });
   }
   // Order unwrap (winding) ranges in DECREASING order (highest winding first);
