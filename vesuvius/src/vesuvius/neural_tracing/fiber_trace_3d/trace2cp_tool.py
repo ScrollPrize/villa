@@ -53,7 +53,7 @@ class NativeTrace2CpConfig:
     smoothness_weight: float = 2.0
     smoothness_tangent_weight: float | None = None
     smoothness_normal_weight: float | None = None
-    smoothness_free_angle_degrees: float = 10.0
+    smoothness_free_angle_degrees: float = 0.0
     max_step_factor: float = 3.0
     max_steps: int | None = None
     trace_step_limit: int | None = None
@@ -1405,7 +1405,7 @@ def _score_candidate_loss_tensors(
     smoothness_weight: float = 2.0,
     smoothness_tangent_weight: float | None = None,
     smoothness_normal_weight: float | None = None,
-    smoothness_free_angle_degrees: float = 10.0,
+    smoothness_free_angle_degrees: float = 0.0,
     candidate_normals: torch.Tensor | np.ndarray | None = None,
     candidate_normals_valid: torch.Tensor | np.ndarray | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
@@ -1487,7 +1487,7 @@ def _score_candidate_loss_tensors_batched(
     smoothness_weight: float = 2.0,
     smoothness_tangent_weight: float | None = None,
     smoothness_normal_weight: float | None = None,
-    smoothness_free_angle_degrees: float = 10.0,
+    smoothness_free_angle_degrees: float = 0.0,
     candidate_normals: torch.Tensor | None = None,
     candidate_normals_valid: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1692,7 +1692,7 @@ def _score_candidate_batch(
     smoothness_weight: float = 2.0,
     smoothness_tangent_weight: float | None = None,
     smoothness_normal_weight: float | None = None,
-    smoothness_free_angle_degrees: float = 10.0,
+    smoothness_free_angle_degrees: float = 0.0,
     candidate_normals: torch.Tensor | np.ndarray | None = None,
     candidate_normals_valid: torch.Tensor | np.ndarray | None = None,
 ) -> tuple[int | None, float, float, float, float, int]:
@@ -4645,7 +4645,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--smoothness-weight", type=float, default=2.0)
     parser.add_argument("--smoothness-tangent-weight", type=float, default=None)
     parser.add_argument("--smoothness-normal-weight", type=float, default=None)
-    parser.add_argument("--smoothness-free-angle-degrees", type=float, default=10.0)
+    parser.add_argument("--smoothness-free-angle-degrees", type=float, default=0.0)
     parser.add_argument("--max-step-factor", type=float, default=3.0)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--trace-step-limit", type=int, default=None)

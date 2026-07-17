@@ -25,13 +25,17 @@
   Lasagna normal sampler is active.
 - Added summary JSON fields for the effective smoothness weights and whether
   normal-aware smoothness was active.
+- Changed the native 3D Trace2CP free-angle default from `10` degrees to `0`
+  degrees in the config dataclass, CLI default, and helper defaults, so tangent
+  and normal smoothness penalties apply immediately unless explicitly
+  overridden.
 - Updated `planning/specs.md`, `docs/code_structure.md`, and
   `planning/changelog.md`.
 
 ## Validation
 
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  - Result: `91 passed in 8.19s`.
+  - Result: `91 passed in 7.53s`.
 - `git diff --check`
   - Result: clean.
 

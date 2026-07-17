@@ -33,8 +33,9 @@ Yes, the Lasagna normal is available and can be sampled directly at native
 - Add separate weights:
   - `smoothness_tangent_weight`
   - `smoothness_normal_weight`
-- Keep `smoothness_free_angle_degrees` as the shared dead zone for both
-  components in the first implementation.
+- Keep `smoothness_free_angle_degrees` as the shared threshold for both
+  components, with the native 3D default set to `0` degrees so tangent/normal
+  turns are penalized immediately unless the CLI overrides it.
 - Keep the existing isotropic smoothness path available for tests, fake caches,
   and any future non-Lasagna/native use. Real native 3D Trace2CP with a normal
   sampler should use the split penalty.

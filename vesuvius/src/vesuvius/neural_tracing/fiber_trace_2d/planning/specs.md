@@ -449,7 +449,9 @@
   candidate step directions after projection into the plane perpendicular to
   the Lasagna normal, while normal-tilt turn is the absolute elevation change
   against that normal. Both components use
-  `max(0, angle - smoothness_free_angle)^2`, in radians. The Lasagna normal
+  `max(0, angle - smoothness_free_angle)^2`, in radians, and the native 3D
+  CLI default for `smoothness_free_angle` is `0` degrees so all measured
+  turns are penalized unless explicitly overridden. The Lasagna normal
   sign ambiguity must not affect this penalty. The CLI flags
   `--smoothness-tangent-weight` and `--smoothness-normal-weight` override the
   component weights independently; when omitted and native candidate-normal

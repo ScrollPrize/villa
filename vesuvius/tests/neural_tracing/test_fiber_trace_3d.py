@@ -1779,7 +1779,7 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().smoothness_weight == 2.0
     assert NativeTrace2CpConfig().smoothness_tangent_weight is None
     assert NativeTrace2CpConfig().smoothness_normal_weight is None
-    assert NativeTrace2CpConfig().smoothness_free_angle_degrees == 10.0
+    assert NativeTrace2CpConfig().smoothness_free_angle_degrees == 0.0
     assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 100.0
 
 
