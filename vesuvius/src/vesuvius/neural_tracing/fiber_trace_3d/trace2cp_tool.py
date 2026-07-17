@@ -54,6 +54,8 @@ class NativeTrace2CpConfig:
     smoothness_tangent_weight: float | None = None
     smoothness_normal_weight: float | None = None
     smoothness_free_angle_degrees: float = 0.0
+    cumulative_smoothness_steps: int = 4
+    cumulative_smoothness_tangent_weight: float = 2.0
     max_step_factor: float = 3.0
     max_steps: int | None = None
     trace_step_limit: int | None = None
@@ -156,6 +158,7 @@ class _NativeTrace2CpSelection:
 class _NativeBeamNode:
     point_zyx: np.ndarray
     previous_direction_zyx: np.ndarray
+    history_direction_zyx: np.ndarray
     parent: "_NativeBeamNode | None"
     step: NativeTraceStep | None
     cumulative_loss: float
@@ -166,6 +169,7 @@ class _NativeBeamNode:
 class _NativeBeamTensorGeneration:
     points_zyx: torch.Tensor
     previous_directions_zyx: torch.Tensor
+    history_directions_zyx: torch.Tensor
     cumulative_loss: torch.Tensor
     depth: torch.Tensor
     parent_indices: torch.Tensor | None
@@ -1401,6 +1405,125 @@ def _native_first_step_normal_gate_torch(
     return gate, gate_valid
 
 
+def _native_cumulative_tangent_smoothness_loss_torch(
+    history: torch.Tensor,
+    candidates: torch.Tensor,
+    *,
+    candidate_normals: torch.Tensor | None,
+    candidate_normals_valid: torch.Tensor | None,
+    cumulative_smoothness_tangent_weight: float,
+    smoothness_free_angle_degrees: float,
+) -> torch.Tensor:
+    weight = float(cumulative_smoothness_tangent_weight)
+    if not math.isfinite(weight) or weight < 0.0:
+        raise ValueError("cumulative_smoothness_tangent_weight must be finite and non-negative")
+    if (
+        not math.isfinite(float(smoothness_free_angle_degrees))
+        or float(smoothness_free_angle_degrees) < 0.0
+    ):
+        raise ValueError("smoothness_free_angle_degrees must be finite and non-negative")
+    if candidates.ndim != 3 or int(candidates.shape[2]) != 3:
+        raise ValueError("candidates must have shape [N,M,3]")
+    state_count = int(candidates.shape[0])
+    if history.shape != (state_count, 3):
+        raise ValueError("history must have shape [N,3]")
+    if weight <= 0.0 or candidate_normals is None:
+        return torch.zeros(candidates.shape[:2], dtype=torch.float32, device=candidates.device)
+
+    if candidate_normals.ndim == 4:
+        normals = candidate_normals[:, :, -1, :]
+        if candidate_normals_valid is None:
+            normals_valid = None
+        elif candidate_normals_valid.ndim == 3:
+            normals_valid = candidate_normals_valid[:, :, -1]
+        else:
+            normals_valid = candidate_normals_valid
+    else:
+        normals = candidate_normals
+        normals_valid = candidate_normals_valid
+    normals = normals.to(device=candidates.device, dtype=torch.float32)
+    if normals_valid is not None:
+        normals_valid = normals_valid.to(device=candidates.device, dtype=torch.bool)
+    if normals.shape != candidates.shape:
+        raise ValueError("candidate_normals must have shape [N,M,3] or [N,M,S,3]")
+    if normals_valid is not None and normals_valid.shape != candidates.shape[:2]:
+        raise ValueError("candidate_normals_valid must have shape [N,M] or [N,M,S]")
+
+    normal_norm = torch.linalg.norm(normals, dim=2)
+    finite_normal = torch.isfinite(normals).all(dim=2) & torch.isfinite(normal_norm)
+    finite_normal = finite_normal & (normal_norm > float(_EPS))
+    if normals_valid is not None:
+        finite_normal = finite_normal & normals_valid
+    unit_normal = F.normalize(normals, p=2.0, dim=2, eps=float(_EPS))
+    history_expand = F.normalize(
+        history.to(device=candidates.device, dtype=torch.float32),
+        p=2.0,
+        dim=1,
+        eps=float(_EPS),
+    )[:, None, :].expand_as(candidates)
+    history_dot_n = torch.sum(history_expand * unit_normal, dim=2).clamp(-1.0, 1.0)
+    candidate_dot_n = torch.sum(candidates * unit_normal, dim=2).clamp(-1.0, 1.0)
+    history_tangent = history_expand - history_dot_n[:, :, None] * unit_normal
+    candidate_tangent = candidates - candidate_dot_n[:, :, None] * unit_normal
+    history_norm = torch.linalg.norm(history_tangent, dim=2)
+    candidate_norm = torch.linalg.norm(candidate_tangent, dim=2)
+    tangent_ok = (history_norm > float(_EPS)) & (candidate_norm > float(_EPS))
+    history_tangent = F.normalize(history_tangent, p=2.0, dim=2, eps=float(_EPS))
+    candidate_tangent = F.normalize(candidate_tangent, p=2.0, dim=2, eps=float(_EPS))
+    tangent_dot = torch.sum(history_tangent * candidate_tangent, dim=2).clamp(-1.0, 1.0)
+    tangent_angle = torch.acos(tangent_dot)
+    free_angle = math.radians(float(smoothness_free_angle_degrees))
+    loss = torch.clamp(tangent_angle - float(free_angle), min=0.0).square() * weight
+    valid = finite_normal & tangent_ok & torch.isfinite(loss)
+    return torch.where(valid, loss, torch.zeros_like(loss))
+
+
+def _update_native_history_direction_torch(
+    history: torch.Tensor,
+    chosen_directions: torch.Tensor,
+    depth: torch.Tensor,
+    *,
+    cumulative_smoothness_steps: int,
+) -> torch.Tensor:
+    steps = int(cumulative_smoothness_steps)
+    if steps <= 1:
+        return F.normalize(chosen_directions, p=2.0, dim=1, eps=float(_EPS))
+    history_t = F.normalize(
+        history.to(device=chosen_directions.device, dtype=torch.float32),
+        p=2.0,
+        dim=1,
+        eps=float(_EPS),
+    )
+    chosen_t = F.normalize(
+        chosen_directions.to(device=chosen_directions.device, dtype=torch.float32),
+        p=2.0,
+        dim=1,
+        eps=float(_EPS),
+    )
+    depth_t = depth.to(device=chosen_directions.device, dtype=torch.long)
+    root = depth_t <= 0
+    count = torch.clamp(depth_t.to(dtype=torch.float32), min=1.0, max=float(steps - 1))
+    blended = history_t * count[:, None] + chosen_t
+    updated = F.normalize(blended, p=2.0, dim=1, eps=float(_EPS))
+    return torch.where(root[:, None], chosen_t, updated)
+
+
+def _update_native_history_direction_np(
+    history: np.ndarray,
+    chosen_direction: np.ndarray,
+    *,
+    depth: int,
+    cumulative_smoothness_steps: int,
+) -> np.ndarray:
+    steps = int(cumulative_smoothness_steps)
+    chosen = _unit(np.asarray(chosen_direction, dtype=np.float32))
+    if int(depth) <= 0 or steps <= 1:
+        return chosen.astype(np.float32)
+    count = float(min(max(int(depth), 1), steps - 1))
+    blended = _unit(np.asarray(history, dtype=np.float32)) * count + chosen
+    return _unit(blended).astype(np.float32)
+
+
 def _format_eta(seconds: float | None) -> str:
     if seconds is None or not math.isfinite(float(seconds)) or float(seconds) < 0.0:
         return "?"
@@ -1452,8 +1575,10 @@ def _score_candidate_loss_tensors(
     smoothness_tangent_weight: float | None = None,
     smoothness_normal_weight: float | None = None,
     smoothness_free_angle_degrees: float = 0.0,
+    cumulative_smoothness_tangent_weight: float = 2.0,
     candidate_normals: torch.Tensor | np.ndarray | None = None,
     candidate_normals_valid: torch.Tensor | np.ndarray | None = None,
+    history_direction: torch.Tensor | np.ndarray | None = None,
     first_step_mask: torch.Tensor | np.ndarray | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     device = _cache_device(cache)
@@ -1504,12 +1629,20 @@ def _score_candidate_loss_tensors(
         smoothness_tangent_weight=smoothness_tangent_weight,
         smoothness_normal_weight=smoothness_normal_weight,
         smoothness_free_angle_degrees=smoothness_free_angle_degrees,
+        cumulative_smoothness_tangent_weight=cumulative_smoothness_tangent_weight,
         candidate_normals=None
         if candidate_normals is None
         else torch.as_tensor(candidate_normals, dtype=torch.float32, device=device),
         candidate_normals_valid=None
         if candidate_normals_valid is None
         else torch.as_tensor(candidate_normals_valid, dtype=torch.bool, device=device),
+        history_directions=None
+        if history_direction is None
+        else torch.as_tensor(
+            np.asarray(history_direction, dtype=np.float32).reshape(1, 3),
+            dtype=torch.float32,
+            device=device,
+        ),
         first_step_mask=None
         if first_step_mask is None
         else torch.as_tensor(first_step_mask, dtype=torch.bool, device=device),
@@ -1538,8 +1671,10 @@ def _score_candidate_loss_tensors_batched(
     smoothness_tangent_weight: float | None = None,
     smoothness_normal_weight: float | None = None,
     smoothness_free_angle_degrees: float = 0.0,
+    cumulative_smoothness_tangent_weight: float = 2.0,
     candidate_normals: torch.Tensor | None = None,
     candidate_normals_valid: torch.Tensor | None = None,
+    history_directions: torch.Tensor | None = None,
     first_step_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     substeps = int(candidate_substeps)
@@ -1575,6 +1710,16 @@ def _score_candidate_loss_tensors_batched(
         raise ValueError("current_directions must have shape [N,3]")
     if previous.shape != (state_count, 3):
         raise ValueError("previous_step_directions must have shape [N,3]")
+    history = None
+    if history_directions is not None:
+        history = F.normalize(
+            history_directions.to(device=device, dtype=torch.float32),
+            p=2.0,
+            dim=1,
+            eps=float(_EPS),
+        )
+        if history.shape != (state_count, 3):
+            raise ValueError("history_directions must have shape [N,3]")
     if first_step_mask is None:
         first_step_t = torch.zeros((state_count,), dtype=torch.bool, device=device)
     else:
@@ -1621,6 +1766,24 @@ def _score_candidate_loss_tensors_batched(
             torch.zeros_like(smoothness_loss),
             smoothness_loss,
         )
+    if history is not None:
+        cumulative_loss = _native_cumulative_tangent_smoothness_loss_torch(
+            history,
+            candidates,
+            candidate_normals=normals_t,
+            candidate_normals_valid=normals_valid_t,
+            cumulative_smoothness_tangent_weight=float(
+                cumulative_smoothness_tangent_weight
+            ),
+            smoothness_free_angle_degrees=float(smoothness_free_angle_degrees),
+        )
+        if bool(torch.any(first_step_t).detach().cpu()):
+            cumulative_loss = torch.where(
+                first_step_t[:, None],
+                torch.zeros_like(cumulative_loss),
+                cumulative_loss,
+            )
+        smoothness_loss = smoothness_loss + cumulative_loss
 
     if substeps == 1:
         flat_points = points.reshape(state_count * candidate_count, 3)
@@ -1765,8 +1928,10 @@ def _score_candidate_batch(
     smoothness_tangent_weight: float | None = None,
     smoothness_normal_weight: float | None = None,
     smoothness_free_angle_degrees: float = 0.0,
+    cumulative_smoothness_tangent_weight: float = 2.0,
     candidate_normals: torch.Tensor | np.ndarray | None = None,
     candidate_normals_valid: torch.Tensor | np.ndarray | None = None,
+    history_direction: torch.Tensor | np.ndarray | None = None,
     first_step: bool = False,
 ) -> tuple[int | None, float, float, float, float, int]:
     if candidate_normals is None:
@@ -1801,8 +1966,10 @@ def _score_candidate_batch(
         smoothness_tangent_weight=smoothness_tangent_weight,
         smoothness_normal_weight=smoothness_normal_weight,
         smoothness_free_angle_degrees=smoothness_free_angle_degrees,
+        cumulative_smoothness_tangent_weight=cumulative_smoothness_tangent_weight,
         candidate_normals=candidate_normals_batched,
         candidate_normals_valid=candidate_normals_valid_batched,
+        history_direction=history_direction,
         first_step_mask=np.asarray([bool(first_step)], dtype=bool),
     )
     valid_count = int(torch.count_nonzero(candidate_valid).detach().cpu())
@@ -1868,6 +2035,12 @@ def _native_trace_cfg_with_effective_smoothness(
     *,
     normal_sampler: NativeTraceNormalSampler | None,
 ) -> NativeTrace2CpConfig:
+    if int(cfg.cumulative_smoothness_steps) < 1:
+        raise ValueError("cumulative_smoothness_steps must be at least 1")
+    _optional_nonnegative_float(
+        cfg.cumulative_smoothness_tangent_weight,
+        name="cumulative_smoothness_tangent_weight",
+    )
     tangent = _optional_nonnegative_float(
         cfg.smoothness_tangent_weight,
         name="smoothness_tangent_weight",
@@ -2025,6 +2198,7 @@ def _trace_native_3d_one_way_greedy(
         label="native 3D Trace2CP initial_direction_zyx",
     )
     previous_direction = initial_direction.astype(np.float32, copy=False)
+    history_direction = initial_direction.astype(np.float32, copy=False)
     trace: list[np.ndarray] = [start.astype(np.float32)]
     steps: list[NativeTraceStep] = []
     current = start.astype(np.float32)
@@ -2073,8 +2247,12 @@ def _trace_native_3d_one_way_greedy(
                 smoothness_tangent_weight=cfg.smoothness_tangent_weight,
                 smoothness_normal_weight=cfg.smoothness_normal_weight,
                 smoothness_free_angle_degrees=float(cfg.smoothness_free_angle_degrees),
+                cumulative_smoothness_tangent_weight=float(
+                    cfg.cumulative_smoothness_tangent_weight
+                ),
                 candidate_normals=candidate_normals,
                 candidate_normals_valid=candidate_normals_valid,
+                history_direction=history_direction,
                 first_step=(_step_index == 0),
             )
         )
@@ -2123,6 +2301,12 @@ def _trace_native_3d_one_way_greedy(
                 rejected_candidates=int(rejected),
                 smoothness_loss=float(smoothness_loss),
             )
+        )
+        history_direction = _update_native_history_direction_np(
+            history_direction,
+            chosen_direction,
+            depth=_step_index,
+            cumulative_smoothness_steps=int(cfg.cumulative_smoothness_steps),
         )
         previous_direction = chosen_direction.astype(np.float32)
         current = next_point
@@ -2262,6 +2446,9 @@ def _native_beam_tensor_node(
         previous_direction = (
             gen.previous_directions_zyx[item_idx].detach().cpu().numpy().astype(np.float32)
         )
+        history_direction = (
+            gen.history_directions_zyx[item_idx].detach().cpu().numpy().astype(np.float32)
+        )
         step = NativeTraceStep(
             point_zyx=point,
             direction_loss=float(gen.step_direction_loss[item_idx].detach().cpu()),
@@ -2273,6 +2460,7 @@ def _native_beam_tensor_node(
         node = _NativeBeamNode(
             point_zyx=point,
             previous_direction_zyx=previous_direction,
+            history_direction_zyx=history_direction,
             parent=node,
             step=step,
             cumulative_loss=float(gen.cumulative_loss[item_idx].detach().cpu()),
@@ -2376,6 +2564,7 @@ def _trace_native_3d_one_way_beam(
     start_node = _NativeBeamNode(
         point_zyx=start.astype(np.float32),
         previous_direction_zyx=initial_direction.astype(np.float32, copy=False),
+        history_direction_zyx=initial_direction.astype(np.float32, copy=False),
         parent=None,
         step=None,
         cumulative_loss=0.0,
@@ -2406,6 +2595,14 @@ def _trace_native_3d_one_way_beam(
             dtype=torch.float32,
             device=device,
         )
+        root_history = torch.as_tensor(
+            np.stack(
+                [np.asarray(node.history_direction_zyx, dtype=np.float32) for node in live],
+                axis=0,
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
         root_cumulative = torch.as_tensor(
             [float(node.cumulative_loss) for node in live],
             dtype=torch.float32,
@@ -2421,6 +2618,12 @@ def _trace_native_3d_one_way_beam(
                 points_zyx=root_points,
                 previous_directions_zyx=F.normalize(
                     root_previous,
+                    p=2.0,
+                    dim=1,
+                    eps=float(_EPS),
+                ),
+                history_directions_zyx=F.normalize(
+                    root_history,
                     p=2.0,
                     dim=1,
                     eps=float(_EPS),
@@ -2449,6 +2652,12 @@ def _trace_native_3d_one_way_beam(
                 dim=1,
                 eps=float(_EPS),
             )
+            history_directions = F.normalize(
+                frontier_gen.history_directions_zyx,
+                p=2.0,
+                dim=1,
+                eps=float(_EPS),
+            )
             current_directions, _current_presence, state_valid = _sample_trace_points_aligned_torch(
                 cache,
                 current_points,
@@ -2468,6 +2677,7 @@ def _trace_native_3d_one_way_beam(
                 break
             current_points_v = current_points[valid_state_indices]
             previous_directions_v = previous_directions[valid_state_indices]
+            history_directions_v = history_directions[valid_state_indices]
             current_directions_v = F.normalize(
                 current_directions[valid_state_indices],
                 p=2.0,
@@ -2504,8 +2714,12 @@ def _trace_native_3d_one_way_beam(
                 smoothness_tangent_weight=cfg.smoothness_tangent_weight,
                 smoothness_normal_weight=cfg.smoothness_normal_weight,
                 smoothness_free_angle_degrees=float(cfg.smoothness_free_angle_degrees),
+                cumulative_smoothness_tangent_weight=float(
+                    cfg.cumulative_smoothness_tangent_weight
+                ),
                 candidate_normals=candidate_normals_t,
                 candidate_normals_valid=candidate_normals_valid_t,
+                history_directions=history_directions_v,
                 first_step_mask=first_step_mask_t,
             )
             candidate_best_loss_t, candidate_best_branch_t = torch.min(total_loss_t, dim=2)
@@ -2538,6 +2752,12 @@ def _trace_native_3d_one_way_beam(
             child_next_points = (
                 current_points_v[child_local_state]
                 + chosen_directions * float(cfg.step_voxels)
+            )
+            child_history = _update_native_history_direction_torch(
+                history_directions_v[child_local_state],
+                chosen_directions,
+                frontier_gen.depth[child_parent_indices],
+                cumulative_smoothness_steps=int(cfg.cumulative_smoothness_steps),
             )
             d0 = torch.sum(
                 (current_points_v[child_local_state] - target_t.view(1, 3))
@@ -2573,6 +2793,7 @@ def _trace_native_3d_one_way_beam(
             child_generation = _NativeBeamTensorGeneration(
                 points_zyx=child_points,
                 previous_directions_zyx=chosen_directions,
+                history_directions_zyx=child_history,
                 cumulative_loss=frontier_gen.cumulative_loss[child_parent_indices]
                 + child_total_loss,
                 depth=frontier_gen.depth[child_parent_indices] + 1,
@@ -4337,6 +4558,10 @@ def _native_trace_smoothness_summary(cfg: NativeTrace2CpConfig) -> dict[str, Any
             or cfg.smoothness_normal_weight is not None
         ),
         "smoothness_free_angle_degrees": float(cfg.smoothness_free_angle_degrees),
+        "cumulative_smoothness_steps": int(cfg.cumulative_smoothness_steps),
+        "cumulative_smoothness_tangent_weight": float(
+            cfg.cumulative_smoothness_tangent_weight
+        ),
         "first_step_cp_tangent_relaxed": True,
     }
 
@@ -4724,6 +4949,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--smoothness-tangent-weight", type=float, default=None)
     parser.add_argument("--smoothness-normal-weight", type=float, default=None)
     parser.add_argument("--smoothness-free-angle-degrees", type=float, default=0.0)
+    parser.add_argument("--cumulative-smoothness-steps", type=int, default=4)
+    parser.add_argument("--cumulative-smoothness-tangent-weight", type=float, default=2.0)
     parser.add_argument("--max-step-factor", type=float, default=3.0)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--trace-step-limit", type=int, default=None)
@@ -4757,6 +4984,10 @@ def main() -> None:
         if args.smoothness_normal_weight is None
         else float(args.smoothness_normal_weight),
         smoothness_free_angle_degrees=float(args.smoothness_free_angle_degrees),
+        cumulative_smoothness_steps=int(args.cumulative_smoothness_steps),
+        cumulative_smoothness_tangent_weight=float(
+            args.cumulative_smoothness_tangent_weight
+        ),
         max_step_factor=float(args.max_step_factor),
         max_steps=None if args.max_steps is None else int(args.max_steps),
         trace_step_limit=None if args.trace_step_limit is None else int(args.trace_step_limit),

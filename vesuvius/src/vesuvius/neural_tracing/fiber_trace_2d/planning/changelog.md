@@ -2,6 +2,10 @@
 
 ## 2026-07-17
 
+- Added native 3D Trace2CP cumulative tangent-only smoothness: trace states
+  carry a short-history heading and candidates receive an additive tangent
+  smoothness penalty via `--cumulative-smoothness-steps` and
+  `--cumulative-smoothness-tangent-weight`.
 - Relaxed native 3D Trace2CP's first CP step: the root step now disables
   smoothness and scores CP-tangent agreement only by the candidate-point
   Lasagna-normal/elevation component, while later steps keep normal-aware

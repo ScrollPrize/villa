@@ -460,6 +460,16 @@
   invalid for one candidate, that candidate falls back to the previous
   isotropic smoothness term
   `smoothness_weight * max(0, angle(previous_step_dir, step_dir) - free_angle)^2`.
+  Native 3D Trace2CP also adds cumulative tangent-only smoothness over a
+  short history direction so several small tangent-plane turns cannot compound
+  into a large tangent-plane bend. This cumulative term is additive
+  smoothness, not a direction/presence gate. It uses
+  `--cumulative-smoothness-steps` to update a running trace heading and
+  `--cumulative-smoothness-tangent-weight` to penalize the tangent-plane angle
+  between that heading and the candidate step. It never penalizes
+  normal/elevation change. If candidate normal sampling is unavailable,
+  invalid, or tangent projection is degenerate, the cumulative term is zero for
+  that candidate.
   The native 3D tool does not expose additive direction/presence
   candidate-selection weights.
 - The first native 3D Trace2CP search step is seeded from the adjacent

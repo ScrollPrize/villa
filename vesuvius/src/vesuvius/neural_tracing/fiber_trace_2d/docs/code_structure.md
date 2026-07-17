@@ -159,7 +159,13 @@ side/top strip input loading.
   `--smoothness-normal-weight` penalizes elevation change into/out of the
   normal direction. Omitted component weights default to
   `--smoothness-weight` (`2.0`) in the native CLI, and invalid candidate
-  normals fall back to the older isotropic previous-step smoothness. Native 3D
+  normals fall back to the older isotropic previous-step smoothness. In
+  addition, each greedy/beam state carries a running history heading. The
+  optional cumulative smoothness term compares candidates against that heading
+  only after projecting both into the candidate Lasagna-normal tangent plane.
+  This uses `--cumulative-smoothness-steps` and
+  `--cumulative-smoothness-tangent-weight`, is added to `smoothness_loss`, and
+  does not affect normal/elevation or direction/presence gates. Native 3D
   Trace2CP does not expose additive direction/presence candidate-selection
   weights.
 - The first search step uses the adjacent CP-local fiber-line tangent in the
