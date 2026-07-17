@@ -27,6 +27,34 @@ vc::atlas::FiberPolyline fiber(uint64_t id,
     return {id, generation, std::move(points)};
 }
 
+cv::Mat_<cv::Vec3f> flatStripGrid(int rows, int cols)
+{
+    cv::Mat_<cv::Vec3f> points(rows, cols);
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            points(row, col) = {
+                static_cast<float>(col),
+                static_cast<float>(row),
+                0.0f};
+        }
+    }
+    return points;
+}
+
+cv::Mat_<cv::Vec3f> foldedOverlappingStripGrid()
+{
+    cv::Mat_<cv::Vec3f> points(4, 2);
+    points(0, 0) = {0.0f, 0.0f, 0.0f};
+    points(0, 1) = {1.0f, 0.0f, 0.0f};
+    points(1, 0) = {0.0f, 1.0f, 0.0f};
+    points(1, 1) = {1.0f, 1.0f, 0.0f};
+    points(2, 0) = {0.0f, 0.0f, 10.0f};
+    points(2, 1) = {1.0f, 0.0f, 10.0f};
+    points(3, 0) = {0.0f, 1.0f, 10.0f};
+    points(3, 1) = {1.0f, 1.0f, 10.0f};
+    return points;
+}
+
 vc::atlas::FiberIntersectionCandidate normalizedCandidateForPair(
     vc::atlas::FiberIntersectionCandidate candidate,
     uint64_t sourceFiberId,
@@ -165,6 +193,167 @@ TEST_CASE("Fiber point R-tree coverage suppresses same-target repeated hits only
         targets.insert(candidate.targetFiberId);
     }
     CHECK(targets == std::set<uint64_t>{2, 3});
+}
+
+TEST_CASE("Fiber side strip query intersects sparse fiber segments with strip triangles")
+{
+    vc::atlas::FiberSpatialIndex index;
+    auto crossing = fiber(2, 1, {p(0.5, 0.5, -5), p(0.5, 0.5, 5)});
+    auto farCrossing = fiber(3, 1, {p(5, 5, -5), p(5, 5, 5)});
+    auto offStrip = fiber(4, 1, {p(0.5, 0.5, 10), p(1.5, 0.5, 10)});
+    index.upsertCommitted(crossing);
+    index.upsertCommitted(farCrossing);
+    index.upsertCommitted(offStrip);
+
+    vc::atlas::FiberSideStripQueryOptions options;
+    options.stripPoints = flatStripGrid(2, 2);
+
+    const auto intersections = index.sideStripIntersections(options);
+    REQUIRE(intersections.size() == 1);
+    CHECK(intersections[0].fiberId == 2);
+    CHECK(intersections[0].point[2] == doctest::Approx(0.0));
+    CHECK(intersections[0].stripRow == doctest::Approx(0.5));
+    CHECK(intersections[0].stripCol == doctest::Approx(0.5));
+
+    options.excludedFiberIds = {2};
+    CHECK(index.sideStripIntersections(options).empty());
+}
+
+TEST_CASE("Fiber side strip query can use direct fiber snapshots without building an index")
+{
+    vc::atlas::FiberSpatialIndex emptyIndex;
+    auto crossing = fiber(2, 1, {p(0.5, 0.5, -5), p(0.5, 0.5, 5)});
+    auto offStrip = fiber(4, 1, {p(0.5, 0.5, 10), p(1.5, 0.5, 10)});
+
+    vc::atlas::FiberSideStripQueryOptions options;
+    options.stripPoints = flatStripGrid(2, 2);
+    options.queryFibers = {&crossing, &offStrip};
+
+    const auto intersections = emptyIndex.sideStripIntersections(options);
+    REQUIRE(intersections.size() == 1);
+    CHECK(intersections[0].fiberId == 2);
+}
+
+TEST_CASE("Fiber side strip query finds long segments and preserves multiple crossings")
+{
+    vc::atlas::FiberSpatialIndex index;
+    auto crossing = fiber(2, 1, {p(1.0, 0.5, -1000), p(1.0, 0.5, 1000)});
+    auto multi = fiber(3, 1, {
+        p(0.25, 0.5, -1),
+        p(0.25, 0.5, 1),
+        p(1.75, 0.5, 1),
+        p(1.75, 0.5, -1),
+    });
+    index.upsertCommitted(crossing);
+    index.upsertCommitted(multi);
+
+    vc::atlas::FiberSideStripQueryOptions options;
+    options.stripPoints = flatStripGrid(2, 3);
+    options.maxResults = 16;
+
+    const auto intersections = index.sideStripIntersections(options);
+    REQUIRE(intersections.size() == 3);
+    CHECK(std::count_if(intersections.begin(), intersections.end(), [](const auto& hit) {
+        return hit.fiberId == 3;
+    }) == 2);
+    CHECK(std::any_of(intersections.begin(), intersections.end(), [](const auto& hit) {
+        return hit.fiberId == 2 && hit.point[2] == doctest::Approx(0.0);
+    }));
+}
+
+TEST_CASE("Fiber side strip query reports branch link line hits and misses")
+{
+    vc::atlas::FiberSpatialIndex index;
+    index.upsertCommitted(fiber(2, 1, {p(0.25, 0.5, -5), p(0.25, 0.5, 5)}));
+    vc::atlas::FiberSideStripQueryOptions options;
+    options.stripPoints = flatStripGrid(2, 2);
+    options.branchLinks = {
+        {77, {0.5, 0.5, -5.0}, {0.0, 0.0, 1.0}, {0.0, 0.0, -5.0}},
+        {88, {5.0, 5.0, -5.0}, {0.0, 0.0, 1.0}, {0.0, 0.0, -5.0}},
+    };
+
+    std::vector<vc::atlas::FiberSideStripProgressPhase> phases;
+    const auto intersections = index.sideStripIntersections(
+        options,
+        [&phases](vc::atlas::FiberSideStripProgressPhase phase, size_t completed, size_t) {
+            if (completed == 0) {
+                phases.push_back(phase);
+            }
+        });
+    REQUIRE(intersections.size() == 2);
+    CHECK(intersections[0].source == vc::atlas::FiberSideStripIntersectionSource::BranchLink);
+    CHECK(intersections[0].fiberId == 77);
+    CHECK(intersections[0].point[2] == doctest::Approx(0.0));
+    CHECK(intersections[0].connectorStart[2] == doctest::Approx(-5.0));
+    CHECK(intersections[1].source == vc::atlas::FiberSideStripIntersectionSource::FiberSegment);
+    const auto branchPhase = std::find(phases.begin(),
+                                       phases.end(),
+                                       vc::atlas::FiberSideStripProgressPhase::BranchLinks);
+    const auto fiberPhase = std::find(phases.begin(),
+                                      phases.end(),
+                                      vc::atlas::FiberSideStripProgressPhase::FiberSegments);
+    REQUIRE(branchPhase != phases.end());
+    REQUIRE(fiberPhase != phases.end());
+    CHECK(branchPhase < fiberPhase);
+
+    options.branchLinks = {
+        {88, {5.0, 5.0, -5.0}, {0.0, 0.0, 1.0}, {0.0, 0.0, -5.0}},
+    };
+    options.excludedFiberIds = {2};
+    CHECK(index.sideStripIntersections(options).empty());
+}
+
+TEST_CASE("Fiber side strip query keeps the projection nearest to the branch target point")
+{
+    vc::atlas::FiberSpatialIndex index;
+    vc::atlas::FiberSideStripQueryOptions options;
+    options.stripPoints = foldedOverlappingStripGrid();
+    options.maxResults = 0;
+    options.branchLinks = {
+        {77, {0.5, 0.5, 9.0}, {0.0, 0.0, 1.0}, {0.5, 0.5, -1.0}},
+    };
+
+    const auto intersections = index.sideStripIntersections(options);
+
+    REQUIRE(intersections.size() == 1);
+    CHECK(intersections[0].source == vc::atlas::FiberSideStripIntersectionSource::BranchLink);
+    CHECK(intersections[0].fiberId == 77);
+    CHECK(intersections[0].point[2] == doctest::Approx(10.0));
+    CHECK(intersections[0].connectorStart[2] == doctest::Approx(-1.0));
+    CHECK(intersections[0].projectionTarget[2] == doctest::Approx(9.0));
+}
+
+TEST_CASE("Fiber side strip branch projection ignores local connector proximity")
+{
+    vc::atlas::FiberSpatialIndex index;
+    vc::atlas::FiberSideStripQueryOptions options;
+    options.stripPoints = foldedOverlappingStripGrid();
+    options.maxResults = 0;
+    options.branchLinks = {
+        {77, {0.5, 0.5, -1.0}, {0.0, 0.0, 1.0}, {0.5, 0.5, 9.0}},
+    };
+
+    const auto intersections = index.sideStripIntersections(options);
+
+    REQUIRE(intersections.size() == 1);
+    CHECK(intersections[0].source == vc::atlas::FiberSideStripIntersectionSource::BranchLink);
+    CHECK(intersections[0].fiberId == 77);
+    CHECK(intersections[0].point[2] == doctest::Approx(0.0));
+    CHECK(intersections[0].connectorStart[2] == doctest::Approx(9.0));
+    CHECK(intersections[0].projectionTarget[2] == doctest::Approx(-1.0));
+}
+
+TEST_CASE("Fiber side strip branch projection emits no connector without a strip hit")
+{
+    vc::atlas::FiberSpatialIndex index;
+    vc::atlas::FiberSideStripQueryOptions options;
+    options.stripPoints = flatStripGrid(2, 2);
+    options.maxResults = 0;
+    options.branchLinks = {
+        {77, {5.0, 5.0, -1.0}, {0.0, 0.0, 1.0}, {0.5, 0.5, 0.0}},
+    };
+
+    CHECK(index.sideStripIntersections(options).empty());
 }
 
 TEST_CASE("Fiber intersection search runs two-sided discovery and preserves distinct minima")
