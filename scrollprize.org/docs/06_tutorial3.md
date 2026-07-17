@@ -1,7 +1,6 @@
 ---
 title: "Tutorial: Segmentation and Flattening"
 sidebar_label: "Segmentation and Flattening"
-hide_table_of_contents: true
 ---
 
 <head>
@@ -37,11 +36,16 @@ hide_table_of_contents: true
   />
 </head>
 
-import { TutorialsTop } from '@site/src/components/TutorialsTop';
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 
-<TutorialsTop highlightId={3} />
+
+:::warning[ARCHIVED]
+
+This page has been archived and is no longer maintained. It describes an earlier generation of the Vesuvius Challenge pipeline — tools, data layouts, and results referenced here may have been superseded. See [Open Problems](2026_open_problems) for the current state of the pipeline and [Prizes](prizes) for what is open today.
+
+:::
+
 
 This tutorial walks through a slice-based approach to segmentation, which is helpful background for learning about the task.
 This was used to generate the 2023 [Grand Prize results](grandprize).
@@ -99,7 +103,7 @@ To perform segmentation, you have two choices of software: Khartes, and Volume C
 
 Khartes is written by @khartes_chuck and has extensive documentation on github located [here](https://github.com/KhartesViewer/khartes).
 
-This guide will focus on [Volume Cartographer](https://github.com/educelab/volume-cartographer), a virtual unwrapping toolkit built by EduceLab’s Seth Parker. Volume Cartographer is designed to create meshes along surfaces of a manuscript (e.g. pages or scroll wraps) and then sample the voxels around these meshes to create a 2D image of the manuscript's contents. Volume Cartographer includes many tools and utilities. In this tutorial we’ll be looking at the main VC GUI as well as the vc_render tool.
+This guide will focus on [Volume Cartographer](https://github.com/educelab/volume-cartographer), a virtual unwrapping toolkit built by EduceLab’s Seth Parker. Volume Cartographer is designed to create meshes along surfaces of a manuscript (e.g. pages or scroll wraps) and then sample the voxels around these meshes to create a 2D image of the manuscript's contents. Volume Cartographer includes many tools and utilities. In this tutorial we’ll be looking at the main VC GUI as well as the vc_render tool. Volume Cartographer screenshots and recordings below are © EduceLab/University of Kentucky.
 
 The segmentation team uses a custom version of Volume Cartographer, initially forked by @RICHI and further enhanced by @spacegaier. These versions include significant improvements, such as Optical Flow Segmentation (OFS), substantial performance increases, ui improvements, and many other changes. The latest fork, maintained by @spacegaier, is available here: https://github.com/spacegaier/volume-cartographer.
 
@@ -508,5 +512,5 @@ By now you'll notice that, contrary to the ink in some scrolls, the ink in our s
 
 The reason for this is that not all inks have the same radio-density. Some inks, like iron gall, show up quite clearly in CT scans because they absorb more x-rays than the papyrus on which they sit. This creates _high contrast_ between the bright iron gall ink voxels and the less bright papyrus voxels. Carbon-based inks, on the other hand, have a very similar radio-density to papyrus and thus have _low contrast_ when compared against the papyrus voxels. More often than not, the contrast is so low for carbon ink that it is very difficult to differentiate the ink from the papyrus when looking at the volume data with the naked eye.
 
-Thankfully, as you'll learn in our next tutorial on [“Ink Detection”](tutorial4), even very difficult to detect ink can still be found...
+Thankfully, as you'll learn in our next tutorial on [“Ink Detection”](tutorial5), even very difficult to detect ink can still be found...
 

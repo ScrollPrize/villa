@@ -199,7 +199,7 @@ def max_composite(tif_paths):
 @click.option('--tifxyz2obj-bin', default='vc_tifxyz2obj', show_default=True, help='Path to the vc_tifxyz2obj binary')
 @click.option('--obj2tifxyz-bin', default='vc_obj2tifxyz', show_default=True, help='Path to the vc_obj2tifxyz binary')
 @click.option('--uv-lift-bin', default='vc_obj_uv_lift', show_default=True, help='Path to the vc_obj_uv_lift binary (used only when --flatten-keep < 100)')
-@click.option('--flatten-keep', type=float, default=100.0, show_default=True, help='Percent of points to keep when decimating the mesh flatboi flattens; <100 decimates (smaller mesh is less prone to SLIM divergence). Quantized to a per-axis stride, so kept fraction ~= 1/round(1/sqrt(keep/100))^2 (e.g. any keep<100 => stride>=2 => <=25%)')
+@click.option('--flatten-keep', type=float, default=6.25, show_default=True, help='Percent of points to keep when decimating the mesh flatboi flattens; <100 decimates (smaller mesh is less prone to SLIM divergence). Quantized to a per-axis stride, so kept fraction ~= 1/round(1/sqrt(keep/100))^2 (e.g. any keep<100 => stride>=2 => <=25%)')
 @click.option('--flatten-iters', type=int, default=50, show_default=True, help='flatboi SLIM iterations')
 @click.option('--flatten-energy', default='symmetric_dirichlet', show_default=True, help='flatboi energy (symmetric_dirichlet or conformal)')
 @click.option('--flatten-tol', type=float, default=0.0, show_default=True, help='flatboi relative-energy early-stop tolerance (0 disables)')

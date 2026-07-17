@@ -26,3 +26,10 @@ dependencies = [
     "wandb>=0.28.0",
     "zarr>=3.2.1",
 ]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []

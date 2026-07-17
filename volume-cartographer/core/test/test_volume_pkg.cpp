@@ -409,6 +409,28 @@ TEST_CASE("VolumePkg reconciles and relocates coordinate-bearing asset entries")
     fs::remove_all(d);
 }
 
+TEST_CASE("VolumePkg persists manifest-backed Lasagna entries independently of normal grids")
+{
+    auto d = tmpDir("lasagna_entries");
+    const auto project = d / "project.json";
+    const auto lasagna = (d / "cache" / "data.lasagna.json").string();
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addLasagnaDatasetEntry(
+        lasagna,
+        {"vc-open-data-lasagna", "vc-open-data-volume-id:vol-a"}));
+    CHECK(pkg->normalGridEntries().empty());
+    pkg->save(project);
+
+    vc::project::LoadOptions options;
+    options.deferResolution = true;
+    auto loaded = VolumePkg::load(project, options);
+    REQUIRE(loaded);
+    REQUIRE(loaded->lasagnaDatasetEntries().size() == 1);
+    CHECK(loaded->lasagnaDatasetEntries().front().location == lasagna);
+    CHECK(loaded->normalGridEntries().empty());
+    fs::remove_all(d);
+}
+
 TEST_CASE("VolumePkg canonicalizes virtual locators and deduplicates explicit base zero")
 {
     auto d = tmpDir("remote_selector_identity");

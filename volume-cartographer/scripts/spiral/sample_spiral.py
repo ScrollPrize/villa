@@ -75,6 +75,41 @@ def get_theta_and_radii(relative_yx, dr_per_winding):
     return theta, radius, shifted_radius
 
 
+def get_theta_crossing_step_adjustments(theta, dr_per_winding, dim=-1):
+    """Return shifted-radius corrections for consecutive theta=0 crossings."""
+    if theta.shape[dim] <= 1:
+        shape = list(theta.shape)
+        shape[dim] = 0
+        return torch.empty(shape, device=theta.device, dtype=theta.dtype)
+
+    theta_diffs = torch.diff(theta.detach(), dim=dim)
+    return (
+        (theta_diffs > np.pi).to(theta.dtype)
+        - (theta_diffs < -np.pi).to(theta.dtype)
+    ) * dr_per_winding.detach()
+
+
+def unwrap_shifted_radii(theta, shifted_radii, dr_per_winding, dim=-1):
+    """Unwrap shifted radii along ``dim`` and return them with their crossing adjustments."""
+    if theta.shape[dim] == 0:
+        return shifted_radii, torch.zeros_like(shifted_radii)
+
+    step_adjustments = get_theta_crossing_step_adjustments(theta, dr_per_winding, dim=dim)
+    zero_shape = list(theta.shape)
+    zero_shape[dim] = 1
+    adjustments = torch.cat([
+        torch.zeros(zero_shape, device=shifted_radii.device, dtype=shifted_radii.dtype),
+        torch.cumsum(step_adjustments.to(shifted_radii.dtype), dim=dim),
+    ], dim=dim)
+    return shifted_radii + adjustments, adjustments
+
+
+def radius_from_unwrapped_shifted(theta, unwrapped_shifted_radii, crossing_adjustments, dr_per_winding):
+    """Convert unwrapped shifted radii back to each point's wrapped-theta radius."""
+    raw_shifted_radii = unwrapped_shifted_radii - crossing_adjustments
+    return raw_shifted_radii + theta / (2 * np.pi) * dr_per_winding
+
+
 def get_bounding_windings(relative_yx, dr_per_winding):
     # The spiral has radius 0 at winding angle 0 then increases linearly at rate dr_per_winding
     # Want to find the two windings that bracket yx

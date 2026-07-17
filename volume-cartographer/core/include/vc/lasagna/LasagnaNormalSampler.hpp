@@ -27,6 +27,7 @@ public:
     LasagnaNormalSampler(LasagnaNormalSampler&&) noexcept;
     LasagnaNormalSampler& operator=(LasagnaNormalSampler&&) noexcept;
 
+    [[nodiscard]] bool supportsConcurrentSampling() const noexcept override { return true; }
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override;
     [[nodiscard]] std::optional<double> sampleWindingDensity(const cv::Vec3d& volumePoint) const;
     [[nodiscard]] std::optional<double> samplePredDt(const cv::Vec3d& volumePoint) const;

@@ -279,6 +279,8 @@ namespace window {
 
 namespace line_annotation {
     constexpr auto GEOMETRY = "lineAnnotation/geometry";
+    constexpr auto INITIAL_CENTERLINE_LENGTH_VX = "lineAnnotation/initial_centerline_length_vx";
+    constexpr int INITIAL_CENTERLINE_LENGTH_VX_DEFAULT = 2400;
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
     constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
     constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes";

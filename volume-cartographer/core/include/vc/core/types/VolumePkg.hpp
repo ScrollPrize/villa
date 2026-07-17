@@ -70,6 +70,7 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& volumeEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& segmentEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& normalGridEntries() const;
+    [[nodiscard]] const std::vector<vc::project::Entry>& lasagnaDatasetEntries() const;
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
     bool mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags);
@@ -93,6 +94,12 @@ public:
                                  const std::string& newLocation);
     bool addSegmentsEntry(const std::string& location, std::vector<std::string> tags = {});
     bool addNormalGridEntry(const std::string& location, std::vector<std::string> tags = {});
+    bool addLasagnaDatasetEntry(const std::string& location,
+                                std::vector<std::string> tags = {});
+    bool reconcileLasagnaDatasetEntryTags(
+        const std::string& location,
+        const std::vector<std::string>& tags,
+        const std::vector<std::string>& singletonPrefixes);
     bool removeEntry(const std::string& location);
 
     void setOutputSegments(const std::string& location);
@@ -172,6 +179,7 @@ private:
     std::vector<vc::project::Entry> volumes_;
     std::vector<vc::project::Entry> segments_;
     std::vector<vc::project::Entry> normalGrids_;
+    std::vector<vc::project::Entry> lasagnaDatasets_;
     std::optional<std::string> outputSegments_;
     std::optional<std::string> selectedLasagnaDataset_;
 

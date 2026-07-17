@@ -10,6 +10,10 @@
 
 #include <zstd.h>
 
+#if defined(_MSC_VER)
+#include <intrin.h>   // __umulh / _udiv128 for the 128-bit rANS reciprocal math
+#endif
+
 namespace vc {
 
 namespace {
@@ -176,8 +180,12 @@ struct RansEncSym {
 
 inline std::uint64_t ransMulHi(std::uint64_t a, std::uint64_t b)
 {
+#if defined(_MSC_VER)
+    return __umulh(a, b);   // high 64 bits of the 64x64 product
+#else
     return static_cast<std::uint64_t>(
         (static_cast<unsigned __int128>(a) * b) >> 64);
+#endif
 }
 
 // Histogram -> frequencies summing to exactly kRansM, every present symbol
@@ -227,9 +235,18 @@ void ransBuildEncTable(const std::uint32_t freq[256], RansEncSym enc[256])
             std::uint32_t k = 1;
             while ((1u << k) < f) ++k;  // k = ceil(log2 f)
             e.shift = k - 1;
+            // num = 2^(k+63) + (f-1): high 64 bits = 2^(k-1), low 64 bits =
+            // (f-1). The quotient num/f provably fits in 64 bits (f > 2^(k-1)),
+            // so the 128/64 -> 64 division is well-defined on both paths.
+#if defined(_MSC_VER)
+            std::uint64_t ransRcpRem;
+            e.rcp = _udiv128(std::uint64_t{1} << (k - 1),
+                             static_cast<std::uint64_t>(f) - 1, f, &ransRcpRem);
+#else
             const auto num =
                 ((static_cast<unsigned __int128>(1) << (k + 63)) + f - 1);
             e.rcp = static_cast<std::uint64_t>(num / f);
+#endif
             e.bias = cum;
         }
         cum += f;

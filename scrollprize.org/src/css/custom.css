@@ -13,24 +13,34 @@
 @tailwind components;
 @tailwind utilities;
 
-/* You can override the default Infima variables here. */
+/* Infima bridge — Obsidian tokens (from tokens.css) drive the Infima ramp.
+   The site is dark-only, so the light-mode :root ramp points at the same
+   tokens (values killed per spec §1). One accent token collapses the old
+   7-step red ramp — hover feedback in the new design is border/bg, not shade. */
 :root {
-  /* From https://colorbox.io/?c0=%26p%24s%24%3D7%26p%24h%24st%24%3D10%26p%24h%24e%24%3D0%26p%24h%24c%24%3Deqo%26p%24sa%24st%24%3D0.3%26p%24sa%24e%24%3D1%26p%24sa%24r%24%3D1%26p%24sa%24c%24%3Deqo%26p%24b%24st%24%3D1%26p%24b%24e%24%3D0.33%26p%24b%24c%24%3Deqti%26o%24n%24%3DRed%26o%24ms%24%3D%5B%5D%26o%24ro%24%3Dccw */
-  --ifm-color-primary-lightest: #ffbfb3;
-  --ifm-color-primary-lighter: #fe8a7a;
-  --ifm-color-primary-light: #fb564a;
-  --ifm-color-primary: #f42f27;
-  --ifm-color-primary-dark: #e41511;
-  --ifm-color-primary-darker: #a80504;
-  --ifm-color-primary-darkest: #540000;
+  --ifm-color-primary-lightest: var(--vc-accent);
+  --ifm-color-primary-lighter: var(--vc-accent);
+  --ifm-color-primary-light: var(--vc-accent);
+  --ifm-color-primary: var(--vc-accent);
+  --ifm-color-primary-dark: var(--vc-accent);
+  --ifm-color-primary-darker: var(--vc-accent);
+  --ifm-color-primary-darkest: var(--vc-accent);
+  --ifm-background-color: var(--vc-bg);
+  --ifm-font-family-base: var(--vc-font);
   --ifm-code-font-size: 95%;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
-  --doc-sidebar-width: 230px !important;
+  --docusaurus-highlighted-code-line-bg: var(--vc-raised);
+  --doc-sidebar-width: 260px !important;
   /* --ifm-navbar-background-color: white;
   --ifm-navbar-link-color: white; */
 
   --ifm-navbar-padding-vertical: 0px;
-  --ifm-navbar-height: 45px;
+  --ifm-navbar-height: 56px;
+
+  /* Docs heading sizes (spec §2 type scale) */
+  --ifm-h1-font-size: 2.5rem;   /* docs h1 */
+  --ifm-h2-font-size: 1.75rem;  /* docs h2 */
+  --ifm-h3-font-size: 1.375rem; /* h3 */
+  --ifm-h4-font-size: 1.125rem; /* h4 */
 }
 
 /* Native smooth scrolling for anchor jumps, back-to-top, and scroll-to-top on
@@ -42,32 +52,30 @@
 
 /* For readability concerns, you should choose a lighter palette in dark mode. */
 [data-theme='dark'] {
-  --ifm-color-primary-lightest: #ffbfb3;
-  --ifm-color-primary-lighter: #fe8a7a;
-  --ifm-color-primary-light: #fb564a;
-  --ifm-color-primary: #e5502b;
-  --ifm-color-primary-dark: #e41511;
-  --ifm-color-primary-darker: #a80504;
-  --ifm-color-primary-darkest: #540000;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
-  --ifm-background-color: #1C1A1D !important;
+  --ifm-color-primary-lightest: var(--vc-accent);
+  --ifm-color-primary-lighter: var(--vc-accent);
+  --ifm-color-primary-light: var(--vc-accent);
+  --ifm-color-primary: var(--vc-accent);
+  --ifm-color-primary-dark: var(--vc-accent);
+  --ifm-color-primary-darker: var(--vc-accent);
+  --ifm-color-primary-darkest: var(--vc-accent);
+  --docusaurus-highlighted-code-line-bg: var(--vc-raised);
+  --ifm-background-color: var(--vc-bg) !important;
 }
 
-/* Make headings match homepage */
+/* Global type reset (spec §2): retire the 900/-0.05em poster weight. */
 h1,
-h2,
+h2 {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
 h3,
 h4,
 h5,
 h6 {
-  font-weight: 900;
-  letter-spacing: -0.05em;
-}
-
-.hero {
-  background-image: url("/img/landing/vesuvius.webp");
-  background-size: cover;
-  background-position: center;
+  font-weight: 650;
+  letter-spacing: 0;
 }
 
 figure {
@@ -81,7 +89,7 @@ figcaption {
 }
 
 .markdown h2 {
-  --ifm-h2-font-size: 2rem;
+  --ifm-h2-font-size: 1.75rem;
   margin-bottom: calc(var(--ifm-heading-vertical-rhythm-bottom) * var(--ifm-leading));
   margin-top: calc(var(--ifm-h2-vertical-rhythm-top) * var(--ifm-leading));
 }
@@ -90,7 +98,7 @@ figcaption {
 .theme-doc-toc-mobile,
 .footer {
   background-color: var(--ifm-background-color);
-  border-top: 1px solid #2F3237 !important;
+  border-top: 1px solid var(--vc-line);
   z-index: 1;
 }
 
@@ -99,14 +107,6 @@ figcaption {
 }
 
 @media (min-width: 997px) {
-  :root {
-    --ifm-navbar-height: 0;
-  }
-
-  .navbar--fixed-top {
-    display: none;
-  }
-
   .docs-doc-id-landing .container {
     padding: 0 32px;
   }
@@ -148,7 +148,7 @@ figcaption {
 }
 
 .docs-doc-id-firstletters {
-  background: black;
+  background: var(--vc-bg);
   /* --ifm-color-primary: rgb(188, 134, 249); */
 }
 
@@ -161,7 +161,7 @@ figcaption {
 }
 
 .theme-doc-sidebar-container {
-  border-right: 1px solid #2F3237 !important;
+  border-right: 1px solid var(--vc-line) !important;
 }
 
 aside {
@@ -170,14 +170,6 @@ aside {
 
 .pagination-nav {
   display: none;
-}
-
-main {
-  max-width: 60rem !important;
-}
-
-.docs-doc-id-landing main {
-  max-width: unset !important;
 }
 
 .navbar__toggle {
@@ -190,35 +182,19 @@ main {
   vertical-align: -5px !important;
 }
 
-.custom-top-header .navbar__logo img {
-  vertical-align: -1px !important;
-}
-
 .navbar__title {
-  font-weight: 900;
-  letter-spacing: -0.05rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   font-size: 18px;
-}
-
-.custom-top-header .navbar__title {
-  margin-bottom: 10px;
-}
-
-@media (max-width: 996px) {
-  .custom-top-header {
-    display: none;
-  }
 }
 
 .navbar__brand {
   margin-left: 8px;
-  opacity: .5;
 }
 
 @media (max-width: 996px) {
   .navbar__brand {
     margin-left: 0;
-    opacity: 1;
   }
 
   .hash-link {
@@ -229,25 +205,6 @@ main {
 *::-webkit-media-controls-start-playback-button {
   display: none !important;
   -webkit-appearance: none;
-}
-
-@keyframes pan {
-  from {
-    transform: translateX(0);
-  }
-
-  to {
-    transform: translateX(-100%);
-    /* Adjust this value based on your image's width */
-  }
-}
-
-.pan-horizontal {
-  animation: pan 40s linear infinite;
-}
-
-.docs-doc-id-grandprize article {
-  font: normal 18px/1.65 "PT Sans", "Helvetica", "Arial", sans-serif;
 }
 
 .docs-doc-id-grandprize article figcaption {
@@ -268,7 +225,7 @@ main {
 .docs-doc-id-grandprize article b,
 .docs-doc-id-grandprize article h2,
 .docs-doc-id-grandprize article h3 {
-  color: white;
+  color: var(--vc-text);
 }
 
 .docs-doc-id-grandprize article h2,
@@ -287,7 +244,7 @@ main {
 
 /* --- Design tokens (scoped) --- */
 .atlas {
-  --card: #1c2127; --line: rgba(255, 255, 255, 0.1); --ink: var(--ifm-font-color-base); --dim: #aeb9c4; --faint: #8a939d; --accent: #c9a24b;
+  --card: var(--vc-surface); --line: var(--vc-line); --ink: var(--ifm-font-color-base); --dim: #aeb9c4; --faint: #8a939d; --accent: #c9a24b;
   --s1: #5b6b7a; --s2: #5a8fb0; --s3: #5aa98a; --s4: #c08a4a; --s5: #c9a24b;
   font-size: 15px;
   line-height: 1.5;
@@ -482,6 +439,48 @@ main {
   .atlas .lightbox { animation: atlaslbfade .14s ease-out; }
   @keyframes atlaslbfade { from { opacity: 0; } to { opacity: 1; } }
 }
+
+/* --- Compare-sweep toggle + frame (CompareRenders, in the lightbox) --- */
+/* Top-CENTER, solid-accent pill: the old chip (12px text, near-transparent
+   background, tucked at top-right beside the close ×) was invisible next to
+   the huge grayscale render and collided with the lightbox chrome on narrow
+   viewports. Center stage + the feature's gold accent makes it the one
+   obviously-interactive affordance; ≥44px tall for a real touch target. It
+   deliberately shares no corner with .lbclose (top-right) / .lbprev / .lbnext
+   (mid-sides), so nothing overlaps at any viewport width. */
+.atlas .lightbox .lbcomparetoggle { position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+  display: inline-flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 20px;
+  color: #0b0d10; background: var(--accent); border: 1px solid rgba(0, 0, 0, .35); border-radius: 999px;
+  font-size: 13.5px; font-weight: 700; letter-spacing: .2px; white-space: nowrap; cursor: pointer;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, .55); }
+.atlas .lightbox .lbcomparetoggle:hover { filter: brightness(1.12); }
+.atlas .lightbox .lbcomparetoggle:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+/* Compare ON: recede to an outlined pill so the sweep is the focus, while the
+   (now "Close compare") control stays clearly findable in the same spot. */
+.atlas .lightbox .lbcomparetoggle[aria-pressed="true"] { color: var(--accent);
+  background: rgba(11, 13, 16, .92); border-color: var(--accent); }
+.atlas .lightbox .comparewrap { display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 96vw; }
+.atlas .lightbox .compareframe { position: relative; max-width: 96vw; max-height: 84vh; width: fit-content;
+  overflow: hidden; border-radius: 8px; box-shadow: 0 16px 50px rgba(0, 0, 0, .5); cursor: ew-resize;
+  touch-action: none; user-select: none; }
+.atlas .lightbox .compareframe:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.atlas .lightbox .cmpimg-a, .atlas .lightbox .cmpimg-b { display: block; max-width: 96vw; max-height: 84vh;
+  width: auto; height: auto; pointer-events: none; }
+.atlas .lightbox .cmpimg-a { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; }
+.atlas .lightbox .cmpdivider { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent);
+  transform: translateX(-1px); pointer-events: none; }
+.atlas .lightbox .cmphandle { position: absolute; top: 50%; left: 50%; width: 30px; height: 30px;
+  transform: translate(-50%, -50%); border-radius: 50%; background: var(--accent); border: 2px solid #0b0d10;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .5); }
+.atlas .lightbox .cmplabel-left, .atlas .lightbox .cmplabel-right { position: absolute; bottom: 10px;
+  color: #fff; font-size: 11.5px; font-weight: 600; background: rgba(8, 9, 11, .6); border-radius: 5px;
+  padding: 3px 8px; pointer-events: none; }
+.atlas .lightbox .cmplabel-left { left: 10px; }
+.atlas .lightbox .cmplabel-right { right: 10px; }
+.atlas .lightbox .cmpfoot { color: #cdd6df; font-size: 12.5px; display: flex; gap: 16px; flex-wrap: wrap;
+  justify-content: center; }
+.atlas .lightbox .cmpfoot a { color: var(--accent); }
+.atlas .lightbox .cmpfoot a:hover { text-decoration: underline; }
 .atlas-detail .embargo { background: #3a2a12; border: 1px solid #6b5224; color: #e7c98a; border-radius: 8px;
   padding: 8px 12px; font-size: 12.5px; margin-bottom: 12px; }
 .atlas-detail .full { grid-column: 1 / -1; }

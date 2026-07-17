@@ -31,6 +31,10 @@ target/
 *build*/
 deps/
 .cache/
+# Machine-local presets (e.g. Windows MSVC toolchain path); see CMakePresets.json
+CMakeUserPresets.json
+# vcpkg manifest-mode install tree (also created under build/ by the toolchain)
+vcpkg_installed/
 
 # Vim
 tags

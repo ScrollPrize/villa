@@ -58,9 +58,9 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     with open(path, 'r') as f:
         data = json.load(f)
 
-    points_xyz = data.get('line_points') or data.get('control_points') or []
+    points_xyz = data.get('control_points', [])
     if not points_xyz:
-        print(f'WARNING: fiber {path} has no line_points/control_points; skipping')
+        print(f'WARNING: fiber {path} has no control_points; skipping')
         return None
 
     points_xyz = np.asarray(points_xyz, dtype=np.float32)
@@ -605,8 +605,15 @@ def save_mesh(
     scroll_zyxs[out_of_roi] = -1.0
 
     spliced_scroll_zyxs = scroll_zyxs.clone()
+    # The splicing decision uses looser criteria than the reported satisfaction metrics.
+    splicing_metrics_overrides = {
+        'satisfaction_radius_tolerance': 0.495,
+        'satisfaction_distance_tolerance': 12.0,
+        'satisfied_patch_quad_fraction': 0.90,
+    }
     satisfied_patches, _, _, _, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(
         slice_to_spiral_transform, dr_per_winding, patches,
+        metrics_overrides=splicing_metrics_overrides,
     )
     _build_spliced_overlay(
         spliced_scroll_zyxs, num_thetas_by_winding, z0, grid_spacing,

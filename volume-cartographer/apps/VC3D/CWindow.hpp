@@ -327,6 +327,7 @@ private:
 
 
     Ui_VCMainWindow ui;
+    bool _destroyingWindow{false};
     QTabWidget* _workspaceTabs{nullptr};
     QMainWindow* _segmentWorkspaceWindow{nullptr};
     StatusDockPanelHost* _statusDockPanelHost{nullptr};
@@ -350,6 +351,7 @@ private:
     std::vector<double> _atlasSearchSignedWindings;
     std::unordered_map<uint64_t, AtlasSearchFiberSnapshot> _atlasSearchFiberSnapshotsByRuntimeId;
     std::optional<std::filesystem::path> _atlasSearchLasagnaManifestPath;
+    double _atlasSearchLasagnaWorkingToBaseScale = 1.0;
     int _atlasSearchPreviewGeneration{0};
     std::optional<int> _atlasSearchHoveredResult;
     std::set<int> _atlasSearchSelectedResults;
