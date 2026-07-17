@@ -1320,18 +1320,18 @@ def test_3d_two_branch_positive_supervision_enforces_minority_floor() -> None:
     weaker_dir = encode_lasagna_direction_3x2(
         torch.tensor([[0.95, 0.25, 0.0]], dtype=torch.float32)
     )[0]
-    output = torch.zeros((1, 14, 1, 1, 10), dtype=torch.float32)
+    output = torch.zeros((1, 14, 1, 1, 12), dtype=torch.float32)
     output[0, 0:6, 0, 0, :] = target_dir.view(6, 1)
     output[0, 7:13, 0, 0, :] = weaker_dir.view(6, 1)
     output[0, 6, 0, 0, :] = 0.95
     output[0, 13, 0, 0, :] = torch.tensor(
-        [0.10, 0.20, 0.20, 0.30, 0.30, 0.40, 0.40, 0.50, 0.80, 0.70],
+        [0.10, 0.10, 0.10, 0.10, 0.70, 0.60, 0.50, 0.40, 0.80, 0.10, 0.10, 0.10],
         dtype=torch.float32,
     )
     output.requires_grad_()
     batch = FiberTrace3DBatch(
-        volume=torch.zeros((1, 1, 1, 1, 10), dtype=torch.float32),
-        valid_mask=torch.ones((1, 1, 1, 1, 10), dtype=torch.bool),
+        volume=torch.zeros((1, 1, 1, 1, 12), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, 1, 1, 12), dtype=torch.bool),
         cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
         crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
         sample_indices=torch.zeros((1,), dtype=torch.long),
@@ -1348,17 +1348,17 @@ def test_3d_two_branch_positive_supervision_enforces_minority_floor() -> None:
         target_tangent_zyx=torch.zeros((1, 3), dtype=torch.float32),
         direction_indices_bzyx=torch.stack(
             [
-                torch.zeros((10,), dtype=torch.long),
-                torch.zeros((10,), dtype=torch.long),
-                torch.zeros((10,), dtype=torch.long),
-                torch.arange(10, dtype=torch.long),
+                torch.zeros((12,), dtype=torch.long),
+                torch.zeros((12,), dtype=torch.long),
+                torch.zeros((12,), dtype=torch.long),
+                torch.arange(12, dtype=torch.long),
             ],
             dim=1,
         ),
-        direction_target_sparse=target_dir.view(1, 6).expand(10, 6),
-        direction_weight_sparse=torch.ones((10, 6), dtype=torch.float32),
-        presence_target=torch.ones((1, 1, 1, 1, 10), dtype=torch.float32),
-        presence_mask=torch.ones((1, 1, 1, 1, 10), dtype=torch.bool),
+        direction_target_sparse=target_dir.view(1, 6).expand(12, 6),
+        direction_weight_sparse=torch.ones((12, 6), dtype=torch.float32),
+        presence_target=torch.ones((1, 1, 1, 1, 12), dtype=torch.float32),
+        presence_mask=torch.ones((1, 1, 1, 1, 12), dtype=torch.bool),
     )
 
     eval_losses = compute_losses(output, batch, direction_weight=1.0, presence_weight=1.0)
@@ -1374,16 +1374,17 @@ def test_3d_two_branch_positive_supervision_enforces_minority_floor() -> None:
     )
     losses["total"].backward()
 
-    assert torch.allclose(losses["branch0_fraction"], torch.tensor(0.8))
-    assert torch.allclose(losses["branch1_fraction"], torch.tensor(0.2))
-    assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, 9]) > 0
-    assert output.grad[0, 13, 0, 0, 9] != 0.0
-    assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, 8]) > 0
-    assert output.grad[0, 13, 0, 0, 8] != 0.0
-    assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, 7]) == 0
-    assert output.grad[0, 13, 0, 0, 7] == 0.0
-    assert torch.count_nonzero(output.grad[0, 0:6, 0, 0, 9]) == 0
-    assert output.grad[0, 6, 0, 0, 9] == 0.0
+    assert torch.allclose(losses["branch0_fraction"], torch.tensor(8.0 / 12.0))
+    assert torch.allclose(losses["branch1_fraction"], torch.tensor(4.0 / 12.0))
+    for x in range(4, 8):
+        assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, x]) > 0
+        assert output.grad[0, 13, 0, 0, x] != 0.0
+        assert torch.count_nonzero(output.grad[0, 0:6, 0, 0, x]) == 0
+        assert output.grad[0, 6, 0, 0, x] == 0.0
+    assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, 8]) == 0
+    assert output.grad[0, 13, 0, 0, 8] == 0.0
+    assert torch.count_nonzero(output.grad[0, 0:6, 0, 0, 8]) == 0
+    assert output.grad[0, 6, 0, 0, 8] != 0.0
 
 
 def test_3d_positive_presence_ignores_masked_sparse_points() -> None:

@@ -352,7 +352,7 @@ def compute_losses(
             selected_branch = _select_branch_by_chunked_min_fraction(
                 score,
                 indices,
-                chunk_size=2,
+                chunk_size=4,
                 min_fraction=0.10,
             )
         row_index = torch.arange(

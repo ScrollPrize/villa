@@ -96,8 +96,8 @@
   `presence_mask`. The unselected positive branch is not trained as negative at
   that positive point.
 - During two-branch 3D training, positive routing includes a batch-local
-  anti-collapse repair over 2x2x2 voxel groups within each patch. Training first
-  averages detached branch choice scores per `(patch, 2x2x2 chunk)`. If either
+  anti-collapse repair over 4-voxel spatial groups within each patch. Training first
+  averages detached branch choice scores per `(patch, 4x4x4 chunk)`. If either
   branch receives fewer than 10% of grouped positive supervision, the
   underrepresented branch takes the missing quota from groups currently assigned
   to the other branch, sorted by the underrepresented branch's grouped detached

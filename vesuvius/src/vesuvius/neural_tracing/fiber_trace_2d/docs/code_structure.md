@@ -213,7 +213,7 @@ side/top strip input loading.
   chooses one branch per supervised point with
   `abs(dot(decoded_predicted_axis, target_axis)) * predicted_presence`.
   Direction loss and positive presence BCE apply only to that selected branch.
-  During training in two-branch configs, routing is grouped by 2x2x2 voxel
+  During training in two-branch configs, routing is grouped by 4-voxel spatial
   chunks within each patch. If one branch falls below 10% of grouped positive
   sparse supervision in a batch, the best missing quota for that branch is
   force-routed to it by grouped detached choice score, then broadcast to every
