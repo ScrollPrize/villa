@@ -1,4 +1,5 @@
 import React, { useRef, useState } from "react";
+import { thumbnailUrls } from "./dataAccess";
 
 // CompareRenders — an in-lightbox swipe/sweep comparison of exactly two render
 // variants of the same ink segment (either two `renders` 2D-ink entries or two
@@ -58,6 +59,17 @@ function variantLabels(renders) {
 
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 
+// The <img> src for one side: the variant's downsampled render, resized
+// through the same Thumbor proxy every other gallery image uses (the single
+// lightbox view requests the identical 2000x2000 fit-in). The raw ds8 JPEGs
+// are multi-MB S3 objects served as binary/octet-stream — measured 0.7–1.3MB
+// per side on PHerc0139 vs ~60KB webp via the proxy — slow enough that the
+// second layer looked "never loaded" during a sweep. Falls back to the raw
+// URL when no proxy prefix matches (thumbnailUrls returns null serviceUrl).
+const sideSrc = (v) =>
+  (v && v.thumbUrl && thumbnailUrls(v.thumbUrl, 2000, 2000).serviceUrl) ||
+  (v ? v.thumbUrl : null);
+
 export default function CompareRenders({ renders, label }) {
   const frameRef = useRef(null);
   const [pos, setPos] = useState(50); // divider position, percent from the left
@@ -114,13 +126,13 @@ export default function CompareRenders({ renders, label }) {
       >
         <img
           className="cmpimg-b"
-          src={b.thumbUrl}
+          src={sideSrc(b)}
           alt={`${label || ""} — ${labelB}`}
           draggable={false}
         />
         <img
           className="cmpimg-a"
-          src={a.thumbUrl}
+          src={sideSrc(a)}
           alt={`${label || ""} — ${labelA}`}
           draggable={false}
           style={{ clipPath: clipTop }}

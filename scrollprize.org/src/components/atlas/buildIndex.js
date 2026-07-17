@@ -99,9 +99,16 @@ function deriveFacts(sample) {
   };
 }
 
-// Parse a resolution like "2.4um" / "7.91um" out of an ink-detection filename.
+// Parse a resolution like "2.4um" / "7.91um" out of an ink-detection file
+// path. The FILENAME is tried before the full path: a segment FOLDER name can
+// itself contain a resolution tag (PHerc0814's "…-46527_2um_try2/…-1.129um-…"
+// really exists) and a whole-path match would grab that "2um" for every
+// variant — mislabeling the segment and, worse, erasing the um difference the
+// live metadata.min.json path (no target_volume → no volume-properties um)
+// relies on to order/label its variants.
 function umFromName(name) {
-  const m = String(name || "").match(/(\d+(?:\.\d+)?)um/);
+  const s = String(name || "");
+  const m = (s.split("/").pop() || "").match(/(\d+(?:\.\d+)?)um/) || s.match(/(\d+(?:\.\d+)?)um/);
   return m ? parseFloat(m[1]) : null;
 }
 
@@ -164,22 +171,97 @@ function groupRendersByVolume(entries) {
   return [...buckets.values()].sort((a, b) => (a.um ?? 1e9) - (b.um ?? 1e9));
 }
 
+// Pair one surviving full-resolution variant `g` with its downsampled
+// counterpart out of `downs`. target_volume is the authoritative join key —
+// BUT the live metadata.min.json projection has been observed (PHerc0139,
+// 2026-07) publishing `target_volume: null` on BOTH the full and downsampled
+// sides, where the old bare `dw.targetVolume === g.targetVolume` join meant
+// null === null: EVERY variant matched the FIRST downsampled entry, so the
+// compare view drew the identical image on both layers (and the grid/lightbox
+// thumbnail could belong to the other variant). Fall back through the
+// filename stem (a downsampled render is "<full stem>-ds8.jpg" by
+// convention), then model_id, then the unambiguous lone-pair case; otherwise
+// return null — no thumbnail is strictly better than the wrong variant's.
+function downFor(g, downs, nVariants) {
+  if (g.targetVolume != null) {
+    const byVol = downs.find((dw) => dw.targetVolume === g.targetVolume);
+    if (byVol) return byVol;
+  }
+  const stem = String(g.url || "")
+    .split("/")
+    .pop()
+    .replace(/\.[A-Za-z0-9]+$/, "");
+  if (stem) {
+    const byStem = downs.find((dw) => String(dw.url || "").includes(stem));
+    if (byStem) return byStem;
+  }
+  if (g.modelId != null) {
+    const byModel = downs.find((dw) => dw.modelId === g.modelId);
+    if (byModel) return byModel;
+  }
+  return nVariants === 1 && downs.length === 1 ? downs[0] : null;
+}
+
+// Reorder multi-variant renders so the variant with the MOST VISIBLE CONTENT
+// comes first (and so becomes the segment's primary image everywhere a single
+// representative is shown: grid thumbnail, default lightbox view, left side of
+// the compare sweep). Finest-um-first turned out to be a poor default: the
+// finest volume is typically a partial-coverage high-res rescan, so its render
+// is mostly black where the segment leaves the scanned region — measured
+// across all 113 multi-variant segments (2026-07), the finest variant was the
+// blacker one in 104 of them.
+//
+// The signal is `renderSizes[thumbUrl] * um²`: the downsampled JPEG's byte
+// size normalized to physical papyrus area. Both variants of a segment cover
+// the same physical area at the same -ds8 factor, so bytes×um² ∝ bytes/pixel —
+// JPEG entropy density — and a mostly-black render compresses far smaller per
+// pixel than one full of detected ink. (Raw bytes alone mislead: a finer-um
+// render has more pixels, which can out-byte a fuller coarse render — the um²
+// normalization picked the measurably-less-black variant in 113/113 segments,
+// raw bytes only 102/113.) `renderSizes` ({thumbUrl: bytes}) is fetched
+// OUTSIDE this pure module (scripts/genAtlasData.js HEADs the JPEGs and
+// persists static/data_browser/renderSizes.json, which the runtime path
+// imports) — if ANY variant is missing a size or um, the finest-first order is
+// kept unchanged, so brand-new variants degrade to the old behavior until the
+// next build refreshes the sizes file.
+function orderByContent(variants, renderSizes) {
+  if (!Array.isArray(variants) || variants.length < 2) return variants;
+  const sizes = renderSizes || {};
+  const scores = variants.map((v) => {
+    const bytes = v.thumbUrl != null ? sizes[v.thumbUrl] : null;
+    return typeof bytes === "number" && bytes > 0 && v.um != null
+      ? bytes * v.um * v.um
+      : null;
+  });
+  if (scores.some((s) => s == null)) return variants;
+  return variants
+    .map((v, i) => [v, scores[i]])
+    .sort((a, b) => b[1] - a[1]) // most content first; stable, ties keep um order
+    .map(([v]) => v);
+}
+
 // Generic per-segment render-variant extractor shared by the 2D ink-detection
 // and 3D alpha-render sides: filter `data` by `type`, resolve + collapse to
 // one surviving entry per target volume, then join each survivor's matching
-// downsampled counterpart (`downType`, same target_volume) as a thumbUrl.
-// `one` is the finest variant — today's exact full/alpha semantics, unchanged
-// for the (overwhelmingly common) single-variant case; `variants` is the
-// complete list and is only set when there's more than one to compare.
-function extractRenderVariants(data, type, downType, s3ToHttp, volumes) {
+// downsampled counterpart (`downType` — see downFor) as a thumbUrl.
+// `one` is the PRIMARY variant — the most-content one when renderSizes covers
+// every variant (see orderByContent), the finest otherwise; exact legacy
+// full/alpha semantics are unchanged for the (overwhelmingly common)
+// single-variant case. `variants` is the complete list, in the same order,
+// and is only set when there's more than one to compare.
+function extractRenderVariants(data, type, downType, s3ToHttp, volumes, renderSizes) {
   const fulls = data.filter((d) => d.type === type).map((d) => toRenderMeta(d, s3ToHttp, volumes));
   const downs = data
     .filter((d) => d.type === downType)
     .map((d) => toRenderMeta(d, s3ToHttp, volumes));
-  const variants = groupRendersByVolume(fulls).map((g) => {
-    const down = downs.find((dw) => dw.targetVolume === g.targetVolume) || null;
-    return { ...g, thumbUrl: down ? down.url : null };
-  });
+  const grouped = groupRendersByVolume(fulls);
+  const variants = orderByContent(
+    grouped.map((g) => {
+      const down = downFor(g, downs, grouped.length);
+      return { ...g, thumbUrl: down ? down.url : null };
+    }),
+    renderSizes
+  );
   const result = { one: variants[0] || null };
   if (variants.length > 1) result.variants = variants;
   return result;
@@ -187,13 +269,14 @@ function extractRenderVariants(data, type, downType, s3ToHttp, volumes) {
 
 // Per-segment ink-detection predictions for a sample, as public HTTPS links —
 // the per-segment list the old atlas exposed. One entry per segment (its
-// finest-resolution run) with a downsampled preview for thumbnailing. Embargoed
-// scrolls expose nothing. `s3ToHttp` maps a segment's s3:// access-root to a
-// public https URL via the dataAccess rewrites. Segments with more than one
-// multi-volume render variant additionally get `renders`/`alphaRenders`
-// arrays (see extractRenderVariants) so a future UI can offer a compare view;
-// the pre-existing fields keep pointing at the finest variant either way.
-function extractInkSegments(sample, id, s3ToHttp) {
+// primary run — see orderByContent) with a downsampled preview for
+// thumbnailing. Embargoed scrolls expose nothing. `s3ToHttp` maps a segment's
+// s3:// access-root to a public https URL via the dataAccess rewrites.
+// Segments with more than one multi-volume render variant additionally get
+// `renders`/`alphaRenders` arrays (see extractRenderVariants) feeding the
+// lightbox compare view; the pre-existing fields keep pointing at the primary
+// (first) variant either way.
+function extractInkSegments(sample, id, s3ToHttp, renderSizes) {
   if (EMBARGOED.has(id)) return [];
   const segs = (sample && sample.segments) || {};
   const volumes = (sample && sample.volumes) || {};
@@ -214,7 +297,8 @@ function extractInkSegments(sample, id, s3ToHttp) {
       "ink-detection",
       "ink-detection-downsampled",
       s3ToHttp,
-      volumes
+      volumes,
+      renderSizes
     );
     // 3D ink (alpha-render): ink painted on the rendered surface, same shape.
     // The full .tif is tens of MB (download only); the ds8 .jpg is the
@@ -225,7 +309,8 @@ function extractInkSegments(sample, id, s3ToHttp) {
       "alpha-render",
       "alpha-render-downsampled",
       s3ToHttp,
-      volumes
+      volumes,
+      renderSizes
     );
     const full = inkX.one;
     const alphaOne = alphaX.one;
@@ -473,9 +558,13 @@ function stageRank(s) {
  *   - overlay:      parsed src/data/atlasOverlay.json ({scrolls,dashboard,...})
  *   - meshManifest: parsed static/img/data_browser/meshes/manifest.json ({id:mesh})
  *   - rewrites:     dataAccess.rewrites ([{from,to}]) for s3://→https thumbnails
+ *   - renderSizes:  parsed static/data_browser/renderSizes.json ({downsampled
+ *                   render url: bytes}) — picks each multi-variant ink
+ *                   segment's primary render (see orderByContent); optional,
+ *                   omitting it keeps the finest-um-first order everywhere
  */
 function buildIndex(samples, opts) {
-  const { overlay = {}, meshManifest = {}, rewrites = [] } = opts || {};
+  const { overlay = {}, meshManifest = {}, rewrites = [], renderSizes = {} } = opts || {};
   const overlayScrolls = overlay.scrolls || {};
   samples = samples || {};
 
@@ -495,7 +584,7 @@ function buildIndex(samples, opts) {
     const o = overlayScrolls[id] || {};
     const mesh = meshManifest[id] || null;
     const inkSegments = samples[id]
-      ? extractInkSegments(samples[id], id, s3ToHttp)
+      ? extractInkSegments(samples[id], id, s3ToHttp, renderSizes)
       : [];
     const predictions = samples[id] ? extractPredictions(samples[id]) : [];
 

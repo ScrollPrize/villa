@@ -346,3 +346,274 @@ test("(f) 2D and 3D render-variant counts are computed independently — neither
   assert.strictEqual(segF2.renders, undefined);
   assert.strictEqual(segF2.alphaRenders.length, 2);
 });
+
+test("(g) REGRESSION (live PHerc0139 shape): null target_volume on both sides still pairs each variant with ITS OWN -ds8 thumb, not the first one", () => {
+  // Mirrors the real live metadata.min.json for PHerc0139 20250223000000
+  // (w059) as observed 2026-07-17: two ink-detection + two downsampled
+  // entries, ALL with target_volume null, distinct model_ids, downsampled
+  // path = "<full stem>-ds8.jpg". The old join (dw.targetVolume ===
+  // g.targetVolume, i.e. null === null) matched BOTH variants to the FIRST
+  // downsampled entry — the compare sweep showed the same image on both
+  // layers.
+  const samples = mkSamples("TestScrollG", {
+    volumes: {},
+    segments: {
+      segG: {
+        suffix: "w059_segG",
+        data: [
+          mkEntry({
+            targetVolume: null,
+            modelId: "20260417190342",
+            path: "segments/segG/ink-detection/segG-2.399um-78keV-volume-20260102150214-20260417190342-recipe-tile256-stride128.tif",
+          }),
+          mkEntry({
+            type: "ink-detection-downsampled",
+            targetVolume: null,
+            modelId: "20260417190342",
+            path: "segments/segG/ink-detection/downsampled/segG-2.399um-78keV-volume-20260102150214-20260417190342-recipe-tile256-stride128-ds8.jpg",
+          }),
+          mkEntry({
+            targetVolume: null,
+            modelId: "20260709123958",
+            path: "segments/segG/ink-detection/segG-1.129um-59keV-volume-20260413113053-L1-20260709123958-mrg20736-tile256-stride128.tif",
+          }),
+          mkEntry({
+            type: "ink-detection-downsampled",
+            targetVolume: null,
+            modelId: "20260709123958",
+            path: "segments/segG/ink-detection/downsampled/segG-1.129um-59keV-volume-20260413113053-L1-20260709123958-mrg20736-tile256-stride128-ds8.jpg",
+          }),
+        ],
+      },
+    },
+  });
+
+  const seg = firstSegment(samples, "TestScrollG");
+  assert.strictEqual(seg.renders.length, 2);
+  // Finest um first (from filename fallback, volumes map is empty here).
+  assert.strictEqual(seg.renders[0].um, 1.129);
+  assert.strictEqual(seg.renders[1].um, 2.399);
+  // THE bug: each variant must get its own downsampled counterpart.
+  assert.ok(seg.renders[0].thumbUrl.includes("volume-20260413113053"));
+  assert.ok(seg.renders[1].thumbUrl.includes("volume-20260102150214"));
+  assert.notStrictEqual(seg.renders[0].thumbUrl, seg.renders[1].thumbUrl);
+  // And the legacy top-level thumb (grid/lightbox) is the finest variant's own.
+  assert.strictEqual(seg.down, seg.renders[0].thumbUrl);
+});
+
+test("(h) null target_volume everywhere with a LONE full+down pair still pairs them even without stem/model hints", () => {
+  // Guards the legacy single-variant behavior the old null===null join gave
+  // for free: one full, one down, no target_volume, no model_id, and a down
+  // filename that does NOT contain the full's stem — the unambiguous 1:1
+  // fallback must still pair them rather than dropping the thumbnail.
+  const samples = mkSamples("TestScrollH", {
+    volumes: {},
+    segments: {
+      segH: {
+        suffix: "w060_segH",
+        data: [
+          mkEntry({ path: "segments/segH/ink-detection/segH_7.91um_prediction.tif" }),
+          mkEntry({
+            type: "ink-detection-downsampled",
+            path: "segments/segH/ink-detection/downsampled/oddly_named_preview.jpg",
+          }),
+        ],
+      },
+    },
+  });
+
+  const seg = firstSegment(samples, "TestScrollH");
+  assert.strictEqual(seg.renders, undefined);
+  assert.ok(seg.down.endsWith("oddly_named_preview.jpg"));
+  assert.strictEqual(seg.preview, seg.down);
+});
+
+// --- opts.renderSizes: content-based primary-variant selection --------------
+//
+// A two-variant fixture mirroring the real dataset shape (2026-07): a fine-um
+// partial-coverage rescan vs a coarse-um full-coverage render. Reused by the
+// renderSizes tests below; sizes are keyed by the (unrewritten) s3:// thumb
+// urls the fixture derives.
+const ROOT_URL = "s3://vesuvius-challenge-open-data";
+const FINE_DS8 = `${ROOT_URL}/segments/segI/ink-detection/downsampled/segI_fine_ink_ds8.jpg`;
+const COARSE_DS8 = `${ROOT_URL}/segments/segI/ink-detection/downsampled/segI_coarse_ink_ds8.jpg`;
+function mkTwoVariantSamples(id) {
+  return mkSamples(id, {
+    volumes: {
+      volFine: { properties: { pixel_size_um: 1.129, energy_keV: 59 } },
+      volCoarse: { properties: { pixel_size_um: 2.399, energy_keV: 78 } },
+    },
+    segments: {
+      segI: {
+        suffix: "w070_segI",
+        data: [
+          mkEntry({
+            targetVolume: "volFine",
+            modelId: "20260709123958",
+            path: "segments/segI/ink-detection/segI_fine_ink.tif",
+          }),
+          mkEntry({
+            type: "ink-detection-downsampled",
+            targetVolume: "volFine",
+            modelId: "20260709123958",
+            path: "segments/segI/ink-detection/downsampled/segI_fine_ink_ds8.jpg",
+          }),
+          mkEntry({
+            targetVolume: "volCoarse",
+            modelId: "20260417190342",
+            path: "segments/segI/ink-detection/segI_coarse_ink.tif",
+          }),
+          mkEntry({
+            type: "ink-detection-downsampled",
+            targetVolume: "volCoarse",
+            modelId: "20260417190342",
+            path: "segments/segI/ink-detection/downsampled/segI_coarse_ink_ds8.jpg",
+          }),
+        ],
+      },
+    },
+  });
+}
+
+test("(i) renderSizes reorders variants by bytes×um² — the fuller coarse render becomes primary everywhere", () => {
+  // Real-world proportions (PHerc0814 46527_2um_try2): the FINE ds8 jpg has
+  // MORE raw bytes (more pixels) but the coarse one wins after um²
+  // normalization — this is exactly the case where "just compare file sizes"
+  // would pick the blacker image. fine: 151090 × 1.129² ≈ 193k; coarse:
+  // 131326 × 2.399² ≈ 756k → coarse first.
+  const samples = mkTwoVariantSamples("TestScrollI");
+  const out = buildIndex(samples, {
+    ...OPTS,
+    renderSizes: { [FINE_DS8]: 151090, [COARSE_DS8]: 131326 },
+  });
+  const seg = out.scrolls.find((s) => s.id === "TestScrollI").inkSegments[0];
+
+  assert.strictEqual(seg.renders.length, 2);
+  assert.strictEqual(seg.renders[0].um, 2.399);
+  assert.strictEqual(seg.renders[1].um, 1.129);
+  // The legacy single-image fields (grid thumbnail, default lightbox view)
+  // all follow the new primary.
+  assert.strictEqual(seg.um, 2.399);
+  assert.ok(seg.full.endsWith("segI_coarse_ink.tif"));
+  assert.strictEqual(seg.down, seg.renders[0].thumbUrl);
+  assert.ok(seg.down.endsWith("segI_coarse_ink_ds8.jpg"));
+  assert.strictEqual(seg.preview, seg.down);
+});
+
+test("(j) a variant missing from renderSizes keeps the finest-um-first order (no partial reordering)", () => {
+  const samples = mkTwoVariantSamples("TestScrollJ");
+  const out = buildIndex(samples, {
+    ...OPTS,
+    renderSizes: { [COARSE_DS8]: 131326 }, // fine variant unknown
+  });
+  const seg = out.scrolls.find((s) => s.id === "TestScrollJ").inkSegments[0];
+
+  assert.strictEqual(seg.renders[0].um, 1.129);
+  assert.strictEqual(seg.renders[1].um, 2.399);
+  assert.strictEqual(seg.um, 1.129);
+  assert.ok(seg.full.endsWith("segI_fine_ink.tif"));
+});
+
+test("(k) omitting renderSizes entirely keeps the pre-existing finest-um-first order", () => {
+  const samples = mkTwoVariantSamples("TestScrollK");
+  const seg = firstSegment(samples, "TestScrollK"); // firstSegment uses bare OPTS
+  assert.strictEqual(seg.renders[0].um, 1.129);
+  assert.strictEqual(seg.um, 1.129);
+});
+
+test("(l) alphaRenders reorder symmetrically via renderSizes", () => {
+  const A_DS8 = `${ROOT_URL}/segments/segL/alpha/segL_a_alpha_ds8.jpg`;
+  const B_DS8 = `${ROOT_URL}/segments/segL/alpha/segL_b_alpha_ds8.jpg`;
+  const samples = mkSamples("TestScrollL", {
+    volumes: {
+      volA: { properties: { pixel_size_um: 2.0, energy_keV: 53 } },
+      volB: { properties: { pixel_size_um: 4.0, energy_keV: 70 } },
+    },
+    segments: {
+      segL: {
+        suffix: "w080_segL",
+        data: [
+          mkEntry({
+            type: "alpha-render",
+            targetVolume: "volA",
+            modelId: "m1",
+            path: "segments/segL/alpha/segL_a_alpha.tif",
+          }),
+          mkEntry({
+            type: "alpha-render-downsampled",
+            targetVolume: "volA",
+            modelId: "m1",
+            path: "segments/segL/alpha/segL_a_alpha_ds8.jpg",
+          }),
+          mkEntry({
+            type: "alpha-render",
+            targetVolume: "volB",
+            modelId: "m2",
+            path: "segments/segL/alpha/segL_b_alpha.tif",
+          }),
+          mkEntry({
+            type: "alpha-render-downsampled",
+            targetVolume: "volB",
+            modelId: "m2",
+            path: "segments/segL/alpha/segL_b_alpha_ds8.jpg",
+          }),
+        ],
+      },
+    },
+  });
+  // volB is coarser (4um) AND smaller in bytes, but 50000×16 > 100000×4.
+  const out = buildIndex(samples, {
+    ...OPTS,
+    renderSizes: { [A_DS8]: 100000, [B_DS8]: 50000 },
+  });
+  const seg = out.scrolls.find((s) => s.id === "TestScrollL").inkSegments[0];
+  assert.strictEqual(seg.alphaRenders.length, 2);
+  assert.strictEqual(seg.alphaRenders[0].um, 4.0);
+  assert.strictEqual(seg.alphaRenders[1].um, 2.0);
+  assert.ok(seg.alpha.endsWith("segL_b_alpha.tif"));
+  assert.strictEqual(seg.alphaPrev, seg.alphaRenders[0].thumbUrl);
+});
+
+test("(m) REGRESSION (PHerc0814 46527_2um_try2): a um tag in the segment FOLDER name must not shadow the filename's um", () => {
+  // Live metadata.min.json has no target_volume → um comes from filename
+  // parsing. The old whole-path regex matched the folder's "2um" first, giving
+  // BOTH variants um=2 — killing the um² normalization and the variant labels.
+  const samples = mkSamples("TestScrollM", {
+    volumes: {},
+    segments: {
+      segM: {
+        suffix: "46527_2um_try2",
+        data: [
+          mkEntry({
+            targetVolume: null,
+            modelId: "20260709123958",
+            path: "segments/20260226000000-46527_2um_try2/ink-detection/S-1.129um-59keV-volume-a-20260709123958-x.tif",
+          }),
+          mkEntry({
+            type: "ink-detection-downsampled",
+            targetVolume: null,
+            modelId: "20260709123958",
+            path: "segments/20260226000000-46527_2um_try2/ink-detection/downsampled/S-1.129um-59keV-volume-a-20260709123958-x-ds8.jpg",
+          }),
+          mkEntry({
+            targetVolume: null,
+            modelId: "20260417190342",
+            path: "segments/20260226000000-46527_2um_try2/ink-detection/S-2.399um-78keV-volume-b-20260417190342-x.tif",
+          }),
+          mkEntry({
+            type: "ink-detection-downsampled",
+            targetVolume: null,
+            modelId: "20260417190342",
+            path: "segments/20260226000000-46527_2um_try2/ink-detection/downsampled/S-2.399um-78keV-volume-b-20260417190342-x-ds8.jpg",
+          }),
+        ],
+      },
+    },
+  });
+
+  const seg = firstSegment(samples, "TestScrollM");
+  assert.deepStrictEqual(
+    seg.renders.map((r) => r.um),
+    [1.129, 2.399] // NOT [2, 2]
+  );
+});

@@ -17,6 +17,10 @@ const { test, expect } = require("@playwright/test");
 //   5. PHercParis4: the 2D tab shows compare on eligible segments, the 3D tab
 //      shows no compare toggle on ANY segment — checked across the whole
 //      grid, not just a single sample.
+//   6. Toggle visibility/geometry at desktop (1440x900) AND mobile (390x844)
+//      viewports: ≥44px touch target, and no overlap with the close / prev /
+//      next lightbox chrome (the original top-right chip collided with the
+//      close button on narrow viewports).
 
 // --- shared helpers -------------------------------------------------------
 
@@ -325,3 +329,59 @@ test.describe("PHercParis4 — 2D/3D toggle compare-eligibility regression", () 
     expect(errors).toEqual([]);
   });
 });
+
+// --- 6. Toggle visibility/geometry at desktop AND mobile viewports ---------
+
+// Axis-aligned bounding boxes don't intersect.
+const disjoint = (a, b) =>
+  a.x + a.width <= b.x ||
+  b.x + b.width <= a.x ||
+  a.y + a.height <= b.y ||
+  b.y + b.height <= a.y;
+
+for (const [name, use] of [
+  ["desktop 1440x900", { viewport: { width: 1440, height: 900 } }],
+  [
+    "mobile 390x844",
+    { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true },
+  ],
+]) {
+  test.describe(`compare toggle geometry — ${name}`, () => {
+    test.use(use);
+
+    test("toggle is a ≥44px target and never overlaps the close/prev/next chrome", async ({
+      page,
+    }) => {
+      const errors = collectConsoleErrors(page);
+      await page.goto("/data_browser/PHerc0814");
+
+      const lightbox = await openLightboxAt(page, 0);
+      const toggle = lightbox.locator(".lbcomparetoggle");
+      await expect(toggle).toBeVisible();
+
+      const check = async () => {
+        const tb = await toggle.boundingBox();
+        expect(tb).not.toBeNull();
+        // Standard minimum touch-target size on the constrained axis.
+        expect(tb.height).toBeGreaterThanOrEqual(44);
+        // Fully on-screen…
+        const vp = page.viewportSize();
+        expect(tb.x).toBeGreaterThanOrEqual(0);
+        expect(tb.x + tb.width).toBeLessThanOrEqual(vp.width);
+        // …and clear of every other piece of lightbox chrome.
+        for (const sel of [".lbclose", ".lbprev", ".lbnext"]) {
+          const other = await lightbox.locator(sel).boundingBox();
+          expect(other, `${sel} should have a box`).not.toBeNull();
+          expect(disjoint(tb, other), `toggle overlaps ${sel}`).toBe(true);
+        }
+      };
+
+      await check(); // off state: "⇄ Compare renders (2)"
+      await toggle.click();
+      await expect(lightbox.locator(".compareframe")).toBeVisible();
+      await check(); // on state: "✕ Close compare" (different width, same rules)
+
+      expect(errors).toEqual([]);
+    });
+  });
+}

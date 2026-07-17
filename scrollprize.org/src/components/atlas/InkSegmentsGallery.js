@@ -269,7 +269,9 @@ export default function InkSegmentsGallery({ segments, display }) {
               aria-pressed={compareOn}
               onClick={() => setCompareOn((c) => !c)}
             >
-              {compareOn ? "Close compare" : `Compare (${activeVariants.length})`}
+              {compareOn
+                ? "✕ Close compare"
+                : `⇄ Compare renders (${activeVariants.length})`}
             </button>
           ) : null}
           {n > 1 ? (
