@@ -1,22 +1,11 @@
-# Native 3D Whole-Fiber Trace2CP Eight-Row Visualization
+# Trace2CP Refined Strip Off-Strip Clipping
 
-Update native 3D Trace2CP whole-fiber visualization so each visual span has
-eight rows:
+Native 3D Trace2CP refined/regenerated strip visualization currently fails
+when a traced point leaves the source strip valid area:
 
-- initial side volume;
-- initial side 3D presence;
-- initial top volume;
-- initial top 3D presence;
-- regenerated/fused side volume;
-- regenerated/fused side 3D presence;
-- regenerated/fused top volume;
-- regenerated/fused top 3D presence.
+`ValueError: refined Trace2CP trace leaves the source strip valid area`
 
-The regenerated strip should be built from the traced/fused whole-fiber span,
-matching the single-pair debug visualization behavior.
-
-Additionally, draw the control points for the displayed span into the full
-fiber visualization panels, including regenerated side/top rows.
-
-Overlay each displayed control point's Trace2CP distance to the trace at that
-CP plane.
+This should not be fatal for visualization. Off-strip trace points, including
+original trace endpoints, should be clipped/ignored while building the refined
+strip. Strict errors should remain for malformed traces, non-finite values, or
+cases where too few valid points remain to build a refined strip.

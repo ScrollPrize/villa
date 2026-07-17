@@ -2599,6 +2599,112 @@ def test_trace2cp_refined_segment_source_samples_from_fused_trace(tmp_path: Path
     assert np.count_nonzero(refined_valid) > 0
 
 
+def test_trace2cp_refined_segment_source_clips_off_strip_trace_points(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    start = np.asarray(source.start_control_point_xy, dtype=np.float32)
+    target = np.asarray(source.target_control_point_xy, dtype=np.float32)
+    midpoint = 0.5 * (start + target)
+    off_strip = midpoint.copy()
+    off_strip[1] = np.float32(source.source_shape_hw[0] + 8)
+
+    refined_source = loader.build_trace2cp_refined_segment_source(
+        source,
+        np.asarray(
+            [
+                [start[0], start[1], 0.0],
+                [off_strip[0], off_strip[1], 0.0],
+                [target[0], target[1], 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        device=torch.device("cpu"),
+    )
+
+    refined_sample, refined_image, refined_valid = loader.sample_trace2cp_segment_source(
+        refined_source
+    )
+    assert refined_sample.start_control_point_index == source.start_control_point_index
+    assert refined_sample.target_control_point_index == source.target_control_point_index
+    assert refined_image.shape == refined_valid.shape
+    assert np.count_nonzero(refined_valid) > 0
+
+
+def test_trace2cp_refined_segment_source_clips_off_strip_endpoint_points(
+    tmp_path: Path,
+) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    start = np.asarray(source.start_control_point_xy, dtype=np.float32)
+    target = np.asarray(source.target_control_point_xy, dtype=np.float32)
+    first_valid = 0.33 * start + 0.67 * target
+    second_valid = 0.67 * start + 0.33 * target
+    off_strip_y = np.float32(source.source_shape_hw[0] + 8)
+
+    refined_source = loader.build_trace2cp_refined_segment_source(
+        source,
+        np.asarray(
+            [
+                [start[0], off_strip_y, 0.0],
+                [first_valid[0], first_valid[1], 0.0],
+                [second_valid[0], second_valid[1], 0.0],
+                [target[0], off_strip_y, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        device=torch.device("cpu"),
+    )
+
+    refined_sample, refined_image, refined_valid = loader.sample_trace2cp_segment_source(
+        refined_source
+    )
+    assert refined_sample.start_control_point_index == source.start_control_point_index
+    assert refined_sample.target_control_point_index == source.target_control_point_index
+    assert refined_image.shape == refined_valid.shape
+    assert np.count_nonzero(refined_valid) > 0
+
+
+def test_trace2cp_refined_segment_source_rejects_all_off_strip_trace_points(
+    tmp_path: Path,
+) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    start = np.asarray(source.start_control_point_xy, dtype=np.float32)
+    target = np.asarray(source.target_control_point_xy, dtype=np.float32)
+    off_strip_y = np.float32(source.source_shape_hw[0] + 8)
+
+    with pytest.raises(ValueError, match="fewer than two source-strip-valid points"):
+        loader.build_trace2cp_refined_segment_source(
+            source,
+            np.asarray(
+                [
+                    [start[0], off_strip_y, 0.0],
+                    [target[0], off_strip_y, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+            device=torch.device("cpu"),
+        )
+
+
 def test_trace2cp_refined_segment_source_preserves_bidirectional_trace_starts(tmp_path: Path) -> None:
     loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
     source = loader.build_trace2cp_segment_source(

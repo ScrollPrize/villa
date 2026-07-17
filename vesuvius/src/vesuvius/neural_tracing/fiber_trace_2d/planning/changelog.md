@@ -2,6 +2,9 @@
 
 ## 2026-07-17
 
+- Changed Trace2CP refined/regenerated strip construction to clip off-strip
+  traced points, including original trace endpoints, instead of aborting
+  visualization when a traced path leaves the source strip valid area.
 - Changed native 3D Trace2CP whole-fiber visualization from four rows to
   eight rows by adding regenerated/fused side and top strip volume/presence
   panels for every restart-delimited span, with span control-point markers

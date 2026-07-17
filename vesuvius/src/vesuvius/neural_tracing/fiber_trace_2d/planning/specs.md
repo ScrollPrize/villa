@@ -583,7 +583,12 @@
   only clip the drawn overlay, not invalidate tracing, metric calculation, or
   3D sampling. The regenerated/fused rows rebuild side/top strip geometry from
   the traced span line using the same refined-source path as single-pair
-  rendering. The regular `trace2cp_native_3d_vis.jpg` path must be overwritten
+  rendering; traced points that are outside the source strip valid area are
+  clipped before building the regenerated strip and are not fatal unless fewer
+  than two valid points remain. If the original start or target trace endpoint
+  is clipped, the regenerated strip uses the first or last remaining valid
+  traced point as its displayed endpoint. The
+  regular `trace2cp_native_3d_vis.jpg` path must be overwritten
   after every completed segment so long whole-fiber runs show partial visual
   progress at the final output filename. The control points covered by each
   visual span must be projected into the displayed initial and regenerated

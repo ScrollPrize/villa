@@ -4281,12 +4281,28 @@ class FiberStrip2DLoader:
         if not bool(np.all(valid)):
             bad = np.flatnonzero(~valid)
             first = int(bad[0]) if bad.size else -1
-            raise ValueError(
-                "refined Trace2CP trace leaves the source strip valid area: "
-                f"invalid_points={int(bad.size)} first_invalid={first}"
-            )
-        center_xyz = center_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
-        sampled_normals = row_axis_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
+            if int(np.count_nonzero(valid)) < 2:
+                raise ValueError(
+                    "refined Trace2CP trace has fewer than two source-strip-valid points "
+                    "after clipping off-strip points: "
+                    f"valid_points={int(np.count_nonzero(valid))} "
+                    f"invalid_points={int(bad.size)} first_invalid={first}"
+                )
+        source_trace_indices = np.flatnonzero(valid).astype(np.int64, copy=False)
+        center_xyz = (
+            center_xyz_t[valid_t]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+        sampled_normals = (
+            row_axis_xyz_t[valid_t]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
 
         keep = [0]
         for idx in range(1, int(center_xyz.shape[0])):
@@ -4295,12 +4311,19 @@ class FiberStrip2DLoader:
         if len(keep) < 2:
             raise ValueError("refined Trace2CP trace degenerates to fewer than two volume points")
         keep_array = np.asarray(keep, dtype=np.int64)
-        kept_start_matches = np.flatnonzero(keep_array == 0)
-        kept_target_matches = np.flatnonzero(keep_array == int(trace.shape[0]) - 1)
-        if kept_start_matches.size == 0 or kept_target_matches.size == 0:
-            raise ValueError("refined Trace2CP trace lost a CP endpoint while removing duplicate points")
-        kept_start_index = int(kept_start_matches[0])
-        kept_target_index = int(kept_target_matches[0])
+        kept_source_trace_indices = source_trace_indices[keep_array]
+        kept_start_matches = np.flatnonzero(kept_source_trace_indices == 0)
+        kept_target_matches = np.flatnonzero(
+            kept_source_trace_indices == int(trace.shape[0]) - 1
+        )
+        kept_start_index = (
+            int(kept_start_matches[0]) if kept_start_matches.size else 0
+        )
+        kept_target_index = (
+            int(kept_target_matches[0])
+            if kept_target_matches.size
+            else int(keep_array.shape[0]) - 1
+        )
         center_xyz = center_xyz[keep_array]
         sampled_normals = sampled_normals[keep_array]
 

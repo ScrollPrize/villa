@@ -1,45 +1,42 @@
-# Native 3D Whole-Fiber Trace2CP Eight-Row Visualization Plan
+# Trace2CP Refined Strip Off-Strip Clipping Plan
 
 ## Implementation
 
-- Change the whole-fiber panel block composer to support eight rows per visual
-  span instead of the current four.
-- For each restart-delimited whole-fiber span, keep the existing initial
-  side/top volume and presence panels.
-- Build a regenerated Trace2CP segment source from the span's stitched traced
-  line using the same refined-source helper used by single-pair rendering.
-- Render regenerated side/top volume panels and regenerated side/top 3D
-  presence panels, with only the regenerated centerline drawn thinly.
-- Project all control points belonging to the displayed span into each side/top
-  strip source and draw them on the initial and regenerated rows.
-- Label each displayed control point with the native whole-fiber segment
-  in-plane distance measured at that CP plane. The span start CP is labeled as
-  zero distance; target CPs use the segment's `in_plane_error_voxels`, or a
-  miss label if the plane was not reached.
-- Preserve the existing partial-output overwrite behavior after each segment.
+- Update `build_trace2cp_refined_segment_source` so source-grid sampling keeps
+  only valid traced points instead of raising when interior points are outside
+  the current source strip.
+- If the original start or target trace endpoint is clipped, use the first and
+  last remaining valid trace points as the regenerated strip endpoints.
+- Preserve strict validation for malformed/non-finite trace inputs and for
+  refined traces with fewer than two valid source-grid samples after clipping.
+- Preserve existing duplicate-point removal and endpoint extension behavior for
+  the remaining valid trace section.
+- Do not change native 3D tracing, scoring, candidate search, model inference,
+  or the initial side/top strip rendering.
 
 ## Spec Update
 
-- Update `planning/specs.md` so native 3D whole-fiber visualization explicitly
-  requires eight rows, including regenerated/fused side/top strips and their
-  presence panels, and requires span control-point markers plus CP-plane trace
-  distance labels on those panels.
+- Update `planning/specs.md` so refined/regenerated Trace2CP strip
+  visualization treats off-strip trace points as clipped display data, not as a
+  fatal trace failure.
 
 ## Docs Updates
 
 - Update durable planning docs only; no separate user-facing docs are needed
-  for this narrow visualization layout fix.
+  for this narrow visualization robustness fix.
 
 ## Tests
 
-- Add or update a focused test that the whole-fiber span renderer returns eight
-  panels, calls the refined-source path, and projects span control points into
-  initial and regenerated strips with distance labels.
+- Add a focused regression test that a refined trace with an off-strip interior
+  point still builds a refined segment source.
+- Add a focused regression test that off-strip trace endpoints are clipped
+  instead of causing a lost-CP-endpoint error.
+- Keep a failure test for cases where clipping leaves fewer than two valid
+  trace points.
 - Run:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 - Run `git diff --check` over touched files.
 
 ## Non-Goals
 
-- Do not change native 3D tracing, fusion, scoring, candidate search, or model
-  inference behavior.
+- Do not silently ignore invalid trace formats or non-finite coordinates.
