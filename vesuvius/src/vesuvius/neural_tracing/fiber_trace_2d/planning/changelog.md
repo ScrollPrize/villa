@@ -2,6 +2,11 @@
 
 ## 2026-07-17
 
+- Changed native 3D Trace2CP CLI/config defaults for current tracing
+  experiments: sample-index fallback 13 for ordinary single-sample mode,
+  `--beam-lookahead-steps 1`, `--beam-width 8`,
+  `--smoothness-normal-weight 0.1`, `--smoothness-tangent-weight 10.0`, and
+  `--core-margin-voxels 20`.
 - Changed native 3D Trace2CP candidate scoring to default to all-pairs
   direction product over previous step, current sampled direction, candidate
   step, and candidate sampled direction, with
@@ -27,7 +32,7 @@
   crossing, and pruning now run as batched torch operations around the
   existing CPU-resident inferred-block cache.
 - Added native 3D Trace2CP beam lookahead: default beam search now expands
-  three future candidate steps before pruning, controlled by
+  one future candidate step before pruning, controlled by
   `--beam-lookahead-steps`, while `--beam-width 1` remains greedy.
 - Changed native 3D Trace2CP to use beam search by default (`--beam-width 8`)
   with explicit 5-degree cone candidate steps. `--beam-width 1` keeps greedy

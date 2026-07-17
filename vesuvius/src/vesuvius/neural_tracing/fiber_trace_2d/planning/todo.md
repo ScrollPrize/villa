@@ -53,7 +53,8 @@
 - [ ] if fibers in dense areas are randoly on top of each other we can still confuse them - use more defined fiber-center & edges to improve tracing
 - [ ] cp dirs are wrong especially in tangent so beam out at additional angles in tangent initially -> can enable stronger tangent loss!
     - [ ] also test slight cp offsets along tangent - given that it might first need centering for optimal trace
-
+- [ ] currently need significant margin (20) for artifact free processing (from patch size 64!)
+    
 # beam-search
 - [ ] beamsearch
 - [ ] short brute-force lookahead

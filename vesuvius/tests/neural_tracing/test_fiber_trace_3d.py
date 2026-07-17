@@ -63,6 +63,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _native_first_step_normal_gate_torch,
     _native_trace2cp_whole_fiber_mode,
     _native_smoothness_loss_torch,
+    _parse_args,
     _native_trace_geometry_normal_record,
     _project_trace_to_initial_strip,
     _resolve_native_trace2cp_selection,
@@ -1774,18 +1775,42 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().cone_angle_step_degrees == 5.0
     assert NativeTrace2CpConfig().beam_width == 8
     assert NativeTrace2CpConfig().beam_prune_distance_voxels == 1.0
-    assert NativeTrace2CpConfig().beam_lookahead_steps == 3
+    assert NativeTrace2CpConfig().beam_lookahead_steps == 1
     assert NativeTrace2CpConfig().candidate_substeps == 1
     assert NativeTrace2CpConfig().max_step_factor == 3.0
     assert NativeTrace2CpConfig().max_steps is None
     assert NativeTrace2CpConfig().smoothness_weight == 2.0
-    assert NativeTrace2CpConfig().smoothness_tangent_weight is None
-    assert NativeTrace2CpConfig().smoothness_normal_weight is None
+    assert NativeTrace2CpConfig().smoothness_tangent_weight == 10.0
+    assert NativeTrace2CpConfig().smoothness_normal_weight == 0.1
     assert NativeTrace2CpConfig().smoothness_free_angle_degrees == 0.0
     assert NativeTrace2CpConfig().cumulative_smoothness_steps == 4
     assert NativeTrace2CpConfig().cumulative_smoothness_tangent_weight == 2.0
     assert NativeTrace2CpConfig().all_pairs_direction_product is True
+    assert NativeTrace2CpConfig().core_margin_voxels == 20
     assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 100.0
+
+
+def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "trace2cp_tool",
+            "config.json",
+            "--checkpoint",
+            "checkpoint.pt",
+            "--export-dir",
+            "out",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.sample_index is None
+    assert args.beam_width == 8
+    assert args.beam_lookahead_steps == 1
+    assert args.smoothness_normal_weight == 0.1
+    assert args.smoothness_tangent_weight == 10.0
+    assert args.core_margin_voxels == 20
 
 
 def test_native_3d_trace2cp_mode_routes_only_unselected_fiber_json_to_whole_fiber() -> None:

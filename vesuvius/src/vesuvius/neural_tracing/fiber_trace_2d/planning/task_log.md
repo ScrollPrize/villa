@@ -1,10 +1,17 @@
-# Native 3D Trace2CP All-Pairs Direction Product Log
+# Native 3D Trace2CP Default Tuning Log
 
-## Planning
+## Implementation Notes
 
-- Replaced current planning docs for the native 3D Trace2CP all-pairs
-  direction product scoring task.
-- Planned a default-enabled switch with an opt-out CLI flag for comparison.
+- Updated native 3D Trace2CP code and CLI defaults to:
+  `--beam-lookahead-steps 1`, `--beam-width 8`,
+  `--smoothness-normal-weight 0.1`, `--smoothness-tangent-weight 10.0`, and
+  `--core-margin-voxels 20`.
+- Kept `args.sample_index` as `None` in the parser so bare `--fiber-json`
+  still triggers whole-fiber mode; ordinary single-sample resolution now falls
+  back to sample index 13.
+- Changed no-normal-sampler paths to fall back to isotropic smoothness instead
+  of rejecting the default split smoothness weights.
+- Updated specs, code-structure docs, and changelog.
 
 ## Deviations / Deferred
 
@@ -13,17 +20,4 @@ None.
 ## Validation
 
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  - Result: `101 passed in 3.12s`.
-- `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/specs.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/code_structure.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/changelog.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/status.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task_log.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task_plan.md`
-  - Result: clean.
-
-## Implementation Notes
-
-- Added `all_pairs_direction_product` to native 3D Trace2CP config and summary.
-- Added CLI opt-out `--no-all-pairs-direction-product`.
-- Default candidate score now multiplies all six pairwise direction dots among
-  previous step direction, current sampled direction, candidate step direction,
-  and candidate sampled direction, times presence.
-- First-step root scoring neutralizes previous/current tangent-plane pair terms
-  so the CP-root normal-only relaxation remains intact.
-- Legacy two-dot score remains available through the opt-out flag and tests.
+  - Result: `102 passed in 3.47s`.

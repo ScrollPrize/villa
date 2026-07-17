@@ -48,11 +48,11 @@ class NativeTrace2CpConfig:
     cone_angle_step_degrees: float = 5.0
     beam_width: int = 8
     beam_prune_distance_voxels: float = 1.0
-    beam_lookahead_steps: int = 3
+    beam_lookahead_steps: int = 1
     candidate_substeps: int = 1
     smoothness_weight: float = 2.0
-    smoothness_tangent_weight: float | None = None
-    smoothness_normal_weight: float | None = None
+    smoothness_tangent_weight: float | None = 10.0
+    smoothness_normal_weight: float | None = 0.1
     smoothness_free_angle_degrees: float = 0.0
     cumulative_smoothness_steps: int = 4
     cumulative_smoothness_tangent_weight: float = 2.0
@@ -61,7 +61,7 @@ class NativeTrace2CpConfig:
     max_steps: int | None = None
     trace_step_limit: int | None = None
     inference_patch_shape_zyx: tuple[int, int, int] = (64, 64, 64)
-    core_margin_voxels: int = 8
+    core_margin_voxels: int = 20
     whole_fiber_error_threshold_voxels: float = 100.0
 
 
@@ -1310,7 +1310,7 @@ def _native_smoothness_loss_torch(
     if not split_requested:
         return isotropic
     if candidate_normals is None:
-        raise ValueError("candidate_normals are required for split smoothness weights")
+        return isotropic
     if candidate_normals.ndim == 4:
         normals = candidate_normals[:, :, -1, :]
         if candidate_normals_valid is None:
@@ -2154,11 +2154,7 @@ def _native_trace_cfg_with_effective_smoothness(
         name="smoothness_normal_weight",
     )
     if normal_sampler is None:
-        if tangent is not None or normal is not None:
-            raise ValueError(
-                "split smoothness weights require native Lasagna candidate normal sampling"
-            )
-        return cfg
+        return replace(cfg, smoothness_tangent_weight=None, smoothness_normal_weight=None)
     fallback = float(cfg.smoothness_weight)
     if not math.isfinite(fallback) or fallback < 0.0:
         raise ValueError("smoothness_weight must be finite and non-negative")
@@ -4722,7 +4718,7 @@ def run_native_trace2cp(
     else:
         selection = _resolve_native_trace2cp_selection(
             loader,
-            sample_index=0 if sample_index is None else int(sample_index),
+            sample_index=13 if sample_index is None else int(sample_index),
             fiber_json=fiber_path,
             start_cp_index=start_cp_index,
             target_cp_index=target_cp_index,
@@ -5050,11 +5046,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cone-angle-step-degrees", type=float, default=5.0)
     parser.add_argument("--beam-width", type=int, default=8)
     parser.add_argument("--beam-prune-distance-voxels", type=float, default=1.0)
-    parser.add_argument("--beam-lookahead-steps", type=int, default=3)
+    parser.add_argument("--beam-lookahead-steps", type=int, default=1)
     parser.add_argument("--candidate-substeps", type=int, default=1)
     parser.add_argument("--smoothness-weight", type=float, default=2.0)
-    parser.add_argument("--smoothness-tangent-weight", type=float, default=None)
-    parser.add_argument("--smoothness-normal-weight", type=float, default=None)
+    parser.add_argument("--smoothness-tangent-weight", type=float, default=10.0)
+    parser.add_argument("--smoothness-normal-weight", type=float, default=0.1)
     parser.add_argument("--smoothness-free-angle-degrees", type=float, default=0.0)
     parser.add_argument("--cumulative-smoothness-steps", type=int, default=4)
     parser.add_argument("--cumulative-smoothness-tangent-weight", type=float, default=2.0)
@@ -5067,7 +5063,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--trace-step-limit", type=int, default=None)
     parser.add_argument("--inference-patch-shape-zyx", nargs=3, type=int, default=None)
-    parser.add_argument("--core-margin-voxels", type=int, default=8)
+    parser.add_argument("--core-margin-voxels", type=int, default=20)
     parser.add_argument("--whole-fiber-error-threshold-voxels", type=float, default=100.0)
     return parser.parse_args()
 

@@ -390,8 +390,13 @@
   semantics. Scale fallback, unresolved requested chunks, or chunk errors must
   fail loudly for debugging renders instead of being shown as valid strips.
 - Native 3D Trace2CP defaults to `--inference-patch-shape-zyx 64 64 64`,
-  matching the current fast 3D training/debug patch size. Larger patch shapes
-  remain explicit CLI overrides.
+  matching the current fast 3D training/debug patch size, and
+  `--core-margin-voxels 20` to crop away block-edge inference artifacts.
+  Larger patch shapes remain explicit CLI overrides.
+- Native 3D Trace2CP ordinary single-sample CLI mode defaults to sample index
+  13 when no explicit `--sample-index` is provided. Bare `--fiber-json`
+  without sample/CP selectors remains whole-fiber mode and must not be turned
+  into sample-index mode by this default.
 - Native 3D Trace2CP does not default to a fixed large step count. The default
   trace guard is distance-derived:
   `ceil(max_step_factor * cp_distance_voxels / step_voxels)`, with
@@ -407,7 +412,7 @@
   not supported.
 - Native 3D Trace2CP uses beam search by default. `--beam-width 8` keeps
   multiple cumulative candidate histories, `--beam-prune-distance-voxels 1.0`
-  merges near-duplicate live beam states, and `--beam-lookahead-steps 3`
+  merges near-duplicate live beam states, and `--beam-lookahead-steps 1`
   expands short future trees before pruning. Pruning happens after the
   configured lookahead expansion, not after every single candidate step.
   `--beam-width 1` preserves the previous greedy one-step-commit control flow
@@ -458,11 +463,10 @@
   turns are penalized unless explicitly overridden. The Lasagna normal
   sign ambiguity must not affect this penalty. The CLI flags
   `--smoothness-tangent-weight` and `--smoothness-normal-weight` override the
-  component weights independently; when omitted and native candidate-normal
-  sampling is active, both component weights default to
-  `--smoothness-weight` (`2.0`). If candidate normal sampling is unavailable or
-  invalid for one candidate, that candidate falls back to the previous
-  isotropic smoothness term
+  component weights independently; their native 3D CLI defaults are `10.0` for
+  tangent-plane turn and `0.1` for normal-tilt turn. If candidate normal
+  sampling is unavailable or invalid for one candidate, that candidate falls
+  back to the previous isotropic smoothness term
   `smoothness_weight * max(0, angle(previous_step_dir, step_dir) - free_angle)^2`.
   Native 3D Trace2CP also adds cumulative tangent-only smoothness over a
   short history direction so several small tangent-plane turns cannot compound

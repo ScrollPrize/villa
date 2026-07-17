@@ -99,7 +99,7 @@ side/top strip input loading.
 - Provides a separate native 3D Trace2CP inspection CLI:
 
   ```bash
-  python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool <config.json> --checkpoint <snapshot.pt> --sample-index 0 --export-dir <dir>
+  python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool <config.json> --checkpoint <snapshot.pt> --sample-index 13 --export-dir <dir>
   ```
 
 - `--fiber-json <path>` without sample or CP selectors runs native whole-fiber
@@ -166,9 +166,10 @@ side/top strip input loading.
   With a valid candidate normal, `--smoothness-tangent-weight` penalizes turns
   within the tangent plane perpendicular to the normal and
   `--smoothness-normal-weight` penalizes elevation change into/out of the
-  normal direction. Omitted component weights default to
-  `--smoothness-weight` (`2.0`) in the native CLI, and invalid candidate
-  normals fall back to the older isotropic previous-step smoothness. In
+  normal direction. The native CLI defaults to
+  `--smoothness-tangent-weight 10.0` and
+  `--smoothness-normal-weight 0.1`; if candidate normals are unavailable or
+  invalid, the scorer falls back to the older isotropic previous-step smoothness. In
   addition, each greedy/beam state carries a running history heading. The
   optional cumulative smoothness term compares candidates against that heading
   only after projecting both into the candidate Lasagna-normal tangent plane.
@@ -190,7 +191,7 @@ side/top strip input loading.
   Native Trace2CP now uses beam search by default (`--beam-width 8`) instead of
   committing greedily at every step. Each beam expands the same branch-aware
   candidate score for `--beam-lookahead-steps` future steps before pruning
-  (default `3`), cumulative loss selects the best target-plane-reaching state,
+  (default `1`), cumulative loss selects the best target-plane-reaching state,
   and `--beam-prune-distance-voxels` merges near-duplicate live states after
   the lookahead expansion. `--beam-width 1` preserves the previous greedy
   control flow and does not use lookahead. Beam candidate selection is batched
@@ -431,8 +432,8 @@ PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --prefetch --prefetch-steps 1
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --resume /path/to/current.pt
-PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --trace2cp-vis --checkpoint /path/to/best.pt --sample-index 0 --export-dir /tmp/fiber_trace_3d_trace2cp
-PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --checkpoint /path/to/best.pt --sample-index 0 --export-dir /tmp/fiber_trace_3d_native_trace2cp
+PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --trace2cp-vis --checkpoint /path/to/best.pt --sample-index 13 --export-dir /tmp/fiber_trace_3d_trace2cp
+PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --checkpoint /path/to/best.pt --sample-index 13 --export-dir /tmp/fiber_trace_3d_native_trace2cp
 ```
 
 The important behavior is:

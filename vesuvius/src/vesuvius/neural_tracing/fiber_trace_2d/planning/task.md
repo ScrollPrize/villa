@@ -1,13 +1,14 @@
-# Native 3D Trace2CP All-Pairs Direction Product
+# Native 3D Trace2CP Default Tuning
 
-Update native 3D Trace2CP candidate scoring to consider all four relevant
-directions:
+Make the following native 3D Trace2CP values the defaults for current tracing
+experiments:
 
-- last step direction: last accepted point to current point;
-- last sampled direction: model direction sampled at the current point;
-- current candidate step direction: current point to candidate point;
-- candidate sampled direction: model direction sampled at the candidate point.
+- `--beam-lookahead-steps 1`
+- `--beam-width 8`
+- `--smoothness-normal-weight 0.1`
+- `--smoothness-tangent-weight 10.0`
+- ordinary single-sample fallback `--sample-index 13`
+- `--core-margin-voxels 20`
 
-The new scoring mode should multiply all pairwise aligned dot products so any
-individual outlier direction penalizes the candidate. Put this behind a switch,
-but enable it by default for testing.
+Keep bare `--fiber-json` whole-fiber mode intact; the sample-index fallback
+must only apply when ordinary single-sample mode is resolved.
