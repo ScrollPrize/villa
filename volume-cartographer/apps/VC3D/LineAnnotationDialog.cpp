@@ -58,6 +58,12 @@ constexpr char kGeneratedDynamicCurrentCutOverlayKey[] = "line-z-slice-current";
 constexpr float kNominalGeneratedRowWidth = 900.0f;
 constexpr float kNominalGeneratedRowHeight = 260.0f;
 constexpr double kSpanMetricHighlightThresholdDegrees = 45.0;
+constexpr double kNormalOffsetEpsilon = 1.0e-6;
+
+bool normalOffsetActive(double offsetVx)
+{
+    return std::abs(offsetVx) > kNormalOffsetEpsilon;
+}
 
 std::string staticStripOverlayKey(const std::string& surfaceName)
 {
@@ -777,7 +783,8 @@ bool LineAnnotationDialog::setGeneratedRows(
     _hasGeneratedViews = false;
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
-    _currentCutStraightOffsetActive = false;
+    _currentCutNormalOffsetVx = 0.0;
+    _sideCutNormalOffsetVx = 0.0;
     _generatedControlIndex = {};
     _haveInitialCurrentCutCamera = false;
     _haveInitialSideCutCamera = false;
@@ -1000,7 +1007,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             _generatedViews.controlPoints);
     _hasGeneratedViews = true;
     _currentCutFollowsStripMouse = views.initialCurrentCutFollowsStripMouse;
-    _currentCutStraightOffsetActive = false;
+    _currentCutNormalOffsetVx = 0.0;
+    _sideCutNormalOffsetVx = 0.0;
     if (!replacingGeneratedViews) {
         _currentCutManualRotation = cv::Matx33f::eye();
         _currentCutManualRotationActive = false;
@@ -1057,7 +1065,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         [this](int steps, QPointF, Qt::KeyboardModifiers modifiers) {
             (void)modifiers;
             if (shiftScrollMode() == ShiftScrollMode::StraightNormal) {
-                return shiftCurrentCutPlaneStraightByScrollSteps(steps);
+                return shiftCurrentCutPlaneNormalOffsetByScrollSteps(steps);
             }
             return shiftCurrentLinePositionByScrollSteps(steps);
         });
@@ -1109,9 +1117,11 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     if (!haveSideCutCamera && finitePoint(_generatedViews.focusPoint)) {
         sideViewer->centerOnVolumePoint(_generatedViews.focusPoint, false);
     }
+    sideViewer->setProperty("vc_show_custom_normal_offset", true);
+    sideViewer->setProperty("vc_custom_normal_offset_vx", _sideCutNormalOffsetVx);
     sideViewer->setShiftScrollOverride(
         [this](int steps, QPointF, Qt::KeyboardModifiers) {
-            return shiftCurrentLinePositionByScrollSteps(steps);
+            return shiftSideCutPlaneNormalOffsetByScrollSteps(steps);
         });
     bindPaneInteractions(views.sideCutName, sideViewer, false);
     connect(sideViewer,
@@ -1406,7 +1416,10 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
         return;
     }
     if (currentChanged && _generatedViews.currentCutSurface) {
-        _currentCutStraightOffsetActive = false;
+        _currentCutNormalOffsetVx = 0.0;
+        if (_currentCutViewer) {
+            _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+        }
         _currentLinePosition = position;
         (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
         if (_currentCutViewer) {
@@ -1422,6 +1435,8 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
     }
     if (_generatedViews.sideCutSurface) {
         (void)updateSidePlaneSurface(_generatedViews.sideCutSurface.get(), _currentLinePosition);
+        (void)applyCutPlaneNormalOffset(_generatedViews.sideCutSurface.get(),
+                                        _sideCutNormalOffsetVx);
     }
     if (_sideCutViewer) {
         // Moving the cursor along the strips moves along the line, so keep the current position
@@ -1435,6 +1450,27 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
         }
     }
     rebuildGeneratedDynamicOverlays(updateCurrentCutOverlay, false);
+}
+
+bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
+{
+    if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
+        return true;
+    }
+    const int sliceStepSize = _viewerManager
+        ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
+        : 1;
+    const double position = vc3d::line_annotation::shiftedLinePosition(
+        _currentLinePosition,
+        steps,
+        sliceStepSize,
+        static_cast<int>(_generatedViews.linePoints.size()));
+    _currentCutNormalOffsetVx = 0.0;
+    if (_currentCutViewer) {
+        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+    }
+    setCurrentLinePosition(position);
+    return true;
 }
 
 void LineAnnotationDialog::cancelControlPointPreviewAnimation()
@@ -1525,35 +1561,43 @@ void LineAnnotationDialog::previewClosestControlPoint()
     });
 }
 
-bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
+bool LineAnnotationDialog::shiftCurrentCutPlaneNormalOffsetByScrollSteps(int steps)
 {
-    if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
-        return true;
-    }
-    const int sliceStepSize = _viewerManager
-        ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
-        : 1;
-    const double position = vc3d::line_annotation::shiftedLinePosition(
-        _currentLinePosition,
-        steps,
-        sliceStepSize,
-        static_cast<int>(_generatedViews.linePoints.size()));
-    _currentCutStraightOffsetActive = false;
-    setCurrentLinePosition(position);
-    return true;
+    return shiftCutPlaneNormalOffsetByScrollSteps(_generatedViews.currentCutSurface.get(),
+                                                  _currentCutViewer,
+                                                  steps,
+                                                  _currentCutNormalOffsetVx,
+                                                  "line annotation current cut normal offset");
 }
 
-bool LineAnnotationDialog::shiftCurrentCutPlaneStraightByScrollSteps(int steps)
+bool LineAnnotationDialog::shiftSideCutPlaneNormalOffsetByScrollSteps(int steps)
 {
-    if (!_hasGeneratedViews || !_generatedViews.currentCutSurface) {
+    return shiftCutPlaneNormalOffsetByScrollSteps(_generatedViews.sideCutSurface.get(),
+                                                  _sideCutViewer,
+                                                  steps,
+                                                  _sideCutNormalOffsetVx,
+                                                  "line annotation side cut normal offset");
+}
+
+bool LineAnnotationDialog::shiftCutPlaneNormalOffsetByScrollSteps(PlaneSurface* plane,
+                                                                  CChunkedVolumeViewer* viewer,
+                                                                  int steps,
+                                                                  double& offsetVx,
+                                                                  const char* renderReason)
+{
+    if (!_hasGeneratedViews || !plane || steps == 0) {
         return true;
     }
-    auto* plane = _generatedViews.currentCutSurface.get();
     const int sliceStepSize = _viewerManager
         ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
         : 1;
     const cv::Vec3f origin = plane->origin();
     const cv::Vec3f normal = plane->normal({0.0f, 0.0f, 0.0f});
+    const float normalNorm = cv::norm(normal);
+    if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) ||
+        !std::isfinite(normal[2]) || normalNorm <= 1.0e-6f) {
+        return true;
+    }
     const cv::Vec3f shiftedOrigin =
         vc3d::line_annotation::shiftedPlaneOriginAlongNormal(origin,
                                                              normal,
@@ -1563,15 +1607,81 @@ bool LineAnnotationDialog::shiftCurrentCutPlaneStraightByScrollSteps(int steps)
         return true;
     }
     plane->setFromNormalAndUp(shiftedOrigin, normal, plane->basisY());
-    if (_currentCutViewer) {
-        _currentCutViewer->markSurfaceGeometryChanged();
+    offsetVx += static_cast<double>(steps) *
+                static_cast<double>(vc3d::line_annotation::shiftScrollLineStepSize(sliceStepSize));
+    if (!normalOffsetActive(offsetVx)) {
+        offsetVx = 0.0;
     }
-    _currentCutStraightOffsetActive = true;
-    if (_currentCutViewer) {
-        _currentCutViewer->renderVisible(true, "line annotation current cut straight shift");
+    if (viewer) {
+        viewer->setProperty("vc_custom_normal_offset_vx", offsetVx);
+        viewer->markSurfaceGeometryChanged();
+        viewer->renderVisible(true, renderReason);
     }
     rebuildGeneratedDynamicOverlays();
     return true;
+}
+
+bool LineAnnotationDialog::applyCutPlaneNormalOffset(PlaneSurface* plane, double offsetVx) const
+{
+    if (!plane || !normalOffsetActive(offsetVx)) {
+        return true;
+    }
+    const cv::Vec3f normal = plane->normal({0.0f, 0.0f, 0.0f});
+    const float normalNorm = cv::norm(normal);
+    if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) ||
+        !std::isfinite(normal[2]) || normalNorm <= 1.0e-6f) {
+        return false;
+    }
+    plane->setFromNormalAndUp(plane->origin() +
+                                  normal * (static_cast<float>(offsetVx) / normalNorm),
+                              normal,
+                              plane->basisY());
+    return true;
+}
+
+void LineAnnotationDialog::resetGeneratedCutNormalOffsets(bool forceRender)
+{
+    if (!_hasGeneratedViews) {
+        return;
+    }
+
+    bool changed = false;
+    const bool currentHadOffset = normalOffsetActive(_currentCutNormalOffsetVx);
+    const bool sideHadOffset = normalOffsetActive(_sideCutNormalOffsetVx);
+    _currentCutNormalOffsetVx = 0.0;
+    _sideCutNormalOffsetVx = 0.0;
+    if (_currentCutViewer) {
+        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+    }
+    if (_sideCutViewer) {
+        _sideCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+    }
+
+    if (currentHadOffset && _generatedViews.currentCutSurface) {
+        if (updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition)) {
+            changed = true;
+            if (_currentCutViewer) {
+                _currentCutViewer->markSurfaceGeometryChanged();
+                if (forceRender) {
+                    _currentCutViewer->renderVisible(true, "line annotation current cut offset reset");
+                }
+            }
+        }
+    }
+    if (sideHadOffset && _generatedViews.sideCutSurface) {
+        if (updateSidePlaneSurface(_generatedViews.sideCutSurface.get(), _currentLinePosition)) {
+            changed = true;
+            if (_sideCutViewer) {
+                _sideCutViewer->markSurfaceGeometryChanged();
+                if (forceRender) {
+                    _sideCutViewer->renderVisible(true, "line annotation side cut offset reset");
+                }
+            }
+        }
+    }
+    if (changed) {
+        rebuildGeneratedDynamicOverlays();
+    }
 }
 
 void LineAnnotationDialog::handleShiftScrollModeChanged()
@@ -1579,14 +1689,21 @@ void LineAnnotationDialog::handleShiftScrollModeChanged()
     if (shiftScrollMode() != ShiftScrollMode::AlongLine) {
         return;
     }
+
+    const bool wasFollowing = _currentCutFollowsStripMouse;
     setCurrentCutFollowsStripMouse(true);
-    if (!_hasGeneratedViews || !_generatedViews.currentCutSurface) {
+    if (!wasFollowing) {
         return;
     }
-    if (!_currentCutStraightOffsetActive) {
+
+    const bool currentHadOffset = normalOffsetActive(_currentCutNormalOffsetVx);
+    _currentCutNormalOffsetVx = 0.0;
+    if (_currentCutViewer) {
+        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+    }
+    if (!currentHadOffset || !_generatedViews.currentCutSurface) {
         return;
     }
-    _currentCutStraightOffsetActive = false;
     if (!updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition)) {
         return;
     }
@@ -1599,7 +1716,11 @@ void LineAnnotationDialog::handleShiftScrollModeChanged()
 
 void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
 {
+    const bool wasFollowing = _currentCutFollowsStripMouse;
     _currentCutFollowsStripMouse = follows;
+    if (follows && !wasFollowing) {
+        resetGeneratedCutNormalOffsets(true);
+    }
 }
 
 void LineAnnotationDialog::requestGeneratedSideStripIntersections()
@@ -1779,17 +1900,22 @@ void LineAnnotationDialog::resetGeneratedViews()
                                       static_cast<double>(_generatedViews.linePoints.size() - 1));
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
-    _currentCutStraightOffsetActive = false;
+    _currentCutNormalOffsetVx = 0.0;
+    _sideCutNormalOffsetVx = 0.0;
     _currentCutFollowsStripMouse = true;
 
     if (_generatedViews.currentCutSurface) {
         (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
         if (_currentCutViewer) {
+            _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
             _currentCutViewer->markSurfaceGeometryChanged();
         }
     }
     if (_generatedViews.sideCutSurface) {
         (void)updateSidePlaneSurface(_generatedViews.sideCutSurface.get(), _currentLinePosition);
+        if (_sideCutViewer) {
+            _sideCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+        }
     }
     restoreInitialGeneratedViewerCameras();
     if (_currentCutViewer) {
@@ -2137,7 +2263,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     }
 
     QPointF centerScenePoint;
-    if (_currentCutStraightOffsetActive) {
+    if (normalOffsetActive(_currentCutNormalOffsetVx)) {
         centerScenePoint = viewer->volumeToScene(interpolatedLinePoint(_currentLinePosition));
     } else {
         centerScenePoint = viewer->surfaceCoordsToScene(0.0f, 0.0f);
@@ -2486,18 +2612,6 @@ void LineAnnotationDialog::resizeEvent(QResizeEvent* event)
 
 bool LineAnnotationDialog::toggleCurrentCutFollowFromKeyboard()
 {
-    if (shiftScrollMode() == ShiftScrollMode::StraightNormal &&
-        _currentCutStraightOffsetActive) {
-        _currentCutStraightOffsetActive = false;
-        _currentCutManualRotation = cv::Matx33f::eye();
-        _currentCutManualRotationActive = false;
-        (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
-        if (_currentCutViewer) {
-            _currentCutViewer->markSurfaceGeometryChanged();
-            _currentCutViewer->renderVisible(true, "line annotation current cut snap to line");
-        }
-        rebuildGeneratedDynamicOverlays();
-    }
     if (_currentCutFollowsStripMouse) {
         setCurrentLinePosition(snappedControlPointPosition(_currentLinePosition));
         setCurrentCutFollowsStripMouse(false);

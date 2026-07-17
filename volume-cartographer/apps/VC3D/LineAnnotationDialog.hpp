@@ -196,7 +196,15 @@ private:
     void jumpToNextControlPoint();
     void previewClosestControlPoint();
     bool shiftCurrentLinePositionByScrollSteps(int steps);
-    bool shiftCurrentCutPlaneStraightByScrollSteps(int steps);
+    bool shiftCurrentCutPlaneNormalOffsetByScrollSteps(int steps);
+    bool shiftSideCutPlaneNormalOffsetByScrollSteps(int steps);
+    bool shiftCutPlaneNormalOffsetByScrollSteps(PlaneSurface* plane,
+                                                CChunkedVolumeViewer* viewer,
+                                                int steps,
+                                                double& offsetVx,
+                                                const char* renderReason);
+    bool applyCutPlaneNormalOffset(PlaneSurface* plane, double offsetVx) const;
+    void resetGeneratedCutNormalOffsets(bool forceRender);
     void handleShiftScrollModeChanged();
     void setCurrentCutFollowsStripMouse(bool follows);
     void requestGeneratedSideStripIntersections();
@@ -319,7 +327,8 @@ private:
     bool _currentCutFollowsStripMouse = true;
     cv::Matx33f _currentCutManualRotation = cv::Matx33f::eye();
     bool _currentCutManualRotationActive = false;
-    bool _currentCutStraightOffsetActive = false;
+    double _currentCutNormalOffsetVx = 0.0;
+    double _sideCutNormalOffsetVx = 0.0;
     bool _generatedOverlayRefreshQueued = false;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
