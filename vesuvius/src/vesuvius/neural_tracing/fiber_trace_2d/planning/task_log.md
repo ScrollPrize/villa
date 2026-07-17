@@ -1,33 +1,27 @@
-# Native 3D Trace2CP Beam Lookahead Log
+# Native 3D Trace2CP Vectorized Beam Lookahead Log
 
-## Implemented
+## Findings
 
-- Added `beam_lookahead_steps` to `NativeTrace2CpConfig` and CLI flag
-  `--beam-lookahead-steps`, defaulting to `3`.
-- Changed the native 3D beam tracer so it expands up to
-  `beam_lookahead_steps` future steps before pruning back to `beam_width`.
-- Kept `beam_width <= 1` on the greedy compatibility path, so lookahead is not
-  used for explicit greedy runs.
-- Added `beam_lookahead_steps` to native Trace2CP summary JSON and progress
-  text.
-- Added a fake-cache regression where one-step beam pruning drops the needed
-  branch but three-step lookahead reaches the target plane.
-- Pinned older constant-field native Trace2CP tests to `beam_width=1` because
-  they validate trace guards/geometry, not default beam runtime.
-- Updated specs, code-structure docs, changelog, and status.
+- Candidate output sampling and scoring currently run on `cache.device`, so
+  normal CLI runs can use GPU for `grid_sample`, direction decoding, branch
+  reduction, and candidate scoring.
+- Current beam lookahead still has Python loops over frontier states and child
+  node creation.
+- Current `_trace_candidate_directions` builds NumPy candidates for one axis at
+  a time, which blocks fully batched GPU candidate expansion.
+
+## Planned Work
+
+- Move beam-mode candidate generation, current-point lookup, candidate scoring,
+  target-plane crossing, and lookahead frontier expansion to batched torch
+  tensors on `cache.device`.
+- Keep final path reconstruction in Python because only one selected path is
+  reconstructed.
 
 ## Validation
 
-- First focused test run was interrupted after it became slow: legacy
-  constant-field tests were accidentally exercising default beam lookahead.
-- After pinning those compatibility tests to greedy:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  - Result: `83 passed in 8.36s`
+- Pending implementation.
 
 ## Deviations / Deferred
 
-- No planned requirement was intentionally skipped.
-- Runtime cost is intentionally higher for default beam tracing: with
-  `beam_width=8`, 81 default candidates, and lookahead `3`, the frontier can be
-  much larger before pruning. The depth is configurable with
-  `--beam-lookahead-steps`.
+- None so far.

@@ -1,7 +1,9 @@
-# Native 3D Trace2CP Beam Lookahead
+# Native 3D Trace2CP Vectorized Beam Lookahead
 
-Extend native 3D Trace2CP beam search so pruning can happen after a short
-brute-force future expansion instead of after every single step. The goal is to
-survive difficult regions where one or more locally suboptimal steps are needed
-before the trace returns to a better path. Start with a default lookahead depth
-of `3` steps.
+Plan how to vectorize native 3D Trace2CP beam lookahead as much as possible on
+GPU. Current candidate scoring is tensorized per beam state, but beam frontier
+expansion, lookahead depth handling, and child bookkeeping still loop in Python.
+The next implementation should batch all active beam/frontier states for each
+lookahead depth, generate candidates on GPU, score them in one call, and prune
+with torch operations before converting the selected final path back to Python
+objects for reporting/visualization.

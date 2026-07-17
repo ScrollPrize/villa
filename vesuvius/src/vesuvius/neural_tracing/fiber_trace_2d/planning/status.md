@@ -1,10 +1,13 @@
-# Native 3D Trace2CP Beam Lookahead Status
+# Native 3D Trace2CP Vectorized Beam Lookahead Status
 
-- [x] Read local workflow and define current task.
-- [x] Write task plan.
-- [x] Implement lookahead config and CLI.
-- [x] Implement N-step beam expansion before pruning.
-- [x] Update specs/docs/changelog.
-- [x] Add regression tests.
-- [x] Run focused 3D fiber trace tests.
-- [x] Record validation and deviations in `task_log.md`.
+- [x] Inspect current beam/scoring/cache vectorization boundaries.
+- [x] Write task and implementation plan.
+- [ ] Implement GPU candidate generation.
+- [ ] Implement batched current-point lookup.
+- [ ] Implement batched candidate scoring over frontier states.
+- [ ] Implement tensor frontier/lookahead expansion.
+- [ ] Implement target-plane crossing and pruning in batched form.
+- [ ] Update specs/docs/changelog.
+- [ ] Add regression and equivalence tests.
+- [ ] Run focused 3D fiber trace tests.
+- [ ] Record validation and deviations in `task_log.md`.
