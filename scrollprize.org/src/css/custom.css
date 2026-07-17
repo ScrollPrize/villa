@@ -439,6 +439,35 @@ aside {
   .atlas .lightbox { animation: atlaslbfade .14s ease-out; }
   @keyframes atlaslbfade { from { opacity: 0; } to { opacity: 1; } }
 }
+
+/* --- Compare-sweep toggle + frame (CompareRenders, in the lightbox) --- */
+.atlas .lightbox .lbcomparetoggle { position: fixed; top: 16px; right: 64px; color: #fff;
+  background: rgba(255, 255, 255, .08); border: 1px solid rgba(255, 255, 255, .25); border-radius: 7px;
+  font-size: 12px; font-weight: 600; padding: 6px 12px; cursor: pointer; opacity: .85; }
+.atlas .lightbox .lbcomparetoggle:hover { opacity: 1; border-color: var(--accent); }
+.atlas .lightbox .lbcomparetoggle[aria-pressed="true"] { color: #0b0d10; background: var(--accent); border-color: var(--accent); opacity: 1; }
+.atlas .lightbox .comparewrap { display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 96vw; }
+.atlas .lightbox .compareframe { position: relative; max-width: 96vw; max-height: 84vh; width: fit-content;
+  overflow: hidden; border-radius: 8px; box-shadow: 0 16px 50px rgba(0, 0, 0, .5); cursor: ew-resize;
+  touch-action: none; user-select: none; }
+.atlas .lightbox .compareframe:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.atlas .lightbox .cmpimg-a, .atlas .lightbox .cmpimg-b { display: block; max-width: 96vw; max-height: 84vh;
+  width: auto; height: auto; pointer-events: none; }
+.atlas .lightbox .cmpimg-a { position: absolute; top: 0; left: 0; }
+.atlas .lightbox .cmpdivider { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent);
+  transform: translateX(-1px); pointer-events: none; }
+.atlas .lightbox .cmphandle { position: absolute; top: 50%; left: 50%; width: 30px; height: 30px;
+  transform: translate(-50%, -50%); border-radius: 50%; background: var(--accent); border: 2px solid #0b0d10;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .5); }
+.atlas .lightbox .cmplabel-left, .atlas .lightbox .cmplabel-right { position: absolute; bottom: 10px;
+  color: #fff; font-size: 11.5px; font-weight: 600; background: rgba(8, 9, 11, .6); border-radius: 5px;
+  padding: 3px 8px; pointer-events: none; }
+.atlas .lightbox .cmplabel-left { left: 10px; }
+.atlas .lightbox .cmplabel-right { right: 10px; }
+.atlas .lightbox .cmpfoot { color: #cdd6df; font-size: 12.5px; display: flex; gap: 16px; flex-wrap: wrap;
+  justify-content: center; }
+.atlas .lightbox .cmpfoot a { color: var(--accent); }
+.atlas .lightbox .cmpfoot a:hover { text-decoration: underline; }
 .atlas-detail .embargo { background: #3a2a12; border: 1px solid #6b5224; color: #e7c98a; border-radius: 8px;
   padding: 8px 12px; font-size: 12.5px; margin-bottom: 12px; }
 .atlas-detail .full { grid-column: 1 / -1; }

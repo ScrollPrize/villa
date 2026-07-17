@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { thumbnailUrls, neuroglancerUrl } from "./dataAccess";
+import CompareRenders from "./CompareRenders";
 
 // InkSegmentsGallery — the per-segment listing the old atlas had: every segment
 // with an ink prediction, as a lazy-loaded grid of small Thumbor thumbnails.
@@ -53,6 +54,13 @@ export default function InkSegmentsGallery({ segments, display }) {
   // Lightbox: index into `shown` of the image in the popup, or null.
   const [zoomIdx, setZoomIdx] = useState(null);
   const [imgLoading, setImgLoading] = useState(false);
+  // Compare-sweep toggle for the lightbox: independent per segment/view, so a
+  // stale on-state or variant selection never carries across a segment step
+  // or a 3D/2D tab switch.
+  const [compareOn, setCompareOn] = useState(false);
+  useEffect(() => {
+    setCompareOn(false);
+  }, [zoomIdx, view]);
 
   // Active view + the segments it shows (also drives lightbox navigation).
   const v = view === "3d" && n3D > 0 ? "3d" : n2D > 0 ? "2d" : "3d";
@@ -65,11 +73,24 @@ export default function InkSegmentsGallery({ segments, display }) {
   useEffect(() => {
     if (zoomIdx == null) return undefined;
     const onKey = (e) => {
-      if (e.key === "Escape") setZoomIdx(null);
-      else if (e.key === "ArrowLeft") {
+      if (e.key === "Escape") {
+        setZoomIdx(null);
+        return;
+      }
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      // Focus inside the compare-sweep frame: let it handle ← / → itself
+      // (nudging the divider) instead of stepping to another segment.
+      if (
+        document.activeElement &&
+        document.activeElement.closest &&
+        document.activeElement.closest(".compareframe")
+      ) {
+        return;
+      }
+      if (e.key === "ArrowLeft") {
         e.preventDefault();
         setZoomIdx((i) => (i == null ? i : (i + n - 1) % n));
-      } else if (e.key === "ArrowRight") {
+      } else {
         e.preventDefault();
         setZoomIdx((i) => (i == null ? i : (i + 1) % n));
       }
@@ -95,6 +116,11 @@ export default function InkSegmentsGallery({ segments, display }) {
 
   // Current lightbox image, derived from the live `shown` list + index.
   const cur = zoomIdx != null ? shown[zoomIdx] : null;
+  // The multi-volume render variants for whichever view is active — reads
+  // alphaRenders in 3D, renders in 2D, so this stays correct even once
+  // alphaRenders is populated for real data (today it never is).
+  const activeVariants = is3d ? cur?.alphaRenders : cur?.renders;
+  const canCompare = Array.isArray(activeVariants) && activeVariants.length > 1;
   const lb = cur
     ? {
         jpg: is3d ? cur.alphaPrev : cur.down,
@@ -236,6 +262,16 @@ export default function InkSegmentsGallery({ segments, display }) {
           >
             ×
           </button>
+          {canCompare ? (
+            <button
+              type="button"
+              className="lbcomparetoggle"
+              aria-pressed={compareOn}
+              onClick={() => setCompareOn((c) => !c)}
+            >
+              {compareOn ? "Close compare" : `Compare (${activeVariants.length})`}
+            </button>
+          ) : null}
           {n > 1 ? (
             <>
               <button
@@ -256,13 +292,19 @@ export default function InkSegmentsGallery({ segments, display }) {
               </button>
             </>
           ) : null}
-          {imgLoading ? <div className="lbspin" aria-label="loading" /> : null}
-          <img
-            src={thumbnailUrls(lb.jpg, 2000, 2000).serviceUrl || lb.jpg}
-            alt={`ink prediction — ${lb.name}`}
-            onLoad={() => setImgLoading(false)}
-            onError={() => setImgLoading(false)}
-          />
+          {compareOn && canCompare ? (
+            <CompareRenders renders={activeVariants} label={lb.name} />
+          ) : (
+            <>
+              {imgLoading ? <div className="lbspin" aria-label="loading" /> : null}
+              <img
+                src={thumbnailUrls(lb.jpg, 2000, 2000).serviceUrl || lb.jpg}
+                alt={`ink prediction — ${lb.name}`}
+                onLoad={() => setImgLoading(false)}
+                onError={() => setImgLoading(false)}
+              />
+            </>
+          )}
           <div className="lbcap">
             {lb.label}
             {n > 1 ? ` · ${zoomIdx + 1}/${n}` : ""}

@@ -44,7 +44,8 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@docusaurus/module-type-aliases": "^3.7.0"
+    "@docusaurus/module-type-aliases": "^3.7.0",
+    "@playwright/test": "^1.61.1"
   },
   "browserslist": {
     "production": [
