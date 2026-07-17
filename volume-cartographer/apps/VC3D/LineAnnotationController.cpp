@@ -232,6 +232,19 @@ constexpr double kLineSegmentLength = 32.0;
 constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
 using Clock = std::chrono::steady_clock;
 
+void closeLineAnnotationDialogAfterFinalization(LineAnnotationDialog* dialog)
+{
+    if (!dialog) {
+        return;
+    }
+    dialog->setCloseAfterFinalizationAllowed(true);
+    QMetaObject::invokeMethod(dialog,
+                              [dialog]() {
+                                  dialog->close();
+                              },
+                              Qt::QueuedConnection);
+}
+
 struct FiberJsonPathOptions {
     fs::path path;
     double scale = 1.0;
@@ -5860,8 +5873,7 @@ void LineAnnotationController::requestFinalizedClose(const std::string& surfaceN
         return;
     }
     if (!pane->session) {
-        pane->dialog->setCloseAfterFinalizationAllowed(true);
-        pane->dialog->close();
+        closeLineAnnotationDialogAfterFinalization(pane->dialog);
         return;
     }
 
@@ -5871,8 +5883,7 @@ void LineAnnotationController::requestFinalizedClose(const std::string& surfaceN
         return;
     }
     if (!needsFinalOptimization(session)) {
-        pane->dialog->setCloseAfterFinalizationAllowed(true);
-        pane->dialog->close();
+        closeLineAnnotationDialogAfterFinalization(pane->dialog);
         return;
     }
     if (!finalizeSessionOptimizationSynchronously(session, false)) {
@@ -5880,8 +5891,7 @@ void LineAnnotationController::requestFinalizedClose(const std::string& surfaceN
     }
     saveSessionAsFiber(session);
     session.suppressFiberSave = true;
-    pane->dialog->setCloseAfterFinalizationAllowed(true);
-    pane->dialog->close();
+    closeLineAnnotationDialogAfterFinalization(pane->dialog);
 }
 
 void LineAnnotationController::startOptimization(LineAnnotationSession& session,
