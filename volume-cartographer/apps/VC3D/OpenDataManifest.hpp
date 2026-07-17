@@ -134,6 +134,25 @@ struct OpenDataSample {
     [[nodiscard]] std::size_t inkDetectionSegmentCount() const;
 };
 
+enum class OpenDataRepresentationKind {
+    NormalGrids,
+    Lasagna,
+    Prediction,
+};
+
+struct OpenDataRepresentationRef {
+    std::size_t volumeIndex = 0;
+    std::size_t artifactIndex = 0;
+    OpenDataRepresentationKind kind = OpenDataRepresentationKind::Prediction;
+};
+
+// Manifest-only view of volume-derived representations. Raw source volume
+// artifacts are intentionally excluded.
+[[nodiscard]] std::vector<OpenDataRepresentationRef> derivedRepresentations(
+    const OpenDataSample& sample);
+[[nodiscard]] std::string_view representationKindName(
+    OpenDataRepresentationKind kind) noexcept;
+
 struct OpenDataModel {
     std::string id;
     nlohmann::json raw = nlohmann::json::object();

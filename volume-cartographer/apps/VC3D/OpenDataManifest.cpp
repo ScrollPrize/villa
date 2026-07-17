@@ -616,6 +616,50 @@ std::size_t OpenDataSample::inkDetectionSegmentCount() const
         }));
 }
 
+std::vector<OpenDataRepresentationRef> derivedRepresentations(
+    const OpenDataSample& sample)
+{
+    std::vector<OpenDataRepresentationRef> result;
+    for (std::size_t volumeIndex = 0;
+         volumeIndex < sample.volumes.size(); ++volumeIndex) {
+        const auto& volume = sample.volumes[volumeIndex];
+        for (std::size_t artifactIndex = 0;
+             artifactIndex < volume.artifacts.size(); ++artifactIndex) {
+            const auto& artifact = volume.artifacts[artifactIndex];
+            std::string type = lowerCopy(artifact.type);
+            std::replace(type.begin(), type.end(), '_', '-');
+
+            std::optional<OpenDataRepresentationKind> kind;
+            if (type.find("normal-grid") != std::string::npos) {
+                kind = OpenDataRepresentationKind::NormalGrids;
+            } else if (type == "lasagna") {
+                kind = OpenDataRepresentationKind::Lasagna;
+            } else {
+                const bool prediction =
+                    type.find("prediction") != std::string::npos ||
+                    type.starts_with("pred-") || type.ends_with("-pred") ||
+                    type.find("-pred-") != std::string::npos;
+                const bool ink3d = type.find("ink-detection") != std::string::npos &&
+                                   type.find("3d") != std::string::npos;
+                if (prediction || ink3d)
+                    kind = OpenDataRepresentationKind::Prediction;
+            }
+            if (kind) result.push_back({volumeIndex, artifactIndex, *kind});
+        }
+    }
+    return result;
+}
+
+std::string_view representationKindName(OpenDataRepresentationKind kind) noexcept
+{
+    switch (kind) {
+        case OpenDataRepresentationKind::NormalGrids: return "Normal grids";
+        case OpenDataRepresentationKind::Lasagna: return "Lasagna";
+        case OpenDataRepresentationKind::Prediction: return "Prediction";
+    }
+    return "Prediction";
+}
+
 const OpenDataSample* OpenDataManifest::findSample(std::string_view id) const noexcept
 {
     const auto it = std::find_if(samples.begin(), samples.end(), [&](const OpenDataSample& sample) {

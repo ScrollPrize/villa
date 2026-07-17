@@ -236,6 +236,29 @@ TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
     CHECK(artifacts.front().baseShapeZYX == volume.shapeZYX);
 }
 
+TEST_CASE("OpenDataManifest enumerates derived volume representations")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "metadata":{"samples":{"sample":{"volumes":{"volume":{"data":[
+        {"type":"zarr"},
+        {"type":"normal-grids"},
+        {"type":"lasagna"},
+        {"type":"surface-prediction-zarr"},
+        {"type":"ink_detection_3d_zarr"},
+        {"type":"future-pred-zarr"}
+      ]}}}}}
+    })");
+    const auto representations = derivedRepresentations(manifest.samples.front());
+    REQUIRE(representations.size() == 5);
+    CHECK(representations[0].kind == OpenDataRepresentationKind::NormalGrids);
+    CHECK(representations[1].kind == OpenDataRepresentationKind::Lasagna);
+    CHECK(representations[2].kind == OpenDataRepresentationKind::Prediction);
+    CHECK(representations[3].kind == OpenDataRepresentationKind::Prediction);
+    CHECK(representations[4].kind == OpenDataRepresentationKind::Prediction);
+    CHECK(representationKindName(representations[0].kind) == "Normal grids");
+    CHECK(representationKindName(representations[1].kind) == "Lasagna");
+}
+
 TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic level")
 {
     auto pkg = VolumePkg::newEmpty();
