@@ -117,7 +117,6 @@ public:
         uint64_t branchFiberId = 0;
         int branchControlPointIndex = -1;
         std::string branchFileName;
-        cv::Vec3d linkDirection{0.0, 0.0, 0.0};
         cv::Vec3d controlPointDirection{0.0, 0.0, 0.0};
         cv::Vec3d branchControlPointDirection{0.0, 0.0, 0.0};
         cv::Vec3d controlPointPosition{0.0, 0.0, 0.0};
@@ -256,6 +255,11 @@ private:
         bool needsSave = false;
     };
 
+    struct StoredFiberSessionSnapshot {
+        StoredFiber fiber;
+        std::vector<int> storedIndexForSessionIndex;
+    };
+
     struct FiberSaveSnapshot {
         uint64_t fiberId = 0;
         uint64_t generation = 0;
@@ -267,6 +271,12 @@ private:
     struct FiberSaveJob {
         uint64_t sequence = 0;
         std::vector<FiberSaveSnapshot> snapshots;
+    };
+
+    struct BranchLinkValidationIssue {
+        size_t fiberIndex = 0;
+        size_t branchIndex = 0;
+        std::string reason;
     };
 
     struct FiberSaveTaskResult {
@@ -466,6 +476,8 @@ private:
         const cv::Vec3d& seedPoint);
     [[nodiscard]] std::optional<int> storedBranchTargetControlPointIndex(
         const FiberBranchRef& branch) const;
+    [[nodiscard]] StoredFiberSessionSnapshot makeStoredFiberSessionSnapshot(
+        LineAnnotationSession& session);
     [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);
     void saveSessionAsFiber(LineAnnotationSession& session);
     [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
@@ -473,6 +485,8 @@ private:
     void scheduleFiberSave(const StoredFiber& fiber);
     void scheduleFiberPairSave(const StoredFiber& first, const StoredFiber& second);
     void scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots);
+    void canonicalizeFiberSaveSnapshots(std::vector<FiberSaveSnapshot>& snapshots) const;
+    void validateFiberSaveSnapshots(const std::vector<FiberSaveSnapshot>& snapshots) const;
     void startNextFiberSaveJob();
     void finishFiberSaveJob(QFutureWatcher<FiberSaveTaskResult>* watcher);
     void waitForFiberSaves();
@@ -481,8 +495,16 @@ private:
         const FiberSaveSnapshot& snapshot,
         double scale = 1.0);
     [[nodiscard]] std::optional<StoredFiber> loadFiberJson(const nlohmann::json& root,
-                                                           const std::filesystem::path& path) const;
+                                                           const std::filesystem::path& path,
+                                                           std::vector<std::string>* branchErrors = nullptr) const;
     [[nodiscard]] std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path) const;
+    [[nodiscard]] std::vector<BranchLinkValidationIssue> collectLoadedFiberBranchIssues(
+        const std::vector<StoredFiber>& fibers) const;
+    [[nodiscard]] bool repairLoadedFiberBranchLinks(
+        std::vector<StoredFiber>& fibers,
+        const std::unordered_set<std::string>& fibersWithRemovedBranchEntries,
+        const std::vector<BranchLinkValidationIssue>& initialIssues,
+        std::vector<std::string>& errors) const;
     [[nodiscard]] std::string uniqueImportedFiberFileName(const StoredFiber& fiber,
                                                           std::unordered_set<std::string>& reserved,
                                                           uint64_t& nextSequence) const;

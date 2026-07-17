@@ -81,9 +81,6 @@ struct GeneratedOverlay {
         cv::Vec3f linkedDirection{std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN()};
-        cv::Vec3f linkDirection{std::numeric_limits<float>::quiet_NaN(),
-                                std::numeric_limits<float>::quiet_NaN(),
-                                std::numeric_limits<float>::quiet_NaN()};
         cv::Vec3f planePoint{std::numeric_limits<float>::quiet_NaN(),
                              std::numeric_limits<float>::quiet_NaN(),
                              std::numeric_limits<float>::quiet_NaN()};

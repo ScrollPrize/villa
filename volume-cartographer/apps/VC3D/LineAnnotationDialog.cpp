@@ -507,6 +507,7 @@ void LineAnnotationDialog::setGeneratedBranchLinePoints(
         return;
     }
     _generatedViews.branchLinePoints = std::move(branchLinePoints);
+    _generatedViews.fiberIntersections.clear();
     rebuildGeneratedOverlays();
 }
 
@@ -517,6 +518,7 @@ void LineAnnotationDialog::setGeneratedBranchLinks(
         return;
     }
     _generatedViews.branchLinks = std::move(branchLinks);
+    _generatedViews.fiberIntersections.clear();
     rebuildGeneratedOverlays();
 }
 
@@ -532,6 +534,7 @@ void LineAnnotationDialog::setGeneratedBranchOverlayData(
     _generatedViews.controlPoints = std::move(controlPoints);
     _generatedViews.branchLinePoints = std::move(branchLinePoints);
     _generatedViews.branchLinks = std::move(branchLinks);
+    _generatedViews.fiberIntersections.clear();
     _generatedViews.spanAlignmentMetrics.clear();
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(

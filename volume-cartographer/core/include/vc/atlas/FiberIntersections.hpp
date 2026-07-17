@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -153,6 +154,10 @@ struct FiberSideStripIntersection {
     cv::Vec3d connectorStart{std::numeric_limits<double>::quiet_NaN(),
                              std::numeric_limits<double>::quiet_NaN(),
                              std::numeric_limits<double>::quiet_NaN()};
+    cv::Vec3d projectionTarget{std::numeric_limits<double>::quiet_NaN(),
+                               std::numeric_limits<double>::quiet_NaN(),
+                               std::numeric_limits<double>::quiet_NaN()};
+    size_t branchLinkIndex = std::numeric_limits<size_t>::max();
 };
 
 enum class AtlasSearchProgressPhase {

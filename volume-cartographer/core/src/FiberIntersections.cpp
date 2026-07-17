@@ -565,6 +565,61 @@ std::optional<StripTriangleHit> intersectLineTriangle(const cv::Vec3d& origin,
     return hit;
 }
 
+double branchLinkProjectionScore(const FiberSideStripIntersection& intersection)
+{
+    if (finitePoint(intersection.projectionTarget) && finitePoint(intersection.point)) {
+        return squaredDistance(intersection.projectionTarget, intersection.point);
+    }
+    return std::abs(intersection.distance);
+}
+
+bool sameBranchLinkProjection(const FiberSideStripIntersection& lhs,
+                              const FiberSideStripIntersection& rhs)
+{
+    return lhs.source == FiberSideStripIntersectionSource::BranchLink &&
+           rhs.source == FiberSideStripIntersectionSource::BranchLink &&
+           lhs.fiberId == rhs.fiberId &&
+           finitePoint(lhs.connectorStart) &&
+           finitePoint(rhs.connectorStart) &&
+           finitePoint(lhs.projectionTarget) &&
+           finitePoint(rhs.projectionTarget) &&
+           lhs.branchLinkIndex == rhs.branchLinkIndex &&
+           lhs.branchLinkIndex != std::numeric_limits<size_t>::max() &&
+           squaredDistance(lhs.connectorStart, rhs.connectorStart) <= 1.0e-12 &&
+           squaredDistance(lhs.projectionTarget, rhs.projectionTarget) <= 1.0e-12;
+}
+
+std::vector<FiberSideStripIntersection> keepNearestBranchLinkProjections(
+    std::vector<FiberSideStripIntersection> intersections)
+{
+    std::vector<FiberSideStripIntersection> filtered;
+    filtered.reserve(intersections.size());
+    for (auto& intersection : intersections) {
+        if (intersection.source != FiberSideStripIntersectionSource::BranchLink ||
+            !finitePoint(intersection.connectorStart) ||
+            !finitePoint(intersection.projectionTarget)) {
+            filtered.push_back(std::move(intersection));
+            continue;
+        }
+
+        const auto existing = std::find_if(
+            filtered.begin(),
+            filtered.end(),
+            [&intersection](const FiberSideStripIntersection& candidate) {
+                return sameBranchLinkProjection(candidate, intersection);
+            });
+        if (existing == filtered.end()) {
+            filtered.push_back(std::move(intersection));
+            continue;
+        }
+        if (branchLinkProjectionScore(intersection) <
+            branchLinkProjectionScore(*existing)) {
+            *existing = std::move(intersection);
+        }
+    }
+    return filtered;
+}
+
 struct JointIntersectionResidual {
     const FiberPolyline& source;
     const FiberPolyline& target;
@@ -1409,7 +1464,9 @@ std::vector<FiberSideStripIntersection> FiberSpatialIndex::sideStripIntersection
                             hit->uv[1],
                             std::abs(hit->lineParameter),
                             FiberSideStripIntersectionSource::BranchLink,
-                            link.link->connectorStart});
+                            link.link->connectorStart,
+                            link.link->point,
+                            linkIndex});
                     }
                     completedBranchWork.fetch_add(end - begin, std::memory_order_relaxed);
                 }
@@ -1696,8 +1753,14 @@ std::vector<FiberSideStripIntersection> FiberSpatialIndex::sideStripIntersection
     for (const auto& intersection : intersections) {
         bool duplicate = false;
         for (const auto& kept : clustered) {
-            if (kept.fiberId != intersection.fiberId ||
-                kept.source != intersection.source) {
+            if (kept.source != intersection.source) {
+                continue;
+            }
+            if (intersection.source == FiberSideStripIntersectionSource::BranchLink) {
+                if (!sameBranchLinkProjection(kept, intersection)) {
+                    continue;
+                }
+            } else if (kept.fiberId != intersection.fiberId) {
                 continue;
             }
             if (std::abs(kept.stripRow - intersection.stripRow) <= stripDistance &&
@@ -1708,9 +1771,6 @@ std::vector<FiberSideStripIntersection> FiberSpatialIndex::sideStripIntersection
         }
         if (!duplicate) {
             clustered.push_back(intersection);
-            if (options.maxResults > 0 && clustered.size() >= options.maxResults) {
-                break;
-            }
         }
     }
 
@@ -1719,7 +1779,11 @@ std::vector<FiberSideStripIntersection> FiberSpatialIndex::sideStripIntersection
                          intersections.size(),
                          intersections.size());
     }
-    return clustered;
+    auto filtered = keepNearestBranchLinkProjections(std::move(clustered));
+    if (options.maxResults > 0 && filtered.size() > options.maxResults) {
+        filtered.resize(options.maxResults);
+    }
+    return filtered;
 }
 
 bool FiberIntersectionCache::lookup(uint64_t fiberA,

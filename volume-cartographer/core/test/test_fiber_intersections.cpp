@@ -41,6 +41,20 @@ cv::Mat_<cv::Vec3f> flatStripGrid(int rows, int cols)
     return points;
 }
 
+cv::Mat_<cv::Vec3f> foldedOverlappingStripGrid()
+{
+    cv::Mat_<cv::Vec3f> points(4, 2);
+    points(0, 0) = {0.0f, 0.0f, 0.0f};
+    points(0, 1) = {1.0f, 0.0f, 0.0f};
+    points(1, 0) = {0.0f, 1.0f, 0.0f};
+    points(1, 1) = {1.0f, 1.0f, 0.0f};
+    points(2, 0) = {0.0f, 0.0f, 10.0f};
+    points(2, 1) = {1.0f, 0.0f, 10.0f};
+    points(3, 0) = {0.0f, 1.0f, 10.0f};
+    points(3, 1) = {1.0f, 1.0f, 10.0f};
+    return points;
+}
+
 vc::atlas::FiberIntersectionCandidate normalizedCandidateForPair(
     vc::atlas::FiberIntersectionCandidate candidate,
     uint64_t sourceFiberId,
@@ -286,6 +300,59 @@ TEST_CASE("Fiber side strip query reports branch link line hits and misses")
         {88, {5.0, 5.0, -5.0}, {0.0, 0.0, 1.0}, {0.0, 0.0, -5.0}},
     };
     options.excludedFiberIds = {2};
+    CHECK(index.sideStripIntersections(options).empty());
+}
+
+TEST_CASE("Fiber side strip query keeps the projection nearest to the branch target point")
+{
+    vc::atlas::FiberSpatialIndex index;
+    vc::atlas::FiberSideStripQueryOptions options;
+    options.stripPoints = foldedOverlappingStripGrid();
+    options.maxResults = 0;
+    options.branchLinks = {
+        {77, {0.5, 0.5, 9.0}, {0.0, 0.0, 1.0}, {0.5, 0.5, -1.0}},
+    };
+
+    const auto intersections = index.sideStripIntersections(options);
+
+    REQUIRE(intersections.size() == 1);
+    CHECK(intersections[0].source == vc::atlas::FiberSideStripIntersectionSource::BranchLink);
+    CHECK(intersections[0].fiberId == 77);
+    CHECK(intersections[0].point[2] == doctest::Approx(10.0));
+    CHECK(intersections[0].connectorStart[2] == doctest::Approx(-1.0));
+    CHECK(intersections[0].projectionTarget[2] == doctest::Approx(9.0));
+}
+
+TEST_CASE("Fiber side strip branch projection ignores local connector proximity")
+{
+    vc::atlas::FiberSpatialIndex index;
+    vc::atlas::FiberSideStripQueryOptions options;
+    options.stripPoints = foldedOverlappingStripGrid();
+    options.maxResults = 0;
+    options.branchLinks = {
+        {77, {0.5, 0.5, -1.0}, {0.0, 0.0, 1.0}, {0.5, 0.5, 9.0}},
+    };
+
+    const auto intersections = index.sideStripIntersections(options);
+
+    REQUIRE(intersections.size() == 1);
+    CHECK(intersections[0].source == vc::atlas::FiberSideStripIntersectionSource::BranchLink);
+    CHECK(intersections[0].fiberId == 77);
+    CHECK(intersections[0].point[2] == doctest::Approx(0.0));
+    CHECK(intersections[0].connectorStart[2] == doctest::Approx(9.0));
+    CHECK(intersections[0].projectionTarget[2] == doctest::Approx(-1.0));
+}
+
+TEST_CASE("Fiber side strip branch projection emits no connector without a strip hit")
+{
+    vc::atlas::FiberSpatialIndex index;
+    vc::atlas::FiberSideStripQueryOptions options;
+    options.stripPoints = flatStripGrid(2, 2);
+    options.maxResults = 0;
+    options.branchLinks = {
+        {77, {5.0, 5.0, -1.0}, {0.0, 0.0, 1.0}, {0.5, 0.5, 0.0}},
+    };
+
     CHECK(index.sideStripIntersections(options).empty());
 }
 

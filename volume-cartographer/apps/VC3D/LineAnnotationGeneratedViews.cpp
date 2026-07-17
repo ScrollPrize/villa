@@ -205,9 +205,10 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     for (const auto& branch : overlay.branchLinePoints) {
         branchPointCount += branch.size();
     }
+    const bool drawDirectBranchLinks = !overlay.useSurfaceCenterLine;
     primitives.reserve(3 + branchPointCount + overlay.controlPoints.size() +
                        overlay.predSnapPoints.size() * 2 +
-                       overlay.branchLinks.size() * 4 +
+                       (drawDirectBranchLinks ? overlay.branchLinks.size() * 4 : 0) +
                        overlay.fiberIntersections.size() * 3);
 
     ViewerOverlayControllerBase::OverlayStyle lineStyle;
@@ -465,25 +466,27 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         }
     }
 
-    for (const auto& link : overlay.branchLinks) {
-        const cv::Vec3f visiblePoint = finiteGeneratedPoint(link.planePoint)
-            ? link.planePoint
-            : link.linkedControlPoint;
-        if (!finiteGeneratedPoint(link.localControlPoint) ||
-            !finiteGeneratedPoint(visiblePoint)) {
-            continue;
+    if (drawDirectBranchLinks) {
+        for (const auto& link : overlay.branchLinks) {
+            const cv::Vec3f visiblePoint = finiteGeneratedPoint(link.planePoint)
+                ? link.planePoint
+                : link.linkedControlPoint;
+            if (!finiteGeneratedPoint(link.localControlPoint) ||
+                !finiteGeneratedPoint(visiblePoint)) {
+                continue;
+            }
+            const QPointF localScene = viewer->volumeToScene(link.localControlPoint);
+            const QPointF visibleScene = viewer->volumeToScene(visiblePoint);
+            if (!finiteScenePoint(localScene) || !finiteScenePoint(visibleScene)) {
+                continue;
+            }
+            const auto& style = link.estimated ? estimatedBranchLinkStyle : branchLinkStyle;
+            primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                {localScene, visibleScene},
+                false,
+                style});
+            addFiberIntersectionMarker(visibleScene);
         }
-        const QPointF localScene = viewer->volumeToScene(link.localControlPoint);
-        const QPointF visibleScene = viewer->volumeToScene(visiblePoint);
-        if (!finiteScenePoint(localScene) || !finiteScenePoint(visibleScene)) {
-            continue;
-        }
-        const auto& style = link.estimated ? estimatedBranchLinkStyle : branchLinkStyle;
-        primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
-            {localScene, visibleScene},
-            false,
-            style});
-        addFiberIntersectionMarker(visibleScene);
     }
 
     for (const auto& intersection : overlay.fiberIntersections) {

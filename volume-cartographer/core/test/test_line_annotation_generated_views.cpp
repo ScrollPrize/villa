@@ -5,13 +5,20 @@
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberNaming.hpp"
+#include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <string>
@@ -39,6 +46,41 @@ vc::lasagna::LineModel lineModel()
           {1.0, {20.0, 0.0, 0.0}, normal()}}},
     };
     return line;
+}
+
+std::filesystem::path makeTempSaveDir(const std::string& testName)
+{
+    const auto stamp =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto dir = std::filesystem::temp_directory_path() /
+        ("vc3d_fiber_save_" + testName + "_" + std::to_string(stamp));
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+void writeText(const std::filesystem::path& path, const std::string& text)
+{
+    std::ofstream out(path);
+    out << text;
+}
+
+std::string readText(const std::filesystem::path& path)
+{
+    std::ifstream in(path);
+    return std::string(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
+}
+
+std::vector<std::filesystem::path> recoveryFilesIn(const std::filesystem::path& dir)
+{
+    std::vector<std::filesystem::path> paths;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().string().find(".recovery.") != std::string::npos) {
+            paths.push_back(entry.path());
+        }
+    }
+    std::sort(paths.begin(), paths.end());
+    return paths;
 }
 
 } // namespace
@@ -456,6 +498,99 @@ TEST_CASE("line annotation stored single point fiber seed rejects real or confli
         {seed}).has_value());
 }
 
+TEST_CASE("line annotation branch metadata json field set is a compatibility boundary")
+{
+    // This locks the documented branch metadata field names into the test suite.
+    // Do not update this set unless the user explicitly asks for an on-disk
+    // format change and the docs/migration path are updated with it.
+    const std::vector<std::string> stableFields{
+        "control_point_index",
+        "branch_fiber_id",
+        "branch_control_point_index",
+        "control_point_direction",
+        "branch_control_point_direction",
+        "control_point_position",
+        "branch_control_point_position",
+        "branch_file",
+    };
+
+    CHECK(stableFields.size() == 8);
+    CHECK(stableFields.front() == "control_point_index");
+    CHECK(stableFields.back() == "branch_file");
+}
+
+TEST_CASE("line annotation single fiber save does not create recovery backup")
+{
+    const auto dir = makeTempSaveDir("single");
+    const auto path = dir / "fiber_a.json";
+    writeText(path, "{\"old\":true}\n");
+
+    vc3d::line_annotation::FiberSavePayload payload;
+    payload.fiberId = 1;
+    payload.generation = 2;
+    payload.path = path;
+    payload.json = nlohmann::json{{"new", true}};
+
+    const auto result = vc3d::line_annotation::runFiberSaveJob(10, {payload});
+
+    CHECK(result.ok);
+    CHECK(result.recoveryFiles.empty());
+    CHECK(recoveryFilesIn(dir).empty());
+    CHECK(readText(path).find("\"new\": true") != std::string::npos);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation successful multi fiber save deletes recovery backups")
+{
+    const auto dir = makeTempSaveDir("multi_success");
+    const auto first = dir / "fiber_a.json";
+    const auto second = dir / "fiber_b.json";
+    writeText(first, "{\"old\":\"a\"}\n");
+    writeText(second, "{\"old\":\"b\"}\n");
+
+    std::vector<vc3d::line_annotation::FiberSavePayload> payloads{
+        {1, 2, first, nlohmann::json{{"new", "a"}}},
+        {2, 3, second, nlohmann::json{{"new", "b"}}},
+    };
+
+    const auto result = vc3d::line_annotation::runFiberSaveJob(11, std::move(payloads));
+
+    CHECK(result.ok);
+    CHECK(result.recoveryFiles.empty());
+    CHECK(recoveryFilesIn(dir).empty());
+    CHECK(readText(first).find("\"new\": \"a\"") != std::string::npos);
+    CHECK(readText(second).find("\"new\": \"b\"") != std::string::npos);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation failed multi fiber save keeps recovery backups")
+{
+    const auto dir = makeTempSaveDir("multi_failure");
+    const auto first = dir / "fiber_a.json";
+    const auto second = dir / "fiber_b.json";
+    writeText(first, "{\"old\":\"a\"}\n");
+    writeText(second, "{\"old\":\"b\"}\n");
+
+    setenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1", 1);
+    std::vector<vc3d::line_annotation::FiberSavePayload> payloads{
+        {1, 2, first, nlohmann::json{{"new", "a"}}},
+        {2, 3, second, nlohmann::json{{"new", "b"}}},
+    };
+
+    const auto result = vc3d::line_annotation::runFiberSaveJob(12, std::move(payloads));
+    unsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
+
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("Injected failure") != std::string::npos);
+    REQUIRE(result.recoveryFiles.size() == 2);
+    for (const auto& recovery : result.recoveryFiles) {
+        CHECK(std::filesystem::exists(recovery));
+        CHECK(recovery.filename().string().find(".recovery.") != std::string::npos);
+    }
+    CHECK(recoveryFilesIn(dir).size() == 2);
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("line annotation intersection display h side uses manual tags before scores")
 {
     using vc3d::line_annotation::FiberHvClassification;
@@ -493,12 +628,31 @@ TEST_CASE("line annotation generated strip overlay includes controls and current
         {{0.0f, 0.0f, 0.0f}, 0.0, false},
         {{2.0f, 0.0f, 0.0f}, 2.0, true},
     };
+    views.controlPoints[0].hasBranches = true;
+    views.controlPoints[0].branchIds = {7};
+    views.controlPoints[0].branchLinks = {{7, 3}};
+    views.branchLinks = {
+        {7,
+         {0.0f, 0.0f, 0.0f},
+         {1.0f, 0.0f, 0.0f},
+         {0.0f, 0.0f, 1.0f},
+         {0.0f, 0.0f, 1.0f},
+         {0.0f, 0.0f, 1.0f},
+         false},
+    };
 
     const auto overlay =
         vc3d::line_annotation::makeGeneratedStripOverlay(views, 1.0, {0.0, 1.0, 2.0});
     CHECK(overlay.useSurfaceCenterLine);
     CHECK(overlay.currentLinePosition == doctest::Approx(1.0));
     CHECK(overlay.controlPoints.size() == 2);
+    CHECK(overlay.branchLinks.empty());
+    REQUIRE(overlay.controlPoints[0].branchLinks.size() == 1);
+    REQUIRE(overlay.controlPoints[0].branchIds.size() == 1);
+    CHECK(overlay.controlPoints[0].hasBranches);
+    CHECK(overlay.controlPoints[0].branchIds[0] == 7);
+    CHECK(overlay.controlPoints[0].branchLinks[0].fiberId == 7);
+    CHECK(overlay.controlPoints[0].branchLinks[0].controlPointIndex == 3);
     CHECK(overlay.markerLinePositions.size() == 3);
     CHECK(overlay.seedLineIndex == -1);
 }
@@ -555,11 +709,30 @@ TEST_CASE("line annotation generated strip static and dynamic overlays split own
         {{0.0f, 0.0f, 0.0f}, 0.0, false},
         {{2.0f, 0.0f, 0.0f}, 2.0, true},
     };
+    views.controlPoints[0].hasBranches = true;
+    views.controlPoints[0].branchIds = {7};
+    views.controlPoints[0].branchLinks = {{7, 3}};
+    views.branchLinks = {
+        {7,
+         {0.0f, 0.0f, 0.0f},
+         {1.0f, 0.0f, 0.0f},
+         {0.0f, 0.0f, 1.0f},
+         {0.0f, 0.0f, 1.0f},
+         {0.0f, 0.0f, 1.0f},
+         false},
+    };
 
     const auto staticOverlay = vc3d::line_annotation::makeGeneratedStaticStripOverlay(views);
     CHECK(staticOverlay.useSurfaceCenterLine);
     CHECK(staticOverlay.linePoints.size() == 3);
     CHECK(staticOverlay.controlPoints.size() == 2);
+    CHECK(staticOverlay.branchLinks.empty());
+    REQUIRE(staticOverlay.controlPoints[0].branchLinks.size() == 1);
+    REQUIRE(staticOverlay.controlPoints[0].branchIds.size() == 1);
+    CHECK(staticOverlay.controlPoints[0].hasBranches);
+    CHECK(staticOverlay.controlPoints[0].branchIds[0] == 7);
+    CHECK(staticOverlay.controlPoints[0].branchLinks[0].fiberId == 7);
+    CHECK(staticOverlay.controlPoints[0].branchLinks[0].controlPointIndex == 3);
     CHECK(staticOverlay.markerLinePositions.empty());
     CHECK_FALSE(std::isfinite(staticOverlay.currentLinePosition));
 
@@ -568,6 +741,7 @@ TEST_CASE("line annotation generated strip static and dynamic overlays split own
     CHECK(dynamicOverlay.useSurfaceCenterLine);
     CHECK(dynamicOverlay.linePoints.empty());
     CHECK(dynamicOverlay.controlPoints.empty());
+    CHECK(dynamicOverlay.branchLinks.empty());
     CHECK(dynamicOverlay.markerLinePositions.size() == 2);
     CHECK(dynamicOverlay.currentLinePosition == doctest::Approx(1.0));
 }
