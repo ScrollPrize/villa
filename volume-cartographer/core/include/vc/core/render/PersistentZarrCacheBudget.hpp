@@ -75,11 +75,13 @@ public:
         WriteReservation(std::shared_ptr<PersistentZarrCacheBudget> owner,
                          std::filesystem::path target,
                          std::vector<std::filesystem::path> replacements,
-                         std::uint64_t reservedGrowth);
+                         std::uint64_t reservedGrowth,
+                         std::uint64_t reservedTemporaryBytes);
         std::shared_ptr<PersistentZarrCacheBudget> owner_;
         std::filesystem::path target_;
         std::vector<std::filesystem::path> replacements_;
         std::uint64_t reservedGrowth_ = 0;
+        std::uint64_t reservedTemporaryBytes_ = 0;
     };
 
     // Nested roots reuse an existing containing budget. Configuring a broader
@@ -118,6 +120,7 @@ private:
     void finishWrite(const std::filesystem::path& target,
                      const std::vector<std::filesystem::path>& replacements,
                      std::uint64_t reservedGrowth,
+                     std::uint64_t reservedTemporaryBytes,
                      bool committed);
 
     std::unique_ptr<Impl> impl_;

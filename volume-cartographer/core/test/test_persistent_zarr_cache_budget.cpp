@@ -170,25 +170,37 @@ TEST_CASE("unlimited maximum still enforces the free-space reserve")
     fs::remove_all(root);
 }
 
-TEST_CASE("below reserve blocks growth but permits equal-size replacement")
+TEST_CASE("equal-size replacements reserve their full temporary payload")
 {
-    const auto root = tempRoot("below");
+    const auto root = tempRoot("replacement_reserve");
     const auto target = volumeChunk(root, 0);
     writeBytes(target, 10, 'a');
-    auto free = std::make_shared<std::atomic<std::uint64_t>>(40);
+    auto free = std::make_shared<std::atomic<std::uint64_t>>(59);
     auto budget = Budget::configure(root, {std::nullopt, 50}, spaceWith(free));
     budget->waitForIdle();
 
-    auto replacement = budget->reserveWrite(target, 10);
-    REQUIRE(static_cast<bool>(replacement));
-    writeBytes(target, 10, 'b');
-    replacement.commit();
-    auto growth = budget->reserveWrite(volumeChunk(root, 1), 1);
-    REQUIRE(static_cast<bool>(growth));
-    CHECK_FALSE(fs::exists(target));
-    growth.cancel();
-    CHECK_FALSE(static_cast<bool>(budget->reserveWrite(volumeChunk(root, 2), 1)));
-    CHECK(budget->stats().lowSpace);
+    CHECK_FALSE(static_cast<bool>(budget->reserveWrite(target, 10)));
+    CHECK(fs::exists(target));
+    free->store(60);
+    CHECK(static_cast<bool>(budget->reserveWrite(target, 10)));
+    fs::remove_all(root);
+}
+
+TEST_CASE("denied oversized writes do not evict existing entries")
+{
+    const auto root = tempRoot("denied_no_evict");
+    const auto first = volumeChunk(root, 0);
+    const auto second = volumeChunk(root, 1);
+    writeBytes(first, 30);
+    writeBytes(second, 30);
+    auto budget = Budget::configure(root, {100, 0}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+
+    CHECK_FALSE(static_cast<bool>(budget->reserveWrite(volumeChunk(root, 2), 101)));
+    CHECK(fs::exists(first));
+    CHECK(fs::exists(second));
+    CHECK(budget->stats().managedBytes == 60);
     fs::remove_all(root);
 }
 

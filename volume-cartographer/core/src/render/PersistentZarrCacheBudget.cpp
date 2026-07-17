@@ -130,6 +130,7 @@ struct PersistentZarrCacheBudget::Impl {
     std::set<std::string> writePins;
     std::uint64_t managedBytes = 0;
     std::uint64_t reservedGrowth = 0;
+    std::uint64_t reservedTemporaryBytes = 0;
     std::uint64_t freeBytes = 0;
     bool lowSpace = false;
     bool scanInFlight = true;
@@ -422,55 +423,74 @@ PersistentZarrCacheBudget::WriteReservation PersistentZarrCacheBudget::reserveWr
             needed = projected - *impl_->limits.maximumBytes;
     }
     if (impl_->limits.minimumFreeBytes > 0) {
-        const auto pendingGrowth =
-            impl_->reservedGrowth > std::numeric_limits<std::uint64_t>::max() - netGrowth
+        const auto pendingTemporaryBytes =
+            impl_->reservedTemporaryBytes >
+                    std::numeric_limits<std::uint64_t>::max() - newSize
                 ? std::numeric_limits<std::uint64_t>::max()
-                : impl_->reservedGrowth + netGrowth;
+                : impl_->reservedTemporaryBytes + newSize;
         if (free < impl_->limits.minimumFreeBytes)
-            needed = std::max(needed, pendingGrowth);
-        else if (pendingGrowth > free - impl_->limits.minimumFreeBytes)
+            needed = std::max(needed, pendingTemporaryBytes);
+        else if (pendingTemporaryBytes > free - impl_->limits.minimumFreeBytes)
             needed = std::max(needed,
-                              pendingGrowth - (free - impl_->limits.minimumFreeBytes));
+                              pendingTemporaryBytes -
+                                  (free - impl_->limits.minimumFreeBytes));
     }
 
     std::set<std::string> protectedPaths{normalizedTarget.string()};
     for (const auto& path : replacements)
         protectedPaths.insert(path.string());
-    std::uint64_t evicted = 0;
-    while (evicted < needed) {
-        auto victim = impl_->entries.end();
-        for (auto it = impl_->entries.begin(); it != impl_->entries.end(); ++it) {
-            if (protectedPaths.contains(it->first) || impl_->readPins.contains(it->first) ||
-                impl_->writePins.contains(it->first))
+
+    if (needed > 0) {
+        struct Candidate {
+            std::string path;
+            std::uint64_t size;
+            fs::file_time_type touched;
+        };
+        std::vector<Candidate> candidates;
+        std::uint64_t evictable = 0;
+        for (const auto& [path, entry] : impl_->entries) {
+            if (protectedPaths.contains(path) || impl_->readPins.contains(path) ||
+                impl_->writePins.contains(path))
                 continue;
-            if (victim == impl_->entries.end() || it->second.touched < victim->second.touched)
-                victim = it;
+            candidates.push_back({path, entry.size, entry.touched});
+            evictable = entry.size >
+                                std::numeric_limits<std::uint64_t>::max() - evictable
+                            ? std::numeric_limits<std::uint64_t>::max()
+                            : evictable + entry.size;
         }
-        if (victim == impl_->entries.end())
-            break;
-        const auto victimPath = fs::path(victim->first);
-        const auto size = victim->second.size;
-        std::error_code ec;
-        if (fs::remove(victimPath, ec) && !ec) {
-            evicted += size;
-            impl_->managedBytes -= std::min(impl_->managedBytes, size);
-            impl_->entries.erase(victim);
-        } else {
-            Logger()->warn("Could not evict persistent Zarr cache entry {}: {}",
-                           victimPath.string(), ec.message());
-            // Pin for this admission attempt and try another candidate.
-            protectedPaths.insert(victimPath.string());
+        if (evictable < needed)
+            return {};
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      return a.touched < b.touched;
+                  });
+
+        std::uint64_t evicted = 0;
+        for (const auto& candidate : candidates) {
+            if (evicted >= needed)
+                break;
+            const auto victimPath = fs::path(candidate.path);
+            std::error_code ec;
+            if (fs::remove(victimPath, ec) && !ec) {
+                evicted += candidate.size;
+                impl_->managedBytes -= std::min(impl_->managedBytes, candidate.size);
+                impl_->entries.erase(candidate.path);
+            } else {
+                Logger()->warn("Could not evict persistent Zarr cache entry {}: {}",
+                               victimPath.string(), ec.message());
+            }
         }
+        if (evicted < needed)
+            return {};
     }
-    if (evicted < needed)
-        return {};
 
     impl_->reservedGrowth += netGrowth;
+    impl_->reservedTemporaryBytes += newSize;
     impl_->writePins.insert(normalizedTarget.string());
     for (const auto& path : replacements)
         impl_->writePins.insert(path.string());
     return WriteReservation(shared_from_this(), normalizedTarget,
-                            std::move(replacements), netGrowth);
+                            std::move(replacements), netGrowth, newSize);
 }
 
 void PersistentZarrCacheBudget::releaseRead(const fs::path& path, bool touch)
@@ -502,12 +522,15 @@ void PersistentZarrCacheBudget::releaseRead(const fs::path& path, bool touch)
 
 void PersistentZarrCacheBudget::finishWrite(
     const fs::path& target, const std::vector<fs::path>& replacements,
-    std::uint64_t reservedGrowth, bool committed)
+    std::uint64_t reservedGrowth, std::uint64_t reservedTemporaryBytes,
+    bool committed)
 {
     bool needsTrim = false;
     {
         std::lock_guard lock(impl_->mutex);
         impl_->reservedGrowth -= std::min(impl_->reservedGrowth, reservedGrowth);
+        impl_->reservedTemporaryBytes -=
+            std::min(impl_->reservedTemporaryBytes, reservedTemporaryBytes);
         impl_->writePins.erase(target.string());
         for (const auto& path : replacements)
             impl_->writePins.erase(path.string());
@@ -584,9 +607,11 @@ void PersistentZarrCacheBudget::ReadPin::release(bool touch)
 
 PersistentZarrCacheBudget::WriteReservation::WriteReservation(
     std::shared_ptr<PersistentZarrCacheBudget> owner, fs::path target,
-    std::vector<fs::path> replacements, std::uint64_t growth)
+    std::vector<fs::path> replacements, std::uint64_t growth,
+    std::uint64_t temporaryBytes)
     : owner_(std::move(owner)), target_(std::move(target)),
-      replacements_(std::move(replacements)), reservedGrowth_(growth) {}
+      replacements_(std::move(replacements)), reservedGrowth_(growth),
+      reservedTemporaryBytes_(temporaryBytes) {}
 PersistentZarrCacheBudget::WriteReservation::WriteReservation(WriteReservation&& other) noexcept = default;
 PersistentZarrCacheBudget::WriteReservation& PersistentZarrCacheBudget::WriteReservation::operator=(WriteReservation&& other) noexcept
 {
@@ -596,7 +621,9 @@ PersistentZarrCacheBudget::WriteReservation& PersistentZarrCacheBudget::WriteRes
         target_ = std::move(other.target_);
         replacements_ = std::move(other.replacements_);
         reservedGrowth_ = other.reservedGrowth_;
+        reservedTemporaryBytes_ = other.reservedTemporaryBytes_;
         other.reservedGrowth_ = 0;
+        other.reservedTemporaryBytes_ = 0;
     }
     return *this;
 }
@@ -605,14 +632,16 @@ void PersistentZarrCacheBudget::WriteReservation::commit()
 {
     if (owner_) {
         auto owner = std::move(owner_);
-        owner->finishWrite(target_, replacements_, reservedGrowth_, true);
+        owner->finishWrite(target_, replacements_, reservedGrowth_,
+                           reservedTemporaryBytes_, true);
     }
 }
 void PersistentZarrCacheBudget::WriteReservation::cancel()
 {
     if (owner_) {
         auto owner = std::move(owner_);
-        owner->finishWrite(target_, replacements_, reservedGrowth_, false);
+        owner->finishWrite(target_, replacements_, reservedGrowth_,
+                           reservedTemporaryBytes_, false);
     }
 }
 
