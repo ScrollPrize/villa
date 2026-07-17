@@ -415,9 +415,16 @@
   beam with the lowest cumulative score is selected; if no beam reaches the
   target plane before the step guard, the best live state is returned with the
   same failure reason semantics as greedy tracing.
-- Native 3D candidate selection is vectorized per beam state. Candidate points
-  are grouped by trusted inference block, sampled with batched `grid_sample`,
-  decoded with the analytic Lasagna 3x2 torch decoder, and scored as tensors.
+- Native 3D beam-mode candidate selection is vectorized across the active
+  beam/frontier states and their candidate directions for each lookahead
+  depth. Candidate directions are generated as torch tensors on `cache.device`;
+  current-point branch selection, candidate scoring, target-plane crossing, and
+  pruning operate on tensors. Candidate points are then grouped by trusted
+  inference block, sampled with batched `grid_sample`, decoded with the
+  analytic Lasagna 3x2 torch decoder, and scored as tensors. The lazy
+  inferred-block cache remains CPU-resident by design, so point-to-block
+  routing and cache-miss block construction may still happen on CPU before
+  the sampled tensors return to `cache.device`.
   For multi-branch outputs, every candidate evaluates every branch at the
   candidate point and uses the branch with the best score. Candidate selection
   minimizes a cost. The base cost is

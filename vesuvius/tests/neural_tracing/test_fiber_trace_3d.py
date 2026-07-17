@@ -64,7 +64,9 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _sample_presence_on_strip,
     _sample_trace_point_aligned,
     _score_candidate_batch,
+    _score_candidate_loss_tensors_batched,
     _target_plane_in_plane_error_voxels,
+    _trace_candidate_directions_torch,
     _volume_trace_to_source_trace_xyz,
     fuse_forward_reverse_traces,
     generate_cone_candidates_by_angle_step,
@@ -1728,6 +1730,39 @@ def test_native_3d_trace2cp_angle_step_candidates_are_deterministic_and_bounded(
     assert float(np.max(angles)) <= 25.0 + 1.0e-4
 
 
+def test_native_3d_trace2cp_torch_candidate_generation_matches_numpy() -> None:
+    axes = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    cfg = NativeTrace2CpConfig(cone_angle_degrees=25.0, cone_angle_step_degrees=5.0)
+
+    candidates = _trace_candidate_directions_torch(axes, cfg).detach().cpu().numpy()
+
+    assert candidates.shape == (2, 81, 3)
+    assert np.allclose(
+        candidates[0],
+        generate_cone_candidates_by_angle_step(
+            axes[0].numpy(),
+            max_angle_degrees=25.0,
+            angle_step_degrees=5.0,
+        ),
+        atol=1.0e-6,
+    )
+    assert np.allclose(
+        candidates[1],
+        generate_cone_candidates_by_angle_step(
+            axes[1].numpy(),
+            max_angle_degrees=25.0,
+            angle_step_degrees=5.0,
+        ),
+        atol=1.0e-6,
+    )
+
+
 def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().inference_patch_shape_zyx == (64, 64, 64)
     assert NativeTrace2CpConfig().cone_grid_size == 25
@@ -2498,6 +2533,69 @@ def test_native_3d_trace2cp_candidate_score_evaluates_all_branches() -> None:
     assert direction_loss == pytest.approx(0.0, abs=1.0e-6)
     assert presence_loss == pytest.approx(0.05, abs=1.0e-6)
     assert smoothness_loss == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_batched_candidate_score_couples_branches() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            assert count == 4
+            directions = torch.tensor(
+                [
+                    [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                    [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+                    [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.tensor(
+                [
+                    [0.1, 0.9],
+                    [0.4, 1.0],
+                    [0.2, 0.8],
+                    [0.2, 1.0],
+                ],
+                dtype=torch.float32,
+            )
+            valid = torch.ones((count, 2), dtype=torch.bool)
+            return directions, presence, valid
+
+    total_loss, direction_loss, presence_loss, smoothness_loss, candidate_valid, rejected = (
+        _score_candidate_loss_tensors_batched(
+            FakeCache(),
+            current_directions=torch.tensor(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=torch.float32,
+            ),
+            previous_step_directions=torch.tensor(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=torch.float32,
+            ),
+            candidate_directions=torch.tensor(
+                [
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                    [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                ],
+                dtype=torch.float32,
+            ),
+            next_points=torch.zeros((2, 2, 3), dtype=torch.float32),
+            smoothness_weight=0.0,
+        )
+    )
+
+    best_loss, best_branch = torch.min(total_loss, dim=2)
+    assert candidate_valid.tolist() == [[True, True], [True, True]]
+    assert rejected.tolist() == [0, 0]
+    assert int(torch.argmin(best_loss[0])) == 0
+    assert int(best_branch[0, 0]) == 1
+    assert int(torch.argmin(best_loss[1])) == 0
+    assert int(best_branch[1, 0]) == 1
+    assert float(direction_loss[0, 0, 1]) == pytest.approx(0.0, abs=1.0e-6)
+    assert float(presence_loss[0, 0, 1]) == pytest.approx(0.1, abs=1.0e-6)
+    assert int(torch.count_nonzero(smoothness_loss).item()) == 0
 
 
 def test_native_3d_trace2cp_current_point_direction_uses_best_branch() -> None:

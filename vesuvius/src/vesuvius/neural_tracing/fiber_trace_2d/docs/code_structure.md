@@ -157,10 +157,15 @@ side/top strip input loading.
   (default `3`), cumulative loss selects the best target-plane-reaching state,
   and `--beam-prune-distance-voxels` merges near-duplicate live states after
   the lookahead expansion. `--beam-width 1` preserves the previous greedy
-  control flow and does not use lookahead. Candidate selection is batched per
-  beam state: candidate points are grouped by trusted inference block, sampled
-  with batched `grid_sample`, decoded in torch, and reduced with tensor
-  operations.
+  control flow and does not use lookahead. Beam candidate selection is batched
+  across the active frontier states for each lookahead depth: cone candidates
+  are generated in torch, current-point branch selection and candidate scoring
+  run as tensor operations, target-plane crossing is evaluated in batch, and
+  tensor pruning keeps the next live frontier before only the selected path is
+  reconstructed as Python trace steps. Candidate point sampling still routes
+  through the lazy CPU-resident inferred-block cache, so block lookup/cache
+  misses happen on CPU before each grouped point batch is sampled with
+  `grid_sample` on `cache.device`.
 - Uses a distance-derived step guard by default:
   `ceil(max_step_factor * cp_distance_voxels / step_voxels)`, with
   `--max-step-factor 3.0`. `--max-steps` is an optional extra cap, and

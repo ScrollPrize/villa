@@ -159,6 +159,25 @@ class _NativeBeamNode:
     depth: int
 
 
+@dataclass(frozen=True)
+class _NativeBeamTensorGeneration:
+    points_zyx: torch.Tensor
+    previous_directions_zyx: torch.Tensor
+    cumulative_loss: torch.Tensor
+    depth: torch.Tensor
+    parent_indices: torch.Tensor | None
+    step_direction_loss: torch.Tensor | None
+    step_presence_loss: torch.Tensor | None
+    step_total_loss: torch.Tensor | None
+    step_smoothness_loss: torch.Tensor | None
+    step_rejected_candidates: torch.Tensor | None
+
+
+_CONE_OFFSET_TABLE_CACHE: dict[
+    tuple[float, float, int, str, torch.dtype], torch.Tensor
+] = {}
+
+
 def _native_trace2cp_whole_fiber_mode(
     *,
     fiber_json: Path | None,
@@ -234,6 +253,147 @@ def _orthonormal_basis(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     b0 = _unit(np.cross(unit, ref))
     b1 = _unit(np.cross(unit, b0))
     return b0, b1
+
+
+def _orthonormal_basis_torch(axes_n3: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    axes = F.normalize(axes_n3.to(dtype=torch.float32), p=2.0, dim=-1, eps=float(_EPS))
+    if axes.ndim != 2 or int(axes.shape[1]) != 3:
+        raise ValueError("axes_n3 must have shape [N,3]")
+    basis = torch.eye(3, dtype=torch.float32, device=axes.device)
+    ref_index = torch.argmin(torch.abs(axes @ basis.T), dim=1)
+    refs = basis[ref_index]
+    b0 = F.normalize(torch.cross(axes, refs, dim=1), p=2.0, dim=1, eps=float(_EPS))
+    b1 = F.normalize(torch.cross(axes, b0, dim=1), p=2.0, dim=1, eps=float(_EPS))
+    return b0, b1
+
+
+def _angle_step_cone_offsets_np(
+    *,
+    max_angle_degrees: float,
+    angle_step_degrees: float,
+) -> np.ndarray:
+    max_angle = max(0.0, float(max_angle_degrees))
+    step = float(angle_step_degrees)
+    if not math.isfinite(step) or step <= 0.0:
+        raise ValueError("angle_step_degrees must be positive")
+    if max_angle <= 0.0:
+        return np.zeros((1, 2), dtype=np.float32)
+    max_steps = int(math.floor(max_angle / step + 1.0e-6))
+    values = np.arange(-max_steps, max_steps + 1, dtype=np.float32) * np.float32(step)
+    uu, vv = np.meshgrid(values, values, indexing="xy")
+    u_deg = uu.reshape(-1).astype(np.float32)
+    v_deg = vv.reshape(-1).astype(np.float32)
+    radius2 = u_deg * u_deg + v_deg * v_deg
+    keep = radius2 <= np.float32(max_angle * max_angle + 1.0e-5)
+    u_deg = u_deg[keep]
+    v_deg = v_deg[keep]
+    radius2 = radius2[keep]
+    if not np.any((u_deg == 0.0) & (v_deg == 0.0)):
+        u_deg = np.concatenate([np.asarray([0.0], dtype=np.float32), u_deg])
+        v_deg = np.concatenate([np.asarray([0.0], dtype=np.float32), v_deg])
+        radius2 = np.concatenate([np.asarray([0.0], dtype=np.float32), radius2])
+    order = np.lexsort((v_deg, u_deg, radius2))
+    u = np.tan(np.deg2rad(u_deg.astype(np.float64))).astype(np.float32)
+    v = np.tan(np.deg2rad(v_deg.astype(np.float64))).astype(np.float32)
+    return np.stack([u[order], v[order]], axis=1).astype(np.float32, copy=False)
+
+
+def _legacy_grid_cone_offsets_np(
+    *,
+    max_angle_degrees: float,
+    grid_size: int,
+) -> np.ndarray:
+    max_angle = math.radians(max(0.0, float(max_angle_degrees)))
+    grid_count = int(grid_size)
+    if grid_count <= 0:
+        raise ValueError("grid_size must be positive")
+    if max_angle <= 0.0 or grid_count == 1:
+        return np.zeros((1, 2), dtype=np.float32)
+    lin = np.linspace(-1.0, 1.0, grid_count, dtype=np.float32)
+    uu, vv = np.meshgrid(lin, lin, indexing="xy")
+    a = uu.reshape(-1).astype(np.float32)
+    b = vv.reshape(-1).astype(np.float32)
+    disk_x = np.zeros_like(a)
+    disk_y = np.zeros_like(b)
+    nonzero = (a != 0.0) | (b != 0.0)
+    a_nz = a[nonzero]
+    b_nz = b[nonzero]
+    use_a = np.abs(a_nz) > np.abs(b_nz)
+    r = np.empty_like(a_nz)
+    phi = np.empty_like(a_nz)
+    r[use_a] = a_nz[use_a]
+    phi[use_a] = (np.float32(math.pi / 4.0) * b_nz[use_a]) / a_nz[use_a]
+    r[~use_a] = b_nz[~use_a]
+    phi[~use_a] = np.float32(math.pi / 2.0) - (
+        np.float32(math.pi / 4.0) * a_nz[~use_a]
+    ) / b_nz[~use_a]
+    disk_x[nonzero] = r * np.cos(phi)
+    disk_y[nonzero] = r * np.sin(phi)
+    tangent_scale = np.float32(math.tan(max_angle))
+    offsets = np.stack([tangent_scale * disk_x, tangent_scale * disk_y], axis=1)
+    center_index = int(np.argmin(disk_x * disk_x + disk_y * disk_y))
+    order = np.concatenate(
+        [
+            np.asarray([center_index], dtype=np.int64),
+            np.asarray(
+                [idx for idx in range(int(offsets.shape[0])) if idx != center_index],
+                dtype=np.int64,
+            ),
+        ]
+    )
+    return offsets[order].astype(np.float32, copy=False)
+
+
+def _cone_offset_table_torch(
+    cfg: NativeTrace2CpConfig,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    key = (
+        float(cfg.cone_angle_degrees),
+        float(cfg.cone_angle_step_degrees),
+        int(cfg.cone_grid_size),
+        str(device),
+        dtype,
+    )
+    cached = _CONE_OFFSET_TABLE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if float(cfg.cone_angle_step_degrees) > 0.0:
+        offsets_np = _angle_step_cone_offsets_np(
+            max_angle_degrees=float(cfg.cone_angle_degrees),
+            angle_step_degrees=float(cfg.cone_angle_step_degrees),
+        )
+    else:
+        offsets_np = _legacy_grid_cone_offsets_np(
+            max_angle_degrees=float(cfg.cone_angle_degrees),
+            grid_size=int(cfg.cone_grid_size),
+        )
+    table = torch.as_tensor(offsets_np, dtype=dtype, device=device)
+    _CONE_OFFSET_TABLE_CACHE[key] = table
+    return table
+
+
+def _trace_candidate_directions_torch(
+    axes_n3: torch.Tensor,
+    cfg: NativeTrace2CpConfig,
+) -> torch.Tensor:
+    axes = F.normalize(axes_n3.to(dtype=torch.float32), p=2.0, dim=-1, eps=float(_EPS))
+    if axes.ndim != 2 or int(axes.shape[1]) != 3:
+        raise ValueError("axes_n3 must have shape [N,3]")
+    offsets = _cone_offset_table_torch(
+        cfg,
+        device=axes.device,
+        dtype=axes.dtype,
+    )
+    b0, b1 = _orthonormal_basis_torch(axes)
+    directions = (
+        axes[:, None, :]
+        + offsets[None, :, 0, None] * b0[:, None, :]
+        + offsets[None, :, 1, None] * b1[:, None, :]
+    )
+    return F.normalize(directions, p=2.0, dim=2, eps=float(_EPS))
 
 
 def generate_cone_candidates(
@@ -826,6 +986,115 @@ def _align_axes_torch(axes: torch.Tensor, references: torch.Tensor) -> torch.Ten
     return axes_n * sign
 
 
+def _points_to_numpy(points_zyx: torch.Tensor | np.ndarray) -> np.ndarray:
+    if isinstance(points_zyx, torch.Tensor):
+        return (
+            points_zyx.detach()
+            .to(device=torch.device("cpu"), dtype=torch.float32)
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+    return np.asarray(points_zyx, dtype=np.float32)
+
+
+def _cache_device(cache: Any, fallback: torch.device | None = None) -> torch.device:
+    if hasattr(cache, "device"):
+        return torch.device(getattr(cache, "device"))
+    if fallback is not None:
+        return torch.device(fallback)
+    return torch.device("cpu")
+
+
+def _sample_point_choices_for_points_torch(
+    cache: Any,
+    points_zyx: torch.Tensor | np.ndarray,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    points_np = _points_to_numpy(points_zyx)
+    fallback_device = points_zyx.device if isinstance(points_zyx, torch.Tensor) else None
+    device = _cache_device(cache, fallback=fallback_device)
+    if hasattr(cache, "sample_point_choices_torch"):
+        directions, presence, valid = cache.sample_point_choices_torch(points_np)
+    else:
+        directions_one, presence_one, valid_one = cache.sample_points_torch(points_np)
+        directions = directions_one[:, None, :]
+        presence = presence_one[:, None]
+        valid = valid_one[:, None]
+    return (
+        directions.to(device=device, dtype=torch.float32),
+        presence.to(device=device, dtype=torch.float32),
+        valid.to(device=device, dtype=torch.bool),
+    )
+
+
+def _sample_trace_points_aligned_torch(
+    cache: Any,
+    points_zyx: torch.Tensor,
+    *,
+    reference_directions_zyx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = _cache_device(cache, fallback=points_zyx.device)
+    points = points_zyx.to(device=device, dtype=torch.float32)
+    references = F.normalize(
+        reference_directions_zyx.to(device=device, dtype=torch.float32),
+        p=2.0,
+        dim=1,
+        eps=float(_EPS),
+    )
+    if not hasattr(cache, "sample_point_choices_torch") and hasattr(cache, "sample_point"):
+        point_np = _points_to_numpy(points)
+        ref_np = _points_to_numpy(references)
+        selected: list[np.ndarray] = []
+        presences: list[float] = []
+        valids: list[bool] = []
+        for point, reference in zip(point_np, ref_np, strict=True):
+            sampled_direction, sampled_presence, valid = cache.sample_point(point)
+            if bool(valid):
+                selected.append(_align_axis(sampled_direction, reference))
+                presences.append(float(sampled_presence))
+                valids.append(True)
+            else:
+                selected.append(np.zeros((3,), dtype=np.float32))
+                presences.append(0.0)
+                valids.append(False)
+        return (
+            torch.as_tensor(np.stack(selected, axis=0), dtype=torch.float32, device=device),
+            torch.as_tensor(presences, dtype=torch.float32, device=device),
+            torch.as_tensor(valids, dtype=torch.bool, device=device),
+        )
+    directions, presence, valid = _sample_point_choices_for_points_torch(cache, points)
+    if int(directions.shape[0]) != int(points.shape[0]):
+        raise ValueError("sampled direction count does not match point count")
+    if int(directions.shape[0]) == 0:
+        return (
+            torch.zeros((0, 3), dtype=torch.float32, device=device),
+            torch.zeros((0,), dtype=torch.float32, device=device),
+            torch.zeros((0,), dtype=torch.bool, device=device),
+        )
+    aligned = _align_axes_torch(directions, references[:, None, :].expand_as(directions))
+    dot = torch.sum(aligned * references[:, None, :].expand_as(aligned), dim=2).clamp(0.0, 1.0)
+    score = torch.where(
+        valid,
+        dot * presence.clamp(0.0, 1.0),
+        torch.full_like(presence, -torch.inf),
+    )
+    best_branch = torch.argmax(score, dim=1)
+    rows = torch.arange(int(points.shape[0]), dtype=torch.long, device=device)
+    any_valid = valid.any(dim=1)
+    selected_direction = aligned[rows, best_branch]
+    selected_presence = presence[rows, best_branch]
+    selected_direction = torch.where(
+        any_valid[:, None],
+        selected_direction,
+        torch.zeros_like(selected_direction),
+    )
+    selected_presence = torch.where(
+        any_valid,
+        selected_presence,
+        torch.zeros_like(selected_presence),
+    )
+    return selected_direction, selected_presence, any_valid
+
+
 def _sample_trace_point_aligned(
     cache: Any,
     point_zyx: np.ndarray,
@@ -908,6 +1177,62 @@ def _score_candidate_loss_tensors(
     smoothness_weight: float = 2.0,
     smoothness_free_angle_degrees: float = 10.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    (
+        total_loss,
+        direction_loss,
+        presence_loss,
+        smoothness_loss,
+        candidate_valid,
+        rejected_per_state,
+    ) = _score_candidate_loss_tensors_batched(
+        cache,
+        current_directions=torch.as_tensor(
+            np.asarray(current_direction, dtype=np.float32).reshape(1, 3),
+            dtype=torch.float32,
+            device=_cache_device(cache),
+        ),
+        previous_step_directions=torch.as_tensor(
+            np.asarray(previous_step_direction, dtype=np.float32).reshape(1, 3),
+            dtype=torch.float32,
+            device=_cache_device(cache),
+        ),
+        candidate_directions=torch.as_tensor(
+            np.asarray(candidate_directions, dtype=np.float32).reshape(
+                1, int(np.asarray(candidate_directions).shape[0]), 3
+            ),
+            dtype=torch.float32,
+            device=_cache_device(cache),
+        ),
+        next_points=torch.as_tensor(
+            np.asarray(next_points, dtype=np.float32).reshape(
+                1, int(np.asarray(next_points).shape[0]), 3
+            ),
+            dtype=torch.float32,
+            device=_cache_device(cache),
+        ),
+        smoothness_weight=smoothness_weight,
+        smoothness_free_angle_degrees=smoothness_free_angle_degrees,
+    )
+    return (
+        total_loss[0],
+        direction_loss[0],
+        presence_loss[0],
+        smoothness_loss[0],
+        candidate_valid[0],
+        int(rejected_per_state[0].detach().cpu()),
+    )
+
+
+def _score_candidate_loss_tensors_batched(
+    cache: NativeTraceFieldCache,
+    *,
+    current_directions: torch.Tensor,
+    previous_step_directions: torch.Tensor,
+    candidate_directions: torch.Tensor,
+    next_points: torch.Tensor,
+    smoothness_weight: float = 2.0,
+    smoothness_free_angle_degrees: float = 10.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not math.isfinite(float(smoothness_weight)) or float(smoothness_weight) < 0.0:
         raise ValueError("smoothness_weight must be finite and non-negative")
     if (
@@ -915,59 +1240,78 @@ def _score_candidate_loss_tensors(
         or float(smoothness_free_angle_degrees) < 0.0
     ):
         raise ValueError("smoothness_free_angle_degrees must be finite and non-negative")
-    candidates = torch.as_tensor(
-        np.asarray(candidate_directions, dtype=np.float32),
-        dtype=torch.float32,
-        device=cache.device,
+    device = _cache_device(cache, fallback=current_directions.device)
+    current = F.normalize(
+        current_directions.to(device=device, dtype=torch.float32),
+        p=2.0,
+        dim=1,
+        eps=float(_EPS),
     )
-    candidates = F.normalize(candidates, p=2.0, dim=1, eps=float(_EPS))
-    current = torch.as_tensor(
-        np.asarray(current_direction, dtype=np.float32).reshape(1, 3),
-        dtype=torch.float32,
-        device=cache.device,
+    previous = F.normalize(
+        previous_step_directions.to(device=device, dtype=torch.float32),
+        p=2.0,
+        dim=1,
+        eps=float(_EPS),
     )
-    current = F.normalize(current, p=2.0, dim=1, eps=float(_EPS))
-    candidates = _align_axes_torch(candidates, current.expand_as(candidates))
-    previous = torch.as_tensor(
-        np.asarray(previous_step_direction, dtype=np.float32).reshape(1, 3),
-        dtype=torch.float32,
-        device=cache.device,
+    candidates = F.normalize(
+        candidate_directions.to(device=device, dtype=torch.float32),
+        p=2.0,
+        dim=2,
+        eps=float(_EPS),
     )
-    previous = F.normalize(previous, p=2.0, dim=1, eps=float(_EPS))
-    if hasattr(cache, "sample_point_choices_torch"):
-        next_direction_choices, presence_choices, valid_choices = (
-            cache.sample_point_choices_torch(next_points)
-        )
-    else:
-        next_directions, presences, valid = cache.sample_points_torch(next_points)
-        next_direction_choices = next_directions[:, None, :]
-        presence_choices = presences[:, None]
-        valid_choices = valid[:, None]
-    current_dot = torch.sum(current.expand_as(candidates) * candidates, dim=1).clamp(-1.0, 1.0)
-    candidate_choices = candidates[:, None, :].expand_as(next_direction_choices)
+    points = next_points.to(device=device, dtype=torch.float32)
+    if candidates.ndim != 3 or int(candidates.shape[2]) != 3:
+        raise ValueError("candidate_directions must have shape [N,M,3]")
+    if points.shape != candidates.shape:
+        raise ValueError("next_points must have the same [N,M,3] shape as candidates")
+    state_count = int(candidates.shape[0])
+    candidate_count = int(candidates.shape[1])
+    if current.shape != (state_count, 3):
+        raise ValueError("current_directions must have shape [N,3]")
+    if previous.shape != (state_count, 3):
+        raise ValueError("previous_step_directions must have shape [N,3]")
+    candidates = _align_axes_torch(
+        candidates,
+        current[:, None, :].expand_as(candidates),
+    )
+    flat_points = points.reshape(state_count * candidate_count, 3)
+    next_direction_choices, presence_choices, valid_choices = _sample_point_choices_for_points_torch(
+        cache,
+        flat_points,
+    )
+    branch_count = int(next_direction_choices.shape[1])
+    next_direction_choices = next_direction_choices.reshape(
+        state_count,
+        candidate_count,
+        branch_count,
+        3,
+    )
+    presence_choices = presence_choices.reshape(state_count, candidate_count, branch_count)
+    valid_choices = valid_choices.reshape(state_count, candidate_count, branch_count)
+    current_dot = torch.sum(current[:, None, :] * candidates, dim=2).clamp(-1.0, 1.0)
+    candidate_choices = candidates[:, :, None, :].expand_as(next_direction_choices)
     next_aligned = _align_axes_torch(next_direction_choices, candidate_choices)
-    next_dot = torch.sum(next_aligned * candidate_choices, dim=2).clamp(-1.0, 1.0)
+    next_dot = torch.sum(next_aligned * candidate_choices, dim=3).clamp(-1.0, 1.0)
     presence = presence_choices.clamp(0.0, 1.0)
-    score = current_dot[:, None] * next_dot * presence
-    direction_loss = 1.0 - 0.5 * (current_dot[:, None] + next_dot)
+    score = current_dot[:, :, None] * next_dot * presence
+    direction_loss = 1.0 - 0.5 * (current_dot[:, :, None] + next_dot)
     presence_loss = 1.0 - presence
     total_loss = 1.0 - score
     if float(smoothness_weight) > 0.0:
-        smooth_dot = torch.sum(previous.expand_as(candidates) * candidates, dim=1).clamp(-1.0, 1.0)
+        smooth_dot = torch.sum(previous[:, None, :] * candidates, dim=2).clamp(-1.0, 1.0)
         smooth_angle = torch.acos(smooth_dot)
         free_angle = math.radians(float(smoothness_free_angle_degrees))
         smoothness_loss = (
             torch.clamp(smooth_angle - float(free_angle), min=0.0).square()
             * float(smoothness_weight)
         )
-        total_loss = total_loss + smoothness_loss[:, None]
+        total_loss = total_loss + smoothness_loss[:, :, None]
     else:
         smoothness_loss = torch.zeros_like(current_dot)
     total_loss = torch.where(valid_choices, total_loss, torch.full_like(total_loss, torch.inf))
-    candidate_valid = valid_choices.any(dim=1)
-    valid_count = int(torch.count_nonzero(candidate_valid).detach().cpu())
-    rejected = int(candidate_valid.numel()) - valid_count
-    return total_loss, direction_loss, presence_loss, smoothness_loss, candidate_valid, rejected
+    candidate_valid = valid_choices.any(dim=2)
+    rejected_per_state = int(candidate_count) - torch.count_nonzero(candidate_valid, dim=1)
+    return total_loss, direction_loss, presence_loss, smoothness_loss, candidate_valid, rejected_per_state
 
 
 def _score_candidate_batch(
@@ -1335,6 +1679,97 @@ def _prune_native_beam_nodes(
     return ordered[:width]
 
 
+def _prune_native_beam_tensor_indices(
+    generation: _NativeBeamTensorGeneration,
+    *,
+    beam_width: int,
+    prune_distance_voxels: float,
+) -> torch.Tensor:
+    count = int(generation.points_zyx.shape[0])
+    if count == 0:
+        return torch.zeros((0,), dtype=torch.long, device=generation.points_zyx.device)
+    width = max(1, int(beam_width))
+    distance = max(0.0, float(prune_distance_voxels))
+    score = generation.cumulative_loss.to(dtype=torch.float64)
+    score = score + generation.depth.to(dtype=torch.float64) * 1.0e-12
+    if distance <= 0.0:
+        keep_count = min(width, count)
+        return torch.topk(score, k=keep_count, largest=False, sorted=True).indices.to(dtype=torch.long)
+
+    available = torch.isfinite(score)
+    kept: list[torch.Tensor] = []
+    distance2 = float(distance) * float(distance)
+    for _ in range(width):
+        masked_score = torch.where(
+            available,
+            score,
+            torch.full_like(score, torch.inf),
+        )
+        best_index = torch.argmin(masked_score)
+        if not bool(torch.isfinite(masked_score[best_index]).detach().cpu()):
+            break
+        kept.append(best_index.to(dtype=torch.long))
+        delta = generation.points_zyx - generation.points_zyx[best_index].view(1, 3)
+        far_enough = torch.sum(delta * delta, dim=1) >= distance2
+        available = available & far_enough
+    if kept:
+        return torch.stack(kept, dim=0).to(dtype=torch.long)
+    return torch.argmin(score).view(1).to(dtype=torch.long)
+
+
+def _native_beam_tensor_node(
+    *,
+    generations: list[_NativeBeamTensorGeneration],
+    root_nodes: list[_NativeBeamNode],
+    generation_index: int,
+    state_index: int,
+) -> _NativeBeamNode:
+    if generation_index < 0 or generation_index >= len(generations):
+        raise ValueError("generation_index is out of range")
+    chain: list[tuple[int, int]] = []
+    idx = int(state_index)
+    for gen_idx in range(int(generation_index), 0, -1):
+        gen = generations[gen_idx]
+        if gen.parent_indices is None:
+            raise ValueError("non-root tensor generation is missing parent indices")
+        chain.append((gen_idx, idx))
+        idx = int(gen.parent_indices[idx].detach().cpu())
+    if idx < 0 or idx >= len(root_nodes):
+        raise ValueError("root tensor state index is out of range")
+    node = root_nodes[idx]
+    for gen_idx, item_idx in reversed(chain):
+        gen = generations[gen_idx]
+        if (
+            gen.step_direction_loss is None
+            or gen.step_presence_loss is None
+            or gen.step_total_loss is None
+            or gen.step_smoothness_loss is None
+            or gen.step_rejected_candidates is None
+        ):
+            raise ValueError("tensor generation is missing step diagnostics")
+        point = gen.points_zyx[item_idx].detach().cpu().numpy().astype(np.float32)
+        previous_direction = (
+            gen.previous_directions_zyx[item_idx].detach().cpu().numpy().astype(np.float32)
+        )
+        step = NativeTraceStep(
+            point_zyx=point,
+            direction_loss=float(gen.step_direction_loss[item_idx].detach().cpu()),
+            presence_loss=float(gen.step_presence_loss[item_idx].detach().cpu()),
+            total_loss=float(gen.step_total_loss[item_idx].detach().cpu()),
+            rejected_candidates=int(gen.step_rejected_candidates[item_idx].detach().cpu()),
+            smoothness_loss=float(gen.step_smoothness_loss[item_idx].detach().cpu()),
+        )
+        node = _NativeBeamNode(
+            point_zyx=point,
+            previous_direction_zyx=previous_direction,
+            parent=node,
+            step=step,
+            cumulative_loss=float(gen.cumulative_loss[item_idx].detach().cpu()),
+            depth=int(gen.depth[item_idx].detach().cpu()),
+        )
+    return node
+
+
 def _trace_native_3d_one_way_beam(
     cache: NativeTraceFieldCache,
     *,
@@ -1436,104 +1871,206 @@ def _trace_native_3d_one_way_beam(
     live: list[_NativeBeamNode] = [start_node]
     best_live = start_node
     committed_step = 0
+    device = _cache_device(cache)
+    target_t = torch.as_tensor(target, dtype=torch.float32, device=device)
+    plane_normal_t = torch.as_tensor(plane_normal, dtype=torch.float32, device=device)
+    initial_direction_t = torch.as_tensor(
+        initial_direction.reshape(1, 3),
+        dtype=torch.float32,
+        device=device,
+    )
     while committed_step < step_limit:
-        frontier: list[_NativeBeamNode] = live
-        reached: list[_NativeBeamNode] = []
+        root_points = torch.as_tensor(
+            np.stack([np.asarray(node.point_zyx, dtype=np.float32) for node in live], axis=0),
+            dtype=torch.float32,
+            device=device,
+        )
+        root_previous = torch.as_tensor(
+            np.stack(
+                [np.asarray(node.previous_direction_zyx, dtype=np.float32) for node in live],
+                axis=0,
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        root_cumulative = torch.as_tensor(
+            [float(node.cumulative_loss) for node in live],
+            dtype=torch.float32,
+            device=device,
+        )
+        root_depth = torch.as_tensor(
+            [int(node.depth) for node in live],
+            dtype=torch.long,
+            device=device,
+        )
+        generations: list[_NativeBeamTensorGeneration] = [
+            _NativeBeamTensorGeneration(
+                points_zyx=root_points,
+                previous_directions_zyx=F.normalize(
+                    root_previous,
+                    p=2.0,
+                    dim=1,
+                    eps=float(_EPS),
+                ),
+                cumulative_loss=root_cumulative,
+                depth=root_depth,
+                parent_indices=None,
+                step_direction_loss=None,
+                step_presence_loss=None,
+                step_total_loss=None,
+                step_smoothness_loss=None,
+                step_rejected_candidates=None,
+            )
+        ]
+        frontier_generation_index = 0
+        reached_generation_index: int | None = None
+        reached_state_index: int | None = None
         expanded_steps = 0
         max_expand = min(lookahead_steps, step_limit - committed_step)
         for lookahead_index in range(max_expand):
-            children: list[_NativeBeamNode] = []
-            for state in frontier:
-                current = np.asarray(state.point_zyx, dtype=np.float32)
-                previous_direction = np.asarray(state.previous_direction_zyx, dtype=np.float32)
-                if state.depth == 0:
-                    current_direction = initial_direction.astype(np.float32, copy=False)
-                else:
-                    sampled_direction, _presence, valid = _sample_trace_point_aligned(
-                        cache,
-                        current,
-                        reference_direction_zyx=previous_direction,
-                    )
-                    if not valid:
-                        continue
-                    current_direction = _align_axis(sampled_direction, previous_direction)
-                candidates_unit = _trace_candidate_directions(current_direction, cfg)
-                next_points = current[None, :] + candidates_unit * np.float32(cfg.step_voxels)
-                (
-                    total_loss_t,
-                    direction_loss_t,
-                    presence_loss_t,
-                    smoothness_loss_t,
-                    candidate_valid_t,
-                    rejected,
-                ) = _score_candidate_loss_tensors(
-                    cache,
-                    current_direction=current_direction,
-                    previous_step_direction=previous_direction,
-                    candidate_directions=candidates_unit,
-                    next_points=next_points,
-                    smoothness_weight=float(cfg.smoothness_weight),
-                    smoothness_free_angle_degrees=float(cfg.smoothness_free_angle_degrees),
-                )
-                candidate_best_loss_t, candidate_best_branch_t = torch.min(total_loss_t, dim=1)
-                candidate_valid = (
-                    candidate_valid_t
-                    & torch.isfinite(candidate_best_loss_t)
-                ).detach().cpu().numpy().astype(bool)
-                if not bool(np.any(candidate_valid)):
-                    continue
-                best_loss = candidate_best_loss_t.detach().cpu().numpy().astype(np.float64)
-                best_branch = candidate_best_branch_t.detach().cpu().numpy().astype(np.int64)
-                direction_loss = direction_loss_t.detach().cpu().numpy().astype(np.float64)
-                presence_loss = presence_loss_t.detach().cpu().numpy().astype(np.float64)
-                smoothness_loss = smoothness_loss_t.detach().cpu().numpy().astype(np.float64)
-                for candidate_index in np.flatnonzero(candidate_valid):
-                    branch_index = int(best_branch[int(candidate_index)])
-                    local_total = float(best_loss[int(candidate_index)])
-                    if not math.isfinite(local_total):
-                        continue
-                    chosen_direction = _align_axis(
-                        candidates_unit[int(candidate_index)],
-                        current_direction,
-                    )
-                    next_point = (
-                        current + chosen_direction * np.float32(cfg.step_voxels)
-                    ).astype(np.float32)
-                    crossing = _interpolate_plane_crossing(
-                        current,
-                        next_point,
-                        plane_point_zyx=target,
-                        plane_normal_zyx=plane_normal,
-                    )
-                    child_point = next_point if crossing is None else crossing.astype(np.float32)
-                    child_step = NativeTraceStep(
-                        point_zyx=child_point.astype(np.float32),
-                        direction_loss=float(direction_loss[int(candidate_index), branch_index]),
-                        presence_loss=float(presence_loss[int(candidate_index), branch_index]),
-                        total_loss=local_total,
-                        rejected_candidates=int(rejected),
-                        smoothness_loss=float(smoothness_loss[int(candidate_index)]),
-                    )
-                    child = _NativeBeamNode(
-                        point_zyx=child_point.astype(np.float32),
-                        previous_direction_zyx=chosen_direction.astype(np.float32),
-                        parent=state,
-                        step=child_step,
-                        cumulative_loss=float(state.cumulative_loss) + local_total,
-                        depth=int(state.depth) + 1,
-                    )
-                    if crossing is None:
-                        children.append(child)
-                    else:
-                        reached.append(child)
+            frontier_gen = generations[frontier_generation_index]
+            current_points = frontier_gen.points_zyx
+            previous_directions = F.normalize(
+                frontier_gen.previous_directions_zyx,
+                p=2.0,
+                dim=1,
+                eps=float(_EPS),
+            )
+            current_directions, _current_presence, state_valid = _sample_trace_points_aligned_torch(
+                cache,
+                current_points,
+                reference_directions_zyx=previous_directions,
+            )
+            root_mask = frontier_gen.depth == 0
+            if bool(torch.any(root_mask).detach().cpu()):
+                current_directions = current_directions.clone()
+                state_valid = state_valid.clone()
+                current_directions[root_mask] = initial_direction_t.expand(
+                    int(current_directions.shape[0]),
+                    3,
+                )[root_mask]
+                state_valid[root_mask] = True
+            valid_state_indices = torch.nonzero(state_valid, as_tuple=False).flatten()
+            if int(valid_state_indices.numel()) == 0:
+                break
+            current_points_v = current_points[valid_state_indices]
+            previous_directions_v = previous_directions[valid_state_indices]
+            current_directions_v = F.normalize(
+                current_directions[valid_state_indices],
+                p=2.0,
+                dim=1,
+                eps=float(_EPS),
+            )
+            candidate_dirs = _trace_candidate_directions_torch(current_directions_v, cfg)
+            next_points = current_points_v[:, None, :] + candidate_dirs * float(cfg.step_voxels)
+            (
+                total_loss_t,
+                direction_loss_t,
+                presence_loss_t,
+                smoothness_loss_t,
+                candidate_valid_t,
+                rejected_per_state_t,
+            ) = _score_candidate_loss_tensors_batched(
+                cache,
+                current_directions=current_directions_v,
+                previous_step_directions=previous_directions_v,
+                candidate_directions=candidate_dirs,
+                next_points=next_points,
+                smoothness_weight=float(cfg.smoothness_weight),
+                smoothness_free_angle_degrees=float(cfg.smoothness_free_angle_degrees),
+            )
+            candidate_best_loss_t, candidate_best_branch_t = torch.min(total_loss_t, dim=2)
+            candidate_valid_t = candidate_valid_t & torch.isfinite(candidate_best_loss_t)
+            child_local_state, child_candidate = torch.nonzero(
+                candidate_valid_t,
+                as_tuple=True,
+            )
+            if int(child_local_state.numel()) == 0:
+                break
+            child_parent_indices = valid_state_indices[child_local_state]
+            child_branch = candidate_best_branch_t[child_local_state, child_candidate]
+            child_total_loss = candidate_best_loss_t[child_local_state, child_candidate]
+            child_direction_loss = direction_loss_t[
+                child_local_state,
+                child_candidate,
+                child_branch,
+            ]
+            child_presence_loss = presence_loss_t[
+                child_local_state,
+                child_candidate,
+                child_branch,
+            ]
+            child_smoothness_loss = smoothness_loss_t[child_local_state, child_candidate]
+            child_rejected = rejected_per_state_t[child_local_state].to(dtype=torch.long)
+            chosen_directions = _align_axes_torch(
+                candidate_dirs[child_local_state, child_candidate],
+                current_directions_v[child_local_state],
+            )
+            child_next_points = (
+                current_points_v[child_local_state]
+                + chosen_directions * float(cfg.step_voxels)
+            )
+            d0 = torch.sum(
+                (current_points_v[child_local_state] - target_t.view(1, 3))
+                * plane_normal_t.view(1, 3),
+                dim=1,
+            )
+            d1 = torch.sum(
+                (child_next_points - target_t.view(1, 3)) * plane_normal_t.view(1, 3),
+                dim=1,
+            )
+            reached_mask = (d0 == 0.0) | (d0 * d1 <= 0.0)
+            denom = d0 - d1
+            safe_denom = torch.where(
+                torch.abs(denom) > float(_EPS),
+                denom,
+                torch.ones_like(denom),
+            )
+            crossing_t = torch.where(
+                torch.abs(denom) > float(_EPS),
+                torch.clamp(d0 / safe_denom, 0.0, 1.0),
+                torch.ones_like(d0),
+            )
+            crossing_t = torch.where(d0 == 0.0, torch.zeros_like(crossing_t), crossing_t)
+            crossing_points = (
+                current_points_v[child_local_state] * (1.0 - crossing_t[:, None])
+                + child_next_points * crossing_t[:, None]
+            )
+            child_points = torch.where(
+                reached_mask[:, None],
+                crossing_points,
+                child_next_points,
+            )
+            child_generation = _NativeBeamTensorGeneration(
+                points_zyx=child_points,
+                previous_directions_zyx=chosen_directions,
+                cumulative_loss=frontier_gen.cumulative_loss[child_parent_indices]
+                + child_total_loss,
+                depth=frontier_gen.depth[child_parent_indices] + 1,
+                parent_indices=child_parent_indices.to(dtype=torch.long),
+                step_direction_loss=child_direction_loss,
+                step_presence_loss=child_presence_loss,
+                step_total_loss=child_total_loss,
+                step_smoothness_loss=child_smoothness_loss,
+                step_rejected_candidates=child_rejected,
+            )
+            generations.append(child_generation)
+            frontier_generation_index = len(generations) - 1
             expanded_steps = lookahead_index + 1
-            if reached:
+            if bool(torch.any(reached_mask).detach().cpu()):
+                reached_indices = torch.nonzero(reached_mask, as_tuple=False).flatten()
+                reached_loss = child_generation.cumulative_loss[reached_indices]
+                best_reached_local = int(torch.argmin(reached_loss).detach().cpu())
+                reached_generation_index = frontier_generation_index
+                reached_state_index = int(reached_indices[best_reached_local].detach().cpu())
                 break
-            frontier = children
-            if not frontier:
-                break
-        if reached:
-            best = min(reached, key=lambda item: (float(item.cumulative_loss), int(item.depth)))
+        if reached_generation_index is not None and reached_state_index is not None:
+            best = _native_beam_tensor_node(
+                generations=generations,
+                root_nodes=live,
+                generation_index=reached_generation_index,
+                state_index=reached_state_index,
+            )
             emit_progress(
                 best.point_zyx,
                 min(step_limit, committed_step + expanded_steps),
@@ -1541,11 +2078,33 @@ def _trace_native_3d_one_way_beam(
                 active_beams=len(live),
             )
             return _beam_node_result(best, reached_target_plane=True, reason="target_plane")
-        live = _prune_native_beam_nodes(
+        if expanded_steps == 0 or frontier_generation_index == 0:
+            emit_progress(
+                best_live.point_zyx,
+                committed_step,
+                reason="all_candidates_invalid",
+                active_beams=0,
+            )
+            return _beam_node_result(
+                best_live,
+                reached_target_plane=False,
+                reason="all_candidates_invalid",
+            )
+        frontier = generations[frontier_generation_index]
+        kept_indices = _prune_native_beam_tensor_indices(
             frontier,
             beam_width=beam_width,
             prune_distance_voxels=float(cfg.beam_prune_distance_voxels),
         )
+        live = [
+            _native_beam_tensor_node(
+                generations=generations,
+                root_nodes=live,
+                generation_index=frontier_generation_index,
+                state_index=int(index.detach().cpu()),
+            )
+            for index in kept_indices
+        ]
         if not live:
             emit_progress(
                 best_live.point_zyx,

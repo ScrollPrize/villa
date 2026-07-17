@@ -2,12 +2,12 @@
 
 - [x] Inspect current beam/scoring/cache vectorization boundaries.
 - [x] Write task and implementation plan.
-- [ ] Implement GPU candidate generation.
-- [ ] Implement batched current-point lookup.
-- [ ] Implement batched candidate scoring over frontier states.
-- [ ] Implement tensor frontier/lookahead expansion.
-- [ ] Implement target-plane crossing and pruning in batched form.
-- [ ] Update specs/docs/changelog.
-- [ ] Add regression and equivalence tests.
-- [ ] Run focused 3D fiber trace tests.
-- [ ] Record validation and deviations in `task_log.md`.
+- [x] Implement GPU candidate generation.
+- [x] Implement batched current-point lookup.
+- [x] Implement batched candidate scoring over frontier states.
+- [x] Implement tensor frontier/lookahead expansion.
+- [x] Implement target-plane crossing and pruning in batched form.
+- [x] Update specs/docs/changelog.
+- [x] Add regression and equivalence tests.
+- [x] Run focused 3D fiber trace tests.
+- [x] Record validation and deviations in `task_log.md`.

@@ -2,6 +2,10 @@
 
 ## 2026-07-17
 
+- Vectorized native 3D Trace2CP beam lookahead across active frontier states:
+  cone candidates, current-point branch lookup, candidate scoring, plane
+  crossing, and pruning now run as batched torch operations around the
+  existing CPU-resident inferred-block cache.
 - Added native 3D Trace2CP beam lookahead: default beam search now expands
   three future candidate steps before pruning, controlled by
   `--beam-lookahead-steps`, while `--beam-width 1` remains greedy.

@@ -53,7 +53,8 @@
 
 # beam-search
 - [ ] beamsearch
-- [ ] short brute-forcce lookahead
+- [ ] short brute-force lookahead
+- [ ] substep evaluation
 
 # multidir
 - [ ] test a loss on multi-dir outputs being perpendicular
