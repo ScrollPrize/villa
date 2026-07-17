@@ -122,6 +122,7 @@ def spacing_cfg(**overrides):
         'dense_spacing_phase_graze_dot': 0.4,
         'dense_spacing_phase_graze_depth_wv': 1.0,
         'dense_spacing_phase_censor_gap_windings': 2.0,
+        'dense_spacing_phase_censor_min_gap_windings': 0.5,
         'dense_attachment_num_points': 512,
         'dense_attachment_scale': 8.0,
     }

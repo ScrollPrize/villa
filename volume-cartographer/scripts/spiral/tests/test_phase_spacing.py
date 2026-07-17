@@ -196,6 +196,23 @@ class TestCompleteBandDetection:
         torch.testing.assert_close(dense_result[0], mmap_result[0])
         torch.testing.assert_close(dense_result[1], mmap_result[1])
 
+    def test_band_spanning_invalid_interior_is_marked_ambiguous(self):
+        volume = sheet_volume(80, [10, 20, 30, 40, 50, 60])
+        # Poison the interior of sheet 3 (x = 30) with no-data voxels: its
+        # entry/exit crossings stay valid but the interior is unobserved and
+        # could hide an exit/re-entry (two sheets read as one band).
+        volume['volume'][:, :, 30] = 0
+        cfg = phase_cfg()
+        bands = detect_complete_sdt_bands(
+            fixed_ray(PerfectSpiralToX(), cfg, 1.0, 6.0), volume,
+            normal_volume(volume['shape']), cfg)
+        poisoned = (bands['phase'] - 3.0).abs().argmin()
+        assert bool(bands['interior_invalid'][poisoned])
+        assert bool(bands['ambiguous'][poisoned])
+        clean = (bands['phase'] - 2.0).abs().argmin()
+        assert not bool(bands['interior_invalid'][clean])
+        assert not bool(bands['ambiguous'][clean])
+
     def test_non_axis_normal_uses_positive_nz_not_an_nz_only_flip(self):
         normals = normal_volume((2, 2, 2), nx=192, ny=166)
         vector, valid = sample_lasagna_normals_nearest(
@@ -256,6 +273,28 @@ class TestPhaseLoss:
         assert metrics['dense_spacing_phase_censor_wide_gap_fraction'] > 0
         assert metrics['dense_spacing_phase_valid_fraction'] > 0
         assert metrics['dense_spacing_phase_span_valid_fraction'] < 0.75
+
+    def test_extra_inserted_band_censors_instead_of_biasing_residuals(self):
+        torch.manual_seed(6)
+        # A spurious extra sheet at x = 45 sits mid-gap between windings 4 and
+        # 5, so detection sees two bands half a modeled winding apart. Unit
+        # enumeration would hand winding 5 to the extra band and shift every
+        # later target a full winding outward - a systematic positive-rho
+        # bias. The narrow-gap censor must stop enumeration at the close pair
+        # instead, keeping all accepted residuals near zero.
+        volume = sheet_volume(100, [10, 20, 30, 40, 45, 50, 60, 70, 80])
+        loss, metrics = get_phase_spacing_loss(
+            PerfectSpiralToX(), torch.tensor(DR_PER_WINDING), volume,
+            normal_volume(volume['shape']), 8, phase_cfg(), 1, 2)
+        assert metrics['dense_spacing_phase_censor_narrow_gap_fraction'] > 0
+        # Rays anchored right at the insertion correctly go quiet; the rest of
+        # the batch must keep scoring.
+        assert metrics['dense_spacing_phase_valid_fraction'] > 0.25
+        assert metrics['dense_spacing_phase_residual_abs_p95'] < 0.1
+        # An un-censored insertion would put whole +1-winding residuals in the
+        # mean (huber(1.0) ~ 0.375 per hit); only encoding-quantization noise
+        # from the tight fixture may remain.
+        assert float(loss) < 1e-3
 
     def test_anchor_only_prefix_has_zero_weight(self):
         torch.manual_seed(12)

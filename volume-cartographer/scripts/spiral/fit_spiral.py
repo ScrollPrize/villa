@@ -253,10 +253,15 @@ default_config = {
     'dense_spacing_phase_graze_dot': 0.4,
     'dense_spacing_phase_graze_depth_wv': 1.0,
     'dense_spacing_phase_censor_gap_windings': 2.0,
-    # Native pre-expansion anti-collapse barrier. Its rollout weight starts at
-    # zero until phase-shadow gradient distributions calibrate it.
-    'loss_weight_min_spacing': 0.0,
-    'loss_weight_dense_spacing_count_rollout': 0.0,
+    # Two bands at most this far apart in modeled phase are an insertion
+    # signature (more detected sheets than modeled windings); censor from the
+    # first band of the pair. Mirrors the wide-gap deletion censor above.
+    'dense_spacing_phase_censor_min_gap_windings': 0.5,
+    # Native pre-expansion anti-collapse barrier, plus the reduced-weight
+    # crossing-count carryover that supplies the count-deficit gradient the
+    # phase loss deliberately censors away (missing bands, quiet regions).
+    'loss_weight_min_spacing': 2.0,
+    'loss_weight_dense_spacing_count_rollout': 8.0,
     'min_spacing_d_min_wv': 6.0,
     'min_spacing_independent_samples': 2_000,
     # SDT attachment: independent of the spacing loss (own weight/enable/counts).

@@ -578,7 +578,10 @@ def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
     scroll = ray['scroll_poly']
     pair_id = ray['pair_id']
     has_successor = ray['has_successor']
+    sdt_started = time.perf_counter()
     field, sample_valid, _ = sample_sdt_trilinear(sdt_volume, scroll)
+    sdt_sample_seconds = time.perf_counter() - sdt_started
+    normal_gather_seconds = 0.0
     edge_valid = has_successor[:-1] & sample_valid[:-1] & sample_valid[1:]
     inside = field < 0
     crossing_edge = edge_valid & (inside[:-1] != inside[1:])
@@ -592,9 +595,11 @@ def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
             'phase': empty, 'direction': torch.zeros([0, 3], device=scroll.device),
             'width': empty, 'depth': empty, 'normal_dot': empty,
             'normal_valid': empty.bool(), 'graze': empty.bool(),
-            'ambiguous': empty.bool(),
+            'ambiguous': empty.bool(), 'interior_invalid': empty.bool(),
             'unsupported_before': empty.bool(), 'merged_count': 0,
             'field_value': field, 'sample_valid': sample_valid,
+            'sdt_sample_seconds': sdt_sample_seconds,
+            'normal_gather_seconds': normal_gather_seconds,
         }
 
     step = (scroll[1:] - scroll[:-1]).norm(dim=-1)
@@ -616,9 +621,11 @@ def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
             'phase': empty, 'direction': torch.zeros([0, 3], device=scroll.device),
             'width': empty, 'depth': empty, 'normal_dot': empty,
             'normal_valid': empty.bool(), 'graze': empty.bool(),
-            'ambiguous': empty.bool(),
+            'ambiguous': empty.bool(), 'interior_invalid': empty.bool(),
             'unsupported_before': empty.bool(), 'merged_count': 0,
             'field_value': field, 'sample_valid': sample_valid,
+            'sdt_sample_seconds': sdt_sample_seconds,
+            'normal_gather_seconds': normal_gather_seconds,
         }
 
     entry_edge = crossing_index[left_cross]
@@ -639,13 +646,22 @@ def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
         dtype=field.dtype)
     depth.scatter_reduce_(
         0, clipped_band[in_band], field[in_band], reduce='amin', include_self=True)
+    # A band whose own interior crosses invalid samples may hide an
+    # exit/re-entry (two sheets read as one complete interval), so its center
+    # and width cannot be trusted.
+    interior_invalid = torch.zeros(
+        entry_edge.numel(), dtype=torch.bool, device=field.device)
+    interior_invalid[clipped_band[in_band & ~sample_valid]] = True
 
     def geometry(e_arc, x_arc):
+        nonlocal normal_gather_seconds
         center_arc = (e_arc + x_arc) * 0.5
         center, phase, direction = _interpolate_at_global_arclength(
             ray, global_arc, center_arc)
+        normal_started = time.perf_counter()
         normal, normal_valid = sample_lasagna_normals_nearest(
             normal_volume, center)
+        normal_gather_seconds += time.perf_counter() - normal_started
         normal_dot = (normal * direction).sum(dim=-1).abs()
         return center_arc, center, phase, direction, normal_dot, normal_valid
 
@@ -671,9 +687,10 @@ def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
     projected = center_separation * torch.minimum(normal_dot[:-1], normal_dot[1:])
     close = same_pair & (
         projected < float(cfg['dense_spacing_phase_min_center_gap_wv']))
-    ambiguous = torch.zeros_like(normal_valid)
+    ambiguous = interior_invalid.clone()
     ambiguous_split = close & (
-        unsupported_before[1:] | ~normal_valid[:-1] | ~normal_valid[1:])
+        unsupported_before[1:] | interior_invalid[:-1] | interior_invalid[1:]
+        | ~normal_valid[:-1] | ~normal_valid[1:])
     ambiguous[:-1] |= ambiguous_split
     ambiguous[1:] |= ambiguous_split
     merge = close & ~ambiguous_split
@@ -696,6 +713,7 @@ def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
         entry_arc, exit_arc = entry_arc[keep], exit_arc[keep]
         depth, band_pair = depth[keep], band_pair[keep]
         ambiguous = ambiguous[keep]
+        interior_invalid = interior_invalid[keep]
         unsupported_before = unsupported_before[keep]
         center_arc, center, phase, direction, normal_dot, normal_valid = geometry(
             entry_arc, exit_arc)
@@ -714,9 +732,12 @@ def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
         'width': exit_arc - entry_arc, 'depth': depth,
         'normal_dot': normal_dot, 'normal_valid': normal_valid,
         'graze': graze,
-        'ambiguous': ambiguous, 'unsupported_before': unsupported_before,
+        'ambiguous': ambiguous, 'interior_invalid': interior_invalid,
+        'unsupported_before': unsupported_before,
         'merged_count': merged_count, 'field_value': field,
         'sample_valid': sample_valid,
+        'sdt_sample_seconds': sdt_sample_seconds,
+        'normal_gather_seconds': normal_gather_seconds,
     }
 
 
@@ -852,10 +873,21 @@ def get_phase_spacing_loss(
         phase_gap[1:] = bands['phase'][1:] - bands['phase'][:-1]
         wide_before = same_prev & (
             phase_gap >= float(cfg['dense_spacing_phase_censor_gap_windings']))
+        # Symmetric insertion guard: two detected bands within a fraction of a
+        # modeled winding claim more sheets than the model has windings there,
+        # and either band could be the spurious one. Unit enumeration would
+        # shift every later ordinal and bias all later residuals one direction,
+        # so censor from the FIRST band of the close pair (censoring is
+        # inclusive of the marked band) - the mirror of the wide-gap deletion
+        # rule, which censors from the band after the gap.
+        narrow_ahead = torch.zeros(n_bands, dtype=torch.bool, device=device)
+        narrow_ahead[:-1] = same_prev[1:] & (phase_gap[1:] <= float(
+            cfg['dense_spacing_phase_censor_min_gap_windings']))
         graze = bands['graze']
         bad_band = graze | ~bands['normal_valid'] | bands['ambiguous']
         censor_here = outward & (
-            bad_band | ((j > 0) & (wide_before | bands['unsupported_before'])))
+            bad_band | narrow_ahead
+            | ((j > 0) & (wide_before | bands['unsupported_before'])))
         censor_cumulative = censor_here.to(torch.long).cumsum(0)
         before_anchor = torch.zeros(num_pairs, dtype=torch.long, device=device)
         valid_anchor_indices = anchor_ok.nonzero(as_tuple=False).squeeze(-1)
@@ -893,7 +925,7 @@ def get_phase_spacing_loss(
         outer_ambiguous = torch.zeros_like(anchor_ok)
         outer_far = torch.zeros_like(anchor_ok)
         outer_no_band = torch.ones_like(anchor_ok)
-        wide_before = graze = accepted = correspondence = torch.zeros(
+        wide_before = narrow_ahead = graze = accepted = correspondence = torch.zeros(
             [0], dtype=torch.bool, device=device)
         j = torch.zeros([0], dtype=torch.long, device=device)
         gref = torch.zeros([0], device=device)
@@ -963,9 +995,16 @@ def get_phase_spacing_loss(
             'dense_spacing_phase_merged_fragment_fraction': float(bands['merged_count'] / max(1, n_bands + bands['merged_count'])),
             'dense_spacing_phase_unsupported_sdt_fraction': float((~bands['sample_valid']).float().mean().item()),
             'dense_spacing_phase_sampled_points': float(ray['scroll_poly'].shape[0]),
-            'dense_spacing_phase_censor_domain_boundary_fraction': float(
+            'dense_spacing_phase_sdt_sample_seconds': bands['sdt_sample_seconds'],
+            'dense_spacing_phase_normal_gather_seconds': bands[
+                'normal_gather_seconds'],
+            # Fraction of rays whose outward extension was clamped at the
+            # fitted-domain edge (they cannot complete an outer band there).
+            'dense_spacing_phase_extension_domain_clamped_fraction': float(
                 (phase_end >= float(outer)).float().mean().item()),
-            'dense_spacing_phase_mean_enumerated_ordinals': float(
+            # Mean scored correspondences per ray (accepted bands that carry a
+            # usable reference gap), not enumerated-then-censored ordinals.
+            'dense_spacing_phase_mean_scored_correspondences': float(
                 pair_corr_count.mean().item()),
         }
         for label, distance, second_distance in (
@@ -999,16 +1038,21 @@ def get_phase_spacing_loss(
             normal_bad_fraction = float((~bands['normal_valid']).float().mean().item())
             wide_fraction = float(wide_before.float().mean().item())
             metrics.update({
+                # Band fractions by censor cause: a wide gap is the deletion
+                # (missing-band) signature, a narrow gap the insertion
+                # (extra-band) signature.
                 'dense_spacing_phase_censor_wide_gap_fraction': wide_fraction,
-                'dense_spacing_phase_missing_band_wide_gap_fraction': wide_fraction,
+                'dense_spacing_phase_censor_narrow_gap_fraction': float(
+                    narrow_ahead.float().mean().item()),
                 'dense_spacing_phase_censor_graze_fraction': graze_fraction,
                 'dense_spacing_phase_censor_unsupported_normal_fraction': normal_bad_fraction,
-                'dense_spacing_phase_unsupported_normal_fraction': normal_bad_fraction,
-                'dense_spacing_phase_missing_observation_fraction': wide_fraction,
+                'dense_spacing_phase_interior_invalid_band_fraction': float(
+                    bands['interior_invalid'].float().mean().item()),
                 'dense_spacing_phase_unsupported_observation_fraction': float(
                     ((~bands['normal_valid']) | bands['unsupported_before']).float().mean().item()),
                 'dense_spacing_phase_censored_action_fraction': float(
-                    (wide_before | graze | ~bands['normal_valid']
+                    (wide_before | narrow_ahead | graze | ~bands['normal_valid']
+                     | bands['ambiguous']
                      | bands['unsupported_before']).float().mean().item()),
             })
             projected_width = bands['width'] * bands['normal_dot']
