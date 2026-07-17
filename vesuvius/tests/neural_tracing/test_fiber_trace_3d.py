@@ -67,6 +67,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _target_plane_in_plane_error_voxels,
     _volume_trace_to_source_trace_xyz,
     fuse_forward_reverse_traces,
+    generate_cone_candidates_by_angle_step,
     generate_cone_candidates,
     trace_native_3d_one_way,
     trace_native_3d_pair,
@@ -1706,9 +1707,33 @@ def test_native_3d_trace2cp_cone_candidates_are_deterministic_and_bounded() -> N
     assert float(np.max(angles)) <= 25.0 + 1.0e-4
 
 
+def test_native_3d_trace2cp_angle_step_candidates_are_deterministic_and_bounded() -> None:
+    axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    candidates_a = generate_cone_candidates_by_angle_step(
+        axis,
+        max_angle_degrees=25.0,
+        angle_step_degrees=5.0,
+    )
+    candidates_b = generate_cone_candidates_by_angle_step(
+        axis,
+        max_angle_degrees=25.0,
+        angle_step_degrees=5.0,
+    )
+
+    assert np.allclose(candidates_a, candidates_b)
+    assert candidates_a.shape == (81, 3)
+    assert np.allclose(candidates_a[0], axis)
+    assert np.allclose(np.linalg.norm(candidates_a, axis=1), 1.0, atol=1.0e-5)
+    angles = np.rad2deg(np.arccos(np.clip(candidates_a @ axis, -1.0, 1.0)))
+    assert float(np.max(angles)) <= 25.0 + 1.0e-4
+
+
 def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().inference_patch_shape_zyx == (64, 64, 64)
     assert NativeTrace2CpConfig().cone_grid_size == 25
+    assert NativeTrace2CpConfig().cone_angle_step_degrees == 5.0
+    assert NativeTrace2CpConfig().beam_width == 8
+    assert NativeTrace2CpConfig().beam_prune_distance_voxels == 1.0
     assert NativeTrace2CpConfig().max_step_factor == 3.0
     assert NativeTrace2CpConfig().max_steps is None
     assert NativeTrace2CpConfig().smoothness_weight == 2.0
@@ -2624,6 +2649,76 @@ def test_native_3d_trace2cp_first_step_uses_supplied_line_tangent() -> None:
 
     assert result.reason == "trace_step_limit"
     assert np.allclose(result.trace_zyx[1], [0.0, 0.0, 2.0])
+
+
+def test_native_3d_trace2cp_beam_keeps_initially_worse_valid_path() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point(self, point_zyx: np.ndarray):
+            point = np.asarray(point_zyx, dtype=np.float32)
+            radial_offset = float(np.linalg.norm(point[:2]))
+            if float(point[2]) > 0.5 and radial_offset < 0.1:
+                return (
+                    np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+                    0.0,
+                    False,
+                )
+            return (
+                np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+                1.0,
+                True,
+            )
+
+        def sample_points_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            count = int(points.shape[0])
+            directions = np.zeros((count, 3), dtype=np.float32)
+            directions[:, 2] = 1.0
+            radial_offset = np.linalg.norm(points[:, :2], axis=1)
+            presence = np.where(radial_offset < 0.1, 1.0, 0.8).astype(np.float32)
+            valid = np.ones((count,), dtype=bool)
+            return (
+                torch.as_tensor(directions, dtype=torch.float32),
+                torch.as_tensor(presence, dtype=torch.float32),
+                torch.as_tensor(valid, dtype=torch.bool),
+            )
+
+    kwargs = dict(
+        cache=FakeCache(),
+        start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        target_zyx=np.asarray([0.0, 0.0, 3.0], dtype=np.float32),
+        initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+    greedy = trace_native_3d_one_way(
+        **kwargs,
+        cfg=NativeTrace2CpConfig(
+            step_voxels=1.0,
+            cone_angle_degrees=25.0,
+            cone_angle_step_degrees=25.0,
+            beam_width=1,
+            trace_step_limit=6,
+            smoothness_weight=0.0,
+        ),
+    )
+    beam = trace_native_3d_one_way(
+        **kwargs,
+        cfg=NativeTrace2CpConfig(
+            step_voxels=1.0,
+            cone_angle_degrees=25.0,
+            cone_angle_step_degrees=25.0,
+            beam_width=2,
+            beam_prune_distance_voxels=0.0,
+            trace_step_limit=6,
+            smoothness_weight=0.0,
+        ),
+    )
+
+    assert not greedy.reached_target_plane
+    assert greedy.reason == "invalid_current_point"
+    assert beam.reached_target_plane
+    assert beam.reason == "target_plane"
+    assert np.max(np.linalg.norm(beam.trace_zyx[:, :2], axis=1)) > 0.1
 
 
 def test_native_3d_trace2cp_field_cache_rejects_nonblocking_sampler() -> None:

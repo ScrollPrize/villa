@@ -45,6 +45,9 @@ class NativeTrace2CpConfig:
     step_voxels: float = 4.0
     cone_angle_degrees: float = 25.0
     cone_grid_size: int = 25
+    cone_angle_step_degrees: float = 5.0
+    beam_width: int = 8
+    beam_prune_distance_voxels: float = 1.0
     smoothness_weight: float = 2.0
     smoothness_free_angle_degrees: float = 10.0
     max_step_factor: float = 3.0
@@ -143,6 +146,16 @@ class _NativeTrace2CpSelection:
     start_cp_index: int
     target_cp_index: int
     explicit_segment: bool
+
+
+@dataclass(frozen=True)
+class _NativeBeamNode:
+    point_zyx: np.ndarray
+    previous_direction_zyx: np.ndarray
+    parent: "_NativeBeamNode | None"
+    step: NativeTraceStep | None
+    cumulative_loss: float
+    depth: int
 
 
 def _native_trace2cp_whole_fiber_mode(
@@ -277,6 +290,62 @@ def generate_cone_candidates(
         ]
     )
     return directions[order].astype(np.float32, copy=False)
+
+
+def generate_cone_candidates_by_angle_step(
+    axis_zyx: np.ndarray,
+    *,
+    max_angle_degrees: float,
+    angle_step_degrees: float = 5.0,
+) -> np.ndarray:
+    """Generate deterministic unit candidate directions by angular tangent steps."""
+
+    axis = _unit(axis_zyx)
+    max_angle = max(0.0, float(max_angle_degrees))
+    step = float(angle_step_degrees)
+    if not math.isfinite(step) or step <= 0.0:
+        raise ValueError("angle_step_degrees must be positive")
+    if max_angle <= 0.0:
+        return axis.reshape(1, 3).astype(np.float32)
+    b0, b1 = _orthonormal_basis(axis)
+    max_steps = int(math.floor(max_angle / step + 1.0e-6))
+    values = np.arange(-max_steps, max_steps + 1, dtype=np.float32) * np.float32(step)
+    uu, vv = np.meshgrid(values, values, indexing="xy")
+    u_deg = uu.reshape(-1).astype(np.float32)
+    v_deg = vv.reshape(-1).astype(np.float32)
+    radius2 = u_deg * u_deg + v_deg * v_deg
+    keep = radius2 <= np.float32(max_angle * max_angle + 1.0e-5)
+    u_deg = u_deg[keep]
+    v_deg = v_deg[keep]
+    radius2 = radius2[keep]
+    if not np.any((u_deg == 0.0) & (v_deg == 0.0)):
+        u_deg = np.concatenate([np.asarray([0.0], dtype=np.float32), u_deg])
+        v_deg = np.concatenate([np.asarray([0.0], dtype=np.float32), v_deg])
+        radius2 = np.concatenate([np.asarray([0.0], dtype=np.float32), radius2])
+    u = np.tan(np.deg2rad(u_deg.astype(np.float64))).astype(np.float32)
+    v = np.tan(np.deg2rad(v_deg.astype(np.float64))).astype(np.float32)
+    directions = axis[None, :] + u[:, None] * b0[None, :] + v[:, None] * b1[None, :]
+    norms = np.linalg.norm(directions, axis=1, keepdims=True)
+    directions = directions / np.maximum(norms, np.float32(_EPS))
+    order = np.lexsort((v_deg, u_deg, radius2))
+    return directions[order].astype(np.float32, copy=False)
+
+
+def _trace_candidate_directions(
+    axis_zyx: np.ndarray,
+    cfg: NativeTrace2CpConfig,
+) -> np.ndarray:
+    if float(cfg.cone_angle_step_degrees) > 0.0:
+        return generate_cone_candidates_by_angle_step(
+            axis_zyx,
+            max_angle_degrees=float(cfg.cone_angle_degrees),
+            angle_step_degrees=float(cfg.cone_angle_step_degrees),
+        )
+    return generate_cone_candidates(
+        axis_zyx,
+        max_angle_degrees=float(cfg.cone_angle_degrees),
+        grid_size=int(cfg.cone_grid_size),
+    )
 
 
 def _grid_sample_channels_at_points(
@@ -828,7 +897,7 @@ def _emit_native_progress(
     )
 
 
-def _score_candidate_batch(
+def _score_candidate_loss_tensors(
     cache: NativeTraceFieldCache,
     *,
     current_direction: np.ndarray,
@@ -837,7 +906,7 @@ def _score_candidate_batch(
     next_points: np.ndarray,
     smoothness_weight: float = 2.0,
     smoothness_free_angle_degrees: float = 10.0,
-) -> tuple[int | None, float, float, float, float, int]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     if not math.isfinite(float(smoothness_weight)) or float(smoothness_weight) < 0.0:
         raise ValueError("smoothness_weight must be finite and non-negative")
     if (
@@ -897,6 +966,36 @@ def _score_candidate_batch(
     candidate_valid = valid_choices.any(dim=1)
     valid_count = int(torch.count_nonzero(candidate_valid).detach().cpu())
     rejected = int(candidate_valid.numel()) - valid_count
+    return total_loss, direction_loss, presence_loss, smoothness_loss, candidate_valid, rejected
+
+
+def _score_candidate_batch(
+    cache: NativeTraceFieldCache,
+    *,
+    current_direction: np.ndarray,
+    previous_step_direction: np.ndarray,
+    candidate_directions: np.ndarray,
+    next_points: np.ndarray,
+    smoothness_weight: float = 2.0,
+    smoothness_free_angle_degrees: float = 10.0,
+) -> tuple[int | None, float, float, float, float, int]:
+    (
+        total_loss,
+        direction_loss,
+        presence_loss,
+        smoothness_loss,
+        candidate_valid,
+        rejected,
+    ) = _score_candidate_loss_tensors(
+        cache,
+        current_direction=current_direction,
+        previous_step_direction=previous_step_direction,
+        candidate_directions=candidate_directions,
+        next_points=next_points,
+        smoothness_weight=smoothness_weight,
+        smoothness_free_angle_degrees=smoothness_free_angle_degrees,
+    )
+    valid_count = int(torch.count_nonzero(candidate_valid).detach().cpu())
     if valid_count == 0:
         return None, math.inf, math.inf, math.inf, math.inf, rejected
     best_flat_index = int(torch.argmin(total_loss.reshape(-1)).detach().cpu())
@@ -1012,7 +1111,7 @@ def _fiber_line_tangent_zyx_toward_target(
     )
 
 
-def trace_native_3d_one_way(
+def _trace_native_3d_one_way_greedy(
     cache: NativeTraceFieldCache,
     *,
     start_zyx: np.ndarray,
@@ -1085,11 +1184,6 @@ def trace_native_3d_one_way(
         label="native 3D Trace2CP initial_direction_zyx",
     )
     previous_direction = initial_direction.astype(np.float32, copy=False)
-    candidates_unit = generate_cone_candidates(
-        previous_direction,
-        max_angle_degrees=cfg.cone_angle_degrees,
-        grid_size=cfg.cone_grid_size,
-    )
     trace: list[np.ndarray] = [start.astype(np.float32)]
     steps: list[NativeTraceStep] = []
     current = start.astype(np.float32)
@@ -1115,13 +1209,7 @@ def trace_native_3d_one_way(
             current_direction = initial_direction.astype(np.float32, copy=False)
         else:
             current_direction = _align_axis(sampled_direction, previous_direction)
-        candidates = generate_cone_candidates(
-            current_direction,
-            max_angle_degrees=cfg.cone_angle_degrees,
-            grid_size=cfg.cone_grid_size,
-        )
-        if candidates.shape == candidates_unit.shape:
-            candidates_unit = candidates
+        candidates_unit = _trace_candidate_directions(current_direction, cfg)
         next_points = current[None, :] + candidates_unit * np.float32(cfg.step_voxels)
         best_index, _total, direction_loss, presence_loss, smoothness_loss, rejected = (
             _score_candidate_batch(
@@ -1189,6 +1277,304 @@ def trace_native_3d_one_way(
         reached_target_plane=False,
         reason=limit_reason,
         steps=tuple(steps),
+    )
+
+
+def _beam_node_result(
+    node: _NativeBeamNode,
+    *,
+    reached_target_plane: bool,
+    reason: str,
+) -> NativeTraceResult:
+    nodes: list[_NativeBeamNode] = []
+    current: _NativeBeamNode | None = node
+    while current is not None:
+        nodes.append(current)
+        current = current.parent
+    nodes.reverse()
+    trace = np.stack([np.asarray(item.point_zyx, dtype=np.float32) for item in nodes], axis=0)
+    steps = tuple(item.step for item in nodes[1:] if item.step is not None)
+    return NativeTraceResult(
+        trace_zyx=trace.astype(np.float32, copy=False),
+        reached_target_plane=bool(reached_target_plane),
+        reason=reason,
+        steps=steps,
+    )
+
+
+def _prune_native_beam_nodes(
+    nodes: list[_NativeBeamNode],
+    *,
+    beam_width: int,
+    prune_distance_voxels: float,
+) -> list[_NativeBeamNode]:
+    if not nodes:
+        return []
+    width = max(1, int(beam_width))
+    distance = max(0.0, float(prune_distance_voxels))
+    ordered = sorted(nodes, key=lambda item: (float(item.cumulative_loss), int(item.depth)))
+    kept: list[_NativeBeamNode] = []
+    for node in ordered:
+        if distance > 0.0 and any(
+            float(
+                np.linalg.norm(
+                    np.asarray(node.point_zyx, dtype=np.float64)
+                    - np.asarray(existing.point_zyx, dtype=np.float64)
+                )
+            )
+            < distance
+            for existing in kept
+        ):
+            continue
+        kept.append(node)
+        if len(kept) >= width:
+            break
+    if kept:
+        return kept
+    return ordered[:width]
+
+
+def _trace_native_3d_one_way_beam(
+    cache: NativeTraceFieldCache,
+    *,
+    start_zyx: np.ndarray,
+    target_zyx: np.ndarray,
+    initial_direction_zyx: np.ndarray,
+    cfg: NativeTrace2CpConfig,
+    target_plane_normal_zyx: np.ndarray | None = None,
+    budget_span_voxels: float | None = None,
+    progress_label: str | None = None,
+) -> NativeTraceResult:
+    start = np.asarray(start_zyx, dtype=np.float32)
+    target = np.asarray(target_zyx, dtype=np.float32)
+    plane_normal = (
+        _unit(target - start)
+        if target_plane_normal_zyx is None
+        else _require_unit(target_plane_normal_zyx, label="target_plane_normal_zyx")
+    )
+    span = float(np.linalg.norm(target - start))
+    if span <= _EPS:
+        raise ValueError("native 3D Trace2CP start and target CPs must differ")
+    budget_span = span if budget_span_voxels is None else float(budget_span_voxels)
+    if not math.isfinite(budget_span) or budget_span <= _EPS:
+        raise ValueError("budget_span_voxels must be positive when set")
+    beam_width = int(cfg.beam_width)
+    if beam_width <= 1:
+        raise ValueError("_trace_native_3d_one_way_beam requires beam_width > 1")
+    if not math.isfinite(float(cfg.beam_prune_distance_voxels)) or float(cfg.beam_prune_distance_voxels) < 0.0:
+        raise ValueError("beam_prune_distance_voxels must be finite and non-negative")
+    step_limit, limit_reason = _native_trace_step_limit(
+        span_voxels=budget_span,
+        cfg=cfg,
+    )
+    progress_max = max(1, step_limit)
+    last_progress_time = 0.0
+    trace_start_time = time.perf_counter()
+
+    def node_progress(point_zyx: np.ndarray) -> float:
+        return float(
+            np.dot(np.asarray(point_zyx, dtype=np.float32) - start, plane_normal)
+            / max(span, _EPS)
+        )
+
+    def emit_progress(
+        point_zyx: np.ndarray,
+        step: int,
+        *,
+        reason: str | None = None,
+        active_beams: int = 0,
+    ) -> None:
+        nonlocal last_progress_time
+        if progress_label is None:
+            return
+        now = time.perf_counter()
+        if reason is None and step > 0 and now - last_progress_time < 0.25:
+            return
+        last_progress_time = now
+        progress = float(np.clip(node_progress(point_zyx), 0.0, 1.0))
+        elapsed = max(0.0, now - trace_start_time)
+        eta = None if progress <= 1.0e-6 else elapsed * (1.0 - progress) / progress
+        bar_width = 24
+        filled = int(math.floor(bar_width * progress))
+        bar = "#" * filled + "-" * (bar_width - filled)
+        suffix = "" if reason is None else f" reason={reason}"
+        end = "\r" if reason is None else "\n"
+        print(
+            f"native trace {progress_label} [{bar}] "
+            f"{progress * 100.0:5.1f}% step={int(step)}/{progress_max} "
+            f"eta={_format_eta(eta)} blocks={len(cache._blocks)} "
+            f"beams={int(active_beams)}/{beam_width}{suffix}",
+            end=end,
+            flush=True,
+        )
+
+    emit_progress(start, 0, active_beams=1)
+    initial_sampled_direction, _presence, valid = _sample_trace_point_aligned(
+        cache,
+        start,
+        reference_direction_zyx=initial_direction_zyx,
+    )
+    if not valid:
+        raise ValueError(f"native 3D Trace2CP start point is invalid: {start.tolist()}")
+    _ = initial_sampled_direction
+    initial_direction = _require_unit(
+        initial_direction_zyx,
+        label="native 3D Trace2CP initial_direction_zyx",
+    )
+    start_node = _NativeBeamNode(
+        point_zyx=start.astype(np.float32),
+        previous_direction_zyx=initial_direction.astype(np.float32, copy=False),
+        parent=None,
+        step=None,
+        cumulative_loss=0.0,
+        depth=0,
+    )
+    live: list[_NativeBeamNode] = [start_node]
+    best_live = start_node
+    for step_index in range(step_limit):
+        children: list[_NativeBeamNode] = []
+        reached: list[_NativeBeamNode] = []
+        for state in live:
+            current = np.asarray(state.point_zyx, dtype=np.float32)
+            previous_direction = np.asarray(state.previous_direction_zyx, dtype=np.float32)
+            if state.depth == 0:
+                current_direction = initial_direction.astype(np.float32, copy=False)
+            else:
+                sampled_direction, _presence, valid = _sample_trace_point_aligned(
+                    cache,
+                    current,
+                    reference_direction_zyx=previous_direction,
+                )
+                if not valid:
+                    continue
+                current_direction = _align_axis(sampled_direction, previous_direction)
+            candidates_unit = _trace_candidate_directions(current_direction, cfg)
+            next_points = current[None, :] + candidates_unit * np.float32(cfg.step_voxels)
+            (
+                total_loss_t,
+                direction_loss_t,
+                presence_loss_t,
+                smoothness_loss_t,
+                candidate_valid_t,
+                rejected,
+            ) = _score_candidate_loss_tensors(
+                cache,
+                current_direction=current_direction,
+                previous_step_direction=previous_direction,
+                candidate_directions=candidates_unit,
+                next_points=next_points,
+                smoothness_weight=float(cfg.smoothness_weight),
+                smoothness_free_angle_degrees=float(cfg.smoothness_free_angle_degrees),
+            )
+            candidate_best_loss_t, candidate_best_branch_t = torch.min(total_loss_t, dim=1)
+            candidate_valid = (
+                candidate_valid_t
+                & torch.isfinite(candidate_best_loss_t)
+            ).detach().cpu().numpy().astype(bool)
+            if not bool(np.any(candidate_valid)):
+                continue
+            best_loss = candidate_best_loss_t.detach().cpu().numpy().astype(np.float64)
+            best_branch = candidate_best_branch_t.detach().cpu().numpy().astype(np.int64)
+            direction_loss = direction_loss_t.detach().cpu().numpy().astype(np.float64)
+            presence_loss = presence_loss_t.detach().cpu().numpy().astype(np.float64)
+            smoothness_loss = smoothness_loss_t.detach().cpu().numpy().astype(np.float64)
+            for candidate_index in np.flatnonzero(candidate_valid):
+                branch_index = int(best_branch[int(candidate_index)])
+                local_total = float(best_loss[int(candidate_index)])
+                if not math.isfinite(local_total):
+                    continue
+                chosen_direction = _align_axis(
+                    candidates_unit[int(candidate_index)],
+                    current_direction,
+                )
+                next_point = (
+                    current + chosen_direction * np.float32(cfg.step_voxels)
+                ).astype(np.float32)
+                crossing = _interpolate_plane_crossing(
+                    current,
+                    next_point,
+                    plane_point_zyx=target,
+                    plane_normal_zyx=plane_normal,
+                )
+                child_point = next_point if crossing is None else crossing.astype(np.float32)
+                child_step = NativeTraceStep(
+                    point_zyx=child_point.astype(np.float32),
+                    direction_loss=float(direction_loss[int(candidate_index), branch_index]),
+                    presence_loss=float(presence_loss[int(candidate_index), branch_index]),
+                    total_loss=local_total,
+                    rejected_candidates=int(rejected),
+                    smoothness_loss=float(smoothness_loss[int(candidate_index)]),
+                )
+                child = _NativeBeamNode(
+                    point_zyx=child_point.astype(np.float32),
+                    previous_direction_zyx=chosen_direction.astype(np.float32),
+                    parent=state,
+                    step=child_step,
+                    cumulative_loss=float(state.cumulative_loss) + local_total,
+                    depth=int(state.depth) + 1,
+                )
+                if crossing is None:
+                    children.append(child)
+                else:
+                    reached.append(child)
+        if reached:
+            best = min(reached, key=lambda item: (float(item.cumulative_loss), int(item.depth)))
+            emit_progress(best.point_zyx, step_index + 1, reason="target_plane", active_beams=len(live))
+            return _beam_node_result(best, reached_target_plane=True, reason="target_plane")
+        live = _prune_native_beam_nodes(
+            children,
+            beam_width=beam_width,
+            prune_distance_voxels=float(cfg.beam_prune_distance_voxels),
+        )
+        if not live:
+            emit_progress(best_live.point_zyx, step_index, reason="all_candidates_invalid", active_beams=0)
+            return _beam_node_result(
+                best_live,
+                reached_target_plane=False,
+                reason="all_candidates_invalid",
+            )
+        best_live = min(live, key=lambda item: (float(item.cumulative_loss), int(item.depth)))
+        progress_node = max(live, key=lambda item: node_progress(item.point_zyx))
+        emit_progress(progress_node.point_zyx, step_index + 1, active_beams=len(live))
+    emit_progress(best_live.point_zyx, progress_max, reason=limit_reason, active_beams=len(live))
+    return _beam_node_result(
+        best_live,
+        reached_target_plane=False,
+        reason=limit_reason,
+    )
+
+
+def trace_native_3d_one_way(
+    cache: NativeTraceFieldCache,
+    *,
+    start_zyx: np.ndarray,
+    target_zyx: np.ndarray,
+    initial_direction_zyx: np.ndarray,
+    cfg: NativeTrace2CpConfig,
+    target_plane_normal_zyx: np.ndarray | None = None,
+    budget_span_voxels: float | None = None,
+    progress_label: str | None = None,
+) -> NativeTraceResult:
+    if int(cfg.beam_width) <= 1:
+        return _trace_native_3d_one_way_greedy(
+            cache,
+            start_zyx=start_zyx,
+            target_zyx=target_zyx,
+            initial_direction_zyx=initial_direction_zyx,
+            cfg=cfg,
+            target_plane_normal_zyx=target_plane_normal_zyx,
+            budget_span_voxels=budget_span_voxels,
+            progress_label=progress_label,
+        )
+    return _trace_native_3d_one_way_beam(
+        cache,
+        start_zyx=start_zyx,
+        target_zyx=target_zyx,
+        initial_direction_zyx=initial_direction_zyx,
+        cfg=cfg,
+        target_plane_normal_zyx=target_plane_normal_zyx,
+        budget_span_voxels=budget_span_voxels,
+        progress_label=progress_label,
     )
 
 
@@ -2983,6 +3369,11 @@ def run_native_trace2cp(
             "native_trace2cp_fiber_restart_rate": float(whole.restart_rate),
             "whole_fiber_error_threshold_voxels": float(cfg.whole_fiber_error_threshold_voxels),
             "step_voxels": float(cfg.step_voxels),
+            "beam_width": int(cfg.beam_width),
+            "beam_prune_distance_voxels": float(cfg.beam_prune_distance_voxels),
+            "cone_angle_degrees": float(cfg.cone_angle_degrees),
+            "cone_angle_step_degrees": float(cfg.cone_angle_step_degrees),
+            "cone_grid_size": int(cfg.cone_grid_size),
             "max_step_factor": float(cfg.max_step_factor),
             "smoothness_weight": float(cfg.smoothness_weight),
             "smoothness_free_angle_degrees": float(cfg.smoothness_free_angle_degrees),
@@ -3102,6 +3493,11 @@ def run_native_trace2cp(
         "forward_steps": int(len(result.forward.steps)),
         "reverse_steps": int(len(result.reverse.steps)),
         "step_voxels": float(cfg.step_voxels),
+        "beam_width": int(cfg.beam_width),
+        "beam_prune_distance_voxels": float(cfg.beam_prune_distance_voxels),
+        "cone_angle_degrees": float(cfg.cone_angle_degrees),
+        "cone_angle_step_degrees": float(cfg.cone_angle_step_degrees),
+        "cone_grid_size": int(cfg.cone_grid_size),
         "max_step_factor": float(cfg.max_step_factor),
         "smoothness_weight": float(cfg.smoothness_weight),
         "smoothness_free_angle_degrees": float(cfg.smoothness_free_angle_degrees),
@@ -3166,6 +3562,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--step-voxels", type=float, default=4.0)
     parser.add_argument("--cone-angle-degrees", type=float, default=25.0)
     parser.add_argument("--cone-grid-size", type=int, default=25)
+    parser.add_argument("--cone-angle-step-degrees", type=float, default=5.0)
+    parser.add_argument("--beam-width", type=int, default=8)
+    parser.add_argument("--beam-prune-distance-voxels", type=float, default=1.0)
     parser.add_argument("--smoothness-weight", type=float, default=2.0)
     parser.add_argument("--smoothness-free-angle-degrees", type=float, default=10.0)
     parser.add_argument("--max-step-factor", type=float, default=3.0)
@@ -3188,6 +3587,9 @@ def main() -> None:
         step_voxels=float(args.step_voxels),
         cone_angle_degrees=float(args.cone_angle_degrees),
         cone_grid_size=int(args.cone_grid_size),
+        cone_angle_step_degrees=float(args.cone_angle_step_degrees),
+        beam_width=int(args.beam_width),
+        beam_prune_distance_voxels=float(args.beam_prune_distance_voxels),
         smoothness_weight=float(args.smoothness_weight),
         smoothness_free_angle_degrees=float(args.smoothness_free_angle_degrees),
         max_step_factor=float(args.max_step_factor),

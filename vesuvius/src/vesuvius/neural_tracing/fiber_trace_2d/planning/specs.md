@@ -397,16 +397,27 @@
   `ceil(max_step_factor * cp_distance_voxels / step_voxels)`, with
   `--max-step-factor 3.0`. `--max-steps N` is only an optional additional
   safety cap.
-- Native 3D candidate stepping samples a deterministic square angular grid
-  mapped onto the cone disk around the current inferred 3D direction. The
-  default candidate grid is `--cone-grid-size 25`, giving 625 candidates per
-  step. Ring/azimuth candidate generation is not supported.
-- Native 3D candidate selection is vectorized per trace step. Candidate points
+- Native 3D candidate stepping samples deterministic tangent-plane angular
+  offsets around the current inferred 3D direction. The default cone is
+  `--cone-angle-degrees 25.0` with `--cone-angle-step-degrees 5.0`, keeping
+  offsets inside the cone disk and always including the center direction. This
+  produces 81 candidates at the default settings. The legacy square-grid
+  generator is used only when `--cone-angle-step-degrees <= 0`, in which case
+  `--cone-grid-size` controls the grid. Ring/azimuth candidate generation is
+  not supported.
+- Native 3D Trace2CP uses beam search by default. `--beam-width 8` keeps
+  multiple cumulative candidate histories, `--beam-prune-distance-voxels 1.0`
+  merges near-duplicate live beam states, and `--beam-width 1` preserves the
+  previous greedy one-step-commit control flow. When target-plane candidates
+  are found, the reached beam with the lowest cumulative score is selected; if
+  no beam reaches the target plane before the step guard, the best live state is
+  returned with the same failure reason semantics as greedy tracing.
+- Native 3D candidate selection is vectorized per beam state. Candidate points
   are grouped by trusted inference block, sampled with batched `grid_sample`,
-  decoded with the analytic Lasagna 3x2 torch decoder, and scored as one tensor
-  batch. For multi-branch outputs, every candidate evaluates every branch at
-  the candidate point and uses the branch with the best score. Candidate
-  selection minimizes a cost. The base cost is
+  decoded with the analytic Lasagna 3x2 torch decoder, and scored as tensors.
+  For multi-branch outputs, every candidate evaluates every branch at the
+  candidate point and uses the branch with the best score. Candidate selection
+  minimizes a cost. The base cost is
   `1 - dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * candidate_presence`.
   Both sampled axes are sign-aligned to the candidate step direction before dot
   products are evaluated. Optional search smoothness adds

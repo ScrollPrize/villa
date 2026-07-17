@@ -2,6 +2,10 @@
 
 ## 2026-07-17
 
+- Changed native 3D Trace2CP to use beam search by default (`--beam-width 8`)
+  with explicit 5-degree cone candidate steps. `--beam-width 1` keeps greedy
+  tracing, and `--cone-angle-step-degrees <= 0` keeps the legacy
+  `--cone-grid-size` square-grid fallback.
 - Made native 3D Trace2CP branch-aware for grouped multi-direction checkpoints:
   inferred blocks decode all direction/presence branches, current-point lookup
   selects the branch best aligned with the previous trace step, and candidate
