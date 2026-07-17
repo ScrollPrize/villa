@@ -1002,9 +1002,10 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     #   (normals) the spiral radial covector at each sample is pulled back to scroll space via
     #             central-difference J^T (a normal is a covector, not a finite-length displacement)
     #             and matched in direction to the precomputed nx/ny scroll-space normal.
-    #   (spacing) [retired grad_mag ablation path; the default spacing loss is the SDT
-    #             crossing count in sdt_losses.py, and compute_spacing=False skips this
-    #             entirely] at each sample, shift inward and outward by dr_per_winding/2
+    #   (spacing) [the legacy dense_spacing_mode='grad_mag' objective, retained
+    #             unchanged for comparison/rollback; the production mode is the
+    #             'phase' bundle in sdt_losses.py, and compute_spacing=False skips
+    #             this entirely] at each sample, shift inward and outward by dr_per_winding/2
     #             along the spiral radial direction (so the two endpoints span exactly one
     #             winding in spiral space), map both endpoints to scroll space, and
     #             integrate the winding-density field (grad_mag, windings per voxel) along

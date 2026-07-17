@@ -243,11 +243,9 @@ def prepare_surf_sdt_volume(
     z_end,
     cache_directory,
     storage_backend='auto',
-    expected_kind='surf_sdt',
     workers=None,
 ):
-    """Resolve and validate a surf-SDT (or raw-surf fallback) store as a
-    mmap-served Lasagna input.
+    """Resolve and validate a surf-SDT store as a mmap-served Lasagna input.
 
     Geometry and encoding are read from the store's own metadata - never from
     ``normal_zarr_group``/``lasagna_scale``. The scale convention is working
@@ -272,48 +270,43 @@ def prepare_surf_sdt_volume(
             f'no OME multiscales scale for group {group_name!r} in {sdt_zarr_path}; '
             'the fitter refuses to infer the store geometry')
 
-    if expected_kind == 'surf_sdt':
-        if attrs.get('kind') != 'surf_sdt':
+    if attrs.get('kind') != 'surf_sdt':
+        raise RuntimeError(
+            f"{sdt_zarr_path} has kind={attrs.get('kind')!r}, expected 'surf_sdt'")
+    for key in ('unit_working_voxels', 'offset', 'cap_working_voxels'):
+        if key not in attrs:
+            raise RuntimeError(f'{sdt_zarr_path} is missing encoding attribute {key!r}')
+    unit = float(attrs['unit_working_voxels'])
+    offset = int(attrs['offset'])
+    cap = float(attrs['cap_working_voxels'])
+    declared = attrs.get('scale_vs_working')
+    if declared is not None:
+        declared = [declared] * 3 if np.isscalar(declared) else list(declared)
+        base_scale = [s / 2 ** _pyramid_level(attrs, group_name) for s in scale_zyx]
+        if any(abs(a - b) > 1e-6 for a, b in zip(base_scale, declared)):
+            print(f'WARNING: {sdt_zarr_path} attrs scale_vs_working {declared} does not '
+                  f'match the OME scale {scale_zyx} for group {group_name}')
+    # Coverage: the store is trusted only when it is stamped complete or its
+    # embedded built working-z ranges cover the requested fit range. The
+    # done_tiles sidecar is deliberately not consulted - it may not travel
+    # with the zarr.
+    if not attrs.get('complete', False):
+        ranges = attrs.get('built_z_ranges_working')
+        if not ranges and 'z_range_working' in attrs:
+            ranges = [attrs['z_range_working']]
+        if not ranges or not _merged_ranges_cover(ranges, z_begin, z_end):
             raise RuntimeError(
-                f"{sdt_zarr_path} has kind={attrs.get('kind')!r}, expected 'surf_sdt'")
-        for key in ('unit_working_voxels', 'offset', 'cap_working_voxels'):
-            if key not in attrs:
-                raise RuntimeError(f'{sdt_zarr_path} is missing encoding attribute {key!r}')
-        unit = float(attrs['unit_working_voxels'])
-        offset = int(attrs['offset'])
-        cap = float(attrs['cap_working_voxels'])
-        declared = attrs.get('scale_vs_working')
-        if declared is not None:
-            declared = [declared] * 3 if np.isscalar(declared) else list(declared)
-            base_scale = [s / 2 ** _pyramid_level(attrs, group_name) for s in scale_zyx]
-            if any(abs(a - b) > 1e-6 for a, b in zip(base_scale, declared)):
-                print(f'WARNING: {sdt_zarr_path} attrs scale_vs_working {declared} does not '
-                      f'match the OME scale {scale_zyx} for group {group_name}')
-        # Coverage: the store is trusted only when it is stamped complete or its
-        # embedded built working-z ranges cover the requested fit range. The
-        # done_tiles sidecar is deliberately not consulted - it may not travel
-        # with the zarr.
-        if not attrs.get('complete', False):
-            ranges = attrs.get('built_z_ranges_working')
-            if not ranges and 'z_range_working' in attrs:
-                ranges = [attrs['z_range_working']]
-            if not ranges or not _merged_ranges_cover(ranges, z_begin, z_end):
-                raise RuntimeError(
-                    f'{sdt_zarr_path} is not stamped complete and its built working-z ranges '
-                    f'{ranges!r} do not cover the fit range [{z_begin}, {z_end}); rebuild or '
-                    'extend the store (unbuilt tiles read as no-data and would silently '
-                    'disable the SDT losses there)')
-        volume_kind = 'sdt'
-    else:
-        # Raw-surf counting fallback: uint8 probability, no distance encoding.
-        unit, offset, cap = None, 128, None
-        volume_kind = 'surf'
+                f'{sdt_zarr_path} is not stamped complete and its built working-z ranges '
+                f'{ranges!r} do not cover the fit range [{z_begin}, {z_end}); rebuild or '
+                'extend the store (unbuilt tiles read as no-data and would silently '
+                'disable the SDT losses there)')
+    volume_kind = 'sdt'
 
     z_size = int(array.shape[0])
     z_lo = max(0, int(np.floor(z_begin / scale_zyx[0])))
     z_hi = min(z_size, int(np.ceil(z_end / scale_zyx[0])))
     if z_hi <= z_lo:
-        raise RuntimeError(f'{expected_kind} z-ROI [{z_lo}, {z_hi}) is empty (z size {z_size})')
+        raise RuntimeError(f'surf_sdt z-ROI [{z_lo}, {z_hi}) is empty (z size {z_size})')
 
     fingerprint = {
         'path': os.path.abspath(sdt_zarr_path),
@@ -337,18 +330,18 @@ def prepare_surf_sdt_volume(
     }
 
     from lasagna_mmap import prepare_scalar_mmap
-    progress = _TqdmSlabProgress(f'{expected_kind} mmap cache:')
+    progress = _TqdmSlabProgress('surf_sdt mmap cache:')
     try:
         store = prepare_scalar_mmap(
             array=array, source_path=sdt_zarr_path, group=group_name,
             z_lo=z_lo, z_hi=z_hi, coordinate_scale=list(scale_zyx),
-            cache_directory=cache_directory, kind=expected_kind,
+            cache_directory=cache_directory, kind='surf_sdt',
             extra_fingerprint={'encoding': [unit, offset, cap]},
             workers=workers, progress=progress,
         )
     finally:
         progress.close()
-    print(f'{expected_kind}: using mmap cache {store.directory} '
+    print(f'surf_sdt: using mmap cache {store.directory} '
           f'({np.prod(store.shape) / 1e9:.1f} GB, {store.worker_count} gather workers)')
     return {
         'backend': 'mmap',

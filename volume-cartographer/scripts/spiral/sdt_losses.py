@@ -1,18 +1,31 @@
-"""Surf-SDT-driven dense losses (docs/spiral_pred_dt_dense_spacing.md).
+"""Surf-SDT-driven dense losses: the ``phase`` dense-spacing bundle.
 
-Three pieces, all driven by one capped signed-distance store of the binarized
-surface prediction (positive outside, negative inside, encoded 0 = no-data):
+All components are driven by one capped signed-distance store of the
+binarized surface prediction (positive outside, negative inside, encoded
+0 = no-data). The ``phase`` bundle executes four independently weighted
+components (a zero sub-weight disables one component, it does not create
+another mode):
 
-- crossing-count spacing: a soft sheet-crossing count along the mapped
-  polyline between integer winding pairs (k, k + m), residual |count - m|;
-- attachment: smooth-L1 of the exterior distance at dense points on fitted
-  winding surfaces;
-- a detached endpoint support gate on the spacing loss with a nominal-mass
-  denominator floor, so spacing scales down (to a defined zero) when support
-  is scarce instead of collapsing back to an ordinary mean.
+- soft-sequence phase registration: complete SDT bands detected on an
+  extended ray are aligned to the ordered modeled-winding sequence with a
+  differentiable monotonic pair-HMM (``soft_alignment``), and the projected,
+  local-gap-normalized Huber residual is applied through the resulting match
+  probabilities;
+- crossing count: a soft sheet-crossing count over the central modeled
+  interval, residual |count - m|, sharing the phase rays' central samples;
+- native minimum spacing: a squared log-gap hinge as the exact-collapse
+  recovery barrier (``get_min_spacing_loss``);
+- SDT attachment: smooth-L1 of the exterior distance at dense points on
+  fitted winding surfaces (``get_dense_attachment_loss``).
 
-The spacing and attachment losses are independent: each has its own weight,
-sample count, and enablement, and neither reuses the other's sample points.
+Observation extraction is detached (rays, bands, reference gaps); only the
+sequence alignment and the modeled winding target positions are
+differentiable. The count loss keeps a detached endpoint support gate with a
+nominal-mass denominator floor, so it scales down (to a defined zero) when
+support is scarce instead of collapsing back to an ordinary mean.
+
+The legacy ``grad_mag`` density-integral objective lives unchanged in
+``losses.iter_lasagna_losses``.
 """
 
 import itertools
@@ -24,17 +37,13 @@ import torch.nn.functional as F
 
 from ddp_helpers import get_world_size, is_distributed
 from loss_maps import diagnostics_enabled, record_loss_samples
+from soft_alignment import soft_align_sequences
 
 
 # A sample is valid when the total trilinear weight of its valid corners is at
 # least this mass (weight mass, not corner count: four valid corners can carry
 # near-zero weight when the sample point sits in the invalid octant).
 MIN_VALID_CORNER_WEIGHT_MASS = 0.5
-
-# Raw-surf counting fallback: indicator temperature in raw uint8 units.
-# 128-centered soft counting was validated to measure identically to
-# threshold-150/200 hard counting (store re-measurement, 2026-07-16).
-SURF_INDICATOR_TEMPERATURE = 20.0
 
 _CORNER_OFFSETS = tuple(itertools.product((0, 1), repeat=3))
 
@@ -139,10 +148,8 @@ def sample_sdt_trilinear(sdt_volume, points_working_zyx):
     return value, sample_valid, values_u8
 
 
-def _inside_indicator(field_value, count_volume, s_count_wv):
-    if count_volume['kind'] == 'sdt':
-        return torch.sigmoid(-field_value / s_count_wv)
-    return torch.sigmoid(field_value / SURF_INDICATOR_TEMPERATURE)
+def _inside_indicator(field_value, s_count_wv):
+    return torch.sigmoid(-field_value / s_count_wv)
 
 
 def _saturation_threshold(sdt_volume):
@@ -291,50 +298,23 @@ def sample_pair_polylines(
     }
 
 
-def compute_pair_counts(
-    slice_to_spiral_transform, dr_per_winding, count_volume, sdt_volume,
-    winding_idx, pair_m, theta, z, cfg,
-):
-    """Soft crossing counts along the mapped inter-winding polylines.
+def _pair_counts_from_samples(ray, field_value, sample_valid, sdt_volume, cfg):
+    """Count/support/validity for a sampled pair-polyline batch.
 
-    Shared by the training loss and the per-pair aggregation diagnostic. Each
-    pair (k, k + m) at (z, theta) becomes a radial segment in spiral space,
-    inverse-mapped as a full polyline (never the endpoint chord). Each
-    constituent winding gap gets its own detached length estimate and step
-    allocation targeting ~1 working voxel between mapped samples, so one
-    unusually wide gap is not undersampled because its neighbours are short.
-    Pairs whose required step count exceeds dense_spacing_max_steps, or whose
-    mapped adjacent samples still exceed dense_spacing_max_step_wv, are marked
-    invalid and reported - they are never evaluated at a spacing that could
-    step over a sheet.
-
-    Returns a dict of per-pair tensors: count (differentiable), residual
-    target m, seg_valid, support (detached), too_long, step_violation, plus
-    the flat sampled field for diagnostics.
+    Shared by :func:`compute_pair_counts` (which builds its own rays) and the
+    phase bundle (which reuses the shared central-ray samples). ``field_value``
+    stays differentiable through the count; support is detached.
     """
-    device = z.device
-    num_pairs = winding_idx.shape[0]
-    dr = dr_per_winding.detach()
-
-    s_count = float(cfg['dense_spacing_count_temperature_wv'])
-    sin_t, cos_t = torch.sin(theta), torch.cos(theta)
-    m_f = pair_m.to(torch.float32)
-    r0 = (winding_idx + theta / (2 * np.pi)) * dr
-    r1 = r0 + m_f * dr
-    ray = sample_pair_polylines(
-        slice_to_spiral_transform, dr_per_winding, winding_idx,
-        winding_idx + m_f, theta, z, cfg)
-    scroll_poly = ray['scroll_poly']
+    device = field_value.device
+    num_pairs = ray['too_long'].shape[0]
     pair_id = ray['pair_id']
     offsets = ray['offsets']
-    samples_per_pair = ray['samples_per_pair']
     has_successor = ray['has_successor']
     too_long = ray['too_long']
     step_violation = ray['step_violation']
+    s_count = float(cfg['dense_spacing_count_temperature_wv'])
 
-    field_value, sample_valid, _ = sample_sdt_trilinear(count_volume, scroll_poly)
-    indicator = _inside_indicator(field_value, count_volume, s_count)
-
+    indicator = _inside_indicator(field_value, s_count)
     diffs = (indicator[1:] - indicator[:-1]).abs()
     diffs = diffs * has_successor[:-1].to(diffs.dtype)
     count = 0.5 * torch.zeros(num_pairs, device=device, dtype=diffs.dtype).index_add_(
@@ -345,14 +325,12 @@ def compute_pair_counts(
     valid_samples_per_pair = torch.zeros(
         num_pairs, device=device, dtype=torch.long).index_add_(
         0, pair_id, sample_valid.to(torch.long))
-    all_samples_valid = valid_samples_per_pair == samples_per_pair
+    all_samples_valid = valid_samples_per_pair == ray['samples_per_pair']
     seg_valid = all_samples_valid & ~too_long & ~step_violation
 
     # Detached endpoint support from the SDT's exterior distance. stop_gradient
     # is required: otherwise the optimiser can lower spacing loss by moving
-    # away from the predicted sheets and eroding its own support. Skipped
-    # entirely when the gate is off - with a separate count source that would
-    # otherwise cost a second full store gather per step.
+    # away from the predicted sheets and eroding its own support.
     first = offsets[:-1]
     last = offsets[1:] - 1
     with torch.no_grad():
@@ -360,15 +338,8 @@ def compute_pair_counts(
         if sdt_volume is None or not cfg['dense_spacing_use_support_gate']:
             support = torch.ones(num_pairs, device=device)
         else:
-            if sdt_volume is count_volume:
-                sd_first, sd_last = field_value[first], field_value[last]
-                valid_first, valid_last = sample_valid[first], sample_valid[last]
-            else:
-                endpoint_points = torch.cat(
-                    [scroll_poly[first], scroll_poly[last]], dim=0).detach()
-                sd_e, valid_e, _ = sample_sdt_trilinear(sdt_volume, endpoint_points)
-                sd_first, sd_last = sd_e[:num_pairs], sd_e[num_pairs:]
-                valid_first, valid_last = valid_e[:num_pairs], valid_e[num_pairs:]
+            sd_first, sd_last = field_value[first], field_value[last]
+            valid_first, valid_last = sample_valid[first], sample_valid[last]
             support_first = torch.exp(-(F.relu(sd_first) / sigma) ** 2)
             support_last = torch.exp(-(F.relu(sd_last) / sigma) ** 2)
             if cfg['dense_spacing_support_policy'] == 'minimum':
@@ -379,143 +350,50 @@ def compute_pair_counts(
 
     return {
         'count': count,
-        'target_m': m_f,
         'seg_valid': seg_valid,
         'support': support,
         'too_long': too_long,
         'step_violation': step_violation,
         'field_value': field_value,
         'sample_valid': sample_valid,
-        'r_mid': (r0 + r1) / 2,
     }
 
 
-def get_crossing_count_spacing_loss(
-    slice_to_spiral_transform, dr_per_winding, count_volume, sdt_volume,
-    outer_winding_idx, cfg, z_begin, z_end,
+def compute_pair_counts(
+    slice_to_spiral_transform, dr_per_winding, sdt_volume,
+    winding_idx, pair_m, theta, z, cfg,
 ):
-    """Support-gated soft crossing-count spacing loss.
+    """Soft crossing counts along the mapped inter-winding polylines.
 
-    L = sum(w * |count - m|) / max(sum(w), alpha * num_pairs): the nominal-mass
-    floor makes the loss scale down (reaching a defined zero) when total
-    support falls below alpha of the batch, instead of a scale-invariant
-    weighted mean that would fire at full strength on uniformly tiny support.
-    Deliberately, well-supported pairs are diluted in sparse-support batches -
-    spacing must not dominate when support is scarce.
+    Shared by the count-only supplement and the per-pair aggregation
+    diagnostic. Each pair (k, k + m) at (z, theta) becomes a radial segment in
+    spiral space, inverse-mapped as a full polyline (never the endpoint
+    chord). Each constituent winding gap gets its own detached length estimate
+    and step allocation targeting ~1 working voxel between mapped samples, so
+    one unusually wide gap is not undersampled because its neighbours are
+    short. Pairs whose required step count exceeds dense_spacing_max_steps, or
+    whose mapped adjacent samples still exceed dense_spacing_max_step_wv, are
+    marked invalid and reported - they are never evaluated at a spacing that
+    could step over a sheet.
+
+    Returns a dict of per-pair tensors: count (differentiable), residual
+    target m, seg_valid, support (detached), too_long, step_violation, plus
+    the flat sampled field for diagnostics.
     """
-    device = dr_per_winding.device
-    zero = torch.zeros([], device=device)
-    if count_volume is None or outer_winding_idx is None:
-        return zero, {}
-
-    num_pairs = int(cfg['dense_spacing_num_pairs'])
-    inner_winding, outer_winding = fitted_winding_domain(outer_winding_idx)
-    domain_span = outer_winding - inner_winding
-    if domain_span < 1:
-        return zero, {}
-    # m is a two-range mixture biased short: most pairs span a few windings
-    # (localized residuals, cheap rays), the rest reach further so rays can
-    # straddle wide unsupported regions. Both ranges are clamped so every
-    # sampled pair keeps both windings inside the fitted domain
-    # (k >= inner and k + m <= outer).
-    def clamped_m_range(bounds):
-        hi = min(int(bounds[1]), domain_span)
-        lo = min(max(1, int(bounds[0])), hi)
-        return lo, hi
-
-    short_lo, short_hi = clamped_m_range(cfg['dense_spacing_pair_m_short'])
-    long_lo, long_hi = clamped_m_range(cfg['dense_spacing_pair_m_long'])
-    long_fraction = float(cfg['dense_spacing_pair_long_fraction'])
-    short_m = torch.randint(short_lo, short_hi + 1, [num_pairs], device=device)
-    long_m = torch.randint(long_lo, long_hi + 1, [num_pairs], device=device)
-    use_long = torch.rand(num_pairs, device=device) < long_fraction
-    pair_m = torch.where(use_long, long_m, short_m)
-    highest_k = (outer_winding - pair_m).to(torch.float32)
-    winding_idx = _sample_windings_by_circumference(
-        inner_winding, highest_k, num_pairs, device)
-    theta = torch.rand(num_pairs, device=device) * (2 * np.pi)
-    z = torch.empty(num_pairs, device=device).uniform_(float(z_begin), float(z_end - 1))
-
-    pair = compute_pair_counts(
-        slice_to_spiral_transform, dr_per_winding, count_volume, sdt_volume,
-        winding_idx, pair_m, theta, z, cfg)
-
-    # `support` is all-ones when the gate is disabled (compute_pair_counts
-    # skips the endpoint sampling entirely then).
-    weight = (pair['support'] * pair['seg_valid'].to(torch.float32)).detach()
-
-    residual = (pair['count'] - pair['target_m']).abs()
-    numerator = (weight * residual).sum()
-    stats = torch.stack([
-        weight.sum(), torch.tensor(float(num_pairs), device=device)])
-    world_size = 1
-    if is_distributed() and torch.is_grad_enabled():
-        # The all-reduce makes the nominal-mass floor global. It must never
-        # run on the no-grad preview/diagnostic path, which executes on the
-        # publishing rank only - an unmatched collective would deadlock the
-        # other ranks.
-        import torch.distributed as dist
-        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-        world_size = get_world_size()
-    support_mass, nominal = stats[0], stats[1]
-    alpha = float(cfg['dense_spacing_support_floor_alpha'])
-    denominator = torch.maximum(support_mass, alpha * nominal)
-    # Gradients are averaged across ranks; scaling each rank's local numerator
-    # by world size makes that average equal the intended global
-    # sum(w * r) / max(sum(w), alpha * N) semantics.
-    loss = world_size * numerator / denominator
-
-    with torch.no_grad():
-        # One stacked device->host transfer for all scalar diagnostics; a
-        # per-metric .item() would serialize ~10 GPU syncs per step.
-        valid_f = pair['seg_valid'].to(torch.float32)
-        n_valid = valid_f.sum()
-        n_valid_floor = n_valid.clamp(min=1.0)
-        (mass_value, nominal_value, valid_fraction, too_long_fraction,
-         step_violation_fraction, count_mean, residual_mean, n_valid_value) = torch.stack([
-            support_mass,
-            nominal,
-            valid_f.mean(),
-            pair['too_long'].to(torch.float32).mean(),
-            pair['step_violation'].to(torch.float32).mean(),
-            (pair['count'] * valid_f).sum() / n_valid_floor,
-            (residual * valid_f).sum() / n_valid_floor,
-            n_valid,
-        ]).tolist()
-        floor_active = mass_value < alpha * nominal_value
-        mass_fraction = mass_value / max(1.0, nominal_value)
-        metrics = {
-            'dense_spacing_support_mass': mass_value,
-            'dense_spacing_support_mass_fraction': mass_fraction,
-            'dense_spacing_floor_active': float(floor_active),
-            'dense_spacing_valid_fraction': valid_fraction,
-            'dense_spacing_too_long_fraction': too_long_fraction,
-            'dense_spacing_step_violation_fraction': step_violation_fraction,
-        }
-        if n_valid_value > 0:
-            metrics['dense_spacing_count_mean'] = count_mean
-            metrics['dense_spacing_count_residual_mean'] = residual_mean
-        metrics.update({
-            f'dense_spacing_sdt_{name}': value
-            for name, value in sdt_sample_fractions(
-                pair['field_value'], pair['sample_valid'], count_volume).items()
-        })
-        global _floor_was_active
-        if floor_active and not _floor_was_active:
-            print('dense_spacing: support-mass floor active '
-                  f'(mass fraction {mass_fraction:.4f} < alpha {alpha}); '
-                  'the spacing loss is effectively scaled down until support recovers')
-        elif _floor_was_active and not floor_active:
-            print('dense_spacing: support-mass floor released '
-                  f'(mass fraction {mass_fraction:.4f} >= alpha {alpha})')
-        _floor_was_active = floor_active
-
-    spiral_mid = torch.stack([
-        z, torch.sin(theta) * pair['r_mid'], torch.cos(theta) * pair['r_mid'],
-    ], dim=-1)
-    record_loss_samples('dense_spacing', spiral_mid, residual, weight > 0)
-
-    return loss, metrics
+    dr = dr_per_winding.detach()
+    m_f = pair_m.to(torch.float32)
+    r0 = (winding_idx + theta / (2 * np.pi)) * dr
+    r1 = r0 + m_f * dr
+    ray = sample_pair_polylines(
+        slice_to_spiral_transform, dr_per_winding, winding_idx,
+        winding_idx + m_f, theta, z, cfg)
+    field_value, sample_valid, _ = sample_sdt_trilinear(
+        sdt_volume, ray['scroll_poly'])
+    result = _pair_counts_from_samples(
+        ray, field_value, sample_valid, sdt_volume, cfg)
+    result['target_m'] = m_f
+    result['r_mid'] = (r0 + r1) / 2
+    return result
 
 
 def sample_lasagna_normals_nearest(lasagna_volume, points_working_zyx):
@@ -569,8 +447,13 @@ def _interpolate_at_global_arclength(ray, global_arc, target_global_arc):
 
 
 @torch.no_grad()
-def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
+def detect_complete_sdt_bands(ray, field, sample_valid, normal_volume, cfg):
     """Detect detached complete outside->inside->outside SDT intervals.
+
+    ``ray`` is a detection view: packed ``scroll_poly`` / ``sample_phase`` /
+    ``pair_id`` / ``has_successor`` tensors plus ``num_pairs``. ``field`` and
+    ``sample_valid`` are the precomputed (detached) SDT samples at the view's
+    points, so central samples shared with the count loss are gathered once.
 
     Leading/trailing partial intervals are never closed at ray endpoints. The
     returned packed band tensors are ordered by pair then outward arclength.
@@ -578,9 +461,7 @@ def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
     scroll = ray['scroll_poly']
     pair_id = ray['pair_id']
     has_successor = ray['has_successor']
-    sdt_started = time.perf_counter()
-    field, sample_valid, _ = sample_sdt_trilinear(sdt_volume, scroll)
-    sdt_sample_seconds = time.perf_counter() - sdt_started
+    field = field.detach()
     normal_gather_seconds = 0.0
     edge_valid = has_successor[:-1] & sample_valid[:-1] & sample_valid[1:]
     inside = field < 0
@@ -598,7 +479,6 @@ def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
             'ambiguous': empty.bool(), 'interior_invalid': empty.bool(),
             'unsupported_before': empty.bool(), 'merged_count': 0,
             'field_value': field, 'sample_valid': sample_valid,
-            'sdt_sample_seconds': sdt_sample_seconds,
             'normal_gather_seconds': normal_gather_seconds,
         }
 
@@ -624,7 +504,6 @@ def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
             'ambiguous': empty.bool(), 'interior_invalid': empty.bool(),
             'unsupported_before': empty.bool(), 'merged_count': 0,
             'field_value': field, 'sample_valid': sample_valid,
-            'sdt_sample_seconds': sdt_sample_seconds,
             'normal_gather_seconds': normal_gather_seconds,
         }
 
@@ -719,7 +598,7 @@ def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
             entry_arc, exit_arc)
 
     counts = torch.zeros(
-        ray['too_long'].numel(), dtype=torch.long, device=field.device)
+        int(ray['num_pairs']), dtype=torch.long, device=field.device)
     counts.index_add_(0, band_pair, torch.ones_like(band_pair))
     band_offsets = F.pad(counts.cumsum(0), (1, 0))
     ordinal = torch.arange(band_pair.numel(), device=field.device) - band_offsets[band_pair]
@@ -736,38 +615,8 @@ def detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg):
         'unsupported_before': unsupported_before,
         'merged_count': merged_count, 'field_value': field,
         'sample_valid': sample_valid,
-        'sdt_sample_seconds': sdt_sample_seconds,
         'normal_gather_seconds': normal_gather_seconds,
     }
-
-
-def _select_nearest_band(bands, target_phase, num_pairs, margin, max_distance):
-    device = target_phase.device
-    pair = bands['pair_id']
-    inf = torch.tensor(float('inf'), device=device)
-    minimum = torch.full([num_pairs], float('inf'), device=device)
-    if pair.numel():
-        distance = (bands['phase'] - target_phase[pair]).abs()
-        minimum.scatter_reduce_(0, pair, distance, reduce='amin', include_self=True)
-        flat_index = torch.arange(pair.numel(), device=device)
-        candidate = torch.full(
-            [num_pairs], pair.numel(), dtype=torch.long, device=device)
-        is_min = distance == minimum[pair]
-        candidate.scatter_reduce_(
-            0, pair[is_min], flat_index[is_min], reduce='amin', include_self=True)
-        safe_candidate = candidate.clamp(max=max(0, pair.numel() - 1))
-        second_values = torch.where(
-            flat_index == safe_candidate[pair], inf, distance)
-        second = torch.full([num_pairs], float('inf'), device=device)
-        second.scatter_reduce_(
-            0, pair, second_values, reduce='amin', include_self=True)
-    else:
-        candidate = torch.zeros([num_pairs], dtype=torch.long, device=device)
-        second = minimum.clone()
-    no_band = ~torch.isfinite(minimum)
-    ambiguity = ~no_band & ((second - minimum) < margin)
-    too_far = ~no_band & (minimum > max_distance)
-    return candidate, minimum, second, no_band, ambiguity, too_far
 
 
 def _sample_spacing_pairs(
@@ -815,335 +664,645 @@ def _aggregate_nominal_mass(pair_loss, weight, alpha):
     return world_size * numerator / denominator, stats
 
 
-def get_phase_spacing_loss(
-    slice_to_spiral_transform, dr_per_winding, sdt_volume, normal_volume,
-    outer_winding_idx, cfg, z_begin, z_end, *, generator=None,
-):
-    """Single-ray complete-band phase registration loss and diagnostics."""
-    started = time.perf_counter()
-    device = dr_per_winding.device
-    zero = torch.zeros([], device=device)
-    if sdt_volume is None or normal_volume is None or outer_winding_idx is None:
-        return zero, {}
-    if sdt_volume['kind'] != 'sdt':
-        raise ValueError('phase spacing requires a signed-distance store')
-    num_pairs = int(cfg['dense_spacing_num_pairs'])
-    inner, outer = fitted_winding_domain(outer_winding_idx)
-    if outer - inner < 1:
-        return zero, {}
+def _phase_band_features(bands, num_pairs, device):
+    """Pack detected bands into padded per-ray tensors for the aligner.
 
-    k, pair_m, theta, z = _sample_spacing_pairs(
-        cfg, inner, outer, num_pairs, device, z_begin, z_end, generator)
-    extension = float(cfg['dense_spacing_phase_extension_windings'])
-    phase_start = (k - extension).clamp(min=float(inner))
-    phase_end = torch.minimum(
-        k + pair_m.to(k.dtype) + extension,
-        torch.full_like(k, float(outer)))
-    ray = sample_pair_polylines(
-        slice_to_spiral_transform, dr_per_winding, phase_start, phase_end,
-        theta, z, cfg, no_grad=True)
-    bands = detect_complete_sdt_bands(ray, sdt_volume, normal_volume, cfg)
+    All outputs are detached observations. The per-band local reference gap
+    is the minimum of the adjacent same-ray center distances - the minimum is
+    robust around insertions and deletions (the corrupted side is either
+    ignored or conservatively shrinks the gap, suppressing the band rather
+    than diluting the residual scale).
+    """
     pair = bands['pair_id']
     n_bands = pair.numel()
-    margin = float(cfg['dense_spacing_phase_anchor_margin'])
-    max_distance = float(cfg['dense_spacing_phase_anchor_max_distance'])
-    (anchor, anchor_distance, anchor_second_distance, no_band,
-     anchor_ambiguous, anchor_far) = _select_nearest_band(
-        bands, k, num_pairs, margin, max_distance)
-    (outer_candidate, outer_distance, outer_second_distance, outer_no_band,
-     outer_ambiguous, outer_far) = _select_nearest_band(
-        bands, k + pair_m, num_pairs, margin, max_distance)
-
-    ray_rejected = ray['too_long'] | ray['step_violation']
+    counts = torch.zeros(num_pairs, dtype=torch.long, device=device)
     if n_bands:
-        safe_anchor = anchor.clamp(max=n_bands - 1)
-        anchor_supported = (
-            bands['normal_valid'][safe_anchor] & ~bands['ambiguous'][safe_anchor])
-        anchor_supported &= ~no_band
-        anchor_ok = (
-            ~ray_rejected & ~no_band & ~anchor_ambiguous & ~anchor_far
-            & anchor_supported)
-        anchor_ordinal = bands['ordinal'][safe_anchor]
-        j = bands['ordinal'] - anchor_ordinal[pair]
-        outward = anchor_ok[pair] & (j >= 0)
+        counts.index_add_(0, pair, torch.ones_like(pair))
+    m_max = int(counts.max().item()) if n_bands else 0
+    features = {
+        'counts': counts,
+        'band_valid': torch.zeros(
+            [num_pairs, max(1, m_max)], dtype=torch.bool, device=device),
+        'phase': torch.zeros([num_pairs, max(1, m_max)], device=device),
+        'center': torch.zeros([num_pairs, max(1, m_max), 3], device=device),
+        'direction': torch.zeros(
+            [num_pairs, max(1, m_max), 3], device=device),
+        'gref': torch.ones([num_pairs, max(1, m_max)], device=device),
+        'matchable': torch.zeros(
+            [num_pairs, max(1, m_max)], dtype=torch.bool, device=device),
+        'confidence_cost': torch.zeros(
+            [num_pairs, max(1, m_max)], device=device),
+    }
+    if not n_bands:
+        return features
 
-        same_prev = torch.zeros(n_bands, dtype=torch.bool, device=device)
-        same_prev[1:] = pair[1:] == pair[:-1]
-        phase_gap = torch.zeros(n_bands, device=device)
-        phase_gap[1:] = bands['phase'][1:] - bands['phase'][:-1]
-        wide_before = same_prev & (
-            phase_gap >= float(cfg['dense_spacing_phase_censor_gap_windings']))
-        # Symmetric insertion guard: two detected bands within a fraction of a
-        # modeled winding claim more sheets than the model has windings there,
-        # and either band could be the spurious one. Unit enumeration would
-        # shift every later ordinal and bias all later residuals one direction,
-        # so censor from the FIRST band of the close pair (censoring is
-        # inclusive of the marked band) - the mirror of the wide-gap deletion
-        # rule, which censors from the band after the gap.
-        narrow_ahead = torch.zeros(n_bands, dtype=torch.bool, device=device)
-        narrow_ahead[:-1] = same_prev[1:] & (phase_gap[1:] <= float(
-            cfg['dense_spacing_phase_censor_min_gap_windings']))
-        graze = bands['graze']
-        bad_band = graze | ~bands['normal_valid'] | bands['ambiguous']
-        censor_here = outward & (
-            bad_band | narrow_ahead
-            | ((j > 0) & (wide_before | bands['unsupported_before'])))
-        censor_cumulative = censor_here.to(torch.long).cumsum(0)
-        before_anchor = torch.zeros(num_pairs, dtype=torch.long, device=device)
-        valid_anchor_indices = anchor_ok.nonzero(as_tuple=False).squeeze(-1)
-        if valid_anchor_indices.numel():
-            ai = anchor[valid_anchor_indices]
-            before_anchor[valid_anchor_indices] = torch.where(
-                ai > 0, censor_cumulative[(ai - 1).clamp(min=0)],
-                torch.zeros_like(ai))
-        censored_since_anchor = censor_cumulative - before_anchor[pair]
-        target_winding = k[pair] + j.to(k.dtype)
-        accepted = (
-            outward & (censored_since_anchor == 0)
-            & (target_winding >= inner) & (target_winding <= outer))
+    same_prev = torch.zeros(n_bands, dtype=torch.bool, device=device)
+    same_prev[1:] = pair[1:] == pair[:-1]
+    gap = torch.zeros(n_bands, device=device)
+    gap[1:] = bands['center_arc'][1:] - bands['center_arc'][:-1]
+    infinite = torch.full([n_bands], float('inf'), device=device)
+    left_gap = torch.where(same_prev, gap, infinite)
+    right_gap = infinite.clone()
+    right_gap[:-1] = torch.where(
+        same_prev[1:], gap[1:], infinite[:-1])
+    gref = torch.minimum(left_gap, right_gap)
+    has_reference = torch.isfinite(gref)
+    matchable = (
+        bands['normal_valid'] & ~bands['ambiguous'] & ~bands['graze']
+        & ~bands['unsupported_before'] & has_reference)
 
-        accepted_gap = torch.zeros(n_bands, dtype=torch.bool, device=device)
-        accepted_gap[1:] = (
-            accepted[1:] & accepted[:-1] & same_prev[1:]
-            & (j[1:] == j[:-1] + 1))
-        gap_length = torch.zeros(n_bands, device=device)
-        gap_length[1:] = bands['center_arc'][1:] - bands['center_arc'][:-1]
-        gref_sum = torch.zeros(n_bands, device=device)
-        gref_count = torch.zeros(n_bands, device=device)
-        gap_right = accepted_gap.nonzero(as_tuple=False).squeeze(-1)
-        if gap_right.numel():
-            lengths = gap_length[gap_right]
-            both = torch.cat([gap_right - 1, gap_right])
-            twice = torch.cat([lengths, lengths])
-            gref_sum.index_add_(0, both, twice)
-            gref_count.index_add_(0, both, torch.ones_like(twice))
-        gref = gref_sum / gref_count.clamp(min=1.0)
-        correspondence = accepted & (gref_count > 0)
-        corr_index = correspondence.nonzero(as_tuple=False).squeeze(-1)
-    else:
-        anchor_ok = torch.zeros(num_pairs, dtype=torch.bool, device=device)
-        outer_ambiguous = torch.zeros_like(anchor_ok)
-        outer_far = torch.zeros_like(anchor_ok)
-        outer_no_band = torch.ones_like(anchor_ok)
-        wide_before = narrow_ahead = graze = accepted = correspondence = torch.zeros(
-            [0], dtype=torch.bool, device=device)
-        j = torch.zeros([0], dtype=torch.long, device=device)
-        gref = torch.zeros([0], device=device)
-        corr_index = torch.zeros([0], dtype=torch.long, device=device)
+    slot = bands['ordinal']
+    features['band_valid'][pair, slot] = True
+    features['phase'][pair, slot] = bands['phase']
+    features['center'][pair, slot] = bands['center']
+    features['direction'][pair, slot] = bands['direction']
+    features['gref'][pair, slot] = torch.where(
+        has_reference, gref, torch.ones_like(gref)).clamp(min=1e-3)
+    features['matchable'][pair, slot] = matchable
+    features['confidence_cost'][pair, slot] = 1.0 - bands['normal_dot']
+    return features
 
-    pair_loss = torch.zeros(num_pairs, device=device)
-    pair_corr_count = torch.zeros(num_pairs, device=device)
-    rho = torch.zeros([corr_index.numel()], device=device)
-    model_physical_gaps = torch.zeros([0], device=device)
-    if corr_index.numel():
-        corr_pair = pair[corr_index]
-        corr_j = j[corr_index]
-        target_winding = k[corr_pair] + corr_j.to(k.dtype)
-        radius = (
-            target_winding + theta[corr_pair] / (2 * np.pi))
-        radius = radius * dr_per_winding.detach()
-        target_spiral = torch.stack([
-            z[corr_pair], torch.sin(theta[corr_pair]) * radius,
-            torch.cos(theta[corr_pair]) * radius,
-        ], dim=-1)
-        target_scroll = slice_to_spiral_transform.inv(target_spiral)
-        adjacent_target = torch.zeros(
-            corr_index.numel(), dtype=torch.bool, device=device)
-        adjacent_target[1:] = (
-            (corr_pair[1:] == corr_pair[:-1])
-            & (corr_j[1:] == corr_j[:-1] + 1))
-        model_physical_gaps = (
-            target_scroll[1:] - target_scroll[:-1]).norm(dim=-1)[
-                adjacent_target[1:]]
-        rho = (
-            (target_scroll - bands['center'][corr_index])
-            * bands['direction'][corr_index]).sum(dim=-1) / gref[corr_index]
-        residual = F.huber_loss(
-            rho, torch.zeros_like(rho), reduction='none',
-            delta=float(cfg['dense_spacing_phase_huber_delta']))
-        pair_loss.index_add_(0, corr_pair, residual)
-        pair_corr_count.index_add_(0, corr_pair, torch.ones_like(residual))
-        pair_loss = pair_loss / pair_corr_count.clamp(min=1.0)
-        if diagnostics_enabled():
-            with torch.no_grad():
-                detected_center_spiral = (
-                    slice_to_spiral_transform(bands['center'][corr_index])
-                    if callable(slice_to_spiral_transform) else target_spiral.detach())
-            record_loss_samples(
-                'dense_spacing_phase', detected_center_spiral, rho.abs(),
-                torch.ones_like(rho, dtype=torch.bool))
-    pair_weight = (anchor_ok & (pair_corr_count >= 2)).to(torch.float32).detach()
-    loss, mass_stats = _aggregate_nominal_mass(
-        pair_loss, pair_weight, cfg['dense_spacing_support_floor_alpha'])
+
+def _build_phase_padding(
+    slice_to_spiral_transform, dr_per_winding, sdt_volume, k, pair_m, theta,
+    z, inner_winding, outer_winding, cfg,
+):
+    """Map the detached extension pads flanking the central interval.
+
+    Pads exist only for band detection; they are mapped and sampled without
+    autograd. Rays whose pads are over budget keep their central samples (and
+    therefore their count validity) but are rejected for phase.
+    """
+    device = k.device
+    num_pairs = k.shape[0]
+    extension = float(cfg['dense_spacing_phase_extension_windings'])
+    m_f = pair_m.to(k.dtype)
+    inner_start = (k - extension).clamp(min=float(inner_winding))
+    outer_end = torch.minimum(
+        k + m_f + extension, torch.full_like(k, float(outer_winding)))
+    ray_index = torch.arange(num_pairs, device=device)
+    has_inner = (k - inner_start) > 1e-4
+    has_outer = (outer_end - (k + m_f)) > 1e-4
+    piece_start = torch.cat([inner_start[has_inner], (k + m_f)[has_outer]])
+    piece_end = torch.cat([k[has_inner], outer_end[has_outer]])
+    piece_ray = torch.cat([ray_index[has_inner], ray_index[has_outer]])
+    piece_is_inner = torch.cat([
+        torch.ones(int(has_inner.sum()), dtype=torch.bool, device=device),
+        torch.zeros(int(has_outer.sum()), dtype=torch.bool, device=device),
+    ])
+    pad_rejected = torch.zeros(num_pairs, dtype=torch.bool, device=device)
+    if piece_start.numel() == 0:
+        return None, pad_rejected, outer_end
+    with torch.no_grad():
+        pad_ray = sample_pair_polylines(
+            slice_to_spiral_transform, dr_per_winding, piece_start, piece_end,
+            theta[piece_ray], z[piece_ray], cfg, no_grad=True)
+        pad_field, pad_valid, _ = sample_sdt_trilinear(
+            sdt_volume, pad_ray['scroll_poly'])
+    rejected_piece = pad_ray['too_long'] | pad_ray['step_violation']
+    pad_rejected[piece_ray[rejected_piece]] = True
+    pads = {
+        'ray': pad_ray,
+        'field': pad_field,
+        'sample_valid': pad_valid,
+        'piece_ray': piece_ray,
+        'piece_is_inner': piece_is_inner,
+        'rejected_piece': rejected_piece,
+    }
+    return pads, pad_rejected, outer_end
+
+
+def _assemble_detection_view(central_ray, central_field, central_valid, pads):
+    """Concatenate detached pad + central samples into one detection view.
+
+    Per ray the view is [inner pad without its terminal sample, central
+    samples, outer pad without its first sample] so the shared endpoints at
+    phases k and k + m are not duplicated. Central values are detached copies
+    of the live count samples - the SDT is gathered once for both losses.
+    """
+    device = central_field.device
+    num_pairs = central_ray['too_long'].shape[0]
+    n_central = central_ray['samples_per_pair']
+    zeros = torch.zeros(num_pairs, dtype=torch.long, device=device)
+    n_inner = zeros.clone()
+    n_outer = zeros.clone()
+    if pads is not None:
+        piece_samples = pads['ray']['samples_per_pair']
+        usable = ~pads['rejected_piece']
+        contribution = torch.where(
+            usable, piece_samples - 1, torch.zeros_like(piece_samples))
+        n_inner.index_add_(
+            0, pads['piece_ray'][pads['piece_is_inner']],
+            contribution[pads['piece_is_inner']])
+        n_outer.index_add_(
+            0, pads['piece_ray'][~pads['piece_is_inner']],
+            contribution[~pads['piece_is_inner']])
+    totals = n_inner + n_central + n_outer
+    view_offsets = F.pad(totals.cumsum(0), (1, 0))
+    total = int(view_offsets[-1].item())
+    scroll = torch.zeros([total, 3], device=device)
+    phase = torch.zeros([total], device=device)
+    field = torch.zeros([total], device=device)
+    valid = torch.zeros([total], dtype=torch.bool, device=device)
+
+    central_pair = central_ray['pair_id']
+    central_dest = (view_offsets[central_pair] + n_inner[central_pair]
+                    + central_ray['position'])
+    scroll[central_dest] = central_ray['scroll_poly'].detach()
+    phase[central_dest] = central_ray['sample_phase'].detach()
+    field[central_dest] = central_field.detach()
+    valid[central_dest] = central_valid
+
+    if pads is not None:
+        pad_ray = pads['ray']
+        pid = pad_ray['pair_id']
+        pos = pad_ray['position']
+        usable = ~pads['rejected_piece']
+        ray_of = pads['piece_ray'][pid]
+        piece_samples = pad_ray['samples_per_pair']
+        inner_mask = (pads['piece_is_inner'][pid] & usable[pid]
+                      & (pos < piece_samples[pid] - 1))
+        outer_mask = (~pads['piece_is_inner'][pid] & usable[pid]
+                      & (pos >= 1))
+        inner_dest = view_offsets[ray_of] + pos
+        outer_dest = (view_offsets[ray_of] + n_inner[ray_of]
+                      + n_central[ray_of] + pos - 1)
+        for mask, dest in ((inner_mask, inner_dest), (outer_mask, outer_dest)):
+            index = dest[mask]
+            scroll[index] = pad_ray['scroll_poly'][mask]
+            phase[index] = pad_ray['sample_phase'][mask]
+            field[index] = pads['field'][mask]
+            valid[index] = pads['sample_valid'][mask]
+
+    view_pair = torch.repeat_interleave(
+        torch.arange(num_pairs, device=device), totals)
+    view_position = torch.arange(total, device=device) - view_offsets[view_pair]
+    has_successor = view_position < (totals[view_pair] - 1)
+    view = {
+        'scroll_poly': scroll,
+        'sample_phase': phase,
+        'pair_id': view_pair,
+        'has_successor': has_successor,
+        'num_pairs': num_pairs,
+    }
+    return view, field, valid
+
+
+def _phase_registration_loss(
+    slice_to_spiral_transform, dr_per_winding, view, view_field, view_valid,
+    normal_volume, k, pair_m, theta, z, phase_rejected, cfg, *,
+    compute_map_path=False,
+):
+    """Soft-sequence phase registration on detached detected bands.
+
+    The modeled winding targets (mapped through the live inverse transform)
+    and the sequence alignment are differentiable; band geometry, reference
+    gaps, and every gate/mass are detached, so the run cannot reduce its
+    objective by rotating observations or eroding its own confidence.
+    """
+    device = k.device
+    num_pairs = k.shape[0]
+    bands = detect_complete_sdt_bands(
+        view, view_field, view_valid, normal_volume, cfg)
+    features = _phase_band_features(bands, num_pairs, device)
+
+    n_max = int(pair_m.max().item()) + 1
+    offsets_i = torch.arange(n_max, device=device)
+    model_valid = offsets_i[None, :] <= pair_m[:, None]
+    winding = k[:, None] + offsets_i[None, :].to(k.dtype)
+    radius = (winding + (theta / (2 * np.pi))[:, None]) * dr_per_winding.detach()
+    spiral = torch.stack([
+        z[:, None].expand_as(radius),
+        torch.sin(theta)[:, None] * radius,
+        torch.cos(theta)[:, None] * radius,
+    ], dim=-1)
+    # Only the modeled targets participating in phase costs go through the
+    # live inverse transform; everything observation-side stays detached.
+    target = slice_to_spiral_transform.inv(
+        spiral.reshape(-1, 3)).reshape(num_pairs, n_max, 3)
+
+    displacement = ((target[:, :, None, :] - features['center'][:, None, :, :])
+                    * features['direction'][:, None, :, :]).sum(dim=-1)
+    rho = displacement / features['gref'][:, None, :]
+    huber = F.huber_loss(
+        rho, torch.zeros_like(rho), reduction='none',
+        delta=float(cfg['dense_spacing_phase_huber_delta']))
+    window = float(cfg['dense_spacing_phase_window_windings'])
+    with torch.no_grad():
+        allowed = (
+            (features['phase'][:, None, :] - winding[:, :, None]).abs()
+            <= window)
+        allowed &= features['matchable'][:, None, :]
+        allowed &= model_valid[:, :, None]
+        allowed &= features['band_valid'][:, None, :]
+        allowed &= ~phase_rejected[:, None, None]
+    confidence = (float(cfg['dense_spacing_phase_band_confidence_cost'])
+                  * features['confidence_cost'])
+    cost = torch.where(
+        allowed, huber + confidence[:, None, :],
+        torch.full_like(huber, float('inf')))
+
+    # Semi-global end gaps as per-band skip costs: padding bands outside the
+    # central interval (plus a protection margin so a slightly displaced
+    # boundary band cannot be dumped into the free gap) are free to skip.
+    with torch.no_grad():
+        margin = float(cfg['dense_spacing_phase_end_free_margin_windings'])
+        m_f = pair_m.to(k.dtype)
+        out_of_model = (
+            (features['phase'] < (k - margin)[:, None])
+            | (features['phase'] > (k + m_f + margin)[:, None]))
+        extra_open = torch.where(
+            out_of_model,
+            torch.zeros_like(features['phase']),
+            torch.full_like(features['phase'],
+                            float(cfg['dense_spacing_phase_extra_cost'])))
+        extra_extend = torch.where(
+            out_of_model,
+            torch.zeros_like(features['phase']),
+            torch.full_like(
+                features['phase'],
+                float(cfg['dense_spacing_phase_extra_extend_cost'])))
+
+    alignment = soft_align_sequences(
+        cost, model_valid, features['band_valid'],
+        missing_open=float(cfg['dense_spacing_phase_missing_cost']),
+        missing_extend=float(cfg['dense_spacing_phase_missing_extend_cost']),
+        extra_open=extra_open,
+        extra_extend=extra_extend,
+        temperature=float(cfg['dense_spacing_phase_temperature']),
+        compute_map_path=compute_map_path)
+    posterior = alignment['match_posterior']
 
     with torch.no_grad():
+        margin_threshold = float(cfg['dense_spacing_phase_top2_margin'])
+        detached_posterior = posterior.detach()
+        # Each winding is scored at its dominant match cell only, weighted by
+        # the live marginal: sub-dominant posterior on a plausible-but-wrong
+        # +-1 match next to a hole is reported (ambiguous/suppressed mass)
+        # but must never pull the surface - crossing count owns the topology
+        # signal. A winding participates only when its dominant match beats
+        # its missing state (probability >= 0.5) and is not multimodal (the
+        # top-2 margin gate also keeps the dominant-cell selection continuous
+        # where marginals cross).
+        masked_posterior = detached_posterior * allowed
+        best = masked_posterior.argmax(dim=2, keepdim=True)
+        dominant = torch.zeros_like(allowed).scatter_(2, best, True) & allowed
+        dominant_mass = (masked_posterior * dominant).sum(dim=2)
+        suppressed_winding = model_valid & (
+            (alignment['top2_margin'] < margin_threshold)
+            | (dominant_mass < 0.5))
+        accept = dominant & ~suppressed_winding[:, :, None]
+        total_match_mass = masked_posterior.sum()
+        ambiguous_mass = (masked_posterior
+                          * ~accept).sum()
+        winding_mass = (detached_posterior * accept).sum(dim=2)
+        useful_windings = (winding_mass >= 0.5).sum(dim=1)
+        mass = winding_mass.sum(dim=1)
+        ray_ok = (
+            ~phase_rejected
+            & (useful_windings
+               >= int(cfg['dense_spacing_phase_min_matched_windings']))
+            & (mass >= float(cfg['dense_spacing_phase_min_matched_mass'])))
+        pair_weight = ray_ok.to(torch.float32)
+        accepted_mass = (winding_mass * pair_weight[:, None]).sum()
+        suppressed_mass = total_match_mass - accepted_mass
+
+    numerator = (posterior * huber * accept).sum(dim=(1, 2))
+    ray_loss = numerator / mass.clamp(min=1e-6)
+    loss, mass_stats = _aggregate_nominal_mass(
+        ray_loss, pair_weight, cfg['dense_spacing_support_floor_alpha'])
+
+    with torch.no_grad():
+        n_bands = int(bands['pair_id'].numel())
+        scoring = ray_ok
+        scoring_f = scoring.to(torch.float32)
+        n_scoring = scoring_f.sum().clamp(min=1.0)
         metrics = {
-            'dense_spacing_phase_support_mass': float(mass_stats[0].item()),
+            'dense_spacing_phase_match_mass': float(accepted_mass.item()),
             'dense_spacing_phase_valid_fraction': float(pair_weight.mean().item()),
-            'dense_spacing_phase_rejected_ray_fraction': float(ray_rejected.float().mean().item()),
-            'dense_spacing_phase_too_long_fraction': float(ray['too_long'].float().mean().item()),
-            'dense_spacing_phase_step_violation_fraction': float(ray['step_violation'].float().mean().item()),
-            'dense_spacing_phase_anchor_no_band_fraction': float(no_band.float().mean().item()),
-            'dense_spacing_phase_anchor_ambiguity_fraction': float(anchor_ambiguous.float().mean().item()),
-            'dense_spacing_phase_anchor_max_distance_fraction': float(anchor_far.float().mean().item()),
-            'dense_spacing_phase_outer_no_band_fraction': float(outer_no_band.float().mean().item()),
-            'dense_spacing_phase_outer_ambiguity_fraction': float(outer_ambiguous.float().mean().item()),
-            'dense_spacing_phase_outer_max_distance_fraction': float(outer_far.float().mean().item()),
-            'dense_spacing_phase_no_reference_gap_fraction': float((anchor_ok & (pair_corr_count < 2)).float().mean().item()),
-            'dense_spacing_phase_complete_bands_per_ray': float(n_bands / max(1, num_pairs)),
-            'dense_spacing_phase_bands_per_modeled_winding': float(n_bands / max(1, int(pair_m.sum().item()))),
-            'dense_spacing_phase_merged_fragment_fraction': float(bands['merged_count'] / max(1, n_bands + bands['merged_count'])),
-            'dense_spacing_phase_unsupported_sdt_fraction': float((~bands['sample_valid']).float().mean().item()),
-            'dense_spacing_phase_sampled_points': float(ray['scroll_poly'].shape[0]),
-            'dense_spacing_phase_sdt_sample_seconds': bands['sdt_sample_seconds'],
+            'dense_spacing_phase_rejected_ray_fraction': float(
+                phase_rejected.float().mean().item()),
+            'dense_spacing_phase_matches_per_ray': float(
+                ((alignment['expected_matches'] * scoring_f).sum()
+                 / n_scoring).item()),
+            'dense_spacing_phase_missing_per_ray': float(
+                ((alignment['expected_missing'] * scoring_f).sum()
+                 / n_scoring).item()),
+            'dense_spacing_phase_extra_per_ray': float(
+                ((alignment['expected_extra'] * scoring_f).sum()
+                 / n_scoring).item()),
+            'dense_spacing_phase_alignment_entropy_mean': float(
+                ((alignment['ray_entropy'] * scoring_f).sum()
+                 / n_scoring).item()),
+            'dense_spacing_phase_ambiguous_match_mass_fraction': float(
+                (ambiguous_mass / total_match_mass.clamp(min=1e-6)).item()),
+            'dense_spacing_phase_suppressed_match_mass_fraction': float(
+                (suppressed_mass.clamp(min=0.0)
+                 / total_match_mass.clamp(min=1e-6)).item()),
+            'dense_spacing_phase_mean_scored_correspondences': float(
+                ((winding_mass.sum(dim=1) * scoring_f).sum()
+                 / n_scoring).item()),
+            'dense_spacing_phase_complete_bands_per_ray': float(
+                n_bands / max(1, num_pairs)),
+            'dense_spacing_phase_bands_per_modeled_winding': float(
+                n_bands / max(1, int(pair_m.sum().item()))),
+            'dense_spacing_phase_merged_fragment_fraction': float(
+                bands['merged_count']
+                / max(1, n_bands + bands['merged_count'])),
+            'dense_spacing_phase_unsupported_sdt_fraction': float(
+                (~view_valid).float().mean().item()) if view_valid.numel()
+            else 0.0,
+            'dense_spacing_phase_sampled_points': float(
+                view['scroll_poly'].shape[0]),
             'dense_spacing_phase_normal_gather_seconds': bands[
                 'normal_gather_seconds'],
-            # Fraction of rays whose outward extension was clamped at the
-            # fitted-domain edge (they cannot complete an outer band there).
-            'dense_spacing_phase_extension_domain_clamped_fraction': float(
-                (phase_end >= float(outer)).float().mean().item()),
-            # Mean scored correspondences per ray (accepted bands that carry a
-            # usable reference gap), not enumerated-then-censored ordinals.
-            'dense_spacing_phase_mean_scored_correspondences': float(
-                pair_corr_count.mean().item()),
         }
-        for label, distance, second_distance in (
-            ('anchor', anchor_distance, anchor_second_distance),
-            ('outer', outer_distance, outer_second_distance),
-        ):
-            finite = torch.isfinite(distance)
-            if finite.any():
-                distance_q = torch.quantile(
-                    distance[finite], torch.tensor([0.5, 0.9, 0.95], device=device))
-                metrics[f'dense_spacing_phase_{label}_distance_p50'] = float(
-                    distance_q[0].item())
-                metrics[f'dense_spacing_phase_{label}_distance_p90'] = float(
-                    distance_q[1].item())
-                metrics[f'dense_spacing_phase_{label}_distance_p95'] = float(
-                    distance_q[2].item())
-            finite_clearance = finite & torch.isfinite(second_distance)
-            if finite_clearance.any():
-                clearance = (
-                    second_distance[finite_clearance] - distance[finite_clearance])
-                clearance_q = torch.quantile(
-                    clearance, torch.tensor([0.1, 0.5, 0.9], device=device))
-                metrics[f'dense_spacing_phase_{label}_clearance_p10'] = float(
-                    clearance_q[0].item())
-                metrics[f'dense_spacing_phase_{label}_clearance_p50'] = float(
-                    clearance_q[1].item())
-                metrics[f'dense_spacing_phase_{label}_clearance_p90'] = float(
-                    clearance_q[2].item())
-        if n_bands:
-            graze_fraction = float(graze.float().mean().item())
-            normal_bad_fraction = float((~bands['normal_valid']).float().mean().item())
-            wide_fraction = float(wide_before.float().mean().item())
-            metrics.update({
-                # Band fractions by censor cause: a wide gap is the deletion
-                # (missing-band) signature, a narrow gap the insertion
-                # (extra-band) signature.
-                'dense_spacing_phase_censor_wide_gap_fraction': wide_fraction,
-                'dense_spacing_phase_censor_narrow_gap_fraction': float(
-                    narrow_ahead.float().mean().item()),
-                'dense_spacing_phase_censor_graze_fraction': graze_fraction,
-                'dense_spacing_phase_censor_unsupported_normal_fraction': normal_bad_fraction,
-                'dense_spacing_phase_interior_invalid_band_fraction': float(
-                    bands['interior_invalid'].float().mean().item()),
-                'dense_spacing_phase_unsupported_observation_fraction': float(
-                    ((~bands['normal_valid']) | bands['unsupported_before']).float().mean().item()),
-                'dense_spacing_phase_censored_action_fraction': float(
-                    (wide_before | narrow_ahead | graze | ~bands['normal_valid']
-                     | bands['ambiguous']
-                     | bands['unsupported_before']).float().mean().item()),
-            })
-            projected_width = bands['width'] * bands['normal_dot']
-            q = torch.quantile(projected_width, torch.tensor(
-                [0.5, 0.9], device=device))
-            metrics['dense_spacing_phase_projected_width_p50'] = float(q[0].item())
-            metrics['dense_spacing_phase_projected_width_p90'] = float(q[1].item())
-            gap_values = gap_length[accepted_gap]
-            if gap_values.numel():
-                gap_q = torch.quantile(gap_values, torch.tensor(
-                    [0.1, 0.5, 0.9], device=device))
-                metrics['dense_spacing_phase_physical_gap_p10'] = float(gap_q[0].item())
-                metrics['dense_spacing_phase_physical_gap_p50'] = float(gap_q[1].item())
-                metrics['dense_spacing_phase_physical_gap_p90'] = float(gap_q[2].item())
-        if rho.numel():
-            abs_rho = rho.abs()
-            metrics['dense_spacing_phase_residual_mean_abs'] = float(abs_rho.mean().item())
+        if scoring.any():
+            entropy_values = alignment['ray_entropy'][scoring]
+            clearance_values = alignment['map_clearance'][scoring]
+            metrics['dense_spacing_phase_alignment_entropy_p90'] = float(
+                torch.quantile(entropy_values, 0.9).item())
+            metrics['dense_spacing_phase_top2_clearance_p10'] = float(
+                torch.quantile(
+                    clearance_values.clamp(max=1e4), 0.1).item())
+        # Effective matches (posterior-dominant accepted cells) drive the
+        # residual quantiles and the by-offset breakdown.
+        effective = accept & (detached_posterior > 0.25) \
+            & scoring[:, None, None]
+        if effective.any():
+            abs_rho = rho.abs()[effective]
+            metrics['dense_spacing_phase_residual_mean_abs'] = float(
+                abs_rho.mean().item())
             rho_q = torch.quantile(
                 abs_rho, torch.tensor([0.5, 0.9, 0.95], device=device))
             metrics['dense_spacing_phase_residual_abs_p50'] = float(rho_q[0].item())
             metrics['dense_spacing_phase_residual_abs_p90'] = float(rho_q[1].item())
             metrics['dense_spacing_phase_residual_abs_p95'] = float(rho_q[2].item())
-            corr_j = j[corr_index]
-            for ordinal in torch.unique(corr_j).tolist():
-                ordinal_mask = corr_j == ordinal
-                metrics[f'dense_spacing_phase_residual_mean_abs_ordinal_{ordinal}'] = float(
-                    abs_rho[ordinal_mask].mean().item())
-            corr_gref = gref[corr_index]
-            boundaries = (0.0, 4.0, 8.0, 16.0, float('inf'))
-            for lo, hi in zip(boundaries[:-1], boundaries[1:]):
-                mask = (corr_gref >= lo) & (corr_gref < hi)
-                if mask.any():
-                    label = f'{lo:g}_{hi:g}' if np.isfinite(hi) else f'{lo:g}_inf'
-                    metrics[f'dense_spacing_phase_signed_rho_gref_{label}'] = float(
-                        rho[mask].mean().item())
-        if model_physical_gaps.numel():
-            model_gap_q = torch.quantile(model_physical_gaps, torch.tensor(
-                [0.1, 0.5, 0.9], device=device))
-            metrics['dense_spacing_phase_model_adjacent_gap_p10'] = float(
-                model_gap_q[0].item())
-            metrics['dense_spacing_phase_model_adjacent_gap_p50'] = float(
-                model_gap_q[1].item())
-            metrics['dense_spacing_phase_model_adjacent_gap_p90'] = float(
-                model_gap_q[2].item())
-        metrics['dense_spacing_phase_span_valid_fraction'] = 0.0
+            offset_grid = offsets_i[None, :, None].expand_as(effective)
+            effective_offset = offset_grid[effective]
+            for ordinal in torch.unique(effective_offset).tolist():
+                ordinal_mask = effective_offset == ordinal
+                metrics[
+                    f'dense_spacing_phase_residual_mean_abs_ordinal_{ordinal}'
+                ] = float(abs_rho[ordinal_mask].mean().item())
         if n_bands:
-            safe_outer = outer_candidate.clamp(max=n_bands - 1)
-            outer_supported = bands['normal_valid'][safe_outer] & ~bands['ambiguous'][safe_outer]
-            outer_ok = ~outer_no_band & ~outer_ambiguous & ~outer_far & outer_supported
-            # A span is valid only when its candidate lies in the accepted prefix.
-            outer_reached = torch.zeros(num_pairs, dtype=torch.bool, device=device)
-            valid_outer_pair = outer_ok.nonzero(as_tuple=False).squeeze(-1)
-            if valid_outer_pair.numel():
-                outer_reached[valid_outer_pair] = accepted[outer_candidate[valid_outer_pair]]
-            span_valid = anchor_ok & outer_ok & outer_reached
-            if span_valid.any():
-                p = span_valid.nonzero(as_tuple=False).squeeze(-1)
-                span = (
-                    bands['ordinal'][outer_candidate[p]]
-                    - bands['ordinal'][anchor[p]])
-                metrics['dense_spacing_phase_span_minus_m_mean'] = float(
-                    (span - pair_m[p]).to(torch.float32).mean().item())
-                metrics['dense_spacing_phase_span_valid_fraction'] = float(
-                    span_valid.float().mean().item())
-        # Keep the shipped soft crossing count as a detached rollout
-        # diagnostic on the unextended modeled interval.
-        indicator = _inside_indicator(
-            bands['field_value'], sdt_volume,
-            float(cfg['dense_spacing_count_temperature_wv']))
-        edge_mid_phase = (ray['sample_phase'][:-1] + ray['sample_phase'][1:]) * 0.5
-        base_edge = (
-            ray['has_successor'][:-1]
-            & bands['sample_valid'][:-1] & bands['sample_valid'][1:]
-            & (edge_mid_phase >= k[ray['pair_id'][:-1]])
-            & (edge_mid_phase <= (k + pair_m)[ray['pair_id'][:-1]]))
-        soft_diff = (indicator[1:] - indicator[:-1]).abs() * base_edge.to(indicator.dtype)
-        soft_count = 0.5 * torch.zeros(num_pairs, device=device).index_add_(
-            0, ray['pair_id'][:-1], soft_diff)
-        non_rejected = ~ray_rejected
-        if non_rejected.any():
-            metrics['dense_spacing_phase_soft_count_mean'] = float(
-                soft_count[non_rejected].mean().item())
-            metrics['dense_spacing_phase_soft_count_residual_mean'] = float(
-                (soft_count[non_rejected] - pair_m[non_rejected]).abs().mean().item())
-        metrics.update({
-            f'dense_spacing_phase_sdt_{name}': value
-            for name, value in sdt_sample_fractions(
-                bands['field_value'], bands['sample_valid'], sdt_volume).items()
-        })
-        metrics['dense_spacing_phase_wall_seconds'] = time.perf_counter() - started
+            projected_width = bands['width'] * bands['normal_dot']
+            width_q = torch.quantile(
+                projected_width, torch.tensor([0.5, 0.9], device=device))
+            metrics['dense_spacing_phase_projected_width_p50'] = float(
+                width_q[0].item())
+            metrics['dense_spacing_phase_projected_width_p90'] = float(
+                width_q[1].item())
+        if diagnostics_enabled() and effective.any():
+            centers = features['center'][:, None, :, :].expand(
+                -1, n_max, -1, -1)[effective]
+            detected_center_spiral = (
+                slice_to_spiral_transform(centers)
+                if callable(slice_to_spiral_transform) else centers)
+            record_loss_samples(
+                'dense_spacing_phase', detected_center_spiral,
+                rho.abs()[effective].detach(),
+                torch.ones(int(effective.sum()), dtype=torch.bool,
+                           device=device))
+    if compute_map_path:
+        metrics['_map_alignment'] = {
+            'map_match': alignment['map_match'],
+            'map_extra': alignment['map_extra'],
+            'match_posterior': alignment['match_posterior'].detach(),
+            'ray_ok': ray_ok,
+        }
     return loss, metrics
+
+
+def _count_loss_from_pairs(counts, targets, supports, seg_valids, cfg,
+                           sdt_volume, diagnostics):
+    """Support-gated |count - m| with the global nominal-mass floor.
+
+    L = sum(w * |count - m|) / max(sum(w), alpha * num_pairs): the floor makes
+    the loss scale down (reaching a defined zero) when total support falls
+    below alpha of the batch, instead of a scale-invariant weighted mean that
+    would fire at full strength on uniformly tiny support.
+    """
+    count = torch.cat(counts)
+    target_m = torch.cat(targets)
+    support = torch.cat(supports)
+    seg_valid = torch.cat(seg_valids)
+    weight = (support * seg_valid.to(torch.float32)).detach()
+    residual = (count - target_m).abs()
+    alpha = float(cfg['dense_spacing_support_floor_alpha'])
+    loss, stats = _aggregate_nominal_mass(residual, weight, alpha)
+
+    with torch.no_grad():
+        valid_f = seg_valid.to(torch.float32)
+        n_valid = valid_f.sum()
+        n_valid_floor = n_valid.clamp(min=1.0)
+        (mass_value, nominal_value, valid_fraction, count_mean,
+         residual_mean, n_valid_value) = torch.stack([
+            stats[0],
+            stats[1],
+            valid_f.mean(),
+            (count * valid_f).sum() / n_valid_floor,
+            (residual * valid_f).sum() / n_valid_floor,
+            n_valid,
+        ]).tolist()
+        floor_active = mass_value < alpha * nominal_value
+        mass_fraction = mass_value / max(1.0, nominal_value)
+        metrics = {
+            'dense_spacing_count_support_mass': mass_value,
+            'dense_spacing_count_support_mass_fraction': mass_fraction,
+            'dense_spacing_count_floor_active': float(floor_active),
+            'dense_spacing_count_valid_fraction': valid_fraction,
+        }
+        metrics.update(diagnostics)
+        if n_valid_value > 0:
+            metrics['dense_spacing_count_mean'] = count_mean
+            metrics['dense_spacing_count_residual_mean'] = residual_mean
+        global _floor_was_active
+        if floor_active and not _floor_was_active:
+            print('dense_spacing_count: support-mass floor active '
+                  f'(mass fraction {mass_fraction:.4f} < alpha {alpha}); '
+                  'the count loss is effectively scaled down until support recovers')
+        elif _floor_was_active and not floor_active:
+            print('dense_spacing_count: support-mass floor released '
+                  f'(mass fraction {mass_fraction:.4f} >= alpha {alpha})')
+        _floor_was_active = floor_active
+    return loss, metrics, residual, weight
+
+
+def phase_bundle_component_weights(cfg, attachment_ramp=1.0):
+    """The four phase-bundle component weights; zero disables a component."""
+    return {
+        'dense_spacing_phase': float(cfg['loss_weight_dense_spacing']),
+        'dense_spacing_count': float(cfg['loss_weight_dense_spacing_count']),
+        'min_spacing': float(cfg['loss_weight_min_spacing']),
+        'dense_attachment': (float(cfg['loss_weight_dense_attachment'])
+                             * float(attachment_ramp)),
+    }
+
+
+def _phase_and_count_losses(
+    slice_to_spiral_transform, dr_per_winding, sdt_volume, normal_volume,
+    outer_winding_idx, cfg, z_begin, z_end, weights, generator,
+    compute_map_path,
+):
+    """Shared-ray phase registration and crossing count.
+
+    One joint ray batch serves both components: the central ``k -> k + m``
+    polyline is built with autograd and the SDT is sampled once with
+    gradients on it; the count uses the live samples while phase band
+    detection sees detached copies plus detached extension pads. Validity is
+    tracked separately - a failed pad must not invalidate a valid central
+    count, and a missing phase correspondence must not silence the count.
+    """
+    device = dr_per_winding.device
+    count_active = weights['dense_spacing_count'] > 0
+    phase_active = weights['dense_spacing_phase'] > 0
+    inner, outer = fitted_winding_domain(outer_winding_idx)
+    if outer - inner < 1:
+        return
+    started = time.perf_counter()
+    num_pairs = int(cfg['dense_spacing_num_pairs'])
+    k, pair_m, theta, z = _sample_spacing_pairs(
+        cfg, inner, outer, num_pairs, device, z_begin, z_end, generator)
+    m_f = pair_m.to(k.dtype)
+
+    build_grad = count_active and torch.is_grad_enabled()
+    central_ray = sample_pair_polylines(
+        slice_to_spiral_transform, dr_per_winding, k, k + m_f, theta, z, cfg,
+        no_grad=not build_grad)
+    sdt_started = time.perf_counter()
+    central_field, central_valid, _ = sample_sdt_trilinear(
+        sdt_volume, central_ray['scroll_poly'])
+    sdt_sample_seconds = time.perf_counter() - sdt_started
+
+    view = view_field = view_valid = None
+    pad_rejected = None
+    if phase_active:
+        pads, pad_rejected, outer_end = _build_phase_padding(
+            slice_to_spiral_transform, dr_per_winding, sdt_volume, k, pair_m,
+            theta, z, inner, outer, cfg)
+        view, view_field, view_valid = _assemble_detection_view(
+            central_ray, central_field, central_valid, pads)
+        del pads
+
+    if count_active:
+        pair = _pair_counts_from_samples(
+            central_ray, central_field, central_valid, sdt_volume, cfg)
+        diagnostics = {
+            'dense_spacing_count_too_long_fraction': float(
+                pair['too_long'].float().mean().item()),
+            'dense_spacing_count_step_violation_fraction': float(
+                pair['step_violation'].float().mean().item()),
+            'dense_spacing_count_sdt_sample_seconds': sdt_sample_seconds,
+        }
+        diagnostics.update({
+            f'dense_spacing_count_sdt_{name}': value
+            for name, value in sdt_sample_fractions(
+                pair['field_value'], pair['sample_valid'],
+                sdt_volume).items()
+        })
+        counts = [pair['count']]
+        targets = [m_f]
+        supports = [pair['support']]
+        seg_valids = [pair['seg_valid']]
+        theta_all, z_all, r_mid_all = [theta], [z], [
+            (k + m_f / 2 + theta / (2 * np.pi)) * dr_per_winding.detach()]
+        extra_pairs = int(cfg['dense_spacing_count_extra_pairs'])
+        if extra_pairs > 0:
+            # Optional count-only supplement restoring spatial coverage when
+            # the shared batch alone is too sparse.
+            k_e, m_e, theta_e, z_e = _sample_spacing_pairs(
+                cfg, inner, outer, extra_pairs, device, z_begin, z_end,
+                generator)
+            extra = compute_pair_counts(
+                slice_to_spiral_transform, dr_per_winding, sdt_volume,
+                k_e, m_e, theta_e, z_e, cfg)
+            counts.append(extra['count'])
+            targets.append(extra['target_m'])
+            supports.append(extra['support'])
+            seg_valids.append(extra['seg_valid'])
+            theta_all.append(theta_e)
+            z_all.append(z_e)
+            r_mid_all.append(extra['r_mid'])
+        count_loss, count_metrics, residual, weight = _count_loss_from_pairs(
+            counts, targets, supports, seg_valids, cfg, sdt_volume,
+            diagnostics)
+        spiral_mid = torch.stack([
+            torch.cat(z_all),
+            torch.sin(torch.cat(theta_all)) * torch.cat(r_mid_all),
+            torch.cos(torch.cat(theta_all)) * torch.cat(r_mid_all),
+        ], dim=-1)
+        record_loss_samples(
+            'dense_spacing_count', spiral_mid, residual, weight > 0)
+        yield 'dense_spacing_count', count_loss, count_metrics
+        del pair, counts, residual
+
+    if phase_active:
+        # Central live tensors are no longer needed once the detached view
+        # exists; drop them so the count backward can free its graph.
+        central_rejected = central_ray['too_long'] | central_ray['step_violation']
+        phase_rejected = central_rejected | pad_rejected
+        central_metrics = {
+            'dense_spacing_phase_too_long_fraction': float(
+                central_ray['too_long'].float().mean().item()),
+            'dense_spacing_phase_step_violation_fraction': float(
+                central_ray['step_violation'].float().mean().item()),
+            'dense_spacing_phase_pad_rejected_fraction': float(
+                pad_rejected.float().mean().item()),
+            'dense_spacing_phase_extension_domain_clamped_fraction': float(
+                ((k + m_f + float(
+                    cfg['dense_spacing_phase_extension_windings']))
+                 > float(outer)).float().mean().item()),
+            'dense_spacing_phase_sdt_sample_seconds': sdt_sample_seconds,
+        }
+        del central_ray, central_field, central_valid
+        phase_loss, phase_metrics = _phase_registration_loss(
+            slice_to_spiral_transform, dr_per_winding, view, view_field,
+            view_valid, normal_volume, k, pair_m, theta, z, phase_rejected,
+            cfg, compute_map_path=compute_map_path)
+        phase_metrics.update(central_metrics)
+        phase_metrics['dense_spacing_phase_wall_seconds'] = (
+            time.perf_counter() - started)
+        yield 'dense_spacing_phase', phase_loss, phase_metrics
+
+
+def iter_phase_bundle_losses(
+    spiral_and_transform, slice_to_spiral_transform, dr_per_winding,
+    sdt_volume, normal_volume, outer_winding_idx, cfg, z_begin, z_end, *,
+    attachment_ramp=1.0, generator=None, compute_map_path=False,
+):
+    """Yield the active phase-bundle components as (name, loss, metrics).
+
+    The bundle is the single ``phase`` dense-spacing mode: soft-sequence
+    phase registration, crossing count (sharing the phase rays), native
+    minimum spacing, and SDT attachment. Yielding lazily lets the training
+    loop run one backward per component so at most one large graph is
+    resident; the public mode stays ``phase`` regardless of this internal
+    backward grouping.
+    """
+    weights = phase_bundle_component_weights(cfg, attachment_ramp)
+    if outer_winding_idx is not None and sdt_volume is not None:
+        if sdt_volume['kind'] != 'sdt':
+            raise ValueError('the phase bundle requires a signed-distance store')
+        if ((weights['dense_spacing_phase'] > 0 and normal_volume is not None)
+                or weights['dense_spacing_count'] > 0):
+            effective = dict(weights)
+            if normal_volume is None:
+                effective['dense_spacing_phase'] = 0.0
+            yield from _phase_and_count_losses(
+                slice_to_spiral_transform, dr_per_winding, sdt_volume,
+                normal_volume, outer_winding_idx, cfg, z_begin, z_end,
+                effective, generator, compute_map_path)
+    if weights['min_spacing'] > 0 and spiral_and_transform is not None:
+        min_loss, min_metrics = get_min_spacing_loss(
+            spiral_and_transform, outer_winding_idx, cfg, z_begin, z_end,
+            generator=generator)
+        yield 'min_spacing', min_loss, min_metrics
+    if weights['dense_attachment'] > 0 and sdt_volume is not None:
+        attachment_loss, attachment_metrics = get_dense_attachment_loss(
+            slice_to_spiral_transform, dr_per_winding, sdt_volume,
+            outer_winding_idx, cfg, z_begin, z_end)
+        yield 'dense_attachment', attachment_loss, attachment_metrics
 
 
 def get_min_spacing_loss(
@@ -1249,7 +1408,7 @@ def get_dense_attachment_loss(
 
 @torch.no_grad()
 def aggregate_pair_counts(
-    slice_to_spiral_transform, dr_per_winding, count_volume, sdt_volume,
+    slice_to_spiral_transform, dr_per_winding, sdt_volume,
     outer_winding_idx, cfg, z_begin, z_end, samples_per_pair=192, pair_m=1,
     batch_pairs=64,
 ):
@@ -1273,7 +1432,7 @@ def aggregate_pair_counts(
         z = torch.empty(k.shape[0], device=device).uniform_(
             float(z_begin), float(z_end - 1))
         pair = compute_pair_counts(
-            slice_to_spiral_transform, dr_per_winding, count_volume, sdt_volume,
+            slice_to_spiral_transform, dr_per_winding, sdt_volume,
             k, m, theta, z, cfg)
         counts = pair['count'].reshape(len(batch), samples_per_pair)
         valid = pair['seg_valid'].reshape(len(batch), samples_per_pair)

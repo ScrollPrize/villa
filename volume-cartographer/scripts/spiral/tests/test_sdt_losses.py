@@ -12,11 +12,12 @@ import torch
 
 from sdt_losses import (
     MIN_VALID_CORNER_WEIGHT_MASS,
+    _sample_spacing_pairs,
     aggregate_pair_counts,
     compute_pair_counts,
     fitted_winding_domain,
-    get_crossing_count_spacing_loss,
     get_dense_attachment_loss,
+    iter_phase_bundle_losses,
     sample_sdt_trilinear,
 )
 
@@ -106,6 +107,7 @@ def spacing_cfg(**overrides):
         'dense_spacing_pair_m_long': (1, 1),
         'dense_spacing_pair_long_fraction': 0.0,
         'dense_spacing_count_temperature_wv': 0.5,
+        'dense_spacing_count_extra_pairs': 0,
         'dense_spacing_target_step_wv': 1.0,
         'dense_spacing_max_step_wv': 2.0,
         'dense_spacing_max_steps': 64,
@@ -117,12 +119,25 @@ def spacing_cfg(**overrides):
         'dense_spacing_phase_huber_delta': 0.5,
         'dense_spacing_phase_extension_windings': 1.0,
         'dense_spacing_phase_min_center_gap_wv': 4.0,
-        'dense_spacing_phase_anchor_margin': 0.25,
-        'dense_spacing_phase_anchor_max_distance': 0.5,
         'dense_spacing_phase_graze_dot': 0.4,
         'dense_spacing_phase_graze_depth_wv': 1.0,
-        'dense_spacing_phase_censor_gap_windings': 2.0,
-        'dense_spacing_phase_censor_min_gap_windings': 0.5,
+        'dense_spacing_phase_window_windings': 1.0,
+        'dense_spacing_phase_end_free_margin_windings': 0.5,
+        'dense_spacing_phase_missing_cost': 0.7,
+        'dense_spacing_phase_missing_extend_cost': 0.7,
+        'dense_spacing_phase_extra_cost': 0.9,
+        'dense_spacing_phase_extra_extend_cost': 0.9,
+        'dense_spacing_phase_temperature': 0.2,
+        'dense_spacing_phase_band_confidence_cost': 0.25,
+        'dense_spacing_phase_top2_margin': 0.2,
+        'dense_spacing_phase_min_matched_windings': 2,
+        'dense_spacing_phase_min_matched_mass': 1.0,
+        'loss_weight_dense_spacing': 12.0,
+        'loss_weight_dense_spacing_count': 8.0,
+        'loss_weight_min_spacing': 0.0,
+        'loss_weight_dense_attachment': 0.0,
+        'min_spacing_d_min_wv': 6.0,
+        'min_spacing_independent_samples': 64,
         'dense_attachment_num_points': 512,
         'dense_attachment_scale': 8.0,
     }
@@ -130,20 +145,32 @@ def spacing_cfg(**overrides):
     return cfg
 
 
-def pair_counts(transform, volume, k, m=1, theta=0.0, cfg=None, sdt_volume='same'):
+def pair_counts(transform, volume, k, m=1, theta=0.0, cfg=None):
     k = torch.as_tensor(k, dtype=torch.float32).reshape(-1)
     n = k.shape[0]
     return compute_pair_counts(
         transform,
         torch.tensor(DR_PER_WINDING),
         volume,
-        volume if sdt_volume == 'same' else sdt_volume,
         k,
         torch.full([n], int(m), dtype=torch.long),
         torch.full([n], float(theta)),
         torch.full([n], 1.5),
         cfg or spacing_cfg(),
     )
+
+
+def run_bundle_count(transform, volume, outer_winding_idx=6, cfg=None,
+                     generator=None):
+    """Run the count component of the phase bundle (phase disabled via a
+    missing normal store) and return (loss, metrics)."""
+    cfg = cfg or spacing_cfg()
+    for name, loss, metrics in iter_phase_bundle_losses(
+            None, transform, torch.tensor(DR_PER_WINDING), volume, None,
+            outer_winding_idx, cfg, 1, 2, generator=generator):
+        if name == 'dense_spacing_count':
+            return loss, metrics
+    return torch.zeros([]), {}
 
 
 class TrilinearSamplingTests(unittest.TestCase):
@@ -378,31 +405,12 @@ class CrossingCountTests(unittest.TestCase):
 
         volume = sheet_volume(96, [10, 20, 30, 40, 50, 60])
         rows = aggregate_pair_counts(
-            SkipsASheet(), torch.tensor(DR_PER_WINDING), volume, volume,
+            SkipsASheet(), torch.tensor(DR_PER_WINDING), volume,
             outer_winding_idx=5, cfg=spacing_cfg(), z_begin=1, z_end=2,
             samples_per_pair=64)
         by_winding = {row['winding']: row for row in rows}
         self.assertAlmostEqual(by_winding[1]['mean_count_minus_m'], 0.0, delta=0.15)
         self.assertAlmostEqual(by_winding[2]['mean_count_minus_m'], 1.0, delta=0.2)
-
-    def test_surf_count_source_fallback(self):
-        # Test 14 (unit form): counting on a raw-surf volume with the
-        # 128-centered sigmoid indicator matches SDT counting.
-        sheets = [10, 20, 30]
-        sdt = sheet_volume(96, sheets)
-        surf_encoded = np.zeros(96, np.uint8)
-        x = np.arange(96)
-        for c in sheets:
-            surf_encoded[np.abs(x - c) <= 2] = 255
-        surf_encoded[surf_encoded == 0] = 5  # decisive outside probability
-        surf = make_volume(np.broadcast_to(surf_encoded, (4, 4, 96)).copy(),
-                           kind='surf', unit=None, cap=None)
-        result = pair_counts(PerfectSpiralToX(), surf, k=[1.0, 2.0], m=1,
-                             sdt_volume=sdt)
-        self.assertTrue(bool(result['seg_valid'].all()))
-        for count in result['count'].tolist():
-            self.assertAlmostEqual(count, 1.0, delta=0.1)
-
 
 class SpacingLossTests(unittest.TestCase):
     def setUp(self):
@@ -411,17 +419,17 @@ class SpacingLossTests(unittest.TestCase):
 
     def loss_and_metrics(self, volume, transform=None, **cfg_overrides):
         cfg = spacing_cfg(**cfg_overrides)
-        return get_crossing_count_spacing_loss(
-            transform or PerfectSpiralToX(), torch.tensor(DR_PER_WINDING),
-            volume, volume, outer_winding_idx=6, cfg=cfg, z_begin=1, z_end=2)
+        return run_bundle_count(
+            transform or PerfectSpiralToX(), volume, outer_winding_idx=6,
+            cfg=cfg)
 
     def test_perfect_fit_has_near_zero_loss(self):
         volume = sheet_volume(96, [10, 20, 30, 40, 50, 60])
         loss, metrics = self.loss_and_metrics(volume)
         self.assertLess(float(loss), 0.06)
-        self.assertGreater(metrics['dense_spacing_valid_fraction'], 0.99)
+        self.assertGreater(metrics['dense_spacing_count_valid_fraction'], 0.99)
         self.assertAlmostEqual(metrics['dense_spacing_count_mean'], 1.0, delta=0.05)
-        self.assertEqual(metrics['dense_spacing_floor_active'], 0.0)
+        self.assertEqual(metrics['dense_spacing_count_floor_active'], 0.0)
 
     def test_zero_support_batch_is_finite_and_floored(self):
         # Test 10: a batch with zero effective support has a finite, defined
@@ -431,14 +439,14 @@ class SpacingLossTests(unittest.TestCase):
         loss, metrics = self.loss_and_metrics(air)
         self.assertTrue(math.isfinite(float(loss)))
         self.assertAlmostEqual(float(loss), 0.0, places=5)
-        self.assertEqual(metrics['dense_spacing_floor_active'], 1.0)
+        self.assertEqual(metrics['dense_spacing_count_floor_active'], 1.0)
 
         # Uniform small-but-nonzero support: encoded sd = +8 wv everywhere ->
         # support = exp(-4)^2 ~ 1.1e-7 per pair. The residual is ~1 (count 0
         # against m=1), so an unfloored weighted mean would be ~1.
         faint = make_volume(np.full([4, 4, 96], 136, np.uint8))
         loss, metrics = self.loss_and_metrics(faint)
-        self.assertEqual(metrics['dense_spacing_floor_active'], 1.0)
+        self.assertEqual(metrics['dense_spacing_count_floor_active'], 1.0)
         self.assertLess(float(loss), 0.01)
 
     def test_multi_m_pairs_stay_calibrated(self):
@@ -449,8 +457,8 @@ class SpacingLossTests(unittest.TestCase):
         loss, metrics = self.loss_and_metrics(
             volume, dense_spacing_pair_m_short=(1, 4),
             dense_spacing_max_steps=128)
-        self.assertGreater(metrics['dense_spacing_valid_fraction'], 0.99)
-        self.assertEqual(metrics['dense_spacing_too_long_fraction'], 0.0)
+        self.assertGreater(metrics['dense_spacing_count_valid_fraction'], 0.99)
+        self.assertEqual(metrics['dense_spacing_count_too_long_fraction'], 0.0)
         # Soft-count conservatism scales with m (~0.96-0.98 per crossing), so
         # the residual grows with baseline but stays a few percent of m.
         self.assertLess(metrics['dense_spacing_count_residual_mean'], 0.2)
@@ -462,23 +470,51 @@ class SpacingLossTests(unittest.TestCase):
         # [1, 3], so both mixture ranges clamp to m=2 and every pair stays
         # in range.
         volume = sheet_volume(96, [10, 20, 30, 40, 50, 60])
-        loss, metrics = get_crossing_count_spacing_loss(
-            PerfectSpiralToX(), torch.tensor(DR_PER_WINDING), volume, volume,
-            outer_winding_idx=4,
+        loss, metrics = run_bundle_count(
+            PerfectSpiralToX(), volume, outer_winding_idx=4,
             cfg=spacing_cfg(dense_spacing_pair_m_short=(3, 7),
                             dense_spacing_pair_m_long=(5, 15),
                             dense_spacing_pair_long_fraction=0.15,
-                            dense_spacing_max_steps=128),
-            z_begin=1, z_end=2)
-        self.assertGreater(metrics['dense_spacing_valid_fraction'], 0.99)
+                            dense_spacing_max_steps=128))
+        self.assertGreater(metrics['dense_spacing_count_valid_fraction'], 0.99)
         self.assertLess(metrics['dense_spacing_count_residual_mean'], 0.2)
 
-    def test_missing_volume_yields_zero(self):
-        loss, metrics = get_crossing_count_spacing_loss(
-            PerfectSpiralToX(), torch.tensor(DR_PER_WINDING), None, None,
-            outer_winding_idx=6, cfg=spacing_cfg(), z_begin=1, z_end=2)
-        self.assertEqual(float(loss), 0.0)
-        self.assertEqual(metrics, {})
+    def test_missing_volume_yields_no_components(self):
+        components = list(iter_phase_bundle_losses(
+            None, PerfectSpiralToX(), torch.tensor(DR_PER_WINDING), None,
+            None, 6, spacing_cfg(), 1, 2))
+        self.assertEqual(components, [])
+
+    def test_shared_ray_counts_match_independent_implementation(self):
+        # The bundle's shared central-ray count must equal the independent
+        # compute_pair_counts implementation under identical (k, m, theta, z)
+        # samples, including gradients through the transform.
+        volume = sheet_volume(96, [10, 20, 30, 40, 50, 60])
+        cfg = spacing_cfg(dense_spacing_num_pairs=64)
+        seed = 11
+
+        offset_bundle = torch.tensor(1.5, requires_grad=True)
+        loss, _ = run_bundle_count(
+            PerfectSpiralToX(x_offset=offset_bundle), volume, 6, cfg,
+            generator=torch.Generator().manual_seed(seed))
+        loss.backward()
+
+        offset_expected = torch.tensor(1.5, requires_grad=True)
+        k, m, theta, z = _sample_spacing_pairs(
+            cfg, 1, 5, 64, torch.device('cpu'), 1, 2,
+            torch.Generator().manual_seed(seed))
+        pair = compute_pair_counts(
+            PerfectSpiralToX(x_offset=offset_expected),
+            torch.tensor(DR_PER_WINDING), volume, k, m, theta, z, cfg)
+        weight = (pair['support'] * pair['seg_valid'].float()).detach()
+        residual = (pair['count'] - pair['target_m']).abs()
+        alpha = float(cfg['dense_spacing_support_floor_alpha'])
+        expected = (weight * residual).sum() / torch.maximum(
+            weight.sum(), torch.tensor(alpha * 64.0))
+        expected.backward()
+
+        torch.testing.assert_close(loss.detach(), expected.detach())
+        torch.testing.assert_close(offset_bundle.grad, offset_expected.grad)
 
     def test_gradient_recovery_from_gap(self):
         # Test 16c: with an endpoint inside a gap, the count residual supplies

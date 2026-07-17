@@ -122,10 +122,13 @@ class InteractiveFitSession:
                         # Influence settings describe one interactive Run, not
                         # durable model configuration. Ignore them even when
                         # opening checkpoints written by older services.
+                        # Keys the current fitter no longer defines are
+                        # dropped; old configurations are not supported.
                         durable = {
                             key: value for key, value in checkpoint_config['cfg'].items()
                             if not key.startswith('interactive_influence_')
                             and key != 'loss_weight_anchor'
+                            and key in config
                         }
                         config.update(durable)
                 finally:
