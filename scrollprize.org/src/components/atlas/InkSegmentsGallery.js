@@ -271,7 +271,9 @@ export default function InkSegmentsGallery({ segments, display }) {
             >
               {compareOn
                 ? "✕ Close compare"
-                : `⇄ Compare renders (${activeVariants.length})`}
+                : activeVariants.length === 2
+                ? "⇄ Compare renders (2)"
+                : `⇄ Compare renders (2 of ${activeVariants.length})`}
             </button>
           ) : null}
           {n > 1 ? (

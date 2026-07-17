@@ -59,6 +59,17 @@ function variantLabels(renders) {
 
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 
+// Exactly two variants are compared at a time. `renders`/`alphaRenders` are
+// pre-sorted primary-first by buildIndex.js, so when more than two are ever
+// supplied (never observed in real data as of writing — confirmed max is 2
+// target_volume variants per segment), fall back to the first two rather
+// than rendering nothing — see the InkSegmentsGallery toggle label, which
+// says "(2 of N)" in that case so it's clear only a pair is being compared.
+function comparePair(renders) {
+  if (!Array.isArray(renders) || renders.length < 2) return null;
+  return renders.length === 2 ? renders : renders.slice(0, 2);
+}
+
 // The <img> src for one side: the variant's downsampled render, resized
 // through the same Thumbor proxy every other gallery image uses (the single
 // lightbox view requests the identical 2000x2000 fit-in). The raw ds8 JPEGs
@@ -74,9 +85,10 @@ export default function CompareRenders({ renders, label }) {
   const frameRef = useRef(null);
   const [pos, setPos] = useState(50); // divider position, percent from the left
 
-  if (!Array.isArray(renders) || renders.length !== 2) return null;
-  const [a, b] = renders;
-  const [labelA, labelB] = variantLabels(renders);
+  const pair = comparePair(renders);
+  if (!pair) return null;
+  const [a, b] = pair;
+  const [labelA, labelB] = variantLabels(pair);
 
   const setFromClientX = (clientX) => {
     const el = frameRef.current;

@@ -330,6 +330,64 @@ test.describe("PHercParis4 — 2D/3D toggle compare-eligibility regression", () 
   });
 });
 
+// --- 6b. N>2 render variants: compare degrades to the first two, never ----
+// --- renders blank (real data has never shipped a 3rd — confirmed max is -
+// --- 2 target_volume variants per segment across the whole public         -
+// --- metadata — but CompareRenders used to hard-require exactly 2 and     -
+// --- return null otherwise, silently emptying the lightbox on click). -----
+
+test.describe("synthetic 3-variant segment — compare never renders blank", () => {
+  test("toggle reads '2 of 3' and clicking it shows two real images, not an empty frame", async ({
+    page,
+  }) => {
+    const errors = collectConsoleErrors(page);
+
+    // Force the live metadata.min.json fetch to fail so useAtlasData.js
+    // falls back to the same-origin bundled snapshot, then splice a 3rd
+    // renders[] entry onto PHerc0814's first segment in that response.
+    await page.route("**/metadata.min.json", (route) => route.abort());
+    await page.route("**/data_browser/index.json", async (route) => {
+      const response = await route.fetch();
+      const json = await response.json();
+      const scroll = json.scrolls.find((s) => s.id === "PHerc0814");
+      const seg = scroll.inkSegments.find(
+        (s) => Array.isArray(s.renders) && s.renders.length === 2
+      );
+      seg.renders = [
+        ...seg.renders,
+        { ...seg.renders[1], targetVolume: "synthetic-3rd", modelId: "synthetic" },
+      ];
+      await route.fulfill({ response, body: JSON.stringify(json) });
+    });
+
+    await page.goto("/data_browser/PHerc0814");
+    // The patched segment is the first one with renders.length===2, i.e.
+    // every PHerc0814 segment — so it's card/lightbox index 0.
+    const lightbox = await openLightboxAt(page, 0);
+
+    const toggle = lightbox.locator(".lbcomparetoggle");
+    await expect(toggle).toBeVisible();
+    await expect(toggle).toHaveText("⇄ Compare renders (2 of 3)");
+    await toggle.click();
+
+    const frame = lightbox.locator(".compareframe");
+    await expect(frame).toBeVisible();
+    const images = frame.locator("img");
+    await expect(images).toHaveCount(2);
+    const srcs = await images.evaluateAll((els) =>
+      els.map((el) => el.getAttribute("src"))
+    );
+    for (const src of srcs) expect(src).toBeTruthy();
+
+    // The intentionally-aborted metadata.min.json request logs its own
+    // "failed to load resource" console error as a side effect of this
+    // test's own setup, not an app bug — filter that one expected message
+    // out before asserting no OTHER errors occurred.
+    const unexpected = errors.filter((e) => !e.includes("ERR_FAILED"));
+    expect(unexpected).toEqual([]);
+  });
+});
+
 // --- 6. Toggle visibility/geometry at desktop AND mobile viewports ---------
 
 // Axis-aligned bounding boxes don't intersect.
