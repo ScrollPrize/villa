@@ -1,6 +1,8 @@
 import numpy as np
 import os
+import posixpath
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 from tqdm.auto import tqdm
 import argparse
@@ -14,6 +16,39 @@ from functools import partial
 from vesuvius.data.utils import open_zarr
 from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
+
+
+def _canonical_store_path(path: str):
+    """Return a comparable local path or normalized remote store URL."""
+    if "://" in path:
+        scheme, remainder = path.split("://", 1)
+        normalized = posixpath.normpath(remainder.replace("\\", "/"))
+        return "remote", f"{scheme.lower()}://{normalized.rstrip('/')}"
+    resolved = Path(path).resolve(strict=False)
+    return "local", os.path.normcase(str(resolved))
+
+
+def store_paths_overlap(first: str, second: str) -> bool:
+    """Return whether two store paths are equal or one contains the other."""
+    first_kind, first_path = _canonical_store_path(first)
+    second_kind, second_path = _canonical_store_path(second)
+    if first_kind != second_kind:
+        return False
+    separator = "/" if first_kind == "remote" else os.sep
+    return (
+        first_path == second_path
+        or first_path.startswith(second_path + separator)
+        or second_path.startswith(first_path + separator)
+    )
+
+
+def validate_output_support_paths(output_path: str, support_volume_path: str) -> None:
+    """Reject output stores that could overwrite their support input."""
+    if store_paths_overlap(output_path, support_volume_path):
+        raise ValueError(
+            "output_path must not equal, contain, or be contained by "
+            "support_volume_path"
+        )
 
 
 @dataclass
@@ -436,6 +471,9 @@ def finalize_logits(
         support_threshold: Maximum value considered unsupported.
         support_anon: Use anonymous credentials for an S3 support volume.
     """
+    if support_volume_path is not None:
+        validate_output_support_paths(output_path, support_volume_path)
+
     tqdm_kwargs = get_tqdm_kwargs()
     if not verbose:
         tqdm_kwargs['disable'] = True

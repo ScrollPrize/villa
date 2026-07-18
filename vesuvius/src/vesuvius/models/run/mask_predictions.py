@@ -5,10 +5,7 @@ from __future__ import annotations
 import argparse
 import math
 import multiprocessing as mp
-import os
-import posixpath
 from concurrent.futures import ProcessPoolExecutor
-from pathlib import Path
 
 import numcodecs
 import numpy as np
@@ -16,6 +13,7 @@ from tqdm.auto import tqdm
 
 from vesuvius.data.utils import open_zarr
 from vesuvius.models.run.finalize_outputs import (
+    store_paths_overlap as _stores_overlap,
     apply_support_mask,
     open_support_volume,
     read_support_chunk,
@@ -26,30 +24,6 @@ from vesuvius.utils.k8s import get_tqdm_kwargs
 
 _worker_state = {}
 _MAX_DEFAULT_CHUNK_BYTES = 256 * 1024 * 1024
-
-
-def _canonical_store_path(path: str):
-    """Return a comparable local path or normalized remote store URL."""
-    if "://" in path:
-        scheme, remainder = path.split("://", 1)
-        normalized = posixpath.normpath(remainder.replace("\\", "/"))
-        return "remote", f"{scheme.lower()}://{normalized.rstrip('/')}"
-    resolved = Path(path).resolve(strict=False)
-    return "local", os.path.normcase(str(resolved))
-
-
-def _stores_overlap(first: str, second: str) -> bool:
-    """Return whether two store paths are equal or one contains the other."""
-    first_kind, first_path = _canonical_store_path(first)
-    second_kind, second_path = _canonical_store_path(second)
-    if first_kind != second_kind:
-        return False
-    separator = "/" if first_kind == "remote" else os.sep
-    return (
-        first_path == second_path
-        or first_path.startswith(second_path + separator)
-        or second_path.startswith(first_path + separator)
-    )
 
 
 def _prediction_spatial_shape(prediction_store) -> tuple[int, int, int]:

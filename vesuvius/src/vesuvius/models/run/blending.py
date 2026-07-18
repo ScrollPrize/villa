@@ -641,6 +641,14 @@ def merge_inference_outputs(
             is applied inline after blending (fused mode), skipping the intermediate float16 array.
     """
 
+    if finalize_config is not None and finalize_config.support_volume_path is not None:
+        from vesuvius.models.run.finalize_outputs import validate_output_support_paths
+
+        validate_output_support_paths(
+            output_path,
+            finalize_config.support_volume_path,
+        )
+
     tqdm_kwargs = get_tqdm_kwargs()
     if not verbose:
         tqdm_kwargs['disable'] = True

@@ -304,6 +304,71 @@ def test_mask_predictions_rejects_resolved_local_alias(tmp_path) -> None:
         )
 
 
+_OVERLAPPING_STORE_PATHS = [
+    ('artifact.zarr', 'artifact.zarr'),
+    ('artifact.zarr/0', 'artifact.zarr'),
+    ('artifact.zarr', 'artifact.zarr/0'),
+]
+
+
+@pytest.mark.parametrize(
+    ('output_relative', 'support_relative'),
+    _OVERLAPPING_STORE_PATHS,
+)
+def test_finalize_logits_rejects_support_output_overlap_before_io(
+    tmp_path,
+    monkeypatch,
+    output_relative: str,
+    support_relative: str,
+) -> None:
+    def fail_if_opened(*args, **kwargs):
+        raise AssertionError('overlap validation must run before opening any store')
+
+    monkeypatch.setattr(
+        'vesuvius.models.run.finalize_outputs.open_zarr',
+        fail_if_opened,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match='must not equal, contain, or be contained by support_volume_path',
+    ):
+        finalize_logits(
+            input_path=str(tmp_path / 'missing-logits.zarr'),
+            output_path=str(tmp_path / output_relative),
+            support_volume_path=str(tmp_path / support_relative),
+            num_workers=1,
+            verbose=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ('output_relative', 'support_relative'),
+    _OVERLAPPING_STORE_PATHS,
+)
+def test_fused_finalize_rejects_support_output_overlap_before_scanning(
+    tmp_path,
+    output_relative: str,
+    support_relative: str,
+) -> None:
+    from vesuvius.models.run.blending import merge_inference_outputs
+
+    with pytest.raises(
+        ValueError,
+        match='must not equal, contain, or be contained by support_volume_path',
+    ):
+        merge_inference_outputs(
+            parent_dir=str(tmp_path / 'missing-parts'),
+            output_path=str(tmp_path / output_relative),
+            num_workers=1,
+            verbose=False,
+            finalize_config=FinalizeConfig(
+                mode='binary',
+                support_volume_path=str(tmp_path / support_relative),
+            ),
+        )
+
+
 def _support_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['binary', 'multiclass'], default='binary')
