@@ -267,6 +267,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 #### ⚙️ Tools
 
+- [inkdx](https://github.com/ash9241/inkdx) by Aishwarya Das. Ink-failure diagnostics: attributes missing ink per tile to scan, surface, or model via causally-gated profile/geometry/prediction metrics; machine-readable JSON + self-contained HTML reports; validated with induced-failure attribution matrices on real scroll data.
+
 - [ScrollMAE](https://github.com/jgcarrasco/ScrollMAE) by Jorge García. Contains the necessary code to pretrain a 3D ResNet on unlabeled data and then finetune it to perform ink detection.
 
 - [Unsupervised Ink Detection with DINO](https://github.com/jgcarrasco/dino-ink-detection) by Jorge García. Contains experiments related to detecting ink without labels, including a Colab notebook.
