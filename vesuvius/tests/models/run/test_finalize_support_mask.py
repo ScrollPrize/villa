@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import zarr
 
 from vesuvius.models.benchmarks.benchmark_support_mask import evaluate_plane
 from vesuvius.models.run.mask_predictions import (
@@ -216,6 +217,58 @@ def test_mask_predictions_default_chunks_align_prediction_and_support() -> None:
     )
 
     assert _spatial_chunks(prediction, support, None) == (384, 384, 384)
+
+
+def test_mask_predictions_invalid_workers_preserve_existing_output(tmp_path) -> None:
+    shape = (2, 2, 2)
+    prediction_path = tmp_path / 'prediction.zarr'
+    support_path = tmp_path / 'support.zarr'
+    output_path = tmp_path / 'existing-output.zarr'
+
+    prediction = zarr.open(
+        str(prediction_path),
+        mode='w',
+        shape=shape,
+        chunks=shape,
+        dtype='u1',
+        zarr_format=2,
+    )
+    prediction[:] = 1
+    support = zarr.open(
+        str(support_path),
+        mode='w',
+        shape=shape,
+        chunks=shape,
+        dtype='u1',
+        zarr_format=2,
+    )
+    support[:] = 1
+    existing_output = zarr.open(
+        str(output_path),
+        mode='w',
+        shape=shape,
+        chunks=shape,
+        dtype='u1',
+        zarr_format=2,
+    )
+    existing_output[:] = 37
+    existing_output.attrs['sentinel'] = 'preserve'
+
+    with pytest.raises(ValueError, match='num_workers must be at least 1'):
+        mask_finalized_predictions(
+            str(prediction_path),
+            str(output_path),
+            str(support_path),
+            num_workers=0,
+            verbose=False,
+        )
+
+    preserved_output = zarr.open(str(output_path), mode='r')
+    assert preserved_output.attrs['sentinel'] == 'preserve'
+    np.testing.assert_array_equal(
+        preserved_output[:],
+        np.full(shape, 37, dtype=np.uint8),
+    )
 
 
 @pytest.mark.parametrize(

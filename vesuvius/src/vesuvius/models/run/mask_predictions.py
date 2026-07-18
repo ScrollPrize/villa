@@ -207,6 +207,10 @@ def mask_finalized_predictions(
         raise ValueError(f"support_threshold must be finite, got {support_threshold}")
     if not 1 <= compression_level <= 9:
         raise ValueError("compression_level must be between 1 and 9")
+    if num_workers is None:
+        num_workers = max(1, mp.cpu_count() // 2)
+    if num_workers < 1:
+        raise ValueError("num_workers must be at least 1")
 
     numcodecs.blosc.use_threads = False
     prediction_store = open_zarr(
@@ -243,10 +247,6 @@ def mask_finalized_predictions(
     )
 
     total_chunks = _spatial_chunk_count(spatial_shape, chunks)
-    if num_workers is None:
-        num_workers = max(1, mp.cpu_count() // 2)
-    if num_workers < 1:
-        raise ValueError("num_workers must be at least 1")
 
     totals = {
         "nonzero_voxels_before": 0,
