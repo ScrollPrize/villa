@@ -1792,7 +1792,8 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().cumulative_smoothness_tangent_weight == 2.0
     assert NativeTrace2CpConfig().all_pairs_direction_product is True
     assert NativeTrace2CpConfig().core_margin_voxels == 20
-    assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 100.0
+    assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 10.0
+    assert NativeTrace2CpConfig().max_cached_inference_gib == pytest.approx(8.0)
 
 
 def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1816,6 +1817,7 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.smoothness_normal_weight == 0.1
     assert args.smoothness_tangent_weight == 10.0
     assert args.core_margin_voxels == 20
+    assert args.max_cached_inference_gib == pytest.approx(8.0)
 
 
 def test_native_3d_trace2cp_mode_routes_only_unselected_fiber_json_to_whole_fiber() -> None:
@@ -2463,7 +2465,7 @@ def test_native_3d_whole_fiber_span_panels_include_regenerated_rows(monkeypatch)
         def build_trace2cp_segment_source(self, *args, **kwargs):
             return self.source
 
-        def build_trace2cp_refined_segment_source(self, source, trace, *, device):
+        def build_trace2cp_volume_trace_segment_source(self, source, trace, *, device):
             assert source is self.source
             assert device == torch.device("cpu")
             self.refined_calls.append(np.asarray(trace, dtype=np.float32))
@@ -2492,13 +2494,13 @@ def test_native_3d_whole_fiber_span_panels_include_regenerated_rows(monkeypatch)
         "_whole_fiber_segment_group_overlays_for_view",
         lambda *args, **kwargs: (),
     )
+    def fail_old_source_trace_conversion(*_args, **_kwargs):
+        raise AssertionError("regenerated native strips must use volume traces directly")
+
     monkeypatch.setattr(
         trace2cp_tool_module,
         "_volume_trace_to_source_trace_xyz",
-        lambda _source, _trace_xyz: np.asarray(
-            [[0.0, 1.0, 0.0], [1.5, 1.2, 0.0], [3.0, 1.0, 0.0]],
-            dtype=np.float32,
-        ),
+        fail_old_source_trace_conversion,
     )
     monkeypatch.setattr(
         trace2cp_tool_module,
@@ -2563,7 +2565,7 @@ def test_native_3d_whole_fiber_span_panels_include_regenerated_rows(monkeypatch)
 
     assert len(panels) == 8
     assert len(loader.refined_calls) == 1
-    assert loader.refined_calls[0].shape == (5, 3)
+    assert loader.refined_calls[0].shape == (4, 3)
     assert sheet.height == sum(panel.height for panel in panels)
     assert cp_marker_calls == [
         ("initial", "offset_axis_xyz"),
@@ -2574,6 +2576,23 @@ def test_native_3d_whole_fiber_span_panels_include_regenerated_rows(monkeypatch)
     assert len(draw_control_points) == 8
     assert all(points.shape == (3, 2) for points in draw_control_points)
     assert draw_control_point_labels == [("d=0.0", "d=3.2", "miss")] * 8
+
+
+def test_native_3d_whole_fiber_composer_can_prefix_closed_sheet() -> None:
+    from PIL import Image
+
+    closed = Image.new("RGBA", (5, 6), (11, 12, 13, 255))
+    block = (
+        Image.new("RGBA", (3, 2), (21, 22, 23, 255)),
+        Image.new("RGBA", (3, 4), (31, 32, 33, 255)),
+    )
+
+    sheet = _compose_whole_fiber_panel_blocks([block], prefix_sheet=closed)
+
+    assert sheet.size == (20, 6)
+    assert sheet.getpixel((0, 0)) == (11, 12, 13, 255)
+    assert sheet.getpixel((17, 0)) == (21, 22, 23, 255)
+    assert sheet.getpixel((17, 3)) == (31, 32, 33, 255)
 
 
 def test_native_3d_trace2cp_block_router_uses_trusted_core() -> None:
@@ -2605,6 +2624,45 @@ def test_native_3d_trace2cp_block_router_uses_trusted_core() -> None:
 
     assert np.allclose(first.origin_zyx, [0, 0, 0])
     assert np.allclose(second.origin_zyx, [8, 0, 0])
+
+
+def test_native_3d_trace2cp_field_cache_evicts_lru_blocks() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class CountingNativeModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6] = 1.0
+            return out
+
+    record = _native_trace_record(np.ones((64, 32, 32), dtype=np.float32))
+    cache = NativeTraceFieldCache(
+        record=record,
+        model=CountingNativeModel(),
+        config=_loader(augment_enabled=False).config,
+        image_normalization="none",
+        patch_shape_zyx=(16, 16, 16),
+        core_margin_voxels=4,
+        device=torch.device("cpu"),
+        max_cached_bytes=2 * (7 * 9**3 * 4 + 9**3),
+    )
+
+    first = cache.block_for_point(np.asarray([8.0, 8.0, 8.0], dtype=np.float32))
+    second = cache.block_for_point(np.asarray([16.0, 8.0, 8.0], dtype=np.float32))
+    third = cache.block_for_point(np.asarray([24.0, 8.0, 8.0], dtype=np.float32))
+    refetched_first = cache.block_for_point(np.asarray([8.0, 8.0, 8.0], dtype=np.float32))
+
+    assert np.allclose(first.origin_zyx, [0, 0, 0])
+    assert np.allclose(second.origin_zyx, [8, 0, 0])
+    assert np.allclose(third.origin_zyx, [16, 0, 0])
+    assert np.allclose(refetched_first.origin_zyx, [0, 0, 0])
+    assert len(cache._blocks) == 2
+    assert cache.total_inferred_blocks == 4
+    assert cache.evicted_inferred_blocks == 2
 
 
 def test_native_3d_trace2cp_field_cache_uses_sampler_and_base_scale() -> None:
@@ -2662,7 +2720,10 @@ def test_native_3d_trace2cp_field_cache_uses_sampler_and_base_scale() -> None:
 
     block = cache._infer_block(np.asarray([1, 2, 3], dtype=np.int64))
 
-    assert block.output_czyx.shape == (7, 4, 4, 4)
+    assert block.output_czyx.shape == (7, 3, 3, 3)
+    assert block.valid_mask_zyx.shape == (3, 3, 3)
+    assert np.allclose(block.origin_zyx, [1, 2, 3])
+    assert np.allclose(block.sample_origin_zyx, [2, 3, 4])
     assert block.output_czyx.device.type == "cpu"
     assert block.valid_mask_zyx.device.type == "cpu"
     assert len(sampler.calls) == 1

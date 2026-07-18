@@ -222,11 +222,13 @@ side/top strip input loading.
   status canvas, so there is always one current status/partial/final image to
   inspect during long renders.
 - In whole-fiber mode, `trace2cp_native_3d_vis.jpg` is also overwritten after
-  every completed CP segment. The whole-fiber sheet has four stitched rows:
-  side volume, side 3D presence, top volume, and top 3D presence. Those rows
-  are rendered as restart-delimited continuous long strips rather than one
-  visual column per CP segment. Failed segment overlays are cut before the next
-  CP region and the displayed trace resumes from the restart CP in the next
+  every completed CP segment. The whole-fiber sheet has eight stitched rows:
+  initial side volume, initial side 3D presence, initial top volume, initial top
+  3D presence, regenerated side volume, regenerated side 3D presence,
+  regenerated top volume, and regenerated top 3D presence. Those rows are
+  rendered as restart-delimited continuous long strips rather than one visual
+  column per CP segment. Failed segment overlays are cut before the next CP
+  region and the displayed trace resumes from the restart CP in the next
   long-strip span. Whole-fiber visualization uses a fixed 64 px cross-strip
   width; paths leaving that strip are clipped visually only.
 - Stops when the trace crosses the plane through the target CP with normal
@@ -237,7 +239,7 @@ side/top strip input loading.
 - Whole-fiber mode traces continuously from CP plane to CP plane. A segment
   succeeds when it reaches the next CP plane within the segment budget and its
   in-plane selected-voxel error to the target CP is below
-  `--whole-fiber-error-threshold-voxels` (default `100`). Failures count one
+  `--whole-fiber-error-threshold-voxels` (default `10`). Failures count one
   restart and resume from the failed target CP. Stdout prints the whole-fiber
   metric as `native_trace2cp_fiber_restart_rate=... restarts=... segments=...`;
   the JSON summary includes per-segment status, errors, step counts, restart
@@ -672,13 +674,21 @@ The important behavior is:
   vectors after frame construction. Whole-fiber Trace2CP can pass a shared-CP
   row-axis reference into this path so adjacent pair-local strips keep the same
   vertical row orientation despite Lasagna normal sign ambiguity.
-- Implements `build_trace2cp_refined_segment_source` for iterative Trace2CP
-  refinement. It samples a prior segment source at a smoothed fused trace
-  `(x,y,z)` to recover volume-space centerline points and strip-normal axes,
-  then builds a fresh side-strip segment from those points. The synthetic line
-  keeps endpoint context on both sides of the CP pair so the next pass behaves
-  like an independent Trace2CP run on a new line source. This path samples the
-  volume again for the next pass; it does not warp the previous image.
+- Implements a shared Trace2CP source builder from explicit
+  `FiberStripLineWindow` points and Lasagna normals. Original CP-pair sources,
+  2D iterative refinement, and native 3D regenerated strips all call this same
+  low-level side-strip grid construction.
+- Implements `build_trace2cp_volume_trace_segment_source` for native 3D
+  regenerated/fused strips. It accepts actual base-volume XYZ trace points,
+  samples fresh Lasagna normals at those points, and builds a new side/top strip
+  source without using the original source strip grid as a validity domain.
+- Implements `build_trace2cp_refined_segment_source` for the older 2D iterative
+  refinement API. It remains a compatibility adapter from prior source-strip
+  `(x,y,z)` coordinates into volume-space points, then calls the shared builder.
+  The synthetic line keeps endpoint context on both sides of the CP pair so the
+  next pass behaves like an independent Trace2CP run on a new line source. This
+  path samples the volume again for the next pass; it does not warp the previous
+  image.
 - Computes prefetch envelopes from the same shared source geometry, asks the
   sampler for dependency-only chunk requests, deduplicates those requests, and
   fetches only chunks not already represented in the VC3D persistent cache.

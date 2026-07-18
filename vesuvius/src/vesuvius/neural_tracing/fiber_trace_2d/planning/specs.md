@@ -369,6 +369,15 @@
 - Native 3D Trace2CP cached inferred blocks must be CPU-resident. CUDA is used
   for model inference and transient block sampling, but the cache must not keep
   all inferred block output tensors on GPU across a long trace or strip render.
+- Native 3D Trace2CP inferred blocks must also be bounded on the CPU by default.
+  The native CLI uses an LRU byte budget exposed as
+  `--max-cached-inference-gib`, defaults to 8 GiB, and reports total inferred,
+  resident, evicted, and resident byte/GiB counts. Eviction may cause
+  re-inference, but long whole-fiber runs must not retain every historical
+  block until process exit. Cached model-output blocks retain only the trusted
+  core plus the one-voxel upper interpolation halo needed to preserve
+  trilinear point sampling inside the trusted core; full margin outputs must
+  not remain in the resident CPU cache after block inference.
 - Native 3D Trace2CP inference blocks are sampled through the configured
   `CoordinateSampler` using the same selected-level to base-coordinate
   conversion as 3D training: selected-level block grids are multiplied by
@@ -525,7 +534,7 @@
   next CP with the local CP-to-CP segment direction as plane normal. A segment
   succeeds only when the trace reaches that plane within the segment's step
   budget and the in-plane selected-voxel error to the target CP is at most
-  `--whole-fiber-error-threshold-voxels` (default `100`). Successful segments
+  `--whole-fiber-error-threshold-voxels` (default `10`). Successful segments
   continue from the reached crossing and carry the accepted trace direction.
   Failed segments count one restart and resume tracing from the failed target
   CP with a fresh CP-local fiber tangent.
@@ -582,17 +591,22 @@
   width is visualization-only, and a traced path leaving the 64 px strip must
   only clip the drawn overlay, not invalidate tracing, metric calculation, or
   3D sampling. The regenerated/fused rows rebuild side/top strip geometry from
-  the traced span line using the same refined-source path as single-pair
-  rendering; traced points that are outside the source strip valid area are
-  clipped before building the regenerated strip and are not fatal unless fewer
-  than two valid points remain. If the original start or target trace endpoint
-  is clipped, the regenerated strip uses the first or last remaining valid
-  traced point as its displayed endpoint. The
+  explicit traced volume-space XYZ points using the same low-level
+  `FiberStripLineWindow` / `build_side_strip_patch_grid_tensor_from_line_window`
+  construction as original CP-pair strips. Regenerated/fused strips must sample
+  fresh Lasagna normals at the traced line points and must not recover their
+  line from `source.grid.coords_xyz`, `source.grid.offset_axis_xyz`, or
+  `source.grid.side_axis_xyz`. Traced points that are outside the original
+  source strip valid area are not fatal and are not clipped for regenerated
+  strip construction; only non-finite or degenerate traced line points may be
+  discarded before construction. The
   regular `trace2cp_native_3d_vis.jpg` path must be overwritten
   after every completed segment so long whole-fiber runs show partial visual
-  progress at the final output filename. The control points covered by each
-  visual span must be projected into the displayed initial and regenerated
-  side/top strip frames and drawn as markers on all eight rows. Each marker
+  progress. Completed whole-fiber spans are retained as one composed sheet, not
+  as a growing list of individual 8-panel image tuples.
+  The control points covered by each visual span must be projected into the
+  displayed initial and regenerated side/top strip frames and drawn as markers
+  on all eight rows. Each marker
   must also show that CP's native trace distance at the CP plane: the span
   start CP is `d=0.0`, reached target planes show the segment's
   `in_plane_error_voxels`, and unreached target planes show `miss`.

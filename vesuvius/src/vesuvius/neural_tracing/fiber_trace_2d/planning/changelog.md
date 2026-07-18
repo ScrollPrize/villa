@@ -1,7 +1,22 @@
 # Changelog
 
+## 2026-07-18
+
+- Refactored Trace2CP strip-source construction so original CP-pair strips,
+  2D refined strips, and native 3D regenerated/fused strips share the same
+  `FiberStripLineWindow` side-strip builder. Native 3D regenerated strips now
+  build from explicit volume-space traced XYZ points with freshly sampled
+  Lasagna normals instead of recovering lines through the original source strip
+  grid. The native whole-fiber restart/error threshold default is now 10
+  selected-scale voxels.
+
 ## 2026-07-17
 
+- Bounded native 3D Trace2CP inferred-block retention with an 8 GiB default
+  LRU `--max-cached-inference-gib` budget, changed cached blocks to retain
+  only the trusted core plus interpolation halo, and changed whole-fiber
+  visualization to stream completed spans into one composed sheet instead of
+  keeping every rendered span panel tuple in RAM.
 - Changed Trace2CP refined/regenerated strip construction to clip off-strip
   traced points, including original trace endpoints, instead of aborting
   visualization when a traced path leaves the source strip valid area.

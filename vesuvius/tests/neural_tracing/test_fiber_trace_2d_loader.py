@@ -2599,6 +2599,40 @@ def test_trace2cp_refined_segment_source_samples_from_fused_trace(tmp_path: Path
     assert np.count_nonzero(refined_valid) > 0
 
 
+def test_trace2cp_volume_trace_segment_source_ignores_original_source_grid(
+    tmp_path: Path,
+) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    broken_grid_source = replace(source, grid=SimpleNamespace())
+    trace_xyz = np.asarray(source.line_window.line_points_xyz, dtype=np.float32).copy()
+    trace_xyz[:, 1] += np.float32(5.0)
+
+    regenerated_source = loader.build_trace2cp_volume_trace_segment_source(
+        broken_grid_source,
+        trace_xyz,
+        device=torch.device("cpu"),
+    )
+    regenerated_sample, regenerated_image, regenerated_valid = (
+        loader.sample_trace2cp_segment_source(regenerated_source)
+    )
+
+    assert regenerated_sample.start_control_point_index == source.start_control_point_index
+    assert regenerated_sample.target_control_point_index == source.target_control_point_index
+    assert regenerated_image.shape == regenerated_valid.shape
+    assert np.count_nonzero(regenerated_valid) > 0
+    assert np.allclose(
+        np.asarray(regenerated_source.line_window.line_points_xyz, dtype=np.float32)[1:-1, 1],
+        trace_xyz[:, 1],
+    )
+
+
 def test_trace2cp_refined_segment_source_clips_off_strip_trace_points(tmp_path: Path) -> None:
     loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
     source = loader.build_trace2cp_segment_source(

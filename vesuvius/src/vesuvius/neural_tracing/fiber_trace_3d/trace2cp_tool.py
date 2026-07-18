@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -38,6 +39,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_
 
 _EPS = 1.0e-12
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
+_GIB = 1024**3
 
 
 @dataclass(frozen=True)
@@ -62,7 +64,8 @@ class NativeTrace2CpConfig:
     trace_step_limit: int | None = None
     inference_patch_shape_zyx: tuple[int, int, int] = (64, 64, 64)
     core_margin_voxels: int = 20
-    whole_fiber_error_threshold_voxels: float = 100.0
+    whole_fiber_error_threshold_voxels: float = 10.0
+    max_cached_inference_gib: float = 8.0
 
 
 @dataclass(frozen=True)
@@ -145,11 +148,13 @@ class _NativeWholeFiberVisualSpan:
 @dataclass(frozen=True)
 class _InferredBlock:
     origin_zyx: np.ndarray
+    sample_origin_zyx: np.ndarray
     shape_zyx: tuple[int, int, int]
     core_lo_zyx: np.ndarray
     core_hi_zyx: np.ndarray
     output_czyx: torch.Tensor
     valid_mask_zyx: torch.Tensor
+    cache_nbytes: int
 
 
 @dataclass(frozen=True)
@@ -240,6 +245,13 @@ def _as_zyx3(value: Any, *, key: str) -> tuple[int, int, int]:
     if any(v <= 0 for v in result):
         raise ValueError(f"{key} values must be positive")
     return result
+
+
+def _cache_bytes_from_gib(value: float) -> int:
+    gib = float(value)
+    if not math.isfinite(gib) or gib < 0.0:
+        raise ValueError("max cached inference GiB must be finite and >= 0")
+    return int(round(gib * float(_GIB)))
 
 
 def _unit(vector: np.ndarray, *, fallback: np.ndarray | None = None) -> np.ndarray:
@@ -632,6 +644,7 @@ class NativeTraceFieldCache:
         patch_shape_zyx: tuple[int, int, int],
         core_margin_voxels: int,
         device: torch.device,
+        max_cached_bytes: int | None = 8 * 1024**3,
     ) -> None:
         self.record = record
         self.model = model
@@ -647,7 +660,13 @@ class NativeTraceFieldCache:
             )
         self.core_shape_zyx = tuple(v - 2 * self.core_margin for v in self.patch_shape_zyx)
         self.device = torch.device(device)
-        self._blocks: dict[tuple[int, int, int], _InferredBlock] = {}
+        if max_cached_bytes is not None and int(max_cached_bytes) < 0:
+            raise ValueError("max_cached_bytes must be >= 0 or None")
+        self.max_cached_bytes = None if max_cached_bytes is None else int(max_cached_bytes)
+        self._blocks: OrderedDict[tuple[int, int, int], _InferredBlock] = OrderedDict()
+        self.total_inferred_blocks = 0
+        self.evicted_inferred_blocks = 0
+        self.resident_inferred_block_bytes = 0
 
     def _block_origin_for_point(self, point_zyx: np.ndarray) -> np.ndarray:
         point = np.asarray(point_zyx, dtype=np.float64)
@@ -738,12 +757,25 @@ class NativeTraceFieldCache:
         sampled = torch.where(sampled_valid, sampled, torch.zeros_like(sampled))
         return sampled, sampled_valid
 
+    def _cached_output_slices(self) -> tuple[tuple[slice, slice, slice], np.ndarray]:
+        lo = int(self.core_margin)
+        hi = np.asarray(self.patch_shape_zyx, dtype=np.int64) - int(self.core_margin)
+        # Keep a one-voxel upper halo so trilinear samples inside the trusted
+        # core can read the same interpolation corners as the full output.
+        crop_hi = np.minimum(
+            np.asarray(self.patch_shape_zyx, dtype=np.int64),
+            hi + np.asarray([1, 1, 1], dtype=np.int64),
+        )
+        slices = tuple(slice(lo, int(axis_hi)) for axis_hi in crop_hi)
+        return slices, np.asarray([lo, lo, lo], dtype=np.int64)
+
     @torch.no_grad()
     def _infer_block(self, origin_zyx: np.ndarray) -> _InferredBlock:
         origin = np.asarray(origin_zyx, dtype=np.int64)
         key = tuple(int(v) for v in origin)
         block = self._blocks.get(key)
         if block is not None:
+            self._blocks.move_to_end(key)
             return block
         raw_t, valid = self._sample_block_volume(origin)
         image = _normalize_image(raw_t, valid, self.image_normalization)
@@ -760,15 +792,36 @@ class NativeTraceFieldCache:
             self.model.train()
         core_lo = origin + int(self.core_margin)
         core_hi = origin + np.asarray(self.patch_shape_zyx, dtype=np.int64) - int(self.core_margin)
+        crop_slices, crop_lo = self._cached_output_slices()
+        output_crop = output[
+            :,
+            crop_slices[0],
+            crop_slices[1],
+            crop_slices[2],
+        ].contiguous()
+        valid_crop = valid_cpu[crop_slices[0], crop_slices[1], crop_slices[2]].contiguous()
+        cache_nbytes = int(output_crop.numel() * output_crop.element_size())
+        cache_nbytes += int(valid_crop.numel() * valid_crop.element_size())
         block = _InferredBlock(
             origin_zyx=origin.astype(np.int64),
-            shape_zyx=self.patch_shape_zyx,
+            sample_origin_zyx=(origin + crop_lo).astype(np.int64),
+            shape_zyx=tuple(int(v) for v in valid_crop.shape),
             core_lo_zyx=core_lo.astype(np.float32),
             core_hi_zyx=core_hi.astype(np.float32),
-            output_czyx=output,
-            valid_mask_zyx=valid_cpu,
+            output_czyx=output_crop,
+            valid_mask_zyx=valid_crop,
+            cache_nbytes=cache_nbytes,
         )
-        self._blocks[key] = block
+        self.total_inferred_blocks += 1
+        if self.max_cached_bytes is None or self.max_cached_bytes > 0:
+            self._blocks[key] = block
+            self._blocks.move_to_end(key)
+            self.resident_inferred_block_bytes += int(block.cache_nbytes)
+            if self.max_cached_bytes is not None:
+                while self._blocks and self.resident_inferred_block_bytes > self.max_cached_bytes:
+                    _evicted_key, evicted = self._blocks.popitem(last=False)
+                    self.resident_inferred_block_bytes -= int(evicted.cache_nbytes)
+                    self.evicted_inferred_blocks += 1
         return block
 
     def block_for_point(self, point_zyx: np.ndarray) -> _InferredBlock:
@@ -804,7 +857,6 @@ class NativeTraceFieldCache:
 
         origins = self._block_origins_for_points(points)
         unique_origins, inverse = np.unique(origins, axis=0, return_inverse=True)
-        shape = np.asarray(self.patch_shape_zyx, dtype=np.float32)
         progress_start = time.perf_counter()
         last_progress_time = 0.0
         new_blocks = 0
@@ -831,7 +883,8 @@ class NativeTraceFieldCache:
                 detail=(
                     f"points={count} valid={valid_done} "
                     f"new={new_blocks} cached={cached_blocks} "
-                    f"cache_blocks={len(self._blocks)}"
+                    f"cache_blocks={len(self._blocks)} "
+                    f"cache_gib={self.resident_inferred_block_bytes / float(_GIB):.3f}"
                 ),
             )
 
@@ -849,7 +902,8 @@ class NativeTraceFieldCache:
             else:
                 new_blocks += 1
             group_points = points[indices]
-            local = group_points - block.origin_zyx.astype(np.float32)
+            shape = np.asarray(block.shape_zyx, dtype=np.float32)
+            local = group_points - block.sample_origin_zyx.astype(np.float32)
             inside_core = np.all(group_points >= block.core_lo_zyx, axis=1) & np.all(
                 group_points < block.core_hi_zyx,
                 axis=1,
@@ -868,7 +922,7 @@ class NativeTraceFieldCache:
             sampled = _grid_sample_channels_at_points(
                 block_output,
                 usable_points,
-                origin_zyx=block.origin_zyx,
+                origin_zyx=block.sample_origin_zyx,
             )
             sampled_branch_count = _direction_branch_count_from_channels(int(sampled.shape[1]))
             if branch_count is None:
@@ -901,7 +955,7 @@ class NativeTraceFieldCache:
             valid_values = _grid_sample_channels_at_points(
                 block_valid.view(1, *block.shape_zyx),
                 usable_points,
-                origin_zyx=block.origin_zyx,
+                origin_zyx=block.sample_origin_zyx,
             )[:, 0]
             axis_choices_zyx, group_presence = _decode_grouped_direction_presence(sampled)
             group_valid = (
@@ -3407,6 +3461,9 @@ def trace_native_3d_whole_fiber(
             ),
         )
 
+    def inferred_block_count() -> int:
+        return int(getattr(cache, "total_inferred_blocks", len(cache._blocks)))
+
     emit_progress(0)
     for segment_index in range(segment_count):
         start_cp = int(segment_index)
@@ -3489,7 +3546,7 @@ def trace_native_3d_whole_fiber(
                 if any(part.size for part in stitched_parts)
                 else np.zeros((0, 3), dtype=np.float32)
             ),
-            inferred_blocks=int(len(cache._blocks)),
+            inferred_blocks=inferred_block_count(),
         )
         if segment_callback is not None:
             segment_callback(segment, partial)
@@ -3505,7 +3562,7 @@ def trace_native_3d_whole_fiber(
         restart_rate=float(restart_count / max(1, segment_count)),
         segment_count=int(segment_count),
         stitched_trace_zyx=stitched,
-        inferred_blocks=int(len(cache._blocks)),
+        inferred_blocks=inferred_block_count(),
     )
 
 
@@ -4051,16 +4108,15 @@ def _make_native_trace_visualization(
     )
     fused_source = None
     if has_fused_trace:
-        fused_trace_xyz = _trace_zyx_to_base_xyz(result.fused_zyx, spacing)
-        fused_source_trace = run_stage(
+        fused_trace_xyz = run_stage(
             "fused-source-trace",
-            lambda: _volume_trace_to_source_trace_xyz(source, fused_trace_xyz),
+            lambda: _trace_zyx_to_base_xyz(result.fused_zyx, spacing),
         )
         fused_source = run_stage(
             "fused-source",
-            lambda: geometry_loader.build_trace2cp_refined_segment_source(
+            lambda: geometry_loader.build_trace2cp_volume_trace_segment_source(
                 source,
-                fused_source_trace,
+                fused_trace_xyz,
                 device=torch.device("cpu"),
             ),
         )
@@ -4445,11 +4501,14 @@ def _native_whole_fiber_visual_spans(
 def _compose_whole_fiber_panel_blocks(
     panel_blocks: list[tuple[Any, ...]],
     *,
+    prefix_sheet: Any | None = None,
     status_text: str | None = None,
 ):
     from PIL import Image, ImageDraw
 
     if not panel_blocks:
+        if prefix_sheet is not None:
+            return prefix_sheet.copy()
         sheet = Image.new("RGBA", (760, 96), (0, 0, 0, 255))
         draw = ImageDraw.Draw(sheet, "RGBA")
         draw.text((8, 8), "native 3D whole-fiber Trace2CP", fill=(255, 255, 255, 255))
@@ -4477,6 +4536,19 @@ def _compose_whole_fiber_panel_blocks(
         x += int(block_width)
         if block_index + 1 < len(panel_blocks):
             x += separator_width
+    if prefix_sheet is not None:
+        prefix = prefix_sheet.convert("RGBA")
+        combined = Image.new(
+            "RGBA",
+            (
+                int(prefix.width) + separator_width + int(sheet.width),
+                max(int(prefix.height), int(sheet.height)),
+            ),
+            (0, 0, 0, 255),
+        )
+        combined.alpha_composite(prefix, (0, 0))
+        combined.alpha_composite(sheet, (int(prefix.width) + separator_width, 0))
+        return combined
     return sheet
 
 
@@ -4503,32 +4575,41 @@ def _build_native_whole_fiber_span_source(
     )
 
 
-def _trim_failed_source_trace_before_target(
-    source_trace: np.ndarray,
+def _trim_failed_volume_trace_before_target(
+    source: _Trace2CpSegmentSource,
+    trace_xyz: np.ndarray,
     *,
     start_xy: np.ndarray,
     target_xy: np.ndarray,
     margin_px: float = 8.0,
 ) -> np.ndarray:
-    trace = np.asarray(source_trace, dtype=np.float32)
+    trace = np.asarray(trace_xyz, dtype=np.float32)
     if trace.ndim != 2 or trace.shape[1] != 3 or trace.shape[0] <= 1:
         return trace.astype(np.float32, copy=True)
+    try:
+        _projected_xyz, projected_xy, projected_valid = _closest_source_line_projection(
+            trace,
+            source,
+        )
+    except (AttributeError, ValueError):
+        finite = trace[np.isfinite(trace).all(axis=1)]
+        return finite.astype(np.float32, copy=False)
     start_x = float(np.asarray(start_xy, dtype=np.float32)[0])
     target_x = float(np.asarray(target_xy, dtype=np.float32)[0])
     sign = 1.0 if target_x >= start_x else -1.0
     cutoff = target_x - sign * max(0.0, float(margin_px))
     if sign >= 0.0:
-        keep = trace[:, 0] <= cutoff
+        keep = projected_xy[:, 0] <= cutoff
     else:
-        keep = trace[:, 0] >= cutoff
-    keep &= np.isfinite(trace).all(axis=1)
+        keep = projected_xy[:, 0] >= cutoff
+    keep &= projected_valid & np.isfinite(projected_xy[:, 0]) & np.isfinite(trace).all(axis=1)
     if int(np.count_nonzero(keep)) >= 2:
         return trace[keep].astype(np.float32, copy=False)
     finite = trace[np.isfinite(trace).all(axis=1)]
     return finite[: min(2, int(finite.shape[0]))].astype(np.float32, copy=False)
 
 
-def _native_whole_fiber_span_source_trace(
+def _native_whole_fiber_span_volume_trace(
     source: _Trace2CpSegmentSource,
     span: _NativeWholeFiberVisualSpan,
 ) -> np.ndarray:
@@ -4537,19 +4618,19 @@ def _native_whole_fiber_span_source_trace(
     previous_success = False
     for segment in span.segments:
         trace_xyz = _trace_zyx_to_base_xyz(segment.trace_zyx, spacing)
-        source_trace = _volume_trace_to_source_trace_xyz(source, trace_xyz)
         if not bool(segment.success):
-            source_trace = _trim_failed_source_trace_before_target(
-                source_trace,
+            trace_xyz = _trim_failed_volume_trace_before_target(
+                source,
+                trace_xyz,
                 start_xy=_trace2cp_source_control_point_xy(source, int(segment.start_cp_index)),
                 target_xy=_trace2cp_source_control_point_xy(source, int(segment.target_cp_index)),
             )
-        if int(source_trace.shape[0]) < 2:
+        if int(trace_xyz.shape[0]) < 2:
             continue
         if parts and previous_success and bool(segment.success):
-            parts.append(source_trace[1:].copy())
+            parts.append(trace_xyz[1:].copy())
         else:
-            parts.append(source_trace.copy())
+            parts.append(trace_xyz.copy())
         previous_success = bool(segment.success)
     if not any(part.size for part in parts):
         raise ValueError(
@@ -4622,8 +4703,8 @@ def _render_native_whole_fiber_span_panels(
         spacing_base=spacing,
         progress_label=f"span{span.start_cp_index}-{span.end_cp_index}-top",
     )
-    regenerated_source_trace = _native_whole_fiber_span_source_trace(source, span)
-    regenerated_source = geometry_loader.build_trace2cp_refined_segment_source(
+    regenerated_source_trace = _native_whole_fiber_span_volume_trace(source, span)
+    regenerated_source = geometry_loader.build_trace2cp_volume_trace_segment_source(
         source,
         regenerated_source_trace,
         device=torch.device("cpu"),
@@ -5034,6 +5115,7 @@ def run_native_trace2cp(
         patch_shape_zyx=cfg.inference_patch_shape_zyx,
         core_margin_voxels=cfg.core_margin_voxels,
         device=device,
+        max_cached_bytes=_cache_bytes_from_gib(float(cfg.max_cached_inference_gib)),
     )
     normal_sampler = _NativeLasagnaNormalSampler(
         geometry_loader=geometry_loader,
@@ -5054,11 +5136,12 @@ def run_native_trace2cp(
         out_dir = Path(export_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         image_path = out_dir / "trace2cp_native_3d_vis.jpg"
-        closed_panel_blocks: list[tuple[Any, ...]] = []
+        closed_panel_sheet: Any | None = None
+        closed_span_count = 0
         active_segments: list[NativeWholeFiberSegmentResult] = []
         active_start_cp_index = 0
         _compose_whole_fiber_panel_blocks(
-            closed_panel_blocks,
+            [],
             status_text="initializing whole-fiber trace",
         ).convert("RGB").save(image_path, quality=90)
         print(f"native whole-fiber partial={image_path} initializing", flush=True)
@@ -5067,7 +5150,7 @@ def run_native_trace2cp(
             segment: NativeWholeFiberSegmentResult,
             partial: NativeWholeFiberResult | None,
         ) -> None:
-            nonlocal active_start_cp_index, active_segments
+            nonlocal active_start_cp_index, active_segments, closed_panel_sheet, closed_span_count
             print(
                 "native whole-fiber render segment "
                 f"{segment.start_cp_index}->{segment.target_cp_index} "
@@ -5092,14 +5175,14 @@ def run_native_trace2cp(
                 image_normalization=loader_config.image_normalization,
                 strip_cross_width_px=64,
             )
-            current_blocks = [*closed_panel_blocks, panels]
             restarts = 0 if partial is None else int(partial.restart_count)
             rate = 0.0 if partial is None else float(partial.restart_rate)
             _compose_whole_fiber_panel_blocks(
-                current_blocks,
+                [panels],
+                prefix_sheet=closed_panel_sheet,
                 status_text=(
                     f"segments={len(partial.segments) if partial is not None else 0} "
-                    f"spans={len(current_blocks)} restarts={restarts} "
+                    f"spans={closed_span_count + 1} restarts={restarts} "
                     f"rate={rate:.6f}"
                 ),
             ).convert("RGB").save(image_path, quality=90)
@@ -5109,7 +5192,11 @@ def run_native_trace2cp(
                 flush=True,
             )
             if not bool(segment.success):
-                closed_panel_blocks.append(panels)
+                closed_panel_sheet = _compose_whole_fiber_panel_blocks(
+                    [panels],
+                    prefix_sheet=closed_panel_sheet,
+                )
+                closed_span_count += 1
                 active_segments = []
                 active_start_cp_index = int(segment.target_cp_index)
 
@@ -5150,7 +5237,17 @@ def run_native_trace2cp(
             **_native_trace_smoothness_summary(cfg),
             "max_steps": None if cfg.max_steps is None else int(cfg.max_steps),
             "trace_step_limit": None if cfg.trace_step_limit is None else int(cfg.trace_step_limit),
-            "inferred_blocks": int(len(cache._blocks)),
+            "inferred_blocks": int(cache.total_inferred_blocks),
+            "resident_inferred_blocks": int(len(cache._blocks)),
+            "evicted_inferred_blocks": int(cache.evicted_inferred_blocks),
+            "resident_inferred_block_bytes": int(cache.resident_inferred_block_bytes),
+            "resident_inferred_block_gib": float(
+                cache.resident_inferred_block_bytes / float(_GIB)
+            ),
+            "max_cached_inference_gib": float(cfg.max_cached_inference_gib),
+            "max_cached_inference_bytes": _cache_bytes_from_gib(
+                float(cfg.max_cached_inference_gib)
+            ),
             "export": str(image_path),
             "segments": [
                 {
@@ -5182,7 +5279,10 @@ def run_native_trace2cp(
         )
         print(
             "native_trace2cp_3d whole_fiber "
-            f"blocks={len(cache._blocks)} export={image_path}",
+            f"blocks={len(cache._blocks)} inferred={cache.total_inferred_blocks} "
+            f"evicted={cache.evicted_inferred_blocks} "
+            f"cache_gib={cache.resident_inferred_block_bytes / float(_GIB):.3f} "
+            f"export={image_path}",
             flush=True,
         )
         return whole
@@ -5293,8 +5393,18 @@ def run_native_trace2cp(
         "fusion_closest_midpoint_zyx": [
             float(v) for v in np.asarray(result.fusion.closest_midpoint_zyx, dtype=np.float32)
         ],
-        "inferred_blocks": int(len(cache._blocks)),
-        "export": str(image_path),
+        "inferred_blocks": int(cache.total_inferred_blocks),
+            "resident_inferred_blocks": int(len(cache._blocks)),
+            "evicted_inferred_blocks": int(cache.evicted_inferred_blocks),
+            "resident_inferred_block_bytes": int(cache.resident_inferred_block_bytes),
+            "resident_inferred_block_gib": float(
+                cache.resident_inferred_block_bytes / float(_GIB)
+            ),
+            "max_cached_inference_gib": float(cfg.max_cached_inference_gib),
+            "max_cached_inference_bytes": _cache_bytes_from_gib(
+                float(cfg.max_cached_inference_gib)
+            ),
+            "export": str(image_path),
     }
     summary_path = out_dir / "trace2cp_native_3d_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -5315,7 +5425,10 @@ def run_native_trace2cp(
         f"sample_index={selection.sample_index} start_cp={selection.start_cp_index} "
         f"target_cp={selection.target_cp_index} "
         f"forward_reached={result.forward.reached_target_plane} reverse_reached={result.reverse.reached_target_plane} "
-        f"blocks={len(cache._blocks)} export={image_path}",
+        f"blocks={len(cache._blocks)} inferred={cache.total_inferred_blocks} "
+        f"evicted={cache.evicted_inferred_blocks} "
+        f"cache_gib={cache.resident_inferred_block_bytes / float(_GIB):.3f} "
+        f"export={image_path}",
         flush=True,
     )
     return result
@@ -5356,7 +5469,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--trace-step-limit", type=int, default=None)
     parser.add_argument("--inference-patch-shape-zyx", nargs=3, type=int, default=None)
     parser.add_argument("--core-margin-voxels", type=int, default=20)
-    parser.add_argument("--whole-fiber-error-threshold-voxels", type=float, default=100.0)
+    parser.add_argument(
+        "--max-cached-inference-gib",
+        type=float,
+        default=8.0,
+        help=(
+            "Maximum resident CPU model-output cache size in GiB for native 3D tracing. "
+            "Use 0 to disable retention; negative values are rejected."
+        ),
+    )
+    parser.add_argument("--whole-fiber-error-threshold-voxels", type=float, default=10.0)
     return parser.parse_args()
 
 
@@ -5395,6 +5517,7 @@ def main() -> None:
         inference_patch_shape_zyx=patch_shape,
         core_margin_voxels=int(args.core_margin_voxels),
         whole_fiber_error_threshold_voxels=float(args.whole_fiber_error_threshold_voxels),
+        max_cached_inference_gib=float(args.max_cached_inference_gib),
     )
     run_native_trace2cp(
         args.config,

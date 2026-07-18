@@ -2813,6 +2813,186 @@ class FiberStrip2DLoader:
             return True
         return float(np.dot(axis / axis_norm, reference / reference_norm)) >= 0.0
 
+    @staticmethod
+    def _align_lasagna_normal_signs_along_line(normals_xyz: np.ndarray) -> np.ndarray:
+        normals = np.asarray(normals_xyz, dtype=np.float32).copy()
+        if normals.ndim != 2 or normals.shape[1] != 3:
+            raise ValueError("normals_xyz must have shape [N,3]")
+        previous: np.ndarray | None = None
+        for index in range(int(normals.shape[0])):
+            normal = np.asarray(normals[index], dtype=np.float32)
+            norm = float(np.linalg.norm(normal))
+            if not np.isfinite(norm) or norm <= 1.0e-12:
+                continue
+            normal = (normal / np.float32(norm)).astype(np.float32, copy=False)
+            if previous is not None and float(np.dot(previous, normal)) < 0.0:
+                normal = (-normal).astype(np.float32, copy=False)
+            normals[index] = normal
+            previous = normal
+        return normals
+
+    def _lasagna_normals_for_points_xyz(
+        self,
+        record: _Record,
+        points_xyz_base: np.ndarray,
+        *,
+        line_indices: np.ndarray | None = None,
+        control_point_index: int | None = None,
+    ) -> np.ndarray:
+        points_xyz = np.asarray(points_xyz_base, dtype=np.float64)
+        if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
+            raise ValueError("points_xyz_base must have shape [N,3]")
+        count = int(points_xyz.shape[0])
+        if count == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        indices = (
+            np.arange(count, dtype=np.int64)
+            if line_indices is None
+            else np.asarray(line_indices, dtype=np.int64)
+        )
+        if indices.shape != (count,):
+            raise ValueError("line_indices must have shape [N]")
+        normals, valid, invalid_by_line = self._lasagna_normals_at_zyx_batch(
+            record,
+            points_xyz[:, [2, 1, 0]],
+            line_indices=indices,
+        )
+        if not bool(np.all(valid)):
+            invalid_positions = np.flatnonzero(~valid)
+            first_pos = int(invalid_positions[0]) if invalid_positions.size else -1
+            first_index = int(indices[first_pos]) if first_pos >= 0 else -1
+            reason = invalid_by_line.get(first_index)
+            if reason is None:
+                reason = self._normal_sample_context(
+                    record,
+                    points_xyz[first_pos, [2, 1, 0]],
+                    channel="grad_mag",
+                    spacing_base=record.grad_mag_spacing_base,
+                    line_point_index=first_index,
+                    control_point_index=control_point_index,
+                )
+            raise ValueError(
+                "Lasagna normal sample is invalid for Trace2CP traced line point: "
+                f"invalid_count={int(invalid_positions.size)} first_invalid={first_index}: "
+                f"{reason}"
+            )
+        return self._align_lasagna_normal_signs_along_line(normals)
+
+    def _build_trace2cp_source_from_line_window(
+        self,
+        *,
+        record: _Record,
+        record_index: int,
+        start_control_point_index: int,
+        target_control_point_index: int,
+        line_window: FiberStripLineWindow,
+        local_target_index: int,
+        source_shape_hw: tuple[int, int],
+        anchor_column_px: float,
+        strip_z_offset: float | None,
+        sampled_normals: np.ndarray | None = None,
+        row_axis_alignment_line_index: int | None = None,
+        row_axis_alignment_xyz: np.ndarray | None = None,
+        device: torch.device | None = None,
+    ) -> _Trace2CpSegmentSource:
+        resolved_device = resolve_torch_device(self.config.augment.device) if device is None else device
+        height, width = (int(v) for v in source_shape_hw)
+        if height <= 0 or width <= 0:
+            raise ValueError(f"invalid Trace2CP source shape {(height, width)}")
+        local_start = int(line_window.local_control_point_index)
+        local_target = int(local_target_index)
+        point_count = int(np.asarray(line_window.line_points_xyz).shape[0])
+        if local_start < 0 or local_start >= point_count:
+            raise ValueError(
+                f"Trace2CP local start index {local_start} out of range for {point_count} points"
+            )
+        if local_target < 0 or local_target >= point_count:
+            raise ValueError(
+                f"Trace2CP local target index {local_target} out of range for {point_count} points"
+            )
+        line_xy = source_line_xy_from_line_window(
+            line_window,
+            patch_shape_hw=(height, width),
+            anchor_column_px=float(anchor_column_px),
+            pixel_spacing_base=record.volume_spacing_base,
+        )
+        start_xy = np.asarray(line_xy[local_start], dtype=np.float32)
+        target_xy = np.asarray(line_xy[local_target], dtype=np.float32)
+        if sampled_normals is None:
+            sampled_normals = self._lasagna_normals_for_line_window(
+                record,
+                line_window,
+                control_point_index=int(start_control_point_index),
+            )
+        sampled_normals = np.asarray(sampled_normals, dtype=np.float32)
+        if sampled_normals.shape != (point_count, 3):
+            raise ValueError(
+                "Trace2CP sampled_normals must have shape [line_points,3], "
+                f"got {sampled_normals.shape} for {point_count} points"
+            )
+        sampled_normals = self._prealign_lasagna_normals_to_row_axis_reference(
+            sampled_normals,
+            line_window,
+            row_axis_alignment_line_index=row_axis_alignment_line_index,
+            row_axis_alignment_xyz=row_axis_alignment_xyz,
+        )
+        center_offset = (
+            min(self.strip_z_offsets, key=lambda value: abs(float(value)))
+            if strip_z_offset is None
+            else float(strip_z_offset)
+        )
+
+        def build_grid(normals: np.ndarray) -> FiberStripGridTorch:
+            return build_side_strip_patch_grid_tensor_from_line_window(
+                line_window,
+                patch_shape_hw=(height, width),
+                strip_z_offset=float(center_offset),
+                sampled_normals=normals,
+                pixel_spacing_base=record.volume_spacing_base,
+                anchor_column_px=float(anchor_column_px),
+                device=resolved_device,
+            )
+
+        grid = build_grid(sampled_normals)
+        if (
+            row_axis_alignment_line_index is not None
+            and row_axis_alignment_xyz is not None
+            and not self._grid_row_axis_aligns_reference(
+                grid,
+                line_window,
+                line_index=int(row_axis_alignment_line_index),
+                reference_xyz=row_axis_alignment_xyz,
+                patch_shape_hw=(height, width),
+                anchor_column_px=float(anchor_column_px),
+                pixel_spacing_base=record.volume_spacing_base,
+            )
+        ):
+            sampled_normals = (-np.asarray(sampled_normals, dtype=np.float32)).astype(
+                np.float32,
+                copy=False,
+            )
+            grid = build_grid(sampled_normals)
+        start_row_axis = self._row_axis_at_xy(grid, start_xy)
+        target_row_axis = self._row_axis_at_xy(grid, target_xy)
+        return _Trace2CpSegmentSource(
+            record=record,
+            record_index=int(record_index),
+            start_control_point_index=int(start_control_point_index),
+            target_control_point_index=int(target_control_point_index),
+            center_offset=float(center_offset),
+            source_shape_hw=(height, width),
+            grid=grid,
+            line_window=line_window,
+            anchor_column_px=float(anchor_column_px),
+            line_xy=np.asarray(line_xy, dtype=np.float32),
+            start_control_point_xy=start_xy.astype(np.float32, copy=False),
+            target_control_point_xy=target_xy.astype(np.float32, copy=False),
+            line_point_indices=np.asarray(line_window.original_line_indices, dtype=np.int64),
+            line_normals_xyz=np.asarray(sampled_normals, dtype=np.float32),
+            start_row_axis_xyz=start_row_axis,
+            target_row_axis_xyz=target_row_axis,
+        )
+
     def _unaugmented_centerline_coords(self, shape_hw: tuple[int, int]) -> np.ndarray:
         height, width = (int(v) for v in shape_hw)
         x = np.arange(width, dtype=np.float32)
@@ -4113,88 +4293,174 @@ class FiberStrip2DLoader:
             start_line_index=start_line_index,
             target_line_index=target_line_index,
         )
-        line_xy = source_line_xy_from_line_window(
-            line_window,
-            patch_shape_hw=(height, width),
-            anchor_column_px=start_col,
-            pixel_spacing_base=record.volume_spacing_base,
+        target_matches = np.flatnonzero(
+            np.asarray(line_window.original_line_indices, dtype=np.int64)
+            == int(target_line_index)
         )
-        start_xy = source_point_xy_for_line_index(
-            line_window,
-            original_line_index=start_line_index,
-            patch_shape_hw=(height, width),
-            anchor_column_px=start_col,
-            pixel_spacing_base=record.volume_spacing_base,
-        )
-        target_xy = source_point_xy_for_line_index(
-            line_window,
-            original_line_index=target_line_index,
-            patch_shape_hw=(height, width),
-            anchor_column_px=start_col,
-            pixel_spacing_base=record.volume_spacing_base,
-        )
-        sampled_normals = self._lasagna_normals_for_line_window(
-            record,
-            line_window,
-            control_point_index=int(start_cp_index),
-        )
-        sampled_normals = self._prealign_lasagna_normals_to_row_axis_reference(
-            sampled_normals,
-            line_window,
-            row_axis_alignment_line_index=row_axis_alignment_line_index,
-            row_axis_alignment_xyz=row_axis_alignment_xyz,
-        )
-        center_offset = (
-            min(self.strip_z_offsets, key=lambda value: abs(float(value)))
-            if strip_z_offset is None
-            else float(strip_z_offset)
-        )
-        def build_grid(normals: np.ndarray) -> FiberStripGridTorch:
-            return build_side_strip_patch_grid_tensor_from_line_window(
-                line_window,
-                patch_shape_hw=(height, width),
-                strip_z_offset=float(center_offset),
-                sampled_normals=normals,
-                pixel_spacing_base=record.volume_spacing_base,
-                anchor_column_px=start_col,
-                device=resolved_device,
-            )
-
-        grid = build_grid(sampled_normals)
-        if (
-            row_axis_alignment_line_index is not None
-            and row_axis_alignment_xyz is not None
-            and not self._grid_row_axis_aligns_reference(
-                grid,
-                line_window,
-                line_index=int(row_axis_alignment_line_index),
-                reference_xyz=row_axis_alignment_xyz,
-                patch_shape_hw=(height, width),
-                anchor_column_px=start_col,
-                pixel_spacing_base=record.volume_spacing_base,
-            )
-        ):
-            sampled_normals = (-np.asarray(sampled_normals, dtype=np.float32)).astype(np.float32, copy=False)
-            grid = build_grid(sampled_normals)
-        start_row_axis = self._row_axis_at_xy(grid, start_xy)
-        target_row_axis = self._row_axis_at_xy(grid, target_xy)
-        return _Trace2CpSegmentSource(
+        if target_matches.size == 0:
+            raise ValueError("Trace2CP line window lost the target control point")
+        return self._build_trace2cp_source_from_line_window(
             record=record,
             record_index=int(record_index),
             start_control_point_index=int(start_cp_index),
             target_control_point_index=int(target_cp_index),
-            center_offset=float(center_offset),
-            source_shape_hw=(height, width),
-            grid=grid,
             line_window=line_window,
+            local_target_index=int(target_matches[0]),
+            source_shape_hw=(height, width),
             anchor_column_px=float(start_col),
-            line_xy=np.asarray(line_xy, dtype=np.float32),
-            start_control_point_xy=start_xy.astype(np.float32, copy=False),
-            target_control_point_xy=target_xy.astype(np.float32, copy=False),
-            line_point_indices=np.asarray(line_window.original_line_indices, dtype=np.int64),
-            line_normals_xyz=np.asarray(sampled_normals, dtype=np.float32),
-            start_row_axis_xyz=start_row_axis,
-            target_row_axis_xyz=target_row_axis,
+            strip_z_offset=strip_z_offset,
+            row_axis_alignment_line_index=row_axis_alignment_line_index,
+            row_axis_alignment_xyz=row_axis_alignment_xyz,
+            device=resolved_device,
+        )
+
+    def build_trace2cp_volume_trace_segment_source(
+        self,
+        source: _Trace2CpSegmentSource,
+        trace_xyz_base: np.ndarray,
+        *,
+        strip_z_offset: float | None = None,
+        row_axis_alignment_xyz: np.ndarray | None = None,
+        device: torch.device | None = None,
+    ) -> _Trace2CpSegmentSource:
+        trace = np.asarray(trace_xyz_base, dtype=np.float32)
+        if trace.ndim != 2 or trace.shape[1] != 3:
+            raise ValueError("trace_xyz_base must have shape [N,3]")
+        finite = np.isfinite(trace).all(axis=1)
+        trace = trace[finite].astype(np.float32, copy=False)
+        if int(trace.shape[0]) < 2:
+            raise ValueError(
+                "Trace2CP volume trace needs at least two finite volume points: "
+                f"finite_points={int(trace.shape[0])}"
+            )
+
+        keep = [0]
+        for idx in range(1, int(trace.shape[0])):
+            if float(np.linalg.norm(trace[idx] - trace[keep[-1]])) > 1.0e-4:
+                keep.append(idx)
+        if len(keep) < 2:
+            raise ValueError("Trace2CP volume trace degenerates to fewer than two distinct points")
+        center_xyz = trace[np.asarray(keep, dtype=np.int64)].astype(np.float32, copy=False)
+        sampled_normals = self._lasagna_normals_for_points_xyz(
+            source.record,
+            center_xyz,
+            line_indices=np.arange(int(center_xyz.shape[0]), dtype=np.int64),
+            control_point_index=int(source.start_control_point_index),
+        )
+
+        previous_start = np.asarray(source.start_control_point_xy, dtype=np.float32)
+        previous_target = np.asarray(source.target_control_point_xy, dtype=np.float32)
+        previous_height, previous_width = (int(v) for v in source.source_shape_hw)
+        target_is_right = float(previous_target[0]) >= float(previous_start[0])
+        if target_is_right:
+            before_start_margin = max(0.0, float(previous_start[0]))
+            after_target_margin = max(0.0, float(previous_width - 1) - float(previous_target[0]))
+        else:
+            before_start_margin = max(0.0, float(previous_width - 1) - float(previous_start[0]))
+            after_target_margin = max(0.0, float(previous_target[0]))
+
+        def extension_length(available: float) -> float:
+            available_f = max(0.0, float(available))
+            if available_f <= 1.0e-3:
+                return 0.0
+            preferred = max(2.0, min(8.0, available_f))
+            return max(0.0, min(preferred, available_f - 1.0e-3))
+
+        def extrapolated_volume_endpoint(
+            anchor: np.ndarray,
+            neighbor: np.ndarray,
+            length_px: float,
+        ) -> np.ndarray | None:
+            if length_px <= 1.0e-6:
+                return None
+            tangent = np.asarray(anchor, dtype=np.float32) - np.asarray(neighbor, dtype=np.float32)
+            norm = float(np.linalg.norm(tangent))
+            if not np.isfinite(norm) or norm <= 1.0e-6:
+                return None
+            length_base = np.float32(length_px * float(source.record.volume_spacing_base))
+            return (
+                np.asarray(anchor, dtype=np.float32)
+                + tangent * np.float32(length_base / norm)
+            ).astype(np.float32)
+
+        local_start = 0
+        local_target = int(center_xyz.shape[0]) - 1
+        start_extension = extrapolated_volume_endpoint(
+            center_xyz[local_start],
+            center_xyz[min(int(center_xyz.shape[0]) - 1, local_start + 1)],
+            extension_length(before_start_margin),
+        )
+        if start_extension is not None:
+            center_xyz = np.concatenate([start_extension[None, :], center_xyz], axis=0)
+            sampled_normals = np.concatenate(
+                [sampled_normals[local_start][None, :], sampled_normals],
+                axis=0,
+            )
+            local_start += 1
+            local_target += 1
+
+        target_extension = extrapolated_volume_endpoint(
+            center_xyz[local_target],
+            center_xyz[max(0, local_target - 1)],
+            extension_length(after_target_margin),
+        )
+        if target_extension is not None:
+            center_xyz = np.concatenate([center_xyz, target_extension[None, :]], axis=0)
+            sampled_normals = np.concatenate(
+                [sampled_normals, sampled_normals[local_target][None, :]],
+                axis=0,
+            )
+
+        if target_is_right:
+            ordered_points = center_xyz
+            ordered_normals = sampled_normals
+            ordered_local_start = local_start
+            ordered_local_target = local_target
+            anchor_column = before_start_margin
+        else:
+            ordered_points = center_xyz[::-1].copy()
+            ordered_normals = sampled_normals[::-1].copy()
+            ordered_local_start = int(center_xyz.shape[0]) - 1 - local_start
+            ordered_local_target = int(center_xyz.shape[0]) - 1 - local_target
+            anchor_column = 0.0
+        cumulative = self._line_arc_lengths(ordered_points)
+        distance_px = abs(
+            float(cumulative[int(ordered_local_target)] - cumulative[int(ordered_local_start)])
+        ) / float(source.record.volume_spacing_base)
+        width = max(
+            previous_width,
+            int(math.ceil(distance_px + before_start_margin + after_target_margin + 1.0)),
+        )
+        height = previous_height
+        if not target_is_right:
+            anchor_column = float(width - 1) - before_start_margin
+        original_indices = np.arange(int(ordered_points.shape[0]), dtype=np.int64)
+        line_window = FiberStripLineWindow(
+            line_points_xyz=np.asarray(ordered_points, dtype=np.float64),
+            original_line_indices=original_indices,
+            local_control_point_index=int(ordered_local_start),
+        )
+        alignment_xyz = (
+            np.asarray(row_axis_alignment_xyz, dtype=np.float32)
+            if row_axis_alignment_xyz is not None
+            else np.asarray(source.start_row_axis_xyz, dtype=np.float32)
+        )
+        return self._build_trace2cp_source_from_line_window(
+            record=source.record,
+            record_index=int(source.record_index),
+            start_control_point_index=int(source.start_control_point_index),
+            target_control_point_index=int(source.target_control_point_index),
+            line_window=line_window,
+            local_target_index=int(ordered_local_target),
+            source_shape_hw=(height, width),
+            anchor_column_px=float(anchor_column),
+            strip_z_offset=(
+                float(source.center_offset) if strip_z_offset is None else float(strip_z_offset)
+            ),
+            sampled_normals=np.asarray(ordered_normals, dtype=np.float32),
+            row_axis_alignment_line_index=int(original_indices[int(ordered_local_start)]),
+            row_axis_alignment_xyz=alignment_xyz,
+            device=device,
         )
 
     def build_trace2cp_refined_segment_source(
@@ -4400,45 +4666,21 @@ class FiberStrip2DLoader:
             original_line_indices=original_indices,
             local_control_point_index=int(local_start),
         )
-        line_xy = source_line_xy_from_line_window(
-            line_window,
-            patch_shape_hw=(height, width),
-            anchor_column_px=anchor_column,
-            pixel_spacing_base=source.record.volume_spacing_base,
-        )
-        start_xy = np.asarray(line_xy[int(local_start)], dtype=np.float32)
-        target_xy = np.asarray(line_xy[int(local_target)], dtype=np.float32)
         center_offset = (
             float(source.center_offset) if strip_z_offset is None else float(strip_z_offset)
         )
-        grid = build_side_strip_patch_grid_tensor_from_line_window(
-            line_window,
-            patch_shape_hw=(height, width),
-            strip_z_offset=center_offset,
-            sampled_normals=ordered_normals,
-            pixel_spacing_base=source.record.volume_spacing_base,
-            anchor_column_px=anchor_column,
-            device=resolved_device,
-        )
-        start_row_axis = self._row_axis_at_xy(grid, start_xy)
-        target_row_axis = self._row_axis_at_xy(grid, target_xy)
-        return _Trace2CpSegmentSource(
+        return self._build_trace2cp_source_from_line_window(
             record=source.record,
             record_index=int(source.record_index),
             start_control_point_index=int(source.start_control_point_index),
             target_control_point_index=int(source.target_control_point_index),
-            center_offset=float(center_offset),
-            source_shape_hw=(height, width),
-            grid=grid,
             line_window=line_window,
+            local_target_index=int(local_target),
+            source_shape_hw=(height, width),
             anchor_column_px=float(anchor_column),
-            line_xy=np.asarray(line_xy, dtype=np.float32),
-            start_control_point_xy=start_xy.astype(np.float32, copy=False),
-            target_control_point_xy=target_xy.astype(np.float32, copy=False),
-            line_point_indices=original_indices,
-            line_normals_xyz=np.asarray(ordered_normals, dtype=np.float32),
-            start_row_axis_xyz=start_row_axis,
-            target_row_axis_xyz=target_row_axis,
+            strip_z_offset=float(center_offset),
+            sampled_normals=np.asarray(ordered_normals, dtype=np.float32),
+            device=resolved_device,
         )
 
     def sample_trace2cp_top_strip_source(

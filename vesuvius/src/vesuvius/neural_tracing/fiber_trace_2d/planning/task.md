@@ -1,11 +1,13 @@
-# Trace2CP Refined Strip Off-Strip Clipping
+# Trace2CP Shared Strip Builder And Tighter Reset Threshold
 
-Native 3D Trace2CP refined/regenerated strip visualization currently fails
-when a traced point leaves the source strip valid area:
+Regenerated/refined native 3D Trace2CP strips should not depend on the original
+source strip grid. The actual side/top strip construction must be shared with
+the original CP-pair strip path; only the argument preparation should differ.
 
-`ValueError: refined Trace2CP trace leaves the source strip valid area`
+The shared builder should take an explicit vector of 3D line points plus the
+line-local metadata needed to build a `FiberStripLineWindow`, sample/align
+Lasagna normals, and construct the side/top grids. It must not assume that all
+inputs come from `record.fiber` or from an old source-strip coordinate system.
 
-This should not be fatal for visualization. Off-strip trace points, including
-original trace endpoints, should be clipped/ignored while building the refined
-strip. Strict errors should remain for malformed traces, non-finite values, or
-cases where too few valid points remain to build a refined strip.
+Also lower the native whole-fiber CP-plane reset/error threshold from 100
+selected-scale voxels to 10 selected-scale voxels.
