@@ -4,7 +4,11 @@ import os
 import numpy as np
 import torch
 
-from sample_spiral import get_theta_and_radii
+from sample_spiral import (
+    get_theta_and_radii,
+    get_theta_crossing_step_adjustments,
+    radius_from_unwrapped_shifted,
+)
 from spiral_helpers import (
     compute_winding_range_and_input_extents,
     save_mesh,
@@ -24,15 +28,15 @@ metrics_config = {
 }
 
 
-def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches, z_begin, z_end, verbose=False):
+def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches, z_begin, z_end, verbose=False, metrics_overrides=None):
     """Per-patch satisfaction metrics.
 
     Returns ``(satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks,
     boundary_satisfied_count, target_winding_idx_per_patch)``: a bool flag per patch
-    indicating whether at least ``metrics_config['satisfied_patch_quad_fraction']`` of
+    indicating whether at least ``satisfied_patch_quad_fraction`` of
     its valid quads are satisfied, the satisfied/total area tensors, the per-patch
     (H-1, W-1) bool quad masks, a bool flag per patch indicating whether at least
-    ``metrics_config['boundary_satisfied_patch_quad_fraction']`` of its boundary quads
+    ``boundary_satisfied_patch_quad_fraction`` of its boundary quads
     (in-ROI valid quads with at least one 4-neighbor that is out-of-bounds or not
     in-ROI-valid) are satisfied, and the per-patch (H-1, W-1) int64 winding-index
     tensors (the integer output-mesh winding each quad's snap-target sits on; -1 where
@@ -53,9 +57,15 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
     (b) the absolute scan-space distance tolerance of
     `satisfaction_distance_tolerance` voxels to the corresponding point on the target
     winding.
+
+    ``metrics_overrides`` optionally overrides individual ``metrics_config`` entries
+    for this call only (e.g. looser thresholds for splicing decisions).
     """
-    spiral_tolerance = dr_per_winding.detach() * metrics_config['satisfaction_radius_tolerance']
-    scan_tolerance = metrics_config['satisfaction_distance_tolerance']
+    thresholds = dict(metrics_config)
+    if metrics_overrides:
+        thresholds.update(metrics_overrides)
+    spiral_tolerance = dr_per_winding.detach() * thresholds['satisfaction_radius_tolerance']
+    scan_tolerance = thresholds['satisfaction_distance_tolerance']
     dr = dr_per_winding.detach()
     device = dr_per_winding.device
 
@@ -145,10 +155,7 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
                     if row_thetas.numel() <= 1:
                         cum_adj = torch.zeros_like(row_thetas)
                     else:
-                        theta_diffs = row_thetas[1:] - row_thetas[:-1]
-                        # Signed: theta_diff < -pi means we wrapped 2pi->0+ (theta jumped down),
-                        # so naive shifted_radius is too high by dr; subtract. Opposite for >+pi.
-                        step_adj = ((theta_diffs > np.pi).to(row_thetas.dtype) - (theta_diffs < -np.pi).to(row_thetas.dtype)) * dr
+                        step_adj = get_theta_crossing_step_adjustments(row_thetas, dr)
                         cum_adj = torch.cat([torch.zeros([1], device=device, dtype=row_thetas.dtype), torch.cumsum(step_adj, dim=0)], dim=0)
                     subrow_infos.append({
                         'row_idx': i,
@@ -208,15 +215,22 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
                     if propagate_branch_offset(source, source_pos, target, target_pos):
                         queue.append(target)
 
-            component_center_rows = [
-                subrow['row_idx']
-                for subrow in all_subrows
-                if subrow['branch_offset'] is not None and subrow['j_min'] <= center_col < subrow['j_max']
-            ]
-            if len(component_center_rows) == 0:
+            # Snap-target winding is chosen from the center column across the connected
+            # component. Gather the BRANCH-CONSISTENT (unwrapped, branch-offset-removed)
+            # shifted radius at that column - the same `adjusted_shifted` frame the
+            # satisfaction check below compares against - NOT the raw shifted_radius_all.
+            # Raw values jump by ~dr across a theta=0 crossing even on the same physical
+            # winding, so a raw median lands between windings and mismatches every quad
+            # (spuriously reporting a well-fit seam-crossing patch as 0% satisfied).
+            component_col_shifted = []
+            for subrow in all_subrows:
+                if subrow['branch_offset'] is None or not (subrow['j_min'] <= center_col < subrow['j_max']):
+                    continue
+                pos = center_col - subrow['j_min']
+                component_col_shifted.append(subrow['unwrapped_shifted'][pos] - subrow['branch_offset'])
+            if len(component_col_shifted) == 0:
                 continue
-            component_center_rows_t = torch.tensor(component_center_rows, device=device, dtype=torch.long)
-            component_col_shifted = shifted_radius_all[component_center_rows_t, center_col]
+            component_col_shifted = torch.stack(component_col_shifted)
             median_shifted_radius = torch.median(component_col_shifted)
             modulus = median_shifted_radius % dr
             target_shifted_radius = torch.where(
@@ -292,11 +306,11 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
                 continue
             num_satisfied_quads = int(satisfied_quad_mask.sum().item())
             satisfied_areas[patch_index] = float(patch.area) * num_satisfied_quads / max(total_full_valid_quads, 1)
-            satisfied_patches[patch_index] = num_satisfied_quads >= metrics_config['satisfied_patch_quad_fraction'] * total_valid_quads
+            satisfied_patches[patch_index] = num_satisfied_quads >= thresholds['satisfied_patch_quad_fraction'] * total_valid_quads
             num_boundary_quads = int(boundary_quad_mask.sum().item())
             if num_boundary_quads > 0:
                 num_satisfied_boundary_quads = int((boundary_quad_mask & satisfied_quad_mask).sum().item())
-                boundary_satisfied_patches[patch_index] = num_satisfied_boundary_quads >= metrics_config['boundary_satisfied_patch_quad_fraction'] * num_boundary_quads
+                boundary_satisfied_patches[patch_index] = num_satisfied_boundary_quads >= thresholds['boundary_satisfied_patch_quad_fraction'] * num_boundary_quads
 
     return satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch
 
@@ -342,18 +356,13 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         spiral_zyxs = transform_in_chunks(zyxs, slice_to_spiral_transform)
         theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
 
-        # Segmented version of _unwrap_track_shifted_radii: build
+        # Segmented version of unwrap_shifted_radii: build
         # adjustments via a global cumsum where step_adj is zeroed across strip
         # boundaries, then subtract each strip's start value so each strip
         # starts at 0 in its own frame.
         if T > 1:
-            theta_d = theta.detach()
-            diffs = theta_d[1:] - theta_d[:-1]
             same_strip = strip_id[1:] == strip_id[:-1]
-            step_adj = (
-                (diffs > np.pi).to(shifted_radii.dtype)
-                - (diffs < -np.pi).to(shifted_radii.dtype)
-            ) * dr
+            step_adj = get_theta_crossing_step_adjustments(theta, dr)
             step_adj = torch.where(same_strip, step_adj, torch.zeros_like(step_adj))
             cumsum_inner = torch.cumsum(step_adj, dim=0)
             cumsum_flat = torch.cat([
@@ -417,7 +426,9 @@ def _strip_satisfaction_from_target(ctx, target_normalised_per_strip):
         target_shifted = target_normalised + windings * dr
         spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
 
-        target_radii = target_shifted - adjustments + theta / (2 * np.pi) * dr
+        target_radii = radius_from_unwrapped_shifted(
+            theta, target_shifted, adjustments, dr,
+        )
         target_spiral_zyxs = torch.stack([
             spiral_zyxs[..., 0],
             torch.sin(theta) * target_radii,
@@ -657,9 +668,10 @@ def save_overlay_and_print_satisfaction(
             render_volume_scale=render_volume_scale,
         )
     if os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1':
-        def get_patch_satisfied_areas_for_mesh(transform, winding_delta, patches, verbose=False):
+        def get_patch_satisfied_areas_for_mesh(transform, winding_delta, patches, verbose=False, metrics_overrides=None):
             return get_patch_satisfied_areas(
                 transform, winding_delta, patches, z_begin, z_end, verbose=verbose,
+                metrics_overrides=metrics_overrides,
             )
 
         save_mesh(

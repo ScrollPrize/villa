@@ -63,6 +63,8 @@ constexpr int kCatalogDefaultWidth = 1520;
 constexpr int kCatalogDefaultHeight = 760;
 constexpr int kSampleTableInitialWidth = 940;
 constexpr int kDetailsInitialWidth = 520;
+constexpr int kRepresentationVolumeIndexRole = Qt::UserRole;
+constexpr int kRepresentationArtifactIndexRole = Qt::UserRole + 1;
 
 class OverviewPhotoLabel : public QLabel {
 public:
@@ -313,6 +315,25 @@ QString artifactUrl(const OpenDataArtifact& artifact)
     return qstr(artifact.resolvedUrl.empty() ? artifact.sourcePath : artifact.resolvedUrl);
 }
 
+QString representationCoordinates(const OpenDataArtifact& artifact,
+                                  OpenDataRepresentationKind kind)
+{
+    if (artifact.sourceCoordinateLevel)
+        return QStringLiteral("L%1").arg(*artifact.sourceCoordinateLevel);
+    if (kind == OpenDataRepresentationKind::Lasagna)
+        return QObject::tr("Base L0 (shape matched)");
+    return QObject::tr("Unspecified");
+}
+
+QString representationParameters(const OpenDataArtifact& artifact)
+{
+    nlohmann::json details = artifact.parameters;
+    if (!details.is_object()) details = nlohmann::json::object();
+    if (!artifact.creationInfo.empty())
+        details["creation_info"] = artifact.creationInfo;
+    return details.empty() ? QStringLiteral("—") : qstr(details.dump());
+}
+
 QImage imageFromBytes(const std::vector<std::byte>& bytes)
 {
     if (bytes.empty() || bytes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
@@ -423,7 +444,7 @@ void OpenDataCatalogWindow::buildUi()
     _inkOnlyCheck = new QCheckBox(tr("Ink"), this);
     _refreshButton = new QPushButton(tr("Refresh"), this);
     _refreshButton->setToolTip(tr("Refresh the open-data catalog manifest from the remote source."));
-    _refreshButton->setStatusTip(tr("Refreshes the open-data catalog listing, including samples, scans, volumes, and segments."));
+    _refreshButton->setStatusTip(tr("Refreshes the open-data catalog listing, including samples, scans, volumes, representations, and segments."));
     topRow->addWidget(_searchEdit, 1);
     topRow->addWidget(_segmentsOnlyCheck);
     topRow->addWidget(_inkOnlyCheck);
@@ -520,6 +541,43 @@ void OpenDataCatalogWindow::buildUi()
     volumesLayout->addLayout(volumeActions);
     _tabs->addTab(volumesPage, tr("Volumes"));
 
+    auto* representationsPage = new QWidget(_tabs);
+    auto* representationsLayout = new QVBoxLayout(representationsPage);
+    auto* representationsHelp = new QLabel(
+        tr("Manifest-declared derived data for this sample. Parent volume and "
+           "coordinate metadata are shown explicitly; these rows are not source volumes."),
+        representationsPage);
+    representationsHelp->setWordWrap(true);
+    _representationsTable = new QTableWidget(representationsPage);
+    _representationsTable->setColumnCount(8);
+    _representationsTable->setHorizontalHeaderLabels({
+        tr("Parent volume"),
+        tr("Representation"),
+        tr("Artifact type"),
+        tr("Model"),
+        tr("Coordinates"),
+        tr("Access"),
+        tr("Parameters"),
+        tr("URL")
+    });
+    _representationsTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    _representationsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    _representationsTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    _representationsTable->horizontalHeader()->setStretchLastSection(true);
+    _representationsTable->verticalHeader()->hide();
+    auto* representationActions = new QHBoxLayout;
+    _copyRepresentationUrlButton =
+        new QPushButton(tr("Copy URL"), representationsPage);
+    _openRepresentationUrlButton =
+        new QPushButton(tr("Open URL"), representationsPage);
+    representationActions->addStretch(1);
+    representationActions->addWidget(_copyRepresentationUrlButton);
+    representationActions->addWidget(_openRepresentationUrlButton);
+    representationsLayout->addWidget(representationsHelp);
+    representationsLayout->addWidget(_representationsTable, 1);
+    representationsLayout->addLayout(representationActions);
+    _tabs->addTab(representationsPage, tr("Representations"));
+
     auto* segmentsPage = new QWidget(_tabs);
     auto* segmentsLayout = new QVBoxLayout(segmentsPage);
     _segmentsTable = new QTableWidget(segmentsPage);
@@ -593,10 +651,29 @@ void OpenDataCatalogWindow::buildUi()
             this, &OpenDataCatalogWindow::updateSelectedSample);
     connect(_volumesTable->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &OpenDataCatalogWindow::updateActionButtons);
+    connect(_representationsTable->selectionModel(),
+            &QItemSelectionModel::selectionChanged,
+            this,
+            &OpenDataCatalogWindow::updateActionButtons);
+    connect(_representationsTable,
+            &QTableWidget::cellDoubleClicked,
+            this,
+            [this](int row, int column) {
+                _representationsTable->setCurrentCell(row, std::max(column, 0));
+                openSelectedRepresentationUrl();
+            });
     connect(_segmentsTable->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &OpenDataCatalogWindow::updateActionButtons);
     connect(_copyVolumeUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::copySelectedVolumeUrl);
     connect(_openVolumeUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedVolumeUrl);
+    connect(_copyRepresentationUrlButton,
+            &QPushButton::clicked,
+            this,
+            &OpenDataCatalogWindow::copySelectedRepresentationUrl);
+    connect(_openRepresentationUrlButton,
+            &QPushButton::clicked,
+            this,
+            &OpenDataCatalogWindow::openSelectedRepresentationUrl);
     connect(_downloadNormalGridsButton, &QPushButton::clicked,
             this, &OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids);
     connect(_copySegmentUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::copySelectedSegmentUrl);
@@ -824,15 +901,17 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
 
     const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
     const auto cacheSummary = sampleCacheSummary(remoteRoot, *sample);
+    const auto representations = derivedRepresentations(*sample);
     _overviewLabel->setText(
         tr("<b>%1</b><br>Type: %2<br>Scans: %3<br>Volumes: %4<br>Segments: %5<br>"
-           "TIFXYZ segments: %6<br>Ink detections: %7<br>Photos: %8<br>"
-           "Local TIFXYZ: %9<br>Manual segments: %10<br>Sync: %11<br><br>%12")
+           "Representations: %6<br>TIFXYZ segments: %7<br>Ink detections: %8<br>Photos: %9<br>"
+           "Local TIFXYZ: %10<br>Manual segments: %11<br>Sync: %12<br><br>%13")
             .arg(qstr(sample->id).toHtmlEscaped())
             .arg(qstr(sample->type).toHtmlEscaped())
             .arg(sample->scanCount())
             .arg(sample->volumeCount())
             .arg(sample->segmentCount())
+            .arg(representations.size())
             .arg(sample->tifxyzSegmentCount())
             .arg(sample->inkDetectionSegmentCount())
             .arg(sample->artifacts.size())
@@ -869,6 +948,42 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
         _volumesTable->setItem(row, 8, item(qstr(volume.createdAt)));
     }
     _volumesTable->resizeColumnsToContents();
+
+    _representationsTable->setRowCount(static_cast<int>(representations.size()));
+    for (int row = 0; row < static_cast<int>(representations.size()); ++row) {
+        const auto& ref = representations[static_cast<std::size_t>(row)];
+        const auto& volume = sample->volumes[ref.volumeIndex];
+        const auto& artifact = volume.artifacts[ref.artifactIndex];
+        auto* volumeItem = item(qstr(volume.id));
+        volumeItem->setData(kRepresentationVolumeIndexRole,
+                            static_cast<qulonglong>(ref.volumeIndex));
+        volumeItem->setData(kRepresentationArtifactIndexRole,
+                            static_cast<qulonglong>(ref.artifactIndex));
+        _representationsTable->setItem(row, 0, volumeItem);
+        _representationsTable->setItem(
+            row, 1, item(qstr(std::string(representationKindName(ref.kind)))));
+        _representationsTable->setItem(row, 2, item(qstr(artifact.type)));
+        _representationsTable->setItem(
+            row, 3, item(qstr(artifact.modelId.value_or(std::string{}))));
+        _representationsTable->setItem(
+            row, 4, item(representationCoordinates(artifact, ref.kind)));
+        _representationsTable->setItem(row, 5, item(qstr(artifact.accessUsage)));
+        const QString parameters = representationParameters(artifact);
+        auto* parametersItem = item(parameters);
+        parametersItem->setToolTip(parameters);
+        _representationsTable->setItem(row, 6, parametersItem);
+        const QString url = artifactUrl(artifact);
+        auto* urlItem = item(url);
+        urlItem->setToolTip(url);
+        _representationsTable->setItem(row, 7, urlItem);
+    }
+    _representationsTable->resizeColumnsToContents();
+    _representationsTable->setColumnWidth(
+        2, std::min(_representationsTable->columnWidth(2), 240));
+    _representationsTable->setColumnWidth(
+        6, std::min(_representationsTable->columnWidth(6), 320));
+    _representationsTable->setColumnWidth(
+        7, std::min(_representationsTable->columnWidth(7), 360));
 
     _segmentsTable->setRowCount(static_cast<int>(sample->segments.size()));
     for (int row = 0; row < static_cast<int>(sample->segments.size()); ++row) {
@@ -911,6 +1026,9 @@ void OpenDataCatalogWindow::clearDetails()
     }
     if (_volumesTable) {
         _volumesTable->setRowCount(0);
+    }
+    if (_representationsTable) {
+        _representationsTable->setRowCount(0);
     }
     if (_segmentsTable) {
         _segmentsTable->setRowCount(0);
@@ -1079,6 +1197,27 @@ const OpenDataVolume* OpenDataCatalogWindow::selectedVolume() const
     return &sample->volumes[static_cast<std::size_t>(volumeIndex)];
 }
 
+const OpenDataArtifact* OpenDataCatalogWindow::selectedRepresentationArtifact() const
+{
+    const auto* sample = selectedSample();
+    if (!sample || !_representationsTable ||
+        _representationsTable->currentRow() < 0) {
+        return nullptr;
+    }
+    const auto* rowItem = _representationsTable->item(
+        _representationsTable->currentRow(), 0);
+    if (!rowItem) return nullptr;
+    const auto volumeIndex = static_cast<std::size_t>(
+        rowItem->data(kRepresentationVolumeIndexRole).toULongLong());
+    const auto artifactIndex = static_cast<std::size_t>(
+        rowItem->data(kRepresentationArtifactIndexRole).toULongLong());
+    if (volumeIndex >= sample->volumes.size() ||
+        artifactIndex >= sample->volumes[volumeIndex].artifacts.size()) {
+        return nullptr;
+    }
+    return &sample->volumes[volumeIndex].artifacts[artifactIndex];
+}
+
 const OpenDataSegment* OpenDataCatalogWindow::selectedSegment() const
 {
     const auto* sample = selectedSample();
@@ -1108,6 +1247,12 @@ QString OpenDataCatalogWindow::selectedVolumeUrl() const
         return {};
     }
     return qstr(artifact->resolvedUrl.empty() ? artifact->sourcePath : artifact->resolvedUrl);
+}
+
+QString OpenDataCatalogWindow::selectedRepresentationUrl() const
+{
+    const auto* artifact = selectedRepresentationArtifact();
+    return artifact ? artifactUrl(*artifact) : QString{};
 }
 
 QString OpenDataCatalogWindow::selectedSegmentUrl() const
@@ -1140,6 +1285,7 @@ void OpenDataCatalogWindow::updateActionButtons()
 {
     const bool manifestReady = !_manifestRefreshPending;
     const bool hasVolumeUrl = !selectedVolumeUrl().isEmpty();
+    const bool hasRepresentationUrl = !selectedRepresentationUrl().isEmpty();
     const bool hasSegmentUrl = !selectedSegmentUrl().isEmpty();
     const auto* sample = selectedSample();
     const auto* segment = selectedSegment();
@@ -1184,6 +1330,14 @@ void OpenDataCatalogWindow::updateActionButtons()
     }
     if (_openVolumeUrlButton) {
         _openVolumeUrlButton->setEnabled(hasVolumeUrl);
+    }
+    if (_copyRepresentationUrlButton) {
+        _copyRepresentationUrlButton->setEnabled(
+            manifestReady && hasRepresentationUrl);
+    }
+    if (_openRepresentationUrlButton) {
+        _openRepresentationUrlButton->setEnabled(
+            manifestReady && hasRepresentationUrl);
     }
     if (_cacheSegmentButton) {
         _cacheSegmentButton->setEnabled(canCacheSegment);
@@ -1237,6 +1391,21 @@ void OpenDataCatalogWindow::openSelectedVolumeUrl()
     if (!url.isEmpty()) {
         QDesktopServices::openUrl(QUrl(url));
     }
+}
+
+void OpenDataCatalogWindow::copySelectedRepresentationUrl()
+{
+    const QString url = selectedRepresentationUrl();
+    if (!url.isEmpty() && QGuiApplication::clipboard()) {
+        QGuiApplication::clipboard()->setText(url);
+        setStatus(tr("Copied representation URL."));
+    }
+}
+
+void OpenDataCatalogWindow::openSelectedRepresentationUrl()
+{
+    const QString url = selectedRepresentationUrl();
+    if (!url.isEmpty()) QDesktopServices::openUrl(QUrl(url));
 }
 
 void OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids()

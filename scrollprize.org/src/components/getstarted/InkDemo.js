@@ -49,10 +49,16 @@ const INK_FRAC_CORRECT = 0.35; // stamp counts as "on ink" above this
 const LETTER_LEARN_FRAC = 0.4; // letter counts as taught above this coverage
 const LETTERS_TO_GENERALIZE = 3;
 const AREA_DONE_FRAC = 0.2; // prediction completes after 20% of ink is labeled
+// phones converge on a bit less: labeling through a zoomed-in viewport is
+// slower going than a desktop drag across the strip — but only a notch
+// under the desktop bar, so converging still feels earned
+const AREA_DONE_FRAC_TOUCH = 0.17;
+const LETTERS_TO_GENERALIZE_TOUCH = 2; // the milestone beat lands before done
 const WRONG_FRAC_MAX = 0.4; // …with under 40% of the labels FAR from any ink
 const FAR_INK_RADIUS = 2.5; // in brush radii: bad labels beyond this are "far"
 const NOISE_GAIN = 1.5; // false positives read as CONFIDENT, near-white blobs
 const MAX_ZOOM = 5; // left pane: wheel/pinch zoom for finer labeling
+const INTRO_DONE_S = 1.6; // phone intro ends once a pinch carries the zoom past this
 const PRED_TINT = "#8d00ff"; // overlay color: porphyras
 
 export default function InkDemo() {
@@ -68,10 +74,17 @@ export default function InkDemo() {
   const [readOn, setReadOn] = useState(false); // done-state reveal opened
   const [doneCueSeen, setDoneCueSeen] = useState(false); // phone finish pill tapped
   const [overlay, setOverlay] = useState(true); // prediction over the surface
+  const [mirrored, setMirrored] = useState(false); // phone: pred pane tracks the draw pane's view
+  const [doneFrac, setDoneFrac] = useState(AREA_DONE_FRAC); // meter target (phones lower it)
+  const [introOn, setIntroOn] = useState(false); // phone: pinch cue is on screen
+  const [pinchStarted, setPinchStarted] = useState(false); // drop the cue once a pinch begins
+  const [tapFx, setTapFx] = useState(null); // momentary tool (clear/hint) tap flash
+  const cueRef = useRef(null); // the cue element, kept over the first letter
   const coarse = useCoarsePointer(); // gesture wording matches the device
 
   const drawRef = useRef(null); // visible surface canvas (top pane)
   const predRef = useRef(null); // prediction canvas (bottom pane)
+  const panesRef = useRef(null); // the two-pane stack, centered on phone start
   const statusRef = useRef(null); // status line, scrolled to on phones
   const outroRef = useRef(null); // done payoff, scrolled to on phones
   const S = useRef(null); // demo state (never re-rendered)
@@ -93,16 +106,24 @@ export default function InkDemo() {
       ]);
       const { width: W, height: H } = m;
       // on phones the draw pane becomes a TALL viewport onto the strip
-      // (roughly 40% of the screen), opened zoomed-in — painting on an
-      // 80px-tall full-strip view is hopeless
+      // (a bit under half the screen; the prediction pane below mirrors it
+      // in a shorter window — the surface is where the work happens, the
+      // prediction only needs to be read). It OPENS on the whole strip —
+      // the word uncut, letterboxed — with a pinch cue: painting on an
+      // 80px-tall full-strip view is hopeless, so the intro's one job is
+      // getting the visitor to zoom in before the brush activates.
       const narrow = window.innerWidth < 700;
+      const screenFrac = (f) =>
+        Math.round(
+          (W * window.innerHeight * f) / Math.max(280, window.innerWidth - 34),
+        );
       const dcW = W;
-      const dcH = narrow
-        ? Math.round(
-            (W * window.innerHeight * 0.4) /
-              Math.max(280, window.innerWidth - 34),
-          )
-        : H;
+      // the draw pane is kept a bit under half the screen (was half) so the
+      // whole stack — both panes and both captions — clears the fold; the
+      // opening scroll pins the bottom caption just off the screen's bottom
+      // edge (see scrollIntoView below), the rest stacking up from there
+      const dcH = narrow ? screenFrac(0.45) : H;
+      const pcH = narrow ? screenFrac(0.3) : H;
       const minS = Math.max(1, dcH / H);
       const labelData = imageToGray(label, W, H);
       let inkTotal = 0;
@@ -118,6 +139,40 @@ export default function InkDemo() {
         label,
         labelData,
         inkTotal,
+        // on phones the prediction pane MIRRORS the draw pane's viewport:
+        // the two panes always show the same spot, at the same zoom —
+        // otherwise the zoomed-in surface sits over a full-strip prediction
+        // and they read as two unrelated pictures. Desktop shows the whole
+        // strip in both panes and manages its own zoom; it never mirrors.
+        mirror: narrow,
+        predFull: makeCanvas(W, H), // full-res composed prediction (blit source)
+        zoomOutPending: false, // payoff zoom-out waits for the fingers to lift
+        viewAnim: 0, // token of the in-flight view tween (0 = none)
+        // phone difficulty: less area to label, an earlier milestone beat,
+        // wider evidence halos (strokes give away fragments of the
+        // NEIGHBORING letters inside the zoomed view) and an earlier
+        // distributed reveal — the loop converges on effort, not pixels
+        doneFrac: narrow ? AREA_DONE_FRAC_TOUCH : AREA_DONE_FRAC,
+        lettersToGen: narrow ? LETTERS_TO_GENERALIZE_TOUCH : LETTERS_TO_GENERALIZE,
+        haloK: narrow ? 1.5 : 1, // halo radius multiplier (spill reach)
+        gaPow: narrow ? 1.1 : 1.35, // patch-emergence curve (lower = earlier)
+        // phone reveal cadence (desktop keeps the old constants, so its
+        // pace stays byte-for-byte unchanged): complete a touch more of the
+        // letter under the brush on the first strokes (a stronger, slightly
+        // longer bootstrap), and hold the WHOLE-strip emergence back
+        // (gaDelay) so the reveal reads in stages — the letter, then its
+        // neighbor, then bits of every letter — instead of every letter
+        // creeping in from the very first stroke.
+        bootMax: narrow ? 0.3 : 0.22,
+        bootWin: narrow ? 0.4 : 0.3,
+        gaDelay: narrow ? 0.15 : 0,
+        intro: narrow, // pinch-cue phase: the brush is off until the first zoom-in
+        introPinched: false, // this touch gesture pinched (vs a plain tap)
+        pinchAnchor: null, // image point that stayed under the last pinch
+        // guided painting zoom: close enough to paint by finger, loose
+        // enough to keep ~3-4 letters in view (the strip-filling zoom the
+        // pane used to OPEN at felt like a keyhole)
+        paintZoom: Math.max(2, (dcH / H) * 0.65),
         brush: Math.max(6, Math.round(m.brushRadius / 2)), // drawn stroke radius
         labeledMask: new Uint8Array(W * H), // unique ink px the user labeled
         labeled: 0,
@@ -134,10 +189,15 @@ export default function InkDemo() {
         predLayer: makeCanvas(W, H), // masked prediction, for the overlay
         dcW,
         dcH,
-        minS, // baseline zoom: 1 on desktop, "strip fills the pane" on phones
-        view: { s: minS, tx: (dcW - W * minS) / 2, ty: 0 }, // zoom/pan
+        minS, // "strip fills the pane" zoom: 1 on desktop, ~4-5 on phones (scales MAX_ZOOM; >1 marks a phone)
+        // every device opens on the WHOLE strip; phones letterbox it and
+        // the pinch cue leads the visitor in
+        view: { s: 1, tx: (dcW - W) / 2, ty: (dcH - H) / 2 }, // zoom/pan
         pointers: new Map(),
         pinch0: null,
+        predPointers: new Map(), // phone: gestures on the mirrored pred pane
+        predPinch0: null,
+        predPan: null,
         pendingPaint: null, // first touch buffered until it's clearly a stroke
         strokeStart: null, // current touch stroke's undo record
         stampCount: 0, // painted stamps (test hook via dataset.stamps)
@@ -160,6 +220,7 @@ export default function InkDemo() {
         perLetter: new Array((m.letters || []).length).fill(0),
         letterInk: null,
         generalizedDone: false,
+        doneReveal: false, // convergence owes a full zoom-out until it lands
         lastTaught: 0,
         needMoreLettersSaid: false,
         corrHealedSaid: false,
@@ -266,20 +327,76 @@ export default function InkDemo() {
       const pc = predRef.current;
       dc.width = dcW;
       dc.height = dcH;
-      pc.width = W;
-      pc.height = H;
+      // mirrored (phone) prediction pane shares the draw pane's width and
+      // view but sits in a shorter window (blitPred centers the vertical
+      // crop) — reading the prediction needs less room than painting
+      pc.width = narrow ? dcW : W;
+      pc.height = narrow ? pcH : H;
+      setMirrored(narrow);
+      setDoneFrac(st.doneFrac);
+      setIntroOn(narrow);
+      // the opening instruction matches the opening move: phones must zoom
+      // in before painting; desktop can paint right away
+      setStatus(
+        narrow
+          ? "That's the whole strip — one line of Greek. Pinch the first letter to zoom in close enough to paint."
+          : `Paint over the bright, cracked texture. That's dried ink. Label at least ${Math.round(
+              st.doneFrac * 100,
+            )}% of it and stay off the bare papyrus.`,
+      );
       redrawLeft();
       setPhase("play");
       composite();
+      // the stage is far taller than the poster it replaces: on phones,
+      // align the BOTTOM of the two-pane stack to the bottom of the screen
+      // (a small pad via scroll-margin-bottom), so its last caption sits
+      // just off the bottom edge and everything above — both panes, both
+      // captions — stacks up fully on screen from the first stroke. The
+      // controls tuck just under; the core tools are icons on the pane
+      // itself, so they stay reachable.
+      if (narrow)
+        setTimeout(
+          () =>
+            panesRef.current?.scrollIntoView({
+              behavior: "smooth",
+              block: "end",
+            }),
+          60,
+        );
     } catch (e) {
       console.error(e);
       setPhase("error");
     }
   }
 
+  // the phone intro ends the moment the visitor zooms in (pinch, tap or
+  // the Hint button) — the cue leaves, the brush arms
+  function endIntro() {
+    const st = S.current;
+    if (!st?.intro) return;
+    st.intro = false;
+    setIntroOn(false);
+  }
+
+  // park the pinch cue over the first letter — the spot we're asking the
+  // visitor to pinch. Tracks the view, so a half-finished pinch that
+  // doesn't dismiss the cue still leaves it on the letter.
+  function positionCue() {
+    const st = S.current;
+    const el = cueRef.current;
+    if (!st?.intro || !el) return;
+    const letters = st.m.letters || [];
+    let b = null;
+    for (const bb of letters) if (!b || bb.x < b.x) b = bb;
+    if (!b) return;
+    const v = st.view;
+    el.style.left = `${((((b.x + b.w / 2) * v.s + v.tx) / st.dcW) * 100).toFixed(2)}%`;
+    el.style.top = `${((((b.y + b.h / 2) * v.s + v.ty) / st.dcH) * 100).toFixed(2)}%`;
+  }
+
   function stamp(x, y) {
     const st = S.current;
-    if (!st) return;
+    if (!st || st.intro) return; // no painting under the pinch cue
     const { m, W, H, labelData } = st;
     const r = st.brush;
     const sctx = st.strokes.getContext("2d");
@@ -415,7 +532,7 @@ export default function InkDemo() {
       const lastG = st.goodStamps[st.goodStamps.length - 1];
       if (!lastG || (lastG.x - x) ** 2 + (lastG.y - y) ** 2 > (r * 0.6) ** 2) {
         st.goodStamps.push({ x, y });
-        paintHalo(st.reveal.getContext("2d"), x, y, r);
+        paintHalo(st.reveal.getContext("2d"), x, y, r, st.haloK);
       }
       // letter coverage (status/teaching only — never drives the reveal)
       if (fresh) {
@@ -464,13 +581,19 @@ export default function InkDemo() {
     const taught = st.perLetter.filter(
       (v, i) => v / st.letterInk[i] > LETTER_LEARN_FRAC,
     ).length;
-    if (taught > st.lastTaught && taught < LETTERS_TO_GENERALIZE) {
+    if (taught > st.lastTaught && taught < st.lettersToGen) {
       setStatus(
-        `Letter learned (${taught}/${LETTERS_TO_GENERALIZE}). The model only trusts regions like the ones you've shown it. Teach it another.`,
+        `Letter learned (${taught}/${st.lettersToGen}). The model only trusts regions like the ones you've shown it. Teach it another.`,
       );
+      // nothing else fires here: after the intro's first "Tap here" the
+      // camera and the next move are the user's. They can pinch out to
+      // find the next letter (they came IN from the full strip, so the
+      // gesture is already known) or tap Hint — and sometimes they'd
+      // rather keep working the letter they're on, so we neither zoom nor
+      // ring for them.
     }
     st.lastTaught = Math.max(st.lastTaught, taught);
-    if (!st.generalizedDone && taught >= LETTERS_TO_GENERALIZE) {
+    if (!st.generalizedDone && taught >= st.lettersToGen) {
       // purely informational: the reveal drivers are continuous, so this
       // moment changes the message, not the picture
       st.generalizedDone = true;
@@ -478,6 +601,9 @@ export default function InkDemo() {
       setStatus(
         "The model generalized. Regions you never labeled are appearing; more labels, more detail.",
       );
+      // no camera move here: the user explores the new regions themselves
+      // (or watches them surface in the prediction pane, which now takes a
+      // pinch of its own). Only convergence pulls the view back on its own.
     }
   }
 
@@ -546,16 +672,18 @@ export default function InkDemo() {
         drawPill(ctx, pillLabel(), st.hintPt.x, st.hintPt.y, rr, k / v.s, st.W);
     }
     ctx.setTransform(1, 0, 0, 1, 0, 0);
+    // the mirrored pane shares this view — every zoom/pan re-blits it
+    if (st.mirror) blitPred();
+    if (st.intro) positionCue();
   }
 
   // ---- left-pane zoom (wheel at cursor, pinch on touch) -------------------
 
   function clampView(v) {
     const st = S.current;
-    // phones OPEN zoomed to fill the tall pane (minS), but that's a
-    // convenience, not a floor: zooming back out to the whole strip
-    // (s = 1, the desktop framing) stays available, with the strip
-    // centered on whichever axis it no longer fills
+    // the whole strip (s = 1, how every device opens) is the floor; the
+    // ceiling scales with the phone pane's fill zoom. The strip centers
+    // on whichever axis it doesn't fill.
     v.s = Math.min(st.minS * MAX_ZOOM, Math.max(1, v.s));
     v.tx =
       st.W * v.s <= st.dcW
@@ -594,6 +722,13 @@ export default function InkDemo() {
       v.ty = cy - iy * v.s;
       clampView(v);
       redrawLeft();
+      // a trackpad zoom counts as the intro's zoom-in too — hint the
+      // spot under the cursor, the point the zoom pivoted on
+      if (st.intro && v.s >= INTRO_DONE_S) {
+        endIntro();
+        const near = { x: ix, y: iy };
+        setTimeout(() => hint(near), 350);
+      }
     };
     c.addEventListener("wheel", onWheel, { passive: false });
     return () => c.removeEventListener("wheel", onWheel);
@@ -642,7 +777,7 @@ export default function InkDemo() {
     // damage is the erosion below: fragments of the revealed letters get
     // BITTEN OUT and noise pours into the holes
     const sig = Math.max(0.35, 1 - 0.75 * corr);
-    const q = Math.min(1, A / AREA_DONE_FRAC) * (1 - 0.8 * corr);
+    const q = Math.min(1, A / st.doneFrac) * (1 - 0.8 * corr);
     // a training set that's substantially bare papyrus makes the model
     // predict ink almost EVERYWHERE: the false-positive flood scales with
     // the share of bad labels, not just their count. corr saturates too
@@ -654,13 +789,23 @@ export default function InkDemo() {
     // area from the very first strokes — no letter-completion gate, no
     // cliffs. The whole segment improves a little with every label;
     // bonusGA fills the last stretch on completion.
-    const localProgress = Math.min(1, A / AREA_DONE_FRAC);
+    const localProgress = Math.min(1, A / st.doneFrac);
     // first-stroke bootstrap: a touch more of the prediction completes
     // around the very first labels, so the stroke you painted reads back
-    // as a whole fragment instead of shreds. Fades out by ~6% coverage —
-    // the pace beyond the opening is unchanged.
-    const boot = 0.22 * Math.max(0, 1 - A / (AREA_DONE_FRAC * 0.3));
-    const eGA = Math.min(1, Math.pow(localProgress, 1.35) * 0.9 + st.bonusGA);
+    // as a whole fragment instead of shreds. Phones complete a bit more of
+    // the letter under the brush and hold the bootstrap slightly longer;
+    // desktop's fades out by ~6% coverage (bootMax/bootWin are the old
+    // constants there, so its pace is unchanged).
+    const boot = st.bootMax * Math.max(0, 1 - A / (st.doneFrac * st.bootWin));
+    // distributed emergence across the WHOLE strip. On phones it holds back
+    // (gaDelay) so the reveal reads in stages — the letter under the brush,
+    // then its neighbor as the halos spill sideways, then bits of every
+    // letter as this ramps up — rather than every letter creeping in from
+    // the first stroke. Desktop keeps the immediate global lift (gaDelay 0).
+    const gaProg = st.gaDelay
+      ? Math.max(0, (localProgress - st.gaDelay) / (1 - st.gaDelay))
+      : localProgress;
+    const eGA = Math.min(1, Math.pow(gaProg, st.gaPow) * 0.9 + st.bonusGA);
     rebuildPatches(st, eGA);
 
     // local evidence, broken by the fragment field: early reveals are
@@ -710,7 +855,9 @@ export default function InkDemo() {
       }
     }
 
-    const ctx = predRef.current.getContext("2d");
+    // compose at full strip resolution offscreen; blitPred() puts it on
+    // screen (1:1 on desktop, through the shared view transform on phones)
+    const ctx = st.predFull.getContext("2d");
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, W, H);
@@ -763,7 +910,7 @@ export default function InkDemo() {
     // replacing it — the reveal window has no visible disc edge, because
     // where the prediction is near-black the pane simply keeps its noise
     const predA =
-      (0.45 + 0.55 * Math.pow(Math.min(1, A / AREA_DONE_FRAC), 0.9)) * sig +
+      (0.45 + 0.55 * Math.pow(Math.min(1, A / st.doneFrac), 0.9)) * sig +
       0.3 * boot;
     // faint patches: dig the noise field out of the prediction so the
     // uncertain spots read as MISSING signal rather than grey on top
@@ -832,16 +979,22 @@ export default function InkDemo() {
     // target share of the ink has taught it the letters, wherever the
     // strokes landed). Compared on the ROUNDED percent so done fires
     // exactly when the meter reads the threshold. The goal is two-sided:
-    // AREA_DONE_FRAC of the ink labeled, with under WRONG_FRAC_MAX of the
-    // training set far out on bare papyrus (edge slop never counts).
+    // the device's doneFrac of the ink labeled, with under WRONG_FRAC_MAX
+    // of the training set far out on bare papyrus (edge slop never counts).
     const pctReached =
-      Math.round(A * 100) >= Math.round(AREA_DONE_FRAC * 100);
+      Math.round(A * 100) >= Math.round(st.doneFrac * 100);
     const clean = wrongFrac < WRONG_FRAC_MAX;
     if (!pctReached || clean) st.dirtyDoneSaid = false; // message can re-arm
     if (pctReached && clean && phaseRef.current === "play") {
       setPhase("done");
       setStatus("");
       animateBonus(1, 1600);
+      // converged: the full-strip reveal, the whole picture on screen.
+      // The demo OWES this beat — a stroke that lands mid-flight cancels
+      // the tween, so the flag keeps re-offering it until it completes
+      // (a deliberate pinch clears it: the user took the camera)
+      st.doneReveal = true;
+      zoomOutSoon(true);
     } else if (pctReached && !clean && phaseRef.current === "play") {
       if (!st.dirtyDoneSaid) {
         st.dirtyDoneSaid = true;
@@ -866,9 +1019,92 @@ export default function InkDemo() {
       setPhase("play");
       setReadOn(false);
       setDoneCueSeen(false); // re-finishing should announce itself again
+      st.doneReveal = false;
       animateBonus(0, 600);
     }
+    blitPred();
+  }
+
+  // put the composed prediction on screen. Desktop: a 1:1 copy of the full
+  // strip. Phones: the draw pane's view transform, so gray and black cover
+  // the same spot at any zoom. The "Generating prediction…" wash re-draws
+  // on top, since painting (and thus blitting) stays live during it.
+  function blitPred() {
+    const st = S.current;
+    const c = predRef.current;
+    if (!st?.predFull || !c) return;
+    const ctx = c.getContext("2d");
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, c.width, c.height);
+    if (st.mirror) {
+      // the pane is shorter than the draw pane: same width, same view,
+      // vertical crop centered on the draw pane's center
+      const v = st.view;
+      ctx.setTransform(v.s, 0, 0, v.s, v.tx, v.ty - (st.dcH - c.height) / 2);
+      ctx.drawImage(st.predFull, 0, 0);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+    } else {
+      ctx.drawImage(st.predFull, 0, 0);
+    }
     if (st.generating) drawGenerating();
+  }
+
+  // ease the view to a new zoom/pan (phone payoff beats). Scale and the
+  // view CENTER interpolate — clamped every frame, so the flight never
+  // shows out-of-bounds black. Any pointer-down cancels it: the user
+  // grabbed the view back.
+  function animateViewTo(target, ms) {
+    const st = S.current;
+    if (!st) return;
+    const from = { ...st.view };
+    const to = { ...st.view, ...target };
+    clampView(to);
+    const c0x = (st.dcW / 2 - from.tx) / from.s;
+    const c0y = (st.dcH / 2 - from.ty) / from.s;
+    const c1x = (st.dcW / 2 - to.tx) / to.s;
+    const c1y = (st.dcH / 2 - to.ty) / to.s;
+    const t0 = performance.now();
+    st.viewAnim = t0;
+    const step = () => {
+      const cur = S.current;
+      if (!cur || cur.viewAnim !== t0) return; // cancelled or demo restarted
+      const k = Math.min(1, (performance.now() - t0) / ms);
+      const e = k * (2 - k);
+      const v = cur.view;
+      v.s = from.s + (to.s - from.s) * e;
+      v.tx = cur.dcW / 2 - (c0x + (c1x - c0x) * e) * v.s;
+      v.ty = cur.dcH / 2 - (c0y + (c1y - c0y) * e) * v.s;
+      clampView(v);
+      redrawLeft();
+      if (k < 1) requestAnimationFrame(step);
+      else cur.viewAnim = 0;
+    };
+    requestAnimationFrame(step);
+  }
+
+  // zoom back out for the convergence payoff — only on phones, which open
+  // zoomed in; the desktop view opens at the full strip and is never
+  // driven. Convergence is the ONLY beat that drives the camera: it pulls
+  // all the way back to the whole strip (full=true). The labeling
+  // milestones — per-letter "Letter learned" and "the model generalized" —
+  // leave the camera to the user. Mid-stroke it only arms a flag: yanking
+  // the view while a finger is down would both feel broken and corrupt the
+  // stroke's coordinates.
+  function zoomOutSoon(full) {
+    const st = S.current;
+    if (!st || st.minS <= 1) return;
+    const target = full ? 1 : Math.max(1.35, st.view.s * 0.55);
+    if (st.view.s <= target + 0.001) return;
+    if (st.pointers.size > 0 || st.painting || st.pendingPaint) {
+      // remember the STRONGER request: a done landing right after a
+      // milestone must still get its full-strip reveal
+      st.zoomOutPending =
+        full || st.zoomOutPending === "full" ? "full" : "part";
+      return;
+    }
+    st.zoomOutPending = false;
+    animateViewTo({ s: target }, 900);
   }
 
   // ---- the inference clock -------------------------------------------------
@@ -915,7 +1151,8 @@ export default function InkDemo() {
       st.revealDirty = false;
       const rctx = st.reveal.getContext("2d");
       rctx.clearRect(0, 0, st.W, st.H);
-      for (const p of st.goodStamps) paintHalo(rctx, p.x, p.y, st.brush);
+      for (const p of st.goodStamps)
+        paintHalo(rctx, p.x, p.y, st.brush, st.haloK);
     }
     const A = st.labeled / st.inkTotal; // grounded: labeled ink area
     // bad labels corrupt the model in proportion to their share of the
@@ -939,7 +1176,7 @@ export default function InkDemo() {
     // strokes that thins out as the real labeled area grows
     const sparse =
       Math.min(1, st.labeled / 900) *
-      Math.max(0, 1 - A / (AREA_DONE_FRAC * 0.7));
+      Math.max(0, 1 - A / (st.doneFrac * 0.7));
     const fpAmt = Math.min(0.9, Math.max(0.95 * corr, 0.5 * sparse));
     st.model = { A, corr, fpAmt, wrongFrac };
     // committed gate state, testable (mirrors the dataset.view hooks)
@@ -1011,7 +1248,10 @@ export default function InkDemo() {
     const ctx = c.getContext("2d");
     ctx.fillStyle = "rgba(8,8,10,0.55)";
     ctx.fillRect(0, 0, c.width, c.height);
-    const fs = Math.round(c.width / 44);
+    // phones: size by backing-px-per-CSS-px, or the banner is unreadably
+    // small on the tall mirrored canvas. Desktop keeps its strip-based size.
+    const k = c.width / (c.getBoundingClientRect().width || c.width);
+    const fs = S.current?.mirror ? Math.round(15 * k) : Math.round(c.width / 44);
     ctx.font = `600 ${fs}px system-ui, sans-serif`;
     ctx.textAlign = "center";
     ctx.fillStyle = "#ff6a3d";
@@ -1031,7 +1271,7 @@ export default function InkDemo() {
   // right on it scores as "on ink". The FIRST hint teaches reading order
   // (the first letter of the word); after that, hints roam the WHOLE
   // segment, pointing at ink the user hasn't labeled yet.
-  function pickInkPoint(firstLetter) {
+  function pickInkPoint(firstLetter, near, vis) {
     const st = S.current;
     if (!st) return null;
     const { m, W, H } = st;
@@ -1047,6 +1287,92 @@ export default function InkDemo() {
         }
       return tot > 0 && ink / tot > 0.55;
     };
+    // sample real ink inside one letter's bbox, optionally clipped to a
+    // visible rect (so the point lands on screen, not in the bbox's
+    // off-screen tail). With a `goal`, return the valid spot closest to
+    // it — the ring should appear WHERE the user went, not across the
+    // letter from it.
+    const inLetter = (b, clip, goal) => {
+      let bx = b.x;
+      let by = b.y;
+      let bw = b.w;
+      let bh = b.h;
+      if (clip) {
+        const cx0 = Math.max(b.x, clip.x0);
+        const cy0 = Math.max(b.y, clip.y0);
+        const cx1 = Math.min(b.x + b.w, clip.x1);
+        const cy1 = Math.min(b.y + b.h, clip.y1);
+        if (cx1 <= cx0 || cy1 <= cy0) return null;
+        bx = cx0;
+        by = cy0;
+        bw = cx1 - cx0;
+        bh = cy1 - cy0;
+      }
+      let bestP = null;
+      let bestD = Infinity;
+      let found = 0;
+      for (let tries = 0; tries < 400; tries++) {
+        const x = Math.round(bx + Math.random() * bw);
+        const y = Math.round(by + Math.random() * bh);
+        if (!(st.labelData[y * W + x] > 127 && dense(x, y))) continue;
+        if (!goal) return { x, y };
+        const d = Math.hypot(x - goal.x, y - goal.y);
+        if (d < bestD) {
+          bestD = d;
+          bestP = { x, y };
+        }
+        if (++found >= 40) break;
+      }
+      return bestP;
+    };
+    // meet the visitor where they went (phone intro — they pinched
+    // somewhere). The cue parked "Pinch here" on the FIRST letter, so a
+    // pinch that lands on or near it rings THAT letter — the two halves
+    // of the guidance stay together. A pinch elsewhere rings the letter
+    // under it: distance to the BBOX (not its center — the first letter
+    // is 400px wide), letters on screen first, ink sampled next to the
+    // pinch. The camera is the user's either way.
+    if (near && (m.letters || []).length) {
+      const bboxDist = (bb) => {
+        const dx = Math.max(bb.x - near.x, 0, near.x - (bb.x + bb.w));
+        const dy = Math.max(bb.y - near.y, 0, near.y - (bb.y + bb.h));
+        return Math.hypot(dx, dy);
+      };
+      let first = null;
+      m.letters.forEach((bb, i) => {
+        // the magnet exists to pair the ring with the intro's "Pinch
+        // here" cue — once that letter is learned it must let go, or a
+        // later hint near it would point at finished work
+        if (st.perLetter[i] / st.letterInk[i] > LETTER_LEARN_FRAC) return;
+        if (!first || bb.x < first.x) first = bb;
+      });
+      let b = null;
+      if (first && bboxDist(first) < 120) b = first;
+      if (!b) {
+        let cand = m.letters;
+        if (vis) {
+          const on = m.letters.filter(
+            (bb) =>
+              bb.x < vis.x1 &&
+              bb.x + bb.w > vis.x0 &&
+              bb.y < vis.y1 &&
+              bb.y + bb.h > vis.y0,
+          );
+          if (on.length) cand = on;
+        }
+        let best = Infinity;
+        cand.forEach((bb) => {
+          const d = bboxDist(bb);
+          if (d < best) {
+            best = d;
+            b = bb;
+          }
+        });
+      }
+      const p =
+        b && ((vis && inLetter(b, vis, near)) || inLetter(b, null, near));
+      if (p) return p;
+    }
     if (firstLetter && (m.letters || []).length) {
       let idx = -1;
       m.letters.forEach((b, i) => {
@@ -1054,12 +1380,10 @@ export default function InkDemo() {
         if (idx < 0 || b.x < m.letters[idx].x) idx = i;
       });
       const b = m.letters[idx];
-      if (b)
-        for (let tries = 0; tries < 400; tries++) {
-          const x = Math.round(b.x + Math.random() * b.w);
-          const y = Math.round(b.y + Math.random() * b.h);
-          if (st.labelData[y * W + x] > 127 && dense(x, y)) return { x, y };
-        }
+      if (b) {
+        const p = inLetter(b);
+        if (p) return p;
+      }
     }
     // how much of the brush disc around a spot is already labeled
     const labeledNear = (x, y) => {
@@ -1101,25 +1425,67 @@ export default function InkDemo() {
   }
 
   // the hint points, it doesn't paint: a pulsing ring marks a spot of real
-  // ink, and the user still does the finding themselves
-  function hint() {
+  // ink, and the user still does the finding themselves. `quiet` rings
+  // without narrating — for beats where the status line is already saying
+  // something more important
+  function hint(near, quiet) {
     const st = S.current;
     if (!st) return;
-    const p = pickInkPoint(!st.hintedOnce);
+    const v = st.view;
+    // `near` means the user zoomed somewhere themselves (intro pinch or
+    // trackpad) — the view is THEIRS. Pick ink inside what they're
+    // looking at and leave the camera alone. A QUIET hint's `near` is a
+    // chosen letter, not a gesture: don't let the viewport re-target it
+    // (the letter may sit just off-screen; the slide below brings the
+    // ring in).
+    const vis =
+      near && !quiet
+        ? {
+            x0: -v.tx / v.s,
+            y0: -v.ty / v.s,
+            x1: (st.dcW - v.tx) / v.s,
+            y1: (st.dcH - v.ty) / v.s,
+          }
+        : null;
+    const p = pickInkPoint(!st.hintedOnce, near, vis);
     if (!p) return;
     st.hintedOnce = true;
+    autoHinted.current = true; // a phone's first hint arrives via the intro
     st.hintPt = p;
     drawRef.current.dataset.hint = `${Math.round(p.x)},${Math.round(p.y)}`;
-    // "go there": center the view on the hint, so asking for one always
-    // shows the ring — a no-op when the whole strip fits the pane
-    // (desktop unzoomed); phones get a zoom bump so the ring is legible
-    const v = st.view;
-    if (st.minS > 1) v.s = Math.max(v.s, st.minS * 1.25);
-    v.tx = st.dcW / 2 - p.x * v.s;
-    v.ty = st.dcH / 2 - p.y * v.s;
-    clampView(v);
+    endIntro(); // asking for a hint IS opting in — the cue's job is done
+    st.viewAnim = 0; // the hint drives the view now — stop any payoff tween
+    if (near) {
+      // stay put. Only if they pinched into bare papyrus and the nearest
+      // ink sits just off-screen, slide (never zoom) the minimum to show
+      // the ring with a little breathing room.
+      const margin = 50;
+      const sx = p.x * v.s + v.tx;
+      const sy = p.y * v.s + v.ty;
+      let tx = v.tx;
+      let ty = v.ty;
+      if (sx < margin) tx += margin - sx;
+      else if (sx > st.dcW - margin) tx -= sx - (st.dcW - margin);
+      if (sy < margin) ty += margin - sy;
+      else if (sy > st.dcH - margin) ty -= sy - (st.dcH - margin);
+      if (tx !== v.tx || ty !== v.ty) animateViewTo({ tx, ty }, 400);
+    } else if (st.minS > 1) {
+      // "go there": an ASKED-for hint (tap fallback, Hint button) still
+      // does the driving — glide to the guided painting zoom
+      const s = Math.max(v.s, st.paintZoom);
+      animateViewTo(
+        { s, tx: st.dcW / 2 - p.x * s, ty: st.dcH / 2 - p.y * s },
+        650,
+      );
+    } else {
+      // desktop unzoomed: centering is a clamped no-op when the whole
+      // strip fits the pane
+      v.tx = st.dcW / 2 - p.x * v.s;
+      v.ty = st.dcH / 2 - p.y * v.s;
+      clampView(v);
+    }
     setHintOn(true);
-    setStatus("See the pulsing ring? That texture is ink. Paint it.");
+    if (!quiet) setStatus("See the pulsing ring? That texture is ink. Paint it.");
     redrawLeft();
   }
 
@@ -1133,15 +1499,23 @@ export default function InkDemo() {
       setStatus("Found it. That texture, wherever it appears, is ink.");
   }
 
-  // the demo opens with a hint already pulsing: the first move is shown,
-  // not explained
+  // desktop opens with a hint already pulsing: the first move is shown,
+  // not explained. Phones open under the pinch cue instead — their first
+  // hint fires when the intro's zoom-in lands (see onPointerUp/onWheel).
   const autoHinted = useRef(false);
   useEffect(() => {
     if (phase !== "play" || autoHinted.current) return;
+    if (S.current?.intro) return;
     autoHinted.current = true;
     hint();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase]);
+
+  // the cue element mounts a render after redrawLeft already ran — place it
+  useEffect(() => {
+    if (introOn) positionCue();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [introOn]);
 
   // keep the hint ring pulsing (skipped under prefers-reduced-motion)
   useEffect(() => {
@@ -1169,6 +1543,7 @@ export default function InkDemo() {
     st.corrHealedSaid = false;
     st.lastTaught = 0;
     st.generalizedDone = false;
+    st.doneReveal = false;
     setGeneralized(false);
     clearHint(false);
     st.lastPct = 0;
@@ -1183,6 +1558,7 @@ export default function InkDemo() {
   function finishForMe() {
     const st = S.current;
     if (!st || st.autoTimer) return;
+    endIntro(); // the fast-forward paints — the brush must be armed
     clearHint(false);
     setTool("brush");
     toolRef.current = "brush";
@@ -1212,6 +1588,10 @@ export default function InkDemo() {
         toolRef.current = "brush";
         return;
       }
+      // the done gate reads the model COMMITTED at the last retrain, which
+      // trails the meter by a beat — pause at the goal line instead of
+      // stamping through it, so the finish lands at the stated target
+      if (cur.labeled / cur.inkTotal >= cur.doneFrac) return;
       placeAutoStamps(4);
     }, 80);
   }
@@ -1264,6 +1644,7 @@ export default function InkDemo() {
   function onPointerDown(e) {
     if (phaseRef.current !== "play" && phaseRef.current !== "done") return;
     const st = S.current;
+    st.viewAnim = 0; // any touch takes the view back from a payoff tween
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
     } catch {
@@ -1277,6 +1658,13 @@ export default function InkDemo() {
     }
     st.pointers.set(e.pointerId, { x: cx, y: cy });
     if (st.pointers.size === 2) {
+      // pinching is deliberate view control — a pending payoff zoom-out
+      // yanking it away afterwards would feel broken, and the owed
+      // convergence reveal is forfeited the same way
+      st.zoomOutPending = false;
+      st.doneReveal = false;
+      st.introPinched = true; // this gesture is a pinch, not an intro tap
+      if (st.intro) setPinchStarted(true); // the cue's done its job — drop it
       // the second finger of a pan/pinch: whatever the first finger
       // buffered was never a stroke — drop it undrawn
       if (st.pendingPaint) {
@@ -1329,6 +1717,9 @@ export default function InkDemo() {
         ix: (mid.x - v.tx) / v.s,
         iy: (mid.y - v.ty) / v.s,
       };
+    } else if (st.intro) {
+      // under the pinch cue the brush is off: a lone touch is either an
+      // intro tap (resolved at pointer-up) or the first finger of a pinch
     } else if (e.pointerType === "touch") {
       // a finger can't commit to painting on contact: the second finger
       // of a two-finger pan lands a beat later, and stamping now would
@@ -1426,10 +1817,145 @@ export default function InkDemo() {
         flushPendingPaint();
       }
     }
-    if (st.pointers.size < 2) st.pinch0 = null;
+    if (st.pointers.size < 2) {
+      // remember where the fingers WERE: the intro's hint points at the
+      // spot they pinched, not at whatever ended up mid-screen
+      if (st.pinch0) st.pinchAnchor = { x: st.pinch0.ix, y: st.pinch0.iy };
+      st.pinch0 = null;
+    }
     if (st.pointers.size === 0) {
+      // resolve the intro at gesture end, never mid-gesture: a pinch that
+      // carried the zoom in hands over to the paint hint; a plain tap asks
+      // the hint to do the zooming (it glides to the first letter); a
+      // pinch that stayed out keeps the cue up — they're still deciding
+      if (st.intro) {
+        if (st.introPinched) {
+          if (st.view.s >= INTRO_DONE_S) {
+            endIntro();
+            // they pinched in wherever they liked — hint the spot under
+            // their fingers (the pinch anchor), not necessarily the
+            // first letter and not whatever ended up mid-screen
+            const v = st.view;
+            const near = st.pinchAnchor || {
+              x: (st.dcW / 2 - v.tx) / v.s,
+              y: (st.dcH / 2 - v.ty) / v.s,
+            };
+            setTimeout(() => hint(near), 350);
+          }
+        } else if (e.type !== "pointercancel") {
+          endIntro();
+          hint();
+        }
+        st.introPinched = false;
+      }
       st.painting = false;
       st.strokeStart = null; // the stroke survived: it's real labeling
+      if (st.zoomOutPending) {
+        // a payoff landed mid-stroke; the fingers are up now — give the
+        // gesture a beat to settle, then pull back
+        const full = st.zoomOutPending === "full";
+        st.zoomOutPending = false;
+        setTimeout(() => zoomOutSoon(full), 350);
+      } else if (st.doneReveal && phaseRef.current === "done") {
+        // the convergence reveal is still owed — the last stroke's
+        // pointer-down cancelled it mid-flight. Re-offer until the full
+        // picture actually lands (pinching forfeits it instead)
+        if (st.view.s <= 1.001) st.doneReveal = false;
+        else setTimeout(() => zoomOutSoon(true), 350);
+      }
+    }
+  }
+
+  // ---- prediction-pane gestures (phones only) -----------------------------
+  // The mirrored pred pane shows the same view as the surface, so let the
+  // user pinch it to zoom (and drag to pan) too — a converged prediction is
+  // most worth pulling back to the whole strip right where they're reading
+  // it. These drive the SHARED st.view and never paint. Desktop's pred pane
+  // isn't mirrored and takes no gestures (every handler early-returns when
+  // !st.mirror), so its behavior is unchanged.
+  function predVOff() {
+    // blitPred crops the pred pane vertically about the surface's center
+    return (S.current.dcH - predRef.current.height) / 2;
+  }
+  function onPredPointerDown(e) {
+    const st = S.current;
+    if (!st?.mirror) return;
+    if (phaseRef.current !== "play" && phaseRef.current !== "done") return;
+    st.viewAnim = 0; // any touch takes the view back from a payoff tween
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* pointer already gone — capture is best-effort */
+    }
+    const [cx, cy] = eventToImageXY(e, predRef.current);
+    st.predPointers.set(e.pointerId, { x: cx, y: cy });
+    if (st.predPointers.size === 2) {
+      // a deliberate pinch forfeits any owed/pending payoff zoom, exactly
+      // like pinching the surface
+      st.zoomOutPending = false;
+      st.doneReveal = false;
+      if (st.intro) {
+        st.introPinched = true;
+        setPinchStarted(true); // pinching the pred pane drops the cue too
+      }
+      const [p1, p2] = [...st.predPointers.values()];
+      const off = predVOff();
+      const v = st.view;
+      const mid = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+      st.predPinch0 = {
+        d: Math.max(1, Math.hypot(p1.x - p2.x, p1.y - p2.y)),
+        s: v.s,
+        ix: (mid.x - v.tx) / v.s,
+        iy: (mid.y - (v.ty - off)) / v.s,
+      };
+      st.predPan = null;
+    } else {
+      st.predPan = { x: cx, y: cy };
+    }
+  }
+  function onPredPointerMove(e) {
+    const st = S.current;
+    if (!st?.mirror || !st.predPointers.has(e.pointerId)) return;
+    const [cx, cy] = eventToImageXY(e, predRef.current);
+    st.predPointers.set(e.pointerId, { x: cx, y: cy });
+    const v = st.view;
+    const off = predVOff();
+    if (st.predPinch0 && st.predPointers.size === 2) {
+      const [p1, p2] = [...st.predPointers.values()];
+      const d = Math.max(1, Math.hypot(p1.x - p2.x, p1.y - p2.y));
+      const mid = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+      v.s = st.predPinch0.s * (d / st.predPinch0.d);
+      v.tx = mid.x - st.predPinch0.ix * v.s;
+      v.ty = mid.y - st.predPinch0.iy * v.s + off;
+      clampView(v);
+      redrawLeft(); // re-blits the pred pane (mirror) and repaints the surface
+    } else if (st.predPan && st.predPointers.size === 1) {
+      v.tx += cx - st.predPan.x;
+      v.ty += cy - st.predPan.y;
+      st.predPan = { x: cx, y: cy };
+      clampView(v);
+      redrawLeft();
+    }
+  }
+  function onPredPointerUp(e) {
+    const st = S.current;
+    if (!st?.mirror) return;
+    st.predPointers.delete(e.pointerId);
+    st.predPan = null;
+    if (st.predPointers.size < 2) st.predPinch0 = null;
+    if (st.predPointers.size === 0 && st.intro && st.introPinched) {
+      // pinching the prediction past the intro threshold arms the brush,
+      // same as pinching the surface — then hand off to the paint hint
+      if (st.view.s >= INTRO_DONE_S) {
+        endIntro();
+        const v = st.view;
+        const near = {
+          x: (st.dcW / 2 - v.tx) / v.s,
+          y: (st.dcH / 2 - v.ty) / v.s,
+        };
+        setTimeout(() => hint(near), 350);
+      }
+      st.introPinched = false;
     }
   }
 
@@ -1439,7 +1965,46 @@ export default function InkDemo() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [overlay]);
 
-  const meterFill = Math.min(100, (labeledPct / (AREA_DONE_FRAC * 100)) * 100);
+  // clear and hint are momentary — no lasting selected state — so a tap
+  // gives no feedback on its own. Flash the pressed icon's box in-and-out
+  // (the CSS --tap animation), and while it plays, the active tool's box
+  // steps aside and then returns (tapFx suppresses its --on) — so tapping a
+  // momentary tool reads as the "selected" box hopping over and back.
+  function tapTool(which, run) {
+    run();
+    setTapFx(which);
+    // short: the selected box hops to the tapped icon and is back on the
+    // active tool quickly (matches the CSS flash duration below)
+    setTimeout(() => setTapFx((c) => (c === which ? null : c)), 210);
+  }
+
+  const meterFill = Math.min(100, (labeledPct / (doneFrac * 100)) * 100);
+
+  // rendered in the tool bar on desktop, but on phones the Overlay toggle
+  // rides the meter's row and the meter is what it grows to fill — so both
+  // are defined once and placed by layout below
+  const overlayBtn = (
+    <button
+      className={`vc-gs-tool ${overlay ? "vc-gs-tool--on" : ""}`}
+      onClick={() => setOverlay((v) => !v)}
+      aria-pressed={overlay}
+    >
+      Overlay prediction
+    </button>
+  );
+  const meterEl = (
+    <div
+      className="vc-gs-meter"
+      role="progressbar"
+      aria-valuenow={labeledPct}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-label="Ink labeled"
+    >
+      <div className="vc-gs-meter__fill" style={{ width: `${meterFill}%` }} />
+      <span className="vc-gs-meter__label">ink labeled {labeledPct}%</span>
+    </div>
+  );
 
   return (
     <div className="vc-gs-demo" id="ink-demo">
@@ -1487,17 +2052,178 @@ export default function InkDemo() {
         }}
       >
         {/* the strip is one wide line of text: stack the panes */}
-        <div className="vc-gs-demo__panes vc-gs-demo__panes--stack">
+        <div className="vc-gs-demo__panes vc-gs-demo__panes--stack" ref={panesRef}>
           <figure className="vc-gs-demo__pane">
-            <canvas
-              ref={drawRef}
-              className="vc-gs-demo__canvas vc-gs-demo__canvas--draw"
-              onPointerDown={onPointerDown}
-              onPointerMove={onPointerMove}
-              onPointerUp={onPointerUp}
-              onPointerCancel={onPointerUp}
-              onContextMenu={(e) => e.preventDefault()}
-            />
+            <div className="vc-gs-canvaswrap">
+              <canvas
+                ref={drawRef}
+                className="vc-gs-demo__canvas vc-gs-demo__canvas--draw"
+                onPointerDown={onPointerDown}
+                onPointerMove={onPointerMove}
+                onPointerUp={onPointerUp}
+                onPointerCancel={onPointerUp}
+                onContextMenu={(e) => e.preventDefault()}
+              />
+              {/* phone intro cue: a breathing bubble parked ON the first
+                  letter, holding two chevron trains that slide outward
+                  along the pinch-out diagonal and fade as they go — the
+                  pinch motion itself. The "Pinch here" pill sways with the
+                  bubble's breath, the way "Tap here" rides the paint
+                  ring's pulse. A live pinch DEFORMS the bubble under the
+                  fingers (see onPointerMove) until the zoom-in pops it.
+                  Pointer events pass through: the cue is watched, the
+                  canvas is touched. */}
+              {introOn && !pinchStarted && phase === "play" && (
+                <div className="vc-gs-pinchcue" aria-hidden="true">
+                  <div className="vc-gs-pinchcue__at" ref={cueRef}>
+                    <div className="vc-gs-pinchcue__bubble">
+                      <svg
+                        className="vc-gs-pinchcue__icon"
+                        viewBox="0 0 48 48"
+                        width="44"
+                        height="44"
+                      >
+                        <circle
+                          className="vc-gs-pinchcue__skin"
+                          cx="24"
+                          cy="24"
+                          r="17"
+                        />
+                        {/* the three paths per side are IDENTICAL, parked
+                            at the source just off center: they release
+                            as ONE batch (a quick squeeze while all are
+                            still at the source), fly out together —
+                            accelerating and brightening all the way,
+                            fully bright at the radius where they vanish,
+                            the dimmer followers a comet trace behind the
+                            head — and the next batch waits until this
+                            one has fully arrived */}
+                        <g className="vc-gs-pinchcue__up">
+                          <path className="vc-gs-pinchcue__w1" d="M25.5 21.5 H21.5 V25.5" />
+                          <path className="vc-gs-pinchcue__w2" d="M25.5 21.5 H21.5 V25.5" />
+                          <path className="vc-gs-pinchcue__w3" d="M25.5 21.5 H21.5 V25.5" />
+                        </g>
+                        <g className="vc-gs-pinchcue__dn">
+                          <path className="vc-gs-pinchcue__w1" d="M22.5 26.5 H26.5 V22.5" />
+                          <path className="vc-gs-pinchcue__w2" d="M22.5 26.5 H26.5 V22.5" />
+                          <path className="vc-gs-pinchcue__w3" d="M22.5 26.5 H26.5 V22.5" />
+                        </g>
+                      </svg>
+                    </div>
+                    <span className="vc-gs-pinchcue__pill">Pinch here</span>
+                  </div>
+                </div>
+              )}
+              {/* phones: quick-access tool icons on the panel's top-right,
+                  under the thumb without leaving the canvas. Same handlers
+                  and state as the (desktop-only) labeled tool buttons, so the
+                  active tool stays in sync. Hidden under the pinch cue. */}
+              {mirrored &&
+                !introOn &&
+                (phase === "play" || phase === "done") && (
+                  <div
+                    className="vc-gs-inktools"
+                    role="group"
+                    aria-label="Ink tools"
+                  >
+                    <button
+                      type="button"
+                      className={`vc-gs-inktool${
+                        tool === "brush" && !tapFx ? " vc-gs-inktool--on" : ""
+                      }`}
+                      onClick={() => setTool("brush")}
+                      aria-pressed={tool === "brush"}
+                      aria-label="Ink brush"
+                      title="Ink brush"
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="m9.06 11.9 8.07-8.06a2.85 2.85 0 1 1 4.03 4.03l-8.06 8.08" />
+                        <path d="M7.07 14.94c-1.66 0-3 1.35-3 3.02 0 1.33-2.5 1.52-2 2.02 1.08 1.1 2.49 2.02 4 2.02 2.2 0 4-1.8 4-4.04a3.01 3.01 0 0 0-3-3.02z" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      className={`vc-gs-inktool${
+                        tool === "eraser" && !tapFx ? " vc-gs-inktool--on" : ""
+                      }`}
+                      onClick={() => setTool("eraser")}
+                      aria-pressed={tool === "eraser"}
+                      aria-label="Erase"
+                      title="Erase"
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.3-9.3c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" />
+                        <path d="M22 21H7" />
+                        <path d="m5 11 9 9" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      className={`vc-gs-inktool${
+                        tapFx === "clear" ? " vc-gs-inktool--tap" : ""
+                      }`}
+                      onClick={() => tapTool("clear", clearAll)}
+                      aria-label="Clear labels"
+                      title="Clear labels"
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M3 6h18" />
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                        <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                        <path d="M10 11v6" />
+                        <path d="M14 11v6" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      className={`vc-gs-inktool${
+                        tapFx === "hint" ? " vc-gs-inktool--tap" : ""
+                      }`}
+                      onClick={() => tapTool("hint", () => hint())}
+                      aria-label="Hint"
+                      title="Hint"
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1.3.5 2.6 1.5 3.5.8.8 1.3 1.5 1.5 2.5" />
+                        <path d="M9 18h6" />
+                        <path d="M10 22h4" />
+                      </svg>
+                    </button>
+                  </div>
+                )}
+            </div>
             <figcaption>
               Papyrus surface: paint the ink{" "}
               <span className="vc-gs-dim">
@@ -1509,41 +2235,70 @@ export default function InkDemo() {
             </figcaption>
           </figure>
           <figure className="vc-gs-demo__pane">
-            <canvas ref={predRef} className="vc-gs-demo__canvas" />
+            <canvas
+              ref={predRef}
+              className={`vc-gs-demo__canvas${
+                mirrored ? " vc-gs-demo__canvas--zoom" : ""
+              }`}
+              // gestures are attached ONLY when the pane mirrors (phones);
+              // desktop's pred canvas keeps zero handlers, exactly as before
+              // (so right-click "Save image as…" still works there)
+              {...(mirrored
+                ? {
+                    onPointerDown: onPredPointerDown,
+                    onPointerMove: onPredPointerMove,
+                    onPointerUp: onPredPointerUp,
+                    onPointerCancel: onPredPointerUp,
+                    onContextMenu: (e) => e.preventDefault(),
+                  }
+                : {})}
+            />
             <figcaption>
               Model prediction. It retrains on your labels every few
               strokes.
+              {mirrored && (
+                <span className="vc-gs-dim">
+                  {" "}
+                  Same spot as above — pinch to zoom out.
+                </span>
+              )}
             </figcaption>
           </figure>
         </div>
 
         <div className="vc-gs-demo__bar">
           <div className="vc-gs-demo__tools" role="group" aria-label="Tools">
-            <button
-              className={`vc-gs-tool ${tool === "brush" ? "vc-gs-tool--on" : ""}`}
-              onClick={() => setTool("brush")}
-            >
-              Ink brush
-            </button>
-            <button
-              className={`vc-gs-tool ${tool === "eraser" ? "vc-gs-tool--on" : ""}`}
-              onClick={() => setTool("eraser")}
-            >
-              Erase
-            </button>
-            <button className="vc-gs-tool" onClick={clearAll}>
-              Clear labels
-            </button>
-            <button
-              className={`vc-gs-tool ${overlay ? "vc-gs-tool--on" : ""}`}
-              onClick={() => setOverlay((v) => !v)}
-              aria-pressed={overlay}
-            >
-              Overlay prediction
-            </button>
-            <button className="vc-gs-tool" onClick={hint}>
-              Hint
-            </button>
+            {/* on phones brush / erase / clear live as icons on the ink
+                panel's top-right (vc-gs-inktools); keep the labeled buttons
+                for desktop only, so the two never duplicate each other */}
+            {!mirrored && (
+              <>
+                <button
+                  className={`vc-gs-tool ${tool === "brush" ? "vc-gs-tool--on" : ""}`}
+                  onClick={() => setTool("brush")}
+                >
+                  Ink brush
+                </button>
+                <button
+                  className={`vc-gs-tool ${tool === "eraser" ? "vc-gs-tool--on" : ""}`}
+                  onClick={() => setTool("eraser")}
+                >
+                  Erase
+                </button>
+                <button className="vc-gs-tool" onClick={clearAll}>
+                  Clear labels
+                </button>
+              </>
+            )}
+            {/* desktop keeps Overlay + Hint in this row; on phones Overlay
+                moves down beside the meter (below) and Hint lives on the
+                ink panel's icon strip, so this row is just "Finish" there */}
+            {!mirrored && overlayBtn}
+            {!mirrored && (
+              <button className="vc-gs-tool" onClick={() => hint()}>
+                Hint
+              </button>
+            )}
             {/* only offered once they've genuinely tried: the point of the
                 demo is doing it, not watching it */}
             {phase === "play" && labeledPct >= 2 && !autoBusy && (
@@ -1552,22 +2307,14 @@ export default function InkDemo() {
               </button>
             )}
           </div>
-          <div
-            className="vc-gs-meter"
-            role="progressbar"
-            aria-valuenow={labeledPct}
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-label="Ink labeled"
-          >
-            <div
-              className="vc-gs-meter__fill"
-              style={{ width: `${meterFill}%` }}
-            />
-            <span className="vc-gs-meter__label">
-              ink labeled {labeledPct}%
-            </span>
-          </div>
+          {mirrored ? (
+            <div className="vc-gs-meterrow">
+              {overlayBtn}
+              {meterEl}
+            </div>
+          ) : (
+            meterEl
+          )}
         </div>
         <p className="vc-gs-demo__status" aria-live="polite" ref={statusRef}>
           {status}
@@ -1653,9 +2400,11 @@ function inkNear(labelData, W, H, x, y, R) {
 
 // the soft evidence halo one correct stamp contributes to the reveal —
 // used both live (as you paint) and when the reveal is rebuilt from the
-// surviving stamps after an erase, so the two must stay identical
-function paintHalo(rctx, x, y, r) {
-  const rr = r * 6;
+// surviving stamps after an erase, so the two must stay identical. k
+// scales the reach: phones widen it so strokes give away fragments of
+// the neighboring letters inside the zoomed viewport.
+function paintHalo(rctx, x, y, r, k = 1) {
+  const rr = r * 6 * k;
   const g = rctx.createRadialGradient(x, y, r * 0.7, x, y, rr);
   g.addColorStop(0, "rgba(255,255,255,0.85)");
   g.addColorStop(0.5, "rgba(255,255,255,0.4)");

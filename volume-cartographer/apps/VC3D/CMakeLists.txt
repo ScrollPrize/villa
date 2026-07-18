@@ -27,6 +27,8 @@ set(srcs
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
     LineAnnotationFiberClassification.hpp
+    LineAnnotationFiberSaveJob.cpp
+    LineAnnotationFiberSaveJob.hpp
     FiberNameDisplay.cpp
     FiberNameDisplay.hpp
     FiberSliceGeometry.cpp
@@ -40,6 +42,8 @@ set(srcs
     OpenDataCatalogWindow.cpp
     OpenDataCatalogWindow.hpp
     OpenDataManifest.cpp
+    OpenDataLasagna.cpp
+    OpenDataLasagna.hpp
     OpenDataManifest.hpp
     OpenDataSampleProject.cpp
     OpenDataSampleProject.hpp
@@ -280,6 +284,45 @@ target_link_libraries(VC3D
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
     Blosc::blosc
 )
+
+# Build-tree Qt plugin deployment (MSVC/vcpkg). vcpkg copies the Qt DLLs next to
+# the executable but not the plugin tree, so a freshly built VC3D.exe cannot find
+# platforms/qwindows.dll and aborts on startup. Copy the plugin folders next to
+# VC3D.exe after each link so it runs straight from the build directory without a
+# separate windeployqt step. (Packaging/install deployment is handled separately
+# in cmake/WindowsPackaging.cmake.)
+if(WIN32 AND MSVC)
+    set(_vc_qwin_loc "")
+    if(TARGET Qt6::QWindowsIntegrationPlugin)
+        foreach(_cfg IMPORTED_LOCATION_RELEASE IMPORTED_LOCATION_RELWITHDEBINFO
+                     IMPORTED_LOCATION_DEBUG IMPORTED_LOCATION)
+            get_target_property(_vc_qwin_loc Qt6::QWindowsIntegrationPlugin ${_cfg})
+            if(_vc_qwin_loc)
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(_vc_qwin_loc)
+        # _vc_qwin_loc = <qt>/plugins/platforms/qwindows.dll; go up twice.
+        get_filename_component(_vc_qt_plugins "${_vc_qwin_loc}" DIRECTORY)
+        get_filename_component(_vc_qt_plugins "${_vc_qt_plugins}" DIRECTORY)
+        foreach(_pd platforms styles imageformats iconengines tls generic
+                    networkinformation)
+            if(EXISTS "${_vc_qt_plugins}/${_pd}")
+                add_custom_command(TARGET VC3D POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+                        "${_vc_qt_plugins}/${_pd}"
+                        "$<TARGET_FILE_DIR:VC3D>/${_pd}"
+                    COMMENT "Deploying Qt ${_pd} plugins next to VC3D.exe"
+                    VERBATIM)
+            endif()
+        endforeach()
+    else()
+        message(WARNING
+            "Qt platform plugin not located; VC3D.exe may not launch from the "
+            "build tree without a manual windeployqt/plugin copy.")
+    endif()
+endif()
 
 if(VC_USE_PCH)
     # VC3D gets its own PCH = vc_core's common headers + the heavy Qt umbrella

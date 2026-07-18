@@ -290,7 +290,7 @@ const config = {
               ],
             },
           ],
-          copyright: `Copyright © ${new Date().getFullYear()} Vesuvius Challenge · Content licensed CC BY-NC 4.0`,
+          copyright: `Copyright © ${new Date().getFullYear()} Vesuvius Challenge · Content licensed CC BY-NC 4.0 unless otherwise specified`,
         },
         image: '/img/social/opengraph.jpg',
         metadata: [

@@ -28,6 +28,7 @@ class QLabel;
 class QMdiArea;
 class QMdiSubWindow;
 class QPoint;
+class QProgressBar;
 class QPushButton;
 class QCloseEvent;
 class QResizeEvent;
@@ -113,9 +114,24 @@ public:
     InitialDirectionMode initialDirectionMode() const;
     ReoptimizationMode reoptimizationMode() const;
     ShiftScrollMode shiftScrollMode() const;
+    int initialCenterlineLengthVx() const;
     int maxControlPointDistanceVx() const;
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedBranchLinePoints(std::vector<std::vector<cv::Vec3f>> branchLinePoints);
+    void setGeneratedBranchLinks(std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks);
+    void setGeneratedBranchOverlayData(
+        std::vector<GeneratedOverlay::ControlPointMarker> controlPoints,
+        std::vector<std::vector<cv::Vec3f>> branchLinePoints,
+        std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks,
+        bool requestSideStripIntersections = true);
+    void setGeneratedFiberIntersectionMarkers(
+        std::vector<GeneratedOverlay::FiberIntersectionMarker> markers);
+    void setGeneratedSideStripIntersectionBusy(bool busy);
+    void setGeneratedSideStripIntersectionProgress(const QString& stage,
+                                                   size_t completed,
+                                                   size_t total);
+    void setGeneratedSideStripIntersectionResult(size_t markerCount);
+    void setGeneratedSideStripIntersectionError();
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setGeneratedSpanAlignmentMetrics(
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
@@ -136,11 +152,15 @@ signals:
                                               double linePosition,
                                               cv::Vec3f volumePoint);
     void generatedControlPointBranchRequested(const std::string& surfaceName,
-                                              size_t controlPointIndex);
+                                              size_t controlPointIndex,
+                                              cv::Vec3f linkedControlPoint,
+                                              bool openAfterCreate,
+                                              cv::Vec3f linkDirection);
     void generatedControlPointBranchOpenRequested(uint64_t branchFiberId,
                                                    int branchControlPointIndex);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
+    void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);
     void showAsMeshRequested();
     void fullOptimizationRequested();
     void closeFinalizationRequested(QCloseEvent* event);
@@ -177,9 +197,20 @@ private:
     void jumpToNextControlPoint();
     void previewClosestControlPoint();
     bool shiftCurrentLinePositionByScrollSteps(int steps);
-    bool shiftCurrentCutPlaneStraightByScrollSteps(int steps);
+    bool shiftCurrentCutPlaneNormalOffsetByScrollSteps(int steps);
+    bool shiftSideCutPlaneNormalOffsetByScrollSteps(int steps);
+    bool shiftCutPlaneNormalOffsetByScrollSteps(PlaneSurface* plane,
+                                                CChunkedVolumeViewer* viewer,
+                                                int steps,
+                                                double& offsetVx,
+                                                const char* renderReason);
+    bool applyCutPlaneNormalOffset(PlaneSurface* plane, double offsetVx) const;
+    void resetGeneratedCutNormalOffsets(bool forceRender);
     void handleShiftScrollModeChanged();
     void setCurrentCutFollowsStripMouse(bool follows);
+    void requestGeneratedSideStripIntersections();
+    cv::Vec3f branchLinkDirectionForViewer(CChunkedVolumeViewer* viewer,
+                                           double linePosition) const;
     bool controlPointPlacementAllowedAt(double linePosition) const;
     vc3d::line_annotation::GeneratedCurrentLineMarkerState currentLineMarkerState() const;
     double snappedControlPointPosition(double position) const;
@@ -189,7 +220,7 @@ private:
     void updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay,
                                             bool updateSpanLabels);
     void clearFastGeneratedOverlayItemRefs();
-    void rebuildGeneratedOverlays();
+    void rebuildGeneratedOverlays(bool requestSideStripIntersections = true);
     void installGeneratedViewShortcuts();
     void resetGeneratedViews();
     bool toggleCurrentCutFollowFromKeyboard();
@@ -231,10 +262,12 @@ private:
     QComboBox* _initialDirectionCombo = nullptr;
     QComboBox* _reoptimizationCombo = nullptr;
     QComboBox* _shiftScrollCombo = nullptr;
+    QSpinBox* _initialCenterlineLengthSpin = nullptr;
     QSpinBox* _maxControlPointDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QLabel* _sliceStepLabel = nullptr;
     QLabel* _optimizationStatusLabel = nullptr;
+    QProgressBar* _sideStripIntersectionProgress = nullptr;
     QPushButton* _showAsMeshButton = nullptr;
     QPushButton* _fullOptimizationButton = nullptr;
     QPushButton* _resetViewsButton = nullptr;
@@ -243,6 +276,7 @@ private:
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;
     bool _closeAfterFinalizationAllowed = false;
+    bool _closing = false;
     bool _workspaceEmbedded = false;
     QString _fiberDisplayName;
 
@@ -295,7 +329,8 @@ private:
     bool _currentCutFollowsStripMouse = true;
     cv::Matx33f _currentCutManualRotation = cv::Matx33f::eye();
     bool _currentCutManualRotationActive = false;
-    bool _currentCutStraightOffsetActive = false;
+    double _currentCutNormalOffsetVx = 0.0;
+    double _sideCutNormalOffsetVx = 0.0;
     bool _generatedOverlayRefreshQueued = false;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;

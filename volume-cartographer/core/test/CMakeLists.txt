@@ -183,6 +183,8 @@ qt6_wrap_cpp(line_annotation_vccollection_moc ${PROJECT_SOURCE_DIR}/core/include
 qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
 vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
@@ -401,6 +403,8 @@ vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_open_data_manifest
     SOURCES test_open_data_manifest.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataLasagna.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataLasagna.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.hpp
@@ -410,7 +414,7 @@ vc_add_test(NAME test_open_data_manifest
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.hpp
-    LIBS doctest::doctest Qt6::Core vc_core
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna)
@@ -508,6 +512,8 @@ vc_add_test(NAME test_volume_pyramid)
 vc_add_test(NAME test_cache_compression)
 
 vc_add_test(NAME test_chunk_cache_persist)
+
+vc_add_test(NAME test_persistent_zarr_cache_budget)
 
 vc_add_test(NAME test_open_data_volume_prefill
     SOURCES test_open_data_volume_prefill.cpp
