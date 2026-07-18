@@ -12,6 +12,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/AffineTransform.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/atlas/Atlas.hpp"
 #include "vc/lasagna/Dataset.hpp"
@@ -24,6 +25,7 @@
 #include <optional>
 
 #include "VCSettings.hpp"
+#include "RemoteVolumeCachePaths.hpp"
 #include "Keybinds.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
@@ -2910,7 +2912,30 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             tabBar->setTabButton(i, QTabBar::RightSide, nullptr);
         }
     }
-    setCentralWidget(_workspaceTabs);
+    auto* workspaceContainer = new QWidget(this);
+    workspaceContainer->setObjectName(QStringLiteral("workspaceContainer"));
+    auto* workspaceLayout = new QVBoxLayout(workspaceContainer);
+    workspaceLayout->setContentsMargins(0, 0, 0, 0);
+    workspaceLayout->setSpacing(0);
+    _persistentCacheWarningBanner = new QFrame(workspaceContainer);
+    _persistentCacheWarningBanner->setObjectName(QStringLiteral("persistentCacheWarningBanner"));
+    _persistentCacheWarningBanner->setStyleSheet(
+        QStringLiteral("QFrame#persistentCacheWarningBanner { background: #fff3cd; color: #664d03; border-bottom: 1px solid #ffda6a; }"));
+    auto* warningLayout = new QHBoxLayout(_persistentCacheWarningBanner);
+    warningLayout->setContentsMargins(10, 5, 8, 5);
+    _persistentCacheWarningText = new QLabel(_persistentCacheWarningBanner);
+    _persistentCacheWarningText->setObjectName(QStringLiteral("persistentCacheWarningText"));
+    _persistentCacheWarningText->setWordWrap(true);
+    warningLayout->addWidget(_persistentCacheWarningText, 1);
+    auto* dismissCacheWarning = new QPushButton(tr("Dismiss"), _persistentCacheWarningBanner);
+    dismissCacheWarning->setObjectName(QStringLiteral("dismissPersistentCacheWarning"));
+    warningLayout->addWidget(dismissCacheWarning);
+    connect(dismissCacheWarning, &QPushButton::clicked,
+            _persistentCacheWarningBanner, &QWidget::hide);
+    _persistentCacheWarningBanner->hide();
+    workspaceLayout->addWidget(_persistentCacheWarningBanner);
+    workspaceLayout->addWidget(_workspaceTabs, 1);
+    setCentralWidget(workspaceContainer);
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_workspaceTabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
         if (!_workspaceTabs) {
@@ -3018,6 +3043,48 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _sharedCacheStatsLabel->setMinimumWidth(320);
     _sharedCacheStatsLabel->setText(tr("RAM --  disk --  network --"));
     statusBar()->addPermanentWidget(_sharedCacheStatsLabel);
+
+    _persistentCacheLowSpaceLabel = new QLabel(this);
+    _persistentCacheLowSpaceLabel->setObjectName(QStringLiteral("persistentCacheLowSpaceLabel"));
+    _persistentCacheLowSpaceLabel->setStyleSheet(QStringLiteral("color: #d28b00; font-weight: 600;"));
+    _persistentCacheLowSpaceLabel->hide();
+    statusBar()->addPermanentWidget(_persistentCacheLowSpaceLabel);
+
+    _persistentCacheSpaceTimer = new QTimer(this);
+    _persistentCacheSpaceTimer->setInterval(5000);
+    auto updatePersistentCacheSpace = [this]() {
+        auto root = vc3d::remoteCacheRootForState(_state);
+        if (_state) {
+            if (const auto volume = _state->currentVolume();
+                volume && !volume->remoteCacheRoot().empty()) {
+                root = volume->remoteCacheRoot();
+            }
+        }
+        auto budget = vc::render::PersistentZarrCacheBudget::findForPath(root);
+        if (!budget)
+            return;
+        const auto stats = budget->stats();
+        if (stats.lowSpace) {
+            const double freeGiB = static_cast<double>(stats.freeBytes) /
+                                   (1024.0 * 1024.0 * 1024.0);
+            const QString text = tr("Low disk space: %1 GiB free; remote Zarr cache growth is paused.")
+                                     .arg(freeGiB, 0, 'f', 1);
+            _persistentCacheLowSpaceLabel->setText(QStringLiteral("⚠ ") + text);
+            _persistentCacheLowSpaceLabel->show();
+            if (!_persistentCacheBannerShownThisSession) {
+                _persistentCacheBannerShownThisSession = true;
+                _persistentCacheWarningText->setText(text);
+                _persistentCacheWarningBanner->show();
+            }
+        } else {
+            _persistentCacheLowSpaceLabel->hide();
+            _persistentCacheWarningBanner->hide();
+        }
+    };
+    connect(_persistentCacheSpaceTimer, &QTimer::timeout, this,
+            updatePersistentCacheSpace);
+    _persistentCacheSpaceTimer->start();
+    updatePersistentCacheSpace();
 
     // Z-scroll sensitivity label in status bar
     _sliceStepLabel = new QLabel(this);

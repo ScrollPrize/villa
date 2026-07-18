@@ -513,6 +513,8 @@ vc_add_test(NAME test_cache_compression)
 
 vc_add_test(NAME test_chunk_cache_persist)
 
+vc_add_test(NAME test_persistent_zarr_cache_budget)
+
 vc_add_test(NAME test_open_data_volume_prefill
     SOURCES test_open_data_volume_prefill.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataVolumePrefill.cpp
