@@ -670,10 +670,10 @@ python lasagna/preprocess_cos_omezarr.py predict3d \
 | `--input` | required | Input zarr array (3D ZYX) |
 | `--output` | required | Output `.lasagna.json` path |
 | `--unet-checkpoint` | required | 3D UNet checkpoint (.pt) |
-| `--cos-scaledown` | 2 | Downsample power for cos channel (OME-Zarr level, actual factor = 2^value) |
-| `--scaledown` | 4 | Downsample power for other channels (OME-Zarr level, actual factor = 2^value) |
+| `--cos-scaledown` | 2 | Direct downsampling factor for the cos channel, relative to the input array |
+| `--scaledown` | 4 | Direct downsampling factor for the other channels, relative to the input array |
 | `--source-to-base` | 1.0 | Source volume to VC3D base coordinate factor |
-| `--tile-size` | 256 | Inference tile size |
+| `--tile-size` | checkpoint `patch_size` | Inference tile size; override only when intentionally using a different fully-convolutional tile size |
 | `--overlap` | 64 | Tile overlap in voxels |
 | `--border` | 16 | Hard discard border at tile edges |
 | `--crop` | none | Crop region: x y z w h d |

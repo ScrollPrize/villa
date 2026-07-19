@@ -51,7 +51,6 @@ except ImportError:
 	)
 
 from common import load_unet, unet_infer_tiled
-from train_unet_3d import build_model as build_model_3d
 
 
 def _crop_xyzwhd_bounds(*, shape_zyx: tuple[int, int, int], crop_xyzwhd: tuple[int, int, int, int, int, int] | None) -> tuple[int, int, int, int, int, int]:
@@ -1553,7 +1552,7 @@ def _read_tile_zarr(
 	volume_shape: tuple[int, int, int],
 	crop_offset: tuple[int, int, int],
 	tz: int, ty: int, tx: int,
-	tile_size: int,
+	tile_size: int | None,
 	border: int,
 ) -> np.ndarray:
 	"""Read a single tile from zarr, using reflect-padding only at volume boundaries.
@@ -2197,6 +2196,16 @@ def run_preprocess_3d(
 	distance encoding: outside=[80,127], inside=[128,175], no data=0.
 	"""
 	from lasagna_volume import LasagnaVolume, ChannelGroup
+	from train_unet_3d import build_model as build_model_3d
+
+	if tile_size is None:
+		_ckpt_meta = torch.load(unet3d_checkpoint, map_location="cpu", weights_only=False)
+		if not isinstance(_ckpt_meta, dict) or _ckpt_meta.get("patch_size") is None:
+			raise ValueError(
+				"checkpoint does not store patch_size; pass --tile-size explicitly"
+			)
+		tile_size = int(_ckpt_meta["patch_size"])
+		print(f"[predict3d] tile_size={tile_size} from checkpoint metadata", flush=True)
 
 	if not output_path.endswith(".lasagna.json"):
 		raise ValueError(f"output must be .lasagna.json, got: {output_path}")
@@ -2420,7 +2429,7 @@ def run_preprocess_3d(
 
 	# --- Build model ---
 	model, _norm_type, _upsample_mode, _output_sigmoid = build_model_3d(
-		tile_size, str(torch_device), weights=str(unet3d_checkpoint))
+		tile_size, str(torch_device), weights=str(unet3d_checkpoint), strict=True)
 	model.eval()
 
 	if calibrate_norm:
@@ -3482,8 +3491,8 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 	p.add_argument("--input", required=True, help="Input zarr array (3D ZYX).")
 	p.add_argument("--output", required=True, help="Output .lasagna.json path.")
 	p.add_argument("--unet-checkpoint", required=True, help="3D UNet checkpoint (.pt).")
-	p.add_argument("--tile-size", type=int, default=256,
-		help="Tile size, must be compatible with model architecture.")
+	p.add_argument("--tile-size", type=int, default=None,
+		help="Inference tile size (default: checkpoint patch_size).")
 	p.add_argument("--overlap", type=int, default=64, help="Tile overlap in voxels.")
 	p.add_argument("--border", type=int, default=16, help="Hard discard border at tile edges.")
 	p.add_argument("--cos-scaledown", type=int, default=2, help="Downsample factor for cos channel.")
@@ -3529,7 +3538,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		unet3d_checkpoint=str(args.unet_checkpoint),
 		device=args.device,
 		crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
-		tile_size=int(args.tile_size),
+		tile_size=int(args.tile_size) if args.tile_size is not None else None,
 		overlap=int(args.overlap),
 		border=int(args.border),
 		cos_scaledown=int(args.cos_scaledown),
@@ -3549,12 +3558,16 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 	return 0
 
 
-if __name__ == "__main__":
+def cli_main(argv: list[str] | None = None) -> int:
+	"""Dispatch the installed ``lasagna-preprocess`` command."""
 	import sys
-	if "--help" in sys.argv or "-h" in sys.argv:
-		raise SystemExit(main(["--help"]))
-	if len(sys.argv) > 1 and sys.argv[1] == "integrate":
-		raise SystemExit(main_integrate(sys.argv[2:]))
-	if len(sys.argv) > 1 and sys.argv[1] == "predict3d":
-		raise SystemExit(main_predict3d(sys.argv[2:]))
-	raise SystemExit(main())
+	args = list(sys.argv[1:] if argv is None else argv)
+	if args and args[0] == "integrate":
+		return main_integrate(args[1:])
+	if args and args[0] == "predict3d":
+		return main_predict3d(args[1:])
+	return main(args)
+
+
+if __name__ == "__main__":
+	raise SystemExit(cli_main())
