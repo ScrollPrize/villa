@@ -97,8 +97,12 @@ class MenuActionController;
 class SegmentationGrower;
 class ViewerControlsPanel;
 class QLabel;
+class QDoubleSpinBox;
 class QMainWindow;
 class QMenu;
+class QLineEdit;
+class QProgressBar;
+class QPushButton;
 class QSpinBox;
 class QStandardItemModel;
 class QTabWidget;
@@ -113,6 +117,19 @@ class AtlasControlPointsDock;
 class StatusDockPanelHost;
 class ViewerCompositePanel;
 class LineAnnotationDialog;
+
+struct FiberIntersectionSearchControls {
+    QPointer<QWidget> content;
+    QPointer<QLabel> currentLabel;
+    QPointer<QLineEdit> tagFilter;
+    QPointer<QLineEdit> excludeTagFilter;
+    QPointer<QDoubleSpinBox> maxDistance;
+    QPointer<QCheckBox> groupByFiber;
+    QPointer<QPushButton> runButton;
+    QPointer<QPushButton> cancelButton;
+    QPointer<QProgressBar> progress;
+    QPointer<QTreeWidget> resultTree;
+};
 
 class CWindow : public QMainWindow
 {
@@ -354,6 +371,7 @@ private:
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
     QDockWidget* _fiberIntersectionSearchDock{nullptr};
+    FiberIntersectionSearchControls _fiberIntersectionSearchControls;
     QDockWidget* _inkDetectionDock{nullptr};
     QDockWidget* _transformsDock{nullptr};
     AtlasControlPointsDock* _atlasControlDock{nullptr};
