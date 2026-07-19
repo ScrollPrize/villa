@@ -544,6 +544,10 @@ void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus
 
         emit toolFinished(_currentTool, false, errorMessage, QString(), false);
     }
+
+    // Completion-dialog suppression is scoped to a single run: clear it now
+    // that every toolFinished slot has observed it for this process.
+    _suppressCompletionDialogs = false;
 }
 
 void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
@@ -584,6 +588,10 @@ void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
     _explicitVolumePath = false;
 
     emit toolFinished(_currentTool, false, errorMessage, QString(), false);
+
+    // Scoped to a single run (see onProcessFinished): clear now that every
+    // toolFinished slot has observed the suppression flag for this process.
+    _suppressCompletionDialogs = false;
 
     if (_consoleOutput) {
         _consoleOutput->appendOutput(errorMessage);

@@ -121,6 +121,7 @@ class CWindow : public QMainWindow
 
     friend class MenuActionController;
     friend class RenderBenchReplay;
+    friend class AgentBridgeServer;
 
 public:
 signals:

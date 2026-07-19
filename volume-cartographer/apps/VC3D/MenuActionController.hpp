@@ -41,6 +41,11 @@ public:
     void openVolpkgAt(const QString& path);
     void showOpenDataCatalog();
     bool isOpenDataCatalogVisible() const;
+    // Headless twin of double-clicking a catalog sample: resolves `sampleId`
+    // against the cached Open Data manifest and forwards to the private
+    // openOpenDataSample(). Returns false when the sample id is unknown or the
+    // open fails. Used by the agent bridge (see agent_bridge/SPEC.md §3.16).
+    bool openOpenDataSampleById(const QString& sampleId);
 
 private slots:
     void newProject();

@@ -1050,9 +1050,21 @@ bool CWindow::initializeCommandLineRunner()
                         _segmentationCommandHandler->resumeLocalJob().has_value() &&
                         tool == CommandLineToolRunner::Tool::NeighborCopy;
 
-                    bool suppressDialogs = neighborJobActive && success &&
+                    const bool neighborFirstPassSuppress = neighborJobActive && success &&
                                            _segmentationCommandHandler->neighborCopyJob()->stage ==
                                                SegmentationCommandHandler::NeighborCopyJob::Stage::FirstPass;
+
+                    // Jobs launched by the agent bridge run unattended (often
+                    // headless/offscreen). A blocking modal here would starve
+                    // every later-connected toolFinished slot -- including the
+                    // bridge's own job-tracking handler -- leaving job.status
+                    // stuck at "running" forever. The runner carries a
+                    // per-run flag the bridge sets for jobs it tracks; honor it
+                    // the same way NeighborCopy's first pass suppresses this
+                    // dialog.
+                    const bool bridgeDriven = _cmdRunner && _cmdRunner->suppressCompletionDialogs();
+
+                    const bool suppressDialogs = bridgeDriven || neighborFirstPassSuppress;
 
                     if (!suppressDialogs) {
                         if (success) {
@@ -1064,7 +1076,7 @@ bool CWindow::initializeCommandLineRunner()
                             showStatusBarMessage(tr("Operation failed"), 5000);
                             QMessageBox::critical(this, tr("Error"), message);
                         }
-                    } else {
+                    } else if (neighborFirstPassSuppress) {
                         showStatusBarMessage(tr("Neighbor copy pass 1 complete"), 2000);
                     }
 

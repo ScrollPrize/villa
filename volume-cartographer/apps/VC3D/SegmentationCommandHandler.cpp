@@ -2515,53 +2515,48 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
     emit statusMessage(tr("Resume-opt local GrowPatch started for %1").arg(segmentId), 5000);
 }
 
-void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3D& seedPoint)
+bool SegmentationCommandHandler::startGrowPatchFromSeed(const QVector3D& seedPoint,
+                                                       const GrowPatchSeedParams& params,
+                                                       QString* errorMessage)
 {
+    // Distinct failure sentences let the agent bridge classify precondition
+    // failures (see apps/VC3D/agent_bridge/SPEC.md §4). Never opens a dialog.
+    auto fail = [&](const QString& message) -> bool {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+
     if (!_state || !_state->vpkg()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume package loaded."));
-        return;
+        return fail(tr("No volume package loaded."));
     }
-
     if (_state->currentVolume() == nullptr) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume loaded."));
-        return;
+        return fail(tr("No volume loaded."));
     }
-
     if (!_cmdRunner) {
-        emit statusMessage(tr("Command line tools not available"), 3000);
-        return;
+        return fail(tr("Command line tools are not available."));
     }
     if (_cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Warning"), tr("A command line tool is already running."));
-        return;
+        return fail(tr("A command line tool is already running."));
     }
-
     if (_growPatchSeedJob) {
-        QMessageBox::warning(_parentWidget, tr("Warning"), tr("A GrowPatch seed run is already active."));
-        return;
+        return fail(tr("A GrowPatch seed run is already active."));
     }
 
     const QString executable = findVcTool("vc_grow_seg_from_seed");
     if (executable.isEmpty()) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-            tr("Could not find the 'vc_grow_seg_from_seed' executable.\n"
-               "Looked in known locations and PATH.\n\n"
-               "Tip: set an override via VC.ini [tools] vc_grow_seg_from_seed, or put "
-               "the binary on PATH."));
-        return;
+        return fail(tr("Could not find the 'vc_grow_seg_from_seed' executable."));
     }
 
     QString defaultVolumeId;
     const auto volumeOptions = buildVolumeOptionList(&defaultVolumeId);
     if (volumeOptions.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volumes available in the volume package."));
-        return;
+        return fail(tr("No volumes available in the volume package."));
     }
 
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    QString selectedVolumeId = settings.value(QStringLiteral("growpatch_seed/volume_id")).toString();
-    if (selectedVolumeId.isEmpty() || std::none_of(volumeOptions.begin(), volumeOptions.end(),
-                                                   [&](const auto& option) { return option.id == selectedVolumeId; })) {
+    QString selectedVolumeId = params.volumeId;
+    if (selectedVolumeId.isEmpty()) {
         selectedVolumeId = defaultVolumeId;
     }
     QString selectedVolumePath;
@@ -2572,15 +2567,7 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
         }
     }
     if (selectedVolumePath.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Cannot determine selected volume path."));
-        return;
-    }
-
-    QHash<QString, QString> openDataPatchesRootsByVolumeId;
-    for (const auto& option : volumeOptions) {
-        if (const auto patchesRoot = openDataPatchesRootForVolume(*_state->vpkg(), option.id)) {
-            openDataPatchesRootsByVolumeId.insert(option.id, *patchesRoot);
-        }
+        return fail(tr("Unknown volume id: %1").arg(selectedVolumeId));
     }
 
     QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
@@ -2591,8 +2578,7 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
         }
     }
     if (normalGridPath.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("No normal grid is available for GrowPatch."));
-        return;
+        return fail(tr("No normal grid is available for GrowPatch."));
     }
 
     QString volpkgRoot = _state->vpkgPath();
@@ -2600,100 +2586,81 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
         volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
     }
     if (volpkgRoot.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Cannot determine volume package folder."));
-        return;
+        return fail(tr("Cannot determine volume package folder."));
     }
 
-    QStringList outputChoices;
-    auto appendChoice = [&outputChoices](const QString& path) {
-        const QString cleaned = QDir::cleanPath(path);
-        if (!cleaned.isEmpty() && !outputChoices.contains(cleaned)) {
-            outputChoices << cleaned;
+    // Resolve the output directory. An empty request uses the same default the
+    // interactive dialog offers: the head of the output-choice list.
+    QString outputDirPath = params.outputDir.trimmed();
+    if (outputDirPath.isEmpty()) {
+        QStringList outputChoices;
+        auto appendChoice = [&outputChoices](const QString& path) {
+            const QString cleaned = QDir::cleanPath(path);
+            if (!cleaned.isEmpty() && !outputChoices.contains(cleaned)) {
+                outputChoices << cleaned;
+            }
+        };
+        if (const auto patchesRoot =
+                openDataPatchesRootForVolume(*_state->vpkg(), selectedVolumeId)) {
+            appendChoice(*patchesRoot);
         }
-    };
+        const auto outputSegmentsPath = _state->vpkg()->outputSegmentsPath();
+        if (!outputSegmentsPath.empty()) {
+            appendChoice(QString::fromStdString(outputSegmentsPath.string()));
+        }
+        for (const auto& path : _state->vpkg()->availableSegmentPaths()) {
+            appendChoice(QString::fromStdString(path.string()));
+        }
+        appendChoice(QDir(volpkgRoot).filePath(QStringLiteral("paths")));
+        appendChoice(QDir(volpkgRoot).filePath(QStringLiteral("traces")));
+        outputDirPath = outputChoices.isEmpty()
+            ? QDir(volpkgRoot).filePath(QStringLiteral("paths"))
+            : outputChoices.front();
+    }
+    if (QDir::isRelativePath(outputDirPath)) {
+        outputDirPath = QDir(volpkgRoot).filePath(outputDirPath);
+    }
+    QDir outDir(outputDirPath);
+    if (!outDir.exists() && !outDir.mkpath(QStringLiteral("."))) {
+        return fail(tr("Failed to create output folder: %1").arg(outputDirPath));
+    }
+    outputDirPath = outDir.absolutePath();
 
-    const auto outputSegmentsPath = _state->vpkg()->outputSegmentsPath();
-    if (const auto it = openDataPatchesRootsByVolumeId.constFind(selectedVolumeId);
-        it != openDataPatchesRootsByVolumeId.cend()) {
-        appendChoice(it.value());
-    }
-    if (!outputSegmentsPath.empty()) {
-        appendChoice(QString::fromStdString(outputSegmentsPath.string()));
-    }
-    for (const auto& path : _state->vpkg()->availableSegmentPaths()) {
-        appendChoice(QString::fromStdString(path.string()));
-    }
-    appendChoice(QDir(volpkgRoot).filePath(QStringLiteral("paths")));
-    appendChoice(QDir(volpkgRoot).filePath(QStringLiteral("traces")));
-
-    int iterations = 200;
-    double minAreaCm = 0.002;
-    QString outputDirPath = outputChoices.isEmpty()
-        ? QDir(volpkgRoot).filePath(QStringLiteral("paths"))
-        : outputChoices.front();
-    if (!selectGrowPatchSeedParams(_parentWidget,
-                                   volpkgRoot,
-                                   volumeOptions,
-                                   outputChoices,
-                                   openDataPatchesRootsByVolumeId,
-                                   &selectedVolumeId,
-                                   &selectedVolumePath,
-                                   &iterations,
-                                   &minAreaCm,
-                                   &outputDirPath)) {
-        emit statusMessage(tr("Create segment cancelled"), 3000);
-        return;
-    }
-    if (selectedVolumePath.trimmed().isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume selected."));
-        return;
-    }
-    settings.setValue(QStringLiteral("growpatch_seed/volume_id"), selectedVolumeId);
+    const int iterations = std::clamp(params.iterations, 1, 100000);
+    const double minAreaCm = std::max(0.0, params.minAreaCm);
 
     double selectedVoxelSize = 0.0;
     if (auto selectedVolume = _state->vpkg()->volume(selectedVolumeId.toStdString())) {
         selectedVoxelSize = selectedVolume->voxelSize();
     }
 
-    outputDirPath = outputDirPath.trimmed();
-    if (QDir::isRelativePath(outputDirPath)) {
-        outputDirPath = QDir(volpkgRoot).filePath(outputDirPath);
-    }
-    QDir outDir(outputDirPath);
-    if (!outDir.exists() && !outDir.mkpath(QStringLiteral("."))) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create output folder: %1").arg(outputDirPath));
-        return;
-    }
-    outputDirPath = outDir.absolutePath();
-
     const QString segmentsEntry = segmentsEntryLocationForPath(outputDirPath, volpkgRoot);
     _state->vpkg()->addSegmentsEntry(segmentsEntry.toStdString(), {"growpatch"});
     _state->vpkg()->setOutputSegments(segmentsEntry.toStdString());
 
-    QJsonObject params;
-    params.insert(QStringLiteral("mode"), QStringLiteral("seed"));
-    params.insert(QStringLiteral("step_size"), 20);
-    params.insert(QStringLiteral("min_area_cm"), minAreaCm);
-    params.insert(QStringLiteral("generations"), iterations);
-    params.insert(QStringLiteral("thread_limit"), 1);
-    params.insert(QStringLiteral("normal_grid_path"), normalGridPath);
-    params.insert(QStringLiteral("cache_root"), QDir(volpkgRoot).filePath(QStringLiteral("cache")));
+    QJsonObject paramsJson;
+    paramsJson.insert(QStringLiteral("mode"), QStringLiteral("seed"));
+    paramsJson.insert(QStringLiteral("step_size"), 20);
+    paramsJson.insert(QStringLiteral("min_area_cm"), minAreaCm);
+    paramsJson.insert(QStringLiteral("generations"), iterations);
+    paramsJson.insert(QStringLiteral("thread_limit"), 1);
+    paramsJson.insert(QStringLiteral("normal_grid_path"), normalGridPath);
+    paramsJson.insert(QStringLiteral("cache_root"), QDir(volpkgRoot).filePath(QStringLiteral("cache")));
     if (std::isfinite(selectedVoxelSize) && selectedVoxelSize > 0.0) {
-        params.insert(QStringLiteral("voxelsize"), selectedVoxelSize);
+        paramsJson.insert(QStringLiteral("voxelsize"), selectedVoxelSize);
     }
     if (_normal3dZarrPathGetter) {
         const QString normal3dPath = _normal3dZarrPathGetter();
         if (!normal3dPath.isEmpty()) {
-            params.insert(QStringLiteral("normal3d_zarr_path"), normal3dPath);
+            paramsJson.insert(QStringLiteral("normal3d_zarr_path"), normal3dPath);
         }
     }
 
     auto paramsFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("growpatch_seed_XXXXXX.json"));
     if (!paramsFile->open()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create temporary params file."));
-        return;
+        return fail(tr("Failed to create temporary params file."));
     }
-    paramsFile->write(QJsonDocument(params).toJson(QJsonDocument::Indented));
+    paramsFile->write(QJsonDocument(paramsJson).toJson(QJsonDocument::Indented));
     paramsFile->flush();
 
     _growPatchSeedJob = GrowPatchSeedJob{};
@@ -2736,10 +2703,18 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
         disconnect(*connection);
         _growPatchSeedJob.reset();
 
+        // Bridge-driven runs are unattended (often headless): never pop a
+        // blocking modal, which would hang the process with no one to dismiss
+        // it. The runner's per-run flag still reads true here because it is
+        // cleared only after all toolFinished slots have run.
+        const bool bridgeDriven = _cmdRunner && _cmdRunner->suppressCompletionDialogs();
+
         if (!success) {
-            QMessageBox::critical(_parentWidget,
-                                  tr("Error"),
-                                  tr("vc_grow_seg_from_seed failed.\n%1").arg(message));
+            if (!bridgeDriven) {
+                QMessageBox::critical(_parentWidget,
+                                      tr("Error"),
+                                      tr("vc_grow_seg_from_seed failed.\n%1").arg(message));
+            }
             emit statusMessage(tr("Create segment failed"), 3000);
             return;
         }
@@ -2773,12 +2748,10 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
             5000);
     });
 
-    _cmdRunner->showConsoleOutput();
     if (!_cmdRunner->executeCustomCommand(executable, args, QStringLiteral("vc_grow_seg_from_seed"))) {
         QObject::disconnect(*connection);
         _growPatchSeedJob.reset();
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to start vc_grow_seg_from_seed."));
-        return;
+        return fail(tr("Failed to start vc_grow_seg_from_seed."));
     }
 
     emit statusMessage(
@@ -2787,6 +2760,136 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
             .arg(seedPoint.y(), 0, 'g', 6)
             .arg(seedPoint.z(), 0, 'g', 6),
         5000);
+    return true;
+}
+
+void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3D& seedPoint)
+{
+    // Interactive path: gather the same defaults the dialog needs, show the
+    // dialog, then hand the collected params to the shared headless launcher.
+    // All dialogs/QMessageBoxes live here; execution lives in
+    // startGrowPatchFromSeed (see apps/VC3D/agent_bridge/SPEC.md §4).
+    if (!_state || !_state->vpkg()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume package loaded."));
+        return;
+    }
+
+    if (_state->currentVolume() == nullptr) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume loaded."));
+        return;
+    }
+
+    if (!_cmdRunner) {
+        emit statusMessage(tr("Command line tools not available"), 3000);
+        return;
+    }
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(_parentWidget, tr("Warning"), tr("A command line tool is already running."));
+        return;
+    }
+
+    if (_growPatchSeedJob) {
+        QMessageBox::warning(_parentWidget, tr("Warning"), tr("A GrowPatch seed run is already active."));
+        return;
+    }
+
+    if (findVcTool("vc_grow_seg_from_seed").isEmpty()) {
+        QMessageBox::critical(_parentWidget, tr("Error"),
+            tr("Could not find the 'vc_grow_seg_from_seed' executable.\n"
+               "Looked in known locations and PATH.\n\n"
+               "Tip: set an override via VC.ini [tools] vc_grow_seg_from_seed, or put "
+               "the binary on PATH."));
+        return;
+    }
+
+    QString defaultVolumeId;
+    const auto volumeOptions = buildVolumeOptionList(&defaultVolumeId);
+    if (volumeOptions.isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volumes available in the volume package."));
+        return;
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QString selectedVolumeId = settings.value(QStringLiteral("growpatch_seed/volume_id")).toString();
+    if (selectedVolumeId.isEmpty() || std::none_of(volumeOptions.begin(), volumeOptions.end(),
+                                                   [&](const auto& option) { return option.id == selectedVolumeId; })) {
+        selectedVolumeId = defaultVolumeId;
+    }
+    QString selectedVolumePath;
+    for (const auto& option : volumeOptions) {
+        if (option.id == selectedVolumeId) {
+            selectedVolumePath = option.path;
+            break;
+        }
+    }
+
+    QHash<QString, QString> openDataPatchesRootsByVolumeId;
+    for (const auto& option : volumeOptions) {
+        if (const auto patchesRoot = openDataPatchesRootForVolume(*_state->vpkg(), option.id)) {
+            openDataPatchesRootsByVolumeId.insert(option.id, *patchesRoot);
+        }
+    }
+
+    QString volpkgRoot = _state->vpkgPath();
+    if (volpkgRoot.isEmpty()) {
+        volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
+    }
+
+    QStringList outputChoices;
+    auto appendChoice = [&outputChoices](const QString& path) {
+        const QString cleaned = QDir::cleanPath(path);
+        if (!cleaned.isEmpty() && !outputChoices.contains(cleaned)) {
+            outputChoices << cleaned;
+        }
+    };
+
+    const auto outputSegmentsPath = _state->vpkg()->outputSegmentsPath();
+    if (const auto it = openDataPatchesRootsByVolumeId.constFind(selectedVolumeId);
+        it != openDataPatchesRootsByVolumeId.cend()) {
+        appendChoice(it.value());
+    }
+    if (!outputSegmentsPath.empty()) {
+        appendChoice(QString::fromStdString(outputSegmentsPath.string()));
+    }
+    for (const auto& path : _state->vpkg()->availableSegmentPaths()) {
+        appendChoice(QString::fromStdString(path.string()));
+    }
+    appendChoice(QDir(volpkgRoot).filePath(QStringLiteral("paths")));
+    appendChoice(QDir(volpkgRoot).filePath(QStringLiteral("traces")));
+
+    int iterations = 200;
+    double minAreaCm = 0.002;
+    QString outputDirPath = outputChoices.isEmpty()
+        ? QDir(volpkgRoot).filePath(QStringLiteral("paths"))
+        : outputChoices.front();
+    if (!selectGrowPatchSeedParams(_parentWidget,
+                                   volpkgRoot,
+                                   volumeOptions,
+                                   outputChoices,
+                                   openDataPatchesRootsByVolumeId,
+                                   &selectedVolumeId,
+                                   &selectedVolumePath,
+                                   &iterations,
+                                   &minAreaCm,
+                                   &outputDirPath)) {
+        emit statusMessage(tr("Create segment cancelled"), 3000);
+        return;
+    }
+    settings.setValue(QStringLiteral("growpatch_seed/volume_id"), selectedVolumeId);
+
+    // Console output is interactive-only UI; the headless path must not pop it.
+    _cmdRunner->showConsoleOutput();
+
+    GrowPatchSeedParams patchParams;
+    patchParams.volumeId = selectedVolumeId;
+    patchParams.iterations = iterations;
+    patchParams.minAreaCm = minAreaCm;
+    patchParams.outputDir = outputDirPath;
+
+    QString err;
+    if (!startGrowPatchFromSeed(seedPoint, patchParams, &err)) {
+        QMessageBox::warning(_parentWidget, tr("Error"), err);
+    }
 }
 
 void SegmentationCommandHandler::onConvertToObj(const std::string& segmentId)

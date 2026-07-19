@@ -116,6 +116,17 @@ public:
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
     void setPreserveConsoleOutput(bool preserve);
 
+    // When set, the interactive toolFinished handler (see
+    // CWindow::initializeCommandLineRunner) must NOT pop a blocking
+    // "Operation Complete"/"Error" QMessageBox for the current run. The agent
+    // bridge sets this before launching a job it tracks so that a headless /
+    // offscreen (or otherwise unattended) process is not starved by a modal
+    // dialog that no one can dismiss (mirrors the NeighborCopy first-pass
+    // suppression). The flag is scoped to a single run: it is cleared
+    // automatically once toolFinished has been emitted.
+    void setSuppressCompletionDialogs(bool suppress) { _suppressCompletionDialogs = suppress; }
+    bool suppressCompletionDialogs() const { return _suppressCompletionDialogs; }
+
 signals:
     void toolStarted(Tool tool, const QString& message);
     void toolFinished(Tool tool, bool success, const QString& message, const QString& outputPath, bool copyToClipboard = false);
@@ -193,6 +204,10 @@ private:
 
     int _ompThreads{-1};
     bool _explicitVolumePath{false};
+    // Set by the agent bridge for jobs it tracks; suppresses the interactive
+    // completion QMessageBox for the current run only. Cleared after the
+    // toolFinished signal is emitted. See setSuppressCompletionDialogs.
+    bool _suppressCompletionDialogs{false};
 
     QString _objOutputDir;
     float _objStretchFactor = 1000.0f;

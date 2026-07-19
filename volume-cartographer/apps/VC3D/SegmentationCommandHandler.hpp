@@ -66,6 +66,17 @@ public:
         std::unique_ptr<QTemporaryFile> paramsFile;
     };
 
+    // Parameters the interactive GrowPatch dialog collects, packaged so the
+    // non-interactive (agent bridge) path can supply them directly. See
+    // startGrowPatchFromSeed and apps/VC3D/agent_bridge/SPEC.md §4.
+    struct GrowPatchSeedParams {
+        QString volumeId;          // vpkg volume id; empty => current volume
+        int     iterations{200};   // clamped/validated to [1, 100000]
+        double  minAreaCm{0.002};  // >= 0
+        QString outputDir;         // absolute or relative to volpkg root; empty =>
+                                   // default head of the dialog's choice list
+    };
+
     // --- Construction ---
 
     explicit SegmentationCommandHandler(QWidget* parentWidget,
@@ -158,6 +169,26 @@ public slots:
     void launchNeighborCopySecondPass();
 
 public:
+    /// Headless GrowPatch-from-seed launch. Performs ALL validation and
+    /// execution that onCreateSegmentGrowPatchFromSeed performs today, but
+    /// reports failures through `errorMessage` (never via QMessageBox) and never
+    /// opens a dialog. Returns true when the vc_grow_seg_from_seed process was
+    /// started (job accepted), false otherwise. On success, completion is
+    /// observable via CommandLineToolRunner::toolFinished exactly as in the
+    /// interactive path (same one-shot handler: meta.json coordinate identity
+    /// fixup, VolumePkg::refreshSegmentations, surface panel reload).
+    bool startGrowPatchFromSeed(const QVector3D& seedPoint,
+                                const GrowPatchSeedParams& params,
+                                QString* errorMessage = nullptr);
+
+    /// Output directory resolved by the most recent successful
+    /// startGrowPatchFromSeed call while its job is still active. Empty when no
+    /// GrowPatch seed job is pending.
+    QString activeGrowPatchOutputDir() const
+    {
+        return _growPatchSeedJob ? _growPatchSeedJob->outputDir : QString();
+    }
+
     QString findNewNeighborSurface(const NeighborCopyJob& job) const;
     bool startNeighborCopyPass(const QString& paramsPath,
                                const QString& resumeSurface,

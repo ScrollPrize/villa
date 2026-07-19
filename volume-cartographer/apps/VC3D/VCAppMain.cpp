@@ -9,6 +9,7 @@
 #include <QCommandLineParser>
 
 #include "CWindow.hpp"
+#include "agent_bridge/AgentBridgeServer.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/Version.hpp"
 #include <QSettings>
@@ -299,6 +300,19 @@ auto main(int argc, char* argv[]) -> int
         "200");
     parser.addOption(replayTimedProfilePeriodOption);
 
+    QCommandLineOption agentBridgeOption(
+        "agent-bridge",
+        "Enable the agent bridge (JSON-RPC over a local socket) on the default "
+        "socket name vc3d-agent-<pid>.");
+    parser.addOption(agentBridgeOption);
+
+    QCommandLineOption agentBridgeNameOption(
+        "agent-bridge-name",
+        "Enable the agent bridge on an explicit QLocalServer name (implies "
+        "--agent-bridge).",
+        "name");
+    parser.addOption(agentBridgeNameOption);
+
     parser.process(app);
 
     if (parser.isSet(debugOption)) {
@@ -387,6 +401,32 @@ auto main(int argc, char* argv[]) -> int
     int rc = 0;
     {
         CWindow aWin(cacheSizeGB, benchOptions);
+
+        // Agent bridge (opt-in, off by default). Constructed only when a bridge
+        // flag is present, so normal runs pay zero cost and open no socket.
+        std::unique_ptr<AgentBridgeServer> agentBridge;
+        const bool bridgeRequested =
+            parser.isSet(agentBridgeOption) || parser.isSet(agentBridgeNameOption);
+        if (bridgeRequested) {
+            QString bridgeName = parser.value(agentBridgeNameOption).trimmed();
+            if (bridgeName.isEmpty()) {
+                bridgeName = QStringLiteral("vc3d-agent-%1")
+                                 .arg(QCoreApplication::applicationPid());
+            }
+            agentBridge = std::make_unique<AgentBridgeServer>(&aWin);
+            if (!agentBridge->listen(bridgeName)) {
+                std::cerr << "Error: agent bridge failed to listen on '"
+                          << bridgeName.toStdString() << "'." << std::endl;
+                std::cerr.flush();
+                return 2;
+            }
+            std::cout << "VC3D-AGENT-BRIDGE: listening name="
+                      << agentBridge->serverName().toStdString()
+                      << " path=" << agentBridge->fullServerName().toStdString()
+                      << std::endl;
+            std::cout.flush();
+        }
+
         aWin.show();
         rc = QApplication::exec();
     }

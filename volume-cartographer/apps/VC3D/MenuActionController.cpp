@@ -489,6 +489,26 @@ bool MenuActionController::isOpenDataCatalogVisible() const
     return _openDataCatalogDialog && _openDataCatalogDialog->isVisible();
 }
 
+bool MenuActionController::openOpenDataSampleById(const QString& sampleId)
+{
+    if (!_window || sampleId.isEmpty()) {
+        return false;
+    }
+
+    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    if (!manifest) {
+        return false;
+    }
+
+    const vc3d::opendata::OpenDataSample* sample =
+        manifest->findSample(sampleId.toStdString());
+    if (!sample) {
+        return false;
+    }
+
+    return openOpenDataSample(*sample);
+}
+
 bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample)
 {
     if (!_window || !_window->_state) {
