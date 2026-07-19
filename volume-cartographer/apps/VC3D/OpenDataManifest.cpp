@@ -1,5 +1,7 @@
 #include "OpenDataManifest.hpp"
 
+#include "vc/core/util/RemoteUrl.hpp"
+
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
@@ -111,6 +113,23 @@ std::optional<int> intValue(const nlohmann::json& obj,
         return static_cast<int>(*value);
     }
     return std::nullopt;
+}
+
+std::optional<std::array<std::size_t, 3>> shapeValue(const nlohmann::json& obj)
+{
+    if (!obj.is_object()) return std::nullopt;
+    const auto it = obj.find("shape");
+    if (it == obj.end() || !it->is_array() || it->size() != 3)
+        return std::nullopt;
+    std::array<std::size_t, 3> shape{};
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+        if (!it->at(i).is_number_unsigned() && !it->at(i).is_number_integer())
+            return std::nullopt;
+        const auto value = it->at(i).get<long long>();
+        if (value <= 0) return std::nullopt;
+        shape[i] = static_cast<std::size_t>(value);
+    }
+    return shape;
 }
 
 nlohmann::json objectOrEmpty(const nlohmann::json& obj, const char* key)
@@ -325,8 +344,43 @@ std::vector<OpenDataArtifact> parseArtifacts(const nlohmann::json& ownerJson)
         }
         OpenDataArtifact artifact;
         artifact.raw = itemJson;
+        artifact.parameters = objectOrEmpty(itemJson, "parameters");
         artifact.properties = objectOrEmpty(itemJson, "properties");
+        artifact.creationInfo = objectOrEmpty(itemJson, "creation_info");
         artifact.type = stringValue(itemJson, {"type"}).value_or("");
+        artifact.modelId = stringValue(artifact.parameters, {"model_id", "modelId"});
+        artifact.lasagnaVersionPresent =
+            artifact.creationInfo.contains("lasagna_version") ||
+            artifact.creationInfo.contains("lasagnaVersion");
+        artifact.lasagnaVersion = intValue(
+            artifact.creationInfo, {"lasagna_version", "lasagnaVersion"});
+        artifact.sourceToBasePresent =
+            artifact.creationInfo.contains("source_to_base") ||
+            artifact.creationInfo.contains("sourceToBase");
+        artifact.sourceToBase = numberValue(
+            artifact.creationInfo, {"source_to_base", "sourceToBase"});
+        if (artifact.sourceToBase &&
+            (!std::isfinite(*artifact.sourceToBase) || *artifact.sourceToBase <= 0.0)) {
+            artifact.sourceToBase.reset();
+        }
+        if (const auto levelIt = artifact.parameters.find("level");
+            levelIt != artifact.parameters.end()) {
+            artifact.levelParameterPresent = true;
+            if (levelIt->is_number_unsigned()) {
+                const auto value = levelIt->get<unsigned long long>();
+                if (value <= 5)
+                    artifact.sourceCoordinateLevel = static_cast<int>(value);
+            } else if (levelIt->is_number_integer()) {
+                const auto value = levelIt->get<long long>();
+                if (value >= 0 && value <= 5)
+                    artifact.sourceCoordinateLevel = static_cast<int>(value);
+            }
+        }
+        if (const auto targetIt = artifact.parameters.find("target_volume");
+            targetIt != artifact.parameters.end() && targetIt->is_string() &&
+            !targetIt->get_ref<const std::string&>().empty()) {
+            artifact.targetVolumeId = targetIt->get<std::string>();
+        }
         if (const auto it = itemJson.find("origins"); it != itemJson.end()) {
             artifact.origins = parseOrigins(*it);
         }
@@ -361,6 +415,7 @@ OpenDataVolume parseVolume(std::string id, const nlohmann::json& volumeJson)
     volume.dataFormat = nestedStringValue(volumeJson, {"data_format", "dataFormat", "format"}).value_or("");
     volume.createdAt = nestedStringValue(volumeJson, {"created_at", "createdAt", "created"}).value_or("");
     volume.properties = objectOrEmpty(volumeJson, "properties");
+    volume.shapeZYX = shapeValue(volume.properties);
     volume.artifacts = parseArtifacts(volumeJson);
     volume.raw = volumeJson.is_object() ? volumeJson : nlohmann::json::object();
     return volume;
@@ -378,6 +433,14 @@ OpenDataSegment parseSegment(std::string id, const nlohmann::json& segmentJson)
     segment.width = intValue(segmentJson, {"width"});
     segment.height = intValue(segmentJson, {"height"});
     segment.createdAt = nestedStringValue(segmentJson, {"created_at", "createdAt", "created"}).value_or("");
+    if (segment.createdAt.empty() && segmentJson.is_object()) {
+        const auto creation = segmentJson.find("creation");
+        if (creation != segmentJson.end() && creation->is_object()) {
+            segment.createdAt = stringValue(
+                *creation, {"date", "created_at", "createdAt", "created"})
+                                    .value_or("");
+        }
+    }
     segment.properties = objectOrEmpty(segmentJson, "properties");
     segment.artifacts = parseArtifacts(segmentJson);
     segment.raw = segmentJson.is_object() ? segmentJson : nlohmann::json::object();
@@ -553,6 +616,50 @@ std::size_t OpenDataSample::inkDetectionSegmentCount() const
         }));
 }
 
+std::vector<OpenDataRepresentationRef> derivedRepresentations(
+    const OpenDataSample& sample)
+{
+    std::vector<OpenDataRepresentationRef> result;
+    for (std::size_t volumeIndex = 0;
+         volumeIndex < sample.volumes.size(); ++volumeIndex) {
+        const auto& volume = sample.volumes[volumeIndex];
+        for (std::size_t artifactIndex = 0;
+             artifactIndex < volume.artifacts.size(); ++artifactIndex) {
+            const auto& artifact = volume.artifacts[artifactIndex];
+            std::string type = lowerCopy(artifact.type);
+            std::replace(type.begin(), type.end(), '_', '-');
+
+            std::optional<OpenDataRepresentationKind> kind;
+            if (type.find("normal-grid") != std::string::npos) {
+                kind = OpenDataRepresentationKind::NormalGrids;
+            } else if (type == "lasagna") {
+                kind = OpenDataRepresentationKind::Lasagna;
+            } else {
+                const bool prediction =
+                    type.find("prediction") != std::string::npos ||
+                    type.starts_with("pred-") || type.ends_with("-pred") ||
+                    type.find("-pred-") != std::string::npos;
+                const bool ink3d = type.find("ink-detection") != std::string::npos &&
+                                   type.find("3d") != std::string::npos;
+                if (prediction || ink3d)
+                    kind = OpenDataRepresentationKind::Prediction;
+            }
+            if (kind) result.push_back({volumeIndex, artifactIndex, *kind});
+        }
+    }
+    return result;
+}
+
+std::string_view representationKindName(OpenDataRepresentationKind kind) noexcept
+{
+    switch (kind) {
+        case OpenDataRepresentationKind::NormalGrids: return "Normal grids";
+        case OpenDataRepresentationKind::Lasagna: return "Lasagna";
+        case OpenDataRepresentationKind::Prediction: return "Prediction";
+    }
+    return "Prediction";
+}
+
 const OpenDataSample* OpenDataManifest::findSample(std::string_view id) const noexcept
 {
     const auto it = std::find_if(samples.begin(), samples.end(), [&](const OpenDataSample& sample) {
@@ -639,6 +746,8 @@ std::string joinOpenDataUrl(std::string root, std::string path)
         startsWith(path, "http://") || startsWith(path, "https://")) {
         return path;
     }
+    if (startsWith(root, "http://") || startsWith(root, "https://"))
+        return vc::joinRemoteUrlPath(root, path);
     while (!root.empty() && root.back() == '/') {
         root.pop_back();
     }

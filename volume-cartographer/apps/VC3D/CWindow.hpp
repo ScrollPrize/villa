@@ -102,6 +102,7 @@ class QMenu;
 class QSpinBox;
 class QStandardItemModel;
 class QTabWidget;
+class QFrame;
 class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
@@ -319,14 +320,20 @@ private:
     QLabel* _segmentTransformWarning{nullptr};
     QLabel* _statusMessageLabel{nullptr};
     QLabel* _sharedCacheStatsLabel{nullptr};
+    QLabel* _persistentCacheLowSpaceLabel{nullptr};
+    QLabel* _persistentCacheWarningText{nullptr};
+    QFrame* _persistentCacheWarningBanner{nullptr};
     QLabel* _sliceStepLabel{nullptr};
     QTimer* _statusMessageTimer{nullptr};
+    QTimer* _persistentCacheSpaceTimer{nullptr};
+    bool _persistentCacheBannerShownThisSession{false};
     QString _segmentationGrowthStatusText;
     QString _lastSegmentTransformWarningVolumeId;
     bool _relayingNativeStatusMessage{false};
 
 
     Ui_VCMainWindow ui;
+    bool _destroyingWindow{false};
     QTabWidget* _workspaceTabs{nullptr};
     QMainWindow* _segmentWorkspaceWindow{nullptr};
     StatusDockPanelHost* _statusDockPanelHost{nullptr};
@@ -350,6 +357,7 @@ private:
     std::vector<double> _atlasSearchSignedWindings;
     std::unordered_map<uint64_t, AtlasSearchFiberSnapshot> _atlasSearchFiberSnapshotsByRuntimeId;
     std::optional<std::filesystem::path> _atlasSearchLasagnaManifestPath;
+    double _atlasSearchLasagnaWorkingToBaseScale = 1.0;
     int _atlasSearchPreviewGeneration{0};
     std::optional<int> _atlasSearchHoveredResult;
     std::set<int> _atlasSearchSelectedResults;

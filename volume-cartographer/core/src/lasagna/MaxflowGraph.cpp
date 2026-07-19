@@ -1,5 +1,7 @@
 #include "vc/lasagna/MaxflowGraph.hpp"
 
+#include "vc/lasagna/Dataset.hpp"
+
 #include "utils/zarr.hpp"
 
 #include <algorithm>
@@ -202,11 +204,12 @@ struct PredDtBinding {
     PredDtBinding binding{
         group,
         *channelIndex,
-        utils::ZarrArray::open(group->zarrPath, vc::buildZarrCodecRegistry(1)),
+        openLasagnaChannelArray(manifest, *group, 1),
         false,
         {0, 0, 0},
         {0, 0, 0},
-        static_cast<double>(group->scaleFactor()) * manifest.sourceToBase,
+        static_cast<double>(group->scaleFactor()) * manifest.sourceToBase /
+            manifest.workingToBaseScale,
     };
     const auto& meta = binding.array.metadata();
     if (meta.dtype != utils::ZarrDtype::uint8) {
@@ -546,7 +549,9 @@ MaxflowGraphBuildReport buildMaxflowGraphFromManifest(
     const MaxflowManifestBuildOptions& options)
 {
     MaxflowGraphBuildReport report;
-    report.manifest = LasagnaDatasetManifest::parseFile(manifestPath);
+    auto dataset = LasagnaDataset::open(
+        manifestPath, LasagnaDatasetOpenOptions{options.workingToBaseScale});
+    report.manifest = dataset.manifest();
     report.predDt = loadPredDtPassability(report.manifest, options);
     const std::array<size_t, 3> cropShapeZYX{
         static_cast<size_t>(report.predDt.cropPredXYZ.end.z - report.predDt.cropPredXYZ.begin.z),

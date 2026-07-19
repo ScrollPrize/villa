@@ -9,6 +9,7 @@
 #include "vc/core/render/Colormaps.hpp"
 #include "vc/core/render/PostProcess.hpp"
 #include "render/ChunkCache.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -547,7 +548,23 @@ std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
     options.maxConcurrentReads = 16;
     options.detectAllFillChunks = volume->isRemote();
     if (volume->isRemote()) {
+        const auto budgetRoot = volume->remoteCacheRoot().empty()
+            ? vc3d::remoteCacheRootForState(state)
+            : volume->remoteCacheRoot();
         options.persistentCachePath = vc3d::persistentCacheDirForVolume(volume, state);
+        options.persistentCacheBudgetRoot = budgetRoot;
+        using namespace vc3d::settings;
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
+        vc::render::PersistentZarrCacheBudget::Limits limits;
+        const auto maximumGiB = settings.value(
+            perf::REMOTE_CACHE_MAX_GIB, perf::REMOTE_CACHE_MAX_GIB_DEFAULT).toULongLong();
+        if (maximumGiB > 0)
+            limits.maximumBytes = maximumGiB * gib;
+        limits.minimumFreeBytes = settings.value(
+            perf::REMOTE_CACHE_MIN_FREE_GIB,
+            perf::REMOTE_CACHE_MIN_FREE_GIB_DEFAULT).toULongLong() * gib;
+        vc::render::PersistentZarrCacheBudget::configure(budgetRoot, limits);
     }
 
     return volume->createChunkCache(std::move(options));
@@ -4979,9 +4996,18 @@ void CChunkedVolumeViewer::updateStatusLabel()
             .arg(formatGigabytes(stats.decodedBytes))
             .arg(formatGigabytes(stats.decodedByteCapacity));
         if (stats.persistentCacheEnabled) {
-            sharedCacheItems << QString("disk %1%2")
-                .arg(formatByteSize(stats.persistentCacheBytes))
-                .arg(stats.persistentCacheScanInFlight ? "+" : "");
+            QString disk = QString("disk %1").arg(formatByteSize(stats.persistentCacheBytes));
+            if (stats.persistentCacheMaximumBytes)
+                disk += QString("/%1").arg(formatByteSize(*stats.persistentCacheMaximumBytes));
+            if (stats.persistentCacheScanInFlight)
+                disk += QStringLiteral(" (scanning)");
+            else if (stats.persistentCacheTrimInFlight)
+                disk += QStringLiteral(" (trimming)");
+            sharedCacheItems << disk;
+            if (stats.persistentCacheLowSpace) {
+                sharedCacheItems << QString("⚠ low disk: %1 free")
+                    .arg(formatByteSize(stats.persistentCacheFreeBytes));
+            }
         } else {
             sharedCacheItems << QStringLiteral("disk off");
         }

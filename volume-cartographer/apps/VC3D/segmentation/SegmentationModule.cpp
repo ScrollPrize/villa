@@ -1,7 +1,7 @@
 #include "SegmentationModule.hpp"
 
 #include "../OpenDataSegmentCache.hpp"
-#include "../VCSettings.hpp"
+#include "../OpenDataCoordinateIdentity.hpp"
 
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
@@ -108,8 +108,13 @@ std::optional<std::pair<int, int>> segmentationSceneToGrid(VolumeViewerBase* vie
 }
 
 
-bool ensureEditableOpenDataSegmentTarget(CState* state, SegmentationWidget* widget)
+bool ensureEditableOpenDataSegmentTarget(CState* state,
+                                         SegmentationWidget* widget,
+                                         std::string* editableSurfaceId)
 {
+    if (editableSurfaceId) {
+        editableSurfaceId->clear();
+    }
     if (!state || !state->vpkg()) {
         return true;
     }
@@ -120,10 +125,10 @@ bool ensureEditableOpenDataSegmentTarget(CState* state, SegmentationWidget* widg
         return true;
     }
 
-    const QString remoteSuggestion = QString::fromStdString(state->vpkg()->remoteCacheRootOrEmpty());
-    const std::filesystem::path remoteRoot(vc3d::remoteCachePath(remoteSuggestion).toStdString());
+    const std::filesystem::path activeSegmentsRoot = state->vpkg()->outputSegmentsPath();
     const std::filesystem::path defaultPath =
-        vc3d::opendata::defaultEditableCopyPathForCatalogSegment(surface->path, remoteRoot);
+        vc3d::opendata::defaultEditableCopyPathForCatalogSegment(
+            surface->path, activeSegmentsRoot);
 
     QMessageBox prompt(QApplication::activeWindow());
     prompt.setWindowTitle(QObject::tr("Open Data Segment"));
@@ -161,11 +166,8 @@ bool ensureEditableOpenDataSegmentTarget(CState* state, SegmentationWidget* widg
         vc3d::opendata::copyCatalogSegmentToEditableDirectory(surface->path, editablePath);
         const std::filesystem::path editableRoot = editablePath.parent_path();
         auto pkg = state->vpkg();
-        if (!pkg->addSegmentsEntry(editableRoot.string(), {"open-data-editable"})) {
-            pkg->setOutputSegments(editableRoot.string());
-        } else {
-            pkg->setOutputSegments(editableRoot.string());
-        }
+        pkg->addSegmentsEntry(editableRoot.string(), {"open-data-editable"});
+        pkg->setOutputSegments(editableRoot.string());
 
         const std::string segmentId = surface->id.empty()
             ? editablePath.filename().string()
@@ -174,7 +176,13 @@ bool ensureEditableOpenDataSegmentTarget(CState* state, SegmentationWidget* widg
         if (!editableSurface) {
             editableSurface = std::make_shared<QuadSurface>(editablePath);
         }
+        vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+            *editableSurface, *pkg, state->currentVolumeId());
+        editableSurface->save_meta();
         state->setSurface("segmentation", editableSurface, false, false);
+        if (editableSurfaceId) {
+            *editableSurfaceId = segmentId;
+        }
         return true;
     } catch (const std::exception& e) {
         QMessageBox::warning(
@@ -655,8 +663,16 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (_editingEnabled == enabled) {
         return;
     }
-    if (enabled && !ensureEditableOpenDataSegmentTarget(_state, _widget)) {
-        return;
+    std::string editableSurfaceId;
+    if (enabled) {
+        if (!ensureEditableOpenDataSegmentTarget(
+                _state, _widget, &editableSurfaceId)) {
+            return;
+        }
+        if (!editableSurfaceId.empty()) {
+            emit segmentationFolderChanged(
+                QString::fromStdString(editableSurfaceId));
+        }
     }
     _editingEnabled = enabled;
 

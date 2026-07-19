@@ -1,6 +1,7 @@
 #include "SettingsDialog.hpp"
 
 #include "VCSettings.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -110,8 +111,14 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
     {
         const QString stored =
             settings.value(viewer::REMOTE_CACHE_DIR).toString();
-        edtRemoteCachePath->setText(vc3d::remoteCachePath(stored));
+        const QString active = vc3d::remoteCachePath(stored);
+        edtRemoteCachePath->setText(active);
+        _activeRemoteCacheRoot = active.toStdString();
     }
+    spinRemoteCacheMaximumGiB->setValue(static_cast<int>(settings.value(
+        perf::REMOTE_CACHE_MAX_GIB, perf::REMOTE_CACHE_MAX_GIB_DEFAULT).toULongLong()));
+    spinRemoteCacheMinimumFreeGiB->setValue(static_cast<int>(settings.value(
+        perf::REMOTE_CACHE_MIN_FREE_GIB, perf::REMOTE_CACHE_MIN_FREE_GIB_DEFAULT).toULongLong()));
 
     // Per-segment rotating-backup count.
     if (spinSegmentBackupCount) {
@@ -324,6 +331,16 @@ void SettingsDialog::accept()
     settings.setValue(perf::REMOTE_CACHE_COMPRESSION, chkCompressRemoteCache->isChecked());
     settings.setValue(perf::REMOTE_CACHE_QUANTIZATION,
                       cmbCacheQuantization->currentData().toInt());
+    settings.setValue(perf::REMOTE_CACHE_MAX_GIB, spinRemoteCacheMaximumGiB->value());
+    settings.setValue(perf::REMOTE_CACHE_MIN_FREE_GIB, spinRemoteCacheMinimumFreeGiB->value());
+    constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
+    vc::render::PersistentZarrCacheBudget::Limits limits;
+    if (spinRemoteCacheMaximumGiB->value() > 0)
+        limits.maximumBytes = static_cast<std::uint64_t>(spinRemoteCacheMaximumGiB->value()) * gib;
+    limits.minimumFreeBytes =
+        static_cast<std::uint64_t>(spinRemoteCacheMinimumFreeGiB->value()) * gib;
+    vc::render::PersistentZarrCacheBudget::configure(_activeRemoteCacheRoot, limits);
+    vc::render::PersistentZarrCacheBudget::updateAllConfiguredLimits(limits);
 
     // Per-segment backup count: persist and apply live (no restart needed).
     if (spinSegmentBackupCount) {
@@ -498,6 +515,7 @@ bool writeFileAtomically(const std::filesystem::path& path,
 
 RedownloadResult redownloadCacheEntry(
     vc::render::IChunkedArray& source,
+    const std::shared_ptr<vc::render::PersistentZarrCacheBudget>& budget,
     const std::filesystem::path& cacheDir,
     const CacheFileEntry& entry,
     std::size_t elemSize,
@@ -511,16 +529,29 @@ RedownloadResult redownloadCacheEntry(
         entry.key.level, entry.key.iz, entry.key.iy, entry.key.ix);
     if (chunk.status == vc::render::ChunkStatus::Missing ||
         chunk.status == vc::render::ChunkStatus::AllFill) {
-        std::error_code ec;
-        fs::remove(rawCachePath(cacheDir, entry.key), ec);
-        ec.clear();
-        fs::remove(compressedCachePath(cacheDir, entry.key), ec);
-        ec.clear();
-        fs::remove(emptyCachePath(cacheDir, entry.key), ec);
         const auto path = emptyCachePath(cacheDir, entry.key);
-        const std::byte newline{static_cast<unsigned char>('\n')};
-        if (!writeFileAtomically(path, std::span<const std::byte>(&newline, 1)))
+        std::vector<fs::path> replacements{
+            rawCachePath(cacheDir, entry.key),
+            compressedCachePath(cacheDir, entry.key)};
+        auto reservation = budget
+            ? budget->reserveWrite(path, 1, replacements)
+            : vc::render::PersistentZarrCacheBudget::WriteReservation{};
+        if (budget && !reservation)
             return RedownloadResult::Failed;
+        std::error_code ec;
+        fs::remove(replacements[0], ec);
+        ec.clear();
+        fs::remove(replacements[1], ec);
+        ec.clear();
+        fs::remove(path, ec);
+        const std::byte newline{static_cast<unsigned char>('\n')};
+        if (!writeFileAtomically(path, std::span<const std::byte>(&newline, 1))) {
+            if (budget)
+                reservation.commit();
+            return RedownloadResult::Failed;
+        }
+        if (budget)
+            reservation.commit();
         bytesOut += 1;
         return RedownloadResult::Missing;
     }
@@ -544,14 +575,30 @@ RedownloadResult redownloadCacheEntry(
         payload = std::span<const std::byte>(compressed.data(), compressed.size());
         path = compressedCachePath(cacheDir, entry.key);
     }
-    std::error_code ec;
-    fs::remove(rawCachePath(cacheDir, entry.key), ec);
-    ec.clear();
-    fs::remove(compressedCachePath(cacheDir, entry.key), ec);
-    ec.clear();
-    fs::remove(emptyCachePath(cacheDir, entry.key), ec);
-    if (!writeFileAtomically(path, payload))
+    std::vector<fs::path> replacements;
+    for (const auto& candidate : {rawCachePath(cacheDir, entry.key),
+                                  compressedCachePath(cacheDir, entry.key),
+                                  emptyCachePath(cacheDir, entry.key)}) {
+        if (candidate != path)
+            replacements.push_back(candidate);
+    }
+    auto reservation = budget
+        ? budget->reserveWrite(path, payload.size(), replacements)
+        : vc::render::PersistentZarrCacheBudget::WriteReservation{};
+    if (budget && !reservation)
         return RedownloadResult::Failed;
+    std::error_code ec;
+    for (const auto& replacement : replacements) {
+        fs::remove(replacement, ec);
+        ec.clear();
+    }
+    if (!writeFileAtomically(path, payload)) {
+        if (budget)
+            reservation.commit();
+        return RedownloadResult::Failed;
+    }
+    if (budget)
+        reservation.commit();
     bytesOut += payload.size();
     return RedownloadResult::Done;
 }
@@ -566,15 +613,20 @@ RedownloadResult redownloadCacheEntry(
 // recorded width is kept when it exceeds the requested one). Returns Failed
 // on any error — including a mismatched or unknown chunk shape, which
 // cacheCompress rejects — and the original file is left untouched then.
-RecompressResult compressCacheFile(const std::filesystem::path& srcPath,
-                                   std::array<int, 3> shapeZYX,
-                                   std::size_t elemSize,
-                                   int quantBinWidth,
-                                   std::uint64_t& bytesIn,
-                                   std::uint64_t& bytesOut)
+RecompressResult compressCacheFile(
+    const std::shared_ptr<vc::render::PersistentZarrCacheBudget>& budget,
+    const std::filesystem::path& srcPath,
+    std::array<int, 3> shapeZYX,
+    std::size_t elemSize,
+    int quantBinWidth,
+    std::uint64_t& bytesIn,
+    std::uint64_t& bytesOut)
 {
     namespace fs = std::filesystem;
 
+    auto readPin = budget
+        ? budget->pinRead(srcPath)
+        : vc::render::PersistentZarrCacheBudget::ReadPin{};
     std::vector<std::byte> input;
     {
         std::ifstream file(srcPath, std::ios::binary | std::ios::ate);
@@ -589,6 +641,8 @@ RecompressResult compressCacheFile(const std::filesystem::path& srcPath,
         if (!file)
             return RecompressResult::Failed;
     }
+    if (budget)
+        readPin.complete(true);
 
     const bool alreadyCompressed =
         srcPath.extension() == vc::kCompressedCacheExtension;
@@ -625,16 +679,29 @@ RecompressResult compressCacheFile(const std::filesystem::path& srcPath,
 
     fs::path zstPath = srcPath;
     zstPath.replace_extension(vc::kCompressedCacheExtension);
+    std::vector<fs::path> replacements;
+    if (!alreadyCompressed)
+        replacements.push_back(srcPath);
+    auto reservation = budget
+        ? budget->reserveWrite(zstPath, compressed.size(), replacements)
+        : vc::render::PersistentZarrCacheBudget::WriteReservation{};
+    if (budget && !reservation)
+        return RecompressResult::Failed;
     const fs::path tmpPath = zstPath.string() + ".tmp";
     {
         std::ofstream file(tmpPath, std::ios::binary | std::ios::trunc);
-        if (!file)
+        if (!file) {
+            if (budget)
+                reservation.commit();
             return RecompressResult::Failed;
+        }
         file.write(reinterpret_cast<const char*>(compressed.data()),
                    static_cast<std::streamsize>(compressed.size()));
         if (!file) {
             std::error_code ec;
             fs::remove(tmpPath, ec);
+            if (budget)
+                reservation.commit();
             return RecompressResult::Failed;
         }
     }
@@ -647,10 +714,14 @@ RecompressResult compressCacheFile(const std::filesystem::path& srcPath,
     }
     if (ec) {
         fs::remove(tmpPath, ec);
+        if (budget)
+            reservation.commit();
         return RecompressResult::Failed;
     }
     if (!alreadyCompressed)
         fs::remove(srcPath, ec);
+    if (budget)
+        reservation.commit();
 
     bytesIn += input.size();
     bytesOut += compressed.size();
@@ -679,6 +750,8 @@ void SettingsDialog::compressExistingCache()
     // the chunk shape used by the delta-zyx compression filter.
     const int quantBinWidth = cmbCacheQuantization->currentData().toInt();
     const auto& layout = _currentVolumeChunkLayout;
+    const auto budget =
+        vc::render::PersistentZarrCacheBudget::findForPath(cacheDir);
     struct RecompressFile {
         fs::path path;
         std::array<int, 3> shapeZYX;
@@ -749,7 +822,7 @@ void SettingsDialog::compressExistingCache()
                 const auto i = nextIndex.fetch_add(1, std::memory_order_relaxed);
                 if (i >= files.size())
                     break;
-                switch (compressCacheFile(files[i].path, files[i].shapeZYX,
+                switch (compressCacheFile(budget, files[i].path, files[i].shapeZYX,
                                           layout.elemSize, quantBinWidth,
                                           bytesIn, bytesOut)) {
                 case RecompressResult::Failed: ++localFailures; break;
@@ -818,6 +891,8 @@ void SettingsDialog::redownloadExistingCache()
 
     const bool compress = chkCompressRemoteCache->isChecked();
     const int quantBinWidth = cmbCacheQuantization->currentData().toInt();
+    const auto budget =
+        vc::render::PersistentZarrCacheBudget::findForPath(cacheDir);
     const std::size_t workerCount = std::min<std::size_t>(
         entries.size(),
         static_cast<std::size_t>(_cacheActionWorkersSpin->value()));
@@ -832,7 +907,7 @@ void SettingsDialog::redownloadExistingCache()
     std::shared_ptr<vc::render::ChunkCache> source;
     try {
         auto freshVolume = Volume::NewFromUrl(
-            _currentVolume->remoteUrl(), {}, _currentVolume->remoteAuth());
+            _currentVolume->remoteLocator(), {}, _currentVolume->remoteAuth());
         vc::render::ChunkCache::Options options;
         options.maxConcurrentReads = workerCount;
         options.compressPersistentCache = false;
@@ -870,7 +945,7 @@ void SettingsDialog::redownloadExistingCache()
                 const auto i = nextIndex.fetch_add(1, std::memory_order_relaxed);
                 if (i >= entries.size())
                     break;
-                switch (redownloadCacheEntry(*source, cacheDir, entries[i],
+                switch (redownloadCacheEntry(*source, budget, cacheDir, entries[i],
                                              _currentVolumeChunkLayout.elemSize,
                                              compress, quantBinWidth, bytesOut)) {
                 case RedownloadResult::Done: ++localRefreshed; break;

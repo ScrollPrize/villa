@@ -1,4 +1,5 @@
 #include "CFiberWidget.hpp"
+#include "FiberNameDisplay.hpp"
 
 #include <QAction>
 #include <QApplication>
@@ -96,6 +97,13 @@ int main(int argc, char** argv)
     auto* treeView = widget.findChild<QTreeView*>(QStringLiteral("fiberTreeView"));
     require(treeView != nullptr, "Fiber tree view was not found");
     require(treeView->model() != nullptr, "Fiber tree view model was not found");
+    const QFontMetrics metrics(treeView->font());
+    const QString adaptedName = vc3d::adaptFiberNameToWidth(
+        QStringLiteral("kb_20260605T184821587_000002"),
+        metrics,
+        metrics.horizontalAdvance(QStringLiteral("kb_..._000002")));
+    require(adaptedName.endsWith(QStringLiteral("_000002")),
+            "Fiber name elision should preserve the sequence suffix");
     require(treeView->model()->columnCount() == 8, "Fiber tree should expose eight columns");
     require(treeView->header()->sectionResizeMode(0) == QHeaderView::Interactive,
             "Fiber tree header should allow changing column widths");
@@ -292,6 +300,7 @@ int main(int argc, char** argv)
     require(reviewCheckbox->isChecked(), "Selected fiber tag should be checked");
     require(!todoCheckbox->isChecked(), "Unchecked known tag should not be checked");
     todoCheckbox->setChecked(true);
+    QApplication::processEvents();
     require(tagRequests == 1, "Checking a tag did not emit one tag request");
     require(requestedTagFiberId == 2, "Tag check emitted the wrong fiber ID");
     require(requestedTag == QStringLiteral("todo"), "Tag check emitted the wrong tag");
@@ -303,6 +312,7 @@ int main(int argc, char** argv)
     require(addTagButton != nullptr, "Add tag button was not found");
     newTagEdit->setText(QStringLiteral("needs-proofread"));
     addTagButton->click();
+    QApplication::processEvents();
     require(tagRequests == 2, "Adding a tag did not emit a second tag request");
     require(requestedTagFiberId == 2, "Added tag emitted the wrong fiber ID");
     require(requestedTag == QStringLiteral("needs-proofread"), "Added tag emitted the wrong tag");

@@ -19,7 +19,7 @@ A Python library for accessing CT scans of ancient scrolls, and for training and
 ## Dataset & Rendering Tools
 
 ### [foundation](foundation/)
-Tools to build/manage scroll datasets and cloud infrastructure.
+Tools to build/manage scroll datasets and cloud infrastructure, including photogrammetry masking.
 
 ### [ink-detection](ink-detection/)
 Training and inference tools for Vesuvius Challenge ink detection models, built on the model that won the 2023 Grand Prize.  

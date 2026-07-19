@@ -1,0 +1,1129 @@
+/* ==========================================================================
+   getstarted.css — /get_started landing-class onboarding page.
+   Loaded after landing.css. Consumes tokens (--vc-*) and utility recipes
+   (.vc-btn, .vc-card, .vc-kicker, .vc-stat-strip). Scope: .vc-gs plus the
+   docs-chrome opt-outs below.
+   ========================================================================== */
+
+/* ---- chrome opt-outs: no sidebar, no 720px measure, no anchor hashes ---- */
+.docs-doc-id-get_started .theme-doc-sidebar-container {
+  display: none;
+}
+.docs-doc-id-get_started main {
+  max-width: none !important;
+}
+html.docs-doc-id-get_started main .container article {
+  max-width: none;
+}
+.docs-doc-id-get_started .hash-link {
+  display: none !important;
+}
+.docs-doc-id-get_started .pagination-nav {
+  display: none;
+}
+
+/* ---- base ---- */
+.vc-gs {
+  color: var(--vc-text);
+  overflow-x: clip; /* full-bleed bands use the 50vw margin trick */
+}
+.vc-gs-container {
+  max-width: 1080px;
+  margin: 0 auto;
+}
+.vc-gs a {
+  text-decoration-color: color-mix(in srgb, var(--vc-accent) 55%, transparent);
+}
+
+.vc-gs-h1 {
+  font-size: clamp(2.1rem, 6vw, 3.4rem);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.06;
+  margin: 10px 0 20px;
+}
+.vc-gs-h2 {
+  font-size: clamp(1.5rem, 4vw, 2.1rem);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 8px 0 16px;
+}
+.vc-gs-lead {
+  font-size: 1.11rem;
+  line-height: 1.65;
+  max-width: 46rem;
+  color: var(--vc-text);
+}
+.vc-gs-lead--em {
+  color: var(--vc-text);
+  font-weight: 600;
+}
+.vc-gs-body {
+  font-size: 1rem;
+  line-height: 1.7;
+  max-width: 44rem;
+  color: var(--vc-text-dim, #b9b4ae);
+}
+.vc-gs-body--center {
+  margin: 28px auto 0;
+  text-align: center;
+}
+.vc-gs-dim {
+  color: var(--vc-text-faint, #8a857f);
+  font-size: 0.85rem;
+}
+
+/* ---- hero ---- */
+.vc-gs-hero {
+  position: relative;
+  padding: clamp(40px, 8vh, 96px) 0 clamp(28px, 4.5vh, 44px);
+  overflow: hidden;
+  /* full-bleed (same trick as the band sections) so the backdrop runs to
+     the viewport edge */
+  margin-inline: calc(50% - 50vw);
+  padding-inline: calc(50vw - 50%);
+}
+/* the unwrapped PHerc. 1667 surface as a full-bleed backdrop (same recipe
+   as the landing hero): the middle ~third of the strip, zoomed, vertically
+   centered. The scrim below keeps the text column solid. */
+.vc-gs-hero__bg {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background-image: url("/get-started/banner-strip-alpha.webp");
+  /* higher-res unwrapped strip with the white knocked out to transparent
+     and the bottom wave + credit trimmed; sized a touch larger than the
+     text column so the writing reads bigger without upscaling to mush */
+  background-size: 300% auto;
+  /* the strip's right half is the continuous, dense-text stretch — show
+     that (stopping short of the dark damage at the very end); the left
+     half is fragmentary */
+  background-position: 90% 50%;
+  background-repeat: no-repeat;
+  opacity: 0.55;
+  pointer-events: none;
+}
+/* solid page bg over the text, a long smooth ramp toward the right, and
+   soft top/bottom edges so the band melts into the page */
+.vc-gs-hero__scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(
+      90deg,
+      var(--vc-bg, #0e0f11) 36%,
+      color-mix(in srgb, var(--vc-bg, #0e0f11) 55%, transparent) 60%,
+      transparent 84%
+    ),
+    linear-gradient(0deg, var(--vc-bg, #0e0f11) 2%, transparent 24%),
+    linear-gradient(180deg, var(--vc-bg, #0e0f11) 2%, transparent 24%);
+}
+.vc-gs-hero__content {
+  position: relative;
+  z-index: 1;
+}
+.vc-gs-hero__ctas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 26px 0 0;
+}
+
+/* ---- section rhythm ---- */
+.vc-gs-section {
+  padding-top: clamp(56px, 10vh, 110px);
+}
+.vc-gs-hero + .vc-gs-section {
+  padding-top: clamp(28px, 4.5vh, 44px);
+}
+/* imperative deck line under a section title */
+.vc-gs-sub {
+  margin: -6px 0 14px;
+  font-size: 1.05rem;
+  font-weight: 650;
+  color: var(--vc-accent, #e5502b);
+}
+.vc-gs-section--band {
+  margin-top: clamp(56px, 10vh, 110px);
+  padding-top: 56px;
+  padding-bottom: 56px;
+  background: var(--vc-surface, #131518);
+  border-top: 1px solid var(--vc-line);
+  border-bottom: 1px solid var(--vc-line);
+  /* full-bleed */
+  margin-inline: calc(50% - 50vw);
+  padding-inline: calc(50vw - 50%);
+}
+.vc-gs-section--band + .vc-gs-section {
+  padding-top: clamp(48px, 8vh, 88px);
+}
+.vc-gs-sechead {
+  scroll-margin-top: 72px;
+}
+/* the kicker belongs to the title beneath it: keep the big gap above the
+   section head, not between the kicker and the heading */
+.vc-gs-sechead .vc-kicker {
+  margin: 0 0 4px;
+}
+.vc-gs-sechead .vc-gs-h2 {
+  margin-top: 0;
+}
+
+/* ---- demos: shared ---- */
+.vc-gs-demo {
+  margin-top: 32px;
+}
+.vc-gs-demo__poster {
+  position: relative;
+  border: 1px solid var(--vc-line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--vc-surface, #131518);
+}
+.vc-gs-demo__poster img {
+  display: block;
+  width: 100%;
+  max-height: 380px;
+  object-fit: cover;
+  opacity: 0.7;
+}
+.vc-gs-demo__poster-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 14px;
+  padding: 24px;
+  background: linear-gradient(
+    to top,
+    rgba(14, 15, 17, 0.88),
+    rgba(14, 15, 17, 0.45)
+  );
+}
+.vc-gs-demo__poster-overlay p {
+  max-width: 34rem;
+  margin: 0;
+  font-size: 1rem;
+  line-height: 1.6;
+}
+.vc-gs-demo__err {
+  font-size: 0.85rem;
+  color: var(--vc-text-faint);
+}
+
+.vc-gs-demo__panes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+/* wide single-line strips (the porphyras crop) read better stacked */
+.vc-gs-demo__panes--stack {
+  grid-template-columns: 1fr;
+  /* the phone opening scroll bottom-aligns this stack; the margin leaves a
+     small pad below the last caption. Inert elsewhere (only scrollIntoView
+     reads it, and that's phones-only). */
+  scroll-margin-bottom: 12px;
+}
+.vc-gs-demo__pane {
+  margin: 0;
+  min-width: 0;
+}
+.vc-gs-demo__canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--vc-line);
+  border-radius: 6px;
+  background: #000;
+}
+.vc-gs-demo__canvas--draw {
+  touch-action: none;
+  cursor: crosshair;
+}
+/* phones: the prediction pane mirrors the surface view, so it takes pinch/
+   drag gestures too (they drive the shared view and never paint). Desktop's
+   pred pane isn't mirrored and keeps its default touch behavior. */
+.vc-gs-demo__canvas--zoom {
+  touch-action: none;
+}
+/* phone intro: the demo opens on the whole strip with the brush off — an
+   animated pinch-out cue (deliberately NOT the paint ring, which means
+   "paint here") invites the zoom-in that arms it. Pointer events pass
+   through: the cue is watched, the canvas is touched. */
+.vc-gs-canvaswrap {
+  position: relative;
+}
+/* phones: brush / erase / clear as small orange icons pinned to the ink
+   panel's top-right (the labeled tool buttons are hidden on phones — see
+   the JSX — so these don't duplicate them). Desktop shows no icons. A
+   stroke started on the canvas keeps pointer capture, so dragging under
+   these never fires them. */
+.vc-gs-inktools {
+  position: absolute;
+  top: 7px;
+  right: 9px;
+  z-index: 4;
+  display: flex;
+  gap: 10px;
+}
+/* bare glyphs when idle — a little padding for the tap area, a drop shadow
+   to keep orange legible over bright papyrus. The transparent border is
+   reserved so the selected state (below) doesn't shift the row. */
+.vc-gs-inktool {
+  padding: 4px;
+  border: 1.2px solid transparent;
+  border-radius: 8px;
+  background: none;
+  line-height: 0;
+  color: var(--vc-accent, #e5502b);
+  cursor: pointer;
+  opacity: 0.85;
+  -webkit-tap-highlight-color: transparent;
+  /* so the selected box fades in/out — and, on a momentary tap, the active
+     tool's box can recede and snap back quickly (see the tap flash below) */
+  transition:
+    border-color 0.1s ease,
+    background-color 0.1s ease,
+    opacity 0.1s ease,
+    transform 0.1s ease;
+}
+.vc-gs-inktool svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+  filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.8));
+}
+/* the selected tool gets its box back — accent border + a soft orange fill,
+   the same "on" language as the desktop tool buttons — so the active tool
+   is unmistakable; the others stay bare */
+.vc-gs-inktool--on {
+  opacity: 1;
+  border-color: var(--vc-accent);
+  background: color-mix(in srgb, var(--vc-accent) 22%, rgba(18, 19, 22, 0.8));
+}
+/* clear / hint are momentary — no lasting selection — so a tap flashes the
+   box in and back out on the pressed icon (JS adds --tap for one cycle;
+   meanwhile the active tool's box steps aside and returns) */
+@keyframes vc-gs-inktool-tap {
+  0% {
+    border-color: transparent;
+    background-color: transparent;
+    transform: scale(1);
+  }
+  40% {
+    border-color: var(--vc-accent);
+    background-color: color-mix(
+      in srgb,
+      var(--vc-accent) 22%,
+      rgba(18, 19, 22, 0.8)
+    );
+    transform: scale(1.14);
+  }
+  100% {
+    border-color: transparent;
+    background-color: transparent;
+    transform: scale(1);
+  }
+}
+.vc-gs-inktool--tap {
+  animation: vc-gs-inktool-tap 0.2s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .vc-gs-inktool {
+    transition: none;
+  }
+  .vc-gs-inktool--tap {
+    animation: none;
+  }
+}
+.vc-gs-pinchcue {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+/* the cue sits ON the first letter (positioned from JS as the view moves):
+   a pulsating bubble with a continuous source at its center that spawns
+   arrows drifting outward along the pinch-out diagonal, brightening to
+   a mid-journey peak and dimming out at the rim — a seamless loop.
+   A live pinch stretches the bubble along the finger axis (inline
+   transform set from the pinch handler); letting go snaps it back; the
+   zoom-in pops it. Kin to the breathing paint ring that follows. */
+.vc-gs-pinchcue__at {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  line-height: 0;
+}
+/* the deformable layer — kept separate from the breathing animation
+   below, which would otherwise override the inline pinch transform */
+.vc-gs-pinchcue__bubble {
+  line-height: 0;
+  transition: transform 0.12s ease-out;
+}
+.vc-gs-pinchcue__icon {
+  animation: vc-gs-pinch-breathe 1.6s ease-in-out infinite;
+}
+.vc-gs-pinchcue__skin {
+  fill: none;
+  stroke: #ff6a3d;
+  stroke-width: 2;
+  filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.7));
+  animation: vc-gs-pinch-skin 1.6s ease-in-out infinite;
+}
+/* the flow: pinch batches from the source at the center gap. The three
+   arrows fire as one burst (0.12s apart, all while still at the
+   source), then the batch flies out as one — nothing else spawns
+   mid-flight. Each arrow ACCELERATES toward the rim like a flicked
+   finger (0.75s journey); the trail stretches as it speeds up. Only
+   once the last arrow of the batch has completed to the radius does
+   the next batch fire (cycle 1.1s = 0.24s burst + 0.75s flight + a
+   beat). Opacity only RISES — dim at birth, fully bright just short of
+   the rim, where it vanishes — so the arrows behind the bright head read
+   as its comet trace. */
+.vc-gs-pinchcue__icon path {
+  fill: none;
+  stroke: #ff6a3d;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.7));
+  opacity: 0;
+  animation: 1.1s linear infinite;
+}
+/* direction + stagger. Selectors outmatch the `animation` shorthand
+   above (which resets animation-name and delay at path-selector
+   specificity) */
+.vc-gs-pinchcue__icon .vc-gs-pinchcue__up path {
+  animation-name: vc-gs-pinch-flow-up;
+}
+.vc-gs-pinchcue__icon .vc-gs-pinchcue__dn path {
+  animation-name: vc-gs-pinch-flow-dn;
+}
+.vc-gs-pinchcue__icon path.vc-gs-pinchcue__w2 {
+  animation-delay: 0.12s;
+}
+.vc-gs-pinchcue__icon path.vc-gs-pinchcue__w3 {
+  animation-delay: 0.24s;
+}
+@keyframes vc-gs-pinch-flow-up {
+  0% {
+    opacity: 0.4;
+    transform: translate(0, 0);
+    animation-timing-function: ease-in;
+  }
+  68% {
+    opacity: 1;
+    transform: translate(-7px, -7px);
+  }
+  69%,
+  100% {
+    opacity: 0;
+    transform: translate(-7px, -7px);
+  }
+}
+@keyframes vc-gs-pinch-flow-dn {
+  0% {
+    opacity: 0.4;
+    transform: translate(0, 0);
+    animation-timing-function: ease-in;
+  }
+  68% {
+    opacity: 1;
+    transform: translate(7px, 7px);
+  }
+  69%,
+  100% {
+    opacity: 0;
+    transform: translate(7px, 7px);
+  }
+}
+/* the bubble pulses like a pinch — contracting under, expanding past
+   its resting size */
+@keyframes vc-gs-pinch-breathe {
+  0%,
+  100% {
+    transform: scale(0.96);
+  }
+  50% {
+    transform: scale(1.08);
+  }
+}
+@keyframes vc-gs-pinch-skin {
+  0%,
+  100% {
+    opacity: 0.65;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+/* same dress as the canvas "Tap here" pill next to the paint ring — and
+   it sways with the bubble's breath the way that pill rides the ring */
+.vc-gs-pinchcue__pill {
+  position: absolute;
+  left: 30px;
+  top: 50%;
+  transform: translate(0, -50%);
+  white-space: nowrap;
+  line-height: 1.9;
+  font:
+    600 13px system-ui,
+    -apple-system,
+    sans-serif;
+  color: #ff6a3d;
+  background: rgba(18, 19, 22, 0.92);
+  border: 1.2px solid rgba(229, 80, 43, 0.9);
+  border-radius: 999px;
+  padding: 0 8px;
+  animation: vc-gs-pinch-pill 1.6s ease-in-out infinite;
+}
+@keyframes vc-gs-pinch-pill {
+  0%,
+  100% {
+    transform: translate(0, -50%);
+  }
+  50% {
+    transform: translate(2.5px, -50%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vc-gs-pinchcue__icon,
+  .vc-gs-pinchcue__skin,
+  .vc-gs-pinchcue__icon path,
+  .vc-gs-pinchcue__pill {
+    animation: none;
+  }
+  /* static comet: the journey frozen at three stations — dim at the
+     source, fully bright at the rim */
+  .vc-gs-pinchcue__icon path {
+    opacity: 0.4;
+  }
+  .vc-gs-pinchcue__up path.vc-gs-pinchcue__w2 {
+    transform: translate(-4px, -4px);
+    opacity: 0.7;
+  }
+  .vc-gs-pinchcue__up path.vc-gs-pinchcue__w3 {
+    transform: translate(-7px, -7px);
+    opacity: 1;
+  }
+  .vc-gs-pinchcue__dn path.vc-gs-pinchcue__w2 {
+    transform: translate(4px, 4px);
+    opacity: 0.7;
+  }
+  .vc-gs-pinchcue__dn path.vc-gs-pinchcue__w3 {
+    transform: translate(7px, 7px);
+    opacity: 1;
+  }
+  .vc-gs-pinchcue__skin {
+    opacity: 0.85;
+  }
+}
+.vc-gs-demo__pane figcaption {
+  margin-top: 7px;
+  font-size: 0.8rem;
+  color: var(--vc-text-faint, #8a857f);
+}
+
+.vc-gs-demo__bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  margin-top: 16px;
+}
+.vc-gs-demo__tools {
+  display: flex;
+  flex-wrap: wrap; /* 4–5 tool buttons overrun a phone in one row — let them
+                      stack into two layers instead of running off-screen */
+  gap: 8px;
+}
+.vc-gs-tool {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 9px 14px;
+  min-height: 44px;
+  border: 1px solid var(--vc-line);
+  border-radius: 6px;
+  background: var(--vc-raised, #1a1c1f);
+  color: var(--vc-text);
+  cursor: pointer;
+}
+.vc-gs-tool--on {
+  border-color: var(--vc-accent);
+  color: var(--vc-accent);
+  background: color-mix(in srgb, var(--vc-accent) 10%, transparent);
+}
+/* phones: the Overlay prediction toggle shares the meter's row (the meter
+   grows to fill what's left of it), so the controls take one fewer row and
+   the whole stack clears the fold */
+.vc-gs-meterrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 100%;
+}
+.vc-gs-meter {
+  position: relative;
+  flex: 1 1 220px;
+  height: 30px;
+  border: 1px solid var(--vc-line);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--vc-bg, #0e0f11);
+}
+.vc-gs-meter__fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: color-mix(in srgb, var(--vc-accent) 55%, transparent);
+  transition: width 0.35s ease;
+}
+.vc-gs-meter__label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  color: var(--vc-text);
+}
+.vc-gs-demo__status {
+  margin: 12px 0 0;
+  min-height: 1.5em;
+  font-size: 0.9rem;
+  color: var(--vc-text-dim, #b9b4ae);
+}
+.vc-gs-demo__win {
+  font-size: 1.02rem;
+  line-height: 1.65;
+  max-width: 44rem;
+  border-left: 2px solid var(--vc-accent);
+  padding-left: 16px;
+}
+.vc-gs-demo__outro {
+  margin-top: 22px;
+}
+.vc-gs-demo__reward {
+  margin: 22px 0 0;
+}
+.vc-gs-demo__reward-video {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--vc-line);
+  border-radius: 6px;
+}
+.vc-gs-demo__reward figcaption {
+  margin-top: 7px;
+}
+
+/* ---- spiral unwrap panel (seg demo done state) ---- */
+.vc-gs-spiral {
+  margin: 22px 0 0;
+}
+.vc-gs-spiral__canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--vc-line);
+  border-radius: 6px;
+  background: #0b0c0e;
+}
+.vc-gs-spiral__bar {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  margin-top: 10px;
+}
+.vc-gs-spiral__caption {
+  margin: 0;
+  flex: 1;
+  font-size: 0.9rem;
+  color: var(--vc-text-dim, #b9b4ae);
+}
+.vc-gs-spiral__invite {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  color: var(--vc-text-dim, #b9b4ae);
+}
+.vc-gs-spiral__invite span {
+  flex: 1 1 30rem;
+  max-width: 44rem;
+  font-size: 0.95rem;
+  line-height: 1.65;
+}
+
+/* ---- "read what you found" reveal (ink demo done state) ---- */
+.vc-gs-read {
+  margin-top: 20px;
+  animation: vc-gs-readin 900ms ease both;
+}
+.vc-gs-read__words {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: clamp(24px, 6vw, 72px);
+  margin: 8px 0 16px;
+}
+.vc-gs-read__word {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  font-size: clamp(1.7rem, 4vw, 2.5rem);
+  letter-spacing: 0.09em;
+  color: var(--vc-accent, #e5502b);
+}
+.vc-gs-read__word small {
+  font-size: 0.85rem;
+  letter-spacing: 0.02em;
+  color: var(--vc-text-dim, #b9b4ae);
+}
+.vc-gs-read__note {
+  max-width: 44rem;
+  margin: 0 auto;
+  font-size: 0.95rem;
+  line-height: 1.65;
+  color: var(--vc-text-dim, #b9b4ae);
+  text-align: center;
+}
+@keyframes vc-gs-readin {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vc-gs-read {
+    animation: none;
+  }
+}
+
+
+/* ---- hints slider (seg demo) ---- */
+.vc-gs-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  font-size: 0.85rem;
+  color: var(--vc-text-dim, #b9b4ae);
+  cursor: pointer;
+}
+.vc-gs-hint input[type="range"] {
+  width: 130px;
+  accent-color: var(--vc-accent);
+}
+
+/* ---- seg demo guidance steps ---- */
+.vc-gs-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  margin: 0 0 14px;
+  padding: 0;
+  list-style: none;
+}
+.vc-gs-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--vc-text-faint, #8a857f);
+}
+.vc-gs-step__n {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--vc-line);
+  border-radius: 50%;
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+.vc-gs-step--on {
+  color: var(--vc-text);
+}
+.vc-gs-step--on .vc-gs-step__n {
+  border-color: var(--vc-accent);
+  color: var(--vc-accent);
+}
+.vc-gs-step--done {
+  color: var(--vc-text-dim, #b9b4ae);
+}
+.vc-gs-step--done .vc-gs-step__n {
+  border-color: color-mix(in srgb, var(--vc-accent) 55%, transparent);
+  color: var(--vc-accent);
+}
+
+/* ---- seg demo layout ---- */
+.vc-gs-seg {
+  display: grid;
+  /* Turntable and slice are square; flattened render is 1.515:1.
+     These ratios give all three canvases the same displayed height. */
+  grid-template-columns: 1fr 1fr 1.515fr;
+  gap: 14px;
+  align-items: start;
+}
+.vc-gs-seg__scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.vc-gs-seg__svg {
+  width: 100%;
+  max-width: 150px;
+}
+.vc-gs-seg__ttcanvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--vc-line);
+  border-radius: 6px;
+  background: #0b0c0e;
+  touch-action: none;
+  cursor: grab;
+}
+.vc-gs-seg__ttcanvas:active {
+  cursor: grabbing;
+}
+.vc-gs-seg__planes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.vc-gs-seg__scroll > .vc-gs-seg__planes {
+  flex-direction: row;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.vc-gs-seg__ttcap {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  text-align: center;
+}
+/* "plane done" reward: the next-layer CTA rides along with the status */
+.vc-gs-nextlayer {
+  margin-left: 12px;
+  padding: 5px 14px;
+  font-size: 0.85rem;
+}
+
+/* ---- completion cues ---- */
+/* a finished slice announces itself ON the canvas: the veil pauses
+   dot-dropping and puts the next step one tap away — some visitors keep
+   extending a done trace because they never read the status line */
+.vc-gs-slicewrap {
+  position: relative;
+}
+.vc-gs-slicedone {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 14px;
+  text-align: center;
+  background: rgba(8, 9, 11, 0.74);
+  border-radius: 6px;
+  animation: vc-gs-fadein 400ms ease both;
+}
+.vc-gs-slicedone p {
+  margin: 0;
+  font-weight: 650;
+  color: var(--vc-text);
+}
+.vc-gs-slicedone__check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border: 2px solid var(--vc-accent);
+  border-radius: 50%;
+  color: var(--vc-accent);
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+.vc-gs-slicedone__dismiss {
+  border: 0;
+  background: none;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 0.8rem;
+  color: var(--vc-text-dim, #b9b4ae);
+  text-decoration: underline;
+  cursor: pointer;
+}
+/* phones: the demo payoff renders below the fold, and hijacking the
+   scroll to it felt broken — a fixed pill announces the finish over
+   whatever the user is doing, and tapping it goes there. Desktop hides
+   it: the outro is already on screen. */
+.vc-gs-donecue {
+  display: none;
+}
+@media (max-width: 699px) {
+  .vc-gs-donecue {
+    display: block;
+    position: fixed;
+    left: 16px;
+    /* stop short of the floating "Ask" launcher (chat.css: fixed, right
+       20px, z-index 170 — it would sit ON TOP of a centered pill) */
+    right: calc(130px + env(safe-area-inset-right));
+    bottom: calc(20px + env(safe-area-inset-bottom));
+    z-index: 40;
+    animation: vc-gs-cuein 480ms ease both;
+  }
+  .vc-gs-donecue .vc-btn {
+    width: 100%;
+    box-shadow: 0 8px 26px rgba(0, 0, 0, 0.6);
+  }
+}
+@keyframes vc-gs-fadein {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes vc-gs-cuein {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---- "go deeper" link rows ---- */
+.vc-gs-next {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px 22px;
+  margin-top: 26px;
+  padding-top: 14px;
+  border-top: 1px solid var(--vc-line);
+  font-size: 0.92rem;
+}
+
+/* ---- stats band ---- */
+.vc-gs-stats {
+  margin-top: 30px;
+}
+/* stat links: the numbers are the design — no underlines through them
+   (same opt-out the landing hero stats use) */
+.vc-gs a.vc-stat {
+  text-decoration: none;
+}
+.vc-gs a.vc-stat:hover .vc-stat__value {
+  color: var(--vc-accent);
+}
+
+/* ---- path cards ---- */
+.vc-gs-paths {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 14px;
+  margin-top: 30px;
+}
+.vc-gs-path {
+  position: relative; /* stretched-link: the CTA's ::after covers the card */
+  display: flex;
+  flex-direction: column;
+  text-decoration: none;
+  color: var(--vc-text);
+}
+.vc-gs-path__cta::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+.vc-gs-path p a {
+  position: relative;
+  z-index: 1; /* inner links stay clickable above the stretched CTA */
+}
+.vc-gs-path:hover {
+  text-decoration: none;
+  border-color: var(--vc-line-strong, #4a4a4a);
+}
+.vc-gs-path h3 {
+  font-size: 1.08rem;
+  margin: 0 0 10px;
+}
+.vc-gs-path p {
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--vc-text-dim, #b9b4ae);
+  margin: 0 0 12px;
+}
+.vc-gs-path__prize {
+  color: var(--vc-accent) !important;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+.vc-gs-path__cta {
+  margin-top: auto;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+/* ---- close ---- */
+.vc-gs-close {
+  padding-bottom: clamp(64px, 10vh, 110px);
+}
+.vc-gs-close__ctas {
+  margin-top: 20px;
+}
+
+/* ---- responsive ---- */
+@media (max-width: 996px) {
+  .vc-gs-seg {
+    grid-template-columns: 1fr;
+  }
+  /* single-column: the turntable is the hero of step 1, keep it big with
+     its caption below — not a thumbnail with the text off to its side */
+  .vc-gs-seg__scroll {
+    align-items: center;
+  }
+  .vc-gs-seg__svg {
+    max-width: 84px;
+  }
+  .vc-gs-seg__ttcanvas {
+    max-width: min(340px, 88vw);
+  }
+  .vc-gs-seg__planes {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  /* the wide ink strip leaves no room for an overlaid intro on top of an
+     ~80px-tall poster: let it flow below the image instead */
+  #ink-demo .vc-gs-demo__poster-overlay {
+    position: static;
+    background: none;
+    padding: 16px 12px 18px;
+  }
+
+  /* full-bleed bands and hero need main to span the viewport. The docs .col
+     carries a default gutter that insets main, and .vc-gs { overflow-x: clip }
+     then clips the bands' full-bleed margins to that inset box — so on phones
+     the band background stops ~16px short of the edge AND its text lands right
+     against the clipped edge (≈2px of padding). Drop the col gutter here and
+     let .vc-gs-container carry it instead, the same model landing.css uses.
+     Desktop is untouched: these overrides live inside the ≤996 query. */
+  .docs-doc-id-get_started main > .container {
+    max-width: none !important; /* Infima caps this at 540–960px ≤996; the cap
+       would keep main.vc-gs narrow so the clip below still eats the bleed */
+    padding: 0 !important;
+  }
+  .docs-doc-id-get_started main > .container > .row {
+    margin: 0 !important;
+  }
+  .docs-doc-id-get_started main > .container > .row > .col {
+    padding: 0 !important;
+  }
+  .vc-gs-container {
+    padding-inline: clamp(20px, 5vw, 28px);
+  }
+}
+@media (max-width: 768px) {
+  .vc-gs-demo__panes {
+    grid-template-columns: 1fr;
+  }
+  /* demo toolbar: stack the groups so nothing runs off a phone. The tool
+     buttons form an even two-column grid (equal widths, two per row); the
+     hint slider and the progress meter each drop to their own line below. */
+  .vc-gs-demo__tools {
+    flex-basis: 100%;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+  .vc-gs-hint,
+  .vc-gs-meter {
+    flex-basis: 100%;
+  }
+  /* the hint slider is 130px on desktop; on its own full-width row it should
+     stretch to fill the space beside the label */
+  .vc-gs-hint {
+    display: flex;
+  }
+  .vc-gs-hint input[type="range"] {
+    flex: 1;
+    width: auto;
+  }
+  /* no free right column on phones: the strip becomes a low band under
+     the CTAs, faded at both edges */
+  .vc-gs-hero {
+    padding-bottom: 120px;
+  }
+  .vc-gs-hero__bg {
+    inset: auto 0 12px 0;
+    height: 96px;
+    background-size: 360% auto;
+    background-position: 50% 50%;
+    opacity: 0.5;
+    -webkit-mask-image: linear-gradient(
+      90deg,
+      transparent,
+      #000 12%,
+      #000 88%,
+      transparent
+    );
+    mask-image: linear-gradient(
+      90deg,
+      transparent,
+      #000 12%,
+      #000 88%,
+      transparent
+    );
+  }
+  .vc-gs-hero__scrim {
+    display: none;
+  }
+  .vc-gs-paths {
+    grid-template-columns: 1fr;
+  }
+  /* the desktop stat row (hairline dividers, 24px pads) wraps into a
+     ragged 2x2 on phones: wrapped cells keep their left borders and
+     padding, so rows land misaligned and hairlines float mid-screen.
+     Make it an even two-column grid and drop the dividers. */
+  .vc-gs-stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px 16px;
+  }
+  .vc-gs-stats .vc-stat {
+    padding: 0;
+    border-left: 0;
+  }
+  /* centered afterthought lines (Meet the winners, Open Problems,
+     Questions?) read as misalignment under left-set body copy when the
+     screen is one column of text — align them with everything else */
+  .vc-gs-body--center {
+    text-align: left;
+  }
+}
+
+/* ---- reduced motion ---- */
+@media (prefers-reduced-motion: reduce) {
+  .vc-gs-meter__fill {
+    transition: none;
+  }
+}

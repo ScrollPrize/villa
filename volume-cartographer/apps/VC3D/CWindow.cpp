@@ -1,4 +1,6 @@
 #include "CWindow.hpp"
+#include "OpenDataCoordinateIdentity.hpp"
+#include "OpenDataLasagna.hpp"
 
 #include "RenderBenchRecorder.hpp"
 #include "RenderBenchReplay.hpp"
@@ -10,6 +12,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/AffineTransform.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/atlas/Atlas.hpp"
 #include "vc/lasagna/Dataset.hpp"
@@ -22,6 +25,7 @@
 #include <optional>
 
 #include "VCSettings.hpp"
+#include "RemoteVolumeCachePaths.hpp"
 #include "Keybinds.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
@@ -202,6 +206,14 @@ constexpr int SURFACE_OVERLAY_NAME_ROLE = Qt::UserRole + 201;
 constexpr int SURFACE_OVERLAY_FOLDER_ROLE = Qt::UserRole + 202;
 constexpr double ATLAS_SEARCH_CLOSE_WINDING_THRESHOLD = 0.5;
 constexpr std::string_view OPEN_DATA_VOLUME_ID_TAG_PREFIX = "vc-open-data-volume-id:";
+
+std::optional<vc3d::opendata::ResolvedOpenDataLasagna>
+resolvedLasagnaForState(const CState* state)
+{
+    if (!state || !state->vpkg()) return std::nullopt;
+    return vc3d::opendata::resolveLasagnaForVolume(
+        *state->vpkg(), state->currentVolumeId());
+}
 
 enum class SurfaceOverlayItemKind {
     Folder,
@@ -662,6 +674,48 @@ QString openDataCatalogVolumeIdForLoadedVolume(const VolumePkg& pkg, const std::
     return {};
 }
 
+std::optional<int> openDataCoordinateLevelForLoadedVolume(
+    const VolumePkg& pkg,
+    const std::string& loadedVolumeId)
+{
+    constexpr std::string_view prefix = "vc-open-data-source-coordinate-level:";
+    for (const auto& tag : pkg.volumeTags(loadedVolumeId)) {
+        if (tag.rfind(prefix, 0) != 0)
+            continue;
+        const auto value = tag.substr(prefix.size());
+        try {
+            std::size_t consumed = 0;
+            const int level = std::stoi(value, &consumed);
+            if (consumed == value.size() && level >= 0 && level <= 5)
+                return level;
+        } catch (...) {
+        }
+    }
+    return std::nullopt;
+}
+
+std::string openDataCoordinateSpaceForLoadedVolume(
+    const VolumePkg& pkg,
+    const std::string& loadedVolumeId)
+{
+    constexpr std::string_view prefix = "vc-open-data-coordinate-space:";
+    for (const auto& tag : pkg.volumeTags(loadedVolumeId)) {
+        if (tag.rfind(prefix, 0) == 0)
+            return tag.substr(prefix.size());
+    }
+    return {};
+}
+
+cv::Matx44d coordinateLevelScale(int level)
+{
+    const double scale = std::ldexp(1.0, level);
+    return cv::Matx44d(
+        scale, 0, 0, 0,
+        0, scale, 0, 0,
+        0, 0, scale, 0,
+        0, 0, 0, 1);
+}
+
 bool isOpenDataSegmentsEntry(const vc::project::Entry& entry)
 {
     if (std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end()) {
@@ -690,6 +744,10 @@ bool isAvailableOpenDataSegmentsEntry(const VolumePkg& pkg,
         pkg.path().parent_path());
     if (!std::filesystem::is_directory(path, ec) || ec) {
         return false;
+    }
+    if (std::find(entry.tags.begin(), entry.tags.end(),
+                  "vc-open-data-segment-aggregate") != entry.tags.end()) {
+        return true;
     }
     return vc::project::validateLocation(
         vc::project::Category::Segments,
@@ -752,6 +810,27 @@ const vc::project::Entry* findOpenDataSegmentsEntryForLoadedVolume(const VolumeP
                                                                    const std::string& loadedVolumeId,
                                                                    QString* matchedCatalogVolumeId = nullptr)
 {
+    const auto coordinateSpace =
+        openDataCoordinateSpaceForLoadedVolume(pkg, loadedVolumeId);
+    if (!coordinateSpace.empty()) {
+        const std::string coordinateTag =
+            "vc-open-data-coordinate-space:" + coordinateSpace;
+        for (const auto& entry : pkg.segmentEntries()) {
+            if (isAvailableOpenDataSegmentsEntry(pkg, entry) &&
+                std::find(entry.tags.begin(), entry.tags.end(), coordinateTag) !=
+                    entry.tags.end()) {
+                if (matchedCatalogVolumeId) {
+                    *matchedCatalogVolumeId =
+                        openDataCatalogVolumeIdForLoadedVolume(pkg, loadedVolumeId);
+                }
+                return &entry;
+            }
+        }
+        // Explicitly identified assets must never fall back to lineage-only
+        // association, because native and virtual views share that lineage.
+        return nullptr;
+    }
+
     for (const QString& candidate : openDataCatalogVolumeIdCandidates(pkg, loadedVolumeId)) {
         if (const auto* entry = findOpenDataSegmentsEntryForVolume(pkg, candidate)) {
             if (matchedCatalogVolumeId) {
@@ -1995,6 +2074,7 @@ AtlasSearchWorkerResult buildSignedAtlasSearchResults(
     const std::unordered_map<uint64_t, AtlasSearchFiberSnapshot>& snapshotsById,
     const std::optional<std::filesystem::path>& atlasDir,
     const std::filesystem::path& lasagnaManifestPath,
+    double workingToBaseScale,
     const vc::atlas::FiberIntersectionProgressCallback& progressCallback,
     bool debugSearch)
 {
@@ -2013,7 +2093,8 @@ AtlasSearchWorkerResult buildSignedAtlasSearchResults(
 
     try {
         vc::lasagna::LasagnaDataset dataset =
-            vc::lasagna::LasagnaDataset::open(lasagnaManifestPath);
+            vc::lasagna::LasagnaDataset::open(
+                lasagnaManifestPath, {workingToBaseScale});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         auto context = prepareAtlasSearchSigningContext(
             rawResults, snapshotsById, atlasDir, dataset, sampler, progressCallback);
@@ -2300,15 +2381,21 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
         return QString();
     }
 
-    // Entries tagged with an open-data volume id only apply to that volume;
-    // untagged entries keep the legacy behavior of applying to everything.
+    // Coordinate-tagged entries apply only to an exact coordinate view;
+    // untagged entries keep the legacy behavior for untagged volumes.
     const auto catalogIds =
         openDataCatalogVolumeIdCandidates(*pkg, loadedVolumeId);
+    const auto coordinateSpace =
+        openDataCoordinateSpaceForLoadedVolume(*pkg, loadedVolumeId);
+    const std::string coordinateTag = coordinateSpace.empty()
+        ? std::string{}
+        : "vc-open-data-coordinate-space:" + coordinateSpace;
     constexpr std::string_view volumeIdTagPrefix = "vc-open-data-volume-id:";
 
     QString untaggedFallback;
     for (const auto& path : paths) {
         const auto pathStr = path.string();
+        const QString candidateStr = QString::fromStdString(pathStr);
         const vc::project::Entry* owningEntry = nullptr;
         for (const auto& entry : pkg->normalGridEntries()) {
             if (pathStr == entry.location ||
@@ -2320,6 +2407,16 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
 
         std::vector<QString> entryVolumeIds;
         if (owningEntry) {
+            if (!coordinateTag.empty()) {
+                if (std::find(owningEntry->tags.begin(), owningEntry->tags.end(),
+                              coordinateTag) != owningEntry->tags.end()) {
+                    if (checkedPath) *checkedPath = candidateStr;
+                    qCInfo(lcSegGrowth) << "Normal grid resolved by coordinate space to"
+                                        << candidateStr;
+                    return candidateStr;
+                }
+                continue;
+            }
             for (const auto& tag : owningEntry->tags) {
                 if (tag.rfind(volumeIdTagPrefix, 0) == 0) {
                     entryVolumeIds.push_back(
@@ -2328,7 +2425,6 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
             }
         }
 
-        const QString candidateStr = QString::fromStdString(pathStr);
         if (entryVolumeIds.empty()) {
             if (untaggedFallback.isEmpty()) {
                 untaggedFallback = candidateStr;
@@ -2348,7 +2444,7 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
         }
     }
 
-    if (!untaggedFallback.isEmpty()) {
+    if (coordinateTag.empty() && !untaggedFallback.isEmpty()) {
         if (checkedPath) *checkedPath = untaggedFallback;
         qCInfo(lcSegGrowth) << "Normal grid resolved to" << untaggedFallback;
         return untaggedFallback;
@@ -2816,7 +2912,30 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             tabBar->setTabButton(i, QTabBar::RightSide, nullptr);
         }
     }
-    setCentralWidget(_workspaceTabs);
+    auto* workspaceContainer = new QWidget(this);
+    workspaceContainer->setObjectName(QStringLiteral("workspaceContainer"));
+    auto* workspaceLayout = new QVBoxLayout(workspaceContainer);
+    workspaceLayout->setContentsMargins(0, 0, 0, 0);
+    workspaceLayout->setSpacing(0);
+    _persistentCacheWarningBanner = new QFrame(workspaceContainer);
+    _persistentCacheWarningBanner->setObjectName(QStringLiteral("persistentCacheWarningBanner"));
+    _persistentCacheWarningBanner->setStyleSheet(
+        QStringLiteral("QFrame#persistentCacheWarningBanner { background: #fff3cd; color: #664d03; border-bottom: 1px solid #ffda6a; }"));
+    auto* warningLayout = new QHBoxLayout(_persistentCacheWarningBanner);
+    warningLayout->setContentsMargins(10, 5, 8, 5);
+    _persistentCacheWarningText = new QLabel(_persistentCacheWarningBanner);
+    _persistentCacheWarningText->setObjectName(QStringLiteral("persistentCacheWarningText"));
+    _persistentCacheWarningText->setWordWrap(true);
+    warningLayout->addWidget(_persistentCacheWarningText, 1);
+    auto* dismissCacheWarning = new QPushButton(tr("Dismiss"), _persistentCacheWarningBanner);
+    dismissCacheWarning->setObjectName(QStringLiteral("dismissPersistentCacheWarning"));
+    warningLayout->addWidget(dismissCacheWarning);
+    connect(dismissCacheWarning, &QPushButton::clicked,
+            _persistentCacheWarningBanner, &QWidget::hide);
+    _persistentCacheWarningBanner->hide();
+    workspaceLayout->addWidget(_persistentCacheWarningBanner);
+    workspaceLayout->addWidget(_workspaceTabs, 1);
+    setCentralWidget(workspaceContainer);
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_workspaceTabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
         if (!_workspaceTabs) {
@@ -2925,6 +3044,48 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _sharedCacheStatsLabel->setText(tr("RAM --  disk --  network --"));
     statusBar()->addPermanentWidget(_sharedCacheStatsLabel);
 
+    _persistentCacheLowSpaceLabel = new QLabel(this);
+    _persistentCacheLowSpaceLabel->setObjectName(QStringLiteral("persistentCacheLowSpaceLabel"));
+    _persistentCacheLowSpaceLabel->setStyleSheet(QStringLiteral("color: #d28b00; font-weight: 600;"));
+    _persistentCacheLowSpaceLabel->hide();
+    statusBar()->addPermanentWidget(_persistentCacheLowSpaceLabel);
+
+    _persistentCacheSpaceTimer = new QTimer(this);
+    _persistentCacheSpaceTimer->setInterval(5000);
+    auto updatePersistentCacheSpace = [this]() {
+        auto root = vc3d::remoteCacheRootForState(_state);
+        if (_state) {
+            if (const auto volume = _state->currentVolume();
+                volume && !volume->remoteCacheRoot().empty()) {
+                root = volume->remoteCacheRoot();
+            }
+        }
+        auto budget = vc::render::PersistentZarrCacheBudget::findForPath(root);
+        if (!budget)
+            return;
+        const auto stats = budget->stats();
+        if (stats.lowSpace) {
+            const double freeGiB = static_cast<double>(stats.freeBytes) /
+                                   (1024.0 * 1024.0 * 1024.0);
+            const QString text = tr("Low disk space: %1 GiB free; remote Zarr cache growth is paused.")
+                                     .arg(freeGiB, 0, 'f', 1);
+            _persistentCacheLowSpaceLabel->setText(QStringLiteral("⚠ ") + text);
+            _persistentCacheLowSpaceLabel->show();
+            if (!_persistentCacheBannerShownThisSession) {
+                _persistentCacheBannerShownThisSession = true;
+                _persistentCacheWarningText->setText(text);
+                _persistentCacheWarningBanner->show();
+            }
+        } else {
+            _persistentCacheLowSpaceLabel->hide();
+            _persistentCacheWarningBanner->hide();
+        }
+    };
+    connect(_persistentCacheSpaceTimer, &QTimer::timeout, this,
+            updatePersistentCacheSpace);
+    _persistentCacheSpaceTimer->start();
+    updatePersistentCacheSpace();
+
     // Z-scroll sensitivity label in status bar
     _sliceStepLabel = new QLabel(this);
     _sliceStepLabel->setContentsMargins(4, 0, 4, 0);
@@ -2973,6 +3134,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             [this](const QString& message, int timeout) {
                 if (statusBar()) {
                     showStatusBarMessage(message, timeout);
+                }
+            });
+    connect(_state, &CState::volumeChanged, _volumeOverlay.get(),
+            [this](const std::shared_ptr<Volume>&, const std::string&) {
+                if (_volumeOverlay) {
+                    _volumeOverlay->refreshForCurrentVolume();
                 }
             });
     _viewerManager->setVolumeOverlay(_volumeOverlay.get());
@@ -3522,6 +3689,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 // Destructor
 CWindow::~CWindow()
 {
+    _destroyingWindow = true;
     if (qApp) {
         qApp->removeEventFilter(this);
     }
@@ -4354,6 +4522,11 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 
     // CState handles cache budget and volume ID resolution, and emits volumeChanged
     _state->setCurrentVolume(newvol);
+    if (_viewerManager && _viewerManager->overlayVolume()) {
+        _viewerManager->setOverlayVolume(
+            _viewerManager->overlayVolume(),
+            _viewerManager->overlayVolumeId());
+    }
     if (_state->currentVolume() && !_state->currentVolumeId().empty()) {
         rememberCurrentVolumeForPackage(QString::fromStdString(_state->currentVolumeId()));
     }
@@ -4422,8 +4595,17 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
                 camera.scale = CChunkedVolumeViewer::clampCameraScale(
                     static_cast<float>(static_cast<double>(captured.camera.scale) / *navigationScale));
             }
-            camera.zOffset = captured.camera.zOffset;
+            camera.zOffset = navigationScale
+                ? static_cast<float>(static_cast<double>(captured.camera.zOffset) *
+                                     *navigationScale)
+                : captured.camera.zOffset;
             camera.zOffsetWorldDir = captured.camera.zOffsetWorldDir;
+            if (cv::norm(captured.camera.zOffsetWorldDir) > 0.0f) {
+                const auto direction = vc::core::util::transformNormal(
+                    captured.camera.zOffsetWorldDir, *navigationTransform);
+                if (finiteVec3(direction))
+                    camera.zOffsetWorldDir = direction;
+            }
             viewer->applyCameraState(camera, false);
         }
     }
@@ -4630,13 +4812,19 @@ void CWindow::openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QS
         connect(escapeShortcut, &QShortcut::activated, dialog, &QWidget::close);
         QWidget* tabWidget = dialog;
         connect(dialog, &QObject::destroyed, this, [this, tabWidget]() {
+            if (_destroyingWindow) {
+                return;
+            }
             if (!_workspaceTabs) {
                 return;
             }
             for (int i = 0; i < _workspaceTabs->count(); ++i) {
                 if (_workspaceTabs->widget(i) == tabWidget) {
+                    const bool wasCurrent = _workspaceTabs->currentIndex() == i;
                     _workspaceTabs->removeTab(i);
-                    switchToMainWorkspace();
+                    if (wasCurrent) {
+                        switchToMainWorkspace();
+                    }
                     break;
                 }
             }
@@ -5356,8 +5544,13 @@ void CWindow::updateAtlasFiberDocks()
     auto updateOptimizeEnabled = [&]() {
         bool hasManifest = false;
         if (_state && _state->vpkg()) {
-            const auto manifestPath = _state->vpkg()->selectedLasagnaDatasetPath();
-            hasManifest = !manifestPath.empty() && std::filesystem::exists(manifestPath);
+            try {
+                const auto resolved = resolvedLasagnaForState(_state);
+                hasManifest = resolved && !resolved->manifestPath.empty() &&
+                              std::filesystem::exists(resolved->manifestPath);
+            } catch (...) {
+                hasManifest = false;
+            }
         }
         if (optimize) {
             optimize->setEnabled(_currentAtlasDir.has_value() &&
@@ -5583,13 +5776,22 @@ void CWindow::remapCurrentAtlas()
         return;
     }
     auto vpkg = _state->vpkg();
-    const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-    if (manifestPath.empty() || !std::filesystem::exists(manifestPath)) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("Select a local Lasagna dataset before remapping."));
+    std::optional<vc3d::opendata::ResolvedOpenDataLasagna> resolvedLasagna;
+    try {
+        resolvedLasagna = resolvedLasagnaForState(_state);
+    } catch (const std::exception& ex) {
+        QMessageBox::warning(this, tr("Atlas"), QString::fromStdString(ex.what()));
         return;
     }
+    if (!resolvedLasagna || resolvedLasagna->manifestPath.empty() ||
+        !std::filesystem::exists(resolvedLasagna->manifestPath)) {
+        QMessageBox::warning(this,
+                             tr("Atlas"),
+                             tr("No Lasagna dataset matches the active volume."));
+        return;
+    }
+    const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
+    const double workingToBaseScale = resolvedLasagna->workingToBaseScale;
 
     const std::filesystem::path atlasDir = *_currentAtlasDir;
     const std::filesystem::path volpkgRoot = vpkg->path().empty()
@@ -5636,14 +5838,15 @@ void CWindow::remapCurrentAtlas()
         }
     });
 
-    watcher->setFuture(QtConcurrent::run([atlasDir, volpkgRoot, manifestPath]() -> QString {
+    watcher->setFuture(QtConcurrent::run(
+        [atlasDir, volpkgRoot, manifestPath, workingToBaseScale]() -> QString {
         std::cerr << "[atlas-remap] start"
                   << " atlas=" << atlasDir.string()
                   << " volpkg_root=" << volpkgRoot.string()
                   << " manifest=" << manifestPath.string()
                   << std::endl;
         vc::lasagna::LasagnaDataset dataset =
-            vc::lasagna::LasagnaDataset::open(manifestPath);
+            vc::lasagna::LasagnaDataset::open(manifestPath, {workingToBaseScale});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         const vc::atlas::Atlas rebuilt =
             vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler);
@@ -5675,16 +5878,33 @@ void CWindow::optimizeAtlasSnapCandidates()
         return;
     }
     auto vpkg = _state->vpkg();
-    const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-    if (manifestPath.empty() || !std::filesystem::exists(manifestPath)) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("Select a local Lasagna dataset before ranking snap candidates."));
+    std::optional<vc3d::opendata::ResolvedOpenDataLasagna> resolvedLasagna;
+    try {
+        resolvedLasagna = resolvedLasagnaForState(_state);
+    } catch (const std::exception& ex) {
+        QMessageBox::warning(this, tr("Atlas"), QString::fromStdString(ex.what()));
         return;
     }
+    if (!resolvedLasagna || resolvedLasagna->manifestPath.empty() ||
+        !std::filesystem::exists(resolvedLasagna->manifestPath)) {
+        QMessageBox::warning(this,
+                             tr("Atlas"),
+                             tr("No Lasagna dataset matches the active volume."));
+        return;
+    }
+    const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
+    const double workingToBaseScale = resolvedLasagna->workingToBaseScale;
 
     auto& manager = LasagnaServiceManager::instance();
     if (manager.isExternal()) {
+        if (resolvedLasagna->manifestBacked) {
+            QMessageBox::warning(
+                this,
+                tr("Atlas"),
+                tr("Manifest-backed Lasagna is available to local tools only. "
+                   "The external service must use a dataset installed on that service."));
+            return;
+        }
         if (!manager.isRunning()) {
             QMessageBox::warning(this,
                                  tr("Atlas"),
@@ -5798,6 +6018,7 @@ void CWindow::optimizeAtlasSnapCandidates()
              startFinish,
              self,
              serviceManifestPath,
+             workingToBaseScale,
              setRankButtonsEnabled]() mutable {
         prepareWatcher->deleteLater();
         try {
@@ -5813,6 +6034,7 @@ void CWindow::optimizeAtlasSnapCandidates()
 
             nlohmann::json serviceRequest = prepared.rankRequest;
             serviceRequest["manifest"] = serviceManifestPath;
+            serviceRequest["working_to_base_scale"] = workingToBaseScale;
             std::cerr << "[atlas-snap] requesting laplace rank jobs="
                       << jobCount
                       << " service_manifest=" << serviceManifestPath
@@ -5877,7 +6099,8 @@ void CWindow::optimizeAtlasSnapCandidates()
 
     prepareWatcher->setFuture(QtConcurrent::run([atlasDir,
                                                   volpkgRoot,
-                                                  manifestPath]() {
+                                                  manifestPath,
+                                                  workingToBaseScale]() {
         try {
             std::cerr << "[atlas-snap] prepare start"
                       << " atlas=" << atlasDir.string()
@@ -5885,7 +6108,8 @@ void CWindow::optimizeAtlasSnapCandidates()
                       << " manifest=" << manifestPath.string()
                       << std::endl;
             vc::lasagna::LasagnaDataset dataset =
-                vc::lasagna::LasagnaDataset::open(manifestPath);
+                vc::lasagna::LasagnaDataset::open(
+                    manifestPath, {workingToBaseScale});
             vc::lasagna::LasagnaNormalSampler sampler(dataset);
             if (!sampler.hasPredDtChannel()) {
                 throw std::runtime_error("selected Lasagna dataset has no pred_dt channel: " +
@@ -6225,8 +6449,17 @@ void CWindow::startAtlasFiberIntersectionSearch()
     vc::atlas::FiberIntersectionCeresOptions ceres;
 
     std::filesystem::path lasagnaManifestPath;
-    if (_state && _state->vpkg()) {
-        lasagnaManifestPath = _state->vpkg()->selectedLasagnaDatasetPath();
+    double lasagnaWorkingToBaseScale = 1.0;
+    try {
+        if (const auto resolved = resolvedLasagnaForState(_state)) {
+            lasagnaManifestPath = resolved->manifestPath;
+            lasagnaWorkingToBaseScale = resolved->workingToBaseScale;
+        }
+    } catch (const std::exception& ex) {
+        QMessageBox::warning(this,
+                             tr("Atlas Object Search"),
+                             QString::fromStdString(ex.what()));
+        return;
     }
     if (lasagnaManifestPath.empty()) {
         QMessageBox::warning(this,
@@ -6240,6 +6473,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
     auto snapshotsByRuntimeIdForWorker = snapshotsByRuntimeId;
     _atlasSearchFiberSnapshotsByRuntimeId = std::move(snapshotsByRuntimeId);
     _atlasSearchLasagnaManifestPath = lasagnaManifestPath;
+    _atlasSearchLasagnaWorkingToBaseScale = lasagnaWorkingToBaseScale;
     _atlasSearchCancelRequested = false;
     _atlasSearchCancelFlag = std::make_shared<std::atomic_bool>(false);
     for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
@@ -6328,6 +6562,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
                                           fiberPathById = std::move(fiberPathById),
                                           snapshotsByRuntimeId = std::move(snapshotsByRuntimeIdForWorker),
                                           lasagnaManifestPath = std::move(lasagnaManifestPath),
+                                          lasagnaWorkingToBaseScale,
                                           atlasDir = atlasDirForWorker,
                                           cache,
                                           broad,
@@ -6336,7 +6571,8 @@ void CWindow::startAtlasFiberIntersectionSearch()
                                           cancelFlag,
                                           debugSearch]() mutable {
         vc::lasagna::LasagnaDataset dataset =
-            vc::lasagna::LasagnaDataset::open(lasagnaManifestPath);
+            vc::lasagna::LasagnaDataset::open(
+                lasagnaManifestPath, {lasagnaWorkingToBaseScale});
         vc::lasagna::LasagnaNormalSampler windingSampler(dataset);
         bool phase2Started = false;
         bool phase2Ended = false;
@@ -6431,6 +6667,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
                                              snapshotsByRuntimeId,
                                              atlasDir,
                                              lasagnaManifestPath,
+                                             lasagnaWorkingToBaseScale,
                                              progressCallback,
                                              debugSearch);
     }));
@@ -6710,6 +6947,7 @@ void CWindow::clearAtlasSearchPreviewState()
     _atlasSearchSignedWindings.clear();
     _atlasSearchFiberSnapshotsByRuntimeId.clear();
     _atlasSearchLasagnaManifestPath.reset();
+    _atlasSearchLasagnaWorkingToBaseScale = 1.0;
     _atlasSearchHoveredResult.reset();
     _atlasSearchSelectedResults.clear();
     _atlasSearchPreviewRequestedResults.clear();
@@ -6890,6 +7128,7 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
     watcher->setFuture(QtConcurrent::run([
         atlasDir = *_currentAtlasDir,
         manifestPath = *_atlasSearchLasagnaManifestPath,
+        workingToBaseScale = _atlasSearchLasagnaWorkingToBaseScale,
         result,
         sourceSnapshot = sourceIt->second,
         targetSnapshot = targetIt->second,
@@ -6905,7 +7144,8 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
             }
 
             vc::lasagna::LasagnaDataset dataset =
-                vc::lasagna::LasagnaDataset::open(manifestPath);
+                vc::lasagna::LasagnaDataset::open(
+                    manifestPath, {workingToBaseScale});
             vc::lasagna::LasagnaNormalSampler sampler(dataset);
             SurfacePatchIndex baseIndex;
             baseIndex.rebuild({baseSurface});
@@ -6991,20 +7231,24 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
         if (!vpkg) {
             throw std::runtime_error("No volume package is loaded");
         }
-        const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-        if (manifestPath.empty()) {
+        const auto resolvedLasagna = resolvedLasagnaForState(_state);
+        if (!resolvedLasagna || resolvedLasagna->manifestPath.empty()) {
             throw std::runtime_error(
-                "No local Lasagna normal dataset is selected; atlas pred-snap attachments are required");
+                "No Lasagna dataset matches the active volume; atlas pred-snap attachments are required");
         }
+        const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
         if (!std::filesystem::exists(manifestPath)) {
-            throw std::runtime_error("Selected Lasagna normal dataset does not exist");
+            throw std::runtime_error("Selected Lasagna dataset does not exist");
         }
         const std::filesystem::path volpkgRoot = vpkg->path().empty()
             ? std::filesystem::path(vpkg->getVolpkgDirectory())
             : vpkg->path().parent_path();
         auto atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
         vc::lasagna::LasagnaDataset dataset =
-            vc::lasagna::LasagnaDataset::open(manifestPath);
+            vc::lasagna::LasagnaDataset::open(
+                manifestPath,
+                vc::lasagna::LasagnaDatasetOpenOptions{
+                    resolvedLasagna->workingToBaseScale});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler);
         atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
@@ -7091,7 +7335,7 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
                 this,
                 tr("Atlas Rebuild Required"),
                 tr("This atlas was saved with an older or stale mapping format and must be rebuilt "
-                   "from its unchanged source fiber JSON using the selected Lasagna normal dataset.\n\n"
+                   "from its unchanged source fiber JSON using the selected Lasagna dataset.\n\n"
                    "Rebuild now?"),
                 QMessageBox::Yes | QMessageBox::No,
                 QMessageBox::No);
@@ -7103,18 +7347,21 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
                 if (!vpkg) {
                     throw std::runtime_error("No volume package is loaded");
                 }
-                const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-                if (manifestPath.empty()) {
-                    throw std::runtime_error("No local Lasagna normal dataset is selected");
-                }
+                const auto resolvedLasagna = resolvedLasagnaForState(_state);
+                if (!resolvedLasagna || resolvedLasagna->manifestPath.empty())
+                    throw std::runtime_error("No Lasagna dataset matches the active volume");
+                const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
                 if (!std::filesystem::exists(manifestPath)) {
-                    throw std::runtime_error("Selected Lasagna normal dataset does not exist");
+                    throw std::runtime_error("Selected Lasagna dataset does not exist");
                 }
                 const std::filesystem::path volpkgRoot = vpkg->path().empty()
                     ? std::filesystem::path{}
                     : vpkg->path().parent_path();
                 vc::lasagna::LasagnaDataset dataset =
-                    vc::lasagna::LasagnaDataset::open(manifestPath);
+                    vc::lasagna::LasagnaDataset::open(
+                        manifestPath,
+                        vc::lasagna::LasagnaDatasetOpenOptions{
+                            resolvedLasagna->workingToBaseScale});
                 vc::lasagna::LasagnaNormalSampler sampler(dataset);
                 if (!sampler.hasPredDtChannel()) {
                     throw std::runtime_error(
@@ -7509,6 +7756,23 @@ void CWindow::CreateWidgets(void)
 
     connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
             this, &CWindow::onSegmentationEditingModeChanged);
+    connect(_segmentationModule.get(), &SegmentationModule::segmentationFolderChanged,
+            this, [this](const QString& surfaceId) {
+                refreshSegmentationDirectoryDropdown();
+                if (!_state || !_state->vpkg() || !_surfacePanel) {
+                    return;
+                }
+
+                _surfacePanel->setVolumePkg(_state->vpkg());
+                _surfacePanel->resetTagUi();
+                _surfacePanel->loadSurfaces(true);
+                _surfacePanel->refreshPointSetFilterOptions();
+
+                if (!restoreActiveSurfaceAfterSurfaceReload(surfaceId.toStdString())) {
+                    clearSurfaceSelection();
+                    _state->setSurface("segmentation", nullptr, true);
+                }
+            });
     connect(_segmentationModule.get(), &SegmentationModule::statusMessageRequested,
             this, &CWindow::onShowStatusMessage);
     connect(_segmentationModule.get(), &SegmentationModule::stopToolsRequested,
@@ -8454,6 +8718,7 @@ void CWindow::saveWindowState()
 
 void CWindow::closeEvent(QCloseEvent* event)
 {
+    _destroyingWindow = true;
     // Flush a render-bench recording (if any) before teardown.
     if (_benchRecorder && _benchRecorder->attached()) {
         _benchRecorder->save();
@@ -8848,7 +9113,31 @@ std::optional<cv::Matx44d> CWindow::openDataVolumeTransformForSwitch(
 {
     const std::string fromCatalogId = openDataVolumeIdForLoadedVolumeId(fromLoadedVolumeId);
     const std::string toCatalogId = openDataVolumeIdForLoadedVolumeId(toLoadedVolumeId);
-    if (fromCatalogId.empty() || toCatalogId.empty() || fromCatalogId == toCatalogId) {
+    if (fromCatalogId.empty() || toCatalogId.empty()) {
+        return std::nullopt;
+    }
+
+    const auto& pkg = *_state->vpkg();
+    const auto fromLevel = openDataCoordinateLevelForLoadedVolume(pkg, fromLoadedVolumeId);
+    const auto toLevel = openDataCoordinateLevelForLoadedVolume(pkg, toLoadedVolumeId);
+    const auto fromSpace = openDataCoordinateSpaceForLoadedVolume(pkg, fromLoadedVolumeId);
+    const auto toSpace = openDataCoordinateSpaceForLoadedVolume(pkg, toLoadedVolumeId);
+    const bool explicitCoordinates = fromLevel && toLevel &&
+                                     !fromSpace.empty() && !toSpace.empty();
+    if (explicitCoordinates) {
+        if (fromSpace == toSpace)
+            return cv::Matx44d::eye();
+        if (fromCatalogId == toCatalogId) {
+            const double factor = std::ldexp(1.0, *fromLevel - *toLevel);
+            return cv::Matx44d(
+                factor, 0, 0, 0,
+                0, factor, 0, 0,
+                0, 0, factor, 0,
+                0, 0, 0, 1);
+        }
+    } else if (fromCatalogId == toCatalogId) {
+        // Preserve legacy/manual same-lineage behavior when explicit
+        // coordinate identity is unavailable.
         return std::nullopt;
     }
 
@@ -8860,7 +9149,11 @@ std::optional<cv::Matx44d> CWindow::openDataVolumeTransformForSwitch(
     for (const auto& sample : manifest->samples) {
         if (auto matrix = vc3d::opendata::findSampleVolumeTransform(
                 sample, fromCatalogId, toCatalogId)) {
-            return matrix;
+            if (!explicitCoordinates)
+                return matrix;
+            const auto sourceScale = coordinateLevelScale(*fromLevel);
+            const auto targetScaleInv = coordinateLevelScale(-*toLevel);
+            return targetScaleInv * *matrix * sourceScale;
         }
     }
 
@@ -8999,6 +9292,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
     QVector<QPair<QString, QString>> volumeEntries;
     QVector<QPair<QString, QString>> openDataVolumeIdMap;
+    std::set<QString> preferredOpenDataSourceIds;
     std::set<QString> openDataVolumesWithoutSegments;
     std::vector<QString> orderedIds;
     QString activeCandidate = preferredVolumeId;
@@ -9048,16 +9342,31 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
             if (hasOpenDataSegments && !volumeHasOpenDataSegmentsEntry(*_state->vpkg(), id)) {
                 openDataVolumesWithoutSegments.insert(idStr);
             }
-            for (const auto& tag : _state->vpkg()->volumeTags(id)) {
+            const auto loadedVolumeTags = _state->vpkg()->volumeTags(id);
+            const bool preferredOpenDataSource =
+                std::find(loadedVolumeTags.begin(), loadedVolumeTags.end(),
+                          "vc-open-data-preferred-source") != loadedVolumeTags.end();
+            for (const auto& tag : loadedVolumeTags) {
                 constexpr std::string_view prefix = "vc-open-data-volume-id:";
                 if (tag.rfind(prefix, 0) != 0) {
                     continue;
                 }
                 const QString catalogVolumeId =
                     QString::fromStdString(tag.substr(prefix.size()));
-                if (!catalogVolumeId.isEmpty() &&
-                    openDataVolumeIdMappedToLoadedId(catalogVolumeId).isEmpty()) {
-                    openDataVolumeIdMap.append({catalogVolumeId, idStr});
+                if (!catalogVolumeId.isEmpty()) {
+                    const auto existing = std::find_if(
+                        openDataVolumeIdMap.begin(), openDataVolumeIdMap.end(),
+                        [&](const auto& mapping) {
+                            return mapping.first == catalogVolumeId;
+                        });
+                    if (existing == openDataVolumeIdMap.end()) {
+                        openDataVolumeIdMap.append({catalogVolumeId, idStr});
+                    } else if (preferredOpenDataSource &&
+                               !preferredOpenDataSourceIds.contains(catalogVolumeId)) {
+                        existing->second = idStr;
+                    }
+                    if (preferredOpenDataSource)
+                        preferredOpenDataSourceIds.insert(catalogVolumeId);
                 }
             }
 
@@ -9567,6 +9876,8 @@ void CWindow::onEditMaskPressed(const QString& segmentId)
         return;
     _maskRenderInProgress = true;
     showStatusBarMessage(tr("Rendering mask..."));
+    vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+        *surf, *_state->vpkg(), _state->currentVolumeId());
 
     auto* watcher = new QFutureWatcher<void>(this);
     connect(watcher, &QFutureWatcher<void>::finished, this,
@@ -9611,6 +9922,8 @@ void CWindow::onAppendMaskPressed(const QString& segmentId)
 
     std::filesystem::path path = surf->path/"mask.tif";
     auto volume = _state->currentVolume();
+    vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+        *surf, *_state->vpkg(), _state->currentVolumeId());
 
     auto* watcher = new QFutureWatcher<QString>(this);
     connect(watcher, &QFutureWatcher<QString>::finished, this,
@@ -9689,7 +10002,7 @@ QString CWindow::getCurrentVolumePath() const
         return QString();
     }
     if (volume->isRemote()) {
-        return QString::fromStdString(volume->remoteUrl());
+        return QString::fromStdString(volume->remoteLocator());
     }
     return QString::fromStdString(volume->path().string());
 }

@@ -18,8 +18,10 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <iomanip>
 #include <fstream>
 #include <mutex>
+#include <sstream>
 #include <system_error>
 #include <thread>
 
@@ -63,6 +65,18 @@ std::string tagValue(const std::vector<std::string>& tags, std::string_view pref
         }
     }
     return {};
+}
+
+std::string shortArtifactHash(std::string_view value)
+{
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char c : value) {
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return out.str();
 }
 
 // Split "https://host/some/key/prefix" into origin ("https://host") and the
@@ -263,6 +277,14 @@ std::vector<std::string> normalGridsEntryTags(const OpenDataNormalGridsInfo& inf
     if (!info.volumeId.empty()) {
         tags.push_back(std::string(kOpenDataVolumeIdTagPrefix) + info.volumeId);
     }
+    tags.push_back("vc-open-data-source-coordinate-level:" +
+                   std::to_string(info.sourceCoordinateLevel));
+    if (!info.sampleId.empty() && !info.volumeId.empty()) {
+        tags.push_back("vc-open-data-coordinate-space:" + info.sampleId + "/" +
+                       info.volumeId + "@L" +
+                       std::to_string(info.sourceCoordinateLevel));
+    }
+    tags.push_back(std::string(kOpenDataNormalGridsTagPrefix) + info.url);
     return tags;
 }
 
@@ -312,6 +334,43 @@ const OpenDataArtifact* normalGridsArtifact(const OpenDataVolume& volume)
     return findArtifact(volume.artifacts, kNormalGridsArtifactType);
 }
 
+std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
+    const std::string& sampleId,
+    const OpenDataVolume& volume)
+{
+    std::vector<OpenDataNormalGridsInfo> result;
+    for (const auto& artifact : volume.artifacts) {
+        if (artifact.type != kNormalGridsArtifactType) {
+            continue;
+        }
+        // An absent level is the documented legacy L0 convention. A present
+        // but malformed level is not safe to auto-associate with any volume.
+        if (artifact.levelParameterPresent && !artifact.sourceCoordinateLevel) {
+            Logger()->warn("Skipping normal-grids artifact with invalid parameters.level for {}/{}",
+                           sampleId, volume.id);
+            continue;
+        }
+        const auto url = artifactUrl(artifact);
+        if (url.empty()) {
+            continue;
+        }
+        OpenDataNormalGridsInfo info;
+        info.sampleId = sampleId;
+        info.volumeId = volume.id;
+        info.url = url;
+        info.sourceCoordinateLevel = artifact.sourceCoordinateLevel.value_or(0);
+        info.levelWasExplicit = artifact.sourceCoordinateLevel.has_value();
+        const auto duplicate = std::find_if(result.begin(), result.end(), [&](const auto& item) {
+            return item.url == info.url &&
+                   item.sourceCoordinateLevel == info.sourceCoordinateLevel;
+        });
+        if (duplicate == result.end()) {
+            result.push_back(std::move(info));
+        }
+    }
+    return result;
+}
+
 std::string normalGridsArtifactUrl(const OpenDataVolume& volume)
 {
     const auto* artifact = normalGridsArtifact(volume);
@@ -325,6 +384,20 @@ std::optional<OpenDataNormalGridsInfo> normalGridsInfoFromTags(
     info.sampleId = tagValue(tags, kOpenDataSampleIdTagPrefix);
     info.volumeId = tagValue(tags, kOpenDataVolumeIdTagPrefix);
     info.url = tagValue(tags, kOpenDataNormalGridsTagPrefix);
+    const auto level = tagValue(tags, "vc-open-data-source-coordinate-level:");
+    if (!level.empty()) {
+        try {
+            std::size_t parsed = 0;
+            info.sourceCoordinateLevel = std::stoi(level, &parsed);
+            if (parsed != level.size() || info.sourceCoordinateLevel < 0 ||
+                info.sourceCoordinateLevel > 5) {
+                return std::nullopt;
+            }
+            info.levelWasExplicit = true;
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
     if (info.volumeId.empty()) {
         return std::nullopt;
     }
@@ -333,11 +406,18 @@ std::optional<OpenDataNormalGridsInfo> normalGridsInfoFromTags(
 
 std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCacheRoot,
                                           const std::string& sampleId,
-                                          const std::string& volumeId)
+                                          const std::string& volumeId,
+                                          int sourceCoordinateLevel,
+                                          std::string_view url)
 {
-    return remoteCacheRoot / "normal_grids" /
+    auto result = remoteCacheRoot / "normal_grids" /
            safePathComponent(sampleId.empty() ? "sample" : sampleId) /
            safePathComponent(volumeId.empty() ? "volume" : volumeId);
+    if (!url.empty() || sourceCoordinateLevel != 0) {
+        const std::string suffix = url.empty() ? std::string{} : "-" + shortArtifactHash(url);
+        result /= "L" + std::to_string(sourceCoordinateLevel) + suffix;
+    }
+    return result;
 }
 
 bool isCachedNormalGridsDir(const std::filesystem::path& dir)
@@ -356,14 +436,43 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
     if (remoteCacheRoot.empty() || info.url.empty()) {
         return false;
     }
-    const auto dir = normalGridsCacheDir(remoteCacheRoot, info.sampleId, info.volumeId);
+    const auto dir = normalGridsCacheDir(remoteCacheRoot, info.sampleId, info.volumeId,
+                                         info.sourceCoordinateLevel, info.url);
+    const auto legacyDir = normalGridsCacheDir(
+        remoteCacheRoot, info.sampleId, info.volumeId);
+    if (info.sourceCoordinateLevel == 0 && legacyDir != dir) {
+        std::error_code ec;
+        if (!std::filesystem::exists(dir, ec) &&
+            std::filesystem::is_directory(legacyDir, ec)) {
+            bool sameArtifact = false;
+            try {
+                const auto marker = nlohmann::json::parse(
+                    std::ifstream(legacyDir /
+                                  vc::core::util::kNormalGridsRemoteMarker));
+                sameArtifact = marker.value("url", std::string{}) == info.url;
+            } catch (...) {
+            }
+            if (sameArtifact) {
+                std::filesystem::rename(legacyDir, dir, ec);
+                if (!ec)
+                    pkg.relocateNormalGridEntry(legacyDir.string(), dir.string());
+            }
+        }
+    }
     if (!writeRemoteMarker(dir, info.url)) {
         Logger()->warn("Failed to create streaming normal-grid cache at {}", dir.string());
         return false;
     }
     // addNormalGridEntry dedups by location and returns false for duplicates;
     // either way the entry ends up attached.
-    pkg.addNormalGridEntry(dir.string(), normalGridsEntryTags(info));
+    const auto tags = normalGridsEntryTags(info);
+    if (!pkg.addNormalGridEntry(dir.string(), tags)) {
+        pkg.reconcileNormalGridEntryTags(
+            dir.string(), tags,
+            {"vc-open-data-source-coordinate-level:",
+             "vc-open-data-coordinate-space:",
+             std::string(kOpenDataNormalGridsTagPrefix)});
+    }
     return true;
 }
 
@@ -373,15 +482,10 @@ int attachOpenDataNormalGrids(VolumePkg& pkg,
 {
     int attached = 0;
     for (const auto& volume : sample.volumes) {
-        OpenDataNormalGridsInfo info;
-        info.sampleId = sample.id;
-        info.volumeId = volume.id;
-        info.url = normalGridsArtifactUrl(volume);
-        if (info.url.empty()) {
-            continue;
-        }
-        if (attachStreamingNormalGridsEntry(pkg, info, remoteCacheRoot)) {
-            ++attached;
+        for (const auto& info : normalGridsArtifacts(sample.id, volume)) {
+            if (attachStreamingNormalGridsEntry(pkg, info, remoteCacheRoot)) {
+                ++attached;
+            }
         }
     }
     return attached;
@@ -393,47 +497,48 @@ NormalGridsCacheState normalGridsCacheState(
     const OpenDataVolume& volume)
 {
     NormalGridsCacheState state;
-    state.hasArtifact = normalGridsArtifact(volume) != nullptr;
+    const auto artifacts = normalGridsArtifacts(sampleId, volume);
+    state.hasArtifact = !artifacts.empty();
     if (!state.hasArtifact || remoteCacheRoot.empty()) {
         return state;
     }
-
-    const auto dir = normalGridsCacheDir(remoteCacheRoot, sampleId, volume.id);
-    std::error_code ec;
-    if (!std::filesystem::is_directory(dir, ec)) {
-        return state;
-    }
-
-    const auto completeMarker = dir / kCompleteMarker;
-    if (std::filesystem::is_regular_file(completeMarker, ec)) {
-        try {
-            const auto marker = nlohmann::json::parse(std::ifstream(completeMarker));
-            state.complete = true;
-            state.totalBytes = marker.value("bytes", std::uint64_t{0});
-            state.cachedBytes = state.totalBytes;
-            state.cachedFiles = marker.value("files", 0);
-            return state;
-        } catch (...) {
+    state.complete = true;
+    for (const auto& artifact : artifacts) {
+        const auto dir = normalGridsCacheDir(remoteCacheRoot, sampleId, volume.id,
+                                             artifact.sourceCoordinateLevel,
+                                             artifact.url);
+        std::error_code ec;
+        bool artifactComplete = false;
+        const auto completeMarker = dir / kCompleteMarker;
+        if (std::filesystem::is_regular_file(completeMarker, ec)) {
+            try {
+                const auto marker = nlohmann::json::parse(std::ifstream(completeMarker));
+                const auto bytes = marker.value("bytes", std::uint64_t{0});
+                state.totalBytes += bytes;
+                state.cachedBytes += bytes;
+                state.cachedFiles += marker.value("files", 0);
+                artifactComplete = true;
+            } catch (...) {
+            }
         }
-    }
-
-    for (auto it = std::filesystem::recursive_directory_iterator(
-             dir, std::filesystem::directory_options::skip_permission_denied, ec);
-         it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) {
-            break;
-        }
-        if (!it->is_regular_file(ec)) {
+        state.complete = state.complete && artifactComplete;
+        if (artifactComplete || !std::filesystem::is_directory(dir, ec))
             continue;
+        for (auto it = std::filesystem::recursive_directory_iterator(
+                 dir, std::filesystem::directory_options::skip_permission_denied, ec);
+             it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec)
+                break;
+            if (!it->is_regular_file(ec))
+                continue;
+            const auto name = it->path().filename().string();
+            if (name == vc::core::util::kNormalGridsRemoteMarker ||
+                name.ends_with(".missing") ||
+                name.find(".tmp-") != std::string::npos)
+                continue;
+            state.cachedBytes += it->file_size(ec);
+            ++state.cachedFiles;
         }
-        const auto name = it->path().filename().string();
-        if (name == vc::core::util::kNormalGridsRemoteMarker ||
-            name.ends_with(".missing") ||
-            name.find(".tmp-") != std::string::npos) {
-            continue;
-        }
-        state.cachedBytes += it->file_size(ec);
-        ++state.cachedFiles;
     }
     return state;
 }
@@ -451,7 +556,8 @@ std::filesystem::path downloadOpenDataNormalGrids(
         return {};
     }
 
-    const auto finalDir = normalGridsCacheDir(remoteCacheRoot, info.sampleId, info.volumeId);
+    const auto finalDir = normalGridsCacheDir(remoteCacheRoot, info.sampleId, info.volumeId,
+                                              info.sourceCoordinateLevel, info.url);
     std::error_code completeEc;
     if (std::filesystem::is_regular_file(finalDir / kCompleteMarker, completeEc)) {
         return finalDir;
@@ -616,9 +722,8 @@ std::vector<OpenDataNormalGridsInfo> normalGridsAvailabilityFromCachedManifest()
     }
     for (const auto& sample : manifest.samples) {
         for (const auto& volume : sample.volumes) {
-            const auto url = normalGridsArtifactUrl(volume);
-            if (!url.empty()) {
-                result.push_back({sample.id, volume.id, url});
+            for (auto info : normalGridsArtifacts(sample.id, volume)) {
+                result.push_back(std::move(info));
             }
         }
     }

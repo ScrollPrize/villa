@@ -75,6 +75,9 @@ vc_add_test(NAME test_segmentation_autosave_state
     LIBS doctest::doctest
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+vc_add_test(NAME test_surface_display_name
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 vc_add_test(NAME test_segmentation_intersection_invalidation
     LIBS Qt6::Core Qt6::Gui Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -89,6 +92,7 @@ vc_add_test(NAME test_ink_detection_overlay
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/VolumeViewerCmaps.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
@@ -137,6 +141,7 @@ qt6_wrap_cpp(cfiber_widget_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CFiberWidget.hpp)
 vc_add_test(NAME test_fiber_widget
     SOURCES test_fiber_widget.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CFiberWidget.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNameDisplay.cpp
             ${cfiber_widget_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -178,6 +183,8 @@ qt6_wrap_cpp(line_annotation_vccollection_moc ${PROJECT_SOURCE_DIR}/core/include
 qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
 vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
@@ -199,6 +206,9 @@ vc_add_test(NAME test_lasagna_maxflow_graph LIBS doctest::doctest vc_lasagna)
 
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
+
+vc_add_test(NAME test_open_data_coordinate_identity
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 # VCCollection shim: verify the on*() hooks still emit Qt signals. Needs the
 # shim TU + its MOC (it isn't built into a lib anymore).
@@ -263,6 +273,16 @@ target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 if(VC_RUN_BENCHES)
     add_test(NAME bench_volume_sample COMMAND bench_volume_sample)
     set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_volume_sample)
+endif()
+
+add_executable(bench_quadsurface_gen bench_quadsurface_gen.cpp)
+target_link_libraries(bench_quadsurface_gen PRIVATE doctest::doctest vc_core)
+# Perf-regression guard for QuadSurface::gen() (warp helpers + per-surface
+# cache reuse). Loose relative assertion; opt-in via VC_RUN_BENCHES, always
+# built as a target so it's runnable manually.
+if(VC_RUN_BENCHES)
+    add_test(NAME bench_quadsurface_gen COMMAND bench_quadsurface_gen)
+    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_quadsurface_gen)
 endif()
 
 add_executable(bench_chunked_plane_sampler bench_chunked_plane_sampler.cpp)
@@ -334,6 +354,8 @@ vc_add_test(NAME test_gridstore)
 
 vc_add_test(NAME test_gridstore_branches)
 
+vc_add_test(NAME test_gridstore_malformed)
+
 # Live network test: anonymous read of the PHerc 0172 zarr on AWS S3.
 # Soft-skips on network failure so offline runs still pass; set
 # VC_TEST_REQUIRE_NETWORK=1 to flip those skips into hard failures.
@@ -381,6 +403,8 @@ vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_open_data_manifest
     SOURCES test_open_data_manifest.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataLasagna.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataLasagna.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.hpp
@@ -388,7 +412,9 @@ vc_add_test(NAME test_open_data_manifest
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataNormalGrids.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.hpp
-    LIBS doctest::doctest Qt6::Core vc_core
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.hpp
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna)
@@ -486,6 +512,8 @@ vc_add_test(NAME test_volume_pyramid)
 vc_add_test(NAME test_cache_compression)
 
 vc_add_test(NAME test_chunk_cache_persist)
+
+vc_add_test(NAME test_persistent_zarr_cache_budget)
 
 vc_add_test(NAME test_open_data_volume_prefill
     SOURCES test_open_data_volume_prefill.cpp

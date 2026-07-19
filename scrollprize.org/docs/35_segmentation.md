@@ -1,7 +1,6 @@
 ---
 title: "Tutorial: Segmentation"
 sidebar_label: "Segmentation"
-hide_table_of_contents: true
 ---
 
 <head>
@@ -38,9 +37,13 @@ hide_table_of_contents: true
 </head>
 
 
-import { TutorialsTop } from '@site/src/components/TutorialsTop';
 
-<TutorialsTop highlightId={4} />
+
+:::warning[ARCHIVED]
+
+This page has been archived and is no longer maintained. It describes an earlier generation of the Vesuvius Challenge pipeline — tools, data layouts, and results referenced here may have been superseded. See [Open Problems](2026_open_problems) for the current state of the pipeline and [Prizes](prizes) for what is open today.
+
+:::
 
 *Last updated: February 20, 2025*
 
@@ -237,7 +240,7 @@ _Widget for creating initial segmentations which can be used for traces or later
 
 
 
-### Creating an inital segmentation 
+### Creating an initial segmentation 
 
 For all growth or editing actions, you'll need an initial mesh to start from. This can be done either through the GUI or the CLI. 
 
@@ -273,7 +276,7 @@ An existing segmentation can be semi-automatically grown utlizing the tracer opt
 
 ### Correcting errors in a segmentation
 
-There are a few ways to fix errors which occured during segmentation. All parameters controlling these actions are in the `segmentation` widget , and have tooltips which will appear on mouse hover.
+There are a few ways to fix errors which occurred during segmentation. All parameters controlling these actions are in the `segmentation` widget , and have tooltips which will appear on mouse hover.
 
 *Deforming/manipulating the mesh manually by left-clicking or dragging near it* 
 

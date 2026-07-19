@@ -5,6 +5,9 @@
 #include <QPointF>
 #include <QString>
 #include <QStringList>
+#include <QPointer>
+
+#include "OpenDataSegmentCache.hpp"
 
 #include <functional>
 #include <filesystem>
@@ -28,6 +31,8 @@ class QDialog;
 class QDoubleSpinBox;
 class QPushButton;
 class QStandardItemModel;
+class QProgressDialog;
+template <typename T> class QFutureWatcher;
 class QuadSurface;
 class DropdownChecklistButton;
 
@@ -127,6 +132,7 @@ public:
     void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
     bool cycleToNextVisibleSegment();
     bool cycleToPreviousVisibleSegment();
+    void materializeCurrentOpenDataFolder();
 
 signals:
     void surfacesLoaded();
@@ -204,6 +210,10 @@ private:
     void applyTransformWarningStyle(SurfaceTreeWidgetItem* item);
     bool cycleVisibleSegment(int direction);
     std::shared_ptr<QuadSurface> getSurfaceById(const std::string& id) const;
+    bool startOpenDataMaterialization(const std::string& id,
+                                      const std::shared_ptr<QuadSurface>& surface);
+    void activateMaterializedSurface(const std::string& id,
+                                     const std::filesystem::path& path);
 
     UiRefs _ui;
     CState* _state{nullptr};
@@ -229,4 +239,11 @@ private:
     // path. Retained so re-checking a folder (or switching back to a selection
     // that includes it) reuses the already-loaded surfaces.
     std::map<std::string, std::shared_ptr<Segmentation>> _overlaySegmentations;
+    QFutureWatcher<vc3d::opendata::OpenDataSegmentMaterializationResult>*
+        _segmentMaterializationWatcher{nullptr};
+    QFutureWatcher<vc3d::opendata::OpenDataSegmentMaterializationResult>*
+        _folderMaterializationWatcher{nullptr};
+    std::string _pendingMaterializationId;
+    QPointer<QProgressDialog> _segmentMaterializationProgress;
+    QPointer<QProgressDialog> _folderMaterializationProgress;
 };

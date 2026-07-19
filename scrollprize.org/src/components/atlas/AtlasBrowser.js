@@ -92,7 +92,7 @@ function AtlasBrowserInner() {
     if (feat.ink3d && !s.hasInk3d) return false;
     if (feat.ct && !(s.mesh || s.volumeZarr)) return false;
     if (q) {
-      const hay = `${s.id} ${s.display || ""} ${
+      const hay = `${s.id} ${s.label || ""} ${s.display || ""} ${
         (s.content && s.content.work) || ""
       } ${s.desc || ""}`.toLowerCase();
       if (!hay.includes(q)) return false;

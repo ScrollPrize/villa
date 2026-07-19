@@ -104,9 +104,11 @@ jobs:
 
           windows_run="$(find_reusable_run vc3d-windows.yml VC3D-windows-installer)"
           macos_run="$(find_reusable_run vc3d-macos.yml VC3D-macos-app)"
+          linux_run="$(find_reusable_run vc3d-linux.yml VC3D-linux-appimage)"
 
           rebuild_windows=false
           rebuild_macos=false
+          rebuild_linux=false
 
           if [[ -z "$windows_run" ]]; then
             rebuild_windows=true
@@ -124,6 +126,14 @@ jobs:
               --raw-field request_id="$GITHUB_RUN_ID" >/dev/null
           fi
 
+          if [[ -z "$linux_run" ]]; then
+            rebuild_linux=true
+            gh workflow run vc3d-linux.yml \
+              --ref main \
+              --raw-field commit_sha="$PROMOTION_SHA" \
+              --raw-field request_id="$GITHUB_RUN_ID" >/dev/null
+          fi
+
           if [[ "$rebuild_windows" == true ]]; then
             windows_run="$(find_dispatched_run \
               vc3d-windows.yml \
@@ -136,17 +146,27 @@ jobs:
               "VC3D macOS workflow_dispatch $GITHUB_RUN_ID")"
           fi
 
-          # Both package builds have already been dispatched, so these waits do
-          # not serialize the actual Windows and macOS compilation work.
+          if [[ "$rebuild_linux" == true ]]; then
+            linux_run="$(find_dispatched_run \
+              vc3d-linux.yml \
+              "VC3D Linux workflow_dispatch $GITHUB_RUN_ID")"
+          fi
+
+          # Every package build has already been dispatched, so these waits do
+          # not serialize the actual Windows, macOS, and Linux compilation work.
           if [[ "$rebuild_windows" == true ]]; then
             gh run watch "$windows_run" --exit-status --interval 15
           fi
           if [[ "$rebuild_macos" == true ]]; then
             gh run watch "$macos_run" --exit-status --interval 15
           fi
+          if [[ "$rebuild_linux" == true ]]; then
+            gh run watch "$linux_run" --exit-status --interval 15
+          fi
 
           echo "WINDOWS_RUN_ID=$windows_run" >> "$GITHUB_ENV"
           echo "MACOS_RUN_ID=$macos_run" >> "$GITHUB_ENV"
+          echo "LINUX_RUN_ID=$linux_run" >> "$GITHUB_ENV"
 
       - name: Download packages from selected commit
         shell: bash
@@ -160,18 +180,25 @@ jobs:
           gh run download "$MACOS_RUN_ID" \
             --name VC3D-macos-app \
             --dir stable-assets
+          gh run download "$LINUX_RUN_ID" \
+            --name VC3D-linux-appimage \
+            --dir stable-assets
 
           shopt -s nullglob
           windows_exe=(stable-assets/VC3D-*-win64.exe)
           windows_zip=(stable-assets/VC3D-*-win64.zip)
           macos_dmg=(stable-assets/VC3D-*-macos-*.dmg)
           macos_zip=(stable-assets/VC3D-*-macos-*.zip)
+          linux_appimage=(stable-assets/VC3D-*.AppImage)
+          linux_debug=(stable-assets/VC3D-*-debug.tar.zst)
 
           if [[ ${#windows_exe[@]} -ne 1 ||
                 ${#windows_zip[@]} -ne 1 ||
                 ${#macos_dmg[@]} -ne 1 ||
-                ${#macos_zip[@]} -ne 1 ]]; then
-            echo "::error::expected exactly one Windows installer, Windows ZIP, macOS DMG, and macOS ZIP"
+                ${#macos_zip[@]} -ne 1 ||
+                ${#linux_appimage[@]} -ne 1 ||
+                ${#linux_debug[@]} -ne 1 ]]; then
+            echo "::error::expected exactly one Windows installer, Windows ZIP, macOS DMG, macOS ZIP, Linux AppImage, and Linux debug tarball"
             find stable-assets -maxdepth 1 -type f -print
             exit 1
           fi
@@ -201,4 +228,4 @@ jobs:
             --verify-tag \
             --title "VC3D Stable" \
             --notes "Promoted from tested package artifacts built at commit $PROMOTION_SHA." \
-            --latest=false
+            --latest

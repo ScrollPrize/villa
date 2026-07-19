@@ -47,6 +47,27 @@ cmake --build --preset ci-windows-mingw
 cpack --config build/ci-windows-mingw/CPackConfig.cmake
 ```
 
+Alternatively, VC3D builds with the **native MSVC / Visual Studio 2022 toolchain**
+using [vcpkg](https://github.com/microsoft/vcpkg) for dependencies, via the
+`windows-msvc` preset. Bootstrap a vcpkg checkout, then from an *x64 Native Tools
+Command Prompt for VS 2022* (so `cl.exe`/Ninja are on `PATH`):
+
+```bat
+set VCPKG_ROOT=C:\path\to\vcpkg
+cmake --preset windows-msvc
+cmake --build build\windows-msvc
+```
+
+The first configure builds the dependency closure (Qt, OpenCV, Ceres, CGAL, ...)
+from source via vcpkg — this takes a while, but later configures restore it from
+vcpkg's binary cache. The result is `build\windows-msvc\bin\VC3D.exe` with the Qt
+plugins and dependency DLLs deployed alongside it, runnable in place. To work in
+the VS2022 IDE, *Open Folder* on `volume-cartographer/`. Note that the VS
+developer environment forces `VCPKG_ROOT` to the port-less bundled vcpkg, so
+create a `CMakeUserPresets.json` (gitignored) that pins `CMAKE_TOOLCHAIN_FILE` to
+your vcpkg and select the resulting local preset — otherwise VS reconfigures
+against the wrong vcpkg and rebuilds every dependency.
+
 Note: the flatboi SLIM flattening tool (PaStiX-based) is not available on Windows; Docker or WSL still covers that workflow.
 
 #### macOS
@@ -100,6 +121,48 @@ From source :
 
 ### Data 
 VC3D requires a few changes to the data you may already have downloaded. All data must be in OME-Zarr format, of dtype uint8, and contain a meta.json file. To check if your zarr is in uint8 already, open a resolution group zarray file (located at /path/to.zarr/0/.zarray) look at the dtype field. "|u1" is uint8, and "|u2" is uint16. 
+
+### Remote virtual-volume locators
+
+VC3D can expose a public remote pyramid group as logical level 0 without
+copying or renumbering the source Zarr. Append the portable fragment selector
+`#vc-base-scale=N`, where `N` is an integer from 0 through 5:
+
+```text
+https://example.org/volume.zarr#vc-base-scale=2
+s3://bucket/volume.zarr#vc-base-scale=2
+```
+
+Level 0 canonicalizes to the ordinary selector-free locator. For a base-2
+view, source groups `/2`, `/3`, ... become logical levels 0, 1, ...; voxel
+coordinates and voxel size are therefore those of physical `/2`. The source
+must be a contiguous numeric, isotropic dyadic ZYX pyramid with zero coordinate
+translations. Query parameters remain part of the network URL and must precede
+the fragment, for example `volume.zarr?token=abc#vc-base-scale=2`.
+
+Coordinate-bearing artifacts created by VC3D retain the selected source view
+in their JSON metadata (`meta.json`, point collections, fibers, and atlas
+`metadata.json`). For example:
+
+```json
+{
+  "vc_open_data_coordinate_space": "PHerc1451/20260319101107@L2",
+  "vc_open_data_source_path": "s3://path/to/the/source/volume",
+  "vc_open_data_source_coordinate_level": 2,
+  "vc_open_data_source_coordinate_scale_factor": 4,
+  "vc_open_data_source_original_resolution": 2.4
+}
+```
+
+The source path identifies the native volume without the `#vc-base-scale`
+selector. The scale factor is `2^level`, and the original resolution is the
+native level-0 voxel size in micrometers.
+
+The selector is part of persistent volume identity but is never sent in HTTP
+requests. Tools that support remote volumes receive the complete portable
+locator. Local-only tools reject it instead of silently discarding the
+selector. Catalog surfaces, normal grids, and overlays are automatically paired
+only when their explicit coordinate-space tags match the selected view.
 
 The meta.json contains the following information. The only real change from a standard VC meta.json is the inclusion of the `format:"zarr"` key.
 ```json

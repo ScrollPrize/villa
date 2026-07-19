@@ -326,8 +326,12 @@ int main(int argc, char *argv[])
 
     const std::string volume_arg = vol_path.string();
     const bool remote_volume = is_remote_volume_path(volume_arg);
+    const double requested_voxelsize = params.value("voxelsize", 0.0);
+    utils::Json remote_metadata;
+    if (std::isfinite(requested_voxelsize) && requested_voxelsize > 0.0)
+        remote_metadata["voxelsize"] = requested_voxelsize;
     auto volume = remote_volume
-        ? Volume::NewFromUrl(volume_arg)
+        ? Volume::NewFromUrl(volume_arg, {}, {}, remote_metadata)
         : Volume::New(vol_path);
     volume->setCacheBudget(size_t(params.value("cache_size", 1e9)));
     auto* chunk_cache = volume->chunkedCache();

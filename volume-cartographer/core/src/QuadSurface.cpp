@@ -54,6 +54,11 @@
 // Use libtiff for BigTIFF
 #include <tiffio.h>
 
+// GCC/Clang spell the restrict qualifier __restrict__; MSVC only has __restrict.
+#if defined(_MSC_VER)
+#define __restrict__ __restrict
+#endif
+
 namespace {
 
 void replaceFile(const std::filesystem::path& source,

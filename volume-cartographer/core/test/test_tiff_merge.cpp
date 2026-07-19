@@ -9,10 +9,13 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#include <tiffio.h>
+
 #include <cstdint>
 #include <filesystem>
 #include <random>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -67,5 +70,42 @@ TEST_CASE("mergeTiffParts: path is a file, parent dir is scanned")
     bool ok = mergeTiffParts(finalFile, 1);
     CHECK(ok);
     CHECK(fs::exists(finalFile));
+    fs::remove_all(d);
+}
+
+namespace {
+// Write a STRIPPED (non-tiled) TIFF, i.e. one with no TILEWIDTH/TILELENGTH
+// tags — what a corrupt or truncated render part might look like.
+void writeStrippedTiff(const fs::path& path, int rows, int cols, uint8_t v)
+{
+    TIFF* t = TIFFOpen(path.string().c_str(), "w");
+    REQUIRE(t != nullptr);
+    TIFFSetField(t, TIFFTAG_IMAGEWIDTH, uint32_t(cols));
+    TIFFSetField(t, TIFFTAG_IMAGELENGTH, uint32_t(rows));
+    TIFFSetField(t, TIFFTAG_BITSPERSAMPLE, uint16_t(8));
+    TIFFSetField(t, TIFFTAG_SAMPLESPERPIXEL, uint16_t(1));
+    TIFFSetField(t, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    TIFFSetField(t, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+    // No TILEWIDTH/TILELENGTH -> libtiff writes scanline strips.
+    std::vector<uint8_t> row(size_t(cols), v);
+    for (int r = 0; r < rows; ++r)
+        TIFFWriteScanline(t, row.data(), uint32_t(r), 0);
+    TIFFClose(t);
+}
+} // namespace
+
+TEST_CASE("mergeTiffParts: a part missing tile-geometry tags is skipped, not crashed")
+{
+    auto d = tmpDir("stripped");
+    // A stripped part TIFF has no TILEWIDTH/TILELENGTH. On the unfixed merge,
+    // tw/th stay uninitialized and (w + tw - 1) / tw divides by zero / reads
+    // garbage. The hardened merge must skip the group and report failure
+    // (returns false) without crashing.
+    writeStrippedTiff(d / "bad.part0.tif", 32, 32, 7);
+
+    auto finalPath = (d / "bad.tif").string();
+    bool ok = mergeTiffParts(finalPath, /*numParts=*/1);
+    CHECK_FALSE(ok);                       // the only group failed
+    CHECK_FALSE(fs::exists(finalPath));    // nothing written
     fs::remove_all(d);
 }
