@@ -116,6 +116,8 @@ class Volume:
                  path: Optional[str] = None,
                  download_only: bool = False,
                  anon: bool = False,
+                 cache: bool = False,
+                 cache_size_mb: int = 256,
                  ):
 
         """
@@ -157,6 +159,15 @@ class Volume:
         anon : bool, default = False
             If True, use anonymous (unsigned) requests for S3 access.
             Required for public S3 buckets when no AWS credentials are configured.
+        cache : bool, default = False
+            If True, keep an in-memory LRU cache of fetched chunks so repeated
+            reads of the same region (overlapping training patches, viewer
+            panning) are served locally instead of re-fetched from the remote
+            store. Byte-exact: the cache stores compressed chunks as-is, so
+            values are identical with or without it.
+        cache_size_mb : int, default = 256
+            Maximum size of the chunk cache in megabytes. Ignored unless
+            ``cache=True``.
         """
 
         # Initialize basic attributes
@@ -169,6 +180,8 @@ class Volume:
         self.return_as_tensor = return_as_tensor
         self.path = path
         self.verbose = verbose
+        self.cache = cache
+        self.cache_size_mb = cache_size_mb
         self.anon = anon
         self.inklabel = None  # Initialize inklabel
 
@@ -292,12 +305,12 @@ class Volume:
             if isinstance(self.data, zarr.Array):
                 # Direct zarr array case
                 self.dtype = self.data.dtype
-            elif hasattr(self.data[0].dtype, 'numpy_dtype'):
+            elif hasattr(self._level(0).dtype, 'numpy_dtype'):
                 #  case
-                self.dtype = self.data[0].dtype.numpy_dtype
+                self.dtype = self._level(0).dtype.numpy_dtype
             else:
                 # Fallback for other cases
-                self.dtype = self.data[0].dtype
+                self.dtype = self._level(0).dtype
 
             # --- Segment Specific ---
             if self.type == "segment":
@@ -339,7 +352,9 @@ class Volume:
                 path=self.path,
                 mode='r',
                 storage_options=self._s3_storage_options(self.path),
-                verbose=self.verbose
+                verbose=self.verbose,
+                cache=self.cache,
+                cache_size_mb=self.cache_size_mb
             )
 
             # Get original dtype - handle both Array and Group cases
@@ -368,10 +383,10 @@ class Volume:
                     print(f"Zarr Group detected, using array '{first_key}' with shape {first_array.shape}")
             else:
                 # Legacy list case or other iterable
-                if hasattr(self.data[0].dtype, 'numpy_dtype'):
-                    self.dtype = self.data[0].dtype.numpy_dtype
+                if hasattr(self._level(0).dtype, 'numpy_dtype'):
+                    self.dtype = self._level(0).dtype.numpy_dtype
                 else:
-                    self.dtype = self.data[0].dtype
+                    self.dtype = self._level(0).dtype
                 
             if self.verbose:
                 print(f"Successfully opened zarr store: {self.data}")
@@ -521,6 +536,42 @@ class Volume:
             print(f"Error reading or parsing config file {self.configs}: {e}")
             raise
 
+
+
+    def _num_levels(self) -> int:
+        """Number of multiscale levels, memoized.
+
+        ``len()`` of a zarr 3 group lists the store's members, which is a
+        network round trip per call on remote volumes; ``__getitem__`` needs
+        this bound on every read.
+        """
+        if isinstance(self.data, zarr.Array):
+            return 1
+        n = getattr(self, "_num_levels_memo", None)
+        if n is None:
+            n = self._num_levels_memo = len(self.data)
+        return n
+
+    def _level(self, idx: int = 0):
+        """Return multiscale level ``idx`` of ``self.data``.
+
+        zarr 3 requires string keys for group member access (integer keys
+        raise ``TypeError``; zarr 2 accepted ints). Plain arrays
+        (single-scale volumes) are returned as-is. Resolved levels are
+        memoized: group member resolution probes store metadata keys on
+        every call, which is a network round trip per access on remote
+        volumes.
+        """
+        if isinstance(self.data, zarr.Array):
+            return self.data
+        key = str(idx)
+        levels = getattr(self, "_level_memo", None)
+        if levels is None:
+            levels = self._level_memo = {}
+        if key not in levels:
+            levels[key] = self.data[key]
+        return levels[key]
+
     def load_ome_metadata(self) -> Dict[str, Any]:
         """Loads OME-Zarr metadata (.zattrs) from zarr group attributes."""
         # Determine the base URL/path correctly, handling direct path or config-derived URL
@@ -622,7 +673,9 @@ class Volume:
                 path=base_path,
                 mode='r',
                 storage_options=self._s3_storage_options(base_path),
-                verbose=self.verbose
+                verbose=self.verbose,
+                cache=self.cache,
+                cache_size_mb=self.cache_size_mb
             )
             
             if self.verbose:
@@ -754,11 +807,11 @@ class Volume:
             if isinstance(self.data, zarr.Array):
                 data_ndim = self.data.ndim  # Dimensionality of the zarr array
             else:
-                data_ndim = self.data[0].ndim  # Dimensionality of the base resolution
+                data_ndim = self._level(0).ndim  # Dimensionality of the base resolution
             if len(idx) == data_ndim + 1 and isinstance(idx[-1], int):
                 # Assume last element is subvolume index
                 potential_subvolume_idx = idx[-1]
-                if 0 <= potential_subvolume_idx < len(self.data):
+                if 0 <= potential_subvolume_idx < self._num_levels():
                     subvolume_idx = potential_subvolume_idx
                     coord_idx = idx[:-1]  # Use preceding elements as coordinates
                     if len(coord_idx) != data_ndim:
@@ -782,7 +835,7 @@ class Volume:
 
         elif isinstance(idx, (int, slice)):
             # Allow single index/slice if data is 1D (unlikely for volumes but possible)
-            if self.data[subvolume_idx].ndim == 1:
+            if self._level(subvolume_idx).ndim == 1:
                 coord_idx = (idx,)  # Make it a tuple
             else:
                 raise IndexError("Single index/slice provided for multi-dimensional data. Use a tuple (z, y, x, ...).")
@@ -794,8 +847,8 @@ class Volume:
             # Direct zarr array doesn't have subvolumes
             if subvolume_idx != 0:
                 raise IndexError(f"Invalid subvolume index: {subvolume_idx}. Direct zarr array has only index 0.")
-        elif not (0 <= subvolume_idx < len(self.data)):
-            raise IndexError(f"Invalid subvolume index: {subvolume_idx}. Must be between 0 and {len(self.data) - 1}.")
+        elif not (0 <= subvolume_idx < self._num_levels()):
+            raise IndexError(f"Invalid subvolume index: {subvolume_idx}. Must be between 0 and {self._num_levels() - 1}.")
 
         # --- Read Data Slice ---
         if self.verbose:
@@ -803,14 +856,14 @@ class Volume:
             if isinstance(self.data, zarr.Array):
                 print(f"  Store shape: {self.data.shape}, Store dtype: {self.data.dtype}")
             else:
-                print(f"  Store shape: {self.data[subvolume_idx].shape}, Store dtype: {self.data[subvolume_idx].dtype}")
+                print(f"  Store shape: {self._level(subvolume_idx).shape}, Store dtype: {self._level(subvolume_idx).dtype}")
 
         try:
             # Handle the case when self.data is a zarr array directly (from _init_from_zarr_path)
             if isinstance(self.data, zarr.Array):
                 data_slice = self.data[coord_idx]
             else:
-                data_slice = self.data[subvolume_idx][coord_idx]
+                data_slice = self._level(subvolume_idx)[coord_idx]
 
             original_dtype = data_slice.dtype  
 
@@ -823,7 +876,7 @@ class Volume:
             if isinstance(self.data, zarr.Array):
                 print(f"  Store Shape: {self.data.shape}")
             else:
-                print(f"  Store Shape: {self.data[subvolume_idx].shape}")
+                print(f"  Store Shape: {self._level(subvolume_idx).shape}")
             print(f"  Error: {e}")
             raise  # Re-raise the exception
 
@@ -1004,9 +1057,9 @@ class Volume:
             return tuple(self.data.shape)
         
         # Original behavior for when self.data is a list of resolution levels
-        if not (0 <= subvolume_idx < len(self.data)):
-            raise IndexError(f"Invalid subvolume index: {subvolume_idx}. Available: 0 to {len(self.data) - 1}")
-        return tuple(self.data[subvolume_idx].shape)
+        if not (0 <= subvolume_idx < self._num_levels()):
+            raise IndexError(f"Invalid subvolume index: {subvolume_idx}. Available: 0 to {self._num_levels() - 1}")
+        return tuple(self._level(subvolume_idx).shape)
 
     @property
     def ndim(self, subvolume_idx: int = 0) -> int:
@@ -1016,9 +1069,9 @@ class Volume:
             return self.data.ndim
             
         # Original behavior for when self.data is a list of resolution levels
-        if not (0 <= subvolume_idx < len(self.data)):
-            raise IndexError(f"Invalid subvolume index: {subvolume_idx}. Available: 0 to {len(self.data) - 1}")
-        return self.data[subvolume_idx].ndim
+        if not (0 <= subvolume_idx < self._num_levels()):
+            raise IndexError(f"Invalid subvolume index: {subvolume_idx}. Available: 0 to {self._num_levels() - 1}")
+        return self._level(subvolume_idx).ndim
 
 
 class Cube:
