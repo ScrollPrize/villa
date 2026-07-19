@@ -218,6 +218,39 @@ def test_support_mask_is_applied_after_low_probability_threshold() -> None:
     assert masked[0, 0, 0, 1] == 0
 
 
+def test_support_mask_catches_saturated_logits_at_gaussian_corner() -> None:
+    from vesuvius.models.run.blending import generate_gaussian_map
+
+    # The current Gaussian uses sigma=patch/8. At an outer 3-D corner its
+    # weight is smaller than process_chunk's normalization epsilon, so even a
+    # source-side +20/-20 background encoding is attenuated toward equal logits.
+    epsilon = 1e-8
+    corner_weight = float(generate_gaussian_map((16, 16, 16))[0, 0, 0, 0])
+    assert 0.0 < corner_weight < epsilon
+
+    saturated_background = np.array(
+        [20.0, -20.0], dtype=np.float32
+    ).reshape(2, 1, 1, 1)
+    blended_logits = (
+        saturated_background * corner_weight / (corner_weight + epsilon)
+    )
+
+    finalized, is_empty = apply_finalization(
+        blended_logits,
+        num_classes=2,
+        config=FinalizeConfig(mode="binary", threshold=0.2),
+    )
+    assert not is_empty
+    assert finalized.item() == 255
+
+    masked, stats = apply_support_mask(
+        finalized,
+        np.zeros((1, 1, 1), dtype=np.uint8),
+    )
+    assert masked.item() == 0
+    assert stats["nonzero_voxels_removed"] == 1
+
+
 def test_constant_nonzero_logits_are_not_treated_as_empty() -> None:
     output, is_empty = apply_finalization(
         np.full((1, 2, 2, 2), 2.0, dtype=np.float32),

@@ -121,6 +121,10 @@ Without `--threshold`, binary mode outputs a single softmax foreground channel; 
 
 The support mask is applied after softmax and optional prediction thresholding. A voxel remains supported only when its support value is finite and greater than `--support-threshold`; all output values at other voxels are set to background. Public `s3://` support volumes use anonymous access by default. Add `--support-authenticated` only when the support array requires configured AWS credentials.
 
+#### Relation to inference-time masking
+
+For future binary inference, unsupported voxels can also be encoded as strong background logits while the raw input patch is already in memory; simply setting equal binary logits to zero would yield foreground probability `0.5`. [PR #1173](https://github.com/ScrollPrize/villa/pull/1173) explores that source-side prevention layer. It is complementary to final-stage masking: source prevention affects new runs and must respect each target's output semantics, while the support-volume path here is applied after Gaussian blending and probability conversion, can use a separate thresholded support array, records output provenance and statistics, and can repair existing finalized predictions.
+
 For example, [issue #1114](https://github.com/ScrollPrize/villa/issues/1114) compares this public PHerc0332 prediction level:
 
 ```text
