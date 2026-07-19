@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import zarr
+from PIL import Image
 
-from vesuvius.models.benchmarks.benchmark_support_mask import evaluate_plane
+from vesuvius.models.benchmarks.benchmark_support_mask import (
+    evaluate_plane,
+    render_support_mask_preview,
+    run_benchmark,
+)
 from vesuvius.models.run.mask_predictions import (
     _spatial_chunks,
     mask_finalized_predictions,
@@ -78,6 +84,68 @@ def test_benchmark_reports_phantom_removal_and_preservation() -> None:
         'supported_values_preserved': True,
         'nonzero_voxels_removed': 3,
     }
+
+
+def test_benchmark_preview_renders_before_effect_and_after(tmp_path) -> None:
+    prediction = np.array(
+        [[255, 255, 0, 0], [255, 255, 0, 0]],
+        dtype=np.uint8,
+    )
+    support = np.array(
+        [[0, 6, 0, 0], [0, 6, 0, 0]],
+        dtype=np.float32,
+    )
+    metrics = evaluate_plane(
+        prediction,
+        support,
+        prediction_threshold=0,
+        support_threshold=5,
+    )
+    output_path = tmp_path / 'support-mask-preview.png'
+
+    render_support_mask_preview(
+        prediction,
+        support,
+        metrics,
+        output_path,
+        z_index=7,
+        prediction_threshold=0,
+        support_threshold=5,
+        label='fixture',
+        panel_size=4,
+    )
+
+    with Image.open(output_path) as image:
+        assert image.mode == 'RGB'
+        colors = {
+            tuple(pixel) for pixel in np.asarray(image).reshape(-1, 3)
+        }
+    assert (0, 0, 0) in colors
+    assert (255, 255, 255) in colors
+    assert (255, 0, 255) in colors
+
+
+@pytest.mark.parametrize(
+    ('output_image', 'image_plane', 'message'),
+    [
+        ('preview.png', None, 'must be provided together'),
+        (None, 0, 'must be provided together'),
+        ('preview.png', 2, 'must be one of the requested planes'),
+    ],
+)
+def test_benchmark_rejects_invalid_image_options_before_opening_inputs(
+    output_image: str | None,
+    image_plane: int | None,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        run_benchmark(
+            'unused-prediction.zarr',
+            'unused-support.zarr',
+            [0],
+            output_image=None if output_image is None else Path(output_image),
+            image_plane=image_plane,
+        )
 
 
 def test_apply_support_mask_accepts_singleton_channel_and_masks_nan() -> None:

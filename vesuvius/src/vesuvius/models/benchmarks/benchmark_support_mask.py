@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import zarr
+from PIL import Image, ImageDraw, ImageFont
 
 from vesuvius.data.utils import open_zarr
 from vesuvius.models.run.finalize_outputs import (
@@ -126,6 +127,156 @@ def evaluate_plane(
     }
 
 
+def _density_preview(mask: np.ndarray, panel_size: int) -> Image.Image:
+    """Downsample a binary mask into a fixed-size density image."""
+    layer = Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255)
+    return layer.resize(
+        (panel_size, panel_size),
+        resample=Image.Resampling.BOX,
+    )
+
+
+def _draw_centered(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    *,
+    x_center: int,
+    y: int,
+    font: ImageFont.ImageFont,
+) -> None:
+    bounds = draw.textbbox((0, 0), text, font=font)
+    width = bounds[2] - bounds[0]
+    draw.text((x_center - width // 2, y), text, fill="white", font=font)
+
+
+def render_support_mask_preview(
+    prediction: np.ndarray,
+    support: np.ndarray,
+    metrics: dict[str, int | float | bool],
+    output_path: Path,
+    *,
+    z_index: int,
+    prediction_threshold: float = 0.0,
+    support_threshold: float = 0.0,
+    label: str = "Support-mask evidence",
+    panel_size: int = 768,
+) -> None:
+    """Render a deterministic before/effect/after density preview.
+
+    Display downsampling is separate from the full-resolution metrics supplied
+    in ``metrics``. Magenta denotes positive predictions removed because the
+    selected support volume does not support them; white denotes retained
+    positives.
+    """
+    prediction = np.asarray(prediction)
+    support = np.asarray(support)
+    if prediction.ndim != 2 or support.ndim != 2:
+        raise ValueError("prediction and support planes must both be 2D")
+    if prediction.shape != support.shape:
+        raise ValueError(
+            f"Prediction/support plane mismatch: {prediction.shape} vs {support.shape}"
+        )
+    if panel_size < 1:
+        raise ValueError("panel_size must be at least 1")
+
+    positive = prediction > prediction_threshold
+    selected_support = np.isfinite(support) & (support > support_threshold)
+    retained = positive & selected_support
+    removed = positive & ~selected_support
+
+    before = _density_preview(positive, panel_size)
+    retained_density = _density_preview(retained, panel_size)
+    removed_density = _density_preview(removed, panel_size)
+    retained_values = np.asarray(retained_density, dtype=np.uint16)
+    removed_values = np.asarray(removed_density, dtype=np.uint16)
+    effect_values = np.empty((panel_size, panel_size, 3), dtype=np.uint8)
+    combined = np.clip(retained_values + removed_values, 0, 255).astype(np.uint8)
+    effect_values[:, :, 0] = combined
+    effect_values[:, :, 1] = retained_values.astype(np.uint8)
+    effect_values[:, :, 2] = combined
+    effect = Image.fromarray(effect_values)
+    after = Image.merge("RGB", (retained_density,) * 3)
+    before = Image.merge("RGB", (before,) * 3)
+
+    margin = 24
+    gap = 16
+    header_height = 70
+    label_height = 34
+    footer_height = 92
+    width = 2 * margin + 3 * panel_size + 2 * gap
+    height = header_height + label_height + panel_size + footer_height
+    canvas = Image.new("RGB", (width, height), "black")
+    draw = ImageDraw.Draw(canvas)
+    title_font = ImageFont.load_default(size=24)
+    label_font = ImageFont.load_default(size=17)
+    footer_font = ImageFont.load_default(size=17)
+
+    header = (
+        f"{label} | z={z_index} | prediction > {prediction_threshold:g} | "
+        f"selected CT support > {support_threshold:g}"
+    )
+    _draw_centered(
+        draw,
+        header,
+        x_center=width // 2,
+        y=20,
+        font=title_font,
+    )
+
+    panels = (
+        ("Before: all positive predictions", before),
+        ("Effect: magenta removed; white retained", effect),
+        ("After: support-masked positives", after),
+    )
+    panel_y = header_height + label_height
+    for index, (panel_label, panel) in enumerate(panels):
+        panel_x = margin + index * (panel_size + gap)
+        _draw_centered(
+            draw,
+            panel_label,
+            x_center=panel_x + panel_size // 2,
+            y=header_height,
+            font=label_font,
+        )
+        canvas.paste(panel, (panel_x, panel_y))
+
+    positives_before = int(metrics["positive_voxels_before"])
+    positives_removed = int(metrics["phantom_positives_before"])
+    removed_fraction = (
+        positives_removed / positives_before if positives_before else 0.0
+    )
+    preserved = "yes" if bool(metrics["supported_values_preserved"]) else "no"
+    summary = (
+        f"Removed {positives_removed:,} / {positives_before:,} positives "
+        f"({removed_fraction:.4%}); unsupported positives after: "
+        f"{int(metrics['phantom_positives_after']):,}; "
+        f"supported values preserved: {preserved}."
+    )
+    limitation = (
+        f"Downsampled density preview of one {prediction.shape[0]}x"
+        f"{prediction.shape[1]} plane; exact counts are full-resolution. "
+        "Post-processing only, not model re-inference."
+    )
+    footer_y = panel_y + panel_size + 16
+    _draw_centered(
+        draw,
+        summary,
+        x_center=width // 2,
+        y=footer_y,
+        font=footer_font,
+    )
+    _draw_centered(
+        draw,
+        limitation,
+        x_center=width // 2,
+        y=footer_y + 30,
+        font=footer_font,
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path, format="PNG", optimize=False, compress_level=9)
+
+
 def run_benchmark(
     prediction_path: str,
     support_path: str,
@@ -134,7 +285,15 @@ def run_benchmark(
     prediction_threshold: float = 0.0,
     support_threshold: float = 0.0,
     anonymous: bool = True,
+    output_image: Path | None = None,
+    image_plane: int | None = None,
+    image_label: str = "Support-mask evidence",
 ) -> dict:
+    if (output_image is None) != (image_plane is None):
+        raise ValueError("output_image and image_plane must be provided together")
+    if image_plane is not None and image_plane not in planes:
+        raise ValueError("image_plane must be one of the requested planes")
+
     storage_options = (
         {"anon": anonymous} if prediction_path.startswith("s3://") else None
     )
@@ -156,6 +315,7 @@ def run_benchmark(
         )
 
     plane_results = []
+    image_payload = None
     started = time.perf_counter()
     for z_index in planes:
         plane_started = time.perf_counter()
@@ -179,6 +339,8 @@ def run_benchmark(
             }
         )
         plane_results.append(metrics)
+        if image_plane == z_index:
+            image_payload = (prediction, support, metrics.copy())
 
     totals = {
         key: sum(int(result[key]) for result in plane_results)
@@ -211,7 +373,7 @@ def run_benchmark(
         bool(result["supported_values_preserved"]) for result in plane_results
     )
 
-    return {
+    report = {
         "schema_version": 2,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "prediction_path": prediction_path,
@@ -234,6 +396,25 @@ def run_benchmark(
             "platform": platform.platform(),
         },
     }
+    if output_image is not None and image_payload is not None:
+        prediction, support, image_metrics = image_payload
+        render_support_mask_preview(
+            prediction,
+            support,
+            image_metrics,
+            output_image,
+            z_index=int(image_plane),
+            prediction_threshold=prediction_threshold,
+            support_threshold=support_threshold,
+            label=image_label,
+        )
+        report["evidence_image"] = {
+            "z_index": int(image_plane),
+            "rendering": "fixed-extent downsampled density preview",
+            "magenta": "positive prediction removed outside selected support",
+            "white": "positive prediction retained inside selected support",
+        }
+    return report
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -257,6 +438,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Use configured credentials instead of anonymous S3 access.",
     )
     parser.add_argument("--output-json", type=Path, default=None)
+    parser.add_argument(
+        "--output-image",
+        type=Path,
+        default=None,
+        help="Write a before/effect/after PNG for --image-plane.",
+    )
+    parser.add_argument(
+        "--image-plane",
+        type=int,
+        default=None,
+        help="One requested Z plane to render with --output-image.",
+    )
+    parser.add_argument(
+        "--image-label",
+        default="Support-mask evidence",
+        help="Short artifact label rendered in the evidence image.",
+    )
     return parser
 
 
@@ -269,12 +467,17 @@ def main() -> int:
         prediction_threshold=args.prediction_threshold,
         support_threshold=args.support_threshold,
         anonymous=not args.authenticated,
+        output_image=args.output_image,
+        image_plane=args.image_plane,
+        image_label=args.image_label,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.write_text(rendered + "\n", encoding="utf-8")
         print(f"Report written to {args.output_json}")
+    if args.output_image is not None:
+        print(f"Image written to {args.output_image}")
     print(rendered)
     return 0
 

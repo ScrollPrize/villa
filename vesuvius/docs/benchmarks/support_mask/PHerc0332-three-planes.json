@@ -1,0 +1,107 @@
+{
+  "aggregate": {
+    "intersecting_chunk_bytes_uncompressed_upper_bound": 14910221760,
+    "logical_plane_bytes": 93188886,
+    "nonzero_voxels_removed": 4500993,
+    "phantom_fraction_after": 0.0,
+    "phantom_fraction_before": 0.6667640915054774,
+    "phantom_positives_after": 0,
+    "phantom_positives_before": 4500993,
+    "positive_voxels_after": 2249510,
+    "positive_voxels_before": 6750503,
+    "spatial_voxels": 46594443,
+    "support_fraction": 0.26149446619632305,
+    "supported_values_preserved": true,
+    "supported_voxels": 12184189
+  },
+  "anonymous_access": true,
+  "created_utc": "2026-07-19T00:07:55.530560+00:00",
+  "elapsed_seconds": 79.14217900001677,
+  "environment": {
+    "numpy": "2.5.1",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.6",
+    "zarr": "3.2.1"
+  },
+  "evidence_image": {
+    "magenta": "positive prediction removed outside selected support",
+    "rendering": "fixed-extent downsampled density preview",
+    "white": "positive prediction retained inside selected support",
+    "z_index": 4224
+  },
+  "planes": [
+    {
+      "elapsed_seconds": 25.665426400024444,
+      "intersecting_chunk_bytes_uncompressed_upper_bound": 4970073920,
+      "logical_plane_bytes": 31062962,
+      "nonzero_voxels_removed": 1538875,
+      "phantom_fraction_after": 0.0,
+      "phantom_fraction_before": 0.6809910618747671,
+      "phantom_positives_after": 0,
+      "phantom_positives_before": 1538875,
+      "positive_voxels_after": 720883,
+      "positive_voxels_before": 2259758,
+      "spatial_voxels": 15531481,
+      "support_fraction": 0.24699215741241934,
+      "supported_values_preserved": true,
+      "supported_voxels": 3836154,
+      "z_index": 2000
+    },
+    {
+      "elapsed_seconds": 26.492006599961314,
+      "intersecting_chunk_bytes_uncompressed_upper_bound": 4970073920,
+      "logical_plane_bytes": 31062962,
+      "nonzero_voxels_removed": 1598695,
+      "phantom_fraction_after": 0.0,
+      "phantom_fraction_before": 0.6717397808004598,
+      "phantom_positives_after": 0,
+      "phantom_positives_before": 1598695,
+      "positive_voxels_after": 781237,
+      "positive_voxels_before": 2379932,
+      "spatial_voxels": 15531481,
+      "support_fraction": 0.2656093774959387,
+      "supported_values_preserved": true,
+      "supported_voxels": 4125307,
+      "z_index": 4224
+    },
+    {
+      "elapsed_seconds": 26.984501599974465,
+      "intersecting_chunk_bytes_uncompressed_upper_bound": 4970073920,
+      "logical_plane_bytes": 31062962,
+      "nonzero_voxels_removed": 1363423,
+      "phantom_fraction_after": 0.0,
+      "phantom_fraction_before": 0.6459231585175949,
+      "phantom_positives_after": 0,
+      "phantom_positives_before": 1363423,
+      "positive_voxels_after": 747390,
+      "positive_voxels_before": 2110813,
+      "spatial_voxels": 15531481,
+      "support_fraction": 0.271881863680611,
+      "supported_values_preserved": true,
+      "supported_voxels": 4222728,
+      "z_index": 6000
+    }
+  ],
+  "prediction_chunks": [
+    192,
+    192,
+    192
+  ],
+  "prediction_dtype": "uint8",
+  "prediction_path": "s3://vesuvius-challenge-open-data/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr/0",
+  "prediction_shape": [
+    8398,
+    3941,
+    3941
+  ],
+  "prediction_threshold": 0.0,
+  "schema_version": 2,
+  "support_chunks": [
+    128,
+    128,
+    128
+  ],
+  "support_dtype": "uint8",
+  "support_path": "s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/2",
+  "support_threshold": 5.0
+}

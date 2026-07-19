@@ -187,7 +187,10 @@ uv run --extra blending python -m vesuvius.models.benchmarks.benchmark_support_m
   s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/2 \
   --planes 2000 4224 6000 \
   --support-threshold 5 \
-  --output-json PHerc0332-support-audit.json
+  --output-json docs/benchmarks/support_mask/PHerc0332-three-planes.json \
+  --image-plane 4224 \
+  --output-image docs/images/support_mask_pherc0332_z4224_before_after.png \
+  --image-label "PHerc0332 public prediction"
 ```
 
 The JSON report includes per-plane and aggregate phantom-positive fractions,
@@ -196,6 +199,32 @@ array metadata. It materializes only one prediction/support plane pair at a
 time. `logical_plane_bytes` is the in-memory NumPy payload; the separate
 intersecting-chunk upper bound describes uncompressed 3-D chunk payload and is
 not a claim about compressed network transfer.
+
+The optional image uses the same uncropped plane and fixed scaling in all three
+panels. It is a downsampled density preview only; the displayed counts are
+computed at full resolution. Magenta marks positive predictions removed outside
+the selected CT support, and white marks retained positives. This demonstrates
+post-processing of the published prediction, not model re-inference or a claim
+of full-volume validation.
+
+![PHerc0332 z=4224 before, removal effect, and after support masking](images/support_mask_pherc0332_z4224_before_after.png)
+
+The checked-in raw reports make the counts and exact public inputs independently
+auditable:
+
+- [PHerc0332 planes 2000, 4224, and 6000](benchmarks/support_mask/PHerc0332-three-planes.json)
+- [PHerc1451 plane 7493](benchmarks/support_mask/PHerc1451-plane-7493.json)
+
+The PHerc1451 report can be regenerated with:
+
+```bash
+uv run --extra blending python -m vesuvius.models.benchmarks.benchmark_support_mask \
+  s3://vesuvius-challenge-open-data/PHerc1451/representations/predictions/surfaces/20260319101107-surface-20260413222639-surface-m7-L2-th0.2.zarr/0 \
+  s3://vesuvius-challenge-open-data/PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr/2 \
+  --planes 7493 \
+  --support-threshold 5 \
+  --output-json docs/benchmarks/support_mask/PHerc1451-plane-7493.json
+```
 
 ## Full Remote Workflow Example
 
