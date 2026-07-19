@@ -97,6 +97,11 @@ struct GeneratedOverlay {
         double distance = std::numeric_limits<double>::quiet_NaN();
         bool projectedBranchLink = false;
         std::optional<cv::Vec3f> connectorStart;
+        uint64_t sourceFiberId = 0;
+        uint64_t otherFiberId = 0;
+        double otherArclength = std::numeric_limits<double>::quiet_NaN();
+        double sourceLinePosition = std::numeric_limits<double>::quiet_NaN();
+        double sourceArclength = std::numeric_limits<double>::quiet_NaN();
     };
 
     std::vector<cv::Vec3f> linePoints;
@@ -910,12 +915,15 @@ struct GeneratedControlPointContextMenuOptions {
     size_t linePointCount = 0;
     double linePosition = std::numeric_limits<double>::quiet_NaN();
     bool stripViewer = false;
+    Qt::KeyboardModifiers modifiers = Qt::NoModifier;
     cv::Vec3f branchLinkDirection{std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN()};
     std::function<void(double, cv::Vec3f)> deleteControlPoint;
     std::function<void(size_t, cv::Vec3f, bool, cv::Vec3f)> addBranch;
     std::function<void(uint64_t, int)> openBranch;
+    std::vector<GeneratedOverlay::FiberIntersectionMarker> fiberIntersections;
+    std::function<void(const GeneratedOverlay::FiberIntersectionMarker&)> inspectFiberIntersection;
 };
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,

@@ -394,6 +394,50 @@ TEST_CASE("Fiber intersection search runs two-sided discovery and preserves dist
     CHECK(sourceArclengths[1] == doctest::Approx(300.0).epsilon(1e-5));
 }
 
+TEST_CASE("Fiber-only all-pairs search uses voxel distance cache and deduplicates symmetric pairs")
+{
+    vc::atlas::FiberIntersectionCache cache;
+    auto source = fiber(1, 7, {p(0, 0, 0), p(10, 0, 0)});
+    auto target = fiber(2, 11, {p(5, 3, -5), p(5, 3, 5)});
+
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    broad.maxDistance = 5.0;
+    broad.maxSampleSpacing = 1.0;
+    broad.clusterArclength = 1.0;
+    vc::atlas::FiberIntersectionCeresOptions ceres;
+    ceres.deduplicateArclength = 1.0;
+
+    const auto first = vc::atlas::searchFiberIntersections(
+        {source, target},
+        {1, 2},
+        {1, 2},
+        &cache,
+        broad,
+        ceres,
+        nullptr);
+
+    REQUIRE(first.size() == 1);
+    CHECK(first[0].sourceFiberId == 1);
+    CHECK(first[0].targetFiberId == 2);
+    CHECK(first[0].windingDistance == doctest::Approx(3.0).epsilon(1e-5));
+    CHECK_FALSE(first[0].cacheHit);
+
+    const auto second = vc::atlas::searchFiberIntersections(
+        {source, target},
+        {1, 2},
+        {1, 2},
+        &cache,
+        broad,
+        ceres,
+        nullptr);
+
+    REQUIRE(second.size() == 1);
+    CHECK(second[0].sourceFiberId == 1);
+    CHECK(second[0].targetFiberId == 2);
+    CHECK(second[0].windingDistance == doctest::Approx(3.0).epsilon(1e-5));
+    CHECK(second[0].cacheHit);
+}
+
 TEST_CASE("Fiber intersection search matches legacy indexed candidate refinement")
 {
     vc::atlas::FiberIntersectionCache cache;

@@ -2695,6 +2695,101 @@ QDockWidget* createAtlasSearchDock(QWidget* parent)
     return dock;
 }
 
+QDockWidget* createFiberIntersectionSearchDock(QWidget* parent)
+{
+    auto* dock = new QDockWidget(QObject::tr("Fiber Intersection Search"), parent);
+    auto* content = new QWidget(dock);
+    content->setObjectName(QStringLiteral("fiberIntersectionSearchContent"));
+    auto* layout = new QVBoxLayout(content);
+    layout->setContentsMargins(8, 8, 8, 8);
+    layout->setSpacing(6);
+
+    auto* current = new QLabel(QObject::tr("No fibers available"), content);
+    current->setObjectName(QStringLiteral("fiberIntersectionSearchCurrentLabel"));
+    current->setWordWrap(true);
+    layout->addWidget(current);
+
+    auto* form = new QFormLayout();
+    form->setContentsMargins(0, 0, 0, 0);
+
+    auto* tagFilter = new QLineEdit(content);
+    tagFilter->setObjectName(QStringLiteral("fiberIntersectionSearchTagFilterEdit"));
+    tagFilter->setPlaceholderText(QObject::tr("tag-a, tag-b"));
+    tagFilter->setClearButtonEnabled(true);
+    tagFilter->setToolTip(QObject::tr(
+        "Only consider fibers that have all listed tags. Separate tags with commas or spaces."));
+    form->addRow(QObject::tr("Fiber tags"), tagFilter);
+
+    auto* excludeTagFilter = new QLineEdit(content);
+    excludeTagFilter->setObjectName(QStringLiteral("fiberIntersectionSearchExcludeTagFilterEdit"));
+    excludeTagFilter->setPlaceholderText(QObject::tr("bad, skip"));
+    excludeTagFilter->setClearButtonEnabled(true);
+    excludeTagFilter->setToolTip(QObject::tr(
+        "Exclude fibers that have any listed tag. Separate tags with commas or spaces."));
+    form->addRow(QObject::tr("Exclude tags"), excludeTagFilter);
+
+    auto* maxDistance = new QDoubleSpinBox(content);
+    maxDistance->setObjectName(QStringLiteral("fiberIntersectionSearchMaxDistanceSpin"));
+    maxDistance->setRange(1.0, 100000.0);
+    maxDistance->setDecimals(2);
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        maxDistance->setValue(settings.value(
+            vc3d::settings::atlas::FIBER_INTERSECTION_SEARCH_MAX_DISTANCE,
+            vc::atlas::FiberIntersectionBroadPhaseOptions{}.maxDistance).toDouble());
+    }
+    maxDistance->setSuffix(QObject::tr(" vx"));
+    maxDistance->setToolTip(QObject::tr(
+        "Broad-phase segment radius in original voxel coordinates. Segment pairs farther apart than this are not sent to Ceres."));
+    form->addRow(QObject::tr("Max straight distance"), maxDistance);
+
+    auto* groupByFiber = new QCheckBox(QObject::tr("Group results by fiber"), content);
+    groupByFiber->setObjectName(QStringLiteral("fiberIntersectionSearchGroupByFiberCheck"));
+    groupByFiber->setChecked(true);
+    groupByFiber->setToolTip(QObject::tr(
+        "Show each fiber as a group with all matching fiber pairs beneath it."));
+    form->addRow(QString(), groupByFiber);
+    layout->addLayout(form);
+
+    auto* buttons = new QHBoxLayout();
+    auto* run = new QPushButton(QObject::tr("Search"), content);
+    run->setObjectName(QStringLiteral("fiberIntersectionSearchRunButton"));
+    auto* cancel = new QPushButton(QObject::tr("Cancel"), content);
+    cancel->setObjectName(QStringLiteral("fiberIntersectionSearchCancelButton"));
+    cancel->setEnabled(false);
+    buttons->addWidget(run);
+    buttons->addWidget(cancel);
+    buttons->addStretch(1);
+    layout->addLayout(buttons);
+
+    auto* progress = new QProgressBar(content);
+    progress->setObjectName(QStringLiteral("fiberIntersectionSearchProgressBar"));
+    progress->setRange(0, 100);
+    progress->setValue(0);
+    layout->addWidget(progress);
+
+    auto* tree = new QTreeWidget(content);
+    tree->setObjectName(QStringLiteral("fiberIntersectionSearchResultTree"));
+    tree->setColumnCount(5);
+    tree->setHeaderLabels({
+        QObject::tr("Distance (vx)"),
+        QObject::tr("Source fiber"),
+        QObject::tr("Target fiber"),
+        QObject::tr("Src idx"),
+        QObject::tr("Tgt idx"),
+    });
+    tree->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    tree->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    tree->setAlternatingRowColors(true);
+    tree->setRootIsDecorated(true);
+    tree->header()->setStretchLastSection(true);
+    layout->addWidget(tree, 1);
+
+    dock->setWidget(content);
+    return dock;
+}
+
 constexpr float kEpsilon = 1e-6f;
 
 cv::Vec3f projectVectorOntoPlane(const cv::Vec3f& v, const cv::Vec3f& normal)
@@ -2975,6 +3070,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 refreshAtlasOverviewDocks();
                 updateAtlasFiberDocks();
                 updateAtlasSearchDocks();
+                updateFiberIntersectionSearchDocks();
                 if (!pkg) return;
                 pkg->setSegmentsChangedCallback(
                     [self = QPointer<CWindow>(this)]() {
@@ -3010,6 +3106,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this,
             &CWindow::displayAtlasFromDirectory);
     connect(_lineAnnotationController.get(),
+            &LineAnnotationController::fiberIntersectionInspectionRequested,
+            this,
+            &CWindow::openFiberIntersectionInspection);
+    connect(_lineAnnotationController.get(),
             &LineAnnotationController::lineAnnotationWorkspaceRequested,
             this,
             &CWindow::openLineAnnotationWorkspace);
@@ -3019,6 +3119,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             [this](uint64_t fiberId, uint64_t) {
                 _fiberIntersectionCache.pruneFiber(fiberId);
                 updateAtlasSearchDocks();
+                updateFiberIntersectionSearchDocks();
             });
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fibersDeleted,
@@ -3028,6 +3129,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                     _fiberIntersectionCache.pruneFiber(fiberId);
                 }
                 updateAtlasSearchDocks();
+                updateFiberIntersectionSearchDocks();
             });
     connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this, [this](VolumeViewerBase* viewer) {
         if (!viewer) {
@@ -3316,6 +3418,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                ui.dockWidgetDistanceTransform,
                                _atlasOverviewDock,
                                _atlasSearchDock,
+                               _fiberIntersectionSearchDock,
                                ui.dockWidgetOverlay,
                                _inkDetectionDock,
                                _transformsDock,
@@ -3355,6 +3458,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                _transformsDock,
                                _atlasOverviewDock,
                                _atlasSearchDock,
+                               _fiberIntersectionSearchDock,
                                static_cast<QDockWidget*>(_atlasControlDock),
                                _atlasWorkspaceOverviewDock,
                                _atlasWorkspaceSearchDock,
@@ -3396,6 +3500,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                    _transformsDock,
                                    _atlasOverviewDock,
                                    _atlasSearchDock,
+                                   _fiberIntersectionSearchDock,
                                    static_cast<QDockWidget*>(_atlasControlDock),
                                    _atlasWorkspaceOverviewDock,
                                    _atlasWorkspaceSearchDock,
@@ -3423,6 +3528,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                   static_cast<QDockWidget*>(_wrapAnnotationWidget),
                                   _atlasOverviewDock,
                                   _atlasSearchDock,
+                                  _fiberIntersectionSearchDock,
                                   static_cast<QDockWidget*>(_atlasControlDock),
                                   static_cast<QDockWidget*>(_fiberWidget)}) {
             _statusDockPanelHost->addDock(dock);
@@ -3747,10 +3853,11 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(menu, _point_collection_widget);
     addDock(menu, _wrapAnnotationWidget);
 
-    if (_fiberWidget || _fiberSliceWidget) {
+    if (_fiberWidget || _fiberSliceWidget || _fiberIntersectionSearchDock) {
         auto* fiberMenu = menu->addMenu(tr("Fibers"));
         addDock(fiberMenu, _fiberWidget);
         addDock(fiberMenu, _fiberSliceWidget);
+        addDock(fiberMenu, _fiberIntersectionSearchDock);
     }
 }
 
@@ -3860,12 +3967,15 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
             connect(graphicsView,
                     &CVolumeViewerView::sendAnnotationContextMenuRequested,
                     this,
-                    [this, viewer](QPointF scenePoint, QPoint globalPos, Qt::KeyboardModifiers) {
+                    [this, viewer](QPointF scenePoint,
+                                   QPoint globalPos,
+                                   Qt::KeyboardModifiers modifiers) {
                         if (_lineAnnotationController &&
                             _lineAnnotationController->showGeneratedControlPointContextMenu(
                                 viewer,
                                 scenePoint,
-                                globalPos)) {
+                                globalPos,
+                                modifiers)) {
                             return;
                         }
 
@@ -5173,8 +5283,15 @@ void CWindow::createAtlasWorkspace()
     _atlasSearchDock->setObjectName(QStringLiteral("dockWidgetAtlasSearch"));
     _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _atlasSearchDock);
 
+    _fiberIntersectionSearchDock = createFiberIntersectionSearchDock(this);
+    _fiberIntersectionSearchDock->setObjectName(
+        QStringLiteral("dockWidgetFiberIntersectionSearch"));
+    _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea,
+                                           _fiberIntersectionSearchDock);
+
     _atlasOverviewDock->hide();
     _atlasSearchDock->hide();
+    _fiberIntersectionSearchDock->hide();
 
     auto connectOverview = [this](QDockWidget* dock) {
         if (!dock || !dock->widget()) {
@@ -5457,9 +5574,77 @@ void CWindow::createAtlasWorkspace()
     };
     connectSearchDock(_atlasSearchDock);
     connectSearchDock(_atlasWorkspaceSearchDock);
+
+    auto connectFiberIntersectionSearchDock = [this](QDockWidget* dock) {
+        if (!dock || !dock->widget()) {
+            return;
+        }
+        if (auto* run = dock->widget()->findChild<QPushButton*>(
+                QStringLiteral("fiberIntersectionSearchRunButton"))) {
+            connect(run, &QPushButton::clicked, this, &CWindow::startFiberIntersectionSearch);
+        }
+        if (auto* cancel = dock->widget()->findChild<QPushButton*>(
+                QStringLiteral("fiberIntersectionSearchCancelButton"))) {
+            connect(cancel, &QPushButton::clicked, this, &CWindow::cancelFiberIntersectionSearch);
+        }
+        if (auto* maxDistance = dock->widget()->findChild<QDoubleSpinBox*>(
+                QStringLiteral("fiberIntersectionSearchMaxDistanceSpin"))) {
+            connect(maxDistance,
+                    QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                    this,
+                    [](double value) {
+                        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                        settings.setValue(
+                            vc3d::settings::atlas::FIBER_INTERSECTION_SEARCH_MAX_DISTANCE,
+                            value);
+                    });
+        }
+        if (auto* groupByFiber = dock->widget()->findChild<QCheckBox*>(
+                QStringLiteral("fiberIntersectionSearchGroupByFiberCheck"))) {
+            connect(groupByFiber,
+                    &QCheckBox::toggled,
+                    this,
+                    [this]() {
+                        if (!_fiberIntersectionSearchCancelFlag &&
+                            !_fiberIntersectionSearchResults.empty()) {
+                            populateFiberIntersectionSearchResults(
+                                _fiberIntersectionSearchResults);
+                        }
+                    });
+        }
+        if (auto* tree = dock->widget()->findChild<QTreeWidget*>(
+                QStringLiteral("fiberIntersectionSearchResultTree"))) {
+            auto openFromItem = [this, tree](QTreeWidgetItem* item) {
+                if (!item ||
+                    tree->property("vc_fiber_intersection_opening_result").toBool()) {
+                    return;
+                }
+                const auto resultIndex = atlasSearchResultIndexForItem(item);
+                if (!resultIndex) {
+                    return;
+                }
+                tree->setProperty("vc_fiber_intersection_opening_result", true);
+                QTimer::singleShot(0, tree, [tree]() {
+                    tree->setProperty("vc_fiber_intersection_opening_result", false);
+                });
+                openFiberIntersectionSearchResult(*resultIndex);
+            };
+            connect(tree,
+                    &QTreeWidget::itemDoubleClicked,
+                    this,
+                    openFromItem);
+            connect(tree,
+                    &QTreeWidget::itemActivated,
+                    this,
+                    openFromItem);
+        }
+    };
+    connectFiberIntersectionSearchDock(_fiberIntersectionSearchDock);
+
     refreshAtlasOverviewDocks();
     updateAtlasFiberDocks();
     updateAtlasSearchDocks();
+    updateFiberIntersectionSearchDocks();
 }
 
 void CWindow::refreshAtlasOverviewDocks()
@@ -5766,6 +5951,50 @@ void CWindow::updateAtlasSearchDocks()
         if (auto* remap = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasRemapButton"))) {
             remap->setEnabled(atlasUsable);
         }
+    }
+}
+
+void CWindow::updateFiberIntersectionSearchDocks()
+{
+    const auto snapshots = _lineAnnotationController
+        ? _lineAnnotationController->fiberSnapshotsFromStorageAndOpenWithPaths()
+        : std::vector<LineAnnotationController::FiberSnapshotWithPath>{};
+    const bool running = static_cast<bool>(_fiberIntersectionSearchCancelFlag);
+    const bool hasAnyFibers = !snapshots.empty();
+    const bool canSearch = snapshots.size() >= 2 && !running;
+
+    if (!_fiberIntersectionSearchDock || !_fiberIntersectionSearchDock->widget()) {
+        return;
+    }
+    auto* dock = _fiberIntersectionSearchDock;
+    if (auto* label = dock->widget()->findChild<QLabel*>(
+            QStringLiteral("fiberIntersectionSearchCurrentLabel"))) {
+        label->setText(tr("%1 saved/open fiber(s) available")
+                           .arg(static_cast<int>(snapshots.size())));
+    }
+    if (auto* run = dock->widget()->findChild<QPushButton*>(
+            QStringLiteral("fiberIntersectionSearchRunButton"))) {
+        run->setEnabled(canSearch);
+    }
+    if (auto* tagFilter = dock->widget()->findChild<QLineEdit*>(
+            QStringLiteral("fiberIntersectionSearchTagFilterEdit"))) {
+        tagFilter->setEnabled(hasAnyFibers && !running);
+    }
+    if (auto* excludeTagFilter = dock->widget()->findChild<QLineEdit*>(
+            QStringLiteral("fiberIntersectionSearchExcludeTagFilterEdit"))) {
+        excludeTagFilter->setEnabled(hasAnyFibers && !running);
+    }
+    if (auto* maxDistance = dock->widget()->findChild<QDoubleSpinBox*>(
+            QStringLiteral("fiberIntersectionSearchMaxDistanceSpin"))) {
+        maxDistance->setEnabled(hasAnyFibers && !running);
+    }
+    if (auto* groupByFiber = dock->widget()->findChild<QCheckBox*>(
+            QStringLiteral("fiberIntersectionSearchGroupByFiberCheck"))) {
+        groupByFiber->setEnabled(hasAnyFibers);
+    }
+    if (auto* cancel = dock->widget()->findChild<QPushButton*>(
+            QStringLiteral("fiberIntersectionSearchCancelButton"))) {
+        cancel->setEnabled(running);
     }
 }
 
@@ -6226,10 +6455,387 @@ void CWindow::updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase phas
     }
 }
 
+void CWindow::cancelFiberIntersectionSearch()
+{
+    _fiberIntersectionSearchCancelRequested = true;
+    if (_fiberIntersectionSearchCancelFlag) {
+        _fiberIntersectionSearchCancelFlag->store(true, std::memory_order_relaxed);
+    }
+    qInfo().noquote() << QStringLiteral("[fiber-intersection-search] cancel requested phase=%1 completed=%2 total=%3")
+        .arg(atlasSearchPhaseNumber(_fiberIntersectionSearchProgressPhase))
+        .arg(static_cast<qulonglong>(_fiberIntersectionSearchPhaseCompleted))
+        .arg(static_cast<qulonglong>(_fiberIntersectionSearchPhaseTotal));
+    if (!_fiberIntersectionSearchDock || !_fiberIntersectionSearchDock->widget()) {
+        return;
+    }
+    if (auto* progress = _fiberIntersectionSearchDock->widget()->findChild<QProgressBar*>(
+            QStringLiteral("fiberIntersectionSearchProgressBar"))) {
+        progress->setRange(0, 100);
+        progress->setValue(vc::atlas::atlasSearchPhaseProgressPercent(
+            _fiberIntersectionSearchProgressPhase,
+            _fiberIntersectionSearchPhaseCompleted,
+            _fiberIntersectionSearchPhaseTotal));
+        progress->setFormat(tr("Canceling: phase %1/%2 %3 (%4 / %5)")
+                                .arg(atlasSearchPhaseNumber(_fiberIntersectionSearchProgressPhase))
+                                .arg(ATLAS_SEARCH_PHASE_COUNT)
+                                .arg(atlasSearchPhaseAction(_fiberIntersectionSearchProgressPhase))
+                                .arg(static_cast<qulonglong>(_fiberIntersectionSearchPhaseCompleted))
+                                .arg(static_cast<qulonglong>(_fiberIntersectionSearchPhaseTotal)));
+    }
+    if (auto* cancel = _fiberIntersectionSearchDock->widget()->findChild<QPushButton*>(
+            QStringLiteral("fiberIntersectionSearchCancelButton"))) {
+        cancel->setEnabled(false);
+    }
+    if (auto* tree = _fiberIntersectionSearchDock->widget()->findChild<QTreeWidget*>(
+            QStringLiteral("fiberIntersectionSearchResultTree"))) {
+        tree->clear();
+    }
+}
+
+void CWindow::updateFiberIntersectionSearchProgress(
+    vc::atlas::AtlasSearchProgressPhase phase,
+    std::size_t completed,
+    std::size_t total)
+{
+    _fiberIntersectionSearchProgressPhase = phase;
+    _fiberIntersectionSearchPhaseCompleted =
+        total == 0 ? completed : std::min(completed, total);
+    _fiberIntersectionSearchPhaseTotal = total;
+
+    const int percent = vc::atlas::atlasSearchPhaseProgressPercent(
+        phase,
+        _fiberIntersectionSearchPhaseCompleted,
+        total);
+    const QString action = atlasSearchPhaseAction(phase);
+    const QString format = _fiberIntersectionSearchCancelRequested
+        ? tr("Canceling: phase %1/%2 %3 (%4 / %5)")
+              .arg(atlasSearchPhaseNumber(phase))
+              .arg(ATLAS_SEARCH_PHASE_COUNT)
+              .arg(action)
+              .arg(static_cast<qulonglong>(_fiberIntersectionSearchPhaseCompleted))
+              .arg(static_cast<qulonglong>(total))
+        : tr("Phase %1/%2: %3 (%4 / %5)")
+              .arg(atlasSearchPhaseNumber(phase))
+              .arg(ATLAS_SEARCH_PHASE_COUNT)
+              .arg(action)
+              .arg(static_cast<qulonglong>(_fiberIntersectionSearchPhaseCompleted))
+              .arg(static_cast<qulonglong>(total));
+
+    if (!_fiberIntersectionSearchDock || !_fiberIntersectionSearchDock->widget()) {
+        return;
+    }
+    if (auto* progress = _fiberIntersectionSearchDock->widget()->findChild<QProgressBar*>(
+            QStringLiteral("fiberIntersectionSearchProgressBar"))) {
+        progress->setRange(0, 100);
+        progress->setValue(percent);
+        progress->setFormat(format);
+    }
+}
+
+void CWindow::startFiberIntersectionSearch()
+{
+    if (!_lineAnnotationController) {
+        updateFiberIntersectionSearchDocks();
+        return;
+    }
+    if (_atlasSearchCancelFlag) {
+        QMessageBox::information(this,
+                                 tr("Fiber Intersection Search"),
+                                 tr("Wait for the atlas object search to finish or cancel it first."));
+        return;
+    }
+
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    QStringList requiredTags;
+    QStringList excludedTags;
+    if (_fiberIntersectionSearchDock && _fiberIntersectionSearchDock->widget()) {
+        if (auto* tagFilter = _fiberIntersectionSearchDock->widget()->findChild<QLineEdit*>(
+                QStringLiteral("fiberIntersectionSearchTagFilterEdit"))) {
+            requiredTags = atlasSearchTagList(tagFilter->text());
+        }
+        if (auto* excludeTagFilter = _fiberIntersectionSearchDock->widget()->findChild<QLineEdit*>(
+                QStringLiteral("fiberIntersectionSearchExcludeTagFilterEdit"))) {
+            excludedTags = atlasSearchTagList(excludeTagFilter->text());
+        }
+        if (auto* spin = _fiberIntersectionSearchDock->widget()->findChild<QDoubleSpinBox*>(
+                QStringLiteral("fiberIntersectionSearchMaxDistanceSpin"))) {
+            broad.maxDistance = spin->value();
+        }
+    }
+
+    const auto fiberSnapshots =
+        _lineAnnotationController->fiberSnapshotsFromStorageAndOpenWithPaths();
+    if (fiberSnapshots.size() < 2) {
+        updateFiberIntersectionSearchDocks();
+        QMessageBox::information(this,
+                                 tr("Fiber Intersection Search"),
+                                 tr("At least two saved or open fibers are required."));
+        return;
+    }
+
+    std::vector<std::filesystem::path> canonicalPaths;
+    canonicalPaths.reserve(fiberSnapshots.size());
+    for (const auto& snapshot : fiberSnapshots) {
+        canonicalPaths.push_back(snapshot.fiberPath);
+    }
+    const auto runtimeIds = vc::atlas::makeFiberRuntimeIdentityMap(canonicalPaths);
+    std::vector<vc::atlas::FiberPolyline> fibers;
+    std::vector<uint64_t> fiberIds;
+    std::unordered_map<uint64_t, AtlasSearchFiberSnapshot> snapshotsByRuntimeId;
+    fibers.reserve(fiberSnapshots.size());
+    fiberIds.reserve(fiberSnapshots.size());
+    snapshotsByRuntimeId.reserve(fiberSnapshots.size());
+
+    qInfo().noquote() << QStringLiteral("[fiber-intersection-search] phase=1 prepare_inputs start total=%1")
+        .arg(static_cast<qulonglong>(fiberSnapshots.size()));
+    updateFiberIntersectionSearchProgress(vc::atlas::AtlasSearchProgressPhase::PrepareInputs,
+                                          0,
+                                          fiberSnapshots.size());
+    std::size_t preparedFibers = 0;
+    for (const auto& snapshot : fiberSnapshots) {
+        const uint64_t runtimeId = runtimeIds.idForPath(snapshot.fiberPath);
+        if (runtimeId == 0 || snapshot.storedFiberId == 0) {
+            continue;
+        }
+        auto fiber = snapshot.fiber;
+        fiber.id = runtimeId;
+        fibers.push_back(std::move(fiber));
+        fiberIds.push_back(runtimeId);
+        auto previewFiber = snapshot.fiber;
+        previewFiber.id = runtimeId;
+        snapshotsByRuntimeId.emplace(
+            runtimeId,
+            AtlasSearchFiberSnapshot{
+                snapshot.fiberPath,
+                std::move(previewFiber),
+                snapshot.storedFiberId,
+                snapshot.hvClassification,
+                snapshot.manualHvTag,
+                snapshot.tags});
+        ++preparedFibers;
+        updateFiberIntersectionSearchProgress(vc::atlas::AtlasSearchProgressPhase::PrepareInputs,
+                                              preparedFibers,
+                                              fiberSnapshots.size());
+    }
+    qInfo().noquote() << QStringLiteral("[fiber-intersection-search] phase=1 prepare_inputs end completed=%1 total=%2")
+        .arg(static_cast<qulonglong>(preparedFibers))
+        .arg(static_cast<qulonglong>(fiberSnapshots.size()));
+
+    if (!requiredTags.isEmpty() || !excludedTags.isEmpty()) {
+        fiberIds.erase(std::remove_if(fiberIds.begin(),
+                                      fiberIds.end(),
+                                      [&snapshotsByRuntimeId,
+                                       &requiredTags,
+                                       &excludedTags](uint64_t id) {
+                                          const auto it = snapshotsByRuntimeId.find(id);
+                                          return it == snapshotsByRuntimeId.end() ||
+                                                 !atlasSearchFiberMatchesTags(it->second.tags,
+                                                                              requiredTags) ||
+                                                 atlasSearchFiberHasAnyTag(it->second.tags,
+                                                                           excludedTags);
+                                      }),
+                       fiberIds.end());
+    }
+    if (fiberIds.size() < 2) {
+        QMessageBox::information(this,
+                                 tr("Fiber Intersection Search"),
+                                 tr("At least two fibers must match the search filters."));
+        return;
+    }
+
+    const std::size_t pairTotal = fiberIds.size() * fiberIds.size();
+    qInfo().noquote() << QStringLiteral("[fiber-intersection-search] start fibers=%1 pairs=%2")
+        .arg(static_cast<qulonglong>(fiberIds.size()))
+        .arg(static_cast<qulonglong>(pairTotal));
+
+    vc::atlas::FiberIntersectionCeresOptions ceres;
+    _fiberIntersectionSearchResults.clear();
+    _fiberIntersectionSearchFiberSnapshotsByRuntimeId = snapshotsByRuntimeId;
+    _fiberIntersectionSearchCancelRequested = false;
+    _fiberIntersectionSearchCancelFlag = std::make_shared<std::atomic_bool>(false);
+    if (_fiberIntersectionSearchDock && _fiberIntersectionSearchDock->widget()) {
+        if (auto* run = _fiberIntersectionSearchDock->widget()->findChild<QPushButton*>(
+                QStringLiteral("fiberIntersectionSearchRunButton"))) {
+            run->setEnabled(false);
+        }
+        if (auto* cancel = _fiberIntersectionSearchDock->widget()->findChild<QPushButton*>(
+                QStringLiteral("fiberIntersectionSearchCancelButton"))) {
+            cancel->setEnabled(true);
+        }
+        if (auto* tree = _fiberIntersectionSearchDock->widget()->findChild<QTreeWidget*>(
+                QStringLiteral("fiberIntersectionSearchResultTree"))) {
+            tree->clear();
+        }
+    }
+    updateFiberIntersectionSearchDocks();
+
+    const auto searchStart = std::chrono::steady_clock::now();
+    auto* watcher = new QFutureWatcher<std::vector<vc::atlas::FiberIntersectionResult>>(this);
+    connect(watcher,
+            &QFutureWatcher<std::vector<vc::atlas::FiberIntersectionResult>>::finished,
+            this,
+            [this,
+             watcher,
+             cancelFlag = _fiberIntersectionSearchCancelFlag,
+             searchStart]() {
+                std::vector<vc::atlas::FiberIntersectionResult> results;
+                try {
+                    results = watcher->result();
+                } catch (const std::exception& ex) {
+                    QMessageBox::warning(
+                        this,
+                        tr("Fiber Intersection Search"),
+                        tr("Could not search fiber intersections: %1")
+                            .arg(extractFutureExceptionMessage(ex)));
+                }
+                watcher->deleteLater();
+                const bool canceled = cancelFlag && cancelFlag->load(std::memory_order_relaxed);
+                if (!canceled && !_fiberIntersectionSearchCancelRequested) {
+                    for (auto& result : results) {
+                        if (auto it = _fiberIntersectionSearchFiberSnapshotsByRuntimeId.find(
+                                result.sourceFiberId);
+                            it != _fiberIntersectionSearchFiberSnapshotsByRuntimeId.end()) {
+                            result.sourceFiberId = it->second.storedFiberId;
+                            result.sourceGeneration = it->second.fiber.generation;
+                        }
+                        if (auto it = _fiberIntersectionSearchFiberSnapshotsByRuntimeId.find(
+                                result.targetFiberId);
+                            it != _fiberIntersectionSearchFiberSnapshotsByRuntimeId.end()) {
+                            result.targetFiberId = it->second.storedFiberId;
+                            result.targetGeneration = it->second.fiber.generation;
+                        }
+                    }
+                    populateFiberIntersectionSearchResults(results);
+                    if (statusBar()) {
+                        showStatusBarMessage(
+                            tr("Fiber intersection search found %1 result(s)")
+                                .arg(static_cast<int>(results.size())),
+                            3000);
+                    }
+                } else {
+                    updateFiberIntersectionSearchProgress(
+                        vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                        1,
+                        1);
+                    if (_fiberIntersectionSearchDock &&
+                        _fiberIntersectionSearchDock->widget()) {
+                        if (auto* progress =
+                                _fiberIntersectionSearchDock->widget()->findChild<QProgressBar*>(
+                                    QStringLiteral("fiberIntersectionSearchProgressBar"))) {
+                            progress->setFormat(tr("Canceled"));
+                        }
+                    }
+                    if (statusBar()) {
+                        showStatusBarMessage(tr("Fiber intersection search canceled"), 3000);
+                    }
+                }
+                const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - searchStart).count();
+                qInfo().noquote() << QStringLiteral("[fiber-intersection-search] final result_count=%1 canceled=%2 elapsed_ms=%3")
+                    .arg(static_cast<qulonglong>(results.size()))
+                    .arg(canceled || _fiberIntersectionSearchCancelRequested ? QStringLiteral("yes") : QStringLiteral("no"))
+                    .arg(static_cast<qlonglong>(elapsedMs));
+                _fiberIntersectionSearchCancelRequested = false;
+                if (_fiberIntersectionSearchCancelFlag == cancelFlag) {
+                    _fiberIntersectionSearchCancelFlag.reset();
+                }
+                updateFiberIntersectionSearchDocks();
+            });
+
+    vc::atlas::FiberIntersectionCache* cache = &_fiberIntersectionCache;
+    QPointer<CWindow> self(this);
+    auto cancelFlag = _fiberIntersectionSearchCancelFlag;
+    watcher->setFuture(QtConcurrent::run([fibers = std::move(fibers),
+                                          fiberIds = std::move(fiberIds),
+                                          cache,
+                                          broad,
+                                          ceres,
+                                          self,
+                                          cancelFlag]() mutable {
+        bool phase2Started = false;
+        bool phase2Ended = false;
+        bool phase3Started = false;
+        bool phase3Ended = false;
+        auto progressCallback = [self,
+                                 cancelFlag,
+                                 &phase2Started,
+                                 &phase2Ended,
+                                 &phase3Started,
+                                 &phase3Ended](vc::atlas::AtlasSearchProgressPhase phase,
+                                               std::size_t completed,
+                                               std::size_t total) {
+            bool* started = nullptr;
+            bool* ended = nullptr;
+            if (phase == vc::atlas::AtlasSearchProgressPhase::BuildSpatialIndex) {
+                started = &phase2Started;
+                ended = &phase2Ended;
+            } else if (phase == vc::atlas::AtlasSearchProgressPhase::SearchPairs) {
+                started = &phase3Started;
+                ended = &phase3Ended;
+            }
+            if (started && !*started && completed == 0) {
+                *started = true;
+                qInfo().noquote() << QStringLiteral("[fiber-intersection-search] phase=%1 %2 start total=%3")
+                    .arg(atlasSearchPhaseNumber(phase))
+                    .arg(atlasSearchPhaseAction(phase).toLower().replace(QChar(' '), QChar('_')))
+                    .arg(static_cast<qulonglong>(total));
+            }
+            if (ended && !*ended && completed >= total) {
+                *ended = true;
+                qInfo().noquote() << QStringLiteral("[fiber-intersection-search] phase=%1 %2 end completed=%3 total=%4")
+                    .arg(atlasSearchPhaseNumber(phase))
+                    .arg(atlasSearchPhaseAction(phase).toLower().replace(QChar(' '), QChar('_')))
+                    .arg(static_cast<qulonglong>(completed))
+                    .arg(static_cast<qulonglong>(total));
+            }
+            if (!self) {
+                return;
+            }
+            QMetaObject::invokeMethod(self.data(), [self, cancelFlag, phase, completed, total]() {
+                if (!self || self->_fiberIntersectionSearchCancelFlag != cancelFlag) {
+                    return;
+                }
+                self->updateFiberIntersectionSearchProgress(phase, completed, total);
+            }, Qt::QueuedConnection);
+        };
+        auto cancelCallback = [cancelFlag]() {
+            return cancelFlag && cancelFlag->load(std::memory_order_relaxed);
+        };
+        auto results = vc::atlas::searchFiberIntersections(fibers,
+                                                           fiberIds,
+                                                           fiberIds,
+                                                           cache,
+                                                           broad,
+                                                           ceres,
+                                                           nullptr,
+                                                           progressCallback,
+                                                           cancelCallback);
+        if (cancelCallback()) {
+            return std::vector<vc::atlas::FiberIntersectionResult>{};
+        }
+        std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
+            if (a.windingDistance != b.windingDistance) {
+                return a.windingDistance < b.windingDistance;
+            }
+            if (a.sourceFiberId != b.sourceFiberId) {
+                return a.sourceFiberId < b.sourceFiberId;
+            }
+            return a.targetFiberId < b.targetFiberId;
+        });
+        return results;
+    }));
+}
+
 void CWindow::startAtlasFiberIntersectionSearch()
 {
     if (!_lineAnnotationController) {
         updateAtlasSearchDocks();
+        return;
+    }
+    if (_fiberIntersectionSearchCancelFlag) {
+        QMessageBox::information(this,
+                                 tr("Atlas Object Search"),
+                                 tr("Wait for the fiber intersection search to finish or cancel it first."));
         return;
     }
 
@@ -6913,6 +7519,211 @@ void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberInter
     updateAtlasSearchPreviewCandidates();
 }
 
+void CWindow::populateFiberIntersectionSearchResults(
+    const std::vector<vc::atlas::FiberIntersectionResult>& results)
+{
+    struct FiberDisplayInfo {
+        QString label;
+        double lengthVx = 0.0;
+    };
+    std::unordered_map<uint64_t, FiberDisplayInfo> fiberInfo;
+    if (_lineAnnotationController) {
+        for (const auto& fiber : _lineAnnotationController->fiberSummaries()) {
+            QString label = QString::number(fiber.id);
+            if (!fiber.name.empty()) {
+                label = tr("%1 (%2)")
+                    .arg(QString::fromStdString(fiber.name))
+                    .arg(fiber.id);
+            }
+            fiberInfo[fiber.id] = FiberDisplayInfo{label, fiber.lengthVx};
+        }
+    }
+
+    auto fiberLabel = [&fiberInfo](uint64_t fiberId) {
+        const auto it = fiberInfo.find(fiberId);
+        if (it != fiberInfo.end()) {
+            return it->second.label;
+        }
+        return QString::number(fiberId);
+    };
+    auto arclengthFraction = [&fiberInfo](uint64_t fiberId, double arclength) {
+        const auto it = fiberInfo.find(fiberId);
+        if (it == fiberInfo.end() || !std::isfinite(it->second.lengthVx) ||
+            it->second.lengthVx <= 0.0 || !std::isfinite(arclength)) {
+            return 0.0;
+        }
+        return std::clamp(arclength / it->second.lengthVx, 0.0, 1.0);
+    };
+
+    _fiberIntersectionSearchResults = results;
+    const std::size_t finishTotal =
+        std::max<std::size_t>(1, _fiberIntersectionSearchResults.size());
+    qInfo().noquote() << QStringLiteral("[fiber-intersection-search] phase=%1 finishing_results start total=%2")
+        .arg(atlasSearchPhaseNumber(vc::atlas::AtlasSearchProgressPhase::FinishResults))
+        .arg(static_cast<qulonglong>(finishTotal));
+    updateFiberIntersectionSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                                          0,
+                                          finishTotal);
+
+    if (!_fiberIntersectionSearchDock || !_fiberIntersectionSearchDock->widget()) {
+        return;
+    }
+    auto* tree = _fiberIntersectionSearchDock->widget()->findChild<QTreeWidget*>(
+        QStringLiteral("fiberIntersectionSearchResultTree"));
+    if (!tree) {
+        return;
+    }
+    tree->clear();
+    tree->setColumnCount(5);
+    tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    tree->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tree->setHeaderLabels({
+        tr("Distance (vx)"),
+        tr("Source fiber"),
+        tr("Target fiber"),
+        tr("Src idx"),
+        tr("Tgt idx"),
+    });
+    const bool groupByFiber = [&]() {
+        if (auto* check = _fiberIntersectionSearchDock->widget()->findChild<QCheckBox*>(
+                QStringLiteral("fiberIntersectionSearchGroupByFiberCheck"))) {
+            return check->isChecked();
+        }
+        return true;
+    }();
+
+    auto fillResultRow = [&](QTreeWidgetItem* row, int resultIndex) {
+        const auto& result =
+            _fiberIntersectionSearchResults[static_cast<size_t>(resultIndex)];
+        row->setData(0, ATLAS_SEARCH_RESULT_INDEX_ROLE, resultIndex);
+        row->setText(0, QString::number(result.windingDistance, 'f', 3));
+        row->setTextAlignment(0, Qt::AlignRight | Qt::AlignVCenter);
+        row->setText(1, fiberLabel(result.sourceFiberId));
+        row->setText(2, fiberLabel(result.targetFiberId));
+        row->setText(3, QString::number(arclengthFraction(result.sourceFiberId,
+                                                          result.sourceArclength),
+                                        'f',
+                                        6));
+        row->setTextAlignment(3, Qt::AlignRight | Qt::AlignVCenter);
+        row->setText(4, QString::number(arclengthFraction(result.targetFiberId,
+                                                          result.targetArclength),
+                                        'f',
+                                        6));
+        row->setTextAlignment(4, Qt::AlignRight | Qt::AlignVCenter);
+    };
+
+    if (!groupByFiber) {
+        for (int rowIndex = 0;
+             rowIndex < static_cast<int>(_fiberIntersectionSearchResults.size());
+             ++rowIndex) {
+            auto* row = new QTreeWidgetItem(tree);
+            fillResultRow(row, rowIndex);
+            updateFiberIntersectionSearchProgress(
+                vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                static_cast<std::size_t>(rowIndex) + 1,
+                finishTotal);
+        }
+        if (_fiberIntersectionSearchResults.empty()) {
+            updateFiberIntersectionSearchProgress(
+                vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                1,
+                finishTotal);
+        }
+    } else {
+        struct FiberGroup {
+            uint64_t fiberId = 0;
+            std::vector<int> resultIndices;
+            std::set<uint64_t> partnerFiberIds;
+        };
+        std::map<uint64_t, FiberGroup> groupsByFiber;
+        for (int rowIndex = 0;
+             rowIndex < static_cast<int>(_fiberIntersectionSearchResults.size());
+             ++rowIndex) {
+            const auto& result =
+                _fiberIntersectionSearchResults[static_cast<size_t>(rowIndex)];
+            auto addToGroup = [&](uint64_t fiberId, uint64_t partnerFiberId) {
+                auto& group = groupsByFiber[fiberId];
+                group.fiberId = fiberId;
+                group.resultIndices.push_back(rowIndex);
+                group.partnerFiberIds.insert(partnerFiberId);
+            };
+            addToGroup(result.sourceFiberId, result.targetFiberId);
+            addToGroup(result.targetFiberId, result.sourceFiberId);
+            updateFiberIntersectionSearchProgress(
+                vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                static_cast<std::size_t>(rowIndex) + 1,
+                finishTotal);
+        }
+
+        std::vector<FiberGroup> groups;
+        groups.reserve(groupsByFiber.size());
+        for (auto& [fiberId, group] : groupsByFiber) {
+            (void)fiberId;
+            std::sort(group.resultIndices.begin(),
+                      group.resultIndices.end(),
+                      [&](int a, int b) {
+                          const auto& ra =
+                              _fiberIntersectionSearchResults[static_cast<size_t>(a)];
+                          const auto& rb =
+                              _fiberIntersectionSearchResults[static_cast<size_t>(b)];
+                          if (ra.windingDistance != rb.windingDistance) {
+                              return ra.windingDistance < rb.windingDistance;
+                          }
+                          if (ra.sourceFiberId != rb.sourceFiberId) {
+                              return ra.sourceFiberId < rb.sourceFiberId;
+                          }
+                          return ra.targetFiberId < rb.targetFiberId;
+                      });
+            groups.push_back(std::move(group));
+        }
+        std::sort(groups.begin(), groups.end(), [&](const FiberGroup& a, const FiberGroup& b) {
+            if (a.partnerFiberIds.size() != b.partnerFiberIds.size()) {
+                return a.partnerFiberIds.size() > b.partnerFiberIds.size();
+            }
+            return fiberLabel(a.fiberId) < fiberLabel(b.fiberId);
+        });
+
+        for (const FiberGroup& group : groups) {
+            auto* root = new QTreeWidgetItem(tree);
+            root->setText(0,
+                          tr("%1 - %2 total pairs, %3 intersections")
+                              .arg(fiberLabel(group.fiberId))
+                              .arg(static_cast<int>(group.partnerFiberIds.size()))
+                              .arg(static_cast<int>(group.resultIndices.size())));
+            root->setData(0,
+                          ATLAS_SEARCH_FIBER_ID_ROLE,
+                          QVariant::fromValue<qulonglong>(group.fiberId));
+            root->setFirstColumnSpanned(true);
+            root->setFlags(root->flags() & ~Qt::ItemIsSelectable);
+            for (int resultIndex : group.resultIndices) {
+                auto* row = new QTreeWidgetItem(root);
+                fillResultRow(row, resultIndex);
+            }
+        }
+        if (_fiberIntersectionSearchResults.empty()) {
+            updateFiberIntersectionSearchProgress(
+                vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                1,
+                finishTotal);
+        }
+        tree->expandAll();
+    }
+    updateFiberIntersectionSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                                          finishTotal,
+                                          finishTotal);
+    qInfo().noquote() << QStringLiteral("[fiber-intersection-search] phase=%1 finishing_results end completed=%2 total=%3")
+        .arg(atlasSearchPhaseNumber(vc::atlas::AtlasSearchProgressPhase::FinishResults))
+        .arg(static_cast<qulonglong>(finishTotal))
+        .arg(static_cast<qulonglong>(finishTotal));
+    if (auto* progress = _fiberIntersectionSearchDock->widget()->findChild<QProgressBar*>(
+            QStringLiteral("fiberIntersectionSearchProgressBar"))) {
+        progress->setFormat(tr("Done"));
+    }
+    tree->resizeColumnToContents(0);
+    tree->resizeColumnToContents(1);
+    tree->resizeColumnToContents(2);
+}
+
 void CWindow::openAtlasSearchResult(int sortedResultIndex)
 {
     if (sortedResultIndex < 0 ||
@@ -6931,13 +7742,49 @@ void CWindow::openAtlasSearchResult(int sortedResultIndex)
                                  tr("Create or select an atlas before inspecting intersections."));
         return;
     }
+    if (!_lineAnnotationController->saveAndCloseOpenFiberAnnotationsForIntersection()) {
+        return;
+    }
     if (_workspaceTabs && _intersectionsWorkspaceWindow) {
         _workspaceTabs->setCurrentWidget(_intersectionsWorkspaceWindow);
     }
     _lineAnnotationController->showIntersectionInspection(
         _atlasSearchResults[static_cast<size_t>(sortedResultIndex)],
         _intersectionsMdiArea,
-        _currentAtlasDir);
+        _currentAtlasDir,
+        LineAnnotationController::IntersectionInspectionMode::AtlasLink);
+}
+
+void CWindow::openFiberIntersectionSearchResult(int sortedResultIndex)
+{
+    if (sortedResultIndex < 0 ||
+        sortedResultIndex >= static_cast<int>(_fiberIntersectionSearchResults.size())) {
+        return;
+    }
+    openFiberIntersectionInspection(
+        _fiberIntersectionSearchResults[static_cast<size_t>(sortedResultIndex)]);
+}
+
+void CWindow::openFiberIntersectionInspection(
+    const vc::atlas::FiberIntersectionResult& result)
+{
+    if (!_lineAnnotationController || !_intersectionsMdiArea) {
+        QMessageBox::warning(this,
+                             tr("Intersections"),
+                             tr("Intersections workspace is not available."));
+        return;
+    }
+    if (!_lineAnnotationController->saveAndCloseOpenFiberAnnotationsForIntersection()) {
+        return;
+    }
+    if (_workspaceTabs && _intersectionsWorkspaceWindow) {
+        _workspaceTabs->setCurrentWidget(_intersectionsWorkspaceWindow);
+    }
+    _lineAnnotationController->showIntersectionInspection(
+        result,
+        _intersectionsMdiArea,
+        std::nullopt,
+        LineAnnotationController::IntersectionInspectionMode::FiberBranchLink);
 }
 
 void CWindow::clearAtlasSearchPreviewState()
@@ -7321,6 +8168,7 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
         refreshAtlasOverviewDocks();
         updateAtlasFiberDocks();
         updateAtlasSearchDocks();
+        updateFiberIntersectionSearchDocks();
         if (_workspaceTabs && _atlasWorkspaceWindow) {
             _workspaceTabs->setCurrentWidget(_atlasWorkspaceWindow);
         }

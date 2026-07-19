@@ -49,6 +49,11 @@ public:
         ZInOut,
     };
 
+    enum class IntersectionInspectionMode {
+        AtlasLink,
+        FiberBranchLink,
+    };
+
     struct OptimizationTaskResult {
         bool ok = false;
         std::filesystem::path manifestPath;
@@ -170,17 +175,23 @@ public:
     void showFiberSlice(uint64_t fiberId, QMdiArea* targetArea);
     void showIntersectionInspection(const vc::atlas::FiberIntersectionResult& result,
                                     QMdiArea* targetArea,
-                                    std::optional<std::filesystem::path> atlasDir = std::nullopt);
+                                    std::optional<std::filesystem::path> atlasDir = std::nullopt,
+                                    IntersectionInspectionMode mode =
+                                        IntersectionInspectionMode::AtlasLink);
+    [[nodiscard]] bool saveAndCloseOpenFiberAnnotationsForIntersection();
     void saveOpenFibers();
     void closeFiberWindowForSurface(const std::string& surfaceName);
     bool showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,
                                               const QPointF& scenePoint,
-                                              const QPoint& globalPos);
+                                              const QPoint& globalPos,
+                                              Qt::KeyboardModifiers modifiers = Qt::NoModifier);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
     [[nodiscard]] std::vector<std::string> knownFiberTags() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsFromStorage() const;
     [[nodiscard]] std::vector<FiberSnapshotWithPath> fiberSnapshotsFromStorageWithPaths() const;
+    [[nodiscard]] std::vector<FiberSnapshotWithPath>
+        fiberSnapshotsFromStorageAndOpenWithPaths() const;
     [[nodiscard]] std::optional<uint64_t> fiberIdForAtlasPath(
         const std::filesystem::path& atlasFiberPath) const;
 
@@ -201,6 +212,8 @@ signals:
     void fiberSaved(uint64_t fiberId, uint64_t generation);
     void fibersDeleted(std::vector<uint64_t> fiberIds);
     void atlasCreated(std::filesystem::path atlasDir);
+    void fiberIntersectionInspectionRequested(
+        const vc::atlas::FiberIntersectionResult& result);
 
 private slots:
     void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
@@ -307,6 +320,7 @@ private:
         uint64_t sourceFiberId = 0;
         std::vector<uint64_t> excludedFiberIds;
         cv::Mat_<cv::Vec3f> stripPoints;
+        std::vector<cv::Vec3d> sourceLinePoints;
         std::vector<vc::atlas::FiberPolyline> fibers;
         std::vector<vc::atlas::FiberSideStripLineQuery> branchLinks;
     };
@@ -481,7 +495,7 @@ private:
     [[nodiscard]] StoredFiberSessionSnapshot makeStoredFiberSessionSnapshot(
         LineAnnotationSession& session);
     [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);
-    void saveSessionAsFiber(LineAnnotationSession& session);
+    [[nodiscard]] bool saveSessionAsFiber(LineAnnotationSession& session);
     [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
     void saveFiberNow(const StoredFiber& fiber) const;
     void scheduleFiberSave(const StoredFiber& fiber);
@@ -491,7 +505,7 @@ private:
     void validateFiberSaveSnapshots(const std::vector<FiberSaveSnapshot>& snapshots) const;
     void startNextFiberSaveJob();
     void finishFiberSaveJob(QFutureWatcher<FiberSaveTaskResult>* watcher);
-    void waitForFiberSaves();
+    [[nodiscard]] bool waitForFiberSaves();
     [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber) const;
     [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
         const FiberSaveSnapshot& snapshot,
@@ -550,6 +564,10 @@ private:
                                                 double oldSourceArclength,
                                                 double oldTargetArclength);
     bool acceptIntersectionSameWindingChoice();
+    bool acceptIntersectionFiberBranchLink();
+    void inspectGeneratedFiberIntersectionMarker(
+        const std::string& surfaceName,
+        const vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker& marker);
     [[nodiscard]] std::shared_ptr<LineAnnotationSession> makeIntersectionLineSession(
         const StoredFiber& fiber,
         double focusLinePosition,
@@ -578,6 +596,7 @@ private:
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;
     bool _fiberSaveRunning = false;
+    std::vector<std::string> _fiberSaveFailureMessages;
     uint64_t _nextSideStripIntersectionToken = 0;
     uint64_t _latestSideStripIntersectionToken = 0;
     std::shared_ptr<std::atomic<uint64_t>> _latestSideStripIntersectionTokenAtomic =

@@ -21,6 +21,38 @@ bool finiteScenePoint(const QPointF& point)
     return std::isfinite(point.x()) && std::isfinite(point.y());
 }
 
+std::optional<size_t> nearestFiberIntersectionMarker(
+    CChunkedVolumeViewer* viewer,
+    const std::vector<GeneratedOverlay::FiberIntersectionMarker>& markers,
+    const QPointF& scenePoint,
+    double maxDistancePx)
+{
+    if (!viewer || !finiteScenePoint(scenePoint) ||
+        !std::isfinite(maxDistancePx) || maxDistancePx <= 0.0) {
+        return std::nullopt;
+    }
+
+    std::optional<size_t> best;
+    double bestDistanceSq = maxDistancePx * maxDistancePx;
+    for (size_t i = 0; i < markers.size(); ++i) {
+        const auto& marker = markers[i];
+        if (!finiteGeneratedPoint(marker.point)) {
+            continue;
+        }
+        const QPointF markerScene = viewer->volumeToScene(marker.point);
+        if (!finiteScenePoint(markerScene)) {
+            continue;
+        }
+        const QPointF delta = markerScene - scenePoint;
+        const double distanceSq = delta.x() * delta.x() + delta.y() * delta.y();
+        if (distanceSq <= bestDistanceSq) {
+            best = i;
+            bestDistanceSq = distanceSq;
+        }
+    }
+    return best;
+}
+
 QPointF generatedStripControlPointToScene(
     CChunkedVolumeViewer* viewer,
     QuadSurface* surface,
@@ -596,8 +628,34 @@ void clearGeneratedControlPointContextPreview(CChunkedVolumeViewer* viewer,
 GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     const GeneratedControlPointContextMenuOptions& options)
 {
-    if (!options.viewer ||
-        options.controlPoints.empty() ||
+    if (!options.viewer) {
+        return GeneratedControlPointContextResult::None;
+    }
+
+    if (options.stripViewer &&
+        options.modifiers.testFlag(Qt::ControlModifier) &&
+        options.inspectFiberIntersection &&
+        !options.fiberIntersections.empty()) {
+        constexpr double kMarkerContextRadiusPx = 14.0;
+        const auto markerIndex = nearestFiberIntersectionMarker(
+            options.viewer,
+            options.fiberIntersections,
+            options.scenePoint,
+            kMarkerContextRadiusPx);
+        if (markerIndex) {
+            QMenu menu(options.parent);
+            QAction* inspectAction =
+                menu.addAction(QWidget::tr("Inspect fiber intersection"));
+            QAction* selected = menu.exec(options.globalPos);
+            if (selected == inspectAction && inspectAction->isEnabled()) {
+                options.inspectFiberIntersection(
+                    options.fiberIntersections[static_cast<size_t>(*markerIndex)]);
+            }
+            return GeneratedControlPointContextResult::Handled;
+        }
+    }
+
+    if (options.controlPoints.empty() ||
         options.linePointCount == 0 ||
         !validGeneratedLinePosition(options.linePosition, options.linePointCount)) {
         return GeneratedControlPointContextResult::None;

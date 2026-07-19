@@ -211,6 +211,8 @@ namespace viewer {
 // -----------------------------------------------------------------------------
 namespace atlas {
     constexpr auto SEARCH_MAX_DISTANCE = "atlas/search_max_distance";
+    constexpr auto FIBER_INTERSECTION_SEARCH_MAX_DISTANCE =
+        "atlas/fiber_intersection_search_max_distance";
 }
 
 // -----------------------------------------------------------------------------

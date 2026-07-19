@@ -109,7 +109,10 @@ public:
         const std::string& surfaceName,
         CChunkedVolumeViewer* viewer,
         const QPointF& scenePoint,
-        const QPoint& globalPos);
+        const QPoint& globalPos,
+        Qt::KeyboardModifiers modifiers = Qt::NoModifier,
+        std::function<void(const GeneratedOverlay::FiberIntersectionMarker&)>
+            inspectFiberIntersection = {});
     const std::vector<Pane>& panes() const { return _panes; }
     InitialDirectionMode initialDirectionMode() const;
     ReoptimizationMode reoptimizationMode() const;

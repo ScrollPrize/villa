@@ -161,16 +161,26 @@ private:
     void refreshAtlasOverviewDocks();
     void updateAtlasFiberDocks();
     void updateAtlasSearchDocks();
+    void updateFiberIntersectionSearchDocks();
     void remapCurrentAtlas();
     void optimizeAtlasSnapCandidates();
     void startAtlasFiberIntersectionSearch();
     void cancelAtlasFiberIntersectionSearch();
+    void startFiberIntersectionSearch();
+    void cancelFiberIntersectionSearch();
     void updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase phase,
                                    std::size_t completed,
                                    std::size_t total);
+    void updateFiberIntersectionSearchProgress(vc::atlas::AtlasSearchProgressPhase phase,
+                                               std::size_t completed,
+                                               std::size_t total);
     void populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results,
                                     std::vector<double> signedWindings = {});
+    void populateFiberIntersectionSearchResults(
+        const std::vector<vc::atlas::FiberIntersectionResult>& results);
     void openAtlasSearchResult(int sortedResultIndex);
+    void openFiberIntersectionSearchResult(int sortedResultIndex);
+    void openFiberIntersectionInspection(const vc::atlas::FiberIntersectionResult& result);
     void clearAtlasSearchPreviewState();
     void updateAtlasSearchPreviewCandidates();
     void setAtlasSearchHoverResult(std::optional<int> sortedResultIndex);
@@ -343,6 +353,7 @@ private:
     QMainWindow* _intersectionsWorkspaceWindow{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
+    QDockWidget* _fiberIntersectionSearchDock{nullptr};
     QDockWidget* _inkDetectionDock{nullptr};
     QDockWidget* _transformsDock{nullptr};
     AtlasControlPointsDock* _atlasControlDock{nullptr};
@@ -354,8 +365,10 @@ private:
     std::string _currentAtlasName;
     vc::atlas::FiberIntersectionCache _fiberIntersectionCache;
     std::vector<vc::atlas::FiberIntersectionResult> _atlasSearchResults;
+    std::vector<vc::atlas::FiberIntersectionResult> _fiberIntersectionSearchResults;
     std::vector<double> _atlasSearchSignedWindings;
     std::unordered_map<uint64_t, AtlasSearchFiberSnapshot> _atlasSearchFiberSnapshotsByRuntimeId;
+    std::unordered_map<uint64_t, AtlasSearchFiberSnapshot> _fiberIntersectionSearchFiberSnapshotsByRuntimeId;
     std::optional<std::filesystem::path> _atlasSearchLasagnaManifestPath;
     double _atlasSearchLasagnaWorkingToBaseScale = 1.0;
     int _atlasSearchPreviewGeneration{0};
@@ -364,10 +377,16 @@ private:
     std::set<int> _atlasSearchPreviewRequestedResults;
     bool _atlasSearchCancelRequested{false};
     std::shared_ptr<std::atomic_bool> _atlasSearchCancelFlag;
+    bool _fiberIntersectionSearchCancelRequested{false};
+    std::shared_ptr<std::atomic_bool> _fiberIntersectionSearchCancelFlag;
     vc::atlas::AtlasSearchProgressPhase _atlasSearchProgressPhase{
         vc::atlas::AtlasSearchProgressPhase::PrepareInputs};
     std::size_t _atlasSearchPhaseCompleted{0};
     std::size_t _atlasSearchPhaseTotal{0};
+    vc::atlas::AtlasSearchProgressPhase _fiberIntersectionSearchProgressPhase{
+        vc::atlas::AtlasSearchProgressPhase::PrepareInputs};
+    std::size_t _fiberIntersectionSearchPhaseCompleted{0};
+    std::size_t _fiberIntersectionSearchPhaseTotal{0};
     QMdiArea *mdiArea;
     QMdiArea* _fiberSliceMdiArea{nullptr};
     QMdiArea* _intersectionsMdiArea{nullptr};

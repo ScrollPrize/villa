@@ -1310,10 +1310,13 @@ LineAnnotationDialog::GeneratedControlPointContextResult
 LineAnnotationDialog::showGeneratedControlPointContextMenu(const std::string& surfaceName,
                                                            CChunkedVolumeViewer* viewer,
                                                            const QPointF& scenePoint,
-                                                           const QPoint& globalPos)
+                                                           const QPoint& globalPos,
+                                                           Qt::KeyboardModifiers modifiers,
+                                                           std::function<void(
+                                                               const GeneratedOverlay::FiberIntersectionMarker&)>
+                                                               inspectFiberIntersection)
 {
-    if (!viewer || !_hasGeneratedViews || _generatedViews.controlPoints.empty() ||
-        _generatedViews.linePoints.empty()) {
+    if (!viewer || !_hasGeneratedViews || _generatedViews.linePoints.empty()) {
         return GeneratedControlPointContextResult::None;
     }
 
@@ -1351,7 +1354,10 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(const std::string& su
     options.linePointCount = _generatedViews.linePoints.size();
     options.linePosition = linePosition;
     options.stripViewer = stripViewer;
+    options.modifiers = modifiers;
     options.branchLinkDirection = branchLinkDirectionForViewer(viewer, linePosition);
+    options.fiberIntersections = _generatedViews.fiberIntersections;
+    options.inspectFiberIntersection = std::move(inspectFiberIntersection);
     options.deleteControlPoint = [this, surfaceName](double selectedLinePosition,
                                                      cv::Vec3f selectedPoint) {
         emit generatedControlPointDeleteRequested(surfaceName,
