@@ -50,6 +50,9 @@ class FakeAgentBridgeServer:
         self._server: asyncio.base_events.Server | None = None
         self._writers: list[asyncio.StreamWriter] = []
         self.received_requests: list[dict] = []
+        # job_id -> kind, so job.status/job.progress can echo the right kind for
+        # both the segmentation.grow and lasagna.optimize job flows.
+        self._job_kinds: dict[str, str] = {}
 
     async def start(self) -> None:
         if os.path.exists(self.socket_path):
@@ -93,15 +96,26 @@ class FakeAgentBridgeServer:
             await self._reply(writer, req_id, result={"vpkg": None, "volume": None})
         elif method == "segmentation.grow":
             job_id = "job-1"
+            self._job_kinds[job_id] = "segmentation.grow"
             await self._reply(writer, req_id, result={"jobId": job_id, "kind": "segmentation.grow"})
-            asyncio.create_task(self._simulate_job(job_id))
+            asyncio.create_task(self._simulate_job(job_id, "segmentation.grow"))
+        elif method == "lasagna.start_optimization":
+            job_id = "job-2"
+            self._job_kinds[job_id] = "lasagna.optimize"
+            await self._reply(
+                writer,
+                req_id,
+                result={"jobId": job_id, "kind": "lasagna.optimize", "source": "lasagna"},
+            )
+            asyncio.create_task(self._simulate_job(job_id, "lasagna.optimize"))
         elif method == "job.status":
+            job_id = params.get("jobId", "job-1")
             await self._reply(
                 writer,
                 req_id,
                 result={
-                    "jobId": params.get("jobId", "job-1"),
-                    "kind": "segmentation.grow",
+                    "jobId": job_id,
+                    "kind": self._job_kinds.get(job_id, "segmentation.grow"),
                     "label": "Grow",
                     "state": "succeeded",
                     "message": "finished",
@@ -122,20 +136,20 @@ class FakeAgentBridgeServer:
         else:
             await self._reply(writer, req_id, error={"code": -32601, "message": "Method not found"})
 
-    async def _simulate_job(self, job_id: str) -> None:
+    async def _simulate_job(self, job_id: str, kind: str = "segmentation.grow") -> None:
         await asyncio.sleep(0.02)
         await self._broadcast(
-            {"jobId": job_id, "kind": "segmentation.grow", "phase": "started", "message": "starting"}
+            {"jobId": job_id, "kind": kind, "phase": "started", "message": "starting"}
         )
         await asyncio.sleep(0.02)
         await self._broadcast(
-            {"jobId": job_id, "kind": "segmentation.grow", "phase": "output", "message": "line A\nline B"}
+            {"jobId": job_id, "kind": kind, "phase": "output", "message": "line A\nline B"}
         )
         await asyncio.sleep(0.02)
         await self._broadcast(
             {
                 "jobId": job_id,
-                "kind": "segmentation.grow",
+                "kind": kind,
                 "phase": "finished",
                 "success": True,
                 "outputPath": None,
@@ -247,6 +261,20 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         result = await server_module.vc3d_grow_segment(steps=1, wait=False)
         self.assertEqual(result["jobId"], "job-1")
         self.assertNotIn("state", result)
+
+    async def test_vc3d_lasagna_start_optimization_no_wait_returns_immediately(self) -> None:
+        result = await server_module.vc3d_lasagna_start_optimization(mode="reoptimize", wait=False)
+        self.assertEqual(result["jobId"], "job-2")
+        self.assertEqual(result["source"], "lasagna")
+        self.assertEqual(result["kind"], "lasagna.optimize")
+        self.assertNotIn("state", result)
+
+    async def test_vc3d_lasagna_start_optimization_wait_returns_terminal_status(self) -> None:
+        result = await server_module.vc3d_lasagna_start_optimization(mode="reoptimize", wait=True)
+        self.assertEqual(result["jobId"], "job-2")
+        self.assertEqual(result["state"], "succeeded")
+        self.assertEqual(result["kind"], "lasagna.optimize")
+        self.assertIn("consoleTail", result)
 
 
 class RegistryDiscoveryTest(unittest.TestCase):

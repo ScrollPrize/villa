@@ -431,6 +431,65 @@ async def vc3d_job_status(job_id: Optional[str] = None, source: Optional[str] = 
 
 
 # ---------------------------------------------------------------------------
+# canvas.drag (SPEC 9.1)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def vc3d_drag(
+    from_point: dict[str, float],
+    to_point: dict[str, float],
+    viewer: Optional[str] = None,
+    space: str = "volume",
+    button: str = "left",
+    modifiers: Optional[list[str]] = None,
+    steps: int = 8,
+) -> dict[str, Any]:
+    """Synthesize a full press-move-release drag in a viewer, from one point to
+    another (the twin of a human click-and-drag). Dispatched through the
+    viewer's real mouse slots, so every signal fires exactly as for a hand drag
+    (no synthetic onVolumeClicked -- a drag is not a click).
+
+    from_point / to_point: the drag endpoints. {"x","y","z"} in volume space
+    (default), or {"x","y"} scene-space when space="scene". In volume space both
+    endpoints are round-trip validated against the target viewer's current view
+    (same rule as vc3d_click); an off-view endpoint fails -32003 with data.point
+    naming the offender ("from" or "to").
+    viewer: viewer id ("v1") or surface-slot name; default "segmentation". Must
+    resolve to a chunked volume viewer, else -32009.
+    space: "volume" | "scene"; applies to both endpoints.
+    button: "left" | "right" | "middle", or "none" for a hover-only positioning
+    drag -- press/release are skipped and only the interpolated move events fire
+    with no button held. button="none" is the cursor-placement primitive
+    vc3d_push_pull_start depends on (hover onto the target vertex, then start).
+    modifiers: any of "shift", "ctrl", "alt", "meta", "keypad".
+    steps: number of interpolated move events, silently clamped to [1, 256]
+    (default 8); a non-integer or a value < 1 is rejected -32602.
+
+    Returns {"dragged": true, "from"/"to": {"scene": {"x","y"}, "volumePoint":
+    Vec3 | null (null when off-surface)}, "steps", "button", "modifiers"}. A
+    drag longer than 1.0 voxel over the surface while correction-point mode is
+    active (see vc3d_corrections_set_point_mode) commits an anchored correction
+    and auto-triggers the corrections solver (a source:"growth" job -- poll
+    vc3d_job_status before further editing RPCs).
+    """
+    return await _call(
+        "canvas.drag",
+        _strip_none(
+            {
+                "viewer": viewer,
+                "from": from_point,
+                "to": to_point,
+                "space": space,
+                "button": button,
+                "modifiers": modifiers if modifiers is not None else [],
+                "steps": steps,
+            }
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Manual-add (hole-fill) + corrections point authoring (SPEC 9.2-9.7)
 # ---------------------------------------------------------------------------
 
@@ -496,6 +555,191 @@ async def vc3d_corrections_set_point_mode(active: bool) -> dict[str, Any]:
     return await _call(
         "segmentation.corrections.set_point_mode", {"active": active}
     )
+
+
+# ---------------------------------------------------------------------------
+# Lasagna service + optimization + workspace switching (SPEC 11)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def vc3d_lasagna_service_status() -> dict[str, Any]:
+    """Report the Lasagna fit-service state without starting anything. Never
+    errors.
+
+    Returns {"running": bool, "external": bool, "host": str, "port": int,
+    "lastError": str | null} -- external is true when attached to an
+    externally-managed service (see vc3d_lasagna_ensure_service); lastError is
+    null when no error has been recorded.
+    """
+    return await _call("lasagna.service_status", {})
+
+
+@mcp.tool()
+async def vc3d_lasagna_ensure_service(
+    python_path: Optional[str] = None,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+) -> dict[str, Any]:
+    """Ensure a Lasagna fit service is available, starting or connecting to one
+    as needed. Two modes, selected by whether host+port are given:
+
+    - Internal (default): omit both host and port. Launches a local service
+    process (optionally using python_path as the interpreter) and blocks until
+    it is up or fails -- returns synchronously.
+    - External: give host AND port together (giving only one is -32602). Pings
+    the external service's GET /health; the call is deferred (~15 s cap) and
+    completes when the service answers, or fails -32005 with data.detail.
+
+    python_path: interpreter path for the internal service; ignored in external
+    mode.
+    host / port: external service address; must be supplied together.
+
+    Returns {"running": true, "external": bool, "host": str, "port": int}.
+    Errors: -32005 (failed to start / connect, message in data.detail), -32602
+    (host without port or vice versa). After this succeeds, vc3d_lasagna_list_datasets
+    / vc3d_lasagna_jobs / vc3d_lasagna_start_optimization become usable.
+    """
+    return await _call(
+        "lasagna.ensure_service",
+        _strip_none({"pythonPath": python_path, "host": host, "port": port}),
+    )
+
+
+@mcp.tool()
+async def vc3d_lasagna_list_datasets() -> dict[str, Any]:
+    """List the datasets the Lasagna fit service knows about. Requires the
+    service to be running (see vc3d_lasagna_ensure_service). Deferred (~10 s cap)
+    while the service is queried.
+
+    Returns {"datasets": [...]} -- the service's dataset objects passed through
+    verbatim (the bridge does not reshape service JSON). Errors: -32005 (service
+    not running, or the fetch timed out).
+    """
+    return await _call("lasagna.list_datasets", {})
+
+
+@mcp.tool()
+async def vc3d_lasagna_start_optimization(
+    mode: str,
+    config_path: Optional[str] = None,
+    seed: Optional[dict[str, float]] = None,
+    atlas_path: Optional[str] = None,
+    wait: bool = False,
+) -> dict[str, Any]:
+    """Start a Lasagna optimization on the open volume package. Async (a
+    source:"lasagna" job -- poll vc3d_job_status, or pass wait=true). Requires
+    the Lasagna service running and the Lasagna panel constructed.
+
+    mode: "reoptimize" | "new_model" | "offset" | "atlas".
+    config_path: path to the optimization config; default is the panel's
+    selected config for the chosen mode. Resolving to nothing on disk fails
+    -32007 (data.kind:"config").
+    seed: optional volume-space {"x","y","z"} seed; its components are rounded to
+    integers.
+    atlas_path: required for mode "atlas" unless the panel already has an atlas
+    selected; missing fails -32007 (data.kind:"atlas"). Ignored for other modes.
+    wait: if true (MCP-server-side only, not part of the underlying RPC), block
+    until the job finishes (30-minute cap) and return the terminal job.status
+    inline instead of just the jobId; on timeout the jobId is returned with an
+    extra "waitTimedOut": true.
+
+    Returns {"jobId", "kind": "lasagna.optimize", "source": "lasagna"}. Errors:
+    -32000 (no volume package), -32004 (data.source:"lasagna" -- the bridge
+    allows one in-flight bridge-submitted optimization; use vc3d_lasagna_jobs for
+    the service's own queue), -32005 (service not running / submission failed,
+    data.detail), -32007 (config/atlas, see above), -32009 (Lasagna panel
+    unavailable), -32602 (bad mode string or malformed seed).
+    """
+    result = await _call(
+        "lasagna.start_optimization",
+        _strip_none(
+            {
+                "mode": mode,
+                "configPath": config_path,
+                "seed": seed,
+                "atlasPath": atlas_path,
+            }
+        ),
+    )
+    return await _wait_for_job(result["jobId"], wait, result)
+
+
+@mcp.tool()
+async def vc3d_lasagna_jobs() -> dict[str, Any]:
+    """List the Lasagna service's job queue (including the local-upload overlay
+    entries the manager merges in). Requires the service to be running. Deferred
+    (~10 s cap).
+
+    Returns {"jobs": [...]} -- service job objects passed through verbatim.
+    Errors: -32005 (service not running, or the fetch timed out).
+    """
+    return await _call("lasagna.jobs", {})
+
+
+@mcp.tool()
+async def vc3d_lasagna_cancel(job_id: Optional[str] = None) -> dict[str, Any]:
+    """Cancel a Lasagna optimization. Requires the service to be running.
+
+    job_id: a bridge job id ("job-<n>", resolved to its underlying service job
+    id) or a raw service job id passed straight through. Omit to stop the active
+    bridge-submitted optimization.
+
+    Returns {"cancelRequested": true, "serviceJobId": str | null (null when the
+    active optimization was stopped without a specific id)}. Errors: -32007
+    (data.kind:"job" -- unknown bridge id, or omitted with no active lasagna
+    job), -32005 (service not running).
+    """
+    return await _call("lasagna.cancel", _strip_none({"jobId": job_id}))
+
+
+@mcp.tool()
+async def vc3d_lasagna_select_output(name: str) -> dict[str, Any]:
+    """Activate a Lasagna output segment by name -- the programmatic twin of
+    picking a lasagna output in the panel. Requires a volume package to be open.
+
+    name: the output segment id/name; must be non-empty (empty fails -32602).
+
+    Returns {"selected": true, "name": str}. Errors: -32000 (no volume package),
+    -32602 (empty name), -32007 (data.kind:"segment" -- unknown or unselectable
+    segment).
+    """
+    return await _call("lasagna.select_output_segment", {"name": name})
+
+
+@mcp.tool()
+async def vc3d_lasagna_repeat_last(wait: bool = False) -> dict[str, Any]:
+    """Repeat the last Lasagna optimization -- relaunch the last-used mode with
+    its settings. Async (a source:"lasagna" job -- poll vc3d_job_status, or pass
+    wait=true); same job semantics as vc3d_lasagna_start_optimization. Requires
+    a volume package open and the Lasagna panel constructed.
+
+    wait: if true (MCP-server-side only), block until the job finishes (30-minute
+    cap) and return the terminal job.status inline; on timeout the jobId is
+    returned with an extra "waitTimedOut": true.
+
+    Returns {"jobId", "kind": "lasagna.optimize", "source": "lasagna"}. Errors:
+    -32000 (no volume package), -32004 (data.source:"lasagna" -- one already in
+    flight), -32005 (nothing to repeat / launch failed, data.detail), -32009
+    (Lasagna panel unavailable).
+    """
+    result = await _call("lasagna.repeat_last", {})
+    return await _wait_for_job(result["jobId"], wait, result)
+
+
+@mcp.tool()
+async def vc3d_switch_workspace(name: str) -> dict[str, Any]:
+    """Switch VC3D's active workspace tab. Requires a volume package to be open.
+
+    name: "lasagna" (the Lasagna optimization workspace) or "fiber_slice" (the
+    fiber-slice workspace). Any viewers the workspace creates register with the
+    ViewerManager and become targetable by vc3d_click / vc3d_drag /
+    vc3d_screenshot etc. (they appear in vc3d_get_state's viewers list).
+
+    Returns {"workspace": str}. Errors: -32602 (unknown name), -32000 (no volume
+    package loaded).
+    """
+    return await _call("workspace.switch", {"name": name})
 
 
 # ---------------------------------------------------------------------------

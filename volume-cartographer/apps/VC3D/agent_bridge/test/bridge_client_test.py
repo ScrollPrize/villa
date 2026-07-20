@@ -38,8 +38,32 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 assert (REPO_ROOT / "apps" / "VC3D").is_dir(), f"unexpected REPO_ROOT={REPO_ROOT}"
 
 DEFAULT_VC3D_BIN = REPO_ROOT / "build-macos" / "bin" / "VC3D"
-LOCAL_VOLPKG_JSON = Path("/Users/giorgio/Projects/villa/test.volpkg.json")
-S3_VOLPKG_JSON = Path("/Users/giorgio/Projects/villa/PHercParis4_neural_tracing.volpkg.json")
+
+# LOCAL_VOLPKG_JSON / S3_VOLPKG_JSON are developer-local fixtures, not
+# committed (no secrets, just filesystem paths -- but at least one is a
+# personal absolute path as data, so it can't be checked in as-is). They
+# default to sitting one directory above the repo root; override via env var
+# if yours lives elsewhere. Recreate LOCAL_VOLPKG_JSON with:
+#   {
+#     "name": "s1_2um_ds2",
+#     "volumes": ["volume-cartographer/test-data/s1_ds2.volpkg/volumes"],
+#     "segments": ["volume-cartographer/test-data/s1_ds2.volpkg/traces"],
+#     "output_segments": "volume-cartographer/test-data/s1_ds2.volpkg/traces",
+#     "normal_grids": ["volume-cartographer/test-data/s1_ds2.volpkg/normalgrids_2um_ds2"],
+#     "lasagna_datasets": [],
+#     "version": 1
+#   }
+# (paths are relative to the monorepo root, i.e. REPO_ROOT.parent). S3_VOLPKG_JSON
+# follows the same schema but points "volumes" at an s3:// URI and "segments" at
+# test-data/PHercParis4_neural_tracing.volpkg/segments/... dirs.
+LOCAL_VOLPKG_JSON = Path(
+    os.environ.get("VC3D_TEST_LOCAL_VOLPKG", str(REPO_ROOT.parent / "test.volpkg.json"))
+)
+S3_VOLPKG_JSON = Path(
+    os.environ.get(
+        "VC3D_TEST_S3_VOLPKG", str(REPO_ROOT.parent / "PHercParis4_neural_tracing.volpkg.json")
+    )
+)
 
 # Real curated seed derived from test-data/s1_ds2.volpkg/trace_params.json
 # control_points (highest-scored real detected-sheet sample point,

@@ -213,10 +213,11 @@ surface as MCP tool errors whose text is the JSON-encoded
 
 | Group | Tools |
 |---|---|
-| Core / navigation | `vc3d_ping`, `vc3d_get_state`, `vc3d_list_segments`, `vc3d_activate_segment`, `vc3d_screenshot`, `vc3d_get_cursor_point`, `vc3d_click`, `vc3d_shift_click`, `vc3d_center_viewer`, `vc3d_zoom_viewer` |
+| Core / navigation | `vc3d_ping`, `vc3d_get_state`, `vc3d_list_segments`, `vc3d_activate_segment`, `vc3d_screenshot`, `vc3d_get_cursor_point`, `vc3d_click`, `vc3d_shift_click`, `vc3d_drag`, `vc3d_center_viewer`, `vc3d_zoom_viewer` |
 | Segmentation growth/editing | `vc3d_enable_editing`, `vc3d_grow_segment`, `vc3d_grow_patch_from_seed`, `vc3d_manual_add_begin`, `vc3d_manual_add_finish`, `vc3d_manual_add_set_line_mode`, `vc3d_manual_add_set_interpolation`, `vc3d_manual_add_undo_constraint`, `vc3d_corrections_set_point_mode`, `vc3d_push_pull_set_config`, `vc3d_push_pull_start`, `vc3d_push_pull_stop` |
 | Points / tags | `vc3d_commit_points`, `vc3d_list_points`, `vc3d_set_segment_tag` |
 | Volumes / catalog | `vc3d_open_volume`, `vc3d_open_catalog_sample`, `vc3d_list_catalog_samples`, `vc3d_describe_catalog_sample`, `vc3d_select_volume` |
+| Lasagna / workspace | `vc3d_lasagna_service_status`, `vc3d_lasagna_ensure_service`, `vc3d_lasagna_list_datasets`, `vc3d_lasagna_start_optimization`, `vc3d_lasagna_jobs`, `vc3d_lasagna_cancel`, `vc3d_lasagna_select_output`, `vc3d_lasagna_repeat_last`, `vc3d_switch_workspace` |
 | Atlas | `vc3d_atlas_open`, `vc3d_atlas_status`, `vc3d_atlas_search_start`, `vc3d_atlas_search_cancel`, `vc3d_atlas_search_results`, `vc3d_atlas_open_result`, `vc3d_atlas_remap`, `vc3d_atlas_optimize_snap_candidates` |
 | Line Annotation (fiber tracing) | `vc3d_fiber_launch`, `vc3d_fiber_list`, `vc3d_fiber_open`, `vc3d_fiber_set_follow`, `vc3d_fiber_save`, `vc3d_fiber_delete`, `vc3d_fiber_set_tag`, `vc3d_fiber_create_atlas`, `vc3d_fiber_export`, `vc3d_fiber_import` |
 | Seeding | `vc3d_seeding_set_winding_annotation_mode`, `vc3d_seeding_preview_rays`, `vc3d_seeding_cast_rays`, `vc3d_seeding_reset_points` |
@@ -227,7 +228,8 @@ surface as MCP tool errors whose text is the JSON-encoded
 
 Long-running tools (`vc3d_grow_segment`, `vc3d_grow_patch_from_seed`,
 `vc3d_run_trace`, `vc3d_render_tifxyz`, `vc3d_flatten_slim`/`_abf`/`_straighten`,
-`vc3d_atlas_search_start`) accept an MCP-only `wait: bool = false` param (not
+`vc3d_atlas_search_start`, `vc3d_lasagna_start_optimization`,
+`vc3d_lasagna_repeat_last`) accept an MCP-only `wait: bool = false` param (not
 part of the underlying RPC, per SPEC.md §5). When `true`, the tool call
 blocks until a `job.progress` notification with `phase:"finished"` arrives
 for that job's source (30-minute cap), then returns the terminal
@@ -238,17 +240,6 @@ returns the original `{jobId, ...}` result with an extra
 
 ## Known gaps
 
-- **No `vc3d_lasagna_*` tools yet.** The bridge's `lasagna.*` RPCs (service
-  status/ensure, dataset listing, start/cancel optimization, output-segment
-  selection, repeat-last, workspace switching) are fully implemented and
-  tested in `AgentBridgeServer`/SPEC.md §11, but no MCP wrapper tools were
-  added for them — an agent can only reach Lasagna today via a raw JSON-RPC
-  call over the bridge socket directly, not through this MCP server. Worth
-  closing as a follow-up.
-- **Directory placement**: SPEC.md §6 originally described
-  `apps/VC3D/agent_bridge/mcp/` as the eventual placement; a standalone
-  `tools/vc3d-mcp/` directory was built instead per explicit instruction.
-  Not reconciled with SPEC.md §6.
 - **`vc3d_click`/`vc3d_shift_click` `position` schema**: SPEC.md's RPC
   params allow `Vec3 | {"x","y"}` depending on `space`. Modeled as a plain
   `dict[str, float]` (rather than a strict union type) so the MCP-level

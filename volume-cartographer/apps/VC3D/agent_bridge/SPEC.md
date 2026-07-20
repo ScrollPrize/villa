@@ -631,7 +631,7 @@ returns the still-running `jobId` on timeout.
 - `SegmentationCommandHandler`: refactor per §4 (this is the only behavioral change to
   existing files beyond friend/wrapper additions).
 - `MenuActionController`: add public `openOpenDataSampleById(const QString&)` (§3.16).
-- MCP server: separate process under `apps/VC3D/agent_bridge/mcp/` (Phase 3), stdio MCP
+- MCP server: separate process under `tools/vc3d-mcp/` (Phase 3), stdio MCP
   transport, QLocalSocket (or platform-equivalent) client to the bridge.
 
 ---
@@ -1262,7 +1262,8 @@ Deferred (§8.4) over `fetchDatasets()` (LasagnaServiceManager.hpp:91), complete
   `lasagna.jobs` for queue visibility), `-32005` (service not running / submission
   failed; `errorMessage` as `data.detail`), `-32007` (`data.kind:"config"` —
   `configPath` resolves to nothing on disk; or `data.kind:"atlas"` for mode `atlas`
-  with no atlas), `-32602` (bad mode string / malformed seed).
+  with no atlas), `-32009` (lasagna panel unavailable), `-32602` (bad mode string /
+  malformed seed).
 
 ### 11.5 `lasagna.jobs`
 
@@ -1294,8 +1295,8 @@ Activate a lasagna output segment by name — the programmatic twin of the
 - Maps to `SurfacePanelController::selectSurfaceById(const std::string&)`
   (SurfacePanelController.hpp:120), i.e. the same handler the signal reaches.
 - **result:** `{"selected": true, "name": str}`
-- **errors:** `-32000`, `-32007` (`data.kind:"segment"` — `selectSurfaceById` returned
-  false).
+- **errors:** `-32000`, `-32602` (`name` is empty), `-32007` (`data.kind:"segment"` —
+  `selectSurfaceById` returned false).
 
 ### 11.8 `lasagna.repeat_last`
 
@@ -1305,7 +1306,7 @@ Activate a lasagna output segment by name — the programmatic twin of the
 - **result:** `{"jobId": str, "kind": "lasagna.optimize", "source": "lasagna"}` — same
   job semantics as §11.4.
 - **errors:** `-32004` (`data.source:"lasagna"`), `-32005` (nothing to repeat / launch
-  failed; `data.detail`), `-32000`.
+  failed; `data.detail`), `-32009` (lasagna panel unavailable), `-32000`.
 
 ### 11.9 `workspace.switch`
 

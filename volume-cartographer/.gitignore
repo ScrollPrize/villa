@@ -63,5 +63,6 @@ build/perf.data
 dist/
 *.AppImage
 
-# Claude Code runtime
-.claude/
+# Claude Code runtime (local settings/state are not shared; skills are)
+.claude/*
+!.claude/skills/
