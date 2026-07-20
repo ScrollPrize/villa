@@ -300,7 +300,9 @@ We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is
 [Improvements to VC3D](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3AVC3D) can be also considered for progress prizes!
 Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
 
+{/* progress-prizes:deadline:start */}
 Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, July 31st, 2026!
+{/* progress-prizes:deadline:end */}
 
 <details>
 <summary>Submission criteria and requirements</summary>
@@ -319,7 +321,9 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
    * Designed for modular integration
 </details>
 
+{/* progress-prizes:form:start */}
 [Submission Form](https://forms.gle/xoF5C3QsYutKP97x7)
+{/* progress-prizes:form:end */}
 
 ***
 
