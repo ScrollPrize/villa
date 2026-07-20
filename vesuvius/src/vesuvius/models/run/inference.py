@@ -206,6 +206,49 @@ def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) 
     return target
 
 
+# Activations with classification semantics, where "background" is well
+# defined for empty-input masking. Heads with any other activation (e.g.
+# 'none' on continuous targets such as surface_frame, or checkpoints whose
+# target config was lost) are skipped: forcing +/-20 logits there would
+# corrupt valid regression output instead of encoding background.
+MASKABLE_ACTIVATIONS = ('sigmoid', 'softmax')
+
+
+def apply_empty_input_mask(output_batch, zero_mask, is_multi_task=False,
+                           target_info=None, num_classes=None):
+    """Force background logits where the raw input volume is 0 (issue #1114).
+
+    +/-20 matches the logit saturation convention in finalize_outputs:
+    a single channel is treated as a sigmoid foreground logit (strongly
+    negative -> background), multiple channels as softmax classes with
+    class 0 the background (driven up, others down).
+
+    When per-target configs are available (train.py checkpoints), only
+    targets whose activation is in MASKABLE_ACTIVATIONS are masked and
+    continuous/regression heads are left untouched. Without target configs
+    (nnUNet or external ResNet loaders) the output is a segmentation or
+    classification head by construction, so channel count alone selects
+    the convention.
+    """
+    if is_multi_task and target_info:
+        for _, info in target_info.items():
+            if info.get('activation') not in MASKABLE_ACTIVATIONS:
+                continue
+            s = info['start_channel']
+            e = info.get('end_channel', s + 1)
+            if e - s > 1:
+                output_batch[:, s:s + 1].masked_fill_(zero_mask, 20.0)
+                output_batch[:, s + 1:e].masked_fill_(zero_mask, -20.0)
+            else:
+                output_batch[:, s:e].masked_fill_(zero_mask, -20.0)
+    elif num_classes == 1:
+        output_batch.masked_fill_(zero_mask, -20.0)
+    else:
+        output_batch[:, 0:1].masked_fill_(zero_mask, 20.0)
+        output_batch[:, 1:].masked_fill_(zero_mask, -20.0)
+    return output_batch
+
+
 class Inferer():
     def __init__(self,
                  model_path: str = None,
@@ -228,7 +271,7 @@ class Inferer():
                  writer_workers: int = None,
                  verbose: bool = False,
                  skip_empty_patches: bool = True,  # Skip empty/homogeneous patches
-                 mask_empty_input: bool = True,  # Suppress logits where raw input volume is 0 (issue #1114)
+                 mask_empty_input: bool = False,  # Opt-in: suppress logits where raw input volume is 0 (issue #1114)
                  # params to get passed to Volume 
                  scroll_id: [str, int] = None,
                  segment_id: [str, int] = None,
@@ -436,7 +479,8 @@ class Inferer():
                 self.target_info[target_name] = {
                     'out_channels': target_channels,
                     'start_channel': self.num_classes,
-                    'end_channel': self.num_classes + target_channels
+                    'end_channel': self.num_classes + target_channels,
+                    'activation': target_config.get('activation')
                 }
                 self.num_classes += target_channels
             if self.verbose:
@@ -480,7 +524,10 @@ class Inferer():
                             self.target_info[target_name] = {
                                 'out_channels': target_channels,
                                 'start_channel': self.num_classes,
-                                'end_channel': self.num_classes + target_channels
+                                'end_channel': self.num_classes + target_channels,
+                                # No config available: activation (and therefore
+                                # background semantics) unknown for this target.
+                                'activation': None
                             }
                             self.num_classes += target_channels
                         if self.verbose:
@@ -493,7 +540,16 @@ class Inferer():
                             print(f"Inferred number of output classes via dummy inference: {self.num_classes}")
             except Exception as e:
                 raise RuntimeError(f"Warning: Could not automatically determine number of classes via dummy inference: {e}. \nEnsure your model is loaded correctly and check the expected input shape")
-            
+
+        # Empty-input masking only applies to heads with classification
+        # semantics; tell the user up front which targets will be skipped.
+        if self.mask_empty_input and self.is_multi_task and self.target_info:
+            skipped = [name for name, info in self.target_info.items()
+                       if info.get('activation') not in MASKABLE_ACTIVATIONS]
+            if skipped:
+                print(f"mask_empty_input: skipping non-classification target(s) {skipped} "
+                      f"(no background class; only sigmoid/softmax heads are masked)")
+
         return model
     
     def _load_train_py_model(self, checkpoint_path):
@@ -604,7 +660,8 @@ class Inferer():
                 self.target_info[target_name] = {
                     'out_channels': target_channels,
                     'start_channel': num_classes,
-                    'end_channel': num_classes + target_channels
+                    'end_channel': num_classes + target_channels,
+                    'activation': target_config.get('activation')
                 }
                 num_classes += target_channels
             
@@ -1002,29 +1059,20 @@ class Inferer():
                     # removed by volume masking). Prevents phantom surface voxels at
                     # mask boundaries -- see ScrollPrize/villa#1114. Overlapping
                     # patches read identical raw voxels, so masking is consistent
-                    # across patches and survives gaussian blending. +/-20 matches
-                    # the logit saturation convention used in finalize_outputs.
+                    # across patches, and blend normalization preserves the
+                    # weighted average at covered voxels (see
+                    # blending.normalize_blended_logits), so saturated logits
+                    # survive blending. The finalize-stage support mask proposed
+                    # in #1156 remains the post-blend invariant and the repair
+                    # path for already-published artifacts.
                     if self.mask_empty_input and isinstance(batch_data, dict) and 'zero_mask' in batch_data:
                         zero_mask = to_device(batch_data['zero_mask'])  # (B, 1, Z, Y, X) bool
-                        if self.is_multi_task and getattr(self, 'target_info', None):
-                            # Per-target, matching finalize_outputs semantics:
-                            # single channel -> sigmoid (negative logit = background);
-                            # multi channel -> class 0 is background (drive it up).
-                            for _, info in self.target_info.items():
-                                s = info['start_channel']
-                                e = info.get('end_channel', s + 1)
-                                if e - s > 1:
-                                    output_batch[:, s:s + 1].masked_fill_(zero_mask, 20.0)
-                                    output_batch[:, s + 1:e].masked_fill_(zero_mask, -20.0)
-                                else:
-                                    output_batch[:, s:e].masked_fill_(zero_mask, -20.0)
-                        elif self.num_classes == 1:
-                            # Sigmoid: strongly negative logit -> p ~ 0
-                            output_batch.masked_fill_(zero_mask, -20.0)
-                        else:
-                            # Single-task softmax: drive background (class 0) up, others down
-                            output_batch[:, 0:1].masked_fill_(zero_mask, 20.0)
-                            output_batch[:, 1:].masked_fill_(zero_mask, -20.0)
+                        apply_empty_input_mask(
+                            output_batch, zero_mask,
+                            is_multi_task=self.is_multi_task,
+                            target_info=getattr(self, 'target_info', None),
+                            num_classes=self.num_classes
+                        )
                         del zero_mask
 
                     output_np = self._finalize_output_batch(output_batch)
@@ -1122,11 +1170,13 @@ def main():
     parser.add_argument('--no-skip-empty-patches', dest='skip_empty_patches', action='store_false',
                       help='Process all patches, even if they appear empty')
     parser.set_defaults(skip_empty_patches=True)
-    parser.add_argument('--no_mask_empty_input', dest='mask_empty_input', action='store_false',
-                      help='Disable suppression of predictions where the raw input volume is 0. '
-                           'By default such voxels (regions removed by volume masking) are forced '
-                           'to background to prevent phantom predictions (see issue #1114).')
-    parser.set_defaults(mask_empty_input=True)
+    parser.add_argument('--mask_empty_input', dest='mask_empty_input', action='store_true',
+                      help='Suppress predictions where the raw input volume is 0 (regions removed '
+                           'by volume masking) to prevent phantom predictions at mask boundaries '
+                           '(see issue #1114). Opt-in. Only classification heads (sigmoid/softmax '
+                           'activation) are masked; continuous-valued heads (activation "none") '
+                           'are skipped.')
+    parser.set_defaults(mask_empty_input=False)
     
     # Add arguments for Zarr compression
     parser.add_argument('--zarr-compressor', type=str, default='zstd',
