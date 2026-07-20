@@ -43,9 +43,8 @@ test('repository prize page has one valid managed Progress Prize pair', async ()
   const here = dirname(fileURLToPath(import.meta.url));
   const page = await readFile(resolve(here, '../../../docs/34_prizes.md'), 'utf8');
   const parsed = parseProgressPrizeMarkdown(page);
-  assert.equal(parsed.cycle, '2026-07');
-  assert.equal(parsed.deadline.label, '11:59pm Pacific, July 31st, 2026');
-  assert.equal(parsed.responderUri, 'https://forms.gle/xoF5C3QsYutKP97x7');
+  assert.match(parsed.cycle, /^\d{4}-(?:0[1-9]|1[0-2])$/);
+  assert.equal(assertPublicResponderUri(parsed.responderUri), parsed.responderUri);
 });
 
 test('strict update changes only managed content and preserves CRLF', () => {
@@ -146,6 +145,7 @@ test('only public responder URLs are accepted', () => {
   for (const uri of [
     'http://forms.gle/OldForm',
     'https://docs.google.com/forms/d/e/EditorForm/edit',
+    'https://docs.google.com/forms/d/private-editor-id/viewform',
     'https://evil.example/forms/viewform',
     'https://forms.gle/OldForm#token',
   ]) {

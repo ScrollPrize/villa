@@ -1,0 +1,361 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+import {
+  assertAutomationBranch,
+  assertDeterministicPageDelta,
+  assertPullBinding,
+  assertSinglePageCommit,
+  gateSnapshot,
+  isTrustedPreviewRun,
+} from '../../../.github/progress-prizes-github.mjs';
+
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+const workflowNames = [
+  'progress-prizes-google.yml',
+  'progress-prizes-page-pr.yml',
+  'progress-prizes-pr-safety.yml',
+  'progress-prizes-rehearsal.yml',
+  'progress-prizes-vercel-preview.yml',
+];
+
+async function workflow(name) {
+  return readFile(resolve(repositoryRoot, '.github/workflows', name), 'utf8');
+}
+
+test('every third-party action is pinned to an approved immutable commit', async () => {
+  const approved = new Set([
+    'actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0',
+    'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+    'google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093',
+  ]);
+  for (const name of workflowNames) {
+    const source = await workflow(name);
+    for (const match of source.matchAll(/^\s*uses:\s*([^\s#]+).*$/gm)) {
+      const action = match[1];
+      if (action.startsWith('./')) continue;
+      assert.ok(approved.has(action), `${name} uses an unapproved action: ${action}`);
+      assert.match(action, /@[a-f0-9]{40}$/);
+    }
+  }
+});
+
+test('Google OIDC exists only in the guarded reusable workflow and authenticated callers', async () => {
+  const google = await workflow('progress-prizes-google.yml');
+  assert.match(google, /^on:\n  workflow_call:/m);
+  assert.doesNotMatch(google, /pull_request(?:_target)?:/);
+  assert.match(google, /github\.repository_id == '890972577'/);
+  assert.match(google, /github\.repository_owner_id == '121906140'/);
+  assert.match(google, /github\.ref == 'refs\/heads\/main'/);
+  assert.match(google, /github\.event_name == 'workflow_dispatch' \|\| github\.event_name == 'schedule'/);
+  assert.match(google, /contents: read\n      id-token: write/);
+  assert.match(google, /create_credentials_file: false/);
+  assert.match(google, /export_environment_variables: false/);
+  assert.match(google, /printf '::add-mask::%s\\n' \"\$value\"/);
+  assert.match(google, /access_token_lifetime: 900s/);
+  assert.match(google, /Authenticate read-only validation/);
+  assert.match(
+    google,
+    /inputs\.operation == 'validate' \|\| inputs\.operation == 'verify' \|\| inputs\['dry-run'\]/,
+  );
+  assert.match(google, /https:\/\/www\.googleapis\.com\/auth\/forms\.body\.readonly/);
+  assert.match(google, /https:\/\/www\.googleapis\.com\/auth\/drive\.readonly/);
+  assert.match(google, /Authenticate mutating operations/);
+  assert.match(google, /https:\/\/www\.googleapis\.com\/auth\/forms\.body\n/);
+  assert.match(google, /https:\/\/www\.googleapis\.com\/auth\/drive\n/);
+  assert.doesNotMatch(google, /drive\.file/);
+  assert.match(google, /TARGET_CYCLE: \$\{\{ inputs\['target-cycle'\] \}\}/);
+  for (const runBlock of google.matchAll(/^ {8}run: \|\n((?:(?: {10}.*)?\n)*)/gm)) {
+    assert.doesNotMatch(runBlock[1], /\$\{\{ inputs\['target-cycle'\] \}\}/);
+  }
+  assert.match(google, /ref: refs\/heads\/main/);
+  assert.match(google, /automation-cli\.mjs/);
+  assert.doesNotMatch(google, /credentials_json|service_account_key|private_key/i);
+
+  const publicSafety = await workflow('progress-prizes-pr-safety.yml');
+  assert.doesNotMatch(publicSafety, /id-token|google-github-actions|GOOGLE_/);
+  assert.doesNotMatch(publicSafety, /secrets\./);
+  assert.doesNotMatch(publicSafety, /pull_request_target/);
+});
+
+test('the authenticated reusable exposes no private Google output', async () => {
+  const google = await workflow('progress-prizes-google.yml');
+  const workflowOutputs = google.slice(
+    google.indexOf('    outputs:\n'),
+    google.indexOf('\n\npermissions:'),
+  );
+  const outputNames = [...workflowOutputs.matchAll(/^      ([a-z][a-z-]+):\n        description:/gm)]
+    .map((match) => match[1]);
+  assert.deepEqual(outputNames, ['responder-uri']);
+  assert.match(google, /Export only the public responder URL/);
+  assert.match(google, /Private Google identifiers and ACL identities are intentionally omitted/);
+  assert.doesNotMatch(google, /GITHUB_OUTPUT.*(?:form-id|folder-id|drive-id|editor)/i);
+});
+
+test('rehearsal controls are fixed to staging and its ephemeral branches', async () => {
+  const rehearsal = await workflow('progress-prizes-rehearsal.yml');
+  assert.match(rehearsal, /^on:\n  workflow_dispatch:/m);
+  assert.doesNotMatch(rehearsal, /schedule:|pull_request/);
+  assert.match(rehearsal, /codex\/progress-prize-smoke-20260720/);
+  assert.match(rehearsal, /codex\/progress-prize-smoke-base-20260720/);
+  assert.match(rehearsal, /fault: after-copy/);
+  assert.match(rehearsal, /fault: after-close-source/);
+  assert.match(rehearsal, /expect-fault: true/g);
+  assert.match(rehearsal, /verify-post-merge-preview/);
+  assert.match(rehearsal, /prove-activation-idempotency/);
+  assert.match(rehearsal, /verify-cleaned-full-rehearsal/);
+  assert.match(rehearsal, /actions: read\n      checks: read/);
+  assert.match(rehearsal, /actions: read\n      contents: read\n      statuses: read/);
+  assert.match(rehearsal, /--base-sha \"\$EXPECTED_BASE_SHA\"/);
+  assert.match(rehearsal, /--source-cycle \"\$SOURCE_CYCLE\"/);
+
+  const pagePr = await workflow('progress-prizes-page-pr.yml');
+  assert.match(pagePr, /--force-with-lease=\"refs\/heads\/\$HEAD_BRANCH:\$REMOTE_HEAD_SHA\"/);
+  assert.match(pagePr, /--force-with-lease=\"refs\/heads\/\$HEAD_BRANCH:\"/);
+  assert.match(pagePr, /--head-sha \"\$HEAD_SHA\"/);
+  assert.match(pagePr, /--base-sha \"\$BASE_SHA\"/);
+  assert.match(pagePr, /--source-cycle \"\$SOURCE_CYCLE\"/);
+  assert.match(pagePr, /--responder-uri \"\$RESPONDER_URI\"/);
+  assert.match(pagePr, /test \"\$\{remote_after%%\[\[:space:\]\]\*\}\" = \"\$HEAD_SHA\"/);
+  assert.match(pagePr, /test \"\$base_sha\" = \"\$\(git rev-parse refs\/remotes\/origin\/main\^\{commit\}\)\"/);
+
+  const google = await workflow('progress-prizes-google.yml');
+  assert.match(google, /passedCopyFault/);
+  assert.match(google, /result\.created === false/);
+  assert.match(google, /result\.resumed === true/);
+});
+
+test('Vercel verification runs trusted default-branch code and requires GitHub association', async () => {
+  const vercel = await workflow('progress-prizes-vercel-preview.yml');
+  assert.match(vercel, /environment: progress-prizes-preview/);
+  assert.match(vercel, /github\.actor == 'vercel\[bot\]'/);
+  assert.match(vercel, /run-name: Progress Prize Vercel preview \$\{\{ github\.event\.client_payload\.git\.sha \}\}/);
+  assert.match(vercel, /ref: refs\/heads\/main/);
+  assert.match(vercel, /pulls\?state=open&head=/);
+  assert.match(vercel, /git\/ref\/heads/);
+  assert.match(vercel, /payload\.git\?\.sha/);
+  assert.match(vercel, /payload\.git\?\.ref/);
+  assert.match(vercel, /progress-prizes\/vercel-preview/);
+  assert.match(vercel, /VERCEL_AUTOMATION_BYPASS_SECRET/);
+  assert.match(vercel, /printf '::add-mask::%s\\n' \"\$VERCEL_PROJECT_ID\"/);
+  assert.match(vercel, /!process\.env\.VERCEL_AUTOMATION_BYPASS_SECRET/);
+  assert.match(vercel, /redirect: 'error'/);
+  assert.doesNotMatch(vercel, /id-token|google-github-actions|GOOGLE_/);
+  assert.doesNotMatch(vercel, /checkout.*(?:HEAD_SHA|deployment|pull_request)/i);
+});
+
+test('trusted branch and exact-check gate helpers reject ambiguous automation state', () => {
+  assert.deepEqual(
+    assertAutomationBranch(
+      'codex/progress-prize-smoke-20260720',
+      'codex/progress-prize-smoke-base-20260720',
+    ).kind,
+    'smoke',
+  );
+  assert.equal(assertAutomationBranch('codex/progress-prize-2026-08', 'main').kind, 'production');
+  assert.throws(() => assertAutomationBranch('feature/untrusted', 'main'));
+
+  const expectedSha = 'a'.repeat(40);
+  const baseSha = 'b'.repeat(40);
+  const statuses = {
+    statuses: [{
+      context: 'progress-prizes/vercel-preview',
+      state: 'success',
+      creator: { login: 'github-actions[bot]' },
+      target_url: 'https://github.com/ScrollPrize/villa/actions/runs/12345',
+    }],
+  };
+  const previewRun = {
+    id: 12345,
+    html_url: statuses.statuses[0].target_url,
+    name: 'Progress Prize Vercel preview gate',
+    path: '.github/workflows/progress-prizes-vercel-preview.yml',
+    event: 'repository_dispatch',
+    actor: { login: 'vercel[bot]', type: 'Bot' },
+    triggering_actor: { login: 'vercel[bot]', type: 'Bot' },
+    repository: {
+      id: 890972577,
+      owner: { id: 121906140 },
+      full_name: 'ScrollPrize/villa',
+    },
+    head_repository: { id: 890972577 },
+    head_branch: 'main',
+    status: 'completed',
+    conclusion: 'success',
+    display_title: `Progress Prize Vercel preview ${expectedSha}`,
+  };
+  const successfulChecks = {
+    total_count: 2,
+    check_runs: [
+      {
+        name: 'Public no-secret tests',
+        status: 'completed',
+        conclusion: 'success',
+        app: { slug: 'github-actions' },
+      },
+      {
+        name: 'Another required check',
+        status: 'completed',
+        conclusion: 'success',
+        app: { slug: 'github-actions' },
+      },
+    ],
+  };
+  assert.equal(isTrustedPreviewRun({ status: statuses.statuses[0], run: previewRun, expectedSha }), true);
+  assert.equal(gateSnapshot({ statuses, checks: successfulChecks, previewRun, expectedSha }).ready, true);
+  assert.equal(gateSnapshot({
+    statuses,
+    checks: { total_count: 1, check_runs: successfulChecks.check_runs.slice(1) },
+    previewRun,
+    expectedSha,
+  }).ready, false);
+  assert.equal(gateSnapshot({
+    statuses,
+    checks: {
+      total_count: 2,
+      check_runs: [
+        successfulChecks.check_runs[0],
+        { name: 'Failing check', status: 'completed', conclusion: 'failure' },
+      ],
+    },
+    previewRun,
+    expectedSha,
+  }).ready, false);
+  assert.equal(gateSnapshot({
+    statuses,
+    checks: { total_count: 101, check_runs: successfulChecks.check_runs },
+    previewRun,
+    expectedSha,
+  }).ready, false);
+  assert.equal(gateSnapshot({
+    statuses: {
+      statuses: [{
+        ...statuses.statuses[0],
+        creator: { login: 'spoofed-user' },
+      }],
+    },
+    checks: successfulChecks,
+    previewRun,
+    expectedSha,
+  }).ready, false);
+
+  for (const [field, value] of [
+    ['name', 'Untrusted workflow'],
+    ['path', '.github/workflows/untrusted.yml'],
+    ['event', 'workflow_dispatch'],
+    ['head_branch', 'feature/untrusted'],
+    ['status', 'in_progress'],
+    ['conclusion', 'failure'],
+    ['display_title', `Progress Prize Vercel preview ${baseSha}`],
+  ]) {
+    assert.equal(isTrustedPreviewRun({
+      status: statuses.statuses[0],
+      run: { ...previewRun, [field]: value },
+      expectedSha,
+    }), false);
+  }
+  assert.equal(isTrustedPreviewRun({
+    status: statuses.statuses[0],
+    run: { ...previewRun, actor: { login: 'attacker', type: 'User' } },
+    expectedSha,
+  }), false);
+  assert.equal(isTrustedPreviewRun({
+    status: statuses.statuses[0],
+    run: { ...previewRun, triggering_actor: { login: 'human', type: 'User' } },
+    expectedSha,
+  }), false);
+  assert.equal(isTrustedPreviewRun({
+    status: statuses.statuses[0],
+    run: {
+      ...previewRun,
+      repository: { ...previewRun.repository, id: 1 },
+    },
+    expectedSha,
+  }), false);
+  assert.equal(isTrustedPreviewRun({
+    status: statuses.statuses[0],
+    run: {
+      ...previewRun,
+      repository: {
+        ...previewRun.repository,
+        owner: { id: 1 },
+      },
+    },
+    expectedSha,
+  }), false);
+  assert.equal(isTrustedPreviewRun({
+    status: statuses.statuses[0],
+    run: { ...previewRun, head_repository: { id: 1 } },
+    expectedSha,
+  }), false);
+  assert.equal(isTrustedPreviewRun({
+    status: { ...statuses.statuses[0], target_url: 'https://github.com/ScrollPrize/villa/actions/runs/999' },
+    run: previewRun,
+    expectedSha,
+  }), false);
+});
+
+test('the GitHub helper binds the PR and exact deterministic page-only commit', () => {
+  const headSha = 'a'.repeat(40);
+  const baseSha = 'b'.repeat(40);
+  const head = 'codex/progress-prize-smoke-20260720';
+  const base = 'codex/progress-prize-smoke-base-20260720';
+  const baseMarkdown = [
+    '# Prizes',
+    '',
+    '## Progress Prizes',
+    '',
+    '{/* progress-prizes:deadline:start */}',
+    'Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, July 31st, 2026!',
+    '{/* progress-prizes:deadline:end */}',
+    '',
+    '{/* progress-prizes:form:start */}',
+    '[Submission Form](https://forms.gle/JulyForm)',
+    '{/* progress-prizes:form:end */}',
+    '',
+    '## Terms and Conditions',
+    '',
+  ].join('\n');
+  const headMarkdown = baseMarkdown
+    .replace('July 31st, 2026', 'August 31st, 2026')
+    .replace('https://forms.gle/JulyForm', 'https://forms.gle/AugustForm');
+
+  assert.equal(assertDeterministicPageDelta({
+    baseMarkdown,
+    headMarkdown,
+    sourceCycle: '2026-07',
+    targetCycle: '2026-08',
+    responderUri: 'https://forms.gle/AugustForm',
+  }).target.cycle, '2026-08');
+  assert.throws(() => assertDeterministicPageDelta({
+    baseMarkdown,
+    headMarkdown: `${headMarkdown}unmanaged change\n`,
+    sourceCycle: '2026-07',
+    targetCycle: '2026-08',
+  }), /deterministic marker-only/);
+
+  const pull = {
+    state: 'open',
+    head: { ref: head, sha: headSha, repo: { id: 890972577, full_name: 'ScrollPrize/villa' } },
+    base: { ref: base, sha: baseSha, repo: { id: 890972577, full_name: 'ScrollPrize/villa' } },
+  };
+  assert.equal(assertPullBinding(pull, { head, base, headSha, baseSha }), pull);
+  assert.throws(
+    () => assertPullBinding(pull, { head, base, headSha, baseSha: 'c'.repeat(40) }),
+    /immutable refs/,
+  );
+
+  const commit = {
+    sha: headSha,
+    parents: [{ sha: baseSha }],
+    files: [{ filename: 'scrollprize.org/docs/34_prizes.md', status: 'modified' }],
+  };
+  assert.equal(assertSinglePageCommit(commit, { headSha, baseSha }), commit);
+  assert.throws(() => assertSinglePageCommit({
+    ...commit,
+    files: [...commit.files, { filename: '.github/workflows/untrusted.yml', status: 'added' }],
+  }, { headSha, baseSha }), /one page-only commit/);
+});

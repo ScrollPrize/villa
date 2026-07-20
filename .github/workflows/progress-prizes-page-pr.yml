@@ -1,0 +1,233 @@
+name: Progress Prize page pull request
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      source-cycle:
+        required: true
+        type: string
+      target-cycle:
+        required: true
+        type: string
+      responder-uri:
+        required: true
+        type: string
+      head-branch:
+        required: true
+        type: string
+      base-branch:
+        required: true
+        type: string
+    outputs:
+      pr-number:
+        value: ${{ jobs.page.outputs['pr-number'] }}
+      head-sha:
+        value: ${{ jobs.page.outputs['head-sha'] }}
+      base-sha:
+        value: ${{ jobs.page.outputs['base-sha'] }}
+
+permissions: {}
+
+jobs:
+  page:
+    name: Test and open draft PR
+    if: >-
+      github.repository == 'ScrollPrize/villa' &&
+      github.repository_id == '890972577' &&
+      github.repository_owner_id == '121906140' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      pr-number: ${{ steps.pr.outputs['pr-number'] }}
+      head-sha: ${{ steps.build.outputs['head-sha'] }}
+      base-sha: ${{ steps.refs.outputs['base-sha'] }}
+    steps:
+      - name: Check fixed branch contract
+        shell: bash
+        env:
+          AUTOMATION_ENVIRONMENT: ${{ inputs.environment }}
+          HEAD_BRANCH: ${{ inputs['head-branch'] }}
+          BASE_BRANCH: ${{ inputs['base-branch'] }}
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+          RESPONDER_URI: ${{ inputs['responder-uri'] }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_CYCLE" != "$TARGET_CYCLE"
+          [[ "$SOURCE_CYCLE" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]
+          [[ "$TARGET_CYCLE" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]
+          case "$RESPONDER_URI" in
+            https://forms.gle/*|https://docs.google.com/forms/d/e/*/viewform) ;;
+            *) exit 1 ;;
+          esac
+          if test "$AUTOMATION_ENVIRONMENT" = staging; then
+            test "$HEAD_BRANCH" = codex/progress-prize-smoke-20260720
+            test "$BASE_BRANCH" = codex/progress-prize-smoke-base-20260720
+          else
+            test "$AUTOMATION_ENVIRONMENT" = production
+            test "$BASE_BRANCH" = main
+            test "$HEAD_BRANCH" = "codex/progress-prize-$TARGET_CYCLE"
+          fi
+
+      - name: Check out trusted main with push credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: refs/heads/main
+          persist-credentials: true
+          clean: true
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Freeze the base and capture the remote head lease
+        id: refs
+        shell: bash
+        env:
+          AUTOMATION_ENVIRONMENT: ${{ inputs.environment }}
+          HEAD_BRANCH: ${{ inputs['head-branch'] }}
+          BASE_BRANCH: ${{ inputs['base-branch'] }}
+        run: |
+          set -euo pipefail
+          if test "$AUTOMATION_ENVIRONMENT" = staging; then
+            if ! git ls-remote --exit-code --heads origin "refs/heads/$BASE_BRANCH" >/dev/null 2>&1; then
+              git push --force-with-lease="refs/heads/$BASE_BRANCH:" \
+                origin "refs/remotes/origin/main:refs/heads/$BASE_BRANCH"
+            fi
+          fi
+          git fetch --no-tags origin \
+            "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
+          base_sha="$(git rev-parse "refs/remotes/origin/$BASE_BRANCH^{commit}")"
+          [[ "$base_sha" =~ ^[a-f0-9]{40}$ ]]
+          if test "$AUTOMATION_ENVIRONMENT" = staging; then
+            test "$base_sha" = "$(git rev-parse refs/remotes/origin/main^{commit})"
+          fi
+
+          remote_head_sha=""
+          remote_head="$(git ls-remote --heads origin "refs/heads/$HEAD_BRANCH")"
+          if test -n "$remote_head"; then
+            test "$(printf '%s\n' "$remote_head" | wc -l)" -eq 1
+            remote_head_sha="${remote_head%%[[:space:]]*}"
+            [[ "$remote_head_sha" =~ ^[a-f0-9]{40}$ ]]
+          fi
+          printf 'base-sha=%s\nremote-head-sha=%s\n' \
+            "$base_sha" "$remote_head_sha" >> "$GITHUB_OUTPUT"
+          git switch --force-create "$HEAD_BRANCH" "$base_sha"
+
+      - name: Update only the managed Progress Prize fields
+        shell: bash
+        env:
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+          RESPONDER_URI: ${{ inputs['responder-uri'] }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from 'node:fs/promises';
+          import {
+            parseProgressPrizeMarkdown,
+            updateProgressPrizeMarkdown,
+          } from './scrollprize.org/scripts/progress-prizes/markdown.mjs';
+
+          const path = 'scrollprize.org/docs/34_prizes.md';
+          const markdown = await readFile(path, 'utf8');
+          const current = parseProgressPrizeMarkdown(markdown);
+          if (current.cycle === process.env.TARGET_CYCLE) {
+            if (current.responderUri !== process.env.RESPONDER_URI) {
+              throw new Error('Existing target branch has a different public responder URL.');
+            }
+          } else {
+            const update = updateProgressPrizeMarkdown(markdown, {
+              targetCycle: process.env.TARGET_CYCLE,
+              responderUri: process.env.RESPONDER_URI,
+              expectedCurrentCycle: process.env.SOURCE_CYCLE,
+              expectedCurrentResponderUri: current.responderUri,
+            });
+            await writeFile(path, update.content, 'utf8');
+          }
+          NODE
+
+      - name: Test the reconstructed page before committing
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          test "$(git diff --name-only)" = scrollprize.org/docs/34_prizes.md
+          node --test \
+            "scrollprize.org/scripts/progress-prizes/**/*.test.mjs" \
+            "scrollprize.org/src/components/atlas/**/*.test.js"
+
+      - name: Commit the exact tested page update
+        id: build
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.refs.outputs['base-sha'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          ! git diff --quiet
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -- scrollprize.org/docs/34_prizes.md
+          git diff --cached --check
+          test "$(git diff --cached --name-only)" = scrollprize.org/docs/34_prizes.md
+          git commit -m "docs(scrollprize): open Progress Prizes $TARGET_CYCLE"
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          test "$(git rev-list --count "$BASE_SHA..HEAD")" -eq 1
+          test -z "$(git status --short)"
+          head_sha="$(git rev-parse HEAD)"
+          [[ "$head_sha" =~ ^[a-f0-9]{40}$ ]]
+          printf 'head-sha=%s\n' "$head_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Push with the captured lease and verify the remote SHA
+        shell: bash
+        env:
+          HEAD_BRANCH: ${{ inputs['head-branch'] }}
+          HEAD_SHA: ${{ steps.build.outputs['head-sha'] }}
+          REMOTE_HEAD_SHA: ${{ steps.refs.outputs['remote-head-sha'] }}
+        run: |
+          set -euo pipefail
+          if test -n "$REMOTE_HEAD_SHA"; then
+            git push --force-with-lease="refs/heads/$HEAD_BRANCH:$REMOTE_HEAD_SHA" \
+              origin "HEAD:refs/heads/$HEAD_BRANCH"
+          else
+            git push --force-with-lease="refs/heads/$HEAD_BRANCH:" \
+              origin "HEAD:refs/heads/$HEAD_BRANCH"
+          fi
+          remote_after="$(git ls-remote --heads origin "refs/heads/$HEAD_BRANCH")"
+          test "$(printf '%s\n' "$remote_after" | wc -l)" -eq 1
+          test "${remote_after%%[[:space:]]*}" = "$HEAD_SHA"
+
+      - name: Create or refetch the SHA-bound draft pull request
+        id: pr
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ inputs['head-branch'] }}
+          BASE_BRANCH: ${{ inputs['base-branch'] }}
+          HEAD_SHA: ${{ steps.build.outputs['head-sha'] }}
+          BASE_SHA: ${{ steps.refs.outputs['base-sha'] }}
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+          RESPONDER_URI: ${{ inputs['responder-uri'] }}
+        run: >-
+          node .github/progress-prizes-github.mjs ensure-pr
+          --head "$HEAD_BRANCH"
+          --base "$BASE_BRANCH"
+          --head-sha "$HEAD_SHA"
+          --base-sha "$BASE_SHA"
+          --source-cycle "$SOURCE_CYCLE"
+          --target-cycle "$TARGET_CYCLE"
+          --responder-uri "$RESPONDER_URI"
+          --title "Progress Prize rollover $TARGET_CYCLE"

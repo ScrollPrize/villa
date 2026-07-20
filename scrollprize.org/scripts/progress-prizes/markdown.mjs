@@ -111,7 +111,7 @@ export function assertPublicResponderUri(responderUri) {
 
   const isShortUrl = url.hostname === 'forms.gle' && /^\/[A-Za-z0-9_-]+\/?$/.test(url.pathname);
   const isCanonicalUrl = url.hostname === 'docs.google.com'
-    && /^\/forms\/d\/(?:e\/)?[A-Za-z0-9_-]+\/viewform\/?$/.test(url.pathname);
+    && /^\/forms\/d\/e\/[A-Za-z0-9_-]+\/viewform\/?$/.test(url.pathname);
   if (!isShortUrl && !isCanonicalUrl) {
     throw new TypeError('responderUri must use forms.gle or the public docs.google.com Forms view URL');
   }

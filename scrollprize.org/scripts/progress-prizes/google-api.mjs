@@ -396,8 +396,9 @@ export function filterPublishedResponderPermissions(permissions) {
 /** Stable comparison key for normalized source/target ACL checks. */
 export function permissionIdentityKey(permission) {
   const normalized = normalizePermissionForCreate(permission);
-  const identity =
-    normalized.emailAddress ?? normalized.domain ?? (normalized.type === "anyone" ? "*" : "");
+  const identity = (
+    normalized.emailAddress ?? normalized.domain ?? (normalized.type === "anyone" ? "*" : "")
+  ).toLowerCase();
   return [
     normalized.type,
     normalized.role,
@@ -763,7 +764,7 @@ function isSensitiveKey(key) {
 function redactString(value, secrets) {
   let redacted = value.replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, `Bearer ${REDACTED}`);
   redacted = redacted.replace(
-    /https:\/\/docs\.google\.com\/forms\/d\/(?!e\/)[^/\s]+\/(?:edit|preview)(?:[^\s]*)?/gi,
+    /https:\/\/docs\.google\.com\/forms\/d\/(?!e\/)[^/\s]+\/(?:edit|preview|viewform)(?:[^\s]*)?/gi,
     REDACTED,
   );
   redacted = redacted.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, REDACTED);
@@ -798,7 +799,12 @@ export function redactForLog(value, { secrets = [] } = {}) {
   return visit(value);
 }
 
+export const GOOGLE_API_READ_SCOPES = Object.freeze([
+  "https://www.googleapis.com/auth/drive.readonly",
+  "https://www.googleapis.com/auth/forms.body.readonly",
+]);
+
 export const GOOGLE_API_SCOPES = Object.freeze([
-  "https://www.googleapis.com/auth/drive.file",
+  "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/forms.body",
 ]);
