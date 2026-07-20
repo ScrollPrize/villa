@@ -18,6 +18,14 @@ html.docs-doc-id-get_started main .container article {
 .docs-doc-id-get_started .hash-link {
   display: none !important;
 }
+/* Tailwind's .container cap steps per breakpoint (1280px, then 1536px only
+   at ≥1536): between ~1300–1535 the stale 1280px cap leaves the clipped
+   bands/hero floating with outsized side gaps that vanish at 1536. Keep the
+   boxed look but make the gap steady: same 1536px ceiling, constant 32px
+   gutters below it. ≤996 overrides below still lift the cap entirely. */
+.docs-doc-id-get_started main > .container {
+  max-width: min(1536px, calc(100% - 64px));
+}
 .docs-doc-id-get_started .pagination-nav {
   display: none;
 }
@@ -28,8 +36,14 @@ html.docs-doc-id-get_started main .container article {
   overflow-x: clip; /* full-bleed bands use the 50vw margin trick */
 }
 .vc-gs-container {
-  max-width: 1080px;
+  /* the inline padding exists for mid widths (~1000–1160px)
+     where the docs container leaves less than 1080px: margin auto
+     collapses to 0 there and text would sit flush against the band edge.
+     max-width includes the padding (border-box) so wide screens still get
+     1080px of content. */
+  max-width: calc(1080px + 2 * clamp(20px, 5vw, 28px));
   margin: 0 auto;
+  padding-inline: clamp(20px, 5vw, 28px);
 }
 .vc-gs a {
   text-decoration-color: color-mix(in srgb, var(--vc-accent) 55%, transparent);
@@ -1038,9 +1052,6 @@ html.docs-doc-id-get_started main .container article {
   }
   .docs-doc-id-get_started main > .container > .row > .col {
     padding: 0 !important;
-  }
-  .vc-gs-container {
-    padding-inline: clamp(20px, 5vw, 28px);
   }
 }
 @media (max-width: 768px) {
