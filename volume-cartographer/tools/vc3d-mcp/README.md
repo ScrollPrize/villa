@@ -73,21 +73,45 @@ priority order:
 4. Otherwise the server exits with status 2 and a stderr message explaining all
    three options above.
 
-So the simplest invocations are:
+### Zero-setup path: `run.sh`
+
+Building VC3D via CMake only produces the C++ binary — it does nothing to
+set up this directory's Python environment. `run.sh` is a self-bootstrapping
+wrapper: the **first** time it's launched it creates `.venv` and installs
+this package automatically (a few seconds, one-time); every launch after
+that is a plain exec with no setup overhead. This means there is no manual
+Python step at all between "finished building VC3D" and "an agent can
+connect" — just point an MCP client at `run.sh` and it works, including on
+a machine where nobody has ever run `pip install` for this package:
+
+```sh
+# (a) attach to whatever VC3D is already running (started with --agent-bridge):
+./tools/vc3d-mcp/run.sh
+
+# (b) auto-launch VC3D if none is running:
+./tools/vc3d-mcp/run.sh --launch ./build-macos/bin/VC3D --volpkg /path/to/foo.volpkg
+
+# (c) attach to an exact socket (unambiguous; e.g. across machines/containers):
+./tools/vc3d-mcp/run.sh --socket /var/folders/.../T/vc3d-agent-<pid>
+```
+
+`run.sh` accepts the exact same arguments as `python -m vc3d_mcp` below —
+it's a drop-in wrapper, not a different interface. Set `PYTHON=/path/to/python3`
+if `python3` isn't the right interpreter to bootstrap with.
+
+### Manual path (explicit venv)
+
+If you'd rather manage the environment yourself (e.g. for a reproducible CI
+setup, or to pin dependency versions explicitly):
 
 ```sh
 cd tools/vc3d-mcp
 python3 -m venv .venv
 ./.venv/bin/pip install -e .        # or: pip install -r requirements.txt
 
-# (a) attach to whatever VC3D is already running (started with --agent-bridge):
-./.venv/bin/python -m vc3d_mcp
-
-# (b) auto-launch VC3D if none is running:
-./.venv/bin/python -m vc3d_mcp --launch ./build-macos/bin/VC3D --volpkg /path/to/foo.volpkg
-
-# (c) attach to an exact socket (unambiguous; e.g. across machines/containers):
-./.venv/bin/python -m vc3d_mcp --socket /var/folders/.../T/vc3d-agent-<pid>
+./.venv/bin/python -m vc3d_mcp                                    # (a) attach
+./.venv/bin/python -m vc3d_mcp --launch ./build-macos/bin/VC3D     # (b) auto-launch
+./.venv/bin/python -m vc3d_mcp --socket /var/folders/.../T/vc3d-agent-<pid>  # (c) exact socket
 ```
 
 To start VC3D yourself for mode (a) or (c):
@@ -112,14 +136,19 @@ interactively.
 ### Registering with Claude Code
 
 ```sh
-# Seamless: no socket needed — attaches to a running VC3D, else auto-launches.
+# Seamless: no socket needed, no manual venv setup needed — run.sh bootstraps
+# its own Python environment on first launch, then attaches to a running
+# VC3D or auto-launches one.
 claude mcp add vc3d-bridge -- \
-  /path/to/tools/vc3d-mcp/.venv/bin/python -m vc3d_mcp --launch /path/to/build-macos/bin/VC3D
+  /path/to/tools/vc3d-mcp/run.sh --launch /path/to/build-macos/bin/VC3D
 
 # ...or pin an explicit socket if you prefer:
 claude mcp add vc3d-bridge -e VC3D_AGENT_BRIDGE_SOCKET=/path/to/socket -- \
-  /path/to/tools/vc3d-mcp/.venv/bin/python -m vc3d_mcp
+  /path/to/tools/vc3d-mcp/run.sh
 ```
+
+(If you set up the venv manually per "Manual path" above, swap `run.sh` for
+`.venv/bin/python -m vc3d_mcp` in either command.)
 
 (or the equivalent entry in `claude_desktop_config.json` / `.mcp.json` for
 other MCP clients.)
