@@ -233,8 +233,9 @@ def main():
             model, outer_winding, cfg, args.z_begin, args.z_end,
             0x6A09E667)
     finally:
-        normals['store'].close()
-        sdt['store'].close()
+        for volume in (normals, sdt):
+            if volume['backend'] == 'mmap':
+                volume['store'].close()
 
     summary = _aggregate(pass_metrics)
     report = {

@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 import geom_utils
 import prefetch
+from dt_targets import patch_dt_target_in_sample_frame, strip_dt_target_in_sample_frame
 from loss_maps import diagnostics_enabled, record_loss_samples
 from sample_spiral import (
     canonical_winding_samples,
@@ -31,6 +32,44 @@ def configure_losses(config, z_begin_value, z_end_value):
 def _masked_mean(values, mask):
     mask_f = mask.to(values.dtype)
     return (values * mask_f).sum() / mask_f.sum().clamp(min=1.)
+
+
+def build_pcl_sampling_strata(sampling_groups):
+    # Precompute the per-step sampling pool for _choose_pcl_indices from each pool
+    # member's sampling group (source json file; fibers split into fibers:H /
+    # fibers:V). Members whose group is None are ineligible and excluded. Returns
+    # {'strata': [int64 pool-index array per group], 'all': all eligible indices}.
+    # (Ported from origin/spiral-fibers-and-dt 015de2ee9.)
+    group_to_indices = {}
+    for idx, group in enumerate(sampling_groups):
+        if group is None:
+            continue
+        group_to_indices.setdefault(group, []).append(idx)
+    strata = [np.asarray(indices, dtype=np.int64) for indices in group_to_indices.values()]
+    all_indices = np.concatenate(strata) if strata else np.empty(0, dtype=np.int64)
+    return {'strata': strata, 'all': all_indices}
+
+
+def _choose_pcl_indices(sampling_strata, num_to_sample):
+    # Choose num_to_sample pool indices from a build_pcl_sampling_strata() bundle.
+    # Stratified mode (cfg['stratified_pcl_sampling']) splits the draw as evenly as
+    # possible across the strata regardless of stratum size (remainder going to a
+    # random subset of strata), then samples uniformly within each stratum, with
+    # replacement only when a stratum's share exceeds its size. Non-stratified mode
+    # is the legacy behaviour: uniform over the whole pool without replacement.
+    if not cfg['stratified_pcl_sampling']:
+        return np.random.choice(sampling_strata['all'], num_to_sample, replace=False)
+    strata = sampling_strata['strata']
+    quotas = np.full(len(strata), num_to_sample // len(strata), dtype=np.int64)
+    remainder = num_to_sample - int(quotas.sum())
+    if remainder > 0:
+        quotas[np.random.choice(len(strata), remainder, replace=False)] += 1
+    chosen = [
+        np.random.choice(stratum, quota, replace=quota > len(stratum))
+        for stratum, quota in zip(strata, quotas)
+        if quota > 0
+    ]
+    return np.concatenate(chosen)
 
 
 
@@ -284,6 +323,7 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
     )
 
     return (
+        combined_ijs_gpu,
         all_slice_zyxs,
         all_spiral_zyxs,
         all_theta,
@@ -302,12 +342,15 @@ def _patch_radius_and_dt_losses(
     num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
     radius_loss_margin, radius_loss_inv, radius_within_norm_p,
     dt_loss_margin, dt_norm_p, dt_within_patch_norm_p,
+    patch_indices=None, sample_ijs=None, dt_target_cache=None,
     diagnostic_prefix='patch',
 ):
     # Shared radius + DT patch losses, operating on pre-sampled row/column tracks
     # (all_*; see _sample_patch_tracks). Pulled out of get_patch_and_umbilicus_losses so the
     # same loss can serve both the verified and the untrusted ('unverified') patch sets with
     # independent hyperparameters. Returns (mean_radius_deviation, patch_dt_loss).
+    # `dt_target_cache` is the whole-object DT target cache (see dt_targets.py) or None
+    # in legacy strip-median mode; `patch_indices` maps the sampled tracks to cache rows.
     radius_hinge_margin = dr_per_winding.detach() * radius_loss_margin
     dt_hinge_margin = dr_per_winding.detach() * dt_loss_margin
 
@@ -370,11 +413,18 @@ def _patch_radius_and_dt_losses(
         dt_shifted_radii = all_shifted_radii[:, :num_patches_for_dt]
         dt_crossing_adjustments = all_crossing_adjustments[:, :num_patches_for_dt]
 
-        # Define the DT target from the same sampled row/column tracks as the radius loss:
-        # each track is snapped to the nearest integer-winding shifted-radius, then every
-        # sampled point on the track is pulled towards the corresponding point on that
-        # target winding.
-        target_shifted_radii = torch.round(dt_shifted_radii.median(dim=-1, keepdim=True).values / dr_per_winding) * dr_per_winding
+        # Define the DT target winding (see patch_dt_target_in_sample_frame: whole-patch cached
+        # target when available, else the track's own snapped median). Every sampled
+        # point on the track is then pulled towards that target winding.
+        target_shifted_radii = patch_dt_target_in_sample_frame(
+            dt_shifted_radii,
+            sample_ijs[:, :num_patches_for_dt] if sample_ijs is not None else None,
+            dt_theta,
+            dt_crossing_adjustments,
+            dr_per_winding,
+            dt_target_cache,
+            patch_indices[:num_patches_for_dt] if patch_indices is not None else None,
+        )
         target_radii = radius_from_unwrapped_shifted(
             dt_theta,
             target_shifted_radii,
@@ -408,14 +458,7 @@ def _patch_radius_and_dt_losses(
 
 
 
-def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None, dt_max_winding=None):
-
-    # Sample once and share the tracks between the radius and DT losses; the loss using
-    # fewer patches takes a prefix of the larger sample.
-    num_patches_to_sample = max(num_patches_for_radius, num_patches_for_dt) if compute_dt else num_patches_for_radius
-    batch = _sample_patch_batch(
-        'verified_patches', patches, patch_sampling_probabilities,
-        num_patches_to_sample, cfg['num_points_per_patch'] // 2)
+def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None, dt_max_winding=None, dt_target_cache=None):
 
     n_umb = umbilicus_zyx.shape[0]
     if shell_valid_zyxs is not None:
@@ -425,33 +468,50 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
     else:
         extra_zyxs = umbilicus_zyx
 
-    (
-        all_slice_zyxs,
-        all_spiral_zyxs,
-        all_theta,
-        all_shifted_radii,
-        all_crossing_adjustments,
-        extra_spiral,
-    ) = _sample_patch_tracks(
-        slice_to_spiral_transform,
-        dr_per_winding,
-        patches,
-        patch_atlas,
-        batch,
-        extra_zyxs,
-    )
+    if len(patches) == 0:
+        # supervision-free (disable_patches) fits: the umbilicus and shell
+        # anchors still apply; the patch radius/DT terms are inert zeros
+        extra_spiral = slice_to_spiral_transform(extra_zyxs)
+        mean_radius_deviation = torch.zeros([], device=dr_per_winding.device)
+        patch_dt_loss = torch.zeros([], device=dr_per_winding.device)
+    else:
+        # Sample once and share the tracks between the radius and DT losses; the loss using
+        # fewer patches takes a prefix of the larger sample.
+        num_patches_to_sample = max(num_patches_for_radius, num_patches_for_dt) if compute_dt else num_patches_for_radius
+        batch = _sample_patch_batch(
+            'verified_patches', patches, patch_sampling_probabilities,
+            num_patches_to_sample, cfg['num_points_per_patch'] // 2)
+
+        (
+            sample_ijs,
+            all_slice_zyxs,
+            all_spiral_zyxs,
+            all_theta,
+            all_shifted_radii,
+            all_crossing_adjustments,
+            extra_spiral,
+        ) = _sample_patch_tracks(
+            slice_to_spiral_transform,
+            dr_per_winding,
+            patches,
+            patch_atlas,
+            batch,
+            extra_zyxs,
+        )
+
+        mean_radius_deviation, patch_dt_loss = _patch_radius_and_dt_losses(
+            slice_to_spiral_transform, dr_per_winding,
+            all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii,
+            all_crossing_adjustments,
+            num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
+            cfg['patch_radius_loss_margin'], cfg['patch_radius_loss_inv'], cfg['patch_radius_within_norm_p'],
+            cfg['patch_dt_loss_margin'], cfg['patch_dt_norm_p'], cfg['patch_dt_within_patch_norm_p'],
+            patch_indices=batch[1], sample_ijs=sample_ijs, dt_target_cache=dt_target_cache,
+            diagnostic_prefix='patch',
+        )
+
     umbilicus_spiral = extra_spiral[:n_umb]
     shell_spiral_zyxs = extra_spiral[n_umb:] if shell_valid_zyxs is not None else None
-
-    mean_radius_deviation, patch_dt_loss = _patch_radius_and_dt_losses(
-        slice_to_spiral_transform, dr_per_winding,
-        all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii,
-        all_crossing_adjustments,
-        num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
-        cfg['patch_radius_loss_margin'], cfg['patch_radius_loss_inv'], cfg['patch_radius_within_norm_p'],
-        cfg['patch_dt_loss_margin'], cfg['patch_dt_norm_p'], cfg['patch_dt_within_patch_norm_p'],
-        diagnostic_prefix='patch',
-    )
 
     # Umbilicus should map to the spiral origin (yx ≈ 0)
     umbilicus_loss = umbilicus_spiral[..., 1:].abs().mean()
@@ -485,7 +545,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
 
 
 
-def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, compute_dt=True, dt_max_winding=None):
+def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, compute_dt=True, dt_max_winding=None, dt_target_cache=None):
     # Radius + DT losses for the untrusted 'unverified' patch set. Same machinery as the
     # verified patches (shared _sample_patch_tracks + _patch_radius_and_dt_losses) but with the
     # independent unverified_* hyperparameters and no umbilicus/shell extras. These patches are
@@ -497,6 +557,7 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
         num_patches_to_sample, cfg['unverified_num_points_per_patch'] // 2)
 
     (
+        sample_ijs,
         all_slice_zyxs,
         all_spiral_zyxs,
         all_theta,
@@ -519,6 +580,7 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
         num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
         cfg['unverified_patch_radius_loss_margin'], cfg['unverified_patch_radius_loss_inv'], cfg['unverified_patch_radius_within_norm_p'],
         cfg['unverified_patch_dt_loss_margin'], cfg['unverified_patch_dt_norm_p'], cfg['unverified_patch_dt_within_patch_norm_p'],
+        patch_indices=batch[1], sample_ijs=sample_ijs, dt_target_cache=dt_target_cache,
         diagnostic_prefix='unverified_patch',
     )
 
@@ -649,7 +711,7 @@ def _batched_pcl_chain_seam_adjustments(slice_to_spiral_transform, dr_per_windin
 
 
 
-def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections):
+def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections, sampling_strata):
     # For pairs of annotated PCL points on different patches, constrain the spiral
     # shifted-radius gap to match the annotated winding-number difference. Each
     # cross-patch pcl exposes its attached points grouped by patch
@@ -675,14 +737,14 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # ls* is a list of 4 L-shape ij strips and pcl_chain_zyxs is ordered p1 -> p2.
     strip_pairs = []
 
-    # Single-point pcls (possible only for winding_is_absolute pcls) can't form a
-    # cross-patch pair, so exclude them from the candidate pool before sampling.
-    candidate_pcls = [pcl for pcl in point_collections if len(pcl['points']) > 1]
-    num_pcls_per_step = min(cfg['rel_winding_num_pcls'], len(candidate_pcls))
+    # sampling_strata indexes into point_collections and already excludes single-point
+    # pcls (possible only for winding_is_absolute pcls), which can't form a cross-patch
+    # pair; see the build_pcl_sampling_strata call in fit_spiral.main.
+    num_pcls_per_step = min(cfg['rel_winding_num_pcls'], len(sampling_strata['all']))
     if num_pcls_per_step <= 0:
         return torch.zeros([], device='cuda')
-    selected_idxs = np.random.choice(len(candidate_pcls), num_pcls_per_step, replace=False)
-    selected_pcls = [candidate_pcls[i] for i in selected_idxs]
+    selected_idxs = _choose_pcl_indices(sampling_strata, num_pcls_per_step)
+    selected_pcls = [point_collections[i] for i in selected_idxs]
 
     for pcl in selected_pcls:
         sorted_pcl_points = None
@@ -1026,6 +1088,8 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     volume = lasagna_volume.get('volume')  # dense: 3 (nx, ny, grad_mag), z, y, x uint8
     z_size, y_size, x_size = lasagna_volume['shape']
     z_origin = lasagna_volume['z_origin']
+    y_origin = lasagna_volume.get('y_origin', 0)
+    x_origin = lasagna_volume.get('x_origin', 0)
     lasagna_scale = lasagna_volume['lasagna_scale']
     if epsilon is None:
         epsilon = cfg['dense_normals_finite_difference_epsilon']
@@ -1053,8 +1117,8 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     scroll_mid = ((scroll_inner + scroll_outer) / 2).detach()
     sample_zyx = (scroll_mid / lasagna_scale).round().long()
     zi = sample_zyx[:, 0] - z_origin
-    yi = sample_zyx[:, 1]
-    xi = sample_zyx[:, 2]
+    yi = sample_zyx[:, 1] - y_origin
+    xi = sample_zyx[:, 2] - x_origin
     in_bounds = (zi >= 0) & (zi < z_size) & (yi >= 0) & (yi < y_size) & (xi >= 0) & (xi < x_size)
     zi = zi.clamp(0, z_size - 1)
     yi = yi.clamp(0, y_size - 1)
@@ -1069,8 +1133,8 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
         integration_zyx = scroll_inner[:, None, :] + step_frac[None, :, None] * scroll_displacement[:, None, :]
         int_idx = (integration_zyx.detach() / lasagna_scale).round().long()
         izi = int_idx[..., 0] - z_origin
-        iyi = int_idx[..., 1]
-        ixi = int_idx[..., 2]
+        iyi = int_idx[..., 1] - y_origin
+        ixi = int_idx[..., 2] - x_origin
         int_in_bounds = (izi >= 0) & (izi < z_size) & (iyi >= 0) & (iyi < y_size) & (ixi >= 0) & (ixi < x_size)
         izi = izi.clamp(0, z_size - 1)
         iyi = iyi.clamp(0, y_size - 1)
@@ -1089,6 +1153,12 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
         nx_u8, ny_u8 = normal_u8.unbind(dim=-1)
         if compute_spacing:
             grad_mag_u8 = grad_mag_u8.reshape(izi.shape)
+    elif backend == 'dense_cuda_paged':
+        from lasagna_data import gather_paged_u8
+        nx_u8 = gather_paged_u8(lasagna_volume, zi, yi, xi, channel=0)
+        ny_u8 = gather_paged_u8(lasagna_volume, zi, yi, xi, channel=1)
+        grad_mag_u8 = (gather_paged_u8(lasagna_volume, izi, iyi, ixi, channel=2)
+                       if compute_spacing else None)
     else:
         nx_u8 = volume[0, zi, yi, xi]
         ny_u8 = volume[1, zi, yi, xi]
@@ -1148,11 +1218,13 @@ def get_unattached_pcl_strip_losses(
     slice_to_spiral_transform,
     dr_per_winding,
     pcl_strips,
+    sampling_strata,
     get_or_build_unattached_pcl_flat,
     num_pcls_per_step,
     num_points_per_pcl,
     compute_dt,
     dt_max_winding=None,
+    dt_target_cache=None,
 ):
     # Unattached pcls are treated as ordered strips, indexed by int(point_id), and
     # assumed to be locally dense enough that adjacent samples have |dtheta| < pi
@@ -1160,25 +1232,32 @@ def get_unattached_pcl_strip_losses(
     # row/column). Two losses are computed, analogous to the patch radius
     # and DT losses: (1) shifted-radius should be constant along the strip after
     # subtracting per-point winding-annotation offsets; (2) each point should snap to
-    # its target winding, with the target taken from the snapped strip median.
+    # its target winding, with the target taken from the snapped strip median (or,
+    # when dt_target_cache is given, the cached whole-strip quantile target from
+    # dt_targets.py, transferred into this sample's unwrap frame through the cached
+    # point nearest a sampled point by within-strip index).
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if not pcl_strips:
         return zero, zero
 
-    num_to_sample = min(num_pcls_per_step, len(pcl_strips))
-    chosen = np.random.choice(len(pcl_strips), num_to_sample, replace=False)
+    num_to_sample = min(num_pcls_per_step, len(sampling_strata['all']))
+    if num_to_sample <= 0:
+        return zero, zero
+    chosen = _choose_pcl_indices(sampling_strata, num_to_sample)
 
     flat = get_or_build_unattached_pcl_flat(pcl_strips, device)
     if flat is None or flat['total'] == 0:
         return zero, zero
 
     starts_cpu = flat['starts_cpu'].numpy()
+    sampled_local_indices = np.empty([num_to_sample, num_points_per_pcl], dtype=np.int64)
     sampled_flat_indices = np.empty([num_to_sample, num_points_per_pcl], dtype=np.int64)
     for k, pcl_idx in enumerate(chosen):
         strip = pcl_strips[pcl_idx]
         N = len(strip['zyxs'])
         coords = np.sort(np.random.choice(N, num_points_per_pcl, replace=num_points_per_pcl > N))
+        sampled_local_indices[k] = coords
         sampled_flat_indices[k] = starts_cpu[pcl_idx] + coords
 
     sampled_flat_indices_t = torch.from_numpy(sampled_flat_indices).to(device=device)
@@ -1221,7 +1300,10 @@ def get_unattached_pcl_strip_losses(
     if not compute_dt:
         return radius_loss, zero
 
-    target_normalised = torch.round(normalised_radii.median(dim=-1, keepdim=True).values / dr_per_winding) * dr_per_winding
+    target_normalised = strip_dt_target_in_sample_frame(
+        normalised_radii, sampled_local_indices, theta, crossing_adjustments,
+        dr_per_winding, dt_target_cache, chosen,
+    )
     target_shifted = target_normalised + winding_t * dr_per_winding
     target_radii = radius_from_unwrapped_shifted(
         theta, target_shifted, crossing_adjustments, dr_per_winding,

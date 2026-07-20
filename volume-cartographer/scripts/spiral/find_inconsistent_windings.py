@@ -162,6 +162,10 @@ def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z
     field independently of the filtering z-range."""
     cfg = dict(fs.default_config)
     cfg.update(checkpoint['cfg'])
+    # This tool IS the patch graph — a checkpoint trained supervision-free
+    # (disable_patches, e.g. the 2026-07-17 normals-only baseline) must not
+    # stop the loaders from reading the patches it wants to analyse.
+    cfg['disable_patches'] = False
     fs.cfg = cfg
     fs.verified_patches_path = patches_dir
     # Attachment is over the verified patch set only, so skip the (slow, unrelated)
@@ -921,7 +925,8 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
     print(f'using umbilicus {umbilicus_path}')
 
     print(f'loading checkpoint {checkpoint}')
-    ckpt = torch.load(checkpoint, map_location='cpu')
+    from checkpoint_io import load_checkpoint_cpu
+    ckpt = load_checkpoint_cpu(checkpoint)
     model_z_begin, model_z_end = install_globals(
         ckpt, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path
     )
@@ -937,6 +942,11 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
     patches, _unverified, _shell, cross_patch_pcls, _unattached = fs.main(
         load_only_patches_and_point_collections=True
     )
+    if isinstance(cross_patch_pcls, list):
+        # fit_spiral now returns the cross-patch pcls as a list; this tool's
+        # vote/edge builders key their reports by pcl id. Per-file collection
+        # ids collide across json files, so key by list position instead.
+        cross_patch_pcls = dict(enumerate(cross_patch_pcls))
     if patch_id not in patches:
         raise SystemExit(
             f'patch id {patch_id!r} not among {len(patches)} loaded patches (after z-filtering); '

@@ -38,13 +38,23 @@ class DatasetResolverTests(unittest.TestCase):
             root = Path(temporary)
             (root / "umbilicus.json").write_text("{}")
             (root / "verified_patches").mkdir()
+            (root / "unverified_patches").mkdir()
+            (root / "fibers").mkdir()
             (root / "tracks").mkdir()
             (root / "tracks" / "only.dbm.db").write_bytes(b"")
             (root / "abs_winding.json").write_text("{}")
+            (root / "relative_windings.json").write_text("{}")
+            (root / "same_windings.json").write_text("{}")
+            (root / "patch-overlap-pcls.json").write_text("{}")
             result = resolve_dataset_root(root)
             self.assertTrue(result.ok)
             self.assertEqual(result.resolved["tracks_dbm"], str(root / "tracks" / "only.dbm"))
-            self.assertEqual(result.pcl_inputs[0]["role"], "absolute")
+            self.assertEqual(result.resolved["verified_patches"],
+                             str(root / "verified_patches"))
+            self.assertEqual(result.resolved["fibers"], str(root / "fibers"))
+            self.assertNotIn("unverified_patches", result.resolved)
+            self.assertEqual([item["role"] for item in result.pcl_inputs],
+                             ["absolute", "relative"])
             self.assertEqual(resolve_logical_dbm(root / "tracks" / "only.dbm.db"),
                              str(root / "tracks" / "only.dbm"))
 

@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import scipy.ndimage
 import torch
@@ -118,7 +120,14 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         self._pinned_scaled_logits = None
 
     def _get_pinned_scaled_logits(self):
-        if self._pinned_scaled_logits is None:
+        # Rebuild the cache if it was first created under no_grad but the
+        # current call needs gradients: a detached cache would silently
+        # disconnect the gap logits for every later use of this transform
+        # instance (e.g. when a no_grad step-estimation pre-pass is the
+        # instance's first call).
+        needs_grad = self.params.logits.requires_grad and torch.is_grad_enabled()
+        cached = self._pinned_scaled_logits
+        if cached is None or (needs_grad and not cached.requires_grad):
             # Pin the 0th logit (i.e. theta=0 on 1th winding) to be zero, to avoid a jump going from winding #0 to #1
             logits = torch.cat([torch.zeros_like(self.params.logits[..., :1]), self.params.logits[..., 1:]], dim=-1)
             self._pinned_scaled_logits = logits * self.gap_expander_lr_scale
@@ -267,13 +276,36 @@ class VaryingLinearTransform(pyro.distributions.transforms.Transform):
 
     def _call(self, input_zyx, inverse=False):
         zs = input_zyx[..., :1]
-        normalised_zs = (zs.view(-1) - self.min_z) / (self.max_z - self.min_z) * 2 - 1
-        logits = F.grid_sample(
-            rearrange(self.logits, 'z r c -> 1 (r c) z 1'),
-            torch.stack([torch.zeros_like(normalised_zs), normalised_zs], dim=-1)[None, None],
-            padding_mode='border',
-            align_corners=True
-        ).squeeze(2).squeeze(0).T.view(*input_zyx.shape[:-1], 2, 2)
+        if os.environ.get('FIT_SPIRAL_FAST_LINEAR', '1') != '0':
+            # Explicit 1-D lerp over z + elementwise 2x2 apply. The
+            # grid_sample this replaces is a pure z-interpolation on a
+            # [Z, 2, 2] table (W=1, align_corners=True, border padding), but
+            # its backward kernel serializes scattering millions of points
+            # into the tiny table; batched [N,2,2]@[N,2,1] matmul likewise
+            # dispatches to pathological tiny-gemm cublas launches. Same
+            # arithmetic per point (fp-association tolerance class).
+            Z = self.logits.shape[0]
+            zn = (zs.view(-1) - self.min_z) / (self.max_z - self.min_z)
+            coord = (zn * 2 - 1 + 1) / 2 * (Z - 1)
+            coord = coord.clamp(min=0., max=float(Z - 1))
+            lo = coord.detach().floor().clamp(max=float(Z - 2) if Z > 1 else 0.)
+            frac = (coord - lo)[..., None]
+            lo = lo.to(torch.int64)
+            flat = self.logits.reshape(Z, 4)
+            if Z > 1:
+                logits = torch.lerp(
+                    F.embedding(lo, flat), F.embedding(lo + 1, flat), frac)
+            else:
+                logits = F.embedding(lo, flat)
+            logits = logits.view(*input_zyx.shape[:-1], 2, 2)
+        else:
+            normalised_zs = (zs.view(-1) - self.min_z) / (self.max_z - self.min_z) * 2 - 1
+            logits = F.grid_sample(
+                rearrange(self.logits, 'z r c -> 1 (r c) z 1'),
+                torch.stack([torch.zeros_like(normalised_zs), normalised_zs], dim=-1)[None, None],
+                padding_mode='border',
+                align_corners=True
+            ).squeeze(2).squeeze(0).T.view(*input_zyx.shape[:-1], 2, 2)
         if inverse:
             logits = -logits
         if self.truncate_frac is not None:
@@ -281,7 +313,11 @@ class VaryingLinearTransform(pyro.distributions.transforms.Transform):
             # towards the identity at frac=0
             logits = logits * self.truncate_frac
         M = expm_2x2(logits)
-        yx_out = (M @ input_zyx[..., 1:, None]).squeeze(-1)
+        y, x = input_zyx[..., 1], input_zyx[..., 2]
+        yx_out = torch.stack([
+            M[..., 0, 0] * y + M[..., 0, 1] * x,
+            M[..., 1, 0] * y + M[..., 1, 1] * x,
+        ], dim=-1)
         return torch.cat([zs, yx_out], dim=-1)
 
     def _inverse(self, input_zyx):
@@ -308,6 +344,98 @@ class UmbilicusTransform(pyro.distributions.transforms.Transform):
 
     def _inverse(self, input_zyx):
         return self._call(input_zyx, inverse=True)
+
+
+def ray_gap_enabled():
+    # Per-ray specialization of the gap-expander stage for radial-ray sample
+    # batches (phase-bundle polylines / registration targets). The generic
+    # inverse chain recomputes the whole winding-radius walk per SAMPLE while
+    # every sample on a ray shares (theta, z); computing the [rays, windings]
+    # radii table once per ray and gathering per sample does the same
+    # arithmetic ~2 orders of magnitude fewer times. Tolerance class: equal to
+    # the eager per-point pipeline up to fp association (the fused gap_triton
+    # kernels it replaces already differ from eager by scan order / FMA).
+    return os.environ.get('FIT_SPIRAL_RAY_GAP', '1') != '0'
+
+
+def ray_specialized_spiral_to_scroll(
+    slice_to_spiral_transform, radii, theta, z, pair_id, sin_t, cos_t,
+):
+    """Spiral->scroll mapping for radial-ray samples, per-ray gap stage.
+
+    Equivalent to ``slice_to_spiral_transform.inv(spiral_poly)`` for
+    ``spiral_poly = [z[pair_id], sin_t[pair_id]*radii, cos_t[pair_id]*radii]``
+    when the transform is the production chain
+    ``Compose([gap, (flip,) diffeo, linear, umbilicus]).inv``. The gap
+    expander's transformed-winding-radii table is built once per ray
+    ([rays, windings], differentiable) instead of once per sample; the
+    per-sample part is a gather + lerp. The flow / linear / umbilicus stages
+    see post-gap (and post-flow) coordinates whose z varies per sample, so
+    they stay generic per-sample calls.
+
+    Returns the mapped points, or ``None`` when the chain does not match the
+    production shape (caller falls back to the generic transform).
+    """
+    # slice_to_spiral is Compose(parts).inv; depending on the torch/pyro
+    # version that is either a ComposeTransform of per-part inverses (in
+    # reversed order) or an _InverseTransform wrapping the forward compose.
+    # Recover the forward parts without relying on the weakref inv cache.
+    inv_parts = getattr(slice_to_spiral_transform, 'parts', None)
+    if inv_parts is not None:
+        try:
+            parts = [p.inv for p in reversed(inv_parts)]
+        except AttributeError:
+            return None
+    else:
+        base = getattr(slice_to_spiral_transform, '_inv', None)
+        parts = list(getattr(base, 'parts', None) or []) or None
+    if not parts or not isinstance(parts[0], GapExpandingTransform):
+        return None
+    gap, rest = parts[0], parts[1:]
+    flip = None
+    if rest and isinstance(rest[0], pyro.distributions.transforms.AffineTransform):
+        flip, rest = rest[0], rest[1:]
+    if len(rest) != 3 or not (
+            isinstance(rest[0], IntegratedFlowDiffeomorphism)
+            and isinstance(rest[1], VaryingLinearTransform)
+            and isinstance(rest[2], UmbilicusTransform)):
+        return None
+    diffeo, linear, umbilicus = rest
+
+    dr = gap.dr_per_winding
+    theta_norm = theta / (2 * torch.pi)
+    # Per-ray transformed winding radii (differentiable through logits + dr;
+    # includes the truncate_frac warm-up lerp exactly like the eager path).
+    table = gap.get_transformed_winding_radii(theta, z)
+    num_windings = table.shape[-1]
+
+    # Eager _call per-sample pipeline, with per-ray quantities gathered.
+    tn_s = theta_norm[pair_id]
+    shifted = (radii - tn_s * dr).clamp(min=0.)
+    inner = torch.floor(shifted / dr).to(torch.int64).clip(
+        min=0, max=num_windings - 2)
+    # Flat per-sample gather from the per-ray table; never materialize the
+    # [samples, windings] expansion. F.embedding rather than plain indexing:
+    # index backward is a pathological _index_put_impl_ accumulate here,
+    # embedding_dense_backward is the fused gather-accumulate kernel.
+    flat_table = table.reshape(-1, 1)
+    flat_idx = pair_id * num_windings + inner
+    r_in = F.embedding(flat_idx, flat_table).squeeze(-1)
+    r_out = F.embedding(flat_idx + 1, flat_table).squeeze(-1)
+    original_inner = (inner + tn_s) * dr
+    original_outer = original_inner + dr
+    frac = (radii - original_inner) / (original_outer - original_inner)
+    transformed_radius = torch.lerp(r_in, r_out, frac)
+    sin_s, cos_s = sin_t[pair_id], cos_t[pair_id]
+    x_sign = -1.0 if flip is not None else 1.0
+    pts = torch.stack([
+        z[pair_id],
+        sin_s * transformed_radius,
+        (cos_s * transformed_radius) * x_sign,
+    ], dim=-1)
+    pts = diffeo._call(pts)
+    pts = linear._call(pts)
+    return umbilicus._call(pts)
 
 
 class SpiralAndTransform(nn.Module):

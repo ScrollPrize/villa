@@ -31,12 +31,28 @@ def scale_counts_for_z_range(
     z_end,
     reference_z_range_num_slices,
     z_range_scaled_count_keys,
+    floors=None,
 ):
+    """Scale per-step sample counts with the z-range, respecting floors.
+
+    Floors exist for losses whose per-sample information is sparse: the
+    phase bundle sees ~6 winding gradient sites per pair, so
+    volume-proportional scaling starves it on narrow windows (a 300-slice
+    session got ~380 pairs from the 12k default and corrected at half
+    grad_mag's rate - 2026-07-17 sampling-scale probes).
+    """
     num_slices = z_end - z_begin
     scale = num_slices / reference_z_range_num_slices
     for key in z_range_scaled_count_keys:
-        config[key] = max(1, round(config[key] * scale))
+        floor = 1 if floors is None else int(floors.get(key, 1))
+        config[key] = max(floor, round(config[key] * scale))
     return scale, num_slices
+
+
+SAMPLING_COUNT_FLOORS = {
+    'dense_spacing_num_pairs': 8_000,
+    'dense_spacing_density_extra_pairs': 16_000,
+}
 
 
 def _decimate_ordered_points_min_spacing(points, min_spacing):

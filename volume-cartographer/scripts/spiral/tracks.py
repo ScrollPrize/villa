@@ -11,6 +11,7 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 import prefetch
+from dt_targets import strip_dt_target_in_sample_frame
 from loss_maps import diagnostics_enabled, record_loss_samples
 import geom_utils
 from sample_spiral import (
@@ -443,7 +444,7 @@ def _draw_track_sample(prepared_tracks, k, num_points_per_track, generator=None)
         sampled_scroll = staging.to(device=device, non_blocking=False)
     else:
         sampled_scroll = sampled_cpu.to(device=device)
-    return track_idx, flat_idx, sampled_scroll
+    return track_idx, point_idx_within, sampled_scroll
 
 
 def _sample_prepared_track_points(prepared_tracks, num_tracks_per_step, num_points_per_track):
@@ -498,7 +499,7 @@ def _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding, cfg):
     )
 
 
-def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_max_winding=None):
+def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_max_winding=None, dt_target_cache=None):
     """Yield radius then DT losses so the caller can backward them separately.
 
     The DT target is detached before its inverse transform, so its graph does
@@ -520,7 +521,7 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
         yield 'track_radius', zero
         yield 'track_dt', zero
         return
-    _, _, sampled_scroll = sample
+    track_idx, sample_local_idx, sampled_scroll = sample
     k = sampled_scroll.shape[0]
     num_points = sampled_scroll.shape[1]
     sampled_spiral = slice_to_spiral_transform(sampled_scroll.reshape(-1, 3)).reshape(k, num_points, 3)
@@ -558,7 +559,10 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
         yield 'track_dt', zero
         return
 
-    target_shifted_radii = torch.round(shifted_radii.median(dim=-1, keepdim=True).values / dr_per_winding) * dr_per_winding
+    target_shifted_radii = strip_dt_target_in_sample_frame(
+        shifted_radii, sample_local_idx, theta, crossing_adjustments,
+        dr_per_winding, dt_target_cache, track_idx,
+    )
     target_radii = radius_from_unwrapped_shifted(
         theta, target_shifted_radii, crossing_adjustments, dr_per_winding,
     )

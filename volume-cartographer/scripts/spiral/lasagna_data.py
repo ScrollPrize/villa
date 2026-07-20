@@ -101,6 +101,139 @@ def _read_zarr_zslab_chunked(zarr_array, z_lo, z_hi, max_workers=32):
     return out
 
 
+def _dense_gpu_store_allowed(nbytes, *, forced=False):
+    """Whether a prepared uint8 store should be promoted to a dense GPU tensor.
+
+    The mmap gather path costs ~0.12 s per million trilinear samples on the
+    GB10 and dominates the phase-bundle step; a resident uint8 tensor makes
+    the same lookups (bit-identical values) essentially free. Gate:
+    ``FIT_SPIRAL_DENSE_GPU_STORES`` = ``auto`` (default: promote when the
+    slab fits within a fraction of currently free GPU memory), ``0`` (never),
+    ``1`` (always), or a float fraction overriding auto's 0.30.
+    """
+    mode = os.environ.get('FIT_SPIRAL_DENSE_GPU_STORES', 'auto').strip().lower()
+    if mode in ('0', 'false', 'no'):
+        return False
+    if not torch.cuda.is_available():
+        return False
+    if forced or mode in ('1', 'true', 'yes', 'force'):
+        return True
+    fraction = 0.30
+    try:
+        fraction = float(mode)
+    except ValueError:
+        pass
+    free, _total = torch.cuda.mem_get_info()
+    return nbytes <= fraction * free
+
+
+def _upload_slabs_to_gpu(destination, reader, slab=64):
+    """Fill a dense CUDA uint8 tensor slab-by-slab from a memmap-backed
+    reader (z-slab callable), never materialising the full array in RAM."""
+    z_size = destination.shape[0]
+    for z_lo in range(0, z_size, slab):
+        z_hi = min(z_lo + slab, z_size)
+        # copy: a contiguous memmap slice arrives read-only, which
+        # torch.from_numpy warns about (we never write, but stay clean).
+        destination[z_lo:z_hi].copy_(
+            torch.from_numpy(np.array(reader(z_lo, z_hi), dtype=np.uint8)))
+    return destination
+
+
+def _paged_chunk_mask(interior_fn, grid_shape, scale_zyx, z_origin, chunk):
+    """Bool [nzc, nyc, nxc] of store-grid chunks intersecting the interior.
+
+    ``interior_fn(points_working_zyx) -> bool`` decides membership in FULL-RES
+    working coordinates (e.g. inside the outer-shell envelope + margin). Each
+    chunk is tested at its center with the chunk's half-diagonal folded into
+    the caller's margin, so a partially-inside chunk is always kept.
+    """
+    nzc = -(-grid_shape[0] // chunk)
+    nyc = -(-grid_shape[1] // chunk)
+    nxc = -(-grid_shape[2] // chunk)
+    zc, yc, xc = np.meshgrid(
+        np.arange(nzc), np.arange(nyc), np.arange(nxc), indexing='ij')
+    centers_grid = np.stack([zc, yc, xc], axis=-1).reshape(-1, 3) * chunk + chunk / 2.0
+    centers_grid[:, 0] += z_origin
+    centers_working = centers_grid * np.asarray(scale_zyx, dtype=np.float64)
+    keep = interior_fn(centers_working.astype(np.float32))
+    return np.asarray(keep, dtype=bool).reshape(nzc, nyc, nxc)
+
+
+def _build_paged_store(reader, grid_shape, keep_mask, chunk, channels=1):
+    """Pack the kept chunks of a z-slab reader into a paged GPU store.
+
+    reader(ch, z_lo, z_hi) -> np.uint8 [z, Y, X] for channel ch. Returns
+    (chunk_grid int32 CUDA [nzc, nyc, nxc] slot-or--1, pool uint8 CUDA
+    [channels, n_kept, chunk**3]). Boundary chunks are zero-padded; 0 is the
+    stores' no-data code, so padding reads as invalid.
+    """
+    nzc, nyc, nxc = keep_mask.shape
+    slots = np.full(keep_mask.shape, -1, dtype=np.int32)
+    slots[keep_mask] = np.arange(int(keep_mask.sum()), dtype=np.int32)
+    n_kept = int(keep_mask.sum())
+    pool = torch.zeros((channels, n_kept, chunk ** 3), dtype=torch.uint8,
+                       device='cuda')
+    pad_y = nyc * chunk - grid_shape[1]
+    pad_x = nxc * chunk - grid_shape[2]
+    for zc in range(nzc):
+        row_mask = keep_mask[zc]
+        if not row_mask.any():
+            continue
+        z_lo = zc * chunk
+        z_hi = min(z_lo + chunk, grid_shape[0])
+        row_slots = slots[zc][row_mask]
+        keep_flat = np.flatnonzero(row_mask.reshape(-1))
+        for ch in range(channels):
+            slab = np.asarray(reader(ch, z_lo, z_hi), dtype=np.uint8)
+            if slab.shape[0] < chunk or pad_y or pad_x:
+                slab = np.pad(slab, ((0, chunk - slab.shape[0]),
+                                     (0, pad_y), (0, pad_x)))
+            # [chunk, nyc, chunk, nxc, chunk] -> [nyc*nxc, chunk^3]
+            tiles = slab.reshape(chunk, nyc, chunk, nxc, chunk)
+            tiles = tiles.transpose(1, 3, 0, 2, 4).reshape(nyc * nxc, chunk ** 3)
+            pool[ch, torch.from_numpy(row_slots.astype(np.int64)).cuda()] = \
+                torch.from_numpy(np.ascontiguousarray(tiles[keep_flat])).cuda()
+    chunk_grid = torch.from_numpy(slots).to(device='cuda')
+    return chunk_grid, pool
+
+
+def gather_paged_u8(volume_dict, zi, yi, xi, channel=0):
+    """Gather uint8 values from a paged store at store-grid indices (any
+    shape). Indices must already be clamped in-bounds; reads landing in a
+    dropped (outside-interior) chunk return 0 = the no-data code."""
+    chunk = volume_dict['paged_chunk']
+    grid = volume_dict['chunk_grid']
+    pool = volume_dict['pool']
+    cz, cy, cx = zi // chunk, yi // chunk, xi // chunk
+    slot = grid[cz, cy, cx].long()
+    local = (((zi - cz * chunk) * chunk + (yi - cy * chunk)) * chunk
+             + (xi - cx * chunk))
+    values = pool[channel, slot.clamp(min=0), local]
+    return torch.where(slot >= 0, values, torch.zeros_like(values))
+
+
+def _grid_yx_window(yx_bounds_working, y_scale, x_scale, y_size, x_size):
+    """Convert a full-res working-coordinate (y0, y1, x0, x1) crop window to
+    store-grid index bounds, clamped to the plane. None -> the full plane.
+
+    The crop applies only to dense-GPU promotion: the store's disk cache stays
+    full-plane, and out-of-window reads under the cropped tensor fall out of
+    bounds -> invalid, exactly like reads past the canvas edge today."""
+    if yx_bounds_working is None:
+        return 0, int(y_size), 0, int(x_size)
+    y0, y1, x0, x1 = yx_bounds_working
+    y_lo = max(0, int(np.floor(float(y0) / y_scale)))
+    y_hi = min(int(y_size), int(np.ceil(float(y1) / y_scale)))
+    x_lo = max(0, int(np.floor(float(x0) / x_scale)))
+    x_hi = min(int(x_size), int(np.ceil(float(x1) / x_scale)))
+    if y_hi <= y_lo or x_hi <= x_lo:
+        raise RuntimeError(
+            f'yx crop window {yx_bounds_working} is empty on the '
+            f'{y_size}x{x_size} store plane')
+    return y_lo, y_hi, x_lo, x_hi
+
+
 def prepare_lasagna_volume(
     scroll_zarr,
     *,
@@ -115,6 +248,9 @@ def prepare_lasagna_volume(
     lasagna_scale,
     storage_backend='dense_cuda',
     cache_directory=None,
+    yx_bounds_working=None,
+    interior_fn=None,
+    paged_chunk=64,
 ):
     # Densely load the precomputed nx/ny normal-component and grad_mag
     # (windings-per-base-voxel) zarrs over the z-ROI into a compact uint8 volume.
@@ -178,6 +314,55 @@ def prepare_lasagna_volume(
             )
         finally:
             progress.close()
+        if interior_fn is not None and storage_backend == 'auto':
+            keep = _paged_chunk_mask(
+                interior_fn, roi_shape, (lasagna_scale,) * 3, z_lo, paged_chunk)
+            pool_bytes = 3 * int(keep.sum()) * paged_chunk ** 3
+            if _dense_gpu_store_allowed(pool_bytes):
+                readers = (
+                    lambda a, b: store.normals[a:b, :, :, 0],
+                    lambda a, b: store.normals[a:b, :, :, 1],
+                    lambda a, b: store.grad_mag[a:b],
+                )
+                chunk_grid, pool = _build_paged_store(
+                    lambda ch, a, b: readers[ch](a, b),
+                    roi_shape, keep, paged_chunk, channels=3)
+                store._drop_resident_pages()
+                store.close()
+                print(f'lasagna: paged GPU store from cache {store.directory} '
+                      f'({pool_bytes / 1e9:.1f} GB, {int(keep.sum())}/{keep.size} '
+                      f'chunks of {paged_chunk}^3 kept)')
+                return {'backend': 'dense_cuda_paged', 'chunk_grid': chunk_grid,
+                        'pool': pool, 'paged_chunk': paged_chunk,
+                        'z_origin': z_lo, 'lasagna_scale': lasagna_scale,
+                        'shape': roi_shape}
+        y_lo, y_hi, x_lo, x_hi = _grid_yx_window(
+            yx_bounds_working, lasagna_scale, lasagna_scale,
+            roi_shape[1], roi_shape[2])
+        dense_shape = (roi_shape[0], y_hi - y_lo, x_hi - x_lo)
+        if storage_backend == 'auto' and _dense_gpu_store_allowed(
+                3 * int(np.prod(dense_shape, dtype=np.int64))):
+            # Promote the cached slab to a resident GPU tensor: identical
+            # uint8 values, no per-step sparse gather. The disk cache stays
+            # for the next mmap-served consumer. With a yx crop only the
+            # sampled window is uploaded (out-of-window -> invalid).
+            volume = torch.empty((3, *dense_shape), dtype=torch.uint8,
+                                 device='cuda')
+            _upload_slabs_to_gpu(
+                volume[0], lambda a, b: store.normals[a:b, y_lo:y_hi, x_lo:x_hi, 0])
+            _upload_slabs_to_gpu(
+                volume[1], lambda a, b: store.normals[a:b, y_lo:y_hi, x_lo:x_hi, 1])
+            _upload_slabs_to_gpu(
+                volume[2], lambda a, b: store.grad_mag[a:b, y_lo:y_hi, x_lo:x_hi])
+            store._drop_resident_pages()
+            store.close()
+            print(f'lasagna: dense GPU store from cache {store.directory} '
+                  f'({volume.numel() / 1e9:.1f} GB, yx window '
+                  f'[{y_lo},{y_hi})x[{x_lo},{x_hi}))')
+            return {'backend': 'dense_cuda', 'volume': volume,
+                    'z_origin': z_lo, 'y_origin': y_lo, 'x_origin': x_lo,
+                    'lasagna_scale': lasagna_scale,
+                    'shape': dense_shape}
         print(f'lasagna: using mmap cache {store.directory} with {store.worker_count} gather workers')
         return {'backend': 'mmap', 'store': store, 'z_origin': z_lo,
                 'lasagna_scale': lasagna_scale, 'shape': roi_shape}
@@ -244,6 +429,9 @@ def prepare_surf_sdt_volume(
     cache_directory,
     storage_backend='auto',
     workers=None,
+    yx_bounds_working=None,
+    interior_fn=None,
+    paged_chunk=64,
 ):
     """Resolve and validate a surf-SDT store as a mmap-served Lasagna input.
 
@@ -252,11 +440,6 @@ def prepare_surf_sdt_volume(
     voxels per stored grid voxel (group 1 of the standard build = 2.0), so
     sampling maps ``working_zyx / scale`` into the store grid.
     """
-    if storage_backend == 'dense_cuda':
-        raise RuntimeError(
-            'the surf-SDT store must be mmap-served: its group-1 z-slab does not fit '
-            'GPU memory. Use storage_backend auto/mmap; do not fall back to dense loading.')
-
     root = zarr.open_group(sdt_zarr_path, mode='r')
     attrs = dict(root.attrs)
     group_name = str(sdt_zarr_group)
@@ -341,20 +524,49 @@ def prepare_surf_sdt_volume(
         )
     finally:
         progress.close()
-    print(f'surf_sdt: using mmap cache {store.directory} '
-          f'({np.prod(store.shape) / 1e9:.1f} GB, {store.worker_count} gather workers)')
-    return {
-        'backend': 'mmap',
+    shape = (z_hi - z_lo, int(array.shape[1]), int(array.shape[2]))
+    common = {
         'kind': volume_kind,
-        'store': store,
         'z_origin': z_lo,
         'scale_zyx': tuple(scale_zyx),
         'unit': unit,
         'offset': offset,
         'cap': cap,
-        'shape': (z_hi - z_lo, int(array.shape[1]), int(array.shape[2])),
+        'shape': shape,
         'fingerprint': fingerprint,
     }
+    if interior_fn is not None and storage_backend == 'auto':
+        keep = _paged_chunk_mask(interior_fn, shape, scale_zyx, z_lo, paged_chunk)
+        pool_bytes = int(keep.sum()) * paged_chunk ** 3
+        if _dense_gpu_store_allowed(pool_bytes):
+            chunk_grid, pool = _build_paged_store(
+                lambda ch, a, b: store.volume[a:b],
+                shape, keep, paged_chunk, channels=1)
+            store._drop_resident_pages()
+            store.close()
+            print(f'surf_sdt: paged GPU store from cache {store.directory} '
+                  f'({pool_bytes / 1e9:.1f} GB, {int(keep.sum())}/{keep.size} '
+                  f'chunks of {paged_chunk}^3 kept)')
+            return {'backend': 'dense_cuda_paged', 'chunk_grid': chunk_grid,
+                    'pool': pool, 'paged_chunk': paged_chunk, **common}
+    y_lo, y_hi, x_lo, x_hi = _grid_yx_window(
+        yx_bounds_working, scale_zyx[1], scale_zyx[2], shape[1], shape[2])
+    dense_shape = (shape[0], y_hi - y_lo, x_hi - x_lo)
+    nbytes = int(np.prod(dense_shape, dtype=np.int64))
+    if storage_backend in ('auto', 'dense_cuda') and _dense_gpu_store_allowed(
+            nbytes, forced=storage_backend == 'dense_cuda'):
+        volume = torch.empty(dense_shape, dtype=torch.uint8, device='cuda')
+        _upload_slabs_to_gpu(
+            volume, lambda a, b: store.volume[a:b, y_lo:y_hi, x_lo:x_hi])
+        store._drop_resident_pages()
+        store.close()
+        print(f'surf_sdt: dense GPU store from cache {store.directory} '
+              f'({nbytes / 1e9:.1f} GB, yx window [{y_lo},{y_hi})x[{x_lo},{x_hi}))')
+        return {'backend': 'dense_cuda', 'volume': volume, **common,
+                'y_origin': y_lo, 'x_origin': x_lo, 'shape': dense_shape}
+    print(f'surf_sdt: using mmap cache {store.directory} '
+          f'({np.prod(store.shape) / 1e9:.1f} GB, {store.worker_count} gather workers)')
+    return {'backend': 'mmap', 'store': store, **common}
 
 
 def _pyramid_level(root_attrs, group_name):

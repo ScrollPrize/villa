@@ -42,6 +42,7 @@ RUN_MUTABLE_SAMPLING_KEYS = frozenset({
     "track_num_points_per_step",
     "dense_normals_num_points",
     "dense_spacing_num_pairs",
+    "dense_spacing_density_extra_pairs",
     "dense_attachment_num_points",
     "min_spacing_independent_samples",
     "regularisation_num_points",
@@ -194,7 +195,6 @@ _CONVENTIONAL_ENTRIES: tuple[tuple[str, str, str, bool], ...] = (
     ("umbilicus", "umbilicus.json", "file", True),
     ("fibers", "fibers", "directory", False),
     ("verified_patches", "verified_patches", "directory", True),
-    ("unverified_patches", "unverified_patches", "directory", False),
     ("outer_shell", "outer_shell", "directory", False),
     ("normal_x", "lasagna_inputs/las_008_nx.ome.zarr", "directory", False),
     ("normal_y", "lasagna_inputs/las_008_ny.ome.zarr", "directory", False),
@@ -204,9 +204,7 @@ _CONVENTIONAL_ENTRIES: tuple[tuple[str, str, str, bool], ...] = (
 
 _PCL_ENTRIES: tuple[tuple[PclRole, str, bool], ...] = (
     (PclRole.ABSOLUTE, "abs_winding.json", False),
-    (PclRole.PATCH_OVERLAP, "patch-overlap-pcls.json", False),
     (PclRole.RELATIVE, "relative_windings.json", False),
-    (PclRole.SAME_WINDING, "same_windings.json", False),
 )
 
 

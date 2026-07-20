@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import click
 import numpy as np
+import scipy.ndimage
 from PIL import Image
 
 from tifxyz import load_tifxyz, save_tifxyz
@@ -92,6 +93,34 @@ def concat_meshes(mesh_paths):
         for g in grids
     ]
     return np.concatenate(padded, axis=1).astype(np.float32)
+
+
+def clean_concat_zyxs(zyxs, erode_cells, keep_largest):
+    """Clean a concatenated mesh grid before flattening: erode the valid mask by
+    ``erode_cells`` grid cells (same semantics as erode_patch_valid_region:
+    border cells erode too) and keep only the largest 4-connected valid
+    component. Ragged edges and disconnected fragments/dust are what make SLIM
+    diverge; trimming them replaces the old --inpaint workaround (which instead
+    FILLED holes with interpolated geometry that then rendered as real surface).
+    Invalid cells are set to the -1 sentinel. Returns the number of cells
+    removed; mutates zyxs in place. If cleaning would remove everything, the
+    grid is left untouched (caller-visible via the returned -1)."""
+    valid = zyxs[..., 0] >= 0
+    cleaned = valid.copy()
+    if erode_cells > 0:
+        cleaned = scipy.ndimage.binary_erosion(
+            cleaned, iterations=int(erode_cells), border_value=0)
+    if keep_largest and cleaned.any():
+        labels, num = scipy.ndimage.label(cleaned)
+        if num > 1:
+            sizes = np.bincount(labels.ravel())
+            sizes[0] = 0
+            cleaned = labels == int(np.argmax(sizes))
+    if not cleaned.any():
+        return -1
+    removed = valid & ~cleaned
+    zyxs[removed] = -1.0
+    return int(removed.sum())
 
 
 def flatten_mesh(concat_path, tifxyz2obj_bin, flatboi_bin, obj2tifxyz_bin, uv_lift_bin,
@@ -203,13 +232,15 @@ def max_composite(tif_paths):
 @click.option('--flatten-iters', type=int, default=50, show_default=True, help='flatboi SLIM iterations')
 @click.option('--flatten-energy', default='symmetric_dirichlet', show_default=True, help='flatboi energy (symmetric_dirichlet or conformal)')
 @click.option('--flatten-tol', type=float, default=0.0, show_default=True, help='flatboi relative-energy early-stop tolerance (0 disables)')
-@click.option('--flatten-inpaint/--no-flatten-inpaint', default=True, show_default=True, help='Inpaint invalid cells during tifxyz->obj so holes/padding do not break flattening')
+@click.option('--flatten-inpaint/--no-flatten-inpaint', default=False, show_default=True, help='Inpaint invalid cells during tifxyz->obj. OFF by default (2026-07-18): inpainted cells render as real surface and inflate ink area; the erode+largest-component cleanup below is the SLIM-safety mechanism instead')
+@click.option('--pre-erode', type=int, default=3, show_default=True, help='Erode each concatenated mesh valid mask by this many grid cells before flattening (0 disables)')
+@click.option('--keep-largest/--no-keep-largest', default=True, show_default=True, help='Keep only the largest 4-connected valid component of each concatenated mesh (removes dust/fragments before flattening)')
 @click.option('--flatboi-threads', type=int, default=32, show_default=True, help='Shared value for PASTIX_NUM_THREADS and OPENBLAS_NUM_THREADS passed to flatboi')
 @click.option('--openblas-coretype', default='Haswell', show_default=True, help='Value for OPENBLAS_CORETYPE passed to flatboi')
 def main(meshes_dir, volume, vc_render_bin, scale, group_idx, num_slices, num_processes,
          flatten, flatboi_bin, tifxyz2obj_bin, obj2tifxyz_bin, uv_lift_bin, flatten_keep,
-         flatten_iters, flatten_energy, flatten_tol, flatten_inpaint, flatboi_threads,
-         openblas_coretype):
+         flatten_iters, flatten_energy, flatten_tol, flatten_inpaint, pre_erode,
+         keep_largest, flatboi_threads, openblas_coretype):
     meshes = sorted(
         (winding_idx(name), name)
         for name in os.listdir(meshes_dir)
@@ -247,6 +278,14 @@ def main(meshes_dir, volume, vc_render_bin, scale, group_idx, num_slices, num_pr
         name = f'w{lo:03d}-{hi:03d}'
         mesh_paths = [os.path.join(meshes_dir, nm) for _, nm in chunk]
         concat_zyxs = concat_meshes(mesh_paths)
+        if pre_erode > 0 or keep_largest:
+            removed = clean_concat_zyxs(concat_zyxs, pre_erode, keep_largest)
+            if removed < 0:
+                print(f'{name}: WARNING cleanup would remove every valid cell; '
+                      f'left uncleaned')
+            elif removed:
+                print(f'{name}: cleanup removed {removed} cells '
+                      f'(erode {pre_erode}, largest component)')
         save_tifxyz(
             concat_zyxs,
             concat_dir,

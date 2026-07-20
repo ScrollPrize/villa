@@ -188,3 +188,29 @@ journalctl --user -u spiral-service -f     # logs (includes the API key print)
 ```
 
 Direct command-line use remains fully supported; the unit is a convenience.
+
+## Converting track DBMs to OME-Zarr
+
+`tracks_to_ome_zarr.py` rasterizes the ZYX polylines produced by
+`extract_surface_tracks.py` into a compressed `uint8` OME-Zarr. Value 0 is
+background; values 1–255 are assigned with proximity-aware reuse and display
+as categorical colors with VC3D's Glasbey colormap. Rasterization uses worker
+processes, while independent Zarr chunks are compressed and written by a
+thread pool using Zstandard level 3.
+
+Use a paired OME-Zarr to copy the exact volume shape and physical geometry:
+
+```sh
+python scripts/spiral/tracks_to_ome_zarr.py \
+    /data/tracks/2um_ds2_ps256_surf_v2.dbm \
+    --out /data/tracks/2um_ds2_ps256_tracks.ome.zarr \
+    --like /data/volumes/2um.ome.zarr \
+    --like-group 0
+```
+
+Alternatively pass `--shape Z,Y,X`. If neither `--shape` nor `--like` is
+given, the script first scans the DBM and uses the maximum track coordinate
+plus one. The explicit forms avoid that extra pass for large databases.
+`--resume` continues an interrupted conversion. Multiple positional DBMs are
+combined into one output, so separate scrolls should be converted in separate
+commands.

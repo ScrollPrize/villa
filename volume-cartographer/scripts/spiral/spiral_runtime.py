@@ -108,7 +108,8 @@ class InteractiveFitSession:
             from ddp_helpers import (maybe_destroy_distributed,
                                      maybe_init_distributed,
                                      split_counts_across_ranks)
-            from spiral_helpers import scale_counts_for_z_range
+            from spiral_helpers import (
+                SAMPLING_COUNT_FLOORS, scale_counts_for_z_range)
 
             maybe_init_distributed()
             distributed_initialized = True
@@ -153,13 +154,14 @@ class InteractiveFitSession:
                 'rel_winding_num_pcls', 'abs_winding_num_pcls',
                 'unattached_pcl_num_per_step', 'track_num_per_step',
                 'dense_normals_num_points', 'dense_spacing_num_pairs',
+                'dense_spacing_density_extra_pairs',
                 'dense_attachment_num_points',
                 'min_spacing_independent_samples',
                 'regularisation_num_points', 'shell_num_samples',
             )
             scale_counts_for_z_range(
                 config, self.run_config.z_begin, self.run_config.z_end, 9500,
-                count_keys)
+                count_keys, floors=SAMPLING_COUNT_FLOORS)
             split_counts_across_ranks(config, count_keys)
             config.update(explicit_sampling_counts)
             self.requested_config = dict(config)

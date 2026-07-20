@@ -29,6 +29,7 @@ The legacy ``grad_mag`` density-integral objective lives unchanged in
 """
 
 import itertools
+import os
 import time
 
 import numpy as np
@@ -38,6 +39,23 @@ import torch.nn.functional as F
 from ddp_helpers import get_world_size, is_distributed
 from loss_maps import diagnostics_enabled, record_loss_samples
 from soft_alignment import soft_align_sequences
+from transforms import ray_gap_enabled, ray_specialized_spiral_to_scroll
+
+
+def _map_radial_samples(
+    slice_to_spiral_transform, radii, theta, z, pair_id, sin_t, cos_t,
+):
+    """Spiral->scroll for radial-ray samples; per-ray gap stage when the
+    production chain is recognized (see transforms.ray_specialized_spiral_to_
+    scroll), generic transform otherwise."""
+    if ray_gap_enabled():
+        out = ray_specialized_spiral_to_scroll(
+            slice_to_spiral_transform, radii, theta, z, pair_id, sin_t, cos_t)
+        if out is not None:
+            return out
+    spiral = torch.stack([
+        z[pair_id], sin_t[pair_id] * radii, cos_t[pair_id] * radii], dim=-1)
+    return slice_to_spiral_transform.inv(spiral)
 
 
 # A sample is valid when the total trilinear weight of its valid corners is at
@@ -50,6 +68,24 @@ _CORNER_OFFSETS = tuple(itertools.product((0, 1), repeat=3))
 # Printed diagnostic state for the support-mass floor (metric is emitted every
 # step regardless; the print fires only on transitions to avoid spam).
 _floor_was_active = False
+
+
+_METRICS_EVERY = max(1, int(os.environ.get('FIT_SPIRAL_METRICS_EVERY', '1')))
+_metrics_tick = itertools.count()
+_metrics_enabled_now = True
+
+
+def metrics_enabled():
+    """Whether this bundle iteration computes the expensive metrics blocks.
+
+    Every float()/.item() in a metrics dict is a device synchronization; at
+    probe/DDP shapes those stalls dominate the step. With
+    FIT_SPIRAL_METRICS_EVERY=K (default 1 = every step, the historical
+    behavior) the sync-heavy metrics run on every K-th
+    iter_phase_bundle_losses call and the skipped steps yield minimal
+    dicts. Losses and gradients are identical either way.
+    """
+    return _metrics_enabled_now
 
 
 def fitted_winding_domain(outer_winding_idx):
@@ -95,7 +131,9 @@ def _sampling_constants(sdt_volume, device, dtype):
     if key not in cache:
         cache[key] = (
             torch.as_tensor(sdt_volume['scale_zyx'], device=device, dtype=dtype),
-            torch.tensor([float(sdt_volume['z_origin']), 0.0, 0.0],
+            torch.tensor([float(sdt_volume['z_origin']),
+                          float(sdt_volume.get('y_origin', 0)),
+                          float(sdt_volume.get('x_origin', 0))],
                          device=device, dtype=dtype),
             torch.tensor(_CORNER_OFFSETS, device=device, dtype=torch.long),
             torch.tensor(sdt_volume['shape'], device=device, dtype=torch.long),
@@ -132,6 +170,10 @@ def sample_sdt_trilinear(sdt_volume, points_working_zyx):
     if sdt_volume['backend'] == 'mmap':
         values_u8 = sdt_volume['store'].gather(
             clamped.reshape(-1, 3), device).reshape(clamped.shape[:2])
+    elif sdt_volume['backend'] == 'dense_cuda_paged':
+        from lasagna_data import gather_paged_u8
+        values_u8 = gather_paged_u8(
+            sdt_volume, clamped[..., 0], clamped[..., 1], clamped[..., 2])
     else:  # dense torch uint8 tensor (tests / tiny ROIs)
         volume = sdt_volume['volume']
         values_u8 = volume[clamped[..., 0], clamped[..., 1], clamped[..., 2]]
@@ -139,7 +181,13 @@ def sample_sdt_trilinear(sdt_volume, points_working_zyx):
     corner_valid = in_bounds & (values_u8 != 0)
     corner_frac = torch.where(
         offsets[None, :, :].bool(), frac[:, None, :], 1.0 - frac[:, None, :])
-    weights = corner_frac.prod(dim=-1)  # (N, 8), differentiable wrt positions
+    # (N, 8), differentiable wrt positions. Explicit chain instead of
+    # .prod(dim=-1): same left-to-right multiply (bitwise-identical values)
+    # but elementwise MulBackward instead of ProdBackward's double-cumprod
+    # scan, which dominated the count-term backward (2x56 ms/step on H100
+    # for the [N*8, 3] scan).
+    weights = (corner_frac[..., 0] * corner_frac[..., 1]
+               * corner_frac[..., 2])
     valid_f = corner_valid.to(weights.dtype)
     mass = (weights * valid_f).sum(dim=-1)
     normalised = weights * valid_f / mass.clamp(min=1e-12)[:, None]
@@ -216,13 +264,10 @@ def sample_pair_polylines(
     probe_pair_id = torch.arange(num_pairs, device=device).repeat_interleave(
         max_segments + 1)
     probe_radii = breakpoint_radii.reshape(-1)
-    probe_spiral = torch.stack([
-        z[probe_pair_id], sin_t[probe_pair_id] * probe_radii,
-        cos_t[probe_pair_id] * probe_radii,
-    ], dim=-1)
     with torch.no_grad():
-        breakpoint_scroll = slice_to_spiral_transform.inv(probe_spiral).reshape(
-            num_pairs, max_segments + 1, 3)
+        breakpoint_scroll = _map_radial_samples(
+            slice_to_spiral_transform, probe_radii, theta, z, probe_pair_id,
+            sin_t, cos_t).reshape(num_pairs, max_segments + 1, 3)
         segment_lengths = torch.diff(breakpoint_scroll, dim=1).norm(dim=-1)
     segment_steps = torch.where(
         active_segment,
@@ -271,9 +316,12 @@ def sample_pair_polylines(
     ], dim=-1)
     if no_grad:
         with torch.no_grad():
-            scroll_poly = slice_to_spiral_transform.inv(spiral_poly)
+            scroll_poly = _map_radial_samples(
+                slice_to_spiral_transform, radii, theta, z, pair_id,
+                sin_t, cos_t)
     else:
-        scroll_poly = slice_to_spiral_transform.inv(spiral_poly)
+        scroll_poly = _map_radial_samples(
+            slice_to_spiral_transform, radii, theta, z, pair_id, sin_t, cos_t)
 
     has_successor = position < n[pair_id]
     with torch.no_grad():
@@ -408,7 +456,8 @@ def sample_lasagna_normals_nearest(lasagna_volume, points_working_zyx):
     scale = float(lasagna_volume['lasagna_scale'])
     index = (points_working_zyx / scale).round().long()
     zi = index[:, 0] - int(lasagna_volume['z_origin'])
-    yi, xi = index[:, 1], index[:, 2]
+    yi = index[:, 1] - int(lasagna_volume.get('y_origin', 0))
+    xi = index[:, 2] - int(lasagna_volume.get('x_origin', 0))
     in_bounds = (
         (zi >= 0) & (zi < z_size) & (yi >= 0) & (yi < y_size)
         & (xi >= 0) & (xi < x_size))
@@ -421,6 +470,10 @@ def sample_lasagna_normals_nearest(lasagna_volume, points_working_zyx):
         normal_u8, _ = lasagna_volume['store'].gather_pair(
             normal_indices, empty, device)
         nx_u8, ny_u8 = normal_u8.unbind(dim=-1)
+    elif lasagna_volume['backend'] == 'dense_cuda_paged':
+        from lasagna_data import gather_paged_u8
+        nx_u8 = gather_paged_u8(lasagna_volume, zi, yi, xi, channel=0)
+        ny_u8 = gather_paged_u8(lasagna_volume, zi, yi, xi, channel=1)
     else:
         volume = lasagna_volume['volume']
         nx_u8 = volume[0, zi, yi, xi]
@@ -477,7 +530,8 @@ def detect_complete_sdt_bands(ray, field, sample_valid, normal_volume, cfg):
             'width': empty, 'depth': empty, 'normal_dot': empty,
             'normal_valid': empty.bool(), 'graze': empty.bool(),
             'ambiguous': empty.bool(), 'interior_invalid': empty.bool(),
-            'unsupported_before': empty.bool(), 'merged_count': 0,
+            'unsupported_before': empty.bool(), 'clearance_before': empty,
+            'merged_count': 0,
             'field_value': field, 'sample_valid': sample_valid,
             'normal_gather_seconds': normal_gather_seconds,
         }
@@ -502,7 +556,8 @@ def detect_complete_sdt_bands(ray, field, sample_valid, normal_volume, cfg):
             'width': empty, 'depth': empty, 'normal_dot': empty,
             'normal_valid': empty.bool(), 'graze': empty.bool(),
             'ambiguous': empty.bool(), 'interior_invalid': empty.bool(),
-            'unsupported_before': empty.bool(), 'merged_count': 0,
+            'unsupported_before': empty.bool(), 'clearance_before': empty,
+            'merged_count': 0,
             'field_value': field, 'sample_valid': sample_valid,
             'normal_gather_seconds': normal_gather_seconds,
         }
@@ -597,6 +652,34 @@ def detect_complete_sdt_bands(ray, field, sample_valid, normal_volume, cfg):
         center_arc, center, phase, direction, normal_dot, normal_valid = geometry(
             entry_arc, exit_arc)
 
+    # Exterior clearance of the gap before each band: the maximum decoded SDT
+    # between the previous same-pair band's exit and this band's entry. A
+    # genuine inter-winding gap contains real air (clearance well above 0); a
+    # band split off its neighbour by a shallow blip or hole barely exits the
+    # sheet. First bands of a ray (no previous band) read +inf.
+    clearance_before = torch.full(
+        [entry_edge.numel()], float('inf'), device=field.device,
+        dtype=field.dtype)
+    if entry_edge.numel() > 1:
+        band_of = torch.searchsorted(entry_edge, sample_index, right=True) - 1
+        clipped = band_of.clamp(min=0, max=entry_edge.numel() - 2)
+        in_gap = (
+            (band_of >= 0) & (band_of < entry_edge.numel() - 1)
+            & (sample_index > exit_edge[clipped])
+            & (sample_index <= entry_edge[clipped + 1])
+            & (pair_id[sample_index] == pair_id[entry_edge[clipped]])
+            & sample_valid)
+        gap_clearance = torch.full(
+            [entry_edge.numel() - 1], float('-inf'), device=field.device,
+            dtype=field.dtype)
+        gap_clearance.scatter_reduce_(
+            0, clipped[in_gap], field[in_gap], reduce='amax',
+            include_self=True)
+        same_prev_band = band_pair[1:] == band_pair[:-1]
+        clearance_before[1:] = torch.where(
+            same_prev_band, gap_clearance,
+            torch.full_like(gap_clearance, float('inf')))
+
     counts = torch.zeros(
         int(ray['num_pairs']), dtype=torch.long, device=field.device)
     counts.index_add_(0, band_pair, torch.ones_like(band_pair))
@@ -609,6 +692,7 @@ def detect_complete_sdt_bands(ray, field, sample_valid, normal_volume, cfg):
         'pair_id': band_pair, 'ordinal': ordinal, 'center': center,
         'center_arc': center_arc, 'phase': phase, 'direction': direction,
         'width': exit_arc - entry_arc, 'depth': depth,
+        'clearance_before': clearance_before,
         'normal_dot': normal_dot, 'normal_valid': normal_valid,
         'graze': graze,
         'ambiguous': ambiguous, 'interior_invalid': interior_invalid,
@@ -692,6 +776,8 @@ def _phase_band_features(bands, num_pairs, device):
             [num_pairs, max(1, m_max)], dtype=torch.bool, device=device),
         'confidence_cost': torch.zeros(
             [num_pairs, max(1, m_max)], device=device),
+        'clearance': torch.full(
+            [num_pairs, max(1, m_max)], float('inf'), device=device),
     }
     if not n_bands:
         return features
@@ -720,6 +806,7 @@ def _phase_band_features(bands, num_pairs, device):
         has_reference, gref, torch.ones_like(gref)).clamp(min=1e-3)
     features['matchable'][pair, slot] = matchable
     features['confidence_cost'][pair, slot] = 1.0 - bands['normal_dot']
+    features['clearance'][pair, slot] = bands['clearance_before']
     return features
 
 
@@ -848,9 +935,135 @@ def _assemble_detection_view(central_ray, central_field, central_valid, pads):
     return view, field, valid
 
 
+def _metric_density_loss(central, features, pair_m, rejected, cfg):
+    """``|integral(lambda ds) - m|`` with a detached band-derived density.
+
+    ``lambda`` is the inverse distance between the two detected band centers
+    bracketing each live polyline step (piecewise-constant, detached), so -
+    unlike the topological crossing count, whose gradient lives only where a
+    sigmoid transition straddles a sample - every step of the live central
+    polyline carries gradient proportional to its length. This is the metric
+    analogue of the legacy grad_mag density integral, sourced from clean SDT
+    band geometry instead of the noisy grad_mag volume, and with no endpoint
+    support gate to self-confirm on a mis-registered model.
+
+    Sub-resolution abstention (band-GT calibrated 2026-07-17): below ~12 wv
+    detected spacing every SDT estimator under-reads winding density ~30%
+    (the store cannot separate that tight a sheet pair), so optimising the
+    integral there actively fights truth. Steps bracketed by such a gap are
+    blind: they contribute nothing to the integral and their detached
+    model-phase span is subtracted from the target, so the rest of the pair
+    still carries an unbiased residual. Pairs that are mostly blind are
+    dropped entirely. The criterion is observation-side (detected gap
+    width); only the excluded span's size uses the model, so there is no
+    restoring force inside blind zones but no self-confirmation either.
+    """
+    device = pair_m.device
+    scroll = central['scroll_poly']
+    pid = central['pair_id']
+    succ = central['has_successor']
+    counts = features['counts']
+    if features['phase'].shape[1] < 2:
+        zero = scroll.sum() * 0.0
+        return zero, {'dense_spacing_density_valid_fraction': 0.0}
+    with torch.no_grad():
+        phase = central['sample_phase'].detach()
+        bphase = features['phase']
+        band_valid = features['band_valid']
+        centers = features['center']
+        gap_floor = float(cfg['dense_spacing_phase_min_center_gap_wv'])
+        gaps = (centers[:, 1:] - centers[:, :-1]).norm(dim=-1).clamp(
+            min=gap_floor)
+        # step midpoint phase -> index of the bracketing gap
+        step_mask = succ.clone()
+        step_mask[-1] = False
+        s_phase = 0.5 * (phase[:-1] + phase[1:])
+        s_pid = pid[:-1]
+        cmp = (bphase[s_pid] <= s_phase[:, None]) & band_valid[s_pid]
+        left = cmp.sum(dim=1) - 1
+        gap_idx = left.clamp(min=0)
+        gap_idx = torch.minimum(
+            gap_idx, (counts[s_pid] - 2).clamp(min=0))
+        step_gap = gaps[s_pid, gap_idx.clamp(max=gaps.shape[1] - 1)]
+        blind = (
+            step_gap < float(cfg['dense_spacing_density_min_gap_wv']))
+        lambda_mode = cfg.get('dense_spacing_density_lambda', 'inverse_gap')
+        if (lambda_mode in ('soft_mass', 'soft_mass_wide')
+                and central.get('field') is not None):
+            # Mass-weighted lambda (outer-recall experiment): per detected
+            # gap, lambda = (soft crossing mass)/2 per unit arclength
+            # instead of 1/(center distance). A sheet the hard detection
+            # missed still carries its |delta indicator| mass (2 per full
+            # crossing), so the integral keeps counting it fractionally —
+            # the density calibration's -12% outer under-read is exactly
+            # missed detections widening gaps.
+            s_count = float(cfg['dense_spacing_count_temperature_wv'])
+            ind = _inside_indicator(central['field'].detach(), s_count)
+            live_step = step_mask[:-1]
+            dmass = (ind[1:] - ind[:-1]).abs() * live_step.to(ind.dtype)
+            ds_det = (scroll[1:] - scroll[:-1]).norm(dim=-1).detach() \
+                * live_step.to(ind.dtype)
+            max_gaps = gaps.shape[1]
+            key = s_pid * max_gaps + gap_idx.clamp(max=max_gaps - 1)
+            flat = torch.zeros(
+                counts.shape[0] * max_gaps, device=device, dtype=ind.dtype)
+            gap_mass = flat.clone().index_add_(0, key, dmass)
+            gap_len = flat.index_add_(0, key, ds_det)
+            lam = (0.5 * gap_mass / gap_len.clamp(min=gap_floor))[key]
+            if lambda_mode == 'soft_mass_wide':
+                # Hybrid: mass only where the detected gap is wide (where
+                # missed sheets live and the soft mass is reliable);
+                # inverse-gap keeps the topological 1-winding-per-gap prior
+                # at tight spacings, where the soft indicator under-reads
+                # (the measured <12 wv estimator blindness).
+                wide = step_gap > float(
+                    cfg.get('dense_spacing_density_soft_mass_min_gap_wv',
+                            20.0))
+                lam = torch.where(wide, lam, 1.0 / step_gap)
+        else:
+            lam = 1.0 / step_gap
+        lam = lam * (step_mask[:-1] & ~blind).to(lam.dtype)
+    ds = (scroll[1:] - scroll[:-1]).norm(dim=-1)
+    num_pairs = int(counts.shape[0])
+    with torch.no_grad():
+        # blind span in detached model windings; removed from the target so
+        # the remaining path is scored against the windings it should hold
+        step_dphase = (phase[1:] - phase[:-1]).clamp(min=0.0)
+        blind_span = torch.zeros(num_pairs, device=device).index_add_(
+            0, s_pid,
+            step_dphase * (blind & step_mask[:-1]).to(step_dphase.dtype))
+        blind_fraction = blind_span / pair_m.to(blind_span.dtype).clamp(min=1e-6)
+        ray_valid = (
+            (counts >= 2) & ~rejected
+            & (blind_fraction
+               <= float(cfg['dense_spacing_density_max_blind_fraction'])))
+        target = (pair_m.to(ds.dtype) - blind_span).clamp(min=0.0)
+    integral = torch.zeros(
+        num_pairs, device=device, dtype=ds.dtype).index_add_(
+        0, s_pid, lam * ds)
+    residual = (integral - target).abs()
+    weight = ray_valid.to(torch.float32)
+    loss, _stats = _aggregate_nominal_mass(
+        residual, weight, cfg['dense_spacing_support_floor_alpha'])
+    if not metrics_enabled():
+        return loss, {}
+    with torch.no_grad():
+        n_valid = weight.sum().clamp(min=1.0)
+        metrics = {
+            'dense_spacing_density_valid_fraction': float(weight.mean()),
+            'dense_spacing_density_blind_fraction_mean': float(
+                blind_fraction.mean()),
+            'dense_spacing_density_integral_mean': float(
+                (integral.detach() * weight).sum() / n_valid),
+            'dense_spacing_density_residual_mean': float(
+                (residual.detach() * weight).sum() / n_valid),
+        }
+    return loss, metrics
+
+
 def _phase_registration_loss(
-    slice_to_spiral_transform, dr_per_winding, view, view_field, view_valid,
-    normal_volume, k, pair_m, theta, z, phase_rejected, cfg, *,
+    slice_to_spiral_transform, dr_per_winding, bands, features, view,
+    view_valid, k, pair_m, theta, z, phase_rejected, cfg, *,
     compute_map_path=False,
 ):
     """Soft-sequence phase registration on detached detected bands.
@@ -859,27 +1072,24 @@ def _phase_registration_loss(
     and the sequence alignment are differentiable; band geometry, reference
     gaps, and every gate/mass are detached, so the run cannot reduce its
     objective by rotating observations or eroding its own confidence.
+    ``bands``/``features`` are the precomputed detached detection outputs
+    (shared with the density component).
     """
     device = k.device
     num_pairs = k.shape[0]
-    bands = detect_complete_sdt_bands(
-        view, view_field, view_valid, normal_volume, cfg)
-    features = _phase_band_features(bands, num_pairs, device)
-
     n_max = int(pair_m.max().item()) + 1
     offsets_i = torch.arange(n_max, device=device)
     model_valid = offsets_i[None, :] <= pair_m[:, None]
     winding = k[:, None] + offsets_i[None, :].to(k.dtype)
     radius = (winding + (theta / (2 * np.pi))[:, None]) * dr_per_winding.detach()
-    spiral = torch.stack([
-        z[:, None].expand_as(radius),
-        torch.sin(theta)[:, None] * radius,
-        torch.cos(theta)[:, None] * radius,
-    ], dim=-1)
     # Only the modeled targets participating in phase costs go through the
     # live inverse transform; everything observation-side stays detached.
-    target = slice_to_spiral_transform.inv(
-        spiral.reshape(-1, 3)).reshape(num_pairs, n_max, 3)
+    target_pair_id = torch.arange(
+        num_pairs, device=device).repeat_interleave(n_max)
+    target = _map_radial_samples(
+        slice_to_spiral_transform, radius.reshape(-1), theta, z,
+        target_pair_id, torch.sin(theta), torch.cos(theta),
+    ).reshape(num_pairs, n_max, 3)
 
     displacement = ((target[:, :, None, :] - features['center'][:, None, :, :])
                     * features['direction'][:, None, :, :]).sum(dim=-1)
@@ -971,6 +1181,9 @@ def _phase_registration_loss(
     ray_loss = numerator / mass.clamp(min=1e-6)
     loss, mass_stats = _aggregate_nominal_mass(
         ray_loss, pair_weight, cfg['dense_spacing_support_floor_alpha'])
+
+    if not (metrics_enabled() or compute_map_path):
+        return loss, {}
 
     with torch.no_grad():
         n_bands = int(bands['pair_id'].numel())
@@ -1070,8 +1283,267 @@ def _phase_registration_loss(
             'map_extra': alignment['map_extra'],
             'match_posterior': alignment['match_posterior'].detach(),
             'ray_ok': ray_ok,
+            'k': k,
+            'm': pair_m,
+            'model_valid': model_valid,
+            'band_valid': features['band_valid'],
+            'band_phase': features['phase'],
+            'band_out_of_model': out_of_model,
+            'rho': rho.detach(),
+            'allowed': allowed,
+            'top2_margin': alignment['top2_margin'],
+            'map_clearance': alignment['map_clearance'],
+            'ray_entropy': alignment['ray_entropy'],
         }
     return loss, metrics
+
+
+def _sheet_walk_offsets(radius, step, device, dtype):
+    count = max(1, int(np.ceil(float(radius) / float(step))))
+    return torch.linspace(-float(radius), float(radius), 2 * count + 1,
+                          device=device, dtype=dtype)
+
+
+def _sample_sdt_normal_lines(sdt_volume, origins, axes, offsets):
+    """Sample parallel per-point lines, returning [points, offsets] tensors."""
+    if origins.shape[0] == 0:
+        shape = (0, offsets.numel())
+        return (torch.empty(shape, device=origins.device, dtype=origins.dtype),
+                torch.empty(shape, device=origins.device, dtype=torch.bool))
+    samples = origins[:, None, :] + offsets[None, :, None] * axes[:, None, :]
+    field, valid, _ = sample_sdt_trilinear(
+        sdt_volume, samples.reshape(-1, 3))
+    return field.reshape(origins.shape[0], -1), valid.reshape(origins.shape[0], -1)
+
+
+def _crossing_offset(field, offsets, edge):
+    """Linearly interpolate the zero crossing on each selected line edge."""
+    row = torch.arange(field.shape[0], device=field.device)
+    edge = edge.clamp(min=0, max=field.shape[1] - 2)
+    f0 = field[row, edge]
+    f1 = field[row, edge + 1]
+    # Replace only exact zeros; valid sign-changing edges otherwise have a
+    # nonzero denominator.
+    denom = f1 - f0
+    safe = torch.where(denom.abs() > 1e-12, denom, torch.ones_like(denom))
+    frac = (-f0 / safe).clamp(0.0, 1.0)
+    return torch.lerp(offsets[edge], offsets[edge + 1], frac)
+
+
+def _transverse_normal(normal):
+    """Normal within a constant-z slice; sign remains intentionally arbitrary."""
+    transverse = torch.stack([
+        torch.zeros_like(normal[:, 0]), normal[:, 1], normal[:, 2]], dim=-1)
+    length = transverse.norm(dim=-1)
+    return transverse / length.clamp(min=1e-12)[:, None], length
+
+
+def _initial_sheet_band(sdt_volume, normal_volume, points, radius, sample_step):
+    """Find the complete SDT-negative band nearest each source point."""
+    normal, normal_valid = sample_lasagna_normals_nearest(normal_volume, points)
+    axis, transverse_length = _transverse_normal(normal)
+    offsets = _sheet_walk_offsets(radius, sample_step, points.device, points.dtype)
+    field, valid = _sample_sdt_normal_lines(sdt_volume, points, axis, offsets)
+    inside = valid & (field < 0)
+    seed_cost = torch.where(
+        inside, offsets.abs()[None, :], torch.full_like(field, float('inf')))
+    seed_cost_min, seed = seed_cost.min(dim=1)
+
+    edge_index = torch.arange(offsets.numel() - 1, device=points.device)
+    edge_valid = valid[:, :-1] & valid[:, 1:]
+    entry = edge_valid & (field[:, :-1] >= 0) & (field[:, 1:] < 0)
+    exit = edge_valid & (field[:, :-1] < 0) & (field[:, 1:] >= 0)
+    before_seed = edge_index[None, :] < seed[:, None]
+    at_or_after_seed = edge_index[None, :] >= seed[:, None]
+    left_edge = torch.where(
+        entry & before_seed, edge_index[None, :],
+        torch.full_like(edge_index[None, :], -1)).max(dim=1).values
+    right_edge = torch.where(
+        exit & at_or_after_seed, edge_index[None, :],
+        torch.full_like(edge_index[None, :], offsets.numel())).min(dim=1).values
+
+    safe_left = left_edge.clamp(min=0, max=offsets.numel() - 2)
+    safe_right = right_edge.clamp(min=0, max=offsets.numel() - 2)
+    left_offset = _crossing_offset(field, offsets, safe_left)
+    right_offset = _crossing_offset(field, offsets, safe_right)
+    left = points + left_offset[:, None] * axis
+    right = points + right_offset[:, None] * axis
+    center = (left + right) * 0.5
+    width = (right - left).norm(dim=-1)
+
+    sample_index = torch.arange(offsets.numel(), device=points.device)
+    interior = ((sample_index[None, :] > safe_left[:, None])
+                & (sample_index[None, :] <= safe_right[:, None]))
+    complete_interior = ((~interior) | inside).all(dim=1)
+    alive = (
+        normal_valid & (transverse_length > 0.25)
+        & torch.isfinite(seed_cost_min)
+        & (left_edge >= 0) & (right_edge < offsets.numel() - 1)
+        & complete_interior & (width > 0.5)
+    )
+    actual_axis = (right - left) / width.clamp(min=1e-12)[:, None]
+    return center, left, right, actual_axis, width, alive
+
+
+def _refine_predicted_boundary(
+    sdt_volume, predicted, axis, radius, sample_step, *, entering,
+):
+    """Continue one oriented zero-crossing inside a tight trust bracket."""
+    offsets = _sheet_walk_offsets(radius, sample_step, predicted.device,
+                                  predicted.dtype)
+    field, valid = _sample_sdt_normal_lines(
+        sdt_volume, predicted, axis, offsets)
+    edge_valid = valid[:, :-1] & valid[:, 1:]
+    if entering:
+        crossing = edge_valid & (field[:, :-1] >= 0) & (field[:, 1:] < 0)
+    else:
+        crossing = edge_valid & (field[:, :-1] < 0) & (field[:, 1:] >= 0)
+    any_crossing = edge_valid & ((field[:, :-1] < 0) != (field[:, 1:] < 0))
+    edge_mid = (offsets[:-1] + offsets[1:]) * 0.5
+    score = torch.where(
+        crossing, edge_mid.abs()[None, :],
+        torch.full_like(field[:, :-1], float('inf')))
+    _, edge = score.min(dim=1)
+    offset = _crossing_offset(field, offsets, edge)
+    point = predicted + offset[:, None] * axis
+    # Any additional crossing in one small trust region indicates a hole,
+    # split, or another sheet. Fail closed instead of choosing one.
+    ok = (crossing.sum(dim=1) == 1) & (any_crossing.sum(dim=1) == 1)
+    return point, ok
+
+
+def _advance_sheet_band(
+    sdt_volume, normal_volume, center, left, right, axis, width, alive,
+    dz_total, *, substep_wv, boundary_search_wv, sample_step_wv,
+):
+    """Paired-boundary predictor/corrector; returns the complete final state."""
+    max_abs = float(dz_total.abs().max()) if dz_total.numel() else 0.0
+    n_substeps = max(1, int(np.ceil(max_abs / float(substep_wv))))
+    dz = dz_total / n_substeps
+    for _ in range(n_substeps):
+        normal, normal_valid = sample_lasagna_normals_nearest(
+            normal_volume, center)
+        _, transverse_length = _transverse_normal(normal)
+        transverse_sq = transverse_length.square()
+        # Minimum-norm tangent with exactly one unit of z motion:
+        # n dot tangent == 0 and tangent[z] == 1. Normal sign cancels.
+        tangent = torch.stack([
+            torch.ones_like(dz),
+            -normal[:, 0] * normal[:, 1] / transverse_sq.clamp(min=1e-12),
+            -normal[:, 0] * normal[:, 2] / transverse_sq.clamp(min=1e-12),
+        ], dim=-1)
+        displacement = dz[:, None] * tangent
+        predicted_center = center + displacement
+        predicted_left = left + displacement
+        predicted_right = right + displacement
+
+        predicted_normal, predicted_normal_valid = \
+            sample_lasagna_normals_nearest(normal_volume, predicted_center)
+        predicted_axis, predicted_transverse = _transverse_normal(predicted_normal)
+        flip = (predicted_axis * axis).sum(dim=-1) < 0
+        predicted_axis = torch.where(
+            flip[:, None], -predicted_axis, predicted_axis)
+
+        new_left, left_ok = _refine_predicted_boundary(
+            sdt_volume, predicted_left, predicted_axis,
+            boundary_search_wv, sample_step_wv, entering=True)
+        new_right, right_ok = _refine_predicted_boundary(
+            sdt_volume, predicted_right, predicted_axis,
+            boundary_search_wv, sample_step_wv, entering=False)
+        new_center = (new_left + new_right) * 0.5
+        new_width = (new_right - new_left).norm(dim=-1)
+        new_axis = ((new_right - new_left)
+                    / new_width.clamp(min=1e-12)[:, None])
+        center_field, center_valid, _ = sample_sdt_trilinear(
+            sdt_volume, new_center)
+
+        width_allowance = torch.maximum(
+            torch.full_like(width, 2.0), width * 0.5)
+        correction = (new_center - predicted_center).norm(dim=-1)
+        axis_alignment = (new_axis * predicted_axis).sum(dim=-1)
+        step_ok = (
+            alive & normal_valid & predicted_normal_valid
+            & (transverse_length > 0.25) & (predicted_transverse > 0.25)
+            & left_ok & right_ok & center_valid & (center_field < 0)
+            & (new_width > 0.5)
+            & ((new_width - width).abs() <= width_allowance)
+            & (correction <= float(boundary_search_wv))
+            & (axis_alignment > 0.75)
+        )
+        center = torch.where(step_ok[:, None], new_center, center)
+        left = torch.where(step_ok[:, None], new_left, left)
+        right = torch.where(step_ok[:, None], new_right, right)
+        axis = torch.where(step_ok[:, None], new_axis, axis)
+        width = torch.where(step_ok, new_width, width)
+        alive = step_ok
+    return center, left, right, axis, width, alive
+
+
+def sheet_walk(
+    sdt_volume, normal_volume, points_zyx, dz_total, *, substep_wv=4.0,
+    band_search_wv=8.0, boundary_search_wv=3.0, sample_step_wv=1.0,
+    validate_roundtrip=True, roundtrip_tolerance_wv=1.0,
+):
+    """Track the medial center of the same physical SDT band through z.
+
+    This observation-side primitive is fully detached. It initializes the
+    nearest complete positive->negative->positive SDT interval along the
+    in-slice component of the Lasagna normal, then continues its TWO oriented
+    zero-crossing boundaries independently. Each substep uses the full
+    Lasagna normal for a sheet-tangent predictor and tightly brackets the
+    predicted entry and exit crossings; their midpoint is the new band center.
+    Ambiguous, missing, implausibly moving, or non-closing bands die rather
+    than falling back to a nearby sheet.
+
+    ``dz_total`` may be scalar or per-point. When ``validate_roundtrip`` is
+    true (the default), the final paired-boundary state is walked back by the
+    opposite displacement and retained only if it closes within
+    ``roundtrip_tolerance_wv``. Returns ``(endpoints, alive)``.
+    """
+    with torch.no_grad():
+        device = points_zyx.device
+        num = points_zyx.shape[0]
+        if num == 0:
+            return points_zyx.clone(), torch.empty(
+                [0], dtype=torch.bool, device=device)
+        if substep_wv <= 0 or band_search_wv <= 0 \
+                or boundary_search_wv <= 0 or sample_step_wv <= 0:
+            raise ValueError('sheet-walk distances and sampling step must be positive')
+        if roundtrip_tolerance_wv < 0:
+            raise ValueError('roundtrip_tolerance_wv must be nonnegative')
+        if not torch.is_tensor(dz_total):
+            dz_total = torch.full(
+                (num,), float(dz_total), device=device,
+                dtype=points_zyx.dtype)
+        else:
+            dz_total = dz_total.to(device=device, dtype=points_zyx.dtype)
+            if dz_total.numel() == 1:
+                dz_total = dz_total.reshape(1).expand(num)
+            elif dz_total.numel() == num:
+                dz_total = dz_total.reshape(num)
+            else:
+                raise ValueError(
+                    'dz_total must be scalar or have one value per point')
+        state = _initial_sheet_band(
+            sdt_volume, normal_volume, points_zyx,
+            float(band_search_wv), float(sample_step_wv))
+        source_center = state[0]
+        end_state = _advance_sheet_band(
+            sdt_volume, normal_volume, *state, dz_total,
+            substep_wv=float(substep_wv),
+            boundary_search_wv=float(boundary_search_wv),
+            sample_step_wv=float(sample_step_wv))
+        endpoint, alive = end_state[0], end_state[-1]
+        if validate_roundtrip and num:
+            back_state = _advance_sheet_band(
+                sdt_volume, normal_volume, *end_state, -dz_total,
+                substep_wv=float(substep_wv),
+                boundary_search_wv=float(boundary_search_wv),
+                sample_step_wv=float(sample_step_wv))
+            closes = ((back_state[0] - source_center).norm(dim=-1)
+                      <= float(roundtrip_tolerance_wv))
+            alive = alive & back_state[-1] & closes
+        return endpoint, alive
 
 
 def _count_loss_from_pairs(counts, targets, supports, seg_valids, cfg,
@@ -1091,6 +1563,9 @@ def _count_loss_from_pairs(counts, targets, supports, seg_valids, cfg,
     residual = (count - target_m).abs()
     alpha = float(cfg['dense_spacing_support_floor_alpha'])
     loss, stats = _aggregate_nominal_mass(residual, weight, alpha)
+
+    if not metrics_enabled():
+        return loss, dict(diagnostics), residual, weight
 
     with torch.no_grad():
         valid_f = seg_valid.to(torch.float32)
@@ -1130,10 +1605,15 @@ def _count_loss_from_pairs(counts, targets, supports, seg_valids, cfg,
 
 
 def phase_bundle_component_weights(cfg, attachment_ramp=1.0):
-    """The four phase-bundle component weights; zero disables a component."""
+    """The phase-bundle component weights; zero disables a component."""
     return {
         'dense_spacing_phase': float(cfg['loss_weight_dense_spacing']),
         'dense_spacing_count': float(cfg['loss_weight_dense_spacing_count']),
+        # Metric density integral over detached band-derived inverse gaps;
+        # shares the band-detection machinery with phase but not the
+        # pair-HMM, so it stays cheap at high sampling.
+        'dense_spacing_density': float(
+            cfg.get('loss_weight_dense_spacing_density', 0.0)),
         'min_spacing': float(cfg['loss_weight_min_spacing']),
         'dense_attachment': (float(cfg['loss_weight_dense_attachment'])
                              * float(attachment_ramp)),
@@ -1156,7 +1636,12 @@ def _phase_and_count_losses(
     """
     device = dr_per_winding.device
     count_active = weights['dense_spacing_count'] > 0
+    density_active = weights.get('dense_spacing_density', 0) > 0
     phase_active = weights['dense_spacing_phase'] > 0
+    # Density derives its detached density field from detected bands, so
+    # band detection runs for either consumer; the pair-HMM alignment itself
+    # runs only when phase is weighted (the density fast path).
+    detection_active = phase_active or density_active
     inner, outer = fitted_winding_domain(outer_winding_idx)
     if outer - inner < 1:
         return
@@ -1166,7 +1651,7 @@ def _phase_and_count_losses(
         cfg, inner, outer, num_pairs, device, z_begin, z_end, generator)
     m_f = pair_m.to(k.dtype)
 
-    build_grad = count_active and torch.is_grad_enabled()
+    build_grad = (count_active or density_active) and torch.is_grad_enabled()
     central_ray = sample_pair_polylines(
         slice_to_spiral_transform, dr_per_winding, k, k + m_f, theta, z, cfg,
         no_grad=not build_grad)
@@ -1177,7 +1662,7 @@ def _phase_and_count_losses(
 
     view = view_field = view_valid = None
     pad_rejected = None
-    if phase_active:
+    if detection_active:
         pads, pad_rejected, outer_end = _build_phase_padding(
             slice_to_spiral_transform, dr_per_winding, sdt_volume, k, pair_m,
             theta, z, inner, outer, cfg)
@@ -1189,18 +1674,21 @@ def _phase_and_count_losses(
         pair = _pair_counts_from_samples(
             central_ray, central_field, central_valid, sdt_volume, cfg)
         diagnostics = {
-            'dense_spacing_count_too_long_fraction': float(
-                pair['too_long'].float().mean().item()),
-            'dense_spacing_count_step_violation_fraction': float(
-                pair['step_violation'].float().mean().item()),
             'dense_spacing_count_sdt_sample_seconds': sdt_sample_seconds,
         }
-        diagnostics.update({
-            f'dense_spacing_count_sdt_{name}': value
-            for name, value in sdt_sample_fractions(
-                pair['field_value'], pair['sample_valid'],
-                sdt_volume).items()
-        })
+        if metrics_enabled():
+            diagnostics.update({
+                'dense_spacing_count_too_long_fraction': float(
+                    pair['too_long'].float().mean().item()),
+                'dense_spacing_count_step_violation_fraction': float(
+                    pair['step_violation'].float().mean().item()),
+            })
+            diagnostics.update({
+                f'dense_spacing_count_sdt_{name}': value
+                for name, value in sdt_sample_fractions(
+                    pair['field_value'], pair['sample_valid'],
+                    sdt_volume).items()
+            })
         counts = [pair['count']]
         targets = [m_f]
         supports = [pair['support']]
@@ -1227,6 +1715,11 @@ def _phase_and_count_losses(
         count_loss, count_metrics, residual, weight = _count_loss_from_pairs(
             counts, targets, supports, seg_valids, cfg, sdt_volume,
             diagnostics)
+        # The count, phase, and shared-batch density losses backpropagate
+        # through one central-ray graph; the tag lets the training loop sum
+        # them into a single backward instead of traversing that graph once
+        # per component (metrics consumers must pop/ignore '_'-keys).
+        count_metrics['_shared_graph'] = True
         spiral_mid = torch.stack([
             torch.cat(z_all),
             torch.sin(torch.cat(theta_all)) * torch.cat(r_mid_all),
@@ -1237,33 +1730,123 @@ def _phase_and_count_losses(
         yield 'dense_spacing_count', count_loss, count_metrics
         del pair, counts, residual
 
-    if phase_active:
+    if detection_active:
         # Central live tensors are no longer needed once the detached view
-        # exists; drop them so the count backward can free its graph.
+        # exists; drop them so the count backward can free its graph. The
+        # density component keeps only the live pieces it integrates over.
         central_rejected = central_ray['too_long'] | central_ray['step_violation']
         phase_rejected = central_rejected | pad_rejected
+        density_central = None
+        if density_active and build_grad:
+            density_central = {
+                'scroll_poly': central_ray['scroll_poly'],
+                'sample_phase': central_ray['sample_phase'],
+                'pair_id': central_ray['pair_id'],
+                'has_successor': central_ray['has_successor'],
+                'field': central_field.detach(),
+            }
         central_metrics = {
-            'dense_spacing_phase_too_long_fraction': float(
-                central_ray['too_long'].float().mean().item()),
-            'dense_spacing_phase_step_violation_fraction': float(
-                central_ray['step_violation'].float().mean().item()),
-            'dense_spacing_phase_pad_rejected_fraction': float(
-                pad_rejected.float().mean().item()),
-            'dense_spacing_phase_extension_domain_clamped_fraction': float(
-                ((k + m_f + float(
-                    cfg['dense_spacing_phase_extension_windings']))
-                 > float(outer)).float().mean().item()),
             'dense_spacing_phase_sdt_sample_seconds': sdt_sample_seconds,
         }
+        if metrics_enabled():
+            central_metrics.update({
+                'dense_spacing_phase_too_long_fraction': float(
+                    central_ray['too_long'].float().mean().item()),
+                'dense_spacing_phase_step_violation_fraction': float(
+                    central_ray['step_violation'].float().mean().item()),
+                'dense_spacing_phase_pad_rejected_fraction': float(
+                    pad_rejected.float().mean().item()),
+                'dense_spacing_phase_extension_domain_clamped_fraction':
+                    float(((k + m_f + float(
+                        cfg['dense_spacing_phase_extension_windings']))
+                        > float(outer)).float().mean().item()),
+            })
         del central_ray, central_field, central_valid
-        phase_loss, phase_metrics = _phase_registration_loss(
-            slice_to_spiral_transform, dr_per_winding, view, view_field,
-            view_valid, normal_volume, k, pair_m, theta, z, phase_rejected,
-            cfg, compute_map_path=compute_map_path)
-        phase_metrics.update(central_metrics)
-        phase_metrics['dense_spacing_phase_wall_seconds'] = (
-            time.perf_counter() - started)
-        yield 'dense_spacing_phase', phase_loss, phase_metrics
+        bands = detect_complete_sdt_bands(
+            view, view_field, view_valid, normal_volume, cfg)
+        features = _phase_band_features(bands, num_pairs, device)
+        density = None
+        if density_central is not None:
+            density = _metric_density_loss(
+                density_central, features, pair_m, phase_rejected, cfg)
+            del density_central
+        if phase_active:
+            phase_loss, phase_metrics = _phase_registration_loss(
+                slice_to_spiral_transform, dr_per_winding, bands, features,
+                view, view_valid, k, pair_m, theta, z, phase_rejected, cfg,
+                compute_map_path=compute_map_path)
+            phase_metrics.update(central_metrics)
+            phase_metrics['dense_spacing_phase_wall_seconds'] = (
+                time.perf_counter() - started)
+            phase_metrics['_shared_graph'] = True
+            yield 'dense_spacing_phase', phase_loss, phase_metrics
+        del bands, features, view, view_field, view_valid
+        if density is not None:
+            density_loss, density_metrics = density
+            if not phase_active:
+                # the shared-batch health metrics otherwise ride with phase
+                density_metrics.update(central_metrics)
+            extra_pairs = int(cfg['dense_spacing_density_extra_pairs'])
+            total_density_pairs = num_pairs + max(0, extra_pairs)
+            share = num_pairs / total_density_pairs
+            density_metrics['_shared_graph'] = True
+            yield ('dense_spacing_density', density_loss * share,
+                   density_metrics)
+            # Density-only supplement: the fast path (polylines + band
+            # detection, no pair-HMM) is cheap enough to run at several times
+            # the shared-batch sampling; chunked so only one chunk's graph is
+            # resident per backward.
+            chunk_cap = int(cfg['dense_spacing_density_chunk_pairs'])
+            remaining = max(0, extra_pairs)
+            while remaining > 0:
+                n_chunk = min(chunk_cap, remaining)
+                remaining -= n_chunk
+                chunk_loss, chunk_metrics = _density_only_batch(
+                    slice_to_spiral_transform, dr_per_winding, sdt_volume,
+                    normal_volume, cfg, inner, outer, n_chunk, device,
+                    z_begin, z_end, generator)
+                yield ('dense_spacing_density',
+                       chunk_loss * (n_chunk / total_density_pairs),
+                       chunk_metrics)
+
+
+def _density_only_batch(
+    slice_to_spiral_transform, dr_per_winding, sdt_volume, normal_volume,
+    cfg, inner, outer, num_pairs, device, z_begin, z_end, generator,
+):
+    """One density-only pair batch: live polylines + band detection, no
+    count and no pair-HMM. This is the cheap path that lets density sample
+    far above the shared-batch budget."""
+    k, pair_m, theta, z = _sample_spacing_pairs(
+        cfg, inner, outer, num_pairs, device, z_begin, z_end, generator)
+    m_f = pair_m.to(k.dtype)
+    central = sample_pair_polylines(
+        slice_to_spiral_transform, dr_per_winding, k, k + m_f, theta, z, cfg)
+    # The field feeds only the (detached) detection view here — the density
+    # loss differentiates through scroll_poly alone — so skip the trilinear
+    # autograd graph; values are identical.
+    with torch.no_grad():
+        field, valid, _ = sample_sdt_trilinear(
+            sdt_volume, central['scroll_poly'])
+    pads, pad_rejected, _ = _build_phase_padding(
+        slice_to_spiral_transform, dr_per_winding, sdt_volume, k, pair_m,
+        theta, z, inner, outer, cfg)
+    view, view_field, view_valid = _assemble_detection_view(
+        central, field, valid, pads)
+    del pads
+    bands = detect_complete_sdt_bands(
+        view, view_field, view_valid, normal_volume, cfg)
+    features = _phase_band_features(bands, num_pairs, device)
+    rejected = central['too_long'] | central['step_violation'] | pad_rejected
+    density_central = {
+        'scroll_poly': central['scroll_poly'],
+        'sample_phase': central['sample_phase'],
+        'pair_id': central['pair_id'],
+        'has_successor': central['has_successor'],
+        'field': field.detach(),
+    }
+    return _metric_density_loss(
+        density_central, features, pair_m, rejected, cfg)
 
 
 def iter_phase_bundle_losses(
@@ -1276,19 +1859,26 @@ def iter_phase_bundle_losses(
     The bundle is the single ``phase`` dense-spacing mode: soft-sequence
     phase registration, crossing count (sharing the phase rays), native
     minimum spacing, and SDT attachment. Yielding lazily lets the training
-    loop run one backward per component so at most one large graph is
-    resident; the public mode stays ``phase`` regardless of this internal
-    backward grouping.
+    loop run one backward per graph so at most one large graph is resident;
+    components whose metrics carry ``'_shared_graph': True`` (count, phase,
+    shared-batch density) share the central-ray graph and should be summed
+    into one backward. The public mode stays ``phase`` regardless of this
+    internal backward grouping.
     """
+    global _metrics_enabled_now
+    _metrics_enabled_now = next(_metrics_tick) % _METRICS_EVERY == 0
     weights = phase_bundle_component_weights(cfg, attachment_ramp)
     if outer_winding_idx is not None and sdt_volume is not None:
         if sdt_volume['kind'] != 'sdt':
             raise ValueError('the phase bundle requires a signed-distance store')
-        if ((weights['dense_spacing_phase'] > 0 and normal_volume is not None)
+        if (((weights['dense_spacing_phase'] > 0
+              or weights['dense_spacing_density'] > 0)
+             and normal_volume is not None)
                 or weights['dense_spacing_count'] > 0):
             effective = dict(weights)
             if normal_volume is None:
                 effective['dense_spacing_phase'] = 0.0
+                effective['dense_spacing_density'] = 0.0
             yield from _phase_and_count_losses(
                 slice_to_spiral_transform, dr_per_winding, sdt_volume,
                 normal_volume, outer_winding_idx, cfg, z_begin, z_end,
@@ -1328,6 +1918,8 @@ def get_min_spacing_loss(
     ell_min = float(np.log(float(cfg['min_spacing_d_min_wv'])))
     deficiency = F.relu(ell_min - ell_gap)
     loss = deficiency.square().mean()
+    if not metrics_enabled():
+        return loss, {}
     with torch.no_grad():
         gap = torch.exp(ell_gap)
         q = torch.quantile(gap, torch.tensor([0.1, 0.5, 0.9], device=device))
