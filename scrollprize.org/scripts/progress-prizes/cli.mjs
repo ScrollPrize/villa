@@ -9,10 +9,12 @@ import { parseProgressPrizeMarkdown, updateProgressPrizeMarkdown } from './markd
 import { planRollover, serializeRolloverPlan } from './state.mjs';
 import {
   CORE_CLI_USAGE,
+  GOOGLE_COMMANDS,
   parseCliArgs,
   parsePositiveIntegerOption,
   requireOption,
 } from './cli-args.mjs';
+import { runAutomationCli } from './automation-cli.mjs';
 
 const defaultPagePath = resolve(dirname(fileURLToPath(import.meta.url)), '../../docs/34_prizes.md');
 
@@ -99,9 +101,19 @@ export async function runCoreCli(argv, {
   return result;
 }
 
+export async function runCli(argv, dependencies = {}) {
+  const { command, options } = parseCliArgs(argv);
+  const googleCommand = command !== 'validate'
+    ? GOOGLE_COMMANDS.includes(command)
+    : options.google === true || options['source-cycle'] !== undefined;
+  return googleCommand
+    ? runAutomationCli(argv, dependencies)
+    : runCoreCli(argv, dependencies);
+}
+
 async function main() {
   try {
-    await runCoreCli(process.argv.slice(2));
+    await runCli(process.argv.slice(2));
   } catch (error) {
     process.stderr.write(`progress-prizes: ${error.message}\n`);
     process.exitCode = 1;

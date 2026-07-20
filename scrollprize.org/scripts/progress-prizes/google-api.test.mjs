@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   GOOGLE_API_SCOPES,
+  GOOGLE_API_READ_SCOPES,
   GoogleApiError,
   buildAppPropertiesQuery,
   createGoogleApiClient,
@@ -343,7 +344,7 @@ test("redacts tokens, internal IDs, ACL identities, and editor links but keeps r
       formId: "private-form-id",
       permission: { emailAddress: "editor@example.org" },
       responderUri,
-      note: "Bearer token-value and secret-value at https://docs.google.com/forms/d/editor-id/edit",
+      note: "Bearer token-value and secret-value at https://docs.google.com/forms/d/editor-id/viewform",
     },
     { secrets: ["secret-value"] },
   );
@@ -356,9 +357,13 @@ test("redacts tokens, internal IDs, ACL identities, and editor links but keeps r
   });
 });
 
-test("exports only the least-privilege Google scopes needed by the workflow", () => {
+test("exports read-only validation and ACL-bounded headless write scopes", () => {
+  assert.deepEqual(GOOGLE_API_READ_SCOPES, [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/forms.body.readonly",
+  ]);
   assert.deepEqual(GOOGLE_API_SCOPES, [
-    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/forms.body",
   ]);
 });
