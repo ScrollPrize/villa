@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -294,7 +295,9 @@ struct FiberSample {
     bool hasNormal = false;
 };
 
-FiberSample sampleFiber(const FiberPolyline& fiber, double arclength)
+FiberSample sampleFiberWithLengths(const FiberPolyline& fiber,
+                                   const std::vector<double>& lengths,
+                                   double arclength)
 {
     FiberSample sample;
     if (fiber.points.empty()) {
@@ -308,13 +311,16 @@ FiberSample sampleFiber(const FiberPolyline& fiber, double arclength)
         }
         return sample;
     }
-
-    const auto lengths = cumulativeArclengths(fiber);
-    const double clamped = std::clamp(arclength, 0.0, lengths.back());
-    size_t segment = 0;
-    while (segment + 1 < lengths.size() && lengths[segment + 1] < clamped) {
-        ++segment;
+    if (lengths.size() != fiber.points.size() || lengths.empty()) {
+        const auto fallbackLengths = cumulativeArclengths(fiber);
+        return sampleFiberWithLengths(fiber, fallbackLengths, arclength);
     }
+
+    const double clamped = std::clamp(arclength, 0.0, lengths.back());
+    auto segmentEndIt = std::lower_bound(std::next(lengths.begin()), lengths.end(), clamped);
+    size_t segment = segmentEndIt == lengths.end()
+        ? fiber.points.size() - 2
+        : static_cast<size_t>(std::distance(lengths.begin(), segmentEndIt) - 1);
     if (segment + 1 >= fiber.points.size()) {
         segment = fiber.points.size() - 2;
     }
@@ -338,6 +344,306 @@ FiberSample sampleFiber(const FiberPolyline& fiber, double arclength)
         sample.hasNormal = norm(sample.normal) > kEpsilon;
     }
     return sample;
+}
+
+std::pair<double, double> closestSegmentParameters(const cv::Vec3d& sourceStart,
+                                                   const cv::Vec3d& sourceEnd,
+                                                   const cv::Vec3d& targetStart,
+                                                   const cv::Vec3d& targetEnd)
+{
+    const cv::Vec3d sourceDelta = sourceEnd - sourceStart;
+    const cv::Vec3d targetDelta = targetEnd - targetStart;
+    const cv::Vec3d offset = sourceStart - targetStart;
+    const double a = dot(sourceDelta, sourceDelta);
+    const double b = dot(sourceDelta, targetDelta);
+    const double c = dot(targetDelta, targetDelta);
+    const double d = dot(sourceDelta, offset);
+    const double e = dot(targetDelta, offset);
+
+    if (a <= kEpsilon && c <= kEpsilon) {
+        return {0.0, 0.0};
+    }
+    if (a <= kEpsilon) {
+        return {0.0, std::clamp(e / c, 0.0, 1.0)};
+    }
+    if (c <= kEpsilon) {
+        return {std::clamp(-d / a, 0.0, 1.0), 0.0};
+    }
+
+    const double determinant = a * c - b * b;
+    double sourceNumerator = 0.0;
+    double sourceDenominator = determinant;
+    double targetNumerator = 0.0;
+    double targetDenominator = determinant;
+
+    if (determinant < kEpsilon) {
+        sourceNumerator = 0.0;
+        sourceDenominator = 1.0;
+        targetNumerator = e;
+        targetDenominator = c;
+    } else {
+        sourceNumerator = b * e - c * d;
+        targetNumerator = a * e - b * d;
+        if (sourceNumerator < 0.0) {
+            sourceNumerator = 0.0;
+            targetNumerator = e;
+            targetDenominator = c;
+        } else if (sourceNumerator > sourceDenominator) {
+            sourceNumerator = sourceDenominator;
+            targetNumerator = e + b;
+            targetDenominator = c;
+        }
+    }
+
+    if (targetNumerator < 0.0) {
+        targetNumerator = 0.0;
+        if (-d < 0.0) {
+            sourceNumerator = 0.0;
+        } else if (-d > a) {
+            sourceNumerator = sourceDenominator;
+        } else {
+            sourceNumerator = -d;
+            sourceDenominator = a;
+        }
+    } else if (targetNumerator > targetDenominator) {
+        targetNumerator = targetDenominator;
+        if (-d + b < 0.0) {
+            sourceNumerator = 0.0;
+        } else if (-d + b > a) {
+            sourceNumerator = sourceDenominator;
+        } else {
+            sourceNumerator = -d + b;
+            sourceDenominator = a;
+        }
+    }
+
+    const double sourceT = std::abs(sourceNumerator) <= kEpsilon
+        ? 0.0
+        : sourceNumerator / sourceDenominator;
+    const double targetT = std::abs(targetNumerator) <= kEpsilon
+        ? 0.0
+        : targetNumerator / targetDenominator;
+    return {std::clamp(sourceT, 0.0, 1.0),
+            std::clamp(targetT, 0.0, 1.0)};
+}
+
+struct FiberSegmentRange {
+    cv::Vec3d start{0.0, 0.0, 0.0};
+    cv::Vec3d end{0.0, 0.0, 0.0};
+    double startArclength = 0.0;
+    double endArclength = 0.0;
+};
+
+struct DirectSegmentSolution {
+    int sourceSegmentIndex = -1;
+    int targetSegmentIndex = -1;
+    double sourceT = 0.0;
+    double targetT = 0.0;
+    double sourceArclength = 0.0;
+    double targetArclength = 0.0;
+    FiberSample sourceSample;
+    FiberSample targetSample;
+    double distance = std::numeric_limits<double>::infinity();
+};
+
+std::optional<FiberSegmentRange> candidateSegmentRange(
+    const FiberPolyline& fiber,
+    const std::vector<double>& lengths,
+    const ArclengthDomain& domain,
+    int segmentIndex)
+{
+    if (segmentIndex < 0 ||
+        static_cast<size_t>(segmentIndex + 1) >= fiber.points.size() ||
+        lengths.size() != fiber.points.size()) {
+        return std::nullopt;
+    }
+    const size_t index = static_cast<size_t>(segmentIndex);
+    const double segmentStart = lengths[index];
+    const double segmentEnd = lengths[index + 1];
+    if (!std::isfinite(segmentStart) || !std::isfinite(segmentEnd) ||
+        segmentEnd - segmentStart <= kEpsilon) {
+        return std::nullopt;
+    }
+    const double clippedStart = std::max(segmentStart, domain.start);
+    const double clippedEnd = std::min(segmentEnd, domain.end);
+    if (clippedEnd - clippedStart <= kEpsilon) {
+        return std::nullopt;
+    }
+    const cv::Vec3d segmentA = fiber.points[index].position;
+    const cv::Vec3d segmentB = fiber.points[index + 1].position;
+    if (!finitePoint(segmentA) || !finitePoint(segmentB)) {
+        return std::nullopt;
+    }
+    return FiberSegmentRange{
+        pointAtSegmentArclength(segmentA, segmentB, segmentStart, segmentEnd, clippedStart),
+        pointAtSegmentArclength(segmentA, segmentB, segmentStart, segmentEnd, clippedEnd),
+        clippedStart,
+        clippedEnd};
+}
+
+std::optional<DirectSegmentSolution> solveDirectSegmentPair(
+    const FiberPolyline& source,
+    const FiberPolyline& target,
+    const std::vector<double>& sourceLengths,
+    const std::vector<double>& targetLengths,
+    const ArclengthDomain& sourceDomain,
+    const ArclengthDomain& targetDomain,
+    int sourceSegmentIndex,
+    int targetSegmentIndex)
+{
+    const auto sourceSegment = candidateSegmentRange(
+        source, sourceLengths, sourceDomain, sourceSegmentIndex);
+    const auto targetSegment = candidateSegmentRange(
+        target, targetLengths, targetDomain, targetSegmentIndex);
+    if (!sourceSegment || !targetSegment) {
+        return std::nullopt;
+    }
+
+    const auto [sourceT, targetT] = closestSegmentParameters(sourceSegment->start,
+                                                            sourceSegment->end,
+                                                            targetSegment->start,
+                                                            targetSegment->end);
+    DirectSegmentSolution solution;
+    solution.sourceSegmentIndex = sourceSegmentIndex;
+    solution.targetSegmentIndex = targetSegmentIndex;
+    solution.sourceT = sourceT;
+    solution.targetT = targetT;
+    solution.sourceArclength = sourceSegment->startArclength +
+        (sourceSegment->endArclength - sourceSegment->startArclength) * sourceT;
+    solution.targetArclength = targetSegment->startArclength +
+        (targetSegment->endArclength - targetSegment->startArclength) * targetT;
+    solution.sourceSample = sampleFiberWithLengths(
+        source, sourceLengths, solution.sourceArclength);
+    solution.targetSample = sampleFiberWithLengths(
+        target, targetLengths, solution.targetArclength);
+    solution.distance = norm(solution.sourceSample.position - solution.targetSample.position);
+    return solution;
+}
+
+bool directSegmentSolutionIsInterior(const DirectSegmentSolution& solution)
+{
+    constexpr double kEndpointTolerance = 1.0e-7;
+    return solution.sourceT > kEndpointTolerance &&
+           solution.sourceT < 1.0 - kEndpointTolerance &&
+           solution.targetT > kEndpointTolerance &&
+           solution.targetT < 1.0 - kEndpointTolerance;
+}
+
+std::vector<std::pair<int, int>> directSegmentNeighborPairs(
+    const DirectSegmentSolution& solution)
+{
+    constexpr double kEndpointTolerance = 1.0e-7;
+    std::vector<int> sourceSegments{solution.sourceSegmentIndex};
+    std::vector<int> targetSegments{solution.targetSegmentIndex};
+
+    if (solution.sourceT <= kEndpointTolerance) {
+        sourceSegments.push_back(solution.sourceSegmentIndex - 1);
+    }
+    if (solution.sourceT >= 1.0 - kEndpointTolerance) {
+        sourceSegments.push_back(solution.sourceSegmentIndex + 1);
+    }
+    if (solution.targetT <= kEndpointTolerance) {
+        targetSegments.push_back(solution.targetSegmentIndex - 1);
+    }
+    if (solution.targetT >= 1.0 - kEndpointTolerance) {
+        targetSegments.push_back(solution.targetSegmentIndex + 1);
+    }
+
+    std::vector<std::pair<int, int>> neighbors;
+    for (int sourceSegment : sourceSegments) {
+        for (int targetSegment : targetSegments) {
+            if (sourceSegment == solution.sourceSegmentIndex &&
+                targetSegment == solution.targetSegmentIndex) {
+                continue;
+            }
+            const auto pair = std::make_pair(sourceSegment, targetSegment);
+            if (std::find(neighbors.begin(), neighbors.end(), pair) == neighbors.end()) {
+                neighbors.push_back(pair);
+            }
+        }
+    }
+    return neighbors;
+}
+
+std::optional<FiberIntersectionResult> refineFiberIntersectionCandidateDirect(
+    const FiberPolyline& source,
+    const FiberPolyline& target,
+    const FiberIntersectionCandidate& candidate,
+    const FiberIntersectionCeresOptions& options,
+    const std::vector<double>& sourceLengths,
+    const std::vector<double>& targetLengths,
+    const ArclengthDomain& sourceDomain,
+    const ArclengthDomain& targetDomain)
+{
+    auto current = solveDirectSegmentPair(source,
+                                          target,
+                                          sourceLengths,
+                                          targetLengths,
+                                          sourceDomain,
+                                          targetDomain,
+                                          candidate.sourceSegmentIndex,
+                                          candidate.targetSegmentIndex);
+    if (!current) {
+        return std::nullopt;
+    }
+
+    std::set<std::pair<int, int>> visited;
+    visited.emplace(current->sourceSegmentIndex, current->targetSegmentIndex);
+    for (;;) {
+        if (directSegmentSolutionIsInterior(*current)) {
+            break;
+        }
+
+        std::optional<DirectSegmentSolution> next;
+        for (const auto& [sourceSegmentIndex, targetSegmentIndex] :
+             directSegmentNeighborPairs(*current)) {
+            if (visited.count({sourceSegmentIndex, targetSegmentIndex}) != 0) {
+                continue;
+            }
+            auto candidateSolution = solveDirectSegmentPair(source,
+                                                            target,
+                                                            sourceLengths,
+                                                            targetLengths,
+                                                            sourceDomain,
+                                                            targetDomain,
+                                                            sourceSegmentIndex,
+                                                            targetSegmentIndex);
+            if (!candidateSolution) {
+                continue;
+            }
+            if (candidateSolution->distance + kEpsilon < current->distance &&
+                (!next || candidateSolution->distance < next->distance)) {
+                next = std::move(candidateSolution);
+            }
+        }
+
+        if (!next) {
+            break;
+        }
+        visited.emplace(next->sourceSegmentIndex, next->targetSegmentIndex);
+        current = std::move(next);
+    }
+
+    const double weightedDistance = options.distanceWeight * current->distance;
+
+    FiberIntersectionResult result;
+    result.sourceFiberId = source.id;
+    result.sourceGeneration = source.generation;
+    result.targetFiberId = target.id;
+    result.targetGeneration = target.generation;
+    result.candidateDistance = candidate.straightDistance;
+    result.refinedScore = 0.5 * weightedDistance * weightedDistance;
+    result.windingDistance = current->distance;
+    result.sourceArclength = current->sourceArclength;
+    result.targetArclength = current->targetArclength;
+    result.sourcePoint = current->sourceSample.position;
+    result.targetPoint = current->targetSample.position;
+    result.converged = true;
+    result.ceresSolves = 0;
+    result.ceresIterations = 0;
+    result.usedNormalResiduals = false;
+    result.message = "direct segment walk closest points";
+    return result;
 }
 
 std::vector<FiberIntersectionCandidate> clusterCandidates(
@@ -620,9 +926,18 @@ std::vector<FiberSideStripIntersection> keepNearestBranchLinkProjections(
     return filtered;
 }
 
+bool requiresWindingSampler(const FiberIntersectionCeresOptions& options)
+{
+    return options.requireWindingScore ||
+           options.optimizationMode ==
+               FiberIntersectionOptimizationMode::WindingCeres;
+}
+
 struct JointIntersectionResidual {
     const FiberPolyline& source;
     const FiberPolyline& target;
+    const std::vector<double>& sourceLengths;
+    const std::vector<double>& targetLengths;
     FiberIntersectionCeresOptions options;
     const vc::lasagna::LasagnaNormalSampler* windingSampler = nullptr;
     FiberIntersectionCancelCallback cancelCallback;
@@ -634,9 +949,10 @@ struct JointIntersectionResidual {
         if (cancelCallback && cancelCallback()) {
             return false;
         }
-        const FiberSample a = sampleFiber(source, sourceS[0]);
-        const FiberSample b = sampleFiber(target, targetS[0]);
-        if (windingSampler) {
+        const FiberSample a = sampleFiberWithLengths(source, sourceLengths, sourceS[0]);
+        const FiberSample b = sampleFiberWithLengths(target, targetLengths, targetS[0]);
+        if (options.optimizationMode ==
+            FiberIntersectionOptimizationMode::WindingCeres) {
             double windingDistance = windingSampler->windingDistance(a.position, b.position);
             if (!std::isfinite(windingDistance)) {
                 windingDistance = norm(a.position - b.position);
@@ -704,6 +1020,42 @@ FiberIntersectionResult normalizedResultForPair(FiberIntersectionResult result,
         std::swap(result.sourcePoint, result.targetPoint);
     }
     return result;
+}
+
+double finalWindingDistance(const FiberIntersectionResult& result,
+                            const vc::lasagna::LasagnaNormalSampler& windingSampler)
+{
+    const double windingDistance =
+        windingSampler.windingDistance(result.sourcePoint, result.targetPoint);
+    return std::isfinite(windingDistance)
+        ? windingDistance
+        : std::numeric_limits<double>::infinity();
+}
+
+void scoreFinalWindingDistances(std::vector<FiberIntersectionResult>& results,
+                                const vc::lasagna::LasagnaNormalSampler& windingSampler)
+{
+    for (auto& result : results) {
+        result.windingDistance = finalWindingDistance(result, windingSampler);
+    }
+}
+
+bool fiberIntersectionResultDistanceLess(const FiberIntersectionResult& a,
+                                         const FiberIntersectionResult& b)
+{
+    if (a.windingDistance != b.windingDistance) {
+        return a.windingDistance < b.windingDistance;
+    }
+    if (a.sourceFiberId != b.sourceFiberId) {
+        return a.sourceFiberId < b.sourceFiberId;
+    }
+    if (a.targetFiberId != b.targetFiberId) {
+        return a.targetFiberId < b.targetFiberId;
+    }
+    if (a.sourceArclength != b.sourceArclength) {
+        return a.sourceArclength < b.sourceArclength;
+    }
+    return a.targetArclength < b.targetArclength;
 }
 
 class FiberIntersectionCancelIterationCallback final : public ceres::IterationCallback {
@@ -1891,11 +2243,28 @@ FiberIntersectionResult refineFiberIntersectionCandidate(
         result.message = "canceled";
         return result;
     }
+    if (requiresWindingSampler(options) && !windingSampler) {
+        throw std::invalid_argument(
+            "fiber intersection search requires a Lasagna winding sampler");
+    }
 
     const auto sourceLengths = cumulativeArclengths(source);
     const auto targetLengths = cumulativeArclengths(target);
     const ArclengthDomain sourceDomain = activeArclengthDomain(source, sourceLengths);
     const ArclengthDomain targetDomain = activeArclengthDomain(target, targetLengths);
+    if (options.optimizationMode ==
+        FiberIntersectionOptimizationMode::GeometricDirectWalk) {
+        if (auto result = refineFiberIntersectionCandidateDirect(source,
+                                                                 target,
+                                                                 candidate,
+                                                                 options,
+                                                                 sourceLengths,
+                                                                 targetLengths,
+                                                                 sourceDomain,
+                                                                 targetDomain)) {
+            return *result;
+        }
+    }
     double sourceS = std::clamp(candidate.sourceArclength, sourceDomain.start, sourceDomain.end);
     double targetS = std::clamp(candidate.targetArclength, targetDomain.start, targetDomain.end);
 
@@ -1905,7 +2274,14 @@ FiberIntersectionResult refineFiberIntersectionCandidate(
                                                         5,
                                                         1,
                                                         1>(
-        new JointIntersectionResidual{source, target, options, windingSampler, cancelCallback});
+        new JointIntersectionResidual{
+            source,
+            target,
+            sourceLengths,
+            targetLengths,
+            options,
+            windingSampler,
+            cancelCallback});
     problem.AddResidualBlock(residual, nullptr, &sourceS, &targetS);
     problem.SetParameterLowerBound(&sourceS, 0, sourceDomain.start);
     problem.SetParameterUpperBound(&sourceS, 0, sourceDomain.end);
@@ -1930,8 +2306,8 @@ FiberIntersectionResult refineFiberIntersectionCandidate(
 
     double finalCost = 0.0;
     problem.Evaluate(ceres::Problem::EvaluateOptions{}, &finalCost, nullptr, nullptr, nullptr);
-    const FiberSample sourceSample = sampleFiber(source, sourceS);
-    const FiberSample targetSample = sampleFiber(target, targetS);
+    const FiberSample sourceSample = sampleFiberWithLengths(source, sourceLengths, sourceS);
+    const FiberSample targetSample = sampleFiberWithLengths(target, targetLengths, targetS);
 
     FiberIntersectionResult result;
     result.sourceFiberId = source.id;
@@ -1940,13 +2316,17 @@ FiberIntersectionResult refineFiberIntersectionCandidate(
     result.targetGeneration = target.generation;
     result.candidateDistance = candidate.straightDistance;
     result.refinedScore = finalCost;
-    result.windingDistance = windingSampler
-        ? windingSampler->windingDistance(sourceSample.position, targetSample.position)
-        : norm(sourceSample.position - targetSample.position);
     result.sourceArclength = sourceS;
     result.targetArclength = targetS;
     result.sourcePoint = sourceSample.position;
     result.targetPoint = targetSample.position;
+    if (options.optimizationMode ==
+        FiberIntersectionOptimizationMode::WindingCeres) {
+        result.windingDistance =
+            finalWindingDistance(result, *windingSampler);
+    } else {
+        result.windingDistance = norm(sourceSample.position - targetSample.position);
+    }
     result.converged = summary.IsSolutionUsable();
     result.ceresSolves = 1;
     result.ceresIterations = static_cast<int>(summary.iterations.size());
@@ -2029,9 +2409,17 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
     const FiberIntersectionCeresOptions& ceres,
     const vc::lasagna::LasagnaNormalSampler* windingSampler,
     FiberIntersectionProgressCallback progressCallback,
-    FiberIntersectionCancelCallback cancelCallback)
+    FiberIntersectionCancelCallback cancelCallback,
+    FiberIntersectionDiagnosticCallback diagnosticCallback)
 {
-    if (windingSampler) {
+    if (requiresWindingSampler(ceres) && !windingSampler) {
+        throw std::invalid_argument(
+            "fiber intersection search requires a Lasagna winding sampler");
+    }
+    if (windingSampler &&
+        (ceres.requireWindingScore ||
+         ceres.optimizationMode ==
+             FiberIntersectionOptimizationMode::WindingCeres)) {
         cache = nullptr;
     }
 
@@ -2132,6 +2520,34 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
                              searchWorkTotal);
         }
     };
+    auto makeDiagnostic = [](FiberIntersectionDiagnosticEvent event,
+                             size_t jobIndex,
+                             size_t jobTotal,
+                             uint64_t sourceFiberId,
+                             uint64_t targetFiberId) {
+        FiberIntersectionDiagnostic diagnostic;
+        diagnostic.event = event;
+        diagnostic.jobIndex = jobIndex;
+        diagnostic.jobTotal = jobTotal;
+        diagnostic.sourceFiberId = sourceFiberId;
+        diagnostic.targetFiberId = targetFiberId;
+        return diagnostic;
+    };
+    auto emitDiagnostic = [&](FiberIntersectionDiagnostic diagnostic) {
+        if (!diagnosticCallback) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(progressMutex);
+            diagnostic.completed = completedSearchWork;
+        }
+        diagnostic.total = searchWorkTotal;
+        diagnosticCallback(diagnostic);
+    };
+    auto elapsedMillis = [](std::chrono::steady_clock::time_point start) {
+        return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count());
+    };
     if (progressCallback) {
         progressCallback(AtlasSearchProgressPhase::SearchPairs, 0, searchWorkTotal);
     }
@@ -2162,8 +2578,24 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
             if (fiberIt == byId.end()) {
                 continue;
             }
+            const auto candidateStart = std::chrono::steady_clock::now();
+            emitDiagnostic(makeDiagnostic(
+                FiberIntersectionDiagnosticEvent::CandidateFiberStarted,
+                candidateIndex,
+                candidateFiberIds.size(),
+                fiberIt->second->id,
+                0));
             candidateResults[candidateIndex] =
                 index.candidatesForFiber(*fiberIt->second, broad, cancelCallback);
+            auto diagnostic = makeDiagnostic(
+                FiberIntersectionDiagnosticEvent::CandidateFiberFinished,
+                candidateIndex,
+                candidateFiberIds.size(),
+                fiberIt->second->id,
+                0);
+            diagnostic.candidateCount = candidateResults[candidateIndex].size();
+            diagnostic.elapsedMs = elapsedMillis(candidateStart);
+            emitDiagnostic(diagnostic);
             reportSearchWorkFinished();
             if (cancelCallback && cancelCallback()) {
                 canceled.store(true, std::memory_order_relaxed);
@@ -2209,6 +2641,11 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
             }
             const PairJob& job = pairJobs[jobIndex];
             if (job.skip) {
+                emitDiagnostic(makeDiagnostic(FiberIntersectionDiagnosticEvent::PairSkipped,
+                                              jobIndex,
+                                              pairJobs.size(),
+                                              0,
+                                              0));
                 reportSearchWorkFinished();
                 continue;
             }
@@ -2218,6 +2655,12 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
             }
             const FiberPolyline& source = *job.source;
             const FiberPolyline& target = *job.target;
+            const auto pairStart = std::chrono::steady_clock::now();
+            emitDiagnostic(makeDiagnostic(FiberIntersectionDiagnosticEvent::PairStarted,
+                                          jobIndex,
+                                          pairJobs.size(),
+                                          source.id,
+                                          target.id));
 
             std::vector<FiberIntersectionResult> pairResults;
             {
@@ -2232,6 +2675,15 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
                     for (auto& result : pairResults) {
                         result = normalizedResultForPair(std::move(result), source.id, target.id);
                     }
+                    auto diagnostic = makeDiagnostic(
+                        FiberIntersectionDiagnosticEvent::PairCacheHit,
+                        jobIndex,
+                        pairJobs.size(),
+                        source.id,
+                        target.id);
+                    diagnostic.resultCount = pairResults.size();
+                    diagnostic.elapsedMs = elapsedMillis(pairStart);
+                    emitDiagnostic(diagnostic);
                     resultsByJob[jobIndex] = std::move(pairResults);
                     reportSearchWorkFinished();
                     continue;
@@ -2258,22 +2710,61 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
                 }
             }
             pairCandidates = clusterCandidates(std::move(pairCandidates), broad.clusterArclength);
+            const size_t pairCandidateCount = pairCandidates.size();
+            {
+                auto diagnostic = makeDiagnostic(
+                    FiberIntersectionDiagnosticEvent::PairCandidatesReady,
+                    jobIndex,
+                    pairJobs.size(),
+                    source.id,
+                    target.id);
+                diagnostic.candidateCount = pairCandidateCount;
+                diagnostic.elapsedMs = elapsedMillis(pairStart);
+                emitDiagnostic(diagnostic);
+            }
             if (pairCandidates.empty()) {
+                auto diagnostic = makeDiagnostic(FiberIntersectionDiagnosticEvent::PairEmpty,
+                                                 jobIndex,
+                                                 pairJobs.size(),
+                                                 source.id,
+                                                 target.id);
+                diagnostic.elapsedMs = elapsedMillis(pairStart);
+                emitDiagnostic(diagnostic);
                 reportSearchWorkFinished();
                 continue;
             }
 
-            for (const auto& c : pairCandidates) {
+            for (size_t candidateIndex = 0; candidateIndex < pairCandidates.size(); ++candidateIndex) {
+                const auto& c = pairCandidates[candidateIndex];
                 if (cancelCallback && cancelCallback()) {
                     canceled.store(true, std::memory_order_relaxed);
                     return;
                 }
+                const auto refineStart = std::chrono::steady_clock::now();
+                auto startDiagnostic = makeDiagnostic(
+                    FiberIntersectionDiagnosticEvent::CandidateRefineStarted,
+                    jobIndex,
+                    pairJobs.size(),
+                    source.id,
+                    target.id);
+                startDiagnostic.candidateCount = pairCandidateCount;
+                startDiagnostic.candidateIndex = candidateIndex;
+                startDiagnostic.candidateTotal = pairCandidateCount;
+                startDiagnostic.sourceArclength = c.sourceArclength;
+                startDiagnostic.targetArclength = c.targetArclength;
+                startDiagnostic.candidateDistance = c.straightDistance;
+                emitDiagnostic(startDiagnostic);
                 pairResults.push_back(refineFiberIntersectionCandidate(source,
                                                                        target,
                                                                        c,
                                                                        ceres,
                                                                        windingSampler,
                                                                        cancelCallback));
+                auto finishDiagnostic = startDiagnostic;
+                finishDiagnostic.event = FiberIntersectionDiagnosticEvent::CandidateRefineFinished;
+                finishDiagnostic.resultCount = pairResults.size();
+                finishDiagnostic.elapsedMs = elapsedMillis(refineStart);
+                emitDiagnostic(finishDiagnostic);
             }
             if (cancelCallback && cancelCallback()) {
                 canceled.store(true, std::memory_order_relaxed);
@@ -2281,6 +2772,29 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
             }
             pairResults = deduplicateFiberIntersectionResults(std::move(pairResults),
                                                               ceres.deduplicateArclength);
+            if (ceres.requireWindingScore) {
+                auto diagnostic = makeDiagnostic(
+                    FiberIntersectionDiagnosticEvent::PairScoringStarted,
+                    jobIndex,
+                    pairJobs.size(),
+                    source.id,
+                    target.id);
+                diagnostic.candidateCount = pairCandidateCount;
+                diagnostic.resultCount = pairResults.size();
+                diagnostic.elapsedMs = elapsedMillis(pairStart);
+                emitDiagnostic(diagnostic);
+
+                const auto scoringStart = std::chrono::steady_clock::now();
+                scoreFinalWindingDistances(pairResults, *windingSampler);
+                std::sort(pairResults.begin(),
+                          pairResults.end(),
+                          fiberIntersectionResultDistanceLess);
+
+                diagnostic.event =
+                    FiberIntersectionDiagnosticEvent::PairScoringFinished;
+                diagnostic.elapsedMs = elapsedMillis(scoringStart);
+                emitDiagnostic(diagnostic);
+            }
             {
                 std::lock_guard<std::mutex> lock(cacheMutex);
                 if (cache) {
@@ -2294,6 +2808,15 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
                 }
             }
             resultsByJob[jobIndex] = std::move(pairResults);
+            auto diagnostic = makeDiagnostic(FiberIntersectionDiagnosticEvent::PairFinished,
+                                             jobIndex,
+                                             pairJobs.size(),
+                                             source.id,
+                                             target.id);
+            diagnostic.candidateCount = pairCandidateCount;
+            diagnostic.resultCount = resultsByJob[jobIndex].size();
+            diagnostic.elapsedMs = elapsedMillis(pairStart);
+            emitDiagnostic(diagnostic);
             reportSearchWorkFinished();
         }
     };
@@ -2313,6 +2836,11 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
     std::vector<FiberIntersectionResult> allResults;
     for (const auto& pairResults : resultsByJob) {
         allResults.insert(allResults.end(), pairResults.begin(), pairResults.end());
+    }
+    if (ceres.requireWindingScore) {
+        std::sort(allResults.begin(),
+                  allResults.end(),
+                  fiberIntersectionResultDistanceLess);
     }
 
     return allResults;

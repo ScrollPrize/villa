@@ -38,8 +38,17 @@ struct Options {
     fs::path fiberDir = "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fibers";
     fs::path atlasDir;
     fs::path lasagnaManifest;
+    std::optional<std::pair<uint64_t, uint64_t>> pairIds;
+    std::optional<vc::atlas::FiberIntersectionOptimizationMode> optimizationMode;
     vc::atlas::FiberIntersectionBroadPhaseOptions broad;
     vc::atlas::FiberIntersectionCeresOptions ceres;
+
+    Options()
+    {
+        ceres.optimizationMode =
+            vc::atlas::FiberIntersectionOptimizationMode::WindingCeres;
+        ceres.requireWindingScore = true;
+    }
 };
 
 double elapsedMs(Clock::time_point start, Clock::time_point end)
@@ -53,9 +62,11 @@ void printUsage(const char* argv0)
         << "Usage: " << argv0 << " [fiber_dir] [options]\n"
         << "\n"
         << "Options:\n"
-        << "  --atlas-dir <path>         Required atlas directory; search atlas fibers -> non-atlas fibers\n"
+        << "  --atlas-dir <path>         Atlas directory; search atlas fibers -> non-atlas fibers\n"
         << "  --lasagna-manifest <path>  Required .lasagna.json for grad_mag winding distance\n"
-        << "  --max-distance <vx>        Broad-phase radius, default 500\n"
+        << "  --pair <source/target>     Profile one non-atlas runtime-id pair, e.g. 28/50\n"
+        << "  --optimization <mode>      geometric-direct, geometric-ceres, or winding-ceres\n"
+        << "  --max-distance <vx>        Broad-phase radius, default 100\n"
         << "  --max-sample-spacing <vx>  Indexed dense point spacing, default 100\n"
         << "  --seed-stride <n>          First-pass source sample stride, default 100\n"
         << "  --cluster-arclength <vx>   Candidate arclength dedup tolerance, default 8\n"
@@ -84,6 +95,59 @@ int parseInt(const std::string& value, const char* name)
     return parsed;
 }
 
+uint64_t parseUint64(const std::string& value, const char* name)
+{
+    size_t pos = 0;
+    const unsigned long long parsed = std::stoull(value, &pos);
+    if (pos != value.size()) {
+        throw std::runtime_error(std::string("invalid ") + name + ": " + value);
+    }
+    return static_cast<uint64_t>(parsed);
+}
+
+std::pair<uint64_t, uint64_t> parsePairIds(const std::string& value)
+{
+    const size_t separator = value.find_first_of("/,:");
+    if (separator == std::string::npos) {
+        throw std::runtime_error("invalid --pair, expected source/target runtime ids");
+    }
+    const uint64_t source = parseUint64(value.substr(0, separator), "--pair source");
+    const uint64_t target = parseUint64(value.substr(separator + 1), "--pair target");
+    if (source == 0 || target == 0 || source == target) {
+        throw std::runtime_error("invalid --pair, ids must be non-zero and distinct");
+    }
+    return {source, target};
+}
+
+vc::atlas::FiberIntersectionOptimizationMode parseOptimizationMode(
+    const std::string& value)
+{
+    if (value == "geometric-direct") {
+        return vc::atlas::FiberIntersectionOptimizationMode::GeometricDirectWalk;
+    }
+    if (value == "geometric-ceres") {
+        return vc::atlas::FiberIntersectionOptimizationMode::GeometricCeres;
+    }
+    if (value == "winding-ceres") {
+        return vc::atlas::FiberIntersectionOptimizationMode::WindingCeres;
+    }
+    throw std::runtime_error("unknown --optimization mode: " + value);
+}
+
+std::string optimizationModeName(
+    vc::atlas::FiberIntersectionOptimizationMode mode)
+{
+    switch (mode) {
+    case vc::atlas::FiberIntersectionOptimizationMode::GeometricDirectWalk:
+        return "geometric-direct";
+    case vc::atlas::FiberIntersectionOptimizationMode::GeometricCeres:
+        return "geometric-ceres";
+    case vc::atlas::FiberIntersectionOptimizationMode::WindingCeres:
+        return "winding-ceres";
+    }
+    return "unknown";
+}
+
 Options parseOptions(int argc, char** argv)
 {
     Options options;
@@ -104,6 +168,11 @@ Options parseOptions(int argc, char** argv)
             options.atlasDir = requireValue("--atlas-dir");
         } else if (arg == "--lasagna-manifest") {
             options.lasagnaManifest = requireValue("--lasagna-manifest");
+        } else if (arg == "--pair") {
+            options.pairIds = parsePairIds(requireValue("--pair"));
+        } else if (arg == "--optimization") {
+            options.optimizationMode =
+                parseOptimizationMode(requireValue("--optimization"));
         } else if (arg == "--max-distance") {
             options.broad.maxDistance = parseDouble(requireValue("--max-distance"), "--max-distance");
         } else if (arg == "--max-sample-spacing") {
@@ -258,6 +327,174 @@ std::string fiberLabel(const TimedFiber* fiber, uint64_t fallbackId)
     return packageRelativeFiberPath(*fiber).generic_string();
 }
 
+const TimedFiber* findFiberByRuntimeId(const std::vector<TimedFiber>& fibers,
+                                       uint64_t runtimeId)
+{
+    const auto it = std::find_if(fibers.begin(), fibers.end(), [runtimeId](const auto& item) {
+        return item.fiber.id == runtimeId;
+    });
+    return it == fibers.end() ? nullptr : &*it;
+}
+
+std::vector<vc::atlas::FiberPolyline> fiberPolylinesFor(
+    const std::vector<TimedFiber>& fibers)
+{
+    std::vector<vc::atlas::FiberPolyline> polylines;
+    polylines.reserve(fibers.size());
+    for (const auto& item : fibers) {
+        polylines.push_back(item.fiber);
+    }
+    return polylines;
+}
+
+struct PairProfileStats {
+    size_t candidateFiberCount = 0;
+    size_t candidateFiberCandidates = 0;
+    int64_t candidateFiberMs = 0;
+    size_t rawPairCandidates = 0;
+    int64_t pairCandidatesReadyMs = 0;
+    size_t refineStarted = 0;
+    size_t refineFinished = 0;
+    int64_t refineMs = 0;
+    int64_t maxRefineMs = 0;
+    size_t scoringStarts = 0;
+    size_t scoringFinishes = 0;
+    size_t scoringResults = 0;
+    int64_t scoringMs = 0;
+    int64_t pairMs = 0;
+    size_t finalPairResults = 0;
+};
+
+void updatePairProfileStats(PairProfileStats& stats,
+                            const vc::atlas::FiberIntersectionDiagnostic& diagnostic)
+{
+    switch (diagnostic.event) {
+    case vc::atlas::FiberIntersectionDiagnosticEvent::CandidateFiberFinished:
+        ++stats.candidateFiberCount;
+        stats.candidateFiberCandidates += diagnostic.candidateCount;
+        stats.candidateFiberMs += diagnostic.elapsedMs;
+        break;
+    case vc::atlas::FiberIntersectionDiagnosticEvent::PairCandidatesReady:
+        stats.rawPairCandidates = diagnostic.candidateCount;
+        stats.pairCandidatesReadyMs = diagnostic.elapsedMs;
+        break;
+    case vc::atlas::FiberIntersectionDiagnosticEvent::CandidateRefineStarted:
+        ++stats.refineStarted;
+        break;
+    case vc::atlas::FiberIntersectionDiagnosticEvent::CandidateRefineFinished:
+        ++stats.refineFinished;
+        stats.refineMs += diagnostic.elapsedMs;
+        stats.maxRefineMs = std::max(stats.maxRefineMs, diagnostic.elapsedMs);
+        break;
+    case vc::atlas::FiberIntersectionDiagnosticEvent::PairScoringStarted:
+        ++stats.scoringStarts;
+        stats.scoringResults = diagnostic.resultCount;
+        break;
+    case vc::atlas::FiberIntersectionDiagnosticEvent::PairScoringFinished:
+        ++stats.scoringFinishes;
+        stats.scoringMs += diagnostic.elapsedMs;
+        stats.scoringResults = diagnostic.resultCount;
+        break;
+    case vc::atlas::FiberIntersectionDiagnosticEvent::PairFinished:
+        stats.pairMs = diagnostic.elapsedMs;
+        stats.finalPairResults = diagnostic.resultCount;
+        break;
+    default:
+        break;
+    }
+}
+
+void printPairProfile(const Options& options,
+                      const std::vector<TimedFiber>& fibers,
+                      const vc::lasagna::LasagnaNormalSampler& windingSampler)
+{
+    if (!options.pairIds) {
+        throw std::runtime_error("pair profile requested without --pair");
+    }
+
+    vc::atlas::FiberIntersectionCeresOptions ceres = options.ceres;
+    ceres.optimizationMode = options.optimizationMode.value_or(
+        vc::atlas::FiberIntersectionOptimizationMode::GeometricDirectWalk);
+    ceres.requireWindingScore = true;
+
+    const uint64_t sourceId = options.pairIds->first;
+    const uint64_t targetId = options.pairIds->second;
+    const TimedFiber* source = findFiberByRuntimeId(fibers, sourceId);
+    const TimedFiber* target = findFiberByRuntimeId(fibers, targetId);
+    if (!source || !target) {
+        std::ostringstream out;
+        out << "runtime pair " << sourceId << "/" << targetId
+            << " not found in " << options.fiberDir;
+        throw std::runtime_error(out.str());
+    }
+
+    PairProfileStats stats;
+    const auto start = Clock::now();
+    auto results = vc::atlas::searchFiberIntersections(
+        fiberPolylinesFor(fibers),
+        {sourceId},
+        {targetId},
+        nullptr,
+        options.broad,
+        ceres,
+        &windingSampler,
+        vc::atlas::FiberIntersectionProgressCallback{},
+        vc::atlas::FiberIntersectionCancelCallback{},
+        [&](const vc::atlas::FiberIntersectionDiagnostic& diagnostic) {
+            updatePairProfileStats(stats, diagnostic);
+        });
+    const double totalMs = elapsedMs(start, Clock::now());
+
+    std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
+        if (a.windingDistance != b.windingDistance) return a.windingDistance < b.windingDistance;
+        if (a.sourceArclength != b.sourceArclength) return a.sourceArclength < b.sourceArclength;
+        return a.targetArclength < b.targetArclength;
+    });
+
+    std::cout << "\npair_profile:\n";
+    std::cout << "  pair=" << sourceId << "/" << targetId << "\n";
+    std::cout << "  source=" << fiberLabel(source, sourceId) << "\n";
+    std::cout << "  target=" << fiberLabel(target, targetId) << "\n";
+    std::cout << "  optimization=" << optimizationModeName(ceres.optimizationMode) << "\n";
+    std::cout << "  total_ms=" << totalMs << "\n";
+    std::cout << "  candidate_fibers=" << stats.candidateFiberCount
+              << " candidate_fiber_candidates=" << stats.candidateFiberCandidates
+              << " candidate_fiber_ms=" << stats.candidateFiberMs << "\n";
+    std::cout << "  raw_pair_candidates=" << stats.rawPairCandidates
+              << " pair_candidates_ready_ms=" << stats.pairCandidatesReadyMs << "\n";
+    std::cout << "  refine_started=" << stats.refineStarted
+              << " refine_finished=" << stats.refineFinished
+              << " refine_total_ms=" << stats.refineMs
+              << " refine_max_ms=" << stats.maxRefineMs << "\n";
+    std::cout << "  final_scoring_starts=" << stats.scoringStarts
+              << " final_scoring_finishes=" << stats.scoringFinishes
+              << " final_scoring_results=" << stats.scoringResults
+              << " final_scoring_ms=" << stats.scoringMs << "\n";
+    std::cout << "  pair_finished_ms=" << stats.pairMs
+              << " final_pair_results=" << stats.finalPairResults
+              << " returned_results=" << results.size() << "\n";
+
+    std::cout << "\npair_results:\n";
+    const size_t resultLimit = std::min<size_t>(results.size(), 20);
+    for (size_t i = 0; i < resultLimit; ++i) {
+        const auto& result = results[i];
+        std::cout << "  [" << i << "]"
+                  << " distance_windings=" << result.windingDistance
+                  << " candidate_vx=" << result.candidateDistance
+                  << " ceres_solves=" << result.ceresSolves
+                  << " ceres_iterations=" << result.ceresIterations
+                  << " src_idx=" << arclengthFraction(source->fiber,
+                                                      result.sourceArclength)
+                  << " tgt_idx=" << arclengthFraction(target->fiber,
+                                                      result.targetArclength)
+                  << "\n";
+    }
+    if (results.size() > resultLimit) {
+        std::cout << "  ... " << (results.size() - resultLimit)
+                  << " more results omitted\n";
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -267,9 +504,6 @@ int main(int argc, char** argv)
         auto fibers = loadFibers(options.fiberDir);
         if (fibers.empty()) {
             throw std::runtime_error("no .json fibers found in " + options.fiberDir.string());
-        }
-        if (options.atlasDir.empty()) {
-            throw std::runtime_error("--atlas-dir is required");
         }
         if (options.lasagnaManifest.empty()) {
             throw std::runtime_error("--lasagna-manifest is required for winding-distance results");
@@ -281,8 +515,14 @@ int main(int argc, char** argv)
 
         std::cout << std::fixed << std::setprecision(3);
         std::cout << "fiber_dir: " << options.fiberDir << "\n";
-        std::cout << "atlas_dir: " << options.atlasDir << "\n";
+        if (!options.atlasDir.empty()) {
+            std::cout << "atlas_dir: " << options.atlasDir << "\n";
+        }
         std::cout << "lasagna_manifest: " << options.lasagnaManifest << "\n";
+        if (options.pairIds) {
+            std::cout << "pair: " << options.pairIds->first
+                      << "/" << options.pairIds->second << "\n";
+        }
         std::cout << "broad_phase: maxDistance=" << options.broad.maxDistance
                   << " maxSampleSpacing=" << options.broad.maxSampleSpacing
                   << " seedStride=" << options.broad.seedStride
@@ -290,7 +530,6 @@ int main(int argc, char** argv)
         std::cout << "ceres: maxIterations=" << options.ceres.maxIterations
                   << " deduplicateArclength=" << options.ceres.deduplicateArclength << "\n";
 
-        std::cout << "\nfibers:\n";
         std::vector<fs::path> canonicalPaths;
         canonicalPaths.reserve(fibers.size());
         for (const auto& item : fibers) {
@@ -300,12 +539,24 @@ int main(int argc, char** argv)
         for (auto& item : fibers) {
             item.fiber.id = runtimeIds.idForPath(packageRelativeFiberPath(item));
         }
+        if (options.pairIds) {
+            std::cout << "\nfibers:\n";
+            std::cout << "  count=" << fibers.size() << "\n";
+            printPairProfile(options, fibers, windingSampler);
+            return 0;
+        }
+
+        std::cout << "\nfibers:\n";
         for (const auto& item : fibers) {
             std::cout << "  path=" << packageRelativeFiberPath(item).generic_string()
                       << " runtime_id=" << item.fiber.id
                       << " generation=" << item.fiber.generation
                       << " points=" << item.fiber.points.size()
                       << "\n";
+        }
+
+        if (options.atlasDir.empty()) {
+            throw std::runtime_error("--atlas-dir is required unless --pair is set");
         }
 
         vc::atlas::FiberSpatialIndex index;

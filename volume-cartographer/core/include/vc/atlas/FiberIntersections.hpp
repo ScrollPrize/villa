@@ -44,7 +44,7 @@ struct FiberSegmentEntry {
 };
 
 struct FiberIntersectionBroadPhaseOptions {
-    double maxDistance = 500.0;
+    double maxDistance = 100.0;
     double maxSampleSpacing = 100.0;
     int seedStride = 100;
     double clusterArclength = 8.0;
@@ -59,11 +59,20 @@ struct FiberIntersectionBroadPhaseOptions {
     }
 };
 
+enum class FiberIntersectionOptimizationMode {
+    GeometricCeres,
+    WindingCeres,
+    GeometricDirectWalk,
+};
+
 struct FiberIntersectionCeresOptions {
     int maxIterations = 50;
     double distanceWeight = 1.0;
     double normalOrthogonalityWeight = 0.25;
     double deduplicateArclength = 4.0;
+    FiberIntersectionOptimizationMode optimizationMode =
+        FiberIntersectionOptimizationMode::GeometricCeres;
+    bool requireWindingScore = false;
 
     friend bool operator==(const FiberIntersectionCeresOptions& a,
                            const FiberIntersectionCeresOptions& b)
@@ -71,7 +80,9 @@ struct FiberIntersectionCeresOptions {
         return a.maxIterations == b.maxIterations &&
                a.distanceWeight == b.distanceWeight &&
                a.normalOrthogonalityWeight == b.normalOrthogonalityWeight &&
-               a.deduplicateArclength == b.deduplicateArclength;
+               a.deduplicateArclength == b.deduplicateArclength &&
+               a.optimizationMode == b.optimizationMode &&
+               a.requireWindingScore == b.requireWindingScore;
     }
 };
 
@@ -178,6 +189,43 @@ using FiberIntersectionCancelCallback = std::function<bool()>;
 using FiberSideStripProgressCallback =
     std::function<void(FiberSideStripProgressPhase phase, size_t completed, size_t total)>;
 
+enum class FiberIntersectionDiagnosticEvent {
+    CandidateFiberStarted,
+    CandidateFiberFinished,
+    PairStarted,
+    PairSkipped,
+    PairCacheHit,
+    PairCandidatesReady,
+    CandidateRefineStarted,
+    CandidateRefineFinished,
+    PairScoringStarted,
+    PairScoringFinished,
+    PairEmpty,
+    PairFinished,
+};
+
+struct FiberIntersectionDiagnostic {
+    FiberIntersectionDiagnosticEvent event =
+        FiberIntersectionDiagnosticEvent::PairStarted;
+    size_t completed = 0;
+    size_t total = 0;
+    size_t jobIndex = 0;
+    size_t jobTotal = 0;
+    uint64_t sourceFiberId = 0;
+    uint64_t targetFiberId = 0;
+    size_t candidateCount = 0;
+    size_t candidateIndex = std::numeric_limits<size_t>::max();
+    size_t candidateTotal = 0;
+    size_t resultCount = 0;
+    int64_t elapsedMs = 0;
+    double sourceArclength = 0.0;
+    double targetArclength = 0.0;
+    double candidateDistance = 0.0;
+};
+
+using FiberIntersectionDiagnosticCallback =
+    std::function<void(const FiberIntersectionDiagnostic& diagnostic)>;
+
 class FiberSpatialIndex {
 public:
     void clear();
@@ -258,6 +306,9 @@ private:
             combine(std::hash<double>{}(key.ceres.distanceWeight));
             combine(std::hash<double>{}(key.ceres.normalOrthogonalityWeight));
             combine(std::hash<double>{}(key.ceres.deduplicateArclength));
+            combine(std::hash<int>{}(
+                static_cast<int>(key.ceres.optimizationMode)));
+            combine(std::hash<bool>{}(key.ceres.requireWindingScore));
             return seed;
         }
     };
@@ -292,6 +343,7 @@ private:
     const FiberIntersectionCeresOptions& ceres,
     const vc::lasagna::LasagnaNormalSampler* windingSampler = nullptr,
     FiberIntersectionProgressCallback progressCallback = {},
-    FiberIntersectionCancelCallback cancelCallback = {});
+    FiberIntersectionCancelCallback cancelCallback = {},
+    FiberIntersectionDiagnosticCallback diagnosticCallback = {});
 
 } // namespace vc::atlas

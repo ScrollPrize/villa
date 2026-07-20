@@ -22,6 +22,7 @@
 
 #include <array>
 #include <functional>
+#include <limits>
 #include <optional>
 
 #include "VCSettings.hpp"
@@ -190,6 +191,7 @@ constexpr auto ATLAS_INTERNAL_SURFACE_NAME = "__atlas_workspace_base_mesh";
 constexpr int ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS = 0;
 constexpr int ATLAS_SEARCH_MODE_NON_ATLAS_ONLY = 1;
 constexpr int ATLAS_SEARCH_PHASE_COUNT = 5;
+constexpr int FIBER_INTERSECTION_SEARCH_PHASE_COUNT = 4;
 constexpr int ATLAS_SEARCH_RESULT_INDEX_ROLE = Qt::UserRole;
 constexpr int ATLAS_SEARCH_FIBER_ID_ROLE = Qt::UserRole + 1;
 constexpr int ATLAS_FIBER_ID_ROLE = Qt::UserRole;
@@ -1609,6 +1611,48 @@ int atlasSearchPhaseNumber(vc::atlas::AtlasSearchProgressPhase phase)
     return static_cast<int>(phase) + 1;
 }
 
+int fiberIntersectionSearchPhaseNumber(vc::atlas::AtlasSearchProgressPhase phase)
+{
+    switch (phase) {
+    case vc::atlas::AtlasSearchProgressPhase::PrepareInputs:
+        return 1;
+    case vc::atlas::AtlasSearchProgressPhase::BuildSpatialIndex:
+        return 2;
+    case vc::atlas::AtlasSearchProgressPhase::SearchPairs:
+        return 3;
+    case vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface:
+    case vc::atlas::AtlasSearchProgressPhase::FinishResults:
+        return 4;
+    }
+    return 1;
+}
+
+int fiberIntersectionSearchPhaseProgressPercent(
+    vc::atlas::AtlasSearchProgressPhase phase,
+    size_t completed,
+    size_t total)
+{
+    constexpr int kPercentMax = 100;
+    const int phaseIndex = std::clamp(
+        fiberIntersectionSearchPhaseNumber(phase) - 1,
+        0,
+        FIBER_INTERSECTION_SEARCH_PHASE_COUNT - 1);
+    const int phaseBase =
+        (phaseIndex * kPercentMax) / FIBER_INTERSECTION_SEARCH_PHASE_COUNT;
+    const int phaseEnd =
+        ((phaseIndex + 1) * kPercentMax) / FIBER_INTERSECTION_SEARCH_PHASE_COUNT;
+    const int phaseSpan = phaseEnd - phaseBase;
+    if (total == 0) {
+        return phaseBase + (completed > 0 ? phaseSpan : 0);
+    }
+    const double fraction = std::clamp(static_cast<double>(completed) /
+                                       static_cast<double>(total),
+                                       0.0,
+                                       1.0);
+    return phaseBase +
+           static_cast<int>(std::round(fraction * static_cast<double>(phaseSpan)));
+}
+
 QString atlasSearchPhaseAction(vc::atlas::AtlasSearchProgressPhase phase)
 {
     switch (phase) {
@@ -1624,6 +1668,106 @@ QString atlasSearchPhaseAction(vc::atlas::AtlasSearchProgressPhase phase)
         return QObject::tr("Finishing results");
     }
     return QObject::tr("Searching");
+}
+
+QString fiberIntersectionDiagnosticEventName(
+    vc::atlas::FiberIntersectionDiagnosticEvent event)
+{
+    switch (event) {
+    case vc::atlas::FiberIntersectionDiagnosticEvent::CandidateFiberStarted:
+        return QStringLiteral("candidate_fiber_start");
+    case vc::atlas::FiberIntersectionDiagnosticEvent::CandidateFiberFinished:
+        return QStringLiteral("candidate_fiber_end");
+    case vc::atlas::FiberIntersectionDiagnosticEvent::PairStarted:
+        return QStringLiteral("pair_start");
+    case vc::atlas::FiberIntersectionDiagnosticEvent::PairSkipped:
+        return QStringLiteral("pair_skipped");
+    case vc::atlas::FiberIntersectionDiagnosticEvent::PairCacheHit:
+        return QStringLiteral("pair_cache_hit");
+    case vc::atlas::FiberIntersectionDiagnosticEvent::PairCandidatesReady:
+        return QStringLiteral("pair_candidates_ready");
+    case vc::atlas::FiberIntersectionDiagnosticEvent::CandidateRefineStarted:
+        return QStringLiteral("candidate_refine_start");
+    case vc::atlas::FiberIntersectionDiagnosticEvent::CandidateRefineFinished:
+        return QStringLiteral("candidate_refine_end");
+    case vc::atlas::FiberIntersectionDiagnosticEvent::PairScoringStarted:
+        return QStringLiteral("pair_scoring_start");
+    case vc::atlas::FiberIntersectionDiagnosticEvent::PairScoringFinished:
+        return QStringLiteral("pair_scoring_end");
+    case vc::atlas::FiberIntersectionDiagnosticEvent::PairEmpty:
+        return QStringLiteral("pair_empty");
+    case vc::atlas::FiberIntersectionDiagnosticEvent::PairFinished:
+        return QStringLiteral("pair_finished");
+    }
+    return QStringLiteral("unknown");
+}
+
+QString fiberIntersectionDiagnosticIndex(size_t index, size_t total)
+{
+    if (total == 0 || index == std::numeric_limits<size_t>::max()) {
+        return QStringLiteral("-");
+    }
+    return QStringLiteral("%1/%2")
+        .arg(static_cast<qulonglong>(index + 1))
+        .arg(static_cast<qulonglong>(total));
+}
+
+bool shouldLogFiberIntersectionDiagnosticTail(
+    const vc::atlas::FiberIntersectionDiagnostic& diagnostic)
+{
+    if (diagnostic.total > 0 && diagnostic.completed + 10 < diagnostic.total) {
+        return false;
+    }
+    const bool isCandidateRefine =
+        diagnostic.event ==
+            vc::atlas::FiberIntersectionDiagnosticEvent::CandidateRefineStarted ||
+        diagnostic.event ==
+            vc::atlas::FiberIntersectionDiagnosticEvent::CandidateRefineFinished;
+    if (!isCandidateRefine) {
+        return true;
+    }
+    const bool hasCandidateIndex =
+        diagnostic.candidateTotal > 0 &&
+        diagnostic.candidateIndex < diagnostic.candidateTotal;
+    if (!hasCandidateIndex) {
+        return true;
+    }
+    if (diagnostic.event ==
+        vc::atlas::FiberIntersectionDiagnosticEvent::CandidateRefineStarted) {
+        return true;
+    }
+    const bool boundaryCandidate =
+        diagnostic.candidateTotal <= 20 ||
+        diagnostic.candidateIndex < 10 ||
+        diagnostic.candidateTotal - diagnostic.candidateIndex <= 10 ||
+        diagnostic.candidateIndex % 10 == 0;
+    return boundaryCandidate || diagnostic.elapsedMs >= 1000;
+}
+
+void logFiberIntersectionDiagnosticTail(
+    const QString& logPrefix,
+    const vc::atlas::FiberIntersectionDiagnostic& diagnostic)
+{
+    if (!shouldLogFiberIntersectionDiagnosticTail(diagnostic)) {
+        return;
+    }
+    qInfo().noquote() << QStringLiteral("[%1] tail event=%2 completed=%3 total=%4 job=%5 source_id=%6 target_id=%7 candidates=%8 candidate=%9 results=%10 elapsed_ms=%11 candidate_vx=%12 source_s=%13 target_s=%14")
+        .arg(logPrefix,
+             fiberIntersectionDiagnosticEventName(diagnostic.event))
+        .arg(static_cast<qulonglong>(diagnostic.completed))
+        .arg(static_cast<qulonglong>(diagnostic.total))
+        .arg(fiberIntersectionDiagnosticIndex(diagnostic.jobIndex,
+                                              diagnostic.jobTotal),
+             QString::number(diagnostic.sourceFiberId),
+             QString::number(diagnostic.targetFiberId))
+        .arg(static_cast<qulonglong>(diagnostic.candidateCount))
+        .arg(fiberIntersectionDiagnosticIndex(diagnostic.candidateIndex,
+                                              diagnostic.candidateTotal))
+        .arg(static_cast<qulonglong>(diagnostic.resultCount))
+        .arg(static_cast<qlonglong>(diagnostic.elapsedMs))
+        .arg(QString::number(diagnostic.candidateDistance, 'g', 12),
+             QString::number(diagnostic.sourceArclength, 'g', 12),
+             QString::number(diagnostic.targetArclength, 'g', 12));
 }
 
 QStringList atlasSearchTagList(const QString& text)
@@ -2801,7 +2945,7 @@ QDockWidget* createFiberIntersectionSearchDock(
     tree->setObjectName(QStringLiteral("fiberIntersectionSearchResultTree"));
     tree->setColumnCount(5);
     tree->setHeaderLabels({
-        QObject::tr("Distance (vx)"),
+        QObject::tr("Distance (windings)"),
         QObject::tr("Source fiber"),
         QObject::tr("Target fiber"),
         QObject::tr("Src idx"),
@@ -6481,20 +6625,21 @@ void CWindow::cancelFiberIntersectionSearch()
         _fiberIntersectionSearchCancelFlag->store(true, std::memory_order_relaxed);
     }
     qInfo().noquote() << QStringLiteral("[fiber-intersection-search] cancel requested phase=%1 completed=%2 total=%3")
-        .arg(atlasSearchPhaseNumber(_fiberIntersectionSearchProgressPhase))
+        .arg(fiberIntersectionSearchPhaseNumber(_fiberIntersectionSearchProgressPhase))
         .arg(static_cast<qulonglong>(_fiberIntersectionSearchPhaseCompleted))
         .arg(static_cast<qulonglong>(_fiberIntersectionSearchPhaseTotal));
     if (_fiberIntersectionSearchControls.progress) {
         _fiberIntersectionSearchControls.progress->setRange(0, 100);
         _fiberIntersectionSearchControls.progress->setValue(
-            vc::atlas::atlasSearchPhaseProgressPercent(
+            fiberIntersectionSearchPhaseProgressPercent(
                 _fiberIntersectionSearchProgressPhase,
                 _fiberIntersectionSearchPhaseCompleted,
                 _fiberIntersectionSearchPhaseTotal));
         _fiberIntersectionSearchControls.progress->setFormat(
             tr("Canceling: phase %1/%2 %3 (%4 / %5)")
-                .arg(atlasSearchPhaseNumber(_fiberIntersectionSearchProgressPhase))
-                .arg(ATLAS_SEARCH_PHASE_COUNT)
+                .arg(fiberIntersectionSearchPhaseNumber(
+                    _fiberIntersectionSearchProgressPhase))
+                .arg(FIBER_INTERSECTION_SEARCH_PHASE_COUNT)
                 .arg(atlasSearchPhaseAction(_fiberIntersectionSearchProgressPhase))
                 .arg(static_cast<qulonglong>(_fiberIntersectionSearchPhaseCompleted))
                 .arg(static_cast<qulonglong>(_fiberIntersectionSearchPhaseTotal)));
@@ -6517,21 +6662,21 @@ void CWindow::updateFiberIntersectionSearchProgress(
         total == 0 ? completed : std::min(completed, total);
     _fiberIntersectionSearchPhaseTotal = total;
 
-    const int percent = vc::atlas::atlasSearchPhaseProgressPercent(
+    const int percent = fiberIntersectionSearchPhaseProgressPercent(
         phase,
         _fiberIntersectionSearchPhaseCompleted,
         total);
     const QString action = atlasSearchPhaseAction(phase);
     const QString format = _fiberIntersectionSearchCancelRequested
         ? tr("Canceling: phase %1/%2 %3 (%4 / %5)")
-              .arg(atlasSearchPhaseNumber(phase))
-              .arg(ATLAS_SEARCH_PHASE_COUNT)
+              .arg(fiberIntersectionSearchPhaseNumber(phase))
+              .arg(FIBER_INTERSECTION_SEARCH_PHASE_COUNT)
               .arg(action)
               .arg(static_cast<qulonglong>(_fiberIntersectionSearchPhaseCompleted))
               .arg(static_cast<qulonglong>(total))
         : tr("Phase %1/%2: %3 (%4 / %5)")
-              .arg(atlasSearchPhaseNumber(phase))
-              .arg(ATLAS_SEARCH_PHASE_COUNT)
+              .arg(fiberIntersectionSearchPhaseNumber(phase))
+              .arg(FIBER_INTERSECTION_SEARCH_PHASE_COUNT)
               .arg(action)
               .arg(static_cast<qulonglong>(_fiberIntersectionSearchPhaseCompleted))
               .arg(static_cast<qulonglong>(total));
@@ -6655,7 +6800,32 @@ void CWindow::startFiberIntersectionSearch()
         .arg(static_cast<qulonglong>(fiberIds.size()))
         .arg(static_cast<qulonglong>(pairTotal));
 
+    std::filesystem::path lasagnaManifestPath;
+    double lasagnaWorkingToBaseScale = 1.0;
+    try {
+        if (const auto resolved = resolvedLasagnaForState(_state)) {
+            lasagnaManifestPath = resolved->manifestPath;
+            lasagnaWorkingToBaseScale = resolved->workingToBaseScale;
+        }
+    } catch (const std::exception& ex) {
+        QMessageBox::warning(this,
+                             tr("Fiber Intersection Search"),
+                             QString::fromStdString(ex.what()));
+        return;
+    }
+    if (lasagnaManifestPath.empty()) {
+        QMessageBox::warning(this,
+                             tr("Fiber Intersection Search"),
+                             tr("Select a local Lasagna dataset before searching. "
+                                "Fiber intersection distance is measured in "
+                                "grad_mag winding-integral space."));
+        return;
+    }
+
     vc::atlas::FiberIntersectionCeresOptions ceres;
+    ceres.optimizationMode =
+        vc::atlas::FiberIntersectionOptimizationMode::GeometricDirectWalk;
+    ceres.requireWindingScore = true;
     _fiberIntersectionSearchResults.clear();
     _fiberIntersectionSearchFiberSnapshotsByRuntimeId = snapshotsByRuntimeId;
     _fiberIntersectionSearchCancelRequested = false;
@@ -6744,11 +6914,17 @@ void CWindow::startFiberIntersectionSearch()
     auto cancelFlag = _fiberIntersectionSearchCancelFlag;
     watcher->setFuture(QtConcurrent::run([fibers = std::move(fibers),
                                           fiberIds = std::move(fiberIds),
+                                          lasagnaManifestPath = std::move(lasagnaManifestPath),
+                                          lasagnaWorkingToBaseScale,
                                           cache,
                                           broad,
                                           ceres,
                                           self,
                                           cancelFlag]() mutable {
+        vc::lasagna::LasagnaDataset dataset =
+            vc::lasagna::LasagnaDataset::open(
+                lasagnaManifestPath, {lasagnaWorkingToBaseScale});
+        vc::lasagna::LasagnaNormalSampler windingSampler(dataset);
         bool phase2Started = false;
         bool phase2Ended = false;
         bool phase3Started = false;
@@ -6773,14 +6949,14 @@ void CWindow::startFiberIntersectionSearch()
             if (started && !*started && completed == 0) {
                 *started = true;
                 qInfo().noquote() << QStringLiteral("[fiber-intersection-search] phase=%1 %2 start total=%3")
-                    .arg(atlasSearchPhaseNumber(phase))
+                    .arg(fiberIntersectionSearchPhaseNumber(phase))
                     .arg(atlasSearchPhaseAction(phase).toLower().replace(QChar(' '), QChar('_')))
                     .arg(static_cast<qulonglong>(total));
             }
             if (ended && !*ended && completed >= total) {
                 *ended = true;
                 qInfo().noquote() << QStringLiteral("[fiber-intersection-search] phase=%1 %2 end completed=%3 total=%4")
-                    .arg(atlasSearchPhaseNumber(phase))
+                    .arg(fiberIntersectionSearchPhaseNumber(phase))
                     .arg(atlasSearchPhaseAction(phase).toLower().replace(QChar(' '), QChar('_')))
                     .arg(static_cast<qulonglong>(completed))
                     .arg(static_cast<qulonglong>(total));
@@ -6798,15 +6974,20 @@ void CWindow::startFiberIntersectionSearch()
         auto cancelCallback = [cancelFlag]() {
             return cancelFlag && cancelFlag->load(std::memory_order_relaxed);
         };
+        auto diagnosticCallback = [](const vc::atlas::FiberIntersectionDiagnostic& diagnostic) {
+            logFiberIntersectionDiagnosticTail(QStringLiteral("fiber-intersection-search"),
+                                               diagnostic);
+        };
         auto results = vc::atlas::searchFiberIntersections(fibers,
                                                            fiberIds,
                                                            fiberIds,
                                                            cache,
                                                            broad,
                                                            ceres,
-                                                           nullptr,
+                                                           &windingSampler,
                                                            progressCallback,
-                                                           cancelCallback);
+                                                           cancelCallback,
+                                                           diagnosticCallback);
         if (cancelCallback()) {
             return std::vector<vc::atlas::FiberIntersectionResult>{};
         }
@@ -7050,6 +7231,9 @@ void CWindow::startAtlasFiberIntersectionSearch()
         .arg(static_cast<qulonglong>(pairTotal));
 
     vc::atlas::FiberIntersectionCeresOptions ceres;
+    ceres.optimizationMode =
+        vc::atlas::FiberIntersectionOptimizationMode::WindingCeres;
+    ceres.requireWindingScore = true;
 
     std::filesystem::path lasagnaManifestPath;
     double lasagnaWorkingToBaseScale = 1.0;
@@ -7233,6 +7417,9 @@ void CWindow::startAtlasFiberIntersectionSearch()
         auto cancelCallback = [cancelFlag]() {
             return cancelFlag && cancelFlag->load(std::memory_order_relaxed);
         };
+        auto diagnosticCallback = [](const vc::atlas::FiberIntersectionDiagnostic& diagnostic) {
+            logFiberIntersectionDiagnosticTail(QStringLiteral("atlas-search"), diagnostic);
+        };
         auto rawResults = vc::atlas::searchFiberIntersections(fibers,
                                                               sourceFiberIds,
                                                               targetFiberIds,
@@ -7241,7 +7428,8 @@ void CWindow::startAtlasFiberIntersectionSearch()
                                                               ceres,
                                                               &windingSampler,
                                                               progressCallback,
-                                                              cancelCallback);
+                                                              cancelCallback,
+                                                              diagnosticCallback);
         if (debugSearch) {
             qInfo().noquote() << QStringLiteral("[atlas-search] finished source_ids=%1 target_ids=%2 result_count=%3")
                 .arg(atlasSearchIdListString(sourceFiberIds),
@@ -7556,7 +7744,8 @@ void CWindow::populateFiberIntersectionSearchResults(
     const std::size_t finishTotal =
         std::max<std::size_t>(1, _fiberIntersectionSearchResults.size());
     qInfo().noquote() << QStringLiteral("[fiber-intersection-search] phase=%1 finishing_results start total=%2")
-        .arg(atlasSearchPhaseNumber(vc::atlas::AtlasSearchProgressPhase::FinishResults))
+        .arg(fiberIntersectionSearchPhaseNumber(
+            vc::atlas::AtlasSearchProgressPhase::FinishResults))
         .arg(static_cast<qulonglong>(finishTotal));
     updateFiberIntersectionSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
                                           0,
@@ -7571,7 +7760,7 @@ void CWindow::populateFiberIntersectionSearchResults(
     tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
     tree->setSelectionBehavior(QAbstractItemView::SelectRows);
     tree->setHeaderLabels({
-        tr("Distance (vx)"),
+        tr("Distance (windings)"),
         tr("Source fiber"),
         tr("Target fiber"),
         tr("Src idx"),
@@ -7701,7 +7890,8 @@ void CWindow::populateFiberIntersectionSearchResults(
                                           finishTotal,
                                           finishTotal);
     qInfo().noquote() << QStringLiteral("[fiber-intersection-search] phase=%1 finishing_results end completed=%2 total=%3")
-        .arg(atlasSearchPhaseNumber(vc::atlas::AtlasSearchProgressPhase::FinishResults))
+        .arg(fiberIntersectionSearchPhaseNumber(
+            vc::atlas::AtlasSearchProgressPhase::FinishResults))
         .arg(static_cast<qulonglong>(finishTotal))
         .arg(static_cast<qulonglong>(finishTotal));
     if (_fiberIntersectionSearchControls.progress) {

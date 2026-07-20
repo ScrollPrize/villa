@@ -2,11 +2,24 @@
 #include "vc_test.hpp"
 
 #include "vc/atlas/FiberIntersections.hpp"
+#include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
+
+#include "utils/zarr.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <set>
+#include <stdexcept>
+#include <string>
+
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -26,6 +39,72 @@ vc::atlas::FiberPolyline fiber(uint64_t id,
 {
     return {id, generation, std::move(points)};
 }
+
+void writeText(const fs::path& path, const std::string& text)
+{
+    std::ofstream out(path);
+    out << text;
+}
+
+void createU8Zarr(const fs::path& path,
+                  std::vector<size_t> shape,
+                  std::vector<size_t> chunks,
+                  const std::vector<uint8_t>& payload)
+{
+    utils::ZarrMetadata meta;
+    meta.version = utils::ZarrVersion::v2;
+    meta.shape = std::move(shape);
+    meta.chunks = std::move(chunks);
+    meta.dtype = utils::ZarrDtype::uint8;
+    meta.compressor_id.clear();
+    meta.fill_value = 0.0;
+    auto array = utils::ZarrArray::create(path, meta);
+    std::vector<std::byte> bytes(payload.size());
+    for (size_t i = 0; i < payload.size(); ++i) {
+        bytes[i] = static_cast<std::byte>(payload[i]);
+    }
+    std::vector<size_t> zero(meta.shape.size(), 0);
+    array.write_chunk(zero, bytes);
+}
+
+struct ConstantLasagnaFixture {
+    fs::path dir;
+    fs::path manifestPath;
+
+    explicit ConstantLasagnaFixture(const std::string& tag)
+    {
+        dir = fs::temp_directory_path() / ("vc_fiber_intersections_" + tag);
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        constexpr size_t side = 16;
+        std::vector<uint8_t> gradMag(side * side * side, 100);
+        std::vector<uint8_t> nx(side * side * side, 128);
+        std::vector<uint8_t> ny(side * side * side, 128);
+        createU8Zarr(dir / "grad_mag.zarr",
+                     {side, side, side},
+                     {side, side, side},
+                     gradMag);
+        createU8Zarr(dir / "nx.zarr", {side, side, side}, {side, side, side}, nx);
+        createU8Zarr(dir / "ny.zarr", {side, side, side}, {side, side, side}, ny);
+        manifestPath = dir / "dataset.lasagna.json";
+        writeText(manifestPath, R"({
+            "version": 2,
+            "grad_mag_encode_scale": 100.0,
+            "grad_mag_factor": 1.0,
+            "groups": {
+                "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+                "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+                "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]}
+            }
+        })");
+    }
+
+    ~ConstantLasagnaFixture()
+    {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+};
 
 cv::Mat_<cv::Vec3f> flatStripGrid(int rows, int cols)
 {
@@ -406,7 +485,14 @@ TEST_CASE("Fiber-only all-pairs search uses voxel distance cache and deduplicate
     broad.clusterArclength = 1.0;
     vc::atlas::FiberIntersectionCeresOptions ceres;
     ceres.deduplicateArclength = 1.0;
+    ceres.optimizationMode =
+        vc::atlas::FiberIntersectionOptimizationMode::GeometricDirectWalk;
 
+    std::atomic_size_t pairStarts{0};
+    std::atomic_size_t pairCandidateReports{0};
+    std::atomic_size_t candidateRefineStarts{0};
+    std::atomic_size_t candidateRefineFinishes{0};
+    std::atomic_size_t pairFinishes{0};
     const auto first = vc::atlas::searchFiberIntersections(
         {source, target},
         {1, 2},
@@ -414,13 +500,47 @@ TEST_CASE("Fiber-only all-pairs search uses voxel distance cache and deduplicate
         &cache,
         broad,
         ceres,
-        nullptr);
+        nullptr,
+        vc::atlas::FiberIntersectionProgressCallback{},
+        vc::atlas::FiberIntersectionCancelCallback{},
+        [&](const vc::atlas::FiberIntersectionDiagnostic& diagnostic) {
+            if (diagnostic.sourceFiberId != 1 || diagnostic.targetFiberId != 2) {
+                return;
+            }
+            switch (diagnostic.event) {
+            case vc::atlas::FiberIntersectionDiagnosticEvent::PairStarted:
+                ++pairStarts;
+                break;
+            case vc::atlas::FiberIntersectionDiagnosticEvent::PairCandidatesReady:
+                if (diagnostic.candidateCount > 0) {
+                    ++pairCandidateReports;
+                }
+                break;
+            case vc::atlas::FiberIntersectionDiagnosticEvent::CandidateRefineStarted:
+                ++candidateRefineStarts;
+                break;
+            case vc::atlas::FiberIntersectionDiagnosticEvent::CandidateRefineFinished:
+                ++candidateRefineFinishes;
+                break;
+            case vc::atlas::FiberIntersectionDiagnosticEvent::PairFinished:
+                ++pairFinishes;
+                break;
+            default:
+                break;
+            }
+        });
 
     REQUIRE(first.size() == 1);
     CHECK(first[0].sourceFiberId == 1);
     CHECK(first[0].targetFiberId == 2);
     CHECK(first[0].windingDistance == doctest::Approx(3.0).epsilon(1e-5));
     CHECK_FALSE(first[0].cacheHit);
+    CHECK(first[0].ceresSolves == 0);
+    CHECK(pairStarts.load() >= 1);
+    CHECK(pairCandidateReports.load() >= 1);
+    CHECK(candidateRefineStarts.load() >= 1);
+    CHECK(candidateRefineFinishes.load() >= 1);
+    CHECK(pairFinishes.load() >= 1);
 
     const auto second = vc::atlas::searchFiberIntersections(
         {source, target},
@@ -609,6 +729,254 @@ TEST_CASE("Fiber intersection search reports pair progress and cancels")
     REQUIRE(completed.size() >= 2);
     CHECK(completed.front() == 0);
     CHECK(completed.back() >= 1);
+}
+
+TEST_CASE("Fiber-only candidate refinement uses direct segment closest points")
+{
+    auto source = fiber(1, 1, {p(0, 0, 0), p(10, 0, 0)});
+    auto target = fiber(2, 1, {p(4, -3, 0), p(4, 3, 0)});
+    vc::atlas::FiberIntersectionCandidate candidate;
+    candidate.sourceFiberId = 1;
+    candidate.sourceGeneration = 1;
+    candidate.sourceSegmentIndex = 0;
+    candidate.sourceArclength = 2.0;
+    candidate.targetFiberId = 2;
+    candidate.targetGeneration = 1;
+    candidate.targetSegmentIndex = 0;
+    candidate.targetArclength = 1.0;
+    candidate.straightDistance = 1.0;
+
+    vc::atlas::FiberIntersectionCeresOptions options;
+    options.optimizationMode =
+        vc::atlas::FiberIntersectionOptimizationMode::GeometricDirectWalk;
+    auto result = vc::atlas::refineFiberIntersectionCandidate(source, target, candidate, options);
+    CHECK(result.ceresSolves == 0);
+    CHECK(result.ceresIterations == 0);
+    CHECK(result.sourceArclength == doctest::Approx(4.0).epsilon(1e-8));
+    CHECK(result.targetArclength == doctest::Approx(3.0).epsilon(1e-8));
+    CHECK(result.windingDistance == doctest::Approx(0.0).epsilon(1e-8));
+}
+
+TEST_CASE("Fiber-only direct segment walk crosses segment boundaries")
+{
+    auto source = fiber(1, 1, {
+        p(0, 0, 0),
+        p(5, 0, 0),
+        p(10, 0, 0),
+    });
+    auto target = fiber(2, 1, {p(6, -2, 0), p(6, 2, 0)});
+    vc::atlas::FiberIntersectionCandidate candidate;
+    candidate.sourceFiberId = 1;
+    candidate.sourceGeneration = 1;
+    candidate.sourceSegmentIndex = 0;
+    candidate.sourceArclength = 5.0;
+    candidate.targetFiberId = 2;
+    candidate.targetGeneration = 1;
+    candidate.targetSegmentIndex = 0;
+    candidate.targetArclength = 2.0;
+    candidate.straightDistance = 1.0;
+
+    vc::atlas::FiberIntersectionCeresOptions options;
+    options.optimizationMode =
+        vc::atlas::FiberIntersectionOptimizationMode::GeometricDirectWalk;
+    auto result = vc::atlas::refineFiberIntersectionCandidate(source, target, candidate, options);
+    CHECK(result.ceresSolves == 0);
+    CHECK(result.sourceArclength == doctest::Approx(6.0).epsilon(1e-8));
+    CHECK(result.targetArclength == doctest::Approx(2.0).epsilon(1e-8));
+    CHECK(result.windingDistance == doctest::Approx(0.0).epsilon(1e-8));
+}
+
+TEST_CASE("Fiber-only direct segment walk terminates on vertex-local optima")
+{
+    auto source = fiber(1, 1, {
+        p(-5, 0, 0),
+        p(0, 0, 0),
+        p(0, 5, 0),
+    });
+    auto target = fiber(2, 1, {p(1, -1, 0), p(1, 1, 0)});
+    vc::atlas::FiberIntersectionCandidate candidate;
+    candidate.sourceFiberId = 1;
+    candidate.sourceGeneration = 1;
+    candidate.sourceSegmentIndex = 0;
+    candidate.sourceArclength = 5.0;
+    candidate.targetFiberId = 2;
+    candidate.targetGeneration = 1;
+    candidate.targetSegmentIndex = 0;
+    candidate.targetArclength = 1.0;
+    candidate.straightDistance = 1.0;
+
+    vc::atlas::FiberIntersectionCeresOptions options;
+    options.optimizationMode =
+        vc::atlas::FiberIntersectionOptimizationMode::GeometricDirectWalk;
+    auto result = vc::atlas::refineFiberIntersectionCandidate(source, target, candidate, options);
+    CHECK(result.ceresSolves == 0);
+    CHECK(result.sourceArclength == doctest::Approx(5.0).epsilon(1e-8));
+    CHECK(result.targetArclength == doctest::Approx(1.0).epsilon(1e-8));
+    CHECK(result.windingDistance == doctest::Approx(1.0).epsilon(1e-8));
+}
+
+TEST_CASE("Fiber intersection search can require winding sampler")
+{
+    vc::atlas::FiberIntersectionCache cache;
+    auto source = fiber(1, 1, {p(0, 0, 0), p(10, 0, 0)});
+    auto target = fiber(2, 1, {p(5, -1, 0), p(5, 1, 0)});
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    vc::atlas::FiberIntersectionCeresOptions ceres;
+    ceres.optimizationMode =
+        vc::atlas::FiberIntersectionOptimizationMode::GeometricDirectWalk;
+    ceres.requireWindingScore = true;
+
+    CHECK_THROWS_AS(vc::atlas::searchFiberIntersections(
+                        {source, target},
+                        {1},
+                        {2},
+                        &cache,
+                        broad,
+                        ceres),
+                    std::invalid_argument);
+}
+
+TEST_CASE("Fiber intersection direct mode scores final results with Lasagna after deduplication")
+{
+    ConstantLasagnaFixture fixture("direct_final_score");
+    const auto dataset = vc::lasagna::LasagnaDataset::open(fixture.manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+
+    auto source = fiber(1, 1, {p(0, 1, 1), p(10, 1, 1)});
+    auto target = fiber(2, 1, {p(5, 4, 1), p(5, 4, 5)});
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    broad.maxDistance = 4.0;
+    broad.maxSampleSpacing = 1.0;
+    broad.clusterArclength = 1.0;
+    vc::atlas::FiberIntersectionCeresOptions ceres;
+    ceres.optimizationMode =
+        vc::atlas::FiberIntersectionOptimizationMode::GeometricDirectWalk;
+    ceres.requireWindingScore = true;
+    ceres.deduplicateArclength = 1.0;
+
+    std::atomic_size_t pairScoringStarts{0};
+    std::atomic_size_t pairScoringFinishes{0};
+    const auto results = vc::atlas::searchFiberIntersections(
+        {source, target},
+        {1},
+        {2},
+        nullptr,
+        broad,
+        ceres,
+        &sampler,
+        vc::atlas::FiberIntersectionProgressCallback{},
+        vc::atlas::FiberIntersectionCancelCallback{},
+        [&](const vc::atlas::FiberIntersectionDiagnostic& diagnostic) {
+            if (diagnostic.event ==
+                vc::atlas::FiberIntersectionDiagnosticEvent::PairScoringStarted) {
+                ++pairScoringStarts;
+            }
+            if (diagnostic.event ==
+                vc::atlas::FiberIntersectionDiagnosticEvent::PairScoringFinished) {
+                ++pairScoringFinishes;
+            }
+        });
+
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].ceresSolves == 0);
+    CHECK(results[0].windingDistance == doctest::Approx(3.0).epsilon(1e-5));
+    CHECK(pairScoringStarts.load() == 1);
+    CHECK(pairScoringFinishes.load() == 1);
+}
+
+TEST_CASE("Fiber intersection final winding scoring runs after duplicate result deduplication")
+{
+    ConstantLasagnaFixture fixture("direct_dedup_before_score");
+    const auto dataset = vc::lasagna::LasagnaDataset::open(fixture.manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+
+    auto source = fiber(1, 1, {
+        p(0, 1, 1),
+        p(2, 1, 1),
+        p(4, 1, 1),
+        p(6, 1, 1),
+        p(8, 1, 1),
+        p(10, 1, 1),
+    });
+    auto target = fiber(2, 1, {
+        p(0, 1, 1),
+        p(2, 1, 1),
+        p(4, 1, 1),
+        p(6, 1, 1),
+        p(8, 1, 1),
+        p(10, 1, 1),
+    });
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    broad.maxDistance = 0.25;
+    broad.maxSampleSpacing = 1.0;
+    broad.clusterArclength = 0.0;
+    vc::atlas::FiberIntersectionCeresOptions ceres;
+    ceres.optimizationMode =
+        vc::atlas::FiberIntersectionOptimizationMode::GeometricDirectWalk;
+    ceres.requireWindingScore = true;
+    ceres.deduplicateArclength = 100.0;
+
+    std::atomic_size_t candidateRefineStarts{0};
+    std::atomic_size_t scoringResultCount{0};
+    const auto results = vc::atlas::searchFiberIntersections(
+        {source, target},
+        {1},
+        {2},
+        nullptr,
+        broad,
+        ceres,
+        &sampler,
+        vc::atlas::FiberIntersectionProgressCallback{},
+        vc::atlas::FiberIntersectionCancelCallback{},
+        [&](const vc::atlas::FiberIntersectionDiagnostic& diagnostic) {
+            if (diagnostic.event ==
+                vc::atlas::FiberIntersectionDiagnosticEvent::CandidateRefineStarted) {
+                ++candidateRefineStarts;
+            }
+            if (diagnostic.event ==
+                vc::atlas::FiberIntersectionDiagnosticEvent::PairScoringStarted) {
+                scoringResultCount = diagnostic.resultCount;
+            }
+        });
+
+    REQUIRE(results.size() == 1);
+    CHECK(candidateRefineStarts.load() > 1);
+    CHECK(scoringResultCount.load() == 1);
+    CHECK(results[0].windingDistance == doctest::Approx(0.0).epsilon(1e-8));
+}
+
+TEST_CASE("Atlas intersection mode uses winding Ceres optimization")
+{
+    ConstantLasagnaFixture fixture("winding_ceres");
+    const auto dataset = vc::lasagna::LasagnaDataset::open(fixture.manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+
+    auto source = fiber(1, 1, {p(0, 1, 1), p(10, 1, 1)});
+    auto target = fiber(2, 1, {p(5, 4, 1), p(5, 4, 5)});
+    vc::atlas::FiberIntersectionCandidate candidate;
+    candidate.sourceFiberId = 1;
+    candidate.sourceGeneration = 1;
+    candidate.sourceSegmentIndex = 0;
+    candidate.sourceArclength = 2.0;
+    candidate.targetFiberId = 2;
+    candidate.targetGeneration = 1;
+    candidate.targetSegmentIndex = 0;
+    candidate.targetArclength = 1.0;
+    candidate.straightDistance = 3.0;
+
+    vc::atlas::FiberIntersectionCeresOptions options;
+    options.optimizationMode =
+        vc::atlas::FiberIntersectionOptimizationMode::WindingCeres;
+    options.requireWindingScore = true;
+    const auto result = vc::atlas::refineFiberIntersectionCandidate(
+        source,
+        target,
+        candidate,
+        options,
+        &sampler);
+
+    CHECK(result.ceresSolves == 1);
+    CHECK(result.windingDistance == doctest::Approx(3.0).epsilon(1e-5));
 }
 
 TEST_CASE("Fiber intersection search ignores extensions outside outer control points")
