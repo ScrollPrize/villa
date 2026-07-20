@@ -54,6 +54,104 @@ HANDSHAKE_RE = re.compile(
     r"^VC3D-AGENT-BRIDGE:\s*listening\s+name=(?P<name>\S+)\s+path=(?P<path>.+)$"
 )
 
+# Where a running VC3D publishes its bridge for auto-discovery. Mirrors the
+# ~/.fit_services convention used by LasagnaServiceManager::discoverServices():
+# one JSON file per process ("<pid>.json") holding {pid, name, path, startedAt},
+# with dead-PID entries reaped on scan. See AgentBridgeServer::writeRegistryFile.
+REGISTRY_DIR = os.path.join(os.path.expanduser("~"), ".vc3d", "agent_bridge")
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with `pid` currently exists (Unix ``kill(pid, 0)``).
+
+    Mirrors the ``kill(pid, 0) != 0 -> stale`` liveness check in
+    ``LasagnaServiceManager::discoverServices()``. A ``PermissionError`` means
+    the process exists but is owned by someone else -- still alive.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def discover_registry_socket(registry_dir: str = REGISTRY_DIR) -> str | None:
+    """Scan the bridge registry for the newest live bridge's socket path.
+
+    Reads every ``*.json`` file in ``registry_dir``, dropping (and deleting)
+    entries whose ``pid`` is no longer alive -- the same stale-cleanup behavior
+    as ``LasagnaServiceManager::discoverServices()``. Returns the ``path`` of
+    the live entry with the greatest ``startedAt`` (newest launch), or ``None``
+    when the directory is absent or holds no live entry.
+    """
+    if not os.path.isdir(registry_dir):
+        return None
+
+    best_path: str | None = None
+    best_started_at = -1.0
+    for name in os.listdir(registry_dir):
+        if not name.endswith(".json"):
+            continue
+        file_path = os.path.join(registry_dir, name)
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            # Unreadable / malformed entry: reap it, matching the C++ scanner
+            # which removes non-object files.
+            _remove_registry_file(file_path)
+            continue
+
+        if not isinstance(obj, dict):
+            _remove_registry_file(file_path)
+            continue
+
+        pid = obj.get("pid")
+        pid = int(pid) if isinstance(pid, (int, float)) else -1
+        if pid <= 0:
+            _remove_registry_file(file_path)
+            continue
+
+        if not _pid_alive(pid):
+            _remove_registry_file(file_path)
+            continue
+
+        path = obj.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+
+        started_at = obj.get("startedAt")
+        started_at = float(started_at) if isinstance(started_at, (int, float)) else 0.0
+        # Tie-break by file mtime so entries lacking a usable startedAt still
+        # order sensibly; startedAt is the primary key.
+        if started_at < 0:
+            started_at = 0.0
+        key = started_at
+        if key <= 0:
+            try:
+                key = os.path.getmtime(file_path)
+            except OSError:
+                key = 0.0
+
+        if key > best_started_at:
+            best_started_at = key
+            best_path = path
+
+    return best_path
+
+
+def _remove_registry_file(file_path: str) -> None:
+    try:
+        os.unlink(file_path)
+    except OSError:
+        pass
+
 
 class BridgeError(Exception):
     """A JSON-RPC error object returned by the bridge (SPEC.md section 2.5)."""

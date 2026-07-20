@@ -74,6 +74,19 @@ private:
     using Handler = std::function<QJsonObject(const QJsonValue& params)>;
 
     void registerHandlers();
+
+    // --- Discovery registry file (mirrors LasagnaServiceManager's
+    // ~/.fit_services convention) ---
+    // On a successful listen(), a small JSON file named "<pid>.json" is written
+    // under ~/.vc3d/agent_bridge/ containing {pid, name, path, startedAt} so an
+    // out-of-process MCP server can auto-discover a running bridge without the
+    // human relaying the stdout handshake line. Removed on clean shutdown (the
+    // destructor); an orphaned file from a hard kill is reaped by the reader's
+    // stale-PID check (dead pid -> file removed), exactly as discoverServices()
+    // does. Pure QFile/QDir I/O -- never touches the UI.
+    void writeRegistryFile();
+    void removeRegistryFile();
+
     void processLine(QLocalSocket* socket, const QByteArray& line);
     void dispatch(QLocalSocket* socket, const QJsonObject& request);
     void sendResponse(QLocalSocket* socket, const QJsonValue& id, const QJsonObject& result);
@@ -297,6 +310,9 @@ private:
 
     CWindow* _window = nullptr;
     QLocalServer* _server = nullptr;
+    // Absolute path of the discovery registry file this process wrote (empty
+    // until a successful listen()); removed in the destructor.
+    QString _registryFilePath;
     QHash<QString, Handler> _handlers;
     QHash<QLocalSocket*, QByteArray> _buffers;
 

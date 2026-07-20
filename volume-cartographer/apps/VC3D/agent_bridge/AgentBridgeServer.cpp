@@ -4,6 +4,8 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QDir>
+#include <QFile>
 #include <QFutureWatcher>
 #include <QImage>
 #include <QJsonArray>
@@ -267,7 +269,12 @@ AgentBridgeServer::AgentBridgeServer(CWindow* window, QObject* parent)
     }
 }
 
-AgentBridgeServer::~AgentBridgeServer() = default;
+AgentBridgeServer::~AgentBridgeServer()
+{
+    // Clean-shutdown removal of the discovery registry file. A hard kill skips
+    // this; the reader-side stale-PID check reaps the orphan instead.
+    removeRegistryFile();
+}
 
 bool AgentBridgeServer::listen(const QString& serverName)
 {
@@ -277,12 +284,63 @@ bool AgentBridgeServer::listen(const QString& serverName)
                 this, &AgentBridgeServer::onNewConnection);
     }
 
-    if (_server->listen(serverName))
-        return true;
+    if (!_server->listen(serverName)) {
+        // Stale socket file from a crashed run: remove once and retry (SPEC §1.1).
+        QLocalServer::removeServer(serverName);
+        if (!_server->listen(serverName))
+            return false;
+    }
 
-    // Stale socket file from a crashed run: remove once and retry (SPEC §1.1).
-    QLocalServer::removeServer(serverName);
-    return _server->listen(serverName);
+    // Publish this process into the discovery registry so an MCP server can
+    // attach without the human relaying the stdout handshake line.
+    writeRegistryFile();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Discovery registry file (mirrors LasagnaServiceManager::discoverServices()'s
+// ~/.fit_services convention). Pure QFile/QDir I/O -- no UI, no event loop.
+// ---------------------------------------------------------------------------
+
+void AgentBridgeServer::writeRegistryFile()
+{
+    if (!_server)
+        return;
+
+    const QString dirPath =
+        QDir::homePath() + QStringLiteral("/.vc3d/agent_bridge");
+    QDir dir;
+    if (!dir.mkpath(dirPath))
+        return;  // best-effort: discovery is an optimization, never fatal
+
+    const qint64 pid = QCoreApplication::applicationPid();
+    const QString filePath =
+        QDir(dirPath).filePath(QStringLiteral("%1.json").arg(pid));
+
+    QJsonObject obj;
+    obj[QStringLiteral("pid")] = static_cast<double>(pid);
+    obj[QStringLiteral("name")] = _server->serverName();
+    obj[QStringLiteral("path")] = _server->fullServerName();
+    // Epoch milliseconds: a plain sortable number the reader uses to pick the
+    // newest live bridge.
+    obj[QStringLiteral("startedAt")] =
+        static_cast<double>(QDateTime::currentMSecsSinceEpoch());
+
+    QFile f(filePath);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return;
+    f.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
+    f.close();
+
+    _registryFilePath = filePath;
+}
+
+void AgentBridgeServer::removeRegistryFile()
+{
+    if (_registryFilePath.isEmpty())
+        return;
+    QFile::remove(_registryFilePath);
+    _registryFilePath.clear();
 }
 
 QString AgentBridgeServer::serverName() const

@@ -31,7 +31,12 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from vc3d_mcp.bridge_client import BridgeClient, BridgeClientConfig, BridgeError  # noqa: E402
+from vc3d_mcp.bridge_client import (  # noqa: E402
+    BridgeClient,
+    BridgeClientConfig,
+    BridgeError,
+    discover_registry_socket,
+)
 from vc3d_mcp import server as server_module  # noqa: E402
 
 
@@ -242,6 +247,83 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         result = await server_module.vc3d_grow_segment(steps=1, wait=False)
         self.assertEqual(result["jobId"], "job-1")
         self.assertNotIn("state", result)
+
+
+class RegistryDiscoveryTest(unittest.TestCase):
+    """discover_registry_socket: newest live entry wins, dead entries reaped.
+
+    Mirrors AgentBridgeServer's registry-file convention (~/.vc3d/agent_bridge/
+    <pid>.json with {pid, name, path, startedAt}) and the stale-PID cleanup of
+    LasagnaServiceManager::discoverServices()."""
+
+    def setUp(self) -> None:
+        self.registry_dir = tempfile.mkdtemp(prefix="vc3d-registry-test-")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.registry_dir, ignore_errors=True)
+
+    def _write_entry(self, pid: int, path: str, started_at: float, name: str = "vc3d-agent") -> str:
+        file_path = os.path.join(self.registry_dir, f"{pid}.json")
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"pid": pid, "name": f"{name}-{pid}", "path": path, "startedAt": started_at},
+                f,
+            )
+        return file_path
+
+    def test_missing_directory_returns_none(self) -> None:
+        self.assertIsNone(
+            discover_registry_socket(os.path.join(self.registry_dir, "does-not-exist"))
+        )
+
+    def test_empty_directory_returns_none(self) -> None:
+        self.assertIsNone(discover_registry_socket(self.registry_dir))
+
+    def test_dead_pid_entry_is_filtered_and_removed(self) -> None:
+        # A PID that is extremely unlikely to be alive. os.kill(pid, 0) must
+        # raise ProcessLookupError, so the entry is treated as stale.
+        dead_pid = 2_000_000_000
+        dead_file = self._write_entry(dead_pid, "/tmp/dead-bridge.sock", started_at=1000.0)
+
+        result = discover_registry_socket(self.registry_dir)
+
+        self.assertIsNone(result)
+        self.assertFalse(
+            os.path.exists(dead_file), "stale dead-PID registry file should be removed"
+        )
+
+    def test_live_entry_is_found(self) -> None:
+        # os.getpid() is by definition alive right now.
+        live_path = "/tmp/live-bridge.sock"
+        live_file = self._write_entry(os.getpid(), live_path, started_at=1234.0)
+
+        result = discover_registry_socket(self.registry_dir)
+
+        self.assertEqual(result, live_path)
+        self.assertTrue(os.path.exists(live_file), "live registry file must be kept")
+
+    def test_newest_live_entry_wins_and_dead_reaped(self) -> None:
+        # Two live entries (both this process's pid is only one file, so use the
+        # real pid for the newest and the parent pid for an older-but-live one).
+        older_path = "/tmp/older-bridge.sock"
+        newer_path = "/tmp/newer-bridge.sock"
+        dead_file = self._write_entry(2_000_000_001, "/tmp/dead2.sock", started_at=9999.0)
+        # Newest startedAt should win even though the dead entry has a larger one.
+        self._write_entry(os.getppid(), older_path, started_at=100.0)
+        self._write_entry(os.getpid(), newer_path, started_at=500.0)
+
+        result = discover_registry_socket(self.registry_dir)
+
+        self.assertEqual(result, newer_path)
+        self.assertFalse(os.path.exists(dead_file), "dead entry must be reaped")
+
+    def test_malformed_file_is_reaped(self) -> None:
+        bad_file = os.path.join(self.registry_dir, "99999.json")
+        with open(bad_file, "w", encoding="utf-8") as f:
+            f.write("{ not valid json")
+
+        self.assertIsNone(discover_registry_socket(self.registry_dir))
+        self.assertFalse(os.path.exists(bad_file), "malformed registry file should be removed")
 
 
 if __name__ == "__main__":
