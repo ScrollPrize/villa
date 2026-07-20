@@ -5769,26 +5769,33 @@ void CWindow::updateAtlasSearchDocks()
     }
 }
 
-void CWindow::remapCurrentAtlas()
+// Headless core of remapCurrentAtlas (SPEC §12.7): preconditions are reported
+// through `errorMessage` instead of QMessageBox, and the asynchronous
+// completion path never opens a dialog — success redisplays via the headless
+// atlas open; the interactive slot supplies its completion QMessageBox through
+// `onFinished`. Returns true when the remap worker was launched.
+bool CWindow::startAtlasRemapHeadless(QString* errorMessage,
+                                      std::function<void(bool success, const QString& detail)> onFinished)
 {
+    auto fail = [errorMessage](const QString& message) {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
     if (!_currentAtlasDir || !_state || !_state->vpkg()) {
-        QMessageBox::warning(this, tr("Atlas"), tr("Load an atlas before remapping."));
-        return;
+        return fail(tr("Load an atlas before remapping."));
     }
     auto vpkg = _state->vpkg();
     std::optional<vc3d::opendata::ResolvedOpenDataLasagna> resolvedLasagna;
     try {
         resolvedLasagna = resolvedLasagnaForState(_state);
     } catch (const std::exception& ex) {
-        QMessageBox::warning(this, tr("Atlas"), QString::fromStdString(ex.what()));
-        return;
+        return fail(QString::fromStdString(ex.what()));
     }
     if (!resolvedLasagna || resolvedLasagna->manifestPath.empty() ||
         !std::filesystem::exists(resolvedLasagna->manifestPath)) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("No Lasagna dataset matches the active volume."));
-        return;
+        return fail(tr("No Lasagna dataset matches the active volume."));
     }
     const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
     const double workingToBaseScale = resolvedLasagna->workingToBaseScale;
@@ -5819,22 +5826,34 @@ void CWindow::remapCurrentAtlas()
     connect(watcher,
             &QFutureWatcher<QString>::finished,
             this,
-            [this, watcher, atlasDir]() {
+            [this, watcher, atlasDir, onFinished = std::move(onFinished)]() {
         watcher->deleteLater();
         try {
             const QString summary = watcher->result();
-            displayAtlasFromDirectory(atlasDir);
+            // Headless redisplay: a remap just rebuilt the mappings, so the
+            // interactive rebuild prompt can never legitimately trigger here;
+            // any load failure is routed to onFinished instead of a dialog.
+            QString displayError;
+            if (!displayAtlasFromDirectoryHeadless(atlasDir, &displayError)) {
+                throw std::runtime_error(displayError.toStdString());
+            }
             if (statusBar()) {
                 showStatusBarMessage(tr("Remapped atlas fibers. %1").arg(summary), 7000);
+            }
+            if (onFinished) {
+                onFinished(true, summary);
             }
         } catch (const std::exception& ex) {
             refreshAtlasOverviewDocks();
             updateAtlasFiberDocks();
             updateAtlasSearchDocks();
-            QMessageBox::warning(
-                this,
-                tr("Atlas Remap"),
-                tr("Could not remap atlas: %1").arg(QString::fromStdString(ex.what())));
+            const QString detail = QString::fromStdString(ex.what());
+            if (statusBar()) {
+                showStatusBarMessage(tr("Could not remap atlas: %1").arg(detail), 7000);
+            }
+            if (onFinished) {
+                onFinished(false, detail);
+            }
         }
     });
 
@@ -5869,28 +5888,53 @@ void CWindow::remapCurrentAtlas()
         std::cerr << "[atlas-remap] finished" << std::endl;
         return QString::fromStdString(summary.str());
     }));
+    return true;
 }
 
-void CWindow::optimizeAtlasSnapCandidates()
+void CWindow::remapCurrentAtlas()
 {
+    QString errorMessage;
+    const bool started = startAtlasRemapHeadless(
+        &errorMessage,
+        [this](bool success, const QString& detail) {
+            if (!success) {
+                QMessageBox::warning(this,
+                                     tr("Atlas Remap"),
+                                     tr("Could not remap atlas: %1").arg(detail));
+            }
+        });
+    if (!started) {
+        QMessageBox::warning(this, tr("Atlas"), errorMessage);
+    }
+}
+
+// Headless core of optimizeAtlasSnapCandidates (SPEC §12.8): preconditions are
+// reported through `errorMessage` instead of QMessageBox; asynchronous
+// failures go to the status bar / stderr and the optional `onAsyncError`
+// callback (the interactive slot uses it for its QMessageBox). Returns true
+// when the prepare/rank pipeline was launched.
+bool CWindow::optimizeAtlasSnapCandidatesHeadless(QString* errorMessage,
+                                                  std::function<void(const QString& detail)> onAsyncError)
+{
+    auto fail = [errorMessage](const QString& message) {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
     if (!_currentAtlasDir || !_state || !_state->vpkg()) {
-        QMessageBox::warning(this, tr("Atlas"), tr("Load an atlas before ranking snap candidates."));
-        return;
+        return fail(tr("Load an atlas before ranking snap candidates."));
     }
     auto vpkg = _state->vpkg();
     std::optional<vc3d::opendata::ResolvedOpenDataLasagna> resolvedLasagna;
     try {
         resolvedLasagna = resolvedLasagnaForState(_state);
     } catch (const std::exception& ex) {
-        QMessageBox::warning(this, tr("Atlas"), QString::fromStdString(ex.what()));
-        return;
+        return fail(QString::fromStdString(ex.what()));
     }
     if (!resolvedLasagna || resolvedLasagna->manifestPath.empty() ||
         !std::filesystem::exists(resolvedLasagna->manifestPath)) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("No Lasagna dataset matches the active volume."));
-        return;
+        return fail(tr("No Lasagna dataset matches the active volume."));
     }
     const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
     const double workingToBaseScale = resolvedLasagna->workingToBaseScale;
@@ -5898,25 +5942,27 @@ void CWindow::optimizeAtlasSnapCandidates()
     auto& manager = LasagnaServiceManager::instance();
     if (manager.isExternal()) {
         if (resolvedLasagna->manifestBacked) {
-            QMessageBox::warning(
-                this,
-                tr("Atlas"),
-                tr("Manifest-backed Lasagna is available to local tools only. "
-                   "The external service must use a dataset installed on that service."));
-            return;
+            return fail(tr("Manifest-backed Lasagna is available to local tools only. "
+                           "The external service must use a dataset installed on that service."));
         }
         if (!manager.isRunning()) {
-            QMessageBox::warning(this,
-                                 tr("Atlas"),
-                                 tr("Connect the external Lasagna service before ranking snap candidates."));
-            return;
+            return fail(tr("Connect the external Lasagna service before ranking snap candidates."));
         }
     } else if (!manager.ensureServiceRunning()) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("Failed to start Lasagna service: %1").arg(manager.lastError()));
-        return;
+        return fail(tr("Failed to start Lasagna service: %1").arg(manager.lastError()));
     }
+
+    // Asynchronous failure reporting shared by the three completion paths
+    // below: never a dialog here (SPEC §1.3) — the interactive slot layers its
+    // QMessageBox on top via `onAsyncError`.
+    auto reportAsyncError = [this, onAsyncError = std::move(onAsyncError)](const QString& message) {
+        if (statusBar()) {
+            showStatusBarMessage(tr("Could not rank snap candidates: %1").arg(message), 7000);
+        }
+        if (onAsyncError) {
+            onAsyncError(message);
+        }
+    };
 
     const std::filesystem::path atlasDir = *_currentAtlasDir;
     const std::filesystem::path volpkgRoot = vpkg->path().empty()
@@ -5943,7 +5989,7 @@ void CWindow::optimizeAtlasSnapCandidates()
 
     QPointer<CWindow> self(this);
     auto startFinish =
-        [this, self, atlasDir, setRankButtonsEnabled](
+        [this, self, atlasDir, setRankButtonsEnabled, reportAsyncError](
             vc::atlas::AtlasSnapPreparedCandidates prepared,
             nlohmann::json rankResponse) {
         if (!self) {
@@ -5956,13 +6002,15 @@ void CWindow::optimizeAtlasSnapCandidates()
         connect(finishWatcher,
                 &QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>::finished,
                 this,
-                [this, finishWatcher, atlasDir, setRankButtonsEnabled]() {
+                [this, finishWatcher, atlasDir, setRankButtonsEnabled, reportAsyncError]() {
             finishWatcher->deleteLater();
             setRankButtonsEnabled(true);
             try {
                 const vc::atlas::AtlasSnapOptimizeReport report = finishWatcher->result();
                 refreshAtlasOverviewDocks();
-                displayAtlasFromDirectory(atlasDir);
+                // Dialog-free redisplay (SPEC §1.3): a load failure here throws
+                // into the catch below instead of raising the rebuild prompt.
+                loadAndDisplayAtlas(atlasDir);
                 if (statusBar()) {
                     showStatusBarMessage(
                         tr("Ranked snap candidates: %1 controls, terms %2 ok / %3 zero / %4 skipped (%5 total), %6 queued, %7 cached.")
@@ -5996,10 +6044,7 @@ void CWindow::optimizeAtlasSnapCandidates()
                 const QString message = extractFutureExceptionMessage(ex);
                 std::cerr << "[atlas-snap] finish failed: "
                           << message.toStdString() << std::endl;
-                QMessageBox::warning(
-                    this,
-                    tr("Atlas Snap Candidates"),
-                    tr("Could not rank snap candidates: %1").arg(message));
+                reportAsyncError(message);
             }
         });
         finishWatcher->setFuture(QtConcurrent::run(
@@ -6019,7 +6064,8 @@ void CWindow::optimizeAtlasSnapCandidates()
              self,
              serviceManifestPath,
              workingToBaseScale,
-             setRankButtonsEnabled]() mutable {
+             setRankButtonsEnabled,
+             reportAsyncError]() mutable {
         prepareWatcher->deleteLater();
         try {
             vc::atlas::AtlasSnapPreparedCandidates prepared = prepareWatcher->result();
@@ -6050,7 +6096,7 @@ void CWindow::optimizeAtlasSnapCandidates()
                               << std::endl;
                     startFinish(prepared, fromQtJsonObject(response));
                 },
-                [self, setRankButtonsEnabled](const QString& message) {
+                [self, setRankButtonsEnabled, reportAsyncError](const QString& message) {
                     if (!self) {
                         return;
                     }
@@ -6059,10 +6105,7 @@ void CWindow::optimizeAtlasSnapCandidates()
                     self->updateAtlasSearchDocks();
                     std::cerr << "[atlas-snap] laplace rank failed: "
                               << message.toStdString() << std::endl;
-                    QMessageBox::warning(
-                        self.data(),
-                        self->tr("Atlas Snap Candidates"),
-                        self->tr("Could not rank snap candidates: %1").arg(message));
+                    reportAsyncError(message);
                 },
                 [self, prepared](int index, const QJsonObject& result) mutable {
                     if (!self) {
@@ -6090,10 +6133,7 @@ void CWindow::optimizeAtlasSnapCandidates()
             const QString message = extractFutureExceptionMessage(ex);
             std::cerr << "[atlas-snap] prepare failed: "
                       << message.toStdString() << std::endl;
-            QMessageBox::warning(
-                this,
-                tr("Atlas Snap Candidates"),
-                tr("Could not rank snap candidates: %1").arg(message));
+            reportAsyncError(message);
         }
     });
 
@@ -6148,6 +6188,22 @@ void CWindow::optimizeAtlasSnapCandidates()
             throw;
         }
     }));
+    return true;
+}
+
+void CWindow::optimizeAtlasSnapCandidates()
+{
+    QString errorMessage;
+    const bool started = optimizeAtlasSnapCandidatesHeadless(
+        &errorMessage,
+        [this](const QString& detail) {
+            QMessageBox::warning(this,
+                                 tr("Atlas Snap Candidates"),
+                                 tr("Could not rank snap candidates: %1").arg(detail));
+        });
+    if (!started) {
+        QMessageBox::warning(this, tr("Atlas"), errorMessage);
+    }
 }
 
 void CWindow::cancelAtlasFiberIntersectionSearch()
@@ -6224,6 +6280,18 @@ void CWindow::updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase phas
             progress->setFormat(format);
         }
     }
+
+    // Machine-readable progress alongside the progress-bar update (SPEC §12.9):
+    // phase in [1, ATLAS_SEARCH_PHASE_COUNT], fraction in [0,1] within it.
+    double fraction = 0.0;
+    if (total > 0) {
+        fraction = static_cast<double>(_atlasSearchPhaseCompleted) /
+                   static_cast<double>(total);
+    } else if (completed > 0) {
+        fraction = 1.0;
+    }
+    fraction = std::clamp(fraction, 0.0, 1.0);
+    emit atlasSearchProgressChanged(atlasSearchPhaseNumber(phase), fraction);
 }
 
 void CWindow::startAtlasFiberIntersectionSearch()
@@ -6233,10 +6301,11 @@ void CWindow::startAtlasFiberIntersectionSearch()
         return;
     }
 
-    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
-    int searchMode = ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS;
-    QStringList requiredTags;
-    QStringList excludedTags;
+    // Scrape the search widgets into an AtlasFiberSearchParams and forward to
+    // the headless launcher (SPEC §12.3): all validation/launch logic lives
+    // there; only the widget scraping and the failure dialog stay here.
+    AtlasFiberSearchParams params;
+    params.searchMode = ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS;
     auto readSearchControls = [&](QDockWidget* dock) {
         if (!dock || !dock->widget()) {
             return false;
@@ -6244,22 +6313,22 @@ void CWindow::startAtlasFiberIntersectionSearch()
         bool found = false;
         if (auto* combo = dock->widget()->findChild<QComboBox*>(
                 QStringLiteral("atlasSearchTypeCombo"))) {
-            searchMode = combo->currentData().toInt();
+            params.searchMode = combo->currentData().toInt();
             found = true;
         }
         if (auto* tagFilter = dock->widget()->findChild<QLineEdit*>(
                 QStringLiteral("atlasSearchTagFilterEdit"))) {
-            requiredTags = atlasSearchTagList(tagFilter->text());
+            params.requiredTags = atlasSearchTagList(tagFilter->text());
             found = true;
         }
         if (auto* excludeTagFilter = dock->widget()->findChild<QLineEdit*>(
                 QStringLiteral("atlasSearchExcludeTagFilterEdit"))) {
-            excludedTags = atlasSearchTagList(excludeTagFilter->text());
+            params.excludedTags = atlasSearchTagList(excludeTagFilter->text());
             found = true;
         }
         if (auto* spin = dock->widget()->findChild<QDoubleSpinBox*>(
                 QStringLiteral("atlasSearchMaxDistanceSpin"))) {
-            broad.maxDistance = spin->value();
+            params.maxDistance = spin->value();
             found = true;
         }
         return found;
@@ -6277,19 +6346,66 @@ void CWindow::startAtlasFiberIntersectionSearch()
             }
         }
     }
-    if (searchMode != ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS &&
-        searchMode != ATLAS_SEARCH_MODE_NON_ATLAS_ONLY) {
-        QMessageBox::warning(this,
-                             tr("Atlas Object Search"),
-                             tr("Unsupported atlas search type."));
+
+    // No saved fibers is a silent no-op in the interactive flow (unchanged
+    // behavior: no dialog, just refresh the docks).
+    if (_lineAnnotationController->fiberSnapshotsFromStorageWithPaths().empty()) {
+        updateAtlasSearchDocks();
         return;
     }
 
+    QString errorMessage;
+    if (!startAtlasFiberIntersectionSearchHeadless(params, &errorMessage)) {
+        QMessageBox::warning(this, tr("Atlas Object Search"), errorMessage);
+    }
+}
+
+// Headless atlas fiber-intersection search (SPEC §12.3): performs the same
+// validation and launch as the interactive slot, but reports every failure
+// through `errorMessage` (never a dialog). Progress/terminal state is
+// observable via atlasSearchProgressChanged / atlasSearchFinished.
+bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchParams& params,
+                                                        QString* errorMessage)
+{
+    auto fail = [errorMessage](const QString& message) {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+    if (!_lineAnnotationController) {
+        updateAtlasSearchDocks();
+        return fail(tr("Line annotation is not available."));
+    }
+    // A live cancel flag means a search is currently in flight (it is created
+    // at launch and reset in the finished handler). The interactive run
+    // button is disabled during a search; headless callers need this guard.
+    if (_atlasSearchCancelFlag) {
+        return fail(tr("An atlas object search is already running."));
+    }
+
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    if (params.maxDistance) {
+        broad.maxDistance = *params.maxDistance;
+    } else {
+        // "Omit to keep the current spin-box value" (SPEC §12.3): the spin box
+        // persists to QSettings on every change and is initialized from this
+        // same key, so reading it matches the visible value without touching
+        // any widget.
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        broad.maxDistance = settings.value(vc3d::settings::atlas::SEARCH_MAX_DISTANCE,
+                                           broad.maxDistance).toDouble();
+    }
+    const int searchMode = params.searchMode;
+    const QStringList requiredTags = params.requiredTags;
+    const QStringList excludedTags = params.excludedTags;
+    if (searchMode != ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS &&
+        searchMode != ATLAS_SEARCH_MODE_NON_ATLAS_ONLY) {
+        return fail(tr("Unsupported atlas search type."));
+    }
+
     if (!_currentAtlasDir && searchMode == ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS) {
-        QMessageBox::information(this,
-                                 tr("Atlas Object Search"),
-                                 tr("Select an atlas, or choose \"Non-atlas fibers only\"."));
-        return;
+        return fail(tr("Select an atlas, or choose \"Non-atlas fibers only\"."));
     }
 
     vc::atlas::Atlas atlas;
@@ -6299,28 +6415,22 @@ void CWindow::startAtlasFiberIntersectionSearch()
             atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
             haveAtlas = true;
         } catch (const std::exception& ex) {
-            QMessageBox::warning(this,
-                                 tr("Atlas Object Search"),
-                                 tr("Could not load selected atlas: %1")
-                                     .arg(QString::fromStdString(ex.what())));
-            return;
+            return fail(tr("Could not load selected atlas: %1")
+                            .arg(QString::fromStdString(ex.what())));
         }
     }
 
     const auto fiberSnapshots = _lineAnnotationController->fiberSnapshotsFromStorageWithPaths();
     if (fiberSnapshots.empty()) {
         updateAtlasSearchDocks();
-        return;
+        return fail(tr("No saved fibers are available to search."));
     }
 
     std::vector<std::string> atlasFiberPaths = haveAtlas
         ? vc::atlas::atlasMappedFiberPathKeys(atlas)
         : std::vector<std::string>{};
     if (searchMode == ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS && atlasFiberPaths.empty()) {
-        QMessageBox::information(this,
-                                 tr("Atlas Object Search"),
-                                 tr("Selected atlas has no saved fiber mappings."));
-        return;
+        return fail(tr("Selected atlas has no saved fiber mappings."));
     }
 
     const bool debugSearch = atlasSearchDebugEnabled();
@@ -6420,18 +6530,12 @@ void CWindow::startAtlasFiberIntersectionSearch()
         keepTagged(targetFiberIds);
     }
     if (sourceFiberIds.empty()) {
-        QMessageBox::information(this,
-                                 tr("Atlas Object Search"),
-                                 searchMode == ATLAS_SEARCH_MODE_NON_ATLAS_ONLY
-                                     ? tr("No saved non-atlas fibers match the search filters.")
-                                     : tr("None of the selected atlas fibers are available in saved fiber files or match the search filters."));
-        return;
+        return fail(searchMode == ATLAS_SEARCH_MODE_NON_ATLAS_ONLY
+                        ? tr("No saved non-atlas fibers match the search filters.")
+                        : tr("None of the selected atlas fibers are available in saved fiber files or match the search filters."));
     }
     if (targetFiberIds.empty()) {
-        QMessageBox::information(this,
-                                 tr("Atlas Object Search"),
-                                 tr("No saved non-atlas fibers are available to search or match the search filters."));
-        return;
+        return fail(tr("No saved non-atlas fibers are available to search or match the search filters."));
     }
     if (debugSearch) {
         qInfo().noquote() << QStringLiteral("[atlas-search] split source_ids=%1 target_ids=%2")
@@ -6456,17 +6560,11 @@ void CWindow::startAtlasFiberIntersectionSearch()
             lasagnaWorkingToBaseScale = resolved->workingToBaseScale;
         }
     } catch (const std::exception& ex) {
-        QMessageBox::warning(this,
-                             tr("Atlas Object Search"),
-                             QString::fromStdString(ex.what()));
-        return;
+        return fail(QString::fromStdString(ex.what()));
     }
     if (lasagnaManifestPath.empty()) {
-        QMessageBox::warning(this,
-                             tr("Atlas Object Search"),
-                             tr("Select a local Lasagna dataset before searching. "
-                                "Intersection distance is measured in grad_mag winding-integral space."));
-        return;
+        return fail(tr("Select a local Lasagna dataset before searching. "
+                       "Intersection distance is measured in grad_mag winding-integral space."));
     }
 
     clearAtlasSearchPreviewState();
@@ -6502,10 +6600,26 @@ void CWindow::startAtlasFiberIntersectionSearch()
              watcher,
              cancelFlag = _atlasSearchCancelFlag,
              searchStart]() {
-                const auto workerResult = watcher->result();
                 watcher->deleteLater();
+                // The worker can throw (e.g. LasagnaDataset::open); result()
+                // rethrows here. Treat that as a failed search instead of
+                // letting the exception escape into the event loop, so the
+                // terminal atlasSearchFinished signal always fires (SPEC §12.9).
+                AtlasSearchWorkerResult workerResult;
+                bool workerFailed = false;
+                QString workerError;
+                try {
+                    workerResult = watcher->result();
+                } catch (const std::exception& ex) {
+                    workerFailed = true;
+                    workerError = QString::fromStdString(ex.what());
+                } catch (...) {
+                    workerFailed = true;
+                    workerError = QStringLiteral("unknown error");
+                }
                 const bool canceled = cancelFlag && cancelFlag->load(std::memory_order_relaxed);
-                if (!canceled && !_atlasSearchCancelRequested) {
+                const bool searchSucceeded = !workerFailed && !canceled && !_atlasSearchCancelRequested;
+                if (searchSucceeded) {
                     populateAtlasSearchResults(workerResult.results, workerResult.signedWindings);
                     if (statusBar()) {
                         const QString message = workerResult.skippedSigningCount == 0
@@ -6530,11 +6644,14 @@ void CWindow::startAtlasFiberIntersectionSearch()
                         }
                         if (auto* progress = dock->widget()->findChild<QProgressBar*>(
                                 QStringLiteral("atlasSearchProgressBar"))) {
-                            progress->setFormat(tr("Canceled"));
+                            progress->setFormat(workerFailed ? tr("Failed") : tr("Canceled"));
                         }
                     }
                     if (statusBar()) {
-                        showStatusBarMessage(tr("Atlas object search canceled"), 3000);
+                        showStatusBarMessage(workerFailed
+                                                 ? tr("Atlas object search failed: %1").arg(workerError)
+                                                 : tr("Atlas object search canceled"),
+                                             3000);
                     }
                 }
                 const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -6550,6 +6667,10 @@ void CWindow::startAtlasFiberIntersectionSearch()
                     _atlasSearchCancelFlag.reset();
                 }
                 updateAtlasSearchDocks();
+                // Terminal notification (SPEC §12.9): success=false covers both
+                // cancellation and worker failure.
+                emit atlasSearchFinished(searchSucceeded,
+                                         static_cast<int>(_atlasSearchResults.size()));
             });
 
     vc::atlas::FiberIntersectionCache* cache = &_fiberIntersectionCache;
@@ -6671,6 +6792,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
                                              progressCallback,
                                              debugSearch);
     }));
+    return true;
 }
 
 void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results,
@@ -7221,9 +7343,15 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
     }));
 }
 
-void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
+// Dialog-free core shared by the interactive displayAtlasFromDirectory (which
+// wraps it in the rebuild prompt / warning dialogs) and the headless
+// displayAtlasFromDirectoryHeadless (SPEC §12.1). Failures propagate as
+// std::exception; this never shows a dialog or spins a nested event loop.
+void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
 {
-    try {
+    // Body kept at its original indentation (it previously lived inside the
+    // interactive method's try-block) to preserve history/blame readability.
+    {
         if (!_atlasWorkspaceWindow || !_atlasViewer) {
             createAtlasWorkspace();
         }
@@ -7329,6 +7457,29 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
                                          .arg(QString::fromStdString(atlas.metadata.name)),
                                      3000);
         }
+    }
+}
+
+// Headless atlas-open (SPEC §12.1): never shows a dialog and never triggers the
+// interactive rebuild prompt. Used by the agent bridge (§1.3).
+bool CWindow::displayAtlasFromDirectoryHeadless(const std::filesystem::path& atlasDir,
+                                                QString* errorMessage)
+{
+    try {
+        loadAndDisplayAtlas(atlasDir);
+        return true;
+    } catch (const std::exception& ex) {
+        if (errorMessage) {
+            *errorMessage = QString::fromStdString(ex.what());
+        }
+        return false;
+    }
+}
+
+void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
+{
+    try {
+        loadAndDisplayAtlas(atlasDir);
     } catch (const std::exception& ex) {
         if (vc::atlas::atlasLoadErrorRequiresRebuild(ex)) {
             const auto choice = QMessageBox::question(
@@ -10495,11 +10646,15 @@ void CWindow::onPlaneIntersectionLinesToggled(bool enabled)
 
 void CWindow::onSegmentationEditingModeChanged(bool enabled)
 {
+    qWarning() << "DIAGVERIFY onSegmentationEditingModeChanged enabled=" << enabled
+               << "_segmentationModule=" << (_segmentationModule ? "present" : "null");
     if (!_segmentationModule) {
         return;
     }
 
     const bool already = _segmentationModule->editingEnabled();
+    qWarning() << "DIAGVERIFY already=" << already << "enabled=" << enabled
+               << "state.surface(segmentation)=" << (_state && _state->surface("segmentation") ? "present" : "null");
     if (already != enabled) {
         // Update widget to reflect actual module state to avoid drift.
         if (_segmentationWidget && _segmentationWidget->isEditingEnabled() != already) {

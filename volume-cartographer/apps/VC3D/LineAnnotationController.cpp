@@ -2510,6 +2510,43 @@ void LineAnnotationController::importFibers()
         return;
     }
 
+    QString errorMessage;
+    int imported = 0;
+    int skipped = 0;
+    if (!importFibersFromPath(options->path, options->scale, &errorMessage,
+                              &imported, &skipped)) {
+        showError(errorMessage);
+        return;
+    }
+    QMessageBox::information(_parentWidget.data(),
+                             tr("Import Fibers"),
+                             skipped > 0
+                                 ? tr("Imported %1 fiber(s). Skipped %2 invalid JSON item(s).")
+                                       .arg(imported)
+                                       .arg(skipped)
+                                 : tr("Imported %1 fiber(s).").arg(imported));
+}
+
+bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
+                                                    double scale,
+                                                    QString* errorMessage,
+                                                    int* importedCount,
+                                                    int* skippedCount)
+{
+    if (importedCount) {
+        *importedCount = 0;
+    }
+    if (skippedCount) {
+        *skippedCount = 0;
+    }
+    const fs::path dir = fibersDir();
+    if (dir.empty()) {
+        if (errorMessage) {
+            *errorMessage = tr("No volume package is loaded.");
+        }
+        return false;
+    }
+
     std::vector<StoredFiber> importedFibers;
     int skipped = 0;
 
@@ -2518,7 +2555,7 @@ void LineAnnotationController::importFibers()
             ++skipped;
             return;
         }
-        scaleStoredFiber(*fiber, options->scale);
+        scaleStoredFiber(*fiber, scale);
         importedFibers.push_back(std::move(*fiber));
     };
     auto bundleEntryPath = [&](const nlohmann::json& item, size_t index) {
@@ -2527,18 +2564,18 @@ void LineAnnotationController::importFibers()
                                              .filename()
                                              .string();
             if (!fileName.empty()) {
-                return options->path.parent_path() / fileName;
+                return importPath.parent_path() / fileName;
             }
         }
-        return options->path.parent_path() /
-               (options->path.stem().string() + "_" + std::to_string(index) + ".json");
+        return importPath.parent_path() /
+               (importPath.stem().string() + "_" + std::to_string(index) + ".json");
     };
 
     try {
         std::error_code ec;
-        if (fs::is_directory(options->path, ec)) {
+        if (fs::is_directory(importPath, ec)) {
             std::vector<fs::path> fiberFiles;
-            for (const auto& entry : fs::directory_iterator(options->path, ec)) {
+            for (const auto& entry : fs::directory_iterator(importPath, ec)) {
                 if (ec) {
                     break;
                 }
@@ -2558,9 +2595,9 @@ void LineAnnotationController::importFibers()
                 }
             }
         } else {
-            std::ifstream in(options->path);
+            std::ifstream in(importPath);
             if (!in) {
-                throw std::runtime_error("Failed to open " + options->path.string());
+                throw std::runtime_error("Failed to open " + importPath.string());
             }
             const nlohmann::json root = nlohmann::json::parse(in);
             if (root.is_array()) {
@@ -2571,12 +2608,12 @@ void LineAnnotationController::importFibers()
                     } catch (const std::exception& ex) {
                         ++skipped;
                         Logger()->warn("Skipping invalid imported fiber entry in {}: {}",
-                                       options->path.string(),
+                                       importPath.string(),
                                        ex.what());
                     }
                 }
             } else if (root.is_object() && root.value("type", std::string{}) == "vc3d_fiber") {
-                tryAddFiber(loadFiberJson(root, options->path));
+                tryAddFiber(loadFiberJson(root, importPath));
             } else {
                 const nlohmann::json* entries = nullptr;
                 if (root.is_object() && root.contains("point_collections")) {
@@ -2596,7 +2633,7 @@ void LineAnnotationController::importFibers()
                     } catch (const std::exception& ex) {
                         ++skipped;
                         Logger()->warn("Skipping invalid imported fiber entry in {}: {}",
-                                       options->path.string(),
+                                       importPath.string(),
                                        ex.what());
                     }
                 }
@@ -2604,11 +2641,16 @@ void LineAnnotationController::importFibers()
         }
 
         if (importedFibers.empty()) {
-            showError(skipped > 0
-                          ? tr("No valid fibers were found. Skipped %1 invalid JSON item(s).")
-                                .arg(skipped)
-                          : tr("No fibers were found."));
-            return;
+            if (skippedCount) {
+                *skippedCount = skipped;
+            }
+            if (errorMessage) {
+                *errorMessage = skipped > 0
+                    ? tr("No valid fibers were found. Skipped %1 invalid JSON item(s).")
+                          .arg(skipped)
+                    : tr("No fibers were found.");
+            }
+            return false;
         }
 
         uint64_t nextSequence = nextFiberSequenceForUsername(currentFiberUsername());
@@ -2632,15 +2674,22 @@ void LineAnnotationController::importFibers()
         }
 
         loadFibersForCurrentPackage();
-        QMessageBox::information(_parentWidget.data(),
-                                 tr("Import Fibers"),
-                                 skipped > 0
-                                     ? tr("Imported %1 fiber(s). Skipped %2 invalid JSON item(s).")
-                                           .arg(importedFibers.size())
-                                           .arg(skipped)
-                                     : tr("Imported %1 fiber(s).").arg(importedFibers.size()));
+        if (importedCount) {
+            *importedCount = static_cast<int>(importedFibers.size());
+        }
+        if (skippedCount) {
+            *skippedCount = skipped;
+        }
+        return true;
     } catch (const std::exception& ex) {
-        showError(tr("Could not import fibers: %1").arg(QString::fromStdString(ex.what())));
+        if (skippedCount) {
+            *skippedCount = skipped;
+        }
+        if (errorMessage) {
+            *errorMessage =
+                tr("Could not import fibers: %1").arg(QString::fromStdString(ex.what()));
+        }
+        return false;
     }
 }
 
@@ -2657,25 +2706,56 @@ void LineAnnotationController::exportFibers()
         return;
     }
 
+    QString errorMessage;
+    int exported = 0;
+    if (!exportFibersToPath(options->path, options->scale, &errorMessage, &exported)) {
+        showError(errorMessage);
+        return;
+    }
+    QMessageBox::information(_parentWidget.data(),
+                             tr("Export Fibers"),
+                             tr("Exported %1 fiber(s) to %2.")
+                                 .arg(exported)
+                                 .arg(QString::fromStdString(options->path.string())));
+}
+
+bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
+                                                  double scale,
+                                                  QString* errorMessage,
+                                                  int* exportedCount)
+{
+    if (exportedCount) {
+        *exportedCount = 0;
+    }
+    if (_fibers.empty()) {
+        if (errorMessage) {
+            *errorMessage = tr("There are no fibers to export.");
+        }
+        return false;
+    }
+
     try {
         nlohmann::json root = nlohmann::json::object();
         root["type"] = "vc3d_fiber_collection";
         root["version"] = 1;
-        root["scale"] = options->scale;
+        root["scale"] = scale;
         copyCoordinateIdentityToJson(root, coordinateIdentityForState(_state));
         root["point_collections"] = nlohmann::json::array();
         for (const auto& fiber : _fibers) {
-            root["point_collections"].push_back(fiberToJson(fiber, options->scale));
+            root["point_collections"].push_back(fiberToJson(fiber, scale));
         }
 
-        writeJsonAtomic(options->path, root);
-        QMessageBox::information(_parentWidget.data(),
-                                 tr("Export Fibers"),
-                                 tr("Exported %1 fiber(s) to %2.")
-                                     .arg(_fibers.size())
-                                     .arg(QString::fromStdString(options->path.string())));
+        writeJsonAtomic(exportPath, root);
+        if (exportedCount) {
+            *exportedCount = static_cast<int>(_fibers.size());
+        }
+        return true;
     } catch (const std::exception& ex) {
-        showError(tr("Could not export fibers: %1").arg(QString::fromStdString(ex.what())));
+        if (errorMessage) {
+            *errorMessage =
+                tr("Could not export fibers: %1").arg(QString::fromStdString(ex.what()));
+        }
+        return false;
     }
 }
 
@@ -2844,6 +2924,42 @@ void LineAnnotationController::requestFiberAlignmentMetrics(uint64_t fiberId)
 void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
 {
     try {
+        const fs::path atlasDir = createAtlasFromFiberCore(fiberId);
+        emit atlasCreated(atlasDir);
+    } catch (const std::exception& ex) {
+        showError(tr("Could not create atlas: %1").arg(QString::fromStdString(ex.what())));
+    }
+}
+
+bool LineAnnotationController::createAtlasFromFiberHeadless(uint64_t fiberId,
+                                                            QString* errorMessage,
+                                                            fs::path* atlasDirOut)
+{
+    // Headless twin (agent bridge, SPEC §13.8): identical core, but failures
+    // come back through `errorMessage` (never showError's QMessageBox) and
+    // atlasCreated is deliberately NOT emitted — that signal is connected to
+    // the interactive CWindow::displayAtlasFromDirectory, whose failure path
+    // raises the atlas rebuild QMessageBox::question. The bridge displays the
+    // created atlas itself via CWindow::displayAtlasFromDirectoryHeadless.
+    try {
+        const fs::path atlasDir = createAtlasFromFiberCore(fiberId);
+        if (atlasDirOut) {
+            *atlasDirOut = atlasDir;
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        if (errorMessage) {
+            *errorMessage = QString::fromStdString(ex.what());
+        }
+        return false;
+    }
+}
+
+fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
+{
+    // NOTE: body kept verbatim from the pre-split createAtlasFromFiber try
+    // block (indentation preserved); failures propagate as std::exception.
+    {
         auto vpkg = _state ? _state->vpkg() : nullptr;
         if (!vpkg) {
             throw std::runtime_error("No volume package is loaded");
@@ -2946,9 +3062,7 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
                                                     *selected.surface,
                                                     sampler);
         }
-        emit atlasCreated(atlasDir);
-    } catch (const std::exception& ex) {
-        showError(tr("Could not create atlas: %1").arg(QString::fromStdString(ex.what())));
+        return atlasDir;
     }
 }
 
@@ -3118,6 +3232,22 @@ void LineAnnotationController::showIntersectionInspection(
     QMdiArea* targetArea,
     std::optional<fs::path> atlasDir)
 {
+    QString errorMessage;
+    if (!showIntersectionInspectionHeadless(result, targetArea, std::move(atlasDir),
+                                            &errorMessage)) {
+        showError(tr("Could not show intersection inspection: %1").arg(errorMessage));
+    }
+}
+
+// Headless twin of showIntersectionInspection (agent bridge, SPEC §12.6):
+// identical logic, but failures are reported through `errorMessage` instead of
+// a QMessageBox — bridge handlers must never reach a blocking dialog.
+bool LineAnnotationController::showIntersectionInspectionHeadless(
+    const vc::atlas::FiberIntersectionResult& result,
+    QMdiArea* targetArea,
+    std::optional<fs::path> atlasDir,
+    QString* errorMessage)
+{
     try {
         if (!_state || !_viewerManager || !targetArea) {
             throw std::runtime_error("Intersections workspace is not available");
@@ -3137,10 +3267,12 @@ void LineAnnotationController::showIntersectionInspection(
         connect(followShortcut, &QShortcut::activated, this, [this]() {
             (void)handleIntersectionFollowKeyPress(Qt::Key_Space, Qt::NoModifier);
         });
-        rebuildIntersectionInspection();
+        return rebuildIntersectionInspection(errorMessage);
     } catch (const std::exception& ex) {
-        showError(tr("Could not show intersection inspection: %1")
-                      .arg(QString::fromStdString(ex.what())));
+        if (errorMessage) {
+            *errorMessage = QString::fromStdString(ex.what());
+        }
+        return false;
     }
 }
 
@@ -3508,7 +3640,7 @@ bool LineAnnotationController::eventFilter(QObject* watched, QEvent* event)
     return QObject::eventFilter(watched, event);
 }
 
-void LineAnnotationController::rebuildIntersectionInspection()
+bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessage)
 {
     namespace fslice = vc3d::fiber_slice;
 
@@ -3551,7 +3683,7 @@ void LineAnnotationController::rebuildIntersectionInspection()
 
     try {
         if (!_intersectionInspection || !_state || !_viewerManager) {
-            return;
+            return true;  // nothing to rebuild; not a failure
         }
         auto* targetArea = _intersectionInspection->targetArea.data();
         if (!targetArea) {
@@ -4412,9 +4544,15 @@ void LineAnnotationController::rebuildIntersectionInspection()
                 }
             }
         }
+        return true;
     } catch (const std::exception& ex) {
-        showError(tr("Could not show intersection inspection: %1")
-                      .arg(QString::fromStdString(ex.what())));
+        if (errorMessage) {
+            *errorMessage = QString::fromStdString(ex.what());
+        } else {
+            showError(tr("Could not show intersection inspection: %1")
+                          .arg(QString::fromStdString(ex.what())));
+        }
+        return false;
     }
 }
 
@@ -4464,9 +4602,13 @@ void LineAnnotationController::refreshIntersectionInspectionAfterEdit(uint64_t e
         if (!nearest) {
             cleanupIntersectionInspectionSurfaces();
             _intersectionInspection.reset();
-            QMessageBox::warning(_parentWidget,
-                                 tr("Intersections"),
-                                 tr("The edited fiber pair no longer has an intersection result."));
+            if (_errorDialogsSuppressed) {
+                showError(tr("The edited fiber pair no longer has an intersection result."));
+            } else {
+                QMessageBox::warning(_parentWidget,
+                                     tr("Intersections"),
+                                     tr("The edited fiber pair no longer has an intersection result."));
+            }
             return;
         }
         _intersectionInspection->result = results[*nearest];
@@ -4477,7 +4619,7 @@ void LineAnnotationController::refreshIntersectionInspectionAfterEdit(uint64_t e
     }
 }
 
-void LineAnnotationController::saveOpenFibers()
+void LineAnnotationController::saveOpenFibersCore()
 {
     for (const auto& pane : _panes) {
         if (!pane.session || pane.session->suppressFiberSave) {
@@ -4495,7 +4637,31 @@ void LineAnnotationController::saveOpenFibers()
         saveSessionAsFiber(session);
         session.suppressFiberSave = true;
     }
+}
+
+void LineAnnotationController::saveOpenFibers()
+{
+    saveOpenFibersCore();
     waitForFiberSaves();
+}
+
+void LineAnnotationController::saveOpenFibersHeadless()
+{
+    // Agent bridge (SPEC §13.5): same scheduling as saveOpenFibers but without
+    // waitForFiberSaves(), which spins a nested QEventLoop (forbidden in
+    // bridge handlers, SPEC §1.3). The scheduled saves complete asynchronously
+    // through the fiber-save watcher on the main event loop.
+    saveOpenFibersCore();
+}
+
+LineAnnotationDialog* LineAnnotationController::mostRecentLineAnnotationDialog() const
+{
+    for (auto it = _panes.rbegin(); it != _panes.rend(); ++it) {
+        if (it->dialog) {
+            return it->dialog.data();
+        }
+    }
+    return nullptr;
 }
 
 void LineAnnotationController::closeFiberWindowForSurface(const std::string& surfaceName)
@@ -4721,9 +4887,15 @@ LineAnnotationController::resolveAlignmentMetricsManifestPath()
     const fs::path startDir = vpkg->path().empty()
         ? fs::path{}
         : vpkg->path().parent_path();
-    auto picked = _datasetPicker ? _datasetPicker(_parentWidget, startDir)
-                                 : std::optional<std::string>{};
+    // Suppressed (agent bridge, SPEC §1.3): never open the dataset-picker
+    // QFileDialog; fail as if the user cancelled, recording the reason.
+    auto picked = (_datasetPicker && !_errorDialogsSuppressed)
+        ? _datasetPicker(_parentWidget, startDir)
+        : std::optional<std::string>{};
     if (!picked || picked->empty()) {
+        if (_errorDialogsSuppressed) {
+            showError(tr("No Lasagna dataset is selected for the active volume."));
+        }
         return std::nullopt;
     }
     selected = *picked;
@@ -5715,9 +5887,15 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         const fs::path startDir = vpkg->path().empty()
             ? fs::path{}
             : vpkg->path().parent_path();
-        auto picked = _datasetPicker ? _datasetPicker(_parentWidget, startDir)
-                                     : std::optional<std::string>{};
+        // Suppressed (agent bridge, SPEC §1.3): never open the dataset-picker
+        // QFileDialog; fail as if the user cancelled, recording the reason.
+        auto picked = (_datasetPicker && !_errorDialogsSuppressed)
+            ? _datasetPicker(_parentWidget, startDir)
+            : std::optional<std::string>{};
         if (!picked || picked->empty()) {
+            if (_errorDialogsSuppressed) {
+                showError(tr("No Lasagna dataset is selected for the active volume."));
+            }
             return false;
         }
         selected = *picked;
@@ -6783,19 +6961,30 @@ void LineAnnotationController::loadFibersForCurrentPackage()
                            .arg(static_cast<int>(branchErrors.size() - shown));
         }
 
-        QMessageBox prompt(_parentWidget.data());
-        prompt.setIcon(QMessageBox::Warning);
-        prompt.setWindowTitle(tr("Broken branch links"));
-        prompt.setText(tr("Some saved fiber branch links are obsolete or inconsistent."));
-        prompt.setInformativeText(details);
-        auto* repairButton = prompt.addButton(
-            tr("Remove broken branch links and reload"),
-            QMessageBox::AcceptRole);
-        prompt.addButton(tr("Keep files unchanged"), QMessageBox::RejectRole);
-        prompt.setDefaultButton(qobject_cast<QPushButton*>(repairButton));
-        prompt.exec();
+        bool repairRequested = false;
+        if (_errorDialogsSuppressed) {
+            // Agent-bridge headless mode (SPEC §1.3): never spin the repair
+            // prompt's nested event loop; take the non-destructive
+            // "keep files unchanged" path and log the details.
+            Logger()->warn("Line Annotation (suppressed dialog): broken fiber "
+                           "branch links, keeping files unchanged:\n{}",
+                           details.toStdString());
+        } else {
+            QMessageBox prompt(_parentWidget.data());
+            prompt.setIcon(QMessageBox::Warning);
+            prompt.setWindowTitle(tr("Broken branch links"));
+            prompt.setText(tr("Some saved fiber branch links are obsolete or inconsistent."));
+            prompt.setInformativeText(details);
+            auto* repairButton = prompt.addButton(
+                tr("Remove broken branch links and reload"),
+                QMessageBox::AcceptRole);
+            prompt.addButton(tr("Keep files unchanged"), QMessageBox::RejectRole);
+            prompt.setDefaultButton(qobject_cast<QPushButton*>(repairButton));
+            prompt.exec();
+            repairRequested = (prompt.clickedButton() == repairButton);
+        }
 
-        if (prompt.clickedButton() == repairButton) {
+        if (repairRequested) {
             std::vector<std::string> repairErrors;
             if (repairLoadedFiberBranchLinks(loadedFibers,
                                              fibersWithRemovedBranchEntries,
@@ -8057,6 +8246,14 @@ bool LineAnnotationController::confirmLinkedControlPointEdit(
 {
     if (!controlPointHasBranch(session, controlPointIndex)) {
         return true;
+    }
+    if (_errorDialogsSuppressed) {
+        // Agent-bridge headless mode (SPEC §1.3): no confirmation prompt is
+        // possible; refuse the linked edit (the dialog's conservative default).
+        showError(tr("%1 was rejected: the control point is linked to another "
+                     "fiber and confirmation prompts are disabled in headless mode.")
+                      .arg(action));
+        return false;
     }
     const auto response = QMessageBox::question(
         _parentWidget.data(),
@@ -9768,9 +9965,32 @@ std::string LineAnnotationController::uniqueImportedFiberFileName(
 
 void LineAnnotationController::showError(const QString& message) const
 {
+    if (_errorDialogsSuppressed) {
+        // Agent-bridge headless mode (SPEC §1.3): record + log, never a
+        // blocking QMessageBox. The bridge retrieves the message through
+        // takeLastSuppressedError() to build a structured RPC error.
+        _lastSuppressedError = message;
+        Logger()->warn("Line Annotation (suppressed dialog): {}", message.toStdString());
+        return;
+    }
     if (_parentWidget) {
         QMessageBox::warning(_parentWidget, tr("Line Annotation"), message);
     } else {
         Logger()->warn("Line Annotation: {}", message.toStdString());
     }
+}
+
+void LineAnnotationController::setErrorDialogsSuppressed(bool suppressed)
+{
+    _errorDialogsSuppressed = suppressed;
+    if (!suppressed) {
+        _lastSuppressedError.clear();
+    }
+}
+
+QString LineAnnotationController::takeLastSuppressedError()
+{
+    QString message = _lastSuppressedError;
+    _lastSuppressedError.clear();
+    return message;
 }

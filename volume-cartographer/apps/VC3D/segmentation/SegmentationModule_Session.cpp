@@ -17,7 +17,10 @@
 
 bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surface)
 {
+    qCWarning(lcSegModule) << "DIAGVERIFY beginEditingSession called, surface=" << surface.get()
+                            << "_editManager=" << _editManager;
     if (!_editManager || !surface) {
+        qCWarning(lcSegModule) << "DIAGVERIFY beginEditingSession early-return false";
         return false;
     }
 

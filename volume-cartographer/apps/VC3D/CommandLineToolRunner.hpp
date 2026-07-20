@@ -37,6 +37,17 @@ public:
         CustomCommand
     };
 
+    // Output format for Tool::RenderTifXYZ. vc_render_tifxyz supports two
+    // mutually-exclusive-in-practice output sinks: a per-slice TIFF stack
+    // (--tif-output, the long-standing GUI default) and an OME-Zarr store
+    // (--zarr-output). Selected via setRenderOutputFormat; the interactive
+    // render path always resets this to TifStack, while the agent bridge can
+    // thread through either choice (SPEC §19).
+    enum class RenderOutputFormat {
+        TifStack,   // --tif-output <pattern>
+        Zarr        // --zarr-output <path.zarr>
+    };
+
     void setVolumePath(const QString& path);
     void setRemoteVolumeUrl(const QString& url);
     void setRemoteVolumeAuth(const QString& accessKey,
@@ -53,6 +64,10 @@ public:
     // tool specific params 
     void setRenderParams(float scale, int resolution, int layers);
     void setRenderVoxelSize(double voxelSizeUm, bool enabled);
+    // Selects --tif-output vs --zarr-output for the next RenderTifXYZ run.
+    // Defaults to TifStack; the interactive render slot re-asserts TifStack so a
+    // prior headless Zarr render never leaks into a subsequent GUI render.
+    void setRenderOutputFormat(RenderOutputFormat format);
     void setRenderAdvanced(int cropX, int cropY, int cropWidth, int cropHeight,
                            const QString& affinePath, bool invertAffine,
                            float scaleSegmentation, double rotateDegrees, int flipAxis);
@@ -173,6 +188,7 @@ private:
     int _layers;
     double _renderVoxelSizeUm{0.0};
     bool _useRenderVoxelSize{false};
+    RenderOutputFormat _renderOutputFormat{RenderOutputFormat::TifStack};
     // Advanced render options
     int _cropX{0};
     int _cropY{0};

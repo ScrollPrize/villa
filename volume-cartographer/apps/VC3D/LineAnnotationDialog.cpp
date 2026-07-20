@@ -1747,6 +1747,12 @@ void LineAnnotationDialog::handleShiftScrollModeChanged()
     rebuildGeneratedDynamicOverlays();
 }
 
+void LineAnnotationDialog::setCutFollowEnabled(bool enabled)
+{
+    // Agent-bridge wrapper (SPEC §13.4); delegates to the private toggle.
+    setCurrentCutFollowsStripMouse(enabled);
+}
+
 void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
 {
     const bool wasFollowing = _currentCutFollowsStripMouse;

@@ -902,7 +902,8 @@ public:
             double keepPercent,
             bool inpaintHoles,
             const QString& outputDir,
-            double voxelSize)
+            double voxelSize,
+            bool suppressDialogs = false)
     : QObject(handler)
     , parentWidget_(parentWidget)
     , handler_(handler)
@@ -921,6 +922,7 @@ public:
     , keepPercent_(keepPercent)
     , inpaintHoles_(inpaintHoles)
     , voxelSize_(voxelSize)
+    , suppressDialogs_(suppressDialogs)
     , proc_(new QProcess(this))
     , progress_(new QProgressDialog(QObject::tr("Preparing SLIM..."), QObject::tr("Cancel"), 0, 0, parentWidget))
     , itRe_(R"(^\s*\[it\s+(\d+)\])", QRegularExpression::CaseInsensitiveOption)
@@ -943,7 +945,12 @@ public:
         progress_->setWindowModality(Qt::WindowModal);
         progress_->setAutoClose(false);
         progress_->setAutoReset(true);
-        progress_->setMinimumDuration(0);
+        // Headless (bridge) runs must never pop UI: a huge minimum-duration
+        // means the QProgressDialog's auto-show timer never fires, so the dialog
+        // stays invisible while every setValue/setLabelText call below remains a
+        // safe no-op on a live-but-hidden object (SPEC §1.3, §20). Nothing in
+        // this class ever calls progress_->show()/exec(), so this fully gates it.
+        progress_->setMinimumDuration(suppressDialogs_ ? std::numeric_limits<int>::max() : 0);
         progress_->setMaximum(1 + iters_ + 1);
         progress_->setValue(0);
         progress_->setAttribute(Qt::WA_DeleteOnClose);
@@ -957,7 +964,11 @@ public:
         QObject::connect(proc_, &QProcess::errorOccurred,
                          this, &SlimJob::onProcError_);
 
-        if (handler_) emit handler_->statusMessage(QObject::tr("Converting TIFXYZ to OBJ..."), 0);
+        if (handler_) {
+            emit handler_->statusMessage(QObject::tr("Converting TIFXYZ to OBJ..."), 0);
+            // Register the job with any bridge listener (SPEC §8.3 source:"flatten").
+            emit handler_->flattenJobStarted(QStringLiteral("flatten.slim"), stem_);
+        }
         startToObj_();
     }
 
@@ -1129,9 +1140,11 @@ private:
         if (QFileInfo::exists(outTemp_)) {
             ioLog_ += QStringLiteral("Removing existing output dir: %1\n").arg(outTemp_);
             if (!QDir(outTemp_).removeRecursively()) {
-                QMessageBox::critical(parentWidget_, QObject::tr("Error"),
-                                      QObject::tr("Output directory already exists and cannot be removed:\n%1")
-                                      .arg(outTemp_));
+                const QString msg = QObject::tr("Output directory already exists and cannot be removed:\n%1")
+                                      .arg(outTemp_);
+                emitFinishedOnce_(false, msg, QString());
+                if (!suppressDialogs_)
+                    QMessageBox::critical(parentWidget_, QObject::tr("Error"), msg);
                 cleanupAndDelete_();
                 return;
             }
@@ -1141,8 +1154,10 @@ private:
         const QString parentPath = QFileInfo(outTemp_).absolutePath();
         QDir parent(parentPath);
         if (!parent.exists() && !parent.mkpath(".")) {
-            QMessageBox::critical(parentWidget_, QObject::tr("Error"),
-                                  QObject::tr("Cannot create parent directory: %1").arg(parentPath));
+            const QString msg = QObject::tr("Cannot create parent directory: %1").arg(parentPath);
+            emitFinishedOnce_(false, msg, QString());
+            if (!suppressDialogs_)
+                QMessageBox::critical(parentWidget_, QObject::tr("Error"), msg);
             cleanupAndDelete_();
             return;
         }
@@ -1172,13 +1187,15 @@ private:
             const QFileInfo tmpInfo(outTemp_);
             QDir parent(tmpInfo.absolutePath());
             if (!parent.rename(tmpInfo.fileName(), QFileInfo(outFinal_).fileName())) {
-                QMessageBox* warn = new QMessageBox(QMessageBox::Warning,
-                    QObject::tr("Warning"),
-                    QObject::tr("Rebuilt directory created, but failed to overwrite original.\n"
-                                "Kept temporary at:\n%1").arg(outTemp_),
-                    QMessageBox::Ok, parentWidget_);
-                warn->setAttribute(Qt::WA_DeleteOnClose);
-                warn->open();
+                if (!suppressDialogs_) {
+                    QMessageBox* warn = new QMessageBox(QMessageBox::Warning,
+                        QObject::tr("Warning"),
+                        QObject::tr("Rebuilt directory created, but failed to overwrite original.\n"
+                                    "Kept temporary at:\n%1").arg(outTemp_),
+                        QMessageBox::Ok, parentWidget_);
+                    warn->setAttribute(Qt::WA_DeleteOnClose);
+                    warn->open();
+                }
             }
         }
     }
@@ -1187,6 +1204,17 @@ private:
         if (progress_) {
             progress_->setValue(progress_->maximum());
             progress_->close();
+        }
+
+        emitFinishedOnce_(true,
+                          QObject::tr("Flattened segment written to: %1").arg(outFinal_),
+                          outFinal_);
+
+        if (suppressDialogs_) {
+            // Headless: no completion dialog; just clean up (SPEC §20).
+            if (progress_) progress_->deleteLater();
+            this->deleteLater();
+            return;
         }
 
         QMessageBox* box = new QMessageBox(QMessageBox::Information,
@@ -1225,6 +1253,7 @@ private:
         }
 
         if (handler_) emit handler_->statusMessage(QObject::tr("SLIM-flatten cancelled"), 5000);
+        emitFinishedOnce_(false, QString(), QString());  // empty msg => cancel
         progress_->close();
         progress_->deleteLater();
         QTimer::singleShot(0, this, [this](){ this->deleteLater(); });
@@ -1284,13 +1313,19 @@ private:
             case Phase::ToTifxyz:  what = QObject::tr("vc_obj2tifxyz failed to start."); break;
             default: break;
         }
+        const QString detail = what + "\n\n" + ioLog_.trimmed() + "\n\n" + why;
+        emitFinishedOnce_(false, detail, QString());
+        if (handler_) emit handler_->statusMessage(QObject::tr("SLIM-flatten failed"), 5000);
+        if (suppressDialogs_) {
+            cleanupAndDelete_();
+            return;
+        }
         QMessageBox* box = new QMessageBox(QMessageBox::Critical, QObject::tr("Error"),
-                                           what + "\n\n" + ioLog_.trimmed() + "\n\n" + why,
+                                           detail,
                                            QMessageBox::Ok, parentWidget_);
         box->setAttribute(Qt::WA_DeleteOnClose);
         QObject::connect(box, &QMessageBox::finished, this, [this]() { cleanupAndDelete_(); });
         box->open();
-        if (handler_) emit handler_->statusMessage(QObject::tr("SLIM-flatten failed"), 5000);
     }
 
     void onFinished_(int exitCode, QProcess::ExitStatus st) {
@@ -1308,10 +1343,21 @@ private:
                 case Phase::ToTifxyz:  what = QObject::tr("vc_obj2tifxyz failed."); break;
                 default: break;
             }
-            QMessageBox* box = new QMessageBox(QMessageBox::Critical, QObject::tr("Error"),
-                                               what + (err.isEmpty()? QString() : ("\n\n" + err)),
-                                               QMessageBox::Ok, parentWidget_);
             errorShown_ = true;  // Prevent duplicate error dialogs
+            const QString detail = what + (err.isEmpty()? QString() : ("\n\n" + err));
+            emitFinishedOnce_(false, detail, QString());
+            if (handler_) emit handler_->statusMessage(QObject::tr("SLIM-flatten failed"), 5000);
+            if (suppressDialogs_) {
+                if (QFileInfo::exists(outTemp_) && outTemp_ != outFinal_) {
+                    QDir(outTemp_).removeRecursively();
+                }
+                if (progress_) { progress_->close(); progress_->deleteLater(); }
+                this->deleteLater();
+                return;
+            }
+            QMessageBox* box = new QMessageBox(QMessageBox::Critical, QObject::tr("Error"),
+                                               detail,
+                                               QMessageBox::Ok, parentWidget_);
             box->setAttribute(Qt::WA_DeleteOnClose);
             QObject::connect(box, &QMessageBox::finished, this, [this]() {
                 if (QFileInfo::exists(outTemp_) && outTemp_ != outFinal_) {
@@ -1321,7 +1367,6 @@ private:
                 this->deleteLater();
             });
             box->open();
-            if (handler_) emit handler_->statusMessage(QObject::tr("SLIM-flatten failed"), 5000);
             return;
         }
 
@@ -1362,7 +1407,7 @@ private:
 
             // Ensure the new tifxyz has a deterministic pixel size in meta.json
             // Requested: "scale": [0.05, 0.05]
-            if (!overwriteMetaScale_(outTemp_, 0.05, 0.05)) {
+            if (!overwriteMetaScale_(outTemp_, 0.05, 0.05) && !suppressDialogs_) {
                 // Non-fatal: warn but continue with swap and completion.
                 QMessageBox* warn = new QMessageBox(QMessageBox::Warning,
                     QObject::tr("Warning"),
@@ -1411,6 +1456,8 @@ private:
     double  keepPercent_ = 100.0;
     bool    inpaintHoles_ = false;
     double  voxelSize_ = 0.0;
+    bool    suppressDialogs_ = false;   // headless (bridge): capture, never show
+    bool    finishedEmitted_ = false;   // guards single flattenJobFinished emit
 
     // process & progress
     QProcess* proc_ = nullptr;
@@ -1433,10 +1480,23 @@ private:
 
     bool errorShown_ = false;
 
+    // Emit flattenJobFinished exactly once so the bridge can transition the
+    // source:"flatten" job out of "running" (SPEC §8.3, §20). Called at every
+    // terminal state, whether or not dialogs are suppressed.
+    void emitFinishedOnce_(bool success, const QString& message,
+                           const QString& outputPath) {
+        if (finishedEmitted_) return;
+        finishedEmitted_ = true;
+        if (handler_) emit handler_->flattenJobFinished(success, message, outputPath);
+    }
+
     void showImmediateToolNotFound_(const char* tool) {
-        QMessageBox::critical(parentWidget_, QObject::tr("Error"),
-            QObject::tr("Could not find the '%1' executable.\n"
-                        "Tip: set VC.ini [tools] %1_path or ensure it's on PATH.").arg(tool));
+        const QString msg = QObject::tr("Could not find the '%1' executable.\n"
+                        "Tip: set VC.ini [tools] %1_path or ensure it's on PATH.").arg(tool);
+        emitFinishedOnce_(false, msg, QString());
+        if (!suppressDialogs_) {
+            QMessageBox::critical(parentWidget_, QObject::tr("Error"), msg);
+        }
         cleanupAndDelete_();
     }
 };
@@ -1522,7 +1582,8 @@ public:
     ABFJob(QWidget* parentWidget, SurfacePanelController* surfacePanel,
            SegmentationCommandHandler* handler,
            const QString& segDir, const QString& segmentStem,
-           int iterations, int downsampleFactor = 1)
+           int iterations, int downsampleFactor = 1,
+           bool suppressDialogs = false)
         : QObject(handler)
         , parentWidget_(parentWidget)
         , handler_(handler)
@@ -1532,17 +1593,25 @@ public:
         , outDir_(segDir.endsWith("_abf") ? segDir : (segDir + "_abf"))
         , iterations_(std::max(1, iterations))
         , downsampleFactor_(std::max(1, downsampleFactor))
+        , suppressDialogs_(suppressDialogs)
         , cancelFlag_(std::make_shared<std::atomic_bool>(false))
         , watcher_(this)
         , progress_(new QProgressDialog(QObject::tr("ABF++ Flattening..."), QObject::tr("Cancel"), 0, 0, parentWidget))
     {
         progress_->setWindowModality(Qt::NonModal);
-        progress_->setMinimumDuration(0);
+        // Headless (bridge): a huge minimum-duration keeps the (non-modal)
+        // progress dialog from ever auto-showing (SPEC §1.3, §20).
+        progress_->setMinimumDuration(suppressDialogs_ ? std::numeric_limits<int>::max() : 0);
         progress_->setRange(0, 0); // indeterminate
         progress_->setAttribute(Qt::WA_DeleteOnClose);
 
         connect(progress_, &QProgressDialog::canceled, this, &ABFJob::onCanceledRequested_);
         connect(&watcher_, &QFutureWatcher<ABFFlattenResult>::finished, this, &ABFJob::onFinished_);
+
+        // Register the job with any bridge listener (SPEC §8.3 source:"flatten").
+        if (handler_)
+            emit handler_->flattenJobStarted(QStringLiteral("flatten.abf"),
+                                             stem_.isEmpty() ? outDir_ : stem_);
 
         startTask_();
     }
@@ -1579,17 +1648,20 @@ private slots:
             if (handler_) {
                 emit handler_->statusMessage(QObject::tr("ABF++ flatten cancelled"), 5000);
             }
+            emitFinishedOnce_(false, QString(), QString());  // empty msg => cancel
             deleteLater();
             return;
         }
 
         if (!result.success) {
+            const QString errorMsg = result.errorMsg.isEmpty()
+                ? QObject::tr("ABF++ flattening failed")
+                : result.errorMsg;
+            emitFinishedOnce_(false, errorMsg, QString());
             if (handler_) {
                 emit handler_->statusMessage(QObject::tr("ABF++ flatten failed"), 5000);
-                const QString errorMsg = result.errorMsg.isEmpty()
-                    ? QObject::tr("ABF++ flattening failed")
-                    : result.errorMsg;
-                QMessageBox::critical(parentWidget_, QObject::tr("ABF++ Flatten Failed"), errorMsg);
+                if (!suppressDialogs_)
+                    QMessageBox::critical(parentWidget_, QObject::tr("ABF++ Flatten Failed"), errorMsg);
             }
             deleteLater();
             return;
@@ -1597,10 +1669,14 @@ private slots:
 
         const QString label = !stem_.isEmpty() ? stem_ : outDir_;
 
+        emitFinishedOnce_(true,
+                          QObject::tr("ABF++ flatten complete: %1").arg(label),
+                          outDir_);
         if (handler_) {
             emit handler_->statusMessage(QObject::tr("ABF++ flatten complete: %1").arg(label), 5000);
-            QMessageBox::information(parentWidget_, QObject::tr("ABF++ Flatten Complete"),
-                QObject::tr("Flattened surface saved to:\n%1").arg(outDir_));
+            if (!suppressDialogs_)
+                QMessageBox::information(parentWidget_, QObject::tr("ABF++ Flatten Complete"),
+                    QObject::tr("Flattened surface saved to:\n%1").arg(outDir_));
         }
 
         if (surfacePanel_) {
@@ -1637,6 +1713,13 @@ private:
         }));
     }
 
+    void emitFinishedOnce_(bool success, const QString& message,
+                           const QString& outputPath) {
+        if (finishedEmitted_) return;
+        finishedEmitted_ = true;
+        if (handler_) emit handler_->flattenJobFinished(success, message, outputPath);
+    }
+
     QWidget* parentWidget_ = nullptr;
     QPointer<SegmentationCommandHandler> handler_;
     QPointer<SurfacePanelController> surfacePanel_;
@@ -1645,6 +1728,8 @@ private:
     QString outDir_;
     int iterations_;
     int downsampleFactor_;
+    bool suppressDialogs_ = false;
+    bool finishedEmitted_ = false;
     std::shared_ptr<std::atomic_bool> cancelFlag_;
     QFutureWatcher<ABFFlattenResult> watcher_;
     QPointer<QProgressDialog> progress_;
@@ -1659,18 +1744,22 @@ public:
     StraightenJob(QWidget* parentWidget, SurfacePanelController* surfacePanel,
                   SegmentationCommandHandler* handler, const QString& straightenExe,
                   const QString& segDir, const QString& segmentStem,
-                  const QString& outputDir, const QStringList& extraArgs)
+                  const QString& outputDir, const QStringList& extraArgs,
+                  bool suppressDialogs = false)
         : QObject(handler)
         , parentWidget_(parentWidget)
         , handler_(handler)
         , surfacePanel_(surfacePanel)
         , stem_(segmentStem)
         , outDir_(outputDir)
+        , suppressDialogs_(suppressDialogs)
         , proc_(new QProcess(this))
         , progress_(new QProgressDialog(QObject::tr("Straightening..."), QObject::tr("Cancel"), 0, 0, parentWidget))
     {
         progress_->setWindowModality(Qt::NonModal);
-        progress_->setMinimumDuration(0);
+        // Headless (bridge): a huge minimum-duration keeps the (non-modal)
+        // progress dialog from ever auto-showing (SPEC §1.3, §20).
+        progress_->setMinimumDuration(suppressDialogs_ ? std::numeric_limits<int>::max() : 0);
         progress_->setRange(0, 0); // indeterminate; vc_straighten emits no PROGRESS
         progress_->setAttribute(Qt::WA_DeleteOnClose);
         connect(progress_, &QProgressDialog::canceled, this, &StraightenJob::onCanceled_);
@@ -1685,7 +1774,12 @@ public:
         args << segDir << outputDir << extraArgs;
         std::cout << "[straighten] launching: " << straightenExe.toStdString()
                   << " " << args.join(' ').toStdString() << std::endl;
-        if (handler_) emit handler_->statusMessage(QObject::tr("Running vc_straighten..."), 0);
+        if (handler_) {
+            emit handler_->statusMessage(QObject::tr("Running vc_straighten..."), 0);
+            // Register the job with any bridge listener (SPEC §8.3 source:"flatten").
+            emit handler_->flattenJobStarted(QStringLiteral("flatten.straighten"),
+                                             stem_.isEmpty() ? outDir_ : stem_);
+        }
         proc_->start(straightenExe, args);
     }
 
@@ -1711,10 +1805,12 @@ private slots:
         // needs handling here.
         if (e != QProcess::FailedToStart || done_) return;
         done_ = true;
+        const QString msg = QObject::tr("Could not launch vc_straighten.");
+        emitFinishedOnce_(false, msg, QString());
         if (handler_) emit handler_->statusMessage(QObject::tr("Straighten failed"), 5000);
         if (progress_) progress_->close();
-        QMessageBox::critical(parentWidget_, QObject::tr("Straighten Failed"),
-            QObject::tr("Could not launch vc_straighten."));
+        if (!suppressDialogs_)
+            QMessageBox::critical(parentWidget_, QObject::tr("Straighten Failed"), msg);
         deleteLater();
     }
 
@@ -1723,16 +1819,21 @@ private slots:
         done_ = true;
         if (progress_) progress_->close();
         if (status != QProcess::NormalExit || code != 0) {
+            const QString msg = QObject::tr("vc_straighten exited with code %1.\nSee the console for details.").arg(code);
+            emitFinishedOnce_(false, msg, QString());
             if (handler_) emit handler_->statusMessage(QObject::tr("Straighten failed"), 5000);
-            QMessageBox::critical(parentWidget_, QObject::tr("Straighten Failed"),
-                QObject::tr("vc_straighten exited with code %1.\nSee the console for details.").arg(code));
+            if (!suppressDialogs_)
+                QMessageBox::critical(parentWidget_, QObject::tr("Straighten Failed"), msg);
             deleteLater();
             return;
         }
         const QString label = !stem_.isEmpty() ? stem_ : outDir_;
+        emitFinishedOnce_(true,
+                          QObject::tr("Straighten complete: %1").arg(label), outDir_);
         if (handler_) emit handler_->statusMessage(QObject::tr("Straighten complete: %1").arg(label), 5000);
-        QMessageBox::information(parentWidget_, QObject::tr("Straighten Complete"),
-            QObject::tr("Straightened surface saved to:\n%1").arg(outDir_));
+        if (!suppressDialogs_)
+            QMessageBox::information(parentWidget_, QObject::tr("Straighten Complete"),
+                QObject::tr("Straightened surface saved to:\n%1").arg(outDir_));
         if (surfacePanel_) {
             QMetaObject::invokeMethod(surfacePanel_.data(),
                                       &SurfacePanelController::reloadSurfacesFromDisk,
@@ -1742,11 +1843,20 @@ private slots:
     }
 
 private:
+    void emitFinishedOnce_(bool success, const QString& message,
+                           const QString& outputPath) {
+        if (finishedEmitted_) return;
+        finishedEmitted_ = true;
+        if (handler_) emit handler_->flattenJobFinished(success, message, outputPath);
+    }
+
     QWidget* parentWidget_ = nullptr;
     QPointer<SegmentationCommandHandler> handler_;
     QPointer<SurfacePanelController> surfacePanel_;
     QString stem_;
     QString outDir_;
+    bool suppressDialogs_ = false;
+    bool finishedEmitted_ = false;
     QProcess* proc_ = nullptr;
     QPointer<QProgressDialog> progress_;
     bool done_ = false;
@@ -1937,6 +2047,10 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
 
     _cmdRunner->setSegmentPath(dlg.segmentPath());
     _cmdRunner->setOutputPattern(dlg.outputPattern());
+    // The interactive dialog always produces a per-slice TIFF stack. Re-assert
+    // TifStack explicitly so a prior headless (agent-bridge) Zarr render cannot
+    // leak its --zarr-output selection into this GUI render (SPEC §19).
+    _cmdRunner->setRenderOutputFormat(CommandLineToolRunner::RenderOutputFormat::TifStack);
     _cmdRunner->setRenderParams(static_cast<float>(dlg.scale()), dlg.groupIdx(), dlg.numSlices());
     _cmdRunner->setRenderVoxelSize(
         renderVolume ? renderVolume->voxelSize() : 0.0,
@@ -2100,6 +2214,9 @@ void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)
 
 void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& segmentId)
 {
+    // Interactive path: the dialog collects params, then the shared headless
+    // launcher (startRunTrace) does all preconditions/merge/launch. Dialogs and
+    // QMessageBoxes live only here (SPEC §14.4).
     auto* surface = requireSurfaceAndRunner(segmentId, true);
     if (!surface) return;
     if (_state && _state->currentVolume() && _state->currentVolume()->isRemote()) {
@@ -2144,40 +2261,432 @@ void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& seg
         return;
     }
 
+    RunTraceParams params;
+    params.paramOverrides = dlg.makeParamsJson();
+    params.ompThreads = dlg.ompThreads();
+    params.tgtDir = dlg.tgtDir();
+
+    QString err;
+    if (!startRunTrace(segmentId, params, &err)) {
+        QMessageBox::warning(_parentWidget, tr("Error"), err);
+        return;
+    }
+
+    _cmdRunner->showConsoleOutput();  // interactive-only (SPEC §14.4)
+    emit statusMessage(tr("Growing segment from: %1").arg(QString::fromStdString(segmentId)), 5000);
+}
+
+bool SegmentationCommandHandler::startRunTrace(const std::string& segmentId,
+                                              const RunTraceParams& params,
+                                              QString* errorMessage,
+                                              QString* resolvedOutputDir)
+{
+    auto setErr = [&](const QString& msg) { if (errorMessage) *errorMessage = msg; };
+
+    // --- Step 1: preconditions (headless mirror of requireSurfaceAndRunner +
+    // the remote/trace_params.json checks in onGrowSegmentFromSegment). Distinct
+    // sentences so the bridge can classify (SPEC §15.4). ---
+    if (!_state || _state->currentVolume() == nullptr || !_state->vpkg()) {
+        setErr(tr("No volume package or volume loaded."));
+        return false;
+    }
+    auto surf = _state->vpkg()->getSurface(segmentId);
+    if (!surf) {
+        setErr(tr("Invalid segment or segment not loaded: %1")
+                   .arg(QString::fromStdString(segmentId)));
+        return false;
+    }
+    if (!_cmdRunner) {
+        setErr(tr("Command line tools not available"));
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command line tool is already running."));
+        return false;
+    }
+    if (_state->currentVolume()->isRemote()) {
+        setErr(tr("Run Trace uses vc_grow_seg_from_segments, which accepts only "
+                  "local volumes (remote current volume rejected)."));
+        return false;
+    }
+
+    const QString srcSegment = QString::fromStdString(surf->path.string());
+
+    const std::filesystem::path volpkgPath =
+        std::filesystem::path(_state->vpkgPath().toStdString());
+    const std::filesystem::path tracesDir = volpkgPath / "traces";
+    const std::filesystem::path jsonParamsPath = volpkgPath / "trace_params.json";
+    const std::filesystem::path pathsDir = volpkgPath / "paths";
+
+    // Resolve target dir: params.tgtDir (absolute or relative to volpkg root) or
+    // <volpkg>/traces by default; created if missing.
+    std::filesystem::path tgtDir = tracesDir;
+    if (!params.tgtDir.isEmpty()) {
+        std::filesystem::path requested(params.tgtDir.toStdString());
+        tgtDir = requested.is_absolute() ? requested : (volpkgPath / requested);
+    }
+    if (!std::filesystem::exists(tgtDir)) {
+        try { std::filesystem::create_directories(tgtDir); }
+        catch (const std::exception& e) {
+            setErr(tr("Failed to create traces directory: %1").arg(e.what()));
+            return false;
+        }
+    }
+
+    if (!std::filesystem::exists(jsonParamsPath)) {
+        setErr(tr("trace_params.json not found in the volpkg"));
+        return false;
+    }
+
+    // --- Step 3: merge overrides over trace_params.json and write the UI copy. ---
     QJsonObject base;
     {
-        QFile f(dlg.jsonParams());
+        QFile f(QString::fromStdString(jsonParamsPath.string()));
         if (f.open(QIODevice::ReadOnly)) {
             const auto doc = QJsonDocument::fromJson(f.readAll());
             f.close();
             if (doc.isObject()) base = doc.object();
         }
     }
-    const QJsonObject ui = dlg.makeParamsJson();
-    for (auto it = ui.begin(); it != ui.end(); ++it) base[it.key()] = it.value();
+    for (auto it = params.paramOverrides.begin(); it != params.paramOverrides.end(); ++it)
+        base[it.key()] = it.value();
 
-    const QString mergedJsonPath = QDir(dlg.tgtDir()).filePath(QString("trace_params_ui.json"));
+    const QString mergedJsonPath =
+        QDir(QString::fromStdString(tgtDir.string())).filePath(QStringLiteral("trace_params_ui.json"));
     {
         QFile f(mergedJsonPath);
         if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to write params JSON: %1").arg(mergedJsonPath));
-            return;
+            setErr(tr("Failed to write params JSON: %1").arg(mergedJsonPath));
+            return false;
         }
         f.write(QJsonDocument(base).toJson(QJsonDocument::Indented));
         f.close();
     }
 
+    // --- Step 4: launch (shared by both paths; showConsoleOutput stays in the
+    // interactive slot only). ---
     _cmdRunner->setTraceParams(
-        dlg.volumePath(),
-        dlg.srcDir(),
-        dlg.tgtDir(),
+        getCurrentVolumePath(),
+        QString::fromStdString(pathsDir.string()),
+        QString::fromStdString(tgtDir.string()),
         mergedJsonPath,
-        dlg.srcSegment());
-    _cmdRunner->setOmpThreads(dlg.ompThreads());
-
-    _cmdRunner->showConsoleOutput();
+        srcSegment);
+    _cmdRunner->setOmpThreads(params.ompThreads);
     _cmdRunner->execute(CommandLineToolRunner::Tool::GrowSegFromSegment);
-    emit statusMessage(tr("Growing segment from: %1").arg(QString::fromStdString(segmentId)), 5000);
+
+    if (resolvedOutputDir)
+        *resolvedOutputDir = QString::fromStdString(tgtDir.string());
+    return true;
+}
+
+bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId,
+                                                    const RenderSegmentParams& params,
+                                                    QString* errorMessage,
+                                                    QString* resolvedOutputDir)
+{
+    auto setErr = [&](const QString& msg) { if (errorMessage) *errorMessage = msg; };
+
+    // --- Step 1: preconditions (headless mirror of requireSurfaceAndRunner +
+    // the execute() pre-launch checks in onRenderSegment). Distinct sentences so
+    // the bridge can classify (SPEC §19). No QMessageBox / dialog on any path. ---
+    if (!_state || !_state->vpkg()) {
+        setErr(tr("No volume package or volume loaded."));
+        return false;
+    }
+    if (!_state->currentVolume()) {
+        setErr(tr("No volume loaded."));
+        return false;
+    }
+    auto surf = _state->vpkg()->getSurface(segmentId);
+    if (!surf) {
+        setErr(tr("Invalid segment or segment not loaded: %1")
+                   .arg(QString::fromStdString(segmentId)));
+        return false;
+    }
+    if (!_cmdRunner) {
+        setErr(tr("Command line tools not available"));
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command line tool is already running."));
+        return false;
+    }
+
+    // Verify the tool executable exists up front. execute() would otherwise pop a
+    // blocking QMessageBox + console dialog on a missing binary (a §1.3 hang for a
+    // headless run), so we pre-check with the same path construction toolName()
+    // uses and report through errorMessage instead.
+    const QString toolPath =
+        QCoreApplication::applicationDirPath() + QStringLiteral("/vc_render_tifxyz");
+    QFileInfo toolInfo(toolPath);
+    if (!toolInfo.exists() || !toolInfo.isExecutable()) {
+        setErr(tr("vc_render_tifxyz not found or not executable: %1").arg(toolPath));
+        return false;
+    }
+
+    // --- Step 2: resolve the render volume + path (+ remote auth). Render
+    // (unlike Run Trace) accepts remote volumes, so we do not reject them. ---
+    std::shared_ptr<Volume> renderVolume;
+    if (params.volumeId.isEmpty()) {
+        renderVolume = _state->currentVolume();
+    } else {
+        const auto ids = _state->vpkg()->volumeIDs();
+        if (std::find(ids.begin(), ids.end(), params.volumeId.toStdString()) == ids.end()) {
+            setErr(tr("Unknown volume id: %1").arg(params.volumeId));
+            return false;
+        }
+        renderVolume = _state->vpkg()->volume(params.volumeId.toStdString());
+    }
+    const QString volumePath = commandPathForVolume(renderVolume);
+    if (volumePath.isEmpty()) {
+        setErr(tr("Could not resolve a volume path for rendering."));
+        return false;
+    }
+
+    // --- Step 3: resolve the output artifact path. Base dir is params.outputDir
+    // (absolute or relative to the volpkg root) or the segment folder by default
+    // (matching the dialog's <segment>/layers). Create it if missing so execute()
+    // never reaches its mkpath-failure QMessageBox. ---
+    const std::filesystem::path volpkgPath(_state->vpkgPath().toStdString());
+    std::filesystem::path baseDir;
+    if (params.outputDir.isEmpty()) {
+        baseDir = surf->path;  // the segment folder
+    } else {
+        std::filesystem::path requested(params.outputDir.toStdString());
+        baseDir = requested.is_absolute() ? requested : (volpkgPath / requested);
+    }
+    if (!std::filesystem::exists(baseDir)) {
+        try { std::filesystem::create_directories(baseDir); }
+        catch (const std::exception& e) {
+            setErr(tr("Failed to create output directory: %1").arg(e.what()));
+            return false;
+        }
+    }
+
+    const bool wantZarr =
+        params.outputFormat == CommandLineToolRunner::RenderOutputFormat::Zarr;
+    const std::filesystem::path outputArtifact =
+        baseDir / (wantZarr ? "surface.zarr" : "layers");
+    const QString outputPattern = QString::fromStdString(outputArtifact.string());
+
+    // --- Step 4: configure the runner and launch. Advanced options (crop/affine/
+    // rotate/flip/flatten/include-tifs) are reset to defaults so a prior
+    // interactive render's dialog settings cannot leak into this reduced-surface
+    // headless render (SPEC §19). ---
+    _cmdRunner->setSegmentPath(QString::fromStdString(surf->path.string()));
+    _cmdRunner->setOutputPattern(outputPattern);
+    _cmdRunner->setRenderOutputFormat(params.outputFormat);
+    _cmdRunner->setRenderParams(params.scale, params.groupIdx, params.numSlices);
+
+    if (params.hasVoxelSize) {
+        _cmdRunner->setRenderVoxelSize(params.voxelSizeUm, true);
+    } else {
+        _cmdRunner->setRenderVoxelSize(
+            renderVolume ? renderVolume->voxelSize() : 0.0,
+            renderVolume &&
+                (renderVolume->baseScaleLevel() > 0 ||
+                 renderVolume->hasExplicitVoxelSizeOverride()));
+    }
+
+    _cmdRunner->setVolumePath(volumePath);
+    configureCommandRunnerRemoteAuthForVolumePath(volumePath);
+
+    _cmdRunner->setRenderAdvanced(0, 0, 0, 0, QString(), false, 1.0f, 0.0, -1);
+    _cmdRunner->setIncludeTifs(false);
+    _cmdRunner->setFlattenOptions(false, 10, 1);
+    _cmdRunner->setOmpThreads(-1);
+
+    _cmdRunner->execute(CommandLineToolRunner::Tool::RenderTifXYZ);
+
+    if (resolvedOutputDir)
+        *resolvedOutputDir = outputPattern;
+    return true;
+}
+
+bool SegmentationCommandHandler::startSlimFlatten(const std::string& segmentId,
+                                                  const SlimFlattenParams& params,
+                                                  QString* errorMessage,
+                                                  QString* resolvedOutputDir)
+{
+    auto setErr = [&](const QString& msg) { if (errorMessage) *errorMessage = msg; };
+
+    // --- Preconditions (headless mirror of onSlimFlatten; distinct sentences so
+    // the bridge can classify, SPEC §20). No QMessageBox / dialog on any path. ---
+    if (!_state || !_state->vpkg() || !_state->currentVolume()) {
+        setErr(tr("No volume package or volume loaded."));
+        return false;
+    }
+    auto surf = _state->vpkg()->getSurface(segmentId);
+    if (!surf) {
+        setErr(tr("Invalid segment or segment not loaded: %1")
+                   .arg(QString::fromStdString(segmentId)));
+        return false;
+    }
+
+    // Resolve every executable the SlimJob pipeline will need UP FRONT, so the
+    // constructed job never reaches its synchronous showImmediateToolNotFound_
+    // (a §1.3 blocking QMessageBox) path. flatboi + vc_tifxyz2obj + vc_obj2tifxyz
+    // are always needed; vc_obj_uv_lift only when decimating (keepPercent < 100).
+    const QString flatboiExe = findFlatboiExecutable();
+    if (flatboiExe.isEmpty()) {
+        setErr(tr("flatboi not found or not executable (checked known locations, "
+                  "PATH, VC.ini [tools] flatboi_path, and $FLATBOI)."));
+        return false;
+    }
+    if (findVcTool("vc_tifxyz2obj").isEmpty()) {
+        setErr(tr("vc_tifxyz2obj not found or not executable."));
+        return false;
+    }
+    if (findVcTool("vc_obj2tifxyz").isEmpty()) {
+        setErr(tr("vc_obj2tifxyz not found or not executable."));
+        return false;
+    }
+    const bool decimating = params.keepPercent < 100.0;
+    if (decimating && findVcTool("vc_obj_uv_lift").isEmpty()) {
+        setErr(tr("vc_obj_uv_lift not found or not executable (required when "
+                  "keepPercent < 100)."));
+        return false;
+    }
+
+    const std::filesystem::path segDirFs = surf->path;
+    const QString segDir = QString::fromStdString(segDirFs.string());
+    const QString segmentStem = QString::fromStdString(segmentId);
+
+    // Resolve the output dir: params.outputDir (absolute or relative to the
+    // volpkg root) or <segment>_flatboi by default (matching the dialog default).
+    QString outputDir;
+    if (params.outputDir.isEmpty()) {
+        outputDir = segDir.endsWith("_flatboi") ? segDir : (segDir + "_flatboi");
+    } else {
+        std::filesystem::path requested(params.outputDir.toStdString());
+        const std::filesystem::path volpkgPath(_state->vpkgPath().toStdString());
+        outputDir = QString::fromStdString(
+            (requested.is_absolute() ? requested : (volpkgPath / requested)).string());
+    }
+
+    double voxelSize = 0.0;
+    try {
+        if (auto volume = _state->currentVolume()) voxelSize = volume->voxelSize();
+    } catch (...) {}
+    if (!std::isfinite(voxelSize) || voxelSize <= 0.0) voxelSize = 0.0;
+
+    const int iters = params.iterations > 0 ? params.iterations : 50;
+
+    // Construct the job with dialogs suppressed. Its multi-stage QProcess
+    // pipeline runs asynchronously; completion is observable via
+    // flattenJobFinished (emitted from the job, SPEC §20). The job parents to
+    // `this` and self-deletes on completion.
+    new SlimJob(_parentWidget, segDir, segmentStem, flatboiExe, this, iters,
+                params.tolerance, params.energyType, params.keepPercent,
+                params.inpaintHoles, outputDir, voxelSize,
+                /*suppressDialogs=*/true);
+
+    if (resolvedOutputDir) *resolvedOutputDir = outputDir;
+    return true;
+}
+
+bool SegmentationCommandHandler::startAbfFlatten(const std::string& segmentId,
+                                                 int iterations,
+                                                 int downsampleFactor,
+                                                 QString* errorMessage,
+                                                 QString* resolvedOutputDir)
+{
+    auto setErr = [&](const QString& msg) { if (errorMessage) *errorMessage = msg; };
+
+    if (!_state || !_state->vpkg()) {
+        setErr(tr("No volume package loaded."));
+        return false;
+    }
+    auto surf = _state->vpkg()->getSurface(segmentId);
+    if (!surf) {
+        setErr(tr("Invalid segment or segment not loaded: %1")
+                   .arg(QString::fromStdString(segmentId)));
+        return false;
+    }
+
+    const std::filesystem::path segDirFs = surf->path;
+    const QString segDir = QString::fromStdString(segDirFs.string());
+    const QString segmentStem = QString::fromStdString(segmentId);
+    const QString outDir = segDir.endsWith("_abf") ? segDir : (segDir + "_abf");
+
+    // ABF++ runs in-process on a QtConcurrent worker; no external tool to
+    // resolve. Completion is observable via flattenJobFinished (SPEC §20).
+    new ABFJob(_parentWidget, _surfacePanel, this, segDir, segmentStem,
+               std::max(1, iterations), std::max(1, downsampleFactor),
+               /*suppressDialogs=*/true);
+
+    if (resolvedOutputDir) *resolvedOutputDir = outDir;
+    return true;
+}
+
+bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
+                                                 const StraightenParams& params,
+                                                 QString* errorMessage,
+                                                 QString* resolvedOutputDir)
+{
+    auto setErr = [&](const QString& msg) { if (errorMessage) *errorMessage = msg; };
+
+    if (!_state || !_state->vpkg() || !_state->currentVolume()) {
+        setErr(tr("No volume package or volume loaded."));
+        return false;
+    }
+    auto surf = _state->vpkg()->getSurface(segmentId);
+    if (!surf) {
+        setErr(tr("Invalid segment or segment not loaded: %1")
+                   .arg(QString::fromStdString(segmentId)));
+        return false;
+    }
+
+    const QString exe = findVcTool("vc_straighten");
+    if (exe.isEmpty()) {
+        setErr(tr("vc_straighten not found or not executable."));
+        return false;
+    }
+
+    const std::filesystem::path segDirFs = surf->path;
+    const QString segDir = QString::fromStdString(segDirFs.string());
+    const QString segmentStem = QString::fromStdString(segmentId);
+
+    QString outputDir;
+    if (params.outputDir.isEmpty()) {
+        outputDir = segDir.endsWith("_straightened") ? (segDir + "_v2")
+                                                     : (segDir + "_straightened");
+    } else {
+        std::filesystem::path requested(params.outputDir.toStdString());
+        const std::filesystem::path volpkgPath(_state->vpkgPath().toStdString());
+        outputDir = QString::fromStdString(
+            (requested.is_absolute() ? requested : (volpkgPath / requested)).string());
+    }
+
+    // vc_straighten refuses to overwrite an existing output dir; reject up front
+    // (mirrors the interactive slot's existence check) instead of letting the
+    // subprocess fail deep in the job.
+    if (QFileInfo::exists(outputDir)) {
+        setErr(tr("Output directory already exists: %1 (vc_straighten will not "
+                  "overwrite it; choose a different name).").arg(outputDir));
+        return false;
+    }
+
+    // Build the CLI args exactly as StraightenDialog::toArgs() does, from params.
+    QStringList args;
+    if (params.unbend) {
+        args << QStringLiteral("--unbend");
+        args << QStringLiteral("--unbend-smooth-cols")
+             << QString::number(params.unbendSmoothCols, 'f', 0);
+    }
+    args << QStringLiteral("--overlap-pairs") << QString::number(params.overlapPasses);
+    if (params.orthogonalize) args << QStringLiteral("--orthogonalize");
+    if (params.trim) {
+        args << QStringLiteral("--trim");
+        args << QStringLiteral("--trim-max-edge")
+             << QString::number(params.trimMaxEdge, 'f', 0);
+    }
+
+    new StraightenJob(_parentWidget, _surfacePanel, this, exe, segDir, segmentStem,
+                      outputDir, args, /*suppressDialogs=*/true);
+
+    if (resolvedOutputDir) *resolvedOutputDir = outputDir;
+    return true;
 }
 
 void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentId, bool copyOut)

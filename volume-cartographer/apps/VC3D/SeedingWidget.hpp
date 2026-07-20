@@ -43,7 +43,25 @@ public:
 
     void setState(CState* state);
     void setViewerManager(ViewerManager* viewerManager);
-    
+
+    // --- Agent bridge headless entry points (SPEC §15.2) ---
+    // The seeding action entry points are private slots; these one-line public
+    // wrappers let the agent bridge invoke the non-blocking ones without a Qt
+    // signal connection. Only the genuinely non-blocking actions are wrapped:
+    // preview-rays (synchronous point math), cast-rays (QtConcurrent background),
+    // and reset-points (pure UI reset). onRunSegmentationClicked /
+    // onExpandSeedsClicked / analyzePaths spin a nested QApplication::
+    // processEvents loop until child processes finish and are deliberately NOT
+    // wrapped (they would violate the bridge's no-nested-event-loop rule, SPEC
+    // §1.3). setDialogsSuppressed() gates the precondition QMessageBox::warning
+    // calls the wrapped slots would otherwise raise (a static QMessageBox spins a
+    // nested event loop), for the bridge's lifetime only.
+    void runPreviewRays() { onPreviewRaysClicked(); }
+    void runCastRays() { onCastRaysClicked(); }
+    void runResetPoints() { onResetPointsClicked(); }
+    void setDialogsSuppressed(bool suppressed) { _dialogsSuppressed = suppressed; }
+    [[nodiscard]] bool dialogsSuppressed() const { return _dialogsSuppressed; }
+
 signals:
     void sendPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void sendStatusMessageAvailable(QString text, int timeout);
@@ -144,6 +162,7 @@ private:
     ProgressUtil* progressUtil;
     
     // Data
+    bool _dialogsSuppressed{false};  // agent bridge suppresses precondition dialogs
     CState* _state{nullptr};
     ViewerManager* _viewerManager{nullptr};
     QPointer<CChunkedVolumeViewer> _relWindingDrawViewer;

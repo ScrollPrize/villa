@@ -171,7 +171,20 @@ public:
     void showIntersectionInspection(const vc::atlas::FiberIntersectionResult& result,
                                     QMdiArea* targetArea,
                                     std::optional<std::filesystem::path> atlasDir = std::nullopt);
+    // Headless twin of showIntersectionInspection (agent bridge, SPEC §12.6):
+    // reports failures through `errorMessage` instead of showError's
+    // QMessageBox. Distinct name (not an overload) per the codebase's
+    // headless-split convention.
+    bool showIntersectionInspectionHeadless(const vc::atlas::FiberIntersectionResult& result,
+                                            QMdiArea* targetArea,
+                                            std::optional<std::filesystem::path> atlasDir,
+                                            QString* errorMessage = nullptr);
     void saveOpenFibers();
+    // Headless twin of saveOpenFibers (agent bridge, SPEC §13.5): schedules the
+    // same per-pane finalize+save work but does NOT call waitForFiberSaves()
+    // (which spins a nested QEventLoop, forbidden in bridge handlers per SPEC
+    // §1.3). Saves complete asynchronously on the normal fiber-save watcher.
+    void saveOpenFibersHeadless();
     void closeFiberWindowForSurface(const std::string& surfaceName);
     bool showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,
                                               const QPointF& scenePoint,
@@ -183,6 +196,52 @@ public:
     [[nodiscard]] std::vector<FiberSnapshotWithPath> fiberSnapshotsFromStorageWithPaths() const;
     [[nodiscard]] std::optional<uint64_t> fiberIdForAtlasPath(
         const std::filesystem::path& atlasFiberPath) const;
+
+    // --- Agent-bridge headless splits (SPEC §13, §14.2) ---------------------
+    // Distinct names, never overloads of the interactive methods (the
+    // codebase's headless-split doctrine: several interactive originals are
+    // used as member-function pointers in connect() calls, and a same-name
+    // overload would make those ambiguous).
+
+    // Headless twin of exportFibers(): writes the vc3d_fiber_collection bundle
+    // to `path` without any dialog. Returns false with `errorMessage` set on
+    // failure (no fibers / write failure). `exportedCount` receives the number
+    // of fibers written on success.
+    bool exportFibersToPath(const std::filesystem::path& path, double scale,
+                            QString* errorMessage = nullptr, int* exportedCount = nullptr);
+    // Headless twin of importFibers(): accepts a single fiber JSON, a bundle,
+    // or a directory of fiber JSONs, exactly like the interactive path
+    // (including loadFibersForCurrentPackage() on success). Returns false with
+    // `errorMessage` set when nothing valid was imported.
+    bool importFibersFromPath(const std::filesystem::path& path, double scale,
+                              QString* errorMessage = nullptr,
+                              int* importedCount = nullptr, int* skippedCount = nullptr);
+    // Headless twin of createAtlasFromFiber(): same core (shared via
+    // createAtlasFromFiberCore) but reports failure through `errorMessage`
+    // instead of showError's QMessageBox and does NOT emit atlasCreated —
+    // that signal is connected to the interactive
+    // CWindow::displayAtlasFromDirectory (which can raise the atlas rebuild
+    // QMessageBox); the bridge displays the result itself via
+    // CWindow::displayAtlasFromDirectoryHeadless.
+    bool createAtlasFromFiberHeadless(uint64_t fiberId, QString* errorMessage = nullptr,
+                                      std::filesystem::path* atlasDirOut = nullptr);
+    // Most recently opened live line-annotation workspace window, or nullptr
+    // (agent bridge, SPEC §13.4 fiber.set_follow).
+    [[nodiscard]] LineAnnotationDialog* mostRecentLineAnnotationDialog() const;
+    // Agent-bridge safety valve (SPEC §1.3/§13): while suppressed, every
+    // blocking prompt reachable from bridge-driven fiber paths is skipped —
+    // showError() logs and records instead of QMessageBox::warning, the
+    // Lasagna dataset picker is never opened (the operation fails as if
+    // cancelled), the broken-branch-links repair prompt defaults to "keep
+    // files unchanged", and linked-control-point edit confirmation defaults
+    // to "no". Set once for the bridge's lifetime by AgentBridgeServer; it
+    // must stay set because failures can also surface from asynchronous
+    // completions (e.g. line-optimization results) long after an RPC returned.
+    void setErrorDialogsSuppressed(bool suppressed);
+    // Returns and clears the most recent suppressed showError message (empty
+    // when none was recorded since the last take). Lets a bridge handler turn
+    // an otherwise-silent interactive failure into a structured RPC error.
+    [[nodiscard]] QString takeLastSuppressedError();
 
     void setDatasetPickerForTesting(DatasetPicker picker);
     void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
@@ -538,8 +597,17 @@ private:
         const vc::lasagna::NormalSampler& sampler);
     void finishFiberAlignmentMetrics(QFutureWatcher<FiberMetricsTaskResult>* watcher);
     void showError(const QString& message) const;
+    // Shared core of createAtlasFromFiber / createAtlasFromFiberHeadless.
+    // Returns the created atlas directory; throws std::exception on failure.
+    // Does not emit atlasCreated (callers decide).
+    std::filesystem::path createAtlasFromFiberCore(uint64_t fiberId);
+    // Shared per-pane finalize+save loop of saveOpenFibers /
+    // saveOpenFibersHeadless (no waiting).
+    void saveOpenFibersCore();
     void cleanupIntersectionInspectionSurfaces();
-    void rebuildIntersectionInspection();
+    // Returns false on failure; with a non-null `errorMessage` the failure is
+    // reported there (dialog-free), otherwise via showError (interactive).
+    bool rebuildIntersectionInspection(QString* errorMessage = nullptr);
     bool updateIntersectionFollowSlice(bool sourceSideFlag,
                                        double linePosition,
                                        const char* reason);
@@ -593,4 +661,8 @@ private:
     std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
+    // Agent-bridge headless error reporting (setErrorDialogsSuppressed).
+    // _lastSuppressedError is mutable because showError() is const.
+    bool _errorDialogsSuppressed = false;
+    mutable QString _lastSuppressedError;
 };

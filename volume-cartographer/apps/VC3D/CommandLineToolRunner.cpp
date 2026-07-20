@@ -147,6 +147,11 @@ void CommandLineToolRunner::setRenderVoxelSize(double voxelSizeUm, bool enabled)
     _useRenderVoxelSize = enabled && std::isfinite(voxelSizeUm) && voxelSizeUm > 0.0;
 }
 
+void CommandLineToolRunner::setRenderOutputFormat(RenderOutputFormat format)
+{
+    _renderOutputFormat = format;
+}
+
 void CommandLineToolRunner::setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment)
 {
     setVolumePath(volumePath);
@@ -607,7 +612,10 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
     switch (tool) {
         case Tool::RenderTifXYZ:
             args << "--volume" << _volumePath
-                 << "--tif-output" << _outputPattern
+                 << (_renderOutputFormat == RenderOutputFormat::Zarr
+                         ? QStringLiteral("--zarr-output")
+                         : QStringLiteral("--tif-output"))
+                 << _outputPattern
                  << "--segmentation" << _segmentPath
                  << "--scale" << QString::number(_scale)
                  << "--group-idx" << QString::number(_resolution)

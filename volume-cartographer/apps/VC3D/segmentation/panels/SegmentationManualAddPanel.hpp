@@ -20,6 +20,11 @@ public:
 
     [[nodiscard]] ManualAddTool::Config config() const;
     ManualAddTool::LinePreviewMode cycleLinePreviewMode();
+    // Set the line-preview / interpolation combos directly (agent-bridge, SPEC
+    // §9.4/§9.5). Selecting a value emits configChanged through the same path a
+    // human combo change takes. Returns the effective mode.
+    ManualAddTool::LinePreviewMode setLinePreviewMode(ManualAddTool::LinePreviewMode mode);
+    ManualAddTool::InterpolationMode setInterpolationMode(ManualAddTool::InterpolationMode mode);
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool manualAddActive);
 

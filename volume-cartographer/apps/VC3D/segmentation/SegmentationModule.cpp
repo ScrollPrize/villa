@@ -2163,6 +2163,48 @@ bool SegmentationModule::finishManualAdd(bool apply)
     return true;
 }
 
+bool SegmentationModule::setManualAddModeActive(bool active, bool apply)
+{
+    if (active) {
+        return beginManualAdd();
+    }
+    return finishManualAdd(apply);
+}
+
+bool SegmentationModule::undoManualAddConstraint()
+{
+    return undoManualAddPlaneConstraint();
+}
+
+bool SegmentationModule::setCorrectionPointMode(bool active, QString* errorMessage)
+{
+    if (!active) {
+        _correctionDragKeyActive = false;
+        return true;
+    }
+    // Mirror the G-key preconditions (SegmentationModule_Input.cpp handleKeyPress).
+    if (!_editingEnabled) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("editing_disabled");
+        }
+        return false;
+    }
+    if (!_editManager || !_editManager->hasSession()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("no_session");
+        }
+        return false;
+    }
+    if (_growthInProgress) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("growth_in_progress");
+        }
+        return false;
+    }
+    _correctionDragKeyActive = true;
+    return true;
+}
+
 void SegmentationModule::resetManualAddState(bool restorePreview)
 {
     _pendingManualAddTracerMask.release();
@@ -2798,6 +2840,18 @@ void SegmentationModule::stopAllPushPull()
     if (_pushPullTool) {
         _pushPullTool->stopAll();
     }
+}
+
+// Agent-bridge public wrappers (SPEC §15.3) — distinct names, no overload of the
+// private startPushPull(int,...) / stopPushPull(int) / stopAllPushPull().
+bool SegmentationModule::startPushPullMode(int direction, std::optional<bool> alphaOverride)
+{
+    return startPushPull(direction, alphaOverride);
+}
+
+void SegmentationModule::stopPushPullAll()
+{
+    stopAllPushPull();
 }
 
 bool SegmentationModule::applyPushPullStep()

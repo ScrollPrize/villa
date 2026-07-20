@@ -900,10 +900,7 @@ void SurfacePanelController::activateMaterializedSurface(
 {
     _overlaySegmentations.erase(path.string());
     loadSurfaces(true);
-    if (selectSurfaceById(id)) {
-        auto surface = getSurfaceById(id);
-        emit surfaceActivated(QString::fromStdString(id), surface.get());
-    } else {
+    if (!activateSurfaceById(id)) {
         emit statusMessageRequested(
             tr("Segment %1 was fetched, but could not be activated.")
                 .arg(QString::fromStdString(id)),
@@ -1700,6 +1697,72 @@ bool SurfacePanelController::selectSurfaceById(const std::string& surfaceId)
             viewer->setWindowTitle(tr("Surface %1").arg(idQString));
         }
     }
+
+    return true;
+}
+
+bool SurfacePanelController::activateSurfaceById(const std::string& surfaceId,
+                                                 QString* errorMessage)
+{
+    auto fail = [errorMessage](const QString& msg) {
+        if (errorMessage) {
+            *errorMessage = msg;
+        }
+        return false;
+    };
+
+    // 1. Selection lock (held during growth) — refuse headlessly.
+    if (_selectionLocked) {
+        return fail(tr("surface selection is locked while growth runs"));
+    }
+
+    if (!_ui.treeWidget || surfaceId.empty()) {
+        return fail(tr("unknown segment: %1").arg(QString::fromStdString(surfaceId)));
+    }
+
+    // 2. Resolve the tree item and the surface.
+    const QString idQString = QString::fromStdString(surfaceId);
+    QTreeWidgetItem* targetItem = nullptr;
+    QTreeWidgetItemIterator it(_ui.treeWidget);
+    while (*it) {
+        if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQString) {
+            targetItem = *it;
+            break;
+        }
+        ++it;
+    }
+    if (!targetItem) {
+        return fail(tr("unknown segment: %1").arg(idQString));
+    }
+
+    auto surface = getSurfaceById(surfaceId);
+    if (!surface) {
+        return fail(tr("segment %1 could not be loaded").arg(idQString));
+    }
+
+    // 3. Refuse unmaterialized open-data placeholders (no interactive fetch here).
+    if (vc3d::opendata::isOpenDataSegmentPlaceholder(surface->path)) {
+        return fail(tr("segment %1 is an open-data placeholder; fetch it first")
+                        .arg(idQString));
+    }
+
+    // 4. Blocked tree selection — unchanged. The explicit emit below replaces the
+    //    tree signal, so the blocker prevents double activation, not activation.
+    if (!selectSurfaceById(surfaceId)) {
+        return fail(tr("segment %1 could not be selected").arg(idQString));
+    }
+
+    // 5. Sync the named CState entry exactly as handleTreeSelectionChanged does,
+    //    so onSurfaceActivated can resolve multi-folder display ids kept in CState.
+    if (_state && !_state->surface(surfaceId)) {
+        _state->setSurface(surfaceId, surface, true, false);
+    }
+
+    // 6. Emit activation synchronously (direct connection), identical to a click.
+    emit surfaceActivated(idQString, surface.get());
+
+    // 7. Mirror the surfaceJustLoaded tail of handleTreeSelectionChanged.
+    applyFilters();
 
     return true;
 }

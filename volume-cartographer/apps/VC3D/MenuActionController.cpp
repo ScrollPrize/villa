@@ -82,13 +82,18 @@ constexpr int kMaxStoredRemoteUrls = 10;
 QString extractExceptionMessage(const std::exception& e);
 bool isAuthError(const QString& msg);
 
-struct OpenDataOpenTaskResult {
+} // namespace
+
+// .cpp-local definition of the forward-declared nested type (SPEC §18.3). It
+// carries the sample id/segment count so finishOpenDataSampleOpen() can build
+// its status messages without re-resolving the sample.
+struct MenuActionController::OpenDataOpenTaskResult {
     std::shared_ptr<VolumePkg> pkg;
     vc3d::opendata::OpenDataSampleProjectResult result;
     QString error;
+    QString sampleId;
+    qint64 tifxyzSegmentCount{0};
 };
-
-} // namespace
 
 MenuActionController::MenuActionController(CWindow* window)
     : QObject(window)
@@ -489,7 +494,7 @@ bool MenuActionController::isOpenDataCatalogVisible() const
     return _openDataCatalogDialog && _openDataCatalogDialog->isVisible();
 }
 
-bool MenuActionController::openOpenDataSampleById(const QString& sampleId)
+bool MenuActionController::openOpenDataSampleById(const QString& sampleId, bool interactive)
 {
     if (!_window || sampleId.isEmpty()) {
         return false;
@@ -506,16 +511,53 @@ bool MenuActionController::openOpenDataSampleById(const QString& sampleId)
         return false;
     }
 
-    return openOpenDataSample(*sample);
+    return openOpenDataSample(*sample, interactive);
 }
 
-bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample)
+bool MenuActionController::openOpenDataSampleById(
+    const QString& sampleId,
+    const OpenDataSampleOpenOptions& options,
+    QString* errorMessage,
+    vc3d::opendata::OpenDataSampleProjectResult* resultOut)
 {
-    if (!_window || !_window->_state) {
+    if (!_window || sampleId.isEmpty()) {
+        if (errorMessage) *errorMessage = QObject::tr("No sample id provided.");
         return false;
     }
 
-    if (_window->_state->vpkg()) {
+    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    if (!manifest) {
+        if (errorMessage) *errorMessage = QObject::tr("Open Data manifest is unavailable.");
+        return false;
+    }
+
+    const vc3d::opendata::OpenDataSample* sample =
+        manifest->findSample(sampleId.toStdString());
+    if (!sample) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("Unknown sample id: %1").arg(sampleId);
+        return false;
+    }
+
+    return openOpenDataSample(*sample, options.interactive, &options.selection,
+                              errorMessage, resultOut);
+}
+
+bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
+                                             bool interactive,
+                                             const vc3d::opendata::OpenDataResourceSelection* selection,
+                                             QString* errorMessage,
+                                             vc3d::opendata::OpenDataSampleProjectResult* resultOut)
+{
+    if (!_window || !_window->_state) {
+        if (errorMessage) *errorMessage = QObject::tr("No application window available.");
+        return false;
+    }
+
+    // Interactive path only: confirm replacing an already-open project. A
+    // non-interactive (agent-bridge) call is treated as explicit consent to
+    // replace, and must never spin a nested event loop (SPEC §1.3, §8.2).
+    if (interactive && _window->_state->vpkg()) {
         QMessageBox prompt(_window);
         prompt.setWindowTitle(QObject::tr("Open Data Sample"));
         prompt.setText(QObject::tr("Open sample %1").arg(QString::fromStdString(sample.id)));
@@ -531,13 +573,98 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         }
     }
 
+    // In-flight guard (SPEC §18.3): a second overlapping open must never
+    // interleave CloseVolume/setVpkg with a still-running open. This is the only
+    // remaining path that spins a nested event loop, and it is interactive-only
+    // (never reachable from the bridge, SPEC §18.5).
+    if (_openDataSampleOpenInFlight) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("An Open Data sample open is already in progress.");
+        return false;
+    }
+
+    OpenDataSampleOpenOutcome outcome;
+    QEventLoop loop;
+    beginOpenDataSampleOpenTask(
+        sample, interactive, selection,
+        [&outcome, &loop](const OpenDataSampleOpenOutcome& o) {
+            outcome = o;
+            loop.quit();
+        },
+        {});
+    loop.exec(QEventLoop::ExcludeUserInputEvents);
+
+    if (errorMessage && !outcome.success) *errorMessage = outcome.error;
+    if (resultOut && outcome.success) *resultOut = outcome.result;
+    return outcome.success;
+}
+
+bool MenuActionController::startOpenDataSampleOpen(
+    const QString& sampleId,
+    const OpenDataSampleOpenOptions& options,
+    std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
+    std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress,
+    QString* errorMessage)
+{
+    if (!_window || !_window->_state) {
+        if (errorMessage) *errorMessage = QObject::tr("No application window available.");
+        return false;
+    }
+    if (sampleId.isEmpty()) {
+        if (errorMessage) *errorMessage = QObject::tr("No sample id provided.");
+        return false;
+    }
+    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    if (!manifest) {
+        if (errorMessage) *errorMessage = QObject::tr("Open Data manifest is unavailable.");
+        return false;
+    }
+    const vc3d::opendata::OpenDataSample* sample =
+        manifest->findSample(sampleId.toStdString());
+    if (!sample) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("Unknown sample id: %1").arg(sampleId);
+        return false;
+    }
+    if (_openDataSampleOpenInFlight) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("An Open Data sample open is already in progress.");
+        return false;
+    }
+
+    // Always non-interactive from the bridge (SPEC §8.2/§18.3): no nested event
+    // loop, no blocking UI. Completion is delivered solely via onFinished on the
+    // GUI thread. `options.selection` is passed by pointer; a default-constructed
+    // selection means attach everything (SPEC §10.3).
+    beginOpenDataSampleOpenTask(*sample, /*interactive=*/false, &options.selection,
+                                std::move(onFinished), std::move(onProgress));
+    return true;
+}
+
+bool MenuActionController::openDataSampleOpenInFlight() const
+{
+    return _openDataSampleOpenInFlight;
+}
+
+void MenuActionController::beginOpenDataSampleOpenTask(
+    const vc3d::opendata::OpenDataSample& sample,
+    bool interactive,
+    const vc3d::opendata::OpenDataResourceSelection* selection,
+    std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
+    std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress)
+{
     const QString cacheDir = vc3d::remoteCachePath();
     const vc3d::opendata::OpenDataSample sampleCopy = sample;
+    // Copy the selection by value so the worker thread never dereferences a
+    // caller-owned pointer; a null selection means attach everything (SPEC §10.3).
+    const bool hasSelection = selection != nullptr;
+    const vc3d::opendata::OpenDataResourceSelection selectionCopy =
+        selection ? *selection : vc3d::opendata::OpenDataResourceSelection{};
     cancelOpenDataVolumePrefills();
     _window->CloseVolume();
 
     QPointer<QProgressDialog> progressDialog;
-    if (sampleCopy.tifxyzSegmentCount() > 0) {
+    if (interactive && sampleCopy.tifxyzSegmentCount() > 0) {
         auto* dialog = new QProgressDialog(
             QObject::tr("Preparing segment downloads..."),
             QString(),
@@ -554,8 +681,23 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         progressDialog = dialog;
     }
 
+    // Forward the same progress stream both to the interactive dialog (when
+    // present) and to the caller's onProgress callback, marshalled to the GUI
+    // thread and guarded by a QPointer liveness check on this (SPEC §18.3).
+    QPointer<MenuActionController> self(this);
     auto progressCallback =
-        [progressDialog](const vc3d::opendata::OpenDataSampleDownloadProgress& progress) {
+        [progressDialog, self, onProgress](
+            const vc3d::opendata::OpenDataSampleDownloadProgress& progress) {
+            if (onProgress) {
+                QMetaObject::invokeMethod(
+                    qApp,
+                    [self, onProgress, progress]() {
+                        if (self && onProgress) {
+                            onProgress(progress);
+                        }
+                    },
+                    Qt::QueuedConnection);
+            }
             if (!progressDialog) {
                 return;
             }
@@ -630,21 +772,46 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
                 Qt::QueuedConnection);
         };
 
-    QFutureWatcher<OpenDataOpenTaskResult> watcher;
-    QEventLoop loop;
-    QObject::connect(&watcher,
-                     &QFutureWatcher<OpenDataOpenTaskResult>::finished,
-                     &loop,
-                     &QEventLoop::quit);
-    watcher.setFuture(QtConcurrent::run(
-        [sampleCopy, cacheDir, progressCallback]() mutable {
+    // Heap watcher parented to this (SPEC §18.3): no QEventLoop on this path.
+    // Its finished slot runs on the GUI thread, clears the in-flight flag, runs
+    // the epilogue, and finally calls onFinished. A QtConcurrent open task cannot
+    // be interrupted; if the app exits mid-open the parented watcher's connection
+    // dies and the result is simply discarded.
+    auto* watcher = new QFutureWatcher<OpenDataOpenTaskResult>(this);
+    connect(watcher,
+            &QFutureWatcher<OpenDataOpenTaskResult>::finished,
+            this,
+            [this, watcher, progressDialog, interactive,
+             onFinished = std::move(onFinished)]() mutable {
+                OpenDataOpenTaskResult task = watcher->result();
+                if (progressDialog) {
+                    progressDialog->close();
+                    progressDialog->deleteLater();
+                }
+                _openDataSampleOpenInFlight = false;
+                watcher->deleteLater();
+
+                OpenDataSampleOpenOutcome outcome;
+                finishOpenDataSampleOpen(std::move(task), interactive, &outcome);
+                if (onFinished) {
+                    onFinished(outcome);
+                }
+            });
+
+    _openDataSampleOpenInFlight = true;
+    watcher->setFuture(QtConcurrent::run(
+        [sampleCopy, cacheDir, progressCallback, hasSelection, selectionCopy]() mutable {
             OpenDataOpenTaskResult taskResult;
+            taskResult.sampleId = QString::fromStdString(sampleCopy.id);
+            taskResult.tifxyzSegmentCount =
+                static_cast<qint64>(sampleCopy.tifxyzSegmentCount());
             try {
                 taskResult.pkg = vc3d::opendata::createOpenDataSampleProject(
                     sampleCopy,
                     cacheDir.toStdString(),
                     &taskResult.result,
-                    progressCallback);
+                    progressCallback,
+                    hasSelection ? &selectionCopy : nullptr);
             } catch (const std::exception& e) {
                 taskResult.error = QString::fromUtf8(e.what());
             } catch (...) {
@@ -652,63 +819,80 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
             }
             return taskResult;
         }));
-    if (!watcher.isFinished()) {
-        loop.exec(QEventLoop::ExcludeUserInputEvents);
-    }
-    OpenDataOpenTaskResult task = watcher.result();
-    if (progressDialog) {
-        progressDialog->close();
-        progressDialog->deleteLater();
-    }
+}
+
+void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
+                                                    bool interactive,
+                                                    OpenDataSampleOpenOutcome* outcomeOut)
+{
+    const QString sampleId = task.sampleId;
 
     if (!task.error.isEmpty()) {
-        QMessageBox::warning(
-            _window,
-            QObject::tr("Open Data Sample"),
-            QObject::tr("Failed to open sample %1:\n\n%2")
-                .arg(QString::fromStdString(sampleCopy.id), task.error));
-        return false;
+        if (interactive) {
+            QMessageBox::warning(
+                _window,
+                QObject::tr("Open Data Sample"),
+                QObject::tr("Failed to open sample %1:\n\n%2")
+                    .arg(sampleId, task.error));
+        }
+        if (outcomeOut) {
+            outcomeOut->success = false;
+            outcomeOut->error = task.error;
+        }
+        return;
     }
 
     vc3d::opendata::OpenDataSampleProjectResult result = std::move(task.result);
 
     auto pkg = std::move(task.pkg);
     if (!pkg) {
-        QMessageBox::warning(
-            _window,
-            QObject::tr("Open Data Sample"),
-            QObject::tr("Failed to create sample project for %1.")
-                .arg(QString::fromStdString(sampleCopy.id)));
-        return false;
+        const QString msg =
+            QObject::tr("Failed to create sample project for %1.").arg(sampleId);
+        if (interactive) {
+            QMessageBox::warning(
+                _window, QObject::tr("Open Data Sample"), msg);
+        }
+        if (outcomeOut) {
+            outcomeOut->success = false;
+            outcomeOut->error = msg;
+        }
+        return;
     }
-    _window->_state->setVpkg(pkg);
+
+    if (_window && _window->_state) {
+        _window->_state->setVpkg(pkg);
+    }
     if (!pkg->path().empty()) {
         updateRecentVolpkgList(QString::fromStdString(pkg->path().string()));
     }
 
-    _window->refreshCurrentVolumePackageUi(
-        QString::fromStdString(result.preferredVolumeId),
-        true);
-    _window->UpdateView();
-    startOpenDataVolumePrefill(_window->_state ? _window->_state->currentVolume() : nullptr);
+    if (_window) {
+        _window->refreshCurrentVolumePackageUi(
+            QString::fromStdString(result.preferredVolumeId),
+            true);
+        _window->UpdateView();
+    }
+    startOpenDataVolumePrefill(
+        _window && _window->_state ? _window->_state->currentVolume() : nullptr);
 
     QString message = QObject::tr("Sample %1: attached %2 of %3 supported volume entries.")
-                          .arg(QString::fromStdString(sampleCopy.id))
+                          .arg(sampleId)
                           .arg(result.attachedVolumeEntries)
                           .arg(result.supportedVolumes);
-    if (sampleCopy.tifxyzSegmentCount() > 0) {
+    if (task.tifxyzSegmentCount > 0) {
         message += QObject::tr(" Cached %1 of %2 tifxyz segments; attached %3 segment source(s).")
                        .arg(result.cachedTifxyzSegments)
                        .arg(result.supportedTifxyzSegments)
                        .arg(result.attachedSegmentEntries);
     }
-    if (_window->statusBar()) {
+    if (_window && _window->statusBar()) {
         _window->showStatusBarMessage(message, 7000);
     }
 
-    if (result.supportedVolumes == 0 ||
-        result.failedVolumes > 0 ||
-        result.failedTifxyzSegments > 0) {
+    if (interactive &&
+        (result.supportedVolumes == 0 ||
+         result.failedVolumes > 0 ||
+         result.failedTifxyzSegments > 0)) {
         QString details;
         for (const auto& item : result.messages) {
             if (!details.isEmpty()) {
@@ -722,7 +906,10 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
             details.isEmpty() ? message : message + QObject::tr("\n\n%1").arg(details));
     }
 
-    return true;
+    if (outcomeOut) {
+        outcomeOut->success = true;
+        outcomeOut->result = std::move(result);
+    }
 }
 
 void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume)
@@ -770,16 +957,27 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
             this,
             [this, watcher, cancelFlag, volumeId]() {
                 vc3d::opendata::OpenDataVolumePrefillResult result;
-                try {
-                    result = watcher->result();
-                } catch (const std::exception& e) {
-                    result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                // Fix A (SPEC §18.2): calling result() on a canceled QFuture is
+                // undefined behavior (the result is never stored) -- the actual
+                // 0x28 SIGSEGV. cancelOpenDataVolumePrefills() cancels this
+                // watcher on every open; the stale finished signal then arrives
+                // on the main loop. Check cancellation BEFORE touching result().
+                if (watcher->isCanceled()) {
+                    result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Cancelled;
                     result.volumeId = volumeId.toStdString();
-                    result.message = e.what();
-                } catch (...) {
-                    result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
-                    result.volumeId = volumeId.toStdString();
-                    result.message = "unknown error";
+                    result.message = "cancelled before completion";
+                } else {
+                    try {
+                        result = watcher->result();
+                    } catch (const std::exception& e) {
+                        result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                        result.volumeId = volumeId.toStdString();
+                        result.message = e.what();
+                    } catch (...) {
+                        result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                        result.volumeId = volumeId.toStdString();
+                        result.message = "unknown error";
+                    }
                 }
 
                 _openDataPrefillWatchers.erase(

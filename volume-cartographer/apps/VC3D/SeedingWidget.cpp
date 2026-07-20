@@ -635,7 +635,8 @@ void SeedingWidget::onPreviewRaysClicked()
 
     POI* focus_poi = _state->poi("focus");
     if (!focus_poi) {
-        QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before previewing rays.");
+        if (!_dialogsSuppressed)
+            QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before previewing rays.");
         return;
     }
 
@@ -682,7 +683,8 @@ void SeedingWidget::onCastRaysClicked()
     if (_castRaysWasPointMode) {
         POI* focusPoi = _state ? _state->poi("focus") : nullptr;
         if (!focusPoi) {
-            QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before casting rays.");
+            if (!_dialogsSuppressed)
+                QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before casting rays.");
             return;
         }
     } else {

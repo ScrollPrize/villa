@@ -1886,6 +1886,12 @@ void SegmentationLasagnaPanel::repeatLastLasagnaAction()
     launchLasagnaMode(_lastLasagnaMode);
 }
 
+bool SegmentationLasagnaPanel::repeatLastLasagnaActionHeadless(CState* state, QString* errorMessage)
+{
+    return startOptimizationHeadless(state, _lastLasagnaMode, QString(), std::nullopt,
+                                      QString(), errorMessage);
+}
+
 void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* statusBar)
 {
     startOptimizationWithOverrides(state, statusBar, -1, QString(), false, 0, 0, 0);
@@ -1935,6 +1941,98 @@ void SegmentationLasagnaPanel::startOptimizationAtSeed(CState* state,
         state, statusBar, static_cast<int>(mode), configPath, true, seedX, seedY, seedZ);
 }
 
+bool SegmentationLasagnaPanel::startOptimizationHeadless(CState* state,
+                                                         LasagnaMode mode,
+                                                         const QString& configPath,
+                                                         std::optional<cv::Vec3i> seed,
+                                                         const QString& atlasPath,
+                                                         QString* errorMessage)
+{
+    auto fail = [errorMessage](const QString& msg) {
+        if (errorMessage) {
+            *errorMessage = msg;
+        }
+        return false;
+    };
+
+    _lastLasagnaMode = mode;
+
+    // Apply an explicit atlas selection before resolving/validating (SPEC §11.4).
+    if (!atlasPath.isEmpty()) {
+        setSelectedAtlasPath(atlasPath);
+    }
+
+    // Resolve the config path (empty => panel selection for the mode). Validate
+    // with plain QFileInfo -- NOT validateLasagnaConfigPath, which pops a
+    // QMessageBox (the headless path must never open a dialog, SPEC §1.3).
+    const QString resolvedConfig = configPath.isEmpty()
+        ? selectedLasagnaConfigPathForMode(mode)
+        : configPath;
+    {
+        const QFileInfo info(resolvedConfig);
+        if (resolvedConfig.isEmpty() || !info.exists() || !info.isFile()) {
+            return fail(QStringLiteral("Lasagna config file not found: %1")
+                            .arg(resolvedConfig.isEmpty()
+                                     ? QStringLiteral("(none selected)")
+                                     : resolvedConfig));
+        }
+    }
+
+    // For atlas mode the config lives in _atlasConfigFilePath and the atlas dir
+    // in _atlasDirPath; validate both (metadata.json required) up front.
+    if (mode == LasagnaMode::Atlas) {
+        if (!configPath.isEmpty()) {
+            _atlasConfigFilePath = resolvedConfig;
+        }
+        const QString atlasDir = selectedAtlasPath();
+        const QFileInfo dirInfo(atlasDir);
+        const QFileInfo metaInfo(QDir(atlasDir).filePath(QStringLiteral("metadata.json")));
+        if (atlasDir.isEmpty() || !dirInfo.exists() || !dirInfo.isDir() ||
+            !metaInfo.exists() || !metaInfo.isFile()) {
+            return fail(QStringLiteral("Atlas not found or missing metadata.json: %1")
+                            .arg(atlasDir.isEmpty() ? QStringLiteral("(none selected)")
+                                                    : atlasDir));
+        }
+    }
+
+    // The bridge drives ensure_service separately; require a live service here so
+    // a submission failure is reported via errorMessage rather than the deeper
+    // dialog paths inside startOptimizationWithOverrides (SPEC §11.4 -> -32005).
+    auto& mgr = LasagnaServiceManager::instance();
+    if (!mgr.isRunning()) {
+        return fail(QStringLiteral("lasagna service is not running"));
+    }
+
+    int seedX = 0;
+    int seedY = 0;
+    int seedZ = 0;
+    const bool hasSeed = seed.has_value();
+    if (hasSeed) {
+        seedX = (*seed)[0];
+        seedY = (*seed)[1];
+        seedZ = (*seed)[2];
+    }
+
+    _headlessSubmissionMade = false;
+    _suppressInteractiveDialogs = true;
+    if (mode == LasagnaMode::Atlas) {
+        // Atlas mode ignores the seed override (it derives seeds from the atlas).
+        startAtlasOptimization(state, nullptr);
+    } else {
+        startOptimizationWithOverrides(state, nullptr, static_cast<int>(mode),
+                                       resolvedConfig, hasSeed, seedX, seedY, seedZ);
+    }
+    _suppressInteractiveDialogs = false;
+
+    if (!_headlessSubmissionMade) {
+        return fail(QStringLiteral(
+            "Lasagna optimization submission failed before reaching the service "
+            "(unreadable or malformed settings file, missing data input, or "
+            "missing seed/model -- see console log for detail)"));
+    }
+    return true;
+}
+
 QString SegmentationLasagnaPanel::selectedLasagnaConfigPathForMode(LasagnaMode mode) const
 {
     return (mode == LasagnaMode::NewModel) ? _newModelConfigFilePath
@@ -1980,7 +2078,9 @@ void SegmentationLasagnaPanel::showLasagnaConfigError(const QString& message,
         _progressLabel->setVisible(true);
     }
 #ifndef VC_TEST_DISABLE_LASAGNA_DIALOGS
-    QMessageBox::warning(this, tr("Lasagna config error"), message);
+    if (!_suppressInteractiveDialogs) {
+        QMessageBox::warning(this, tr("Lasagna config error"), message);
+    }
 #endif
 }
 
@@ -2223,6 +2323,7 @@ void SegmentationLasagnaPanel::startAtlasOptimization(CState* state, QStatusBar*
               << std::endl;
 
     mgr.startOptimization(request, outputDir);
+    _headlessSubmissionMade = true;
     _submittedOutputNames.insert(outputName);
     showStatus(tr("Lasagna atlas optimization started. Output: %1").arg(outputName), 3000);
 }
@@ -2804,6 +2905,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
               << std::endl;
 
     mgr.startOptimization(request, outputDir);
+    _headlessSubmissionMade = true;
     if (!outputName.isEmpty()) {
         _submittedOutputNames.insert(outputName);
     }

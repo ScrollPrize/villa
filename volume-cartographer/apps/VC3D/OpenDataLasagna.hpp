@@ -53,10 +53,13 @@ struct ResolvedOpenDataLasagna {
     const std::filesystem::path& remoteCacheRoot,
     std::string* errorOut = nullptr);
 
+// `selection` (SPEC §10.3) optionally restricts which volumes/lasagna
+// representations attach; nullptr preserves attach-everything behavior.
 int attachOpenDataLasagna(VolumePkg& pkg,
                           const OpenDataSample& sample,
                           const std::filesystem::path& remoteCacheRoot,
-                          std::vector<std::string>* messages = nullptr);
+                          std::vector<std::string>* messages = nullptr,
+                          const OpenDataResourceSelection* selection = nullptr);
 
 [[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaForVolume(
     const VolumePkg& pkg,

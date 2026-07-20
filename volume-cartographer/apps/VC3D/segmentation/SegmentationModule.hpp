@@ -187,6 +187,34 @@ public:
     [[nodiscard]] cv::Mat takePendingManualAddTracerMask();
     bool applyManualAddTracerPreview(QuadSurface* surface);
 
+    // --- Agent-bridge public wrappers (SPEC §9.2–9.7) ---
+    // Enter/leave manual-add (hole-fill) mode without a keypress, delegating to
+    // the private beginManualAdd()/finishManualAdd(apply). With active==true
+    // returns whether the mode is active afterward (beginManualAdd is itself
+    // idempotent); with active==false returns finishManualAdd(apply)'s applied
+    // flag.
+    bool setManualAddModeActive(bool active, bool apply = true);
+    // Public wrapper for undoManualAddPlaneConstraint() (SPEC §9.6): removes the
+    // most recently placed user plane constraint, returns false when there was
+    // none to remove.
+    bool undoManualAddConstraint();
+    // Toggle correction-point authoring mode (the G-key flag) without a keypress
+    // (SPEC §9.7). When activating, enforces the same preconditions as the key
+    // handler (editing enabled, active edit session, no growth in progress); on
+    // failure returns false and, when errorMessage is non-null, sets it to a
+    // machine tag ("editing_disabled" | "no_session" | "growth_in_progress").
+    // Deactivating always succeeds. Unlike the key, the mode is not auto-cleared
+    // on mouse release.
+    bool setCorrectionPointMode(bool active, QString* errorMessage = nullptr);
+    [[nodiscard]] bool correctionPointMode() const { return _correctionDragKeyActive; }
+    // Public wrappers for Gaussian push/pull (SPEC §15.3). Distinct names (not a
+    // same-name overload of the private startPushPull/stopAllPushPull) so no
+    // connect()/overload ambiguity can arise. startPushPullMode returns the bool
+    // from startPushPull (false when there is no valid hover target / no session);
+    // stopPushPull forwards to stopAllPushPull.
+    bool startPushPullMode(int direction, std::optional<bool> alphaOverride = std::nullopt);
+    void stopPushPullAll();
+
 public slots:
     void setSelectedAnnotationCollection(uint64_t collectionId);
 

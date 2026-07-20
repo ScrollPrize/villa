@@ -16,6 +16,7 @@ namespace vc3d::opendata {
 struct OpenDataArtifact;
 struct OpenDataSample;
 struct OpenDataVolume;
+struct OpenDataResourceSelection;
 
 inline constexpr std::string_view kNormalGridsArtifactType = "normal-grids";
 inline constexpr std::string_view kOpenDataSampleIdTagPrefix = "vc-open-data-sample-id:";
@@ -64,10 +65,13 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
                                      const std::filesystem::path& remoteCacheRoot);
 
 // Set up streaming normal grids for every volume of this sample that has a
-// normal-grids artifact. Returns the number of entries attached.
+// normal-grids artifact. Returns the number of entries attached. `selection`
+// (SPEC §10.3) optionally restricts which volumes/normal-grid representations
+// attach; nullptr preserves the historical attach-everything behavior.
 int attachOpenDataNormalGrids(VolumePkg& pkg,
                               const OpenDataSample& sample,
-                              const std::filesystem::path& remoteCacheRoot);
+                              const std::filesystem::path& remoteCacheRoot,
+                              const OpenDataResourceSelection* selection = nullptr);
 
 // On-disk cache state of one volume's normal grids.
 struct NormalGridsCacheState {

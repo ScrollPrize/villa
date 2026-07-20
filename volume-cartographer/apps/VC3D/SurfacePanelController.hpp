@@ -118,6 +118,14 @@ public:
 
     void syncSelectionUi(const std::string& surfaceId, QuadSurface* surface);
     bool selectSurfaceById(const std::string& surfaceId);
+    /// Programmatically activate a segment: select it in the tree (signals blocked,
+    /// via selectSurfaceById) and then emit surfaceActivated exactly as a live click
+    /// would, reaching CWindow::onSurfaceActivated. Never shows UI. Returns false with
+    /// a reason in *errorMessage when the id is unknown, the surface cannot be loaded,
+    /// the segment is an unmaterialized open-data placeholder, or the selection is
+    /// locked while growth runs.
+    bool activateSurfaceById(const std::string& surfaceId,
+                             QString* errorMessage = nullptr);
     void resetTagUi();
 
     bool isCurrentOnlyFilterEnabled() const;
