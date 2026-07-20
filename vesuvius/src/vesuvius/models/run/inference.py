@@ -214,6 +214,13 @@ def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) 
 MASKABLE_ACTIVATIONS = ('sigmoid', 'softmax')
 
 
+def _is_maskable_activation(activation):
+    """True when a target's configured activation implies classification
+    semantics. Case-insensitive, matching how activation strings are treated
+    elsewhere in villa (e.g. utils/plotting.py); None/unknown is not maskable."""
+    return isinstance(activation, str) and activation.lower() in MASKABLE_ACTIVATIONS
+
+
 def apply_empty_input_mask(output_batch, zero_mask, is_multi_task=False,
                            target_info=None, num_classes=None):
     """Force background logits where the raw input volume is 0 (issue #1114).
@@ -224,15 +231,15 @@ def apply_empty_input_mask(output_batch, zero_mask, is_multi_task=False,
     class 0 the background (driven up, others down).
 
     When per-target configs are available (train.py checkpoints), only
-    targets whose activation is in MASKABLE_ACTIVATIONS are masked and
-    continuous/regression heads are left untouched. Without target configs
+    targets whose activation matches MASKABLE_ACTIVATIONS (case-insensitive)
+    are masked and continuous/regression heads are left untouched. Without target configs
     (nnUNet or external ResNet loaders) the output is a segmentation or
     classification head by construction, so channel count alone selects
     the convention.
     """
     if is_multi_task and target_info:
         for _, info in target_info.items():
-            if info.get('activation') not in MASKABLE_ACTIVATIONS:
+            if not _is_maskable_activation(info.get('activation')):
                 continue
             s = info['start_channel']
             e = info.get('end_channel', s + 1)
@@ -545,10 +552,13 @@ class Inferer():
         # semantics; tell the user up front which targets will be skipped.
         if self.mask_empty_input and self.is_multi_task and self.target_info:
             skipped = [name for name, info in self.target_info.items()
-                       if info.get('activation') not in MASKABLE_ACTIVATIONS]
+                       if not _is_maskable_activation(info.get('activation'))]
             if skipped:
                 print(f"mask_empty_input: skipping non-classification target(s) {skipped} "
                       f"(no background class; only sigmoid/softmax heads are masked)")
+                if len(skipped) == len(self.target_info):
+                    print("mask_empty_input: no maskable targets found - "
+                          "masking will have no effect for this model")
 
         return model
     

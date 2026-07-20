@@ -10,9 +10,11 @@ covered in test_blending_normalization.py.
 
 import inspect
 import math
+import sys
 
 import torch
 
+from vesuvius.models.run import inference
 from vesuvius.models.run.inference import (
     Inferer,
     MASKABLE_ACTIVATIONS,
@@ -31,6 +33,45 @@ SATURATION = 20.0
 def test_mask_empty_input_is_opt_in():
     sig = inspect.signature(Inferer.__init__)
     assert sig.parameters["mask_empty_input"].default is False
+
+
+def test_main_forwards_mask_empty_input(monkeypatch, tmp_path):
+    """The CLI flag must actually reach Inferer, and default to off without it
+    (mirrors test_main_accepts_input_anon in test_inference_legacy_checkpoint)."""
+    captured = {}
+    logits_path = tmp_path / "logits_part_0.zarr"
+    coords_path = tmp_path / "coordinates_part_0.zarr"
+    logits_path.mkdir()
+    coords_path.mkdir()
+
+    class FakeInferer:
+        skip_empty_patches = False
+        dataset = None
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def infer(self):
+            return str(logits_path), str(coords_path)
+
+    monkeypatch.setattr(inference, "Inferer", FakeInferer)
+    base_argv = [
+        "vesuvius.predict",
+        "--model_path", str(tmp_path / "model.pth"),
+        "--input_dir", str(tmp_path / "in.zarr"),
+        "--output_dir", str(tmp_path / "out"),
+        "--max_patches", "1",
+        "--device", "cpu",
+    ]
+
+    monkeypatch.setattr(sys, "argv", base_argv + ["--mask_empty_input"])
+    assert inference.main() == 0
+    assert captured["mask_empty_input"] is True
+
+    captured.clear()
+    monkeypatch.setattr(sys, "argv", list(base_argv))
+    assert inference.main() == 0
+    assert captured["mask_empty_input"] is False
 
 
 def _make_target_info(specs):
@@ -127,6 +168,23 @@ def test_single_task_conventions_without_target_info():
     apply_empty_input_mask(output, zero_mask, num_classes=3)
     assert (output[:, 0] == SATURATION).all()
     assert (output[:, 1:] == -SATURATION).all()
+
+
+def test_activation_matching_is_case_insensitive():
+    """Cased activation strings appear in configs and are lowercased elsewhere
+    in villa (cf. utils/plotting.py); the masking gate must tolerate them."""
+    torch.manual_seed(3)
+    output = torch.randn(2, 3, 4, 4, 4)
+    zero_mask = torch.ones(2, 1, 4, 4, 4, dtype=torch.bool)
+    target_info = _make_target_info([("ink", 1, "Sigmoid"), ("damage", 2, "SOFTMAX")])
+
+    apply_empty_input_mask(
+        output, zero_mask, is_multi_task=True, target_info=target_info, num_classes=3
+    )
+
+    assert (output[:, 0] == -SATURATION).all()
+    assert (output[:, 1] == SATURATION).all()
+    assert (output[:, 2] == -SATURATION).all()
 
 
 def test_maskable_activations_are_classification_only():
