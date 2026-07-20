@@ -70,7 +70,9 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [llfio-chunkloader](https://github.com/climbmax123/LLFIOCunkloadingTestingAndBenching): A method to access data in chunks of (x,y,z) that is much faster and more compute-efficient than Zarr. (Written in C++ but it is possible to integrate in Python).
 
-- [preprocessed-data](https://github.com/usc-caisplusplus/scroll-data-preprocessing): Data preprocessing code and a fully processed version of the dataset in .zarr format to allow for faster training of ink detection models. 
+- [preprocessed-data](https://github.com/usc-caisplusplus/scroll-data-preprocessing): Data preprocessing code and a fully processed version of the dataset in .zarr format to allow for faster training of ink detection models.
+
+- [scroll-mcp-server](https://github.com/zengdard/scroll-mcp-server): MCP server exposing the Vesuvius papyrological corpus as adressable resources (`scroll://` URIs). Includes automated mesh quality audit (`analyze_mesh_quality`) producing structured reports with 🔴 critical drift zones, 🟡 wiggle detection, 🟢 anchor zones, and prioritized active learning tickets. Integrates with OpenCode, Claude Code, and Discord bots. By zengdard
 
 ## Segmentation
 
@@ -165,6 +167,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
   
 - [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
     - [GPU-accelerated MLS projection for ScrollFiesta](https://github.com/pscamillo/scrollfiesta_public/blob/cuda-mls/BENCHMARKS.md) by pscamillo — OpenMP + CUDA FP32 acceleration, byte-identical, ~6x throughput.
+
+- [scroll-label-refiner](https://github.com/zengdard/scroll-label-refiner): Automatic mesh refinement pipeline that snaps VC3D/ThaumatoAnakalyptor meshes to CT gradient peaks. Includes gradient-guided snapping (`SnapEngine`), quality audit (`audit_mesh_quality`), active learning ticket generation, napari annotation plugin, and reproducible benchmarks (43.8% improvement on real Scroll 1 data). By zengdard
       
 ### 📦 Materials
 
