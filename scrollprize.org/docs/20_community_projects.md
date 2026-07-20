@@ -70,6 +70,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [llfio-chunkloader](https://github.com/climbmax123/LLFIOCunkloadingTestingAndBenching): A method to access data in chunks of (x,y,z) that is much faster and more compute-efficient than Zarr. (Written in C++ but it is possible to integrate in Python).
 
+- [Volume read cache + chunk-size study](https://github.com/ScrollPrize/villa/pull/1177) by Prasad Khake. Fixes zarr-3 breakage in the Python `vesuvius` `Volume` (multiscale reads raised `TypeError` under the pinned zarr) and adds an opt-in LRU chunk cache — repeated reads of a region are served from memory (~300× faster, byte-identical, off by default) instead of re-fetched, restoring the caching lost when zarr 3 removed `LRUStoreCache`. Includes a measured chunk-size × access-pattern study: read amplification (bytes fetched vs. requested) swings from 1.3× to 176× depending on chunk geometry and access pattern (random patches / z-slices / sequential tracing), giving a basis for choosing chunk shape per workload rather than by opinion.
+
 - [preprocessed-data](https://github.com/usc-caisplusplus/scroll-data-preprocessing): Data preprocessing code and a fully processed version of the dataset in .zarr format to allow for faster training of ink detection models. 
 
 ## Segmentation
