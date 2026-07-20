@@ -6,7 +6,9 @@ Transfers run through rclone (parallel, one process per batch) when the rclone
 binary is available, and fall back to serial per-file aws CLI calls otherwise.
 Neither path needs an rclone config file: credentials come from the standard
 AWS credential chain (env vars pasted into the terminal, ~/.aws/credentials,
-or EC2 instance roles).
+or EC2 instance roles). Where possible, the credentials the aws CLI resolved
+are handed to rclone as static env vars (via `aws configure export-credentials`)
+so both tools use the same identity and rclone never resolves its own.
 
 Automatically ignores:
 - Hidden files and directories (starting with .)
@@ -53,6 +55,7 @@ Hugging Face sync (hfsync):
 import os
 import sys
 import json
+import shlex
 import shutil
 import sqlite3
 import argparse
@@ -712,18 +715,83 @@ class S3SyncManager:
         env_auth=true uses the standard AWS credential chain, so this works
         both with credentials pasted into the terminal (env vars) and with
         EC2 instance roles — same sources as the aws CLI.
+
+        no_head=true skips rclone's post-upload verification HEAD. On a
+        versioned bucket that HEAD targets the new object's versionId, which
+        needs the s3:GetObjectVersion permission — credentials without it
+        (but with Get/Put/List) see every upload 403 on rclone's first
+        attempt even though the PUT itself succeeded. The batch methods below
+        verify every upload themselves against fresh S3 metadata, so
+        rclone's HEAD is redundant here.
         """
-        return f":s3,provider=AWS,env_auth=true,no_check_bucket=true:{self.s3_bucket}/{self.s3_prefix}"
+        return (f":s3,provider=AWS,env_auth=true,no_check_bucket=true,"
+                f"no_head=true:{self.s3_bucket}/{self.s3_prefix}")
 
     def _rclone_env(self):
-        """Environment for rclone subprocesses, mirroring aws CLI credential/region config"""
+        """Environment for rclone subprocesses, mirroring aws CLI credential/region config.
+
+        When the aws CLI can export the credentials it resolved (cached SSO /
+        assume-role sessions, instance-role creds from IMDS, pasted env vars),
+        they are injected as static env vars so rclone uses the exact identity
+        the scan phase just used. rclone resolving credentials on its own is a
+        known source of transient 403s (flaky IMDS fetches, fresh-token
+        propagation races) and hard failures (SSO profiles on older rclone).
+        """
         env = os.environ.copy()
         if self.aws_profile:
             env['AWS_PROFILE'] = self.aws_profile
+
+        creds = self._export_aws_credentials()
+        if creds:
+            # Drop any stale session token so it can't be combined with the
+            # exported key pair (long-lived keys export no session token)
+            env.pop('AWS_SESSION_TOKEN', None)
+            env.update(creds)
+
+        # State the credential mode once per process: essential when
+        # debugging 403s from machines we can't see
+        if not getattr(self, '_creds_mode_printed', False):
+            self._creds_mode_printed = True
+            if creds:
+                print("  rclone credentials: injected from aws CLI")
+            else:
+                print("  rclone credentials: resolving independently "
+                      "(aws CLI could not export them)")
+
         region = env.get('AWS_REGION') or env.get('AWS_DEFAULT_REGION')
         if region:
             env.setdefault('RCLONE_S3_REGION', region)
         return env
+
+    def _export_aws_credentials(self):
+        """Credentials as resolved by the aws CLI, as env vars for rclone.
+
+        Returns {} when `aws configure export-credentials` is unavailable
+        (aws CLI v1 / old v2) or fails for any reason; rclone then resolves
+        credentials itself via env_auth, exactly as before.
+        """
+        cmd = ['aws', 'configure', 'export-credentials', '--format', 'env-no-export']
+        if self.aws_profile:
+            cmd += ['--profile', self.aws_profile]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        if result.returncode != 0:
+            return {}
+
+        wanted = ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN')
+        creds = {}
+        for line in result.stdout.splitlines():
+            key, sep, value = line.strip().partition('=')
+            if sep and key in wanted and value:
+                creds[key] = value
+
+        # A partial key pair must not shadow rclone's own resolution
+        if 'AWS_ACCESS_KEY_ID' not in creds or 'AWS_SECRET_ACCESS_KEY' not in creds:
+            return {}
+        return creds
 
     def _run_rclone(self, args, paths):
         """Run one rclone command over a --files-from list of relative paths"""
@@ -741,6 +809,13 @@ class S3SyncManager:
             '--checkers', str(self.RCLONE_CHECKERS),
             '--stats-one-line', '--stats', '15s',
         ]
+
+        # Debugging escape hatch, e.g. to capture which HTTP request a 403
+        # comes from: VC_SYNC_RCLONE_FLAGS='-vv --dump headers' (rclone
+        # redacts the Authorization header in dumps)
+        extra_flags = os.environ.get('VC_SYNC_RCLONE_FLAGS')
+        if extra_flags:
+            cmd += shlex.split(extra_flags)
 
         try:
             result = subprocess.run(cmd, env=self._rclone_env())
@@ -929,6 +1004,17 @@ class S3SyncManager:
         if len(files) > max_files:
             print(f"  ... and {len(files) - max_files} more files")
 
+    @staticmethod
+    def _print_sync_summary(uploads, downloads, deletes_local, deletes_remote,
+                            conflicts_label, conflicts_count):
+        """Summary of pending operations, printed right before the user decides"""
+        print(f"\nSync Summary:")
+        print(f"  Uploads pending:    {len(uploads)}")
+        print(f"  Downloads pending:  {len(downloads)}")
+        print(f"  Local deletions:    {len(deletes_local)}")
+        print(f"  Remote deletions:   {len(deletes_remote)}")
+        print(f"  {conflicts_label + ':':<20}{conflicts_count}")
+
     def _validate_upload_candidates(self, paths):
         """Flag zero-byte files and unparseable JSON among upload candidates"""
         flagged = []
@@ -989,14 +1075,6 @@ class S3SyncManager:
             elif action == SyncAction.CONFLICT:
                 conflicts.append((path, reason))
 
-        # Summary
-        print(f"\nSync Summary:")
-        print(f"  Uploads pending:    {len(uploads)}")
-        print(f"  Downloads pending:  {len(downloads)}")
-        print(f"  Local deletions:    {len(deletes_local)}")
-        print(f"  Remote deletions:   {len(deletes_remote)}")
-        print(f"  Conflicts:          {len(conflicts)}")
-
         if not any([uploads, downloads, deletes_local, deletes_remote, conflicts]):
             print("\n✓ Everything is in sync!")
             return
@@ -1016,6 +1094,8 @@ class S3SyncManager:
                 print(f"\n⚠️  {len(invalid_uploads)} upload candidate(s) look invalid:")
                 for path, problem in invalid_uploads:
                     print(f"  {path}: {problem}")
+            self._print_sync_summary(uploads, downloads, deletes_local, deletes_remote,
+                                     "Conflicts", len(conflicts))
             print("\n--dry-run mode: No changes will be made")
             return
 
@@ -1050,16 +1130,8 @@ class S3SyncManager:
                 resolved_actions = [(p, a) for p, a in resolved_actions if p not in skip_paths]
                 print(f"\nSkipping {len(skip_paths)} invalid file(s)")
 
-        # Confirm before proceeding
-        total_operations = (len(uploads) + len(downloads) + len(deletes_local) +
-                            len(deletes_remote) + len(resolved_actions))
-
-        print(f"\n{total_operations} operations will be performed.")
-        if not confirm("Continue? [y/N]: "):
-            print("Sync cancelled.")
-            return
-
-        # Merge resolved conflicts into the main action lists
+        # Merge resolved conflicts into the main action lists so the summary
+        # below reflects exactly what will run
         for path, action in resolved_actions:
             if action == SyncAction.UPLOAD:
                 uploads.append((path, "Resolved conflict"))
@@ -1069,6 +1141,19 @@ class S3SyncManager:
                 deletes_local.append((path, "Resolved conflict"))
             elif action == SyncAction.DELETE_REMOTE:
                 deletes_remote.append((path, "Resolved conflict"))
+
+        # The summary sits right next to the confirmation prompt: with a long
+        # file list above, this is what makes the decision readable
+        self._print_sync_summary(uploads, downloads, deletes_local, deletes_remote,
+                                 "Conflicts skipped", len(conflicts) - len(resolved_actions))
+
+        total_operations = (len(uploads) + len(downloads) +
+                            len(deletes_local) + len(deletes_remote))
+
+        print(f"\n{total_operations} operations will be performed.")
+        if not confirm("Continue? [y/N]: "):
+            print("Sync cancelled.")
+            return
 
         # Perform operations
         print("\nSyncing...")
