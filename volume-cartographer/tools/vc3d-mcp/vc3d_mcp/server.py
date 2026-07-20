@@ -197,6 +197,12 @@ async def vc3d_click(
     space when space="scene".
     button: "left" | "right" | "middle".
     modifiers: any of "shift", "ctrl", "alt", "meta", "keypad".
+
+    On a fiber-tracing (Line Annotation) workspace pane specifically: a PLAIN
+    click (no "shift" modifier) is what adds a control point. Adding "shift"
+    switches to a different gesture there (see vc3d_shift_click) -- it does
+    NOT place a control point on these panes, unlike its usual place-point
+    role elsewhere.
     """
     return await _call(
         "canvas.click",
@@ -221,7 +227,11 @@ async def vc3d_shift_click(
     modifiers: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Shift+click convenience: the canonical place-point / set-focus gesture.
-    Identical to vc3d_click with "shift" unioned into modifiers."""
+    Identical to vc3d_click with "shift" unioned into modifiers.
+
+    Exception: on a fiber-tracing (Line Annotation) workspace pane, this
+    triggers a "predicted snap point" gesture instead of adding a control
+    point -- use plain vc3d_click (no shift) there to add control points."""
     return await _call(
         "canvas.shift_click",
         _strip_none(
@@ -860,11 +870,25 @@ async def vc3d_fiber_launch(
     """Open the line-annotation (fiber tracing) workspace seeded at a position
     (the twin of the interactive launch gesture). The workspace's panes appear
     in vc3d_get_state's viewers and are drivable with vc3d_click / vc3d_drag.
+    Add control points with plain vc3d_click (NOT vc3d_shift_click -- that
+    triggers a different "predicted snap point" gesture on these panes).
 
     position: {"x","y","z"} in volume space (default) or {"x","y"} scene-space
     when space="scene". The point must lie on the target viewer's current
     view (same round-trip rule as vc3d_click). Requires a Lasagna dataset to
-    be resolvable for the active volume; otherwise fails -32005 with detail.
+    be resolvable for the active volume; otherwise fails -32005 with detail
+    (not every catalog sample has one -- check vc3d_describe_catalog_sample
+    for a "lasagna"-kind representation before opening).
+    replace_owning: defaults True, which DISCARDS the caller's currently
+    open/in-progress fiber workspace (verified: launching a second fiber with
+    the default silently drops the first fiber's unsaved control points).
+    Pass False to keep multiple fiber workspaces open at once, e.g. tracing
+    several fibers before one combined vc3d_fiber_save.
+
+    The workspace's viewer ids are NOT stable across edits -- each control
+    point placed rebuilds/reoptimizes the panes under new "v<N>" ids. Call
+    vc3d_get_state again before targeting a pane after any edit; a stale id
+    fails -32002.
     """
     return await _call(
         "fiber.launch",

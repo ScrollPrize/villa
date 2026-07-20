@@ -1557,6 +1557,21 @@ the annotation panes DO flow through the public slots and work via
 `canvas.click`/`canvas.drag`; menu-only operations (delete a generated
 control point, create/open a branch) currently have no bridge surface.
 
+**Verified behavior (live agent run, 2026-07-20):** on an annotation pane, a
+plain `canvas.click` (no `"shift"` modifier) fires
+`generatedControlPointRequested` — this is what adds a control point.
+`canvas.shift_click` (or `canvas.click` with `"shift"` in `modifiers`) instead
+fires `generatedPredSnapPointRequested`, a "predicted snap point" gesture —
+**not** a control-point add (`LineAnnotationDialog.cpp`). Callers placing
+control points must use plain `canvas.click`/`vc3d_click`; §3.7's general
+"shift+click = place point" framing does not hold on these panes.
+
+Also verified: the annotation panes' `"v<N>"` viewer ids are **not stable
+across edits** — `LineAnnotationDialog` rebuilds/reoptimizes its panes after
+each control-point change and re-registers them with `ViewerManager` under
+new ids. Callers must re-call `state.get` before targeting a pane after any
+edit; a stale id fails `-32002`.
+
 ### 13.1 `fiber.launch`
 
 Open the line-annotation workspace seeded at a position — the twin of the launch
@@ -1572,6 +1587,11 @@ gesture. Maps to
    "space"?: "volume" | "scene",            // default "volume"; §3.6 validation rules
    "replaceOwning"?: bool = true}
   ```
+  **`replaceOwning` defaults to `true`**, which discards the caller's currently
+  open/in-progress annotation workspace (verified live: launching fiber 2 with
+  the default silently threw away fiber 1's unsaved control points). Pass
+  `replaceOwning: false` to keep multiple fiber workspaces open at once (e.g.
+  tracing several fibers before a single combined `fiber.save`).
 - **result:** `{"launched": true}` — the workspace's new panes appear in
   `state.get.viewers` (registered per the preamble above).
 - **errors:** `-32000`, `-32001`, `-32002`, `-32003`, `-32009`

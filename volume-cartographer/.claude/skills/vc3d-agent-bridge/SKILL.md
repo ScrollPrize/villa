@@ -69,3 +69,23 @@ it takes a few seconds.
 position you pass it. Use `vc3d_drag` with `button="none"` to hover-position
 the cursor first (no press/release, just interpolated move events), then
 call `vc3d_push_pull_start`, wait, then `vc3d_push_pull_stop`.
+
+## 7. Fiber tracing (`vc3d_fiber_launch` + a fiber workspace pane)
+
+- Not every catalog sample has fiber data: `vc3d_fiber_launch` needs a
+  resolvable Lasagna dataset for the active volume, and some samples (e.g.
+  PHercParis4, verified live) have none published at all — check
+  `vc3d_describe_catalog_sample` for a `lasagna`-kind representation before
+  opening, or you'll hit `-32005` no matter what you try.
+- On a fiber workspace pane, plain `vc3d_click` adds a control point;
+  `vc3d_shift_click` does **not** — it triggers a "predicted snap point"
+  gesture instead. This inverts the usual shift-click-to-place-a-point
+  convention that holds everywhere else in the bridge.
+- The pane's `"v<N>"` viewer ids are **not stable across edits** — each
+  control point placed rebuilds the workspace and reassigns ids. Re-call
+  `vc3d_get_state` before targeting a pane after any edit, or you'll get
+  `-32002` on a now-stale id.
+- `vc3d_fiber_launch`'s `replace_owning` defaults to `true` and silently
+  discards the currently open fiber's unsaved control points. Pass
+  `replace_owning=false` to trace several fibers before one combined
+  `vc3d_fiber_save`.
