@@ -44,6 +44,13 @@ def test_corner_weight_is_in_the_legacy_pathological_regime():
     assert diluted > LOGIT_CUTOFF
     assert 0.4 < 1.0 / (1.0 + math.exp(-diluted)) < 0.5
 
+    # Two-channel convention: +20/-20 diluted to ~+0.075/-0.075, so the
+    # foreground softmax read ~0.462 - also above the 0.2 threshold.
+    fg = (-SATURATION * w) / (w + LEGACY_EPSILON)
+    bg = (+SATURATION * w) / (w + LEGACY_EPSILON)
+    assert (fg - bg) > LOGIT_CUTOFF
+    assert 0.4 < 1.0 / (1.0 + math.exp(-(fg - bg))) < 0.5
+
 
 def test_normalization_preserves_saturation_at_corner_weight():
     w = _corner_weight()
@@ -54,6 +61,23 @@ def test_normalization_preserves_saturation_at_corner_weight():
 
     assert np.isclose(logits[0, 0, 0, 0], -SATURATION, rtol=1e-5)
     assert logits[0, 0, 0, 0] < LOGIT_CUTOFF
+
+
+def test_normalization_preserves_softmax_pair_at_corner_weight():
+    """The two-channel +20/-20 background/foreground pair also survives at the
+    corner weight: the foreground softmax stays decisively below threshold."""
+    w = _corner_weight()
+    logits = np.zeros((2, 1, 1, 1), dtype=np.float32)
+    logits[0, 0, 0, 0] = +SATURATION * w
+    logits[1, 0, 0, 0] = -SATURATION * w
+    weights = np.full((1, 1, 1), w, dtype=np.float32)
+
+    normalize_blended_logits(logits, weights)
+
+    assert np.isclose(logits[0, 0, 0, 0], +SATURATION, rtol=1e-5)
+    assert np.isclose(logits[1, 0, 0, 0], -SATURATION, rtol=1e-5)
+    # p_fg > T <=> logit_fg - logit_bg > cutoff; -40 is decisively below.
+    assert (logits[1, 0, 0, 0] - logits[0, 0, 0, 0]) < LOGIT_CUTOFF
 
 
 def test_normalization_is_exact_for_multiple_contributions():
