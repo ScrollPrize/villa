@@ -77,10 +77,10 @@ jobs:
             test "$HEAD_BRANCH" = "codex/progress-prize-$TARGET_CYCLE"
           fi
 
-      - name: Check out trusted main with push credentials
+      - name: Check out the exact trusted trigger commit with push credentials
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: refs/heads/main
+          ref: ${{ github.sha }}
           persist-credentials: true
           clean: true
           fetch-depth: 0
@@ -97,21 +97,22 @@ jobs:
           AUTOMATION_ENVIRONMENT: ${{ inputs.environment }}
           HEAD_BRANCH: ${{ inputs['head-branch'] }}
           BASE_BRANCH: ${{ inputs['base-branch'] }}
+          TRIGGER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          [[ "$TRIGGER_SHA" =~ ^[a-f0-9]{40}$ ]]
+          git cat-file -e "$TRIGGER_SHA^{commit}"
           if test "$AUTOMATION_ENVIRONMENT" = staging; then
             if ! git ls-remote --exit-code --heads origin "refs/heads/$BASE_BRANCH" >/dev/null 2>&1; then
               git push --force-with-lease="refs/heads/$BASE_BRANCH:" \
-                origin "refs/remotes/origin/main:refs/heads/$BASE_BRANCH"
+                origin "$TRIGGER_SHA:refs/heads/$BASE_BRANCH"
             fi
           fi
           git fetch --no-tags origin \
             "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
           base_sha="$(git rev-parse "refs/remotes/origin/$BASE_BRANCH^{commit}")"
           [[ "$base_sha" =~ ^[a-f0-9]{40}$ ]]
-          if test "$AUTOMATION_ENVIRONMENT" = staging; then
-            test "$base_sha" = "$(git rev-parse refs/remotes/origin/main^{commit})"
-          fi
+          test "$base_sha" = "$TRIGGER_SHA"
 
           remote_head_sha=""
           remote_head="$(git ls-remote --heads origin "refs/heads/$HEAD_BRANCH")"

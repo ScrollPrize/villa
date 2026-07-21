@@ -20,16 +20,12 @@ repository secret, file, log, cache, or artifact.
 
 ## Workflow map
 
-- `progress-prizes-google.yml` is the only Google-authenticated reusable
-  workflow. A no-secret preflight rejects unsafe routing, then exactly one of two
-  jobs with literal `progress-prizes-staging` or `progress-prizes-production`
-  Environment bindings checks out the exact approved workflow commit. It exports
-  only the intentionally public `responder-uri`.
 - `.github/actions/progress-prizes-google/action.yml` is the shared local action
-  used by both literal Environment jobs. It validates controls again, exchanges
-  OIDC without a credential file, and runs the dependency-free CLI.
-- `progress-prizes-rehearsal.yml` is the July 20 staging rehearsal. Its fixed
-  branches are `codex/progress-prize-smoke-20260720` and
+  used directly by every Google-authenticated job. It validates controls,
+  exchanges OIDC without a credential file, and runs the dependency-free CLI.
+- `progress-prizes-rehearsal.yml` is the July 20 staging rehearsal. Its Google
+  jobs are ordinary top-level jobs with literal protected Environment bindings;
+  its fixed branches are `codex/progress-prize-smoke-20260720` and
   `codex/progress-prize-smoke-base-20260720`.
 - `progress-prizes-page-pr.yml` updates the page, runs dependency-free tests,
   commits, and creates a draft PR. It has no Google configuration or OIDC.
@@ -59,12 +55,14 @@ uploaded, and only a canonical `forms.gle` or
 `docs.google.com/forms/d/e/.../viewform` URL may cross the authenticated job
 boundary. The workflows also register every protected identifier with
 `add-mask` before validation as defense in depth.
-Callers never pass or inherit these secrets. The reusable workflow uses two
-literal Environment jobs because the July rehearsal proved that GitHub created
-the correct deployment but did not hydrate secrets for an expression-selected
-Environment in a called workflow. Both jobs invoke the same local action, and
-the exact trigger commit—not a mutable branch tip—is the executable code that
-receives the approved secrets.
+Google-secret-consuming jobs are never placed behind `workflow_call`, and no
+workflow uses `secrets: inherit`. Live July validation runs showed that GitHub
+created and approved the correct deployment but still evaluated every protected
+Environment secret as empty inside a called workflow, both with expression-based
+and literal Environment names. Each top-level dispatch or schedule workflow
+therefore binds its Google jobs directly to a literal protected Environment and
+invokes the same local action. The exact trigger commit—not a mutable branch
+tip—is the executable code that receives the approved secrets.
 
 ## GitHub Environments
 
@@ -195,7 +193,8 @@ attribute.repository_owner_id = assertion.repository_owner_id
 attribute.ref                 = assertion.ref
 attribute.event_name          = assertion.event_name
 attribute.environment         = assertion.environment
-attribute.job_workflow_ref    = assertion.job_workflow_ref
+attribute.workflow_ref        = assertion.workflow_ref
+attribute.workflow_sha        = assertion.workflow_sha
 ```
 
 Use this condition blueprint for staging. Staging has no scheduled caller, so it
@@ -208,17 +207,20 @@ attribute.repository_owner_id == '121906140' &&
 attribute.ref == 'refs/heads/main' &&
 attribute.event_name == 'workflow_dispatch' &&
 attribute.environment == 'progress-prizes-staging' &&
-attribute.job_workflow_ref == 'ScrollPrize/villa/.github/workflows/progress-prizes-google.yml@refs/heads/main'
+attribute.workflow_ref == 'ScrollPrize/villa/.github/workflows/progress-prizes-rehearsal.yml@refs/heads/main' &&
+assertion.workflow_sha == assertion.sha
 ```
 
-Use the same immutable repository, owner, ref, Environment, and reusable-workflow
-checks for production, but set the Environment to
-`progress-prizes-production` and permit either `workflow_dispatch` or `schedule`.
+For the rehearsal, use the same immutable repository, owner, ref, event, and
+top-level workflow checks for production, but set the Environment to
+`progress-prizes-production`. Milestone 4 replaces the rehearsal workflow ref
+with the exact production workflow ref; milestone 5 adds the exact schedule
+workflow ref and permits `schedule` only for that workflow.
 
 Bind only that provider principal to its matching service account with
 `roles/iam.workloadIdentityUser`. Use the numeric Google project number when
 constructing the `principalSet` member. Do not grant one provider impersonation
-rights on both accounts. The workflow asks for a 900-second access token scoped
+rights on both accounts. The workflow asks for a 1200-second access token scoped
 to read-only Forms/Drive scopes for `validate`, `verify`, and dry runs. Mutations
 use `forms.body` plus `drive`: this headless workflow must find a pre-existing
 form and app-property-managed files in a Shared Drive, which `drive.file` cannot
