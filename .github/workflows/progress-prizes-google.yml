@@ -150,50 +150,17 @@ jobs:
         with:
           node-version: 24
 
-      - name: Validate protected environment configuration
+      - name: Register protected Google configuration masks
         shell: bash
         env:
-          GOOGLE_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
-          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ vars.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-          PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: ${{ vars.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
-          PROGRESS_PRIZE_DRIVE_ID: ${{ vars.PROGRESS_PRIZE_DRIVE_ID }}
-          PROGRESS_PRIZE_FOLDER_ID: ${{ vars.PROGRESS_PRIZE_FOLDER_ID }}
-          PROGRESS_PRIZE_SOURCE_FORM_ID: ${{ vars.PROGRESS_PRIZE_SOURCE_FORM_ID }}
-          PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: ${{ vars.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
-          PROGRESS_PRIZE_ARCHIVE_FOLDER_ID: ${{ vars.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
-          AUTOMATION_ENVIRONMENT: ${{ inputs.environment }}
-          OPERATION: ${{ inputs.operation }}
-        run: |
-          set -euo pipefail
-          for name in \
-            GOOGLE_WORKLOAD_IDENTITY_PROVIDER \
-            GOOGLE_SERVICE_ACCOUNT_EMAIL \
-            PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL \
-            PROGRESS_PRIZE_DRIVE_ID \
-            PROGRESS_PRIZE_FOLDER_ID \
-            PROGRESS_PRIZE_SOURCE_FORM_ID \
-            PROGRESS_PRIZE_EDITOR_GROUP_EMAIL
-          do
-            test -n "${!name}" || { echo "Missing protected Environment variable: $name" >&2; exit 1; }
-          done
-          if test "$AUTOMATION_ENVIRONMENT" = staging -a "$OPERATION" = cleanup; then
-            test -n "$PROGRESS_PRIZE_ARCHIVE_FOLDER_ID" || {
-              echo "Missing protected Environment variable: PROGRESS_PRIZE_ARCHIVE_FOLDER_ID" >&2
-              exit 1
-            }
-          fi
-
-      - name: Mask protected Google identifiers
-        shell: bash
-        env:
-          GOOGLE_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
-          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ vars.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-          PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: ${{ vars.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
-          PROGRESS_PRIZE_DRIVE_ID: ${{ vars.PROGRESS_PRIZE_DRIVE_ID }}
-          PROGRESS_PRIZE_FOLDER_ID: ${{ vars.PROGRESS_PRIZE_FOLDER_ID }}
-          PROGRESS_PRIZE_ARCHIVE_FOLDER_ID: ${{ vars.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
-          PROGRESS_PRIZE_SOURCE_FORM_ID: ${{ vars.PROGRESS_PRIZE_SOURCE_FORM_ID }}
-          PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: ${{ vars.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+          GOOGLE_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          PROGRESS_PRIZE_DRIVE_ID: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          PROGRESS_PRIZE_FOLDER_ID: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          PROGRESS_PRIZE_ARCHIVE_FOLDER_ID: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          PROGRESS_PRIZE_SOURCE_FORM_ID: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
         run: |
           set -euo pipefail
           for name in \
@@ -209,21 +176,54 @@ jobs:
             value="${!name}"
             test -z "$value" && continue
             case "$value" in
-              *$'\r'*|*$'\n'*) echo "Protected Environment variable has an invalid value." >&2; exit 1 ;;
+              *$'\r'*|*$'\n'*) echo "Protected Environment secret has an invalid value." >&2; exit 1 ;;
             esac
             printf '::add-mask::%s\n' "$value"
           done
+
+      - name: Validate protected environment configuration
+        shell: bash
+        env:
+          GOOGLE_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          PROGRESS_PRIZE_DRIVE_ID: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          PROGRESS_PRIZE_FOLDER_ID: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          PROGRESS_PRIZE_SOURCE_FORM_ID: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+          PROGRESS_PRIZE_ARCHIVE_FOLDER_ID: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          AUTOMATION_ENVIRONMENT: ${{ inputs.environment }}
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set -euo pipefail
+          for name in \
+            GOOGLE_WORKLOAD_IDENTITY_PROVIDER \
+            GOOGLE_SERVICE_ACCOUNT_EMAIL \
+            PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL \
+            PROGRESS_PRIZE_DRIVE_ID \
+            PROGRESS_PRIZE_FOLDER_ID \
+            PROGRESS_PRIZE_SOURCE_FORM_ID \
+            PROGRESS_PRIZE_EDITOR_GROUP_EMAIL
+          do
+            test -n "${!name}" || { echo "Missing protected Environment secret: $name" >&2; exit 1; }
+          done
+          if test "$AUTOMATION_ENVIRONMENT" = staging -a "$OPERATION" = cleanup; then
+            test -n "$PROGRESS_PRIZE_ARCHIVE_FOLDER_ID" || {
+              echo "Missing protected Environment secret: PROGRESS_PRIZE_ARCHIVE_FOLDER_ID" >&2
+              exit 1
+            }
+          fi
 
       - name: Authenticate read-only validation without a credential file
         if: inputs.operation == 'validate' || inputs.operation == 'verify' || inputs['dry-run']
         id: auth-read
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
-          workload_identity_provider: ${{ vars.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          workload_identity_provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
           token_format: access_token
           access_token_lifetime: 900s
-          access_token_scopes: >-
+          access_token_scopes: |-
             https://www.googleapis.com/auth/forms.body.readonly
             https://www.googleapis.com/auth/drive.readonly
           create_credentials_file: false
@@ -234,11 +234,11 @@ jobs:
         id: auth-write
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
-          workload_identity_provider: ${{ vars.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          workload_identity_provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
           token_format: access_token
           access_token_lifetime: 900s
-          access_token_scopes: >-
+          access_token_scopes: |-
             https://www.googleapis.com/auth/forms.body
             https://www.googleapis.com/auth/drive
           create_credentials_file: false
@@ -281,15 +281,15 @@ jobs:
           GOOGLE_ACCESS_TOKEN: ${{ steps['auth-read'].outputs.access_token || steps['auth-write'].outputs.access_token }}
           PROGRESS_PRIZE_ENVIRONMENT: ${{ inputs.environment }}
           PROGRESS_PRIZE_EVENT_NAME: ${{ github.event_name }}
-          PROGRESS_PRIZE_DRIVE_ID: ${{ vars.PROGRESS_PRIZE_DRIVE_ID }}
-          PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: ${{ vars.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
-          PROGRESS_PRIZE_FOLDER_ID: ${{ vars.PROGRESS_PRIZE_FOLDER_ID }}
-          PROGRESS_PRIZE_ARCHIVE_FOLDER_ID: ${{ vars.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
-          PROGRESS_PRIZE_SOURCE_FORM_ID: ${{ vars.PROGRESS_PRIZE_SOURCE_FORM_ID }}
-          PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: ${{ vars.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
-          PROGRESS_PRIZE_SERVICE_ACCOUNT_EMAIL: ${{ vars.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-          PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: ${{ inputs.environment == 'staging' && vars.GOOGLE_SERVICE_ACCOUNT_EMAIL || '' }}
-          PROGRESS_PRIZE_STAGING_FOLDER_ID: ${{ inputs.environment == 'staging' && vars.PROGRESS_PRIZE_FOLDER_ID || '' }}
+          PROGRESS_PRIZE_DRIVE_ID: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          PROGRESS_PRIZE_FOLDER_ID: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          PROGRESS_PRIZE_ARCHIVE_FOLDER_ID: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          PROGRESS_PRIZE_SOURCE_FORM_ID: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+          PROGRESS_PRIZE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: ${{ inputs.environment == 'staging' && secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL || '' }}
+          PROGRESS_PRIZE_STAGING_FOLDER_ID: ${{ inputs.environment == 'staging' && secrets.PROGRESS_PRIZE_FOLDER_ID || '' }}
           PROGRESS_PRIZE_BRANCH: ${{ inputs.branch }}
           PROGRESS_PRIZE_TARGET_BRANCH: ${{ inputs['target-branch'] }}
           PROGRESS_PRIZE_DEFAULT_TARGET_BRANCH: main

@@ -55,12 +55,41 @@ test('Google OIDC exists only in the guarded reusable workflow and authenticated
   assert.match(google, /create_credentials_file: false/);
   assert.match(google, /export_environment_variables: false/);
   assert.match(google, /printf '::add-mask::%s\\n' \"\$value\"/);
+  const maskStep = google.indexOf('- name: Register protected Google configuration masks');
+  const validationStep = google.indexOf('- name: Validate protected environment configuration');
+  assert.ok(maskStep >= 0 && maskStep < validationStep, 'mask registration must precede validation');
+  assert.doesNotMatch(
+    google,
+    /\$\{\{\s*vars(?:\.|\[)/,
+    'protected Google configuration must use auto-masked Environment secrets, never variables',
+  );
+  for (const name of [
+    'GOOGLE_WORKLOAD_IDENTITY_PROVIDER',
+    'GOOGLE_SERVICE_ACCOUNT_EMAIL',
+    'PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL',
+    'PROGRESS_PRIZE_DRIVE_ID',
+    'PROGRESS_PRIZE_FOLDER_ID',
+    'PROGRESS_PRIZE_ARCHIVE_FOLDER_ID',
+    'PROGRESS_PRIZE_SOURCE_FORM_ID',
+    'PROGRESS_PRIZE_EDITOR_GROUP_EMAIL',
+  ]) {
+    assert.match(google, new RegExp(`secrets\\.${name}\\b`), `${name} must be an Environment secret`);
+  }
   assert.ok(
-    [...google.matchAll(/PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: \$\{\{ vars\.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL \}\}/g)].length >= 3,
+    [...google.matchAll(/PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: \$\{\{ secrets\.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL \}\}/g)].length >= 3,
     'the private Drive administrator must be validated, masked, and passed to the CLI',
   );
   assert.match(google, /GOOGLE_SERVICE_ACCOUNT_EMAIL \\\n            PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL \\\n            PROGRESS_PRIZE_DRIVE_ID/);
   assert.match(google, /access_token_lifetime: 900s/);
+  assert.doesNotMatch(google, /access_token_scopes: >-/);
+  assert.match(
+    google,
+    /access_token_scopes: \|-\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.body\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/drive\.readonly/,
+  );
+  assert.match(
+    google,
+    /access_token_scopes: \|-\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.body\n\s+https:\/\/www\.googleapis\.com\/auth\/drive\n/,
+  );
   assert.match(google, /Authenticate read-only validation/);
   assert.match(
     google,
@@ -75,6 +104,7 @@ test('Google OIDC exists only in the guarded reusable workflow and authenticated
   assert.match(google, /TARGET_CYCLE: \$\{\{ inputs\['target-cycle'\] \}\}/);
   for (const runBlock of google.matchAll(/^ {8}run: \|\n((?:(?: {10}.*)?\n)*)/gm)) {
     assert.doesNotMatch(runBlock[1], /\$\{\{ inputs\['target-cycle'\] \}\}/);
+    assert.doesNotMatch(runBlock[1], /\$\{\{\s*(?:secrets|vars)(?:\.|\[)/);
   }
   assert.match(google, /ref: refs\/heads\/main/);
   assert.match(google, /automation-cli\.mjs/);
@@ -145,6 +175,12 @@ test('Vercel verification runs trusted default-branch code and requires GitHub a
   assert.match(vercel, /payload\.git\?\.ref/);
   assert.match(vercel, /progress-prizes\/vercel-preview/);
   assert.match(vercel, /VERCEL_AUTOMATION_BYPASS_SECRET/);
+  assert.doesNotMatch(vercel, /\$\{\{\s*vars\.VERCEL_PROJECT_ID\s*\}\}/);
+  assert.equal(
+    [...vercel.matchAll(/\$\{\{\s*secrets\.VERCEL_PROJECT_ID\s*\}\}/g)].length,
+    2,
+    'the Vercel project identifier must be auto-masked at both uses',
+  );
   assert.match(vercel, /printf '::add-mask::%s\\n' \"\$VERCEL_PROJECT_ID\"/);
   assert.match(vercel, /!process\.env\.VERCEL_AUTOMATION_BYPASS_SECRET/);
   assert.match(vercel, /redirect: 'error'/);

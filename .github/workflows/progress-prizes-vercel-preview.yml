@@ -43,12 +43,12 @@ jobs:
       - name: Mask the protected Vercel project identifier
         shell: bash
         env:
-          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
           set -euo pipefail
           test -n "$VERCEL_PROJECT_ID"
           case "$VERCEL_PROJECT_ID" in
-            *$'\r'*|*$'\n'*) echo "Preview Environment variable has an invalid value." >&2; exit 1 ;;
+            *$'\r'*|*$'\n'*) echo "Preview Environment secret has an invalid value." >&2; exit 1 ;;
           esac
           printf '::add-mask::%s\n' "$VERCEL_PROJECT_ID"
 
@@ -57,7 +57,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_PATH: ${{ github.event_path }}
-          EXPECTED_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          EXPECTED_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |

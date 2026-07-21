@@ -47,12 +47,14 @@ The workflows invoke:
 node scrollprize.org/scripts/progress-prizes/automation-cli.mjs COMMAND ...
 ```
 
-Private identifiers are read only from the protected Environment variables
-below. Operation JSON is kept in `$RUNNER_TEMP`, never uploaded, and only a
-canonical `forms.gle` or `docs.google.com/forms/d/e/.../viewform` URL may cross
-the authenticated job boundary. Because GitHub variables are not masked
-automatically, the workflows validate and register every protected Google and
-Vercel identifier with `add-mask` before an action or verifier can log it.
+Private identifiers are read only from protected Environment secrets below.
+They are configuration values rather than Google credentials, but secrets are
+required because GitHub does not automatically redact Environment variables
+from public Actions logs. Operation JSON is kept in `$RUNNER_TEMP`, never
+uploaded, and only a canonical `forms.gle` or
+`docs.google.com/forms/d/e/.../viewform` URL may cross the authenticated job
+boundary. The workflows also register every protected identifier with
+`add-mask` before validation as defense in depth.
 
 ## GitHub Environments
 
@@ -64,7 +66,7 @@ require a month-end wait.
 
 ### `progress-prizes-staging`
 
-Protected Environment variables:
+Protected Environment secrets:
 
 - `GOOGLE_WORKLOAD_IDENTITY_PROVIDER`
 - `GOOGLE_SERVICE_ACCOUNT_EMAIL`
@@ -108,7 +110,7 @@ on each managed staging form.
 
 ### `progress-prizes-production`
 
-Protected Environment variables:
+Protected Environment secrets:
 
 - `GOOGLE_WORKLOAD_IDENTITY_PROVIDER`
 - `GOOGLE_SERVICE_ACCOUNT_EMAIL`
@@ -152,23 +154,22 @@ renamed. At activation it is closed first and receives only the private recovery
 state marker. The August copy is created in the production Shared Drive and is
 cryptographically bound to that exact source ID. After its activation, managed
 `appProperties` discovery always selects the prior managed target, so the
-fallback variable does not need a monthly edit and is ignored for later cycles.
+fallback secret does not need a monthly edit and is ignored for later cycles.
 
 ### `progress-prizes-preview`
 
-Protected Environment variable:
+Protected Environment secret:
 
 - `VERCEL_PROJECT_ID`
-
-Environment secret:
 
 - `VERCEL_AUTOMATION_BYPASS_SECRET`
 
 The bypass value is needed because the current Vercel previews are protected by
 SSO. It is sent only after the verifier has accepted an HTTPS `*.vercel.app`
-origin for the configured project; redirects are never followed. This is the
-only long-lived GitHub secret required by these workflows, and it is a Vercel
-preview secret—not a Google credential.
+origin for the configured project; redirects are never followed. This bypass
+value is the only secret here that grants access outside GitHub. The Google
+Environment secrets contain identifiers and ACL configuration only—not a key,
+refresh token, or other reusable credential.
 
 ## Google WIF setup
 
@@ -295,7 +296,7 @@ managed source in any later cycle fails instead of reusing July:
    write the private recovery marker.
 6. After the August form is active and verified, the owner may remove both
    direct service-account ACLs from July. Later cycles resolve only managed forms
-   in the production Shared Drive, even if the stale fallback variable remains.
+   in the production Shared Drive, even if the stale fallback secret remains.
 
 If Workspace policy refuses direct sharing to a service-account principal, move
 the source into the production Shared Drive or redesign the identity boundary.
