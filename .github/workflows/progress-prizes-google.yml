@@ -59,6 +59,31 @@ on:
         required: false
         type: string
         default: ""
+    secrets:
+      GOOGLE_WORKLOAD_IDENTITY_PROVIDER:
+        description: Resolved only from the selected protected Environment
+        required: false
+      GOOGLE_SERVICE_ACCOUNT_EMAIL:
+        description: Resolved only from the selected protected Environment
+        required: false
+      PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL:
+        description: Resolved only from the selected protected Environment
+        required: false
+      PROGRESS_PRIZE_DRIVE_ID:
+        description: Resolved only from the selected protected Environment
+        required: false
+      PROGRESS_PRIZE_FOLDER_ID:
+        description: Resolved only from the selected protected Environment
+        required: false
+      PROGRESS_PRIZE_ARCHIVE_FOLDER_ID:
+        description: Resolved only from the selected protected Environment
+        required: false
+      PROGRESS_PRIZE_SOURCE_FORM_ID:
+        description: Resolved only from the selected protected Environment
+        required: false
+      PROGRESS_PRIZE_EDITOR_GROUP_EMAIL:
+        description: Resolved only from the selected protected Environment
+        required: false
     outputs:
       responder-uri:
         description: Intentionally public canonical responder URL

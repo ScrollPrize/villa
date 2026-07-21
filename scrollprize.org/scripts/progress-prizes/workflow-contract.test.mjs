@@ -63,7 +63,7 @@ test('Google OIDC exists only in the guarded reusable workflow and authenticated
     /\$\{\{\s*vars(?:\.|\[)/,
     'protected Google configuration must use auto-masked Environment secrets, never variables',
   );
-  for (const name of [
+  const protectedGoogleSecretNames = [
     'GOOGLE_WORKLOAD_IDENTITY_PROVIDER',
     'GOOGLE_SERVICE_ACCOUNT_EMAIL',
     'PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL',
@@ -72,7 +72,19 @@ test('Google OIDC exists only in the guarded reusable workflow and authenticated
     'PROGRESS_PRIZE_ARCHIVE_FOLDER_ID',
     'PROGRESS_PRIZE_SOURCE_FORM_ID',
     'PROGRESS_PRIZE_EDITOR_GROUP_EMAIL',
-  ]) {
+  ];
+  const declarationBlock = google.slice(
+    google.indexOf('    secrets:\n'),
+    google.indexOf('    outputs:\n'),
+  );
+  const declaredEnvironmentSecrets = [
+    ...declarationBlock.matchAll(
+      /^      ([A-Z][A-Z0-9_]+):\n        description: .*\n        required: false$/gm,
+    ),
+  ].map((match) => match[1]);
+  assert.deepEqual(declaredEnvironmentSecrets, protectedGoogleSecretNames);
+  assert.doesNotMatch(declarationBlock, /required: true/);
+  for (const name of protectedGoogleSecretNames) {
     assert.match(google, new RegExp(`secrets\\.${name}\\b`), `${name} must be an Environment secret`);
   }
   assert.ok(
@@ -134,6 +146,11 @@ test('rehearsal controls are fixed to staging and its ephemeral branches', async
   const rehearsal = await workflow('progress-prizes-rehearsal.yml');
   assert.match(rehearsal, /^on:\n  workflow_dispatch:/m);
   assert.doesNotMatch(rehearsal, /schedule:|pull_request/);
+  assert.doesNotMatch(
+    rehearsal,
+    /^ {4}secrets:/m,
+    'callers must not pass or override the Google job Environment secrets',
+  );
   assert.match(rehearsal, /codex\/progress-prize-smoke-20260720/);
   assert.match(rehearsal, /codex\/progress-prize-smoke-base-20260720/);
   assert.match(rehearsal, /fault: after-copy/);
