@@ -173,6 +173,22 @@ export function assertSinglePageCommit(commit, { headSha, baseSha } = {}) {
   return commit;
 }
 
+export function activationCommitNeedsRefresh(commit, { headSha, baseSha } = {}) {
+  assertSha(headSha);
+  assertSha(baseSha);
+  if (
+    commit?.sha !== headSha
+    || commit.parents?.length !== 1
+    || commit.files?.length !== 1
+    || commit.files[0]?.filename !== PAGE_PATH
+    || commit.files[0]?.status !== 'modified'
+  ) {
+    fail('Only a page-only commit with a stale parent may be refreshed.');
+  }
+  const parentSha = assertSha(commit.parents[0]?.sha ?? '');
+  return parentSha !== baseSha;
+}
+
 export function isTrustedPreviewRun({ status, run, expectedSha } = {}) {
   const sha = assertSha(expectedSha);
   const runId = previewRunId(status);
@@ -256,42 +272,74 @@ async function findPull(head, base) {
   return assertPullAssociation(pull, { head, base });
 }
 
-async function activationState(options) {
-  const head = required(options, 'head');
-  const base = required(options, 'base');
-  const cycle = assertCycle(required(options, 'cycle'));
+export async function resolveProductionActivationState({
+  head,
+  base,
+  cycle,
+  expectedBaseSha,
+} = {}, {
+  listPulls = () => github(
+    `/repos/${OWNER}/${REPO}/pulls?state=open&head=${encodeURIComponent(`${OWNER}:${head}`)}&base=${encodeURIComponent(base)}&per_page=10`,
+  ),
+  readCommit = (sha) => github(`/repos/${OWNER}/${REPO}/commits/${sha}`),
+  readMainRef = () => github(`/repos/${OWNER}/${REPO}/git/ref/heads/main`),
+  readPage = (sha) => readPageAt(sha),
+} = {}) {
+  if (typeof head !== 'string' || head === '') fail('Missing production activation head.');
+  if (typeof base !== 'string' || base === '') fail('Missing production activation base.');
+  const targetCycle = assertCycle(cycle);
+  const trustedBaseSha = assertSha(expectedBaseSha);
   const contract = assertAutomationBranch(head, base);
   if (contract.kind !== 'production') fail('Activation-state recovery is production-only.');
-  const pulls = await github(
-    `/repos/${OWNER}/${REPO}/pulls?state=open&head=${encodeURIComponent(`${OWNER}:${head}`)}&base=${encodeURIComponent(base)}&per_page=10`,
-  );
+  const pulls = await listPulls();
   if (!Array.isArray(pulls) || pulls.length > 1) fail('Production activation PR state is ambiguous.');
   let state;
   let sha;
   let baseSha;
   let number = '';
+  let refreshRequired = false;
   if (pulls.length === 1) {
     const pull = pulls[0];
     sha = assertSha(pull.head?.sha ?? '');
     baseSha = assertSha(pull.base?.sha ?? '');
+    if (baseSha !== trustedBaseSha) fail('Production main moved after the workflow was dispatched.');
     assertPullBinding(pull, { head, base, headSha: sha, baseSha });
+    const commit = await readCommit(sha);
+    refreshRequired = activationCommitNeedsRefresh(commit, { headSha: sha, baseSha });
     state = 'pending';
     number = String(pull.number);
   } else {
-    const ref = await github(`/repos/${OWNER}/${REPO}/git/ref/heads/main`);
+    const ref = await readMainRef();
     sha = assertSha(ref?.object?.sha ?? '');
+    if (sha !== trustedBaseSha) fail('Production main moved after the workflow was dispatched.');
     baseSha = sha;
-    const page = await readPageAt(sha);
-    if (page.cycle !== cycle) fail('Neither a pending PR nor a completed production cycle exists.');
+    const page = await readPage(sha);
+    if (page.cycle !== targetCycle) fail('Neither a pending PR nor a completed production cycle exists.');
     state = 'completed';
   }
+  return {
+    state,
+    headSha: sha,
+    baseSha,
+    pullNumber: number,
+    refreshRequired,
+  };
+}
+
+async function activationState(options) {
+  const result = await resolveProductionActivationState({
+    head: required(options, 'head'),
+    base: required(options, 'base'),
+    cycle: required(options, 'cycle'),
+    expectedBaseSha: required(options, 'expected-base-sha'),
+  });
   if (process.env.GITHUB_OUTPUT) {
     await appendFile(
       process.env.GITHUB_OUTPUT,
-      `state=${state}\nhead-sha=${sha}\nbase-sha=${baseSha}\npr-number=${number}\n`,
+      `state=${result.state}\nhead-sha=${result.headSha}\nbase-sha=${result.baseSha}\npr-number=${result.pullNumber}\nrefresh-required=${result.refreshRequired}\n`,
     );
   }
-  return { state, headSha: sha, baseSha, pullNumber: number };
+  return result;
 }
 
 async function readPageMarkdownAt(sha) {

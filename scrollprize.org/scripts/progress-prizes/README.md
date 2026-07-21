@@ -34,9 +34,10 @@ repository secret, file, log, cache, or artifact.
 - `progress-prizes-vercel-preview.yml` runs trusted default-branch verifier code
   on a Vercel `repository_dispatch`. It never checks out or executes deployed
   branch code.
-- Milestone 4 adds `progress-prizes-production.yml` only after the complete
-  staging rehearsal passes. It provides guarded `validate`, `dry-run`, `prepare`,
-  `activate`, and `verify` operations.
+- `progress-prizes-production.yml` provides guarded `validate`, `dry-run`,
+  `prepare`, `activate`, and `verify` operations after the complete staging
+  rehearsal has passed. Every authenticated job is literal in that top-level
+  workflow and calls the same local action exercised by staging.
 - Milestone 5 adds `progress-prizes-schedule.yml` only after production
   `validate` and `dry-run` pass. Reaching `main` is what enables its Pacific-time
   schedules.
@@ -59,18 +60,23 @@ Google-secret-consuming jobs are never placed behind `workflow_call`, and no
 workflow uses `secrets: inherit`. Live July validation runs showed that GitHub
 created and approved the correct deployment but still evaluated every protected
 Environment secret as empty inside a called workflow, both with expression-based
-and literal Environment names. Each top-level dispatch or schedule workflow
-therefore binds its Google jobs directly to a literal protected Environment and
-invokes the same local action. The exact trigger commit—not a mutable branch
-tip—is the executable code that receives the approved secrets.
+and literal Environment names. Each top-level workflow that authenticates to
+Google therefore binds its Google jobs directly to a literal protected
+Environment and invokes the same local action. The separate scheduler
+authenticates only to GitHub and dispatches the production workflow. The exact
+trigger commit—not a mutable branch tip—is the executable code that receives
+the approved secrets.
 
 ## GitHub Environments
 
-Create these environments before merging the workflows. Restrict all three to
+Create these environments before merging the workflows. Restrict all four to
 the protected `main` branch. Require an authorized Vesuvius Challenge reviewer
-on `progress-prizes-production`; this is the human gate before production Google
-access, including the real July 31 activation. Staging and preview should not
-require a month-end wait.
+only on `progress-prizes-production-activation`; this is the human gate for the
+real close/open transition. The approval job receives no Google configuration,
+OIDC permission, or repository write permission. Staging, preview, and
+`progress-prizes-production` itself must not require a reviewer, so a queued
+daily preparation cannot hold the production concurrency lock and block the
+cutoff or its recovery run.
 
 ### `progress-prizes-staging`
 
@@ -161,9 +167,11 @@ any other Google service account—including a reader or owner—fails closed, a
 do inherited editors, domains, additional Managers, or Content managers.
 
 No archive or staging folder is supplied to production. Production mutation
-jobs receive no staging identity; the initial July read-only validation is the
-only exception, because it verifies the expected staging reader on the live
-form without granting the production identity access to staging.
+jobs receive no staging identity. The initial July read-only validation is the
+only exception: the workflow conditionally supplies the expected staging reader
+identity for that source cycle, so it can verify the live form without granting
+the production identity access to staging. Later validation cycles receive an
+empty staging-identity input.
 `PROGRESS_PRIZE_SOURCE_FORM_ID` is a one-time, explicit fallback. The July form
 never receives managed environment/role/cycle markers and is never moved or
 renamed. At activation it is closed first and receives only the private recovery
@@ -171,6 +179,16 @@ state marker. The August copy is created in the production Shared Drive and is
 cryptographically bound to that exact source ID. After its activation, managed
 `appProperties` discovery always selects the prior managed target, so the
 fallback secret does not need a monthly edit and is ignored for later cycles.
+
+### `progress-prizes-production-activation`
+
+This Environment contains no secrets or variables. Require one authorized
+Vesuvius Challenge reviewer, disallow self-review if the organization supports
+it, and restrict deployment branches to protected `main`. The workflow first
+freezes and verifies the exact Progress Prize PR, public test, and Vercel
+preview; then this Environment records the human approval. The following
+Google job rechecks the immutable lease immediately before mutation, so a PR or
+`main` change while approval is pending fails closed.
 
 ### `progress-prizes-preview`
 
@@ -219,11 +237,25 @@ attribute.workflow_ref == 'ScrollPrize/villa/.github/workflows/progress-prizes-r
 assertion.workflow_sha == assertion.sha
 ```
 
-For the rehearsal, use the same immutable repository, owner, ref, event, and
-top-level workflow checks for production, but set the Environment to
-`progress-prizes-production`. Milestone 4 replaces the rehearsal workflow ref
-with the exact production workflow ref; milestone 5 adds the exact schedule
-workflow ref and permits `schedule` only for that workflow.
+Use this separate condition blueprint for the production provider after the
+production workflow reaches protected `main`:
+
+```text
+attribute.repository == 'ScrollPrize/villa' &&
+attribute.repository_id == '890972577' &&
+attribute.repository_owner_id == '121906140' &&
+attribute.ref == 'refs/heads/main' &&
+attribute.event_name == 'workflow_dispatch' &&
+attribute.environment == 'progress-prizes-production' &&
+attribute.workflow_ref == 'ScrollPrize/villa/.github/workflows/progress-prizes-production.yml@refs/heads/main' &&
+assertion.workflow_sha == assertion.sha
+```
+
+The schedule milestone does not receive Google configuration or OIDC. It
+computes the Pacific window and dispatches this exact production workflow with
+`GITHUB_TOKEN`; GitHub documents `workflow_dispatch` as an event that is allowed
+to create a new run from `GITHUB_TOKEN`. The production WIF condition therefore
+does not need to permit the schedule workflow path or a `schedule` event.
 
 Bind only that provider principal to its matching service account with
 `roles/iam.workloadIdentityUser`. Use the numeric Google project number when
@@ -269,10 +301,12 @@ Before rehearsal, an administrator must:
    automation PR with the exact head SHA/ref and allowed base, or the exact
    current SHA of the fixed smoke base after merge.
 
-As observed on July 20, 2026, the repository still lacked the three Progress
-Prize Environments, `main` branch protection, and the Actions PR setting; Vercel
-previews redirected to SSO. Those are external blockers, not values that can be
-safely filled in by repository code.
+The July 20 setup created the staging, production, and preview Environments,
+enabled an active `Protect main` ruleset, and verified an exact Vercel preview
+through its protected bypass secret. The separate secret-free production
+activation Environment is added with the guarded production milestone. These
+controls remain administrator-managed external configuration; their private
+values never belong in repository code.
 
 ## Initial My Drive cycle
 
@@ -359,10 +393,49 @@ Individual rehearsal segments are available for recovery. They remain fixed to
 the same staging identities, folder, clock rules, and smoke branches; the core
 also rejects fault injection unless every staging condition is true.
 
-After the full rehearsal passes, add and merge the guarded production workflow,
-then dispatch production `dry-run` and `validate`. Add
+The full rehearsal passed through verified cleanup before the production
+workflow was added. Merge the guarded production workflow, update the
+production WIF condition to its exact path, then dispatch production `validate`
+and `dry-run`. Add
 `progress-prizes-schedule.yml` only at the final schedule milestone: once it
 reaches `main`, GitHub enables the Pacific daily schedules.
+
+## Production operations and recovery
+
+Use **Progress Prize production rollover** on `main`. For July to August, keep
+`source-cycle=2026-07` and `target-cycle=2026-08`; later targets must always be
+the immediately following month. Leave `request-id` empty for every manual run.
+
+- `validate` performs the read-only live-form, capability, publishing, response,
+  ACL, copy, and linked-Sheet preflight. It never writes Google or GitHub state.
+- `dry-run` is deliberately useful before the normal seven-day preparation
+  window. It uses the real clock and the same preparation preflight, but extends
+  only the read-only planning window to 31 days. It creates no copy, changes no
+  ACL or publishing state, writes no website branch, and records only the
+  proposed public title and deadline in the run summary. Real `prepare` remains
+  fixed to seven days.
+- `prepare` is safe to dispatch repeatedly. It succeeds without opening a page
+  PR outside the seven-day window. Inside the window it resumes the one managed
+  target for the cycle, keeps it published but closed, and reconstructs the one
+  marker-only draft page PR.
+- `verify` with `prepared` requires that exact page-only PR on current `main`;
+  `active` requires the completed website and Google close/open state.
+- `activate` should be dispatched near 23:40 Pacific on the final day. The exact
+  PR tests and Vercel preview pass first. Approval is offered only when the real
+  cutoff is at most one hour away (or has passed), through the secret-free
+  `progress-prizes-production-activation` Environment. The job waits without a
+  Google token, authenticates at cutoff, reacquires a zero-wait GitHub lease,
+  closes the source, opens and reload-verifies the target, then merges only the
+  activated commit.
+
+If preparation, activation, or merge stops, rerun the same operation and cycle.
+Managed Drive markers make Google copy and close/open recovery idempotent. A
+rerun after a completed merge performs read-only active verification. If `main`
+moved before mutation, activation reconstructs and rechecks a stale-parent page
+commit; any multi-file, merge, wrong-path, or query-bearing change fails closed.
+Never use simulated time, fault controls, alternate branches, or staging folders
+for production; those inputs are absent and the shared action rejects them
+before authentication.
 
 ## Local verification
 

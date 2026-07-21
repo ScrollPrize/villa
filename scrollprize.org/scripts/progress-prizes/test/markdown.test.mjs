@@ -6,6 +6,7 @@ import { dirname, resolve } from 'node:path';
 
 import {
   PROGRESS_PRIZE_MARKERS,
+  assertCanonicalPublicResponderUri,
   assertPublicResponderUri,
   parseProgressPrizeMarkdown,
   updateProgressPrizeMarkdown,
@@ -142,6 +143,15 @@ test('parser rejects noncanonical or non-month-end deadlines', () => {
 test('only public responder URLs are accepted', () => {
   assert.equal(assertPublicResponderUri(oldUri), oldUri);
   assert.equal(assertPublicResponderUri(`${newUri}?usp=sf_link`), `${newUri}?usp=sf_link`);
+  assert.equal(assertCanonicalPublicResponderUri(newUri), newUri);
+  assert.throws(
+    () => assertCanonicalPublicResponderUri(`${newUri}?entry.123=prefilled`),
+    /query parameters/,
+  );
+  assert.throws(
+    () => parseProgressPrizeMarkdown(fixture({ uri: `${newUri}?entry.123=prefilled` })),
+    /query parameters/,
+  );
   for (const uri of [
     'http://forms.gle/OldForm',
     'https://docs.google.com/forms/d/e/EditorForm/edit',
