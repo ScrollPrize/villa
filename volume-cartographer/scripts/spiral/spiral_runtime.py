@@ -37,6 +37,7 @@ class InteractiveFitSession:
         self.input_manifest = paths.manifest()
         self.requested_config = dict(run.config)
         self._run_config = None
+        self._run_config_limits = None
         self._default_advanced_config = None
         self._status_callback = status_callback
         self.publishes_outputs = publishes_outputs
@@ -86,6 +87,9 @@ class InteractiveFitSession:
             }
             if self._run_config is not None:
                 result["run_config"] = copy.deepcopy(self._run_config)
+            if self._run_config_limits is not None:
+                result["run_config_limits"] = copy.deepcopy(
+                    self._run_config_limits)
             if self._default_advanced_config is not None:
                 result["default_advanced_config"] = copy.deepcopy(
                     self._default_advanced_config)
@@ -186,6 +190,11 @@ class InteractiveFitSession:
             self.requested_config = dict(config)
             with self._condition:
                 self._run_config = run_mutable_config(config)
+                self._run_config_limits = {
+                    'max_track_crossing_per_step': max(
+                        int(config.get('track_crossing_precompute_max', 0)),
+                        int(config.get('max_track_crossing_per_step', 0))),
+                }
                 self._default_advanced_config = default_advanced_config
             self._publish_status()
 

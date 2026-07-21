@@ -189,6 +189,72 @@ journalctl --user -u spiral-service -f     # logs (includes the API key print)
 
 Direct command-line use remains fully supported; the unit is a convenience.
 
+## Packing large track databases
+
+Legacy track DBMs store a pickled list of NumPy arrays in every key. For large
+datasets this spends minutes decoding millions of Python objects each time a
+fit starts. Convert a DBM once to the adjacent packed format:
+
+```sh
+python scripts/spiral/convert_track_store.py \
+    /data/tracks/2um_ds2_ps256_surf_v2.dbm
+```
+
+This writes `2um_ds2_ps256_surf_v2.dbm.vctracks/` atomically. The directory
+contains contiguous coordinates, ragged offsets, source IDs, family codes,
+Z bounds, arclengths, and tortuosities. `fit_spiral.py` automatically prefers
+a current adjacent packed store while retaining the DBM as the authoritative
+source and compatibility fallback. A source-file fingerprint prevents a stale
+store from being used after the DBM changes; rerun with `--force` to replace it.
+
+The native `vc.track_store` loader memory-maps the packed files, applies the Z
+ROI from per-track metadata, and emits one compact float32 ragged array without
+constructing per-track Python objects. The crossing builder also stages
+directly from a current packed store, bypassing DBM and pickle decoding.
+
+## Caching exact track crossings
+
+Crossing-connected track sampling needs the exact shared voxels between the
+horizontal and vertical track families. Build that index once as a CSR
+sidecar instead of sorting every track point whenever a fit session loads:
+
+```sh
+python scripts/spiral/build_track_crossings.py \
+    /data/tracks/2um_ds2_ps256_surf_v2.dbm \
+    --z-min 4000 --z-max 17000 \
+    --temp-dir /fast/disk/tmp
+```
+
+The optional Z range is half-open (`[z-min, z-max)`) and retains only tracks
+entirely contained in that range. Omit both options to index the whole DBM.
+The standalone builder uses a hybrid memory/disk index: it streams DBM tracks
+into temporary coordinate and packed-voxel files, keeps the coordinates
+memory-mapped, then loads and radix-sorts the packed keys in RAM. The native
+`vc.track_crossings` kernel uses all requested workers for sorting, exact-voxel
+discovery, arclength calculation, and pair consolidation. Build it for a source
+checkout with `ninja -C build vc_track_crossings`; installed VC Python packages
+include it automatically. A slower Python fallback remains available.
+
+The builder needs roughly 20 bytes of temporary disk space per selected point.
+The native radix sort temporarily holds about 32 RAM bytes per point; after the
+sort, those arrays are released before the 8-byte-per-point arclength vector and
+compact 16-byte crossing events are consolidated. This avoids retaining either
+the selected track database or Python dictionaries of crossing pairs in RAM.
+Temporary files are removed after the sidecar is written. Without `--temp-dir`,
+the temporary workspace is created beside the tracks DBM rather than under the
+system temporary directory.
+
+The script writes
+`/data/tracks/2um_ds2_ps256_surf_v2.dbm.crossings.npz` atomically.
+`fit_spiral.py` finds it automatically from the configured tracks path. The
+sidecar includes a fingerprint of every DBM backing file; a stale or malformed
+file is ignored and the fitter falls back to its in-memory exact crossing
+scan. Re-run the builder after changing the DBM (`--force` replaces a current
+cache). A range-limited sidecar can serve the same or a narrower fitting Z
+range; building another range replaces it. Point-level track exclusion also
+uses the fallback because clipping a
+track changes its crossing-local indices.
+
 ## Converting track DBMs to OME-Zarr
 
 `tracks_to_ome_zarr.py` rasterizes the ZYX polylines produced by

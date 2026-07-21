@@ -137,6 +137,15 @@ vc_add_test(NAME test_scale_bar_units
     LIBS doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+qt6_wrap_cpp(spiral_config_profile_editor_moc
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.hpp)
+vc_add_test(NAME test_spiral_config_profile_editor
+    SOURCES test_spiral_config_profile_editor.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.cpp
+            ${spiral_config_profile_editor_moc}
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 qt6_wrap_cpp(cfiber_widget_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CFiberWidget.hpp)
 vc_add_test(NAME test_fiber_widget
     SOURCES test_fiber_widget.cpp

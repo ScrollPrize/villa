@@ -51,10 +51,25 @@ RUN_MUTABLE_SAMPLING_KEYS = frozenset({
 })
 
 
+RUN_MUTABLE_BOOLEAN_KEYS = frozenset({
+    "save_png_visualizations",
+})
+
+
+RUN_MUTABLE_TRACK_POLICY_KEYS = frozenset({
+    "track_length_bin_weights",
+    "max_track_crossing_per_step",
+    "track_min_sample_spacing",
+    "track_max_sample_spacing",
+})
+
+
 def is_run_mutable_config_key(key: str) -> bool:
     """Return whether an advanced setting may change at a Run boundary."""
     return (
         key in RUN_MUTABLE_SAMPLING_KEYS
+        or key in RUN_MUTABLE_BOOLEAN_KEYS
+        or key in RUN_MUTABLE_TRACK_POLICY_KEYS
         or (key.startswith("loss_weight_") and key != "loss_weight_anchor")
         or key.startswith("loss_start_")
     )

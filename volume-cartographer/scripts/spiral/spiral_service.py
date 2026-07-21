@@ -34,7 +34,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_SAMPLING_KEYS,
+from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_BOOLEAN_KEYS,
+                         RUN_MUTABLE_SAMPLING_KEYS,
                          parse_session_request,
                          resolve_dataset_root, validate_checkpoint_container,
                          validate_session_request)
@@ -172,7 +173,7 @@ def _validate_run_influence_config(value):
     return result
 
 
-def _validate_run_config(value, current):
+def _validate_run_config(value, current, limits=None):
     """Validate settings which the resident fitter can change between Runs."""
     if value is None:
         return {}
@@ -180,6 +181,7 @@ def _validate_run_config(value, current):
         raise ApiError(HTTPStatus.BAD_REQUEST,
                        "run_config must be a JSON object")
     current = current if isinstance(current, dict) else {}
+    limits = limits if isinstance(limits, dict) else {}
     unknown = sorted(set(value) - set(current))
     if unknown:
         raise ApiError(HTTPStatus.BAD_REQUEST,
@@ -187,6 +189,50 @@ def _validate_run_config(value, current):
 
     result = {}
     for key, item in value.items():
+        if key == "track_length_bin_weights":
+            if item is None:
+                result[key] = None
+                continue
+            if (not isinstance(item, list) or len(item) != 3
+                    or any(isinstance(weight, bool)
+                           or not isinstance(weight, (int, float))
+                           or not math.isfinite(float(weight))
+                           or float(weight) < 0 for weight in item)
+                    or sum(float(weight) for weight in item) <= 0):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    f"{key} must be null or three finite non-negative weights "
+                    "with a positive sum")
+            result[key] = [float(weight) for weight in item]
+            continue
+        if key == "max_track_crossing_per_step":
+            if (isinstance(item, bool) or not isinstance(item, (int, float))
+                    or not math.isfinite(float(item))
+                    or not float(item).is_integer() or int(item) < 0):
+                raise ApiError(HTTPStatus.BAD_REQUEST,
+                               f"{key} must be a non-negative integer")
+            maximum = limits.get(key)
+            if (not isinstance(maximum, bool)
+                    and isinstance(maximum, (int, float))
+                    and int(item) > int(maximum)):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    f"{key} cannot exceed this session's prepared limit ({int(maximum)})")
+            result[key] = int(item)
+            continue
+        if key in ("track_min_sample_spacing", "track_max_sample_spacing"):
+            if (isinstance(item, bool) or not isinstance(item, (int, float))
+                    or not math.isfinite(float(item)) or float(item) <= 0):
+                raise ApiError(HTTPStatus.BAD_REQUEST,
+                               f"{key} must be a finite positive number")
+            result[key] = float(item)
+            continue
+        if key in RUN_MUTABLE_BOOLEAN_KEYS:
+            if not isinstance(item, bool):
+                raise ApiError(HTTPStatus.BAD_REQUEST,
+                               f"{key} must be boolean")
+            result[key] = item
+            continue
         if key.startswith("loss_start_") and item is None:
             if key == "loss_start_patch_dt":
                 raise ApiError(HTTPStatus.BAD_REQUEST,
@@ -222,6 +268,16 @@ def _validate_run_config(value, current):
                     raise ApiError(HTTPStatus.BAD_REQUEST,
                                    f"{key} must be at least 1")
         result[key] = number
+    effective = dict(current)
+    effective.update(result)
+    minimum = effective.get("track_min_sample_spacing")
+    maximum = effective.get("track_max_sample_spacing")
+    if (not isinstance(minimum, bool) and isinstance(minimum, (int, float))
+            and not isinstance(maximum, bool) and isinstance(maximum, (int, float))
+            and float(minimum) > float(maximum)):
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "track_min_sample_spacing must be <= track_max_sample_spacing")
     return result
 
 
@@ -915,10 +971,12 @@ class ServiceState:
 
     def run(self, request):
         session = self._require_session()
+        status = session.status()
         influence_config = _validate_run_influence_config(
             request.get("influence_config"))
         run_config = _validate_run_config(
-            request.get("run_config"), session.status().get("run_config"))
+            request.get("run_config"), status.get("run_config"),
+            status.get("run_config_limits"))
         with self.lock:
             pending = [record for record in self.ephemeral_records
                        if record["state"] == "pending"]

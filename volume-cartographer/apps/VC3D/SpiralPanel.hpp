@@ -22,6 +22,7 @@ class QPlainTextEdit;
 class QSlider;
 class QToolButton;
 class SpiralServiceManager;
+class SpiralConfigProfileEditor;
 class QFormLayout;
 
 class SpiralPanel : public QWidget
@@ -50,19 +51,18 @@ private:
     QJsonObject influenceConfig() const;
     QJsonObject sessionAdvancedConfig() const;
     QJsonObject runAdvancedConfig() const;
-    QJsonObject durableAdvancedConfig() const;
     void applyOptionalInputConfig(QJsonObject& config, bool includeSelectionFlags) const;
     void applyTrackSamplingConfig(QJsonObject& config) const;
     void syncTrackSamplingControlsFromAdvanced();
     void writeTrackSamplingControlsToAdvanced();
     void updateTrackSamplingUi();
-    QSet<QString> forcedOptionalRunConfigKeys() const;
     bool optionalInputEnabled(const QString& key) const;
     void updateOptionalInputUi();
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
     void applyResolution(const QJsonObject& resolution, bool force);
     void updateStatus(const QJsonObject& status);
-    void markReloadRequired();
+    QJsonObject normalizedReloadRequest(QJsonObject request) const;
+    void refreshReloadRequired();
     void persist() const;
     void restore();
 
@@ -119,6 +119,7 @@ private:
     QSpinBox* _influenceThetaPct = nullptr;
     QSpinBox* _influenceDisableDtPct = nullptr;
     QDoubleSpinBox* _influenceAnchorWeight = nullptr;
+    SpiralConfigProfileEditor* _advancedProfiles = nullptr;
     QPlainTextEdit* _advanced = nullptr;
     VolumeSelector* _volumeSelector = nullptr;
     QPushButton* _load = nullptr;
@@ -153,7 +154,9 @@ private:
     QPushButton* _removeInput = nullptr;
     QLabel* _commitHint = nullptr;
     QJsonArray _lastEphemeral;
-    QJsonObject _loadedDurableAdvanced;
+    QJsonObject _loadedSessionRequest;
+    QJsonObject _pendingSessionRequest;
+    QJsonObject _defaultAdvancedConfig;
     QSet<QString> _runConfigKeys;
     qint64 _advancedSessionGeneration = -1;
 
@@ -164,6 +167,7 @@ private:
     bool _hasManualEdits = false;
     bool _hasSession = false;
     bool _reloadRequired = false;
+    bool _sessionRunnable = false;
     bool _remoteMode = false;
     bool _connected = false;
     int _ephemeralCount = 0;

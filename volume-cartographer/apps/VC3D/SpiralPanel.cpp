@@ -1,8 +1,10 @@
 #include "SpiralPanel.hpp"
 
+#include "SpiralReloadComparison.hpp"
 #include "SpiralServiceManager.hpp"
 #include "VCSettings.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
+#include "elements/SpiralConfigProfileEditor.hpp"
 #include "elements/VolumeSelector.hpp"
 
 #include <QAbstractItemView>
@@ -23,7 +25,6 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QMessageBox>
-#include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollArea>
@@ -37,71 +38,6 @@
 
 namespace {
 const QString kLocalhostProfileId = QStringLiteral("localhost");
-
-class VerticallyResizablePlainTextEdit final : public QPlainTextEdit
-{
-public:
-    explicit VerticallyResizablePlainTextEdit(const QString& text, QWidget* parent = nullptr)
-        : QPlainTextEdit(text, parent)
-    {
-        setMouseTracking(true);
-        setMinimumHeight(72);
-    }
-
-    QSize sizeHint() const override
-    {
-        QSize result = QPlainTextEdit::sizeHint();
-        result.setHeight(120);
-        return result;
-    }
-
-protected:
-    void mousePressEvent(QMouseEvent* event) override
-    {
-        if (event->button() == Qt::LeftButton && onResizeEdge(event->position())) {
-            _resizing = true;
-            _dragStartY = event->globalPosition().y();
-            _dragStartHeight = height();
-            event->accept();
-            return;
-        }
-        QPlainTextEdit::mousePressEvent(event);
-    }
-
-    void mouseMoveEvent(QMouseEvent* event) override
-    {
-        if (_resizing) {
-            const int requested = _dragStartHeight
-                + qRound(event->globalPosition().y() - _dragStartY);
-            setFixedHeight(qMax(72, requested));
-            event->accept();
-            return;
-        }
-        viewport()->setCursor(onResizeEdge(event->position())
-                                  ? Qt::SizeVerCursor : Qt::IBeamCursor);
-        QPlainTextEdit::mouseMoveEvent(event);
-    }
-
-    void mouseReleaseEvent(QMouseEvent* event) override
-    {
-        if (_resizing && event->button() == Qt::LeftButton) {
-            _resizing = false;
-            event->accept();
-            return;
-        }
-        QPlainTextEdit::mouseReleaseEvent(event);
-    }
-
-private:
-    bool onResizeEdge(const QPointF& position) const
-    {
-        return position.y() >= viewport()->height() - 7;
-    }
-
-    bool _resizing = false;
-    qreal _dragStartY = 0;
-    int _dragStartHeight = 0;
-};
 }
 
 SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
@@ -253,7 +189,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         ++optionalIndex;
         connect(check, &QCheckBox::toggled, this, [this](bool) {
             updateOptionalInputUi();
-            markReloadRequired();
+            refreshReloadRequired();
         });
     }
     pathsForm->addRow(tr("Use inputs"), optionalInputs);
@@ -339,11 +275,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
 
     _maxTrackCrossings = new QSpinBox(pathsContents);
     _maxTrackCrossings->setObjectName(QStringLiteral("spiralMaxTrackCrossings"));
-    _maxTrackCrossings->setRange(0, 1000);
+    _maxTrackCrossings->setRange(0, 8);
     _maxTrackCrossings->setValue(0);
     _maxTrackCrossings->setToolTip(
         tr("Maximum differently oriented crossing partners appended for each sampled "
-           "primary track. Zero disables crossing-pair sampling."));
+           "primary track. Applies on the next Run; zero disables crossing-pair "
+           "sampling. The upper bound is prepared when the session loads."));
     pathsForm->addRow(tr("Max crossings / sampled track"), _maxTrackCrossings);
     updateTrackSamplingUi();
 
@@ -417,9 +354,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _influenceAnchorWeight->setRange(0.0, 10000.0); _influenceAnchorWeight->setDecimals(1); _influenceAnchorWeight->setValue(20.0);
     _influenceAnchorWeight->setToolTip(tr("Weight of the loss holding the fit in place outside the influence region"));
     _runTag = new QLineEdit(outputContents);
-    _advanced = new VerticallyResizablePlainTextEdit(QStringLiteral("{}"), outputContents);
-    _advanced->setToolTip(tr("Sampling counts, loss weights, and loss start steps apply to the next Run. "
-                             "Drag the bottom edge to resize this editor vertically."));
+    _advancedProfiles = new SpiralConfigProfileEditor(outputContents);
+    _advanced = _advancedProfiles->textEdit();
     outputForm->addRow(tr("z begin"), _zBegin);
     outputForm->addRow(tr("z end"), _zEnd);
     outputForm->addRow(tr("Scroll name"), _scrollName);
@@ -435,7 +371,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     outputForm->addRow(tr("Influence theta"), _influenceThetaPct);
     outputForm->addRow(tr("% of iters to disable DT"), _influenceDisableDtPct);
     outputForm->addRow(tr("Influence anchor weight"), _influenceAnchorWeight);
-    outputForm->addRow(tr("Advanced config JSON"), _advanced);
+    outputForm->addRow(tr("Advanced config JSON"), _advancedProfiles);
 
     auto* displayGroup = makeSection(tr("Display"),
                                      QStringLiteral("spiralDisplayGroup"),
@@ -636,7 +572,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         addPclItem(path, _pclRole->currentData().toString());
         _pclPath->clear();
         _hasManualEdits = true;
-        markReloadRequired();
+        refreshReloadRequired();
     };
     connect(_addPclButton, &QPushButton::clicked, this, appendPcl);
     connect(_pclPath, &QLineEdit::returnPressed, this, appendPcl);
@@ -652,7 +588,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         if (auto* item = _pclList->takeItem(_pclList->currentRow())) {
             delete item;
             _hasManualEdits = true;
-            markReloadRequired();
+            refreshReloadRequired();
         }
     });
 
@@ -691,9 +627,14 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_service, &SpiralServiceManager::sessionAccepted, this,
             [this](const QJsonObject&, qint64) {
                 _hasSession = true;
+                _loadedSessionRequest = _pendingSessionRequest;
+                _pendingSessionRequest = {};
                 _reloadRequired = false;
                 _advancedSessionGeneration = -1;
-                _loadedDurableAdvanced = durableAdvancedConfig();
+                _defaultAdvancedConfig = {};
+                _applyingResolution = true;
+                _advancedProfiles->clearSessionDefault();
+                _applyingResolution = false;
                 for (auto it = _visibilityChecks.begin(); it != _visibilityChecks.end(); ++it)
                     it.value()->setChecked(it.key() == QStringLiteral("output"));
             });
@@ -738,7 +679,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             return;
         persist();
         emit pythonOutputRequested();
-        _service->loadSession(sessionRequest());
+        _pendingSessionRequest = sessionRequest();
+        _service->loadSession(_pendingSessionRequest);
     });
     connect(_run, &QPushButton::clicked, this, [this]() {
         QJsonParseError error;
@@ -799,18 +741,18 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             [this](int) { emit volumeSelected(_volumeSelector->selectedVolumeId()); });
     for (QSpinBox* spin : {_zBegin, _zEnd, _lasagnaScale, _legacyCheckpointStep,
                            _renderVolumeScale})
-        connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) { markReloadRequired(); });
+        connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) { refreshReloadRequired(); });
     for (QDoubleSpinBox* spin : {_voxelSize})
         connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
-                [this](double) { markReloadRequired(); });
+                [this](double) { refreshReloadRequired(); });
     for (QLineEdit* edit : {_lasagnaGroup, _scrollName, _runTag})
-        connect(edit, &QLineEdit::textEdited, this, [this](const QString&) { markReloadRequired(); });
+        connect(edit, &QLineEdit::textEdited, this, [this](const QString&) { refreshReloadRequired(); });
     connect(_outwardSense, qOverload<int>(&QComboBox::currentIndexChanged), this,
-            [this](int) { markReloadRequired(); });
+            [this](int) { refreshReloadRequired(); });
     connect(_storageBackend, qOverload<int>(&QComboBox::currentIndexChanged), this,
-            [this](int) { markReloadRequired(); });
+            [this](int) { refreshReloadRequired(); });
     connect(_savePngVisualizations, &QCheckBox::toggled, this,
-            [this](bool) { markReloadRequired(); });
+            [this](bool) { refreshReloadRequired(); });
     connect(_trackLengthBinSampling, &QCheckBox::toggled, this, [this](bool) {
         updateTrackSamplingUi();
         writeTrackSamplingControlsToAdvanced();
@@ -822,10 +764,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     }
     connect(_maxTrackCrossings, qOverload<int>(&QSpinBox::valueChanged), this,
             [this](int) { writeTrackSamplingControlsToAdvanced(); });
-    connect(_advanced, &QPlainTextEdit::textChanged, this, [this]() {
+    connect(_advancedProfiles, &SpiralConfigProfileEditor::textChanged, this, [this]() {
         syncTrackSamplingControlsFromAdvanced();
-        if (durableAdvancedConfig() != _loadedDurableAdvanced)
-            markReloadRequired();
+        refreshReloadRequired();
     });
 
     // Profile management
@@ -1040,7 +981,7 @@ QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const 
     connect(edit, &QLineEdit::textEdited, this, [this, key](const QString&) {
         if (!_applyingResolution) {
             if (key != QStringLiteral("dataset_root")) _hasManualEdits = true;
-            markReloadRequired();
+            refreshReloadRequired();
         }
     });
     connect(browse, &QToolButton::clicked, this, [this, edit, directory, key]() {
@@ -1050,7 +991,7 @@ QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const 
         if (!chosen.isEmpty()) {
             edit->setText(chosen);
             if (key != QStringLiteral("dataset_root")) _hasManualEdits = true;
-            markReloadRequired();
+            refreshReloadRequired();
         }
     });
     return edit;
@@ -1120,7 +1061,7 @@ void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
     // A refreshed resolution that resolves to the very same inputs (e.g. the
     // re-advertisement after committing ephemeral inputs) must not disable Run
     // on the live session; only an actual form change requires a reload.
-    if (sessionRequest() != before) markReloadRequired();
+    if (sessionRequest() != before) refreshReloadRequired();
     const QStringList missing = resolution.value("missing_required").toVariant().toStringList();
     QStringList notes;
     if (!missing.isEmpty()) notes << tr("Missing required: %1").arg(missing.join(", "));
@@ -1192,19 +1133,12 @@ QJsonObject SpiralPanel::influenceConfig() const
     return config;
 }
 
-QJsonObject SpiralPanel::durableAdvancedConfig() const
-{
-    QJsonObject config = sessionAdvancedConfig();
-    for (const QString& key : _runConfigKeys)
-        config.remove(key);
-    return config;
-}
-
 QJsonObject SpiralPanel::sessionAdvancedConfig() const
 {
     const QJsonDocument advanced =
         QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
-    QJsonObject config = advanced.isObject() ? advanced.object() : QJsonObject{};
+    QJsonObject config = !_advancedProfiles->isDefaultProfile() && advanced.isObject()
+        ? advanced.object() : QJsonObject{};
     for (auto it = config.begin(); it != config.end();) {
         if (it.key().startsWith(QStringLiteral("interactive_influence_"))
             || it.key() == QStringLiteral("loss_weight_anchor"))
@@ -1212,7 +1146,6 @@ QJsonObject SpiralPanel::sessionAdvancedConfig() const
         else
             ++it;
     }
-    applyTrackSamplingConfig(config);
     applyOptionalInputConfig(config, true);
     return config;
 }
@@ -1227,6 +1160,9 @@ QJsonObject SpiralPanel::runAdvancedConfig() const
     for (const QString& key : _runConfigKeys) {
         if (all.contains(key)) config.insert(key, all.value(key));
     }
+    if (_runConfigKeys.contains(QStringLiteral("save_png_visualizations")))
+        config[QStringLiteral("save_png_visualizations")] =
+            _savePngVisualizations->isChecked();
     applyOptionalInputConfig(config, false);
     for (auto it = config.begin(); it != config.end();) {
         if (!_runConfigKeys.contains(it.key()))
@@ -1291,6 +1227,10 @@ void SpiralPanel::syncTrackSamplingControlsFromAdvanced()
         config.value(QStringLiteral("max_track_crossing_per_step"));
     {
         const QSignalBlocker blocker(_maxTrackCrossings);
+        const int preparedMaximum = config
+            .value(QStringLiteral("track_crossing_precompute_max"))
+            .toInt(8);
+        _maxTrackCrossings->setMaximum(qMax(0, preparedMaximum));
         _maxTrackCrossings->setValue(crossings.isDouble() ? crossings.toInt() : 0);
     }
     updateTrackSamplingUi();
@@ -1301,17 +1241,14 @@ void SpiralPanel::writeTrackSamplingControlsToAdvanced()
     QJsonDocument document =
         QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
     if (!document.isObject()) {
-        markReloadRequired();
+        refreshReloadRequired();
         return;
     }
     QJsonObject config = document.object();
     applyTrackSamplingConfig(config);
-    {
-        const QSignalBlocker blocker(_advanced);
-        _advanced->setPlainText(QString::fromUtf8(
-            QJsonDocument(config).toJson(QJsonDocument::Indented)).trimmed());
-    }
-    markReloadRequired();
+    _advancedProfiles->setCurrentText(QString::fromUtf8(
+        QJsonDocument(config).toJson(QJsonDocument::Indented)).trimmed());
+    refreshReloadRequired();
 }
 
 void SpiralPanel::updateTrackSamplingUi()
@@ -1385,21 +1322,6 @@ void SpiralPanel::applyOptionalInputConfig(QJsonObject& config,
         zero({"loss_weight_dense_spacing", "dense_spacing_num_pairs"});
 }
 
-QSet<QString> SpiralPanel::forcedOptionalRunConfigKeys() const
-{
-    QJsonObject forced;
-    const QJsonDocument advanced =
-        QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
-    if (advanced.isObject() && advanced.object().contains(QStringLiteral("dense_spacing_mode")))
-        forced[QStringLiteral("dense_spacing_mode")] =
-            advanced.object().value(QStringLiteral("dense_spacing_mode"));
-    applyOptionalInputConfig(forced, false);
-    forced.remove(QStringLiteral("dense_spacing_mode"));
-    QSet<QString> result;
-    for (auto it = forced.begin(); it != forced.end(); ++it) result.insert(it.key());
-    return result;
-}
-
 void SpiralPanel::updateOptionalInputUi()
 {
     for (auto it = _paths.begin(); it != _paths.end(); ++it) {
@@ -1417,34 +1339,10 @@ void SpiralPanel::updateOptionalInputUi()
 
 void SpiralPanel::applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration)
 {
-    QJsonDocument document = QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
-    QJsonObject merged = document.isObject() ? document.object() : QJsonObject{};
-    const QSet<QString> forcedKeys = forcedOptionalRunConfigKeys();
-    QJsonObject preservedForcedValues;
-    for (const QString& key : _runConfigKeys) {
-        if (forcedKeys.contains(key) && merged.contains(key))
-            preservedForcedValues.insert(key, merged.value(key));
-        merged.remove(key);
-    }
     _runConfigKeys.clear();
-    for (auto it = config.begin(); it != config.end(); ++it) {
+    for (auto it = config.begin(); it != config.end(); ++it)
         _runConfigKeys.insert(it.key());
-        // Checkbox-forced zeroes are effective session values, not edits to
-        // the user's Advanced JSON. Preserve the prior value so re-enabling
-        // an input and reloading restores its configured/default behaviour.
-        if (!forcedKeys.contains(it.key()))
-            merged.insert(it.key(), it.value());
-        else if (preservedForcedValues.contains(it.key()))
-            merged.insert(it.key(), preservedForcedValues.value(it.key()));
-    }
-    {
-        const QSignalBlocker blocker(_advanced);
-        _advanced->setPlainText(QString::fromUtf8(
-            QJsonDocument(merged).toJson(QJsonDocument::Indented)).trimmed());
-    }
-    syncTrackSamplingControlsFromAdvanced();
     _advancedSessionGeneration = sessionGeneration;
-    _loadedDurableAdvanced = durableAdvancedConfig();
 }
 
 void SpiralPanel::updateStatus(const QJsonObject& status)
@@ -1452,9 +1350,27 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     const qint64 sessionGeneration =
         status.value(QStringLiteral("session_generation")).toInteger(-1);
     const QJsonObject runConfig = status.value(QStringLiteral("run_config")).toObject();
+    const QJsonObject runConfigLimits =
+        status.value(QStringLiteral("run_config_limits")).toObject();
+    const QJsonObject defaultConfig =
+        status.value(QStringLiteral("default_advanced_config")).toObject();
     if (sessionGeneration >= 0 && sessionGeneration != _advancedSessionGeneration
-        && !runConfig.isEmpty())
+        && !runConfig.isEmpty()) {
+        if (!defaultConfig.isEmpty()) {
+            _defaultAdvancedConfig = defaultConfig;
+            _applyingResolution = true;
+            _advancedProfiles->setSessionDefault(defaultConfig);
+            _applyingResolution = false;
+        }
         applySessionRunConfig(runConfig, sessionGeneration);
+        refreshReloadRequired();
+    }
+    const QJsonValue crossingLimit =
+        runConfigLimits.value(QStringLiteral("max_track_crossing_per_step"));
+    if (crossingLimit.isDouble()) {
+        const QSignalBlocker blocker(_maxTrackCrossings);
+        _maxTrackCrossings->setMaximum(qMax(0, crossingLimit.toInt()));
+    }
 
     const QString state = status.value("state").toString();
     QString stateText = tr("Session: %1 — %2 — iteration %3/%4")
@@ -1462,7 +1378,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         .arg(status.value("current_iteration").toInteger())
         .arg(status.value("target_iteration").toInteger());
     // Status polls arrive every second; without this the reload-required
-    // notice set by markReloadRequired() vanishes immediately, leaving an
+    // notice set by refreshReloadRequired() vanishes immediately, leaving an
     // unexplained disabled Run button.
     if (_reloadRequired)
         stateText += QStringLiteral("\n")
@@ -1479,6 +1395,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     }
     _warnings->setText(diagnostics.join(QStringLiteral("\n\n")));
     const bool runnable = state == "Ready" || state == "Paused";
+    _sessionRunnable = runnable;
     _run->setEnabled(_connected && runnable && !_reloadRequired);
     _stop->setEnabled(state == "Running");
     _save->setEnabled(_connected && runnable);
@@ -1536,12 +1453,63 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         _commitHint->clear();
 }
 
-void SpiralPanel::markReloadRequired()
+QJsonObject SpiralPanel::normalizedReloadRequest(QJsonObject request) const
 {
-    if (!_hasSession || _applyingResolution) return;
-    _reloadRequired = true;
-    _run->setEnabled(false);
-    _state->setText(tr("Reload required — fit inputs or training configuration changed"));
+    // Run-mutable settings are excluded because they can be applied at the
+    // next Run boundary without rebuilding the resident session.
+    return vc3d::normalizedSpiralReloadRequest(
+        std::move(request), _defaultAdvancedConfig, _runConfigKeys);
+}
+
+void SpiralPanel::refreshReloadRequired()
+{
+    if (!_hasSession || _applyingResolution || _loadedSessionRequest.isEmpty()) return;
+
+    QJsonObject current = sessionRequest();
+
+    // A loaded input may be disabled at a Run boundary by forcing its mutable
+    // loss weights and sample counts to zero. Re-enabling an input that was not
+    // loaded, or changing its path, still requires rebuilding the session.
+    QJsonObject currentRun = current.value(QStringLiteral("run")).toObject();
+    QJsonObject currentConfig = currentRun.value(QStringLiteral("config")).toObject();
+    const QJsonObject loadedRun =
+        _loadedSessionRequest.value(QStringLiteral("run")).toObject();
+    const QJsonObject loadedConfig =
+        loadedRun.value(QStringLiteral("config")).toObject();
+    QJsonObject currentPaths = current.value(QStringLiteral("paths")).toObject();
+    const QJsonObject loadedPaths =
+        _loadedSessionRequest.value(QStringLiteral("paths")).toObject();
+    const QHash<QString, QStringList> optionalInputs{
+        {QStringLiteral("use_verified_patches"), {QStringLiteral("verified_patches")}},
+        {QStringLiteral("use_unverified_patches"), {QStringLiteral("unverified_patches")}},
+        {QStringLiteral("use_normals"), {QStringLiteral("normal_x"), QStringLiteral("normal_y")}},
+        {QStringLiteral("use_surf_sdt"), {QStringLiteral("surf_sdt")}},
+        {QStringLiteral("use_tracks"), {QStringLiteral("tracks_dbm")}},
+        {QStringLiteral("use_gradient_magnitude"), {QStringLiteral("gradient_magnitude")}},
+        {QStringLiteral("use_fibers"), {QStringLiteral("fibers")}},
+    };
+    for (auto it = optionalInputs.begin(); it != optionalInputs.end(); ++it) {
+        const QString& flag = it.key();
+        const bool loaded = loadedConfig.value(flag).toBool(true);
+        const bool enabled = currentConfig.value(flag).toBool(true);
+        if (!loaded || enabled) continue;
+        currentConfig[flag] = true;
+        for (const QString& pathKey : it.value()) {
+            currentPaths[pathKey] = loadedPaths.value(pathKey);
+        }
+    }
+    currentRun[QStringLiteral("config")] = currentConfig;
+    current[QStringLiteral("run")] = currentRun;
+    current[QStringLiteral("paths")] = currentPaths;
+
+    const bool wasReloadRequired = _reloadRequired;
+    _reloadRequired = normalizedReloadRequest(current)
+        != normalizedReloadRequest(_loadedSessionRequest);
+    _run->setEnabled(_connected && _sessionRunnable && !_reloadRequired);
+    if (_reloadRequired)
+        _state->setText(tr("Reload required — fit inputs or session configuration changed"));
+    else if (wasReloadRequired)
+        _state->setText(tr("Session configuration restored — no reload required"));
 }
 
 void SpiralPanel::persist() const
@@ -1581,7 +1549,7 @@ void SpiralPanel::persist() const
     settings.setValue(prefix + "influence_disable_dt_pct", _influenceDisableDtPct->value());
     settings.setValue(prefix + "influence_anchor_weight", _influenceAnchorWeight->value());
     settings.setValue(prefix + "iterations", _iterations->value());
-    settings.setValue(prefix + "advanced_config", _advanced->toPlainText());
+    settings.remove(prefix + "advanced_config");
 }
 
 void SpiralPanel::restore()
@@ -1646,18 +1614,15 @@ void SpiralPanel::restore()
     _influenceAnchorWeight->setValue(
         settings.value(valuePrefix + "influence_anchor_weight", 20.0).toDouble());
     _iterations->setValue(settings.value(valuePrefix + "iterations", 100).toInt());
-    const QString savedAdvanced =
-        settings.value(valuePrefix + "advanced_config", "{}").toString();
-    const QJsonDocument advancedDocument = QJsonDocument::fromJson(savedAdvanced.toUtf8());
-    _advanced->setPlainText(advancedDocument.isObject()
-        ? QString::fromUtf8(advancedDocument.toJson(QJsonDocument::Indented)).trimmed()
-        : savedAdvanced);
+    _advancedProfiles->clearSessionDefault();
     _applyingResolution = false;
     _hasManualEdits = false;
     _hasSession = false;
     _reloadRequired = false;
     _advancedSessionGeneration = -1;
     _runConfigKeys.clear();
-    _loadedDurableAdvanced = durableAdvancedConfig();
+    _loadedSessionRequest = {};
+    _pendingSessionRequest = {};
+    _defaultAdvancedConfig = {};
     updateOptionalInputUi();
 }

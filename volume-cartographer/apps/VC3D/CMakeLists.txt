@@ -75,6 +75,8 @@ set(srcs
     elements/DropdownChecklistButton.hpp
     elements/JsonProfileEditor.cpp
     elements/JsonProfileEditor.hpp
+    elements/SpiralConfigProfileEditor.cpp
+    elements/SpiralConfigProfileEditor.hpp
     elements/LabeledControlRow.cpp
     elements/LabeledControlRow.hpp
     elements/VolumeSelector.cpp

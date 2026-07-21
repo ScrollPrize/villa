@@ -44,8 +44,12 @@ from dt_targets import (
     prepare_patch_dt_target_samples,
 )
 from tracks import (
+    PackedTrackCollection,
+    configure_prepared_track_sampling,
+    filter_tracks_to_outer_shell,
     get_track_satisfied_counts_in_chunks,
     iter_track_losses,
+    load_track_crossing_cache,
     load_tracks_from_dbm,
     prepare_main_phase_tracks,
     validate_track_sampling_config,
@@ -226,11 +230,21 @@ default_config = {
     'unattached_pcl_min_point_spacing': 16.,
     'track_num_per_step': 48000,
     'track_num_points_per_step': 24,
+    # Resample each complete track in full-resolution polyline arclength.
+    # track_num_points_per_step selects target-estimation points; the spacing
+    # bounds control how many points contribute to the complete-track loss.
+    'track_min_sample_spacing': 20.0,
+    'track_max_sample_spacing': 60.0,
     # Optional track-pool policies. None preserves uniform sampling and keeps
     # every track regardless of tortuosity; crossing supplements are opt-in.
     'track_length_bin_weights': None,  # [short, medium, long], using eligible-track arclength tertiles
     'track_max_tortuosity': None,  # whole-track arclength / endpoint chord; None disables filtering
-    'max_track_crossing_per_step': 0,  # opposite-family partners appended per primary track
+    # Crossing discovery is session-scoped; the active per-step count can then
+    # change freely up to this prepared ceiling at a Run boundary.
+    'track_crossing_precompute_max': 8,
+    # Opposite-family partners joined to each primary track's shared winding
+    # target. Zero disables crossing-connected sampling.
+    'max_track_crossing_per_step': 0,
     'track_exclusion_radius': 0.0,
     'track_radius_target': 'mean',
     'track_radius_loss_margin': 0.025,
@@ -800,8 +814,14 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 continue
         return patches
 
+    filter_tracks_by_shell = (
+        not load_only_patches_and_point_collections
+        and bool(cfg.get('use_tracks', True))
+        and bool(tracks_dbm_path)
+        and bool(shell_path)
+    )
     shell_patch = None
-    if shell_losses_enabled():
+    if shell_losses_enabled() or filter_tracks_by_shell:
         if not shell_path:
             raise RuntimeError('shell losses are enabled, but FIT_SPIRAL_SHELL_PATH is not set')
         shell_patch = load_tifxyz(shell_path)
@@ -1136,8 +1156,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # on CPU from the same shell/umbilicus inputs on every rank
     # (deterministic), used only at store-promotion time.
     volume_interior_fn = None
-    if int(cfg['volume_paging_chunk']) > 0 and shell_patch is not None:
-        interior_envelope = ShellPolarMap(
+    shell_envelope = None
+    if (shell_patch is not None
+            and (int(cfg['volume_paging_chunk']) > 0 or filter_tracks_by_shell)):
+        shell_envelope = ShellPolarMap(
             shell_patch,
             umbilicus,
             z_min=z_begin - cfg['flow_bounds_z_margin'],
@@ -1145,22 +1167,23 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             num_theta_bins=cfg['shell_num_theta_bins'],
             device='cpu',
         )
-        interior_margin = float(cfg['volume_interior_margin'])
+        if int(cfg['volume_paging_chunk']) > 0:
+            interior_margin = float(cfg['volume_interior_margin'])
 
-        def volume_interior_fn(points_working_zyx):
-            points = torch.from_numpy(
-                np.ascontiguousarray(points_working_zyx, dtype=np.float32))
-            target_radius, radius, _confidence, _valid = \
-                interior_envelope.lookup(points)
-            # The radius table is distance-transform-filled and smoothed over
-            # the whole (z, theta) grid, so it is meaningful even in
-            # low-confidence bins — do NOT gate the mask on confidence (that
-            # kept ~87% of chunks). Stay conservative only outside the
-            # table's z coverage.
-            keep = radius <= target_radius + interior_margin
-            out_of_z = ((points[:, 0] < interior_envelope.z_min)
-                        | (points[:, 0] > interior_envelope.z_max))
-            return (keep | out_of_z).cpu().numpy()
+            def volume_interior_fn(points_working_zyx):
+                points = torch.from_numpy(
+                    np.ascontiguousarray(points_working_zyx, dtype=np.float32))
+                target_radius, radius, _confidence, _valid = \
+                    shell_envelope.lookup(points)
+                # The radius table is distance-transform-filled and smoothed over
+                # the whole (z, theta) grid, so it is meaningful even in
+                # low-confidence bins — do NOT gate the mask on confidence (that
+                # kept ~87% of chunks). Stay conservative only outside the
+                # table's z coverage.
+                keep = radius <= target_radius + interior_margin
+                out_of_z = ((points[:, 0] < shell_envelope.z_min)
+                            | (points[:, 0] > shell_envelope.z_max))
+                return (keep | out_of_z).cpu().numpy()
 
     # FIT_SPIRAL_PAGED_STORES: which stores may take GPU residency.
     #   'all' (default) - both stores page/promote under the usual budget.
@@ -1248,13 +1271,22 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
 
     track_sampling_config = validate_track_sampling_config(cfg)
     track_families = None
+    track_source_ids = None
+    track_crossing_cache = None
     if tracks_dbm_path is not None and cfg.get('use_tracks', True):
         print(f'loading tracks from {tracks_dbm_path}')
-        if track_sampling_config['max_crossings'] > 0:
-            tracks, track_families = load_tracks_from_dbm(
-                tracks_dbm_path, z_begin, z_end, return_families=True)
+        if track_sampling_config['crossing_precompute_max'] > 0:
+            track_crossing_cache = load_track_crossing_cache(tracks_dbm_path)
+            tracks, track_families, track_source_ids = load_tracks_from_dbm(
+                tracks_dbm_path, z_begin, z_end, return_families=True,
+                return_source_ids=True)
         else:
             tracks = load_tracks_from_dbm(tracks_dbm_path, z_begin, z_end)
+        if filter_tracks_by_shell:
+            tracks, track_families, kept_track_indices = filter_tracks_to_outer_shell(
+                tracks, shell_envelope, track_families, return_indices=True)
+            if track_source_ids is not None:
+                track_source_ids = track_source_ids[kept_track_indices]
         print(f'loaded {len(tracks)} tracks within z-roi [{z_begin}, {z_end})')
     else:
         tracks = None
@@ -1889,12 +1921,20 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             anchor_tree=trusted_geometry_tree,
             sampling_config=track_sampling_config,
             track_families=track_families,
+            track_source_ids=track_source_ids,
+            crossing_cache=track_crossing_cache,
         )
+        # The sidecar CSR is setup-only. The prepared bundle now owns only its
+        # fixed-width training tables, so release the whole-DB graph promptly.
+        track_crossing_cache = None
         # With the usual zero exclusion radius, the training bundle already
         # contains every authoritative track point as one flat CPU tensor.  Reuse it
         # for preview bounds instead of walking millions of short NumPy tracks.
         if prepared_main_tracks is not None:
-            input_track_points = sum(len(track) for track in tracks)
+            input_track_points = (
+                int(tracks.selected_lengths.sum())
+                if isinstance(tracks, PackedTrackCollection)
+                else sum(len(track) for track in tracks))
             if prepared_main_tracks['flat_zyx_cpu'].shape[0] == input_track_points:
                 preview_extent_tracks = (prepared_main_tracks['flat_zyx_cpu'],)
 
@@ -2375,6 +2415,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         def configure_interactive_run(config):
             # Only called by the resident driver on the fitter thread at a
             # pause boundary. These settings are read afresh by every step.
+            if ({'track_length_bin_weights', 'max_track_crossing_per_step'}
+                    & set(config)):
+                configure_prepared_track_sampling(prepared_main_tracks, config)
             cfg.update(config, allow_val_change=True)
 
         geometry_manifest = None
@@ -2386,7 +2429,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 category = 'fibers' if fiber_root and os.path.commonpath([fiber_root, source]) == fiber_root else 'pcls'
                 snapshot_categories[category].append(strip['zyxs'])
             if tracks:
-                snapshot_categories['tracks'] = [np.asarray(track, dtype=np.float32) for track in tracks if len(track)]
+                snapshot_categories['tracks'] = (
+                    tracks if isinstance(tracks, PackedTrackCollection)
+                    else [np.asarray(track, dtype=np.float32)
+                          for track in tracks if len(track)])
             geometry_path = os.path.join(out_path, '.spiral-geometry', f'generation-{time.time_ns()}')
             write_geometry_snapshot(geometry_path, snapshot_categories, input_order='ZYX')
             geometry_manifest = os.path.join(geometry_path, 'manifest.json')
