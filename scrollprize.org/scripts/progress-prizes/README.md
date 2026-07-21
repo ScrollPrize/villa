@@ -6,6 +6,12 @@ the exact Vercel preview commit, then closes the old form before opening the new
 one. The cutoff is midnight immediately after the last calendar day in
 `America/Los_Angeles` (the published deadline remains 11:59pm Pacific).
 
+A fresh copy is closed at the first possible Forms API call, before title, ACL,
+or capability reconciliation. At cutoff, the fingerprint-bound target records
+durable activation intent before the source is closed. Activation refetches and
+revalidates both forms after the preview gate, so a manual source closure or
+post-gate ACL/metadata change cannot be mistaken for a recoverable transition.
+
 The repository is public. Google authentication is therefore keyless: GitHub's
 short-lived OIDC token is exchanged through Google Workload Identity Federation
 (WIF). Do **not** add a service-account JSON key, OAuth refresh token, Google
@@ -65,13 +71,17 @@ Protected Environment variables:
 - `PROGRESS_PRIZE_DRIVE_ID` (the staging Shared Drive)
 - `PROGRESS_PRIZE_FOLDER_ID` (the staging active folder)
 - `PROGRESS_PRIZE_ARCHIVE_FOLDER_ID` (the staging archive folder)
-- `PROGRESS_PRIZE_SOURCE_FORM_ID` (the current live form's private file ID)
+- `PROGRESS_PRIZE_SOURCE_FORM_ID` (the initial owner-My-Drive form's private file ID)
 - `PROGRESS_PRIZE_EDITOR_GROUP_EMAIL` (a staging-only internal group)
 
-The staging service account needs read/copy access to the current production
-source, but must not be able to edit or share it. Give it the necessary creator,
-editor, and sharing rights only in the staging Shared Drive. The staging group
-must not be the production editor group.
+Share only the initial form, not its My Drive folder, directly with the staging
+service account as Viewer. The preflight requires `canCopy` and rejects
+`canEdit` or `canShare`; it also verifies the direct, non-expiring reader ACL.
+Give that account creator, editor, and sharing rights only in the staging Shared
+Drive. The staging group must not be the production editor group.
+After setup, keep the staging automation account as that Shared Drive's only
+Manager or Content manager; other inherited administrative access fails the
+same exact ACL gate used in production.
 
 ### `progress-prizes-production`
 
@@ -79,18 +89,31 @@ Protected Environment variables:
 
 - `GOOGLE_WORKLOAD_IDENTITY_PROVIDER`
 - `GOOGLE_SERVICE_ACCOUNT_EMAIL`
-- `PROGRESS_PRIZE_DRIVE_ID` (the production Shared Drive)
-- `PROGRESS_PRIZE_FOLDER_ID` (the production active forms folder)
-- `PROGRESS_PRIZE_SOURCE_FORM_ID` (the current live form's private file ID)
+- `PROGRESS_PRIZE_DRIVE_ID` (the destination/managed production Shared Drive)
+- `PROGRESS_PRIZE_FOLDER_ID` (the destination active forms folder)
+- `PROGRESS_PRIZE_SOURCE_FORM_ID` (the initial owner-My-Drive form's private file ID)
 - `PROGRESS_PRIZE_EDITOR_GROUP_EMAIL` (the production internal editor group)
 
-The production account must be able to copy, edit, and share the managed forms
-in this folder. It should have no access to the staging Shared Drive. No archive
-folder is supplied to production, and the workflow deliberately supplies empty
-staging-identity values in production mode. `PROGRESS_PRIZE_SOURCE_FORM_ID` is
-the initial fallback: after the first managed activation, Drive `appProperties`
-discovery selects the prior cycle's managed target, so this private variable does
-not need a monthly edit.
+Share only the initial form, not its My Drive folder, directly with the
+production service account as Editor. The preflight requires a direct,
+non-expiring writer ACL plus `canCopy` and `canEdit`; `canShare` is deliberately
+not required on this owner-controlled source. The account must separately be
+able to create, copy, edit, and share forms in the production destination
+folder, and must have no access to the staging Shared Drive. The destination is
+validated as a writable folder in the configured Shared Drive before any copy.
+Keep the matching automation account as the only Shared Drive Manager or
+Content manager. Unexpected inherited writers, domains, service accounts,
+Managers, or Content managers fail the ACL gate.
+
+No archive folder is supplied to production, and the workflow deliberately
+supplies empty staging-identity values in production mode.
+`PROGRESS_PRIZE_SOURCE_FORM_ID` is a one-time, explicit fallback. The July form
+never receives managed environment/role/cycle markers and is never moved or
+renamed. At activation it is closed first and receives only the private recovery
+state marker. The August copy is created in the production Shared Drive and is
+cryptographically bound to that exact source ID. After its activation, managed
+`appProperties` discovery always selects the prior managed target, so the
+fallback variable does not need a monthly edit and is ignored for later cycles.
 
 ### `progress-prizes-preview`
 
@@ -142,15 +165,20 @@ Bind only that provider principal to its matching service account with
 `roles/iam.workloadIdentityUser`. Use the numeric Google project number when
 constructing the `principalSet` member. Do not grant one provider impersonation
 rights on both accounts. The workflow asks for a 900-second access token scoped
-to read-only Forms/Drive scopes for `validate`, `verify`, and dry runs. Mutations use
-`forms.body` plus `drive`: this headless workflow must find a pre-existing form
-and app-property-managed files in a Shared Drive, which `drive.file` cannot
-reliably authorize without an interactive picker. The separate service accounts
-and Shared Drive ACLs bound the writable resources. Credential-file creation and
-global environment export remain disabled.
+to read-only Forms/Drive scopes for `validate`, `verify`, and dry runs. Mutations
+use `forms.body` plus `drive`: this headless workflow must find a pre-existing
+form and app-property-managed files in a Shared Drive, which `drive.file` cannot
+reliably authorize without an interactive picker. The separate service accounts,
+the two exact-file ACLs on the initial My Drive form, and the isolated Shared
+Drive ACLs bound the writable resources. Credential-file creation and global
+environment export remain disabled.
 
 Google file access is controlled separately by Shared Drive and form ACLs. WIF
-impersonation alone must not grant the staging identity production write access.
+impersonation alone grants no Drive access. The staging identity has read/copy
+access only to the initial production form; the production identity has
+copy/edit access only to that form plus its managed destination. Never share the
+owner's My Drive folder, enable domain-wide delegation, or substitute a JSON key
+or user refresh token if Workspace policy blocks service-account access.
 
 ## Repository and Vercel prerequisites
 
@@ -182,6 +210,40 @@ Prize Environments, `main` branch protection, and the Actions PR setting; Vercel
 previews redirected to SSO. Those are external blockers, not values that can be
 safely filled in by repository code.
 
+## Initial My Drive cycle
+
+The current July form may remain owner-controlled in My Drive. This is a narrow
+bootstrap exception, not a second managed storage location. The code permits an
+explicit fallback only for the immutable `2026-07` source cycle; a missing
+managed source in any later cycle fails instead of reusing July:
+
+1. Put the same private form ID in the staging and production protected
+   Environments. Do not put it in a repository file or ordinary GitHub variable.
+2. Share only that form directly with the staging service account as Viewer and
+   the production service account as Editor. Keep both ACLs non-expiring through
+   the rehearsal; keep the production writer through activation, recovery, and
+   active verification.
+3. The Google copy operation does not carry the source ACL into the destination.
+   The destination first inherits its Shared Drive access, then the automation
+   reconciles the anonymous published-reader permission and human/group editors.
+   Owner and automation-service-account ACLs are never recreated on the copy.
+   Effective inherited writers/commenters and Shared Drive administrative roles
+   are checked exactly. The current environment's automation account is the only
+   ignored administrative identity; any staging/rogue service account, domain
+   writer, Manager, or Content manager fails closed.
+4. Before the real cutoff, repeat the close/open mutation path on a sacrificial
+   My Drive form. Read-only capability validation cannot prove that Workspace
+   policy will allow the service account to call Forms publish settings and
+   write the private recovery marker.
+5. After the August form is active and verified, the owner may remove both
+   direct service-account ACLs from July. Later cycles resolve only managed forms
+   in the production Shared Drive, even if the stale fallback variable remains.
+
+If Workspace policy refuses direct sharing to a service-account principal, move
+the source into the production Shared Drive or redesign the identity boundary.
+Do not work around that policy with domain-wide delegation or reusable Google
+credentials.
+
 ## July 20 rehearsal
 
 The workflow and WIF policy intentionally require the foundation workflows to be
@@ -190,13 +252,14 @@ After the environment setup above:
 
 1. Dispatch **Progress Prize July 20 rehearsal** with `full-rehearsal` and the
    defaults. Its first Google operation is the required read-only production
-   validation of the live July form; it cannot close, rename, publish, or change
-   that form's permissions.
+   validation of the live July My Drive form; it cannot close, rename, publish,
+   move, or change that form's permissions.
 2. The preparation clock is July 25 (inside the seven-day window) and activation
    is August 1 at 07:01 UTC (just after the July Pacific cutoff).
-3. The run copies July read-only into staging, injects one `after-copy` failure,
-   resumes the same managed copy, prepares the closed August target, and opens a
-   draft PR against the fixed ephemeral smoke base.
+3. The run uses the staging identity to copy July read-only from My Drive into
+   the staging Shared Drive, injects one `after-copy` failure, resumes the same
+   managed copy, prepares the closed August target, and opens a draft PR against
+   the fixed ephemeral smoke base.
 4. After the exact Vercel preview and public test pass, it injects one
    `after-close-source` failure, resumes activation, verifies source closed and
    target open, readies and squash-merges the smoke PR, verifies the smoke-base

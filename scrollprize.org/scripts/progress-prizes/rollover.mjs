@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import {
   AUTOMATION_ENVIRONMENTS,
   ROLLOVER_PHASES,
@@ -14,6 +16,7 @@ import {
 import {
   filterDirectCollaboratorPermissions,
   filterPublishedResponderPermissions,
+  isInheritedPermission,
   normalizePermissionForCreate,
   permissionIdentityKey,
 } from './google-api.mjs';
@@ -54,6 +57,14 @@ const REQUIRED_GOOGLE_METHODS = Object.freeze([
 
 const ALLOWED_EVENTS = new Set(['schedule', 'workflow_dispatch']);
 const ALLOWED_VERIFY_MODES = new Set(['prepared', 'active', 'cleaned']);
+const GOOGLE_FORM_MIME_TYPE = 'application/vnd.google-apps.form';
+const GOOGLE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
+const INITIAL_EXPLICIT_SOURCE_CYCLE = '2026-07';
+const SOURCE_ORIGINS = Object.freeze({
+  MANAGED: 'managed',
+  EXPLICIT_SHARED_DRIVE: 'explicit-shared-drive',
+  EXPLICIT_MY_DRIVE: 'explicit-my-drive',
+});
 
 export class RolloverFaultError extends Error {
   constructor(step) {
@@ -312,28 +323,45 @@ function assertSameStructure(source, target) {
   }
 }
 
-function comparablePermissions(permissions) {
-  return [
-    ...filterDirectCollaboratorPermissions(permissions),
-    ...filterPublishedResponderPermissions(permissions),
-  ];
-}
-
 function effectiveCollaboratorPermissions(permissions) {
+  // Only writer/commenter entries are reproducible form collaborators. A
+  // separate effective-access comparison also detects inherited domain grants
+  // and Shared Drive organizer/fileOrganizer roles before activation.
   return permissions.filter((permission) => (
     permission
     && permission.deleted !== true
     && permission.pendingOwner !== true
-    && ['user', 'group'].includes(permission.type)
     && ['writer', 'commenter'].includes(permission.role)
+    && ['user', 'group'].includes(permission.type)
     && typeof permission.emailAddress === 'string'
     && permission.emailAddress !== ''
   ));
 }
 
+function effectiveEditablePermissions(permissions) {
+  return permissions.filter((permission) => (
+    permission
+    && permission.deleted !== true
+    && permission.pendingOwner !== true
+    && ['writer', 'commenter', 'organizer', 'fileOrganizer'].includes(permission.role)
+    && (
+      (
+        ['user', 'group'].includes(permission.type)
+        && typeof permission.emailAddress === 'string'
+        && permission.emailAddress !== ''
+      )
+      || (
+        permission.type === 'domain'
+        && typeof permission.domain === 'string'
+        && permission.domain !== ''
+      )
+    )
+  ));
+}
+
 function effectiveComparablePermissions(permissions) {
   return [
-    ...effectiveCollaboratorPermissions(permissions),
+    ...effectiveEditablePermissions(permissions),
     ...filterPublishedResponderPermissions(permissions),
   ];
 }
@@ -359,32 +387,98 @@ function uniquePermissions(permissions) {
   return [...byKey.values()];
 }
 
-function desiredPermissions(sourcePermissions, collaboratorPermissions, copySourceCollaborators) {
+function isAutomationIdentity(permission, serviceAccountEmail) {
+  return (
+    typeof permission?.emailAddress === 'string'
+    && permission.emailAddress.toLowerCase() === serviceAccountEmail.toLowerCase()
+  );
+}
+
+function isGoogleServiceAccountIdentity(permission) {
+  if (typeof permission?.emailAddress !== 'string') return false;
+  return permission.emailAddress.toLowerCase().endsWith('.iam.gserviceaccount.com');
+}
+
+function assertCollaboratorConfiguration(collaboratorPermissions, serviceAccountEmail) {
   assertCollaboratorPermissions(collaboratorPermissions);
+  if (collaboratorPermissions.some(
+    (permission) => isGoogleServiceAccountIdentity(permission)
+      || isAutomationIdentity(permission, serviceAccountEmail),
+  )) {
+    throw new Error('An automation service account cannot be configured as a form collaborator');
+  }
+}
+
+function publicResponderPermissions(permissions) {
+  return filterPublishedResponderPermissions(permissions).filter(
+    (permission) => permission.type === 'anyone',
+  );
+}
+
+function desiredPermissions(
+  sourcePermissions,
+  collaboratorPermissions,
+  copySourceCollaborators,
+  {
+    includeInheritedCollaborators = false,
+    serviceAccountEmail,
+  } = {},
+) {
+  assertNonEmptyString(serviceAccountEmail, 'serviceAccountEmail');
+  assertCollaboratorConfiguration(collaboratorPermissions, serviceAccountEmail);
+  const sourceCollaborators = includeInheritedCollaborators
+    ? effectiveCollaboratorPermissions(sourcePermissions)
+    : filterDirectCollaboratorPermissions(sourcePermissions);
+  if (
+    copySourceCollaborators
+    && sourceCollaborators.some(
+      (permission) => isGoogleServiceAccountIdentity(permission)
+        && !isAutomationIdentity(permission, serviceAccountEmail),
+    )
+  ) {
+    throw new Error('Source form has an unexpected service-account collaborator');
+  }
+  if (
+    copySourceCollaborators
+    && effectiveEditablePermissions(sourcePermissions).some(
+      (permission) => permission.type === 'domain',
+    )
+  ) {
+    throw new Error('Source form has an unsupported domain collaborator');
+  }
   return uniquePermissions([
     ...(copySourceCollaborators
-      ? filterDirectCollaboratorPermissions(sourcePermissions)
+      ? sourceCollaborators.filter(
+        (permission) => !isAutomationIdentity(permission, serviceAccountEmail),
+      )
       : []),
     ...collaboratorPermissions,
-    ...filterPublishedResponderPermissions(sourcePermissions),
+    ...publicResponderPermissions(sourcePermissions),
   ]);
 }
 
-function assertPermissionsMatch(expected, actual) {
+function assertPermissionsMatch(expected, actual, { serviceAccountEmail } = {}) {
+  assertNonEmptyString(serviceAccountEmail, 'serviceAccountEmail');
   const expectedKeys = new Set(expected.map(permissionIdentityKey));
-  const effectiveKeys = new Set(effectiveComparablePermissions(actual).map(permissionIdentityKey));
-  const unexpectedDirect = comparablePermissions(actual)
-    .map(permissionIdentityKey)
-    .some((key) => !expectedKeys.has(key));
-  if (unexpectedDirect || [...expectedKeys].some((key) => !effectiveKeys.has(key))) {
+  const effectivePermissions = effectiveComparablePermissions(actual).filter(
+    (permission) => !isAutomationIdentity(permission, serviceAccountEmail),
+  );
+  const effectiveKeys = new Set(effectivePermissions.map(permissionIdentityKey));
+  const hasUnexpectedPermission = effectivePermissions
+    .some((permission) => !expectedKeys.has(permissionIdentityKey(permission)));
+  if (hasUnexpectedPermission || [...expectedKeys].some((key) => !effectiveKeys.has(key))) {
     throw new Error('Target form collaborator or published-responder permissions do not match');
   }
 }
 
 function assertRequiredSourcePermissions(permissions, requiredCollaborators = []) {
   assertCollaboratorPermissions(requiredCollaborators);
-  if (filterPublishedResponderPermissions(permissions).length === 0) {
-    throw new Error('Source form is missing its published responder permission');
+  const publishedPermissions = filterPublishedResponderPermissions(permissions);
+  if (publicResponderPermissions(permissions).length === 0) {
+    throw new Error('Source form is missing its anonymous published responder permission');
+  }
+  if (publishedPermissions.some((permission) => permission.type !== 'anyone')) {
+    throw new Error('Source form has an unexpected non-public published responder permission');
   }
   for (const required of requiredCollaborators) {
     const expected = normalizePermissionForCreate(required);
@@ -401,7 +495,22 @@ function assertRequiredSourcePermissions(permissions, requiredCollaborators = []
   }
 }
 
-async function ensurePermissions(google, fileId, expected) {
+function assertDirectAutomationPermission(permissions, runtime, expectedRole) {
+  const matches = permissions.filter((permission) => (
+    permission?.deleted !== true
+    && permission?.pendingOwner !== true
+    && permission?.type === 'user'
+    && permission?.role === expectedRole
+    && !isInheritedPermission(permission)
+    && !hasValue(permission.expirationTime)
+    && isAutomationIdentity(permission, runtime.serviceAccountEmail)
+  ));
+  if (matches.length !== 1) {
+    throw new Error('The bootstrap form lacks the required direct automation access');
+  }
+}
+
+async function ensurePermissions(google, fileId, expected, options) {
   let current = await google.getAllPermissions({ fileId });
   const currentKeys = new Set(effectiveComparablePermissions(current).map(permissionIdentityKey));
   for (const permission of expected) {
@@ -416,7 +525,7 @@ async function ensurePermissions(google, fileId, expected) {
     }
   }
   current = await google.getAllPermissions({ fileId });
-  assertPermissionsMatch(expected, current);
+  assertPermissionsMatch(expected, current, options);
   return current;
 }
 
@@ -463,10 +572,16 @@ function activationTransition(sourceSnapshot, targetSnapshot) {
     && ![ROLLOVER_FILE_STATES.CLOSED, ROLLOVER_FILE_STATES.ARCHIVED].includes(sourceState)
   ) return 'prepared';
   if (
+    sourceOpen
+    && targetClosed
+    && targetState === ROLLOVER_FILE_STATES.ACTIVATING
+    && ![ROLLOVER_FILE_STATES.CLOSED, ROLLOVER_FILE_STATES.ARCHIVED].includes(sourceState)
+  ) return 'recover-intent';
+  if (
     sourceClosed
     && targetClosed
     && sourceState !== ROLLOVER_FILE_STATES.ARCHIVED
-    && [ROLLOVER_FILE_STATES.PREPARED, ROLLOVER_FILE_STATES.ACTIVATING].includes(targetState)
+    && targetState === ROLLOVER_FILE_STATES.ACTIVATING
   ) return 'recover-closed';
   if (
     sourceClosed
@@ -512,12 +627,71 @@ function assertSourceCapabilities(file, required = ['canCopy', 'canEdit', 'canSh
   }
 }
 
+function assertReadCopyOnlyCapabilities(file) {
+  assertSourceCapabilities(file, ['canCopy']);
+  if (file?.capabilities?.canEdit === true || file?.capabilities?.canShare === true) {
+    throw new Error('The staging identity has forbidden edit or share access to production');
+  }
+}
+
+function assertUsableFormFile(file) {
+  if (file?.mimeType !== GOOGLE_FORM_MIME_TYPE) {
+    throw new Error('The configured source is not a Google Form');
+  }
+  if (file.trashed === true) {
+    throw new Error('The configured source form is trashed');
+  }
+}
+
 function assertSharedDriveLocation(file, runtime, { requireActiveFolder = true } = {}) {
   if (file?.driveId !== runtime.driveId) {
     throw new Error('Form is not in the configured Shared Drive');
   }
   if (requireActiveFolder && !file?.parents?.includes(runtime.folderId)) {
     throw new Error('Form is not in the configured active folder');
+  }
+}
+
+function assertManagedFile(file, runtime, role, cycle, {
+  state,
+  requireActiveFolder = true,
+} = {}) {
+  assertUsableFormFile(file);
+  assertSharedDriveLocation(file, runtime, { requireActiveFolder });
+  const expected = {
+    ...managedQuery(runtime, role, cycle),
+    ...(state === undefined ? {} : { state }),
+  };
+  if (Object.entries(expected).some(
+    ([key, value]) => file?.appProperties?.[key] !== value,
+  )) {
+    throw new Error('Managed form metadata does not match the requested rollover cycle');
+  }
+}
+
+function assertDestinationFolder(folder, runtime) {
+  if (
+    folder?.id !== runtime.folderId
+    || folder?.mimeType !== GOOGLE_FOLDER_MIME_TYPE
+    || folder?.trashed === true
+    || folder?.driveId !== runtime.driveId
+    || folder?.capabilities?.canAddChildren !== true
+    || folder?.capabilities?.canShare !== true
+  ) {
+    throw new Error('The configured destination is not a writable Shared Drive folder');
+  }
+}
+
+function sourceFingerprint(runtime, sourceCycle, sourceFileId) {
+  return createHash('sha256')
+    .update(`${runtime.environment}\0${sourceCycle}\0${sourceFileId}`)
+    .digest('hex');
+}
+
+function assertSourceFingerprint(targetFile, sourceFile, runtime, sourceCycle) {
+  const expected = sourceFingerprint(runtime, sourceCycle, sourceFile.id);
+  if (targetFile?.appProperties?.sourceFingerprint !== expected) {
+    throw new Error('Prepared target is not bound to the resolved source form');
   }
 }
 
@@ -530,7 +704,7 @@ function publicSummary({ cycle, title, form, permissions, file }) {
     isPublished: state.isPublished,
     isAcceptingResponses: state.isAcceptingResponses,
     collaboratorCount: effectiveCollaboratorPermissions(permissions).length,
-    hasPublicResponderPermission: filterPublishedResponderPermissions(permissions).length > 0,
+    hasPublicResponderPermission: publicResponderPermissions(permissions).length > 0,
     canCopy: file?.capabilities?.canCopy === true,
     canEdit: file?.capabilities?.canEdit === true,
     canShare: file?.capabilities?.canShare === true,
@@ -579,7 +753,9 @@ export function createRolloverService({
       throw new Error(`Multiple managed ${role} forms exist for cycle ${cycle}; refusing to guess`);
     }
     if (files[0] !== undefined) {
-      assertSharedDriveLocation(files[0], runtime, { requireActiveFolder: inActiveFolder });
+      assertManagedFile(files[0], runtime, role, cycle, {
+        requireActiveFolder: inActiveFolder,
+      });
     }
     return files[0];
   }
@@ -592,7 +768,49 @@ export function createRolloverService({
     return file;
   }
 
-  async function resolveSourceFile({ sourceFormId, sourceCycle, inActiveFolder = true }) {
+  function assertResolvedSourceLocation(resolution, file) {
+    if (file?.id !== resolution.file.id) {
+      throw new Error('Resolved source identity changed during preflight');
+    }
+    if (resolution.origin === SOURCE_ORIGINS.MANAGED) {
+      assertManagedFile(file, runtime, resolution.role, resolution.sourceCycle, {
+        requireActiveFolder: resolution.inActiveFolder,
+      });
+      return;
+    }
+
+    assertUsableFormFile(file);
+    if (file.appProperties?.managedBy === ROLLOVER_MANAGED_BY) {
+      throw new Error('An explicit fallback cannot claim managed rollover metadata');
+    }
+    if (resolution.origin === SOURCE_ORIGINS.EXPLICIT_MY_DRIVE) {
+      if (file.driveId !== undefined && file.driveId !== null) {
+        throw new Error('The My Drive fallback source changed location during preflight');
+      }
+      return;
+    }
+    assertSharedDriveLocation(file, runtime, {
+      requireActiveFolder: resolution.inActiveFolder,
+    });
+  }
+
+  function sourceResolution(file, origin, {
+    role,
+    sourceCycle,
+    inActiveFolder,
+  }) {
+    const resolution = Object.freeze({
+      file,
+      origin,
+      role,
+      sourceCycle,
+      inActiveFolder,
+    });
+    assertResolvedSourceLocation(resolution, file);
+    return resolution;
+  }
+
+  async function resolveSource({ sourceFormId, sourceCycle, inActiveFolder = true }) {
     const [managedTarget, managedSource] = await Promise.all([
       findManagedFile(ROLLOVER_FILE_ROLES.TARGET, sourceCycle, { inActiveFolder }),
       findManagedFile(ROLLOVER_FILE_ROLES.SOURCE, sourceCycle, { inActiveFolder }),
@@ -601,15 +819,96 @@ export function createRolloverService({
       throw new Error(`Multiple managed source candidates exist for cycle ${sourceCycle}`);
     }
     if (managedTarget !== undefined || managedSource !== undefined) {
-      return managedTarget ?? managedSource;
+      return sourceResolution(
+        managedTarget ?? managedSource,
+        SOURCE_ORIGINS.MANAGED,
+        {
+          role: managedTarget === undefined
+            ? ROLLOVER_FILE_ROLES.SOURCE
+            : ROLLOVER_FILE_ROLES.TARGET,
+          sourceCycle,
+          inActiveFolder,
+        },
+      );
     }
     if (sourceFormId !== undefined) {
+      if (sourceCycle !== INITIAL_EXPLICIT_SOURCE_CYCLE) {
+        throw new Error('The explicit fallback is restricted to the initial bootstrap cycle');
+      }
       assertNonEmptyString(sourceFormId, 'sourceFormId');
       const file = await google.getFile({ fileId: sourceFormId });
+      assertUsableFormFile(file);
+      if (file.appProperties?.managedBy === ROLLOVER_MANAGED_BY) {
+        throw new Error('An explicit fallback cannot claim managed rollover metadata');
+      }
+      if (file.driveId === undefined || file.driveId === null) {
+        if (runtime.environment !== AUTOMATION_ENVIRONMENTS.PRODUCTION) {
+          throw new Error('A My Drive fallback source is restricted to production');
+        }
+        return sourceResolution(file, SOURCE_ORIGINS.EXPLICIT_MY_DRIVE, {
+          sourceCycle,
+          inActiveFolder,
+        });
+      }
       assertSharedDriveLocation(file, runtime, { requireActiveFolder: inActiveFolder });
-      return file;
+      return sourceResolution(file, SOURCE_ORIGINS.EXPLICIT_SHARED_DRIVE, {
+        sourceCycle,
+        inActiveFolder,
+      });
     }
     throw new Error(`Managed source form is missing for cycle ${sourceCycle}`);
+  }
+
+  async function requireDestinationFolder(collaboratorPermissions) {
+    const [folder, permissions] = await Promise.all([
+      google.getFile({ fileId: runtime.folderId }),
+      google.getAllPermissions({ fileId: runtime.folderId }),
+    ]);
+    assertDestinationFolder(folder, runtime);
+    const allowedKeys = new Set(collaboratorPermissions.map(permissionIdentityKey));
+    const hasUnexpectedAccess = effectiveEditablePermissions(permissions).some((permission) => (
+      !isAutomationIdentity(permission, runtime.serviceAccountEmail)
+      && !allowedKeys.has(permissionIdentityKey(permission))
+    ));
+    if (hasUnexpectedAccess) {
+      throw new Error('The destination folder has unexpected inherited edit access');
+    }
+    return folder;
+  }
+
+  function assertResolvedSourceAccess(resolution, snapshot, {
+    requireCopy = false,
+    requireShare = false,
+  } = {}) {
+    assertResolvedSourceLocation(resolution, snapshot.file);
+    const requiredCapabilities = [
+      'canEdit',
+      ...(requireCopy ? ['canCopy'] : []),
+      ...(requireShare && resolution.origin !== SOURCE_ORIGINS.EXPLICIT_MY_DRIVE
+        ? ['canShare']
+        : []),
+    ];
+    assertSourceCapabilities(snapshot.file, requiredCapabilities);
+    if (resolution.origin === SOURCE_ORIGINS.EXPLICIT_MY_DRIVE) {
+      assertDirectAutomationPermission(snapshot.permissions, runtime, 'writer');
+    }
+  }
+
+  function expectedTargetPermissions(
+    sourcePermissions,
+    collaboratorPermissions,
+    copySourceCollaborators,
+    sourceOrigin,
+  ) {
+    return desiredPermissions(
+      sourcePermissions,
+      collaboratorPermissions,
+      copySourceCollaborators,
+      {
+        includeInheritedCollaborators: sourceOrigin === SOURCE_ORIGINS.EXPLICIT_MY_DRIVE,
+        serviceAccountEmail: runtime.serviceAccountEmail,
+      },
+    );
   }
 
   async function loadSnapshot(file) {
@@ -674,10 +973,20 @@ export function createRolloverService({
     expectAcceptingResponses = true,
   } = {}) {
     parseCycle(sourceCycle);
-    const file = await resolveSourceFile({ sourceFormId, sourceCycle });
-    const snapshot = await loadSnapshot(file);
-    assertSourceCapabilities(snapshot.file);
+    assertCollaboratorConfiguration(collaboratorPermissions, runtime.serviceAccountEmail);
+    const source = await resolveSource({ sourceFormId, sourceCycle });
+    const snapshot = await loadSnapshot(source.file);
+    assertResolvedSourceAccess(source, snapshot, {
+      requireCopy: true,
+      requireShare: true,
+    });
     assertRequiredSourcePermissions(snapshot.permissions, collaboratorPermissions);
+    expectedTargetPermissions(
+      snapshot.permissions,
+      collaboratorPermissions,
+      true,
+      source.origin,
+    );
     assertTitle(snapshot.form, snapshot.file, expectedTitle);
     const state = publishState(snapshot.form);
     if (!state.isPublished || state.isAcceptingResponses !== expectAcceptingResponses) {
@@ -708,12 +1017,15 @@ export function createRolloverService({
     assertStagingIdentity(runtime);
     parseCycle(sourceCycle);
     assertNonEmptyString(sourceFormId, 'sourceFormId');
+    assertCollaboratorConfiguration(collaboratorPermissions, runtime.serviceAccountEmail);
 
     const liveFile = await google.getFile({ fileId: sourceFormId });
+    assertUsableFormFile(liveFile);
     const liveSnapshot = await loadSnapshot(liveFile);
     // The staging identity deliberately has read/copy-only access to production.
     // It must never need edit or share capability on the active live form.
-    assertSourceCapabilities(liveSnapshot.file, ['canCopy']);
+    assertReadCopyOnlyCapabilities(liveSnapshot.file);
+    assertDirectAutomationPermission(liveSnapshot.permissions, runtime, 'reader');
     assertRequiredSourcePermissions(liveSnapshot.permissions);
     assertTitle(liveSnapshot.form, liveSnapshot.file, cycleTitle(sourceCycle));
     assertExpectedPublishing(liveSnapshot.form, {
@@ -723,6 +1035,9 @@ export function createRolloverService({
     await assertPageState(sourceCycle, liveSnapshot.form.responderUri);
 
     let stagedFile = await findManagedFile(ROLLOVER_FILE_ROLES.SOURCE, sourceCycle);
+    if (stagedFile === undefined) {
+      await requireDestinationFolder(collaboratorPermissions);
+    }
     if (dryRun && stagedFile === undefined) {
       return Object.freeze({
         action: 'bootstrap',
@@ -747,6 +1062,13 @@ export function createRolloverService({
           ROLLOVER_FILE_STATES.COPIED,
         ),
       });
+      assertManagedFile(
+        stagedFile,
+        runtime,
+        ROLLOVER_FILE_ROLES.SOURCE,
+        sourceCycle,
+        { state: ROLLOVER_FILE_STATES.COPIED },
+      );
       created = true;
       if (faultInjection === ROLLOVER_FAULTS.AFTER_COPY) {
         throw new RolloverFaultError(ROLLOVER_FAULTS.AFTER_COPY);
@@ -765,6 +1087,13 @@ export function createRolloverService({
     }
 
     let stagedSnapshot = await loadSnapshot(stagedFile);
+    assertManagedFile(
+      stagedSnapshot.file,
+      runtime,
+      ROLLOVER_FILE_ROLES.SOURCE,
+      sourceCycle,
+    );
+    assertSourceCapabilities(stagedSnapshot.file);
     const title = managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.SOURCE, sourceCycle);
     const titled = await updateTitles(stagedSnapshot.file, stagedSnapshot.form, title);
     stagedSnapshot = {
@@ -775,15 +1104,17 @@ export function createRolloverService({
       isPublished: true,
       isAcceptingResponses: true,
     });
-    const expectedPermissions = desiredPermissions(
+    const expectedPermissions = expectedTargetPermissions(
       liveSnapshot.permissions,
       collaboratorPermissions,
       false,
+      SOURCE_ORIGINS.EXPLICIT_MY_DRIVE,
     );
     stagedSnapshot.permissions = await ensurePermissions(
       google,
       stagedSnapshot.file.id,
       expectedPermissions,
+      { serviceAccountEmail: runtime.serviceAccountEmail },
     );
     assertSameStructure(liveSnapshot.form, stagedSnapshot.form);
     assertTitle(stagedSnapshot.form, stagedSnapshot.file, title);
@@ -837,13 +1168,17 @@ export function createRolloverService({
         preparationOpensAt: rollover.preparationOpensAt.toISOString(),
       });
     }
+    assertCollaboratorConfiguration(collaboratorPermissions, runtime.serviceAccountEmail);
 
-    const sourceFile = await resolveSourceFile({
+    const source = await resolveSource({
       sourceFormId,
       sourceCycle: rollover.sourceCycle,
     });
-    const sourceSnapshot = await loadSnapshot(sourceFile);
-    assertSourceCapabilities(sourceSnapshot.file);
+    const sourceSnapshot = await loadSnapshot(source.file);
+    assertResolvedSourceAccess(source, sourceSnapshot, {
+      requireCopy: true,
+      requireShare: true,
+    });
     assertRequiredSourcePermissions(sourceSnapshot.permissions, collaboratorPermissions);
     assertExpectedPublishing(sourceSnapshot.form, {
       isPublished: true,
@@ -856,6 +1191,12 @@ export function createRolloverService({
       rollover.sourceCycle,
     );
     assertTitle(sourceSnapshot.form, sourceSnapshot.file, sourceTitle);
+    const expectedPermissions = expectedTargetPermissions(
+      sourceSnapshot.permissions,
+      collaboratorPermissions,
+      copySourceCollaborators,
+      source.origin,
+    );
 
     const currentPage = parseProgressPrizeMarkdown(await page.read());
     if (currentPage.cycle !== rollover.sourceCycle && currentPage.cycle !== targetCycle) {
@@ -872,6 +1213,16 @@ export function createRolloverService({
     }
 
     let targetFile = await findManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle);
+    if (targetFile === undefined) {
+      await requireDestinationFolder(collaboratorPermissions);
+    } else {
+      assertSourceFingerprint(
+        targetFile,
+        sourceSnapshot.file,
+        runtime,
+        rollover.sourceCycle,
+      );
+    }
     if (dryRun && targetFile === undefined) {
       return Object.freeze({
         action: 'prepare',
@@ -890,30 +1241,64 @@ export function createRolloverService({
         fileId: sourceSnapshot.file.id,
         name: managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle),
         parentId: runtime.folderId,
-        appProperties: managedProperties(
-          runtime,
-          ROLLOVER_FILE_ROLES.TARGET,
-          targetCycle,
-          ROLLOVER_FILE_STATES.COPIED,
-        ),
+        appProperties: {
+          ...managedProperties(
+            runtime,
+            ROLLOVER_FILE_ROLES.TARGET,
+            targetCycle,
+            ROLLOVER_FILE_STATES.COPIED,
+          ),
+          sourceFingerprint: sourceFingerprint(
+            runtime,
+            rollover.sourceCycle,
+            sourceSnapshot.file.id,
+          ),
+        },
       });
+      assertNonEmptyString(targetFile?.id, 'copied form ID');
+      const copiedForm = await google.getForm({ formId: targetFile.id });
+      const closedCopy = await ensurePublishState(google, copiedForm, {
+        isPublished: true,
+        isAcceptingResponses: false,
+      });
+      assertExpectedPublishing(closedCopy, {
+        isPublished: true,
+        isAcceptingResponses: false,
+      });
+      assertManagedFile(
+        targetFile,
+        runtime,
+        ROLLOVER_FILE_ROLES.TARGET,
+        targetCycle,
+        { state: ROLLOVER_FILE_STATES.COPIED },
+      );
+      assertSourceFingerprint(
+        targetFile,
+        sourceSnapshot.file,
+        runtime,
+        rollover.sourceCycle,
+      );
       created = true;
       if (faultInjection === ROLLOVER_FAULTS.AFTER_COPY) {
-        const copiedSnapshot = await loadSnapshot(targetFile);
-        const closedCopy = await ensurePublishState(google, copiedSnapshot.form, {
-          isPublished: true,
-          isAcceptingResponses: false,
-        });
-        assertExpectedPublishing(closedCopy, {
-          isPublished: true,
-          isAcceptingResponses: false,
-        });
         throw new RolloverFaultError(ROLLOVER_FAULTS.AFTER_COPY);
       }
     }
 
     if (dryRun) {
       const existing = await loadSnapshot(targetFile);
+      assertManagedFile(
+        existing.file,
+        runtime,
+        ROLLOVER_FILE_ROLES.TARGET,
+        targetCycle,
+      );
+      assertSourceCapabilities(existing.file);
+      assertSourceFingerprint(
+        existing.file,
+        sourceSnapshot.file,
+        runtime,
+        rollover.sourceCycle,
+      );
       return Object.freeze({
         action: 'prepare',
         status: 'planned',
@@ -927,6 +1312,19 @@ export function createRolloverService({
     }
 
     let targetSnapshot = await loadSnapshot(targetFile);
+    assertManagedFile(
+      targetSnapshot.file,
+      runtime,
+      ROLLOVER_FILE_ROLES.TARGET,
+      targetCycle,
+    );
+    assertSourceFingerprint(
+      targetSnapshot.file,
+      sourceSnapshot.file,
+      runtime,
+      rollover.sourceCycle,
+    );
+    assertSourceCapabilities(targetSnapshot.file);
     // A copied form may inherit an accepting state. Close it before title and
     // ACL work so an unprepared target is never left accepting responses.
     targetSnapshot.form = await ensurePublishState(google, targetSnapshot.form, {
@@ -936,15 +1334,11 @@ export function createRolloverService({
     const title = managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle);
     const titled = await updateTitles(targetSnapshot.file, targetSnapshot.form, title);
     targetSnapshot = { ...targetSnapshot, ...titled };
-    const expectedPermissions = desiredPermissions(
-      sourceSnapshot.permissions,
-      collaboratorPermissions,
-      copySourceCollaborators,
-    );
     targetSnapshot.permissions = await ensurePermissions(
       google,
       targetSnapshot.file.id,
       expectedPermissions,
+      { serviceAccountEmail: runtime.serviceAccountEmail },
     );
     assertSameStructure(sourceSnapshot.form, targetSnapshot.form);
     assertTitle(targetSnapshot.form, targetSnapshot.file, title);
@@ -994,6 +1388,59 @@ export function createRolloverService({
     });
   }
 
+  async function loadActivationState({
+    targetCycle,
+    sourceFormId,
+    collaboratorPermissions,
+    copySourceCollaborators,
+    sourceCycle,
+  }) {
+    const source = await resolveSource({ sourceFormId, sourceCycle });
+    const targetFile = await requireManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle);
+    const [sourceSnapshot, targetSnapshot] = await Promise.all([
+      loadSnapshot(source.file),
+      loadSnapshot(targetFile),
+    ]);
+    assertResolvedSourceAccess(source, sourceSnapshot);
+    assertManagedFile(
+      targetSnapshot.file,
+      runtime,
+      ROLLOVER_FILE_ROLES.TARGET,
+      targetCycle,
+    );
+    assertSourceCapabilities(targetSnapshot.file);
+    assertSourceFingerprint(targetSnapshot.file, sourceSnapshot.file, runtime, sourceCycle);
+    assertSameStructure(sourceSnapshot.form, targetSnapshot.form);
+    assertRequiredSourcePermissions(sourceSnapshot.permissions, collaboratorPermissions);
+    assertPermissionsMatch(
+      expectedTargetPermissions(
+        sourceSnapshot.permissions,
+        collaboratorPermissions,
+        copySourceCollaborators,
+        source.origin,
+      ),
+      targetSnapshot.permissions,
+      { serviceAccountEmail: runtime.serviceAccountEmail },
+    );
+    assertTitle(
+      sourceSnapshot.form,
+      sourceSnapshot.file,
+      managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.SOURCE, sourceCycle),
+    );
+    assertTitle(
+      targetSnapshot.form,
+      targetSnapshot.file,
+      managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle),
+    );
+    await assertPageState(targetCycle, targetSnapshot.form.responderUri);
+    return Object.freeze({
+      source,
+      sourceSnapshot,
+      targetSnapshot,
+      transition: activationTransition(sourceSnapshot, targetSnapshot),
+    });
+  }
+
   async function activate({
     targetCycle,
     sourceFormId,
@@ -1010,38 +1457,15 @@ export function createRolloverService({
     if (rollover.phase !== ROLLOVER_PHASES.ACTIVATE) {
       throw new Error('Activation is forbidden before the source-cycle cutoff');
     }
+    assertCollaboratorConfiguration(collaboratorPermissions, runtime.serviceAccountEmail);
 
-    const sourceFile = await resolveSourceFile({
+    const initialState = await loadActivationState({
+      targetCycle,
       sourceFormId,
+      collaboratorPermissions,
+      copySourceCollaborators,
       sourceCycle: rollover.sourceCycle,
     });
-    const targetFile = await requireManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle);
-    const [sourceSnapshot, targetSnapshotBefore] = await Promise.all([
-      loadSnapshot(sourceFile),
-      loadSnapshot(targetFile),
-    ]);
-    assertSameStructure(sourceSnapshot.form, targetSnapshotBefore.form);
-    assertRequiredSourcePermissions(sourceSnapshot.permissions, collaboratorPermissions);
-    assertPermissionsMatch(
-      desiredPermissions(
-        sourceSnapshot.permissions,
-        collaboratorPermissions,
-        copySourceCollaborators,
-      ),
-      targetSnapshotBefore.permissions,
-    );
-    assertTitle(
-      sourceSnapshot.form,
-      sourceSnapshot.file,
-      managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.SOURCE, rollover.sourceCycle),
-    );
-    assertTitle(
-      targetSnapshotBefore.form,
-      targetSnapshotBefore.file,
-      managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle),
-    );
-    await assertPageState(targetCycle, targetSnapshotBefore.form.responderUri);
-    const transition = activationTransition(sourceSnapshot, targetSnapshotBefore);
 
     if (activationGate === undefined) {
       throw new Error('Activation requires an injected successful code and Vercel preview gate');
@@ -1051,7 +1475,7 @@ export function createRolloverService({
     }
     const gate = await activationGate({
       targetCycle,
-      responderUri: targetSnapshotBefore.form.responderUri,
+      responderUri: initialState.targetSnapshot.form.responderUri,
       branch: runtime.branch,
       targetBranch: runtime.targetBranch,
       headSha,
@@ -1060,7 +1484,20 @@ export function createRolloverService({
       throw new Error('Code checks and Vercel preview gate did not pass for activation');
     }
 
-    if (transition === 'active') {
+    const currentState = await loadActivationState({
+      targetCycle,
+      sourceFormId,
+      collaboratorPermissions,
+      copySourceCollaborators,
+      sourceCycle: rollover.sourceCycle,
+    });
+    await assertResponderUrisMatch(
+      page,
+      currentState.targetSnapshot.form.responderUri,
+      initialState.targetSnapshot.form.responderUri,
+    );
+
+    if (currentState.transition === 'active') {
       return Object.freeze({
         action: 'activate',
         status: 'active',
@@ -1068,29 +1505,35 @@ export function createRolloverService({
         targetCycle,
         sourceAcceptingResponses: false,
         targetAcceptingResponses: true,
-        responderUri: assertPublicResponderUri(targetSnapshotBefore.form.responderUri),
+        responderUri: assertPublicResponderUri(currentState.targetSnapshot.form.responderUri),
       });
     }
 
-    const sourceForm = await ensurePublishState(google, sourceSnapshot.form, {
-      isPublished: true,
-      isAcceptingResponses: false,
-    });
-    await markFile(sourceSnapshot.file, ROLLOVER_FILE_STATES.CLOSED, {
-      targetCycle,
-    });
-    if (faultInjection === ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE) {
-      throw new RolloverFaultError(ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE);
+    if (currentState.transition === 'prepared') {
+      await markFile(currentState.targetSnapshot.file, ROLLOVER_FILE_STATES.ACTIVATING, {
+        sourceCycle: rollover.sourceCycle,
+      });
     }
 
-    await markFile(targetSnapshotBefore.file, ROLLOVER_FILE_STATES.ACTIVATING, {
-      sourceCycle: rollover.sourceCycle,
-    });
-    const targetForm = await ensurePublishState(google, targetSnapshotBefore.form, {
+    let sourceForm = currentState.sourceSnapshot.form;
+    if (currentState.transition !== 'recover-opened') {
+      sourceForm = await ensurePublishState(google, currentState.sourceSnapshot.form, {
+        isPublished: true,
+        isAcceptingResponses: false,
+      });
+      await markFile(currentState.sourceSnapshot.file, ROLLOVER_FILE_STATES.CLOSED, {
+        targetCycle,
+      });
+      if (faultInjection === ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE) {
+        throw new RolloverFaultError(ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE);
+      }
+    }
+
+    const targetForm = await ensurePublishState(google, currentState.targetSnapshot.form, {
       isPublished: true,
       isAcceptingResponses: true,
     });
-    await markFile(targetSnapshotBefore.file, ROLLOVER_FILE_STATES.ACTIVE, {
+    await markFile(currentState.targetSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
       sourceCycle: rollover.sourceCycle,
     });
 
@@ -1125,18 +1568,38 @@ export function createRolloverService({
     if (!ALLOWED_VERIFY_MODES.has(mode)) {
       throw new Error('verify mode must be prepared, active, or cleaned');
     }
+    assertCollaboratorConfiguration(collaboratorPermissions, runtime.serviceAccountEmail);
     const sourceCycle = previousCycle(targetCycle);
     const inActiveFolder = mode !== 'cleaned';
-    const sourceFile = mode === 'cleaned'
-      ? await requireManagedFile(ROLLOVER_FILE_ROLES.SOURCE, sourceCycle, { inActiveFolder: false })
-      : await resolveSourceFile({ sourceFormId, sourceCycle, inActiveFolder });
+    const source = mode === 'cleaned'
+      ? Object.freeze({
+        file: await requireManagedFile(
+          ROLLOVER_FILE_ROLES.SOURCE,
+          sourceCycle,
+          { inActiveFolder: false },
+        ),
+        origin: SOURCE_ORIGINS.MANAGED,
+      })
+      : await resolveSource({ sourceFormId, sourceCycle, inActiveFolder });
     const targetFile = await requireManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle, {
       inActiveFolder,
     });
     const [sourceSnapshot, targetSnapshot] = await Promise.all([
-      loadSnapshot(sourceFile),
+      loadSnapshot(source.file),
       loadSnapshot(targetFile),
     ]);
+    assertManagedFile(
+      targetSnapshot.file,
+      runtime,
+      ROLLOVER_FILE_ROLES.TARGET,
+      targetCycle,
+      { requireActiveFolder: inActiveFolder },
+    );
+    assertSourceFingerprint(targetSnapshot.file, sourceSnapshot.file, runtime, sourceCycle);
+    if (mode !== 'cleaned') {
+      assertResolvedSourceAccess(source, sourceSnapshot);
+      assertSourceCapabilities(targetSnapshot.file);
+    }
     assertSameStructure(sourceSnapshot.form, targetSnapshot.form);
     assertTitle(
       sourceSnapshot.form,
@@ -1152,12 +1615,17 @@ export function createRolloverService({
     if (mode !== 'cleaned') {
       assertRequiredSourcePermissions(sourceSnapshot.permissions, collaboratorPermissions);
     }
-    const expectedPermissions = desiredPermissions(
+    const expectedPermissions = expectedTargetPermissions(
       sourceSnapshot.permissions,
       collaboratorPermissions,
       copySourceCollaborators,
+      source.origin,
     );
-    assertPermissionsMatch(expectedPermissions, targetSnapshot.permissions);
+    assertPermissionsMatch(
+      expectedPermissions,
+      targetSnapshot.permissions,
+      { serviceAccountEmail: runtime.serviceAccountEmail },
+    );
 
     if (mode === 'prepared') {
       assertExpectedPublishing(sourceSnapshot.form, {
