@@ -795,43 +795,43 @@ def _release_memmap_pages(arr: np.ndarray, z0: int, z1: int) -> None:
 	if z1 <= z0 or not hasattr(arr, 'ctypes'):
 		return
 	page = 4096
-	aligned_offset = 0
-	aligned_length = 0
+	ranges = []
+	# In C,Z,Y,X layout, a z-band is contiguous within each channel but not
+	# across channels, so calculate a separate byte range for every channel.
+	for channel in range(int(arr.shape[0])):
+		offset = channel * int(arr.strides[0]) + z0 * int(arr.strides[1])
+		end = channel * int(arr.strides[0]) + z1 * int(arr.strides[1])
+		aligned_offset = ((offset + page - 1) // page) * page
+		aligned_end = (end // page) * page
+		if aligned_end > aligned_offset:
+			ranges.append((aligned_offset, aligned_end - aligned_offset))
 	try:
 		libc = _get_libc()
-		# Bytes per z-slice: product of dims after z * itemsize
-		# For shape (C, Z, Y, X), stride along z-axis
-		bytes_per_z = int(np.prod(arr.shape[2:])) * arr.shape[0] * arr.itemsize
-		offset = z0 * bytes_per_z
-		length = (z1 - z0) * bytes_per_z
-		aligned_offset = (offset // page) * page
-		aligned_end = ((offset + length + page - 1) // page) * page
-		aligned_length = aligned_end - aligned_offset
-		if aligned_length <= 0:
-			return
-		addr = ctypes.c_void_p(arr.ctypes.data + aligned_offset)
 		MADV_DONTNEED = 4
-		libc.madvise(addr, ctypes.c_size_t(aligned_length), ctypes.c_int(MADV_DONTNEED))
+		for aligned_offset, aligned_length in ranges:
+			addr = ctypes.c_void_p(arr.ctypes.data + aligned_offset)
+			libc.madvise(addr, ctypes.c_size_t(aligned_length), ctypes.c_int(MADV_DONTNEED))
 	except Exception:
 		pass  # best effort — non-critical
 	try:
 		path = getattr(arr, "_lasagna_tmp_path", None)
-		if path and aligned_length > 0 and os.path.exists(path):
+		if path and ranges and os.path.exists(path):
 			fd = os.open(path, os.O_RDWR)
 			try:
 				libc = _get_libc()
 				FALLOC_FL_KEEP_SIZE = 0x01
 				FALLOC_FL_PUNCH_HOLE = 0x02
-				ret = libc.fallocate(
-					ctypes.c_int(fd),
-					ctypes.c_int(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE),
-					ctypes.c_longlong(aligned_offset),
-					ctypes.c_longlong(aligned_length),
-				)
-				if ret != 0:
-					err = ctypes.get_errno()
-					if err not in (0, 38, 45, 95):  # ENOSYS, EOPNOTSUPP, ENOTSUP
-						print(f"[predict3d] warning: hole punch failed for {path}: errno={err}", flush=True)
+				for aligned_offset, aligned_length in ranges:
+					ret = libc.fallocate(
+						ctypes.c_int(fd),
+						ctypes.c_int(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE),
+						ctypes.c_longlong(aligned_offset),
+						ctypes.c_longlong(aligned_length),
+					)
+					if ret != 0:
+						err = ctypes.get_errno()
+						if err not in (0, 38, 45, 95):  # ENOSYS, EOPNOTSUPP, ENOTSUP
+							print(f"[predict3d] warning: hole punch failed for {path}: errno={err}", flush=True)
 			finally:
 				os.close(fd)
 	except Exception:
