@@ -46,6 +46,27 @@ using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
 
 
 namespace {
+
+// Resolve the command-line volume argument for vc_grow_seg_from_seed the same
+// way SegmentationCommandHandler::commandPathForVolume does: a fully
+// remote/streaming-only volume (no local zarr mirror, e.g. an Open Data catalog
+// sample) has an empty Volume::path(), so we must pass its remote locator
+// instead. Passing the empty local path used to spawn the child with an empty
+// volume argument, which failed instantly (issue #1188). Kept as a small
+// file-local helper (mirroring the file-local static in
+// SegmentationCommandHandler.cpp) rather than a shared header, matching how this
+// codebase already duplicates such tiny cross-file helpers.
+QString commandPathForVolume(const std::shared_ptr<Volume>& volume)
+{
+    if (!volume) {
+        return QString();
+    }
+    if (volume->isRemote()) {
+        return QString::fromStdString(volume->remoteLocator());
+    }
+    return QString::fromStdString(volume->path().string());
+}
+
 struct SegmentTriangleHit {
     float pathT = 0.0f;
     float distanceSq = std::numeric_limits<float>::max();
@@ -1211,7 +1232,12 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     _batchCompleted = 0;
     _batchNextIndex = 0;
     _batchOmpThreads = ompThreads;
-    _batchVolumePath = currentVolume->path();
+    _batchVolumePath = commandPathForVolume(currentVolume);
+    if (_batchVolumePath.isEmpty()) {
+        setError(tr("Could not resolve a volume path for segmentation "
+                    "(no local mirror and no remote locator)."));
+        return false;
+    }
     _batchPathsDir = pathsDir;
     _batchConfigJson = seedJsonPath;
     _batchWorkingDir = QString::fromStdString(pathsDir.parent_path().string());
@@ -1264,7 +1290,7 @@ void SeedingWidget::startSegmentationProcessForPoint(int pointIndex)
         });
 
     const QStringList toolArgs = QStringList()
-                  << QString::fromStdString(_batchVolumePath.string())
+                  << _batchVolumePath
                   << QString::fromStdString(_batchPathsDir.string())
                   << QString::fromStdString(_batchConfigJson.string())
                   << QString::number(point.p[0])
@@ -2287,7 +2313,12 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     _batchCompleted = 0;
     _batchNextIndex = 0;
     _batchOmpThreads = ompThreads;
-    _batchVolumePath = currentVolume->path();
+    _batchVolumePath = commandPathForVolume(currentVolume);
+    if (_batchVolumePath.isEmpty()) {
+        setError(tr("Could not resolve a volume path for expansion "
+                    "(no local mirror and no remote locator)."));
+        return false;
+    }
     _batchPathsDir = pathsDir;
     _batchConfigJson = expandJsonPath;
     _batchWorkingDir = QString::fromStdString(pathsDir.parent_path().string());
@@ -2339,7 +2370,7 @@ void SeedingWidget::startExpansionProcessForIteration(int iterationIndex)
         });
 
     const QStringList toolArgs = QStringList()
-                  << QString::fromStdString(_batchVolumePath.string())
+                  << _batchVolumePath
                   << QString::fromStdString(_batchPathsDir.string())
                   << QString::fromStdString(_batchConfigJson.string());
 

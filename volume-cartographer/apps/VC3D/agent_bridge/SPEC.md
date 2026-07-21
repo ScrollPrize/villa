@@ -1927,12 +1927,18 @@ binding):
 | RPC | params | wrapper → private target | result |
 |---|---|---|---|
 | `seeding.set_winding_annotation_mode` | `{"active": bool}` | (already public slot) `setRelWindingAnnotationMode(bool)` (SeedingWidget.hpp:64) | `{"active": bool}` |
-| `seeding.analyze_paths` | `{}` | `runAnalyzePaths()` → `analyzePaths()` (:98) | `{"analyzed": true}` |
+| `seeding.analyze_paths` | `{}` | `runAnalyzePaths()` → `analyzePaths()` (:98) | superseded, see below † |
 | `seeding.preview_rays` | `{}` | `runPreviewRays()` → `onPreviewRaysClicked()` (:69) | `{"requested": true}` |
 | `seeding.cast_rays` | `{}` | `runCastRays()` → `onCastRaysClicked()` (:71) | `{"requested": true}` |
-| `seeding.run` | `{}` | `runSeeding()` → `onRunSegmentationClicked()` (:74) | `{"requested": true}` |
-| `seeding.expand` | `{}` | `runExpandSeeds()` → `onExpandSeedsClicked()` (:75) | `{"requested": true}` |
+| `seeding.run` | `{}` | `runSeeding()` → `onRunSegmentationClicked()` (:74) | superseded, see below † |
+| `seeding.expand` | `{}` | `runExpandSeeds()` → `onExpandSeedsClicked()` (:75) | superseded, see below † |
 | `seeding.reset_points` | `{}` | `runResetPoints()` → `onResetPointsClicked()` (:76) | `{"reset": true}` |
+
+† `run`/`expand`/`analyze_paths` were deferred at this point in the doc's history (see the
+Stage 6 amendment immediately below), then actually implemented later (see the
+"batch-seeding follow-up" amendment further down) with real result shapes that
+supersede the placeholder ones in this table — jump to that amendment for the
+binding params/result/error contract, this row is history only.
 
 Errors for all: `-32000`, `-32001`. When a wrapper launches work through
 `CommandLineToolRunner`, the standard `source:"tool"` job wiring (§8.3) picks it up
@@ -2013,6 +2019,29 @@ instead of blocking. Result shapes: `preview_rays`/`cast_rays` return
   gone out. Populating the source collection for `seeding.run` reuses `points.commit`
   (a committed collection becomes the combo's current selection) or the widget's own
   Cast Rays flow; `analyze_paths` requires paths drawn via Draw-mode `canvas.drag`.
+
+**Amendment (as-built, issue #1188): remote-aware volume argument.**
+`runSegmentationHeadless`/`runExpandSeedsHeadless` (and therefore the interactive
+`onRunSegmentationClicked`/`onExpandSeedsClicked` slots that delegate to them) used to
+pass `currentVolume->path()` verbatim as the `vc_grow_seg_from_seed` volume positional
+argument. For a fully remote/streaming-only volume (no local zarr mirror — e.g. an Open
+Data catalog sample attached via `catalog.open_sample`), `Volume::path()` is empty, so
+the child was spawned with an **empty** volume argument and failed instantly. Both
+functions now resolve the argument via a file-local `commandPathForVolume()` helper
+(mirroring the one in `SegmentationCommandHandler.cpp` that already backs
+`segmentation.grow_patch_from_seed`): a remote volume contributes its
+`Volume::remoteLocator()` (the portable S3/HTTP zarr URL), a local volume its
+`path()`. The latched `SeedingWidget::_batchVolumePath` member is now a `QString`
+(the resolved command path, which may be a URL) rather than a `std::filesystem::path`.
+If resolution yields an empty string (no local mirror **and** no remote locator), the
+headless function fails its precondition with a distinct message
+("Could not resolve a volume path for segmentation/expansion …"); through
+`launchSeedingBatch` this maps to the already-documented **`-32005`**
+(`data.detail` carries the message) — it does not add a new error code. This does
+**not** change the `paths`/`seed.json`/`expand.json` config-file resolution, which still
+derives from `Volume::path()` and so remains local-only for the seeding widget (a
+separate, lower-priority concern than `startGrowPatchFromSeed`'s dynamic
+`normalGridPaths()` resolution — see the issue's secondary note).
 
 ### 15.3 `segmentation.push_pull.*`
 

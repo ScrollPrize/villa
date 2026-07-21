@@ -98,3 +98,36 @@ now fails `-32009` instead of silently returning a near-zero-size image — this
 used to return a genuinely degenerate (e.g. 15×50px) but "successful" PNG,
 which cost real debugging time before anyone noticed. If you hit this, switch
 to the right tab/workspace (or activate that pane) before capturing.
+
+## 9. Seeding batch runs (`vc3d_seeding_run`/`_expand`) need a real local `paths`/`seed.json` — even on a remote volume
+
+`seeding.run`/`seeding.expand` spawn `vc_grow_seg_from_seed` once per source
+point / expansion iteration, same underlying tool as `vc3d_grow_patch_from_seed`.
+Two things that will bite you, both about the config VC3D resolves, not the
+points you commit:
+
+- **`paths`/`seed.json` (or `expand.json`) resolution is local-only, and is
+  relative to VC3D's own working directory when the open project has no
+  segmentations yet** (the common case for a freshly-attached catalog sample).
+  If neither exists there, you get a clean `-32007` (`data.kind:"file"`) —
+  not a crash, but also not something `catalog.open_sample` sets up for you.
+  For a remote-only project you must create a real `paths/` directory and a
+  `seed.json` (schema: `{"cache_root", "thread_limit", "normal_grid_path",
+  "min_area_cm", "generations"}`) yourself, in whatever directory VC3D was
+  launched from.
+- **`normal_grid_path` inside that file is a static local path, with no
+  awareness of remote/streaming normal-grid stores** — this is a real,
+  currently-open gap (unlike `vc3d_grow_patch_from_seed`, which resolves
+  normal grids dynamically and does support remote stores). To seed a remote
+  volume, point `normal_grid_path` at the already-fetched local cache dir for
+  that sample's normal grid: `~/.VC3D/remote_cache/normal_grids/<sampleId>/
+  <volumeId>/L<level>-<hash>/` (created by `catalog.open_sample` when you pass
+  a `normal_grids`-kind `representationRefs` entry — check `vc3d_get_state` or
+  the catalog attach result for the exact hash-suffixed directory name).
+- The volume argument itself (the actual CT data source) *does* now resolve
+  correctly for remote volumes (`Volume::remoteLocator()`, issue #1188) — you
+  do not need to work around that part.
+- `seeding.run`'s source point collection is whatever `points.commit` last
+  created (it becomes the widget's combo-box selection) — commit real points
+  from `canvas.get_cursor_volume_point` after a screenshot, not fabricated
+  coordinates.

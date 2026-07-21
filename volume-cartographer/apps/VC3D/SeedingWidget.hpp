@@ -235,7 +235,11 @@ private:
     int _batchNextIndex{0};
     int _batchOmpThreads{0};
     std::vector<ColPoint> _batchPoints;      // run: source points; empty for expand
-    std::filesystem::path _batchVolumePath;
+    // Resolved vc_grow_seg_from_seed volume argument: local zarr path for a
+    // mirrored volume, or the remote locator for a streaming-only volume
+    // (issue #1188). A QString (not filesystem::path) because a remote locator
+    // is a URL, not a path.
+    QString _batchVolumePath;
     std::filesystem::path _batchPathsDir;
     std::filesystem::path _batchConfigJson;  // seed.json (run) or expand.json (expand)
     QString _batchWorkingDir;
