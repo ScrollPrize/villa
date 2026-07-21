@@ -15,12 +15,13 @@ const API = 'https://api.github.com';
 const SMOKE_HEAD = 'codex/progress-prize-smoke-20260720';
 const SMOKE_BASE = 'codex/progress-prize-smoke-base-20260720';
 const PREVIEW_CONTEXT = 'progress-prizes/vercel-preview';
-const PREVIEW_WORKFLOW_NAME = 'Progress Prize Vercel preview gate';
+const PREVIEW_DESCRIPTION = 'Exact Progress Prize preview verified';
 const PREVIEW_WORKFLOW_PATH = '.github/workflows/progress-prizes-vercel-preview.yml';
 const TEST_CHECK = 'Public no-secret tests';
 const SUCCESSFUL_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
 const REPOSITORY_ID = 890972577;
 const OWNER_ID = 121906140;
+const GITHUB_ACTIONS_BOT_ID = 41898282;
 const PAGE_PATH = 'scrollprize.org/docs/34_prizes.md';
 
 function previewRunId(status) {
@@ -33,7 +34,16 @@ function isTrustedPreviewStatus(status) {
   return status?.context === PREVIEW_CONTEXT
     && status.state === 'success'
     && status.creator?.login === 'github-actions[bot]'
+    && status.creator?.id === GITHUB_ACTIONS_BOT_ID
+    && status.creator?.type === 'Bot'
+    && status.description === PREVIEW_DESCRIPTION
     && previewRunId(status) !== undefined;
+}
+
+function latestPreviewStatus(statuses) {
+  return Array.isArray(statuses)
+    ? statuses.find((status) => status.context === PREVIEW_CONTEXT)
+    : undefined;
 }
 
 function fail(message) {
@@ -156,10 +166,11 @@ export function assertSinglePageCommit(commit, { headSha, baseSha } = {}) {
 export function isTrustedPreviewRun({ status, run, expectedSha } = {}) {
   const sha = assertSha(expectedSha);
   const runId = previewRunId(status);
+  const expectedRunName = `Progress Prize Vercel preview ${sha}`;
   return isTrustedPreviewStatus(status)
     && String(run?.id ?? '') === runId
     && run?.html_url === status.target_url
-    && run?.name === PREVIEW_WORKFLOW_NAME
+    && run?.name === expectedRunName
     && run?.path === PREVIEW_WORKFLOW_PATH
     && run?.event === 'repository_dispatch'
     && run?.actor?.login === 'vercel[bot]'
@@ -173,7 +184,7 @@ export function isTrustedPreviewRun({ status, run, expectedSha } = {}) {
     && run?.head_branch === 'main'
     && run?.status === 'completed'
     && run?.conclusion === 'success'
-    && run?.display_title === `Progress Prize Vercel preview ${sha}`;
+    && run?.display_title === expectedRunName;
 }
 
 async function github(path, { method = 'GET', body, token = process.env.GITHUB_TOKEN } = {}) {
@@ -321,7 +332,7 @@ async function readPreviewRun(status, expectedSha) {
 }
 
 export function gateSnapshot({ statuses, checks, previewRun, expectedSha }) {
-  const preview = statuses?.statuses?.find((status) => status.context === PREVIEW_CONTEXT);
+  const preview = latestPreviewStatus(statuses);
   const runs = checks?.check_runs;
   const publicTest = Array.isArray(runs) && runs.find((run) => run.name === TEST_CHECK);
   const allFinishedSuccessfully = Array.isArray(runs)
@@ -364,7 +375,7 @@ async function gate(options) {
     });
     if (sha !== expectedSha) fail('Pull request head changed after preparation.');
     const [statuses, checks] = await Promise.all([
-      github(`/repos/${OWNER}/${REPO}/commits/${sha}/status`),
+      github(`/repos/${OWNER}/${REPO}/commits/${sha}/statuses?per_page=100`),
       github(`/repos/${OWNER}/${REPO}/commits/${sha}/check-runs?per_page=100`),
       verifyPageDelta({
         head,
@@ -375,7 +386,7 @@ async function gate(options) {
         targetCycle,
       }),
     ]);
-    const preview = statuses?.statuses?.find((status) => status.context === PREVIEW_CONTEXT);
+    const preview = latestPreviewStatus(statuses);
     const previewRun = await readPreviewRun(preview, expectedSha);
     if (gateSnapshot({ statuses, checks, previewRun, expectedSha }).ready) {
       if (process.env.GITHUB_OUTPUT) {
@@ -404,14 +415,14 @@ async function waitPreview(options) {
   while (true) {
     const [ref, statuses, page] = await Promise.all([
       github(`/repos/${OWNER}/${REPO}/git/ref/heads/${encodeURIComponent(branch)}`),
-      github(`/repos/${OWNER}/${REPO}/commits/${sha}/status`),
+      github(`/repos/${OWNER}/${REPO}/commits/${sha}/statuses?per_page=100`),
       readPageAt(sha),
     ]);
     if (ref?.object?.type !== 'commit' || ref.object.sha !== sha) {
       fail('Fixed smoke base changed while waiting for its preview.');
     }
     if (page.cycle !== cycle) fail('Post-merge smoke base has the wrong page cycle.');
-    const preview = statuses?.statuses?.find((status) => status.context === PREVIEW_CONTEXT);
+    const preview = latestPreviewStatus(statuses);
     const previewRun = await readPreviewRun(preview, sha);
     if (previewRun) return { headSha: sha };
     if (Date.now() >= deadline) fail('Timed out waiting for the post-merge smoke preview.');
