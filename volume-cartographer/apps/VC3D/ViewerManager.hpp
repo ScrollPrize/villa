@@ -17,6 +17,7 @@
 #include <opencv2/core/mat.hpp>
 
 #include "vc/core/util/Compositing.hpp"
+#include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QMdiArea;
@@ -100,6 +101,8 @@ public:
 
     void setOverlayColormap(const std::string& colormapId);
     const std::string& overlayColormap() const { return _overlayColormapId; }
+    void setOverlaySamplingMethod(vc::Sampling method);
+    vc::Sampling overlaySamplingMethod() const { return _overlaySamplingMethod; }
     void setOverlayThreshold(float threshold);
     float overlayThreshold() const { return _overlayWindowLow; }
 
@@ -302,6 +305,7 @@ private:
     std::string _overlayVolumeId;
     float _overlayOpacity{0.5f};
     std::string _overlayColormapId;
+    vc::Sampling _overlaySamplingMethod{vc::Sampling::Nearest};
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
     int _overlayMaxDisplayedResolution{0};

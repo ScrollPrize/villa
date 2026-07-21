@@ -7603,6 +7603,7 @@ void CWindow::CreateWidgets(void)
         VolumeOverlayController::UiRefs overlayUi{
             .volumeSelect = overlayVolumeSelect,
             .colormapSelect = ui.overlayColormapSelect,
+            .samplingMethodSelect = ui.overlayInterpolationSelect,
             .opacitySpin = ui.overlayOpacitySpin,
             .thresholdSpin = ui.overlayThresholdSpin,
             .maxDisplayedResolutionSpin = ui.overlayMaxDisplayedResolutionSpin,

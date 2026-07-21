@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include "vc/core/types/Sampling.hpp"
+
 class ViewerManager;
 class VolumePkg;
 class Volume;
@@ -26,6 +28,7 @@ public:
     struct UiRefs {
         QPointer<QComboBox> volumeSelect;
         QPointer<QComboBox> colormapSelect;
+        QPointer<QComboBox> samplingMethodSelect;
         QPointer<QSpinBox> opacitySpin;
         QPointer<QSpinBox> thresholdSpin;
         QPointer<QSpinBox> maxDisplayedResolutionSpin;
@@ -59,6 +62,7 @@ private:
     void loadState();
     void saveState() const;
     void setColormap(const std::string& id);
+    void setSamplingMethod(vc::Sampling method);
     void setOpacity(float value);
     void setThreshold(float value);
     void setWindowBounds(float low, float high);
@@ -68,6 +72,7 @@ private:
 
     void handleVolumeComboChanged(int index);
     void handleColormapChanged(int index);
+    void handleSamplingMethodChanged(int index);
     void handleOpacityChanged(int value);
     void handleThresholdChanged(int value);
     void handleMaxDisplayedResolutionChanged(int value);
@@ -85,6 +90,7 @@ private:
     std::string _overlayVolumeId;
     std::string _overlayVolumeIdBeforeToggle;
     std::string _overlayColormapName;
+    vc::Sampling _overlaySamplingMethod{vc::Sampling::Nearest};
     float _overlayOpacity{0.5f};
     float _overlayOpacityBeforeToggle{0.5f};
     float _overlayWindowLow{0.0f};

@@ -384,6 +384,7 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setOverlayVolume(_overlayVolume);
     baseViewer->setOverlayOpacity(_overlayOpacity);
     baseViewer->setOverlayColormap(_overlayColormapId);
+    baseViewer->setOverlaySamplingMethod(_overlaySamplingMethod);
     baseViewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
     baseViewer->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     baseViewer->setOverlayComposite(_overlayComposite);
@@ -1043,6 +1044,16 @@ void ViewerManager::setOverlayColormap(const std::string& colormapId)
 {
     _overlayColormapId = colormapId;
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayColormap(_overlayColormapId); });
+}
+
+void ViewerManager::setOverlaySamplingMethod(vc::Sampling method)
+{
+    _overlaySamplingMethod = method == vc::Sampling::Trilinear
+        ? vc::Sampling::Trilinear
+        : vc::Sampling::Nearest;
+    forEachBaseViewer([this](VolumeViewerBase* v) {
+        v->setOverlaySamplingMethod(_overlaySamplingMethod);
+    });
 }
 
 void ViewerManager::setOverlayThreshold(float threshold)

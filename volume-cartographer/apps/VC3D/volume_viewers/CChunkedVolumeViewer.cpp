@@ -1410,6 +1410,7 @@ struct CChunkedVolumeViewer::RenderContext {
     int startLevel = 0;
     int overlayStartLevel = 0;
     vc::Sampling samplingMethod = vc::Sampling::Trilinear;
+    vc::Sampling overlaySamplingMethod = vc::Sampling::Nearest;
     CompositeRenderSettings compositeSettings;
     float windowLow = 0.0f;
     float windowHigh = 255.0f;
@@ -1506,6 +1507,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
     const vc::render::ChunkedPlaneSampler::Options options(ctx.samplingMethod, 32);
+    const vc::render::ChunkedPlaneSampler::Options overlayOptions(
+        ctx.overlaySamplingMethod, options.tileSize);
 
     auto streamingCompositeUnsupported = [&]() {
         return !isSupportedStreamingCompositeMethod(ctx.compositeSettings.params.method) ||
@@ -1579,12 +1582,12 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                                      int layersFront,
                                      int layersBehind,
                                      float zStep,
-                                     const CompositeParams& params) {
+                                     const CompositeParams& params,
+                                     const vc::render::ChunkedPlaneSampler::Options& samplingOptions) {
         const int front = std::max(0, layersFront);
         const int behind = std::max(0, layersBehind);
         const int numLayers = front + behind + 1;
         const int zStart = -behind;
-        const auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(vc::Sampling::Nearest, options.tileSize);
         std::vector<cv::Mat_<uint8_t>> layerValues;
         std::vector<cv::Mat_<uint8_t>> layerCoverage;
         cv::Mat_<cv::Vec3f> layerCoords(coords.rows, coords.cols);
@@ -1607,7 +1610,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             layerCoverage.emplace_back(dst.rows, dst.cols, uint8_t(0));
             vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
                 array, startLevel, layerCoords,
-                layerValues.back(), layerCoverage.back(), compositeOptions);
+                layerValues.back(), layerCoverage.back(), samplingOptions);
         }
         LayerStack stack;
         stack.values.resize(numLayers);
@@ -1648,10 +1651,12 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         }
 
         const float zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
+        const auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(
+            vc::Sampling::Nearest, options.tileSize);
         sampleCoordsComposite(coords, normals, dst, cov, array, ctx.startLevel,
                               ctx.compositeSettings.layersFront,
                               ctx.compositeSettings.layersBehind,
-                              zStep, ctx.compositeSettings.params);
+                              zStep, ctx.compositeSettings.params, compositeOptions);
     };
 
     const bool planeView = dynamic_cast<PlaneSurface*>(ctx.surf.get()) != nullptr;
@@ -1678,7 +1683,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             const int level = std::clamp(ctx.overlayStartLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
             vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
                 *ctx.overlayChunkArray, level, origin, vxStep, vyStep,
-                overlayValues, overlayCoverage, options);
+                overlayValues, overlayCoverage, overlayOptions);
         }
     } else {
         cv::Mat_<cv::Vec3f> coords;
@@ -1766,10 +1771,11 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                                           *ctx.overlayChunkArray, level,
                                           ctx.overlayComposite.layersFront,
                                           ctx.overlayComposite.layersBehind,
-                                          zStep, overlayParams);
+                                          zStep, overlayParams, overlayOptions);
                 } else {
                     vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                        *ctx.overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
+                        *ctx.overlayChunkArray, level, coords, overlayValues, overlayCoverage,
+                        overlayOptions);
                 }
             }
         }
@@ -1870,6 +1876,7 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.startLevel = renderStartLevel(preferSurfaceResolution);
     job.overlayStartLevel = overlayRenderStartLevel(preferSurfaceResolution);
     job.samplingMethod = _samplingMethod;
+    job.overlaySamplingMethod = _overlaySamplingMethod;
     job.compositeSettings = _compositeSettings;
     job.windowLow = _windowLow;
     job.windowHigh = _windowHigh;
@@ -1920,6 +1927,7 @@ bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
            a.startLevel == b.startLevel &&
            a.overlayStartLevel == b.overlayStartLevel &&
            a.samplingMethod == b.samplingMethod &&
+           a.overlaySamplingMethod == b.overlaySamplingMethod &&
            a.compositeSettings == b.compositeSettings &&
            a.windowLow == b.windowLow &&
            a.windowHigh == b.windowHigh &&
@@ -1994,6 +2002,7 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.startLevel = job.startLevel;
     ctx.overlayStartLevel = job.overlayStartLevel;
     ctx.samplingMethod = job.samplingMethod;
+    ctx.overlaySamplingMethod = job.overlaySamplingMethod;
     ctx.compositeSettings = job.compositeSettings;
     ctx.windowLow = job.windowLow;
     ctx.windowHigh = job.windowHigh;
@@ -2307,6 +2316,23 @@ void CChunkedVolumeViewer::setOverlayColormap(const std::string& colormapId)
     }
     _overlayColormapId = colormapId;
     submitRender("overlay colormap changed");
+}
+
+void CChunkedVolumeViewer::setOverlaySamplingMethod(vc::Sampling method)
+{
+    if (_closing) {
+        return;
+    }
+
+    const vc::Sampling sanitized = method == vc::Sampling::Trilinear
+        ? vc::Sampling::Trilinear
+        : vc::Sampling::Nearest;
+    if (_overlaySamplingMethod == sanitized) {
+        return;
+    }
+
+    _overlaySamplingMethod = sanitized;
+    submitRender("overlay sampling changed");
 }
 
 void CChunkedVolumeViewer::setOverlayThreshold(float threshold)

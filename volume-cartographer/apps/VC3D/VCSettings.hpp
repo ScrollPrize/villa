@@ -449,6 +449,7 @@ namespace volume_overlay {
     constexpr auto WINDOW_HIGH = "window_high";
     constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
+    constexpr auto SAMPLING_METHOD = "sampling_method";
     constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
     constexpr auto COMPOSITE_ENABLED = "composite_enabled";
     constexpr auto COMPOSITE_METHOD = "composite_method";
@@ -456,6 +457,7 @@ namespace volume_overlay {
     constexpr auto COMPOSITE_LAYERS_BEHIND = "composite_layers_behind";
 
     constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
+    constexpr auto SAMPLING_METHOD_DEFAULT = "nearest";
     constexpr bool COMPOSITE_ENABLED_DEFAULT = false;
     constexpr auto COMPOSITE_METHOD_DEFAULT = "max";
     constexpr int COMPOSITE_LAYERS_FRONT_DEFAULT = 8;

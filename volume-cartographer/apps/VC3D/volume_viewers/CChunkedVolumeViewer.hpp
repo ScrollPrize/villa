@@ -136,6 +136,7 @@ public:
     void setOverlayVolume(std::shared_ptr<Volume> volume) override;
     void setOverlayOpacity(float opacity) override;
     void setOverlayColormap(const std::string& colormapId) override;
+    void setOverlaySamplingMethod(vc::Sampling method) override;
     void setOverlayThreshold(float threshold) override;
     void setOverlayWindow(float low, float high) override;
     void setOverlayMaxDisplayedResolution(int level) override;
@@ -307,6 +308,7 @@ private:
         int startLevel = 0;
         int overlayStartLevel = 0;
         vc::Sampling samplingMethod = vc::Sampling::Trilinear;
+        vc::Sampling overlaySamplingMethod = vc::Sampling::Nearest;
         CompositeRenderSettings compositeSettings;
         float windowLow = 0.0f;
         float windowHigh = 255.0f;
@@ -446,6 +448,7 @@ private:
     vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;
+    vc::Sampling _overlaySamplingMethod = vc::Sampling::Nearest;
     float _overlayWindowLow = 0.0f;
     float _overlayWindowHigh = 255.0f;
     int _overlayMaxDisplayedResolution = 0;
