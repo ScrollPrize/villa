@@ -329,25 +329,26 @@ runs:
           if test "$operation_status" -ne 0; then
             grep -Fq "Injected staging rollover failure at $FAULT" "$RUNNER_TEMP/progress-prizes-error.txt"
           else
-            FAULT="$FAULT" node --input-type=module <<'NODE'
-            import { readFile } from 'node:fs/promises';
+        # Keep this heredoc at the YAML block indent so Bash sees a column-zero delimiter.
+        FAULT="$FAULT" node --input-type=module <<'NODE'
+        import { readFile } from 'node:fs/promises';
 
-            const result = JSON.parse(await readFile(
-              `${process.env.RUNNER_TEMP}/progress-prizes-result.json`,
-              'utf8',
-            ));
-            const passedCopyFault = process.env.FAULT === 'after-copy'
-              && result.action === 'prepare'
-              && result.status === 'prepared'
-              && result.created === false
-              && result.resumed === true;
-            const passedCloseFault = process.env.FAULT === 'after-close-source'
-              && result.action === 'activate'
-              && result.status === 'active';
-            if (!passedCopyFault && !passedCloseFault) {
-              throw new Error('Expected staging fault neither occurred nor had already been recovered.');
-            }
-            NODE
+        const result = JSON.parse(await readFile(
+          `${process.env.RUNNER_TEMP}/progress-prizes-result.json`,
+          'utf8',
+        ));
+        const passedCopyFault = process.env.FAULT === 'after-copy'
+          && result.action === 'prepare'
+          && result.status === 'prepared'
+          && result.created === false
+          && result.resumed === true;
+        const passedCloseFault = process.env.FAULT === 'after-close-source'
+          && result.action === 'activate'
+          && result.status === 'active';
+        if (!passedCopyFault && !passedCloseFault) {
+          throw new Error('Expected staging fault neither occurred nor had already been recovered.');
+        }
+        NODE
           fi
           : >"$RUNNER_TEMP/progress-prizes-error.txt"
           printf '{"status":"expected-fault"}\n' >"$RUNNER_TEMP/progress-prizes-result.json"
