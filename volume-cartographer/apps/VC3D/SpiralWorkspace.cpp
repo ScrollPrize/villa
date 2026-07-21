@@ -1162,6 +1162,7 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
     updateSurfaceIntersections();
     for (auto* viewer : _viewerManager->baseViewers()) if (viewer) {
         viewer->invalidateIntersect("segmentation");
+        viewer->renderIntersections("Spiral preview installed");
         viewer->requestRender("Spiral preview installed");
     }
     if (!previousRegistration.isEmpty() && previousRegistration != registrationId)
