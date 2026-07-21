@@ -90,26 +90,36 @@ export function assertAutomationBranch(head, base) {
   fail('Head/base pair is outside the Progress Prize automation allowlist.');
 }
 
+function assertPullAssociation(pull, { head, base } = {}) {
+  assertAutomationBranch(head, base);
+  if (
+    pull?.state !== 'open'
+    || pull.head?.ref !== head
+    || pull.base?.ref !== base
+    || pull.head?.repo?.id !== REPOSITORY_ID
+    || pull.base?.repo?.id !== REPOSITORY_ID
+    || pull.head?.repo?.full_name !== `${OWNER}/${REPO}`
+    || pull.base?.repo?.full_name !== `${OWNER}/${REPO}`
+  ) {
+    fail('Automation pull request association failed.');
+  }
+  return pull;
+}
+
+function pullShasMatch(pull, { headSha, baseSha }) {
+  return pull?.head?.sha === headSha && pull?.base?.sha === baseSha;
+}
+
 export function assertPullBinding(pull, {
   head,
   base,
   headSha,
   baseSha,
 } = {}) {
-  assertAutomationBranch(head, base);
+  assertPullAssociation(pull, { head, base });
   assertSha(headSha);
   assertSha(baseSha);
-  if (
-    pull?.state !== 'open'
-    || pull.head?.ref !== head
-    || pull.base?.ref !== base
-    || pull.head?.sha !== headSha
-    || pull.base?.sha !== baseSha
-    || pull.head?.repo?.id !== REPOSITORY_ID
-    || pull.base?.repo?.id !== REPOSITORY_ID
-    || pull.head?.repo?.full_name !== `${OWNER}/${REPO}`
-    || pull.base?.repo?.full_name !== `${OWNER}/${REPO}`
-  ) {
+  if (!pullShasMatch(pull, { headSha, baseSha })) {
     fail('Automation pull request is not bound to the expected immutable refs.');
   }
   return pull;
@@ -205,6 +215,37 @@ async function github(path, { method = 'GET', body, token = process.env.GITHUB_T
   return response.status === 204 ? undefined : response.json();
 }
 
+export async function waitForPullBinding({
+  number,
+  head,
+  base,
+  headSha,
+  baseSha,
+} = {}, {
+  attempts = 12,
+  delayMs = 5_000,
+  readPull = (pullNumber) => github(`/repos/${OWNER}/${REPO}/pulls/${pullNumber}`),
+  sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+} = {}) {
+  if (!Number.isInteger(number) || number < 1) fail('Invalid pull request number.');
+  assertAutomationBranch(head, base);
+  assertSha(headSha);
+  assertSha(baseSha);
+  if (!Number.isInteger(attempts) || attempts < 1 || attempts > 12) {
+    fail('Invalid pull request convergence attempts.');
+  }
+  if (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > 5_000) {
+    fail('Invalid pull request convergence delay.');
+  }
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const pull = await readPull(number);
+    assertPullAssociation(pull, { head, base });
+    if (pullShasMatch(pull, { headSha, baseSha })) return pull;
+    if (attempt < attempts) await sleep(delayMs);
+  }
+  fail('Automation pull request immutable refs did not converge.');
+}
+
 async function findPull(head, base) {
   assertAutomationBranch(head, base);
   const pulls = await github(
@@ -212,17 +253,7 @@ async function findPull(head, base) {
   );
   if (!Array.isArray(pulls) || pulls.length !== 1) fail('Expected exactly one open automation pull request.');
   const pull = pulls[0];
-  if (
-    pull.head?.ref !== head
-    || pull.base?.ref !== base
-    || pull.head?.repo?.id !== REPOSITORY_ID
-    || pull.base?.repo?.id !== REPOSITORY_ID
-    || pull.head?.repo?.full_name !== `${OWNER}/${REPO}`
-    || pull.base?.repo?.full_name !== `${OWNER}/${REPO}`
-  ) {
-    fail('Automation pull request association failed.');
-  }
-  return pull;
+  return assertPullAssociation(pull, { head, base });
 }
 
 async function activationState(options) {
@@ -450,8 +481,9 @@ async function ensurePull(options) {
     responderUri,
   });
   const pulls = await github(
-    `/repos/${OWNER}/${REPO}/pulls?state=open&head=${encodeURIComponent(`${OWNER}:${head}`)}&base=${encodeURIComponent(base)}&per_page=10`,
+    `/repos/${OWNER}/${REPO}/pulls?state=open&head=${encodeURIComponent(`${OWNER}:${head}`)}&per_page=10`,
   );
+  if (!Array.isArray(pulls)) fail('Automation pull request listing failed.');
   let pull;
   if (pulls.length === 0) {
     pull = await github(`/repos/${OWNER}/${REPO}/pulls`, {
@@ -465,13 +497,18 @@ async function ensurePull(options) {
       },
     });
   } else if (pulls.length === 1) {
-    pull = pulls[0];
+    pull = assertPullAssociation(pulls[0], { head, base });
   } else {
-    fail('Multiple automation pull requests match the fixed head/base pair.');
+    fail('Multiple open pull requests use the fixed automation head.');
   }
   if (!Number.isInteger(pull?.number) || pull.number < 1) fail('Pull request creation failed.');
-  pull = await github(`/repos/${OWNER}/${REPO}/pulls/${pull.number}`);
-  assertPullBinding(pull, { head, base, headSha, baseSha });
+  pull = await waitForPullBinding({
+    number: pull.number,
+    head,
+    base,
+    headSha,
+    baseSha,
+  });
   await verifyPageDelta({
     head,
     base,

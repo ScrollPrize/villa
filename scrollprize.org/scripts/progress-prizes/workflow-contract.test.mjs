@@ -12,6 +12,7 @@ import {
   assertSinglePageCommit,
   gateSnapshot,
   isTrustedPreviewRun,
+  waitForPullBinding,
 } from '../../../.github/progress-prizes-github.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -437,6 +438,20 @@ test('preview gates use creator-bearing newest-first commit status history', asy
   assert.equal(helper.includes(combinedEndpoint), false);
 });
 
+test('PR preparation discovers by immutable head and waits for exact SHA convergence', async () => {
+  const helper = await readFile(
+    resolve(repositoryRoot, '.github/progress-prizes-github.mjs'),
+    'utf8',
+  );
+  const start = helper.indexOf('async function ensurePull(options)');
+  const end = helper.indexOf('async function merge(options)', start);
+  assert.ok(start >= 0 && end > start);
+  const ensurePull = helper.slice(start, end);
+  assert.match(ensurePull, /pulls\?state=open&head=/);
+  assert.doesNotMatch(ensurePull, /&base=/);
+  assert.match(ensurePull, /waitForPullBinding/);
+});
+
 test('trusted branch and exact-check gate helpers reject ambiguous automation state', () => {
   assert.deepEqual(
     assertAutomationBranch(
@@ -714,4 +729,90 @@ test('the GitHub helper binds the PR and exact deterministic page-only commit', 
     ...commit,
     files: [...commit.files, { filename: '.github/workflows/untrusted.yml', status: 'added' }],
   }, { headSha, baseSha }), /one page-only commit/);
+});
+
+test('PR binding retry tolerates only bounded stale SHAs', async () => {
+  const head = 'codex/progress-prize-smoke-20260720';
+  const base = 'codex/progress-prize-smoke-base-20260720';
+  const headSha = 'a'.repeat(40);
+  const baseSha = 'b'.repeat(40);
+  const exactPull = {
+    number: 1194,
+    state: 'open',
+    head: {
+      ref: head,
+      sha: headSha,
+      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
+    },
+    base: {
+      ref: base,
+      sha: baseSha,
+      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
+    },
+  };
+  const stalePull = {
+    ...exactPull,
+    head: { ...exactPull.head, sha: 'c'.repeat(40) },
+    base: { ...exactPull.base, sha: 'd'.repeat(40) },
+  };
+  const responses = [stalePull, stalePull, exactPull];
+  const sleeps = [];
+  const result = await waitForPullBinding({
+    number: exactPull.number,
+    head,
+    base,
+    headSha,
+    baseSha,
+  }, {
+    attempts: 3,
+    delayMs: 7,
+    readPull: async () => responses.shift(),
+    sleep: async (milliseconds) => sleeps.push(milliseconds),
+  });
+  assert.equal(result, exactPull);
+  assert.deepEqual(sleeps, [7, 7]);
+
+  let unsafeReads = 0;
+  let unsafeSleeps = 0;
+  await assert.rejects(
+    waitForPullBinding({
+      number: exactPull.number,
+      head,
+      base,
+      headSha,
+      baseSha,
+    }, {
+      attempts: 3,
+      delayMs: 0,
+      readPull: async () => {
+        unsafeReads += 1;
+        return { ...stalePull, base: { ...stalePull.base, ref: 'main' } };
+      },
+      sleep: async () => { unsafeSleeps += 1; },
+    }),
+    /association failed/,
+  );
+  assert.equal(unsafeReads, 1);
+  assert.equal(unsafeSleeps, 0);
+
+  let staleReads = 0;
+  await assert.rejects(
+    waitForPullBinding({
+      number: exactPull.number,
+      head,
+      base,
+      headSha,
+      baseSha,
+    }, {
+      attempts: 2,
+      delayMs: 0,
+      readPull: async () => {
+        staleReads += 1;
+        return stalePull;
+      },
+      sleep: async () => {},
+    }),
+    /immutable refs did not converge/,
+  );
+  assert.equal(staleReads, 2);
 });
