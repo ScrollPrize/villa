@@ -15,12 +15,36 @@ import {
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const workflowNames = [
-  'progress-prizes-google.yml',
   'progress-prizes-page-pr.yml',
   'progress-prizes-pr-safety.yml',
   'progress-prizes-rehearsal.yml',
   'progress-prizes-vercel-preview.yml',
 ];
+const googleJobNames = [
+  'validate-production',
+  'bootstrap-staging',
+  'inject-copy-fault',
+  'recover-prepare',
+  'verify-prepared',
+  'inject-close-fault',
+  'recover-activate',
+  'verify-active',
+  'prove-activation-idempotency',
+  'cleanup-full-rehearsal',
+  'verify-cleaned-full-rehearsal',
+  'cleanup-standalone',
+  'verify-cleaned-standalone',
+];
+const protectedSecretMappings = new Map([
+  ['workload-identity-provider', 'GOOGLE_WORKLOAD_IDENTITY_PROVIDER'],
+  ['service-account-email', 'GOOGLE_SERVICE_ACCOUNT_EMAIL'],
+  ['drive-admin-email', 'PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL'],
+  ['drive-id', 'PROGRESS_PRIZE_DRIVE_ID'],
+  ['folder-id', 'PROGRESS_PRIZE_FOLDER_ID'],
+  ['archive-folder-id', 'PROGRESS_PRIZE_ARCHIVE_FOLDER_ID'],
+  ['source-form-id', 'PROGRESS_PRIZE_SOURCE_FORM_ID'],
+  ['editor-group-email', 'PROGRESS_PRIZE_EDITOR_GROUP_EMAIL'],
+]);
 
 async function workflow(name) {
   return readFile(resolve(repositoryRoot, '.github/workflows', name), 'utf8');
@@ -40,6 +64,10 @@ function jobBlock(source, name) {
   const following = source.slice(start + marker.length);
   const next = following.search(/^  [a-z][a-z0-9-]*:\n/m);
   return source.slice(start, next === -1 ? source.length : start + marker.length + next);
+}
+
+function jobNames(source) {
+  return [...source.matchAll(/^  ([a-z][a-z0-9-]*):\n/gm)].map((match) => match[1]);
 }
 
 test('every third-party action is pinned to an approved immutable commit', async () => {
@@ -62,61 +90,84 @@ test('every third-party action is pinned to an approved immutable commit', async
   }
 });
 
-test('Google OIDC uses two literal protected Environment jobs and one secret-free composite', async () => {
-  const google = await workflow('progress-prizes-google.yml');
+test('Google OIDC is confined to direct literal Environment jobs and one composite', async () => {
+  const rehearsal = await workflow('progress-prizes-rehearsal.yml');
   const action = await googleAction();
-  assert.match(google, /^on:\n  workflow_call:/m);
-  assert.doesNotMatch(google, /pull_request(?:_target)?:/);
-  assert.doesNotMatch(google, /^    secrets:/m, 'Environment secrets must not be caller inputs');
-  assert.doesNotMatch(google, /environment:\s*\$\{\{/);
+  const readme = await readFile(
+    resolve(repositoryRoot, 'scrollprize.org/scripts/progress-prizes/README.md'),
+    'utf8',
+  );
+  await assert.rejects(
+    workflow('progress-prizes-google.yml'),
+    (error) => error?.code === 'ENOENT',
+    'Google-secret jobs must not be reintroduced behind workflow_call',
+  );
+  assert.match(rehearsal, /^on:\n  workflow_dispatch:/m);
+  assert.doesNotMatch(rehearsal, /workflow_call:|pull_request(?:_target)?:/);
+  assert.doesNotMatch(rehearsal, /uses: \.\/\.github\/workflows\/progress-prizes-google\.yml/);
+  assert.doesNotMatch(rehearsal, /secrets:\s*inherit/);
+  assert.doesNotMatch(rehearsal, /environment:\s*\$\{\{/);
+  assert.match(
+    readme,
+    /attribute\.workflow_ref == 'ScrollPrize\/villa\/\.github\/workflows\/progress-prizes-rehearsal\.yml@refs\/heads\/main'/,
+  );
+  assert.match(readme, /attribute\.workflow_sha\s+= assertion\.workflow_sha/);
+  assert.match(readme, /assertion\.workflow_sha == assertion\.sha/);
+  assert.doesNotMatch(readme, /job_workflow_ref|workflow_ref.*progress-prizes-google\.yml/);
+  assert.match(readme, /1200-second access token/);
 
-  const production = jobBlock(google, 'production');
-  const staging = jobBlock(google, 'staging');
-  for (const [name, protectedJob] of [['production', production], ['staging', staging]]) {
-    assert.match(protectedJob, new RegExp(`if: inputs\\.environment == '${name}'`));
-    assert.match(protectedJob, new RegExp(`environment: progress-prizes-${name}`));
+  for (const name of googleJobNames) {
+    const protectedJob = jobBlock(rehearsal, name);
+    const environment = name === 'validate-production' ? 'production' : 'staging';
+    assert.match(protectedJob, /runs-on: ubuntu-24\.04/);
+    assert.match(protectedJob, /timeout-minutes: 20/);
+    assert.match(protectedJob, new RegExp(`environment: progress-prizes-${environment}`));
     assert.match(protectedJob, /contents: read\n      id-token: write/);
     assert.match(protectedJob, /ref: \$\{\{ github\.sha \}\}/);
+    assert.match(protectedJob, /persist-credentials: false/);
+    assert.match(protectedJob, /id: google/);
     assert.match(protectedJob, /uses: \.\/\.github\/actions\/progress-prizes-google/);
-    assert.match(protectedJob, new RegExp(`^          environment: ${name}$`, 'm'));
+    assert.match(protectedJob, new RegExp(`^          environment: ${environment}$`, 'm'));
     assert.match(
       protectedJob,
       /responder-uri: \$\{\{ steps\.google\.outputs\['responder-uri'\] \}\}/,
     );
+    for (const [input, secret] of protectedSecretMappings) {
+      assert.match(
+        protectedJob,
+        new RegExp(`^          ${input}: \\$\\{\\{ secrets\\.${secret} \\}\\}$`, 'm'),
+      );
+    }
   }
+
+  assert.equal([...rehearsal.matchAll(/id-token: write/g)].length, googleJobNames.length);
+  const rehearsalCheckoutCount = [...rehearsal.matchAll(/uses: actions\/checkout@/g)].length;
   assert.equal(
-    [...google.matchAll(/ref: \$\{\{ github\.sha \}\}/g)].length,
-    2,
-    'both protected jobs must check out the exact approved workflow commit',
+    [...rehearsal.matchAll(/ref: \$\{\{ github\.sha \}\}/g)].length,
+    rehearsalCheckoutCount,
+    'every rehearsal checkout must execute the exact trigger commit',
+  );
+  assert.doesNotMatch(rehearsal, /ref: refs\/heads\/main/);
+  assert.equal(
+    [...rehearsal.matchAll(/environment: progress-prizes-production/g)].length,
+    1,
+  );
+  assert.equal(
+    [...rehearsal.matchAll(/environment: progress-prizes-staging/g)].length,
+    googleJobNames.length - 1,
   );
 
-  const secretMappings = new Map([
-    ['workload-identity-provider', 'GOOGLE_WORKLOAD_IDENTITY_PROVIDER'],
-    ['service-account-email', 'GOOGLE_SERVICE_ACCOUNT_EMAIL'],
-    ['drive-admin-email', 'PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL'],
-    ['drive-id', 'PROGRESS_PRIZE_DRIVE_ID'],
-    ['folder-id', 'PROGRESS_PRIZE_FOLDER_ID'],
-    ['archive-folder-id', 'PROGRESS_PRIZE_ARCHIVE_FOLDER_ID'],
-    ['source-form-id', 'PROGRESS_PRIZE_SOURCE_FORM_ID'],
-    ['editor-group-email', 'PROGRESS_PRIZE_EDITOR_GROUP_EMAIL'],
-  ]);
-  for (const [input, secret] of secretMappings) {
-    const mapping = `          ${input}: \${{ secrets.${secret} }}`;
-    assert.equal(
-      google.split(mapping).length - 1,
-      2,
-      `${secret} must be mapped once in each literal Environment job`,
-    );
+  for (const name of jobNames(rehearsal).filter((name) => !googleJobNames.includes(name))) {
+    const ordinaryJob = jobBlock(rehearsal, name);
+    assert.doesNotMatch(ordinaryJob, /id-token: write/);
+    assert.doesNotMatch(ordinaryJob, /secrets\.(?:GOOGLE_|PROGRESS_PRIZE_)/);
+  }
+
+  for (const [input] of protectedSecretMappings) {
     if (input === 'archive-folder-id') {
-      assert.match(
-        action,
-        /^  archive-folder-id:\n(?:    .*\n)*?    required: false\n    default: ""$/m,
-      );
+      assert.match(action, /^  archive-folder-id:\n(?:    .*\n)*?    required: false\n    default: ""$/m);
     } else {
-      assert.match(
-        action,
-        new RegExp(`^  ${input}:\\n(?:    .*\\n)*?    required: true$`, 'm'),
-      );
+      assert.match(action, new RegExp(`^  ${input}:\\n(?:    .*\\n)*?    required: true$`, 'm'));
     }
   }
   assert.doesNotMatch(
@@ -124,7 +175,7 @@ test('Google OIDC uses two literal protected Environment jobs and one secret-fre
     /\$\{\{\s*(?:secrets|vars)(?:\.|\[)/,
     'the composite must receive protected values only through explicit inputs',
   );
-  assert.doesNotMatch(google, /google-github-actions\/auth/);
+  assert.doesNotMatch(rehearsal, /google-github-actions\/auth/);
   assert.equal([...action.matchAll(/google-github-actions\/auth@/g)].length, 2);
   assert.match(action, /create_credentials_file: false/);
   assert.match(action, /export_environment_variables: false/);
@@ -144,7 +195,7 @@ test('Google OIDC uses two literal protected Environment jobs and one secret-fre
   );
   assert.doesNotMatch(action, /drive\.file/);
   assert.match(action, /automation-cli\.mjs/);
-  assert.doesNotMatch(`${google}\n${action}`, /credentials_json|service_account_key|private_key/i);
+  assert.doesNotMatch(`${rehearsal}\n${action}`, /credentials_json|service_account_key|private_key/i);
 
   const publicSafety = await workflow('progress-prizes-pr-safety.yml');
   assert.match(publicSafety, /\.github\/actions\/progress-prizes-google\/\*\*/);
@@ -153,74 +204,51 @@ test('Google OIDC uses two literal protected Environment jobs and one secret-fre
   assert.doesNotMatch(publicSafety, /pull_request_target/);
 });
 
-test('Google preflight and result selector fail closed around one protected job', async () => {
-  const google = await workflow('progress-prizes-google.yml');
+test('secret-free preflight and composite guards reject unsafe controls before OIDC', async () => {
+  const rehearsal = await workflow('progress-prizes-rehearsal.yml');
   const action = await googleAction();
-  const preflight = jobBlock(google, 'preflight');
-  const selector = jobBlock(google, 'select-result');
+  const preflight = jobBlock(rehearsal, 'preflight');
 
-  assert.match(preflight, /name: Reject unsafe Google routing/);
   assert.match(preflight, /permissions: \{\}/);
-  assert.match(preflight, /WORKFLOW_SHA: \$\{\{ github\.sha \}\}/);
-  assert.match(preflight, /test "\$REPOSITORY" = ScrollPrize\/villa/);
-  assert.match(preflight, /test "\$REPOSITORY_ID" = 890972577/);
-  assert.match(preflight, /test "\$REPOSITORY_OWNER_ID" = 121906140/);
-  assert.match(preflight, /test "\$REF" = refs\/heads\/main/);
-  assert.match(preflight, /\[\[ "\$WORKFLOW_SHA" =~ \^\[a-f0-9\]\{40\}\$ \]\]/);
-  assert.match(preflight, /case "\$AUTOMATION_ENVIRONMENT" in staging\|production/);
-  assert.match(preflight, /test "\$OPERATION" != bootstrap/);
+  assert.doesNotMatch(preflight, /secrets\.|id-token|environment:/);
+  assert.match(preflight, /HEAD_SHA: \$\{\{ github\.sha \}\}/);
+  assert.match(preflight, /assert\.equal\(process\.env\.REPOSITORY, 'ScrollPrize\/villa'\)/);
+  assert.match(preflight, /assert\.equal\(process\.env\.REPOSITORY_ID, '890972577'\)/);
+  assert.match(preflight, /assert\.equal\(process\.env\.REPOSITORY_OWNER_ID, '121906140'\)/);
+  assert.match(preflight, /assert\.equal\(process\.env\.REF, 'refs\/heads\/main'\)/);
+  assert.match(preflight, /assert\.match\(process\.env\.HEAD_SHA/);
+  assert.match(preflight, /assert\.equal\(process\.env\.EVENT_NAME, 'workflow_dispatch'\)/);
+  assert.match(preflight, /allowedOperations\.has\(process\.env\.OPERATION/);
+  assert.match(preflight, /SOURCE_CYCLE/);
+  assert.match(preflight, /TARGET_CYCLE/);
+  assert.match(preflight, /PREPARATION_NOW/);
+  assert.match(preflight, /ACTIVATION_NOW/);
+  assert.match(jobBlock(rehearsal, 'validate-production'), /needs: preflight/);
+  assert.match(jobBlock(rehearsal, 'cleanup-standalone'), /needs: preflight/);
+
+  assert.match(action, /test "\$REPOSITORY" = ScrollPrize\/villa/);
+  assert.match(action, /test "\$REPOSITORY_ID" = 890972577/);
+  assert.match(action, /test "\$REPOSITORY_OWNER_ID" = 121906140/);
+  assert.match(action, /test "\$REF" = refs\/heads\/main/);
   assert.match(action, /test "\$OPERATION" != bootstrap/);
+  assert.match(action, /test "\$OPERATION" != cleanup/);
 
-  assert.match(selector, /needs:\n      - preflight\n      - production\n      - staging/);
-  assert.match(selector, /if: always\(\)/);
-  assert.match(selector, /permissions: \{\}/);
-  assert.match(selector, /test "\$PREFLIGHT_RESULT" = success/);
-  assert.match(selector, /test "\$PRODUCTION_RESULT" = success/);
-  assert.match(selector, /test "\$STAGING_RESULT" = skipped/);
-  assert.match(selector, /test "\$STAGING_RESULT" = success/);
-  assert.match(selector, /test "\$PRODUCTION_RESULT" = skipped/);
-  assert.match(selector, /https:\/\/docs\.google\.com\/forms\/d\/e\/\*\/viewform/);
-
-  const workflowOutputs = google.slice(
-    google.indexOf('    outputs:\n'),
-    google.indexOf('\n\npermissions:'),
-  );
-  const workflowOutputNames = [
-    ...workflowOutputs.matchAll(/^      ([a-z][a-z-]+):\n        description:/gm),
-  ].map((match) => match[1]);
-  assert.deepEqual(workflowOutputNames, ['responder-uri']);
-  assert.match(
-    google,
-    /value: \$\{\{ jobs\.select-result\.outputs\['responder-uri'\] \}\}/,
-  );
-
-  const actionOutputs = action.slice(
-    action.indexOf('outputs:\n'),
-    action.indexOf('\nruns:'),
-  );
+  const actionOutputs = action.slice(action.indexOf('outputs:\n'), action.indexOf('\nruns:'));
   const actionOutputNames = [...actionOutputs.matchAll(/^  ([a-z][a-z-]+):\n/gm)]
     .map((match) => match[1]);
   assert.deepEqual(actionOutputNames, ['responder-uri']);
-  assert.match(selector, /printf 'responder-uri=%s\\n' "\$selected_uri" >>"\$GITHUB_OUTPUT"/);
   assert.doesNotMatch(
-    `${google}\n${action}`,
+    `${rehearsal}\n${action}`,
     /GITHUB_OUTPUT.*(?:form-id|folder-id|drive-id|editor)/i,
   );
 });
 
 test('composite boolean inputs stay strings across authentication and fault handling', async () => {
-  const google = await workflow('progress-prizes-google.yml');
   const action = await googleAction();
   for (const input of ['expect-fault', 'dry-run']) {
     assert.match(
       action,
       new RegExp(`^  ${input}:\\n(?:    .*\\n)*?    default: "false"$`, 'm'),
-    );
-    const forwarding = `          ${input}: \${{ inputs['${input}'] }}`;
-    assert.equal(
-      google.split(forwarding).length - 1,
-      2,
-      `${input} must be passed to both protected jobs`,
     );
   }
   assert.match(action, /inputs\['dry-run'\] == 'true'/);
@@ -237,8 +265,9 @@ test('rehearsal controls are fixed to staging and its ephemeral branches', async
   assert.doesNotMatch(
     rehearsal,
     /^ {4}secrets:/m,
-    'callers must not pass or override the Google job Environment secrets',
+    'the top-level workflow must not forward a workflow-level secret map',
   );
+  assert.doesNotMatch(rehearsal, /secrets:\s*inherit/);
   assert.match(rehearsal, /codex\/progress-prize-smoke-20260720/);
   assert.match(rehearsal, /codex\/progress-prize-smoke-base-20260720/);
   assert.match(rehearsal, /fault: after-copy/);
@@ -260,11 +289,13 @@ test('rehearsal controls are fixed to staging and its ephemeral branches', async
   assert.match(pagePr, /--source-cycle \"\$SOURCE_CYCLE\"/);
   assert.match(pagePr, /--responder-uri \"\$RESPONDER_URI\"/);
   assert.match(pagePr, /test \"\$\{remote_after%%\[\[:space:\]\]\*\}\" = \"\$HEAD_SHA\"/);
-  assert.match(pagePr, /test \"\$base_sha\" = \"\$\(git rev-parse refs\/remotes\/origin\/main\^\{commit\}\)\"/);
+  assert.match(pagePr, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(pagePr, /TRIGGER_SHA: \$\{\{ github\.sha \}\}/);
+  assert.match(pagePr, /origin \"\$TRIGGER_SHA:refs\/heads\/\$BASE_BRANCH\"/);
+  assert.match(pagePr, /test \"\$base_sha\" = \"\$TRIGGER_SHA\"/);
+  assert.doesNotMatch(pagePr, /ref: refs\/heads\/main/);
 
-  const google = await workflow('progress-prizes-google.yml');
   const action = await googleAction();
-  assert.doesNotMatch(google, /passedCopyFault|passedCloseFault/);
   assert.match(action, /passedCopyFault/);
   assert.match(action, /passedCloseFault/);
   assert.match(action, /result\.created === false/);
@@ -276,7 +307,8 @@ test('Vercel verification runs trusted default-branch code and requires GitHub a
   assert.match(vercel, /environment: progress-prizes-preview/);
   assert.match(vercel, /github\.actor == 'vercel\[bot\]'/);
   assert.match(vercel, /run-name: Progress Prize Vercel preview \$\{\{ github\.event\.client_payload\.git\.sha \}\}/);
-  assert.match(vercel, /ref: refs\/heads\/main/);
+  assert.match(vercel, /ref: \$\{\{ github\.sha \}\}/);
+  assert.doesNotMatch(vercel, /ref: refs\/heads\/main/);
   assert.match(vercel, /pulls\?state=open&head=/);
   assert.match(vercel, /git\/ref\/heads/);
   assert.match(vercel, /payload\.git\?\.sha/);
@@ -290,6 +322,7 @@ test('Vercel verification runs trusted default-branch code and requires GitHub a
     'the Vercel project identifier must be auto-masked at both uses',
   );
   assert.match(vercel, /printf '::add-mask::%s\\n' \"\$VERCEL_PROJECT_ID\"/);
+  assert.match(vercel, /printf '::add-mask::%s\\n' \"\$VERCEL_AUTOMATION_BYPASS_SECRET\"/);
   assert.match(vercel, /!process\.env\.VERCEL_AUTOMATION_BYPASS_SECRET/);
   assert.match(vercel, /redirect: 'error'/);
   assert.doesNotMatch(vercel, /id-token|google-github-actions|GOOGLE_/);
