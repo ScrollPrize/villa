@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { appendFile, readFile, writeFile } from 'node:fs/promises';
+import { Buffer } from 'node:buffer';
 import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -25,6 +26,9 @@ const DEFAULT_PAGE_PATH = resolve(
 );
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const GIT_SHA_PATTERN = /^[a-f0-9]{40}$/i;
+const AUTOMATION_ERROR_INPUT_MAX_UNITS = 4_096;
+const AUTOMATION_ERROR_MAX_BYTES = 600;
+export const AUTOMATION_ERROR_FALLBACK = 'progress-prizes: Automation failed without a safe diagnostic';
 const OUTPUT_STATUSES = new Set([
   'active',
   'archived',
@@ -245,6 +249,65 @@ function privateValues(env) {
   return PRIVATE_ENV_NAMES.map((name) => optionalEnv(env, name)).filter(Boolean);
 }
 
+/**
+ * Produce one bounded log line without retaining private Google configuration,
+ * ACL identities, URLs, opaque identifiers, or control characters.
+ */
+export function formatAutomationError(error, { env = process.env } = {}) {
+  try {
+    if (!(error instanceof Error) || typeof error.message !== 'string') {
+      return AUTOMATION_ERROR_FALLBACK;
+    }
+    const oversized = error.message.length > AUTOMATION_ERROR_INPUT_MAX_UNITS;
+    let message = error.message.slice(0, AUTOMATION_ERROR_INPUT_MAX_UNITS);
+    if (oversized) message = `${message.replace(/\S+$/u, '')} [TRUNCATED]`;
+
+    const redacted = redactForLog(message, { secrets: privateValues(env) })
+      .replace(/https?:\/\/\S+/giu, '[REDACTED_URL]')
+      .replace(/\S*@\S*/gu, '[REDACTED_EMAIL]')
+      .replace(/(?:[A-Za-z0-9_-]{16,}|\d{10,})/g, '[REDACTED]')
+      .replace(/::/g, ': :')
+      .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, ' ')
+      .replace(/[^\x20-\x7e]/g, '?')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (redacted === '') return AUTOMATION_ERROR_FALLBACK;
+
+    const value = `progress-prizes: ${redacted}`;
+    if (Buffer.byteLength(value, 'utf8') <= AUTOMATION_ERROR_MAX_BYTES) return value;
+    let low = 0;
+    let high = value.length;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (Buffer.byteLength(value.slice(0, middle), 'utf8') <= AUTOMATION_ERROR_MAX_BYTES) {
+        low = middle;
+      } else {
+        high = middle - 1;
+      }
+    }
+    return value.slice(0, low);
+  } catch {
+    return AUTOMATION_ERROR_FALLBACK;
+  }
+}
+
+/** Accept and independently re-sanitize one bounded ASCII diagnostic line. */
+export function safeAutomationDiagnostic(value, { env = process.env } = {}) {
+  try {
+    if (!Buffer.isBuffer(value) || value.length < 2 || value.length > 601) {
+      return AUTOMATION_ERROR_FALLBACK;
+    }
+    const decoded = value.toString('utf8');
+    if (!Buffer.from(decoded, 'utf8').equals(value)) return AUTOMATION_ERROR_FALLBACK;
+    const match = decoded.match(/^(progress-prizes: [\x20-\x7e]{1,583})\n$/);
+    if (!match) return AUTOMATION_ERROR_FALLBACK;
+    const message = match[1].slice('progress-prizes: '.length);
+    return formatAutomationError(new Error(message), { env });
+  } catch {
+    return AUTOMATION_ERROR_FALLBACK;
+  }
+}
+
 function assertSourceCycleMatchesTarget(options, targetCycle) {
   const expected = previousCycle(targetCycle);
   if (options['source-cycle'] !== undefined) {
@@ -455,7 +518,7 @@ async function main() {
   try {
     await runAutomationCli(process.argv.slice(2));
   } catch (error) {
-    process.stderr.write(`progress-prizes: ${error.message}\n`);
+    process.stderr.write(`${formatAutomationError(error)}\n`);
     process.exitCode = 1;
   }
 }
