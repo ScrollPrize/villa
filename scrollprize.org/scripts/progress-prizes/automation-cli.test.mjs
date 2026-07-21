@@ -17,6 +17,7 @@ const PRIVATE = Object.freeze({
   drive: 'private-staging-drive-id',
   form: 'private-production-editor-form-id',
   account: 'staging-bot@private.example',
+  admin: 'staging-break-glass@private.example',
   group: 'staging-editors@private.example',
   archive: 'private-staging-archive-id',
 });
@@ -31,6 +32,7 @@ function productionEnv(overrides = {}) {
     PROGRESS_PRIZE_ENVIRONMENT: 'production',
     PROGRESS_PRIZE_FOLDER_ID: 'private-production-folder-id',
     PROGRESS_PRIZE_DRIVE_ID: 'private-production-drive-id',
+    PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: 'production-break-glass@private.example',
     PROGRESS_PRIZE_SERVICE_ACCOUNT_EMAIL: 'production-bot@private.example',
     PROGRESS_PRIZE_SOURCE_FORM_ID: PRIVATE.form,
     PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: 'production-editors@private.example',
@@ -50,6 +52,7 @@ function stagingEnv(overrides = {}) {
     PROGRESS_PRIZE_STAGING_FOLDER_ID: PRIVATE.folder,
     PROGRESS_PRIZE_ARCHIVE_FOLDER_ID: PRIVATE.archive,
     PROGRESS_PRIZE_DRIVE_ID: PRIVATE.drive,
+    PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: PRIVATE.admin,
     PROGRESS_PRIZE_SERVICE_ACCOUNT_EMAIL: PRIVATE.account,
     PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: PRIVATE.account,
     PROGRESS_PRIZE_SOURCE_FORM_ID: PRIVATE.form,
@@ -220,7 +223,7 @@ test('staging prepare passes only the configured editor group ACL and emits no p
         sourceCycle: '2026-07',
         targetCycle: '2026-08',
         responderUri: RESPONDER,
-        privateEcho: `${PRIVATE.group} ${PRIVATE.folder} ${PRIVATE.token}`,
+        privateEcho: `${PRIVATE.group} ${PRIVATE.folder} ${PRIVATE.admin} ${PRIVATE.token}`,
       },
     }),
     output: (value) => outputs.push(value),
@@ -237,7 +240,8 @@ test('staging prepare passes only the configured editor group ACL and emits no p
   assert.equal(capture.input.dryRun, true);
   assert.equal(capture.input.faultInjection, 'after-copy');
   assert.equal(capture.dependencies.runtime.stagingFolderId, PRIVATE.folder);
-  assert.equal(summary.privateEcho, '[REDACTED] [REDACTED] [REDACTED]');
+  assert.equal(capture.dependencies.runtime.driveAdminEmail, PRIVATE.admin);
+  assert.equal(summary.privateEcho, '[REDACTED] [REDACTED] [REDACTED] [REDACTED]');
   assert.equal(outputs.length, 1);
   for (const privateValue of Object.values(PRIVATE)) {
     assert.equal(outputs[0].includes(privateValue), false);
@@ -247,6 +251,26 @@ test('staging prepare passes only the configured editor group ACL and emits no p
     `status=prepared\nsource_cycle=2026-07\ntarget_cycle=2026-08\nresponder_uri=${RESPONDER}\n`,
     'utf8',
   ]]);
+});
+
+test('CLI requires the private Drive administrator before token or I/O access', async () => {
+  let clientCalls = 0;
+  let fileCalls = 0;
+  await assert.rejects(
+    runAutomationCli(['prepare', '--target-cycle', '2026-08', '--dry-run'], {
+      env: stagingEnv({
+        GOOGLE_ACCESS_TOKEN: undefined,
+        PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: undefined,
+      }),
+      googleFactory: () => { clientCalls += 1; return {}; },
+      read: async () => { fileCalls += 1; return ''; },
+      write: async () => { fileCalls += 1; },
+      output: () => {},
+    }),
+    /Required environment variable PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL is missing/,
+  );
+  assert.equal(clientCalls, 0);
+  assert.equal(fileCalls, 0);
 });
 
 test('GitHub output fields use fixed keys and reject newline injection before writing', async () => {

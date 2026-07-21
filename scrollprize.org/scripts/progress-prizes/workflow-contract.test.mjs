@@ -55,6 +55,11 @@ test('Google OIDC exists only in the guarded reusable workflow and authenticated
   assert.match(google, /create_credentials_file: false/);
   assert.match(google, /export_environment_variables: false/);
   assert.match(google, /printf '::add-mask::%s\\n' \"\$value\"/);
+  assert.ok(
+    [...google.matchAll(/PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: \$\{\{ vars\.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL \}\}/g)].length >= 3,
+    'the private Drive administrator must be validated, masked, and passed to the CLI',
+  );
+  assert.match(google, /GOOGLE_SERVICE_ACCOUNT_EMAIL \\\n            PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL \\\n            PROGRESS_PRIZE_DRIVE_ID/);
   assert.match(google, /access_token_lifetime: 900s/);
   assert.match(google, /Authenticate read-only validation/);
   assert.match(

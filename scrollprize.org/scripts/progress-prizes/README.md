@@ -68,6 +68,8 @@ Protected Environment variables:
 
 - `GOOGLE_WORKLOAD_IDENTITY_PROVIDER`
 - `GOOGLE_SERVICE_ACCOUNT_EMAIL`
+- `PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL` (one private human kept as the inherited
+  break-glass Shared Drive Manager)
 - `PROGRESS_PRIZE_DRIVE_ID` (the staging Shared Drive)
 - `PROGRESS_PRIZE_FOLDER_ID` (the staging active folder)
 - `PROGRESS_PRIZE_ARCHIVE_FOLDER_ID` (the staging archive folder)
@@ -95,9 +97,14 @@ Drive. The staging group and production group are distinct private groups, each
 containing the same three internal editors. Staging bootstrap deliberately does
 not copy any production collaborator: the staging form receives only the
 staging group and its anonymous published-responder permission.
-After setup, keep the staging automation account as that Shared Drive's only
-Manager or Content manager; other inherited administrative access fails the
-same exact ACL gate used in production.
+Keep exactly two editable members on the staging Shared Drive: the staging
+automation account and `PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL`, both at the
+non-expiring Manager level. Their permissions must therefore appear as inherited
+`organizer` permissions on the active folder and managed forms. The break-glass
+identity must be a user, not a group, and it must not have a second direct
+folder/form permission. Do not add the staging editor group to the Shared Drive
+or active folder; the automation grants that group an explicit writer permission
+on each managed staging form.
 
 ### `progress-prizes-production`
 
@@ -105,6 +112,8 @@ Protected Environment variables:
 
 - `GOOGLE_WORKLOAD_IDENTITY_PROVIDER`
 - `GOOGLE_SERVICE_ACCOUNT_EMAIL`
+- `PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL` (one private human kept as the inherited
+  break-glass Shared Drive Manager)
 - `PROGRESS_PRIZE_DRIVE_ID` (the destination/managed production Shared Drive)
 - `PROGRESS_PRIZE_FOLDER_ID` (the destination active forms folder)
 - `PROGRESS_PRIZE_SOURCE_FORM_ID` (the initial owner-My-Drive form's private file ID)
@@ -125,11 +134,15 @@ account is recreated as a direct form collaborator.
 The production account must separately be able to create, copy, edit, and share
 forms in the production destination folder, and must have no access to the
 staging Shared Drive. The destination is validated as a writable folder in the
-configured Shared Drive before any copy. Keep the matching automation account
-as the only Shared Drive Manager or Content manager. Every active permission
-role is inspected: any other Google service account—including a reader or
-owner—fails closed, as do unexpected inherited writers, domains, Managers, or
-Content managers.
+configured Shared Drive before any copy. Keep exactly the production automation
+account and `PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL` as non-expiring Shared Drive
+Managers, so both appear as inherited `organizer` permissions on the active
+folder and managed forms. The break-glass identity must be a user, not a group,
+and it must not also be a direct form/folder collaborator. Do not add the
+production editor group to the Shared Drive or active folder; it is granted
+explicitly on every managed form. Every active permission role is inspected:
+any other Google service account—including a reader or owner—fails closed, as
+do inherited editors, domains, additional Managers, or Content managers.
 
 No archive folder is supplied to production, and the workflow deliberately
 supplies empty staging-identity values in production mode.
@@ -267,9 +280,15 @@ managed source in any later cycle fails instead of reusing July:
    copies its production group and direct external writer. Owner and
    automation-service-account ACLs are never recreated on a copy.
    Effective inherited writers/commenters and Shared Drive administrative roles
-   are checked exactly. The current environment's automation account is the only
-   permitted service-account identity on managed resources; any other service
-   account at any role, domain writer, Manager, or Content manager fails closed.
+   are checked exactly. Managed resources must expose exactly one inherited
+   Manager permission for the current automation account and one for the
+   configured break-glass user. Each permission must have exactly one Drive role
+   source: a Shared Drive `member` organizer inherited from the configured Drive
+   itself. A merged direct file/folder grant or any other role source fails. The
+   break-glass permission is ignored in form-ACL equality only after its identity,
+   role source, inheritance, uniqueness, and lack of expiration are verified.
+   Any other service account at any role, inherited editor, domain writer,
+   Manager, or Content manager fails closed.
 5. Before the real cutoff, repeat the close/open mutation path on a sacrificial
    My Drive form. Read-only capability validation cannot prove that Workspace
    policy will allow the service account to call Forms publish settings and
