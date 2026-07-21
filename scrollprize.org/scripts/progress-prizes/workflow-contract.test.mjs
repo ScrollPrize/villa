@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import test from 'node:test';
@@ -70,6 +71,32 @@ function jobNames(source) {
   return [...source.matchAll(/^  ([a-z][a-z0-9-]*):\n/gm)].map((match) => match[1]);
 }
 
+function literalRunScripts(source) {
+  const lines = source.split('\n');
+  const scripts = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const run = lines[index].match(/^(\s*)run:\s*\|[-+]?\s*$/);
+    if (!run) continue;
+
+    let firstContent = index + 1;
+    while (firstContent < lines.length && lines[firstContent].trim() === '') {
+      firstContent += 1;
+    }
+    const contentIndent = lines[firstContent]?.match(/^ */)?.[0].length ?? 0;
+    assert.ok(contentIndent > run[1].length, `run block at line ${index + 1} has no body`);
+
+    const body = [];
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const line = lines[cursor];
+      const indentation = line.match(/^ */)?.[0].length ?? 0;
+      if (line.trim() !== '' && indentation < contentIndent) break;
+      body.push(line.trim() === '' ? '' : line.slice(contentIndent));
+    }
+    scripts.push({ line: index + 1, source: `${body.join('\n')}\n` });
+  }
+  return scripts;
+}
+
 test('every third-party action is pinned to an approved immutable commit', async () => {
   const approved = new Set([
     'actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0',
@@ -86,6 +113,26 @@ test('every third-party action is pinned to an approved immutable commit', async
       if (action.startsWith('./')) continue;
       assert.ok(approved.has(action), `${name} uses an unapproved action: ${action}`);
       assert.match(action, /@[a-f0-9]{40}$/);
+    }
+  }
+});
+
+test('every literal Progress Prize run block has valid Bash syntax after YAML indentation', async () => {
+  const sources = await Promise.all([
+    ...workflowNames.map(async (name) => [name, await workflow(name)]),
+    ['progress-prizes-google/action.yml', await googleAction()],
+  ]);
+  for (const [name, source] of sources) {
+    for (const script of literalRunScripts(source)) {
+      const result = spawnSync('bash', ['--noprofile', '--norc', '-n'], {
+        input: script.source,
+        encoding: 'utf8',
+      });
+      assert.equal(
+        result.status,
+        0,
+        `${name}:${script.line} is not valid Bash:\n${result.stderr}`,
+      );
     }
   }
 });
