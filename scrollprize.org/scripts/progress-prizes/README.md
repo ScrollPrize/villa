@@ -55,6 +55,9 @@ uploaded, and only a canonical `forms.gle` or
 `docs.google.com/forms/d/e/.../viewform` URL may cross the authenticated job
 boundary. The workflows also register every protected identifier with
 `add-mask` before validation as defense in depth.
+The reusable Google workflow declares these secret names as optional solely so
+GitHub can resolve the job's selected Environment. Callers never pass or
+inherit them, and the job-level Environment value is authoritative.
 
 ## GitHub Environments
 
