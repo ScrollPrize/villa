@@ -78,10 +78,14 @@ Protected Environment secrets:
 
 - `GOOGLE_WORKLOAD_IDENTITY_PROVIDER`
 - `GOOGLE_SERVICE_ACCOUNT_EMAIL`
+- `PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL` (an independently configured
+  copy of the expected staging service-account identity)
 - `PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL` (one private human kept as the inherited
   break-glass Shared Drive Manager)
 - `PROGRESS_PRIZE_DRIVE_ID` (the staging Shared Drive)
 - `PROGRESS_PRIZE_FOLDER_ID` (the staging active folder)
+- `PROGRESS_PRIZE_STAGING_FOLDER_ID` (an independently configured copy of the
+  expected staging active-folder ID)
 - `PROGRESS_PRIZE_ARCHIVE_FOLDER_ID` (the staging archive folder)
 - `PROGRESS_PRIZE_SOURCE_FORM_ID` (the initial owner-My-Drive form's private file ID)
 - `PROGRESS_PRIZE_EDITOR_GROUP_EMAIL` (the staging-only group containing the
@@ -122,6 +126,8 @@ Protected Environment secrets:
 
 - `GOOGLE_WORKLOAD_IDENTITY_PROVIDER`
 - `GOOGLE_SERVICE_ACCOUNT_EMAIL`
+- `PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL` (the staging reader identity
+  expected on the initial live form during read-only validation)
 - `PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL` (one private human kept as the inherited
   break-glass Shared Drive Manager)
 - `PROGRESS_PRIZE_DRIVE_ID` (the destination/managed production Shared Drive)
@@ -154,8 +160,10 @@ explicitly on every managed form. Every active permission role is inspected:
 any other Google service account—including a reader or owner—fails closed, as
 do inherited editors, domains, additional Managers, or Content managers.
 
-No archive folder is supplied to production, and the workflow deliberately
-supplies empty staging-identity values in production mode.
+No archive or staging folder is supplied to production. Production mutation
+jobs receive no staging identity; the initial July read-only validation is the
+only exception, because it verifies the expected staging reader on the live
+form without granting the production identity access to staging.
 `PROGRESS_PRIZE_SOURCE_FORM_ID` is a one-time, explicit fallback. The July form
 never receives managed environment/role/cycle markers and is never moved or
 renamed. At activation it is closed first and receives only the private recovery

@@ -443,6 +443,34 @@ async function bootstrapAndPrepare(context) {
   });
 }
 
+async function closedActivationCheckpoint() {
+  const google = new FakeGoogle();
+  const page = new MemoryPage();
+  await bootstrapAndPrepare(service({ google, page }));
+  const activation = service({
+    google,
+    page,
+    clock: fixedClock('2026-08-01T07:00:01Z'),
+    runtime: stagingRuntime({ simulatedNow: '2026-08-01T07:00:01Z' }),
+  });
+  await assert.rejects(
+    activation.rollover.activate({
+      targetCycle: '2026-08',
+      faultInjection: ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE,
+    }),
+    (error) => error instanceof RolloverFaultError
+      && error.step === ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE,
+  );
+  page.content = pageMarkdown();
+  return {
+    google,
+    page,
+    source: google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0],
+    target: google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0],
+    bootstrap: service({ google, page }).rollover,
+  };
+}
+
 test('validate performs a read-only production preflight and resolves the public short URL', async () => {
   const google = grantProductionSourceAccess(new FakeGoogle());
   const context = service({
@@ -2369,6 +2397,458 @@ test('activate recovers after closing the source, opens the target once, and is 
   assert.equal((await active.rollover.verify({ targetCycle: '2026-08', mode: 'active' })).status, 'valid');
 });
 
+test('explicit staging bootstrap rewinds only the exact close-fault checkpoint', async () => {
+  const context = await closedActivationCheckpoint();
+  const copiesBefore = context.google.calls.filter(({ method }) => method === 'copyFile').length;
+
+  const rewound = await context.bootstrap.bootstrapStagingSource({
+    sourceFormId: LIVE_FORM_ID,
+    sourceCycle: '2026-07',
+    targetCycle: '2026-08',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+    allowActivationRewind: true,
+  });
+
+  assert.equal(rewound.status, 'active');
+  assert.equal(rewound.created, false);
+  assert.equal(rewound.resumed, true);
+  assert.equal(context.source.appProperties.state, ROLLOVER_FILE_STATES.ACTIVE);
+  assert.equal(context.target.appProperties.state, ROLLOVER_FILE_STATES.PREPARED);
+  assert.equal(context.source.appProperties.rewindTargetCycle, '2026-08');
+  assert.equal(context.target.appProperties.rewindSourceCycle, '2026-07');
+  assert.deepEqual(context.google.forms.get(context.source.id).publishSettings.publishState, {
+    isPublished: true,
+    isAcceptingResponses: true,
+  });
+  assert.deepEqual(context.google.forms.get(context.target.id).publishSettings.publishState, {
+    isPublished: true,
+    isAcceptingResponses: false,
+  });
+  assert.equal(
+    context.google.calls.filter(({ method }) => method === 'copyFile').length,
+    copiesBefore,
+  );
+
+  const mutationStart = context.google.calls.length;
+  assert.equal((await context.bootstrap.bootstrapStagingSource({
+    sourceFormId: LIVE_FORM_ID,
+    sourceCycle: '2026-07',
+    targetCycle: '2026-08',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+    allowActivationRewind: true,
+  })).status, 'active');
+  assert.deepEqual(
+    context.google.calls.slice(mutationStart).filter(({ method }) => [
+      'copyFile',
+      'createPermission',
+      'setPublishState',
+      'updateFile',
+      'updateFormTitle',
+    ].includes(method)),
+    [],
+  );
+
+  const prepared = await context.bootstrap.prepare({
+    targetCycle: '2026-08',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+    faultInjection: ROLLOVER_FAULTS.AFTER_COPY,
+  });
+  assert.equal(prepared.status, 'prepared');
+  assert.equal(prepared.created, false);
+  assert.equal(prepared.resumed, true);
+});
+
+test('activation rewind is explicit, dry-run safe, and rejects completed or drifted targets', async (t) => {
+  await t.test('explicit control is required', async () => {
+    const context = await closedActivationCheckpoint();
+    const sourceOpenWritesBefore = context.google.calls.filter(
+      ({ method, formId, isAcceptingResponses }) => method === 'setPublishState'
+        && formId === context.source.id
+        && isAcceptingResponses === true,
+    ).length;
+    await assert.rejects(
+      context.bootstrap.bootstrapStagingSource({
+        sourceFormId: LIVE_FORM_ID,
+        sourceCycle: '2026-07',
+        collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+      }),
+      /not in a bootstrap recovery state/,
+    );
+    assert.equal(
+      context.google.calls.filter(
+        ({ method, formId, isAcceptingResponses }) => method === 'setPublishState'
+          && formId === context.source.id
+          && isAcceptingResponses === true,
+      ).length,
+      sourceOpenWritesBefore,
+    );
+  });
+
+  await t.test('dry run validates without mutation', async () => {
+    const context = await closedActivationCheckpoint();
+    const mutationStart = context.google.calls.length;
+    const result = await context.bootstrap.bootstrapStagingSource({
+      sourceFormId: LIVE_FORM_ID,
+      sourceCycle: '2026-07',
+      targetCycle: '2026-08',
+      collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+      allowActivationRewind: true,
+      dryRun: true,
+    });
+    assert.equal(result.status, 'planned');
+    assert.deepEqual(
+      context.google.calls.slice(mutationStart).filter(({ method }) => [
+        'copyFile',
+        'createPermission',
+        'setPublishState',
+        'updateFile',
+        'updateFormTitle',
+      ].includes(method)),
+      [],
+    );
+    assert.equal(context.source.appProperties.state, ROLLOVER_FILE_STATES.CLOSED);
+    assert.equal(context.target.appProperties.state, ROLLOVER_FILE_STATES.ACTIVATING);
+  });
+
+  await t.test('dry run never closes an open COPIED checkpoint', async () => {
+    const google = new FakeGoogle();
+    const page = new MemoryPage();
+    const bootstrap = service({ google, page });
+    await assert.rejects(
+      bootstrap.rollover.bootstrapStagingSource({
+        sourceFormId: LIVE_FORM_ID,
+        sourceCycle: '2026-07',
+        collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+        faultInjection: ROLLOVER_FAULTS.AFTER_COPY,
+      }),
+      /after-copy/,
+    );
+    const source = google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0];
+    google.forms.get(source.id).publishSettings.publishState.isAcceptingResponses = true;
+    const mutationStart = google.calls.length;
+    const result = await bootstrap.rollover.bootstrapStagingSource({
+      sourceFormId: LIVE_FORM_ID,
+      sourceCycle: '2026-07',
+      targetCycle: '2026-08',
+      collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+      allowActivationRewind: true,
+      dryRun: true,
+    });
+    assert.equal(result.status, 'planned');
+    assert.equal(
+      google.calls.slice(mutationStart).some(({ method }) => [
+        'copyFile',
+        'createPermission',
+        'setPublishState',
+        'updateFile',
+        'updateFormTitle',
+      ].includes(method)),
+      false,
+    );
+    assert.equal(
+      google.forms.get(source.id).publishSettings.publishState.isAcceptingResponses,
+      true,
+    );
+    assert.equal(source.appProperties.state, ROLLOVER_FILE_STATES.COPIED);
+  });
+
+  await t.test('dry run never repairs an invalid reopened checkpoint', async () => {
+    const context = await closedActivationCheckpoint();
+    Object.assign(context.source.appProperties, {
+      state: ROLLOVER_FILE_STATES.ACTIVE,
+      targetCycle: '2026-08',
+      rewindTargetCycle: '2026-08',
+    });
+    Object.assign(context.target.appProperties, {
+      state: ROLLOVER_FILE_STATES.PREPARED,
+      sourceCycle: '2026-07',
+      rewindSourceCycle: '2026-07',
+    });
+    context.google.forms.get(context.source.id)
+      .publishSettings.publishState.isAcceptingResponses = true;
+    context.google.forms.get(context.target.id)
+      .publishSettings.publishState.isAcceptingResponses = true;
+    const mutationStart = context.google.calls.length;
+    await assert.rejects(
+      context.bootstrap.bootstrapStagingSource({
+        sourceFormId: LIVE_FORM_ID,
+        sourceCycle: '2026-07',
+        targetCycle: '2026-08',
+        collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+        allowActivationRewind: true,
+        dryRun: true,
+      }),
+      /not in an allowed activation rewind state/,
+    );
+    assert.equal(
+      context.google.calls.slice(mutationStart).some(({ method }) => [
+        'copyFile',
+        'createPermission',
+        'setPublishState',
+        'updateFile',
+        'updateFormTitle',
+      ].includes(method)),
+      false,
+    );
+    assert.equal(
+      context.google.forms.get(context.source.id).publishSettings.publishState
+        .isAcceptingResponses,
+      true,
+    );
+  });
+
+  await t.test('completed activation cannot be rewound', async () => {
+    const context = await closedActivationCheckpoint();
+    context.page.content = pageMarkdown(
+      '2026-08',
+      context.google.forms.get(context.target.id).responderUri,
+    );
+    const active = service({
+      google: context.google,
+      page: context.page,
+      clock: fixedClock('2026-08-01T07:00:01Z'),
+      runtime: stagingRuntime({ simulatedNow: '2026-08-01T07:00:01Z' }),
+    });
+    await active.rollover.activate({ targetCycle: '2026-08' });
+    context.page.content = pageMarkdown();
+    const mutationStart = context.google.calls.length;
+    await assert.rejects(
+      context.bootstrap.bootstrapStagingSource({
+        sourceFormId: LIVE_FORM_ID,
+        sourceCycle: '2026-07',
+        targetCycle: '2026-08',
+        collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+        allowActivationRewind: true,
+      }),
+      /not in an allowed activation rewind state/,
+    );
+    assert.equal(
+      context.google.calls.slice(mutationStart).some(
+        ({ method, formId, isAcceptingResponses }) => method === 'setPublishState'
+          && formId === context.source.id
+          && isAcceptingResponses === true,
+      ),
+      false,
+    );
+    assert.equal(context.source.appProperties.state, ROLLOVER_FILE_STATES.CLOSED);
+    assert.equal(context.target.appProperties.state, ROLLOVER_FILE_STATES.ACTIVE);
+  });
+
+  await t.test('source fingerprint drift fails before reopening', async () => {
+    const context = await closedActivationCheckpoint();
+    context.target.appProperties.sourceFingerprint = 'drifted-source-fingerprint';
+    const mutationStart = context.google.calls.length;
+    await assert.rejects(
+      context.bootstrap.bootstrapStagingSource({
+        sourceFormId: LIVE_FORM_ID,
+        sourceCycle: '2026-07',
+        targetCycle: '2026-08',
+        collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+        allowActivationRewind: true,
+      }),
+      /not bound to the resolved source form/,
+    );
+    assert.equal(
+      context.google.calls.slice(mutationStart).some(
+        ({ method, formId, isAcceptingResponses }) => method === 'setPublishState'
+          && formId === context.source.id
+          && isAcceptingResponses === true,
+      ),
+      false,
+    );
+  });
+});
+
+test('activation rewind resumes every mutation checkpoint without another copy', async (t) => {
+  const scenarios = [
+    { name: 'target REWINDING marker', method: 'updateFile', role: 'target', state: 'rewinding' },
+    { name: 'source ACTIVE marker', method: 'updateFile', role: 'source', state: 'active' },
+    { name: 'target PREPARED marker', method: 'updateFile', role: 'target', state: 'prepared' },
+    { name: 'source reopen', method: 'setPublishState', role: 'source' },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const context = await closedActivationCheckpoint();
+      const copiesBefore = context.google.calls.filter(({ method }) => method === 'copyFile').length;
+      let failOnce = true;
+      if (scenario.method === 'updateFile') {
+        const updateFile = context.google.updateFile.bind(context.google);
+        context.google.updateFile = async (input) => {
+          const expectedId = scenario.role === 'source' ? context.source.id : context.target.id;
+          if (
+            failOnce
+            && input.fileId === expectedId
+            && input.appProperties?.state === scenario.state
+          ) {
+            failOnce = false;
+            throw new Error(`injected ${scenario.name} failure`);
+          }
+          return updateFile(input);
+        };
+      } else {
+        const setPublishState = context.google.setPublishState.bind(context.google);
+        context.google.setPublishState = async (input) => {
+          if (
+            failOnce
+            && input.formId === context.source.id
+            && input.isAcceptingResponses === true
+          ) {
+            failOnce = false;
+            throw new Error('injected source reopen failure');
+          }
+          return setPublishState(input);
+        };
+      }
+
+      const options = {
+        sourceFormId: LIVE_FORM_ID,
+        sourceCycle: '2026-07',
+        targetCycle: '2026-08',
+        collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+        allowActivationRewind: true,
+      };
+      await assert.rejects(
+        context.bootstrap.bootstrapStagingSource(options),
+        /injected .* failure/,
+      );
+      assert.equal((await context.bootstrap.bootstrapStagingSource(options)).status, 'active');
+      assert.equal(context.source.appProperties.state, ROLLOVER_FILE_STATES.ACTIVE);
+      assert.equal(context.target.appProperties.state, ROLLOVER_FILE_STATES.PREPARED);
+      assert.equal(
+        context.google.calls.filter(({ method }) => method === 'copyFile').length,
+        copiesBefore,
+      );
+    });
+  }
+});
+
+test('activation rewind revalidates the target after a hard stop following source reopen', async () => {
+  const context = await closedActivationCheckpoint();
+  Object.assign(context.source.appProperties, {
+    state: ROLLOVER_FILE_STATES.ACTIVE,
+    targetCycle: '2026-08',
+    rewindTargetCycle: '2026-08',
+  });
+  Object.assign(context.target.appProperties, {
+    state: ROLLOVER_FILE_STATES.PREPARED,
+    sourceCycle: '2026-07',
+    rewindSourceCycle: '2026-07',
+  });
+  context.google.forms.get(context.source.id)
+    .publishSettings.publishState.isAcceptingResponses = true;
+
+  const options = {
+    sourceFormId: LIVE_FORM_ID,
+    sourceCycle: '2026-07',
+    targetCycle: '2026-08',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+    allowActivationRewind: true,
+  };
+  const mutationStart = context.google.calls.length;
+  assert.equal((await context.bootstrap.bootstrapStagingSource(options)).status, 'active');
+  assert.equal(
+    context.google.calls.slice(mutationStart).some(({ method }) => [
+      'copyFile',
+      'createPermission',
+      'setPublishState',
+      'updateFile',
+      'updateFormTitle',
+    ].includes(method)),
+    false,
+  );
+
+  context.google.forms.get(context.target.id)
+    .publishSettings.publishState.isAcceptingResponses = true;
+  await assert.rejects(
+    context.bootstrap.bootstrapStagingSource(options),
+    /not in an allowed activation rewind state/,
+  );
+  assert.equal(
+    context.google.forms.get(context.source.id).publishSettings.publishState.isAcceptingResponses,
+    false,
+  );
+  context.google.forms.get(context.target.id)
+    .publishSettings.publishState.isAcceptingResponses = false;
+  assert.equal((await context.bootstrap.bootstrapStagingSource(options)).status, 'active');
+});
+
+test('activation rewind re-closes the source when the target races open', async () => {
+  const context = await closedActivationCheckpoint();
+  const setPublishState = context.google.setPublishState.bind(context.google);
+  let raceOnce = true;
+  context.google.setPublishState = async (input) => {
+    const result = await setPublishState(input);
+    if (
+      raceOnce
+      && input.formId === context.source.id
+      && input.isAcceptingResponses === true
+    ) {
+      raceOnce = false;
+      context.google.forms.get(context.target.id)
+        .publishSettings.publishState.isAcceptingResponses = true;
+    }
+    return result;
+  };
+
+  const options = {
+    sourceFormId: LIVE_FORM_ID,
+    sourceCycle: '2026-07',
+    targetCycle: '2026-08',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+    allowActivationRewind: true,
+  };
+  await assert.rejects(
+    context.bootstrap.bootstrapStagingSource(options),
+    /not in an allowed activation rewind state/,
+  );
+  assert.equal(
+    context.google.forms.get(context.source.id).publishSettings.publishState.isAcceptingResponses,
+    false,
+  );
+  context.google.forms.get(context.target.id)
+    .publishSettings.publishState.isAcceptingResponses = false;
+  assert.equal((await context.bootstrap.bootstrapStagingSource(options)).status, 'active');
+});
+
+test('activation rewind refuses to overwrite a freshly changed target state', async () => {
+  const context = await closedActivationCheckpoint();
+  const getFile = context.google.getFile.bind(context.google);
+  let targetReads = 0;
+  context.google.getFile = async (input) => {
+    if (input.fileId === context.target.id) {
+      targetReads += 1;
+      if (targetReads === 2) {
+        context.target.appProperties.state = ROLLOVER_FILE_STATES.ACTIVE;
+        context.google.forms.get(context.target.id)
+          .publishSettings.publishState.isAcceptingResponses = true;
+      }
+    }
+    return getFile(input);
+  };
+
+  await assert.rejects(
+    context.bootstrap.bootstrapStagingSource({
+      sourceFormId: LIVE_FORM_ID,
+      sourceCycle: '2026-07',
+      targetCycle: '2026-08',
+      collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+      allowActivationRewind: true,
+    }),
+    /changed before its rollover state transition/,
+  );
+  assert.equal(context.target.appProperties.state, ROLLOVER_FILE_STATES.ACTIVE);
+  assert.equal(context.source.appProperties.state, ROLLOVER_FILE_STATES.CLOSED);
+  assert.equal(
+    context.google.calls.some(
+      ({ method, fileId, appProperties }) => method === 'updateFile'
+        && fileId === context.target.id
+        && appProperties?.state === ROLLOVER_FILE_STATES.REWINDING,
+    ),
+    false,
+  );
+});
+
 test('activate rejects publishing drift and resumes an explicitly marked target activation', async () => {
   const manualGoogle = new FakeGoogle();
   const manualPage = new MemoryPage();
@@ -2577,6 +3057,18 @@ test('production safety rejects simulated time, faults, alternate bases, and sta
     /fault injection is forbidden in production/,
   );
   assert.throws(
+    () => assertRolloverRuntimeSafety(productionRuntime({ eventName: 'workflow_dispatch' }), {
+      allowActivationRewind: true,
+    }),
+    /activation rewind is forbidden in production/,
+  );
+  assert.throws(
+    () => assertRolloverRuntimeSafety(productionRuntime(), {
+      allowActivationRewind: 'true',
+    }),
+    /must be a boolean/,
+  );
+  assert.throws(
     () => assertRolloverRuntimeSafety(productionRuntime({ targetBranch: 'test-base' })),
     /alternate target branch/,
   );
@@ -2629,19 +3121,22 @@ test('break-glass administrator cannot also be the explicit editor collaborator'
   assert.equal(google.calls.length, 0);
 });
 
-test('fault injection also requires the staging account, folder, dispatch event, and smoke branch', () => {
+test('staging-only controls require the staging account, folder, dispatch event, and smoke branch', () => {
   for (const [override, expected] of [
     [{ eventName: 'schedule', simulatedNow: undefined }, /manually dispatched staging run/],
     [{ serviceAccountEmail: 'wrong@example.org' }, /staging service account/],
     [{ folderId: 'wrong-folder' }, /staging folder/],
     [{ branch: 'feature/not-a-smoke-run' }, /smoke branch prefix/],
   ]) {
-    assert.throws(
-      () => assertRolloverRuntimeSafety(stagingRuntime(override), {
-        faultInjection: ROLLOVER_FAULTS.AFTER_COPY,
-      }),
-      expected,
-    );
+    for (const controls of [
+      { faultInjection: ROLLOVER_FAULTS.AFTER_COPY },
+      { allowActivationRewind: true },
+    ]) {
+      assert.throws(
+        () => assertRolloverRuntimeSafety(stagingRuntime(override), controls),
+        expected,
+      );
+    }
   }
 });
 

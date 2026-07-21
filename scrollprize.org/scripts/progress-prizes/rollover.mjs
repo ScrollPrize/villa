@@ -7,6 +7,7 @@ import {
   assertPublicResponderUri,
   assertStagingOnlyControl,
   getCycleDeadline,
+  nextCycle,
   parseCycle,
   parseProgressPrizeMarkdown,
   planRollover,
@@ -32,6 +33,7 @@ export const ROLLOVER_FILE_STATES = Object.freeze({
   COPIED: 'copied',
   PREPARED: 'prepared',
   ACTIVATING: 'activating',
+  REWINDING: 'rewinding',
   ACTIVE: 'active',
   CLOSED: 'closed',
   ARCHIVED: 'archived',
@@ -174,10 +176,17 @@ function assertStagingIdentity(runtime) {
  * Identifiers are compared but deliberately omitted from every error message so
  * that a failed public workflow cannot disclose private Workspace configuration.
  */
-export function assertRolloverRuntimeSafety(runtimeInput, { faultInjection } = {}) {
+export function assertRolloverRuntimeSafety(runtimeInput, {
+  faultInjection,
+  allowActivationRewind = false,
+} = {}) {
   const runtime = normalizeRuntime(runtimeInput);
   const hasSimulatedTime = hasValue(runtime.simulatedNow);
   const hasFault = hasValue(faultInjection);
+
+  if (typeof allowActivationRewind !== 'boolean') {
+    throw new TypeError('allowActivationRewind must be a boolean');
+  }
 
   assertStagingOnlyControl({
     environment: runtime.environment,
@@ -190,6 +199,12 @@ export function assertRolloverRuntimeSafety(runtimeInput, { faultInjection } = {
     eventName: runtime.eventName,
     controlName: 'fault injection',
     enabled: hasFault,
+  });
+  assertStagingOnlyControl({
+    environment: runtime.environment,
+    eventName: runtime.eventName,
+    controlName: 'activation rewind',
+    enabled: allowActivationRewind,
   });
 
   if (hasFault && !Object.values(ROLLOVER_FAULTS).includes(faultInjection)) {
@@ -211,7 +226,7 @@ export function assertRolloverRuntimeSafety(runtimeInput, { faultInjection } = {
     }
   }
 
-  if (hasSimulatedTime || hasFault) {
+  if (hasSimulatedTime || hasFault || allowActivationRewind) {
     assertStagingIdentity(runtime);
   }
 
@@ -1104,8 +1119,25 @@ export function createRolloverService({
     return { form, file: currentFile, permissions };
   }
 
-  async function markFile(file, state, extra = {}) {
+  async function markFile(file, state, extra = {}, { expectedAppProperties } = {}) {
+    // The workflow's static concurrency group is the mutation lock. Refetching
+    // here additionally rejects a state changed since the last full snapshot
+    // before issuing the metadata patch.
     const current = await google.getFile({ fileId: file.id });
+    if (expectedAppProperties !== undefined) {
+      if (
+        expectedAppProperties === null
+        || typeof expectedAppProperties !== 'object'
+        || Array.isArray(expectedAppProperties)
+      ) {
+        throw new TypeError('expectedAppProperties must be an object');
+      }
+      if (Object.entries(expectedAppProperties).some(
+        ([key, value]) => current.appProperties?.[key] !== value,
+      )) {
+        throw new Error('Managed file changed before its rollover state transition');
+      }
+    }
     const appProperties = {
       ...(current.appProperties ?? {}),
       ...extra,
@@ -1194,16 +1226,274 @@ export function createRolloverService({
     });
   }
 
+  function bootstrapRewindTransition(sourceSnapshot, targetSnapshot, {
+    sourceCycle,
+    targetCycle,
+  }) {
+    const sourceState = sourceSnapshot.file.appProperties?.state;
+    const targetState = targetSnapshot.file.appProperties?.state;
+    const sourceOpen = publishingMatches(sourceSnapshot.form, {
+      isPublished: true,
+      isAcceptingResponses: true,
+    });
+    const sourceClosed = publishingMatches(sourceSnapshot.form, {
+      isPublished: true,
+      isAcceptingResponses: false,
+    });
+    const targetClosed = publishingMatches(targetSnapshot.form, {
+      isPublished: true,
+      isAcceptingResponses: false,
+    });
+    const sourceRewindBound = sourceSnapshot.file.appProperties?.rewindTargetCycle
+      === targetCycle;
+    const targetRewindBound = targetSnapshot.file.appProperties?.rewindSourceCycle
+      === sourceCycle;
+
+    if (
+      sourceState === ROLLOVER_FILE_STATES.CLOSED
+      && sourceClosed
+      && targetState === ROLLOVER_FILE_STATES.ACTIVATING
+      && targetClosed
+    ) return 'closed-activating';
+    if (
+      sourceState === ROLLOVER_FILE_STATES.CLOSED
+      && sourceClosed
+      && targetState === ROLLOVER_FILE_STATES.REWINDING
+      && targetClosed
+      && targetRewindBound
+    ) return 'target-rewinding';
+    if (
+      sourceState === ROLLOVER_FILE_STATES.ACTIVE
+      && sourceClosed
+      && targetState === ROLLOVER_FILE_STATES.REWINDING
+      && targetClosed
+      && sourceRewindBound
+      && targetRewindBound
+    ) return 'source-armed';
+    if (
+      sourceState === ROLLOVER_FILE_STATES.ACTIVE
+      && sourceClosed
+      && targetState === ROLLOVER_FILE_STATES.PREPARED
+      && targetClosed
+      && sourceRewindBound
+      && targetRewindBound
+    ) return 'target-prepared';
+    if (
+      sourceState === ROLLOVER_FILE_STATES.ACTIVE
+      && sourceOpen
+      && targetState === ROLLOVER_FILE_STATES.PREPARED
+      && targetClosed
+      && sourceRewindBound
+      && targetRewindBound
+    ) return 'rewound';
+    throw new Error('Managed staging forms are not in an allowed activation rewind state');
+  }
+
+  async function loadBootstrapRewindPair({
+    sourceFile,
+    liveSnapshot,
+    sourceCycle,
+    targetCycle,
+    collaboratorPermissions,
+    expectedSourcePermissions,
+  }) {
+    const targetFile = await requireManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle);
+    const [sourceSnapshot, targetSnapshot] = await Promise.all([
+      loadSnapshot(sourceFile),
+      loadSnapshot(targetFile),
+    ]);
+    assertManagedFile(
+      sourceSnapshot.file,
+      runtime,
+      ROLLOVER_FILE_ROLES.SOURCE,
+      sourceCycle,
+    );
+    assertManagedFile(
+      targetSnapshot.file,
+      runtime,
+      ROLLOVER_FILE_ROLES.TARGET,
+      targetCycle,
+    );
+    assertSourceCapabilities(sourceSnapshot.file);
+    assertSourceCapabilities(targetSnapshot.file);
+    assertSameStructure(liveSnapshot.form, sourceSnapshot.form);
+    assertSameStructure(sourceSnapshot.form, targetSnapshot.form);
+    assertTitle(
+      sourceSnapshot.form,
+      sourceSnapshot.file,
+      managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.SOURCE, sourceCycle),
+    );
+    assertTitle(
+      targetSnapshot.form,
+      targetSnapshot.file,
+      managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle),
+    );
+    assertPermissionsMatch(expectedSourcePermissions, sourceSnapshot.permissions, { runtime });
+    assertPermissionsMatch(
+      expectedTargetPermissions(
+        sourceSnapshot.permissions,
+        collaboratorPermissions,
+        true,
+        SOURCE_ORIGINS.MANAGED,
+      ),
+      targetSnapshot.permissions,
+      { runtime },
+    );
+    assertSourceFingerprint(targetSnapshot.file, sourceSnapshot.file, runtime, sourceCycle);
+    if (
+      sourceSnapshot.file.appProperties?.targetCycle !== targetCycle
+      || targetSnapshot.file.appProperties?.sourceCycle !== sourceCycle
+    ) {
+      throw new Error('Managed staging activation rewind cycle binding does not match');
+    }
+    return Object.freeze({
+      sourceSnapshot,
+      targetSnapshot,
+      transition: bootstrapRewindTransition(sourceSnapshot, targetSnapshot, {
+        sourceCycle,
+        targetCycle,
+      }),
+    });
+  }
+
+  async function rewindStagingActivation({
+    sourceFile,
+    liveSnapshot,
+    sourceCycle,
+    targetCycle,
+    collaboratorPermissions,
+    expectedSourcePermissions,
+    dryRun,
+  }) {
+    const loadPair = () => loadBootstrapRewindPair({
+      sourceFile,
+      liveSnapshot,
+      sourceCycle,
+      targetCycle,
+      collaboratorPermissions,
+      expectedSourcePermissions,
+    });
+    async function restoreClosedSourceAfterValidationFailure() {
+      try {
+        const sourceForm = await google.getForm({ formId: sourceFile.id });
+        const currentPublishing = publishState(sourceForm);
+        if (!currentPublishing.isAcceptingResponses) return;
+
+        const currentFile = await google.getFile({ fileId: sourceFile.id });
+        assertManagedFile(
+          currentFile,
+          runtime,
+          ROLLOVER_FILE_ROLES.SOURCE,
+          sourceCycle,
+        );
+        const currentState = currentFile.appProperties?.state;
+        const isCloseCheckpoint = currentState === ROLLOVER_FILE_STATES.CLOSED;
+        const isRewindCheckpoint = currentState === ROLLOVER_FILE_STATES.ACTIVE
+          && currentFile.appProperties?.rewindTargetCycle === targetCycle;
+        if (!isCloseCheckpoint && !isRewindCheckpoint) {
+          throw new Error('Source is not bound to this activation rewind');
+        }
+        await ensurePublishState(google, sourceForm, {
+          isPublished: currentPublishing.isPublished,
+          isAcceptingResponses: false,
+        });
+      } catch {
+        throw new Error('Managed staging activation rewind could not restore a closed source');
+      }
+    }
+
+    let pair;
+    try {
+      pair = await loadPair();
+    } catch (error) {
+      if (!dryRun) await restoreClosedSourceAfterValidationFailure();
+      throw error;
+    }
+    if (dryRun || pair.transition === 'rewound') return pair;
+
+    if (pair.transition === 'closed-activating') {
+      await markFile(pair.targetSnapshot.file, ROLLOVER_FILE_STATES.REWINDING, {
+        sourceCycle,
+        rewindSourceCycle: sourceCycle,
+      }, {
+        expectedAppProperties: {
+          state: ROLLOVER_FILE_STATES.ACTIVATING,
+          sourceCycle,
+        },
+      });
+      pair = await loadPair();
+    }
+    if (pair.transition === 'target-rewinding') {
+      // Arm the source marker while the form is still closed. This makes a
+      // failed marker write retryable without ever exposing two open forms.
+      await markFile(pair.sourceSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
+        sourceCycle,
+        targetCycle,
+        rewindTargetCycle: targetCycle,
+      }, {
+        expectedAppProperties: {
+          state: ROLLOVER_FILE_STATES.CLOSED,
+          targetCycle,
+        },
+      });
+      pair = await loadPair();
+    }
+    if (pair.transition === 'source-armed') {
+      await markFile(pair.targetSnapshot.file, ROLLOVER_FILE_STATES.PREPARED, {
+        sourceCycle,
+        rewindSourceCycle: sourceCycle,
+      }, {
+        expectedAppProperties: {
+          state: ROLLOVER_FILE_STATES.REWINDING,
+          sourceCycle,
+          rewindSourceCycle: sourceCycle,
+        },
+      });
+      pair = await loadPair();
+    }
+    if (pair.transition === 'target-prepared') {
+      // Reload immediately before opening, then reload again afterward. If the
+      // closed target or any binding drifts across that boundary, close the
+      // source again before surfacing the failure.
+      pair = await loadPair();
+      try {
+        await ensurePublishState(google, pair.sourceSnapshot.form, {
+          isPublished: true,
+          isAcceptingResponses: true,
+        });
+        pair = await loadPair();
+        if (pair.transition !== 'rewound') {
+          throw new Error('Managed staging activation rewind did not reach its final state');
+        }
+      } catch (error) {
+        await restoreClosedSourceAfterValidationFailure();
+        throw error;
+      }
+    }
+    if (pair.transition !== 'rewound') {
+      throw new Error('Managed staging activation rewind stopped at an unsupported checkpoint');
+    }
+    return pair;
+  }
+
   async function bootstrapStagingSource({
     sourceFormId,
     sourceCycle,
+    targetCycle,
     collaboratorPermissions = [],
     dryRun = false,
     faultInjection,
+    allowActivationRewind = false,
   } = {}) {
-    assertRolloverRuntimeSafety(runtime, { faultInjection });
+    assertRolloverRuntimeSafety(runtime, { faultInjection, allowActivationRewind });
     assertStagingIdentity(runtime);
     parseCycle(sourceCycle);
+    if (allowActivationRewind) {
+      parseCycle(targetCycle);
+      if (targetCycle !== nextCycle(sourceCycle)) {
+        throw new Error('Activation rewind target cycle must immediately follow the source cycle');
+      }
+    }
     if (sourceCycle !== INITIAL_EXPLICIT_SOURCE_CYCLE) {
       throw new Error('Staging bootstrap is restricted to the initial explicit source cycle');
     }
@@ -1288,7 +1578,7 @@ export function createRolloverService({
       }
     }
 
-    if (dryRun) {
+    if (dryRun && !allowActivationRewind) {
       if (stagedFile !== undefined) {
         const permissions = await google.getAllPermissions({ fileId: stagedFile.id });
         assertSharedDriveManagerPermissions(permissions, runtime);
@@ -1304,7 +1594,7 @@ export function createRolloverService({
       });
     }
 
-    if (stagedFile.appProperties?.state === ROLLOVER_FILE_STATES.COPIED) {
+    if (!dryRun && stagedFile.appProperties?.state === ROLLOVER_FILE_STATES.COPIED) {
       const recoveryForm = await google.getForm({ formId: stagedFile.id });
       await ensurePublishState(google, recoveryForm, {
         isPublished: true,
@@ -1320,36 +1610,69 @@ export function createRolloverService({
     );
     assertSourceCapabilities(stagedSnapshot.file);
     const title = managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.SOURCE, sourceCycle);
-    const titled = await updateTitles(stagedSnapshot.file, stagedSnapshot.form, title);
-    stagedSnapshot = {
-      ...stagedSnapshot,
-      ...titled,
-    };
     const expectedPermissions = expectedTargetPermissions(
       [ANONYMOUS_PUBLISHED_RESPONDER_PERMISSION],
       collaboratorPermissions,
       false,
       SOURCE_ORIGINS.MANAGED,
     );
-    stagedSnapshot.permissions = await ensurePermissions(
-      google,
-      stagedSnapshot.file.id,
-      expectedPermissions,
-      { runtime },
-    );
-    assertSameStructure(liveSnapshot.form, stagedSnapshot.form);
-    assertTitle(stagedSnapshot.form, stagedSnapshot.file, title);
     const stagedState = stagedSnapshot.file.appProperties?.state;
-    if (
-      stagedState !== ROLLOVER_FILE_STATES.COPIED
-      && stagedState !== ROLLOVER_FILE_STATES.ACTIVE
-    ) {
-      throw new Error('Managed staging source is not in a bootstrap recovery state');
+    const sourceHasRewindBinding = stagedState === ROLLOVER_FILE_STATES.ACTIVE
+      && stagedSnapshot.file.appProperties?.rewindTargetCycle === targetCycle;
+    const needsActivationRewind = allowActivationRewind
+      && (stagedState === ROLLOVER_FILE_STATES.CLOSED || sourceHasRewindBinding);
+    let rewound = false;
+    if (needsActivationRewind) {
+      const pair = await rewindStagingActivation({
+        sourceFile: stagedSnapshot.file,
+        liveSnapshot,
+        sourceCycle,
+        targetCycle,
+        collaboratorPermissions,
+        expectedSourcePermissions: expectedPermissions,
+        dryRun,
+      });
+      stagedSnapshot = pair.sourceSnapshot;
+      rewound = !dryRun;
+    } else if (dryRun) {
+      assertSharedDriveManagerPermissions(stagedSnapshot.permissions, runtime);
+      assertNoInheritedOrAdministrativeFormCollaborators(stagedSnapshot.permissions, runtime);
+    } else {
+      const titled = await updateTitles(stagedSnapshot.file, stagedSnapshot.form, title);
+      stagedSnapshot = {
+        ...stagedSnapshot,
+        ...titled,
+      };
+      stagedSnapshot.permissions = await ensurePermissions(
+        google,
+        stagedSnapshot.file.id,
+        expectedPermissions,
+        { runtime },
+      );
+      assertSameStructure(liveSnapshot.form, stagedSnapshot.form);
+      assertTitle(stagedSnapshot.form, stagedSnapshot.file, title);
+      if (
+        stagedState !== ROLLOVER_FILE_STATES.COPIED
+        && stagedState !== ROLLOVER_FILE_STATES.ACTIVE
+      ) {
+        throw new Error('Managed staging source is not in a bootstrap recovery state');
+      }
+      assertExpectedPublishing(stagedSnapshot.form, {
+        isPublished: true,
+        isAcceptingResponses: stagedState === ROLLOVER_FILE_STATES.ACTIVE,
+      });
     }
-    assertExpectedPublishing(stagedSnapshot.form, {
-      isPublished: true,
-      isAcceptingResponses: stagedState === ROLLOVER_FILE_STATES.ACTIVE,
-    });
+
+    if (dryRun) {
+      return Object.freeze({
+        action: 'bootstrap',
+        status: 'planned',
+        cycle: sourceCycle,
+        title,
+        created: false,
+        resumed: true,
+      });
+    }
 
     const liveAfter = await loadReadableSnapshot(liveFile);
     if (
@@ -1361,17 +1684,19 @@ export function createRolloverService({
       throw new Error('Production source changed during staging bootstrap');
     }
 
-    stagedSnapshot.form = await ensurePublishState(google, stagedSnapshot.form, {
-      isPublished: true,
-      isAcceptingResponses: true,
-    });
-    assertExpectedPublishing(stagedSnapshot.form, {
-      isPublished: true,
-      isAcceptingResponses: true,
-    });
-    await markFile(stagedSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
-      sourceCycle,
-    });
+    if (!rewound) {
+      stagedSnapshot.form = await ensurePublishState(google, stagedSnapshot.form, {
+        isPublished: true,
+        isAcceptingResponses: true,
+      });
+      assertExpectedPublishing(stagedSnapshot.form, {
+        isPublished: true,
+        isAcceptingResponses: true,
+      });
+      await markFile(stagedSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
+        sourceCycle,
+      });
+    }
 
     return Object.freeze({
       action: 'bootstrap',

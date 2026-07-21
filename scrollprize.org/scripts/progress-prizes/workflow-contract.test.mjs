@@ -151,6 +151,10 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
     'Google-secret jobs must not be reintroduced behind workflow_call',
   );
   assert.match(rehearsal, /^on:\n  workflow_dispatch:/m);
+  assert.match(
+    rehearsal,
+    /^concurrency:\n  group: progress-prizes-staging-rehearsal\n  cancel-in-progress: false$/m,
+  );
   assert.doesNotMatch(rehearsal, /workflow_call:|pull_request(?:_target)?:/);
   assert.doesNotMatch(rehearsal, /uses: \.\/\.github\/workflows\/progress-prizes-google\.yml/);
   assert.doesNotMatch(rehearsal, /secrets:\s*inherit/);
@@ -211,15 +215,25 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
   );
   assert.equal(
     [...rehearsal.matchAll(/secrets\.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL/g)].length,
-    1,
-    'only protected production validation may receive the staging identity',
+    googleJobNames.length,
+    'every Google job must receive an independently protected staging identity',
   );
+  assert.doesNotMatch(productionValidationJob, /staging-folder-id|PROGRESS_PRIZE_STAGING_FOLDER_ID/);
   for (const name of googleJobNames.filter((name) => name !== 'validate-production')) {
-    assert.doesNotMatch(
-      jobBlock(rehearsal, name),
-      /staging-service-account-email|PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL/,
+    const stagingJob = jobBlock(rehearsal, name);
+    assert.match(
+      stagingJob,
+      /^          staging-service-account-email: \$\{\{ secrets\.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \}\}$/m,
+    );
+    assert.match(
+      stagingJob,
+      /^          staging-folder-id: \$\{\{ secrets\.PROGRESS_PRIZE_STAGING_FOLDER_ID \}\}$/m,
     );
   }
+  assert.equal(
+    [...rehearsal.matchAll(/secrets\.PROGRESS_PRIZE_STAGING_FOLDER_ID/g)].length,
+    googleJobNames.length - 1,
+  );
 
   for (const name of jobNames(rehearsal).filter((name) => !googleJobNames.includes(name))) {
     const ordinaryJob = jobBlock(rehearsal, name);
@@ -240,16 +254,25 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
   );
   assert.match(
     action,
+    /^  staging-folder-id:\n(?:    .*\n)*?    required: false\n    default: ""$/m,
+  );
+  assert.match(
+    action,
     /PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL:\s+\$\{\{ inputs\['staging-service-account-email'\] \}\}/,
   );
   assert.match(
     action,
-    /PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \\\n\s+PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL/,
-    'the staging identity must be masked before protected configuration validation',
+    /PROGRESS_PRIZE_STAGING_FOLDER_ID:\s+\$\{\{ inputs\['staging-folder-id'\] \}\}/,
   );
   assert.match(
     action,
-    /inputs\.environment == 'staging' && inputs\['service-account-email'\] \|\| inputs\['staging-service-account-email'\]/,
+    /PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \\\n\s+PROGRESS_PRIZE_STAGING_FOLDER_ID \\\n\s+PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL/,
+    'the independent staging identity and folder must be masked before validation',
+  );
+  assert.doesNotMatch(
+    action,
+    /inputs\.environment == 'staging' && inputs\['(?:service-account-email|folder-id)'\]/,
+    'the expected staging identity and folder must not be derived from operational inputs',
   );
   assert.doesNotMatch(
     action,
@@ -273,6 +296,14 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
     action,
     /if test "\$AUTOMATION_ENVIRONMENT" = production \\\n\s+&& test "\$OPERATION" = validate \\\n\s+&& test "\$SOURCE_CYCLE" = 2026-07\n\s+then\n\s+test -n "\$PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL"/,
     'initial production validation must require the exact staging identity before authentication',
+  );
+  assert.match(
+    action,
+    /test "\$GOOGLE_SERVICE_ACCOUNT_EMAIL" = "\$PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL"/,
+  );
+  assert.match(
+    action,
+    /test "\$PROGRESS_PRIZE_FOLDER_ID" = "\$PROGRESS_PRIZE_STAGING_FOLDER_ID"/,
   );
   assert.equal([...action.matchAll(/access_token_lifetime: 1200s/g)].length, 2);
   assert.doesNotMatch(action, /access_token_scopes: >-/);
@@ -319,6 +350,8 @@ test('secret-free preflight and composite guards reject unsafe controls before O
   assert.match(preflight, /allowedOperations\.has\(process\.env\.OPERATION/);
   assert.match(preflight, /SOURCE_CYCLE/);
   assert.match(preflight, /TARGET_CYCLE/);
+  assert.match(preflight, /assert\.equal\(process\.env\.SOURCE_CYCLE, '2026-07'\)/);
+  assert.match(preflight, /assert\.equal\(process\.env\.TARGET_CYCLE, '2026-08'\)/);
   assert.match(preflight, /PREPARATION_NOW/);
   assert.match(preflight, /ACTIVATION_NOW/);
   assert.match(jobBlock(rehearsal, 'validate-production'), /needs: preflight/);
@@ -330,6 +363,13 @@ test('secret-free preflight and composite guards reject unsafe controls before O
   assert.match(action, /test "\$REF" = refs\/heads\/main/);
   assert.match(action, /test "\$OPERATION" != bootstrap/);
   assert.match(action, /test "\$OPERATION" != cleanup/);
+  assert.match(action, /test "\$SOURCE_CYCLE" = 2026-07/);
+  assert.match(
+    action,
+    /test "\$OPERATION" = bootstrap && test -n "\$TARGET_CYCLE"/,
+  );
+  assert.match(action, /test "\$ALLOW_ACTIVATION_REWIND" = true/);
+  assert.match(action, /test "\$TARGET_CYCLE" = 2026-08/);
 
   const actionOutputs = action.slice(action.indexOf('outputs:\n'), action.indexOf('\nruns:'));
   const actionOutputNames = [...actionOutputs.matchAll(/^  ([a-z][a-z-]+):\n/gm)]
@@ -343,7 +383,7 @@ test('secret-free preflight and composite guards reject unsafe controls before O
 
 test('composite boolean inputs stay strings across authentication and fault handling', async () => {
   const action = await googleAction();
-  for (const input of ['expect-fault', 'dry-run']) {
+  for (const input of ['expect-fault', 'dry-run', 'allow-activation-rewind']) {
     assert.match(
       action,
       new RegExp(`^  ${input}:\\n(?:    .*\\n)*?    default: "false"$`, 'm'),
@@ -353,7 +393,70 @@ test('composite boolean inputs stay strings across authentication and fault hand
   assert.match(action, /inputs\['dry-run'\] != 'true'/);
   assert.match(action, /case "\$EXPECT_FAULT" in true\|false/);
   assert.match(action, /case "\$DRY_RUN" in true\|false/);
+  assert.match(action, /case "\$ALLOW_ACTIVATION_REWIND" in true\|false/);
   assert.match(action, /test "\$DRY_RUN" = false \|\| arguments\+=\(--dry-run\)/);
+  assert.match(
+    action,
+    /test "\$ALLOW_ACTIVATION_REWIND" = false \|\| arguments\+=\(--allow-activation-rewind\)/,
+  );
+});
+
+test('composite pre-auth guard executes the activation rewind matrix before OIDC', async () => {
+  const action = await googleAction();
+  const guard = literalRunScripts(action)[0]?.source;
+  assert.equal(typeof guard, 'string');
+  const valid = {
+    REPOSITORY: 'ScrollPrize/villa',
+    REPOSITORY_ID: '890972577',
+    REPOSITORY_OWNER_ID: '121906140',
+    REF: 'refs/heads/main',
+    AUTOMATION_ENVIRONMENT: 'staging',
+    EVENT_NAME: 'workflow_dispatch',
+    OPERATION: 'bootstrap',
+    SIMULATED_NOW: '',
+    FAULT: '',
+    EXPECT_FAULT: 'false',
+    DRY_RUN: 'false',
+    ALLOW_ACTIVATION_REWIND: 'true',
+    BRANCH: 'codex/progress-prize-smoke-20260720',
+    TARGET_BRANCH: 'codex/progress-prize-smoke-base-20260720',
+    SOURCE_CYCLE: '2026-07',
+    TARGET_CYCLE: '2026-08',
+    HEAD_SHA: '',
+  };
+  const run = (override = {}) => spawnSync('bash', ['--noprofile', '--norc'], {
+    input: guard,
+    encoding: 'utf8',
+    env: { ...valid, ...override },
+  });
+
+  assert.equal(run().status, 0);
+  for (const override of [
+    { ALLOW_ACTIVATION_REWIND: 'TRUE' },
+    { ALLOW_ACTIVATION_REWIND: '1' },
+    { ALLOW_ACTIVATION_REWIND: '' },
+    { ALLOW_ACTIVATION_REWIND: 'false' },
+    { TARGET_CYCLE: '' },
+    { TARGET_CYCLE: '2026-09' },
+    { SOURCE_CYCLE: '2026-12', TARGET_CYCLE: '2027-01' },
+    { OPERATION: 'prepare' },
+    { EVENT_NAME: 'schedule' },
+    { BRANCH: 'feature/not-smoke' },
+    { TARGET_BRANCH: 'main' },
+    {
+      AUTOMATION_ENVIRONMENT: 'production',
+      BRANCH: 'main',
+      TARGET_BRANCH: 'main',
+    },
+    {
+      AUTOMATION_ENVIRONMENT: 'production',
+      EVENT_NAME: 'schedule',
+      BRANCH: 'main',
+      TARGET_BRANCH: 'main',
+    },
+  ]) {
+    assert.notEqual(run(override).status, 0, JSON.stringify(override));
+  }
 });
 
 test('rehearsal controls are fixed to staging and its ephemeral branches', async () => {
@@ -378,6 +481,22 @@ test('rehearsal controls are fixed to staging and its ephemeral branches', async
   assert.match(rehearsal, /actions: read\n      contents: read\n      statuses: read/);
   assert.match(rehearsal, /--base-sha \"\$EXPECTED_BASE_SHA\"/);
   assert.match(rehearsal, /--source-cycle \"\$SOURCE_CYCLE\"/);
+
+  const bootstrap = jobBlock(rehearsal, 'bootstrap-staging');
+  assert.equal([...rehearsal.matchAll(/allow-activation-rewind:/g)].length, 1);
+  assert.match(bootstrap, /^          operation: bootstrap$/m);
+  assert.match(bootstrap, /^          environment: staging$/m);
+  assert.match(
+    bootstrap,
+    /^          allow-activation-rewind: \$\{\{ inputs\.operation == 'full-rehearsal' \|\| inputs\.operation == 'activation-fault-recovery' \}\}$/m,
+  );
+  assert.match(
+    bootstrap,
+    /^          target-cycle: \$\{\{ \(inputs\.operation == 'full-rehearsal' \|\| inputs\.operation == 'activation-fault-recovery'\) && inputs\['target-cycle'\] \|\| '' \}\}$/m,
+  );
+  for (const name of googleJobNames.filter((name) => name !== 'bootstrap-staging')) {
+    assert.doesNotMatch(jobBlock(rehearsal, name), /allow-activation-rewind/);
+  }
 
   const pagePr = await workflow('progress-prizes-page-pr.yml');
   assert.match(pagePr, /--force-with-lease=\"refs\/heads\/\$HEAD_BRANCH:\$REMOTE_HEAD_SHA\"/);

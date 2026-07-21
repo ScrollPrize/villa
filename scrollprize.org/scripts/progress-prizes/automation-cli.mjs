@@ -14,7 +14,7 @@ import {
   assertRolloverRuntimeSafety,
   createRolloverService,
 } from './rollover.mjs';
-import { parseCycle, previousCycle } from './dates.mjs';
+import { nextCycle, parseCycle, previousCycle } from './dates.mjs';
 import {
   GOOGLE_CLI_USAGE,
   GOOGLE_COMMANDS,
@@ -361,6 +361,32 @@ function assertAutomationOptions(command, options) {
   if (options.fault !== undefined && !['bootstrap', 'prepare', 'activate'].includes(command)) {
     throw new Error('--fault is accepted only by bootstrap, prepare, and activate');
   }
+  if (command === 'bootstrap') {
+    const sourceCycle = requireOption(options, 'source-cycle');
+    parseCycle(sourceCycle);
+    if (sourceCycle !== '2026-07') {
+      throw new Error('Staging bootstrap is restricted to the initial 2026-07 source cycle');
+    }
+  }
+  if (options['allow-activation-rewind'] === true && command !== 'bootstrap') {
+    throw new Error('--allow-activation-rewind is accepted only by bootstrap');
+  }
+  if (options['allow-activation-rewind'] === true) {
+    const sourceCycle = requireOption(options, 'source-cycle');
+    const targetCycle = requireOption(options, 'target-cycle');
+    parseCycle(sourceCycle);
+    parseCycle(targetCycle);
+    if (nextCycle(sourceCycle) !== targetCycle) {
+      throw new Error('Activation rewind target cycle must immediately follow the source cycle');
+    }
+  }
+  if (
+    command === 'bootstrap'
+    && options['target-cycle'] !== undefined
+    && options['allow-activation-rewind'] !== true
+  ) {
+    throw new Error('--target-cycle requires --allow-activation-rewind for bootstrap');
+  }
   for (const shaOption of ['head-sha', 'verified-sha']) {
     if (options[shaOption] !== undefined && command !== 'activate') {
       throw new Error(`--${shaOption} is accepted only by activate`);
@@ -449,7 +475,10 @@ export async function runAutomationCli(argv, {
   // This validation deliberately precedes token access, Google client creation,
   // responder URL resolution, and every filesystem/network call.
   const runtime = buildRuntime(options, env);
-  assertRolloverRuntimeSafety(runtime, { faultInjection: options.fault });
+  assertRolloverRuntimeSafety(runtime, {
+    faultInjection: options.fault,
+    allowActivationRewind: options['allow-activation-rewind'] === true,
+  });
   const clock = createClock({
     environment: runtime.environment,
     eventName: runtime.eventName,
@@ -495,12 +524,21 @@ export async function runAutomationCli(argv, {
   } else if (command === 'bootstrap') {
     const sourceCycle = requireOption(options, 'source-cycle');
     parseCycle(sourceCycle);
+    const allowActivationRewind = options['allow-activation-rewind'] === true;
+    let targetCycle;
+    if (allowActivationRewind) {
+      targetCycle = requireOption(options, 'target-cycle');
+      parseCycle(targetCycle);
+      assertSourceCycleMatchesTarget(options, targetCycle);
+    }
     result = await rollover.bootstrapStagingSource({
       sourceFormId: requiredEnv(env, AUTOMATION_ENV.SOURCE_FORM_ID),
       sourceCycle,
+      targetCycle,
       collaboratorPermissions: collaborators,
       dryRun: options['dry-run'] === true,
       faultInjection: options.fault,
+      allowActivationRewind,
     });
   } else {
     const targetCycle = requireOption(options, 'target-cycle');
