@@ -344,7 +344,8 @@ runs:
 
         if test "$EXPECT_FAULT" = true; then
           if test "$operation_status" -ne 0; then
-            grep -Fq "Injected staging rollover failure at $FAULT" "$RUNNER_TEMP/progress-prizes-error.txt"
+            grep -Fxq "progress-prizes: Injected staging rollover failure at $FAULT" \
+              "$RUNNER_TEMP/progress-prizes-error.txt"
           else
         # Keep this heredoc at the YAML block indent so Bash sees a column-zero delimiter.
         FAULT="$FAULT" node --input-type=module <<'NODE'
