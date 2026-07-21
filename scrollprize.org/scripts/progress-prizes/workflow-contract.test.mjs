@@ -426,6 +426,17 @@ test('Vercel verification runs trusted default-branch code and requires GitHub a
   assert.doesNotMatch(vercel, /checkout.*(?:HEAD_SHA|deployment|pull_request)/i);
 });
 
+test('preview gates use creator-bearing newest-first commit status history', async () => {
+  const helper = await readFile(
+    resolve(repositoryRoot, '.github/progress-prizes-github.mjs'),
+    'utf8',
+  );
+  const historyEndpoint = 'github(`/repos/${OWNER}/${REPO}/commits/${sha}/statuses?per_page=100`)';
+  const combinedEndpoint = 'github(`/repos/${OWNER}/${REPO}/commits/${sha}/status`)';
+  assert.equal(helper.split(historyEndpoint).length - 1, 2);
+  assert.equal(helper.includes(combinedEndpoint), false);
+});
+
 test('trusted branch and exact-check gate helpers reject ambiguous automation state', () => {
   assert.deepEqual(
     assertAutomationBranch(
@@ -439,18 +450,17 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
 
   const expectedSha = 'a'.repeat(40);
   const baseSha = 'b'.repeat(40);
-  const statuses = {
-    statuses: [{
-      context: 'progress-prizes/vercel-preview',
-      state: 'success',
-      creator: { login: 'github-actions[bot]' },
-      target_url: 'https://github.com/ScrollPrize/villa/actions/runs/12345',
-    }],
-  };
+  const statuses = [{
+    context: 'progress-prizes/vercel-preview',
+    state: 'success',
+    description: 'Exact Progress Prize preview verified',
+    creator: { login: 'github-actions[bot]', id: 41898282, type: 'Bot' },
+    target_url: 'https://github.com/ScrollPrize/villa/actions/runs/12345',
+  }];
   const previewRun = {
     id: 12345,
-    html_url: statuses.statuses[0].target_url,
-    name: 'Progress Prize Vercel preview gate',
+    html_url: statuses[0].target_url,
+    name: `Progress Prize Vercel preview ${expectedSha}`,
     path: '.github/workflows/progress-prizes-vercel-preview.yml',
     event: 'repository_dispatch',
     actor: { login: 'vercel[bot]', type: 'Bot' },
@@ -483,8 +493,20 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
       },
     ],
   };
-  assert.equal(isTrustedPreviewRun({ status: statuses.statuses[0], run: previewRun, expectedSha }), true);
+  assert.equal(isTrustedPreviewRun({ status: statuses[0], run: previewRun, expectedSha }), true);
   assert.equal(gateSnapshot({ statuses, checks: successfulChecks, previewRun, expectedSha }).ready, true);
+  assert.equal(gateSnapshot({
+    statuses: { statuses },
+    checks: successfulChecks,
+    previewRun,
+    expectedSha,
+  }).ready, false, 'the obsolete combined-status response shape must fail closed');
+  assert.equal(gateSnapshot({
+    statuses: [{ context: 'unrelated', state: 'failure' }, statuses[0]],
+    checks: successfulChecks,
+    previewRun,
+    expectedSha,
+  }).ready, true, 'the first matching context is the newest preview status');
   assert.equal(gateSnapshot({
     statuses,
     checks: { total_count: 1, check_runs: successfulChecks.check_runs.slice(1) },
@@ -510,19 +532,42 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
     expectedSha,
   }).ready, false);
   assert.equal(gateSnapshot({
-    statuses: {
-      statuses: [{
-        ...statuses.statuses[0],
-        creator: { login: 'spoofed-user' },
-      }],
-    },
+    statuses: [{
+      ...statuses[0],
+      creator: { login: 'spoofed-user' },
+    }, statuses[0]],
     checks: successfulChecks,
     previewRun,
     expectedSha,
-  }).ready, false);
+  }).ready, false, 'an older trusted success must not override the newest matching status');
+  assert.equal(gateSnapshot({
+    statuses: [{ ...statuses[0], state: 'pending' }, statuses[0]],
+    checks: successfulChecks,
+    previewRun,
+    expectedSha,
+  }).ready, false, 'an older success must not override a newer pending status');
+  assert.equal(gateSnapshot({
+    statuses: [statuses[0], { ...statuses[0], state: 'failure' }],
+    checks: successfulChecks,
+    previewRun,
+    expectedSha,
+  }).ready, true, 'a newer trusted success supersedes older statuses');
+
+  for (const status of [
+    { ...statuses[0], context: 'untrusted/context' },
+    { ...statuses[0], state: 'failure' },
+    { ...statuses[0], description: 'Looks plausible but is not exact' },
+    { ...statuses[0], creator: undefined },
+    { ...statuses[0], creator: null },
+    { ...statuses[0], creator: { ...statuses[0].creator, login: 'spoofed-user' } },
+    { ...statuses[0], creator: { ...statuses[0].creator, id: 1 } },
+    { ...statuses[0], creator: { ...statuses[0].creator, type: 'User' } },
+  ]) {
+    assert.equal(isTrustedPreviewRun({ status, run: previewRun, expectedSha }), false);
+  }
 
   for (const [field, value] of [
-    ['name', 'Untrusted workflow'],
+    ['name', `Progress Prize Vercel preview ${baseSha}`],
     ['path', '.github/workflows/untrusted.yml'],
     ['event', 'workflow_dispatch'],
     ['head_branch', 'feature/untrusted'],
@@ -531,23 +576,33 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
     ['display_title', `Progress Prize Vercel preview ${baseSha}`],
   ]) {
     assert.equal(isTrustedPreviewRun({
-      status: statuses.statuses[0],
+      status: statuses[0],
       run: { ...previewRun, [field]: value },
       expectedSha,
     }), false);
   }
   assert.equal(isTrustedPreviewRun({
-    status: statuses.statuses[0],
+    status: statuses[0],
     run: { ...previewRun, actor: { login: 'attacker', type: 'User' } },
     expectedSha,
   }), false);
   assert.equal(isTrustedPreviewRun({
-    status: statuses.statuses[0],
+    status: statuses[0],
+    run: { ...previewRun, actor: { login: 'vercel[bot]', type: 'User' } },
+    expectedSha,
+  }), false);
+  assert.equal(isTrustedPreviewRun({
+    status: statuses[0],
     run: { ...previewRun, triggering_actor: { login: 'human', type: 'User' } },
     expectedSha,
   }), false);
   assert.equal(isTrustedPreviewRun({
-    status: statuses.statuses[0],
+    status: statuses[0],
+    run: { ...previewRun, triggering_actor: { login: 'vercel[bot]', type: 'User' } },
+    expectedSha,
+  }), false);
+  assert.equal(isTrustedPreviewRun({
+    status: statuses[0],
     run: {
       ...previewRun,
       repository: { ...previewRun.repository, id: 1 },
@@ -555,7 +610,7 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
     expectedSha,
   }), false);
   assert.equal(isTrustedPreviewRun({
-    status: statuses.statuses[0],
+    status: statuses[0],
     run: {
       ...previewRun,
       repository: {
@@ -566,12 +621,34 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
     expectedSha,
   }), false);
   assert.equal(isTrustedPreviewRun({
-    status: statuses.statuses[0],
+    status: statuses[0],
     run: { ...previewRun, head_repository: { id: 1 } },
     expectedSha,
   }), false);
   assert.equal(isTrustedPreviewRun({
-    status: { ...statuses.statuses[0], target_url: 'https://github.com/ScrollPrize/villa/actions/runs/999' },
+    status: statuses[0],
+    run: { ...previewRun, id: 999 },
+    expectedSha,
+  }), false);
+  assert.equal(isTrustedPreviewRun({
+    status: statuses[0],
+    run: { ...previewRun, html_url: 'https://github.com/ScrollPrize/villa/actions/runs/999' },
+    expectedSha,
+  }), false);
+  for (const target_url of [
+    'https://github.com/ScrollPrize/villa/actions/runs/12345/',
+    'https://github.com/ScrollPrize/villa/actions/runs/12345?trusted=false',
+    'https://github.com/ScrollPrize/villa/actions/runs/12345#spoofed',
+    'https://github.com/attacker/villa/actions/runs/12345',
+  ]) {
+    assert.equal(isTrustedPreviewRun({
+      status: { ...statuses[0], target_url },
+      run: previewRun,
+      expectedSha,
+    }), false);
+  }
+  assert.equal(isTrustedPreviewRun({
+    status: { ...statuses[0], target_url: 'https://github.com/ScrollPrize/villa/actions/runs/999' },
     run: previewRun,
     expectedSha,
   }), false);
