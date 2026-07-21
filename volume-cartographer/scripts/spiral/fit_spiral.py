@@ -151,6 +151,16 @@ def release_interactive_resources():
         _active_scalar_stores.pop().close()
 
 default_config = {
+    # Session-level dataset input switches. VC3D uses these in addition to
+    # clearing local paths because a dataset-owned remote service resolves
+    # its own paths. Disabled inputs must never be opened by the fitter.
+    'use_verified_patches': True,
+    'use_unverified_patches': True,
+    'use_normals': True,
+    'use_surf_sdt': True,
+    'use_tracks': True,
+    'use_gradient_magnitude': True,
+    'use_fibers': True,
     'random_seed': 1,
     # Multi-GPU batch policy (only relevant under torchrun, world size > 1):
     #   True  -> split per-step object-sample counts by world_size so the effective
@@ -790,22 +800,27 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             raise RuntimeError('shell losses are enabled, but FIT_SPIRAL_SHELL_PATH is not set')
         shell_patch = load_tifxyz(shell_path)
 
-    if cfg['disable_patches']:
+    use_verified_patches = (
+        bool(cfg.get('use_verified_patches', True)) and not cfg['disable_patches'])
+    use_unverified_patches = (
+        bool(cfg.get('use_unverified_patches', True)) and not cfg['disable_patches'])
+    if not use_verified_patches and not use_unverified_patches:
         verified_patches = {}
         unverified_patches = {}
-        print('disable_patches=True: skipping all verified/unverified patch loading')
+        print('skipping all verified/unverified patch loading')
     else:
         # An empty verified dir is allowed when unverified patches are supplied
         # (unverified-only ablations); both empty is a configuration error.
         verified_patches = (
             load_patches_from_dir(verified_patches_path)
-            if verified_patches_path else {}
+            if use_verified_patches and verified_patches_path else {}
         )
         unverified_patches = {}
-        if unverified_patches_path:
+        if use_unverified_patches and unverified_patches_path:
             unverified_patches = load_patches_from_dir(unverified_patches_path)
 
-    if not verified_patches and not unverified_patches and not cfg['disable_patches']:
+    if (not verified_patches and not unverified_patches
+            and (use_verified_patches or use_unverified_patches)):
         raise RuntimeError('No patches could be loaded')
 
     print(f" loaded {len(verified_patches)} patches")
@@ -864,7 +879,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 next_id += 1
 
     fiber_point_collections, next_id = load_fiber_point_collections(
-        fibers_path,
+        fibers_path if cfg.get('use_fibers', True) else None,
         next_id,
         min_point_spacing=cfg['fiber_min_point_spacing'],
     )
@@ -1100,9 +1115,15 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         raise ValueError(
             f'dense_spacing_mode={dense_spacing_mode!r} must be '
             "'phase' or 'grad_mag'")
-    phase_mode = dense_spacing_mode == 'phase'
+    phase_mode = (
+        dense_spacing_mode == 'phase'
+        and cfg.get('use_normals', True)
+        and cfg.get('use_surf_sdt', True)
+    )
     grad_mag_spacing_enabled = (
-        dense_spacing_mode == 'grad_mag' and cfg['loss_weight_dense_spacing'] > 0
+        dense_spacing_mode == 'grad_mag'
+        and cfg.get('use_gradient_magnitude', True)
+        and cfg['loss_weight_dense_spacing'] > 0
     )
     # Interior membership for dense-store GPU paging: inside the outer-shell
     # polar envelope + margin (see volume_paging_chunk config comment). Built
@@ -1150,7 +1171,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         lasagna_interior_fn = None
     lasagna_volume = prepare_lasagna_volume(
         scroll_zarr,
-        use_normals=(cfg['loss_weight_dense_normals'] > 0 or phase_mode),
+        use_normals=(cfg.get('use_normals', True)
+                     and (cfg['loss_weight_dense_normals'] > 0 or phase_mode)),
         use_spacing=grad_mag_spacing_enabled,
         normal_nx_zarr_path=normal_nx_zarr_path,
         normal_ny_zarr_path=normal_ny_zarr_path,
@@ -1218,7 +1240,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                       f'{dense_spacing_mode!r}; this component runs only as '
                       "part of the 'phase' bundle and is INACTIVE.")
 
-    if tracks_dbm_path is not None:
+    if tracks_dbm_path is not None and cfg.get('use_tracks', True):
         print(f'loading tracks from {tracks_dbm_path}')
         tracks = load_tracks_from_dbm(tracks_dbm_path, z_begin, z_end)
         print(f'loaded {len(tracks)} tracks within z-roi [{z_begin}, {z_end})')

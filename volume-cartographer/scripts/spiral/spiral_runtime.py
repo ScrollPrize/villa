@@ -19,6 +19,7 @@ import uuid
 
 from fit_session import (RUN_MUTABLE_SAMPLING_KEYS, SpiralInputPaths,
                          SpiralPreviewConfig, SpiralRunConfig,
+                         apply_optional_input_selection,
                          run_mutable_config)
 
 
@@ -164,6 +165,7 @@ class InteractiveFitSession:
                 count_keys, floors=SAMPLING_COUNT_FLOORS)
             split_counts_across_ranks(config, count_keys)
             config.update(explicit_sampling_counts)
+            apply_optional_input_selection(config)
             self.requested_config = dict(config)
             with self._condition:
                 self._run_config = run_mutable_config(config)
@@ -381,8 +383,13 @@ class InteractiveFitSession:
                 if self._configure_run is None:
                     raise RuntimeError(
                         "The resident fitter does not support Run configuration changes")
-                self._idle_actions.append(("configure", run_config))
                 self.requested_config.update(run_config)
+                apply_optional_input_selection(self.requested_config)
+                run_config = {
+                    key: self.requested_config[key]
+                    for key in run_config
+                }
+                self._idle_actions.append(("configure", run_config))
                 self._run_config.update(run_config)
             if pending_inputs:
                 if self._incorporate_inputs is None:

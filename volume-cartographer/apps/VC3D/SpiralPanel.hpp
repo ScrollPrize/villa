@@ -51,6 +51,10 @@ private:
     QJsonObject sessionAdvancedConfig() const;
     QJsonObject runAdvancedConfig() const;
     QJsonObject durableAdvancedConfig() const;
+    void applyOptionalInputConfig(QJsonObject& config, bool includeSelectionFlags) const;
+    QSet<QString> forcedOptionalRunConfigKeys() const;
+    bool optionalInputEnabled(const QString& key) const;
+    void updateOptionalInputUi();
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
     void applyResolution(const QJsonObject& resolution, bool force);
     void updateStatus(const QJsonObject& status);
@@ -72,6 +76,7 @@ private:
     QHash<QString, QLineEdit*> _paths;
     QHash<QString, QToolButton*> _pathBrowseButtons;
     QHash<QString, QCheckBox*> _visibilityChecks;
+    QHash<QString, QCheckBox*> _optionalInputs;
     QHash<QString, bool> _pathDirectories;
     QDialog* _displayDialog = nullptr;
     QSpinBox* _minimumDisplayedWinding = nullptr;

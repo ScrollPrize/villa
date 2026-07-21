@@ -384,6 +384,24 @@ class DatasetOwnershipTests(unittest.TestCase):
                              "run": {"z_begin": 0, "z_end": 10}})
         self.assertEqual(caught.exception.status, 400)
 
+    def test_dataset_request_omits_disabled_optional_inputs(self):
+        config = {
+            "use_verified_patches": False,
+            "use_unverified_patches": False,
+            "use_normals": False,
+            "use_surf_sdt": False,
+            "use_tracks": False,
+            "use_gradient_magnitude": False,
+            "use_fibers": False,
+        }
+        request = self.state._dataset_session_request({
+            "run": {"z_begin": 0, "z_end": 10, "config": config},
+        })
+        for field in ("verified_patches", "unverified_patches", "normal_x",
+                      "normal_y", "surf_sdt", "tracks_dbm",
+                      "gradient_magnitude", "fibers"):
+            self.assertEqual(request["paths"][field], "")
+
     def test_save_checkpoint_is_constrained_to_output_directory(self):
         _attach_fake_session(self.state, self.root / "spiral_output", self.root)
         with self.assertRaises(ApiError) as caught:

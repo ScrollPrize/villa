@@ -21,7 +21,8 @@ from sdt_losses import (
 )
 from transforms import GapExpanderParams, GapExpandingTransform
 from fit_session import (
-    SpiralInputPaths, SpiralRunConfig, validate_session_request,
+    SpiralInputPaths, SpiralRunConfig, apply_optional_input_selection,
+    validate_session_request,
 )
 from test_sdt_losses import (
     DR_PER_WINDING,
@@ -528,6 +529,16 @@ class TestModeContract:
         fields = {error['field'] for error in validate_session_request(paths, run)}
         assert {'normal_x', 'normal_y', 'surf_sdt'} <= fields
 
+    def test_disabled_phase_inputs_are_not_required(self, tmp_path):
+        paths, run = self.base_request(tmp_path, {
+            'use_normals': False,
+            'use_surf_sdt': False,
+        })
+        fields = {error['field'] for error in validate_session_request(paths, run)}
+        assert 'normal_x' not in fields
+        assert 'normal_y' not in fields
+        assert 'surf_sdt' not in fields
+
     def test_grad_mag_mode_requires_grad_mag_not_sdt(self, tmp_path):
         paths, run = self.base_request(tmp_path, {
             'dense_spacing_mode': 'grad_mag',
@@ -537,6 +548,15 @@ class TestModeContract:
         assert 'gradient_magnitude' in fields
         assert 'surf_sdt' not in fields
         assert 'normal_x' not in fields
+
+    def test_disabled_grad_mag_is_not_required(self, tmp_path):
+        paths, run = self.base_request(tmp_path, {
+            'dense_spacing_mode': 'grad_mag',
+            'loss_weight_dense_spacing': 12.0,
+            'use_gradient_magnitude': False,
+        })
+        fields = {error['field'] for error in validate_session_request(paths, run)}
+        assert 'gradient_magnitude' not in fields
 
     def test_invalid_mode_is_rejected_before_asset_errors(self, tmp_path):
         paths, run = self.base_request(tmp_path, {
@@ -549,6 +569,79 @@ class TestModeContract:
         # mode-derived asset errors.
         assert 'surf_sdt' not in by_field
         assert 'gradient_magnitude' not in by_field
+
+
+class TestOptionalInputSelection:
+    def test_disabled_inputs_zero_their_weights_and_sampling(self):
+        config = {
+            'dense_spacing_mode': 'phase',
+            'use_verified_patches': False,
+            'use_unverified_patches': False,
+            'use_normals': False,
+            'use_surf_sdt': False,
+            'use_tracks': False,
+            'use_fibers': False,
+            'loss_weight_patch_radius': 8.0,
+            'loss_weight_patch_dt': 4.0,
+            'num_patches_per_step': 360,
+            'num_patches_per_step_for_dt': 240,
+            'num_points_per_patch': 800,
+            'loss_weight_unverified_patch_radius': 2.0,
+            'loss_weight_unverified_patch_dt': 1.0,
+            'unverified_num_patches_per_step': 120,
+            'unverified_num_patches_per_step_for_dt': 80,
+            'unverified_num_points_per_patch': 800,
+            'loss_weight_dense_normals': 100.0,
+            'dense_normals_num_points': 60_000,
+            'loss_weight_dense_spacing': 12.0,
+            'loss_weight_dense_spacing_count': 2.0,
+            'loss_weight_dense_spacing_density': 3.0,
+            'loss_weight_min_spacing': 4.0,
+            'loss_weight_dense_attachment': 5.0,
+            'dense_spacing_num_pairs': 12_000,
+            'dense_spacing_density_extra_pairs': 24_000,
+            'dense_attachment_num_points': 20_000,
+            'min_spacing_independent_samples': 2_000,
+            'loss_weight_track_radius': 50.0,
+            'loss_weight_track_dt': 10.0,
+            'track_num_per_step': 48_000,
+            'track_num_points_per_step': 24,
+            'loss_weight_unattached_pcl_radius': 2.0,
+            'loss_weight_unattached_pcl_dt': 4.0,
+            'unattached_pcl_num_per_step': 84,
+            'unattached_pcl_num_points_per_step': 32,
+        }
+        apply_optional_input_selection(config)
+        expected_zero = {
+            'loss_weight_patch_radius', 'loss_weight_patch_dt',
+            'num_patches_per_step', 'num_patches_per_step_for_dt',
+            'num_points_per_patch', 'loss_weight_unverified_patch_radius',
+            'loss_weight_unverified_patch_dt', 'unverified_num_patches_per_step',
+            'unverified_num_patches_per_step_for_dt',
+            'unverified_num_points_per_patch', 'loss_weight_dense_normals',
+            'dense_normals_num_points', 'loss_weight_dense_spacing',
+            'loss_weight_dense_spacing_count',
+            'loss_weight_dense_spacing_density', 'loss_weight_min_spacing',
+            'loss_weight_dense_attachment', 'dense_spacing_num_pairs',
+            'dense_spacing_density_extra_pairs', 'dense_attachment_num_points',
+            'min_spacing_independent_samples', 'loss_weight_track_radius',
+            'loss_weight_track_dt', 'track_num_per_step',
+            'track_num_points_per_step', 'loss_weight_unattached_pcl_radius',
+            'loss_weight_unattached_pcl_dt', 'unattached_pcl_num_per_step',
+            'unattached_pcl_num_points_per_step',
+        }
+        assert all(config[key] == 0 for key in expected_zero)
+
+    def test_disabled_grad_mag_zeroes_legacy_spacing(self):
+        config = {
+            'dense_spacing_mode': 'grad_mag',
+            'use_gradient_magnitude': False,
+            'loss_weight_dense_spacing': 12.0,
+            'dense_spacing_num_pairs': 12_000,
+        }
+        apply_optional_input_selection(config)
+        assert config['loss_weight_dense_spacing'] == 0
+        assert config['dense_spacing_num_pairs'] == 0
 
 
 class TestNativeMinimumGap:

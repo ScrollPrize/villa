@@ -778,6 +778,25 @@ class ServiceState:
                                [{"field": "tracks_dbm", "message": "Not a service-advertised candidate"}])
             paths["tracks_dbm"] = str(Path(tracks).resolve(strict=False))
 
+        # A dataset-owned service resolves conventional paths itself, but the
+        # client still controls which optional sources belong to this session.
+        # Clear disabled paths so the manifest and worker agree that they were
+        # not loaded.
+        config = (request.get("run") or {}).get("config") or {}
+        selected_paths = {
+            "use_verified_patches": ("verified_patches",),
+            "use_unverified_patches": ("unverified_patches",),
+            "use_normals": ("normal_x", "normal_y"),
+            "use_surf_sdt": ("surf_sdt",),
+            "use_tracks": ("tracks_dbm",),
+            "use_gradient_magnitude": ("gradient_magnitude",),
+            "use_fibers": ("fibers",),
+        }
+        for flag, field_names in selected_paths.items():
+            if not bool(config.get(flag, True)):
+                for field_name in field_names:
+                    paths[field_name] = ""
+
         return {**request, "paths": paths}
 
     def load(self, request):
