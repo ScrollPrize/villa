@@ -1,4 +1,4 @@
-const BOOLEAN_OPTIONS = new Set(['dry-run', 'google', 'help']);
+const BOOLEAN_OPTIONS = new Set(['allow-activation-rewind', 'dry-run', 'google', 'help']);
 const VALUE_OPTIONS = new Set([
   'environment',
   'event-name',
@@ -107,6 +107,7 @@ Clock options:
 export const GOOGLE_CLI_USAGE = `Google automation (private values are environment variables only):
   node automation-cli.mjs validate --source-cycle YYYY-MM [--page-path PATH]
   node automation-cli.mjs bootstrap --source-cycle YYYY-MM [--dry-run] [staging controls]
+    [--allow-activation-rewind --target-cycle YYYY-MM]
   node automation-cli.mjs prepare --target-cycle YYYY-MM [--source-cycle YYYY-MM] [--dry-run]
   node automation-cli.mjs activate --target-cycle YYYY-MM [--source-cycle YYYY-MM] [--fault STEP]
   node automation-cli.mjs verify --target-cycle YYYY-MM [--source-cycle YYYY-MM] \\
@@ -120,6 +121,7 @@ Public controls:
   --preparation-days N               Defaults to 7
   --simulated-now ISO_TIMESTAMP      Staging workflow_dispatch only
   --fault after-copy|after-close-source
+  --allow-activation-rewind          Explicit staging bootstrap recovery only
   --head-sha SHA --verified-sha SHA  Exact preview-verified activation commit
   --dry-run                          Bootstrap and prepare only
 `;

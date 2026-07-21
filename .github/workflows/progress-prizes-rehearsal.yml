@@ -92,6 +92,8 @@ jobs:
 
           const source = parseCycle(process.env.SOURCE_CYCLE);
           const target = parseCycle(process.env.TARGET_CYCLE);
+          assert.equal(process.env.SOURCE_CYCLE, '2026-07');
+          assert.equal(process.env.TARGET_CYCLE, '2026-08');
           const expectedTarget = source.month === 12
             ? { year: source.year + 1, month: 1 }
             : { year: source.year, month: source.month + 1 };
@@ -204,14 +206,18 @@ jobs:
           operation: bootstrap
           environment: staging
           source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ (inputs.operation == 'full-rehearsal' || inputs.operation == 'activation-fault-recovery') && inputs['target-cycle'] || '' }}
+          allow-activation-rewind: ${{ inputs.operation == 'full-rehearsal' || inputs.operation == 'activation-fault-recovery' }}
           simulated-now: ${{ inputs['preparation-now'] }}
           branch: codex/progress-prize-smoke-20260720
           target-branch: codex/progress-prize-smoke-base-20260720
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
           archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
@@ -253,9 +259,11 @@ jobs:
           target-branch: codex/progress-prize-smoke-base-20260720
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
           archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
@@ -295,9 +303,11 @@ jobs:
           target-branch: codex/progress-prize-smoke-base-20260720
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
           archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
@@ -357,9 +367,11 @@ jobs:
           head-sha: ${{ needs.prepare-page.outputs['head-sha'] }}
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
           archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
@@ -447,9 +459,11 @@ jobs:
           head-sha: ${{ needs.activation-gate.outputs['head-sha'] }}
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
           archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
@@ -489,9 +503,11 @@ jobs:
           head-sha: ${{ needs.activation-gate.outputs['head-sha'] }}
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
           archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
@@ -532,9 +548,11 @@ jobs:
           head-sha: ${{ needs.activation-gate.outputs['head-sha'] }}
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
           archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
@@ -652,9 +670,11 @@ jobs:
           head-sha: ${{ needs.activation-gate.outputs['head-sha'] }}
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
           archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
@@ -693,9 +713,11 @@ jobs:
           target-branch: codex/progress-prize-smoke-base-20260720
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
           archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
@@ -733,9 +755,11 @@ jobs:
           target-branch: codex/progress-prize-smoke-base-20260720
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
           archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
@@ -772,9 +796,11 @@ jobs:
           target-branch: codex/progress-prize-smoke-base-20260720
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
           archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
@@ -812,9 +838,11 @@ jobs:
           target-branch: codex/progress-prize-smoke-base-20260720
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
           archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
