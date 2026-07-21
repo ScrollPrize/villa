@@ -1408,7 +1408,18 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
 
-    QuadSurface *surf = tracer(*volume, 1.0, 0, origin, params, cache_root.string(), voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+    QuadSurface *surf = nullptr;
+    try {
+        surf = tracer(*volume, 1.0, 0, origin, params, cache_root.string(), voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+    } catch (const std::exception& e) {
+        // A growth failure (e.g. a remote normal-grid store whose metadata
+        // could not be fetched) must exit as a normal tool failure, not crash
+        // the process with an uncaught exception (SIGABRT). The bridge and the
+        // GUI runner report a non-zero exit + this stderr line cleanly.
+        std::cerr << "ERROR: vc_grow_seg_from_seed: segment growth failed: "
+                  << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
 
     double area_cm2 = surf->meta["area_cm2"].get_double();
     if (area_cm2 < min_area_cm) {

@@ -72,7 +72,9 @@
 
          pimpl(const std::string& path, int requested_level) : base_path(path) {
             load_remote_marker();
-            ensure_local_file("metadata.json");
+            if (!ensure_local_file("metadata.json")) {
+                throw std::runtime_error(missing_file_error("metadata.json"));
+            }
             metadata = utils::Json::parse_file(fs::path(base_path) / "metadata.json");
             multiscale = metadata.value("format", std::string()) == "normal-grid-multiscale";
             if (multiscale) {
@@ -84,11 +86,13 @@
                 const std::string level_metadata_name =
                     "metadata.level" + std::to_string(selected_level) + ".json";
                 const fs::path level_metadata_path = fs::path(base_path) / level_metadata_name;
-                ensure_local_file(level_metadata_name);
-                if (fs::exists(level_metadata_path)) {
+                const bool level_present = ensure_local_file(level_metadata_name);
+                if (level_present && fs::exists(level_metadata_path)) {
                     level_metadata = utils::Json::parse_file(level_metadata_path);
                 } else if (metadata.contains("source-metadata")) {
                     level_metadata = metadata["source-metadata"];
+                } else if (remote && !level_present) {
+                    throw std::runtime_error(missing_file_error(level_metadata_name));
                 } else {
                     throw std::runtime_error("multiscale normal grids missing level metadata: " +
                                              level_metadata_path.string());
@@ -144,6 +148,22 @@
                 remote_url.pop_back();
             }
             remote = !remote_url.empty();
+        }
+
+        // Build an intentional, actionable error message for a normal-grid file
+        // that could not be made available locally. Distinguishes the remote-
+        // streaming failure (fetch from remote_url failed) from a plain missing
+        // local file so the caller can surface it instead of the generic
+        // "Cannot open" thrown by Json::parse_file on a still-absent file.
+        std::string missing_file_error(const std::string& rel) const {
+            if (remote) {
+                return "Failed to fetch remote normal-grid file '" + rel +
+                       "' from " + remote_url +
+                       " (cached under " + base_path +
+                       "); see preceding stderr for the HTTP status or network error";
+            }
+            return "normal-grid file not found: " +
+                   (fs::path(base_path) / rel).string();
         }
 
         std::string relative_grid_path(int plane_idx, int slice_idx) const {
