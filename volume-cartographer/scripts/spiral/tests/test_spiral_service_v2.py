@@ -593,6 +593,19 @@ class UploadTests(unittest.TestCase):
                 "num_patches_per_step": 0,
             }})
 
+    def test_run_accepts_advertised_zero_count_for_disabled_input(self):
+        session = self._session()
+        session.run_config["dense_attachment_num_points"] = 0
+
+        response = self.state.run({"iterations": 10, "run_config": {
+            "dense_attachment_num_points": 0,
+        }})
+
+        self.assertEqual(session.run_calls[-1][4], {
+            "dense_attachment_num_points": 0,
+        })
+        self.assertEqual(response["run_config"]["dense_attachment_num_points"], 0)
+
     def test_new_session_does_not_see_previous_ephemeral_inputs(self):
         self._session()
         upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)

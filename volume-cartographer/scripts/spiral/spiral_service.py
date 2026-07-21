@@ -206,8 +206,21 @@ def _validate_run_config(value, current):
                                f"{key} must be an integer")
             number = int(number)
             if key in RUN_MUTABLE_SAMPLING_KEYS and number < 1:
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               f"{key} must be at least 1")
+                # Disabled optional inputs have their loss weights and sample
+                # counts forced to zero when the session is loaded.  VC3D
+                # round-trips those advertised active values on every Run.
+                # Permit that unchanged disabled value, while still rejecting
+                # attempts to turn an active sampler off by setting its count
+                # to zero at a Run boundary.
+                current_value = current.get(key)
+                current_is_zero = (
+                    not isinstance(current_value, bool)
+                    and isinstance(current_value, (int, float))
+                    and float(current_value) == 0.0
+                )
+                if number != 0 or not current_is_zero:
+                    raise ApiError(HTTPStatus.BAD_REQUEST,
+                                   f"{key} must be at least 1")
         result[key] = number
     return result
 
