@@ -166,6 +166,7 @@ jobs:
           target-branch: main
           workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
           service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
           drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
           drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
           folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}

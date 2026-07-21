@@ -52,6 +52,10 @@ inputs:
   service-account-email:
     description: Protected Environment service account identifier
     required: true
+  staging-service-account-email:
+    description: Protected staging identity used by production ACL validation
+    required: false
+    default: ""
   drive-admin-email:
     description: Protected Environment break-glass administrator identity
     required: true
@@ -155,6 +159,7 @@ runs:
       env:
         GOOGLE_WORKLOAD_IDENTITY_PROVIDER: ${{ inputs['workload-identity-provider'] }}
         GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ inputs['service-account-email'] }}
+        PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: ${{ inputs['staging-service-account-email'] }}
         PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: ${{ inputs['drive-admin-email'] }}
         PROGRESS_PRIZE_DRIVE_ID: ${{ inputs['drive-id'] }}
         PROGRESS_PRIZE_FOLDER_ID: ${{ inputs['folder-id'] }}
@@ -166,6 +171,7 @@ runs:
         for name in \
           GOOGLE_WORKLOAD_IDENTITY_PROVIDER \
           GOOGLE_SERVICE_ACCOUNT_EMAIL \
+          PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \
           PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL \
           PROGRESS_PRIZE_DRIVE_ID \
           PROGRESS_PRIZE_FOLDER_ID \
@@ -186,6 +192,7 @@ runs:
       env:
         GOOGLE_WORKLOAD_IDENTITY_PROVIDER: ${{ inputs['workload-identity-provider'] }}
         GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ inputs['service-account-email'] }}
+        PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: ${{ inputs['staging-service-account-email'] }}
         PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: ${{ inputs['drive-admin-email'] }}
         PROGRESS_PRIZE_DRIVE_ID: ${{ inputs['drive-id'] }}
         PROGRESS_PRIZE_FOLDER_ID: ${{ inputs['folder-id'] }}
@@ -194,6 +201,7 @@ runs:
         PROGRESS_PRIZE_ARCHIVE_FOLDER_ID: ${{ inputs['archive-folder-id'] }}
         AUTOMATION_ENVIRONMENT: ${{ inputs.environment }}
         OPERATION: ${{ inputs.operation }}
+        SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
       run: |
         set -euo pipefail
         for name in \
@@ -210,6 +218,15 @@ runs:
         if test "$AUTOMATION_ENVIRONMENT" = staging -a "$OPERATION" = cleanup; then
           test -n "$PROGRESS_PRIZE_ARCHIVE_FOLDER_ID" || {
             echo "Missing protected Environment secret: PROGRESS_PRIZE_ARCHIVE_FOLDER_ID" >&2
+            exit 1
+          }
+        fi
+        if test "$AUTOMATION_ENVIRONMENT" = production \
+          && test "$OPERATION" = validate \
+          && test "$SOURCE_CYCLE" = 2026-07
+        then
+          test -n "$PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL" || {
+            echo "Missing protected Environment secret: PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL" >&2
             exit 1
           }
         fi
@@ -288,7 +305,7 @@ runs:
         PROGRESS_PRIZE_SOURCE_FORM_ID: ${{ inputs['source-form-id'] }}
         PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: ${{ inputs['editor-group-email'] }}
         PROGRESS_PRIZE_SERVICE_ACCOUNT_EMAIL: ${{ inputs['service-account-email'] }}
-        PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: ${{ inputs.environment == 'staging' && inputs['service-account-email'] || '' }}
+        PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: ${{ inputs.environment == 'staging' && inputs['service-account-email'] || inputs['staging-service-account-email'] }}
         PROGRESS_PRIZE_STAGING_FOLDER_ID: ${{ inputs.environment == 'staging' && inputs['folder-id'] || '' }}
         PROGRESS_PRIZE_BRANCH: ${{ inputs.branch }}
         PROGRESS_PRIZE_TARGET_BRANCH: ${{ inputs['target-branch'] }}

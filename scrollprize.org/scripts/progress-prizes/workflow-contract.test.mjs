@@ -203,6 +203,22 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
     [...rehearsal.matchAll(/environment: progress-prizes-staging/g)].length,
     googleJobNames.length - 1,
   );
+  const productionValidationJob = jobBlock(rehearsal, 'validate-production');
+  assert.match(
+    productionValidationJob,
+    /^          staging-service-account-email: \$\{\{ secrets\.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \}\}$/m,
+  );
+  assert.equal(
+    [...rehearsal.matchAll(/secrets\.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL/g)].length,
+    1,
+    'only protected production validation may receive the staging identity',
+  );
+  for (const name of googleJobNames.filter((name) => name !== 'validate-production')) {
+    assert.doesNotMatch(
+      jobBlock(rehearsal, name),
+      /staging-service-account-email|PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL/,
+    );
+  }
 
   for (const name of jobNames(rehearsal).filter((name) => !googleJobNames.includes(name))) {
     const ordinaryJob = jobBlock(rehearsal, name);
@@ -217,6 +233,23 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
       assert.match(action, new RegExp(`^  ${input}:\\n(?:    .*\\n)*?    required: true$`, 'm'));
     }
   }
+  assert.match(
+    action,
+    /^  staging-service-account-email:\n(?:    .*\n)*?    required: false\n    default: ""$/m,
+  );
+  assert.match(
+    action,
+    /PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL:\s+\$\{\{ inputs\['staging-service-account-email'\] \}\}/,
+  );
+  assert.match(
+    action,
+    /PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \\\n\s+PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL/,
+    'the staging identity must be masked before protected configuration validation',
+  );
+  assert.match(
+    action,
+    /inputs\.environment == 'staging' && inputs\['service-account-email'\] \|\| inputs\['staging-service-account-email'\]/,
+  );
   assert.doesNotMatch(
     action,
     /\$\{\{\s*(?:secrets|vars)(?:\.|\[)/,
@@ -229,7 +262,17 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
   assert.match(action, /printf '::add-mask::%s\\n' "\$value"/);
   const maskStep = action.indexOf('- name: Register protected Google configuration masks');
   const validationStep = action.indexOf('- name: Validate protected environment configuration');
+  const readAuthStep = action.indexOf('- name: Authenticate read-only validation');
   assert.ok(maskStep >= 0 && maskStep < validationStep, 'mask registration must precede validation');
+  assert.ok(
+    validationStep < readAuthStep,
+    'protected configuration must be validated before requesting an OIDC token',
+  );
+  assert.match(
+    action,
+    /if test "\$AUTOMATION_ENVIRONMENT" = production \\\n\s+&& test "\$OPERATION" = validate \\\n\s+&& test "\$SOURCE_CYCLE" = 2026-07\n\s+then\n\s+test -n "\$PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL"/,
+    'initial production validation must require the exact staging identity before authentication',
+  );
   assert.equal([...action.matchAll(/access_token_lifetime: 1200s/g)].length, 2);
   assert.doesNotMatch(action, /access_token_scopes: >-/);
   assert.match(

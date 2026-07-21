@@ -60,6 +60,12 @@ const ALLOWED_VERIFY_MODES = new Set(['prepared', 'active', 'cleaned']);
 const GOOGLE_FORM_MIME_TYPE = 'application/vnd.google-apps.form';
 const GOOGLE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
 const INITIAL_EXPLICIT_SOURCE_CYCLE = '2026-07';
+const ANONYMOUS_PUBLISHED_RESPONDER_PERMISSION = Object.freeze({
+  type: 'anyone',
+  role: 'reader',
+  allowFileDiscovery: false,
+  view: 'published',
+});
 const SOURCE_ORIGINS = Object.freeze({
   MANAGED: 'managed',
   EXPLICIT_SHARED_DRIVE: 'explicit-shared-drive',
@@ -615,6 +621,28 @@ function assertDirectAutomationPermission(permissions, runtime, expectedRole) {
   }
 }
 
+function assertSingleBootstrapReaderPermission(permissions, runtime) {
+  if (runtime.stagingServiceAccountEmail === undefined) {
+    throw new Error('Production validation requires the configured staging automation identity');
+  }
+  const nonPublishedReaders = permissions.filter((permission) => (
+    permission?.deleted !== true
+    && permission?.pendingOwner !== true
+    && permission?.role === 'reader'
+    && permission?.view !== 'published'
+  ));
+  const bootstrapReaders = nonPublishedReaders.filter((permission) => (
+    permission.type === 'user'
+    && !isInheritedPermission(permission)
+    && !hasValue(permission.expirationTime)
+    && isGoogleServiceAccountIdentity(permission)
+    && isAutomationIdentity(permission, runtime.stagingServiceAccountEmail)
+  ));
+  if (nonPublishedReaders.length !== 1 || bootstrapReaders.length !== 1) {
+    throw new Error('The production form must have exactly one direct copy-only automation reader');
+  }
+}
+
 async function ensurePermissions(google, fileId, expected, options) {
   let current = await google.getAllPermissions({ fileId });
   const currentKeys = new Set(effectiveComparablePermissions(current).map(permissionIdentityKey));
@@ -734,7 +762,10 @@ function assertSourceCapabilities(file, required = ['canCopy', 'canEdit', 'canSh
 
 function assertReadCopyOnlyCapabilities(file) {
   assertSourceCapabilities(file, ['canCopy']);
-  if (file?.capabilities?.canEdit === true || file?.capabilities?.canShare === true) {
+  if (
+    file?.capabilities?.canEdit !== false
+    || file?.capabilities?.canShare !== false
+  ) {
     throw new Error('The staging identity has forbidden edit or share access to production');
   }
 }
@@ -1028,15 +1059,23 @@ export function createRolloverService({
     );
   }
 
-  async function loadSnapshot(file) {
-    const [form, currentFile, permissions] = await Promise.all([
+  async function loadReadableSnapshot(file) {
+    const [form, currentFile] = await Promise.all([
       google.getForm({ formId: file.id }),
       google.getFile({ fileId: file.id }),
-      google.getAllPermissions({ fileId: file.id }),
     ]);
     assertNoLinkedSheet(form);
     publishState(form);
     assertPublicResponderUri(form.responderUri);
+    return { form, file: currentFile };
+  }
+
+  async function loadSnapshot(file) {
+    const [readable, permissions] = await Promise.all([
+      loadReadableSnapshot(file),
+      google.getAllPermissions({ fileId: file.id }),
+    ]);
+    const { form, file: currentFile } = readable;
     return { form, file: currentFile, permissions };
   }
 
@@ -1102,6 +1141,9 @@ export function createRolloverService({
       requireShare: true,
     });
     assertRequiredSourcePermissions(snapshot.permissions, collaboratorPermissions);
+    if (source.origin === SOURCE_ORIGINS.EXPLICIT_MY_DRIVE) {
+      assertSingleBootstrapReaderPermission(snapshot.permissions, runtime);
+    }
     expectedTargetPermissions(
       snapshot.permissions,
       collaboratorPermissions,
@@ -1155,12 +1197,12 @@ export function createRolloverService({
     ) {
       throw new Error('Staging bootstrap requires the initial explicit My Drive source');
     }
-    const liveSnapshot = await loadSnapshot(liveFile);
-    // The staging identity deliberately has read/copy-only access to production.
-    // It must never need edit or share capability on the active live form.
+    // Google permits detailed My Drive ACL reads only to writers/owners. The
+    // separately approved production validation checks that ACL; this staging
+    // identity must remain a Viewer and validates only its effective read/copy
+    // capabilities plus the source content and publishing state.
+    const liveSnapshot = await loadReadableSnapshot(liveFile);
     assertReadCopyOnlyCapabilities(liveSnapshot.file);
-    assertDirectAutomationPermission(liveSnapshot.permissions, runtime, 'reader');
-    assertRequiredSourcePermissions(liveSnapshot.permissions);
     assertTitle(liveSnapshot.form, liveSnapshot.file, cycleTitle(sourceCycle));
     assertExpectedPublishing(liveSnapshot.form, {
       isPublished: true,
@@ -1259,10 +1301,10 @@ export function createRolloverService({
       ...titled,
     };
     const expectedPermissions = expectedTargetPermissions(
-      liveSnapshot.permissions,
+      [ANONYMOUS_PUBLISHED_RESPONDER_PERMISSION],
       collaboratorPermissions,
       false,
-      SOURCE_ORIGINS.EXPLICIT_MY_DRIVE,
+      SOURCE_ORIGINS.MANAGED,
     );
     stagedSnapshot.permissions = await ensurePermissions(
       google,
@@ -1284,7 +1326,7 @@ export function createRolloverService({
       isAcceptingResponses: stagedState === ROLLOVER_FILE_STATES.ACTIVE,
     });
 
-    const liveAfter = await loadSnapshot(liveFile);
+    const liveAfter = await loadReadableSnapshot(liveFile);
     if (
       JSON.stringify(formStructure(liveSnapshot.form)) !== JSON.stringify(formStructure(liveAfter.form))
       || liveSnapshot.form.info?.title !== liveAfter.form.info?.title

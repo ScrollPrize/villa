@@ -40,6 +40,7 @@ function productionEnv(overrides = {}) {
     PROGRESS_PRIZE_DRIVE_ID: 'private-production-drive-id',
     PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: 'production-break-glass@private.example',
     PROGRESS_PRIZE_SERVICE_ACCOUNT_EMAIL: 'production-bot@private.example',
+    PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: PRIVATE.account,
     PROGRESS_PRIZE_SOURCE_FORM_ID: PRIVATE.form,
     PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: 'production-editors@private.example',
     PROGRESS_PRIZE_BRANCH: 'codex/progress-prize-2026-08',
@@ -473,6 +474,7 @@ test('top-level CLI keeps page validate compatibility and routes source-cycle va
   });
   assert.equal(capture.method, 'validate');
   assert.equal(capture.input.sourceFormId, PRIVATE.form);
+  assert.equal(capture.dependencies.runtime.stagingServiceAccountEmail, PRIVATE.account);
 });
 
 test('bootstrap, verify, and cleanup commands map to the corresponding service operations', async () => {
