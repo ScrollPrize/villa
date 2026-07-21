@@ -1622,6 +1622,26 @@ export function createRolloverService({
       isAcceptingResponses: true,
     });
 
+    // Do not treat the mutation responses as proof of a completed rollover.
+    // Reload both resources so a concurrent ACL, title, structure, metadata,
+    // binding, marker, or publish-state change cannot escape the activation
+    // boundary and allow the website PR to merge against an invalid form pair.
+    const finalState = await loadActivationState({
+      targetCycle,
+      sourceFormId,
+      collaboratorPermissions,
+      copySourceCollaborators,
+      sourceCycle: rollover.sourceCycle,
+    });
+    await assertResponderUrisMatch(
+      page,
+      finalState.targetSnapshot.form.responderUri,
+      initialState.targetSnapshot.form.responderUri,
+    );
+    if (finalState.transition !== 'active') {
+      throw new Error('Activation did not reach the fully verified active transition');
+    }
+
     return Object.freeze({
       action: 'activate',
       status: 'active',
@@ -1629,7 +1649,7 @@ export function createRolloverService({
       targetCycle,
       sourceAcceptingResponses: false,
       targetAcceptingResponses: true,
-      responderUri: assertPublicResponderUri(targetForm.responderUri),
+      responderUri: assertPublicResponderUri(finalState.targetSnapshot.form.responderUri),
     });
   }
 
