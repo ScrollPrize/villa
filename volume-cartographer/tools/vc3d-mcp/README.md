@@ -220,7 +220,7 @@ surface as MCP tool errors whose text is the JSON-encoded
 | Lasagna / workspace | `vc3d_lasagna_service_status`, `vc3d_lasagna_ensure_service`, `vc3d_lasagna_list_datasets`, `vc3d_lasagna_start_optimization`, `vc3d_lasagna_jobs`, `vc3d_lasagna_cancel`, `vc3d_lasagna_select_output`, `vc3d_lasagna_repeat_last`, `vc3d_switch_workspace` |
 | Atlas | `vc3d_atlas_open`, `vc3d_atlas_status`, `vc3d_atlas_search_start`, `vc3d_atlas_search_cancel`, `vc3d_atlas_search_results`, `vc3d_atlas_open_result`, `vc3d_atlas_remap`, `vc3d_atlas_optimize_snap_candidates` |
 | Line Annotation (fiber tracing) | `vc3d_fiber_launch`, `vc3d_fiber_list`, `vc3d_fiber_open`, `vc3d_fiber_set_follow`, `vc3d_fiber_save`, `vc3d_fiber_delete`, `vc3d_fiber_set_tag`, `vc3d_fiber_create_atlas`, `vc3d_fiber_export`, `vc3d_fiber_import` |
-| Seeding | `vc3d_seeding_set_winding_annotation_mode`, `vc3d_seeding_preview_rays`, `vc3d_seeding_cast_rays`, `vc3d_seeding_reset_points` |
+| Seeding | `vc3d_seeding_set_winding_annotation_mode`, `vc3d_seeding_preview_rays`, `vc3d_seeding_cast_rays`, `vc3d_seeding_reset_points`, `vc3d_seeding_run`, `vc3d_seeding_expand`, `vc3d_seeding_cancel`, `vc3d_seeding_analyze_paths` |
 | Tracer / flatten / render | `vc3d_run_trace`, `vc3d_render_tifxyz`, `vc3d_flatten_slim`, `vc3d_flatten_abf`, `vc3d_flatten_straighten` |
 | Jobs | `vc3d_job_status` |
 
@@ -229,7 +229,8 @@ surface as MCP tool errors whose text is the JSON-encoded
 Long-running tools (`vc3d_grow_segment`, `vc3d_grow_patch_from_seed`,
 `vc3d_run_trace`, `vc3d_render_tifxyz`, `vc3d_flatten_slim`/`_abf`/`_straighten`,
 `vc3d_atlas_search_start`, `vc3d_lasagna_start_optimization`,
-`vc3d_lasagna_repeat_last`) accept an MCP-only `wait: bool = false` param (not
+`vc3d_lasagna_repeat_last`, `vc3d_seeding_run`, `vc3d_seeding_expand`) accept an
+MCP-only `wait: bool = false` param (not
 part of the underlying RPC, per SPEC.md §5). When `true`, the tool call
 blocks until a `job.progress` notification with `phase:"finished"` arrives
 for that job's source (30-minute cap), then returns the terminal

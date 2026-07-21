@@ -184,6 +184,20 @@ private:
     QJsonObject handleSeedingPreviewRays(const QJsonValue& params);
     QJsonObject handleSeedingCastRays(const QJsonValue& params);
     QJsonObject handleSeedingResetPoints(const QJsonValue& params);
+    // Batch seeding: run/expand spawn vc_grow_seg_from_seed child processes and
+    // resolve through the seedingBatch* signals as source:"seeding" jobs (SPEC
+    // §15.2). analyze_paths is pure synchronous compute (not a job). cancel is a
+    // bounded synchronous teardown.
+    QJsonObject handleSeedingRun(const QJsonValue& params);
+    QJsonObject handleSeedingExpand(const QJsonValue& params);
+    QJsonObject handleSeedingCancel(const QJsonValue& params);
+    QJsonObject handleSeedingAnalyzePaths(const QJsonValue& params);
+    // Shared body for run/expand: validate vpkg/volume/widget, requireSourceIdle,
+    // invoke the headless launcher, map its distinct failure sentences to codes,
+    // and register the source:"seeding" job.
+    QJsonObject launchSeedingBatch(
+        const QString& kind, const QString& label,
+        const std::function<bool(QString* err)>& launch);
     QJsonObject handlePushPullSetConfig(const QJsonValue& params);
     QJsonObject handlePushPullStart(const QJsonValue& params);
     QJsonObject handlePushPullStop(const QJsonValue& params);
@@ -222,7 +236,7 @@ private:
     struct JobRecord {
         QString id;          // "job-<n>"
         int     num = 0;     // monotonic order key (parsed-free "most recent" sort)
-        QString source;      // "tool" | "growth" | "lasagna" | "atlas" | "catalog"
+        QString source;      // "tool" | "growth" | "lasagna" | "atlas" | "catalog" | "seeding"
         QString kind;        // "segmentation.grow", "segmentation.grow_patch_from_seed", ...
         QString label;
         QString state;       // "running" | "succeeded" | "failed"
@@ -285,6 +299,13 @@ private:
     // group-by-fiber checkbox), which would leak a never-finishing job.
     void handleAtlasSearchProgress(int phase, double fraction);
     void handleAtlasSearchFinished(bool success, int resultCount);
+    // Batch seeding lifecycle -> source:"seeding" JobRecord (SPEC §15.2). Wired
+    // from SeedingWidget::seedingBatchProgressChanged / seedingBatchFinished. Like
+    // the atlas search, only bridge-initiated batches are tracked (progress/
+    // finished for a human-initiated Run/Expand click are not auto-registered).
+    void handleSeedingBatchProgress(const QString& kind, int completed, int total);
+    void handleSeedingBatchFinished(const QString& kind, bool success,
+                                    int completed, int total);
     // Resolves the active "catalog" job when an async catalog.open_sample
     // finishes: builds the v1/§10.3 result body into the job record and calls
     // finishJob (SPEC §18.4). Kept out of the handler lambda.

@@ -1941,26 +1941,78 @@ themselves stay fire-and-forget. Seed/path placement reuses `canvas.click` /
 `canvas.drag` (the widget's `onMousePress/Move/Release` slots, SeedingWidget.hpp:61–63,
 are already fed by the real viewer wiring).
 
-**Amendment (as-built, Stage 6):** verified against real code, three of the seven
-listed actions are **not exposed** and are deferred:
+**Amendment (as-built, Stage 6):** initially, three of the seven listed actions
+(`run`, `expand`, `analyze_paths`) were **deferred** because each ended in a nested
+`QApplication::processEvents` loop that blocked the event loop until child processes
+finished (`run`/`expand`) or repainted per-path (`analyze_paths`) — a §1.3 violation.
+The exposed subset was `set_winding_annotation_mode`, `preview_rays`, `cast_rays`
+(async `QtConcurrent`, safe), and `reset_points`.
 
-| RPC | reason deferred |
-|---|---|
-| `seeding.run` (`onRunSegmentationClicked`) | spins a **nested `QApplication::processEvents` loop** (`while (jobsRunning && completedJobs < totalPoints)`, SeedingWidget.cpp ~1308) that blocks until every child `vc_grow_seg_from_seed` process finishes — a §1.3 violation. The loop's `finished` lambdas capture stack locals by reference, so removing it is a real refactor, not a wrapper. |
-| `seeding.expand` (`onExpandSeedsClicked`) | same nested-`processEvents` pattern (SeedingWidget.cpp ~2290). |
-| `seeding.analyze_paths` (`analyzePaths`) | spins `QApplication::processEvents()` per path (SeedingWidget.cpp ~1463) — reentrant during the handler. |
-
-The exposed subset is `set_winding_annotation_mode`, `preview_rays`, `cast_rays`
-(async `QtConcurrent`, safe), and `reset_points`. `preview_rays` / `cast_rays` each
-raise a precondition `QMessageBox::warning` when no focus POI is set (a static
-`QMessageBox` spins a nested event loop); the bridge sets a lifetime
-`SeedingWidget::setDialogsSuppressed(true)` in `AgentBridgeServer`'s constructor
-(gated on the bridge being enabled, mirroring
+`preview_rays` / `cast_rays` each raise a precondition `QMessageBox::warning` when no
+focus POI is set (a static `QMessageBox` spins a nested event loop); the bridge sets a
+lifetime `SeedingWidget::setDialogsSuppressed(true)` in `AgentBridgeServer`'s
+constructor (gated on the bridge being enabled, mirroring
 `LineAnnotationController::setErrorDialogsSuppressed`), so those calls return cleanly
-instead of blocking. The public wrappers added are `runPreviewRays()`,
-`runCastRays()`, `runResetPoints()` (the `analyzePaths`/`run`/`expand` wrappers named
-above were **not** added). Result shapes: `preview_rays`/`cast_rays` return
-`{"requested": true}`; `reset_points` returns `{"reset": true}`.
+instead of blocking. Result shapes: `preview_rays`/`cast_rays` return
+`{"requested": true}`; `reset_points` returns `{"reset": true}`;
+`set_winding_annotation_mode` returns `{"active": bool}`.
+
+**Amendment (as-built, batch-seeding follow-up):** the three deferred actions are now
+**exposed**, the blocking loops removed:
+
+- **The refactor (SeedingWidget.hpp/.cpp).** `onRunSegmentationClicked` /
+  `onExpandSeedsClicked` no longer spin `while (jobsRunning) processEvents`. The
+  self-referencing local `std::function` launchers and the by-reference-captured
+  stack locals (`completedJobs`, `nextPointIndex`/`nextIterationIndex`, `totalPoints`/
+  `expansionIterations`, the batch config) were promoted to member state (`_batchKind`,
+  `_batchTotal`, `_batchCompleted`, `_batchNextIndex`, `_batchOmpThreads`,
+  `_batchPoints`, `_batchVolumePath`, `_batchPathsDir`, `_batchConfigJson`,
+  `_batchWorkingDir`) and to member methods (`startSegmentationProcessForPoint`,
+  `startExpansionProcessForIteration`, `handleBatchProcessFinished`,
+  `finalizeSeedingBatch`). Only one batch (run OR expand) is active at a time, gated by
+  the pre-existing `jobsRunning` flag. Each interactive slot now delegates to a
+  distinctly-named non-blocking headless twin (`runSegmentationHeadless(QString*)` /
+  `runExpandSeedsHeadless(QString*)`) that runs the same validation + launch and
+  reports precondition failures through the out-param instead of a `QMessageBox`. The
+  batch drains through the `QProcess` `finished` callbacks and resolves via
+  `finalizeSeedingBatch`. `analyzePaths` dropped its per-path
+  `QApplication::processEvents()` (pure synchronous compute now) and gained
+  `runAnalyzePathsHeadless(QString*, int* pathsAnalyzed, int* peaksFound)`. The Cancel
+  button's `onCancelClicked` slot delegates to a headless twin
+  `cancelSeedingBatchHeadless()` (bounded `terminate()` + `waitForFinished(1000)` →
+  `kill()` per child).
+
+- **New `SeedingWidget` signals (binding).**
+  `void seedingBatchProgressChanged(const QString& kind, int completed, int total)`
+  (emitted on each child completion; `kind` is `"run"` | `"expand"`) and
+  `void seedingBatchFinished(const QString& kind, bool success, int completed, int total)`
+  (emitted at completion or cancel; `success=false` for cancel). The bridge connects
+  these in `subscribeJobSignals()` and mirrors them onto a `source:"seeding"` job,
+  exactly as the atlas search wires `atlasSearchProgressChanged`/`atlasSearchFinished`.
+  Introspection getters: `seedingBatchActive()` (run/expand only — excludes a neural
+  trace, which shares `jobsRunning`), `seedingBatchKind()`, `seedingBatchTotal()`.
+
+- **Job model.** `seeding.run` and `seeding.expand` are both `source:"seeding"`
+  (§8.3). They are already mutually exclusive via `jobsRunning`; mapping both to one
+  source expresses that through the job model too — a second run/expand while one is
+  active returns `-32004` (`data.source:"seeding"`). Only bridge-initiated batches
+  become tracked jobs (a human-clicked Run/Expand is not auto-registered), mirroring
+  the atlas-search precedent (the widget's `seedingBatchActive()` is the lifecycle
+  authority used by `jobIsRunning("seeding")`, so a human batch still reads as busy for
+  the `-32004` guard). `job.progress` label is `"<kind> <completed>/<total>"`.
+
+  | RPC | params | result | errors |
+  |---|---|---|---|
+  | `seeding.run` | `{}` | `{"jobId", "kind": "seeding.run", "source": "seeding", "points", "total"}` | `-32000`, `-32001`, `-32004` (`data.source:"seeding"`), `-32005` (no source collection / no points / launch failure, `data.detail`), `-32006` (`vc_grow_seg_from_seed` not found), `-32007` (`data.kind:"file"` — `seed.json`/paths dir missing), `-32010` |
+  | `seeding.expand` | `{}` | `{"jobId", "kind": "seeding.expand", "source": "seeding", "iterations", "total"}` | `-32000`, `-32001`, `-32004`, `-32005`, `-32006`, `-32007` (`data.kind:"file"` — `expand.json`/paths dir missing), `-32010` |
+  | `seeding.cancel` | `{}` | `{"cancelRequested": true}` | `-32007` (`data.kind:"job"` — no batch running), `-32010` |
+  | `seeding.analyze_paths` | `{}` | `{"analyzed": true, "paths", "peaks"}` (synchronous, **not** a job) | `-32000`, `-32001`, `-32007` (`data.kind:"path"` — no drawn paths), `-32010` |
+
+  `seeding.cancel` is synchronous: the bounded teardown emits `seedingBatchFinished`
+  before the RPC returns, so the job's terminal `job.progress` notification has already
+  gone out. Populating the source collection for `seeding.run` reuses `points.commit`
+  (a committed collection becomes the combo's current selection) or the widget's own
+  Cast Rays flow; `analyze_paths` requires paths drawn via Draw-mode `canvas.drag`.
 
 ### 15.3 `segmentation.push_pull.*`
 

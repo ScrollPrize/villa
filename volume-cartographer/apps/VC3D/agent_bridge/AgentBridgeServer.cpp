@@ -254,16 +254,16 @@ AgentBridgeServer::AgentBridgeServer(CWindow* window, QObject* parent)
     }
 
     // Seeding widget headless dialog suppression (SPEC §15.2, §1.3): every
-    // seeding action slot the bridge invokes (preview_rays, cast_rays) opens a
-    // precondition QMessageBox::warning when no focus point is set; a static
-    // QMessageBox spins a nested event loop, forbidden in a bridge handler. As
-    // with the line-annotation valve above, set once for the bridge's lifetime
-    // (the bridge is opt-in via --agent-bridge, so interactive sessions are
-    // unaffected). NOTE: seeding.run / seeding.expand / seeding.analyze_paths
-    // are deliberately NOT exposed — those slots spin a nested
-    // QApplication::processEvents loop until child processes finish (SeedingWidget
-    // .cpp run/expand: ~while(jobsRunning)... , analyzePaths per-path), which a
-    // suppression flag cannot make safe.
+    // seeding action the bridge invokes (preview_rays, cast_rays, and the batch
+    // run/expand entry points) opens a precondition QMessageBox::warning on a
+    // failed precondition; a static QMessageBox spins a nested event loop,
+    // forbidden in a bridge handler. As with the line-annotation valve above, set
+    // once for the bridge's lifetime (the bridge is opt-in via --agent-bridge, so
+    // interactive sessions are unaffected). The batch actions (seeding.run /
+    // seeding.expand) are now exposed: their former nested-processEvents wait was
+    // refactored away (SeedingWidget::runSegmentationHeadless / runExpandSeedsHeadless
+    // launch the QProcess batch and return; it drains through the process finished
+    // callbacks and resolves via the seedingBatch* signals — see subscribeJobSignals).
     if (_window && _window->_seedingWidget) {
         _window->_seedingWidget->setDialogsSuppressed(true);
     }
@@ -803,6 +803,14 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleSeedingCastRays(p); });
     _handlers.insert("seeding.reset_points",
         [this](const QJsonValue& p) { return handleSeedingResetPoints(p); });
+    _handlers.insert("seeding.run",
+        [this](const QJsonValue& p) { return handleSeedingRun(p); });
+    _handlers.insert("seeding.expand",
+        [this](const QJsonValue& p) { return handleSeedingExpand(p); });
+    _handlers.insert("seeding.cancel",
+        [this](const QJsonValue& p) { return handleSeedingCancel(p); });
+    _handlers.insert("seeding.analyze_paths",
+        [this](const QJsonValue& p) { return handleSeedingAnalyzePaths(p); });
     _handlers.insert("segmentation.push_pull.set_config",
         [this](const QJsonValue& p) { return handlePushPullSetConfig(p); });
     _handlers.insert("segmentation.push_pull.start",
@@ -2613,6 +2621,20 @@ void AgentBridgeServer::subscribeJobSignals()
                     handleAtlasSearchFinished(success, resultCount);
                 });
     }
+
+    // Batch seeding lifecycle -> source:"seeding" jobs (SPEC §15.2). Emitted from
+    // the SeedingWidget QProcess finished callbacks (run/expand). Only
+    // bridge-initiated batches become tracked jobs (see handleSeedingBatch*).
+    if (_window && _window->_seedingWidget) {
+        connect(_window->_seedingWidget, &SeedingWidget::seedingBatchProgressChanged, this,
+                [this](const QString& kind, int completed, int total) {
+                    handleSeedingBatchProgress(kind, completed, total);
+                });
+        connect(_window->_seedingWidget, &SeedingWidget::seedingBatchFinished, this,
+                [this](const QString& kind, bool success, int completed, int total) {
+                    handleSeedingBatchFinished(kind, success, completed, total);
+                });
+    }
 }
 
 bool AgentBridgeServer::jobIsRunning(const QString& source) const
@@ -2631,6 +2653,13 @@ bool AgentBridgeServer::jobIsRunning(const QString& source) const
         // when a search launches and reset in its finished handler, so a
         // non-null flag means a search (bridge- or human-initiated) is live.
         if (source == QLatin1String("atlas") && _window->_atlasSearchCancelFlag)
+            return true;
+        // Lifecycle authority for seeding batches: seedingBatchActive() is true
+        // only while a run/expand batch is draining (not a neural trace, which
+        // shares the widget's jobsRunning flag) — so a human-initiated Run/Expand
+        // click is also seen as busy here (SPEC §15.2).
+        if (source == QLatin1String("seeding") && _window->_seedingWidget &&
+            _window->_seedingWidget->seedingBatchActive())
             return true;
     }
     return false;
@@ -2999,6 +3028,46 @@ void AgentBridgeServer::handleAtlasSearchFinished(bool success, int resultCount)
                   ? QStringLiteral("Atlas fiber search finished: %1 result(s)").arg(resultCount)
                   : QStringLiteral("Atlas fiber search canceled or failed"),
               QString());
+}
+
+// --- Batch seeding lifecycle (SPEC §15.2) ---
+
+void AgentBridgeServer::handleSeedingBatchProgress(const QString& kind, int completed,
+                                                   int total)
+{
+    // Only bridge-initiated batches are tracked (mirroring the atlas search): a
+    // human-clicked Run/Expand is deliberately NOT auto-registered as a job.
+    auto it = _activeJobs.find(QStringLiteral("seeding"));
+    if (it == _activeJobs.end())
+        return;
+    JobRecord& job = it.value();
+
+    const QString label = QStringLiteral("%1 %2/%3").arg(kind).arg(completed).arg(total);
+    job.message = label;
+
+    job.consoleTail.append(label);
+    while (job.consoleTail.size() > 50)
+        job.consoleTail.removeFirst();
+
+    // Rate-limit job.progress "output" to <=10/sec (SPEC §3.18).
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - _lastConsoleBroadcastMs < 100)
+        return;
+    _lastConsoleBroadcastMs = now;
+    broadcastJobProgress(job, QStringLiteral("output"), label);
+}
+
+void AgentBridgeServer::handleSeedingBatchFinished(const QString& kind, bool success,
+                                                   int completed, int total)
+{
+    // finishJob is a no-op when no seeding job is active (a human-initiated
+    // batch, or the neural-trace cancel path that emits an empty kind).
+    if (!_activeJobs.contains(QStringLiteral("seeding")))
+        return;
+    const QString label = success
+        ? QStringLiteral("Seeding %1 finished: %2/%3").arg(kind).arg(completed).arg(total)
+        : QStringLiteral("Seeding %1 canceled").arg(kind);
+    finishJob(QStringLiteral("seeding"), success, label, QString());
 }
 
 QJsonObject AgentBridgeServer::handleJobStatus(const QJsonValue& params)
@@ -4403,6 +4472,138 @@ QJsonObject AgentBridgeServer::handleSeedingResetPoints(const QJsonValue&)
     widget->runResetPoints();
     QJsonObject result;
     result["reset"] = true;
+    return result;
+}
+
+QJsonObject AgentBridgeServer::launchSeedingBatch(
+    const QString& kind, const QString& label,
+    const std::function<bool(QString* err)>& launch)
+{
+    CState* state = _window ? _window->_state : nullptr;
+    if (!state || !state->hasVpkg())
+        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+    if (!state->currentVolume())
+        throw AgentBridgeError{-32001, "No volume loaded", {}};
+    SeedingWidget* widget = _window ? _window->_seedingWidget : nullptr;
+    if (!widget) {
+        QJsonObject data;
+        data["detail"] = "seeding widget is not available";
+        throw AgentBridgeError{-32010, "Seeding widget unavailable", data};
+    }
+
+    // run and expand are mutually exclusive with each other (shared jobsRunning
+    // flag); both map to source:"seeding", so the standard per-source guard
+    // rejects a second batch of either kind (SPEC §8.3).
+    requireSourceIdle(QStringLiteral("seeding"));
+
+    QString err;
+    if (!launch(&err)) {
+        QJsonObject data;
+        data["detail"] = err;
+        // vc_grow_seg_from_seed missing -> -32006.
+        if (err.contains(QLatin1String("executable not found"), Qt::CaseInsensitive))
+            throw AgentBridgeError{-32006, "vc_grow_seg_from_seed not found", data};
+        // Missing config/paths inputs -> -32007 kind:"file" (mirrors
+        // tracer.run_trace's treatment of a missing trace_params.json).
+        if (err.contains(QLatin1String("seed.json"), Qt::CaseInsensitive) ||
+            err.contains(QLatin1String("expand.json"), Qt::CaseInsensitive) ||
+            err.contains(QLatin1String("paths directory"), Qt::CaseInsensitive)) {
+            data["kind"] = "file";
+            throw AgentBridgeError{-32007, err, data};
+        }
+        // Everything else (no source collection, no points, no volume) is a
+        // precondition/launch failure.
+        throw AgentBridgeError{-32005, QStringLiteral("Failed to start seeding %1").arg(kind), data};
+    }
+
+    const QString rpcKind = QStringLiteral("seeding.%1").arg(kind);
+    const QString jobId = beginJob(QStringLiteral("seeding"), rpcKind, label,
+                                   /*broadcastStart=*/true);
+
+    QJsonObject result;
+    result["jobId"] = jobId;
+    result["kind"] = rpcKind;
+    result["source"] = "seeding";
+    result["total"] = widget->seedingBatchTotal();
+    return result;
+}
+
+QJsonObject AgentBridgeServer::handleSeedingRun(const QJsonValue&)
+{
+    SeedingWidget* widget = _window ? _window->_seedingWidget : nullptr;
+    QJsonObject result = launchSeedingBatch(
+        QStringLiteral("run"), QStringLiteral("Seeding run started"),
+        [widget](QString* err) { return widget->runSegmentationHeadless(err); });
+    // For run, "total" is the source-collection point count.
+    result["points"] = result.value("total");
+    return result;
+}
+
+QJsonObject AgentBridgeServer::handleSeedingExpand(const QJsonValue&)
+{
+    SeedingWidget* widget = _window ? _window->_seedingWidget : nullptr;
+    QJsonObject result = launchSeedingBatch(
+        QStringLiteral("expand"), QStringLiteral("Seeding expand started"),
+        [widget](QString* err) { return widget->runExpandSeedsHeadless(err); });
+    // For expand, "total" is the number of expansion iterations.
+    result["iterations"] = result.value("total");
+    return result;
+}
+
+QJsonObject AgentBridgeServer::handleSeedingCancel(const QJsonValue&)
+{
+    SeedingWidget* widget = _window ? _window->_seedingWidget : nullptr;
+    if (!widget) {
+        QJsonObject data;
+        data["detail"] = "seeding widget is not available";
+        throw AgentBridgeError{-32010, "Seeding widget unavailable", data};
+    }
+    if (!jobIsRunning(QStringLiteral("seeding"))) {
+        QJsonObject data;
+        data["kind"] = "job";
+        throw AgentBridgeError{-32007, "No seeding batch running", data};
+    }
+    // Bounded synchronous teardown: terminate() + waitForFinished(1000) then
+    // kill() per running child (numProcesses is small — the "Processes" spin box).
+    // This synchronously emits seedingBatchFinished(kind,false,...), so the
+    // source:"seeding" job is already resolved (a job.progress "finished"
+    // notification has gone out) by the time this response is written.
+    widget->cancelSeedingBatchHeadless();
+    QJsonObject result;
+    result["cancelRequested"] = true;
+    return result;
+}
+
+QJsonObject AgentBridgeServer::handleSeedingAnalyzePaths(const QJsonValue&)
+{
+    CState* state = _window ? _window->_state : nullptr;
+    if (!state || !state->hasVpkg())
+        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+    if (!state->currentVolume())
+        throw AgentBridgeError{-32001, "No volume loaded", {}};
+    SeedingWidget* widget = _window ? _window->_seedingWidget : nullptr;
+    if (!widget) {
+        QJsonObject data;
+        data["detail"] = "seeding widget is not available";
+        throw AgentBridgeError{-32010, "Seeding widget unavailable", data};
+    }
+    // Synchronous, in-process compute (no QProcess, no nested event loop): runs
+    // to completion before returning, so this is a plain synchronous RPC rather
+    // than a job (SPEC §15.2). Requires paths drawn in the widget's Draw mode.
+    QString err;
+    int pathsAnalyzed = 0;
+    int peaksFound = 0;
+    if (!widget->runAnalyzePathsHeadless(&err, &pathsAnalyzed, &peaksFound)) {
+        QJsonObject data;
+        data["detail"] = err;
+        // No drawn paths is a precondition failure, not a bad-params error.
+        data["kind"] = "path";
+        throw AgentBridgeError{-32007, err, data};
+    }
+    QJsonObject result;
+    result["analyzed"] = true;
+    result["paths"] = pathsAnalyzed;
+    result["peaks"] = peaksFound;
     return result;
 }
 
