@@ -396,7 +396,19 @@ function isAutomationIdentity(permission, serviceAccountEmail) {
 
 function isGoogleServiceAccountIdentity(permission) {
   if (typeof permission?.emailAddress !== 'string') return false;
-  return permission.emailAddress.toLowerCase().endsWith('.iam.gserviceaccount.com');
+  return permission.emailAddress.toLowerCase().endsWith('.gserviceaccount.com');
+}
+
+function assertNoUnexpectedServiceAccountPermissions(permissions, serviceAccountEmail) {
+  assertNonEmptyString(serviceAccountEmail, 'serviceAccountEmail');
+  const hasUnexpectedServiceAccount = permissions.some((permission) => (
+    permission?.deleted !== true
+    && isGoogleServiceAccountIdentity(permission)
+    && !isAutomationIdentity(permission, serviceAccountEmail)
+  ));
+  if (hasUnexpectedServiceAccount) {
+    throw new Error('Google resource has an unexpected service-account permission');
+  }
 }
 
 function assertCollaboratorConfiguration(collaboratorPermissions, serviceAccountEmail) {
@@ -459,6 +471,7 @@ function desiredPermissions(
 
 function assertPermissionsMatch(expected, actual, { serviceAccountEmail } = {}) {
   assertNonEmptyString(serviceAccountEmail, 'serviceAccountEmail');
+  assertNoUnexpectedServiceAccountPermissions(actual, serviceAccountEmail);
   const expectedKeys = new Set(expected.map(permissionIdentityKey));
   const effectivePermissions = effectiveComparablePermissions(actual).filter(
     (permission) => !isAutomationIdentity(permission, serviceAccountEmail),
@@ -865,6 +878,7 @@ export function createRolloverService({
       google.getAllPermissions({ fileId: runtime.folderId }),
     ]);
     assertDestinationFolder(folder, runtime);
+    assertNoUnexpectedServiceAccountPermissions(permissions, runtime.serviceAccountEmail);
     const allowedKeys = new Set(collaboratorPermissions.map(permissionIdentityKey));
     const hasUnexpectedAccess = effectiveEditablePermissions(permissions).some((permission) => (
       !isAutomationIdentity(permission, runtime.serviceAccountEmail)
@@ -881,6 +895,16 @@ export function createRolloverService({
     requireShare = false,
   } = {}) {
     assertResolvedSourceLocation(resolution, snapshot.file);
+    // The explicit owner-My-Drive July source is the only exception: it carries
+    // the production writer and the intentional direct staging reader needed
+    // for the one-time bootstrap. Managed and Shared Drive sources may expose
+    // only the automation identity for their own environment.
+    if (resolution.origin !== SOURCE_ORIGINS.EXPLICIT_MY_DRIVE) {
+      assertNoUnexpectedServiceAccountPermissions(
+        snapshot.permissions,
+        runtime.serviceAccountEmail,
+      );
+    }
     const requiredCapabilities = [
       'canEdit',
       ...(requireCopy ? ['canCopy'] : []),
@@ -1016,11 +1040,20 @@ export function createRolloverService({
     assertRolloverRuntimeSafety(runtime, { faultInjection });
     assertStagingIdentity(runtime);
     parseCycle(sourceCycle);
+    if (sourceCycle !== INITIAL_EXPLICIT_SOURCE_CYCLE) {
+      throw new Error('Staging bootstrap is restricted to the initial explicit source cycle');
+    }
     assertNonEmptyString(sourceFormId, 'sourceFormId');
     assertCollaboratorConfiguration(collaboratorPermissions, runtime.serviceAccountEmail);
 
     const liveFile = await google.getFile({ fileId: sourceFormId });
     assertUsableFormFile(liveFile);
+    if (
+      (liveFile.driveId !== undefined && liveFile.driveId !== null)
+      || liveFile.appProperties?.managedBy === ROLLOVER_MANAGED_BY
+    ) {
+      throw new Error('Staging bootstrap requires the initial explicit My Drive source');
+    }
     const liveSnapshot = await loadSnapshot(liveFile);
     // The staging identity deliberately has read/copy-only access to production.
     // It must never need edit or share capability on the active live form.
@@ -1062,6 +1095,18 @@ export function createRolloverService({
           ROLLOVER_FILE_STATES.COPIED,
         ),
       });
+      assertNonEmptyString(stagedFile?.id, 'copied form ID');
+      // The source copy inherits the live form's accepting state. Close it
+      // before trusting or reconciling any copied Drive metadata or ACLs.
+      const copiedForm = await google.getForm({ formId: stagedFile.id });
+      const closedCopy = await ensurePublishState(google, copiedForm, {
+        isPublished: true,
+        isAcceptingResponses: false,
+      });
+      assertExpectedPublishing(closedCopy, {
+        isPublished: true,
+        isAcceptingResponses: false,
+      });
       assertManagedFile(
         stagedFile,
         runtime,
@@ -1076,6 +1121,13 @@ export function createRolloverService({
     }
 
     if (dryRun) {
+      if (stagedFile !== undefined) {
+        const permissions = await google.getAllPermissions({ fileId: stagedFile.id });
+        assertNoUnexpectedServiceAccountPermissions(
+          permissions,
+          runtime.serviceAccountEmail,
+        );
+      }
       return Object.freeze({
         action: 'bootstrap',
         status: 'planned',
@@ -1086,6 +1138,13 @@ export function createRolloverService({
       });
     }
 
+    if (stagedFile.appProperties?.state === ROLLOVER_FILE_STATES.COPIED) {
+      const recoveryForm = await google.getForm({ formId: stagedFile.id });
+      await ensurePublishState(google, recoveryForm, {
+        isPublished: true,
+        isAcceptingResponses: false,
+      });
+    }
     let stagedSnapshot = await loadSnapshot(stagedFile);
     assertManagedFile(
       stagedSnapshot.file,
@@ -1100,10 +1159,6 @@ export function createRolloverService({
       ...stagedSnapshot,
       ...titled,
     };
-    stagedSnapshot.form = await ensurePublishState(google, stagedSnapshot.form, {
-      isPublished: true,
-      isAcceptingResponses: true,
-    });
     const expectedPermissions = expectedTargetPermissions(
       liveSnapshot.permissions,
       collaboratorPermissions,
@@ -1118,12 +1173,16 @@ export function createRolloverService({
     );
     assertSameStructure(liveSnapshot.form, stagedSnapshot.form);
     assertTitle(stagedSnapshot.form, stagedSnapshot.file, title);
+    const stagedState = stagedSnapshot.file.appProperties?.state;
+    if (
+      stagedState !== ROLLOVER_FILE_STATES.COPIED
+      && stagedState !== ROLLOVER_FILE_STATES.ACTIVE
+    ) {
+      throw new Error('Managed staging source is not in a bootstrap recovery state');
+    }
     assertExpectedPublishing(stagedSnapshot.form, {
       isPublished: true,
-      isAcceptingResponses: true,
-    });
-    await markFile(stagedSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
-      sourceCycle,
+      isAcceptingResponses: stagedState === ROLLOVER_FILE_STATES.ACTIVE,
     });
 
     const liveAfter = await loadSnapshot(liveFile);
@@ -1135,6 +1194,18 @@ export function createRolloverService({
     ) {
       throw new Error('Production source changed during staging bootstrap');
     }
+
+    stagedSnapshot.form = await ensurePublishState(google, stagedSnapshot.form, {
+      isPublished: true,
+      isAcceptingResponses: true,
+    });
+    assertExpectedPublishing(stagedSnapshot.form, {
+      isPublished: true,
+      isAcceptingResponses: true,
+    });
+    await markFile(stagedSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
+      sourceCycle,
+    });
 
     return Object.freeze({
       action: 'bootstrap',
@@ -1298,6 +1369,11 @@ export function createRolloverService({
         sourceSnapshot.file,
         runtime,
         rollover.sourceCycle,
+      );
+      assertPermissionsMatch(
+        expectedPermissions,
+        existing.permissions,
+        { serviceAccountEmail: runtime.serviceAccountEmail },
       );
       return Object.freeze({
         action: 'prepare',
@@ -1588,6 +1664,12 @@ export function createRolloverService({
       loadSnapshot(source.file),
       loadSnapshot(targetFile),
     ]);
+    if (mode === 'cleaned') {
+      assertNoUnexpectedServiceAccountPermissions(
+        sourceSnapshot.permissions,
+        runtime.serviceAccountEmail,
+      );
+    }
     assertManagedFile(
       targetSnapshot.file,
       runtime,
@@ -1696,13 +1778,22 @@ export function createRolloverService({
       await requireManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle, { inActiveFolder: false }),
     ];
 
+    const permissionsByFile = new Map(await Promise.all(files.map(async (file) => {
+      const permissions = await google.getAllPermissions({ fileId: file.id });
+      assertNoUnexpectedServiceAccountPermissions(
+        permissions,
+        runtime.serviceAccountEmail,
+      );
+      return [file.id, permissions];
+    })));
+
     for (const file of files) {
       let form = await google.getForm({ formId: file.id });
       form = await ensurePublishState(google, form, {
         isPublished: false,
         isAcceptingResponses: false,
       });
-      const permissions = await google.getAllPermissions({ fileId: file.id });
+      const permissions = permissionsByFile.get(file.id);
       for (const permission of filterPublishedResponderPermissions(permissions)) {
         await google.deletePermission({ fileId: file.id, permissionId: permission.id });
       }

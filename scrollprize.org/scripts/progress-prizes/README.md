@@ -72,13 +72,29 @@ Protected Environment variables:
 - `PROGRESS_PRIZE_FOLDER_ID` (the staging active folder)
 - `PROGRESS_PRIZE_ARCHIVE_FOLDER_ID` (the staging archive folder)
 - `PROGRESS_PRIZE_SOURCE_FORM_ID` (the initial owner-My-Drive form's private file ID)
-- `PROGRESS_PRIZE_EDITOR_GROUP_EMAIL` (a staging-only internal group)
+- `PROGRESS_PRIZE_EDITOR_GROUP_EMAIL` (the staging-only group containing the
+  three internal form editors)
 
 Share only the initial form, not its My Drive folder, directly with the staging
-service account as Viewer. The preflight requires `canCopy` and rejects
-`canEdit` or `canShare`; it also verifies the direct, non-expiring reader ACL.
-Give that account creator, editor, and sharing rights only in the staging Shared
-Drive. The staging group must not be the production editor group.
+service account using a Drive `reader` permission. The current Forms sharing UI
+offers only **Responder** and **Editor**, so it cannot create this least-privilege
+ACL: use Drive API `permissions.create` with the following generic request and
+keep the resulting permission non-expiring:
+
+```text
+fileId: <INITIAL_FORM_FILE_ID>
+supportsAllDrives: true
+sendNotificationEmail: false
+requestBody: {type: "user", role: "reader", emailAddress: <STAGING_SERVICE_ACCOUNT_EMAIL>}
+```
+
+Do not substitute the Forms **Responder** role. The preflight requires `canCopy`
+and rejects `canEdit` or `canShare`; it also verifies the direct reader ACL.
+Give the account creator, editor, and sharing rights only in the staging Shared
+Drive. The staging group and production group are distinct private groups, each
+containing the same three internal editors. Staging bootstrap deliberately does
+not copy any production collaborator: the staging form receives only the
+staging group and its anonymous published-responder permission.
 After setup, keep the staging automation account as that Shared Drive's only
 Manager or Content manager; other inherited administrative access fails the
 same exact ACL gate used in production.
@@ -92,18 +108,28 @@ Protected Environment variables:
 - `PROGRESS_PRIZE_DRIVE_ID` (the destination/managed production Shared Drive)
 - `PROGRESS_PRIZE_FOLDER_ID` (the destination active forms folder)
 - `PROGRESS_PRIZE_SOURCE_FORM_ID` (the initial owner-My-Drive form's private file ID)
-- `PROGRESS_PRIZE_EDITOR_GROUP_EMAIL` (the production internal editor group)
+- `PROGRESS_PRIZE_EDITOR_GROUP_EMAIL` (the production-only group containing the
+  three internal form editors)
 
 Share only the initial form, not its My Drive folder, directly with the
 production service account as Editor. The preflight requires a direct,
 non-expiring writer ACL plus `canCopy` and `canEdit`; `canShare` is deliberately
-not required on this owner-controlled source. The account must separately be
-able to create, copy, edit, and share forms in the production destination
-folder, and must have no access to the staging Shared Drive. The destination is
-validated as a writable folder in the configured Shared Drive before any copy.
-Keep the matching automation account as the only Shared Drive Manager or
-Content manager. Unexpected inherited writers, domains, service accounts,
-Managers, or Content managers fail the ACL gate.
+not required on this owner-controlled source. Share the form with the production
+editor group as Editor, remove the three internal editors' individual form ACLs
+after group access is verified, and retain the external editor as one direct,
+non-expiring production writer. Do not add that external editor to either
+internal group or to staging. Production copies preserve the configured
+production group and that direct external writer across cycles; neither service
+account is recreated as a direct form collaborator.
+
+The production account must separately be able to create, copy, edit, and share
+forms in the production destination folder, and must have no access to the
+staging Shared Drive. The destination is validated as a writable folder in the
+configured Shared Drive before any copy. Keep the matching automation account
+as the only Shared Drive Manager or Content manager. Every active permission
+role is inspected: any other Google service account—including a reader or
+owner—fails closed, as do unexpected inherited writers, domains, Managers, or
+Content managers.
 
 No archive folder is supplied to production, and the workflow deliberately
 supplies empty staging-identity values in production mode.
@@ -148,18 +174,22 @@ attribute.environment         = assertion.environment
 attribute.job_workflow_ref    = assertion.job_workflow_ref
 ```
 
-Use this condition blueprint for staging, substituting only the Environment name
-for production:
+Use this condition blueprint for staging. Staging has no scheduled caller, so it
+accepts manual dispatch only:
 
 ```text
 attribute.repository == 'ScrollPrize/villa' &&
 attribute.repository_id == '890972577' &&
 attribute.repository_owner_id == '121906140' &&
 attribute.ref == 'refs/heads/main' &&
-(attribute.event_name == 'workflow_dispatch' || attribute.event_name == 'schedule') &&
+attribute.event_name == 'workflow_dispatch' &&
 attribute.environment == 'progress-prizes-staging' &&
 attribute.job_workflow_ref == 'ScrollPrize/villa/.github/workflows/progress-prizes-google.yml@refs/heads/main'
 ```
+
+Use the same immutable repository, owner, ref, Environment, and reusable-workflow
+checks for production, but set the Environment to
+`progress-prizes-production` and permit either `workflow_dispatch` or `schedule`.
 
 Bind only that provider principal to its matching service account with
 `roles/iam.workloadIdentityUser`. Use the numeric Google project number when
@@ -219,23 +249,32 @@ managed source in any later cycle fails instead of reusing July:
 
 1. Put the same private form ID in the staging and production protected
    Environments. Do not put it in a repository file or ordinary GitHub variable.
-2. Share only that form directly with the staging service account as Viewer and
-   the production service account as Editor. Keep both ACLs non-expiring through
-   the rehearsal; keep the production writer through activation, recovery, and
-   active verification.
-3. The Google copy operation does not carry the source ACL into the destination.
+2. Give the staging service account the direct Drive API `reader` permission
+   described above and give the production service account a direct Forms
+   Editor/Drive `writer` permission. Keep both ACLs non-expiring through the
+   rehearsal; keep the production writer through activation, recovery, and
+   active verification. The staging reader is permitted only on this explicit
+   initial My Drive source, never on a managed form or destination folder.
+3. Create separate private production and staging editor groups containing the
+   same three internal editors. Share July with the production group as Editor,
+   remove those three people's direct ACLs after verification, and keep the one
+   external editor as a direct production writer. Do not share either the
+   production group or the external editor with staging.
+4. The Google copy operation does not carry the source ACL into the destination.
    The destination first inherits its Shared Drive access, then the automation
-   reconciles the anonymous published-reader permission and human/group editors.
-   Owner and automation-service-account ACLs are never recreated on the copy.
+   reconciles the anonymous published-reader permission and the environment's
+   intended collaborators. Staging copies only its staging group. Production
+   copies its production group and direct external writer. Owner and
+   automation-service-account ACLs are never recreated on a copy.
    Effective inherited writers/commenters and Shared Drive administrative roles
    are checked exactly. The current environment's automation account is the only
-   ignored administrative identity; any staging/rogue service account, domain
-   writer, Manager, or Content manager fails closed.
-4. Before the real cutoff, repeat the close/open mutation path on a sacrificial
+   permitted service-account identity on managed resources; any other service
+   account at any role, domain writer, Manager, or Content manager fails closed.
+5. Before the real cutoff, repeat the close/open mutation path on a sacrificial
    My Drive form. Read-only capability validation cannot prove that Workspace
    policy will allow the service account to call Forms publish settings and
    write the private recovery marker.
-5. After the August form is active and verified, the owner may remove both
+6. After the August form is active and verified, the owner may remove both
    direct service-account ACLs from July. Later cycles resolve only managed forms
    in the production Shared Drive, even if the stale fallback variable remains.
 
