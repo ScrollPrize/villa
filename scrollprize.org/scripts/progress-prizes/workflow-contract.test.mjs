@@ -6,12 +6,14 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  activationCommitNeedsRefresh,
   assertAutomationBranch,
   assertDeterministicPageDelta,
   assertPullBinding,
   assertSinglePageCommit,
   gateSnapshot,
   isTrustedPreviewRun,
+  resolveProductionActivationState,
   waitForPullBinding,
 } from '../../../.github/progress-prizes-github.mjs';
 
@@ -19,6 +21,7 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../.
 const workflowNames = [
   'progress-prizes-page-pr.yml',
   'progress-prizes-pr-safety.yml',
+  'progress-prizes-production.yml',
   'progress-prizes-rehearsal.yml',
   'progress-prizes-vercel-preview.yml',
 ];
@@ -418,11 +421,13 @@ test('composite pre-auth guard executes the activation rewind matrix before OIDC
     EXPECT_FAULT: 'false',
     DRY_RUN: 'false',
     ALLOW_ACTIVATION_REWIND: 'true',
+    VERIFY_MODE: 'prepared',
     BRANCH: 'codex/progress-prize-smoke-20260720',
     TARGET_BRANCH: 'codex/progress-prize-smoke-base-20260720',
     SOURCE_CYCLE: '2026-07',
     TARGET_CYCLE: '2026-08',
     HEAD_SHA: '',
+    BASE_SHA: '',
   };
   const run = (override = {}) => spawnSync('bash', ['--noprofile', '--norc'], {
     input: guard,
@@ -454,6 +459,52 @@ test('composite pre-auth guard executes the activation rewind matrix before OIDC
       BRANCH: 'main',
       TARGET_BRANCH: 'main',
     },
+  ]) {
+    assert.notEqual(run(override).status, 0, JSON.stringify(override));
+  }
+});
+
+test('composite production activation guard requires an exact immutable base lease', async () => {
+  const action = await googleAction();
+  const guard = literalRunScripts(action)[0]?.source;
+  const valid = {
+    REPOSITORY: 'ScrollPrize/villa',
+    REPOSITORY_ID: '890972577',
+    REPOSITORY_OWNER_ID: '121906140',
+    REF: 'refs/heads/main',
+    AUTOMATION_ENVIRONMENT: 'production',
+    EVENT_NAME: 'workflow_dispatch',
+    OPERATION: 'activate',
+    SIMULATED_NOW: '',
+    FAULT: '',
+    EXPECT_FAULT: 'false',
+    DRY_RUN: 'false',
+    ALLOW_ACTIVATION_REWIND: 'false',
+    VERIFY_MODE: 'prepared',
+    BRANCH: 'codex/progress-prize-2026-08',
+    TARGET_BRANCH: 'main',
+    SOURCE_CYCLE: '2026-07',
+    TARGET_CYCLE: '2026-08',
+    HEAD_SHA: 'a'.repeat(40),
+    BASE_SHA: 'b'.repeat(40),
+  };
+  const run = (override = {}) => spawnSync('bash', ['--noprofile', '--norc'], {
+    input: guard,
+    encoding: 'utf8',
+    env: { ...valid, ...override },
+  });
+
+  assert.equal(run().status, 0);
+  for (const override of [
+    { BASE_SHA: '' },
+    { BASE_SHA: 'not-a-sha' },
+    { EVENT_NAME: 'schedule' },
+    { BRANCH: 'main' },
+    { TARGET_BRANCH: 'release' },
+    { SIMULATED_NOW: '2026-08-01T07:01:00.000Z' },
+    { FAULT: 'after-close-source' },
+    { DRY_RUN: 'true' },
+    { VERIFY_MODE: 'invalid' },
   ]) {
     assert.notEqual(run(override).status, 0, JSON.stringify(override));
   }
@@ -844,10 +895,123 @@ test('the GitHub helper binds the PR and exact deterministic page-only commit', 
     files: [{ filename: 'scrollprize.org/docs/34_prizes.md', status: 'modified' }],
   };
   assert.equal(assertSinglePageCommit(commit, { headSha, baseSha }), commit);
+  assert.equal(activationCommitNeedsRefresh(commit, { headSha, baseSha }), false);
   assert.throws(() => assertSinglePageCommit({
     ...commit,
     files: [...commit.files, { filename: '.github/workflows/untrusted.yml', status: 'added' }],
   }, { headSha, baseSha }), /one page-only commit/);
+  assert.equal(activationCommitNeedsRefresh({
+    ...commit,
+    parents: [{ sha: 'c'.repeat(40) }],
+  }, { headSha, baseSha }), true);
+  assert.throws(() => activationCommitNeedsRefresh({
+    ...commit,
+    files: [...commit.files, { filename: '.github/workflows/untrusted.yml', status: 'added' }],
+  }, { headSha, baseSha }), /Only a page-only commit/);
+  assert.throws(() => activationCommitNeedsRefresh({
+    ...commit,
+    parents: [{ sha: baseSha }, { sha: 'c'.repeat(40) }],
+  }, { headSha, baseSha }), /Only a page-only commit/);
+});
+
+test('production activation-state recovery distinguishes exact, stale, and completed state', async () => {
+  const head = 'codex/progress-prize-2026-08';
+  const base = 'main';
+  const headSha = 'a'.repeat(40);
+  const baseSha = 'b'.repeat(40);
+  const staleSha = 'c'.repeat(40);
+  const pull = {
+    number: 42,
+    state: 'open',
+    head: {
+      ref: head,
+      sha: headSha,
+      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
+    },
+    base: {
+      ref: base,
+      sha: baseSha,
+      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
+    },
+  };
+  const exactCommit = {
+    sha: headSha,
+    parents: [{ sha: baseSha }],
+    files: [{ filename: 'scrollprize.org/docs/34_prizes.md', status: 'modified' }],
+  };
+  const options = { head, base, cycle: '2026-08', expectedBaseSha: baseSha };
+
+  const pending = await resolveProductionActivationState(options, {
+    listPulls: async () => [pull],
+    readCommit: async () => exactCommit,
+  });
+  assert.deepEqual(pending, {
+    state: 'pending',
+    headSha,
+    baseSha,
+    pullNumber: '42',
+    refreshRequired: false,
+  });
+
+  const stale = await resolveProductionActivationState(options, {
+    listPulls: async () => [pull],
+    readCommit: async () => ({ ...exactCommit, parents: [{ sha: staleSha }] }),
+  });
+  assert.equal(stale.refreshRequired, true);
+
+  const completed = await resolveProductionActivationState(options, {
+    listPulls: async () => [],
+    readMainRef: async () => ({ object: { sha: baseSha } }),
+    readPage: async () => ({ cycle: '2026-08' }),
+  });
+  assert.deepEqual(completed, {
+    state: 'completed',
+    headSha: baseSha,
+    baseSha,
+    pullNumber: '',
+    refreshRequired: false,
+  });
+});
+
+test('production activation-state recovery fails closed on ambiguous or drifting state', async () => {
+  const head = 'codex/progress-prize-2026-08';
+  const base = 'main';
+  const headSha = 'a'.repeat(40);
+  const baseSha = 'b'.repeat(40);
+  const pull = {
+    number: 42,
+    state: 'open',
+    head: {
+      ref: head,
+      sha: headSha,
+      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
+    },
+    base: {
+      ref: base,
+      sha: baseSha,
+      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
+    },
+  };
+  const options = { head, base, cycle: '2026-08', expectedBaseSha: baseSha };
+
+  await assert.rejects(
+    resolveProductionActivationState(options, { listPulls: async () => [pull, pull] }),
+    /ambiguous/,
+  );
+  await assert.rejects(
+    resolveProductionActivationState(options, {
+      listPulls: async () => [{ ...pull, base: { ...pull.base, sha: 'c'.repeat(40) } }],
+    }),
+    /main moved/,
+  );
+  await assert.rejects(
+    resolveProductionActivationState(options, {
+      listPulls: async () => [],
+      readMainRef: async () => ({ object: { sha: baseSha } }),
+      readPage: async () => ({ cycle: '2026-07' }),
+    }),
+    /Neither a pending PR nor a completed production cycle exists/,
+  );
 });
 
 test('PR binding retry tolerates only bounded stale SHAs', async () => {
