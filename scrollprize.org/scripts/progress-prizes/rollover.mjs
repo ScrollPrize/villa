@@ -81,8 +81,12 @@ function assertNonEmptyString(value, label) {
   return value;
 }
 
-function normalizeEmail(value) {
-  return assertNonEmptyString(value, 'service account identity').trim().toLowerCase();
+function normalizeEmail(value, label) {
+  const normalized = assertNonEmptyString(value, label).trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+$/.test(normalized)) {
+    throw new TypeError(`${label} must be an email address`);
+  }
+  return normalized;
 }
 
 function hasValue(value) {
@@ -102,9 +106,10 @@ function normalizeRuntime(runtime = {}) {
     eventName,
     folderId: assertNonEmptyString(runtime.folderId, 'folderId'),
     driveId: assertNonEmptyString(runtime.driveId, 'driveId'),
-    serviceAccountEmail: normalizeEmail(runtime.serviceAccountEmail),
+    serviceAccountEmail: normalizeEmail(runtime.serviceAccountEmail, 'serviceAccountEmail'),
+    driveAdminEmail: normalizeEmail(runtime.driveAdminEmail, 'driveAdminEmail'),
     stagingServiceAccountEmail: hasValue(runtime.stagingServiceAccountEmail)
-      ? normalizeEmail(runtime.stagingServiceAccountEmail)
+      ? normalizeEmail(runtime.stagingServiceAccountEmail, 'stagingServiceAccountEmail')
       : undefined,
     stagingFolderId: runtime.stagingFolderId,
     branch: assertNonEmptyString(runtime.branch, 'branch'),
@@ -122,6 +127,12 @@ function normalizeRuntime(runtime = {}) {
   }
   if (normalized.archiveFolderId !== undefined) {
     assertNonEmptyString(normalized.archiveFolderId, 'archiveFolderId');
+  }
+  if (
+    normalized.driveAdminEmail === normalized.serviceAccountEmail
+    || normalized.driveAdminEmail.endsWith('.gserviceaccount.com')
+  ) {
+    throw new Error('driveAdminEmail must identify a separate human break-glass administrator');
   }
   if (normalized.smokeDate !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(normalized.smokeDate)) {
     throw new TypeError('smokeDate must use YYYY-MM-DD format');
@@ -343,7 +354,7 @@ function effectiveEditablePermissions(permissions) {
     permission
     && permission.deleted !== true
     && permission.pendingOwner !== true
-    && ['writer', 'commenter', 'organizer', 'fileOrganizer'].includes(permission.role)
+    && ['writer', 'commenter', 'organizer', 'fileOrganizer', 'owner'].includes(permission.role)
     && (
       (
         ['user', 'group'].includes(permission.type)
@@ -399,6 +410,13 @@ function isGoogleServiceAccountIdentity(permission) {
   return permission.emailAddress.toLowerCase().endsWith('.gserviceaccount.com');
 }
 
+function isDriveAdminIdentity(permission, driveAdminEmail) {
+  return (
+    typeof permission?.emailAddress === 'string'
+    && permission.emailAddress.toLowerCase() === driveAdminEmail.toLowerCase()
+  );
+}
+
 function assertNoUnexpectedServiceAccountPermissions(permissions, serviceAccountEmail) {
   assertNonEmptyString(serviceAccountEmail, 'serviceAccountEmail');
   const hasUnexpectedServiceAccount = permissions.some((permission) => (
@@ -411,13 +429,78 @@ function assertNoUnexpectedServiceAccountPermissions(permissions, serviceAccount
   }
 }
 
-function assertCollaboratorConfiguration(collaboratorPermissions, serviceAccountEmail) {
+function assertExactInheritedOrganizer(permissions, identityEmail, driveId, { label } = {}) {
+  const matches = permissions.filter((permission) => (
+    permission?.deleted !== true
+    && permission?.pendingOwner !== true
+    && typeof permission?.emailAddress === 'string'
+    && permission.emailAddress.toLowerCase() === identityEmail.toLowerCase()
+  ));
+  const permission = matches[0];
+  const details = permission?.permissionDetails;
+  const detail = details?.[0];
+  // Drive uses one Permission resource per grantee and records every direct and
+  // inherited role source in permissionDetails. Checking only the top-level
+  // effective role would therefore hide a merged direct file/folder grant.
+  const valid = matches.length === 1
+    && permission.type === 'user'
+    && permission.role === 'organizer'
+    && !hasValue(permission.expirationTime)
+    && Array.isArray(details)
+    && details.length === 1
+    && detail.permissionType === 'member'
+    && detail.role === 'organizer'
+    && detail.inherited === true
+    && detail.inheritedFrom === driveId;
+  if (!valid) {
+    throw new Error(`Shared Drive ${label} access is not exactly one inherited Manager permission`);
+  }
+}
+
+function assertSharedDriveManagerPermissions(permissions, runtime) {
+  assertNoUnexpectedServiceAccountPermissions(permissions, runtime.serviceAccountEmail);
+  assertExactInheritedOrganizer(permissions, runtime.serviceAccountEmail, runtime.driveId, {
+    label: 'automation',
+  });
+  assertExactInheritedOrganizer(permissions, runtime.driveAdminEmail, runtime.driveId, {
+    label: 'break-glass administrator',
+  });
+}
+
+function assertNoInheritedOrAdministrativeFormCollaborators(permissions, runtime) {
+  const hasForbiddenAccess = effectiveEditablePermissions(permissions).some((permission) => (
+    !isAutomationIdentity(permission, runtime.serviceAccountEmail)
+    && !isDriveAdminIdentity(permission, runtime.driveAdminEmail)
+    && (
+      isInheritedPermission(permission)
+      || ['organizer', 'fileOrganizer', 'owner'].includes(permission.role)
+      || permission.type === 'domain'
+    )
+  ));
+  if (hasForbiddenAccess) {
+    throw new Error('Managed form has unexpected inherited or administrative edit access');
+  }
+}
+
+function assertCollaboratorConfiguration(
+  collaboratorPermissions,
+  serviceAccountEmail,
+  driveAdminEmail,
+) {
   assertCollaboratorPermissions(collaboratorPermissions);
   if (collaboratorPermissions.some(
     (permission) => isGoogleServiceAccountIdentity(permission)
       || isAutomationIdentity(permission, serviceAccountEmail),
   )) {
     throw new Error('An automation service account cannot be configured as a form collaborator');
+  }
+  if (
+    driveAdminEmail !== undefined
+    && collaboratorPermissions.some(
+      (permission) => isDriveAdminIdentity(permission, driveAdminEmail),
+    )
+  ) {
+    throw new Error('The break-glass administrator cannot be configured as a form collaborator');
   }
 }
 
@@ -434,10 +517,15 @@ function desiredPermissions(
   {
     includeInheritedCollaborators = false,
     serviceAccountEmail,
+    driveAdminEmail,
   } = {},
 ) {
   assertNonEmptyString(serviceAccountEmail, 'serviceAccountEmail');
-  assertCollaboratorConfiguration(collaboratorPermissions, serviceAccountEmail);
+  assertCollaboratorConfiguration(
+    collaboratorPermissions,
+    serviceAccountEmail,
+    driveAdminEmail,
+  );
   const sourceCollaborators = includeInheritedCollaborators
     ? effectiveCollaboratorPermissions(sourcePermissions)
     : filterDirectCollaboratorPermissions(sourcePermissions);
@@ -469,12 +557,15 @@ function desiredPermissions(
   ]);
 }
 
-function assertPermissionsMatch(expected, actual, { serviceAccountEmail } = {}) {
-  assertNonEmptyString(serviceAccountEmail, 'serviceAccountEmail');
-  assertNoUnexpectedServiceAccountPermissions(actual, serviceAccountEmail);
+function assertPermissionsMatch(expected, actual, { runtime } = {}) {
+  assertSharedDriveManagerPermissions(actual, runtime);
+  assertNoInheritedOrAdministrativeFormCollaborators(actual, runtime);
   const expectedKeys = new Set(expected.map(permissionIdentityKey));
   const effectivePermissions = effectiveComparablePermissions(actual).filter(
-    (permission) => !isAutomationIdentity(permission, serviceAccountEmail),
+    (permission) => (
+      !isAutomationIdentity(permission, runtime.serviceAccountEmail)
+      && !isDriveAdminIdentity(permission, runtime.driveAdminEmail)
+    ),
   );
   const effectiveKeys = new Set(effectivePermissions.map(permissionIdentityKey));
   const hasUnexpectedPermission = effectivePermissions
@@ -498,6 +589,7 @@ function assertRequiredSourcePermissions(permissions, requiredCollaborators = []
     const found = permissions.some((permission) => (
       permission?.deleted !== true
       && permission?.pendingOwner !== true
+      && !isInheritedPermission(permission)
       && permission?.type === expected.type
       && permission?.role === expected.role
       && permission?.emailAddress?.toLowerCase() === expected.emailAddress?.toLowerCase()
@@ -872,19 +964,20 @@ export function createRolloverService({
     throw new Error(`Managed source form is missing for cycle ${sourceCycle}`);
   }
 
-  async function requireDestinationFolder(collaboratorPermissions) {
+  async function requireDestinationFolder() {
     const [folder, permissions] = await Promise.all([
       google.getFile({ fileId: runtime.folderId }),
       google.getAllPermissions({ fileId: runtime.folderId }),
     ]);
     assertDestinationFolder(folder, runtime);
-    assertNoUnexpectedServiceAccountPermissions(permissions, runtime.serviceAccountEmail);
-    const allowedKeys = new Set(collaboratorPermissions.map(permissionIdentityKey));
-    const hasUnexpectedAccess = effectiveEditablePermissions(permissions).some((permission) => (
-      !isAutomationIdentity(permission, runtime.serviceAccountEmail)
-      && !allowedKeys.has(permissionIdentityKey(permission))
-    ));
-    if (hasUnexpectedAccess) {
+    assertSharedDriveManagerPermissions(permissions, runtime);
+    const editablePermissions = effectiveEditablePermissions(permissions).filter(
+      (permission) => (
+        !isAutomationIdentity(permission, runtime.serviceAccountEmail)
+        && !isDriveAdminIdentity(permission, runtime.driveAdminEmail)
+      ),
+    );
+    if (editablePermissions.length !== 0) {
       throw new Error('The destination folder has unexpected inherited edit access');
     }
     return folder;
@@ -898,12 +991,11 @@ export function createRolloverService({
     // The explicit owner-My-Drive July source is the only exception: it carries
     // the production writer and the intentional direct staging reader needed
     // for the one-time bootstrap. Managed and Shared Drive sources may expose
-    // only the automation identity for their own environment.
+    // only the configured inherited automation and break-glass Managers plus
+    // the expected form collaborators for their own environment.
     if (resolution.origin !== SOURCE_ORIGINS.EXPLICIT_MY_DRIVE) {
-      assertNoUnexpectedServiceAccountPermissions(
-        snapshot.permissions,
-        runtime.serviceAccountEmail,
-      );
+      assertSharedDriveManagerPermissions(snapshot.permissions, runtime);
+      assertNoInheritedOrAdministrativeFormCollaborators(snapshot.permissions, runtime);
     }
     const requiredCapabilities = [
       'canEdit',
@@ -931,6 +1023,7 @@ export function createRolloverService({
       {
         includeInheritedCollaborators: sourceOrigin === SOURCE_ORIGINS.EXPLICIT_MY_DRIVE,
         serviceAccountEmail: runtime.serviceAccountEmail,
+        driveAdminEmail: runtime.driveAdminEmail,
       },
     );
   }
@@ -997,7 +1090,11 @@ export function createRolloverService({
     expectAcceptingResponses = true,
   } = {}) {
     parseCycle(sourceCycle);
-    assertCollaboratorConfiguration(collaboratorPermissions, runtime.serviceAccountEmail);
+    assertCollaboratorConfiguration(
+      collaboratorPermissions,
+      runtime.serviceAccountEmail,
+      runtime.driveAdminEmail,
+    );
     const source = await resolveSource({ sourceFormId, sourceCycle });
     const snapshot = await loadSnapshot(source.file);
     assertResolvedSourceAccess(source, snapshot, {
@@ -1044,7 +1141,11 @@ export function createRolloverService({
       throw new Error('Staging bootstrap is restricted to the initial explicit source cycle');
     }
     assertNonEmptyString(sourceFormId, 'sourceFormId');
-    assertCollaboratorConfiguration(collaboratorPermissions, runtime.serviceAccountEmail);
+    assertCollaboratorConfiguration(
+      collaboratorPermissions,
+      runtime.serviceAccountEmail,
+      runtime.driveAdminEmail,
+    );
 
     const liveFile = await google.getFile({ fileId: sourceFormId });
     assertUsableFormFile(liveFile);
@@ -1069,7 +1170,7 @@ export function createRolloverService({
 
     let stagedFile = await findManagedFile(ROLLOVER_FILE_ROLES.SOURCE, sourceCycle);
     if (stagedFile === undefined) {
-      await requireDestinationFolder(collaboratorPermissions);
+      await requireDestinationFolder();
     }
     if (dryRun && stagedFile === undefined) {
       return Object.freeze({
@@ -1123,10 +1224,8 @@ export function createRolloverService({
     if (dryRun) {
       if (stagedFile !== undefined) {
         const permissions = await google.getAllPermissions({ fileId: stagedFile.id });
-        assertNoUnexpectedServiceAccountPermissions(
-          permissions,
-          runtime.serviceAccountEmail,
-        );
+        assertSharedDriveManagerPermissions(permissions, runtime);
+        assertNoInheritedOrAdministrativeFormCollaborators(permissions, runtime);
       }
       return Object.freeze({
         action: 'bootstrap',
@@ -1169,7 +1268,7 @@ export function createRolloverService({
       google,
       stagedSnapshot.file.id,
       expectedPermissions,
-      { serviceAccountEmail: runtime.serviceAccountEmail },
+      { runtime },
     );
     assertSameStructure(liveSnapshot.form, stagedSnapshot.form);
     assertTitle(stagedSnapshot.form, stagedSnapshot.file, title);
@@ -1239,7 +1338,11 @@ export function createRolloverService({
         preparationOpensAt: rollover.preparationOpensAt.toISOString(),
       });
     }
-    assertCollaboratorConfiguration(collaboratorPermissions, runtime.serviceAccountEmail);
+    assertCollaboratorConfiguration(
+      collaboratorPermissions,
+      runtime.serviceAccountEmail,
+      runtime.driveAdminEmail,
+    );
 
     const source = await resolveSource({
       sourceFormId,
@@ -1285,7 +1388,7 @@ export function createRolloverService({
 
     let targetFile = await findManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle);
     if (targetFile === undefined) {
-      await requireDestinationFolder(collaboratorPermissions);
+      await requireDestinationFolder();
     } else {
       assertSourceFingerprint(
         targetFile,
@@ -1373,7 +1476,7 @@ export function createRolloverService({
       assertPermissionsMatch(
         expectedPermissions,
         existing.permissions,
-        { serviceAccountEmail: runtime.serviceAccountEmail },
+        { runtime },
       );
       return Object.freeze({
         action: 'prepare',
@@ -1414,7 +1517,7 @@ export function createRolloverService({
       google,
       targetSnapshot.file.id,
       expectedPermissions,
-      { serviceAccountEmail: runtime.serviceAccountEmail },
+      { runtime },
     );
     assertSameStructure(sourceSnapshot.form, targetSnapshot.form);
     assertTitle(targetSnapshot.form, targetSnapshot.file, title);
@@ -1496,7 +1599,7 @@ export function createRolloverService({
         source.origin,
       ),
       targetSnapshot.permissions,
-      { serviceAccountEmail: runtime.serviceAccountEmail },
+      { runtime },
     );
     assertTitle(
       sourceSnapshot.form,
@@ -1533,7 +1636,11 @@ export function createRolloverService({
     if (rollover.phase !== ROLLOVER_PHASES.ACTIVATE) {
       throw new Error('Activation is forbidden before the source-cycle cutoff');
     }
-    assertCollaboratorConfiguration(collaboratorPermissions, runtime.serviceAccountEmail);
+    assertCollaboratorConfiguration(
+      collaboratorPermissions,
+      runtime.serviceAccountEmail,
+      runtime.driveAdminEmail,
+    );
 
     const initialState = await loadActivationState({
       targetCycle,
@@ -1664,7 +1771,11 @@ export function createRolloverService({
     if (!ALLOWED_VERIFY_MODES.has(mode)) {
       throw new Error('verify mode must be prepared, active, or cleaned');
     }
-    assertCollaboratorConfiguration(collaboratorPermissions, runtime.serviceAccountEmail);
+    assertCollaboratorConfiguration(
+      collaboratorPermissions,
+      runtime.serviceAccountEmail,
+      runtime.driveAdminEmail,
+    );
     const sourceCycle = previousCycle(targetCycle);
     const inActiveFolder = mode !== 'cleaned';
     const source = mode === 'cleaned'
@@ -1685,10 +1796,8 @@ export function createRolloverService({
       loadSnapshot(targetFile),
     ]);
     if (mode === 'cleaned') {
-      assertNoUnexpectedServiceAccountPermissions(
-        sourceSnapshot.permissions,
-        runtime.serviceAccountEmail,
-      );
+      assertSharedDriveManagerPermissions(sourceSnapshot.permissions, runtime);
+      assertNoInheritedOrAdministrativeFormCollaborators(sourceSnapshot.permissions, runtime);
     }
     assertManagedFile(
       targetSnapshot.file,
@@ -1726,7 +1835,7 @@ export function createRolloverService({
     assertPermissionsMatch(
       expectedPermissions,
       targetSnapshot.permissions,
-      { serviceAccountEmail: runtime.serviceAccountEmail },
+      { runtime },
     );
 
     if (mode === 'prepared') {
@@ -1800,10 +1909,8 @@ export function createRolloverService({
 
     const permissionsByFile = new Map(await Promise.all(files.map(async (file) => {
       const permissions = await google.getAllPermissions({ fileId: file.id });
-      assertNoUnexpectedServiceAccountPermissions(
-        permissions,
-        runtime.serviceAccountEmail,
-      );
+      assertSharedDriveManagerPermissions(permissions, runtime);
+      assertNoInheritedOrAdministrativeFormCollaborators(permissions, runtime);
       return [file.id, permissions];
     })));
 

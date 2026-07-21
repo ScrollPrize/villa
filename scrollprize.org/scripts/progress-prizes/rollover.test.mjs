@@ -22,6 +22,8 @@ const STAGING_EDITOR = 'progress-prizes-staging@example.org';
 const EXTERNAL_PRODUCTION_EDITOR = 'external-progress-prize-editor@example.net';
 const STAGING_SERVICE_ACCOUNT = 'staging-automation@private-project.iam.gserviceaccount.com';
 const PRODUCTION_SERVICE_ACCOUNT = 'production-automation@private-project.iam.gserviceaccount.com';
+const STAGING_DRIVE_ADMIN = 'staging-break-glass@example.org';
+const PRODUCTION_DRIVE_ADMIN = 'production-break-glass@example.org';
 
 const STAGING_EDITOR_PERMISSION = Object.freeze({
   type: 'group',
@@ -42,6 +44,26 @@ const PUBLIC_PERMISSION = Object.freeze({
   allowFileDiscovery: false,
   view: 'published',
 });
+
+function sharedDriveManagerDetail(driveId, overrides = {}) {
+  return {
+    permissionType: 'member',
+    role: 'organizer',
+    inherited: true,
+    inheritedFrom: driveId,
+    ...overrides,
+  };
+}
+
+function sharedDriveManagerPermission({ id, emailAddress, driveId }) {
+  return {
+    id,
+    type: 'user',
+    role: 'organizer',
+    emailAddress,
+    permissionDetails: [sharedDriveManagerDetail(driveId)],
+  };
+}
 
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
@@ -181,6 +203,42 @@ class FakeGoogle {
         { id: 'production-editor', type: 'group', role: 'writer', emailAddress: 'private-team@example.org' },
         PUBLIC_PERMISSION,
       ]],
+      ['private-staging-folder', [
+        sharedDriveManagerPermission({
+          id: 'staging-manager',
+          emailAddress: STAGING_SERVICE_ACCOUNT,
+          driveId: 'private-staging-drive',
+        }),
+        sharedDriveManagerPermission({
+          id: 'staging-break-glass-manager',
+          emailAddress: STAGING_DRIVE_ADMIN,
+          driveId: 'private-staging-drive',
+        }),
+      ]],
+      ['private-staging-archive', [
+        sharedDriveManagerPermission({
+          id: 'staging-archive-manager',
+          emailAddress: STAGING_SERVICE_ACCOUNT,
+          driveId: 'private-staging-drive',
+        }),
+        sharedDriveManagerPermission({
+          id: 'staging-archive-break-glass-manager',
+          emailAddress: STAGING_DRIVE_ADMIN,
+          driveId: 'private-staging-drive',
+        }),
+      ]],
+      ['private-production-folder', [
+        sharedDriveManagerPermission({
+          id: 'production-manager',
+          emailAddress: PRODUCTION_SERVICE_ACCOUNT,
+          driveId: 'private-production-drive',
+        }),
+        sharedDriveManagerPermission({
+          id: 'production-break-glass-manager',
+          emailAddress: PRODUCTION_DRIVE_ADMIN,
+          driveId: 'private-production-drive',
+        }),
+      ]],
     ]);
   }
 
@@ -245,7 +303,7 @@ class FakeGoogle {
     form.responderUri = `https://docs.google.com/forms/d/e/public-${id}/viewform`;
     this.files.set(id, file);
     this.forms.set(id, form);
-    this.permissions.set(id, []);
+    this.permissions.set(id, clone(this.permissions.get(parentId) ?? []));
     return clone(file);
   }
 
@@ -329,6 +387,7 @@ function stagingRuntime(overrides = {}) {
     stagingFolderId: 'private-staging-folder',
     archiveFolderId: 'private-staging-archive',
     driveId: 'private-staging-drive',
+    driveAdminEmail: STAGING_DRIVE_ADMIN,
     serviceAccountEmail: STAGING_SERVICE_ACCOUNT,
     stagingServiceAccountEmail: STAGING_SERVICE_ACCOUNT,
     branch: 'codex/progress-prize-smoke-20260720',
@@ -347,6 +406,7 @@ function productionRuntime(overrides = {}) {
     eventName: 'schedule',
     folderId: 'private-production-folder',
     driveId: 'private-production-drive',
+    driveAdminEmail: PRODUCTION_DRIVE_ADMIN,
     serviceAccountEmail: PRODUCTION_SERVICE_ACCOUNT,
     stagingServiceAccountEmail: STAGING_SERVICE_ACCOUNT,
     branch: 'codex/progress-prize-2026-08',
@@ -624,10 +684,227 @@ test('destination folder preflight blocks both dry-run and real copies', async (
           collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
           dryRun,
         }),
-        /writable Shared Drive folder|unexpected inherited edit access/,
+        /writable Shared Drive folder|unexpected inherited edit access|inherited Manager permission/,
       );
       assert.equal(google.calls.some(({ method }) => method === 'copyFile'), false);
     }
+  }
+});
+
+test('destination permits only the exact human break-glass Manager', async () => {
+  const google = grantProductionSourceAccess(new FakeGoogle());
+  const result = await service({
+    google,
+    runtime: productionRuntime(),
+  }).rollover.prepare({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+    dryRun: true,
+  });
+
+  assert.equal(result.status, 'planned');
+  assert.equal(google.calls.some(({ method }) => method === 'copyFile'), false);
+});
+
+test('break-glass access must be one inherited, non-expiring Manager permission', async (t) => {
+  for (const scenario of [
+    { name: 'writer', role: 'writer', detailRole: 'writer' },
+    { name: 'commenter', role: 'commenter', detailRole: 'commenter' },
+    { name: 'Content manager', role: 'fileOrganizer', detailRole: 'fileOrganizer' },
+    {
+      name: 'direct Manager',
+      role: 'organizer',
+      permissionType: 'file',
+      inherited: false,
+      inheritedFrom: undefined,
+    },
+    { name: 'expiring Manager', role: 'organizer', inherited: true, expirationTime: '2026-08-01T00:00:00Z' },
+    { name: 'group Manager', role: 'organizer', type: 'group' },
+    { name: 'wrong permission type', role: 'organizer', permissionType: 'file' },
+    { name: 'wrong detail role', role: 'organizer', detailRole: 'fileOrganizer' },
+    { name: 'wrong inheritance source', role: 'organizer', inheritedFrom: 'different-drive' },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const google = grantProductionSourceAccess(new FakeGoogle());
+      const admin = google.permissions.get('private-production-folder').find(
+        ({ emailAddress }) => emailAddress === PRODUCTION_DRIVE_ADMIN,
+      );
+      admin.type = scenario.type ?? 'user';
+      admin.role = scenario.role;
+      admin.permissionDetails = [sharedDriveManagerDetail('private-production-drive', {
+        permissionType: scenario.permissionType ?? 'member',
+        role: scenario.detailRole ?? 'organizer',
+        inherited: scenario.inherited ?? true,
+        inheritedFrom: Object.hasOwn(scenario, 'inheritedFrom')
+          ? scenario.inheritedFrom
+          : 'private-production-drive',
+      })];
+      if (scenario.expirationTime !== undefined) admin.expirationTime = scenario.expirationTime;
+
+      await assert.rejects(
+        service({ google, runtime: productionRuntime() }).rollover.prepare({
+          targetCycle: '2026-08',
+          sourceFormId: LIVE_FORM_ID,
+          collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+          dryRun: true,
+        }),
+        /break-glass administrator access is not exactly one inherited Manager permission/,
+      );
+      assert.equal(google.calls.some(({ method }) => method === 'copyFile'), false);
+    });
+  }
+
+  await t.test('multiple role-source details', async () => {
+    const google = grantProductionSourceAccess(new FakeGoogle());
+    const admin = google.permissions.get('private-production-folder').find(
+      ({ emailAddress }) => emailAddress === PRODUCTION_DRIVE_ADMIN,
+    );
+    admin.permissionDetails.push({
+      permissionType: 'file',
+      role: 'writer',
+      inherited: false,
+    });
+    await assert.rejects(
+      service({ google, runtime: productionRuntime() }).rollover.prepare({
+        targetCycle: '2026-08',
+        sourceFormId: LIVE_FORM_ID,
+        collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+        dryRun: true,
+      }),
+      /break-glass administrator access is not exactly one inherited Manager permission/,
+    );
+  });
+});
+
+test('automation access must also be exactly one inherited, non-expiring Manager', async (t) => {
+  for (const scenario of [
+    { name: 'reader', role: 'reader', detailRole: 'reader' },
+    { name: 'writer', role: 'writer', detailRole: 'writer' },
+    { name: 'Content manager', role: 'fileOrganizer', detailRole: 'fileOrganizer' },
+    {
+      name: 'direct Manager',
+      role: 'organizer',
+      permissionType: 'file',
+      inherited: false,
+      inheritedFrom: undefined,
+    },
+    { name: 'expiring Manager', role: 'organizer', inherited: true, expirationTime: '2026-08-01T00:00:00Z' },
+    { name: 'wrong permission type', role: 'organizer', permissionType: 'file' },
+    { name: 'wrong detail role', role: 'organizer', detailRole: 'fileOrganizer' },
+    { name: 'wrong inheritance source', role: 'organizer', inheritedFrom: 'different-drive' },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const google = grantProductionSourceAccess(new FakeGoogle());
+      const automation = google.permissions.get('private-production-folder').find(
+        ({ emailAddress }) => emailAddress === PRODUCTION_SERVICE_ACCOUNT,
+      );
+      automation.role = scenario.role;
+      automation.permissionDetails = [sharedDriveManagerDetail('private-production-drive', {
+        permissionType: scenario.permissionType ?? 'member',
+        role: scenario.detailRole ?? 'organizer',
+        inherited: scenario.inherited ?? true,
+        inheritedFrom: Object.hasOwn(scenario, 'inheritedFrom')
+          ? scenario.inheritedFrom
+          : 'private-production-drive',
+      })];
+      if (scenario.expirationTime !== undefined) {
+        automation.expirationTime = scenario.expirationTime;
+      }
+
+      await assert.rejects(
+        service({ google, runtime: productionRuntime() }).rollover.prepare({
+          targetCycle: '2026-08',
+          sourceFormId: LIVE_FORM_ID,
+          collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+          dryRun: true,
+        }),
+        /automation access is not exactly one inherited Manager permission/,
+      );
+      assert.equal(google.calls.some(({ method }) => method === 'copyFile'), false);
+    });
+  }
+});
+
+test('destination rejects a merged direct role source for either permitted Manager', async (t) => {
+  for (const [name, emailAddress, expected] of [
+    ['automation', PRODUCTION_SERVICE_ACCOUNT, /automation access is not exactly one inherited Manager permission/],
+    ['break-glass administrator', PRODUCTION_DRIVE_ADMIN, /break-glass administrator access is not exactly one inherited Manager permission/],
+  ]) {
+    await t.test(name, async () => {
+      const google = grantProductionSourceAccess(new FakeGoogle());
+      const permission = google.permissions.get('private-production-folder').find(
+        ({ emailAddress: current }) => current === emailAddress,
+      );
+      permission.permissionDetails.push({
+        permissionType: 'file',
+        role: 'writer',
+        inherited: false,
+      });
+
+      await assert.rejects(
+        service({ google, runtime: productionRuntime() }).rollover.prepare({
+          targetCycle: '2026-08',
+          sourceFormId: LIVE_FORM_ID,
+          collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+          dryRun: true,
+        }),
+        expected,
+      );
+      assert.equal(google.calls.some(({ method }) => method === 'copyFile'), false);
+    });
+  }
+});
+
+test('destination rejects every other editable human, group, or domain identity', async (t) => {
+  for (const permission of [
+    {
+      id: 'unexpected-human-writer',
+      type: 'user',
+      role: 'writer',
+      emailAddress: 'unexpected-human@example.org',
+      permissionDetails: [{ inherited: true }],
+    },
+    {
+      id: 'configured-editor-on-drive',
+      ...PRODUCTION_EDITOR_PERMISSION,
+      permissionDetails: [{ inherited: true }],
+    },
+    {
+      id: 'unexpected-domain-writer',
+      type: 'domain',
+      role: 'writer',
+      domain: 'example.org',
+      permissionDetails: [{ inherited: true }],
+    },
+    {
+      id: 'unexpected-human-manager',
+      type: 'user',
+      role: 'organizer',
+      emailAddress: 'unexpected-manager@example.org',
+      permissionDetails: [{ inherited: true }],
+    },
+    {
+      id: 'unexpected-human-owner',
+      type: 'user',
+      role: 'owner',
+      emailAddress: 'unexpected-owner@example.org',
+    },
+  ]) {
+    await t.test(permission.id, async () => {
+      const google = grantProductionSourceAccess(new FakeGoogle());
+      google.permissions.get('private-production-folder').push(permission);
+      await assert.rejects(
+        service({ google, runtime: productionRuntime() }).rollover.prepare({
+          targetCycle: '2026-08',
+          sourceFormId: LIVE_FORM_ID,
+          collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+          dryRun: true,
+        }),
+        /destination folder has unexpected inherited edit access/,
+      );
+      assert.equal(google.calls.some(({ method }) => method === 'copyFile'), false);
+    });
   }
 });
 
@@ -738,7 +1015,9 @@ test('bootstrap copies the live form into staging, limits ACLs, and never mutate
   assert.equal(sources[0].appProperties.state, ROLLOVER_FILE_STATES.ACTIVE);
   const stagedPermissions = context.google.permissions.get(sources[0].id);
   assert.deepEqual(
-    stagedPermissions.map(({ type, role, emailAddress }) => ({ type, role, emailAddress })),
+    stagedPermissions
+      .filter(({ role }) => role === 'writer' || role === 'commenter' || role === 'reader')
+      .map(({ type, role, emailAddress }) => ({ type, role, emailAddress })),
     [
       { type: 'group', role: 'writer', emailAddress: STAGING_EDITOR },
       { type: 'anyone', role: 'reader', emailAddress: undefined },
@@ -859,12 +1138,101 @@ test('managed sources and targets reject other service accounts at every role', 
         id: `current-staging-service-account-${role}`,
         emailAddress: STAGING_SERVICE_ACCOUNT,
       });
-      assert.equal((await context.rollover.verify({
-        targetCycle: '2026-08',
-        collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
-      })).status, 'valid');
+      await assert.rejects(
+        context.rollover.verify({
+          targetCycle: '2026-08',
+          collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+        }),
+        /Shared Drive automation access is not exactly one inherited Manager permission/,
+      );
     });
   }
+});
+
+test('managed forms ignore only the exact inherited break-glass Manager permission', async (t) => {
+  for (const scenario of [
+    { name: 'writer', role: 'writer', detailRole: 'writer' },
+    { name: 'commenter', role: 'commenter', detailRole: 'commenter' },
+    { name: 'Content manager', role: 'fileOrganizer', detailRole: 'fileOrganizer' },
+    {
+      name: 'direct Manager',
+      role: 'organizer',
+      permissionType: 'file',
+      inherited: false,
+      inheritedFrom: undefined,
+    },
+    { name: 'wrong inheritance source', role: 'organizer', inheritedFrom: 'different-drive' },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const context = service();
+      await bootstrapAndPrepare(context);
+      const target = context.google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+      const admin = context.google.permissions.get(target.id).find(
+        ({ emailAddress }) => emailAddress === STAGING_DRIVE_ADMIN,
+      );
+      admin.role = scenario.role;
+      admin.permissionDetails = [sharedDriveManagerDetail('private-staging-drive', {
+        permissionType: scenario.permissionType ?? 'member',
+        role: scenario.detailRole ?? 'organizer',
+        inherited: scenario.inherited ?? true,
+        inheritedFrom: Object.hasOwn(scenario, 'inheritedFrom')
+          ? scenario.inheritedFrom
+          : 'private-staging-drive',
+      })];
+
+      await assert.rejects(
+        context.rollover.verify({
+          targetCycle: '2026-08',
+          collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+        }),
+        /break-glass administrator access is not exactly one inherited Manager permission/,
+      );
+    });
+  }
+
+  for (const [name, emailAddress, expected] of [
+    ['automation with a merged direct form grant', STAGING_SERVICE_ACCOUNT, /automation access is not exactly one inherited Manager permission/],
+    ['break-glass administrator with a merged direct form grant', STAGING_DRIVE_ADMIN, /break-glass administrator access is not exactly one inherited Manager permission/],
+  ]) {
+    await t.test(name, async () => {
+      const context = service();
+      await bootstrapAndPrepare(context);
+      const target = context.google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+      const permission = context.google.permissions.get(target.id).find(
+        ({ emailAddress: current }) => current === emailAddress,
+      );
+      permission.permissionDetails.push({
+        permissionType: 'file',
+        role: 'writer',
+        inherited: false,
+      });
+
+      await assert.rejects(
+        context.rollover.verify({
+          targetCycle: '2026-08',
+          collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+        }),
+        expected,
+      );
+    });
+  }
+
+  await t.test('editor group inherited from the Shared Drive', async () => {
+    const context = service();
+    await bootstrapAndPrepare(context);
+    const target = context.google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+    const editor = context.google.permissions.get(target.id).find(
+      ({ emailAddress }) => emailAddress === STAGING_EDITOR,
+    );
+    editor.permissionDetails = [{ inherited: true }];
+    await assert.rejects(
+      context.rollover.verify({
+        targetCycle: '2026-08',
+        collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+      }),
+      /unexpected inherited or administrative edit access/,
+    );
+  });
 });
 
 test('bootstrap closes a fresh staging source before the copy fault and reopens only after reconciliation', async () => {
@@ -887,7 +1255,12 @@ test('bootstrap closes a fresh staging source before the copy fault and reopens 
     isPublished: true,
     isAcceptingResponses: false,
   });
-  assert.deepEqual(context.google.permissions.get(stagedSource.id), []);
+  assert.deepEqual(
+    context.google.permissions.get(stagedSource.id).filter(
+      ({ permissionDetails }) => !permissionDetails?.some(({ inherited }) => inherited === true),
+    ),
+    [],
+  );
   assert.equal(
     context.google.calls.some(({ method, fileId, formId }) =>
       (fileId === stagedSource.id || formId === stagedSource.id)
@@ -1233,20 +1606,21 @@ test('production preserves its group and direct external editor without copying 
   assert.equal(firstCopy.fileId, LIVE_FORM_ID);
   assert.equal(firstCopy.parentId, 'private-production-folder');
   const copiedCollaborators = google.permissions.get(augustTarget.id)
-    .filter(({ type }) => type === 'user' || type === 'group')
+    .filter(({ type, role }) => (
+      (type === 'user' || type === 'group')
+      && (role === 'writer' || role === 'commenter')
+    ))
     .map(({ emailAddress }) => emailAddress)
     .sort();
   assert.deepEqual(copiedCollaborators, [
     EXTERNAL_PRODUCTION_EDITOR,
     'private-team@example.org',
   ]);
-  assert.equal(
-    google.permissions.get(augustTarget.id).some(({ emailAddress }) => (
-      emailAddress === PRODUCTION_SERVICE_ACCOUNT
-      || emailAddress === STAGING_SERVICE_ACCOUNT
-    )),
-    false,
-  );
+  assert.equal(google.permissions.get(augustTarget.id).some((permission) => (
+    (permission.emailAddress === PRODUCTION_SERVICE_ACCOUNT
+      || permission.emailAddress === STAGING_SERVICE_ACCOUNT)
+    && !permission.permissionDetails?.some(({ inherited }) => inherited === true)
+  )), false);
   assert.equal((await july.rollover.verify({
     targetCycle: '2026-08',
     sourceFormId: LIVE_FORM_ID,
@@ -1325,18 +1699,19 @@ test('production preserves its group and direct external editor without copying 
   assert.equal(septemberCopy.fileId, augustTarget.id);
   assert.deepEqual(
     google.permissions.get(septemberTarget.id)
-      .filter(({ type }) => type === 'user' || type === 'group')
+      .filter(({ type, role }) => (
+        (type === 'user' || type === 'group')
+        && (role === 'writer' || role === 'commenter')
+      ))
       .map(({ emailAddress }) => emailAddress)
       .sort(),
     [EXTERNAL_PRODUCTION_EDITOR, 'private-team@example.org'],
   );
-  assert.equal(
-    google.permissions.get(septemberTarget.id).some(({ emailAddress }) => (
-      emailAddress === PRODUCTION_SERVICE_ACCOUNT
-      || emailAddress === STAGING_SERVICE_ACCOUNT
-    )),
-    false,
-  );
+  assert.equal(google.permissions.get(septemberTarget.id).some((permission) => (
+    (permission.emailAddress === PRODUCTION_SERVICE_ACCOUNT
+      || permission.emailAddress === STAGING_SERVICE_ACCOUNT)
+    && !permission.permissionDetails?.some(({ inherited }) => inherited === true)
+  )), false);
   assert.equal(
     google.calls.some(({ fileId, formId }) => fileId === LIVE_FORM_ID || formId === LIVE_FORM_ID),
     false,
@@ -1504,7 +1879,7 @@ test('activate revalidates target binding and ACLs after the preview gate', asyn
 
     await assert.rejects(
       active.rollover.activate({ targetCycle: '2026-08' }),
-      /not bound to the resolved source form|permissions do not match|unexpected service-account permission/,
+      /not bound to the resolved source form|permissions do not match|unexpected service-account permission|unexpected inherited or administrative edit access/,
     );
     assert.equal(
       google.forms.get(source.id).publishSettings.publishState.isAcceptingResponses,
@@ -1920,6 +2295,37 @@ test('production safety rejects simulated time, faults, alternate bases, and sta
     () => assertRolloverRuntimeSafety(productionRuntime({ eventName: 'pull_request' })),
     /only for schedule or workflow_dispatch/,
   );
+});
+
+test('runtime requires a separate non-service-account break-glass email', () => {
+  for (const [driveAdminEmail, expected] of [
+    [undefined, /driveAdminEmail must be a non-empty string/],
+    ['not-an-email', /driveAdminEmail must be an email address/],
+    [PRODUCTION_SERVICE_ACCOUNT, /separate human break-glass administrator/],
+    ['other@private-project.iam.gserviceaccount.com', /separate human break-glass administrator/],
+  ]) {
+    assert.throws(
+      () => assertRolloverRuntimeSafety(productionRuntime({ driveAdminEmail })),
+      expected,
+    );
+  }
+});
+
+test('break-glass administrator cannot also be the explicit editor collaborator', async () => {
+  const google = grantProductionSourceAccess(new FakeGoogle());
+  await assert.rejects(
+    service({ google, runtime: productionRuntime() }).rollover.prepare({
+      targetCycle: '2026-08',
+      sourceFormId: LIVE_FORM_ID,
+      collaboratorPermissions: [{
+        type: 'user',
+        role: 'writer',
+        emailAddress: PRODUCTION_DRIVE_ADMIN,
+      }],
+    }),
+    /break-glass administrator cannot be configured as a form collaborator/,
+  );
+  assert.equal(google.calls.length, 0);
 });
 
 test('fault injection also requires the staging account, folder, dispatch event, and smoke branch', () => {
