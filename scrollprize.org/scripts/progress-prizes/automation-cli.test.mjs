@@ -16,6 +16,7 @@ import {
 } from './automation-cli.mjs';
 import { runCli } from './cli.mjs';
 import { PROGRESS_PRIZE_MARKERS } from './markdown.mjs';
+import { ROLLOVER_FAULTS, RolloverFaultError } from './rollover.mjs';
 
 const PRIVATE = Object.freeze({
   token: 'private-wif-access-token',
@@ -195,6 +196,73 @@ test('automation failure diagnostics are single-line, bounded, and fully redacte
   assert.doesNotMatch(forged, /https?:\/\/|::|@/);
   assert.equal(forged.includes(PRIVATE.token), false);
   assert.equal(forged.includes(forgedOpaqueId), false);
+});
+
+test('automation diagnostics expose only allowlisted staging fault labels', () => {
+  for (const step of Object.values(ROLLOVER_FAULTS)) {
+    const expected = `progress-prizes: Injected staging rollover failure at ${step}`;
+    const diagnostic = formatAutomationError(new RolloverFaultError(step), {
+      env: stagingEnv(),
+    });
+    assert.equal(diagnostic, expected);
+    assert.equal(
+      safeAutomationDiagnostic(Buffer.from(`${diagnostic}\n`), { env: stagingEnv() }),
+      expected,
+    );
+
+    const plainError = new Error(`Injected staging rollover failure at ${step}`);
+    assert.equal(
+      formatAutomationError(plainError, { env: stagingEnv() }),
+      AUTOMATION_ERROR_FALLBACK,
+    );
+
+    const spoofedError = new Error(plainError.message);
+    spoofedError.name = 'RolloverFaultError';
+    spoofedError.step = step;
+    assert.equal(
+      formatAutomationError(spoofedError, { env: stagingEnv() }),
+      AUTOMATION_ERROR_FALLBACK,
+    );
+
+    const sanitizedImitation = new Error(`\u0000Injected staging rollover failure at ${step}`);
+    const imitationDiagnostic = formatAutomationError(sanitizedImitation, {
+      env: stagingEnv(),
+    });
+    assert.notEqual(imitationDiagnostic, expected);
+    if (step === ROLLOVER_FAULTS.AFTER_COPY) {
+      assert.equal(imitationDiagnostic, AUTOMATION_ERROR_FALLBACK);
+    }
+  }
+
+  const privateStep = 'private-long-fault-step';
+  const diagnostic = formatAutomationError(new RolloverFaultError(privateStep), {
+    env: stagingEnv(),
+  });
+  assert.equal(diagnostic.includes(privateStep), false);
+  assert.match(diagnostic, /\[REDACTED\]/);
+
+  const privateTyped = new RolloverFaultError(PRIVATE.form);
+  const privateTypedDiagnostic = formatAutomationError(privateTyped, { env: stagingEnv() });
+  assert.equal(privateTypedDiagnostic.includes(PRIVATE.form), false);
+
+  const mutatedKnownError = new RolloverFaultError(ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE);
+  mutatedKnownError.message = PRIVATE.token;
+  assert.equal(
+    formatAutomationError(mutatedKnownError, { env: stagingEnv() }),
+    `progress-prizes: Injected staging rollover failure at ${ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE}`,
+  );
+
+  const forged = safeAutomationDiagnostic(Buffer.from(
+    `progress-prizes: Injected staging rollover failure at ${privateStep}\n`,
+  ), { env: stagingEnv() });
+  assert.equal(forged.includes(privateStep), false);
+  assert.match(forged, /\[REDACTED\]/);
+
+  const suffixed = safeAutomationDiagnostic(Buffer.from(
+    `progress-prizes: Injected staging rollover failure at ${ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE} ${PRIVATE.token}\n`,
+  ), { env: stagingEnv() });
+  assert.equal(suffixed.includes(ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE), false);
+  assert.equal(suffixed.includes(PRIVATE.token), false);
 });
 
 test('automation failure formatter fails closed for hostile errors and environments', () => {

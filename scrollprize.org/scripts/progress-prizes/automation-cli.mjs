@@ -9,6 +9,8 @@ import { createClock } from './clock.mjs';
 import { createGoogleApiClient, redactForLog } from './google-api.mjs';
 import { assertPublicResponderUri } from './markdown.mjs';
 import {
+  ROLLOVER_FAULTS,
+  RolloverFaultError,
   assertRolloverRuntimeSafety,
   createRolloverService,
 } from './rollover.mjs';
@@ -29,6 +31,10 @@ const GIT_SHA_PATTERN = /^[a-f0-9]{40}$/i;
 const AUTOMATION_ERROR_INPUT_MAX_UNITS = 4_096;
 const AUTOMATION_ERROR_MAX_BYTES = 600;
 export const AUTOMATION_ERROR_FALLBACK = 'progress-prizes: Automation failed without a safe diagnostic';
+const ALLOWED_ROLLOVER_FAULT_STEPS = new Set([
+  ROLLOVER_FAULTS.AFTER_COPY,
+  ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE,
+]);
 const OUTPUT_STATUSES = new Set([
   'active',
   'archived',
@@ -249,6 +255,17 @@ function privateValues(env) {
   return PRIVATE_ENV_NAMES.map((name) => optionalEnv(env, name)).filter(Boolean);
 }
 
+function knownRolloverFaultDiagnostic(step) {
+  if (!ALLOWED_ROLLOVER_FAULT_STEPS.has(step)) return undefined;
+  return `progress-prizes: Injected staging rollover failure at ${step}`;
+}
+
+function knownRolloverFaultStep(diagnostic) {
+  return [...ALLOWED_ROLLOVER_FAULT_STEPS].find(
+    (step) => diagnostic === knownRolloverFaultDiagnostic(step),
+  );
+}
+
 /**
  * Produce one bounded log line without retaining private Google configuration,
  * ACL identities, URLs, opaque identifiers, or control characters.
@@ -256,6 +273,13 @@ function privateValues(env) {
 export function formatAutomationError(error, { env = process.env } = {}) {
   try {
     if (!(error instanceof Error) || typeof error.message !== 'string') {
+      return AUTOMATION_ERROR_FALLBACK;
+    }
+    if (error instanceof RolloverFaultError) {
+      const diagnostic = knownRolloverFaultDiagnostic(error.step);
+      if (diagnostic !== undefined) return diagnostic;
+    }
+    if (knownRolloverFaultStep(`progress-prizes: ${error.message}`) !== undefined) {
       return AUTOMATION_ERROR_FALLBACK;
     }
     const oversized = error.message.length > AUTOMATION_ERROR_INPUT_MAX_UNITS;
@@ -274,6 +298,7 @@ export function formatAutomationError(error, { env = process.env } = {}) {
     if (redacted === '') return AUTOMATION_ERROR_FALLBACK;
 
     const value = `progress-prizes: ${redacted}`;
+    if (knownRolloverFaultStep(value) !== undefined) return AUTOMATION_ERROR_FALLBACK;
     if (Buffer.byteLength(value, 'utf8') <= AUTOMATION_ERROR_MAX_BYTES) return value;
     let low = 0;
     let high = value.length;
@@ -302,6 +327,10 @@ export function safeAutomationDiagnostic(value, { env = process.env } = {}) {
     const match = decoded.match(/^(progress-prizes: [\x20-\x7e]{1,583})\n$/);
     if (!match) return AUTOMATION_ERROR_FALLBACK;
     const message = match[1].slice('progress-prizes: '.length);
+    const knownFaultStep = knownRolloverFaultStep(match[1]);
+    if (knownFaultStep !== undefined) {
+      return formatAutomationError(new RolloverFaultError(knownFaultStep), { env });
+    }
     return formatAutomationError(new Error(message), { env });
   } catch {
     return AUTOMATION_ERROR_FALLBACK;

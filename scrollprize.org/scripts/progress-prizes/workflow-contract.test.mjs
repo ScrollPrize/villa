@@ -288,10 +288,10 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
   assert.match(action, /automation-cli\.mjs/);
   assert.match(action, /error-diagnostic-cli\.mjs/);
   assert.doesNotMatch(action, /(?:cat|head|tail|read|wc) .*progress-prizes-error/);
-  assert.equal([...action.matchAll(/grep .*progress-prizes-error/g)].length, 1);
+  assert.equal([...action.matchAll(/\bgrep\b/g)].length, 1);
   assert.match(
     action,
-    /grep -Fq "Injected staging rollover failure at \$FAULT" "\$RUNNER_TEMP\/progress-prizes-error\.txt"/,
+    /grep -Fxq "progress-prizes: Injected staging rollover failure at \$FAULT" \\\n\s+"\$RUNNER_TEMP\/progress-prizes-error\.txt"/,
   );
   assert.doesNotMatch(`${rehearsal}\n${action}`, /credentials_json|service_account_key|private_key/i);
 
