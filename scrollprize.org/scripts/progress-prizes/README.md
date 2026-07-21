@@ -20,10 +20,14 @@ repository secret, file, log, cache, or artifact.
 
 ## Workflow map
 
-- `progress-prizes-google.yml` is the only Google-authenticated reusable job. It
-  accepts only `workflow_dispatch` or `schedule`, checks the immutable repository
-  and owner IDs, checks out trusted `main`, and exports only the intentionally
-  public `responder-uri`.
+- `progress-prizes-google.yml` is the only Google-authenticated reusable
+  workflow. A no-secret preflight rejects unsafe routing, then exactly one of two
+  jobs with literal `progress-prizes-staging` or `progress-prizes-production`
+  Environment bindings checks out the exact approved workflow commit. It exports
+  only the intentionally public `responder-uri`.
+- `.github/actions/progress-prizes-google/action.yml` is the shared local action
+  used by both literal Environment jobs. It validates controls again, exchanges
+  OIDC without a credential file, and runs the dependency-free CLI.
 - `progress-prizes-rehearsal.yml` is the July 20 staging rehearsal. Its fixed
   branches are `codex/progress-prize-smoke-20260720` and
   `codex/progress-prize-smoke-base-20260720`.
@@ -55,9 +59,12 @@ uploaded, and only a canonical `forms.gle` or
 `docs.google.com/forms/d/e/.../viewform` URL may cross the authenticated job
 boundary. The workflows also register every protected identifier with
 `add-mask` before validation as defense in depth.
-The reusable Google workflow declares these secret names as optional solely so
-GitHub can resolve the job's selected Environment. Callers never pass or
-inherit them, and the job-level Environment value is authoritative.
+Callers never pass or inherit these secrets. The reusable workflow uses two
+literal Environment jobs because the July rehearsal proved that GitHub created
+the correct deployment but did not hydrate secrets for an expression-selected
+Environment in a called workflow. Both jobs invoke the same local action, and
+the exact trigger commit—not a mutable branch tip—is the executable code that
+receives the approved secrets.
 
 ## GitHub Environments
 
