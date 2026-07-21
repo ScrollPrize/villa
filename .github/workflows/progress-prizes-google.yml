@@ -59,79 +59,52 @@ on:
         required: false
         type: string
         default: ""
-    secrets:
-      GOOGLE_WORKLOAD_IDENTITY_PROVIDER:
-        description: Resolved only from the selected protected Environment
-        required: false
-      GOOGLE_SERVICE_ACCOUNT_EMAIL:
-        description: Resolved only from the selected protected Environment
-        required: false
-      PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL:
-        description: Resolved only from the selected protected Environment
-        required: false
-      PROGRESS_PRIZE_DRIVE_ID:
-        description: Resolved only from the selected protected Environment
-        required: false
-      PROGRESS_PRIZE_FOLDER_ID:
-        description: Resolved only from the selected protected Environment
-        required: false
-      PROGRESS_PRIZE_ARCHIVE_FOLDER_ID:
-        description: Resolved only from the selected protected Environment
-        required: false
-      PROGRESS_PRIZE_SOURCE_FORM_ID:
-        description: Resolved only from the selected protected Environment
-        required: false
-      PROGRESS_PRIZE_EDITOR_GROUP_EMAIL:
-        description: Resolved only from the selected protected Environment
-        required: false
     outputs:
       responder-uri:
         description: Intentionally public canonical responder URL
-        value: ${{ jobs.google.outputs['responder-uri'] }}
+        value: ${{ jobs.select-result.outputs['responder-uri'] }}
 
 permissions: {}
 
 jobs:
-  google:
-    name: ${{ inputs.environment }} ${{ inputs.operation }}
-    if: >-
-      github.repository == 'ScrollPrize/villa' &&
-      github.repository_id == '890972577' &&
-      github.repository_owner_id == '121906140' &&
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') &&
-      (inputs.environment == 'staging' || inputs.environment == 'production') &&
-      contains(fromJSON('["validate","bootstrap","prepare","activate","verify","cleanup"]'), inputs.operation)
+  preflight:
+    name: Reject unsafe Google routing
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    environment: ${{ inputs.environment == 'staging' && 'progress-prizes-staging' || 'progress-prizes-production' }}
-    permissions:
-      contents: read
-      id-token: write
-    outputs:
-      responder-uri: ${{ steps.result.outputs['responder-uri'] }}
+    timeout-minutes: 5
+    permissions: {}
     steps:
-      - name: Reject unsafe controls before authentication
+      - name: Validate immutable context and controls
         shell: bash
         env:
-          AUTOMATION_ENVIRONMENT: ${{ inputs.environment }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
+          AUTOMATION_ENVIRONMENT: ${{ inputs.environment }}
           OPERATION: ${{ inputs.operation }}
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
           SIMULATED_NOW: ${{ inputs['simulated-now'] }}
           FAULT: ${{ inputs.fault }}
           EXPECT_FAULT: ${{ inputs['expect-fault'] }}
+          DRY_RUN: ${{ inputs['dry-run'] }}
           BRANCH: ${{ inputs.branch }}
           TARGET_BRANCH: ${{ inputs['target-branch'] }}
-          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
-          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
           HEAD_SHA: ${{ inputs['head-sha'] }}
         run: |
           set -euo pipefail
+          test "$REPOSITORY" = ScrollPrize/villa
+          test "$REPOSITORY_ID" = 890972577
+          test "$REPOSITORY_OWNER_ID" = 121906140
+          test "$REF" = refs/heads/main
+          [[ "$WORKFLOW_SHA" =~ ^[a-f0-9]{40}$ ]]
           test "$EVENT_NAME" = workflow_dispatch -o "$EVENT_NAME" = schedule
-          case "$OPERATION" in
-            validate|bootstrap|prepare|activate|verify|cleanup) ;;
-            *) exit 1 ;;
-          esac
+          case "$AUTOMATION_ENVIRONMENT" in staging|production) ;; *) exit 1 ;; esac
+          case "$OPERATION" in validate|bootstrap|prepare|activate|verify|cleanup) ;; *) exit 1 ;; esac
+          case "$EXPECT_FAULT" in true|false) ;; *) exit 1 ;; esac
+          case "$DRY_RUN" in true|false) ;; *) exit 1 ;; esac
           if test -n "$SOURCE_CYCLE"; then [[ "$SOURCE_CYCLE" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]; fi
           if test -n "$TARGET_CYCLE"; then [[ "$TARGET_CYCLE" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]; fi
           case "$OPERATION" in
@@ -141,6 +114,8 @@ jobs:
           if test "$OPERATION" = activate; then [[ "$HEAD_SHA" =~ ^[a-fA-F0-9]{40}$ ]]; fi
           if test -n "$HEAD_SHA"; then [[ "$HEAD_SHA" =~ ^[a-fA-F0-9]{40}$ ]]; fi
           if test "$AUTOMATION_ENVIRONMENT" = production; then
+            test "$OPERATION" != bootstrap
+            test "$OPERATION" != cleanup
             test -z "$SIMULATED_NOW"
             test -z "$FAULT"
             test "$EXPECT_FAULT" = false
@@ -151,10 +126,7 @@ jobs:
             test "$BRANCH" = codex/progress-prize-smoke-20260720
             test "$TARGET_BRANCH" = codex/progress-prize-smoke-base-20260720
             if test -n "$FAULT"; then
-              case "$FAULT" in
-                after-copy|after-close-source) ;;
-                *) exit 1 ;;
-              esac
+              case "$FAULT" in after-copy|after-close-source) ;; *) exit 1 ;; esac
             fi
           fi
           if test "$EXPECT_FAULT" = true; then
@@ -162,263 +134,138 @@ jobs:
             test "$AUTOMATION_ENVIRONMENT" = staging
           fi
 
-      - name: Check out trusted automation code
+  production:
+    name: production ${{ inputs.operation }}
+    needs: preflight
+    if: inputs.environment == 'production'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-production
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out the exact approved workflow commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: refs/heads/main
+          ref: ${{ github.sha }}
           persist-credentials: false
           clean: true
           fetch-depth: 1
-
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Run production Google operation
+        id: google
+        uses: ./.github/actions/progress-prizes-google
         with:
-          node-version: 24
+          operation: ${{ inputs.operation }}
+          environment: production
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['simulated-now'] }}
+          fault: ${{ inputs.fault }}
+          expect-fault: ${{ inputs['expect-fault'] }}
+          dry-run: ${{ inputs['dry-run'] }}
+          verify-mode: ${{ inputs['verify-mode'] }}
+          branch: ${{ inputs.branch }}
+          target-branch: ${{ inputs['target-branch'] }}
+          head-sha: ${{ inputs['head-sha'] }}
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
 
-      - name: Register protected Google configuration masks
-        shell: bash
-        env:
-          GOOGLE_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
-          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-          PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
-          PROGRESS_PRIZE_DRIVE_ID: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
-          PROGRESS_PRIZE_FOLDER_ID: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
-          PROGRESS_PRIZE_ARCHIVE_FOLDER_ID: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
-          PROGRESS_PRIZE_SOURCE_FORM_ID: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
-          PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
-        run: |
-          set -euo pipefail
-          for name in \
-            GOOGLE_WORKLOAD_IDENTITY_PROVIDER \
-            GOOGLE_SERVICE_ACCOUNT_EMAIL \
-            PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL \
-            PROGRESS_PRIZE_DRIVE_ID \
-            PROGRESS_PRIZE_FOLDER_ID \
-            PROGRESS_PRIZE_ARCHIVE_FOLDER_ID \
-            PROGRESS_PRIZE_SOURCE_FORM_ID \
-            PROGRESS_PRIZE_EDITOR_GROUP_EMAIL
-          do
-            value="${!name}"
-            test -z "$value" && continue
-            case "$value" in
-              *$'\r'*|*$'\n'*) echo "Protected Environment secret has an invalid value." >&2; exit 1 ;;
-            esac
-            printf '::add-mask::%s\n' "$value"
-          done
-
-      - name: Validate protected environment configuration
-        shell: bash
-        env:
-          GOOGLE_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
-          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-          PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
-          PROGRESS_PRIZE_DRIVE_ID: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
-          PROGRESS_PRIZE_FOLDER_ID: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
-          PROGRESS_PRIZE_SOURCE_FORM_ID: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
-          PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
-          PROGRESS_PRIZE_ARCHIVE_FOLDER_ID: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
-          AUTOMATION_ENVIRONMENT: ${{ inputs.environment }}
-          OPERATION: ${{ inputs.operation }}
-        run: |
-          set -euo pipefail
-          for name in \
-            GOOGLE_WORKLOAD_IDENTITY_PROVIDER \
-            GOOGLE_SERVICE_ACCOUNT_EMAIL \
-            PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL \
-            PROGRESS_PRIZE_DRIVE_ID \
-            PROGRESS_PRIZE_FOLDER_ID \
-            PROGRESS_PRIZE_SOURCE_FORM_ID \
-            PROGRESS_PRIZE_EDITOR_GROUP_EMAIL
-          do
-            test -n "${!name}" || { echo "Missing protected Environment secret: $name" >&2; exit 1; }
-          done
-          if test "$AUTOMATION_ENVIRONMENT" = staging -a "$OPERATION" = cleanup; then
-            test -n "$PROGRESS_PRIZE_ARCHIVE_FOLDER_ID" || {
-              echo "Missing protected Environment secret: PROGRESS_PRIZE_ARCHIVE_FOLDER_ID" >&2
-              exit 1
-            }
-          fi
-
-      - name: Authenticate read-only validation without a credential file
-        if: inputs.operation == 'validate' || inputs.operation == 'verify' || inputs['dry-run']
-        id: auth-read
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+  staging:
+    name: staging ${{ inputs.operation }}
+    needs: preflight
+    if: inputs.environment == 'staging'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out the exact approved workflow commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          workload_identity_provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-          token_format: access_token
-          access_token_lifetime: 900s
-          access_token_scopes: |-
-            https://www.googleapis.com/auth/forms.body.readonly
-            https://www.googleapis.com/auth/drive.readonly
-          create_credentials_file: false
-          export_environment_variables: false
-
-      - name: Authenticate mutating operations without a credential file
-        if: inputs.operation != 'validate' && inputs.operation != 'verify' && !inputs['dry-run']
-        id: auth-write
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Run staging Google operation
+        id: google
+        uses: ./.github/actions/progress-prizes-google
         with:
-          workload_identity_provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-          token_format: access_token
-          access_token_lifetime: 900s
-          access_token_scopes: |-
-            https://www.googleapis.com/auth/forms.body
-            https://www.googleapis.com/auth/drive
-          create_credentials_file: false
-          export_environment_variables: false
+          operation: ${{ inputs.operation }}
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['simulated-now'] }}
+          fault: ${{ inputs.fault }}
+          expect-fault: ${{ inputs['expect-fault'] }}
+          dry-run: ${{ inputs['dry-run'] }}
+          verify-mode: ${{ inputs['verify-mode'] }}
+          branch: ${{ inputs.branch }}
+          target-branch: ${{ inputs['target-branch'] }}
+          head-sha: ${{ inputs['head-sha'] }}
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
 
-      - name: Fetch the managed page at the exact gated commit
-        if: inputs.operation == 'activate' || (inputs.operation == 'verify' && inputs['head-sha'] != '')
-        shell: bash
-        env:
-          HEAD_SHA: ${{ inputs['head-sha'] }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          node --input-type=module <<'NODE'
-          import { writeFile } from 'node:fs/promises';
-
-          const sha = process.env.HEAD_SHA ?? '';
-          if (!/^[a-f0-9]{40}$/i.test(sha)) throw new Error('The operation requires an exact commit SHA.');
-          const url = new URL('https://api.github.com/repos/ScrollPrize/villa/contents/scrollprize.org/docs/34_prizes.md');
-          url.searchParams.set('ref', sha);
-          const response = await fetch(url, {
-            redirect: 'error',
-            headers: {
-              accept: 'application/vnd.github.raw+json',
-              authorization: `Bearer ${process.env.GH_TOKEN}`,
-              'user-agent': 'progress-prize-rollover',
-              'x-github-api-version': '2022-11-28',
-            },
-          });
-          if (response.status !== 200) throw new Error('Could not read the managed page at the activation commit.');
-          const body = await response.text();
-          if (Buffer.byteLength(body, 'utf8') > 1024 * 1024) throw new Error('Managed page response is too large.');
-          await writeFile(`${process.env.RUNNER_TEMP}/progress-prizes-page.md`, body, { mode: 0o600 });
-          NODE
-
-      - name: Run Google operation
-        id: operation
-        shell: bash
-        env:
-          GOOGLE_ACCESS_TOKEN: ${{ steps['auth-read'].outputs.access_token || steps['auth-write'].outputs.access_token }}
-          PROGRESS_PRIZE_ENVIRONMENT: ${{ inputs.environment }}
-          PROGRESS_PRIZE_EVENT_NAME: ${{ github.event_name }}
-          PROGRESS_PRIZE_DRIVE_ID: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
-          PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
-          PROGRESS_PRIZE_FOLDER_ID: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
-          PROGRESS_PRIZE_ARCHIVE_FOLDER_ID: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
-          PROGRESS_PRIZE_SOURCE_FORM_ID: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
-          PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
-          PROGRESS_PRIZE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-          PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: ${{ inputs.environment == 'staging' && secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL || '' }}
-          PROGRESS_PRIZE_STAGING_FOLDER_ID: ${{ inputs.environment == 'staging' && secrets.PROGRESS_PRIZE_FOLDER_ID || '' }}
-          PROGRESS_PRIZE_BRANCH: ${{ inputs.branch }}
-          PROGRESS_PRIZE_TARGET_BRANCH: ${{ inputs['target-branch'] }}
-          PROGRESS_PRIZE_DEFAULT_TARGET_BRANCH: main
-          PROGRESS_PRIZE_SMOKE_BRANCH_PREFIX: codex/progress-prize-smoke-
-          PROGRESS_PRIZE_SMOKE_DATE: ${{ inputs.environment == 'staging' && '2026-07-20' || '' }}
-          PROGRESS_PRIZE_VERIFIED_SHA: ${{ inputs['head-sha'] }}
-          PROGRESS_PRIZE_HEAD_SHA: ${{ inputs['head-sha'] }}
-          OPERATION: ${{ inputs.operation }}
-          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
-          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
-          SIMULATED_NOW: ${{ inputs['simulated-now'] }}
-          FAULT: ${{ inputs.fault }}
-          EXPECT_FAULT: ${{ inputs['expect-fault'] }}
-          DRY_RUN: ${{ inputs['dry-run'] }}
-          VERIFY_MODE: ${{ inputs['verify-mode'] }}
-        run: |
-          set -euo pipefail
-          arguments=("$OPERATION" --environment "$PROGRESS_PRIZE_ENVIRONMENT" --event-name "$PROGRESS_PRIZE_EVENT_NAME")
-          test -z "$SOURCE_CYCLE" || arguments+=(--source-cycle "$SOURCE_CYCLE")
-          test -z "$TARGET_CYCLE" || arguments+=(--target-cycle "$TARGET_CYCLE")
-          test -z "$SIMULATED_NOW" || arguments+=(--simulated-now "$SIMULATED_NOW")
-          test -z "$FAULT" || arguments+=(--fault "$FAULT")
-          test "$DRY_RUN" = false || arguments+=(--dry-run)
-          if test "$OPERATION" = verify; then arguments+=(--mode "$VERIFY_MODE"); fi
-          if test -f "$RUNNER_TEMP/progress-prizes-page.md"; then
-            arguments+=(--page-path "$RUNNER_TEMP/progress-prizes-page.md")
-          fi
-
-          set +e
-          node scrollprize.org/scripts/progress-prizes/automation-cli.mjs "${arguments[@]}" \
-            >"$RUNNER_TEMP/progress-prizes-result.json" \
-            2>"$RUNNER_TEMP/progress-prizes-error.txt"
-          operation_status=$?
-          set -e
-
-          if test "$EXPECT_FAULT" = true; then
-            if test "$operation_status" -ne 0; then
-              grep -Fq "Injected staging rollover failure at $FAULT" "$RUNNER_TEMP/progress-prizes-error.txt"
-            else
-              FAULT="$FAULT" node --input-type=module <<'NODE'
-              import { readFile } from 'node:fs/promises';
-
-              const result = JSON.parse(await readFile(
-                `${process.env.RUNNER_TEMP}/progress-prizes-result.json`,
-                'utf8',
-              ));
-              const passedCopyFault = process.env.FAULT === 'after-copy'
-                && result.action === 'prepare'
-                && result.status === 'prepared'
-                && result.created === false
-                && result.resumed === true;
-              const passedCloseFault = process.env.FAULT === 'after-close-source'
-                && result.action === 'activate'
-                && result.status === 'active';
-              if (!passedCopyFault && !passedCloseFault) {
-                throw new Error('Expected staging fault neither occurred nor had already been recovered.');
-              }
-              NODE
-            fi
-            : >"$RUNNER_TEMP/progress-prizes-error.txt"
-            printf '{"status":"expected-fault"}\n' >"$RUNNER_TEMP/progress-prizes-result.json"
-          elif test "$operation_status" -ne 0; then
-            echo "The redacted Progress Prize operation failed; inspect the job summary." >&2
-            exit "$operation_status"
-          fi
-
-      - name: Export only the public responder URL
+  select-result:
+    name: Export selected public result
+    needs:
+      - preflight
+      - production
+      - staging
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      responder-uri: ${{ steps.result.outputs['responder-uri'] }}
+    steps:
+      - name: Require exactly one successful protected job
         id: result
         shell: bash
         env:
-          RESULT_PATH: ${{ runner.temp }}/progress-prizes-result.json
+          AUTOMATION_ENVIRONMENT: ${{ inputs.environment }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          PRODUCTION_RESULT: ${{ needs.production.result }}
+          STAGING_RESULT: ${{ needs.staging.result }}
+          PRODUCTION_URI: ${{ needs.production.outputs['responder-uri'] }}
+          STAGING_URI: ${{ needs.staging.outputs['responder-uri'] }}
         run: |
           set -euo pipefail
-          node --input-type=module <<'NODE'
-          import { appendFile, readFile } from 'node:fs/promises';
-
-          const result = JSON.parse(await readFile(process.env.RESULT_PATH, 'utf8'));
-          const value = result.responderUri ?? result.publicResponderUri ?? '';
-          if (value !== '') {
-            const url = new URL(value);
-            const short = url.origin === 'https://forms.gle';
-            const canonical = url.origin === 'https://docs.google.com'
-              && url.pathname.startsWith('/forms/d/e/')
-              && url.pathname.endsWith('/viewform');
-            if ((!short && !canonical) || url.username || url.password || url.search || url.hash || /[\r\n]/.test(value)) {
-              throw new Error('Operation did not return a canonical public responder URL.');
-            }
-          }
-          await appendFile(process.env.GITHUB_OUTPUT, `responder-uri=${value}\n`);
-          NODE
-
-      - name: Write redacted audit summary
-        if: always()
-        shell: bash
-        env:
-          OPERATION: ${{ inputs.operation }}
-          AUTOMATION_ENVIRONMENT: ${{ inputs.environment }}
-          OPERATION_OUTCOME: ${{ steps.operation.outcome }}
-        run: |
-          {
-            echo "### Progress Prize Google operation"
-            echo
-            echo "- Environment: \`$AUTOMATION_ENVIRONMENT\`"
-            echo "- Operation: \`$OPERATION\`"
-            echo "- Outcome: \`$OPERATION_OUTCOME\`"
-            echo "- Private Google identifiers and ACL identities are intentionally omitted."
-          } >>"$GITHUB_STEP_SUMMARY"
+          test "$PREFLIGHT_RESULT" = success
+          case "$AUTOMATION_ENVIRONMENT" in
+            production)
+              test "$PRODUCTION_RESULT" = success
+              test "$STAGING_RESULT" = skipped
+              selected_uri="$PRODUCTION_URI"
+              ;;
+            staging)
+              test "$STAGING_RESULT" = success
+              test "$PRODUCTION_RESULT" = skipped
+              selected_uri="$STAGING_URI"
+              ;;
+            *) exit 1 ;;
+          esac
+          case "$selected_uri" in *$'\r'*|*$'\n'*) exit 1 ;; esac
+          case "$selected_uri" in
+            ""|https://forms.gle/*|https://docs.google.com/forms/d/e/*/viewform) ;;
+            *) exit 1 ;;
+          esac
+          printf 'responder-uri=%s\n' "$selected_uri" >>"$GITHUB_OUTPUT"
