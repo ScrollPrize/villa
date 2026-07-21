@@ -301,7 +301,7 @@ We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is
 Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
 
 {/* progress-prizes:deadline:start */}
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, July 31st, 2026!
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, August 31st, 2026!
 {/* progress-prizes:deadline:end */}
 
 <details>
@@ -322,7 +322,7 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
 </details>
 
 {/* progress-prizes:form:start */}
-[Submission Form](https://forms.gle/xoF5C3QsYutKP97x7)
+[Submission Form](https://docs.google.com/forms/d/e/1FAIpQLScF6CLnkcIq-YPHY0tT86lfmHhj0qz-GD2MJmwbyW5gX_CxRw/viewform)
 {/* progress-prizes:form:end */}
 
 ***
