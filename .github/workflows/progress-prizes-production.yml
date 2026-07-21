@@ -47,6 +47,7 @@ permissions: {}
 concurrency:
   group: progress-prizes-production
   cancel-in-progress: false
+  queue: max
 
 jobs:
   preflight:
@@ -762,6 +763,12 @@ jobs:
     name: Report a redacted scheduled production failure
     if: >-
       always() &&
+      github.repository == 'ScrollPrize/villa' &&
+      github.repository_id == '890972577' &&
+      github.repository_owner_id == '121906140' &&
+      github.ref == 'refs/heads/main' &&
+      github.workflow_ref == 'ScrollPrize/villa/.github/workflows/progress-prizes-production.yml@refs/heads/main' &&
+      github.workflow_sha == github.sha &&
       inputs['request-id'] != '' &&
       (needs.preflight.result == 'failure' ||
        needs.validate.result == 'failure' ||
