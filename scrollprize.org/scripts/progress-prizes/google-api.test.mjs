@@ -84,13 +84,14 @@ test("retries transient responses with Retry-After and injected sleep", async ()
 
 test("retries fetch network failures with deterministic exponential backoff", async () => {
   const sleeps = [];
-  const { client } = clientFor(
+  const { client, mock } = clientFor(
     [new TypeError("socket contained private host details"), new TypeError("again"), jsonResponse({ id: "file" })],
     { sleep: async (milliseconds) => sleeps.push(milliseconds) },
   );
 
   await client.getFile({ fileId: "file" });
   assert.deepEqual(sleeps, [100, 200]);
+  assert.match(mock.calls[2].url.searchParams.get("fields"), /canAddChildren/);
 });
 
 test("throws structured errors without retaining Google's private response body", async () => {
@@ -162,7 +163,7 @@ test("rejects empty appProperties searches and repeated pagination tokens", asyn
   );
 });
 
-test("copies and updates Drive files with appProperties and Shared Drive flags", async () => {
+test("copies a My Drive source into an explicit Shared Drive parent with managed properties", async () => {
   const { client, mock } = clientFor([
     jsonResponse({ id: "copy" }),
     jsonResponse({ id: "copy", name: "renamed" }),

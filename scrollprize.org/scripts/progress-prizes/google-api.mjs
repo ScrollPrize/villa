@@ -12,7 +12,7 @@ const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
 const REDACTED = "[REDACTED]";
 
 const DEFAULT_FILE_FIELDS =
-  "id,name,mimeType,parents,appProperties,trashed,driveId,capabilities(canCopy,canEdit,canShare)";
+  "id,name,mimeType,parents,appProperties,trashed,driveId,capabilities(canAddChildren,canCopy,canEdit,canShare)";
 const DEFAULT_PERMISSION_FIELDS =
   "id,type,role,emailAddress,domain,allowFileDiscovery,expirationTime,deleted,displayName,permissionDetails,view,pendingOwner,inheritedPermissionsDisabled";
 

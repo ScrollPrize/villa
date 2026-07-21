@@ -19,6 +19,8 @@ const LIVE_FORM_ID = 'private-live-form';
 const LIVE_RESPONDER = 'https://docs.google.com/forms/d/e/live-public-id/viewform';
 const LIVE_SHORT_URL = 'https://forms.gle/livePublic';
 const STAGING_EDITOR = 'progress-prizes-staging@example.org';
+const STAGING_SERVICE_ACCOUNT = 'staging-automation@private-project.iam.gserviceaccount.com';
+const PRODUCTION_SERVICE_ACCOUNT = 'production-automation@private-project.iam.gserviceaccount.com';
 
 const STAGING_EDITOR_PERMISSION = Object.freeze({
   type: 'group',
@@ -100,10 +102,41 @@ class FakeGoogle {
       [LIVE_FORM_ID, {
         id: LIVE_FORM_ID,
         name: 'July 2026 Progress Prizes',
-        parents: ['private-production-folder'],
+        mimeType: 'application/vnd.google-apps.form',
+        parents: ['private-owner-my-drive-folder'],
+        appProperties: {},
+        trashed: false,
+        capabilities: { canCopy: true, canEdit: false, canShare: false },
+      }],
+      ['private-staging-folder', {
+        id: 'private-staging-folder',
+        name: 'Staging active forms',
+        mimeType: 'application/vnd.google-apps.folder',
+        parents: [],
+        driveId: 'private-staging-drive',
+        appProperties: {},
+        trashed: false,
+        capabilities: { canAddChildren: true, canShare: true },
+      }],
+      ['private-staging-archive', {
+        id: 'private-staging-archive',
+        name: 'Staging archive',
+        mimeType: 'application/vnd.google-apps.folder',
+        parents: [],
+        driveId: 'private-staging-drive',
+        appProperties: {},
+        trashed: false,
+        capabilities: { canAddChildren: true, canShare: true },
+      }],
+      ['private-production-folder', {
+        id: 'private-production-folder',
+        name: 'Production active forms',
+        mimeType: 'application/vnd.google-apps.folder',
+        parents: [],
         driveId: 'private-production-drive',
         appProperties: {},
-        capabilities: { canCopy: true, canEdit: true, canShare: true },
+        trashed: false,
+        capabilities: { canAddChildren: true, canShare: true },
       }],
     ]);
     this.forms = new Map([
@@ -131,6 +164,19 @@ class FakeGoogle {
     ]);
     this.permissions = new Map([
       [LIVE_FORM_ID, [
+        { id: 'owner', type: 'user', role: 'owner', emailAddress: 'private-owner@example.org' },
+        {
+          id: 'production-automation',
+          type: 'user',
+          role: 'writer',
+          emailAddress: PRODUCTION_SERVICE_ACCOUNT,
+        },
+        {
+          id: 'staging-automation',
+          type: 'user',
+          role: 'reader',
+          emailAddress: STAGING_SERVICE_ACCOUNT,
+        },
         { id: 'production-editor', type: 'group', role: 'writer', emailAddress: 'private-team@example.org' },
         PUBLIC_PERMISSION,
       ]],
@@ -169,6 +215,7 @@ class FakeGoogle {
       .filter((file) => Object.entries(appProperties).every(
         ([key, value]) => file.appProperties?.[key] === value,
       ))
+      .filter((file) => driveId === undefined || file.driveId === driveId)
       .filter((file) => parentId === undefined || file.parents?.includes(parentId))
       .map(clone);
   }
@@ -176,15 +223,16 @@ class FakeGoogle {
   async copyFile({ fileId, name, parentId, appProperties }) {
     this.record('copyFile', { fileId, name, parentId, appProperties });
     const sourceForm = this.requireForm(fileId);
+    const destination = this.requireFile(parentId);
     const id = `managed-form-${this.nextFile++}`;
     const file = {
       id,
       name,
+      mimeType: 'application/vnd.google-apps.form',
       parents: [parentId],
-      driveId: parentId === 'private-staging-folder'
-        ? 'private-staging-drive'
-        : 'private-production-drive',
+      driveId: destination.driveId,
       appProperties: clone(appProperties),
+      trashed: false,
       capabilities: { canCopy: true, canEdit: true, canShare: true },
     };
     const form = clone(sourceForm);
@@ -263,6 +311,15 @@ function fixedClock(instant) {
   return { now: () => new Date(instant) };
 }
 
+function grantProductionSourceAccess(google) {
+  google.files.get(LIVE_FORM_ID).capabilities = {
+    canCopy: true,
+    canEdit: true,
+    canShare: false,
+  };
+  return google;
+}
+
 function stagingRuntime(overrides = {}) {
   return {
     environment: 'staging',
@@ -271,8 +328,8 @@ function stagingRuntime(overrides = {}) {
     stagingFolderId: 'private-staging-folder',
     archiveFolderId: 'private-staging-archive',
     driveId: 'private-staging-drive',
-    serviceAccountEmail: 'staging-automation@example.org',
-    stagingServiceAccountEmail: 'staging-automation@example.org',
+    serviceAccountEmail: STAGING_SERVICE_ACCOUNT,
+    stagingServiceAccountEmail: STAGING_SERVICE_ACCOUNT,
     branch: 'codex/progress-prize-smoke-20260720',
     targetBranch: 'codex/progress-prize-smoke-base-20260720',
     defaultTargetBranch: 'main',
@@ -289,8 +346,8 @@ function productionRuntime(overrides = {}) {
     eventName: 'schedule',
     folderId: 'private-production-folder',
     driveId: 'private-production-drive',
-    serviceAccountEmail: 'production-automation@example.org',
-    stagingServiceAccountEmail: 'staging-automation@example.org',
+    serviceAccountEmail: PRODUCTION_SERVICE_ACCOUNT,
+    stagingServiceAccountEmail: STAGING_SERVICE_ACCOUNT,
     branch: 'codex/progress-prize-2026-08',
     targetBranch: 'main',
     defaultTargetBranch: 'main',
@@ -326,7 +383,7 @@ async function bootstrapAndPrepare(context) {
 }
 
 test('validate performs a read-only production preflight and resolves the public short URL', async () => {
-  const google = new FakeGoogle();
+  const google = grantProductionSourceAccess(new FakeGoogle());
   const context = service({
     google,
     runtime: productionRuntime(),
@@ -336,6 +393,7 @@ test('validate performs a read-only production preflight and resolves the public
   const result = await context.rollover.validate({
     sourceFormId: LIVE_FORM_ID,
     sourceCycle: '2026-07',
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
   });
 
   assert.equal(result.status, 'valid');
@@ -379,9 +437,10 @@ test('validate safely stops for linked Sheets and legacy publish settings', asyn
   );
 });
 
-test('production preflight requires the configured Shared Drive and explicit capabilities', async () => {
+test('production accepts only its explicit My Drive bootstrap source with copy and edit access', async () => {
   const wrongDriveGoogle = new FakeGoogle();
   wrongDriveGoogle.files.get(LIVE_FORM_ID).driveId = 'unexpected-drive';
+  wrongDriveGoogle.files.get(LIVE_FORM_ID).parents = ['unexpected-folder'];
   await assert.rejects(
     service({ google: wrongDriveGoogle, runtime: productionRuntime() }).rollover.validate({
       sourceFormId: LIVE_FORM_ID,
@@ -391,21 +450,101 @@ test('production preflight requires the configured Shared Drive and explicit cap
   );
   assert.equal(wrongDriveGoogle.calls.some(({ method }) => method === 'getForm'), false);
 
-  const unknownCapabilityGoogle = new FakeGoogle();
-  delete unknownCapabilityGoogle.files.get(LIVE_FORM_ID).capabilities.canShare;
+  const disguisedManagedGoogle = grantProductionSourceAccess(new FakeGoogle());
+  const disguisedFile = disguisedManagedGoogle.files.get(LIVE_FORM_ID);
+  disguisedFile.driveId = 'private-production-drive';
+  disguisedFile.parents = ['private-production-folder'];
+  disguisedFile.appProperties = {
+    managedBy: ROLLOVER_MANAGED_BY,
+    schemaVersion: '1',
+    environment: 'production',
+    role: ROLLOVER_FILE_ROLES.TARGET,
+    cycle: '2026-06',
+  };
   await assert.rejects(
-    service({ google: unknownCapabilityGoogle, runtime: productionRuntime() }).rollover.validate({
+    service({ google: disguisedManagedGoogle, runtime: productionRuntime() }).rollover.validate({
       sourceFormId: LIVE_FORM_ID,
       sourceCycle: '2026-07',
     }),
-    /required canShare capability/,
+    /explicit fallback cannot claim managed rollover metadata/,
+  );
+  assert.equal(disguisedManagedGoogle.calls.some(({ method }) => method === 'getForm'), false);
+
+  const missingEditGoogle = new FakeGoogle();
+  await assert.rejects(
+    service({ google: missingEditGoogle, runtime: productionRuntime() }).rollover.validate({
+      sourceFormId: LIVE_FORM_ID,
+      sourceCycle: '2026-07',
+    }),
+    /required canEdit capability/,
+  );
+
+  const leastPrivilegeGoogle = grantProductionSourceAccess(new FakeGoogle());
+  assert.equal(leastPrivilegeGoogle.files.get(LIVE_FORM_ID).capabilities.canShare, false);
+  assert.equal((await service({
+    google: leastPrivilegeGoogle,
+    runtime: productionRuntime(),
+  }).rollover.validate({
+    sourceFormId: LIVE_FORM_ID,
+    sourceCycle: '2026-07',
+  })).status, 'valid');
+
+  for (const [mutate, expected] of [
+    [(file) => { file.mimeType = 'application/vnd.google-apps.spreadsheet'; }, /not a Google Form/],
+    [(file) => { file.trashed = true; }, /source form is trashed/],
+  ]) {
+    const invalidGoogle = grantProductionSourceAccess(new FakeGoogle());
+    mutate(invalidGoogle.files.get(LIVE_FORM_ID));
+    await assert.rejects(
+      service({ google: invalidGoogle, runtime: productionRuntime() }).rollover.validate({
+        sourceFormId: LIVE_FORM_ID,
+        sourceCycle: '2026-07',
+      }),
+      expected,
+    );
+    assert.equal(invalidGoogle.calls.some(({ method }) => method === 'getForm'), false);
+  }
+
+  await assert.rejects(
+    service().rollover.prepare({
+      targetCycle: '2026-08',
+      sourceFormId: LIVE_FORM_ID,
+      collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+    }),
+    /My Drive fallback source is restricted to production/,
+  );
+
+  const driftingGoogle = grantProductionSourceAccess(new FakeGoogle());
+  const originalGetFile = driftingGoogle.getFile.bind(driftingGoogle);
+  let liveReads = 0;
+  driftingGoogle.getFile = async (input) => {
+    const file = await originalGetFile(input);
+    if (input.fileId === LIVE_FORM_ID && ++liveReads === 2) {
+      file.driveId = 'unexpected-drive';
+      file.parents = ['unexpected-folder'];
+    }
+    return file;
+  };
+  await assert.rejects(
+    service({ google: driftingGoogle, runtime: productionRuntime() }).rollover.validate({
+      sourceFormId: LIVE_FORM_ID,
+      sourceCycle: '2026-07',
+    }),
+    /My Drive fallback source changed location during preflight/,
   );
 });
 
 test('production preflight verifies the published reader and configured editor group', async () => {
-  const missingPublishedGoogle = new FakeGoogle();
+  const missingPublishedGoogle = grantProductionSourceAccess(new FakeGoogle());
   missingPublishedGoogle.permissions.set(LIVE_FORM_ID, [
+    {
+      id: 'production-automation',
+      type: 'user',
+      role: 'writer',
+      emailAddress: PRODUCTION_SERVICE_ACCOUNT,
+    },
     { id: 'production-editor', ...PRODUCTION_EDITOR_PERMISSION },
+    { id: 'domain-published', type: 'domain', role: 'reader', domain: 'example.org', view: 'published' },
   ]);
   await assert.rejects(
     service({ google: missingPublishedGoogle, runtime: productionRuntime() }).rollover.validate({
@@ -416,7 +555,7 @@ test('production preflight verifies the published reader and configured editor g
     /published responder permission/,
   );
 
-  const missingEditorGoogle = new FakeGoogle();
+  const missingEditorGoogle = grantProductionSourceAccess(new FakeGoogle());
   await assert.rejects(
     service({ google: missingEditorGoogle, runtime: productionRuntime() }).rollover.validate({
       sourceFormId: LIVE_FORM_ID,
@@ -424,6 +563,123 @@ test('production preflight verifies the published reader and configured editor g
       collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
     }),
     /configured internal collaborator/,
+  );
+
+  const missingAutomationGoogle = grantProductionSourceAccess(new FakeGoogle());
+  missingAutomationGoogle.permissions.set(
+    LIVE_FORM_ID,
+    missingAutomationGoogle.permissions.get(LIVE_FORM_ID).filter(
+      ({ emailAddress }) => emailAddress !== PRODUCTION_SERVICE_ACCOUNT,
+    ),
+  );
+  await assert.rejects(
+    service({ google: missingAutomationGoogle, runtime: productionRuntime() }).rollover.validate({
+      sourceFormId: LIVE_FORM_ID,
+      sourceCycle: '2026-07',
+      collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+    }),
+    /required direct automation access/,
+  );
+
+  const extraPublishedGoogle = grantProductionSourceAccess(new FakeGoogle());
+  extraPublishedGoogle.permissions.get(LIVE_FORM_ID).push({
+    id: 'unexpected-domain-published',
+    type: 'domain',
+    role: 'reader',
+    domain: 'example.org',
+    view: 'published',
+  });
+  await assert.rejects(
+    service({ google: extraPublishedGoogle, runtime: productionRuntime() }).rollover.validate({
+      sourceFormId: LIVE_FORM_ID,
+      sourceCycle: '2026-07',
+      collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+    }),
+    /unexpected non-public published responder permission/,
+  );
+});
+
+test('destination folder preflight blocks both dry-run and real copies', async () => {
+  for (const mutate of [
+    (google, folder) => { folder.driveId = 'unexpected-drive'; },
+    (google, folder) => { folder.capabilities.canShare = false; },
+    (google, folder) => {
+      google.permissions.set(folder.id, [{
+        id: 'unexpected-folder-manager',
+        type: 'user',
+        role: 'organizer',
+        emailAddress: 'unexpected-manager@example.org',
+        permissionDetails: [{ inherited: true }],
+      }]);
+    },
+  ]) {
+    for (const dryRun of [true, false]) {
+      const google = grantProductionSourceAccess(new FakeGoogle());
+      mutate(google, google.files.get('private-production-folder'));
+      await assert.rejects(
+        service({ google, runtime: productionRuntime() }).rollover.prepare({
+          targetCycle: '2026-08',
+          sourceFormId: LIVE_FORM_ID,
+          collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+          dryRun,
+        }),
+        /writable Shared Drive folder|unexpected inherited edit access/,
+      );
+      assert.equal(google.calls.some(({ method }) => method === 'copyFile'), false);
+    }
+  }
+});
+
+test('service accounts cannot be configured as copied collaborators', async () => {
+  const google = grantProductionSourceAccess(new FakeGoogle());
+  await assert.rejects(
+    service({ google, runtime: productionRuntime() }).rollover.prepare({
+      targetCycle: '2026-08',
+      sourceFormId: LIVE_FORM_ID,
+      collaboratorPermissions: [{
+        type: 'user',
+        role: 'writer',
+        emailAddress: PRODUCTION_SERVICE_ACCOUNT,
+      }],
+    }),
+    /service account cannot be configured as a form collaborator/,
+  );
+  assert.equal(google.calls.length, 0);
+
+  const privilegedStagingGoogle = grantProductionSourceAccess(new FakeGoogle());
+  privilegedStagingGoogle.permissions.get(LIVE_FORM_ID).find(
+    ({ emailAddress }) => emailAddress === STAGING_SERVICE_ACCOUNT,
+  ).role = 'writer';
+  await assert.rejects(
+    service({
+      google: privilegedStagingGoogle,
+      runtime: productionRuntime({ stagingServiceAccountEmail: undefined }),
+    }).rollover.prepare({
+      targetCycle: '2026-08',
+      sourceFormId: LIVE_FORM_ID,
+      collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+    }),
+    /unexpected service-account collaborator/,
+  );
+  assert.equal(
+    privilegedStagingGoogle.calls.some(({ method }) => method === 'copyFile'),
+    false,
+  );
+
+  const domainGoogle = grantProductionSourceAccess(new FakeGoogle());
+  domainGoogle.permissions.get(LIVE_FORM_ID).push({
+    id: 'domain-writer',
+    type: 'domain',
+    role: 'writer',
+    domain: 'example.org',
+  });
+  await assert.rejects(
+    service({ google: domainGoogle, runtime: productionRuntime() }).rollover.validate({
+      sourceFormId: LIVE_FORM_ID,
+      sourceCycle: '2026-07',
+      collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+    }),
+    /unsupported domain collaborator/,
   );
 });
 
@@ -463,6 +719,22 @@ test('bootstrap copies the live form into staging, limits ACLs, and never mutate
     (fileId === LIVE_FORM_ID || formId === LIVE_FORM_ID)
     && ['updateFile', 'createPermission', 'deletePermission', 'updateFormTitle', 'setPublishState'].includes(method));
   assert.deepEqual(liveMutations, []);
+});
+
+test('bootstrap rejects an overprivileged staging identity before copying production', async () => {
+  for (const capability of ['canEdit', 'canShare']) {
+    const context = service();
+    context.google.files.get(LIVE_FORM_ID).capabilities[capability] = true;
+    await assert.rejects(
+      context.rollover.bootstrapStagingSource({
+        sourceFormId: LIVE_FORM_ID,
+        sourceCycle: '2026-07',
+        collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+      }),
+      /forbidden edit or share access/,
+    );
+    assert.equal(context.google.calls.some(({ method }) => method === 'copyFile'), false);
+  }
 });
 
 test('prepare resumes the one appProperties copy after an injected failure and writes only the managed page lines', async () => {
@@ -555,8 +827,44 @@ test('prepare refuses to copy a source that is no longer live', async () => {
   assert.equal(context.google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08').length, 0);
 });
 
+test('a newly copied target is closed before later capability validation can fail', async () => {
+  const context = service();
+  await context.rollover.bootstrapStagingSource({
+    sourceFormId: LIVE_FORM_ID,
+    sourceCycle: '2026-07',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+  });
+  const originalCopyFile = context.google.copyFile.bind(context.google);
+  context.google.copyFile = async (input) => {
+    const copied = await originalCopyFile(input);
+    copied.capabilities.canShare = false;
+    context.google.files.get(copied.id).capabilities.canShare = false;
+    return copied;
+  };
+
+  await assert.rejects(
+    context.rollover.prepare({
+      targetCycle: '2026-08',
+      collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+    }),
+    /required canShare capability/,
+  );
+  const target = context.google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+  assert.deepEqual(context.google.forms.get(target.id).publishSettings.publishState, {
+    isPublished: true,
+    isAcceptingResponses: false,
+  });
+});
+
 test('later production cycles discover the previously activated managed target', async () => {
-  const google = new FakeGoogle();
+  const google = grantProductionSourceAccess(new FakeGoogle());
+  google.permissions.get(LIVE_FORM_ID).push({
+    id: 'inherited-human-editor',
+    type: 'user',
+    role: 'writer',
+    emailAddress: 'private-human-editor@example.org',
+    permissionDetails: [{ inherited: true }],
+  });
   const page = new MemoryPage();
   const july = service({
     google,
@@ -570,6 +878,39 @@ test('later production cycles discover the previously activated managed target',
     collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
   });
   const augustTarget = google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+  assert.equal(augustTarget.driveId, 'private-production-drive');
+  assert.deepEqual(augustTarget.parents, ['private-production-folder']);
+  assert.equal(augustTarget.appProperties.managedBy, ROLLOVER_MANAGED_BY);
+  assert.equal(augustTarget.appProperties.environment, 'production');
+  assert.equal(augustTarget.appProperties.role, ROLLOVER_FILE_ROLES.TARGET);
+  assert.equal(augustTarget.appProperties.cycle, '2026-08');
+  assert.equal(augustTarget.appProperties.state, ROLLOVER_FILE_STATES.PREPARED);
+  assert.match(augustTarget.appProperties.sourceFingerprint, /^[a-f0-9]{64}$/);
+  assert.deepEqual(google.files.get(LIVE_FORM_ID).appProperties, {});
+  const firstCopy = google.calls.find(({ method }) => method === 'copyFile');
+  assert.equal(firstCopy.fileId, LIVE_FORM_ID);
+  assert.equal(firstCopy.parentId, 'private-production-folder');
+  const copiedCollaborators = google.permissions.get(augustTarget.id)
+    .filter(({ type }) => type === 'user' || type === 'group')
+    .map(({ emailAddress }) => emailAddress)
+    .sort();
+  assert.deepEqual(copiedCollaborators, [
+    'private-human-editor@example.org',
+    'private-team@example.org',
+  ]);
+  google.permissions.get(augustTarget.id).push({
+    id: 'inherited-production-automation',
+    type: 'user',
+    role: 'organizer',
+    emailAddress: PRODUCTION_SERVICE_ACCOUNT,
+    permissionDetails: [{ inherited: true }],
+  });
+  assert.equal((await july.rollover.verify({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  })).status, 'valid');
+  google.files.get(LIVE_FORM_ID).capabilities.canCopy = false;
 
   const cutoff = service({
     google,
@@ -583,6 +924,44 @@ test('later production cycles discover the previously activated managed target',
     collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
     headSha: 'a'.repeat(40),
   });
+  assert.equal(
+    google.forms.get(LIVE_FORM_ID).publishSettings.publishState.isAcceptingResponses,
+    false,
+  );
+  assert.equal(
+    google.forms.get(augustTarget.id).publishSettings.publishState.isAcceptingResponses,
+    true,
+  );
+  const sourceCloseIndex = google.calls.findIndex((call) => (
+    call.method === 'setPublishState'
+    && call.formId === LIVE_FORM_ID
+    && call.isAcceptingResponses === false
+  ));
+  const targetOpenIndex = google.calls.findIndex((call) => (
+    call.method === 'setPublishState'
+    && call.formId === augustTarget.id
+    && call.isAcceptingResponses === true
+  ));
+  assert.ok(sourceCloseIndex >= 0 && targetOpenIndex > sourceCloseIndex);
+  assert.equal(google.files.get(LIVE_FORM_ID).appProperties.managedBy, undefined);
+  assert.equal(google.files.get(LIVE_FORM_ID).appProperties.state, ROLLOVER_FILE_STATES.CLOSED);
+  assert.equal((await cutoff.rollover.verify({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    mode: 'active',
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  })).status, 'valid');
+  assert.equal((await cutoff.rollover.activate({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+    headSha: 'a'.repeat(40),
+  })).status, 'active');
+
+  google.files.delete(LIVE_FORM_ID);
+  google.forms.delete(LIVE_FORM_ID);
+  google.permissions.delete(LIVE_FORM_ID);
+  google.calls.length = 0;
 
   const august = service({
     google,
@@ -601,6 +980,50 @@ test('later production cycles discover the previously activated managed target',
     method === 'copyFile' && appProperties?.cycle === '2026-09'
   ));
   assert.equal(septemberCopy.fileId, augustTarget.id);
+  assert.equal(
+    google.calls.some(({ fileId, formId }) => fileId === LIVE_FORM_ID || formId === LIVE_FORM_ID),
+    false,
+  );
+});
+
+test('a missing later managed source cannot fall back to the stale initial form ID', async () => {
+  const google = grantProductionSourceAccess(new FakeGoogle());
+  const page = new MemoryPage();
+  const july = service({
+    google,
+    page,
+    runtime: productionRuntime(),
+    clock: fixedClock('2026-07-26T12:00:00Z'),
+  });
+  await july.rollover.prepare({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  });
+  const augustTarget = google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+  google.files.delete(augustTarget.id);
+  google.forms.delete(augustTarget.id);
+  google.permissions.delete(augustTarget.id);
+  google.calls.length = 0;
+
+  const august = service({
+    google,
+    page,
+    runtime: productionRuntime(),
+    clock: fixedClock('2026-08-25T12:00:00Z'),
+  });
+  await assert.rejects(
+    august.rollover.prepare({
+      targetCycle: '2026-09',
+      sourceFormId: LIVE_FORM_ID,
+      collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+    }),
+    /explicit fallback is restricted to the initial bootstrap cycle/,
+  );
+  assert.equal(
+    google.calls.some(({ fileId, formId }) => fileId === LIVE_FORM_ID || formId === LIVE_FORM_ID),
+    false,
+  );
 });
 
 test('activate requires the injected preview gate before closing the source', async () => {
@@ -634,6 +1057,108 @@ test('activate requires the injected preview gate before closing the source', as
     google.forms.get(source.id).publishSettings.publishState.isAcceptingResponses,
     true,
   );
+});
+
+test('activate rejects target capability or source-binding drift before closing the source', async () => {
+  for (const mutate of [
+    (target) => { target.capabilities.canShare = false; },
+    (target) => { target.appProperties.sourceFingerprint = '0'.repeat(64); },
+  ]) {
+    const google = new FakeGoogle();
+    const page = new MemoryPage();
+    await bootstrapAndPrepare(service({ google, page }));
+    const source = google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0];
+    const target = google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+    mutate(target);
+    let gateCalled = false;
+    const active = service({
+      google,
+      page,
+      clock: fixedClock('2026-08-01T07:00:01Z'),
+      runtime: stagingRuntime({ simulatedNow: '2026-08-01T07:00:01Z' }),
+      activationGate: async () => {
+        gateCalled = true;
+        return true;
+      },
+    });
+
+    await assert.rejects(
+      active.rollover.activate({ targetCycle: '2026-08' }),
+      /required canShare capability|not bound to the resolved source form/,
+    );
+    assert.equal(gateCalled, false);
+    assert.equal(
+      google.forms.get(source.id).publishSettings.publishState.isAcceptingResponses,
+      true,
+    );
+    assert.equal(
+      google.forms.get(target.id).publishSettings.publishState.isAcceptingResponses,
+      false,
+    );
+  }
+});
+
+test('activate revalidates target binding and ACLs after the preview gate', async () => {
+  for (const mutate of [
+    (google, target) => { target.appProperties.sourceFingerprint = '0'.repeat(64); },
+    (google, target) => {
+      google.permissions.get(target.id).push({
+        id: 'unexpected-inherited-editor',
+        type: 'user',
+        role: 'writer',
+        emailAddress: 'unexpected-editor@example.org',
+        permissionDetails: [{ inherited: true }],
+      });
+    },
+    (google, target) => {
+      google.permissions.get(target.id).push({
+        id: 'unexpected-rogue-service-account',
+        type: 'user',
+        role: 'writer',
+        emailAddress: 'rogue@private-project.iam.gserviceaccount.com',
+        permissionDetails: [{ inherited: true }],
+      });
+    },
+    (google, target) => {
+      google.permissions.get(target.id).push({
+        id: 'unexpected-drive-manager',
+        type: 'user',
+        role: 'organizer',
+        emailAddress: 'unexpected-manager@example.org',
+        permissionDetails: [{ inherited: true }],
+      });
+    },
+  ]) {
+    const google = new FakeGoogle();
+    const page = new MemoryPage();
+    await bootstrapAndPrepare(service({ google, page }));
+    const source = google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0];
+    const target = google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+    const active = service({
+      google,
+      page,
+      clock: fixedClock('2026-08-01T07:00:01Z'),
+      runtime: stagingRuntime({ simulatedNow: '2026-08-01T07:00:01Z' }),
+      activationGate: async () => {
+        mutate(google, target);
+        return true;
+      },
+    });
+
+    await assert.rejects(
+      active.rollover.activate({ targetCycle: '2026-08' }),
+      /not bound to the resolved source form|permissions do not match/,
+    );
+    assert.equal(
+      google.forms.get(source.id).publishSettings.publishState.isAcceptingResponses,
+      true,
+    );
+    assert.equal(
+      google.forms.get(target.id).publishSettings.publishState.isAcceptingResponses,
+      false,
+    );
+    assert.equal(target.appProperties.state, ROLLOVER_FILE_STATES.PREPARED);
+  }
 });
 
 test('activate recovers after closing the source, opens the target once, and is idempotent', async () => {
@@ -670,6 +1195,8 @@ test('activate recovers after closing the source, opens the target once, and is 
     isPublished: true,
     isAcceptingResponses: false,
   });
+  source.capabilities.canCopy = false;
+  source.capabilities.canShare = false;
 
   const first = await active.rollover.activate({ targetCycle: '2026-08' });
   const publishCallsAfterFirst = google.calls.filter(({ method }) => method === 'setPublishState').length;
@@ -688,6 +1215,27 @@ test('activate recovers after closing the source, opens the target once, and is 
 });
 
 test('activate rejects publishing drift and resumes an explicitly marked target activation', async () => {
+  const manualGoogle = new FakeGoogle();
+  const manualPage = new MemoryPage();
+  await bootstrapAndPrepare(service({ google: manualGoogle, page: manualPage }));
+  const manualSource = manualGoogle.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0];
+  const manualTarget = manualGoogle.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+  manualGoogle.forms.get(manualSource.id).publishSettings.publishState.isAcceptingResponses = false;
+  const manualService = service({
+    google: manualGoogle,
+    page: manualPage,
+    clock: fixedClock('2026-08-01T07:00:01Z'),
+    runtime: stagingRuntime({ simulatedNow: '2026-08-01T07:00:01Z' }),
+  });
+  await assert.rejects(
+    manualService.rollover.activate({ targetCycle: '2026-08' }),
+    /not in an allowed activation or recovery state/,
+  );
+  assert.equal(
+    manualGoogle.forms.get(manualTarget.id).publishSettings.publishState.isAcceptingResponses,
+    false,
+  );
+
   const driftGoogle = new FakeGoogle();
   const driftPage = new MemoryPage();
   await bootstrapAndPrepare(service({ google: driftGoogle, page: driftPage }));
@@ -709,6 +1257,20 @@ test('activate rejects publishing drift and resumes an explicitly marked target 
     ).publishSettings.publishState.isAcceptingResponses,
     true,
   );
+
+  const intentGoogle = new FakeGoogle();
+  const intentPage = new MemoryPage();
+  await bootstrapAndPrepare(service({ google: intentGoogle, page: intentPage }));
+  const intentTarget = intentGoogle.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+  intentTarget.appProperties.state = ROLLOVER_FILE_STATES.ACTIVATING;
+  const intentRecovery = service({
+    google: intentGoogle,
+    page: intentPage,
+    clock: fixedClock('2026-08-01T07:00:01Z'),
+    runtime: stagingRuntime({ simulatedNow: '2026-08-01T07:00:01Z' }),
+  });
+  assert.equal((await intentRecovery.rollover.activate({ targetCycle: '2026-08' })).status, 'active');
+  assert.equal(intentTarget.appProperties.state, ROLLOVER_FILE_STATES.ACTIVE);
 
   const recoveryGoogle = new FakeGoogle();
   const recoveryPage = new MemoryPage();
@@ -764,6 +1326,7 @@ test('activate resumes when the source closed but its CLOSED marker write failed
     isAcceptingResponses: false,
   });
   assert.equal(source.appProperties.state, ROLLOVER_FILE_STATES.ACTIVE);
+  assert.equal(target.appProperties.state, ROLLOVER_FILE_STATES.ACTIVATING);
   assert.deepEqual(google.forms.get(target.id).publishSettings.publishState, {
     isPublished: true,
     isAcceptingResponses: false,
@@ -870,7 +1433,7 @@ test('production safety rejects simulated time, faults, alternate bases, and sta
   );
   assert.throws(
     () => assertRolloverRuntimeSafety(productionRuntime({
-      serviceAccountEmail: 'staging-automation@example.org',
+      serviceAccountEmail: STAGING_SERVICE_ACCOUNT,
     })),
     /staging service account/,
   );
