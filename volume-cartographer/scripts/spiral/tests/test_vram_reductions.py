@@ -9,7 +9,12 @@ import torch.nn.functional as F
 from flow_fields import CartesianFlowField, sample_field
 from checkpoint_io import load_checkpoint_cpu
 from tifxyz import Patch
-from tracks import _sample_prepared_track_points, iter_track_losses, prepare_main_phase_tracks
+from tracks import (
+    _sample_prepared_track_points,
+    iter_track_losses,
+    prepare_main_phase_tracks,
+    validate_track_sampling_config,
+)
 
 
 class CartesianFlowGradientTests(unittest.TestCase):
@@ -79,6 +84,14 @@ class CartesianFlowGradientTests(unittest.TestCase):
 
 
 class CpuTrackStorageTests(unittest.TestCase):
+    @staticmethod
+    def _line_track(length, *, z=10, y=10, axis=2):
+        points = np.zeros((int(length) + 1, 3), dtype=np.float32)
+        points[:, 0] = z
+        points[:, 1] = y
+        points[:, axis] = np.arange(int(length) + 1, dtype=np.float32)
+        return points
+
     def test_only_sampled_track_batch_moves_to_training_device(self):
         tracks = [
             np.arange(18, dtype=np.float32).reshape(6, 3),
@@ -116,6 +129,131 @@ class CpuTrackStorageTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(prepared['offsets'].numpy(), [0, 6, 12])
         np.testing.assert_array_equal(prepared['lengths'].numpy(), [6, 6])
+
+    def test_disabled_sampling_policies_preserve_seeded_legacy_draw(self):
+        tracks = [
+            self._line_track(5, y=10),
+            self._line_track(7, y=20),
+            self._line_track(9, y=30),
+        ]
+        legacy = prepare_main_phase_tracks(tracks, None, 0.0, 'cpu')
+        configured = prepare_main_phase_tracks(
+            tracks, None, 0.0, 'cpu',
+            sampling_config={
+                'track_length_bin_weights': None,
+                'track_max_tortuosity': None,
+                'max_track_crossing_per_step': 0,
+            },
+        )
+
+        torch.manual_seed(123)
+        legacy_sample = _sample_prepared_track_points(legacy, 3, 4)
+        torch.manual_seed(123)
+        configured_sample = _sample_prepared_track_points(configured, 3, 4)
+        for actual, expected in zip(configured_sample, legacy_sample):
+            torch.testing.assert_close(actual, expected)
+
+    def test_track_point_indices_are_unique_and_short_tracks_are_ineligible(self):
+        short = self._line_track(2, y=10)  # Three points: cannot supply four uniquely.
+        long_a = self._line_track(8, y=20)
+        long_b = self._line_track(10, y=30)
+        prepared = prepare_main_phase_tracks(
+            [short, long_a, long_b], None, 0.0, 'cpu')
+
+        torch.manual_seed(7)
+        track_ids, local_indices, _ = _sample_prepared_track_points(
+            prepared, 3, 4)
+
+        self.assertNotIn(0, track_ids.tolist())
+        for row in local_indices:
+            self.assertEqual(torch.unique(row).numel(), 4)
+            self.assertTrue(torch.all(row[1:] > row[:-1]))
+
+    def test_length_bin_weights_are_distributed_within_tertiles(self):
+        tracks = [self._line_track(length, y=length * 2) for length in range(1, 10)]
+        prepared = prepare_main_phase_tracks(
+            tracks, None, 0.0, 'cpu',
+            sampling_config={
+                'track_length_bin_weights': [0.15, 0.25, 0.60],
+                'track_max_tortuosity': None,
+                'max_track_crossing_per_step': 0,
+            },
+        )
+
+        probabilities = prepared['sampling_probabilities'].numpy()
+        np.testing.assert_allclose([
+            probabilities[:3].sum(),
+            probabilities[3:6].sum(),
+            probabilities[6:].sum(),
+        ], [0.15, 0.25, 0.60], rtol=1e-6, atol=1e-7)
+        np.testing.assert_allclose(probabilities[:3], np.full(3, 0.05))
+
+    def test_tortuosity_filter_is_opt_in_and_uses_arclength_over_chord(self):
+        straight = np.array([
+            [10, 10, 0], [10, 10, 5], [10, 10, 10],
+        ], dtype=np.float32)
+        tortuous = np.array([
+            [10, 10, 0], [10, 13, 0], [10, 13, 4], [10, 10, 4],
+        ], dtype=np.float32)
+
+        unfiltered = prepare_main_phase_tracks(
+            [straight, tortuous], None, 0.0, 'cpu',
+            sampling_config={'track_max_tortuosity': None},
+        )
+        filtered = prepare_main_phase_tracks(
+            [straight, tortuous], None, 0.0, 'cpu',
+            sampling_config={'track_max_tortuosity': 2.0},
+        )
+
+        self.assertEqual(unfiltered['lengths'].numel(), 2)
+        self.assertEqual(filtered['lengths'].numel(), 1)
+        np.testing.assert_array_equal(filtered['flat_zyx_cpu'].numpy(), straight)
+
+    def test_crossing_partners_are_opposite_family_angled_and_spaced(self):
+        primary = self._line_track(20, z=10, y=10, axis=2)
+
+        def vertical_at(x):
+            track = np.zeros((21, 3), dtype=np.float32)
+            track[:, 0] = 10
+            track[:, 1] = np.arange(21, dtype=np.float32)
+            track[:, 2] = x
+            return track
+
+        tracks = [
+            primary,
+            vertical_at(4),
+            vertical_at(10),
+            vertical_at(16),
+            primary.copy(),  # Opposite provenance, but parallel: reject it.
+        ]
+        prepared = prepare_main_phase_tracks(
+            tracks, None, 0.0, 'cpu',
+            sampling_config={
+                'track_length_bin_weights': None,
+                'track_max_tortuosity': None,
+                'max_track_crossing_per_step': 2,
+            },
+            track_families=['horizontal', 'vertical', 'vertical', 'vertical', 'vertical'],
+        )
+
+        np.testing.assert_array_equal(
+            prepared['crossing_partners'][0].numpy(), [1, 3])
+        self.assertNotIn(4, prepared['crossing_partners'][0].tolist())
+
+        # Force primary track zero so the draw deterministically appends its two
+        # prepared, well-spaced crossing partners.
+        prepared['sampling_probabilities'] = torch.tensor([1., 0., 0., 0., 0.])
+        track_ids, _, sampled = _sample_prepared_track_points(prepared, 1, 4)
+        np.testing.assert_array_equal(track_ids.numpy(), [0, 1, 3])
+        self.assertEqual(sampled.shape, (3, 4, 3))
+
+    def test_sampling_policy_validation_rejects_malformed_values(self):
+        with self.assertRaisesRegex(ValueError, 'short, medium, long'):
+            validate_track_sampling_config({'track_length_bin_weights': [1, 2]})
+        with self.assertRaisesRegex(ValueError, '>= 1'):
+            validate_track_sampling_config({'track_max_tortuosity': 0.9})
+        with self.assertRaisesRegex(ValueError, 'non-negative integer'):
+            validate_track_sampling_config({'max_track_crossing_per_step': 1.5})
 
     def test_staged_track_backward_matches_combined_backward(self):
         class Translation:

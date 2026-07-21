@@ -48,6 +48,7 @@ from tracks import (
     iter_track_losses,
     load_tracks_from_dbm,
     prepare_main_phase_tracks,
+    validate_track_sampling_config,
 )
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 from sample_spiral import (
@@ -225,6 +226,11 @@ default_config = {
     'unattached_pcl_min_point_spacing': 16.,
     'track_num_per_step': 48000,
     'track_num_points_per_step': 24,
+    # Optional track-pool policies. None preserves uniform sampling and keeps
+    # every track regardless of tortuosity; crossing supplements are opt-in.
+    'track_length_bin_weights': None,  # [short, medium, long], using eligible-track arclength tertiles
+    'track_max_tortuosity': None,  # whole-track arclength / endpoint chord; None disables filtering
+    'max_track_crossing_per_step': 0,  # opposite-family partners appended per primary track
     'track_exclusion_radius': 0.0,
     'track_radius_target': 'mean',
     'track_radius_loss_margin': 0.025,
@@ -1240,9 +1246,15 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                       f'{dense_spacing_mode!r}; this component runs only as '
                       "part of the 'phase' bundle and is INACTIVE.")
 
+    track_sampling_config = validate_track_sampling_config(cfg)
+    track_families = None
     if tracks_dbm_path is not None and cfg.get('use_tracks', True):
         print(f'loading tracks from {tracks_dbm_path}')
-        tracks = load_tracks_from_dbm(tracks_dbm_path, z_begin, z_end)
+        if track_sampling_config['max_crossings'] > 0:
+            tracks, track_families = load_tracks_from_dbm(
+                tracks_dbm_path, z_begin, z_end, return_families=True)
+        else:
+            tracks = load_tracks_from_dbm(tracks_dbm_path, z_begin, z_end)
         print(f'loaded {len(tracks)} tracks within z-roi [{z_begin}, {z_end})')
     else:
         tracks = None
@@ -1875,6 +1887,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             float(cfg['track_exclusion_radius']),
             device,
             anchor_tree=trusted_geometry_tree,
+            sampling_config=track_sampling_config,
+            track_families=track_families,
         )
         # With the usual zero exclusion radius, the training bundle already
         # contains every authoritative track point as one flat CPU tensor.  Reuse it

@@ -33,7 +33,7 @@ constexpr int kPollBackoffMs = 2000;
 constexpr int kPollReconnectMs = 5000;
 constexpr int kRemoteLogPollMs = 10000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 5;
+constexpr int kSupportedApiVersion = 6;
 constexpr int kPreviewCacheKept = 3;
 
 QString stateName(SpiralServiceManager::ConnectionState state)

@@ -1,5 +1,7 @@
 import colorsys
 import dbm
+import itertools
+import math
 import pickle
 
 import kornia
@@ -22,13 +24,19 @@ from sample_spiral import (
 )
 
 
-def load_tracks_from_dbm(path, z_lo, z_hi):
+def load_tracks_from_dbm(path, z_lo, z_hi, return_families=False):
     # Load tracks written by extract_surface_tracks.py. Each DBM value is a
     # pickled list of (N, 3) int32 zyx arrays; keep only tracks that lie entirely
     # within the full-resolution [z_lo, z_hi) ROI.
     tracks = []
+    families = []
     with dbm.open(path, 'r') as db:
         for key in tqdm(db.keys(), desc='loading tracks'):
+            family = None
+            if return_families:
+                prefix = key.decode().split(':', 1)[0]
+                family = 'horizontal' if prefix == 'h' else (
+                    'vertical' if prefix in ('vx', 'vy') else None)
             entries = pickle.loads(db[key])
             if not entries:
                 continue
@@ -47,7 +55,249 @@ def load_tracks_from_dbm(path, z_lo, z_hi):
             keep = (zmins >= z_lo) & (zmaxs < z_hi)
             for j in np.nonzero(keep)[0]:
                 tracks.append(entries[idx[j]].astype(np.float32))
+                if return_families:
+                    families.append(family)
+    if return_families:
+        return tracks, families
     return tracks
+
+
+def validate_track_sampling_config(config):
+    """Validate and normalize the optional session-scoped track policies."""
+    weights = config.get('track_length_bin_weights')
+    if weights is not None:
+        if not isinstance(weights, (list, tuple)) or len(weights) != 3:
+            raise ValueError('track_length_bin_weights must be null or [short, medium, long]')
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(float(value)) or float(value) < 0
+               for value in weights):
+            raise ValueError('track_length_bin_weights values must be finite and non-negative')
+        weights = np.asarray(weights, dtype=np.float64)
+        if float(weights.sum()) <= 0:
+            raise ValueError('track_length_bin_weights must contain at least one positive value')
+        weights = weights / weights.sum()
+
+    max_tortuosity = config.get('track_max_tortuosity')
+    if max_tortuosity is not None:
+        if (isinstance(max_tortuosity, bool)
+                or not isinstance(max_tortuosity, (int, float))
+                or not math.isfinite(float(max_tortuosity))
+                or float(max_tortuosity) < 1.0):
+            raise ValueError('track_max_tortuosity must be null or a finite number >= 1')
+        max_tortuosity = float(max_tortuosity)
+
+    max_crossings = config.get('max_track_crossing_per_step', 0)
+    if (isinstance(max_crossings, bool) or not isinstance(max_crossings, (int, float))
+            or not math.isfinite(float(max_crossings))
+            or not float(max_crossings).is_integer() or int(max_crossings) < 0):
+        raise ValueError('max_track_crossing_per_step must be a non-negative integer')
+
+    return {
+        'length_bin_weights': weights,
+        'max_tortuosity': max_tortuosity,
+        'max_crossings': int(max_crossings),
+    }
+
+
+def _polyline_arclengths(tracks):
+    return np.asarray([
+        np.linalg.norm(np.diff(np.asarray(track, dtype=np.float64), axis=0), axis=1).sum()
+        if len(track) >= 2 else 0.0
+        for track in tracks
+    ], dtype=np.float64)
+
+
+def _track_tortuosities(tracks, arclengths):
+    chords = np.asarray([
+        np.linalg.norm(np.asarray(track[-1], dtype=np.float64)
+                       - np.asarray(track[0], dtype=np.float64))
+        if len(track) >= 2 else 0.0
+        for track in tracks
+    ], dtype=np.float64)
+    result = np.full(len(tracks), np.inf, dtype=np.float64)
+    np.divide(arclengths, chords, out=result, where=chords > 0)
+    return result
+
+
+def _length_bin_probabilities(arclengths, weights, device):
+    edges = np.quantile(arclengths, [1 / 3, 2 / 3])
+    bin_ids = (arclengths > edges[0]).astype(np.int64)
+    bin_ids += (arclengths > edges[1]).astype(np.int64)
+    counts = np.bincount(bin_ids, minlength=3)
+    available_weights = np.where(counts > 0, weights, 0.0)
+    if available_weights.sum() <= 0:
+        raise ValueError(
+            'track_length_bin_weights assign no probability to the non-empty length bins')
+    available_weights /= available_weights.sum()
+    probabilities = available_weights[bin_ids] / counts[bin_ids]
+    print(
+        'track length bins: '
+        f'short <= {edges[0]:.1f} ({counts[0]}), '
+        f'medium <= {edges[1]:.1f} ({counts[1]}), long ({counts[2]}); '
+        f'effective weights {available_weights.tolist()}'
+    )
+    return torch.as_tensor(probabilities, dtype=torch.float32, device=device)
+
+
+def _track_tangent(track, raw_index, radius_voxels=12.0):
+    point = np.asarray(track[raw_index], dtype=np.float64)
+    left = raw_index
+    while left > 0 and np.linalg.norm(np.asarray(track[left], dtype=np.float64) - point) < radius_voxels:
+        left -= 1
+    right = raw_index
+    while (right + 1 < len(track)
+           and np.linalg.norm(np.asarray(track[right], dtype=np.float64) - point) < radius_voxels):
+        right += 1
+    vector = np.asarray(track[right], dtype=np.float64) - np.asarray(track[left], dtype=np.float64)
+    norm = np.linalg.norm(vector)
+    return vector / norm if norm else None
+
+
+def _pack_track_points(points):
+    integer_points = np.asarray(points, dtype=np.int64)
+    if np.any(integer_points < 0) or np.any(integer_points >= (1 << 20)):
+        raise ValueError('track coordinates must lie in [0, 2**20) for crossing pairing')
+    packed = integer_points.astype(np.uint64, copy=False)
+    return ((packed[:, 0] << np.uint64(40))
+            | (packed[:, 1] << np.uint64(20)) | packed[:, 2])
+
+
+def _select_spaced_crossing_partners(candidates, maximum):
+    """Choose distinct partners, spreading their crossings along the primary."""
+    if not candidates or maximum <= 0:
+        return []
+    remaining = list(candidates)
+    if maximum == 1 or len(remaining) == 1:
+        return [max(remaining, key=lambda item: (item[2], -item[0]))[0]]
+
+    # Seed the set with the widest-separated pair, then use maximin spacing
+    # for any remaining slots. Clearance and partner id make ties stable.
+    first = min(remaining, key=lambda item: (item[1], -item[2], item[0]))
+    selected = [first]
+    remaining.remove(first)
+    second = max(
+        remaining,
+        key=lambda item: (abs(item[1] - first[1]), item[2], -item[0]),
+    )
+    selected.append(second)
+    remaining.remove(second)
+    while remaining and len(selected) < maximum:
+        positions = [item[1] for item in selected]
+        choice = max(
+            remaining,
+            key=lambda item: (
+                min(abs(item[1] - position) for position in positions),
+                item[2],
+                -item[0],
+            ),
+        )
+        selected.append(choice)
+        remaining.remove(choice)
+    return [partner for partner, _, _ in selected]
+
+
+def _build_crossing_partner_table(tracks, families, maximum, device):
+    """Mirror grow_track_grids exact crossings for the opt-in sampler."""
+    if maximum <= 0:
+        return None
+    if families is None or len(families) != len(tracks):
+        raise ValueError('crossing-track sampling requires DBM track-family provenance')
+    if not tracks:
+        return torch.empty((0, maximum), dtype=torch.int64, device=device)
+
+    lengths = np.fromiter((len(track) for track in tracks), dtype=np.int64, count=len(tracks))
+    points = np.concatenate(tracks, axis=0)
+    track_ids = np.repeat(np.arange(len(tracks), dtype=np.int64), lengths)
+    local_indices = np.concatenate([
+        np.arange(length, dtype=np.int64) for length in lengths
+    ])
+    packed = _pack_track_points(points)
+    order = np.argsort(packed, kind='stable')
+    packed = packed[order]
+    track_ids = track_ids[order]
+    local_indices = local_indices[order]
+    boundaries = np.flatnonzero(packed[1:] != packed[:-1]) + 1
+    starts = np.r_[0, boundaries]
+    stops = np.r_[boundaries, len(packed)]
+    shared = stops - starts > 1
+    starts = starts[shared]
+    stops = stops[shared]
+    del points, packed, order, boundaries, shared
+
+    angle_cutoff = math.cos(math.radians(30.0))
+    tangent_cache = {}
+    raw_events = {}
+    for start, stop in zip(starts, stops):
+        unique = {}
+        for position in range(int(start), int(stop)):
+            unique.setdefault(int(track_ids[position]), int(local_indices[position]))
+        if len(unique) < 2:
+            continue
+        for first, second in itertools.combinations(unique, 2):
+            if (families[first] is None or families[second] is None
+                    or families[first] == families[second]):
+                continue
+            first_index, second_index = unique[first], unique[second]
+            first_key, second_key = (first, first_index), (second, second_index)
+            if first_key not in tangent_cache:
+                tangent_cache[first_key] = _track_tangent(tracks[first], first_index)
+            if second_key not in tangent_cache:
+                tangent_cache[second_key] = _track_tangent(tracks[second], second_index)
+            first_tangent, second_tangent = tangent_cache[first_key], tangent_cache[second_key]
+            if first_tangent is None or second_tangent is None:
+                continue
+            if abs(float(np.dot(first_tangent, second_tangent))) > angle_cutoff:
+                continue
+            raw_events.setdefault((first, second), []).append((first_index, second_index))
+
+    cumulative = [np.r_[0.0, np.cumsum(np.linalg.norm(
+        np.diff(np.asarray(track, dtype=np.float64), axis=0), axis=1))]
+        for track in tracks]
+    adjacency = [[] for _ in tracks]
+    accepted_events = 0
+    for (first, second), events in raw_events.items():
+        events.sort()
+        clusters = []
+        cluster = []
+        for event in events:
+            if (cluster and abs(event[0] - cluster[-1][0]) <= 4
+                    and abs(event[1] - cluster[-1][1]) <= 4):
+                cluster.append(event)
+            else:
+                if cluster:
+                    clusters.append(cluster)
+                cluster = [event]
+        if cluster:
+            clusters.append(cluster)
+        representatives = [cluster[len(cluster) // 2] for cluster in clusters]
+        best = None
+        for first_index, second_index in representatives:
+            first_position = float(cumulative[first][first_index])
+            second_position = float(cumulative[second][second_index])
+            clearance = min(
+                first_position, cumulative[first][-1] - first_position,
+                second_position, cumulative[second][-1] - second_position,
+            )
+            candidate = (clearance, first_position, second_position)
+            if best is None or candidate > best:
+                best = candidate
+        clearance, first_position, second_position = best
+        adjacency[first].append((second, first_position, clearance))
+        adjacency[second].append((first, second_position, clearance))
+        accepted_events += len(representatives)
+
+    table = np.full((len(tracks), maximum), -1, dtype=np.int64)
+    for track_id, candidates in enumerate(adjacency):
+        chosen = _select_spaced_crossing_partners(candidates, maximum)
+        table[track_id, :len(chosen)] = chosen
+    paired_tracks = int(np.count_nonzero(np.any(table >= 0, axis=1)))
+    partner_slots = int(np.count_nonzero(table >= 0))
+    print(
+        f'track crossings: {accepted_events} exact crossing events, '
+        f'{paired_tracks}/{len(tracks)} tracks have partners, '
+        f'{partner_slots} partner slots retained (max {maximum} per primary)'
+    )
+    return torch.from_numpy(table).to(device=device)
 
 
 def _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding):
@@ -330,24 +580,82 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold):
     return np.isinf(dist)
 
 
-def prepare_main_phase_tracks(tracks, anchor_scroll_zyxs, exclusion_radius, device, anchor_tree=None):
+def prepare_main_phase_tracks(
+        tracks, anchor_scroll_zyxs, exclusion_radius, device, anchor_tree=None,
+        sampling_config=None, track_families=None):
     if not tracks:
         return None
+    if sampling_config is not None and 'length_bin_weights' in sampling_config:
+        policy = sampling_config
+    else:
+        policy = validate_track_sampling_config(sampling_config or {})
+    weights = policy['length_bin_weights']
+    max_tortuosity = policy['max_tortuosity']
+    max_crossings = policy['max_crossings']
+
+    input_track_count = len(tracks)
+    working_tracks = list(tracks)
+    working_families = list(track_families) if track_families is not None else None
+    arclengths = None
+    if weights is not None or max_tortuosity is not None:
+        arclengths = _polyline_arclengths(working_tracks)
+    if max_tortuosity is not None:
+        tortuosities = _track_tortuosities(working_tracks, arclengths)
+        keep = np.flatnonzero(tortuosities <= max_tortuosity)
+        working_tracks = [working_tracks[index] for index in keep]
+        if working_families is not None:
+            working_families = [working_families[index] for index in keep]
+        arclengths = arclengths[keep]
+        print(
+            f'track tortuosity <= {max_tortuosity:g}: kept '
+            f'{len(working_tracks)} / {input_track_count} tracks'
+        )
+        if not working_tracks:
+            return None
+
     print('removing tracks near patches')
     if anchor_tree is None:
         anchor_tree = _build_anchor_kdtree(anchor_scroll_zyxs)
+
+    def finish_prepared(flat_zyx_np, lengths_new, surviving_indices):
+        offsets_new = np.empty(len(lengths_new) + 1, dtype=np.int64)
+        offsets_new[0] = 0
+        np.cumsum(lengths_new, out=offsets_new[1:])
+        prepared = {
+            # The full point cloud can be tens of millions of points, while a
+            # step consumes only a sampled batch. Keep coordinates in host RAM.
+            'flat_zyx_cpu': torch.from_numpy(flat_zyx_np).contiguous(),
+            'offsets': torch.from_numpy(offsets_new).to(device=device),
+            'lengths': torch.from_numpy(lengths_new).to(device=device),
+            'device': torch.device(device),
+            'staging': None,
+        }
+        if weights is not None:
+            eligible_arclengths = arclengths[surviving_indices]
+            prepared['sampling_probabilities'] = _length_bin_probabilities(
+                eligible_arclengths, weights, device)
+        if max_crossings > 0:
+            eligible_tracks = [working_tracks[index] for index in surviving_indices]
+            eligible_families = (
+                [working_families[index] for index in surviving_indices]
+                if working_families is not None else None)
+            prepared['crossing_partners'] = _build_crossing_partner_table(
+                eligible_tracks, eligible_families, max_crossings, device)
+        return prepared
 
     # The common configuration has no exclusion radius.  The generic path
     # below creates several point-count-sized int64 arrays and stable-sorts the
     # already grouped tracks; none of that changes the result when every point
     # is kept.  Concatenate only the surviving (length >= 2) tracks directly.
     if exclusion_radius <= 0 or anchor_tree is None:
+        surviving = np.asarray([
+            index for index, track in enumerate(working_tracks) if len(track) >= 2
+        ], dtype=np.int64)
         surviving_tracks = [
-            np.asarray(track, dtype=np.float32)
-            for track in tracks
-            if len(track) >= 2
+            np.asarray(working_tracks[index], dtype=np.float32)
+            for index in surviving
         ]
-        print(f'kept {len(surviving_tracks)} / {len(tracks)} tracks')
+        print(f'kept {len(surviving_tracks)} / {len(working_tracks)} tracks')
         if not surviving_tracks:
             return None
         lengths_new = np.fromiter(
@@ -356,32 +664,23 @@ def prepare_main_phase_tracks(tracks, anchor_scroll_zyxs, exclusion_radius, devi
             count=len(surviving_tracks),
         )
         flat_zyx_np = np.concatenate(surviving_tracks, axis=0)
-        offsets_new = np.empty(len(lengths_new) + 1, dtype=np.int64)
-        offsets_new[0] = 0
-        np.cumsum(lengths_new, out=offsets_new[1:])
         print(
-            f'track radius loss: {len(surviving_tracks)}/{len(tracks)} tracks survive exclusion '
+            f'track radius loss: {len(surviving_tracks)}/{len(working_tracks)} tracks survive exclusion '
             f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
         )
-        return {
-            'flat_zyx_cpu': torch.from_numpy(flat_zyx_np).contiguous(),
-            'offsets': torch.from_numpy(offsets_new).to(device=device),
-            'lengths': torch.from_numpy(lengths_new).to(device=device),
-            'device': torch.device(device),
-            'staging': None,
-        }
+        return finish_prepared(flat_zyx_np, lengths_new, surviving)
 
-    flat_zyx_np = np.concatenate([t.astype(np.float32) for t in tracks], axis=0)
+    flat_zyx_np = np.concatenate([t.astype(np.float32) for t in working_tracks], axis=0)
     track_id_np = np.concatenate([
-        np.full(len(t), i, dtype=np.int64) for i, t in enumerate(tracks)
+        np.full(len(t), i, dtype=np.int64) for i, t in enumerate(working_tracks)
     ])
     keep_np = _track_points_far_from_anchors_mask(flat_zyx_np, anchor_tree, exclusion_radius)
     flat_zyx_np = flat_zyx_np[keep_np]
     track_id_np = track_id_np[keep_np]
-    num_tracks_orig = len(tracks)
+    num_tracks_orig = len(working_tracks)
     new_lengths = np.bincount(track_id_np, minlength=num_tracks_orig)
     surviving = np.where(new_lengths >= 2)[0]
-    print(f'kept {len(surviving)} / {len(tracks)} tracks')
+    print(f'kept {len(surviving)} / {len(working_tracks)} tracks')
     if len(surviving) == 0:
         return None
     old_to_new = -np.ones(num_tracks_orig, dtype=np.int64)
@@ -393,25 +692,41 @@ def prepare_main_phase_tracks(tracks, anchor_scroll_zyxs, exclusion_radius, devi
     sort_idx = np.argsort(new_id, kind='stable')
     flat_zyx_np = flat_zyx_np[sort_idx]
     lengths_new = new_lengths[surviving].astype(np.int64)
-    offsets_new = np.concatenate([[0], np.cumsum(lengths_new)]).astype(np.int64)
     print(
         f'track radius loss: {len(surviving)}/{num_tracks_orig} tracks survive exclusion '
         f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
     )
-    return {
-        # The full point cloud can be tens of millions of points, while a step
-        # consumes only a sampled batch. Keep coordinates in host RAM and stage
-        # that batch below; offsets/lengths remain on CUDA so sampling stays fast
-        # and retains the existing CUDA RNG sequence.
-        'flat_zyx_cpu': torch.from_numpy(flat_zyx_np).contiguous(),
-        'offsets': torch.from_numpy(offsets_new).to(device=device),
-        'lengths': torch.from_numpy(lengths_new).to(device=device),
-        'device': torch.device(device),
-        'staging': None,
-    }
+    return finish_prepared(flat_zyx_np, lengths_new, surviving)
 
 
-def _draw_track_sample(prepared_tracks, k, num_points_per_track, generator=None):
+def _draw_unique_track_point_indices(track_lengths, num_points, generator=None):
+    """Uniformly draw fixed-size point sets without replacement per track."""
+    sample_count = int(track_lengths.numel())
+    device = track_lengths.device
+    random_values = torch.rand(
+        [sample_count, num_points], device=device, generator=generator)
+    selected = torch.empty(
+        [sample_count, num_points], dtype=torch.int64, device=device)
+
+    # Batched Floyd sampling. For column c, draw from [0, L-k+c]. If that
+    # value is already present in the row, use the new upper endpoint instead.
+    # This produces a uniform k-subset using O(k) random values per track.
+    first_upper = track_lengths - num_points
+    for column in range(num_points):
+        upper = first_upper + column
+        candidate = (
+            random_values[:, column] * (upper + 1).to(torch.float32)
+        ).to(torch.int64)
+        if column:
+            duplicate = (selected[:, :column] == candidate[:, None]).any(dim=1)
+            candidate = torch.where(duplicate, upper, candidate)
+        selected[:, column] = candidate
+    return torch.sort(selected, dim=-1).values
+
+
+def _draw_track_sample(
+        prepared_tracks, eligible_track_indices, k, num_points_per_track,
+        generator=None):
     # GPU index math, one forced D2H of the flat indices, the big host-side
     # coordinate gather, and the H2D upload. Under prefetch this runs on the
     # worker thread for the next step, so the syncs stall the worker rather
@@ -420,18 +735,40 @@ def _draw_track_sample(prepared_tracks, k, num_points_per_track, generator=None)
     offsets = prepared_tracks['offsets']
     lengths = prepared_tracks['lengths']
     device = prepared_tracks['device']
-    num_tracks = int(lengths.numel())
-    track_idx = torch.randint(num_tracks, (k,), device=device, generator=generator)
+    num_eligible = int(eligible_track_indices.numel())
+    sampling_probabilities = prepared_tracks.get('sampling_probabilities')
+    if sampling_probabilities is None:
+        eligible_choice = torch.randint(
+            num_eligible, (k,), device=device, generator=generator)
+        track_idx = eligible_track_indices[eligible_choice]
+    else:
+        eligible_probabilities = sampling_probabilities[eligible_track_indices]
+        probability_sum = eligible_probabilities.sum()
+        if float(probability_sum) <= 0:
+            raise ValueError(
+                'track_length_bin_weights assign no probability to tracks long enough '
+                'for track_num_points_per_step')
+        track_idx = torch.multinomial(
+            eligible_probabilities / probability_sum,
+            k, replacement=True, generator=generator)
+        track_idx = eligible_track_indices[track_idx]
+
+    crossing_partners = prepared_tracks.get('crossing_partners')
+    if crossing_partners is not None and crossing_partners.shape[1] > 0:
+        partners = crossing_partners[track_idx]
+        partners = partners[partners >= 0]
+        partners = partners[lengths[partners] >= num_points_per_track]
+        if partners.numel() > 0:
+            track_idx = torch.cat([track_idx, partners])
+
+    sample_count = int(track_idx.numel())
     track_lengths_sample = lengths[track_idx]
     track_offsets_sample = offsets[track_idx]
-    point_idx_within = (
-        torch.rand([k, num_points_per_track], device=device, generator=generator)
-        * track_lengths_sample[:, None].to(torch.float32)
-    ).to(torch.int64)
-    point_idx_within, _ = torch.sort(point_idx_within, dim=-1)
+    point_idx_within = _draw_unique_track_point_indices(
+        track_lengths_sample, num_points_per_track, generator)
     flat_idx = (track_offsets_sample[:, None] + point_idx_within).reshape(-1)
     flat_idx_cpu = flat_idx.to(device='cpu')
-    sampled_cpu = flat_zyx_cpu[flat_idx_cpu].view(k, num_points_per_track, 3)
+    sampled_cpu = flat_zyx_cpu[flat_idx_cpu].view(sample_count, num_points_per_track, 3)
     if device.type == 'cuda':
         staging = prepared_tracks.get('staging')
         if staging is None or staging.shape != sampled_cpu.shape:
@@ -453,16 +790,33 @@ def _sample_prepared_track_points(prepared_tracks, num_tracks_per_step, num_poin
     num_tracks = int(lengths.numel())
     if num_tracks == 0 or num_tracks_per_step <= 0 or num_points_per_track <= 0:
         return None
-    k = min(int(num_tracks_per_step), num_tracks)
+    eligibility_cache = prepared_tracks.setdefault('eligibility_cache', {})
+    eligible_track_indices = eligibility_cache.get(int(num_points_per_track))
+    if eligible_track_indices is None:
+        eligible_track_indices = torch.nonzero(
+            lengths >= int(num_points_per_track), as_tuple=False).squeeze(-1)
+        eligibility_cache[int(num_points_per_track)] = eligible_track_indices
+        if int(eligible_track_indices.numel()) != num_tracks:
+            print(
+                f'track point sampling: {int(eligible_track_indices.numel())}/{num_tracks} '
+                f'tracks have at least {int(num_points_per_track)} unique points'
+            )
+    num_eligible = int(eligible_track_indices.numel())
+    if num_eligible == 0:
+        return None
+    k = min(int(num_tracks_per_step), num_eligible)
 
     if prefetch.prefetch_enabled() and device.type == 'cuda':
         pf = prefetch.get_prefetcher()
         generator = pf.torch_rng('tracks', device)
         return pf.pop_or_run(
             ('tracks', k, num_points_per_track),
-            lambda: _draw_track_sample(prepared_tracks, k, num_points_per_track, generator),
+            lambda: _draw_track_sample(
+                prepared_tracks, eligible_track_indices, k,
+                num_points_per_track, generator),
         )
-    return _draw_track_sample(prepared_tracks, k, num_points_per_track)
+    return _draw_track_sample(
+        prepared_tracks, eligible_track_indices, k, num_points_per_track)
 
 
 @geom_utils.maybe_compile

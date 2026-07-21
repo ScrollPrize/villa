@@ -41,6 +41,11 @@ class FakeSession:
             "loss_start_patch_dt": 25_000,
             "loss_start_track_dt": 10_000,
         }
+        self.default_advanced_config = {
+            "learning_rate": 3e-5,
+            "num_patches_per_step": 360,
+            "loss_weight_patch_radius": 8.0,
+        }
         self.saved = []
         self.closed = False
 
@@ -52,6 +57,7 @@ class FakeSession:
             "geometry_snapshot_manifest_path": None,
             "supports_input_incorporation": True,
             "run_config": dict(self.run_config),
+            "default_advanced_config": dict(self.default_advanced_config),
         }
 
     def run(self, count, pending_inputs=None, mark_incorporated=None,

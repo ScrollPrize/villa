@@ -52,6 +52,10 @@ private:
     QJsonObject runAdvancedConfig() const;
     QJsonObject durableAdvancedConfig() const;
     void applyOptionalInputConfig(QJsonObject& config, bool includeSelectionFlags) const;
+    void applyTrackSamplingConfig(QJsonObject& config) const;
+    void syncTrackSamplingControlsFromAdvanced();
+    void writeTrackSamplingControlsToAdvanced();
+    void updateTrackSamplingUi();
     QSet<QString> forcedOptionalRunConfigKeys() const;
     bool optionalInputEnabled(const QString& key) const;
     void updateOptionalInputUi();
@@ -104,6 +108,11 @@ private:
     QComboBox* _outwardSense = nullptr;
     QComboBox* _storageBackend = nullptr;
     QCheckBox* _savePngVisualizations = nullptr;
+    QCheckBox* _trackLengthBinSampling = nullptr;
+    QDoubleSpinBox* _trackShortWeight = nullptr;
+    QDoubleSpinBox* _trackMediumWeight = nullptr;
+    QDoubleSpinBox* _trackLongWeight = nullptr;
+    QSpinBox* _maxTrackCrossings = nullptr;
     QCheckBox* _influenceEnabled = nullptr;
     QSpinBox* _influenceZ = nullptr;
     QDoubleSpinBox* _influenceWindings = nullptr;

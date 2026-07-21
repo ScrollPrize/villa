@@ -18,8 +18,9 @@ import zipfile
 
 
 
-# Version 5 makes sampling counts, loss weights, and loss start steps Run-scoped.
-API_VERSION = 5
+# Version 6 exposes the session's effective Python/checkpoint Advanced-config
+# baseline independently from client overrides.
+API_VERSION = 6
 
 
 # Counts which describe how many training objects/points are sampled per

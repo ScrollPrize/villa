@@ -300,6 +300,53 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
 
     addPathRow(pathsForm, "fibers", tr("Fibers"), true);
     addPathRow(pathsForm, "tracks_dbm", tr("Tracks DBM"), false);
+
+    _trackLengthBinSampling = new QCheckBox(tr("Sample tracks by length bins"), pathsContents);
+    _trackLengthBinSampling->setObjectName(QStringLiteral("spiralTrackLengthBinSampling"));
+    _trackLengthBinSampling->setChecked(false);
+    _trackLengthBinSampling->setToolTip(
+        tr("Draw short, medium, and long tracks using configurable weights. "
+           "The bin boundaries are computed from eligible-track arclength tertiles."));
+    pathsForm->addRow(_trackLengthBinSampling);
+
+    auto* trackWeights = new QWidget(pathsContents);
+    auto* trackWeightsLayout = new QHBoxLayout(trackWeights);
+    trackWeightsLayout->setContentsMargins(0, 0, 0, 0);
+    _trackShortWeight = new QDoubleSpinBox(trackWeights);
+    _trackMediumWeight = new QDoubleSpinBox(trackWeights);
+    _trackLongWeight = new QDoubleSpinBox(trackWeights);
+    const auto configureTrackWeight = [](QDoubleSpinBox* spin, double value,
+                                         const QString& objectName) {
+        spin->setObjectName(objectName);
+        spin->setRange(0.0, 1000.0);
+        spin->setDecimals(3);
+        spin->setSingleStep(0.05);
+        spin->setValue(value);
+    };
+    configureTrackWeight(_trackShortWeight, 0.15,
+                         QStringLiteral("spiralTrackShortWeight"));
+    configureTrackWeight(_trackMediumWeight, 0.25,
+                         QStringLiteral("spiralTrackMediumWeight"));
+    configureTrackWeight(_trackLongWeight, 0.60,
+                         QStringLiteral("spiralTrackLongWeight"));
+    trackWeightsLayout->addWidget(new QLabel(tr("Short"), trackWeights));
+    trackWeightsLayout->addWidget(_trackShortWeight);
+    trackWeightsLayout->addWidget(new QLabel(tr("Medium"), trackWeights));
+    trackWeightsLayout->addWidget(_trackMediumWeight);
+    trackWeightsLayout->addWidget(new QLabel(tr("Long"), trackWeights));
+    trackWeightsLayout->addWidget(_trackLongWeight);
+    pathsForm->addRow(tr("Length-bin weights"), trackWeights);
+
+    _maxTrackCrossings = new QSpinBox(pathsContents);
+    _maxTrackCrossings->setObjectName(QStringLiteral("spiralMaxTrackCrossings"));
+    _maxTrackCrossings->setRange(0, 1000);
+    _maxTrackCrossings->setValue(0);
+    _maxTrackCrossings->setToolTip(
+        tr("Maximum differently oriented crossing partners appended for each sampled "
+           "primary track. Zero disables crossing-pair sampling."));
+    pathsForm->addRow(tr("Max crossings / sampled track"), _maxTrackCrossings);
+    updateTrackSamplingUi();
+
     addPathRow(pathsForm, "verified_patches", tr("Verified patches"), true);
     addPathRow(pathsForm, "unverified_patches", tr("Unverified patches"), true);
     addPathRow(pathsForm, "outer_shell", tr("Outer shell"), true);
@@ -617,7 +664,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 case CS::Disconnected: text = tr("Disconnected"); break;
                 case CS::Starting: text = tr("Starting…"); break;
                 case CS::Connecting: text = tr("Connecting…"); break;
-                case CS::Ready: text = tr("Connected — API v5%1")
+                case CS::Ready: text = tr("Connected — API v6%1")
                         .arg(message.isEmpty() ? QString() : QStringLiteral(" — ") + message); break;
                 case CS::Reconnecting: text = tr("Reconnecting… %1").arg(message); break;
                 case CS::Failed: text = tr("Failed: %1").arg(message); break;
@@ -764,7 +811,19 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             [this](int) { markReloadRequired(); });
     connect(_savePngVisualizations, &QCheckBox::toggled, this,
             [this](bool) { markReloadRequired(); });
+    connect(_trackLengthBinSampling, &QCheckBox::toggled, this, [this](bool) {
+        updateTrackSamplingUi();
+        writeTrackSamplingControlsToAdvanced();
+    });
+    for (QDoubleSpinBox* spin : {_trackShortWeight, _trackMediumWeight,
+                                 _trackLongWeight}) {
+        connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+                [this](double) { writeTrackSamplingControlsToAdvanced(); });
+    }
+    connect(_maxTrackCrossings, qOverload<int>(&QSpinBox::valueChanged), this,
+            [this](int) { writeTrackSamplingControlsToAdvanced(); });
     connect(_advanced, &QPlainTextEdit::textChanged, this, [this]() {
+        syncTrackSamplingControlsFromAdvanced();
         if (durableAdvancedConfig() != _loadedDurableAdvanced)
             markReloadRequired();
     });
@@ -1153,6 +1212,7 @@ QJsonObject SpiralPanel::sessionAdvancedConfig() const
         else
             ++it;
     }
+    applyTrackSamplingConfig(config);
     applyOptionalInputConfig(config, true);
     return config;
 }
@@ -1183,8 +1243,89 @@ bool SpiralPanel::optionalInputEnabled(const QString& key) const
     return it == _optionalInputs.cend() || it.value()->isChecked();
 }
 
+void SpiralPanel::applyTrackSamplingConfig(QJsonObject& config) const
+{
+    if (_trackLengthBinSampling->isChecked()) {
+        config[QStringLiteral("track_length_bin_weights")] = QJsonArray{
+            _trackShortWeight->value(),
+            _trackMediumWeight->value(),
+            _trackLongWeight->value(),
+        };
+    } else {
+        config[QStringLiteral("track_length_bin_weights")] = QJsonValue::Null;
+    }
+    config[QStringLiteral("max_track_crossing_per_step")] =
+        _maxTrackCrossings->value();
+}
+
+void SpiralPanel::syncTrackSamplingControlsFromAdvanced()
+{
+    const QJsonDocument document =
+        QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
+    if (!document.isObject()) return;
+    const QJsonObject config = document.object();
+
+    bool binSampling = false;
+    const QJsonValue weightsValue =
+        config.value(QStringLiteral("track_length_bin_weights"));
+    if (weightsValue.isArray()) {
+        const QJsonArray weights = weightsValue.toArray();
+        if (weights.size() == 3
+            && weights[0].isDouble() && weights[1].isDouble()
+            && weights[2].isDouble()) {
+            binSampling = true;
+            const QSignalBlocker shortBlocker(_trackShortWeight);
+            const QSignalBlocker mediumBlocker(_trackMediumWeight);
+            const QSignalBlocker longBlocker(_trackLongWeight);
+            _trackShortWeight->setValue(weights[0].toDouble());
+            _trackMediumWeight->setValue(weights[1].toDouble());
+            _trackLongWeight->setValue(weights[2].toDouble());
+        }
+    }
+    {
+        const QSignalBlocker blocker(_trackLengthBinSampling);
+        _trackLengthBinSampling->setChecked(binSampling);
+    }
+
+    const QJsonValue crossings =
+        config.value(QStringLiteral("max_track_crossing_per_step"));
+    {
+        const QSignalBlocker blocker(_maxTrackCrossings);
+        _maxTrackCrossings->setValue(crossings.isDouble() ? crossings.toInt() : 0);
+    }
+    updateTrackSamplingUi();
+}
+
+void SpiralPanel::writeTrackSamplingControlsToAdvanced()
+{
+    QJsonDocument document =
+        QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
+    if (!document.isObject()) {
+        markReloadRequired();
+        return;
+    }
+    QJsonObject config = document.object();
+    applyTrackSamplingConfig(config);
+    {
+        const QSignalBlocker blocker(_advanced);
+        _advanced->setPlainText(QString::fromUtf8(
+            QJsonDocument(config).toJson(QJsonDocument::Indented)).trimmed());
+    }
+    markReloadRequired();
+}
+
+void SpiralPanel::updateTrackSamplingUi()
+{
+    const bool tracksEnabled = optionalInputEnabled(QStringLiteral("tracks_dbm"));
+    _trackLengthBinSampling->setEnabled(tracksEnabled);
+    _trackShortWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
+    _trackMediumWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
+    _trackLongWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
+    _maxTrackCrossings->setEnabled(tracksEnabled);
+}
+
 void SpiralPanel::applyOptionalInputConfig(QJsonObject& config,
-                                           bool includeSelectionFlags) const
+                                            bool includeSelectionFlags) const
 {
     const bool verified = optionalInputEnabled(QStringLiteral("verified_patches"));
     const bool unverified = optionalInputEnabled(QStringLiteral("unverified_patches"));
@@ -1271,6 +1412,7 @@ void SpiralPanel::updateOptionalInputUi()
         if (_pathBrowseButtons.contains(it.key()))
             _pathBrowseButtons[it.key()]->setEnabled(enabled);
     }
+    updateTrackSamplingUi();
 }
 
 void SpiralPanel::applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration)
@@ -1300,6 +1442,7 @@ void SpiralPanel::applySessionRunConfig(const QJsonObject& config, qint64 sessio
         _advanced->setPlainText(QString::fromUtf8(
             QJsonDocument(merged).toJson(QJsonDocument::Indented)).trimmed());
     }
+    syncTrackSamplingControlsFromAdvanced();
     _advancedSessionGeneration = sessionGeneration;
     _loadedDurableAdvanced = durableAdvancedConfig();
 }

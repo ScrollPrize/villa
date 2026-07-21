@@ -37,6 +37,7 @@ class InteractiveFitSession:
         self.input_manifest = paths.manifest()
         self.requested_config = dict(run.config)
         self._run_config = None
+        self._default_advanced_config = None
         self._status_callback = status_callback
         self.publishes_outputs = publishes_outputs
         self._condition = threading.Condition()
@@ -85,6 +86,9 @@ class InteractiveFitSession:
             }
             if self._run_config is not None:
                 result["run_config"] = copy.deepcopy(self._run_config)
+            if self._default_advanced_config is not None:
+                result["default_advanced_config"] = copy.deepcopy(
+                    self._default_advanced_config)
             return result
 
     def _publish_status(self):
@@ -141,6 +145,17 @@ class InteractiveFitSession:
             unknown = sorted(set(self.run_config.config) - set(config))
             if unknown:
                 raise ValueError(f"Unknown advanced config keys: {unknown}")
+            # Default is a session-scoped baseline, not the final active
+            # configuration.  It follows the selected input availability,
+            # because those switches determine which samplers can actually be
+            # active, but deliberately excludes every other client override.
+            default_advanced_config = copy.deepcopy(config)
+            for key in (
+                    'use_verified_patches', 'use_unverified_patches',
+                    'use_normals', 'use_surf_sdt', 'use_tracks',
+                    'use_gradient_magnitude', 'use_fibers'):
+                if key in self.run_config.config:
+                    default_advanced_config[key] = self.run_config.config[key]
             # Explicit sample-count overrides are literal active counts. This
             # lets VC3D round-trip the host's post-scaling values through a
             # reload without applying the z-range/DDP transforms twice.
@@ -160,15 +175,18 @@ class InteractiveFitSession:
                 'min_spacing_independent_samples',
                 'regularisation_num_points', 'shell_num_samples',
             )
-            scale_counts_for_z_range(
-                config, self.run_config.z_begin, self.run_config.z_end, 9500,
-                count_keys, floors=SAMPLING_COUNT_FLOORS)
-            split_counts_across_ranks(config, count_keys)
+            for prepared in (default_advanced_config, config):
+                scale_counts_for_z_range(
+                    prepared, self.run_config.z_begin, self.run_config.z_end,
+                    9500, count_keys, floors=SAMPLING_COUNT_FLOORS)
+                split_counts_across_ranks(prepared, count_keys)
             config.update(explicit_sampling_counts)
+            apply_optional_input_selection(default_advanced_config)
             apply_optional_input_selection(config)
             self.requested_config = dict(config)
             with self._condition:
                 self._run_config = run_mutable_config(config)
+                self._default_advanced_config = default_advanced_config
             self._publish_status()
 
             fitter.dataset_path = self.paths.dataset_root
