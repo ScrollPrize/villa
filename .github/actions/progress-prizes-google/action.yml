@@ -353,7 +353,8 @@ runs:
           : >"$RUNNER_TEMP/progress-prizes-error.txt"
           printf '{"status":"expected-fault"}\n' >"$RUNNER_TEMP/progress-prizes-result.json"
         elif test "$operation_status" -ne 0; then
-          echo "The redacted Progress Prize operation failed; inspect the job summary." >&2
+          node scrollprize.org/scripts/progress-prizes/error-diagnostic-cli.mjs \
+            "$RUNNER_TEMP/progress-prizes-error.txt"
           exit "$operation_status"
         fi
 

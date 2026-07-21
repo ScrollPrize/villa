@@ -1,12 +1,18 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { Buffer } from 'node:buffer';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
   ResponderUrlResolutionError,
+  AUTOMATION_ERROR_FALLBACK,
   createExactShaActivationGate,
   createFilePageFacade,
+  formatAutomationError,
   resolveGoogleResponderUri,
   runAutomationCli,
+  safeAutomationDiagnostic,
 } from './automation-cli.mjs';
 import { runCli } from './cli.mjs';
 import { PROGRESS_PRIZE_MARKERS } from './markdown.mjs';
@@ -131,6 +137,98 @@ test('short URL resolution rejects unsafe redirect targets with a fixed log-safe
       return true;
     },
   );
+});
+
+test('automation failure diagnostics are single-line, bounded, and fully redacted', () => {
+  const unknownOpaqueId = '1UnknownGoogleOpaqueIdentifier9876543210';
+  const unconfiguredEmail = 'private-user@localhost';
+  const diagnostic = formatAutomationError(new Error([
+    'Google API request failed',
+    PRIVATE.token,
+    PRIVATE.form,
+    PRIVATE.folder,
+    PRIVATE.account,
+    `https://docs.google.com/forms/d/${unknownOpaqueId}/edit`,
+    unknownOpaqueId,
+    unconfiguredEmail,
+    '\n\u0085\u2028::warning title=unsafe::injected',
+    'multibyte-\u00e9\u00e9\u00e9\u00e9',
+    'x'.repeat(10_000),
+  ].join(' ')), { env: stagingEnv() });
+
+  assert.match(diagnostic, /^progress-prizes: /);
+  assert.ok(Buffer.byteLength(diagnostic, 'utf8') <= 600);
+  assert.doesNotMatch(diagnostic, /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
+  assert.doesNotMatch(diagnostic, /https?:\/\//);
+  assert.doesNotMatch(diagnostic, /::/);
+  assert.equal(diagnostic.includes(unconfiguredEmail), false);
+  assert.equal(diagnostic.includes(unknownOpaqueId), false);
+  for (const privateValue of Object.values(PRIVATE)) {
+    assert.equal(diagnostic.includes(privateValue), false);
+  }
+  assert.equal(safeAutomationDiagnostic(Buffer.from(`${diagnostic}\n`)), diagnostic);
+  assert.equal(
+    safeAutomationDiagnostic(Buffer.from(`${diagnostic}\nsecond line\n`)),
+    AUTOMATION_ERROR_FALLBACK,
+  );
+  assert.equal(
+    safeAutomationDiagnostic(Buffer.alloc(602, 0x61)),
+    AUTOMATION_ERROR_FALLBACK,
+  );
+  assert.equal(
+    safeAutomationDiagnostic(Buffer.from([0xff, 0x0a])),
+    AUTOMATION_ERROR_FALLBACK,
+  );
+
+  const forgedOpaqueId = '-UnknownGoogleOpaqueIdentifier9876543210-';
+  const forged = safeAutomationDiagnostic(Buffer.from([
+    'progress-prizes:',
+    PRIVATE.token,
+    PRIVATE.account,
+    `https://docs.google.com/forms/d/${forgedOpaqueId}/edit`,
+    forgedOpaqueId,
+    'private-user@localhost',
+    '::warning title=unsafe::injected',
+  ].join(' ') + '\n'), { env: stagingEnv() });
+  assert.match(forged, /^progress-prizes: /);
+  assert.doesNotMatch(forged, /https?:\/\/|::|@/);
+  assert.equal(forged.includes(PRIVATE.token), false);
+  assert.equal(forged.includes(forgedOpaqueId), false);
+});
+
+test('automation failure formatter fails closed for hostile errors and environments', () => {
+  const hostileError = new Proxy(new Error('private-message'), {
+    get(target, property, receiver) {
+      if (property === 'message') throw new Error('hostile getter');
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  assert.equal(
+    formatAutomationError(hostileError, { env: stagingEnv() }),
+    'progress-prizes: Automation failed without a safe diagnostic',
+  );
+  assert.equal(
+    formatAutomationError(new Error('private-message'), {
+      env: new Proxy({}, { get() { throw new Error('hostile environment'); } }),
+    }),
+    'progress-prizes: Automation failed without a safe diagnostic',
+  );
+  const multibyte = formatAutomationError(new Error('\u20ac'.repeat(1_000)), { env: stagingEnv() });
+  assert.ok(Buffer.byteLength(multibyte, 'utf8') <= 600);
+});
+
+test('automation CLI subprocess emits only one bounded redacted diagnostic line', () => {
+  const unknownOpaqueId = '1UnknownGoogleOpaqueIdentifier9876543210';
+  const cli = fileURLToPath(new URL('./automation-cli.mjs', import.meta.url));
+  const child = spawnSync(process.execPath, [cli, 'prepare', `--${unknownOpaqueId}`], {
+    encoding: 'utf8',
+    env: { ...process.env, ...stagingEnv() },
+  });
+  assert.equal(child.status, 1);
+  assert.equal(child.stdout, '');
+  assert.match(child.stderr, /^progress-prizes: [^\r\n]+\n$/);
+  assert.ok(Buffer.byteLength(child.stderr.trimEnd(), 'utf8') <= 600);
+  assert.equal(child.stderr.includes(unknownOpaqueId), false);
 });
 
 test('file page facade keeps file IO local and resolves canonical URLs without fetch', async () => {
