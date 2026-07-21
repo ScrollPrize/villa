@@ -583,15 +583,44 @@ def get_initialized_chunk_indices(zarr_array: zarr.Array) -> set:
     set
         Set of chunk index tuples.
     """
-    chunk_keys = [k for k in zarr_array.store.keys() if not k.startswith('.')]
+    store = zarr_array.store
+    array_prefix = getattr(getattr(zarr_array, "store_path", None), "path", "")
+    list_prefix = f"{array_prefix}/" if array_prefix else ""
+
+    if hasattr(store, "list_prefix"):
+        # Zarr 3 stores expose an asynchronous listing API rather than the
+        # Mapping.keys() API used by Zarr 2.
+        from zarr.core.sync import collect_aiterator
+
+        store_keys = collect_aiterator(store.list_prefix(list_prefix))
+    else:
+        # Compatibility with Zarr 2 mapping-backed stores.
+        store_keys = store.keys()
+
+    metadata = getattr(zarr_array, "metadata", None)
+    if metadata is not None and hasattr(metadata, "encode_chunk_key"):
+        zero_key = metadata.encode_chunk_key((0,) * zarr_array.ndim)
+        separator = "/" if "/" in zero_key else "."
+        encoded_parts = zero_key.split(separator)
+        chunk_key_prefix = tuple(encoded_parts[:-zarr_array.ndim])
+    else:
+        # Zarr 2 arrays expose the configured separator directly.
+        separator = getattr(zarr_array, "_dimension_separator", ".")
+        chunk_key_prefix = ()
+
     indices = set()
-    for key in chunk_keys:
+    for key in store_keys:
+        if list_prefix and key.startswith(list_prefix):
+            key = key[len(list_prefix):]
+        parts = key.split(separator)
+        if tuple(parts[:-zarr_array.ndim]) != chunk_key_prefix:
+            continue
         try:
-            parts = tuple(map(int, key.split('.')))
-            if len(parts) == 3:
-                indices.add(parts)
+            chunk_idx = tuple(map(int, parts[-zarr_array.ndim:]))
         except ValueError:
             continue
+        if len(chunk_idx) == 3:
+            indices.add(chunk_idx)
     return indices
 
 
@@ -648,7 +677,7 @@ def expand_chunk_worker(args: Tuple) -> dict:
     ----------
     args : Tuple
         (chunk_idx, zarr_path, label_expand_distance, padding_expand_distance,
-         label_value, padding_value, fill_value, chunks, shape, halo)
+         label_value, padding_value, fill_value, chunks, shape, halo, marker)
 
     Returns
     -------
@@ -656,7 +685,7 @@ def expand_chunk_worker(args: Tuple) -> dict:
         Result with chunk_idx and expanded_voxels count.
     """
     (chunk_idx, zarr_path, label_expand_distance, padding_expand_distance,
-     label_value, padding_value, fill_value, chunks, shape, halo) = args
+     label_value, padding_value, fill_value, chunks, shape, halo, marker) = args
 
     cz, cy, cx = chunk_idx
     chunk_z, chunk_y, chunk_x = chunks
@@ -707,7 +736,11 @@ def expand_chunk_worker(args: Tuple) -> dict:
             label_expand_mask = label_expand_mask & can_expand_into
 
             if label_expand_mask.any():
-                extended_data[label_expand_mask] = label_value
+                # Write newly-expanded voxels as a distinct marker (not label_value)
+                # so that other chunks expanding in later phases treat only the
+                # ORIGINAL labels as sources -- otherwise expansions cascade and
+                # over-grow across chunk boundaries. Remapped to label_value after.
+                extended_data[label_expand_mask] = marker
                 expanded_count = 1
 
     # Extract inner chunk region
@@ -762,12 +795,16 @@ def process_chunks_in_phases(
     worker_args_builder,
     num_workers: int = 1,
     description: str = "Processing",
+    stride: Tuple[int, int, int] = (2, 2, 2),
 ) -> List[Any]:
-    """Process chunks in 8 phases to avoid race conditions.
+    """Process chunks in phases to avoid race conditions.
 
-    Chunks are grouped by (cz % 2, cy % 2, cx % 2). Chunks in the same
-    phase are at least 2 chunks apart, so they can be processed in parallel
-    without conflicts. Phases are processed sequentially.
+    Chunks are grouped by (cz % sz, cy % sy, cx % sx) for the given ``stride``.
+    Chunks in the same phase are ``stride`` chunks apart in each axis, so a
+    worker's read-halo can never reach a concurrently-written same-phase chunk.
+    Phases are processed sequentially; chunks within a phase run in parallel.
+    The default ``stride=(2, 2, 2)`` is the classic 8-phase scheme, correct when
+    each worker's halo fits within a single chunk.
 
     Parameters
     ----------
@@ -781,23 +818,29 @@ def process_chunks_in_phases(
         Number of parallel workers per phase.
     description : str
         Description for progress bar.
+    stride : Tuple[int, int, int]
+        Distance between same-phase chunks along each axis.
 
     Returns
     -------
     List[Any]
         Results from all worker calls.
     """
-    # Group chunks by phase
+    # Group chunks by phase using the given stride.
+    sz, sy, sx = stride
     phases: Dict[Tuple[int, int, int], List[Tuple[int, int, int]]] = {}
     for chunk_idx in chunk_indices:
-        phase = get_chunk_phase(chunk_idx)
+        cz, cy, cx = chunk_idx
+        phase = (cz % sz, cy % sy, cx % sx)
         if phase not in phases:
             phases[phase] = []
         phases[phase].append(chunk_idx)
 
+    phase_order = [(pz, py, px)
+                   for pz in range(sz) for py in range(sy) for px in range(sx)]
     all_results = []
 
-    for phase in PHASE_ORDER:
+    for phase in phase_order:
         if phase not in phases:
             continue
 
@@ -834,9 +877,9 @@ def expand_labels_in_zarr(
 ) -> int:
     """Expand labels in zarr volume using EDT.
 
-    Uses an 8-phase approach for deterministic parallel processing:
-    - Chunks are grouped by (cz % 2, cy % 2, cx % 2) into 8 phases
-    - Chunks in the same phase are 2 chunks apart in every dimension
+    Uses a phased approach for deterministic parallel processing:
+    - Chunks are grouped by their index modulo a halo-dependent stride
+    - Chunks in the same phase are far enough apart for their read halos
     - Phases are processed sequentially, but chunks within each phase run in parallel
     - This ensures no race conditions while maintaining parallelism
 
@@ -857,7 +900,8 @@ def expand_labels_in_zarr(
     num_workers : int
         Number of parallel workers.
     halo : int
-        Halo/overlap size in voxels (default: 0, no overlap).
+        Minimum halo/overlap size in voxels. It is automatically increased to
+        cover the requested expansion distance (default: 0).
 
     Returns
     -------
@@ -878,6 +922,19 @@ def expand_labels_in_zarr(
 
     # Find all chunks that need processing (neighbors of initialized chunks)
     max_expansion = max(expand_distance, padding_expansion)
+
+    # The worker reads a `halo` of neighbour context so labels can expand across
+    # chunk boundaries. If the halo is smaller than the expansion distance, the
+    # expansion silently stops at chunk edges (seams). Ensure the halo covers it.
+    effective_halo = max(halo, max_expansion)
+    if max_expansion > 0 and effective_halo > halo:
+        print(f"  halo={halo} < expansion {max_expansion}; using halo={effective_halo} "
+              f"so labels expand across chunk boundaries")
+    # Phase stride: a halo of `h` voxels reaches ceil(h/chunk) chunks, so
+    # same-phase chunks must be ceil(h/chunk)+1 apart to stay race-free. Reduces
+    # to stride-2 (the 8-phase scheme) when the halo fits within one chunk.
+    phase_stride = tuple((effective_halo + c - 1) // c + 1 for c in chunks)
+
     chunks_to_process = set()
     for chunk_idx in initialized_chunks:
         neighbors = get_neighbor_chunk_indices(
@@ -887,19 +944,53 @@ def expand_labels_in_zarr(
 
     print(f"Will process {len(chunks_to_process)} chunks for expansion")
 
+    # Pick a marker value not otherwise used, to tag newly-expanded voxels so they
+    # are not re-used as expansion sources by other chunks (prevents cascade).
+    used_values = {int(label_value), int(fill_value)}
+    if padding_value is not None:
+        used_values.add(int(padding_value))
+    for (cz, cy, cx) in chunks_to_process:
+        blk = zarr_array[cz*chunks[0]:min((cz+1)*chunks[0], shape[0]),
+                         cy*chunks[1]:min((cy+1)*chunks[1], shape[1]),
+                         cx*chunks[2]:min((cx+1)*chunks[2], shape[2])]
+        used_values.update(int(v) for v in np.unique(blk))
+    dtype = np.dtype(zarr_array.dtype)
+    if not np.issubdtype(dtype, np.integer):
+        raise TypeError(f"Expansion requires an integer zarr dtype, got {dtype}")
+    dtype_info = np.iinfo(dtype)
+    marker = next(
+        (v for v in range(int(dtype_info.max), int(dtype_info.min) - 1, -1)
+         if v not in used_values),
+        None,
+    )
+    if marker is None:
+        raise ValueError(f"No free {dtype.name} value available to use as expansion marker")
+
     # Build args builder for expand_chunk_worker
     def build_expand_args(chunk_idx: Tuple[int, int, int]):
         return (chunk_idx, zarr_path, expand_distance, padding_expansion,
-                label_value, padding_value, fill_value, chunks, shape, halo)
+                label_value, padding_value, fill_value, chunks, shape, effective_halo, marker)
 
-    # Process chunks in phases
+    # Process chunks in phases (stride chosen so the read-halo is race-safe)
     results = process_chunks_in_phases(
         chunks_to_process,
         expand_chunk_worker,
         build_expand_args,
         num_workers=num_workers,
         description="Expanding",
+        stride=phase_stride,
     )
+
+    # Remap the temporary marker back to the real label value.
+    zarr_rw = zarr.open(zarr_path, mode='r+')
+    for (cz, cy, cx) in chunks_to_process:
+        zs, ze = cz*chunks[0], min((cz+1)*chunks[0], shape[0])
+        ys, ye = cy*chunks[1], min((cy+1)*chunks[1], shape[1])
+        xs, xe = cx*chunks[2], min((cx+1)*chunks[2], shape[2])
+        blk = zarr_rw[zs:ze, ys:ye, xs:xe]
+        if (blk == marker).any():
+            blk[blk == marker] = label_value
+            zarr_rw[zs:ze, ys:ye, xs:xe] = blk
 
     total_expanded = sum(r['expanded_voxels'] for r in results)
     return total_expanded
