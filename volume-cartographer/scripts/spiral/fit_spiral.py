@@ -175,10 +175,18 @@ default_config = {
     'rel_winding_num_pcls': 48,
     'rel_winding_num_patch_pairs_per_pcl': 4,
     'rel_winding_adjacent_patches_only': True,
-    # Stratify the per-step pcl draws (rel-winding and unattached-strip losses) so each
-    # pcl source file, plus fibers split into horizontal/vertical, gets an equal share
-    # of the samples regardless of how many pcls it holds. False = uniform over pcls.
-    'stratified_pcl_sampling': False,
+    # Per-group weighting of the per-step pcl draws (rel-winding and unattached-strip
+    # losses). None = legacy behaviour: uniform over all pcls regardless of source.
+    # A dict switches on stratified sampling: each sampling group (pcl source json,
+    # keyed by basename with the .json suffix stripped e.g. 'relative_windings';
+    # fibers split into 'fibers:H' / 'fibers:V') gets a per-step share of the samples
+    # proportional to its weight, regardless of how many pcls it holds. When set, the
+    # dict must list every group explicitly (a missing group is an error); weight 0
+    # switches a group off entirely. Equal weights reproduce plain stratification; e.g.
+    # {'abs_winding': 1, 'patch-overlap-pcls': 1, 'relative_windings': 1,
+    #  'same_windings': 0, 'fibers:H': 2, 'fibers:V': 1} drops same-windings and
+    # doubles the horizontal-fiber share.
+    'pcl_sampling_weights': None,
     'abs_winding_num_pcls': 48,
     'abs_winding_num_points_per_pcl': 4,
     'fiber_min_point_spacing': 40.,
@@ -797,12 +805,15 @@ def main(load_only_patches_and_point_collections=False):
         f'pcls: {len(cross_patch_pcls)} cross-patch, '
         f'{len(unattached_pcl_strips)} unattached'
     )
-    if cfg['stratified_pcl_sampling']:
+    if cfg['pcl_sampling_weights'] is not None:
         def _group_counts(groups):
             counts = {}
             for group in groups:
                 counts[group] = counts.get(group, 0) + 1
-            return ', '.join(f'{os.path.basename(str(g))}: {n}' for g, n in sorted(counts.items(), key=lambda kv: str(kv[0])))
+            return ', '.join(
+                f'{os.path.splitext(os.path.basename(str(g)))[0]} (w={cfg["pcl_sampling_weights"][os.path.splitext(os.path.basename(str(g)))[0]]}): {n}'
+                for g, n in sorted(counts.items(), key=lambda kv: str(kv[0]))
+            )
         print(f'  cross-patch sampling groups: {_group_counts(pcl["sampling_group"] for pcl in cross_patch_pcls)}')
         print(f'  unattached sampling groups: {_group_counts(unattached_strip_sampling_groups)}')
     if load_only_patches_and_point_collections:

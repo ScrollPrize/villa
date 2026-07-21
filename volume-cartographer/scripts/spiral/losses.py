@@ -1,4 +1,5 @@
 import itertools
+import os
 
 import numpy as np
 import torch
@@ -33,42 +34,79 @@ def _masked_mean(values, mask):
     return (values * mask_f).sum() / mask_f.sum().clamp(min=1.)
 
 
+def _pcl_sampling_group_weight(group):
+    # Look up the per-step sampling weight of a sampling group in
+    # cfg['pcl_sampling_weights']. Keys are matched on the group's basename with the
+    # .json suffix stripped, so the source json stem (e.g. 'relative_windings') or the
+    # fiber tag ('fibers:H' / 'fibers:V'). When the dict is in use every group must
+    # have an explicit key, so a missing one is an error rather than a silent default.
+    key = os.path.splitext(os.path.basename(str(group)))[0]
+    try:
+        return float(cfg['pcl_sampling_weights'][key])
+    except KeyError:
+        raise KeyError(
+            f'pcl_sampling_weights has no entry for sampling group {key!r}; '
+            f'when set, it must list a weight for every group'
+        )
+
+
 def build_pcl_sampling_strata(sampling_groups):
     # Precompute the per-step sampling pool for _choose_pcl_indices from each pool
     # member's sampling group (source json file; fibers split into fibers:H /
-    # fibers:V). Members whose group is None are ineligible and excluded. Returns
-    # {'strata': [int64 pool-index array per group], 'all': all eligible indices}.
+    # fibers:V). Members whose group is None are ineligible and excluded. When
+    # cfg['pcl_sampling_weights'] is a dict, every group must have an explicit weight
+    # and groups with weight <= 0 are switched off (dropped from the pool entirely).
+    # Returns {'strata': [int64 pool-index array per group], 'groups': [group name
+    # per stratum], 'weights': float weight per stratum, 'all': all eligible indices}.
     group_to_indices = {}
     for idx, group in enumerate(sampling_groups):
         if group is None:
             continue
         group_to_indices.setdefault(group, []).append(idx)
-    strata = [np.asarray(indices, dtype=np.int64) for indices in group_to_indices.values()]
+    weighted = cfg['pcl_sampling_weights'] is not None
+    strata, groups, weights = [], [], []
+    for group, indices in group_to_indices.items():
+        weight = _pcl_sampling_group_weight(group) if weighted else 1.0
+        if weighted and weight <= 0:
+            continue  # switched off
+        strata.append(np.asarray(indices, dtype=np.int64))
+        groups.append(group)
+        weights.append(weight)
     all_indices = np.concatenate(strata) if strata else np.empty(0, dtype=np.int64)
-    return {'strata': strata, 'all': all_indices}
+    return {
+        'strata': strata,
+        'groups': groups,
+        'weights': np.asarray(weights, dtype=np.float64),
+        'all': all_indices,
+    }
 
 
 def _choose_pcl_indices(sampling_strata, num_to_sample):
     # Choose num_to_sample pool indices from a build_pcl_sampling_strata() bundle.
-    # Stratified mode (cfg['stratified_pcl_sampling'], the default) splits the draw
-    # as evenly as possible across the strata regardless of stratum size (remainder
-    # going to a random subset of strata), then samples uniformly within each
-    # stratum, with replacement only when a stratum's share exceeds its size.
-    # Non-stratified mode is the legacy behaviour: uniform over the whole pool
-    # without replacement.
-    if not cfg['stratified_pcl_sampling']:
+    # Stratified mode (cfg['pcl_sampling_weights'] is a dict) allocates the draw
+    # across the strata proportional to their weights (floor of the ideal share,
+    # remainder handed to strata chosen with probability proportional to the leftover
+    # fractional share), then samples uniformly within each stratum, with replacement
+    # only when a stratum's share exceeds its size. With every weight equal this is an
+    # even split. Non-stratified mode (weights is None) is the legacy behaviour:
+    # uniform over the whole pool without replacement.
+    if cfg['pcl_sampling_weights'] is None:
         return np.random.choice(sampling_strata['all'], num_to_sample, replace=False)
     strata = sampling_strata['strata']
-    quotas = np.full(len(strata), num_to_sample // len(strata), dtype=np.int64)
+    weights = sampling_strata['weights']
+    shares = num_to_sample * weights / weights.sum()
+    quotas = np.floor(shares).astype(np.int64)
     remainder = num_to_sample - int(quotas.sum())
     if remainder > 0:
-        quotas[np.random.choice(len(strata), remainder, replace=False)] += 1
+        frac = shares - quotas
+        probs = frac / frac.sum() if frac.sum() > 0 else weights / weights.sum()
+        quotas[np.random.choice(len(strata), remainder, replace=False, p=probs)] += 1
     chosen = [
         np.random.choice(stratum, quota, replace=quota > len(stratum))
         for stratum, quota in zip(strata, quotas)
         if quota > 0
     ]
-    return np.concatenate(chosen)
+    return np.concatenate(chosen) if chosen else np.empty(0, dtype=np.int64)
 
 
 
