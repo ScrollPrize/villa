@@ -1316,11 +1316,19 @@ Activate a lasagna output segment by name — the programmatic twin of the
 
 ### 11.9 `workspace.switch`
 
-- **params:** `{"name": str}` — `"lasagna"` or `"fiber_slice"`.
-- Maps to `CWindow::switchToLasagnaWorkspace()` (CWindow.hpp:182, CWindow.cpp:4760) /
-  `CWindow::switchToFiberSliceWorkspace()` (CWindow.hpp:184, CWindow.cpp:4786); both
+- **params:** `{"name": str}` — `"main"`, `"lasagna"`, or `"fiber_slice"`.
+- Maps to `CWindow::switchToMainWorkspace()` (CWindow.hpp:241, CWindow.cpp:4773) /
+  `CWindow::switchToLasagnaWorkspace()` (CWindow.hpp:182, CWindow.cpp:4760) /
+  `CWindow::switchToFiberSliceWorkspace()` (CWindow.hpp:184, CWindow.cpp:4786); all
   private, reached via the existing `friend class AgentBridge` (§1.1). The workspace
-  tabs are created at CWindow.cpp:2906/2908.
+  tabs are created at CWindow.cpp:2905–2909 (5 tabs total: main, Lasagna, Atlas,
+  Fiber Slice, Intersections — only these three are RPC-reachable; Atlas/
+  Intersections have no `workspace.switch` target as of this writing).
+  **`"main"` is the only documented way back** from `"lasagna"`/`"fiber_slice"` —
+  there is no automatic return, and the workspace tab is real Qt UI state that
+  persists across app restarts (verified live: a freshly launched VC3D opened
+  straight onto a leftover "Fiber Slice" tab from a prior session, silently
+  hiding the main-tab viewers — see the screenshot §3.4 note above).
 - **result:** `{"workspace": str}`. Any viewers the workspace creates register through
   `ViewerManager` and become targetable per §2.2.
 - **errors:** `-32602` (unknown name), `-32000`.

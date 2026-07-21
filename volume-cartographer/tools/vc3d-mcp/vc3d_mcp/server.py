@@ -747,10 +747,20 @@ async def vc3d_lasagna_repeat_last(wait: bool = False) -> dict[str, Any]:
 async def vc3d_switch_workspace(name: str) -> dict[str, Any]:
     """Switch VC3D's active workspace tab. Requires a volume package to be open.
 
-    name: "lasagna" (the Lasagna optimization workspace) or "fiber_slice" (the
-    fiber-slice workspace). Any viewers the workspace creates register with the
-    ViewerManager and become targetable by vc3d_click / vc3d_drag /
-    vc3d_screenshot etc. (they appear in vc3d_get_state's viewers list).
+    name: "main" (the default segmentation/navigation workspace -- v1-v4's
+    viewers live here), "lasagna" (the Lasagna optimization workspace), or
+    "fiber_slice" (the fiber-slice workspace). Any viewers the workspace
+    creates register with the ViewerManager and become targetable by
+    vc3d_click / vc3d_drag / vc3d_screenshot etc. (they appear in
+    vc3d_get_state's viewers list).
+
+    "main" is the only documented way back from "lasagna"/"fiber_slice" --
+    there's no automatic return. This tab is real Qt UI state that persists
+    across app restarts: a freshly launched VC3D can silently open on a
+    leftover "lasagna"/"fiber_slice" tab from a prior session, in which case
+    vc3d_screenshot on a main-tab viewer fails -32009 (not visible) until you
+    call this with name="main" first. Check vc3d_get_state's viewers, or just
+    call this proactively if a main-tab capture unexpectedly fails.
 
     Returns {"workspace": str}. Errors: -32602 (unknown name), -32000 (no volume
     package loaded).

@@ -3342,7 +3342,9 @@ QJsonObject AgentBridgeServer::handleWorkspaceSwitch(const QJsonValue& params)
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    if (name == QLatin1String("lasagna")) {
+    if (name == QLatin1String("main")) {
+        _window->switchToMainWorkspace();
+    } else if (name == QLatin1String("lasagna")) {
         _window->switchToLasagnaWorkspace();
     } else if (name == QLatin1String("fiber_slice")) {
         _window->switchToFiberSliceWorkspace();
