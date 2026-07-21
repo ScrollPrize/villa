@@ -1518,6 +1518,128 @@ test('activate revalidates target binding and ACLs after the preview gate', asyn
   }
 });
 
+for (const scenario of [
+  {
+    name: 'ACL drift',
+    error: /permissions do not match/,
+    mutate(google, target) {
+      const permission = {
+        id: 'post-open-unexpected-editor',
+        type: 'user',
+        role: 'writer',
+        emailAddress: 'post-open-unexpected-editor@example.org',
+      };
+      google.permissions.get(target.id).push(permission);
+      return () => {
+        google.permissions.set(
+          target.id,
+          google.permissions.get(target.id).filter(({ id }) => id !== permission.id),
+        );
+      };
+    },
+  },
+  {
+    name: 'visible-title drift',
+    error: /visible form title do not match/,
+    mutate(google, target) {
+      const form = google.forms.get(target.id);
+      const original = form.info.title;
+      form.info.title = 'Tampered after opening';
+      return () => { form.info.title = original; };
+    },
+  },
+  {
+    name: 'structure drift',
+    error: /structure or settings do not match/,
+    mutate(google, target) {
+      const form = google.forms.get(target.id);
+      const original = form.items[0].title;
+      form.items[0].title = 'Tampered question';
+      return () => { form.items[0].title = original; };
+    },
+  },
+  {
+    name: 'source-fingerprint drift',
+    error: /not bound to the resolved source form/,
+    mutate(google, target) {
+      const original = target.appProperties.sourceFingerprint;
+      target.appProperties.sourceFingerprint = '0'.repeat(64);
+      return () => { target.appProperties.sourceFingerprint = original; };
+    },
+  },
+  {
+    name: 'active-marker drift',
+    error: /fully verified active transition/,
+    mutate(google, target) {
+      target.appProperties.state = ROLLOVER_FILE_STATES.ACTIVATING;
+      // ACTIVATING plus an already-open target is the supported recovery
+      // state, so the retry itself repairs this injected marker failure.
+      return () => {};
+    },
+  },
+]) {
+  test(`activate catches post-open ${scenario.name} and recovers idempotently`, async () => {
+    const google = new FakeGoogle();
+    const page = new MemoryPage();
+    await bootstrapAndPrepare(service({ google, page }));
+    const source = google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0];
+    const target = google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+    const updateFile = google.updateFile.bind(google);
+    let injectOnce = true;
+    let repair = () => {};
+    google.updateFile = async (input) => {
+      const updated = await updateFile(input);
+      if (
+        injectOnce
+        && input.fileId === target.id
+        && input.appProperties?.state === ROLLOVER_FILE_STATES.ACTIVE
+      ) {
+        injectOnce = false;
+        repair = scenario.mutate(google, target);
+      }
+      return updated;
+    };
+    const active = service({
+      google,
+      page,
+      clock: fixedClock('2026-08-01T07:00:01Z'),
+      runtime: stagingRuntime({ simulatedNow: '2026-08-01T07:00:01Z' }),
+    });
+
+    await assert.rejects(
+      active.rollover.activate({ targetCycle: '2026-08' }),
+      scenario.error,
+    );
+    assert.equal(
+      google.forms.get(source.id).publishSettings.publishState.isAcceptingResponses,
+      false,
+    );
+    assert.equal(
+      google.forms.get(target.id).publishSettings.publishState.isAcceptingResponses,
+      true,
+    );
+
+    repair();
+    const publishCallsBeforeRecovery = google.calls.filter(
+      ({ method }) => method === 'setPublishState',
+    ).length;
+    assert.equal(
+      (await active.rollover.activate({ targetCycle: '2026-08' })).status,
+      'active',
+    );
+    assert.equal(
+      google.calls.filter(({ method }) => method === 'setPublishState').length,
+      publishCallsBeforeRecovery,
+    );
+    assert.equal(source.appProperties.state, ROLLOVER_FILE_STATES.CLOSED);
+    assert.equal(target.appProperties.state, ROLLOVER_FILE_STATES.ACTIVE);
+    assert.equal(
+      (await active.rollover.verify({ targetCycle: '2026-08', mode: 'active' })).status,
+      'valid',
+    );
+  });
+}
+
 test('activate recovers after closing the source, opens the target once, and is idempotent', async () => {
   const google = new FakeGoogle();
   const page = new MemoryPage();
