@@ -183,7 +183,7 @@ default_config = {
     'unattached_pcl_min_point_spacing': 16.,
     'track_num_per_step': 48000,
     'track_num_points_per_step': 24,
-    'track_exclusion_radius': 0.0,
+    'track_exclusion_radius': 16.0,
     'track_radius_target': 'mean',
     'track_radius_loss_margin': 0.025,
     'track_radius_within_norm_p': 6.0,  # >1 emphasises worst within-track point in the radius loss (1.0 = mean)
