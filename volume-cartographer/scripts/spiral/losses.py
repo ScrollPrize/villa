@@ -261,7 +261,7 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng):
 
 
 def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
-                        num_points_per_direction):
+                        num_points_per_direction, patch_atlas=None):
     # Returns (combined_ijs_gpu (2,N,P,2), patch_indices_gpu (N,)). With
     # prefetch enabled the batch was assembled and uploaded for this step
     # during the previous one, and next step's batch is scheduled now.
@@ -271,7 +271,17 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
     def build(rng):
         patch_indices = rng.choice(len(patches), num_to_sample,
                                    p=sampling_probabilities, replace=True)
-        ijs_np = _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng)
+        native_atlas = getattr(patch_atlas, 'sampling_atlas', None)
+        if native_atlas is not None:
+            seed = int(rng.randint(0, np.iinfo(np.int64).max))
+            ijs_np = np.asarray(native_atlas.sample_patch_strips(
+                np.ascontiguousarray(patch_indices, dtype=np.int64),
+                num_points_per_direction,
+                seed,
+            ))
+        else:
+            ijs_np = _build_patch_ijs(
+                patches, patch_indices, num_points_per_direction, rng)
         ijs_gpu = torch.from_numpy(ijs_np).cuda(non_blocking=True)
         idx_gpu = torch.from_numpy(
             np.ascontiguousarray(patch_indices, dtype=np.int64)).cuda(non_blocking=True)
@@ -480,7 +490,8 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         num_patches_to_sample = max(num_patches_for_radius, num_patches_for_dt) if compute_dt else num_patches_for_radius
         batch = _sample_patch_batch(
             'verified_patches', patches, patch_sampling_probabilities,
-            num_patches_to_sample, cfg['num_points_per_patch'] // 2)
+            num_patches_to_sample, cfg['num_points_per_patch'] // 2,
+            patch_atlas)
 
         (
             sample_ijs,
@@ -554,7 +565,8 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
     num_patches_to_sample = max(num_patches_for_radius, num_patches_for_dt) if compute_dt else num_patches_for_radius
     batch = _sample_patch_batch(
         'unverified_patches', patches, patch_sampling_probabilities,
-        num_patches_to_sample, cfg['unverified_num_points_per_patch'] // 2)
+        num_patches_to_sample, cfg['unverified_num_points_per_patch'] // 2,
+        patch_atlas)
 
     (
         sample_ijs,
@@ -685,6 +697,33 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
     ]
 
 
+def _sample_l_shapes_batch(patches_dict, patch_atlas, requests, num_points):
+    """Sample four L-shapes for each ``(patch_id, i, j)`` request."""
+    if not requests:
+        return []
+    native_atlas = getattr(patch_atlas, 'sampling_atlas', None)
+    if native_atlas is None:
+        return [
+            _sample_l_shapes_at_ij(patches_dict[pid], i, j, num_points)
+            for pid, i, j in requests
+        ]
+    patch_indices = np.fromiter(
+        (patch_atlas.id_to_idx[pid] for pid, _, _ in requests),
+        dtype=np.int64,
+        count=len(requests),
+    )
+    anchors = np.asarray([(i, j) for _, i, j in requests], dtype=np.int64)
+    result = native_atlas.sample_l_shapes(
+        patch_indices,
+        np.ascontiguousarray(anchors),
+        num_points,
+        int(np.random.randint(0, np.iinfo(np.int64).max)),
+    )
+    ijs = np.asarray(result['ijs'])
+    valid = np.asarray(result['valid'], dtype=bool)
+    return [ijs[k] if valid[k] else None for k in range(len(requests))]
+
+
 
 def _batched_pcl_chain_seam_adjustments(slice_to_spiral_transform, dr_per_winding, chain_zyxs_list):
     # Cumulative theta=0 seam adjustment (last unwrap entry) for each pcl chain.
@@ -736,6 +775,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # Each entry: (ls1, ls2, pid1, pid2, winding_diff, pcl_chain_zyxs), where
     # ls* is a list of 4 L-shape ij strips and pcl_chain_zyxs is ordered p1 -> p2.
     strip_pairs = []
+    pair_requests = []
 
     # sampling_strata indexes into point_collections and already excludes single-point
     # pcls (possible only for winding_is_absolute pcls), which can't form a cross-patch
@@ -780,11 +820,6 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             i1, j1 = int(p1['on_patch']['ij'][0]), int(p1['on_patch']['ij'][1])
             i2, j2 = int(p2['on_patch']['ij'][0]), int(p2['on_patch']['ij'][1])
 
-            ls1 = _sample_l_shapes_at_ij(patches_dict[pid1], i1, j1, num_points_per_strip)
-            ls2 = _sample_l_shapes_at_ij(patches_dict[pid2], i2, j2, num_points_per_strip)
-            if ls1 is None or ls2 is None:
-                continue
-
             if cfg['rel_winding_adjacent_patches_only']:
                 pcl_chain = [p1, p2]
             else:
@@ -794,7 +829,23 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
                 else:
                     pcl_chain = list(reversed(sorted_pcl_points[idx2:idx1 + 1]))
             pcl_chain_zyxs = np.stack([point['zyx'] for point in pcl_chain], axis=0).astype(np.float32)
-            strip_pairs.append((ls1, ls2, pid1, pid2, winding_diff, pcl_chain_zyxs))
+            pair_requests.append((
+                (pid1, i1, j1), (pid2, i2, j2),
+                pid1, pid2, winding_diff, pcl_chain_zyxs,
+            ))
+
+    sampled_l_shapes = _sample_l_shapes_batch(
+        patches_dict,
+        patch_atlas,
+        [request for pair in pair_requests for request in pair[:2]],
+        num_points_per_strip,
+    )
+    for pair_index, pair in enumerate(pair_requests):
+        ls1 = sampled_l_shapes[2 * pair_index]
+        ls2 = sampled_l_shapes[2 * pair_index + 1]
+        if ls1 is None or ls2 is None:
+            continue
+        strip_pairs.append((ls1, ls2, *pair[2:]))
 
     if not strip_pairs:
         return torch.zeros([], device='cuda')
@@ -895,6 +946,7 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
 
     # Each entry: (ls, pid, winding_annotation) where ls is a list of 4 L-shape ij strips.
     strips = []
+    strip_requests = []
 
     abs_pcls = [pcl for pcl in point_collections if pcl.get('metadata', {}).get('winding_is_absolute', False)]
     num_pcls_per_step = min(cfg['abs_winding_num_pcls'], len(abs_pcls))
@@ -914,10 +966,17 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             p = attached[idx]
             pid = p['on_patch']['id']
             i, j = int(p['on_patch']['ij'][0]), int(p['on_patch']['ij'][1])
-            ls = _sample_l_shapes_at_ij(patches_dict[pid], i, j, num_points_per_strip)
-            if ls is None:
-                continue
-            strips.append((ls, pid, p['winding_annotation']))
+            strip_requests.append(((pid, i, j), pid, p['winding_annotation']))
+
+    sampled_l_shapes = _sample_l_shapes_batch(
+        patches_dict,
+        patch_atlas,
+        [entry[0] for entry in strip_requests],
+        num_points_per_strip,
+    )
+    for entry, ls in zip(strip_requests, sampled_l_shapes):
+        if ls is not None:
+            strips.append((ls, entry[1], entry[2]))
 
     if not strips:
         return torch.zeros([], device='cuda')

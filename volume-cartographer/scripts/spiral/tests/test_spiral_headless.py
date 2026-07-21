@@ -92,6 +92,38 @@ class HandoffTests(unittest.TestCase):
             self.assertEqual(entry["polyline_count"], 70_000)
             self.assertEqual(entry["point_count"], 140_000)
 
+    def test_geometry_snapshot_uses_bulk_packed_protocol(self):
+        class PackedLines:
+            def __iter__(self):
+                raise AssertionError("packed geometry must not iterate polylines")
+
+            def as_packed_polylines(self):
+                return (
+                    np.array([
+                        [1, 2, 3], [4, 5, 6],
+                        [7, 8, 9], [10, 11, 12], [13, 14, 15],
+                    ], dtype=np.float32),
+                    np.array([0, 2, 5], dtype=np.int64),
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "snapshot"
+            manifest = write_geometry_snapshot(
+                destination, {"tracks": PackedLines()}, input_order="ZYX")
+            validate_geometry_snapshot(destination)
+            entry = manifest["categories"]["tracks"]
+            self.assertEqual(entry["polyline_count"], 2)
+            self.assertEqual(entry["point_count"], 5)
+            np.testing.assert_array_equal(
+                np.fromfile(destination / entry["offsets_file"], dtype="<u8"),
+                [0, 2, 5],
+            )
+            np.testing.assert_array_equal(
+                np.fromfile(destination / entry["points_file"], dtype="<f4").reshape(-1, 3),
+                [[3, 2, 1], [6, 5, 4], [9, 8, 7],
+                 [12, 11, 10], [15, 14, 13]],
+            )
+
     def test_combined_preview_has_separators_and_ordered_components(self):
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "generation-1"

@@ -30,10 +30,14 @@ unwrap-frame change (see snap_patch_dt_target / snap_strip_dt_target).
 import numpy as np
 import torch
 
+from native_spiral import load_native_spiral_sampling
 from sample_spiral import (
     get_theta_and_radii,
     get_theta_crossing_step_adjustments,
 )
+
+
+_native_spiral_sampling = load_native_spiral_sampling()
 
 
 class DtTargetCacheManager:
@@ -276,6 +280,10 @@ def prepare_patch_dt_target_samples(patches, num_points, max_stride_voxels):
     # fail, so snap_patch_dt_target reports the strip invalid (median fallback) instead.
     for patch in patches:
         mask = patch._sampling_valid_quad_mask_np
+        scale = np.asarray(
+            patch.scale.detach().cpu() if hasattr(patch.scale, 'detach') else patch.scale,
+            dtype=np.float64,
+        ).reshape(-1)
         rows = np.flatnonzero(mask.any(axis=1))
         cols = np.flatnonzero(mask.any(axis=0))
         r0, r1 = int(rows[0]), int(rows[-1]) + 1
@@ -286,10 +294,6 @@ def prepare_patch_dt_target_samples(patches, num_points, max_stride_voxels):
         nr = min(max(nr, 1), box_h)
         nc = min(max(int(round(target / nr)), 1), box_w)
         if max_stride_voxels and max_stride_voxels > 0:
-            scale = np.asarray(
-                patch.scale.detach().cpu() if hasattr(patch.scale, 'detach') else patch.scale,
-                dtype=np.float64,
-            ).reshape(-1)
             # patch.scale is grid cells per voxel, so convert the shared physical
             # stride to independent row/column grid-cell bounds.
             row_stride = max(1, int(np.floor(float(max_stride_voxels) * scale[0])))
@@ -299,6 +303,18 @@ def prepare_patch_dt_target_samples(patches, num_points, max_stride_voxels):
         row_edges = np.linspace(r0, r1, nr + 1)
         col_edges = np.linspace(c0, c1, nc + 1)
         patch._dt_target_anchor_max_dist_sq = 4.0 * ((box_h / nr) ** 2 + (box_w / nc) ** 2)
+        if _native_spiral_sampling is not None:
+            prepared = _native_spiral_sampling.prepare_dt_samples(
+                np.ascontiguousarray(mask, dtype=bool),
+                np.ascontiguousarray(row_edges, dtype=np.int64),
+                np.ascontiguousarray(col_edges, dtype=np.int64),
+            )
+            patch._dt_target_ijs = np.asarray(
+                prepared['ijs'], dtype=np.float32)
+            patch._dt_target_block_rc = np.asarray(
+                prepared['block_rc'], dtype=np.int32)
+            patch._dt_target_block_shape = (nr, nc)
+            continue
         ijs = []
         block_rc = []
         for bi in range(nr):
@@ -331,6 +347,17 @@ def _unwrap_block_samples(theta, block_rc, block_shape):
     # offset relative to it, so callers must exclude them from pooling.
     num_samples = len(theta)
     nr, nc = block_shape
+    if _native_spiral_sampling is not None:
+        result = _native_spiral_sampling.unwrap_block_samples(
+            np.ascontiguousarray(theta, dtype=np.float32),
+            np.ascontiguousarray(block_rc, dtype=np.int32),
+            int(nr),
+            int(nc),
+        )
+        return (
+            np.asarray(result['adjustments'], dtype=np.int64),
+            np.asarray(result['main'], dtype=bool),
+        )
     idx_grid = np.full((nr, nc), -1, dtype=np.int64)
     idx_grid[block_rc[:, 0], block_rc[:, 1]] = np.arange(num_samples)
     adjustments = np.zeros(num_samples, dtype=np.int64)

@@ -392,7 +392,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _maximumDisplayedWinding = new QSpinBox(windingRange);
     _maximumDisplayedWinding->setObjectName(QStringLiteral("spiralMaximumDisplayedWinding"));
     _maximumDisplayedWinding->setRange(-1, 1000000);
-    _maximumDisplayedWinding->setValue(-1);
+    _maximumDisplayedWinding->setValue(130);
     _maximumDisplayedWinding->setToolTip(
         tr("Last winding to display (inclusive); -1 displays through the final winding"));
     windingRangeLayout->addWidget(new QLabel(tr("Min winding"), windingRange));

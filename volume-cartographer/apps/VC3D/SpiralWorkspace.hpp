@@ -162,7 +162,7 @@ private:
     qreal _lossMapOpacity = 0.8;
     quint64 _previewDisplayRevision = 0;
     int _minimumDisplayedWinding = 10;
-    int _maximumDisplayedWinding = -1;
+    int _maximumDisplayedWinding = 130;
     bool _outputVisible = true;
     bool _showSurfaceIntersections = true;
     bool _pendingPatchesOnly = false;

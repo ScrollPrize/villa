@@ -155,6 +155,10 @@ class PackedTrackCollection:
         np.cumsum(lengths, out=offsets[1:])
         return np.concatenate(tracks, axis=0), offsets
 
+    def as_packed_polylines(self):
+        """Return contiguous coordinates and offsets for bulk geometry output."""
+        return self.materialize()
+
 
 class _NativeCrossingProgress:
     """Present native phase counters as one honest tqdm bar at a time."""

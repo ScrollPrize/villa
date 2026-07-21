@@ -105,6 +105,18 @@ set_target_properties(vc_track_store PROPERTIES
 target_link_libraries(vc_track_store PRIVATE OpenMP::OpenMP_CXX)
 target_compile_features(vc_track_store PRIVATE cxx_std_23)
 
+nanobind_add_module(vc_spiral_sampling
+    NOMINSIZE
+    vc/spiral_sampling.cpp
+)
+set_target_properties(vc_spiral_sampling PROPERTIES
+    OUTPUT_NAME spiral_sampling
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
+)
+target_link_libraries(vc_spiral_sampling PRIVATE OpenMP::OpenMP_CXX)
+target_compile_features(vc_spiral_sampling PRIVATE cxx_std_23)
+
 install(TARGETS vc_lasagna_amgx
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
@@ -116,7 +128,7 @@ install(TARGETS vc_core vc_lasagna utils utils_c3d_codec c3d
     ARCHIVE DESTINATION .
 )
 
-install(TARGETS vc_volume vc_surface_index vc_track_crossings vc_track_store
+install(TARGETS vc_volume vc_surface_index vc_track_crossings vc_track_store vc_spiral_sampling
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )

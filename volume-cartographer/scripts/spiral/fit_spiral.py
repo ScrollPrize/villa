@@ -30,6 +30,7 @@ from ddp_helpers import (
 from lasagna_data import prepare_lasagna_volume, prepare_surf_sdt_volume
 from checkpoint_io import load_checkpoint_cpu
 from influence import make_influence_state, subsample_rows
+from native_spiral import load_native_spiral_sampling
 from tifxyz import load_tifxyz
 from geom_utils import bilinear_atlas_lookup, interp1d
 from point_collection import (
@@ -611,6 +612,14 @@ class PatchGpuAtlas:
         self.widths = torch.tensor(widths, device=device, dtype=torch.int64)  # (N,)
         self.heights = torch.tensor(heights, device=device, dtype=torch.int64)  # (N,)
         self.id_to_idx = {pid: i for i, pid in enumerate(patches_by_id.keys())}
+        native = load_native_spiral_sampling()
+        self.sampling_atlas = (
+            native.PatchSamplingAtlas([
+                np.ascontiguousarray(p._sampling_valid_quad_mask_np, dtype=bool)
+                for p in patches_by_id.values()
+            ])
+            if native is not None and patches_by_id else None
+        )
 
     def memory_mb(self):
         return self.zyxs_flat.numel() * 4 / 1e6
@@ -664,6 +673,16 @@ class PatchGpuAtlas:
         for pid in patches_by_id:
             self.id_to_idx[pid] = next_idx
             next_idx += 1
+        masks = [
+            np.ascontiguousarray(p._sampling_valid_quad_mask_np, dtype=bool)
+            for p in patches_by_id.values()
+        ]
+        if self.sampling_atlas is not None:
+            self.sampling_atlas.append(masks)
+        else:
+            native = load_native_spiral_sampling()
+            if native is not None:
+                self.sampling_atlas = native.PatchSamplingAtlas(masks)
 
 
 class _UnattachedPclStripList(list):
@@ -1296,6 +1315,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # ==========================================================================
 
     def prepare_patch_sampling_cache(patches):
+        native_sampling_available = load_native_spiral_sampling() is not None
         patch_areas = np.empty(len(patches), dtype=np.float32)
         for patch_idx, patch in enumerate(patches):
             # Use the quad-valid mask so bilinear interpolation at (row_idx+di, j+dj)
@@ -1315,41 +1335,38 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 # entirely outside the z-ROI are dropped earlier.
                 in_roi_quad_mask_np = valid_quad_mask_np
             patch._sampling_valid_quad_mask_np = in_roi_quad_mask_np
-            patch._sampling_valid_quad_rows = np.flatnonzero(in_roi_quad_mask_np.any(axis=1))
-            patch._sampling_valid_quad_cols = np.flatnonzero(in_roi_quad_mask_np.any(axis=0))
+            if not native_sampling_available:
+                patch._sampling_valid_quad_rows = np.flatnonzero(in_roi_quad_mask_np.any(axis=1))
+                patch._sampling_valid_quad_cols = np.flatnonzero(in_roi_quad_mask_np.any(axis=0))
 
-            # Precompute, per row and per column, the contiguous valid-quad runs so the
-            # per-iteration sampler can skip the run_containing_index work. We keep the
-            # original "row uniform, run-within-row weighted by length" distribution by
-            # indexing runs per row/col.
-            def _runs_per_line(mask_np, fixed_axis, valid_lines):
-                # Returns parallel lists indexed 0..len(valid_lines)-1:
-                # los_list[k], his_list[k], cum_list[k] are arrays of run lo/hi/cum-length
-                # for the k'th valid line (mask_np row if fixed_axis==0 else column).
+                # Python fallback: precompute, per row and per column, the
+                # contiguous valid-quad runs. The native atlas owns an equivalent
+                # packed representation and avoids these many small Python arrays.
+                def _runs_per_line(mask_np, fixed_axis, valid_lines):
+                    # Returns parallel lists indexed by valid line.
 
-                def _build_line_runs(line_valid):
-                    # Returns (los, his) arrays of contiguous True runs in a 1-D bool array.
-                    padded = np.concatenate([[False], line_valid, [False]]).astype(np.int8)
-                    diff = np.diff(padded)
-                    los = np.where(diff == 1)[0].astype(np.int64)
-                    his = np.where(diff == -1)[0].astype(np.int64)
-                    return los, his
+                    def _build_line_runs(line_valid):
+                        padded = np.concatenate([[False], line_valid, [False]]).astype(np.int8)
+                        diff = np.diff(padded)
+                        los = np.where(diff == 1)[0].astype(np.int64)
+                        his = np.where(diff == -1)[0].astype(np.int64)
+                        return los, his
 
-                los_list, his_list, cum_list = [], [], []
-                for r in valid_lines:
-                    line = mask_np[r] if fixed_axis == 0 else mask_np[:, r]
-                    los, his = _build_line_runs(line)
-                    los_list.append(los)
-                    his_list.append(his)
-                    cum_list.append(np.cumsum(his - los))
-                return los_list, his_list, cum_list
+                    los_list, his_list, cum_list = [], [], []
+                    for r in valid_lines:
+                        line = mask_np[r] if fixed_axis == 0 else mask_np[:, r]
+                        los, his = _build_line_runs(line)
+                        los_list.append(los)
+                        his_list.append(his)
+                        cum_list.append(np.cumsum(his - los))
+                    return los_list, his_list, cum_list
 
-            patch._h_runs_los, patch._h_runs_his, patch._h_runs_cum = _runs_per_line(
-                in_roi_quad_mask_np, 0, patch._sampling_valid_quad_rows
-            )
-            patch._v_runs_los, patch._v_runs_his, patch._v_runs_cum = _runs_per_line(
-                in_roi_quad_mask_np, 1, patch._sampling_valid_quad_cols
-            )
+                patch._h_runs_los, patch._h_runs_his, patch._h_runs_cum = _runs_per_line(
+                    in_roi_quad_mask_np, 0, patch._sampling_valid_quad_rows
+                )
+                patch._v_runs_los, patch._v_runs_his, patch._v_runs_cum = _runs_per_line(
+                    in_roi_quad_mask_np, 1, patch._sampling_valid_quad_cols
+                )
 
             patch_areas[patch_idx] = float(patch.area)
 

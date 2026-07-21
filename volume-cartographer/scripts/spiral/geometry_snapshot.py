@@ -14,6 +14,33 @@ import numpy as np
 
 SNAPSHOT_SCHEMA_VERSION = 1
 
+
+def _write_packed_polylines(points_stream, offsets_stream, packed, input_order):
+    points, offsets = packed
+    points = np.asarray(points, dtype=np.float32)
+    offsets = np.asarray(offsets, dtype=np.int64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("Packed points must have shape [N, 3]")
+    if (offsets.ndim != 1 or len(offsets) == 0 or offsets[0] != 0
+            or offsets[-1] != len(points)
+            or np.any(offsets[1:] <= offsets[:-1])):
+        raise ValueError("Packed offsets must delimit non-empty polylines")
+    order = input_order.upper()
+    if order not in ("ZYX", "XYZ"):
+        raise ValueError("input_order must be XYZ or ZYX")
+    # Reverse/write in bounded point chunks: one Python call per large block,
+    # rather than one call per short track, without making a second full cloud.
+    chunk_points = 1_048_576
+    for start in range(0, len(points), chunk_points):
+        part = points[start:start + chunk_points]
+        if not np.isfinite(part).all():
+            raise ValueError("Packed points contain non-finite coordinates")
+        if order == "ZYX":
+            part = part[:, ::-1]
+        np.ascontiguousarray(part, dtype="<f4").tofile(points_stream)
+    np.ascontiguousarray(offsets, dtype="<u8").tofile(offsets_stream)
+    return len(points), len(offsets) - 1
+
 def write_geometry_snapshot(
     destination: str | os.PathLike[str],
     categories: Mapping[str, Sequence[np.ndarray]],
@@ -44,37 +71,43 @@ def write_geometry_snapshot(
             offset_buffer = np.empty(65_536, dtype="<u8")
             buffered_offsets = 1
             offset_buffer[0] = 0
-            # Write one polyline at a time.  Building reversed-coordinate pieces
-            # and concatenating the complete category used two additional full
-            # point-cloud copies during the resident fitter's VC3D handoff.
+            # Packed providers write large bounded chunks. The fallback writes
+            # one polyline at a time; concatenating a complete generic category
+            # would require two additional full point-cloud copies.
             with (
                 (temp / points_name).open("wb") as points_stream,
                 (temp / offsets_name).open("wb") as offsets_stream,
             ):
-                for index, polyline in enumerate(categories[category]):
-                    points = np.asarray(polyline, dtype=np.float32)
-                    if points.ndim != 2 or points.shape[1] != 3:
-                        raise ValueError(f"Polyline {index} must have shape [N, 3]")
-                    if len(points) == 0:
-                        raise ValueError(f"Polyline {index} is empty")
-                    if not np.isfinite(points).all():
-                        raise ValueError(f"Polyline {index} contains non-finite coordinates")
-                    if input_order.upper() == "ZYX":
-                        output_points = np.ascontiguousarray(points[:, ::-1], dtype="<f4")
-                    elif input_order.upper() == "XYZ":
-                        output_points = np.ascontiguousarray(points, dtype="<f4")
-                    else:
-                        raise ValueError("input_order must be XYZ or ZYX")
-                    output_points.tofile(points_stream)
-                    point_count += len(output_points)
-                    polyline_count += 1
-                    offset_buffer[buffered_offsets] = point_count
-                    buffered_offsets += 1
-                    if buffered_offsets == len(offset_buffer):
-                        offset_buffer.tofile(offsets_stream)
-                        buffered_offsets = 0
-                if buffered_offsets:
-                    offset_buffer[:buffered_offsets].tofile(offsets_stream)
+                packed_provider = getattr(
+                    categories[category], "as_packed_polylines", None)
+                if packed_provider is not None:
+                    point_count, polyline_count = _write_packed_polylines(
+                        points_stream, offsets_stream, packed_provider(), input_order)
+                else:
+                    for index, polyline in enumerate(categories[category]):
+                        points = np.asarray(polyline, dtype=np.float32)
+                        if points.ndim != 2 or points.shape[1] != 3:
+                            raise ValueError(f"Polyline {index} must have shape [N, 3]")
+                        if len(points) == 0:
+                            raise ValueError(f"Polyline {index} is empty")
+                        if not np.isfinite(points).all():
+                            raise ValueError(f"Polyline {index} contains non-finite coordinates")
+                        if input_order.upper() == "ZYX":
+                            output_points = np.ascontiguousarray(points[:, ::-1], dtype="<f4")
+                        elif input_order.upper() == "XYZ":
+                            output_points = np.ascontiguousarray(points, dtype="<f4")
+                        else:
+                            raise ValueError("input_order must be XYZ or ZYX")
+                        output_points.tofile(points_stream)
+                        point_count += len(output_points)
+                        polyline_count += 1
+                        offset_buffer[buffered_offsets] = point_count
+                        buffered_offsets += 1
+                        if buffered_offsets == len(offset_buffer):
+                            offset_buffer.tofile(offsets_stream)
+                            buffered_offsets = 0
+                    if buffered_offsets:
+                        offset_buffer[:buffered_offsets].tofile(offsets_stream)
             manifest["categories"][category] = {
                 "points_file": points_name,
                 "offsets_file": offsets_name,
