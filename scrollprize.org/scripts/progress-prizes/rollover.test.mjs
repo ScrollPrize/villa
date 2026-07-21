@@ -658,6 +658,76 @@ test('production preflight verifies the published reader and configured editor g
     }),
     /unexpected non-public published responder permission/,
   );
+
+  for (const mutate of [
+    (permissions) => permissions.filter(
+      ({ emailAddress }) => emailAddress !== STAGING_SERVICE_ACCOUNT,
+    ),
+    (permissions) => [...permissions, {
+      id: 'unexpected-human-reader',
+      type: 'user',
+      role: 'reader',
+      emailAddress: 'unexpected-reader@example.org',
+    }],
+    (permissions) => permissions.map((permission) => (
+      permission.emailAddress === STAGING_SERVICE_ACCOUNT
+        ? { ...permission, expirationTime: '2027-01-01T00:00:00Z' }
+        : permission
+    )),
+    (permissions) => permissions.map((permission) => (
+      permission.emailAddress === STAGING_SERVICE_ACCOUNT
+        ? { ...permission, role: 'commenter' }
+        : permission
+    )),
+    (permissions) => permissions.map((permission) => (
+      permission.emailAddress === STAGING_SERVICE_ACCOUNT
+        ? { ...permission, permissionDetails: [{ inherited: true }] }
+        : permission
+    )),
+    (permissions) => [...permissions, {
+      id: 'duplicate-automation-reader',
+      type: 'user',
+      role: 'reader',
+      emailAddress: 'duplicate-reader@private-project.iam.gserviceaccount.com',
+    }],
+    (permissions) => permissions.map((permission) => (
+      permission.emailAddress === STAGING_SERVICE_ACCOUNT
+        ? {
+          ...permission,
+          emailAddress: 'replacement-reader@private-project.iam.gserviceaccount.com',
+        }
+        : permission
+    )),
+  ]) {
+    const invalidBootstrapReaderGoogle = grantProductionSourceAccess(new FakeGoogle());
+    invalidBootstrapReaderGoogle.permissions.set(
+      LIVE_FORM_ID,
+      mutate(invalidBootstrapReaderGoogle.permissions.get(LIVE_FORM_ID)),
+    );
+    await assert.rejects(
+      service({
+        google: invalidBootstrapReaderGoogle,
+        runtime: productionRuntime(),
+      }).rollover.validate({
+        sourceFormId: LIVE_FORM_ID,
+        sourceCycle: '2026-07',
+        collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+      }),
+      /exactly one direct copy-only automation reader/,
+    );
+  }
+
+  await assert.rejects(
+    service({
+      google: grantProductionSourceAccess(new FakeGoogle()),
+      runtime: productionRuntime({ stagingServiceAccountEmail: undefined }),
+    }).rollover.validate({
+      sourceFormId: LIVE_FORM_ID,
+      sourceCycle: '2026-07',
+      collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+    }),
+    /requires the configured staging automation identity/,
+  );
 });
 
 test('destination folder preflight blocks both dry-run and real copies', async () => {
@@ -1027,21 +1097,57 @@ test('bootstrap copies the live form into staging, limits ACLs, and never mutate
     (fileId === LIVE_FORM_ID || formId === LIVE_FORM_ID)
     && ['updateFile', 'createPermission', 'deletePermission', 'updateFormTitle', 'setPublishState'].includes(method));
   assert.deepEqual(liveMutations, []);
+  assert.equal(
+    context.google.calls.some(
+      ({ method, fileId }) => method === 'getAllPermissions' && fileId === LIVE_FORM_ID,
+    ),
+    false,
+  );
+});
+
+test('bootstrap does not require a staging Viewer to enumerate the production ACL', async () => {
+  const context = service();
+  context.google.files.get(LIVE_FORM_ID).capabilities.canEdit = false;
+  context.google.files.get(LIVE_FORM_ID).capabilities.canShare = false;
+  const originalGetAllPermissions = context.google.getAllPermissions.bind(context.google);
+  let livePermissionReads = 0;
+  context.google.getAllPermissions = async (input) => {
+    if (input.fileId === LIVE_FORM_ID) {
+      livePermissionReads += 1;
+      throw new Error('A Viewer cannot enumerate the production ACL');
+    }
+    return originalGetAllPermissions(input);
+  };
+
+  const result = await context.rollover.bootstrapStagingSource({
+    sourceFormId: LIVE_FORM_ID,
+    sourceCycle: '2026-07',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+  });
+
+  assert.equal(result.status, 'active');
+  assert.equal(livePermissionReads, 0);
 });
 
 test('bootstrap rejects an overprivileged staging identity before copying production', async () => {
   for (const capability of ['canEdit', 'canShare']) {
-    const context = service();
-    context.google.files.get(LIVE_FORM_ID).capabilities[capability] = true;
-    await assert.rejects(
-      context.rollover.bootstrapStagingSource({
-        sourceFormId: LIVE_FORM_ID,
-        sourceCycle: '2026-07',
-        collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
-      }),
-      /forbidden edit or share access/,
-    );
-    assert.equal(context.google.calls.some(({ method }) => method === 'copyFile'), false);
+    for (const invalidValue of [true, null, 'false', undefined]) {
+      const context = service();
+      if (invalidValue === undefined) {
+        delete context.google.files.get(LIVE_FORM_ID).capabilities[capability];
+      } else {
+        context.google.files.get(LIVE_FORM_ID).capabilities[capability] = invalidValue;
+      }
+      await assert.rejects(
+        context.rollover.bootstrapStagingSource({
+          sourceFormId: LIVE_FORM_ID,
+          sourceCycle: '2026-07',
+          collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+        }),
+        /forbidden edit or share access/,
+      );
+      assert.equal(context.google.calls.some(({ method }) => method === 'copyFile'), false);
+    }
   }
 });
 
