@@ -289,15 +289,40 @@ function managedTitle(runtime, clock, role, cycle) {
 }
 
 function publishState(form) {
-  const state = form?.publishSettings?.publishState;
-  if (
-    state === null
-    || typeof state !== 'object'
-    || typeof state.isPublished !== 'boolean'
-    || typeof state.isAcceptingResponses !== 'boolean'
-  ) {
+  const settings = form?.publishSettings;
+  if (settings === undefined) {
     throw new Error('Form does not expose modern publishSettings; migrate it before rollover');
   }
+  if (
+    settings === null
+    || typeof settings !== 'object'
+    || Array.isArray(settings)
+  ) {
+    throw new Error('Form exposes malformed modern publishSettings');
+  }
+  // Forms uses protobuf JSON. A modern unpublished form can expose an empty
+  // publishSettings message, and false scalar fields can be omitted. Only the
+  // absence of publishSettings itself identifies a legacy form.
+  const encodedState = settings.publishState;
+  if (
+    encodedState !== undefined
+    && (
+      encodedState === null
+      || typeof encodedState !== 'object'
+      || Array.isArray(encodedState)
+    )
+  ) {
+    throw new Error('Form exposes malformed modern publishSettings');
+  }
+  for (const field of ['isPublished', 'isAcceptingResponses']) {
+    if (encodedState?.[field] !== undefined && typeof encodedState[field] !== 'boolean') {
+      throw new Error('Form exposes malformed modern publishSettings');
+    }
+  }
+  const state = {
+    isPublished: encodedState?.isPublished ?? false,
+    isAcceptingResponses: encodedState?.isAcceptingResponses ?? false,
+  };
   if (!state.isPublished && state.isAcceptingResponses) {
     throw new Error('Form reports an invalid publishing state');
   }
