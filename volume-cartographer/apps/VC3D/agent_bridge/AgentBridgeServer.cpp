@@ -1121,7 +1121,28 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     if (!widget)
         throw AgentBridgeError{-32002, "No capture target available", {}};
 
+    if (!widget->isVisible()) {
+        QJsonObject data;
+        data["detail"] = "target widget is not currently visible (e.g. it's on a "
+                          "non-frontmost tab or a hidden pane) -- a grab() of a "
+                          "hidden widget returns a meaningless, often near-zero-size "
+                          "image; switch to it (e.g. via workspace.switch) before "
+                          "capturing";
+        throw AgentBridgeError{-32009, "Capture target not visible", data};
+    }
+
     QPixmap pixmap = widget->grab();
+
+    static constexpr int kMinCaptureDim = 8;
+    if (pixmap.width() < kMinCaptureDim || pixmap.height() < kMinCaptureDim) {
+        QJsonObject data;
+        data["detail"] = QStringLiteral(
+                              "captured pixmap is degenerate (%1x%2) -- the target "
+                              "widget has not been laid out to a meaningful size")
+                              .arg(pixmap.width())
+                              .arg(pixmap.height());
+        throw AgentBridgeError{-32009, "Capture target has degenerate size", data};
+    }
 
     if (p.contains("maxDim")) {
         const int maxDim = p.value("maxDim").toInt(0);

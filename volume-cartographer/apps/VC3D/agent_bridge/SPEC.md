@@ -243,7 +243,13 @@ Snapshot of app state. Never errors on missing volume — reports what exists.
     "filePath": str | null, "base64": str | null}`
   — `base64` is set iff `filePath` was omitted. Implementation: `QWidget::grab()` on
   `CWindow` or the resolved viewer widget (`CChunkedVolumeViewer` is a `QWidget`).
+  Before grabbing, the target's `isVisible()` is checked, and the grabbed pixmap's
+  size is checked against a minimum (8px/side) — a widget on a non-frontmost tab
+  (verified live: a fiber-workspace pane while a different tab was active) is
+  hidden by its `QStackedWidget`/`QTabWidget` and would otherwise `grab()` a
+  meaningless near-zero-size image (observed: 15×50px) with no error.
 - **errors:** `-32002` (bad viewer target), `-32005` (file write failed, reuse with
+  `data.detail`), `-32009` (target widget not visible, or captured size degenerate;
   `data.detail`).
 
 ### 3.5 `canvas.get_cursor_volume_point`

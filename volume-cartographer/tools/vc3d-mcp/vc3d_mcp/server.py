@@ -158,6 +158,12 @@ async def vc3d_screenshot(
     file_path: absolute path; when set, the PNG is written to disk and the
     result's base64 field is null. Omit to get the PNG back as base64.
     max_dim: optional downscale, longest side in pixels, aspect preserved.
+
+    Fails -32009 if the target widget isn't currently visible (e.g. it's on a
+    non-frontmost tab, such as a fiber/lasagna workspace pane while a
+    different tab is active) or its captured size is degenerate (<8px on a
+    side) -- rather than silently returning a meaningless near-zero-size
+    image. Switch to the right tab/workspace first if you hit this.
     """
     return await _call(
         "screenshot.capture",

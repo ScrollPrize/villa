@@ -89,3 +89,12 @@ call `vc3d_push_pull_start`, wait, then `vc3d_push_pull_stop`.
   discards the currently open fiber's unsaved control points. Pass
   `replace_owning=false` to trace several fibers before one combined
   `vc3d_fiber_save`.
+
+## 8. `vc3d_screenshot` fails loudly on a hidden target (by design)
+
+If the target viewer is on a non-frontmost tab (e.g. a fiber/lasagna
+workspace pane while the main tab is active, or vice versa), `vc3d_screenshot`
+now fails `-32009` instead of silently returning a near-zero-size image — this
+used to return a genuinely degenerate (e.g. 15×50px) but "successful" PNG,
+which cost real debugging time before anyone noticed. If you hit this, switch
+to the right tab/workspace (or activate that pane) before capturing.
