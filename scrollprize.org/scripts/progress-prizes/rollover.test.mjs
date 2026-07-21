@@ -496,6 +496,24 @@ test('validate safely stops for linked Sheets and legacy publish settings', asyn
     legacy.rollover.validate({ sourceFormId: LIVE_FORM_ID, sourceCycle: '2026-07' }),
     /modern publishSettings/,
   );
+
+  const unpublishedModernGoogle = grantProductionSourceAccess(new FakeGoogle());
+  unpublishedModernGoogle.forms.get(LIVE_FORM_ID).publishSettings = {};
+  await assert.rejects(
+    service({
+      google: unpublishedModernGoogle,
+      runtime: productionRuntime(),
+    }).rollover.validate({
+      sourceFormId: LIVE_FORM_ID,
+      sourceCycle: '2026-07',
+      collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+    }),
+    /not in the expected live publishing state/,
+  );
+  assert.equal(
+    unpublishedModernGoogle.calls.some(({ method }) => method === 'setPublishState'),
+    false,
+  );
 });
 
 test('production accepts only its explicit My Drive bootstrap source with copy and edit access', async () => {
@@ -1127,6 +1145,183 @@ test('bootstrap does not require a staging Viewer to enumerate the production AC
 
   assert.equal(result.status, 'active');
   assert.equal(livePermissionReads, 0);
+});
+
+test('bootstrap initializes omitted modern publish-state defaults on exactly one copy', async (t) => {
+  for (const scenario of [
+    {
+      name: 'optional publishState omitted',
+      publishSettings: {},
+      expectedAcceptingWrites: [false, true],
+    },
+    {
+      name: 'false scalar fields omitted',
+      publishSettings: { publishState: {} },
+      expectedAcceptingWrites: [false, true],
+    },
+    {
+      name: 'false accepting-responses field omitted',
+      publishSettings: { publishState: { isPublished: true } },
+      expectedAcceptingWrites: [true],
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const context = service();
+      const originalCopyFile = context.google.copyFile.bind(context.google);
+      context.google.copyFile = async (input) => {
+        const copied = await originalCopyFile(input);
+        context.google.forms.get(copied.id).publishSettings = clone(scenario.publishSettings);
+        return copied;
+      };
+
+      const result = await context.rollover.bootstrapStagingSource({
+        sourceFormId: LIVE_FORM_ID,
+        sourceCycle: '2026-07',
+        collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+      });
+      const stagedSource = context.google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0];
+      const publishWrites = context.google.calls.filter(
+        ({ method, formId }) => method === 'setPublishState' && formId === stagedSource.id,
+      );
+
+      assert.equal(result.status, 'active');
+      assert.equal(result.created, true);
+      assert.deepEqual(
+        publishWrites.map(({ isAcceptingResponses }) => isAcceptingResponses),
+        scenario.expectedAcceptingWrites,
+      );
+      assert.equal(
+        context.google.calls.filter(({ method, appProperties }) =>
+          method === 'copyFile' && appProperties?.role === ROLLOVER_FILE_ROLES.SOURCE).length,
+        1,
+      );
+      assert.deepEqual(context.google.forms.get(stagedSource.id).publishSettings.publishState, {
+        isPublished: true,
+        isAcceptingResponses: true,
+      });
+    });
+  }
+});
+
+test('bootstrap resumes one marked copy with omitted modern publish-state defaults', async () => {
+  const context = service();
+  const stagedSource = await context.google.copyFile({
+    fileId: LIVE_FORM_ID,
+    name: '[SMOKE SOURCE 2026-07-20] July 2026 Progress Prizes',
+    parentId: 'private-staging-folder',
+    appProperties: {
+      managedBy: ROLLOVER_MANAGED_BY,
+      schemaVersion: '1',
+      environment: 'staging',
+      role: ROLLOVER_FILE_ROLES.SOURCE,
+      cycle: '2026-07',
+      state: ROLLOVER_FILE_STATES.COPIED,
+    },
+  });
+  context.google.forms.get(stagedSource.id).publishSettings = {};
+
+  const result = await context.rollover.bootstrapStagingSource({
+    sourceFormId: LIVE_FORM_ID,
+    sourceCycle: '2026-07',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+  });
+  const publishWrites = context.google.calls.filter(
+    ({ method, formId }) => method === 'setPublishState' && formId === stagedSource.id,
+  );
+
+  assert.equal(result.status, 'active');
+  assert.equal(result.created, false);
+  assert.equal(result.resumed, true);
+  assert.deepEqual(
+    publishWrites.map(({ isAcceptingResponses }) => isAcceptingResponses),
+    [false, true],
+  );
+  assert.equal(
+    context.google.calls.filter(({ method, appProperties }) =>
+      method === 'copyFile' && appProperties?.role === ROLLOVER_FILE_ROLES.SOURCE).length,
+    1,
+  );
+  assert.equal(
+    context.google.files.get(stagedSource.id).appProperties.state,
+    ROLLOVER_FILE_STATES.ACTIVE,
+  );
+});
+
+test('bootstrap rejects absent or malformed copied publish settings before reconciliation', async (t) => {
+  for (const scenario of [
+    {
+      name: 'legacy settings absent',
+      publishSettings: undefined,
+      expected: /modern publishSettings/,
+    },
+    {
+      name: 'publishSettings is null',
+      publishSettings: null,
+      expected: /malformed modern publishSettings/,
+    },
+    {
+      name: 'publishSettings is not an object',
+      publishSettings: 'invalid',
+      expected: /malformed modern publishSettings/,
+    },
+    {
+      name: 'publishSettings is an array',
+      publishSettings: [],
+      expected: /malformed modern publishSettings/,
+    },
+    {
+      name: 'publishState is null',
+      publishSettings: { publishState: null },
+      expected: /malformed modern publishSettings/,
+    },
+    {
+      name: 'published flag is not boolean',
+      publishSettings: { publishState: { isPublished: 'false' } },
+      expected: /malformed modern publishSettings/,
+    },
+    {
+      name: 'accepting flag is not boolean',
+      publishSettings: { publishState: { isAcceptingResponses: 'false' } },
+      expected: /malformed modern publishSettings/,
+    },
+    {
+      name: 'accepting while unpublished',
+      publishSettings: { publishState: { isAcceptingResponses: true } },
+      expected: /invalid publishing state/,
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const context = service();
+      const originalCopyFile = context.google.copyFile.bind(context.google);
+      context.google.copyFile = async (input) => {
+        const copied = await originalCopyFile(input);
+        if (scenario.publishSettings === undefined) {
+          delete context.google.forms.get(copied.id).publishSettings;
+        } else {
+          context.google.forms.get(copied.id).publishSettings = clone(scenario.publishSettings);
+        }
+        return copied;
+      };
+
+      await assert.rejects(
+        context.rollover.bootstrapStagingSource({
+          sourceFormId: LIVE_FORM_ID,
+          sourceCycle: '2026-07',
+          collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+        }),
+        scenario.expected,
+      );
+      const stagedSource = context.google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0];
+      assert.ok(stagedSource);
+      assert.equal(stagedSource.appProperties.state, ROLLOVER_FILE_STATES.COPIED);
+      assert.equal(
+        context.google.calls.some(({ method, fileId, formId }) =>
+          (fileId === stagedSource.id || formId === stagedSource.id)
+          && ['updateFile', 'createPermission', 'updateFormTitle', 'setPublishState'].includes(method)),
+        false,
+      );
+    });
+  }
 });
 
 test('bootstrap rejects an overprivileged staging identity before copying production', async () => {
