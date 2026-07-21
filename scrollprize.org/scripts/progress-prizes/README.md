@@ -38,9 +38,10 @@ repository secret, file, log, cache, or artifact.
   `prepare`, `activate`, and `verify` operations after the complete staging
   rehearsal has passed. Every authenticated job is literal in that top-level
   workflow and calls the same local action exercised by staging.
-- Milestone 5 adds `progress-prizes-schedule.yml` only after production
-  `validate` and `dry-run` pass. Reaching `main` is what enables its Pacific-time
-  schedules.
+- `progress-prizes-schedule.yml` is the secret-free scheduler added only after
+  production `validate` and `dry-run` passed. Reaching `main` enables its
+  Pacific-time schedules; a manual dispatch is permanently restricted to a
+  read-only production dry-run.
 
 The workflows invoke:
 
@@ -394,11 +395,11 @@ the same staging identities, folder, clock rules, and smoke branches; the core
 also rejects fault injection unless every staging condition is true.
 
 The full rehearsal passed through verified cleanup before the production
-workflow was added. Merge the guarded production workflow, update the
-production WIF condition to its exact path, then dispatch production `validate`
-and `dry-run`. Add
-`progress-prizes-schedule.yml` only at the final schedule milestone: once it
-reaches `main`, GitHub enables the Pacific daily schedules.
+workflow was added. The guarded workflow was then merged, the production WIF
+condition was restricted to its exact path, and production `validate` and
+`dry-run` both passed on July 21, 2026. The scheduler is the final milestone:
+GitHub enables its Pacific schedules only after that reviewed file reaches
+`main`.
 
 ## Production operations and recovery
 
@@ -437,6 +438,43 @@ Never use simulated time, fault controls, alternate branches, or staging folders
 for production; those inputs are absent and the shared action rejects them
 before authentication.
 
+## Automated schedule and immediate smoke
+
+The scheduler owns no Google or Vercel configuration, protected Environment,
+OIDC permission, reusable credential, or repository secret. It runs only trusted
+code from the exact `main` commit, derives cycles from the real
+`America/Los_Angeles` clock, and uses the repository `GITHUB_TOKEN` solely to
+dispatch `progress-prizes-production.yml` on `main`. The dispatch response is
+bound to the exact child run ID and public Actions URL.
+
+- `06:17` Pacific is the daily preparation probe. It no-ops before the exact
+  seven-day window and after cutoff. Once an exact page-only draft PR already
+  sits directly above current `main`, it skips repeated preparation instead of
+  force-pushing a new commit and restarting checks.
+- `23:40` Pacific on candidate final days dispatches activation only when the
+  observed date is the actual last calendar day. The production workflow—not
+  the scheduler—runs tests and the Vercel gate, requests human approval, waits
+  for cutoff without a Google token, then authenticates.
+- `00:17` and `06:47` Pacific on the first day are independent recovery probes.
+  Delayed final-day events retain the previous source cycle through that first
+  day, while every day-two event no-ops. If an exact production run is already
+  nonterminal, the scheduler does not enqueue a stale duplicate.
+
+Production and scheduler concurrency groups never cancel an in-progress run and
+use GitHub's queued concurrency mode so a manual race cannot silently replace a
+pending cutoff run. The scheduler itself never sleeps. GitHub may delay or drop
+a scheduled event, and public-repository schedules can be disabled after 60 days
+without repository activity, so the production workflow keeps its manual
+`prepare` and `activate` recovery path.
+
+Immediately after the scheduler reaches `main`, manually dispatch **Progress
+Prize production schedule** once. Manual scheduler runs have no inputs and can
+only dispatch the real-clock production `dry-run`; they cannot prepare, close,
+open, share, publish, merge, or update the website. Verify that the scheduler's
+recorded child run is the exact successful read-only production run. Scheduled
+preparation must remain reviewer-free; the reviewer gate belongs only to the
+secret-free `progress-prizes-production-activation` Environment.
+
 ## Local verification
 
 No package installation is required for the automation tests:
@@ -451,11 +489,19 @@ Lint only the new workflows with actionlint (the repository has unrelated legacy
 workflow findings):
 
 ```bash
-actionlint ../.github/workflows/progress-prizes-*.yml
+actionlint \
+  -ignore 'unexpected key "queue" for "concurrency" section' \
+  ../.github/workflows/progress-prizes-*.yml
 ```
+
+The narrow ignore is for actionlint 1.7.12, released before GitHub added the
+valid `concurrency.queue: max` syntax in May 2026. It suppresses only that known
+schema-lag diagnostic; every other workflow finding remains fatal. Remove the
+ignore once a released actionlint understands queued concurrency.
 
 The rehearsal-foundation contract test checks immutable action pins, OIDC
 isolation, repository IDs, staging-only controls, exact-commit Vercel
 association, and trusted GitHub check provenance. The gated production and
-schedule milestones have separate contract tests so those files cannot be
-committed early merely to satisfy a foundation test.
+scheduler have separate executable contract tests for the clock boundaries,
+minimal permissions, deduplication, fixed dispatch endpoint, child-run binding,
+redacted failures, and absence of Google configuration.

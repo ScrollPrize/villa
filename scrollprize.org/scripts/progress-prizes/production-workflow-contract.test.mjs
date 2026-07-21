@@ -99,7 +99,10 @@ test('production accepts only a secret-free manual dispatch contract', async () 
   assert.doesNotMatch(source, /workflow_call:|pull_request(?:_target)?:/);
   assert.doesNotMatch(inputSection, /^  (?:schedule|repository_dispatch):/m);
   assert.doesNotMatch(inputSection, /^\s+(?:simulated-now|fault|base-branch|head-sha):/m);
-  assert.match(source, /^concurrency:\n  group: progress-prizes-production\n  cancel-in-progress: false$/m);
+  assert.match(
+    source,
+    /^concurrency:\n  group: progress-prizes-production\n  cancel-in-progress: false\n  queue: max$/m,
+  );
   assert.match(preflight, /permissions: \{\}/);
   assert.doesNotMatch(preflight, /environment:|id-token|secrets\./);
   assert.match(preflight, /assert\.equal\(process\.env\.REPOSITORY, 'ScrollPrize\/villa'\)/);

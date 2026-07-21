@@ -23,6 +23,7 @@ const workflowNames = [
   'progress-prizes-pr-safety.yml',
   'progress-prizes-production.yml',
   'progress-prizes-rehearsal.yml',
+  'progress-prizes-schedule.yml',
   'progress-prizes-vercel-preview.yml',
 ];
 const googleJobNames = [
