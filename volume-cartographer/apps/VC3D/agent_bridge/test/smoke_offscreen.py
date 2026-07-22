@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Fixture-free offscreen smoke test for the VC3D Agent Bridge.
+
+Exercises the C2/C3/C4 stabilization work against the REAL VC3D binary with no
+volume package and no display (QT_QPA_PLATFORM=offscreen), so it is safe to run
+anywhere the build tree exists:
+
+  C4  strict wire-parameter parsing rejects a present-but-malformed value with
+      -32602 + data.param, BEFORE touching viewer/controller state, and the
+      bridge keeps answering afterwards (no crash, no state corruption).
+  C2  a single request line exceeding the 1 MiB per-client bound gets the
+      offending client disconnected (best-effort -32600), while other clients
+      remain unaffected.
+  C3  a second server launched on the same --agent-bridge-name REFUSES (probes
+      the live endpoint first and does not unlink it); the first server stays
+      reachable.
+
+Note on the fractional-integer C4 case (growth `steps` / tracer `ompThreads`):
+offscreen those handlers hit their "No volume package loaded" (-32000) gate
+BEFORE the strict int parse runs, so the -32602 fractional-int rejection is not
+reachable here — it is covered deterministically by the C++ unit test
+(apps/VC3D/agent_bridge/test/test_agent_bridge_parse.cpp, ctest agent_bridge_parse).
+This smoke still fires such a request to confirm it is cleanly rejected (not a
+crash) and that the bridge survives.
+
+Prints a single JSON result object on the last stdout line; exits nonzero if any
+check fails. Every socket wait carries a timeout so an offscreen hang cannot
+block forever.
+
+    python3 smoke_offscreen.py [--vc3d /path/to/VC3D]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from bridge_client import BridgeClient, BridgeError, parse_handshake_line  # noqa: E402
+from vc3d_process import VC3DProcess  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+DEFAULT_VC3D_BIN = REPO_ROOT / "build" / "ci-release-gcc" / "bin" / "VC3D"
+
+OFFSCREEN_ENV = {"QT_QPA_PLATFORM": "offscreen"}
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+class Results:
+    def __init__(self) -> None:
+        self.checks: dict[str, dict] = {}
+
+    def record(self, name: str, ok: bool, detail: str = "") -> bool:
+        self.checks[name] = {"pass": bool(ok), "detail": detail}
+        log(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}")
+        return ok
+
+    @property
+    def ok(self) -> bool:
+        return all(c["pass"] for c in self.checks.values())
+
+
+def unique_name(tag: str) -> str:
+    return f"vc3d-smoke-{tag}-{os.getpid()}-{int(time.time() * 1000) % 100000}"
+
+
+def launch(binary: str, name: str) -> VC3DProcess:
+    return VC3DProcess(
+        binary,
+        ["--agent-bridge", "--agent-bridge-name", name],
+        env_overrides=OFFSCREEN_ENV,
+    )
+
+
+def expect_param_error(client: BridgeClient, method: str, params: dict,
+                       expect_param: str) -> tuple[bool, str]:
+    """Calls `method`; expects BridgeError(-32602) with data.param == expect_param."""
+    try:
+        result, _ = client.call(method, params, timeout=10.0)
+        return False, f"expected -32602, got result keys={list(result)[:6]}"
+    except BridgeError as e:
+        if e.code != -32602:
+            return False, f"expected code -32602, got {e.code} ({e.message})"
+        got = e.data.get("param")
+        if got != expect_param:
+            return False, f"expected data.param={expect_param!r}, got {got!r}"
+        return True, f"code=-32602 param={got!r}"
+    except Exception as e:  # noqa: BLE001
+        return False, f"unexpected {type(e).__name__}: {e}"
+
+
+def check_c4(client: BridgeClient, results: Results) -> None:
+    # Liveness / dispatch sanity.
+    try:
+        state, _ = client.call("state.get", {}, timeout=10.0)
+        results.record("liveness_state_get", isinstance(state, dict),
+                       f"keys={list(state)[:4] if isinstance(state, dict) else state}")
+    except Exception as e:  # noqa: BLE001
+        results.record("liveness_state_get", False, f"{type(e).__name__}: {e}")
+
+    # C4: rotate with a string `degrees` — parse rejection precedes the
+    # axis-aligned-slice-mode state check.
+    ok, detail = expect_param_error(
+        client, "viewer.rotate",
+        {"plane": "seg xz", "degrees": "abc"}, "degrees")
+    results.record("c4_rotate_degrees_string", ok, detail)
+
+    # C4: zoom with a non-numeric `factor`.
+    ok, detail = expect_param_error(
+        client, "viewer.zoom", {"factor": "abc"}, "factor")
+    results.record("c4_zoom_factor_string", ok, detail)
+
+    # C4: fractional value for an integer param. Offscreen this is gated by the
+    # -32000 "no volume package" check before the int parse (see module docstring);
+    # assert it is cleanly rejected (any BridgeError) rather than crashing. The
+    # -32602 fractional-int rejection itself is covered by the C++ unit test.
+    try:
+        client.call("segmentation.grow",
+                    {"direction": "all", "steps": 1.5}, timeout=10.0)
+        results.record("c4_int_fractional_rejected", False,
+                       "expected a BridgeError, got a result")
+    except BridgeError as e:
+        results.record("c4_int_fractional_rejected", True,
+                       f"cleanly rejected code={e.code} (int -32602 covered by unit test)")
+    except Exception as e:  # noqa: BLE001
+        results.record("c4_int_fractional_rejected", False,
+                       f"unexpected {type(e).__name__}: {e}")
+
+    # No state corruption: bridge still answers after the malformed requests.
+    try:
+        state2, _ = client.call("state.get", {}, timeout=10.0)
+        results.record("c4_no_corruption_state_get", isinstance(state2, dict),
+                       "bridge still answers after malformed requests")
+    except Exception as e:  # noqa: BLE001
+        results.record("c4_no_corruption_state_get", False, f"{type(e).__name__}: {e}")
+
+
+def check_c2_oversized(sock_path: str, results: Results) -> None:
+    """Send a single unterminated line > 1 MiB; the server must drop that socket
+    while a separate fresh connection keeps working."""
+    over = 2 * 1024 * 1024  # > kMaxLineBytes (1 MiB), no newline
+    raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw.settimeout(10.0)
+    closed_by_server = False
+    detail = ""
+    try:
+        raw.connect(sock_path)
+        # Send the oversized unterminated payload in chunks. The server trips the
+        # bound mid-stream, sends a best-effort -32600, and disconnects — so the
+        # send itself may raise EPIPE/ECONNRESET (that IS the server dropping us),
+        # or we observe EOF on the read side. Either proves the drop.
+        chunk = b" " * 65536
+        sent = 0
+        try:
+            while sent < over:
+                sent += raw.send(chunk)
+            # Fully sent without error: the server must close the read side (EOF).
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                try:
+                    data = raw.recv(65536)
+                except socket.timeout:
+                    break
+                if data == b"":
+                    closed_by_server = True
+                    break
+            detail = ("server closed the oversized client (EOF)"
+                      if closed_by_server else "server did not close within 10s")
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # Server closed the socket while we were still sending the payload.
+            closed_by_server = True
+            detail = f"server dropped mid-send ({type(e).__name__}) after {sent} bytes"
+        results.record("c2_oversized_socket_dropped", closed_by_server, detail)
+    except Exception as e:  # noqa: BLE001
+        results.record("c2_oversized_socket_dropped", False,
+                       f"{type(e).__name__}: {e}")
+    finally:
+        raw.close()
+
+    # A separate fresh connection must be unaffected.
+    try:
+        fresh = BridgeClient(sock_path, connect_timeout=10.0)
+        try:
+            state, _ = fresh.call("state.get", {}, timeout=10.0)
+            results.record("c2_other_client_unaffected", isinstance(state, dict),
+                           "fresh connection still answers state.get")
+        finally:
+            fresh.close()
+    except Exception as e:  # noqa: BLE001
+        results.record("c2_other_client_unaffected", False,
+                       f"{type(e).__name__}: {e}")
+
+
+def _inode(path: str):
+    try:
+        return os.stat(path).st_ino
+    except OSError:
+        return None
+
+
+def check_c3_live_probe(binary: str, name: str, sock_path: str,
+                        first_client: BridgeClient, results: Results) -> None:
+    """Launch a second server on the same name; it MUST refuse (probe the live
+    endpoint and leave it alone). A refusal means: the second exits nonzero /
+    logs a collision, never prints its own handshake, and the live socket file is
+    NOT replaced (same inode). Detecting takeover requires the inode check — an
+    already-established client connection and a bare path-exists check both
+    survive an unlink+re-listen and would mask the strand."""
+    ino_before = _inode(sock_path)
+    second = launch(binary, name)
+    exit_code = None
+    took_over = False
+    try:
+        # Boot is sub-second; wait for a terminal signal: the second either exits
+        # (refused) or prints its own handshake / replaces the socket (took over).
+        deadline = time.monotonic() + 45.0
+        while time.monotonic() < deadline:
+            exit_code = second.exit_code()
+            if exit_code is not None:
+                break
+            if any(parse_handshake_line(ln) for ln in second.tail_log(120)):
+                took_over = True
+                break
+            if _inode(sock_path) not in (ino_before, None):
+                took_over = True
+                break
+            time.sleep(0.2)
+        ino_after = _inode(sock_path)
+        inode_changed = (ino_after is not None and ino_after != ino_before)
+        logged = any("failed to listen" in ln.lower() for ln in second.tail_log(120))
+        refused = (not took_over and not inode_changed
+                   and ((exit_code is not None and exit_code != 0) or logged))
+        results.record(
+            "c3_second_server_refused", refused,
+            f"exit_code={exit_code} printed_handshake={took_over} "
+            f"logged_collision={logged} inode_changed={inode_changed} "
+            f"(ino {ino_before}->{ino_after})")
+        # Explicit, separately-scored takeover assertion (the live socket must
+        # not be unlinked+recreated).
+        results.record(
+            "c3_live_socket_not_unlinked", not inode_changed and not took_over,
+            "live socket preserved" if not inode_changed
+            else "live socket was unlinked + re-listened by the second server")
+    finally:
+        second.terminate()
+
+    # The already-connected client survives regardless (existing fd), so this is
+    # only a weak liveness signal, not proof the endpoint wasn't reclaimed.
+    try:
+        state, _ = first_client.call("state.get", {}, timeout=10.0)
+        results.record("c3_first_conn_still_answers", isinstance(state, dict),
+                       "pre-existing connection still answers state.get")
+    except Exception as e:  # noqa: BLE001
+        results.record("c3_first_conn_still_answers", False,
+                       f"{type(e).__name__}: {e}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--vc3d", default=str(DEFAULT_VC3D_BIN),
+                    help="path to the VC3D binary")
+    args = ap.parse_args()
+
+    binary = args.vc3d
+    if not os.path.exists(binary):
+        log(f"VC3D binary not found: {binary}")
+        print(json.dumps({"ok": False, "error": f"binary not found: {binary}"}))
+        return 2
+
+    results = Results()
+    name = unique_name("main")
+    proc = launch(binary, name)
+    client = None
+    try:
+        sock_path = proc.wait_for_handshake(timeout=60.0)
+        log(f"handshake: name={name} path={sock_path}")
+        client = BridgeClient(sock_path, connect_timeout=10.0)
+
+        check_c4(client, results)
+        check_c2_oversized(sock_path, results)
+        check_c3_live_probe(binary, name, sock_path, client, results)
+
+        # Final: the original process is still alive after everything.
+        results.record("process_alive", proc.is_running(),
+                       f"running={proc.is_running()}")
+    except Exception as e:  # noqa: BLE001
+        results.record("harness", False, f"{type(e).__name__}: {e}")
+    finally:
+        if client is not None:
+            client.close()
+        proc.terminate()
+
+    summary = {
+        "ok": results.ok,
+        "checks": results.checks,
+    }
+    print(json.dumps(summary))
+    return 0 if results.ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
