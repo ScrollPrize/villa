@@ -223,6 +223,15 @@ set(srcs
     volume_viewers/CChunkedVolumeViewer.hpp
     agent_bridge/AgentBridgeServer.cpp
     agent_bridge/AgentBridgeServer.hpp
+    agent_bridge/AgentBridgeInternal.hpp
+    agent_bridge/AgentBridgeJobs.cpp
+    agent_bridge/AgentBridgeHandlers_session.cpp
+    agent_bridge/AgentBridgeHandlers_editing.cpp
+    agent_bridge/AgentBridgeHandlers_atlas.cpp
+    agent_bridge/AgentBridgeHandlers_fiber.cpp
+    agent_bridge/AgentBridgeHandlers_seeding.cpp
+    agent_bridge/AgentBridgeHandlers_lasagna.cpp
+    agent_bridge/AgentBridgeHandlers_flatten.cpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
