@@ -321,8 +321,8 @@ private:
     // the atlas search, only bridge-initiated batches are tracked (progress/
     // finished for a human-initiated Run/Expand click are not auto-registered).
     void handleSeedingBatchProgress(const QString& kind, int completed, int total);
-    void handleSeedingBatchFinished(const QString& kind, bool success,
-                                    int completed, int total);
+    void handleSeedingBatchFinished(const QString& kind, bool success, bool canceled,
+                                    int completed, int total, const QString& message);
     // Resolves the active "catalog" job when an async catalog.open_sample
     // finishes: builds the v1/§10.3 result body into the job record and calls
     // finishJob (SPEC §18.4). Kept out of the handler lambda.

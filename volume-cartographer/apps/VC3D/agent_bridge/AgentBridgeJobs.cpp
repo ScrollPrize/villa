@@ -216,8 +216,9 @@ void AgentBridgeServer::subscribeJobSignals()
                     handleSeedingBatchProgress(kind, completed, total);
                 });
         connect(_window->_seedingWidget, &SeedingWidget::seedingBatchFinished, this,
-                [this](const QString& kind, bool success, int completed, int total) {
-                    handleSeedingBatchFinished(kind, success, completed, total);
+                [this](const QString& kind, bool success, bool canceled, int completed,
+                       int total, const QString& message) {
+                    handleSeedingBatchFinished(kind, success, canceled, completed, total, message);
                 });
     }
 }
@@ -681,15 +682,25 @@ void AgentBridgeServer::handleSeedingBatchProgress(const QString& kind, int comp
 
 
 void AgentBridgeServer::handleSeedingBatchFinished(const QString& kind, bool success,
-                                                   int completed, int total)
+                                                   bool canceled, int completed, int total,
+                                                   const QString& message)
 {
     // finishJob is a no-op when no seeding job is active (a human-initiated
     // batch, or the neural-trace cancel path that emits an empty kind).
     if (!_activeJobs.contains(QStringLiteral("seeding")))
         return;
-    const QString label = success
-        ? QStringLiteral("Seeding %1 finished: %2/%3").arg(kind).arg(completed).arg(total)
-        : QStringLiteral("Seeding %1 canceled").arg(kind);
+    // Both an execution failure and a user cancel map to a failed job; the widget
+    // supplies meaningful terminal text distinguishing them (SPEC §1). Fall back
+    // to a synthesized label only if the widget passed none.
+    QString label = message;
+    if (label.isEmpty()) {
+        if (success)
+            label = QStringLiteral("Seeding %1 finished: %2/%3").arg(kind).arg(completed).arg(total);
+        else if (canceled)
+            label = QStringLiteral("Seeding %1 canceled after %2/%3").arg(kind).arg(completed).arg(total);
+        else
+            label = QStringLiteral("Seeding %1 failed").arg(kind);
+    }
     finishJob(QStringLiteral("seeding"), success, label, QString());
 }
 

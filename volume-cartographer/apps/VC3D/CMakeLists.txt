@@ -93,6 +93,8 @@ set(srcs
     SurfaceTreeWidget.cpp
     SurfaceDisplayName.hpp
     SurfaceTimestamp.hpp
+    SeedingBatchTracker.cpp
+    SeedingBatchTracker.hpp
     SeedingWidget.cpp
     SeedingWidget.hpp
     segmentation/SegmentationCommon.hpp

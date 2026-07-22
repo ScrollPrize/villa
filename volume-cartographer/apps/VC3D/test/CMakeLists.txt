@@ -1,0 +1,30 @@
+# Standalone unit test for SeedingBatchTracker (apps/VC3D/SeedingBatchTracker.*),
+# the honest run/expand batch-outcome aggregation extracted from SeedingWidget.
+# Deterministic, no process launch, no volume data — safe for the default ctest
+# run. Built only under VC_TESTING (wired from the top-level testing block).
+#
+# The tracker is a small QObject-free class using only QString/QStringList/QSet,
+# so we compile its source straight into the test and link just Qt6::Core (for
+# QString et al.) + Qt6::Test (the QTest harness). No other VC3D code is pulled
+# in, keeping the test fast and self-contained.
+find_package(Qt6 REQUIRED COMPONENTS Core Test)
+
+add_executable(test_seeding_batch_tracker
+    test_seeding_batch_tracker.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SeedingBatchTracker.cpp)
+
+# The test class itself uses Q_OBJECT (QtTest) and is MOC'd via the in-file
+# #include "..._tracker.moc"; SeedingBatchTracker has no Q_OBJECT so AUTOMOC has
+# nothing else to do. Keep AUTOMOC ON so QtTest's moc runs.
+set_target_properties(test_seeding_batch_tracker PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_seeding_batch_tracker PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_seeding_batch_tracker PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME seeding_batch_tracker COMMAND test_seeding_batch_tracker)
+set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_seeding_batch_tracker)

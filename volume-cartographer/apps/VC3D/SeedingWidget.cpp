@@ -16,6 +16,7 @@
 #include <QSettings>
 #include <QDir>
 #include <QFile>
+#include <QStandardPaths>
 #include <QtConcurrent/QtConcurrent>
 
 #include <opencv2/imgproc.hpp>
@@ -1226,12 +1227,12 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     // Latch per-batch config into member state so the QProcess finished callbacks
     // (which outlive this call now that the blocking loop is gone) read stable
     // fields rather than dangling stack captures.
-    _batchKind = QStringLiteral("run");
+    // Reset outcome aggregation before launching the first child (SPEC §1).
+    _batch.begin(QStringLiteral("run"), totalPoints);
     _batchPoints = std::move(allPoints);
-    _batchTotal = totalPoints;
-    _batchCompleted = 0;
     _batchNextIndex = 0;
     _batchOmpThreads = ompThreads;
+    _batchProcessTail.clear();
     _batchVolumePath = commandPathForVolume(currentVolume);
     if (_batchVolumePath.isEmpty()) {
         setError(tr("Could not resolve a volume path for segmentation "
@@ -1268,7 +1269,7 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
 
 void SeedingWidget::startSegmentationProcessForPoint(int pointIndex)
 {
-    if (pointIndex >= _batchTotal || !jobsRunning) {
+    if (pointIndex >= _batch.total() || !jobsRunning) {
         return;
     }
 
@@ -1283,12 +1284,6 @@ void SeedingWidget::startSegmentationProcessForPoint(int pointIndex)
     }
     process->setProcessEnvironment(env);
 
-    // Connect finished signal to the member handler (no captured stack locals).
-    connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
-        [this, process, pointIndex](int exitCode, QProcess::ExitStatus /*exitStatus*/) {
-            handleBatchProcessFinished(process, pointIndex, exitCode);
-        });
-
     const QStringList toolArgs = QStringList()
                   << _batchVolumePath
                   << QString::fromStdString(_batchPathsDir.string())
@@ -1301,32 +1296,32 @@ void SeedingWidget::startSegmentationProcessForPoint(int pointIndex)
               << executablePath.toStdString() << " " << toolArgs.join(' ').toStdString()
               << std::endl;
 
-#if defined(Q_OS_LINUX)
-    // Background priority so batch growth doesn't starve the UI.
-    process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3"
-                                         << executablePath << toolArgs);
-#elif defined(Q_OS_UNIX)
-    // ionice is Linux-specific; macOS still provides nice.
-    process->start("nice", QStringList() << "-n" << "19" << executablePath << toolArgs);
-#else
-    process->start(executablePath, toolArgs);
-#endif
-
-    runningProcesses.append(QPointer<QProcess>(process));
+    launchBatchProcess(process, pointIndex, toolArgs);
 }
 
-void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int exitCode)
+void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int exitCode,
+                                               QProcess::ExitStatus exitStatus, bool failedToStart)
 {
     if (!jobsRunning) {
         return;
     }
 
-    const bool isExpand = (_batchKind == QLatin1String("expand"));
+    const bool isExpand = (_batch.kind() == QLatin1String("expand"));
+    const bool crashed = (exitStatus != QProcess::NormalExit);
 
-    // Log result
-    if (exitCode != 0) {
-        std::cerr << (isExpand ? "Expansion iteration " : "Segmentation for point ")
-                  << index << " failed with exit code: " << exitCode << std::endl;
+    // Aggregate the outcome (dedup by the QProcess identity: finished() and
+    // errorOccurred() can both fire for the same child). recordTerminal returns
+    // false if this child already reached its terminal state — count once.
+    const QString label = isExpand ? tr("Expansion iteration %1").arg(index)
+                                   : tr("Segmentation for point %1").arg(index);
+    if (!_batch.recordTerminal(process, failedToStart, crashed, exitCode,
+                               _batchProcessTail.value(process), label)) {
+        return;
+    }
+
+    const bool failed = failedToStart || crashed || exitCode != 0;
+    if (failed) {
+        std::cerr << _batch.failureMessages().constLast().toStdString() << std::endl;
     } else {
         std::cout << (isExpand ? "Completed expansion iteration "
                                : "Completed segmentation for point ")
@@ -1334,16 +1329,16 @@ void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int
     }
 
     // Update progress
-    _batchCompleted++;
-    progressUtil->updateProgress(_batchCompleted);
-    emit seedingBatchProgressChanged(_batchKind, _batchCompleted, _batchTotal);
+    progressUtil->updateProgress(_batch.completed());
+    emit seedingBatchProgressChanged(_batch.kind(), _batch.completed(), _batch.total());
 
     // Remove from running list (QPointer handles null checking)
     runningProcesses.removeOne(process);
+    _batchProcessTail.remove(process);
     process->deleteLater();
 
-    // Start next process if available
-    if (_batchNextIndex < _batchTotal && jobsRunning) {
+    // Continue the remaining batch after an individual failure unless canceled.
+    if (_batchNextIndex < _batch.total() && jobsRunning && !_batch.cancelRequested()) {
         if (isExpand) {
             startExpansionProcessForIteration(_batchNextIndex++);
         } else {
@@ -1352,20 +1347,33 @@ void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int
     }
 
     // Check if all done
-    if (_batchCompleted >= _batchTotal) {
-        finalizeSeedingBatch(true);
+    if (_batch.isComplete()) {
+        finalizeSeedingBatch();
     }
 }
 
-void SeedingWidget::finalizeSeedingBatch(bool success)
+void SeedingWidget::finalizeSeedingBatch()
 {
     // Common terminal teardown for a run/expand batch OR a cancel of any seeding
     // widget process batch. A neural trace shares jobsRunning/runningProcesses/
-    // cancelButton but leaves _batchKind empty, so we emit the batch-finished
-    // signal (and use seeding-specific wording) only for a real run/expand batch.
-    const QString kind = _batchKind;
-    const int completed = _batchCompleted;
-    const int total = _batchTotal;
+    // cancelButton but leaves the tracker kind empty, so we emit the batch-
+    // finished signal (and use seeding-specific wording) only for a real run/
+    // expand batch. Idempotent: cancel + the last child completion both reach here.
+    if (_batch.finalized()) {
+        return;
+    }
+
+    // The tracker owns the honest outcome + terminal message (SPEC §1); capture
+    // kind before finalize() clears it. A neural trace shares jobsRunning/
+    // runningProcesses/cancelButton but never called _batch.begin(), so kind is
+    // empty and we skip the seeding-specific wording / seedingBatchFinished emit.
+    const QString kind = _batch.kind();
+    const SeedingBatchTracker::Result r = _batch.finalize();
+    const int completed = r.completed;
+    const int total = r.total;
+    const bool canceled = r.canceled;
+    const bool success = r.success;
+    const QString message = r.message;
 
     progressUtil->stopProgress();
     cancelButton->setVisible(false);
@@ -1380,9 +1388,12 @@ void SeedingWidget::finalizeSeedingBatch(bool success)
             infoLabel->setText(tr("Segmentation complete for %1 points.").arg(total));
             emit sendStatusMessageAvailable(tr("Completed segmentation for %1 points").arg(total), 5000);
         }
-    } else if (!success) {
+    } else if (canceled) {
         infoLabel->setText(tr("Jobs cancelled by user"));
         emit sendStatusMessageAvailable(tr("Jobs cancelled by user"), 3000);
+    } else if (!kind.isEmpty()) {
+        infoLabel->setText(message);
+        emit sendStatusMessageAvailable(message, 5000);
     }
 
     runSegmentationButton->setEnabled(true);
@@ -1390,12 +1401,13 @@ void SeedingWidget::finalizeSeedingBatch(bool success)
     updateButtonStates();
 
     // Drop the latched batch config; nothing must dangle past this point.
+    // (_batch retains its finalized outcome for idempotency; begin() resets it.)
     _batchPoints.clear();
     _batchPoints.shrink_to_fit();
-    _batchKind.clear();
+    _batchProcessTail.clear();
 
     if (!kind.isEmpty()) {
-        emit seedingBatchFinished(kind, success, completed, total);
+        emit seedingBatchFinished(kind, success, canceled, completed, total, message);
     }
 }
 
@@ -2307,12 +2319,12 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     }
 
     // Latch per-batch config into member state (see runSegmentationHeadless).
-    _batchKind = QStringLiteral("expand");
+    // Reset outcome aggregation before launching the first child (SPEC §1).
+    _batch.begin(QStringLiteral("expand"), expansionIterations);
     _batchPoints.clear();
-    _batchTotal = expansionIterations;
-    _batchCompleted = 0;
     _batchNextIndex = 0;
     _batchOmpThreads = ompThreads;
+    _batchProcessTail.clear();
     _batchVolumePath = commandPathForVolume(currentVolume);
     if (_batchVolumePath.isEmpty()) {
         setError(tr("Could not resolve a volume path for expansion "
@@ -2349,7 +2361,7 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
 
 void SeedingWidget::startExpansionProcessForIteration(int iterationIndex)
 {
-    if (iterationIndex >= _batchTotal || !jobsRunning) {
+    if (iterationIndex >= _batch.total() || !jobsRunning) {
         return;
     }
 
@@ -2363,12 +2375,6 @@ void SeedingWidget::startExpansionProcessForIteration(int iterationIndex)
     }
     process->setProcessEnvironment(env);
 
-    // Connect finished signal to the member handler (no captured stack locals).
-    connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
-        [this, process, iterationIndex](int exitCode, QProcess::ExitStatus /*exitStatus*/) {
-            handleBatchProcessFinished(process, iterationIndex, exitCode);
-        });
-
     const QStringList toolArgs = QStringList()
                   << _batchVolumePath
                   << QString::fromStdString(_batchPathsDir.string())
@@ -2378,18 +2384,64 @@ void SeedingWidget::startExpansionProcessForIteration(int iterationIndex)
               << executablePath.toStdString() << " " << toolArgs.join(' ').toStdString()
               << std::endl;
 
+    launchBatchProcess(process, iterationIndex, toolArgs);
+}
+
+
+void SeedingWidget::launchBatchProcess(QProcess* process, int index, const QStringList& toolArgs)
+{
+    // Drain merged child output continuously so the QProcess buffer never grows
+    // unbounded; retain a bounded per-child tail for terminal failure diagnostics.
+    connect(process, &QProcess::readyReadStandardOutput, this, [this, process]() {
+        const QByteArray chunk = process->readAllStandardOutput();
+        QString& tail = _batchProcessTail[process];
+        tail += QString::fromLocal8Bit(chunk);
+        constexpr int kTailMax = 2048;
+        if (tail.size() > kTailMax)
+            tail = tail.right(kTailMax);
+    });
+
+    // finished() carries the exit code/status; errorOccurred(FailedToStart) never
+    // emits finished(), so route it through the same completion path (once) so a
+    // missing nice/ionice/tool fails the batch instead of stranding it.
+    connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+        [this, process, index](int exitCode, QProcess::ExitStatus exitStatus) {
+            handleBatchProcessFinished(process, index, exitCode, exitStatus, /*failedToStart=*/false);
+        });
+    connect(process, &QProcess::errorOccurred, this,
+        [this, process, index](QProcess::ProcessError err) {
+            if (err == QProcess::FailedToStart)
+                handleBatchProcessFinished(process, index, /*exitCode=*/-1,
+                                           QProcess::CrashExit, /*failedToStart=*/true);
+        });
+
+    // Track the child before start() so a synchronous FailedToStart is still in
+    // runningProcesses when the completion path runs (SPEC §1).
+    runningProcesses.append(QPointer<QProcess>(process));
+
+    // Resolve the priority wrappers: nice/ionice may be absent (macOS has no
+    // ionice at all). Fall back to launching vc_grow_seg_from_seed directly.
+    // FailedToStart is handled on every path by the connection above.
+#if defined(Q_OS_UNIX)
+    const QString nicePath = QStandardPaths::findExecutable(QStringLiteral("nice"));
 #if defined(Q_OS_LINUX)
-    // Background priority so batch growth doesn't starve the UI.
-    process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3"
-                                         << executablePath << toolArgs);
-#elif defined(Q_OS_UNIX)
-    // ionice is Linux-specific; macOS still provides nice.
-    process->start("nice", QStringList() << "-n" << "19" << executablePath << toolArgs);
+    const QString ionicePath = QStandardPaths::findExecutable(QStringLiteral("ionice"));
+#else
+    const QString ionicePath;
+#endif
+    if (!nicePath.isEmpty()) {
+        QStringList args;
+        args << QStringLiteral("-n") << QStringLiteral("19");
+        if (!ionicePath.isEmpty())
+            args << ionicePath << QStringLiteral("-c") << QStringLiteral("3");
+        args << executablePath << toolArgs;
+        process->start(nicePath, args);
+    } else {
+        process->start(executablePath, toolArgs);
+    }
 #else
     process->start(executablePath, toolArgs);
 #endif
-
-    runningProcesses.append(QPointer<QProcess>(process));
 }
 
 void SeedingWidget::cancelSeedingBatchHeadless()
@@ -2398,8 +2450,10 @@ void SeedingWidget::cancelSeedingBatchHeadless()
         return;
     }
 
-    // Set flag to stop any new processes from starting.
+    // Set flags to stop any new processes from starting and to mark the terminal
+    // outcome as a user cancel (distinct from an execution failure) (SPEC §1).
     jobsRunning = false;
+    _batch.requestCancel();
 
     // using qpointer here to avoid dangling pointers
     for (const QPointer<QProcess>& processPtr : runningProcesses) {
@@ -2426,9 +2480,9 @@ void SeedingWidget::cancelSeedingBatchHeadless()
     }
     runningProcesses.clear();
 
-    // Common terminal teardown + seedingBatchFinished(kind,false,...) when a
-    // run/expand batch was active.
-    finalizeSeedingBatch(false);
+    // Common terminal teardown + seedingBatchFinished(kind,false,canceled=true,...)
+    // when a run/expand batch was active.
+    finalizeSeedingBatch();
 }
 
 void SeedingWidget::onCancelClicked()
