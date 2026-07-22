@@ -25,8 +25,8 @@ Socket resolution (see README.md "Socket discovery" for the full writeup):
    ``--agent-bridge-name`` takes) and probe the handful of locations Qt is
    known to place local-server sockets under on this platform
    (``$TMPDIR/<name>``, ``/tmp/<name>``). First one that exists wins.
-3. If VC3D was spawned by us (not exercised yet -- see SPEC.md section
-   5, "spawns VC3D itself"), ``BridgeClient.socket_path_from_handshake``
+3. If VC3D was spawned by us (the auto-launch path in ``server.py``),
+   ``BridgeClient.socket_path_from_handshake``
    extracts the authoritative path out of the
    ``VC3D-AGENT-BRIDGE: listening name=... path=...`` stdout line instead
    of guessing.
@@ -44,8 +44,7 @@ import asyncio
 import json
 import os
 import re
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from .jobs import JobTracker
@@ -203,9 +202,13 @@ class BridgeClient:
         self._pending: dict[int, _Pending] = {}
         self._next_id = 1
         self._write_lock = asyncio.Lock()
+        self._connect_lock = asyncio.Lock()
         self.jobs = JobTracker()
-        self._connected_event = asyncio.Event()
         self._closed = False
+        # Bumped on every successful connect(); passed into _read_loop so a
+        # stale reader only tears down state it still owns (prevents a dead
+        # reader from clearing a newer connection).
+        self._generation = 0
 
     # -- connection lifecycle -------------------------------------------------
 
@@ -257,23 +260,66 @@ class BridgeClient:
                 f"(configured as {self._config.socket!r}): {exc}"
             ) from exc
         self._closed = False
-        self._read_task = asyncio.create_task(self._read_loop(), name="vc3d-bridge-reader")
-        self._connected_event.set()
+        self.jobs.reset_error()
+        self._generation += 1
+        self._read_task = asyncio.create_task(
+            self._read_loop(self._generation), name="vc3d-bridge-reader"
+        )
+
+    def _is_live(self) -> bool:
+        return (
+            self._writer is not None
+            and not self._writer.is_closing()
+            and self._read_task is not None
+            and not self._read_task.done()
+        )
 
     async def ensure_connected(self) -> None:
-        if self._writer is None or self._writer.is_closing():
+        if self._closed:
+            raise BridgeConnectionError("bridge client has been closed")
+        if self._is_live():
+            return
+        async with self._connect_lock:
+            # Double-check under the lock: a racing caller may have connected.
+            if self._closed:
+                raise BridgeConnectionError("bridge client has been closed")
+            if self._is_live():
+                return
             await self.connect()
 
     async def close(self) -> None:
+        # Idempotent: safe to call multiple times / after a drop.
         self._closed = True
-        if self._read_task is not None:
-            self._read_task.cancel()
-        if self._writer is not None:
-            self._writer.close()
-        for pending in self._pending.values():
-            if not pending.future.done():
-                pending.future.set_exception(BridgeConnectionError("connection closed"))
-        self._pending.clear()
+        task, self._read_task = self._read_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        writer, self._writer = self._writer, None
+        self._reader = None
+        if writer is not None and not writer.is_closing():
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001 - closing a dead writer can raise
+                pass
+        self._on_disconnect(BridgeConnectionError("connection closed"))
+
+    def _on_disconnect(self, exc: Exception) -> None:
+        """Fail all pending RPC futures and wake/fail all job waiters."""
+        self._fail_all_pending(exc)
+        self.jobs.fail_all(exc)
+
+    def _reset_transport(self) -> None:
+        """Drop the dead reader/writer so the next call reconnects."""
+        self._read_task = None
+        self._reader = None
+        writer = self._writer
+        self._writer = None
+        if writer is not None and not writer.is_closing():
+            writer.close()
 
     @property
     def connected(self) -> bool:
@@ -308,24 +354,39 @@ class BridgeClient:
                 self._writer.write(line.encode("utf-8"))
                 await self._writer.drain()
             except OSError as exc:
+                # Write failed: the connection is dead. Invalidate it so the
+                # next call reconnects, and wake anyone else waiting on it.
+                err = BridgeConnectionError(f"write failed: {exc}")
                 self._pending.pop(req_id, None)
-                raise BridgeConnectionError(f"write failed: {exc}") from exc
+                self._reset_transport()
+                self._on_disconnect(err)
+                raise err from exc
 
+        effective_timeout = timeout if timeout is not None else self._config.request_timeout
         try:
-            return await asyncio.wait_for(fut, timeout=timeout or self._config.request_timeout)
+            return await asyncio.wait_for(fut, timeout=effective_timeout)
         except asyncio.TimeoutError as exc:
-            self._pending.pop(req_id, None)
             raise BridgeConnectionError(
                 f"timed out waiting for response to {method!r} (id={req_id})"
             ) from exc
+        except asyncio.CancelledError:
+            # Preserve caller cancellation; the finally below cleans up _pending.
+            raise
+        finally:
+            # Timeout OR caller cancellation: the reader never popped us.
+            # Idempotent on success (dispatch already removed the entry).
+            self._pending.pop(req_id, None)
 
     # -- background reader -----------------------------------------------------
 
-    async def _read_loop(self) -> None:
-        assert self._reader is not None
+    async def _read_loop(self, generation: int) -> None:
+        # Read from our own captured reader so a stale loop keeps draining its
+        # own (dead) socket rather than a newer connection's.
+        reader = self._reader
+        assert reader is not None
         try:
             while True:
-                line = await self._reader.readline()
+                line = await reader.readline()
                 if not line:
                     break
                 line = line.strip()
@@ -333,11 +394,18 @@ class BridgeClient:
                     continue
                 self._dispatch_line(line)
         except asyncio.CancelledError:
-            pass
+            return  # close() cancelled us; it owns teardown + pending.
         except Exception as exc:  # noqa: BLE001 - surface to all waiters below
-            self._fail_all_pending(BridgeConnectionError(f"reader loop crashed: {exc}"))
+            if generation == self._generation:
+                self._reset_transport()
+                self._on_disconnect(BridgeConnectionError(f"reader loop crashed: {exc}"))
             return
-        self._fail_all_pending(BridgeConnectionError("connection closed by peer"))
+        # EOF: drop the now-dead socket so the next call reconnects -- but only
+        # if we still own the active connection (a stale reader must not clear
+        # a newer one).
+        if generation == self._generation:
+            self._reset_transport()
+            self._on_disconnect(BridgeConnectionError("connection closed by peer"))
 
     def _fail_all_pending(self, exc: Exception) -> None:
         for pending in self._pending.values():
