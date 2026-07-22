@@ -165,8 +165,6 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _fetchingPreviewArtifact.clear();
     _installedGeometryArtifact.clear();
     _fetchingGeometryArtifact.clear();
-    _installedAnnotationVolumeArtifact.clear();
-    _fetchingAnnotationVolumeArtifact.clear();
     _statusFailures = 0;
     _hasActiveSession = false;
     _serviceOwnsDataset = false;
@@ -1051,8 +1049,7 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _lastPreviewLocalPath = entryPath;
                 emit previewAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(sessionId, kPreviewCacheKept,
-                                             {_lastPreviewLocalPath, _lastGeometryLocalPath,
-                                              _lastAnnotationVolumeLocalPath});
+                                             {_lastPreviewLocalPath, _lastGeometryLocalPath});
             });
     }
 
@@ -1076,34 +1073,6 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _installedGeometryArtifact = geometryId;
                 _lastGeometryLocalPath = entryPath;
                 emit geometryAvailable(entryPath, static_cast<quint64>(sessionGeneration));
-            });
-    }
-
-    const QJsonObject annotationRef =
-        status.value(QStringLiteral("annotation_volume_artifact")).toObject();
-    const QString annotationId = annotationRef.value(QStringLiteral("id")).toString();
-    if (!annotationId.isEmpty() && annotationId != _installedAnnotationVolumeArtifact
-        && annotationId != _fetchingAnnotationVolumeArtifact) {
-        _fetchingAnnotationVolumeArtifact = annotationId;
-        const quint64 generation = _connectionGeneration;
-        const qint64 sessionGeneration =
-            status.value(QStringLiteral("session_generation")).toInteger();
-        _artifactCache->fetchArtifact(
-            sessionId, annotationId,
-            [this, annotationId, sessionGeneration, generation](const QString& entryPath,
-                                                                 const QString& error, bool gone) {
-                if (generation != _connectionGeneration) return;
-                if (_fetchingAnnotationVolumeArtifact == annotationId)
-                    _fetchingAnnotationVolumeArtifact.clear();
-                if (entryPath.isEmpty()) {
-                    if (!gone) emit errorOccurred(error);
-                    return;
-                }
-                _installedAnnotationVolumeArtifact = annotationId;
-                _lastAnnotationVolumeLocalPath = entryPath;
-                emit annotationVolumeAvailable(
-                    QFileInfo(entryPath).absolutePath(),
-                    static_cast<quint64>(sessionGeneration));
             });
     }
 }

@@ -16,8 +16,6 @@ add_library(vc_core
         src/UnixSocket.cpp
         src/VolpkgConvert.cpp
         src/SparseChunkSpool.cpp
-        src/SparseAnnotationVolume.cpp
-        src/FiberAnnotationVolume.cpp
         src/Slicing.cpp
         src/Compositing.cpp
         src/AffineTransform.cpp

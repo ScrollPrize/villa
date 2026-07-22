@@ -291,15 +291,6 @@ void CFiberWidget::setupUi()
         }
     });
 
-    _showFiberVolumeCheckBox = new QCheckBox(tr("Show fiber volume"), mainWidget);
-    _showFiberVolumeCheckBox->setObjectName(QStringLiteral("showFiberVolumeCheckBox"));
-    _showFiberVolumeCheckBox->setEnabled(false);
-    _showFiberVolumeCheckBox->setToolTip(
-        tr("Show all compatible fibers as a categorical volume overlay."));
-    layout->addWidget(_showFiberVolumeCheckBox);
-    connect(_showFiberVolumeCheckBox, &QCheckBox::toggled,
-            this, &CFiberWidget::showFiberVolumeToggled);
-
     _model = new QStandardItemModel(this);
     _model->setColumnCount(kColumnCount);
     _model->setHorizontalHeaderLabels({
@@ -422,24 +413,6 @@ void CFiberWidget::setupUi()
 
     updateClassificationUi();
     setWidget(mainWidget);
-}
-
-void CFiberWidget::setFiberVolumeAvailable(bool available)
-{
-    _showFiberVolumeCheckBox->setEnabled(available);
-    if (!available)
-        setShowFiberVolumeChecked(false);
-}
-
-void CFiberWidget::setShowFiberVolumeChecked(bool checked)
-{
-    const QSignalBlocker blocker(_showFiberVolumeCheckBox);
-    _showFiberVolumeCheckBox->setChecked(checked);
-}
-
-bool CFiberWidget::showFiberVolumeChecked() const
-{
-    return _showFiberVolumeCheckBox->isChecked();
 }
 
 QString CFiberWidget::displayNameForFiber(const FiberEntry& fiber)

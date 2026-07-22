@@ -204,7 +204,6 @@ bool readVoxel(IChunkedArray& array,
                int iz,
                int iy,
                int ix,
-               bool categoricalLabels,
                uint8_t& out,
                int& requested,
                int& errors)
@@ -241,21 +240,13 @@ bool readVoxel(IChunkedArray& array,
     const int lz = iz - cz * chunkShape[0];
     const int ly = iy - cy * chunkShape[1];
     const int lx = ix - cx * chunkShape[2];
-    const std::size_t elementIndex = (std::size_t(lz) * std::size_t(chunkShape[1])
-                                   + std::size_t(ly)) * std::size_t(chunkShape[2])
-                                   + std::size_t(lx);
-    const std::size_t elementSize = result.dtype == ChunkDtype::UInt16 ? 2 : 1;
-    const std::size_t offset = elementIndex * elementSize;
-    if (offset + elementSize > result.bytes->size())
+    const std::size_t offset = (std::size_t(lz) * std::size_t(chunkShape[1])
+                              + std::size_t(ly)) * std::size_t(chunkShape[2])
+                              + std::size_t(lx);
+    if (offset >= result.bytes->size())
         return false;
-    std::uint16_t value = std::to_integer<std::uint8_t>((*result.bytes)[offset]);
-    if (elementSize == 2) {
-        value |= static_cast<std::uint16_t>(
-                     std::to_integer<std::uint8_t>((*result.bytes)[offset + 1])) << 8U;
-    }
-    out = categoricalLabels && value > 0
-        ? static_cast<std::uint8_t>(1U + ((value - 1U) % 255U))
-        : static_cast<std::uint8_t>(std::min<std::uint16_t>(value, 255U));
+
+    out = std::to_integer<uint8_t>((*result.bytes)[offset]);
     return true;
 }
 
@@ -461,7 +452,6 @@ bool sampleNearest(IChunkedArray& array,
                    const LevelAccess& access,
                    int level,
                    const cv::Vec3f& p,
-                   bool categoricalLabels,
                    uint8_t& out,
                    int& requested,
                    int& errors)
@@ -479,8 +469,7 @@ bool sampleNearest(IChunkedArray& array,
     ix = std::clamp(ix, 0, shape[2] - 1);
     iy = std::clamp(iy, 0, shape[1] - 1);
     iz = std::clamp(iz, 0, shape[0] - 1);
-    return readVoxel(array, cache, access, level, iz, iy, ix,
-                     categoricalLabels, out, requested, errors);
+    return readVoxel(array, cache, access, level, iz, iy, ix, out, requested, errors);
 }
 
 bool sampleTrilinear(IChunkedArray& array,
@@ -488,15 +477,10 @@ bool sampleTrilinear(IChunkedArray& array,
                      const LevelAccess& access,
                      int level,
                      const cv::Vec3f& p,
-                     bool categoricalLabels,
                      uint8_t& out,
                      int& requested,
                      int& errors)
 {
-    if (categoricalLabels) {
-        return sampleNearest(array, cache, access, level, p, true,
-                             out, requested, errors);
-    }
     const auto& shape = access.shape;
     const float x = p[0], y = p[1], z = p[2];
     if (!inLevelBounds(shape, z, y, x)) {
@@ -568,14 +552,14 @@ bool sampleTrilinear(IChunkedArray& array,
     uint8_t v000 = 0, v001 = 0, v010 = 0, v011 = 0;
     uint8_t v100 = 0, v101 = 0, v110 = 0, v111 = 0;
     bool ready = true;
-    ready = readVoxel(array, cache, access, level, iz,     iy,     ix,     false, v000, requested, errors) && ready;
-    ready = readVoxel(array, cache, access, level, iz,     iy,     ix + 1, false, v001, requested, errors) && ready;
-    ready = readVoxel(array, cache, access, level, iz,     iy + 1, ix,     false, v010, requested, errors) && ready;
-    ready = readVoxel(array, cache, access, level, iz,     iy + 1, ix + 1, false, v011, requested, errors) && ready;
-    ready = readVoxel(array, cache, access, level, iz + 1, iy,     ix,     false, v100, requested, errors) && ready;
-    ready = readVoxel(array, cache, access, level, iz + 1, iy,     ix + 1, false, v101, requested, errors) && ready;
-    ready = readVoxel(array, cache, access, level, iz + 1, iy + 1, ix,     false, v110, requested, errors) && ready;
-    ready = readVoxel(array, cache, access, level, iz + 1, iy + 1, ix + 1, false, v111, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz,     iy,     ix,     v000, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz,     iy,     ix + 1, v001, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz,     iy + 1, ix,     v010, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz,     iy + 1, ix + 1, v011, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz + 1, iy,     ix,     v100, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz + 1, iy,     ix + 1, v101, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz + 1, iy + 1, ix,     v110, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz + 1, iy + 1, ix + 1, v111, requested, errors) && ready;
     if (!ready)
         return false;
 
@@ -597,7 +581,6 @@ bool samplePoint(IChunkedArray& array,
                  const cv::Vec3f& p0,
                  vc::Sampling sampling,
                  bool zeroIsSentinel,
-                 bool categoricalLabels,
                  uint8_t& out,
                  int& requested,
                  int& errors)
@@ -610,12 +593,10 @@ bool samplePoint(IChunkedArray& array,
     }
 
     const cv::Vec3f p = toLevelCoord(access, p0);
-    if (sampling == vc::Sampling::Nearest || categoricalLabels)
-        return sampleNearest(array, cache, access, level, p, categoricalLabels,
-                             out, requested, errors);
+    if (sampling == vc::Sampling::Nearest)
+        return sampleNearest(array, cache, access, level, p, out, requested, errors);
 
-    return sampleTrilinear(array, cache, access, level, p, false,
-                           out, requested, errors);
+    return sampleTrilinear(array, cache, access, level, p, out, requested, errors);
 }
 
 bool sampleLevelPoint(IChunkedArray& array,
@@ -624,19 +605,16 @@ bool sampleLevelPoint(IChunkedArray& array,
                       int level,
                       const cv::Vec3f& p,
                       vc::Sampling sampling,
-                      bool categoricalLabels,
                       uint8_t& out,
                       int& requested,
                       int& errors)
 {
     // Non-finite coords fail inLevelBounds (NaN compares false) and return
     // fill, identical to an explicit finiteCoord check.
-    if (sampling == vc::Sampling::Nearest || categoricalLabels)
-        return sampleNearest(array, cache, access, level, p, categoricalLabels,
-                             out, requested, errors);
+    if (sampling == vc::Sampling::Nearest)
+        return sampleNearest(array, cache, access, level, p, out, requested, errors);
 
-    return sampleTrilinear(array, cache, access, level, p, false,
-                           out, requested, errors);
+    return sampleTrilinear(array, cache, access, level, p, out, requested, errors);
 }
 
 void addStats(ChunkedPlaneSampler::Stats& dst, const ChunkedPlaneSampler::Stats& src)
@@ -1024,7 +1002,7 @@ ChunkedPlaneSampler::Stats samplePlaneLevelImpl(
                     uint8_t value = 0;
                     if (sampleLevelPoint(array, chunkCache, access, level,
                                          rowBase + levelPlane.vxStep * float(x),
-                                         options.sampling, options.categoricalLabels, value,
+                                         options.sampling, value,
                                          localStats.requestedChunks, localStats.errorChunks)) {
                         const bool wasCovered = coverageRow[x] != 0;
                         outRow[x] = value;
@@ -1106,8 +1084,7 @@ ChunkedPlaneSampler::Stats sampleCoordsLevelImpl(
 
                     uint8_t value = 0;
                     if (samplePoint(array, chunkCache, access, level, coordRow[x], options.sampling,
-                                    true, options.categoricalLabels, value,
-                                    localStats.requestedChunks, localStats.errorChunks)) {
+                                    true, value, localStats.requestedChunks, localStats.errorChunks)) {
                         const bool wasCovered = coverageRow[x] != 0;
                         outRow[x] = value;
                         coverageRow[x] = 1;

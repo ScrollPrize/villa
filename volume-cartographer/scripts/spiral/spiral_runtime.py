@@ -57,7 +57,6 @@ class InteractiveFitSession:
         self._preview_generation = 0
         self._preview_session_id = uuid.uuid4().hex
         self._geometry_snapshot_manifest = None
-        self._annotation_volume_manifest = None
         self._save_checkpoint = None
         self._export_preview = None
         self._incorporate_inputs = None
@@ -84,7 +83,6 @@ class InteractiveFitSession:
                 "preview_manifest_path": self._preview_manifest,
                 "preview_generation": self._preview_generation,
                 "geometry_snapshot_manifest_path": self._geometry_snapshot_manifest,
-                "annotation_volume_manifest_path": self._annotation_volume_manifest,
                 "supports_input_incorporation": self._incorporate_inputs is not None,
             }
             if self._run_config is not None:
@@ -223,7 +221,6 @@ class InteractiveFitSession:
             fitter.lasagna_storage_backend = self.run_config.storage_backend
             fitter.cache_path = self.paths.cache_directory
             fitter.render_volume_scale = self.run_config.render_volume_scale
-            fitter.annotation_volume_spec = dict(self.run_config.annotation_volume)
             fitter.run_tag = self.run_config.run_tag or None
             fitter.umbilicus_z_to_yx = lambda: fitter.json_umbilicus_z_to_yx(
                 self.paths.umbilicus, coordinate_scale=1.0)
@@ -261,7 +258,6 @@ class InteractiveFitSession:
     # Fitter-thread callbacks.
     def on_ready(self, *, completed_iterations, output_path,
                  save_checkpoint, export_preview, geometry_snapshot_manifest=None,
-                 annotation_volume_manifest=None,
                  incorporate_inputs=None, finish_run=None, configure_run=None):
         with self._condition:
             self._completed = self._target = completed_iterations
@@ -272,16 +268,10 @@ class InteractiveFitSession:
             self._finish_run = finish_run
             self._configure_run = configure_run
             self._geometry_snapshot_manifest = geometry_snapshot_manifest
-            self._annotation_volume_manifest = annotation_volume_manifest
         if self.paths.checkpoint and getattr(self, "publishes_outputs", True):
             self._set_state("ExportingPreview", "Exporting restored checkpoint preview")
             self._publish_preview()
         self._set_state("Ready", "Ready")
-
-    def publish_annotation_volume(self, manifest_path):
-        """Publish a fitter-thread generation in the next status snapshot."""
-        with self._condition:
-            self._annotation_volume_manifest = manifest_path
 
     def wait_for_iteration(self, iteration):
         while True:
@@ -556,7 +546,6 @@ class DistributedInteractiveFitSession:
             "session_horizon": None, "latest_metrics": {}, "warnings": [],
             "error": None, "preview_manifest_path": None,
             "preview_generation": 0, "geometry_snapshot_manifest_path": None,
-            "annotation_volume_manifest_path": None,
             "supports_input_incorporation": False,
         }
         self._acks = {}

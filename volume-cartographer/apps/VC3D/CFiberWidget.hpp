@@ -81,9 +81,6 @@ public:
     void selectFiber(uint64_t fiberId);
     void selectFibers(const std::vector<uint64_t>& fiberIds);
     void setDeleteConfirmationForTesting(std::function<bool(const std::vector<uint64_t>&)> confirmer);
-    void setFiberVolumeAvailable(bool available);
-    void setShowFiberVolumeChecked(bool checked);
-    [[nodiscard]] bool showFiberVolumeChecked() const;
 
 signals:
     void fiberOpenRequested(uint64_t fiberId);
@@ -100,7 +97,6 @@ signals:
     void importFibersRequested();
     void exportFibersRequested();
     void metricsCalculationRequested(std::vector<uint64_t> orderedFiberIds);
-    void showFiberVolumeToggled(bool checked);
 
 private slots:
     void onSelectionChanged();
@@ -148,7 +144,6 @@ private:
     Qt::SortOrder _sortOrder = Qt::AscendingOrder;
 
     QCheckBox* _calcMetricsCheckBox;
-    QCheckBox* _showFiberVolumeCheckBox;
     QTreeView* _treeView;
     QStandardItemModel* _model;
     QLabel* _nameLabel;

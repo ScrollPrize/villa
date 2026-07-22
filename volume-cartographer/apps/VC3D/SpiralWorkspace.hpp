@@ -25,7 +25,6 @@ class SpiralServiceManager;
 class ViewerManager;
 class ViewerSplitGrid;
 class VolumePkg;
-class Volume;
 class PolylineIndex;
 class SpiralOverlayController;
 class SegmentationOverlayController;
@@ -96,8 +95,6 @@ private:
 
     void refreshVolumes();
     void selectVolume(const QString& id);
-    void updateAnnotationVolumeSpec();
-    void setFiberVolumeVisible(bool visible);
     QString mapServicePath(const QString& servicePath) const;
     void loadPreview(const QString& manifestPath, qint64 generation);
     void installPreview(const PreviewLoadResult& result, qint64 generation);
@@ -144,9 +141,6 @@ private:
     ViewerSplitGrid* _grid = nullptr;
     qint64 _requestedPreviewGeneration = -1;
     QString _geometryManifestPath;
-    std::shared_ptr<Volume> _fiberAnnotationVolume;
-    QString _fiberAnnotationVolumePath;
-    bool _fiberVolumeVisible = false;
     QHash<QString, QStringList> _surfaceCategoryIds;
     QHash<QString, QString> _surfaceSourceIds;
     QHash<QString, bool> _surfaceCategoryVisible;

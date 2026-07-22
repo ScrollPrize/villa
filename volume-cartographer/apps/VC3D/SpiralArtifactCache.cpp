@@ -19,10 +19,7 @@ namespace {
 constexpr int kManifestTimeoutMs = 30000;
 constexpr int kFileTimeoutMs = 60 * 60 * 1000; // bounded by transfer, effectively
 constexpr qint64 kMaxDeclaredTotalBytes = 64LL * 1024 * 1024 * 1024;
-// Sparse Zarr artifacts can legitimately contain one file per occupied chunk.
-// The byte cap still bounds the transfer; this cap prevents path-list abuse
-// without rejecting moderately fragmented annotation volumes.
-constexpr int kMaxFiles = 250000;
+constexpr int kMaxFiles = 4096;
 const QString kManifestCopyName = QStringLiteral(".artifact-manifest.json");
 
 bool isSafeRelativeName(const QString& name)

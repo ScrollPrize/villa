@@ -710,8 +710,6 @@ class ServiceState:
         self._preview_artifact = None
         self._geometry_artifact = None
         self._registered_geometry_manifest = None
-        self._annotation_volume_artifact = None
-        self._registered_annotation_volume_manifest = None
 
     # ------------------------------------------------------------------
     # Status and health
@@ -758,7 +756,6 @@ class ServiceState:
             })
             response["preview_artifact"] = self._preview_artifact
             response["geometry_artifact"] = self._geometry_artifact
-            response["annotation_volume_artifact"] = self._annotation_volume_artifact
             response["ephemeral_inputs"] = [
                 {"id": record["id"], "kind": record["kind"],
                  "role": record.get("role"), "state": record["state"],
@@ -929,8 +926,6 @@ class ServiceState:
         self._preview_artifact = None
         self._geometry_artifact = None
         self._registered_geometry_manifest = None
-        self._annotation_volume_artifact = None
-        self._registered_annotation_volume_manifest = None
 
     def _status_changed(self, status):
         # Runs on the fitter thread inside the pause/export window, so artifact
@@ -949,14 +944,10 @@ class ServiceState:
             preview_generation = int(status.get("preview_generation") or 0)
             preview_manifest = status.get("preview_manifest_path")
             geometry_manifest = status.get("geometry_snapshot_manifest_path")
-            annotation_manifest = status.get("annotation_volume_manifest_path")
             register_preview = (preview_manifest
                                 and preview_generation > self._registered_preview_generation)
             register_geometry = (geometry_manifest
                                  and geometry_manifest != self._registered_geometry_manifest)
-            register_annotation = (
-                annotation_manifest
-                and annotation_manifest != self._registered_annotation_volume_manifest)
         if register_preview:
             manifest_path = Path(preview_manifest)
             ref = self.artifacts.register_directory(
@@ -977,18 +968,6 @@ class ServiceState:
                 if self.session_id == session_id:
                     self._geometry_artifact = ref
                     self._registered_geometry_manifest = geometry_manifest
-        if register_annotation:
-            manifest_path = Path(annotation_manifest)
-            ref = self.artifacts.register_directory(
-                "spiral-annotation-volume", session_id, 1,
-                manifest_path.parent, manifest_path.name,
-                delete_root_on_prune=True)
-            with self.lock:
-                if self.session_id == session_id:
-                    self._annotation_volume_artifact = ref
-                    self._registered_annotation_volume_manifest = annotation_manifest
-            self.artifacts.prune(
-                "spiral-annotation-volume", session_id, PREVIEW_ARTIFACTS_KEPT)
 
     def run(self, request):
         session = self._require_session()

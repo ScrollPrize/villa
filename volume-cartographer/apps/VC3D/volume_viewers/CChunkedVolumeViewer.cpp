@@ -1428,7 +1428,6 @@ struct CChunkedVolumeViewer::RenderContext {
     int overlayStartLevel = 0;
     vc::Sampling samplingMethod = vc::Sampling::Trilinear;
     vc::Sampling overlaySamplingMethod = vc::Sampling::Nearest;
-    bool overlayCategorical = false;
     CompositeRenderSettings compositeSettings;
     float windowLow = 0.0f;
     float windowHigh = 255.0f;
@@ -1526,9 +1525,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     cv::Mat_<uint8_t> overlayCoverage;
     const vc::render::ChunkedPlaneSampler::Options options(ctx.samplingMethod, 32);
     const vc::render::ChunkedPlaneSampler::Options overlayOptions(
-        ctx.overlayCategorical ? vc::Sampling::Nearest : ctx.overlaySamplingMethod,
-        options.tileSize,
-        ctx.overlayCategorical);
+        ctx.overlaySamplingMethod, options.tileSize);
 
     auto streamingCompositeUnsupported = [&]() {
         return !isSupportedStreamingCompositeMethod(ctx.compositeSettings.params.method) ||
@@ -1714,7 +1711,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const bool overlayActive =
             ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f;
         const bool overlayWantsComposite =
-            overlayActive && !ctx.overlayCategorical && ctx.overlayComposite.enabled &&
+            overlayActive && ctx.overlayComposite.enabled &&
             (ctx.overlayComposite.method == "max" ||
              ctx.overlayComposite.method == "mean" ||
              ctx.overlayComposite.method == "min") &&
@@ -1859,11 +1856,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const auto* overlayCov = hasOverlay ? overlayCoverage.ptr<uint8_t>(y) : nullptr;
         for (int x = 0; x < ctx.fbW; ++x) {
             uint32_t pixel = cov[x] ? lut[src[x]] : uncoveredPixel;
-            const bool overlayVisible = hasOverlay && (ctx.overlayCategorical
-                ? overlaySrc[x] != 0
-                : overlaySrc[x] >= ctx.overlayWindowLow &&
-                  overlaySrc[x] <= ctx.overlayWindowHigh);
-            if (overlayVisible && overlayCov[x]) {
+            if (hasOverlay && overlayCov[x] &&
+                overlaySrc[x] >= ctx.overlayWindowLow && overlaySrc[x] <= ctx.overlayWindowHigh) {
                 pixel = alphaBlendArgb(pixel, overlayLut[overlaySrc[x]], ctx.overlayOpacity);
             }
             row[x] = pixel;
@@ -1900,7 +1894,6 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.overlayStartLevel = overlayRenderStartLevel(preferSurfaceResolution);
     job.samplingMethod = _samplingMethod;
     job.overlaySamplingMethod = _overlaySamplingMethod;
-    job.overlayCategorical = _overlayCategorical;
     job.compositeSettings = _compositeSettings;
     job.windowLow = _windowLow;
     job.windowHigh = _windowHigh;
@@ -1952,7 +1945,6 @@ bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
            a.overlayStartLevel == b.overlayStartLevel &&
            a.samplingMethod == b.samplingMethod &&
            a.overlaySamplingMethod == b.overlaySamplingMethod &&
-           a.overlayCategorical == b.overlayCategorical &&
            a.compositeSettings == b.compositeSettings &&
            a.windowLow == b.windowLow &&
            a.windowHigh == b.windowHigh &&
@@ -2028,7 +2020,6 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.overlayStartLevel = job.overlayStartLevel;
     ctx.samplingMethod = job.samplingMethod;
     ctx.overlaySamplingMethod = job.overlaySamplingMethod;
-    ctx.overlayCategorical = job.overlayCategorical;
     ctx.compositeSettings = job.compositeSettings;
     ctx.windowLow = job.windowLow;
     ctx.windowHigh = job.windowHigh;
@@ -2300,16 +2291,6 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
         _overlayChunkCbId = 0;
     }
     _overlayVolume = std::move(volume);
-    _overlayCategorical = false;
-    if (_overlayVolume) {
-        try {
-            const auto attrs = _overlayVolume->rootAttributes();
-            _overlayCategorical = attrs.contains("vc_annotation_volume") &&
-                                  attrs["vc_annotation_volume"].is_object();
-        } catch (const std::exception&) {
-            _overlayCategorical = false;
-        }
-    }
     _overlayChunkArray.reset();
     if (_overlayVolume) {
         try {

@@ -15,27 +15,16 @@ public:
         Options()
             : sampling(vc::Sampling::Nearest)
             , tileSize(32)
-            , categoricalLabels(false)
         {
         }
         Options(vc::Sampling sampling_, int tileSize_)
             : sampling(sampling_)
             , tileSize(tileSize_)
-            , categoricalLabels(false)
-        {
-        }
-        Options(vc::Sampling sampling_, int tileSize_, bool categoricalLabels_)
-            : sampling(sampling_)
-            , tileSize(tileSize_)
-            , categoricalLabels(categoricalLabels_)
         {
         }
 
         vc::Sampling sampling;
         int tileSize;
-        // Decode complete integer samples and map positive labels to
-        // 1 + ((label - 1) % 255). This mode is always nearest-neighbor.
-        bool categoricalLabels;
     };
 
     struct Stats {

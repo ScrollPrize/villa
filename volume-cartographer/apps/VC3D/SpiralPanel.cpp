@@ -1100,14 +1100,7 @@ QJsonObject SpiralPanel::sessionRequest() const
                     {"run_tag", _runTag->text()},
                     {"render_volume_scale", _renderVolumeScale->value()},
                     {"config", config}};
-    if (!_annotationVolumeSpec.isEmpty())
-        run[QStringLiteral("annotation_volume")] = _annotationVolumeSpec;
     return {{"paths", paths}, {"run", run}, {"preview", QJsonObject{{"first_winding", 10}}}};
-}
-
-void SpiralPanel::setAnnotationVolumeSpec(const QJsonObject& spec)
-{
-    _annotationVolumeSpec = spec;
 }
 
 QJsonObject SpiralPanel::influenceConfig() const

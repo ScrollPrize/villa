@@ -254,7 +254,6 @@ void VolumeOverlayController::setVolumePkg(const std::shared_ptr<VolumePkg>& pkg
 {
     saveState();
 
-    _supplementalVolumes.clear();
     _volumePkg = pkg;
     _volpkgPath = normalizedVolpkgPath(path);
     _overlayVolume.reset();
@@ -287,7 +286,6 @@ void VolumeOverlayController::clearVolumePkg()
 
     _suspendPersistence = true;
     _volumePkg.reset();
-    _supplementalVolumes.clear();
     _volpkgPath.clear();
     _overlayVolume.reset();
     _overlayVolumeId.clear();
@@ -383,21 +381,6 @@ void VolumeOverlayController::refreshVolumeOptions()
                 indexToSelect = row;
             }
         }
-    }
-    std::vector<std::string> supplementalIds;
-    supplementalIds.reserve(_supplementalVolumes.size());
-    for (const auto& [id, supplemental] : _supplementalVolumes) {
-        if (supplemental.volume)
-            supplementalIds.push_back(id);
-    }
-    std::sort(supplementalIds.begin(), supplementalIds.end());
-    for (const auto& id : supplementalIds) {
-        const auto& supplemental = _supplementalVolumes.at(id);
-        const int row = _ui.volumeSelect->count();
-        _ui.volumeSelect->addItem(supplemental.label,
-                                  QVariant(QString::fromStdString(id)));
-        if (_overlayVolumeId == id)
-            indexToSelect = row;
     }
 
     _ui.volumeSelect->setCurrentIndex(indexToSelect);
@@ -514,79 +497,6 @@ bool VolumeOverlayController::hasOverlaySelection() const
     return _overlayVolume && !_overlayVolumeId.empty();
 }
 
-bool VolumeOverlayController::isCategoricalOverlay() const
-{
-    if (!_overlayVolume)
-        return false;
-    try {
-        const auto attrs = _overlayVolume->rootAttributes();
-        return attrs.contains("vc_annotation_volume") &&
-               attrs["vc_annotation_volume"].is_object();
-    } catch (const std::exception&) {
-        return false;
-    }
-}
-
-bool VolumeOverlayController::selectOverlay(const std::string& volumeId)
-{
-    if (volumeId.empty()) {
-        _overlayVolumeId.clear();
-    } else {
-        bool available = _supplementalVolumes.contains(volumeId);
-        if (!available && _volumePkg) {
-            const auto ids = _volumePkg->volumeIDs();
-            available = std::find(ids.begin(), ids.end(), volumeId) != ids.end();
-        }
-        if (!available)
-            return false;
-        _overlayVolumeId = volumeId;
-    }
-
-    if (_ui.volumeSelect) {
-        const QString target = QString::fromStdString(_overlayVolumeId);
-        int row = _overlayVolumeId.empty() ? 0 : _ui.volumeSelect->findData(target);
-        if (row < 0)
-            return false;
-        const QSignalBlocker blocker(_ui.volumeSelect);
-        _ui.volumeSelect->setCurrentIndex(row);
-    }
-    applyOverlayVolume();
-    updateUiEnabled();
-    if (!_suspendPersistence)
-        saveState();
-    return _overlayVolumeId.empty() || hasOverlaySelection();
-}
-
-void VolumeOverlayController::setSupplementalVolume(const std::string& volumeId,
-                                                    const QString& label,
-                                                    std::shared_ptr<Volume> volume)
-{
-    if (volumeId.empty())
-        throw std::invalid_argument("supplemental overlay id must not be empty");
-    if (!volume) {
-        removeSupplementalVolume(volumeId);
-        return;
-    }
-    _supplementalVolumes[volumeId] = SupplementalVolume{label, std::move(volume)};
-    const bool selected = _overlayVolumeId == volumeId;
-    refreshVolumeOptions();
-    if (selected)
-        applyOverlayVolume();
-    updateUiEnabled();
-}
-
-void VolumeOverlayController::removeSupplementalVolume(const std::string& volumeId)
-{
-    if (!_supplementalVolumes.erase(volumeId))
-        return;
-    if (_overlayVolumeId == volumeId) {
-        _overlayVolumeId.clear();
-        applyOverlayVolume();
-    }
-    refreshVolumeOptions();
-    updateUiEnabled();
-}
-
 void VolumeOverlayController::connectUiSignals()
 {
     _connections.clear();
@@ -695,11 +605,7 @@ void VolumeOverlayController::populateColormapOptions()
 void VolumeOverlayController::applyOverlayVolume()
 {
     std::shared_ptr<Volume> overlayVolume;
-    const auto supplementalIt = _supplementalVolumes.find(_overlayVolumeId);
-    const bool supplemental = supplementalIt != _supplementalVolumes.end();
-    if (supplemental)
-        overlayVolume = supplementalIt->second.volume;
-    if (!supplemental && _volumePkg && !_overlayVolumeId.empty()) {
+    if (_volumePkg && !_overlayVolumeId.empty()) {
         const std::string baseVolumeId = _viewerManager
             ? _viewerManager->currentVolumeId()
             : std::string{};
@@ -714,7 +620,7 @@ void VolumeOverlayController::applyOverlayVolume()
             }
         }
     }
-    if (!supplemental && _volumePkg && !_overlayVolumeId.empty()) {
+    if (_volumePkg && !_overlayVolumeId.empty()) {
         try {
             overlayVolume = _volumePkg->volume(_overlayVolumeId);
         } catch (const std::out_of_range&) {
@@ -730,27 +636,6 @@ void VolumeOverlayController::applyOverlayVolume()
     _overlayVolume = std::move(overlayVolume);
     if (_viewerManager) {
         _viewerManager->setOverlayVolume(_overlayVolume, _overlayVolumeId);
-        if (_overlayVolume && _viewerManager->overlayVolume() != _overlayVolume) {
-            _overlayVolume.reset();
-            _overlayVolumeId.clear();
-            if (_ui.volumeSelect) {
-                const QSignalBlocker blocker(_ui.volumeSelect);
-                _ui.volumeSelect->setCurrentIndex(0);
-            }
-            emit requestStatusMessage(
-                tr("Overlay rejected: volume coordinate spaces do not match."), 5000);
-        }
-        if (isCategoricalOverlay()) {
-            _viewerManager->setOverlaySamplingMethod(vc::Sampling::Nearest);
-            _viewerManager->setOverlayWindow(1.0f, 255.0f);
-            auto composite = currentCompositeSettings();
-            composite.enabled = false;
-            _viewerManager->setOverlayComposite(composite);
-        } else {
-            _viewerManager->setOverlaySamplingMethod(_overlaySamplingMethod);
-            _viewerManager->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
-            _viewerManager->setOverlayComposite(currentCompositeSettings());
-        }
     }
 
     const bool visible = hasOverlaySelection() && _overlayOpacity > 0.0f;
@@ -758,7 +643,6 @@ void VolumeOverlayController::applyOverlayVolume()
     if (_overlayVisible) {
         _overlayOpacityBeforeToggle = _overlayOpacity;
     }
-    emit overlaySelectionChanged(_overlayVolumeId);
 }
 
 void VolumeOverlayController::updateUiEnabled()
@@ -769,12 +653,11 @@ void VolumeOverlayController::updateUiEnabled()
     }
 
     const bool hasOverlay = hasOverlaySelection();
-    const bool categorical = isCategoricalOverlay();
     if (_ui.opacitySpin) {
         _ui.opacitySpin->setEnabled(hasOverlay);
     }
     if (_ui.thresholdSpin) {
-        _ui.thresholdSpin->setEnabled(hasOverlay && !categorical);
+        _ui.thresholdSpin->setEnabled(hasOverlay);
     }
     if (_ui.maxDisplayedResolutionSpin) {
         _ui.maxDisplayedResolutionSpin->setEnabled(hasOverlay);
@@ -784,12 +667,12 @@ void VolumeOverlayController::updateUiEnabled()
         _ui.colormapSelect->setEnabled(hasOverlay && hasColormaps);
     }
     if (_ui.samplingMethodSelect) {
-        _ui.samplingMethodSelect->setEnabled(hasOverlay && !categorical);
+        _ui.samplingMethodSelect->setEnabled(hasOverlay);
     }
     if (_ui.compositeEnabledCheck) {
-        _ui.compositeEnabledCheck->setEnabled(hasOverlay && !categorical);
+        _ui.compositeEnabledCheck->setEnabled(hasOverlay);
     }
-    const bool compositeControlsEnabled = hasOverlay && !categorical && _compositeEnabled;
+    const bool compositeControlsEnabled = hasOverlay && _compositeEnabled;
     if (_ui.compositeMethodSelect) {
         _ui.compositeMethodSelect->setEnabled(compositeControlsEnabled);
     }

@@ -143,7 +143,6 @@ lasagna_scale = 4
 # session API already resolved 'auto' to mmap before this changed.
 lasagna_storage_backend = 'auto'
 render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
-annotation_volume_spec = None
 _active_lasagna_store = None
 _active_scalar_stores = []
 
@@ -932,7 +931,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # Fibers form two sampling groups, horizontal and vertical, rather than one
     # group per source file like the regular pcls.
     for pcl in fiber_point_collections.values():
-        pcl.setdefault('metadata', {})['input_role'] = 'fiber'
         hv_tag = pcl.get('metadata', {}).get('hv_classification', {}).get('automatic_tag')
         if hv_tag not in ('H', 'V'):
             print(
@@ -2192,38 +2190,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             torch.random.set_rng_state(torch_state)
             torch.cuda.set_rng_state_all(cuda_states)
 
-    fiber_display_geometry = {}
-    write_fiber_annotation_volume = None
-    load_fiber_display_geometry = None
-    if (interactive_driver is not None
-            and getattr(interactive_driver, 'publishes_outputs', True)
-            and annotation_volume_spec):
-        from fiber_annotation_volume import (
-            load_fiber_display_geometry, write_fiber_annotation_volume)
-        display_scale = float(annotation_volume_spec.get(
-            'fiber_coordinate_scale', 0.25))
-        if fibers_path:
-            for fiber_path in sorted(glob.glob(os.path.join(fibers_path, '*.json'))):
-                try:
-                    display = load_fiber_display_geometry(
-                        fiber_path, identity=os.path.basename(fiber_path),
-                        coordinate_scale=display_scale)
-                    if display is not None:
-                        fiber_display_geometry[display['identity']] = display
-                except Exception as exc:
-                    print(f'WARNING: could not prepare fiber display geometry '
-                          f'{fiber_path}: {exc}')
-
-    def publish_fiber_annotation_volume():
-        if write_fiber_annotation_volume is None or not fiber_display_geometry:
-            return None
-        destination = os.path.join(
-            out_path, '.spiral-fiber-volumes', f'generation-{time.time_ns()}')
-        manifest = write_fiber_annotation_volume(
-            destination, annotation_volume_spec, fiber_display_geometry)
-        interactive_driver.publish_annotation_volume(manifest)
-        return manifest
-
     def incorporate_interactive_inputs(records, influence_config=None):
         """Append uploaded ephemeral inputs to the resident fit structures.
 
@@ -2252,7 +2218,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             run_cfg.update(dict(influence_config or {}))
             new_patches = {}
             new_collections = {}
-            new_display_fibers = {}
             for record in records:
                 kind = record.get('kind')
                 path = record.get('path')
@@ -2283,13 +2248,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     hv_tag = pcl['metadata'].get('hv_classification', {}).get('automatic_tag')
                     pcl['sampling_group'] = f'fibers:{hv_tag if hv_tag in ("H", "V") else "H"}'
                     new_collections[next_id] = pcl
-                    if load_fiber_display_geometry is not None:
-                        display = load_fiber_display_geometry(
-                            path, identity=str(input_id),
-                            coordinate_scale=float(annotation_volume_spec.get(
-                                'fiber_coordinate_scale', 0.25)))
-                        if display is not None:
-                            new_display_fibers[display['identity']] = display
                     next_id += 1
                 elif kind == 'pcl':
                     role = record.get('role')
@@ -2419,7 +2377,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                         'source_file': pcl.get('source_file'),
                         'zyxs': zyxs,
                         'windings': windings,
-                        'display_category': pcl.get('metadata', {}).get('input_role'),
                     })
                     unattached_strip_sampling_groups.append(pcl.get('sampling_group'))
                 # The flat GPU bundle is derived from the strip list; drop it so
@@ -2448,14 +2405,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 interactive_influence_loss_weight = float(run_cfg['loss_weight_anchor'])
                 interactive_influence_anchor_samples = int(
                     run_cfg['interactive_influence_anchor_samples_per_step'])
-
-            if new_display_fibers:
-                fiber_display_geometry.update(new_display_fibers)
-                try:
-                    publish_fiber_annotation_volume()
-                except Exception as exc:
-                    print(f'WARNING: failed to publish updated fiber annotation '
-                          f'volume: {type(exc).__name__}: {exc}')
 
             # run() sets the target before this callback is drained at the
             # pause boundary, so this is exactly the iteration window requested
@@ -2491,17 +2440,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         geometry_manifest = None
         if getattr(interactive_driver, 'publishes_outputs', True):
             fiber_root = os.path.abspath(fibers_path) if fibers_path else None
-            snapshot_categories = {'pcls': [], 'tracks': []}
+            snapshot_categories = {'fibers': [], 'pcls': [], 'tracks': []}
             for strip in unattached_pcl_strips:
                 source = os.path.abspath(strip.get('source_file') or '')
-                is_fiber = strip.get('display_category') == 'fiber'
-                if not is_fiber and fiber_root:
-                    try:
-                        is_fiber = os.path.commonpath([fiber_root, source]) == fiber_root
-                    except ValueError:
-                        is_fiber = False
-                if not is_fiber:
-                    snapshot_categories['pcls'].append(strip['zyxs'])
+                category = 'fibers' if fiber_root and os.path.commonpath([fiber_root, source]) == fiber_root else 'pcls'
+                snapshot_categories[category].append(strip['zyxs'])
             if tracks:
                 snapshot_categories['tracks'] = (
                     tracks if isinstance(tracks, PackedTrackCollection)
@@ -2511,13 +2454,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             write_geometry_snapshot(geometry_path, snapshot_categories, input_order='ZYX')
             geometry_manifest = os.path.join(geometry_path, 'manifest.json')
             del snapshot_categories
-        annotation_volume_manifest = None
-        if getattr(interactive_driver, 'publishes_outputs', True):
-            try:
-                annotation_volume_manifest = publish_fiber_annotation_volume()
-            except Exception as exc:
-                print(f'WARNING: failed to publish initial fiber annotation '
-                      f'volume: {type(exc).__name__}: {exc}')
         # In the usual zero-exclusion case preview bounds reuse the prepared
         # flat tensor, so the original list of per-track arrays is no longer
         # needed after the one-time VC3D geometry handoff.
@@ -2529,7 +2465,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             save_checkpoint=save_model_to,
             export_preview=export_interactive_preview,
             geometry_snapshot_manifest=geometry_manifest,
-            annotation_volume_manifest=annotation_volume_manifest,
             incorporate_inputs=incorporate_interactive_inputs,
             finish_run=clear_interactive_influence,
             configure_run=configure_interactive_run,

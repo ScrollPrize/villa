@@ -61,7 +61,6 @@ class FakeSession:
             "target_iteration": 5, "latest_metrics": {}, "warnings": [],
             "error": None, "preview_manifest_path": None, "preview_generation": 0,
             "geometry_snapshot_manifest_path": None,
-            "annotation_volume_manifest_path": None,
             "supports_input_incorporation": True,
             "run_config": dict(self.run_config),
             "run_config_limits": {"max_track_crossing_per_step": 8},
@@ -354,40 +353,6 @@ class ArtifactHttpTests(HttpServiceFixture):
         self.assertEqual(path.read_bytes(), b"0123456789abcdef")
         self.state.artifacts.release(artifact)
         self.assertFalse(artifact_root.exists())
-
-
-class AnnotationArtifactRegistrationTests(unittest.TestCase):
-    def test_annotation_volume_is_published_separately_from_geometry(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            geometry = root / "geometry"
-            geometry.mkdir()
-            (geometry / "manifest.json").write_text("{}")
-            volume = root / "fiber-volume"
-            (volume / "0").mkdir(parents=True)
-            (volume / "meta.json").write_text("{}")
-            (volume / ".zattrs").write_text("{}")
-            (volume / "0" / ".zarray").write_text("{}")
-
-            state = ServiceState()
-            state.session_id = "spiral-test"
-            state._maybe_register_artifacts({
-                "preview_generation": 0,
-                "preview_manifest_path": None,
-                "geometry_snapshot_manifest_path": str(
-                    geometry / "manifest.json"),
-                "annotation_volume_manifest_path": str(volume / "meta.json"),
-            })
-
-            self.assertEqual(state._geometry_artifact["kind"],
-                             "spiral-geometry")
-            self.assertEqual(state._annotation_volume_artifact["kind"],
-                             "spiral-annotation-volume")
-            annotation_manifest = state.artifacts.manifest(
-                state._annotation_volume_artifact["id"])
-            self.assertEqual(annotation_manifest["entry_point"], "meta.json")
-            self.assertIn("0/.zarray", {
-                entry["name"] for entry in annotation_manifest["files"]})
 
 
 class DatasetOwnershipTests(unittest.TestCase):

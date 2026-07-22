@@ -309,7 +309,6 @@ private:
         int overlayStartLevel = 0;
         vc::Sampling samplingMethod = vc::Sampling::Trilinear;
         vc::Sampling overlaySamplingMethod = vc::Sampling::Nearest;
-        bool overlayCategorical = false;
         CompositeRenderSettings compositeSettings;
         float windowLow = 0.0f;
         float windowHigh = 255.0f;
@@ -450,7 +449,6 @@ private:
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;
     vc::Sampling _overlaySamplingMethod = vc::Sampling::Nearest;
-    bool _overlayCategorical = false;
     float _overlayWindowLow = 0.0f;
     float _overlayWindowHigh = 255.0f;
     int _overlayMaxDisplayedResolution = 0;

@@ -137,7 +137,6 @@
 #include "AtlasControlPointsDock.hpp"
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
-#include "FiberVolumeController.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
@@ -7368,101 +7367,6 @@ void CWindow::CreateWidgets(void)
         _fiberSliceWidget->setObjectName(QStringLiteral("fiberSliceDock"));
         _fiberSliceWidget->setWindowTitle(tr("Fiber Slice Fibers"));
         _fiberSliceWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _fiberSliceWidget);
-    }
-
-    _fiberVolumeController = std::make_unique<FiberVolumeController>(
-        _state, _lineAnnotationController.get(), this);
-    auto syncFiberVolumeChecks = [this](bool checked) {
-        if (_fiberWidget)
-            _fiberWidget->setShowFiberVolumeChecked(checked);
-        if (_fiberSliceWidget)
-            _fiberSliceWidget->setShowFiberVolumeChecked(checked);
-    };
-    auto toggleFiberVolume = [this, syncFiberVolumeChecks](bool checked) {
-        if (!_volumeOverlay || _fiberVolumeOverlayId.empty()) {
-            syncFiberVolumeChecks(false);
-            return;
-        }
-        if (checked) {
-            const std::string current = _volumeOverlay->selectedOverlayId();
-            if (current != _fiberVolumeOverlayId)
-                _overlayBeforeFiberVolume = current;
-            const bool selected = _volumeOverlay->selectOverlay(_fiberVolumeOverlayId);
-            if (selected)
-                _volumeOverlay->setSelectedColormap("glasbey_black0");
-            syncFiberVolumeChecks(selected);
-        } else {
-            if (_volumeOverlay->selectedOverlayId() == _fiberVolumeOverlayId) {
-                if (!_overlayBeforeFiberVolume.empty() &&
-                    !_volumeOverlay->selectOverlay(_overlayBeforeFiberVolume)) {
-                    _volumeOverlay->selectOverlay({});
-                } else if (_overlayBeforeFiberVolume.empty()) {
-                    _volumeOverlay->selectOverlay({});
-                }
-            }
-            _overlayBeforeFiberVolume.clear();
-            syncFiberVolumeChecks(false);
-        }
-    };
-    if (_fiberWidget) {
-        connect(_fiberWidget, &CFiberWidget::showFiberVolumeToggled,
-                this, toggleFiberVolume);
-    }
-    if (_fiberSliceWidget) {
-        connect(_fiberSliceWidget, &CFiberWidget::showFiberVolumeToggled,
-                this, toggleFiberVolume);
-    }
-    connect(_fiberVolumeController.get(), &FiberVolumeController::availabilityChanged,
-            this, [this, syncFiberVolumeChecks](bool available) {
-                if (_fiberWidget)
-                    _fiberWidget->setFiberVolumeAvailable(available);
-                if (_fiberSliceWidget)
-                    _fiberSliceWidget->setFiberVolumeAvailable(available);
-                if (!available) {
-                    if (_volumeOverlay &&
-                        _volumeOverlay->selectedOverlayId() == _fiberVolumeOverlayId) {
-                        if (_overlayBeforeFiberVolume.empty() ||
-                            !_volumeOverlay->selectOverlay(_overlayBeforeFiberVolume)) {
-                            _volumeOverlay->selectOverlay({});
-                        }
-                    }
-                    if (_volumeOverlay && !_fiberVolumeOverlayId.empty())
-                        _volumeOverlay->removeSupplementalVolume(_fiberVolumeOverlayId);
-                    _fiberVolumeOverlayId.clear();
-                    syncFiberVolumeChecks(false);
-                }
-            });
-    connect(_fiberVolumeController.get(), &FiberVolumeController::volumeReady,
-            this, [this, syncFiberVolumeChecks](std::shared_ptr<Volume> volume,
-                                                std::string volumeId) {
-                if (!_volumeOverlay)
-                    return;
-                const std::string oldId = _fiberVolumeOverlayId;
-                const bool wasSelected = !oldId.empty() &&
-                    _volumeOverlay->selectedOverlayId() == oldId;
-                const bool requested = (_fiberWidget && _fiberWidget->showFiberVolumeChecked()) ||
-                                       (_fiberSliceWidget && _fiberSliceWidget->showFiberVolumeChecked());
-                _fiberVolumeOverlayId = std::move(volumeId);
-                _volumeOverlay->setSupplementalVolume(
-                    _fiberVolumeOverlayId, tr("Fibers (generated)"), std::move(volume));
-                if (wasSelected || requested) {
-                    _volumeOverlay->selectOverlay(_fiberVolumeOverlayId);
-                    _volumeOverlay->setSelectedColormap("glasbey_black0");
-                    syncFiberVolumeChecks(true);
-                }
-                if (!oldId.empty() && oldId != _fiberVolumeOverlayId)
-                    _volumeOverlay->removeSupplementalVolume(oldId);
-            });
-    connect(_fiberVolumeController.get(), &FiberVolumeController::buildFailed,
-            this, [this](const QString& message) {
-                showStatusBarMessage(tr("Fiber volume build failed: %1").arg(message), 5000);
-            });
-    if (_volumeOverlay) {
-        connect(_volumeOverlay.get(), &VolumeOverlayController::overlaySelectionChanged,
-                this, [this, syncFiberVolumeChecks](const std::string& volumeId) {
-                    syncFiberVolumeChecks(!volumeId.empty() &&
-                                          volumeId == _fiberVolumeOverlayId);
-                });
     }
 
     if (_lineAnnotationController) {

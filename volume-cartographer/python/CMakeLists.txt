@@ -56,18 +56,6 @@ set_target_properties(vc_volume PROPERTIES
 target_link_libraries(vc_volume PRIVATE vc_core)
 target_compile_features(vc_volume PRIVATE cxx_std_23)
 
-nanobind_add_module(vc_annotation_volume
-    NOMINSIZE
-    vc/annotation_volume.cpp
-)
-set_target_properties(vc_annotation_volume PROPERTIES
-    OUTPUT_NAME annotation_volume
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
-)
-target_link_libraries(vc_annotation_volume PRIVATE vc_core)
-target_compile_features(vc_annotation_volume PRIVATE cxx_std_23)
-
 nanobind_add_module(vc_compression_vcz1
     NOMINSIZE
     vc/compression/vcz1.cpp
@@ -140,7 +128,7 @@ install(TARGETS vc_core vc_lasagna utils utils_c3d_codec c3d
     ARCHIVE DESTINATION .
 )
 
-install(TARGETS vc_volume vc_annotation_volume vc_surface_index vc_track_crossings vc_track_store vc_spiral_sampling
+install(TARGETS vc_volume vc_surface_index vc_track_crossings vc_track_store vc_spiral_sampling
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )

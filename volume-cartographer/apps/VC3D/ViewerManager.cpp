@@ -1008,18 +1008,7 @@ void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::
     if (volume && _state && _state->vpkg()) {
         const auto baseSpace = coordinateSpaceTag(
             *_state->vpkg(), _state->currentVolumeId());
-        auto overlaySpace = coordinateSpaceTag(*_state->vpkg(), volumeId);
-        if (overlaySpace.empty()) {
-            try {
-                const auto attrs = volume->rootAttributes();
-                if (attrs.contains("vc_open_data_coordinate_space") &&
-                    attrs["vc_open_data_coordinate_space"].is_string()) {
-                    overlaySpace = attrs["vc_open_data_coordinate_space"].get_string();
-                }
-            } catch (const std::exception&) {
-                overlaySpace.clear();
-            }
-        }
+        const auto overlaySpace = coordinateSpaceTag(*_state->vpkg(), volumeId);
         if ((!baseSpace.empty() || !overlaySpace.empty()) &&
             (baseSpace.empty() || baseSpace != overlaySpace)) {
             Logger()->warn(

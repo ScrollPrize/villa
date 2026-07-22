@@ -202,7 +202,6 @@ class SpiralRunConfig:
     legacy_checkpoint_step: int = 0
     run_tag: str = ""
     render_volume_scale: int = 16
-    annotation_volume: Mapping[str, Any] = field(default_factory=dict)
     config: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -219,7 +218,6 @@ class SpiralRunConfig:
             legacy_checkpoint_step=int(value.get("legacy_checkpoint_step", 0)),
             run_tag=str(value.get("run_tag", "")),
             render_volume_scale=int(value.get("render_volume_scale", 16)),
-            annotation_volume=dict(value.get("annotation_volume", {})),
             config=dict(value.get("config", {})),
         )
 
