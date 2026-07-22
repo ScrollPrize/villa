@@ -587,6 +587,11 @@ SpiralWorkspace::~SpiralWorkspace()
     }
 }
 
+void SpiralWorkspace::setFiberViewDistance(double distance)
+{
+    _overlay->setFiberViewDistance(distance);
+}
+
 void SpiralWorkspace::keyPressEvent(QKeyEvent* event)
 {
     using namespace vc3d::keybinds;

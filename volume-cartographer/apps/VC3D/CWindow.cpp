@@ -137,6 +137,7 @@
 #include "AtlasControlPointsDock.hpp"
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
+#include "overlays/FiberOverlayController.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
@@ -2679,6 +2680,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _pointsOverlay = std::make_unique<PointsOverlayController>(_state->pointCollection(), this);
     _viewerManager->setPointsOverlay(_pointsOverlay.get());
+
+    _fiberOverlay = std::make_unique<FiberOverlayController>(this);
+    _fiberOverlay->bindToViewerManager(_viewerManager.get());
 
     _rawPointsOverlay = std::make_unique<RawPointsOverlayController>(_state, this);
     _viewerManager->setRawPointsOverlay(_rawPointsOverlay.get());
@@ -7369,6 +7373,54 @@ void CWindow::CreateWidgets(void)
         _fiberSliceWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _fiberSliceWidget);
     }
 
+    auto syncShowFiberChecks = [this](bool checked) {
+        if (_fiberWidget) {
+            _fiberWidget->setShowFibersChecked(checked);
+        }
+        if (_fiberSliceWidget) {
+            _fiberSliceWidget->setShowFibersChecked(checked);
+        }
+    };
+    auto syncFiberViewDistances = [this](double distance) {
+        if (_fiberWidget) {
+            _fiberWidget->setFiberViewDistance(distance);
+        }
+        if (_fiberSliceWidget) {
+            _fiberSliceWidget->setFiberViewDistance(distance);
+        }
+    };
+    auto setFiberOverlayVisible = [this, syncShowFiberChecks](bool visible) {
+        if (!_fiberOverlay || !_fiberOverlay->hasChains()) {
+            visible = false;
+        }
+        if (_fiberOverlay) {
+            _fiberOverlay->setVisible(visible);
+        }
+        syncShowFiberChecks(visible);
+    };
+    auto setFiberViewDistance = [this, syncFiberViewDistances](double distance) {
+        if (_fiberOverlay) {
+            _fiberOverlay->setViewDistance(distance);
+        }
+        if (_spiralWorkspace) {
+            _spiralWorkspace->setFiberViewDistance(distance);
+        }
+        syncFiberViewDistances(distance);
+    };
+    if (_fiberWidget) {
+        connect(_fiberWidget, &CFiberWidget::showFibersToggled,
+                this, setFiberOverlayVisible);
+        connect(_fiberWidget, &CFiberWidget::fiberViewDistanceChanged,
+                this, setFiberViewDistance);
+    }
+    if (_fiberSliceWidget) {
+        connect(_fiberSliceWidget, &CFiberWidget::showFibersToggled,
+                this, setFiberOverlayVisible);
+        connect(_fiberSliceWidget, &CFiberWidget::fiberViewDistanceChanged,
+                this, setFiberViewDistance);
+    }
+    setFiberViewDistance(_fiberWidget->fiberViewDistance());
+
     if (_lineAnnotationController) {
         auto toFiberWidgetAlignment =
             [](const LineAnnotationController::FiberSummary::AlignmentMetrics& source) {
@@ -7382,7 +7434,8 @@ void CWindow::CreateWidgets(void)
                 return alignment;
             };
         auto updateFiberList =
-            [this, toFiberWidgetAlignment](const std::vector<LineAnnotationController::FiberSummary>& fibers) {
+            [this, toFiberWidgetAlignment, syncShowFiberChecks](
+                const std::vector<LineAnnotationController::FiberSummary>& fibers) {
             std::vector<CFiberWidget::FiberEntry> entries;
             entries.reserve(fibers.size());
             for (const auto& fiber : fibers) {
@@ -7430,6 +7483,35 @@ void CWindow::CreateWidgets(void)
             if (_fiberSliceWidget) {
                 _fiberSliceWidget->setFibers(entries);
                 _fiberSliceWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
+            }
+
+            std::vector<FiberOverlayController::Chain> chains;
+            for (const auto& snapshot : _lineAnnotationController->fiberSnapshots()) {
+                if (snapshot.controlPoints.empty()) {
+                    continue;
+                }
+                FiberOverlayController::Chain chain;
+                chain.id = snapshot.id;
+                chain.points.reserve(snapshot.controlPoints.size());
+                for (const cv::Vec3d& point : snapshot.controlPoints) {
+                    chain.points.emplace_back(static_cast<float>(point[0]),
+                                              static_cast<float>(point[1]),
+                                              static_cast<float>(point[2]));
+                }
+                chains.push_back(std::move(chain));
+            }
+            const bool fibersAvailable = !chains.empty();
+            if (_fiberOverlay) {
+                _fiberOverlay->setChains(std::move(chains));
+            }
+            if (_fiberWidget) {
+                _fiberWidget->setShowFibersAvailable(fibersAvailable);
+            }
+            if (_fiberSliceWidget) {
+                _fiberSliceWidget->setShowFibersAvailable(fibersAvailable);
+            }
+            if (!fibersAvailable) {
+                syncShowFiberChecks(false);
             }
             updateAtlasFiberDocks();
         };

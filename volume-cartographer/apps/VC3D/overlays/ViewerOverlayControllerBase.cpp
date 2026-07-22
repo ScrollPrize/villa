@@ -24,6 +24,7 @@
 
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 
 ViewerOverlayControllerBase::PathPrimitive
 ViewerOverlayControllerBase::PathPrimitive::densify(float samplingInterval) const
@@ -343,6 +344,7 @@ void ViewerOverlayControllerBase::scheduleRebuild(VolumeViewerBase* viewer)
 
 void ViewerOverlayControllerBase::detachViewer(VolumeViewerBase* viewer)
 {
+    clearPointChainProjectionCache(viewer);
     for (auto iter = _viewers.begin(); iter != _viewers.end();) {
         if (iter->viewer != viewer) {
             ++iter;
@@ -357,7 +359,7 @@ void ViewerOverlayControllerBase::detachViewer(VolumeViewerBase* viewer)
             iter->rebuildTimer = nullptr;
         }
         if (iter->viewer) {
-            iter->viewer->clearOverlayGroup(_overlayGroupKey);
+            clearOverlay(iter->viewer);
         }
         iter = _viewers.erase(iter);
     }
@@ -415,6 +417,13 @@ void ViewerOverlayControllerBase::refreshViewer(VolumeViewerBase* viewer)
 bool ViewerOverlayControllerBase::isOverlayEnabledFor(VolumeViewerBase* /*viewer*/) const
 {
     return true;
+}
+
+void ViewerOverlayControllerBase::applyOverlayPrimitives(
+    VolumeViewerBase* viewer,
+    std::vector<OverlayPrimitive> primitives)
+{
+    applyPrimitives(viewer, _overlayGroupKey, std::move(primitives));
 }
 
 void ViewerOverlayControllerBase::clearOverlay(VolumeViewerBase* viewer) const
@@ -543,7 +552,8 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurface(VolumeViewerBase* vie
                                                            const std::vector<cv::Vec3f>& points,
                                                            float tolerance,
                                                            std::vector<float>* opacities,
-                                                           const std::optional<VolumeBounds>& bounds) const
+                                                           const std::optional<VolumeBounds>& bounds,
+                                                           bool requireSceneVisibility) const
 {
     Surface* surface = viewerSurface(viewer);
     auto* planeSurface = dynamic_cast<PlaneSurface*>(surface);
@@ -553,7 +563,7 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurface(VolumeViewerBase* vie
     std::vector<float> pointOpacities(points.size(), 1.0f);
     PointFilterOptions filter;
     filter.clipToSurface = false;
-    filter.requireSceneVisibility = true;
+    filter.requireSceneVisibility = requireSceneVisibility;
     filter.computeScenePoints = true;
     filter.volumePredicate = [planeSurface, quadSurface, patchIndex, tolerance, &bounds,
                               &pointOpacities](const cv::Vec3f& point, size_t index) {
@@ -591,6 +601,149 @@ ViewerOverlayControllerBase::filterPointsNearViewerSurface(VolumeViewerBase* vie
         }
     }
     return filtered;
+}
+
+ViewerOverlayControllerBase::FilteredPoints
+ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
+                                                  const std::vector<cv::Vec3f>& points,
+                                                  float tolerance,
+                                                  std::vector<float>* opacities) const
+{
+    FilteredPoints filtered;
+    if (!viewer || points.empty()) {
+        return filtered;
+    }
+
+    Surface* surface = viewerSurface(viewer);
+    auto* plane = dynamic_cast<PlaneSurface*>(surface);
+    auto* quad = dynamic_cast<QuadSurface*>(surface);
+    if (!plane && !quad) {
+        return filterPointsNearViewerSurface(
+            viewer, points, tolerance, opacities, std::nullopt, false);
+    }
+
+    auto* patchIndex = _manager ? _manager->surfacePatchIndex() : nullptr;
+    const std::uint64_t surfaceGeneration = quad && patchIndex
+        ? patchIndex->globalGeneration()
+        : 0;
+    const cv::Vec3f planeOrigin = plane ? plane->origin() : cv::Vec3f{};
+    const cv::Vec3f planeBasisX = plane ? plane->basisX() : cv::Vec3f{};
+    const cv::Vec3f planeBasisY = plane ? plane->basisY() : cv::Vec3f{};
+
+    auto sameVector = [](const cv::Vec3f& a, const cv::Vec3f& b) {
+        return a == b;
+    };
+    const PointChainProjectionCacheKey cacheKey{viewer, points.data(), points.size()};
+    auto [cacheIt, inserted] = _pointChainProjectionCache.try_emplace(cacheKey);
+    PointChainProjectionCacheEntry& cached = cacheIt->second;
+    const bool cacheMatches = !inserted &&
+                              cached.surface == surface &&
+                              cached.surfaceGeneration == surfaceGeneration &&
+                              cached.tolerance == tolerance &&
+                              sameVector(cached.planeOrigin, planeOrigin) &&
+                              sameVector(cached.planeBasisX, planeBasisX) &&
+                              sameVector(cached.planeBasisY, planeBasisY);
+
+    if (!cacheMatches) {
+        // A plane can move while retaining the same Surface pointer. Rebuild
+        // this chain's entry in place so lookup and invalidation remain O(1).
+        PointChainProjectionCacheEntry entry;
+        entry.surface = surface;
+        entry.surfaceGeneration = surfaceGeneration;
+        entry.tolerance = tolerance;
+        entry.planeOrigin = planeOrigin;
+        entry.planeBasisX = planeBasisX;
+        entry.planeBasisY = planeBasisY;
+        entry.volumePoints.reserve(points.size());
+        entry.surfacePoints.reserve(points.size());
+        entry.sourceIndices.reserve(points.size());
+        entry.opacities.reserve(points.size());
+
+        auto opacityForDistance = [tolerance](float distance) {
+            if (!std::isfinite(distance) || distance < 0.0f) {
+                return 0.0f;
+            }
+            if (!std::isfinite(tolerance)) {
+                return 1.0f;
+            }
+            if (tolerance <= 0.0f) {
+                return distance <= 0.0f ? 1.0f : 0.0f;
+            }
+            return distance >= tolerance ? 0.0f : 1.0f - distance / tolerance;
+        };
+
+        for (std::size_t index = 0; index < points.size(); ++index) {
+            const cv::Vec3f& point = points[index];
+            cv::Vec2f surfacePoint;
+            float distance = 0.0f;
+            bool valid = true;
+            if (plane) {
+                distance = std::fabs(plane->pointDist(point));
+                const cv::Vec3f projected = plane->project(point, 1.0f, 1.0f);
+                surfacePoint = {projected[0], projected[1]};
+            } else {
+                cv::Vec3f pointer = quad->pointer();
+                distance = quad->pointTo(pointer,
+                                         point,
+                                         std::max(tolerance, 0.0f),
+                                         100,
+                                         patchIndex);
+                if (distance < 0.0f || distance > tolerance) {
+                    valid = false;
+                } else {
+                    const cv::Vec3f location = quad->loc(pointer);
+                    surfacePoint = {location[0], location[1]};
+                }
+            }
+
+            const float opacity = valid ? opacityForDistance(distance) : 0.0f;
+            if (opacity <= 0.0f || !std::isfinite(surfacePoint[0]) ||
+                !std::isfinite(surfacePoint[1])) {
+                continue;
+            }
+            entry.volumePoints.push_back(point);
+            entry.surfacePoints.push_back(surfacePoint);
+            entry.sourceIndices.push_back(index);
+            entry.opacities.push_back(opacity);
+        }
+
+        cached = std::move(entry);
+    }
+
+    filtered.volumePoints = cached.volumePoints;
+    filtered.sourceIndices = cached.sourceIndices;
+    filtered.scenePoints.reserve(cached.surfacePoints.size());
+    for (const cv::Vec2f& point : cached.surfacePoints) {
+        filtered.scenePoints.push_back(viewer->surfaceCoordsToScene(point[0], point[1]));
+    }
+    if (opacities) {
+        *opacities = cached.opacities;
+    }
+    return filtered;
+}
+
+void ViewerOverlayControllerBase::clearPointChainProjectionCache()
+{
+    _pointChainProjectionCache.clear();
+}
+
+void ViewerOverlayControllerBase::clearPointChainProjectionCache(VolumeViewerBase* viewer)
+{
+    std::erase_if(_pointChainProjectionCache,
+                  [viewer](const auto& item) {
+                      return item.first.viewer == viewer;
+                  });
+}
+
+std::size_t ViewerOverlayControllerBase::PointChainProjectionCacheKeyHash::operator()(
+    const PointChainProjectionCacheKey& key) const
+{
+    auto combine = [](std::size_t seed, std::size_t value) {
+        return seed ^ (value + 0x9e3779b9U + (seed << 6U) + (seed >> 2U));
+    };
+    std::size_t seed = std::hash<VolumeViewerBase*>{}(key.viewer);
+    seed = combine(seed, std::hash<const cv::Vec3f*>{}(key.pointsData));
+    return combine(seed, std::hash<std::size_t>{}(key.pointCount));
 }
 
 float ViewerOverlayControllerBase::polylineBreakDistance(const std::vector<cv::Vec3f>& positions)
@@ -669,8 +822,14 @@ void ViewerOverlayControllerBase::renderPointChain(VolumeViewerBase* viewer,
         return;
     }
     std::vector<float> opacities;
-    const FilteredPoints filtered =
-        filterPointsNearViewerSurface(viewer, points, style.distanceTolerance, &opacities, bounds);
+    const FilteredPoints filtered = bounds
+        ? filterPointsNearViewerSurface(viewer,
+                                        points,
+                                        style.distanceTolerance,
+                                        &opacities,
+                                        bounds,
+                                        false)
+        : projectedPointChain(viewer, points, style.distanceTolerance, &opacities);
     if (filtered.scenePoints.empty()) {
         return;
     }
@@ -1105,14 +1264,14 @@ void ViewerOverlayControllerBase::rebuildOverlay(VolumeViewerBase* viewer)
     }
 
     if (!isOverlayEnabledFor(viewer)) {
-        viewer->clearOverlayGroup(_overlayGroupKey);
+        clearOverlay(viewer);
         return;
     }
 
     OverlayBuilder builder(viewer);
     collectPrimitives(viewer, builder);
     auto primitives = builder.takePrimitives();
-    applyPrimitives(viewer, _overlayGroupKey, std::move(primitives));
+    applyOverlayPrimitives(viewer, std::move(primitives));
 }
 
 void ViewerOverlayControllerBase::detachAllViewers()
@@ -1126,7 +1285,7 @@ void ViewerOverlayControllerBase::detachAllViewers()
             entry.rebuildTimer = nullptr;
         }
         if (entry.viewer) {
-            entry.viewer->clearOverlayGroup(_overlayGroupKey);
+            clearOverlay(entry.viewer);
         }
     }
     _viewers.clear();

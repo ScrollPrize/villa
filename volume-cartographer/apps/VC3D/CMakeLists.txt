@@ -165,6 +165,8 @@ set(srcs
     overlays/AtlasControlPointsOverlayController.hpp
     overlays/FiberSliceOverlayController.cpp
     overlays/FiberSliceOverlayController.hpp
+    overlays/FiberOverlayController.cpp
+    overlays/FiberOverlayController.hpp
     overlays/InkDetectionOverlayController.cpp
     overlays/InkDetectionOverlayController.hpp
     overlays/VolumeOverlayController.cpp

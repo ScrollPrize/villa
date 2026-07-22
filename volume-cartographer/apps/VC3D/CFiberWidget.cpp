@@ -8,6 +8,7 @@
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QColor>
+#include <QDoubleSpinBox>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QItemSelectionModel>
@@ -291,6 +292,37 @@ void CFiberWidget::setupUi()
         }
     });
 
+    auto* fiberDisplayLayout = new QHBoxLayout();
+    _showFibersCheckBox = new QCheckBox(tr("Show fibers"), mainWidget);
+    _showFibersCheckBox->setObjectName(QStringLiteral("fiberShowFibersCheckBox"));
+    _showFibersCheckBox->setEnabled(false);
+    _showFibersCheckBox->setToolTip(
+        tr("Show all loaded fibers as control-point chains in the volume viewers."));
+    fiberDisplayLayout->addWidget(_showFibersCheckBox);
+    connect(_showFibersCheckBox, &QCheckBox::toggled,
+            this, &CFiberWidget::showFibersToggled);
+
+    auto* viewDistanceLabel = new QLabel(tr("View distance:"), mainWidget);
+    fiberDisplayLayout->addWidget(viewDistanceLabel);
+    _fiberViewDistanceSpinBox = new QDoubleSpinBox(mainWidget);
+    _fiberViewDistanceSpinBox->setObjectName(QStringLiteral("fiberViewDistanceSpinBox"));
+    _fiberViewDistanceSpinBox->setRange(0.0, 10000.0);
+    _fiberViewDistanceSpinBox->setDecimals(1);
+    _fiberViewDistanceSpinBox->setSingleStep(1.0);
+    _fiberViewDistanceSpinBox->setValue(10.0);
+    _fiberViewDistanceSpinBox->setSuffix(tr(" vx"));
+    _fiberViewDistanceSpinBox->setMaximumWidth(100);
+    _fiberViewDistanceSpinBox->setToolTip(
+        tr("Maximum distance from the current plane or surface at which fibers remain visible."));
+    viewDistanceLabel->setBuddy(_fiberViewDistanceSpinBox);
+    fiberDisplayLayout->addWidget(_fiberViewDistanceSpinBox);
+    fiberDisplayLayout->addStretch(1);
+    layout->addLayout(fiberDisplayLayout);
+    connect(_fiberViewDistanceSpinBox,
+            qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this,
+            &CFiberWidget::fiberViewDistanceChanged);
+
     _model = new QStandardItemModel(this);
     _model->setColumnCount(kColumnCount);
     _model->setHorizontalHeaderLabels({
@@ -413,6 +445,36 @@ void CFiberWidget::setupUi()
 
     updateClassificationUi();
     setWidget(mainWidget);
+}
+
+void CFiberWidget::setShowFibersAvailable(bool available)
+{
+    _showFibersCheckBox->setEnabled(available);
+    if (!available) {
+        setShowFibersChecked(false);
+    }
+}
+
+void CFiberWidget::setShowFibersChecked(bool checked)
+{
+    const QSignalBlocker blocker(_showFibersCheckBox);
+    _showFibersCheckBox->setChecked(checked);
+}
+
+bool CFiberWidget::showFibersChecked() const
+{
+    return _showFibersCheckBox->isChecked();
+}
+
+void CFiberWidget::setFiberViewDistance(double distance)
+{
+    const QSignalBlocker blocker(_fiberViewDistanceSpinBox);
+    _fiberViewDistanceSpinBox->setValue(distance);
+}
+
+double CFiberWidget::fiberViewDistance() const
+{
+    return _fiberViewDistanceSpinBox->value();
 }
 
 QString CFiberWidget::displayNameForFiber(const FiberEntry& fiber)

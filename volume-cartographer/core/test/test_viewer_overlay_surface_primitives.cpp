@@ -9,8 +9,10 @@
 #include "AtlasControlPointsDock.hpp"
 #include "overlays/AtlasControlPointsOverlayController.hpp"
 #include "overlays/AtlasOverlayController.hpp"
+#include "overlays/FiberOverlayController.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
@@ -47,13 +49,15 @@ public:
 
     QPointF volumeToScene(const cv::Vec3f& point) override
     {
-        return {point[0] * 10.0 + 1.0, point[1] * 10.0 + 2.0};
+        return {point[0] * surfaceScale_ + surfaceOffset_.x(),
+                point[1] * surfaceScale_ + surfaceOffset_.y()};
     }
     cv::Vec3f sceneToVolume(const QPointF&) const override { return {}; }
     cv::Vec2f sceneToSurfaceCoords(const QPointF&) const override { return {}; }
     QPointF surfaceCoordsToScene(float surfX, float surfY) const override
     {
-        return {surfX * 10.0 + 1.0, surfY * 10.0 + 2.0};
+        return {surfX * surfaceScale_ + surfaceOffset_.x(),
+                surfY * surfaceScale_ + surfaceOffset_.y()};
     }
     QPointF lastScenePosition() const override { return {}; }
     void setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>&) override {}
@@ -73,7 +77,12 @@ public:
     Surface* currentSurface() const override { return surface_.get(); }
     std::string surfName() const override { return surfName_; }
     void setSurfName(std::string name) { surfName_ = std::move(name); }
-    void setCurrentSurface(std::shared_ptr<QuadSurface> surface) { surface_ = std::move(surface); }
+    void setCurrentSurface(std::shared_ptr<Surface> surface) { surface_ = std::move(surface); }
+    void setSurfaceSceneTransform(qreal scale, QPointF offset)
+    {
+        surfaceScale_ = scale;
+        surfaceOffset_ = offset;
+    }
     std::shared_ptr<Volume> currentVolume() const override { return {}; }
     VCCollection* pointCollection() const override { return nullptr; }
 
@@ -184,7 +193,9 @@ public:
 private:
     CVolumeViewerView view_;
     QGraphicsScene scene_;
-    std::shared_ptr<QuadSurface> surface_;
+    std::shared_ptr<Surface> surface_;
+    qreal surfaceScale_{10.0};
+    QPointF surfaceOffset_{1.0, 2.0};
     CompositeRenderSettings compositeSettings_;
     std::vector<ViewerOverlayControllerBase::PathPrimitive> paths_;
     std::map<std::string, cv::Vec3b> surfaceOverlays_;
@@ -211,6 +222,61 @@ class ViewerOverlaySurfacePrimitivesTest final : public QObject {
     Q_OBJECT
 
 private slots:
+    void fiberStylesUseDistinctMatchingColors()
+    {
+        const QColor first = FiberOverlayController::fiberColor(1);
+        const QColor second = FiberOverlayController::fiberColor(2);
+        QVERIFY(first.isValid());
+        QVERIFY(second.isValid());
+        QVERIFY(first != second);
+
+        const auto style = FiberOverlayController::fiberStyle(first, 25.0f);
+        QCOMPARE(style.color, first);
+        QCOMPARE(style.pointBorderColor, first);
+        QCOMPARE(style.distanceTolerance, 25.0f);
+    }
+
+    void fiberOverlayRetainsGraphicsItemsAcrossRefreshes()
+    {
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+        viewer.setSurfaceSceneTransform(1.0, QPointF{});
+        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
+            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
+
+        FiberOverlayController controller;
+        controller.attachViewer(&viewer);
+        controller.setChains({
+            FiberOverlayController::Chain{1, {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}}},
+            FiberOverlayController::Chain{2, {{0, 2, 0}, {1, 2, 0}, {2, 2, 0}}},
+        });
+        controller.setVisible(true);
+
+        const auto initialItems = viewer.scene().items();
+        QCOMPARE(initialItems.size(), 2);
+        const std::set<QGraphicsItem*> initialSet(initialItems.begin(), initialItems.end());
+        const QRectF initialBounds = viewer.scene().itemsBoundingRect();
+
+        controller.refreshViewer(&viewer);
+        const auto refreshedItems = viewer.scene().items();
+        const std::set<QGraphicsItem*> refreshedSet(refreshedItems.begin(), refreshedItems.end());
+        QCOMPARE(refreshedItems.size(), 2);
+        QVERIFY(refreshedSet == initialSet);
+
+        // Camera changes update the retained batches in place rather than
+        // replacing their QGraphicsItems.
+        viewer.setSurfaceSceneTransform(2.0, QPointF(20.0, 30.0));
+        controller.refreshViewer(&viewer);
+        const auto movedItems = viewer.scene().items();
+        const std::set<QGraphicsItem*> movedSet(movedItems.begin(), movedItems.end());
+        QCOMPARE(movedItems.size(), 2);
+        QVERIFY(movedSet == initialSet);
+        QVERIFY(viewer.scene().itemsBoundingRect() != initialBounds);
+
+        controller.setVisible(false);
+        QCOMPARE(viewer.scene().items().size(), 0);
+    }
+
     void surfacePrimitivesUseViewerSurfaceTransform()
     {
         FakeViewer viewer;
@@ -573,6 +639,60 @@ private slots:
         }
         QCOMPARE(strips, std::size_t{1});
         QCOMPARE(dots, chain.size());
+    }
+
+    void renderPointChainKeepsTopologyStableAcrossCameraChanges()
+    {
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(320, 240);
+        auto plane = std::make_shared<PlaneSurface>(cv::Vec3f(0.0f, 0.0f, 0.0f),
+                                                    cv::Vec3f(0.0f, 0.0f, 1.0f));
+        viewer.setCurrentSurface(plane);
+
+        ChainTestController controller;
+        const std::vector<cv::Vec3f> chain = {
+            {-100.0f, 1.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {100.0f, 1.0f, 0.0f}};
+        ViewerOverlayControllerBase::PointChainStyle style;
+        style.distanceTolerance = 4.0f;
+        style.sceneJumpRatio = 20.0f;
+
+        ChainTestController::OverlayBuilder initialBuilder(&viewer);
+        controller.renderPointChain(&viewer, initialBuilder, chain, style);
+        const auto initial = initialBuilder.takePrimitives();
+        const auto initialLine = std::find_if(initial.begin(), initial.end(), [](const auto& primitive) {
+            return std::holds_alternative<ViewerOverlayControllerBase::LineStripPrimitive>(primitive);
+        });
+        QVERIFY(initialLine != initial.end());
+        const auto* initialStrip =
+            std::get_if<ViewerOverlayControllerBase::LineStripPrimitive>(&*initialLine);
+        QVERIFY(initialStrip != nullptr);
+        QCOMPARE(initialStrip->points.size(), chain.size());
+        QCOMPARE(initialStrip->points.front().x(), -999.0);
+        QCOMPARE(initialStrip->points.back().x(), 1001.0);
+
+        // A pan/zoom changes only the final surface-to-scene transform. The
+        // complete source chain, including off-screen endpoints, must remain.
+        viewer.setSurfaceSceneTransform(5.0, QPointF(20.0, 30.0));
+        ChainTestController::OverlayBuilder movedBuilder(&viewer);
+        controller.renderPointChain(&viewer, movedBuilder, chain, style);
+        const auto moved = movedBuilder.takePrimitives();
+        const auto movedLine = std::find_if(moved.begin(), moved.end(), [](const auto& primitive) {
+            return std::holds_alternative<ViewerOverlayControllerBase::LineStripPrimitive>(primitive);
+        });
+        QVERIFY(movedLine != moved.end());
+        const auto* movedStrip =
+            std::get_if<ViewerOverlayControllerBase::LineStripPrimitive>(&*movedLine);
+        QVERIFY(movedStrip != nullptr);
+        QCOMPARE(movedStrip->points.size(), chain.size());
+        QCOMPARE(movedStrip->points.front().x(), -480.0);
+        QCOMPARE(movedStrip->points.back().x(), 520.0);
+
+        // Plane movement retains the Surface pointer, so its geometry
+        // signature must still invalidate the cached projection.
+        plane->setOrigin(cv::Vec3f(0.0f, 0.0f, 100.0f));
+        ChainTestController::OverlayBuilder movedPlaneBuilder(&viewer);
+        controller.renderPointChain(&viewer, movedPlaneBuilder, chain, style);
+        QVERIFY(movedPlaneBuilder.takePrimitives().empty());
     }
 
     void renderPointChainCullsPointsOutsideVolumeBounds()

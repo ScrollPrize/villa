@@ -14,6 +14,7 @@ class QLabel;
 class QButtonGroup;
 class QAction;
 class QCheckBox;
+class QDoubleSpinBox;
 class QLineEdit;
 class QTreeView;
 class QVBoxLayout;
@@ -81,6 +82,11 @@ public:
     void selectFiber(uint64_t fiberId);
     void selectFibers(const std::vector<uint64_t>& fiberIds);
     void setDeleteConfirmationForTesting(std::function<bool(const std::vector<uint64_t>&)> confirmer);
+    void setShowFibersAvailable(bool available);
+    void setShowFibersChecked(bool checked);
+    [[nodiscard]] bool showFibersChecked() const;
+    void setFiberViewDistance(double distance);
+    [[nodiscard]] double fiberViewDistance() const;
 
 signals:
     void fiberOpenRequested(uint64_t fiberId);
@@ -97,6 +103,8 @@ signals:
     void importFibersRequested();
     void exportFibersRequested();
     void metricsCalculationRequested(std::vector<uint64_t> orderedFiberIds);
+    void showFibersToggled(bool checked);
+    void fiberViewDistanceChanged(double distance);
 
 private slots:
     void onSelectionChanged();
@@ -144,6 +152,8 @@ private:
     Qt::SortOrder _sortOrder = Qt::AscendingOrder;
 
     QCheckBox* _calcMetricsCheckBox;
+    QCheckBox* _showFibersCheckBox;
+    QDoubleSpinBox* _fiberViewDistanceSpinBox;
     QTreeView* _treeView;
     QStandardItemModel* _model;
     QLabel* _nameLabel;

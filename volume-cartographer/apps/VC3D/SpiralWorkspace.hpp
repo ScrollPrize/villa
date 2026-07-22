@@ -37,6 +37,7 @@ public:
     ~SpiralWorkspace() override;
 
     ViewerManager* viewerManager() const { return _viewerManager.get(); }
+    void setFiberViewDistance(double distance);
 
     // Cross-panel entry points for "Add to current spiral fit".
     bool hasActiveSpiralSession() const;

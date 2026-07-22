@@ -110,9 +110,11 @@ vc_add_test(NAME test_ink_detection_overlay
     DEFS VC_TESTING)
 
 qt6_wrap_cpp(viewer_overlay_base_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
+qt6_wrap_cpp(fiber_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/FiberOverlayController.hpp)
 vc_add_test(NAME test_viewer_overlay_surface_primitives
     SOURCES test_viewer_overlay_surface_primitives.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/FiberOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/AtlasOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/AtlasControlPointsOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/AtlasControlPointsDock.cpp
@@ -120,6 +122,7 @@ vc_add_test(NAME test_viewer_overlay_surface_primitives
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
             test_viewer_manager_stub.cpp
             ${viewer_overlay_base_surface_primitives_moc}
+            ${fiber_overlay_surface_primitives_moc}
             ${viewer_manager_overlay_test_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core vc_atlas
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)

@@ -21,6 +21,7 @@ public:
     void publishLossMap(std::shared_ptr<QuadSurface> surface, QImage image,
                         qreal opacity);
     void setRunDiffVisible(bool visible);
+    void setFiberViewDistance(double distance);
     void reset();
     void setCategoryVisible(const QString& category, bool visible);
     void detachViewer(VolumeViewerBase* viewer) override;
@@ -37,12 +38,11 @@ private:
     };
     // One resident entry per fiber/pcl polyline: the whole generation stays
     // loaded so panning never waits on a viewport query. The points are owned
-    // by _index (immutable once published); the AABB is the per-refresh cull.
+    // by _index (immutable once published).
     struct ChainEntry {
+        uint64_t objectId = 0;
         QString category;
         const std::vector<cv::Vec3f>* points = nullptr;
-        cv::Vec3f lo{0, 0, 0};
-        cv::Vec3f hi{0, 0, 0};
     };
     void schedule(VolumeViewerBase* viewer, const QString& key,
                   const cv::Vec3f& lo, const cv::Vec3f& hi);
@@ -61,4 +61,5 @@ private:
     std::shared_ptr<QuadSurface> _lossMapSurface;
     QImage _lossMapImage;
     qreal _lossMapOpacity = 0.8;
+    float _fiberViewDistance = 10.0f;
 };

@@ -108,6 +108,7 @@ class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class ViewerTransformsPanel;
 class LineAnnotationController;
+class FiberOverlayController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
 class StatusDockPanelHost;
@@ -404,6 +405,7 @@ private:
     std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
     std::unique_ptr<AtlasOverlayController> _atlasOverlay;
     std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;
+    std::unique_ptr<FiberOverlayController> _fiberOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<MenuActionController> _menuController;

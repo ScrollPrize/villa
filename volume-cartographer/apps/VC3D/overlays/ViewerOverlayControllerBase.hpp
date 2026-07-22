@@ -16,10 +16,12 @@
 #include <opencv2/core/mat.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -337,7 +339,8 @@ protected:
                                                  const std::vector<cv::Vec3f>& points,
                                                  float tolerance,
                                                  std::vector<float>* opacities = nullptr,
-                                                 const std::optional<VolumeBounds>& bounds = std::nullopt) const;
+                                                 const std::optional<VolumeBounds>& bounds = std::nullopt,
+                                                 bool requireSceneVisibility = true) const;
 
     // Longest volume-space distance two consecutive chain points may span and
     // still be joined by a polyline: 4x the median inter-point distance, or
@@ -361,11 +364,58 @@ protected:
                           const PointChainStyle& style,
                           const std::optional<VolumeBounds>& bounds = std::nullopt) const;
 
-    void clearOverlay(VolumeViewerBase* viewer) const;
+    // Invalidates the surface-coordinate projections retained by
+    // renderPointChain(). Controllers must call this whenever their source
+    // chain storage is replaced or mutated.
+    void clearPointChainProjectionCache();
+
+    // The default implementation materializes primitives as QGraphicsItems.
+    // High-volume overlays may override this to retain their graphics items
+    // across refreshes while continuing to use the common primitive builder.
+    virtual void applyOverlayPrimitives(VolumeViewerBase* viewer,
+                                        std::vector<OverlayPrimitive> primitives);
+    virtual void clearOverlay(VolumeViewerBase* viewer) const;
 
     ViewerManager* manager() const { return _manager; }
 
 private:
+    struct PointChainProjectionCacheKey {
+        VolumeViewerBase* viewer{nullptr};
+        const cv::Vec3f* pointsData{nullptr};
+        std::size_t pointCount{0};
+
+        friend bool operator==(const PointChainProjectionCacheKey& lhs,
+                               const PointChainProjectionCacheKey& rhs)
+        {
+            return lhs.viewer == rhs.viewer &&
+                   lhs.pointsData == rhs.pointsData &&
+                   lhs.pointCount == rhs.pointCount;
+        }
+    };
+
+    struct PointChainProjectionCacheKeyHash {
+        std::size_t operator()(const PointChainProjectionCacheKey& key) const;
+    };
+
+    struct PointChainProjectionCacheEntry {
+        Surface* surface{nullptr};
+        std::uint64_t surfaceGeneration{0};
+        float tolerance{0.0f};
+        cv::Vec3f planeOrigin{0.0f, 0.0f, 0.0f};
+        cv::Vec3f planeBasisX{0.0f, 0.0f, 0.0f};
+        cv::Vec3f planeBasisY{0.0f, 0.0f, 0.0f};
+        std::vector<cv::Vec3f> volumePoints;
+        std::vector<cv::Vec2f> surfacePoints;
+        std::vector<std::size_t> sourceIndices;
+        std::vector<float> opacities;
+    };
+
+    FilteredPoints projectedPointChain(VolumeViewerBase* viewer,
+                                       const std::vector<cv::Vec3f>& points,
+                                       float tolerance,
+                                       std::vector<float>* opacities) const;
+    void clearPointChainProjectionCache(VolumeViewerBase* viewer);
+
     struct ViewerEntry {
         VolumeViewerBase* viewer{nullptr};
         QMetaObject::Connection overlaysUpdatedConn;
@@ -388,6 +438,10 @@ private:
     std::vector<ViewerEntry> _viewers;
 
     ViewerManager* _manager{nullptr};
+    mutable std::unordered_map<PointChainProjectionCacheKey,
+                               PointChainProjectionCacheEntry,
+                               PointChainProjectionCacheKeyHash>
+        _pointChainProjectionCache;
     QMetaObject::Connection _managerCreatedConn;
     QMetaObject::Connection _managerClosingConn;
     QMetaObject::Connection _managerDestroyedConn;

@@ -1,5 +1,7 @@
 #include "SpiralOverlayController.hpp"
 
+#include "FiberOverlayController.hpp"
+
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -31,6 +33,7 @@ void SpiralOverlayController::publishIndex(std::shared_ptr<const PolylineIndex> 
     _index = std::move(index);
     _indexGeneration = generation;
     _cache.clear();
+    clearPointChainProjectionCache();
     rebuildChains();
     refreshAll();
 }
@@ -58,6 +61,15 @@ void SpiralOverlayController::setRunDiffVisible(bool visible)
     refreshAll();
 }
 
+void SpiralOverlayController::setFiberViewDistance(double distance)
+{
+    const float clamped = static_cast<float>(std::clamp(distance, 0.0, 10000.0));
+    if (_fiberViewDistance == clamped) return;
+    _fiberViewDistance = clamped;
+    clearPointChainProjectionCache();
+    refreshAll();
+}
+
 void SpiralOverlayController::reset()
 {
     _index.reset();
@@ -65,6 +77,7 @@ void SpiralOverlayController::reset()
     ++_requestGeneration;
     _cache.clear();
     _chains.clear();
+    clearPointChainProjectionCache();
     _runDiffSurface.reset();
     _runDiffImage = {};
     _lossMapSurface.reset();
@@ -83,15 +96,9 @@ void SpiralOverlayController::rebuildChains()
         const QString category = QString::fromStdString(polyline.category);
         if (category == QStringLiteral("tracks") || polyline.points.empty()) continue;
         ChainEntry entry;
+        entry.objectId = polyline.objectId;
         entry.category = category;
         entry.points = &polyline.points;
-        entry.lo = entry.hi = polyline.points.front();
-        for (const cv::Vec3f& point : polyline.points) {
-            for (int axis = 0; axis < 3; ++axis) {
-                entry.lo[axis] = std::min(entry.lo[axis], point[axis]);
-                entry.hi[axis] = std::max(entry.hi[axis], point[axis]);
-            }
-        }
         _chains.push_back(std::move(entry));
     }
 }
@@ -172,8 +179,28 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
     const bool geometryVisible = _index && !_index->empty()
         && std::any_of(_visible.begin(), _visible.end(), [](bool value) { return value; });
     if (!geometryVisible) return;
-    const QRectF rect = visibleSceneRect(viewer);
     const bool surfacePane = dynamic_cast<QuadSurface*>(viewer->currentSurface()) != nullptr;
+    const float slab = surfacePane ? 10.0f : 4.0f;
+    // Fibers and pcls are ordered control-point chains: draw them like point
+    // collections (dots + polylines joining only consecutive points), fading
+    // out with distance to the pane's plane or surface. They render
+    // synchronously from the resident chain list so panning never waits on
+    // the async viewport query. The complete projected chains are handed to
+    // Qt for viewport clipping, keeping their topology camera-independent.
+    for (const auto& entry : _chains) {
+        if (!_visible.value(entry.category)) continue;
+        const bool fiber = entry.category == QStringLiteral("fibers");
+        const QColor color = fiber
+            ? FiberOverlayController::fiberColor(entry.objectId)
+            : categoryColor(entry.category);
+        const float distance = fiber ? _fiberViewDistance : slab;
+        PointChainStyle chainStyle = FiberOverlayController::fiberStyle(color, distance);
+        renderPointChain(viewer, builder, *entry.points, chainStyle);
+    }
+
+    if (!_visible.value(QStringLiteral("tracks"))) return;
+
+    const QRectF rect = visibleSceneRect(viewer);
     const int samplesPerAxis = surfacePane ? 5 : 2;
     cv::Vec3f lo, hi;
     bool haveBounds = false;
@@ -196,33 +223,13 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
         }
     }
     if (!haveBounds) return;
-    const float slab = surfacePane ? 10.0f : 4.0f;
     lo -= cv::Vec3f(slab, slab, slab); hi += cv::Vec3f(slab, slab, slab);
     const QString key = QStringLiteral("%1:%2:%3:%4:%5:%6:%7:%8")
         .arg(_indexGeneration).arg(lo[0], 0, 'f', 1).arg(lo[1], 0, 'f', 1).arg(lo[2], 0, 'f', 1)
         .arg(hi[0], 0, 'f', 1).arg(hi[1], 0, 'f', 1).arg(hi[2], 0, 'f', 1)
         .arg(QString::fromStdString(viewer->surfName()));
     auto& cache = _cache[viewer];
-    if (_visible.value(QStringLiteral("tracks")) && cache.requestKey != key)
-        schedule(viewer, key, lo, hi);
-    // Fibers and pcls are ordered control-point chains: draw them like point
-    // collections (dots + polylines joining only consecutive points), fading
-    // out with distance to the pane's plane or surface. They render
-    // synchronously from the resident chain list so panning never waits on
-    // the async viewport query; the viewport box culls whole chains first and
-    // individual points after.
-    const VolumeBounds bounds{lo, hi};
-    for (const auto& entry : _chains) {
-        if (!_visible.value(entry.category)) continue;
-        if (entry.hi[0] < lo[0] || entry.lo[0] > hi[0]
-            || entry.hi[1] < lo[1] || entry.lo[1] > hi[1]
-            || entry.hi[2] < lo[2] || entry.lo[2] > hi[2]) continue;
-        PointChainStyle chainStyle;
-        chainStyle.color = categoryColor(entry.category);
-        chainStyle.lineOpacity = 0.75f;
-        chainStyle.distanceTolerance = slab;
-        renderPointChain(viewer, builder, *entry.points, chainStyle, bounds);
-    }
+    if (cache.requestKey != key) schedule(viewer, key, lo, hi);
     for (const auto& path : cache.paths) {
         if (!surfacePane) {
             builder.addPath(path);
