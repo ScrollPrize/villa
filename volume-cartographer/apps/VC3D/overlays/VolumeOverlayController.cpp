@@ -97,6 +97,27 @@ std::string sanitizedCompositeMethod(const std::string& method)
     return vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
 }
 
+vc::Sampling sanitizedSamplingMethod(vc::Sampling method)
+{
+    return method == vc::Sampling::Trilinear
+        ? vc::Sampling::Trilinear
+        : vc::Sampling::Nearest;
+}
+
+QString samplingMethodName(vc::Sampling method)
+{
+    return method == vc::Sampling::Trilinear
+        ? QStringLiteral("trilinear")
+        : QStringLiteral("nearest");
+}
+
+vc::Sampling samplingMethodFromName(const QString& name)
+{
+    return name.compare(QStringLiteral("trilinear"), Qt::CaseInsensitive) == 0
+        ? vc::Sampling::Trilinear
+        : vc::Sampling::Nearest;
+}
+
 std::string coordinateSpaceTag(const VolumePkg& pkg, const std::string& volumeId)
 {
     constexpr std::string_view prefix = "vc-open-data-coordinate-space:";
@@ -124,6 +145,58 @@ VolumeOverlayController::VolumeOverlayController(ViewerManager* manager, QObject
 {
 }
 
+void VolumeOverlayController::setViewerManager(ViewerManager* manager)
+{
+    if (_viewerManager == manager) {
+        return;
+    }
+    if (_viewerManager) {
+        _viewerManager->setVolumeOverlay(nullptr);
+    }
+
+    _viewerManager = manager;
+    if (!_viewerManager) {
+        updateUiEnabled();
+        return;
+    }
+
+    const bool wasSuspended = _suspendPersistence;
+    _suspendPersistence = true;
+    _overlayVolume = _viewerManager->overlayVolume();
+    _overlayVolumeId = _viewerManager->overlayVolumeId();
+    _overlayOpacity = _viewerManager->overlayOpacity();
+    _overlayOpacityBeforeToggle = _overlayOpacity;
+    _overlayColormapName = _viewerManager->overlayColormap();
+    _overlaySamplingMethod = _viewerManager->overlaySamplingMethod();
+    _overlayWindowLow = _viewerManager->overlayWindowLow();
+    _overlayWindowHigh = _viewerManager->overlayWindowHigh();
+    _overlayMaxDisplayedResolution = _viewerManager->overlayMaxDisplayedResolution();
+    const auto& composite = _viewerManager->overlayComposite();
+    _compositeEnabled = composite.enabled;
+    _compositeMethod = composite.method;
+    _compositeLayersFront = composite.layersFront;
+    _compositeLayersBehind = composite.layersBehind;
+    _overlayVisible = hasOverlaySelection() && _overlayOpacity > 0.0f;
+
+    _viewerManager->setVolumeOverlay(this);
+    refreshVolumeOptions();
+    populateColormapOptions();
+    applyOverlayVolume();
+    setOpacity(_overlayOpacity);
+    setSamplingMethod(_overlaySamplingMethod);
+    setWindowBounds(_overlayWindowLow, _overlayWindowHigh);
+    if (_ui.maxDisplayedResolutionSpin) {
+        const QSignalBlocker blocker(_ui.maxDisplayedResolutionSpin);
+        _ui.maxDisplayedResolutionSpin->setValue(_overlayMaxDisplayedResolution);
+    }
+
+    _viewerManager->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
+    syncCompositeUi();
+    pushCompositeToManager();
+    updateUiEnabled();
+    _suspendPersistence = wasSuspended;
+}
+
 void VolumeOverlayController::setUi(const UiRefs& ui)
 {
     disconnectUiSignals();
@@ -145,6 +218,16 @@ void VolumeOverlayController::setUi(const UiRefs& ui)
         QSignalBlocker blocker(_ui.maxDisplayedResolutionSpin);
         _ui.maxDisplayedResolutionSpin->setValue(std::clamp(_overlayMaxDisplayedResolution, 0, 5));
     }
+
+    if (_ui.samplingMethodSelect) {
+        const QSignalBlocker blocker(_ui.samplingMethodSelect);
+        _ui.samplingMethodSelect->clear();
+        _ui.samplingMethodSelect->addItem(
+            tr("Nearest"), static_cast<int>(vc::Sampling::Nearest));
+        _ui.samplingMethodSelect->addItem(
+            tr("Trilinear"), static_cast<int>(vc::Sampling::Trilinear));
+    }
+    setSamplingMethod(_overlaySamplingMethod);
 
     if (_ui.compositeMethodSelect) {
         const QSignalBlocker blocker(_ui.compositeMethodSelect);
@@ -182,6 +265,7 @@ void VolumeOverlayController::setVolumePkg(const std::shared_ptr<VolumePkg>& pkg
     applyOverlayVolume();
     setColormap(_overlayColormapName);
     setOpacity(_overlayOpacity);
+    setSamplingMethod(_overlaySamplingMethod);
     setWindowBounds(_overlayWindowLow, _overlayWindowHigh);
     if (_ui.maxDisplayedResolutionSpin) {
         const QSignalBlocker blocker(_ui.maxDisplayedResolutionSpin);
@@ -229,6 +313,7 @@ void VolumeOverlayController::clearVolumePkg()
     _overlayWindowLow = 0.0f;
     _overlayWindowHigh = 255.0f;
     _overlayMaxDisplayedResolution = vc3d::settings::volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT;
+    _overlaySamplingMethod = vc::Sampling::Nearest;
     _compositeEnabled = vc3d::settings::volume_overlay::COMPOSITE_ENABLED_DEFAULT;
     _compositeMethod = vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
     _compositeLayersFront = vc3d::settings::volume_overlay::COMPOSITE_LAYERS_FRONT_DEFAULT;
@@ -246,6 +331,7 @@ void VolumeOverlayController::clearVolumePkg()
         const QSignalBlocker blocker(_ui.maxDisplayedResolutionSpin);
         _ui.maxDisplayedResolutionSpin->setValue(_overlayMaxDisplayedResolution);
     }
+    setSamplingMethod(_overlaySamplingMethod);
 
     if (_viewerManager) {
         _viewerManager->setOverlayOpacity(_overlayOpacity);
@@ -426,6 +512,11 @@ void VolumeOverlayController::connectUiSignals()
             _ui.colormapSelect, qOverload<int>(&QComboBox::currentIndexChanged),
             this, [this](int index) { handleColormapChanged(index); }));
     }
+    if (_ui.samplingMethodSelect) {
+        _connections.push_back(QObject::connect(
+            _ui.samplingMethodSelect, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this](int index) { handleSamplingMethodChanged(index); }));
+    }
 
     if (_ui.opacitySpin) {
         _connections.push_back(QObject::connect(
@@ -575,6 +666,9 @@ void VolumeOverlayController::updateUiEnabled()
         const bool hasColormaps = _ui.colormapSelect->count() > 0;
         _ui.colormapSelect->setEnabled(hasOverlay && hasColormaps);
     }
+    if (_ui.samplingMethodSelect) {
+        _ui.samplingMethodSelect->setEnabled(hasOverlay);
+    }
     if (_ui.compositeEnabledCheck) {
         _ui.compositeEnabledCheck->setEnabled(hasOverlay);
     }
@@ -619,6 +713,7 @@ void VolumeOverlayController::loadState()
     _overlayWindowLow = 0.0f;
     _overlayWindowHigh = 255.0f;
     _overlayColormapName.clear();
+    _overlaySamplingMethod = vc::Sampling::Nearest;
     _overlayMaxDisplayedResolution = vc3d::settings::volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT;
     _compositeEnabled = vc3d::settings::volume_overlay::COMPOSITE_ENABLED_DEFAULT;
     _compositeMethod = vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
@@ -672,6 +767,11 @@ void VolumeOverlayController::loadState()
         _overlayColormapName = storedColormap.toStdString();
     }
 
+    _overlaySamplingMethod = samplingMethodFromName(
+        settings.value(volume_overlay::SAMPLING_METHOD,
+                       QString::fromLatin1(volume_overlay::SAMPLING_METHOD_DEFAULT))
+            .toString());
+
     _overlayMaxDisplayedResolution = std::clamp(
         settings.value(volume_overlay::MAX_DISPLAYED_RESOLUTION,
                        volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT).toInt(),
@@ -721,6 +821,8 @@ void VolumeOverlayController::saveState() const
     settings.setValue(volume_overlay::WINDOW_HIGH, _overlayWindowHigh);
     settings.setValue(volume_overlay::THRESHOLD, _overlayWindowLow); // legacy compatibility
     settings.setValue(volume_overlay::COLORMAP, QString::fromStdString(_overlayColormapName));
+    settings.setValue(volume_overlay::SAMPLING_METHOD,
+                      samplingMethodName(_overlaySamplingMethod));
     settings.setValue(volume_overlay::MAX_DISPLAYED_RESOLUTION, _overlayMaxDisplayedResolution);
     settings.setValue(volume_overlay::COMPOSITE_ENABLED, _compositeEnabled);
     settings.setValue(volume_overlay::COMPOSITE_METHOD, QString::fromStdString(_compositeMethod));
@@ -792,6 +894,24 @@ void VolumeOverlayController::setOpacity(float value)
     _overlayVisible = visible;
     if (_overlayVisible) {
         _overlayOpacityBeforeToggle = _overlayOpacity;
+    }
+}
+
+void VolumeOverlayController::setSamplingMethod(vc::Sampling method)
+{
+    _overlaySamplingMethod = sanitizedSamplingMethod(method);
+
+    if (_ui.samplingMethodSelect) {
+        const QSignalBlocker blocker(_ui.samplingMethodSelect);
+        const int index = _ui.samplingMethodSelect->findData(
+            static_cast<int>(_overlaySamplingMethod));
+        if (index >= 0) {
+            _ui.samplingMethodSelect->setCurrentIndex(index);
+        }
+    }
+
+    if (_viewerManager) {
+        _viewerManager->setOverlaySamplingMethod(_overlaySamplingMethod);
     }
 }
 
@@ -1010,6 +1130,19 @@ void VolumeOverlayController::handleColormapChanged(int index)
 void VolumeOverlayController::handleOpacityChanged(int value)
 {
     setOpacity(normalizedOpacityFromPercent(value));
+    if (!_suspendPersistence) {
+        saveState();
+    }
+}
+
+void VolumeOverlayController::handleSamplingMethodChanged(int index)
+{
+    if (!_ui.samplingMethodSelect || index < 0) {
+        return;
+    }
+
+    setSamplingMethod(static_cast<vc::Sampling>(
+        _ui.samplingMethodSelect->itemData(index).toInt()));
     if (!_suspendPersistence) {
         saveState();
     }

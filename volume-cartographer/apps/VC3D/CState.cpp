@@ -341,7 +341,7 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
         resetViewOnSurfaceChangeEnabled()) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
             try {
-                auto focusPoi = createSegmentationFocusPoi(this, *quad);
+                auto focusPoi = createSurfaceFocusPoi(*quad);
                 if (focusPoi) {
                     delayedFocusPoi = focusPoi.get();
                     _pois["focus"] = std::move(focusPoi);
@@ -430,6 +430,11 @@ std::vector<std::string> CState::surfaceNames()
 }
 
 // --- POI methods (from CSurfaceCollection) ---
+
+std::unique_ptr<POI> CState::createSurfaceFocusPoi(QuadSurface& surface)
+{
+    return createSegmentationFocusPoi(this, surface);
+}
 
 void CState::setPOI(const std::string& name, POI* poi)
 {

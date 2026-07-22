@@ -108,11 +108,13 @@ class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class ViewerTransformsPanel;
 class LineAnnotationController;
+class FiberOverlayController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
 class StatusDockPanelHost;
 class ViewerCompositePanel;
 class LineAnnotationDialog;
+class SpiralWorkspace;
 
 class CWindow : public QMainWindow
 {
@@ -127,7 +129,6 @@ signals:
 
 public slots:
     void onShowStatusMessage(QString text, int timeout);
-    void onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onVisLasagnaObj(const std::string& segmentId);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
@@ -155,6 +156,8 @@ protected:
 private:
     void CreateWidgets(void);
     QMainWindow* segmentWorkspaceWindow() const { return _segmentWorkspaceWindow; }
+    ViewerManager* activeWorkspaceViewerManager() const;
+    void updateActiveWorkspaceViewerControls();
     void populateDockToggleMenu(QMenu* menu) const;
     void createAtlasWorkspace();
     void displayAtlasFromDirectory(const std::filesystem::path& atlasDir);
@@ -341,6 +344,8 @@ private:
     QMainWindow* _atlasWorkspaceWindow{nullptr};
     QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
     QMainWindow* _intersectionsWorkspaceWindow{nullptr};
+    QMainWindow* _spiralWorkspaceWindow{nullptr};
+    SpiralWorkspace* _spiralWorkspace{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
     QDockWidget* _inkDetectionDock{nullptr};
@@ -371,7 +376,6 @@ private:
     QMdiArea *mdiArea;
     QMdiArea* _fiberSliceMdiArea{nullptr};
     QMdiArea* _intersectionsMdiArea{nullptr};
-    VolumeViewerBase* _activeBaseViewer{nullptr};
 
     bool can_change_volume_();
 
@@ -401,6 +405,7 @@ private:
     std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
     std::unique_ptr<AtlasOverlayController> _atlasOverlay;
     std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;
+    std::unique_ptr<FiberOverlayController> _fiberOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<MenuActionController> _menuController;

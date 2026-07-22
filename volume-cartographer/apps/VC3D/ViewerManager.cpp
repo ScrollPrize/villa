@@ -1,9 +1,11 @@
 #include "ViewerManager.hpp"
 #include "OpenDataSegmentCache.hpp"
 
+#include "AxisAlignedSliceController.hpp"
 #include "VCSettings.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
+#include "volume_viewers/CVolumeViewerView.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
 #include "overlays/RawPointsOverlayController.hpp"
@@ -17,8 +19,12 @@
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/Logging.hpp"
 
+#include <QApplication>
+#include <QCursor>
+#include <QPointer>
 #include <QMdiArea>
 #include <QTimer>
 #include <QThread>
@@ -36,6 +42,7 @@
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
 
+#include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 Q_LOGGING_CATEGORY(lcViewerManager, "vc.viewer.manager")
@@ -67,6 +74,102 @@ QString compactViewerLabel(const std::string& surfaceName, const QString& title)
     return {};
 }
 
+bool isChunkedViewer(VolumeViewerBase* viewer)
+{
+    return viewer && qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
+}
+
+bool isAnnotationViewer(VolumeViewerBase* viewer)
+{
+    return viewer &&
+           viewer->asQObject() &&
+           viewer->asQObject()->property("vc_viewer_role").toString() == QStringLiteral("annotation");
+}
+
+void centerViewerOnVolumePointForNavigation(VolumeViewerBase* viewer, const cv::Vec3f& position)
+{
+    if (!viewer) {
+        return;
+    }
+    viewer->centerOnVolumePoint(position, !isChunkedViewer(viewer));
+}
+
+void centerViewerOnSurfacePointForNavigation(VolumeViewerBase* viewer, const cv::Vec2f& position)
+{
+    if (!viewer) {
+        return;
+    }
+    viewer->centerOnSurfacePoint(position, !isChunkedViewer(viewer));
+}
+
+bool finiteVec3(const cv::Vec3f& v)
+{
+    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+}
+
+std::optional<cv::Vec3f> transformPoint(const cv::Vec3f& point, const cv::Matx44d& matrix)
+{
+    cv::Vec3d transformed;
+    if (!vc::core::util::applyAffineTransform(cv::Vec3d(point), matrix, transformed)) {
+        return std::nullopt;
+    }
+    const cv::Vec3f out(static_cast<float>(transformed[0]),
+                        static_cast<float>(transformed[1]),
+                        static_cast<float>(transformed[2]));
+    return finiteVec3(out) ? std::optional<cv::Vec3f>(out) : std::nullopt;
+}
+
+cv::Vec3f clampToVolumeBounds(cv::Vec3f point, const std::shared_ptr<Volume>& volume)
+{
+    if (!volume) {
+        return point;
+    }
+    const auto [w, h, d] = volume->shapeXyz();
+    point[0] = std::clamp(point[0], 0.0f, static_cast<float>(std::max(1, w) - 1));
+    point[1] = std::clamp(point[1], 0.0f, static_cast<float>(std::max(1, h) - 1));
+    point[2] = std::clamp(point[2], 0.0f, static_cast<float>(std::max(1, d) - 1));
+    return point;
+}
+
+// Uniform distance scale of an affine transform, or nullopt when the linear
+// part is too anisotropic for a single scalar to be meaningful.
+std::optional<double> relativeAffineDistanceScale(const cv::Matx44d& matrix)
+{
+    cv::Mat linear(3, 3, CV_64F);
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            linear.at<double>(row, col) = matrix(row, col);
+        }
+    }
+
+    cv::SVD svd(linear, cv::SVD::NO_UV);
+    if (svd.w.rows < 3) {
+        return std::nullopt;
+    }
+    const double s0 = svd.w.at<double>(0, 0);
+    const double s1 = svd.w.at<double>(1, 0);
+    const double s2 = svd.w.at<double>(2, 0);
+    if (!(std::isfinite(s0) && std::isfinite(s1) && std::isfinite(s2)) ||
+        s0 <= 0.0 || s1 <= 0.0 || s2 <= 0.0) {
+        return std::nullopt;
+    }
+
+    const double mean = (s0 + s1 + s2) / 3.0;
+    const double maxDeviation =
+        std::max({std::abs(s0 - mean), std::abs(s1 - mean), std::abs(s2 - mean)});
+    const double relativeDeviation = maxDeviation / mean;
+    if (!std::isfinite(relativeDeviation) || relativeDeviation > 0.02) {
+        return std::nullopt;
+    }
+    return mean;
+}
+
+std::vector<ViewerManager*>& managerRegistry()
+{
+    static std::vector<ViewerManager*> registry;
+    return registry;
+}
+
 }
 
 ViewerManager::ViewerManager(CState* state,
@@ -76,6 +179,7 @@ ViewerManager::ViewerManager(CState* state,
     , _state(state)
     , _points(points)
 {
+    managerRegistry().push_back(this);
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const int savedOpacityPercent = settings.value(viewer::INTERSECTION_OPACITY, viewer::INTERSECTION_OPACITY_DEFAULT).toInt();
@@ -128,6 +232,10 @@ ViewerManager::ViewerManager(CState* state,
                 &CState::surfaceWillBeDeleted,
                 this,
                 &ViewerManager::handleSurfaceWillBeDeleted);
+        connect(_state,
+                &CState::poiChanged,
+                this,
+                &ViewerManager::handleFocusPoiChanged);
     }
 
     // The single maintenance clock for the whole app: ~60Hz, free-running. Render
@@ -136,6 +244,17 @@ ViewerManager::ViewerManager(CState* state,
     _globalClock->setInterval(16);
     connect(_globalClock, &QTimer::timeout, this, &ViewerManager::onGlobalTick);
     _globalClock->start();
+}
+
+ViewerManager::~ViewerManager()
+{
+    auto& registry = managerRegistry();
+    registry.erase(std::remove(registry.begin(), registry.end(), this), registry.end());
+}
+
+const std::vector<ViewerManager*>& ViewerManager::allManagers()
+{
+    return managerRegistry();
 }
 
 void ViewerManager::onGlobalTick()
@@ -232,6 +351,21 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setSegmentationEditActive(_segmentationEditActive);
     baseViewer->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
 
+    if (role != ViewerRole::Annotation) {
+        connect(chunkedViewer, &CChunkedVolumeViewer::sendVolumeClicked,
+                this, &ViewerManager::handleVolumeClicked);
+    }
+    connect(chunkedViewer, &CChunkedVolumeViewer::sharedCacheStatsChanged,
+            this, &ViewerManager::sharedCacheStatsChanged);
+
+    if (auto* graphicsView = chunkedViewer->graphicsView()) {
+        auto markActiveViewer = [this, baseViewer]() { _activeViewer = baseViewer; };
+        connect(graphicsView, &CVolumeViewerView::sendMousePress, this, markActiveViewer);
+        connect(graphicsView, &CVolumeViewerView::sendMouseDoubleClick, this, markActiveViewer);
+        connect(graphicsView, &CVolumeViewerView::sendZoom, this, markActiveViewer);
+        connect(graphicsView, &CVolumeViewerView::sendCursorMove, this, markActiveViewer);
+    }
+
     _baseViewers.push_back(baseViewer);
 
     // Clean up when viewer is destroyed without an earlier close event.
@@ -250,6 +384,7 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setOverlayVolume(_overlayVolume);
     baseViewer->setOverlayOpacity(_overlayOpacity);
     baseViewer->setOverlayColormap(_overlayColormapId);
+    baseViewer->setOverlaySamplingMethod(_overlaySamplingMethod);
     baseViewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
     baseViewer->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     baseViewer->setOverlayComposite(_overlayComposite);
@@ -278,8 +413,486 @@ void ViewerManager::unregisterViewer(VolumeViewerBase* viewer)
     if (_segmentationModule) {
         _segmentationModule->detachViewer(viewer);
     }
+    if (_activeViewer == viewer) {
+        _activeViewer = nullptr;
+    }
     _resetDefaults.erase(viewer);
     _baseViewers.erase(std::remove(_baseViewers.begin(), _baseViewers.end(), viewer), _baseViewers.end());
+}
+
+void ViewerManager::handleFocusPoiChanged(std::string name, POI* poi)
+{
+    if (name != "focus" || !poi) {
+        return;
+    }
+    if (_slices) {
+        _slices->applyOrientation();
+    }
+    if (!poi->suppressViewerRecenter) {
+        const cv::Vec3f focusPosition = poi->p;
+        QTimer::singleShot(0, this, [this, focusPosition]() {
+            recenterPlaneViewersOn(focusPosition);
+        });
+    }
+}
+
+bool ViewerManager::resetFocusForVolumeChange(bool resetToCenter,
+                                              const std::optional<cv::Vec3f>& overridePoint,
+                                              const std::optional<cv::Vec3f>& overrideNormal)
+{
+    if (!_state || !_state->currentVolume()) {
+        return false;
+    }
+
+    const auto [w, h, d] = _state->currentVolume()->shapeXyz();
+    const cv::Vec3f hi(static_cast<float>(std::max(1, w) - 1),
+                       static_cast<float>(std::max(1, h) - 1),
+                       static_cast<float>(std::max(1, d) - 1));
+    const auto clampToBounds = [&hi](cv::Vec3f p) {
+        for (int axis = 0; axis < 3; ++axis) {
+            p[axis] = std::clamp(p[axis], 0.0f, hi[axis]);
+        }
+        return p;
+    };
+
+    POI* poi = _state->poi("focus");
+    const bool createdPoi = (poi == nullptr);
+    if (!poi) {
+        poi = new POI;
+        poi->n = cv::Vec3f(0, 0, 1);
+    }
+
+    if (overridePoint) {
+        poi->p = clampToBounds(*overridePoint);
+        if (overrideNormal) {
+            poi->n = *overrideNormal;
+        }
+    } else if (createdPoi || resetToCenter) {
+        poi->p = hi * 0.5f;
+    } else {
+        poi->p = clampToBounds(poi->p);
+    }
+    poi->surfacePtr.reset();
+
+    _state->setPOI("focus", poi);
+    return true;
+}
+
+bool ViewerManager::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId)
+{
+    if (!_state) {
+        return false;
+    }
+
+    POI* focus = _state->poi("focus");
+    if (!focus) {
+        focus = new POI;
+    }
+
+    focus->p = position;
+    if (cv::norm(normal) > 0.0) {
+        focus->n = normal;
+    }
+    if (!sourceId.empty()) {
+        focus->surfaceId = sourceId;
+    } else if (focus->surfaceId.empty()) {
+        focus->surfaceId = "segmentation";
+    }
+    focus->surfacePtr.reset();
+
+    focus->suppressTransientPlaneIntersections = true;
+    _state->setPOI("focus", focus);
+    recenterSegmentationViewerNear(position);
+
+    // Get surface for orientation - look up by ID
+    Surface* orientationSource = _state->surfaceRaw(focus->surfaceId);
+    if (!orientationSource) {
+        orientationSource = _state->surfaceRaw("segmentation");
+    }
+    if (_slices) {
+        _slices->applyOrientation(orientationSource);
+    }
+
+    emit focusCenteredByUser(position);
+    return true;
+}
+
+bool ViewerManager::centerFocusOnCursor()
+{
+    if (!_state) {
+        return false;
+    }
+
+    const QPoint globalPos = QCursor::pos();
+    auto tryCenterFromViewer = [&](VolumeViewerBase* viewer) -> bool {
+        if (!viewer) {
+            return false;
+        }
+
+        auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject());
+        if (viewerWidget && !viewerWidget->isVisible()) {
+            return false;
+        }
+
+        auto* gv = viewer->graphicsView();
+        auto* viewport = gv ? gv->viewport() : nullptr;
+        if (!viewport) {
+            return false;
+        }
+
+        const QPoint viewportPos = viewport->mapFromGlobal(globalPos);
+        if (!viewport->rect().contains(viewportPos)) {
+            return false;
+        }
+
+        const QPointF scenePos = gv->mapToScene(viewportPos);
+        const cv::Vec3f p = viewer->sceneToVolume(scenePos);
+        if (!finiteVec3(p)) {
+            return false;
+        }
+        cv::Vec3f n(0, 0, 1);
+        if (auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
+            n = plane->normal(cv::Vec3f(0, 0, 0), {});
+        }
+
+        return centerFocusAt(p, n, viewer->surfName());
+    };
+
+    // Prefer the viewer actually under the mouse cursor: the active
+    // window/subwindow can lag behind the hovered viewer, which would make the
+    // focus jump use the wrong scene transform.
+    if (QWidget* hoveredWidget = QApplication::widgetAt(globalPos)) {
+        for (QWidget* widget = hoveredWidget; widget; widget = widget->parentWidget()) {
+            if (auto* viewer = qobject_cast<CChunkedVolumeViewer*>(widget)) {
+                if (tryCenterFromViewer(viewer)) {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+
+    for (auto* viewer : _baseViewers) {
+        if (tryCenterFromViewer(viewer)) {
+            return true;
+        }
+    }
+
+    // Fall back to the stored cursor POI when the mouse isn't over any viewport.
+    POI* cursor = _state->poi("cursor");
+    if (!cursor) {
+        return false;
+    }
+    return centerFocusAt(cursor->p, cursor->n, cursor->surfaceId);
+}
+
+void ViewerManager::handleVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surface* surf,
+                                        Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
+{
+    if (_volumeClickInterceptor && _volumeClickInterceptor(volLoc, normal, surf, button, modifiers)) {
+        return;
+    }
+
+    if (modifiers & Qt::ShiftModifier) {
+        // Reserved for point tools.
+        return;
+    }
+    if (modifiers & Qt::ControlModifier) {
+        std::string surfId;
+        if (_state && surf) {
+            surfId = _state->findSurfaceId(surf);
+        }
+        centerFocusAt(volLoc, normal, surfId);
+    }
+}
+
+VolumeViewerBase* ViewerManager::activeViewer() const
+{
+    if (!_activeViewer) {
+        return nullptr;
+    }
+    if (auto* activeObject = _activeViewer->asQObject()) {
+        if (!activeObject->parent()) {
+            return nullptr;
+        }
+    }
+    return _activeViewer;
+}
+
+bool ViewerManager::recenterViewersOnCurrentFocus()
+{
+    if (!_state) {
+        return false;
+    }
+
+    POI* focus = _state->poi("focus");
+    if (!focus) {
+        return false;
+    }
+
+    const cv::Vec3f position = focus->p;
+    forEachBaseViewer([&position](VolumeViewerBase* viewer) {
+        if (viewer && !isAnnotationViewer(viewer)) {
+            centerViewerOnVolumePointForNavigation(viewer, position);
+        }
+    });
+
+    return true;
+}
+
+void ViewerManager::recenterPlaneViewersOn(const cv::Vec3f& position)
+{
+    forEachBaseViewer([&position](VolumeViewerBase* viewer) {
+        if (!viewer || isAnnotationViewer(viewer)) {
+            return;
+        }
+
+        const std::string name = viewer->surfName();
+        if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
+            centerViewerOnVolumePointForNavigation(viewer, position);
+        }
+    });
+}
+
+void ViewerManager::recenterSegmentationViewerNear(const cv::Vec3f& position)
+{
+    static constexpr float kMaxDistanceVoxels = 100.0f;
+
+    auto* viewer = segmentationViewer();
+    if (!viewer) {
+        return;
+    }
+
+    auto activeSurface = _segmentationModule ? _segmentationModule->activeBaseSurfaceShared() : nullptr;
+    if (!activeSurface) {
+        activeSurface = std::dynamic_pointer_cast<QuadSurface>(_state ? _state->surface("segmentation") : nullptr);
+    }
+    if (!activeSurface) {
+        return;
+    }
+
+    auto* patchIndex = surfacePatchIndex();
+    if (!patchIndex || !patchIndex->containsSurface(activeSurface)) {
+        return;
+    }
+
+    SurfacePatchIndex::PointQuery query;
+    query.worldPoint = position;
+    query.tolerance = kMaxDistanceVoxels;
+    query.surfaces.only = activeSurface;
+    auto hit = patchIndex->locate(query);
+    if (hit && hit->distance <= kMaxDistanceVoxels) {
+        const cv::Vec3f loc = activeSurface->loc(hit->ptr);
+        centerViewerOnSurfacePointForNavigation(viewer, {loc[0], loc[1]});
+    }
+}
+
+VolumeViewerBase* ViewerManager::segmentationViewer() const
+{
+    for (auto* viewer : _baseViewers) {
+        if (viewer && viewer->surfName() == "segmentation") {
+            return viewer;
+        }
+    }
+    return nullptr;
+}
+
+void ViewerManager::setShowDirectionHints(bool show)
+{
+    forEachBaseViewer([show](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setShowDirectionHints(show);
+        }
+    });
+}
+
+void ViewerManager::setShowSurfaceNormals(bool show)
+{
+    forEachBaseViewer([show](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setShowSurfaceNormals(show);
+        }
+    });
+}
+
+void ViewerManager::setPlaneIntersectionLinesVisible(bool visible)
+{
+    forEachBaseViewer([visible](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setPlaneIntersectionLinesVisible(visible);
+        }
+    });
+}
+
+void ViewerManager::setSurfaceOverlaysEnabled(bool enabled)
+{
+    forEachBaseViewer([enabled](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setSurfaceOverlayEnabled(enabled);
+        }
+    });
+}
+
+void ViewerManager::setSurfaceOverlapThreshold(float threshold)
+{
+    forEachBaseViewer([threshold](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setSurfaceOverlapThreshold(threshold);
+        }
+    });
+}
+
+void ViewerManager::setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays)
+{
+    forEachBaseViewer([&overlays](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setSurfaceOverlays(overlays);
+        }
+    });
+}
+
+void ViewerManager::setResetViewOnSurfaceChangeDefault(bool enabled)
+{
+    const bool editingActive = _segmentationModule && _segmentationModule->editingEnabled();
+    forEachBaseViewer([this, enabled, editingActive](VolumeViewerBase* viewer) {
+        if (!viewer) {
+            return;
+        }
+        setResetDefaultFor(viewer, enabled);
+        if (editingActive && viewer->surfName() == "segmentation") {
+            viewer->setResetViewOnSurfaceChange(false);
+            return;
+        }
+        viewer->setResetViewOnSurfaceChange(enabled);
+    });
+}
+
+void ViewerManager::setSegmentationResetViewSuppressed(bool suppressed)
+{
+    forEachBaseViewer([this, suppressed](VolumeViewerBase* viewer) {
+        if (!viewer || viewer->surfName() != "segmentation") {
+            return;
+        }
+        viewer->setResetViewOnSurfaceChange(suppressed ? false : resetDefaultFor(viewer));
+    });
+}
+
+struct ViewerManager::ViewerNavigationSnapshot {
+    struct Entry {
+        QPointer<CChunkedVolumeViewer> viewer;
+        CChunkedVolumeViewer::CameraState camera;
+        cv::Vec3f center{0, 0, 0};
+        bool hasCenter{false};
+    };
+    std::vector<Entry> entries;
+};
+
+std::shared_ptr<ViewerManager::ViewerNavigationSnapshot> ViewerManager::captureNavigation() const
+{
+    auto snapshot = std::make_shared<ViewerNavigationSnapshot>();
+    forEachBaseViewer([&snapshot](VolumeViewerBase* baseViewer) {
+        auto* viewer = dynamic_cast<CChunkedVolumeViewer*>(baseViewer);
+        if (!viewer || !viewer->graphicsView()) {
+            return;
+        }
+        ViewerNavigationSnapshot::Entry captured;
+        captured.viewer = viewer;
+        captured.camera = viewer->cameraState();
+        const QSize viewportSize = viewer->graphicsView()->viewport()->size();
+        const QPointF centerScene(
+            static_cast<qreal>(std::max(1, viewportSize.width())) * 0.5,
+            static_cast<qreal>(std::max(1, viewportSize.height())) * 0.5);
+        if (const auto sample = viewer->sampleSceneVolume(centerScene)) {
+            if (finiteVec3(sample->position)) {
+                captured.center = sample->position;
+                captured.hasCenter = true;
+            }
+        }
+        snapshot->entries.push_back(std::move(captured));
+    });
+    return snapshot;
+}
+
+void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnapshot>& snapshot,
+                                      const cv::Matx44d& transform)
+{
+    if (!snapshot || !_state || !_state->currentVolume()) {
+        return;
+    }
+
+    const auto navigationScale = relativeAffineDistanceScale(transform);
+    for (const auto& captured : snapshot->entries) {
+        CChunkedVolumeViewer* viewer = captured.viewer.data();
+        if (!viewer || viewer->currentVolume() != _state->currentVolume()) {
+            continue;
+        }
+
+        std::optional<cv::Vec3f> transformedCenter;
+        if (captured.hasCenter) {
+            transformedCenter = transformPoint(captured.center, transform);
+        }
+        if (!transformedCenter) {
+            continue;
+        }
+
+        viewer->centerOnVolumePoint(
+            clampToVolumeBounds(*transformedCenter, _state->currentVolume()),
+            false);
+        auto camera = viewer->cameraState();
+        camera.scale = captured.camera.scale;
+        if (navigationScale) {
+            camera.scale = CChunkedVolumeViewer::clampCameraScale(
+                static_cast<float>(static_cast<double>(captured.camera.scale) / *navigationScale));
+        }
+        camera.zOffset = navigationScale
+            ? static_cast<float>(static_cast<double>(captured.camera.zOffset) *
+                                 *navigationScale)
+            : captured.camera.zOffset;
+        camera.zOffsetWorldDir = captured.camera.zOffsetWorldDir;
+        if (cv::norm(captured.camera.zOffsetWorldDir) > 0.0f) {
+            const auto direction = vc::core::util::transformNormal(
+                captured.camera.zOffsetWorldDir, transform);
+            if (finiteVec3(direction)) {
+                camera.zOffsetWorldDir = direction;
+            }
+        }
+        viewer->applyCameraState(camera, false);
+    }
+}
+
+void ViewerManager::switchVolume(std::shared_ptr<Volume> volume,
+                                 const std::optional<cv::Matx44d>& navigationTransform)
+{
+    if (!_state) {
+        return;
+    }
+    const bool hadVolume = static_cast<bool>(_state->currentVolume());
+
+    std::optional<cv::Vec3f> transformedFocusPoint;
+    std::optional<cv::Vec3f> transformedFocusNormal;
+    std::shared_ptr<ViewerNavigationSnapshot> snapshot;
+    if (navigationTransform) {
+        if (POI* focus = _state->poi("focus"); focus && finiteVec3(focus->p)) {
+            transformedFocusPoint = transformPoint(focus->p, *navigationTransform);
+            if (cv::norm(focus->n) > 0.0f) {
+                const cv::Vec3f normal =
+                    vc::core::util::transformNormal(focus->n, *navigationTransform);
+                if (finiteVec3(normal)) {
+                    transformedFocusNormal = normal;
+                }
+            }
+        }
+        snapshot = captureNavigation();
+    }
+
+    // CState handles cache budget and volume ID resolution, and emits volumeChanged
+    _state->setCurrentVolume(std::move(volume));
+
+    resetFocusForVolumeChange(!hadVolume, transformedFocusPoint, transformedFocusNormal);
+
+    if (snapshot && navigationTransform) {
+        restoreNavigation(snapshot, *navigationTransform);
+    }
 }
 
 void ViewerManager::registerOverlay(ViewerOverlayControllerBase* overlay)
@@ -431,6 +1044,16 @@ void ViewerManager::setOverlayColormap(const std::string& colormapId)
 {
     _overlayColormapId = colormapId;
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayColormap(_overlayColormapId); });
+}
+
+void ViewerManager::setOverlaySamplingMethod(vc::Sampling method)
+{
+    _overlaySamplingMethod = method == vc::Sampling::Trilinear
+        ? vc::Sampling::Trilinear
+        : vc::Sampling::Nearest;
+    forEachBaseViewer([this](VolumeViewerBase* v) {
+        v->setOverlaySamplingMethod(_overlaySamplingMethod);
+    });
 }
 
 void ViewerManager::setOverlayThreshold(float threshold)

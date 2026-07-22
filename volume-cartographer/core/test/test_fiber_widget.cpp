@@ -4,6 +4,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QDoubleSpinBox>
 #include <QHeaderView>
 #include <QLineEdit>
 #include <QMetaObject>
@@ -157,6 +158,59 @@ int main(int argc, char** argv)
                      });
     auto* calcMetrics = widget.findChild<QCheckBox*>(QStringLiteral("fiberCalcMetricsCheckBox"));
     require(calcMetrics != nullptr, "Calc metrics checkbox was not found");
+    auto* showFibers = widget.findChild<QCheckBox*>(QStringLiteral("fiberShowFibersCheckBox"));
+    require(showFibers != nullptr, "Show fibers checkbox was not found");
+    require(!showFibers->isEnabled(), "Show fibers should start disabled");
+    require(!widget.showFibersChecked(), "Show fibers should start unchecked");
+    auto* fiberViewDistance =
+        widget.findChild<QDoubleSpinBox*>(QStringLiteral("fiberViewDistanceSpinBox"));
+    require(fiberViewDistance != nullptr, "Fiber view-distance spinbox was not found");
+    require(widget.fiberViewDistance() == 10.0,
+            "Fiber view distance should default to 10 voxels");
+    int fiberViewDistanceRequests = 0;
+    double requestedFiberViewDistance = 0.0;
+    QObject::connect(&widget,
+                     &CFiberWidget::fiberViewDistanceChanged,
+                     &widget,
+                     [&](double distance) {
+                         ++fiberViewDistanceRequests;
+                         requestedFiberViewDistance = distance;
+                     });
+    widget.setFiberViewDistance(25.0);
+    require(widget.fiberViewDistance() == 25.0,
+            "Programmatic fiber view-distance sync did not update the spinbox");
+    require(fiberViewDistanceRequests == 0,
+            "Programmatic fiber view-distance sync should not emit a request");
+    fiberViewDistance->setValue(30.0);
+    require(fiberViewDistanceRequests == 1 && requestedFiberViewDistance == 30.0,
+            "User fiber view-distance change did not emit the requested distance");
+    int showFiberRequests = 0;
+    bool requestedShowFibers = false;
+    QObject::connect(&widget,
+                     &CFiberWidget::showFibersToggled,
+                     &widget,
+                     [&](bool checked) {
+                         ++showFiberRequests;
+                         requestedShowFibers = checked;
+                     });
+    widget.setShowFibersAvailable(true);
+    require(showFibers->isEnabled(), "Loaded fibers should enable Show fibers");
+    widget.setShowFibersChecked(true);
+    require(widget.showFibersChecked(), "Programmatic Show fibers sync did not update the checkbox");
+    require(showFiberRequests == 0,
+            "Programmatic Show fibers sync should not emit a visibility request");
+    showFibers->setChecked(false);
+    require(showFiberRequests == 1 && !requestedShowFibers,
+            "User Show fibers toggle did not emit the requested state");
+    showFibers->setChecked(true);
+    require(showFiberRequests == 2 && requestedShowFibers,
+            "User Show fibers enable did not emit the requested state");
+    widget.setShowFibersAvailable(false);
+    require(!showFibers->isEnabled(), "Unavailable fibers should disable Show fibers");
+    require(!widget.showFibersChecked(), "Unavailable fibers should reset Show fibers");
+    require(showFiberRequests == 2,
+            "Availability reset should not emit a duplicate visibility request");
+    widget.setShowFibersAvailable(true);
     auto* model = qobject_cast<QStandardItemModel*>(treeView->model());
     require(model != nullptr, "Fiber tree should use a standard item model");
     QMetaObject::invokeMethod(treeView->header(),
