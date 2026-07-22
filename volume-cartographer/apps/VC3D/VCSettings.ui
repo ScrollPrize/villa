@@ -711,6 +711,37 @@
             </property>
            </widget>
           </item>
+          <item row="4" column="0">
+           <widget class="QLabel" name="labelRemoteCacheMaximum">
+            <property name="text">
+             <string>Remote Zarr cache maximum (GiB)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="4" column="1">
+           <widget class="QSpinBox" name="spinRemoteCacheMaximumGiB">
+            <property name="minimum"><number>0</number></property>
+            <property name="maximum"><number>1048576</number></property>
+            <property name="specialValueText"><string>Unlimited</string></property>
+            <property name="suffix"><string> GiB</string></property>
+            <property name="toolTip"><string>Maximum compressed bytes shared by all remote volume and Lasagna Zarr caches in this cache directory. 0 means unlimited. Applied immediately.</string></property>
+           </widget>
+          </item>
+          <item row="5" column="0">
+           <widget class="QLabel" name="labelRemoteCacheMinimumFree">
+            <property name="text">
+             <string>Minimum free disk space (GiB)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="5" column="1">
+           <widget class="QSpinBox" name="spinRemoteCacheMinimumFreeGiB">
+            <property name="minimum"><number>0</number></property>
+            <property name="maximum"><number>1048576</number></property>
+            <property name="suffix"><string> GiB</string></property>
+            <property name="toolTip"><string>Prevent cache growth when writing would cross this free-space reserve. 0 disables the reserve warning. Applied immediately.</string></property>
+           </widget>
+          </item>
           <item row="6" column="0">
            <widget class="QLabel" name="lblIOThreads">
             <property name="text">

@@ -19,6 +19,8 @@
 
 namespace vc::render {
 
+class PersistentZarrCacheBudget;
+
 class ChunkCache final : public IChunkedArray {
 public:
     struct LevelInfo {
@@ -39,6 +41,10 @@ public:
         std::size_t maxConcurrentReads = 16;
         bool detectAllFillChunks = true;
         std::optional<std::filesystem::path> persistentCachePath;
+        // When set to a root registered with PersistentZarrCacheBudget, disk
+        // accounting and eviction are shared with every remote Zarr cache
+        // beneath that root. Unregistered/core-only caches stay unlimited.
+        std::optional<std::filesystem::path> persistentCacheBudgetRoot;
         // Store raw (".bin") persistent-cache chunks zstd-compressed
         // (".zst"). Reading handles both formats regardless of this flag;
         // it only selects the write format. Combined (OR) with the
@@ -65,6 +71,11 @@ public:
         std::size_t persistentCacheBytes = 0;
         bool persistentCacheEnabled = false;
         bool persistentCacheScanInFlight = false;
+        bool persistentCacheTrimInFlight = false;
+        bool persistentCacheLowSpace = false;
+        std::size_t persistentCacheFreeBytes = 0;
+        std::size_t persistentCacheMinimumFreeBytes = 0;
+        std::optional<std::size_t> persistentCacheMaximumBytes;
         std::size_t remoteFetchesInFlight = 0;
         double remoteDownloadBytesPerSecond = 0.0;
         // Monotonic count of capacity enforcements that stayed above the
@@ -187,6 +198,7 @@ private:
         std::atomic<std::int64_t> persistentCacheBytes_{0};
         std::atomic_bool persistentCacheScanInFlight_{false};
         std::atomic_size_t persistentWritesInFlight_{0};
+        std::shared_ptr<PersistentZarrCacheBudget> persistentBudget_;
     };
 
     static ChunkResult resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry);

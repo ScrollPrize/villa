@@ -2,6 +2,14 @@
 """
 AWS S3 Interactive Sync Tool with Conflict Resolution
 
+Transfers run through rclone (parallel, one process per batch) when the rclone
+binary is available, and fall back to serial per-file aws CLI calls otherwise.
+Neither path needs an rclone config file: credentials come from the standard
+AWS credential chain (env vars pasted into the terminal, ~/.aws/credentials,
+or EC2 instance roles). Where possible, the credentials the aws CLI resolved
+are handed to rclone as static env vars (via `aws configure export-credentials`)
+so both tools use the same identity and rclone never resolves its own.
+
 Automatically ignores:
 - Hidden files and directories (starting with .)
 - Any directory containing 'layers' in its name (e.g., layers/, layers_fullres/, old_layers/)
@@ -9,24 +17,51 @@ Automatically ignores:
 - Files matching backup patterns (see BACKUP_PATTERNS)
 - Directories named 'backups' (unless --sync-backups is specified)
 
+Change detection compares file size and mtime locally (1-second tolerance)
+and size + ETag on S3, so a local edit that preserves both size and mtime is
+invisible until the file changes again.
+
+'update' refreshes tracking non-destructively (records files already in sync,
+prunes entries for files gone from both sides) and never hides a pending
+difference. 'reset' stamps the current state as the synced baseline, which
+discards pending differences — it asks for confirmation.
+
 Usage:
     python s3_sync.py init <directory> <s3_bucket> <s3_prefix> [--profile=<aws_profile>]
     python s3_sync.py status <directory> [--verbose] [--sync-backups]
     python s3_sync.py sync <directory> [--dry-run] [--sync-backups]
     python s3_sync.py update <directory> [--sync-backups]
     python s3_sync.py reset <directory> [--sync-backups]
+    python s3_sync.py hfsync <directory> [--dry-run]
+
+Hugging Face sync (hfsync):
+    Pushes fiber JSONs carrying a given tag to a Hugging Face storage bucket.
+    Opt-in per directory: it only runs where a .hfsync.json exists next to the
+    data (the file is never synced to S3 and should not be committed anywhere):
+
+        {
+          "hf_bucket_path": "hf://buckets/<org>/<bucket>/<path>",
+          "hf_cli": "/path/to/hf",          # optional, defaults to hf on PATH
+          "tag": "reviewed"                 # optional, defaults to "reviewed"
+        }
+
+    Authentication uses the token stored by `hf auth login`; no credentials
+    are read from or written to this script or its config. Upload is additive
+    and skips unchanged files; a remote file is only removed when the same
+    filename exists locally WITHOUT the tag. Files that exist only remotely
+    are never touched.
 """
 
 import os
 import sys
 import json
-import csv
-import tempfile
+import shlex
+import shutil
 import sqlite3
 import argparse
+import tempfile
 import subprocess
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime
 from enum import Enum
 from contextlib import contextmanager
 
@@ -39,11 +74,6 @@ BACKUP_PATTERNS = [
     '_bak',
     '.bak',
 ]
-
-# Report configuration
-REPORT_S3_BUCKET = "philodemos"
-REPORT_S3_PREFIX = "david/reports"
-
 
 class SyncAction(Enum):
     UPLOAD = "upload"
@@ -59,7 +89,33 @@ def is_backup_file(filename):
     return any(pattern in filename.lower() for pattern in BACKUP_PATTERNS)
 
 
+def prompt_choice(message, choices):
+    """Prompt until the user enters one of `choices`; EOF (Ctrl-D) returns None"""
+    while True:
+        try:
+            response = input(message).strip().lower()
+        except EOFError:
+            print()
+            return None
+        if response in choices:
+            return response
+        print(f"Invalid choice. Please enter one of: {', '.join(choices)}.")
+
+
+def confirm(message):
+    """[y/N]-style confirmation; anything but 'y' (including EOF) is no"""
+    try:
+        return input(message).strip().lower() == 'y'
+    except EOFError:
+        print()
+        return False
+
+
 class S3SyncManager:
+    # Parallel transfer settings for the rclone fast path
+    RCLONE_TRANSFERS = 16
+    RCLONE_CHECKERS = 32
+
     def __init__(self, local_dir, s3_bucket=None, s3_prefix=None,
                  aws_profile=None):
         self.local_dir = os.path.abspath(local_dir)
@@ -83,6 +139,37 @@ class S3SyncManager:
 
         # Initialize database
         self._init_db()
+
+        self.use_rclone = self._detect_rclone()
+
+    def _detect_rclone(self):
+        """Use rclone only if the binary exists AND can read the sync directory.
+
+        Sandboxed installs (e.g. the Ubuntu snap) may lack access to some
+        paths — a snap without the removable-media interface cannot read
+        /media, for instance. Probing the actual sync dir catches that.
+
+        Sets self.rclone_unavailable_reason when returning False.
+        """
+        self.rclone_unavailable_reason = None
+
+        if not shutil.which('rclone'):
+            self.rclone_unavailable_reason = "rclone binary not found on PATH"
+            return False
+
+        result = subprocess.run(
+            ['rclone', 'lsf', self.local_dir, '--max-depth', '1'],
+            capture_output=True, text=True)
+        if result.returncode != 0:
+            detail_lines = (result.stderr or '').strip().splitlines()
+            detail = detail_lines[-1] if detail_lines else "unknown error"
+            self.rclone_unavailable_reason = (
+                f"rclone cannot read {self.local_dir} "
+                f"(sandboxed install? a snap needs its home/removable-media "
+                f"interfaces connected): {detail}")
+            return False
+
+        return True
 
     def _load_config(self):
         """Load configuration from JSON file"""
@@ -121,8 +208,9 @@ class S3SyncManager:
                      )
                      ''')
 
-        # Create index for faster lookups
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_path ON files(path)')
+        # path is the PRIMARY KEY and therefore already indexed; drop the
+        # redundant secondary index older versions of this script created
+        conn.execute('DROP INDEX IF EXISTS idx_path')
         conn.commit()
         conn.close()
 
@@ -131,14 +219,40 @@ class S3SyncManager:
         """Context manager for database connections"""
         conn = sqlite3.connect(self.db_file)
         conn.row_factory = sqlite3.Row
-        yield conn
-        conn.commit()
-        conn.close()
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            # Roll back explicitly (and loudly, via re-raise) so an interrupted
+            # transaction can't silently discard a whole tracking update
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _track_file(conn, path, local_info, s3_info):
+        """Record a file's synced state (the single writer for tracking rows).
+
+        local_info needs 'local_size'/'local_mtime', s3_info needs
+        's3_size'/'s3_mtime' (+ optional 's3_etag'); either may be None for a
+        file that only exists on one side.
+        """
+        conn.execute('''
+            INSERT OR REPLACE INTO files
+            (path, local_size, local_mtime, s3_size, s3_mtime, s3_etag)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (path,
+              local_info['local_size'] if local_info else None,
+              local_info['local_mtime'] if local_info else None,
+              s3_info['s3_size'] if s3_info else None,
+              s3_info['s3_mtime'] if s3_info else None,
+              s3_info.get('s3_etag') if s3_info else None))
 
     def _run_aws_command(self, cmd):
         """Run AWS CLI command with optional profile and better error handling"""
         if self.aws_profile:
-            cmd.extend(['--profile', self.aws_profile])
+            cmd = cmd + ['--profile', self.aws_profile]
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -179,32 +293,45 @@ class S3SyncManager:
             except OSError:
                 break
 
+    @staticmethod
+    def _is_ignored(relative_path, include_backups=False):
+        """Shared ignore rules for local and S3 scans (POSIX-style path).
+
+        Both scans MUST agree on these rules: transfer verification compares
+        upload/delete candidates against a fresh S3 listing, so a file one
+        scan sees and the other skips would never verify.
+        """
+        parts = relative_path.split('/')
+        filename = parts[-1]
+
+        if filename.startswith('.') or filename.endswith('.obj'):
+            return True
+
+        for part in parts[:-1]:
+            if part.startswith('.') or 'layers' in part.lower():
+                return True
+            if not include_backups and part == 'backups':
+                return True
+
+        return False
+
     def scan_local_files(self, include_backups=False):
         """Scan local directory for files"""
         print(f"Scanning local directory: {self.local_dir}")
         files = {}
 
         for root, dirs, filenames in os.walk(self.local_dir):
-            # Skip hidden directories, directories containing 'layers', and backups (unless requested)
+            # Prune ignored directories early so huge layers/ trees aren't walked;
+            # _is_ignored below stays the authority on what counts as ignored
             dirs[:] = [d for d in dirs if not d.startswith('.') and
                        'layers' not in d.lower() and
                        (include_backups or d != 'backups')]
 
             for filename in filenames:
-                # Skip hidden files, sync config, and database
-                if filename.startswith('.') or filename in ['.s3sync.json', '.s3sync.db'] or filename.endswith('.obj'):
-                    continue
-
                 filepath = os.path.join(root, filename)
-                relative_path = os.path.relpath(filepath, self.local_dir)
+                relative_path = os.path.relpath(filepath, self.local_dir).replace(os.sep, '/')
 
-                # Skip files in directories containing 'layers'
-                path_parts = relative_path.split(os.sep)
-                if any('layers' in part.lower() for part in path_parts[:-1]):
-                    continue
-
-                # Skip files in backups directories unless explicitly requested
-                if not include_backups and 'backups' in path_parts[:-1]:
+                if self._is_ignored(relative_path, include_backups):
                     continue
 
                 stat = os.stat(filepath)
@@ -225,11 +352,14 @@ class S3SyncManager:
         continuation_token = None
         page_count = 0
 
+        # Trailing slash keeps sibling prefixes (e.g. "<prefix>_old") out of the listing
+        list_prefix = f"{self.s3_prefix}/" if self.s3_prefix else ""
+
         while True:
             cmd = [
                 'aws', 's3api', 'list-objects-v2',
                 '--bucket', self.s3_bucket,
-                '--prefix', self.s3_prefix
+                '--prefix', list_prefix
             ]
 
             if continuation_token:
@@ -248,29 +378,14 @@ class S3SyncManager:
                     print("No files found in S3")
                 break
 
-            prefix_len = len(self.s3_prefix) + 1 if self.s3_prefix else 0
-
             for obj in data['Contents']:
                 # Skip if it's just the prefix itself
-                if obj['Key'] == self.s3_prefix + '/':
+                if obj['Key'] == list_prefix:
                     continue
 
-                relative_path = obj['Key'][prefix_len:]
+                relative_path = obj['Key'][len(list_prefix):]
 
-                # Skip hidden files
-                filename = os.path.basename(relative_path)
-                if filename.startswith('.') or filename.endswith('.obj'):
-                    continue
-
-                # Skip files in hidden directories or directories containing 'layers'
-                path_parts = relative_path.split('/')
-                if any(part.startswith('.') for part in path_parts[:-1]):
-                    continue
-                if any('layers' in part.lower() for part in path_parts[:-1]):
-                    continue
-
-                # Skip backups directories unless explicitly requested
-                if not include_backups and 'backups' in path_parts[:-1]:
+                if self._is_ignored(relative_path, include_backups):
                     continue
 
                 files[relative_path] = {
@@ -278,7 +393,7 @@ class S3SyncManager:
                     's3_size': obj['Size'],
                     's3_mtime': self._parse_timestamp(obj['LastModified']),
                     's3_etag': obj.get('ETag', '').strip('"'),
-                    'is_backup': is_backup_file(filename)
+                    'is_backup': is_backup_file(os.path.basename(relative_path))
                 }
 
             page_count += 1
@@ -296,257 +411,68 @@ class S3SyncManager:
         print(f"Found {len(files)} S3 files")
         return files
 
-    def _get_report_csv_path(self, suffix=""):
-        """Return the S3 URL and filename for the report based on the volume package name"""
-        pkg_name = Path(self.local_dir).resolve().parent.name
-        if pkg_name.endswith(".volpkg"):
-            pkg_name = pkg_name[:-7]
-        filename = f"{pkg_name}{suffix}.csv"
-        return f"s3://{REPORT_S3_BUCKET}/{REPORT_S3_PREFIX}/{filename}", filename
+    def _prune_stale_tracking(self, current_paths, include_backups=False):
+        """Drop tracking rows for paths that no longer exist locally or on S3.
 
-    def _get_segment_name(self, root, meta_data):
-        """Resolve segment name from meta.json contents or directory name"""
-        return meta_data.get('uuid', os.path.basename(root))
+        Rows that are invisible to this run's scans only because backups/
+        directories were excluded are left alone — the scans carry no
+        information about them. Rows for permanently ignored paths (hidden,
+        layers, .obj) are still pruned.
+        """
+        def invisible_backup(path):
+            return (not include_backups and
+                    self._is_ignored(path) and
+                    not self._is_ignored(path, include_backups=True))
 
-    def _get_volume_voxel_size(self):
-        """Find voxel size from volumes/*/meta.json"""
-        volumes_dir = Path(self.local_dir).resolve().parent / "volumes"
-        if not volumes_dir.exists():
-            return None
+        with self._get_db() as conn:
+            cursor = conn.execute('SELECT path FROM files')
+            stale = [row['path'] for row in cursor
+                     if row['path'] not in current_paths
+                     and not invisible_backup(row['path'])]
+            for path in stale:
+                conn.execute('DELETE FROM files WHERE path = ?', (path,))
 
-        for root, dirs, filenames in os.walk(volumes_dir):
-            if 'meta.json' not in filenames:
-                continue
-            meta_path = os.path.join(root, 'meta.json')
-            try:
-                with open(meta_path, 'r') as f:
-                    meta_data = json.load(f)
-                voxel_size = meta_data.get('voxelsize')
-            except (json.JSONDecodeError, OSError):
-                continue
+        if stale:
+            print(f"Pruned {len(stale)} tracking entries for files that no longer exist anywhere")
+        return len(stale)
 
-            if isinstance(voxel_size, (list, tuple)) and voxel_size:
-                voxel_size = voxel_size[0]
+    def refresh_tracking(self, include_backups=False):
+        """Non-destructive tracking refresh (the 'update' command).
 
-            try:
-                return float(voxel_size)
-            except (TypeError, ValueError):
-                continue
-
-        return None
-
-    def _count_non_black_pixels(self, image_path):
-        """Count non-black pixels in an image file"""
-        try:
-            from PIL import Image
-        except ImportError:
-            print("  Warning: Pillow is required to read approval.tif files")
-            return None
-
-        try:
-            with Image.open(image_path) as img:
-                data = img.getdata()
-                if img.mode in ("1", "L", "I", "I;16", "F"):
-                    return sum(1 for p in data if p != 0)
-
-                count = 0
-                for p in data:
-                    if isinstance(p, int):
-                        if p != 0:
-                            count += 1
-                    else:
-                        if any(channel != 0 for channel in p[:3]):
-                            count += 1
-                return count
-        except Exception as e:
-            print(f"  Warning: Could not read {image_path}: {e}")
-            return None
-
-    def _collect_segment_areas(self):
-        """Collect segment names and area_cm2 values from meta.json files"""
-        segments = {}
-        for root, dirs, filenames in os.walk(self.local_dir):
-            dirs[:] = [d for d in dirs if not d.startswith('.') and 'layers' not in d.lower() and d != 'backups']
-            if 'meta.json' in filenames:
-                meta_path = os.path.join(root, 'meta.json')
-                try:
-                    with open(meta_path, 'r') as f:
-                        meta_data = json.load(f)
-                    segment_name = self._get_segment_name(root, meta_data)
-                    area_cm2 = meta_data.get('area_cm2', 0.0)
-                    segments[segment_name] = area_cm2
-                except (json.JSONDecodeError, OSError) as e:
-                    print(f"  Warning: Could not read {meta_path}: {e}")
-                    continue
-        return segments
-
-    def _collect_approval_areas(self):
-        """Collect segment names and approval areas from approval.tif files"""
-        voxel_size = self._get_volume_voxel_size()
-        if voxel_size is None:
-            return {}
-        pixel_area = (20 * voxel_size / 10000) ** 2
-
-        segments = {}
-        for root, dirs, filenames in os.walk(self.local_dir):
-            dirs[:] = [d for d in dirs if not d.startswith('.') and 'layers' not in d.lower() and d != 'backups']
-            if 'meta.json' in filenames:
-                meta_path = os.path.join(root, 'meta.json')
-                try:
-                    with open(meta_path, 'r') as f:
-                        meta_data = json.load(f)
-                    segment_name = self._get_segment_name(root, meta_data)
-                except (json.JSONDecodeError, OSError) as e:
-                    print(f"  Warning: Could not read {meta_path}: {e}")
-                    continue
-
-                approval_path = os.path.join(root, 'approval.tif')
-                if os.path.exists(approval_path):
-                    pixel_count = self._count_non_black_pixels(approval_path)
-                    if pixel_count is None:
-                        continue
-                    segments[segment_name] = pixel_count * pixel_area
-                else:
-                    segments[segment_name] = 0.0
-
-        return segments
-
-    def _generate_report(self, current_segments, report_suffix):
-        """Generate or update a CSV report and upload to S3"""
-        s3_csv_path, report_filename = self._get_report_csv_path(report_suffix)
-        current_datetime = datetime.now().strftime("%Y%m%d%H%M%S")
-
-        if not current_segments:
-            return False
-
-        existing_data = {}
-        existing_datetimes = []
-
-        # Try to download existing CSV
-        download_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-        download_tmp_path = download_tmp.name
-        download_tmp.close()
-
-        try:
-            cmd = ['aws', 's3', 'cp', s3_csv_path, download_tmp_path]
-            if self.aws_profile:
-                cmd.extend(['--profile', self.aws_profile])
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-            with open(download_tmp_path, 'r', newline='') as f:
-                reader = csv.reader(f)
-                rows = list(reader)
-
-            if rows:
-                existing_datetimes = rows[0][1:] if len(rows[0]) > 1 else []
-                for row in rows[1:]:
-                    if not row:
-                        continue
-                    segment_name = row[0]
-                    values = [float(val) if val else 0.0 for val in row[1:]]
-                    # Pad to header length if necessary
-                    if len(values) < len(existing_datetimes):
-                        values.extend([0.0] * (len(existing_datetimes) - len(values)))
-                    existing_data[segment_name] = values
-
-                pass
-        except subprocess.CalledProcessError:
-            pass
-        except Exception:
-            pass
-        finally:
-            try:
-                os.unlink(download_tmp_path)
-            except OSError:
-                pass
-
-        # Only include segments that currently exist (remove deleted segments)
-        all_segments = set(current_segments.keys())
-        header_row = ["Segment Name"] + existing_datetimes + [current_datetime]
-        csv_rows = [header_row]
-
-        for segment_name in sorted(all_segments):
-            row = [segment_name]
-            previous_values = existing_data.get(segment_name, [0.0] * len(existing_datetimes))
-            if len(previous_values) < len(existing_datetimes):
-                previous_values.extend([0.0] * (len(existing_datetimes) - len(previous_values)))
-            row.extend(previous_values)
-            row.append(current_segments.get(segment_name, 0.0))
-            csv_rows.append(row)
-
-        # Write new CSV
-        upload_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-        upload_tmp_path = upload_tmp.name
-        try:
-            with open(upload_tmp_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerows(csv_rows)
-
-            cmd = ['aws', 's3', 'cp', upload_tmp_path, s3_csv_path]
-            if self.aws_profile:
-                cmd.extend(['--profile', self.aws_profile])
-            subprocess.run(cmd, check=True, capture_output=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            return False
-        finally:
-            try:
-                os.unlink(upload_tmp_path)
-            except OSError:
-                pass
-
-    def generate_segment_report(self):
-        """Generate or update the segment area CSV report and upload to S3"""
-        print("\nGenerating reports...")
-        current_segments = self._collect_segment_areas()
-        segment_ok = self._generate_report(current_segments, "")
-
-        approval_segments = self._collect_approval_areas()
-        approval_ok = self._generate_report(approval_segments, "_approval")
-
-        if segment_ok and approval_ok:
-            print("✓ Reports uploaded")
-        else:
-            print("✗ At least one report failed")
-
-    def update_files(self, include_backups=False):
-        """Update file tracking with current state"""
-        print("\nUpdating file tracking...")
+        Records files that are already identical on both sides and prunes
+        entries for files gone from both. Tracking for files with pending
+        differences is left untouched, so 'sync' still proposes them.
+        """
+        print("\nRefreshing file tracking...")
 
         local_files = self.scan_local_files(include_backups)
         s3_files = self.scan_s3_files(include_backups)
 
+        self._record_untracked_synced(local_files, s3_files)
+        self._prune_stale_tracking(set(local_files) | set(s3_files), include_backups)
+
+        print("File tracking refreshed")
+
+    def reset_tracking(self, include_backups=False):
+        """Stamp the current local and S3 state as the synced baseline.
+
+        Destructive: files that currently differ between local and S3 are
+        recorded as in sync, so their pending differences will never be
+        proposed. The 'reset' command confirms before calling this.
+        """
+        print("\nResetting file tracking...")
+
+        local_files = self.scan_local_files(include_backups)
+        s3_files = self.scan_s3_files(include_backups)
+        current_paths = set(local_files) | set(s3_files)
+
         with self._get_db() as conn:
-            # Get all tracked paths
-            cursor = conn.execute('SELECT path FROM files')
-            tracked_paths = set(row['path'] for row in cursor)
-
-            # Get all current paths
-            current_paths = set(local_files.keys()) | set(s3_files.keys())
-
-            # Update or insert files
             for path in current_paths:
-                local_info = local_files.get(path)
-                s3_info = s3_files.get(path)
+                self._track_file(conn, path, local_files.get(path), s3_files.get(path))
 
-                conn.execute('''
-                    INSERT OR REPLACE INTO files 
-                    (path, local_size, local_mtime, s3_size, s3_mtime, s3_etag)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (
-                    path,
-                    local_info['local_size'] if local_info else None,
-                    local_info['local_mtime'] if local_info else None,
-                    s3_info['s3_size'] if s3_info else None,
-                    s3_info['s3_mtime'] if s3_info else None,
-                    s3_info.get('s3_etag') if s3_info else None
-                ))
+        self._prune_stale_tracking(current_paths, include_backups)
 
-            # Remove files that no longer exist anywhere
-            for path in tracked_paths - current_paths:
-                conn.execute('DELETE FROM files WHERE path = ?', (path,))
-
-        print("File tracking updated successfully")
+        print("File tracking reset")
 
     def analyze_changes(self, local_files, s3_files):
         """Analyze what needs to be synced and detect conflicts"""
@@ -634,6 +560,31 @@ class S3SyncManager:
 
         return actions
 
+    def _record_untracked_synced(self, local_files, s3_files):
+        """Record tracking for size-matched files that have no sync history.
+
+        Without a tracking row, a file later deleted locally looks like a new
+        S3 file and gets re-downloaded instead of proposed for remote
+        deletion. This self-heals tracking lost to an interrupted init/update.
+        """
+        with self._get_db() as conn:
+            cursor = conn.execute('SELECT path FROM files')
+            tracked = {row['path'] for row in cursor}
+
+            # Backup-pattern files are excluded: they are upload-only, and
+            # analyze_changes deliberately re-uploads them when untracked
+            # (even on a size match). The upload itself records tracking.
+            healed = [path for path in local_files.keys() & s3_files.keys()
+                      if path not in tracked and
+                      not local_files[path].get('is_backup') and
+                      local_files[path]['local_size'] == s3_files[path]['s3_size']]
+
+            for path in healed:
+                self._track_file(conn, path, local_files[path], s3_files[path])
+
+        if healed:
+            print(f"Recorded {len(healed)} in-sync file(s) that had no tracking history")
+
     def resolve_conflict(self, path, reason, local_info, s3_info):
         """Interactively resolve a conflict"""
         print(f"\n⚠️  CONFLICT: {path}")
@@ -648,16 +599,11 @@ class S3SyncManager:
             if "both" in reason.lower():
                 print("  ⚠️  Both files have been modified since last sync!")
 
-            while True:
-                response = input("\nChoose: [l]ocal → remote, [r]emote → local, [s]kip? ").strip().lower()
-                if response == 'l':
-                    return SyncAction.UPLOAD
-                elif response == 'r':
-                    return SyncAction.DOWNLOAD
-                elif response == 's':
-                    return SyncAction.SKIP
-                else:
-                    print("Invalid choice. Please enter 'l', 'r', or 's'.")
+            response = prompt_choice(
+                "\nChoose: [l]ocal → remote, [r]emote → local, [s]kip? ",
+                ('l', 'r', 's'))
+            return {'l': SyncAction.UPLOAD,
+                    'r': SyncAction.DOWNLOAD}.get(response, SyncAction.SKIP)
 
         return SyncAction.SKIP
 
@@ -666,10 +612,19 @@ class S3SyncManager:
         local_path = os.path.join(self.local_dir, path)
         s3_path = self._get_s3_url(path)
 
+        # Re-stat immediately before upload: interactive prompts can leave a long
+        # window between scan and upload, during which the file may have changed
+        pre_stat = os.stat(local_path)
+
         print(f"  Uploading: {path} → remote")
 
         cmd = ['aws', 's3', 'cp', local_path, s3_path]
         self._run_aws_command(cmd)
+
+        post_stat = os.stat(local_path)
+        if (post_stat.st_size, post_stat.st_mtime) != (pre_stat.st_size, pre_stat.st_mtime):
+            print(f"  ⚠️  {path} changed while it was being uploaded; "
+                  f"the S3 copy may be incomplete and will be re-uploaded on next sync")
 
         print(f"  ✓ Uploaded: {path}")
 
@@ -679,23 +634,19 @@ class S3SyncManager:
         result = self._run_aws_command(cmd)
 
         data = json.loads(result.stdout)
-        s3_mtime = self._parse_timestamp(data['LastModified'])
-        s3_etag = data.get('ETag', '').strip('"')
+        s3_info = {
+            's3_size': data['ContentLength'],
+            's3_mtime': self._parse_timestamp(data['LastModified']),
+            's3_etag': data.get('ETag', '').strip('"'),
+        }
 
-        # Update database with actual local file info
+        # Track the pre-upload stats: if the file changed during upload, the next
+        # scan will see a local difference and schedule a re-upload
         with self._get_db() as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO files 
-                (path, local_size, local_mtime, s3_size, s3_mtime, s3_etag)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                path,
-                local_files[path]['local_size'],
-                local_files[path]['local_mtime'],
-                local_files[path]['local_size'],
-                s3_mtime,
-                s3_etag
-            ))
+            self._track_file(conn, path,
+                             {'local_size': pre_stat.st_size,
+                              'local_mtime': pre_stat.st_mtime},
+                             s3_info)
 
         return True
 
@@ -714,25 +665,13 @@ class S3SyncManager:
 
         print(f"  ✓ Downloaded: {path}")
 
-        # Get the actual mtime of the downloaded file
+        # Update database with the downloaded file's actual stats
         stat = os.stat(local_path)
-        actual_local_mtime = stat.st_mtime
-        actual_local_size = stat.st_size
-
-        # Update database with actual file stats
         with self._get_db() as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO files 
-                (path, local_size, local_mtime, s3_size, s3_mtime, s3_etag)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                path,
-                actual_local_size,
-                actual_local_mtime,  # Use actual mtime from filesystem
-                s3_files[path]['s3_size'],
-                s3_files[path]['s3_mtime'],
-                s3_files[path].get('s3_etag')
-            ))
+            self._track_file(conn, path,
+                             {'local_size': stat.st_size,
+                              'local_mtime': stat.st_mtime},
+                             s3_files[path])
 
         return True
 
@@ -770,6 +709,287 @@ class S3SyncManager:
 
         return True
 
+    def _rclone_remote(self):
+        """On-the-fly rclone remote for the S3 target (no rclone.conf needed).
+
+        env_auth=true uses the standard AWS credential chain, so this works
+        both with credentials pasted into the terminal (env vars) and with
+        EC2 instance roles — same sources as the aws CLI.
+
+        no_head=true skips rclone's post-upload verification HEAD. On a
+        versioned bucket that HEAD targets the new object's versionId, which
+        needs the s3:GetObjectVersion permission — credentials without it
+        (but with Get/Put/List) see every upload 403 on rclone's first
+        attempt even though the PUT itself succeeded. The batch methods below
+        verify every upload themselves against fresh S3 metadata, so
+        rclone's HEAD is redundant here.
+        """
+        return (f":s3,provider=AWS,env_auth=true,no_check_bucket=true,"
+                f"no_head=true:{self.s3_bucket}/{self.s3_prefix}")
+
+    def _rclone_env(self):
+        """Environment for rclone subprocesses, mirroring aws CLI credential/region config.
+
+        When the aws CLI can export the credentials it resolved (cached SSO /
+        assume-role sessions, instance-role creds from IMDS, pasted env vars),
+        they are injected as static env vars so rclone uses the exact identity
+        the scan phase just used. rclone resolving credentials on its own is a
+        known source of transient 403s (flaky IMDS fetches, fresh-token
+        propagation races) and hard failures (SSO profiles on older rclone).
+        """
+        env = os.environ.copy()
+        if self.aws_profile:
+            env['AWS_PROFILE'] = self.aws_profile
+
+        creds = self._export_aws_credentials()
+        if creds:
+            # Drop any stale session token so it can't be combined with the
+            # exported key pair (long-lived keys export no session token)
+            env.pop('AWS_SESSION_TOKEN', None)
+            env.update(creds)
+
+        # State the credential mode once per process: essential when
+        # debugging 403s from machines we can't see
+        if not getattr(self, '_creds_mode_printed', False):
+            self._creds_mode_printed = True
+            if creds:
+                print("  rclone credentials: injected from aws CLI")
+            else:
+                print("  rclone credentials: resolving independently "
+                      "(aws CLI could not export them)")
+
+        region = env.get('AWS_REGION') or env.get('AWS_DEFAULT_REGION')
+        if region:
+            env.setdefault('RCLONE_S3_REGION', region)
+        return env
+
+    def _export_aws_credentials(self):
+        """Credentials as resolved by the aws CLI, as env vars for rclone.
+
+        Returns {} when `aws configure export-credentials` is unavailable
+        (aws CLI v1 / old v2) or fails for any reason; rclone then resolves
+        credentials itself via env_auth, exactly as before.
+        """
+        cmd = ['aws', 'configure', 'export-credentials', '--format', 'env-no-export']
+        if self.aws_profile:
+            cmd += ['--profile', self.aws_profile]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        if result.returncode != 0:
+            return {}
+
+        wanted = ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN')
+        creds = {}
+        for line in result.stdout.splitlines():
+            key, sep, value = line.strip().partition('=')
+            if sep and key in wanted and value:
+                creds[key] = value
+
+        # A partial key pair must not shadow rclone's own resolution
+        if 'AWS_ACCESS_KEY_ID' not in creds or 'AWS_SECRET_ACCESS_KEY' not in creds:
+            return {}
+        return creds
+
+    def _run_rclone(self, args, paths):
+        """Run one rclone command over a --files-from list of relative paths"""
+        # The list file lives inside the sync dir (hidden, so scans skip it):
+        # sandboxed rclone installs (e.g. snap) often cannot read /tmp, but
+        # must be able to read the sync dir for transfers to work at all
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False,
+                                         dir=self.local_dir, prefix='.s3sync-files-') as f:
+            f.write('\n'.join(paths) + '\n')
+            list_path = f.name
+
+        cmd = ['rclone'] + args + [
+            '--files-from', list_path,
+            '--transfers', str(self.RCLONE_TRANSFERS),
+            '--checkers', str(self.RCLONE_CHECKERS),
+            '--stats-one-line', '--stats', '15s',
+        ]
+
+        # Debugging escape hatch, e.g. to capture which HTTP request a 403
+        # comes from: VC_SYNC_RCLONE_FLAGS='-vv --dump headers' (rclone
+        # redacts the Authorization header in dumps)
+        extra_flags = os.environ.get('VC_SYNC_RCLONE_FLAGS')
+        if extra_flags:
+            cmd += shlex.split(extra_flags)
+
+        try:
+            result = subprocess.run(cmd, env=self._rclone_env())
+            return result.returncode == 0
+        finally:
+            try:
+                os.unlink(list_path)
+            except OSError:
+                pass
+
+    # Verify batches up to this size with per-file head-object calls; larger
+    # batches use one full prefix listing instead
+    VERIFY_HEAD_MAX = 8
+
+    def _fetch_s3_info(self, paths, include_backups=False):
+        """Fresh S3 metadata for the given paths, for post-transfer verification.
+
+        Returns {path: s3_info} containing only paths that exist remotely.
+        Small batches use per-file head-object calls (cheaper than listing a
+        large prefix); anything bigger reuses the full listing scan. Errors
+        other than a clean 404 keep the path in the result with unknown size,
+        so callers treat it conservatively (upload unverified / delete not
+        confirmed) rather than concluding the file is gone.
+        """
+        if len(paths) > self.VERIFY_HEAD_MAX:
+            print("  Verifying against a fresh S3 listing...")
+            return self.scan_s3_files(include_backups)
+
+        print(f"  Verifying {len(paths)} file(s) against S3...")
+        info = {}
+        for path in paths:
+            cmd = ['aws', 's3api', 'head-object', '--bucket', self.s3_bucket,
+                   '--key', f"{self.s3_prefix}/{path}"]
+            if self.aws_profile:
+                cmd += ['--profile', self.aws_profile]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                if '404' in (result.stderr or ''):
+                    continue  # confirmed absent
+                print(f"  ⚠️  Could not verify {path}: {(result.stderr or '').strip()}")
+                info[path] = {'path': path, 's3_size': None, 's3_mtime': None}
+                continue
+
+            data = json.loads(result.stdout)
+            info[path] = {
+                'path': path,
+                's3_size': data['ContentLength'],
+                's3_mtime': self._parse_timestamp(data['LastModified']),
+                's3_etag': data.get('ETag', '').strip('"'),
+            }
+        return info
+
+    def perform_uploads_batch(self, paths, include_backups=False):
+        """Upload files to S3 in one parallel rclone run and update tracking"""
+        if not paths:
+            return 0
+
+        # Stat immediately before the transfer so mid-upload changes are detectable
+        pre_stats = {}
+        for path in paths:
+            try:
+                stat = os.stat(os.path.join(self.local_dir, path))
+                pre_stats[path] = (stat.st_size, stat.st_mtime)
+            except OSError as e:
+                print(f"  ❌ Cannot read {path}: {e}")
+
+        if not pre_stats:
+            return 0
+
+        print(f"  Uploading {len(pre_stats)} files ({self.RCLONE_TRANSFERS} parallel transfers)...")
+        ok = self._run_rclone(['copy', self.local_dir, self._rclone_remote()],
+                              list(pre_stats))
+        if not ok:
+            # Don't advance tracking on a partial failure: a same-size stale
+            # remote object would pass the size check below and the file would
+            # then be recorded as in sync, permanently skipping the re-upload.
+            # Leaving tracking unchanged re-schedules every file next sync;
+            # rclone skips the ones that did transfer, so the retry is cheap.
+            print(f"  ❌ rclone reported errors during upload; tracking left "
+                  f"unchanged for all {len(pre_stats)} files, will retry on next sync")
+            return 0
+
+        for path, (size, mtime) in pre_stats.items():
+            try:
+                stat = os.stat(os.path.join(self.local_dir, path))
+                if (stat.st_size, stat.st_mtime) != (size, mtime):
+                    print(f"  ⚠️  {path} changed while it was being uploaded; "
+                          f"the S3 copy may be incomplete and will be re-uploaded on next sync")
+            except OSError:
+                print(f"  ⚠️  {path} disappeared during upload")
+
+        fresh_s3 = self._fetch_s3_info(list(pre_stats), include_backups)
+
+        success_count = 0
+        with self._get_db() as conn:
+            for path, (size, mtime) in pre_stats.items():
+                s3_info = fresh_s3.get(path)
+                if not s3_info or s3_info['s3_size'] != size:
+                    print(f"  ❌ Upload not verified for {path}; will retry on next sync")
+                    continue
+                self._track_file(conn, path,
+                                 {'local_size': size, 'local_mtime': mtime},
+                                 s3_info)
+                success_count += 1
+
+        print(f"  ✓ Uploaded {success_count}/{len(paths)} files")
+        return success_count
+
+    def perform_downloads_batch(self, paths, s3_files):
+        """Download files from S3 in one parallel rclone run and update tracking"""
+        if not paths:
+            return 0
+
+        print(f"  Downloading {len(paths)} files ({self.RCLONE_TRANSFERS} parallel transfers)...")
+        ok = self._run_rclone(['copy', self._rclone_remote(), self.local_dir], paths)
+        if not ok:
+            # Mirror of the upload case: a same-size stale local file would
+            # pass the size check and be recorded as in sync with the new
+            # remote ETag, permanently skipping the re-download
+            print(f"  ❌ rclone reported errors during download; tracking left "
+                  f"unchanged for all {len(paths)} files, will retry on next sync")
+            return 0
+
+        success_count = 0
+        with self._get_db() as conn:
+            for path in paths:
+                local_path = os.path.join(self.local_dir, path)
+                try:
+                    stat = os.stat(local_path)
+                except OSError:
+                    print(f"  ❌ Download not verified for {path}; will retry on next sync")
+                    continue
+                if stat.st_size != s3_files[path]['s3_size']:
+                    print(f"  ❌ Size mismatch for {path}; will retry on next sync")
+                    continue
+                self._track_file(conn, path,
+                                 {'local_size': stat.st_size,
+                                  'local_mtime': stat.st_mtime},
+                                 s3_files[path])
+                success_count += 1
+
+        print(f"  ✓ Downloaded {success_count}/{len(paths)} files")
+        return success_count
+
+    def perform_deletes_remote_batch(self, paths, include_backups=False):
+        """Delete files from S3 in one rclone run and update tracking"""
+        if not paths:
+            return 0
+
+        print(f"  Deleting {len(paths)} files from S3...")
+        ok = self._run_rclone(['delete', self._rclone_remote()], paths)
+        if not ok:
+            print("  ⚠️  rclone reported errors during deletion; verifying what was deleted")
+
+        # rclone delete exits 0 even when --files-from matched nothing on the
+        # remote, so the exit code alone can't confirm deletion. Verify against
+        # fresh S3 metadata and only drop tracking for files that are actually
+        # gone — a cleared row for a still-present file would make the next
+        # sync propose re-downloading it instead of retrying the delete.
+        fresh_s3 = self._fetch_s3_info(paths, include_backups)
+
+        success_count = 0
+        with self._get_db() as conn:
+            for path in paths:
+                if path in fresh_s3:
+                    print(f"  ❌ {path} is still present on S3; will retry on next sync")
+                    continue
+                conn.execute('DELETE FROM files WHERE path = ?', (path,))
+                success_count += 1
+
+        print(f"  ✓ Deleted {success_count}/{len(paths)} files from S3")
+        return success_count
+
     def _print_file_preview(self, files, title, max_files=50):
         """Print preview of files to be processed"""
         if not files:
@@ -784,10 +1004,45 @@ class S3SyncManager:
         if len(files) > max_files:
             print(f"  ... and {len(files) - max_files} more files")
 
+    @staticmethod
+    def _print_sync_summary(uploads, downloads, deletes_local, deletes_remote,
+                            conflicts_label, conflicts_count):
+        """Summary of pending operations, printed right before the user decides"""
+        print(f"\nSync Summary:")
+        print(f"  Uploads pending:    {len(uploads)}")
+        print(f"  Downloads pending:  {len(downloads)}")
+        print(f"  Local deletions:    {len(deletes_local)}")
+        print(f"  Remote deletions:   {len(deletes_remote)}")
+        print(f"  {conflicts_label + ':':<20}{conflicts_count}")
+
+    def _validate_upload_candidates(self, paths):
+        """Flag zero-byte files and unparseable JSON among upload candidates"""
+        flagged = []
+        for path in paths:
+            local_path = os.path.join(self.local_dir, path)
+            try:
+                if os.path.getsize(local_path) == 0:
+                    flagged.append((path, "zero-byte file"))
+                    continue
+                if path.lower().endswith('.json'):
+                    with open(local_path, 'r') as f:
+                        json.load(f)
+            except json.JSONDecodeError as e:
+                flagged.append((path, f"unparseable JSON ({e.msg} at line {e.lineno})"))
+            except (OSError, UnicodeDecodeError) as e:
+                flagged.append((path, f"unreadable ({e})"))
+        return flagged
+
     def sync(self, dry_run=False, include_backups=False):
         """Perform interactive sync operation"""
         if not include_backups:
             print("Note: Ignoring backups/ directories (use --sync-backups to include them)")
+
+        if self.use_rclone:
+            print("Transfer backend: rclone (parallel transfers)")
+        else:
+            print("Transfer backend: aws CLI (serial)")
+            print(f"⚠️  rclone unavailable, syncs will be slower: {self.rclone_unavailable_reason}")
 
         print("\nAnalyzing changes...")
 
@@ -795,6 +1050,11 @@ class S3SyncManager:
         s3_files = self.scan_s3_files(include_backups)
 
         actions = self.analyze_changes(local_files, s3_files)
+
+        # Self-heal tracking so a future local deletion of these files is
+        # proposed as a remote delete rather than a re-download
+        if not dry_run:
+            self._record_untracked_synced(local_files, s3_files)
 
         # Separate actions by type
         uploads = []
@@ -815,14 +1075,6 @@ class S3SyncManager:
             elif action == SyncAction.CONFLICT:
                 conflicts.append((path, reason))
 
-        # Summary
-        print(f"\nSync Summary:")
-        print(f"  Uploads pending:    {len(uploads)}")
-        print(f"  Downloads pending:  {len(downloads)}")
-        print(f"  Local deletions:    {len(deletes_local)}")
-        print(f"  Remote deletions:   {len(deletes_remote)}")
-        print(f"  Conflicts:          {len(conflicts)}")
-
         if not any([uploads, downloads, deletes_local, deletes_remote, conflicts]):
             print("\n✓ Everything is in sync!")
             return
@@ -834,7 +1086,16 @@ class S3SyncManager:
         self._print_file_preview(deletes_remote, "Files to Delete from S3")
         self._print_file_preview(conflicts, "Conflicts to Resolve")
 
+        # Flag suspect upload candidates (zero-byte files, unparseable JSON)
+        invalid_uploads = self._validate_upload_candidates([p for p, _ in uploads])
+
         if dry_run:
+            if invalid_uploads:
+                print(f"\n⚠️  {len(invalid_uploads)} upload candidate(s) look invalid:")
+                for path, problem in invalid_uploads:
+                    print(f"  {path}: {problem}")
+            self._print_sync_summary(uploads, downloads, deletes_local, deletes_remote,
+                                     "Conflicts", len(conflicts))
             print("\n--dry-run mode: No changes will be made")
             return
 
@@ -848,14 +1109,49 @@ class S3SyncManager:
             if action != SyncAction.SKIP:
                 resolved_actions.append((path, action))
 
-        # Confirm before proceeding
-        total_operations = (len(uploads) + len(downloads) + len(deletes_local) +
-                            len(deletes_remote) + len(resolved_actions))
+        # Let the user decide what to do with suspect upload candidates
+        invalid_uploads += self._validate_upload_candidates(
+            [p for p, a in resolved_actions if a == SyncAction.UPLOAD])
+
+        if invalid_uploads:
+            print(f"\n⚠️  {len(invalid_uploads)} upload candidate(s) look invalid:")
+            for path, problem in invalid_uploads:
+                print(f"  {path}: {problem}")
+
+            skip_paths = set()
+            for path, problem in invalid_uploads:
+                response = prompt_choice(
+                    f"\n{path} ({problem}) — [u]pload anyway, [s]kip? ", ('u', 's'))
+                if response != 'u':
+                    skip_paths.add(path)
+
+            if skip_paths:
+                uploads = [(p, r) for p, r in uploads if p not in skip_paths]
+                resolved_actions = [(p, a) for p, a in resolved_actions if p not in skip_paths]
+                print(f"\nSkipping {len(skip_paths)} invalid file(s)")
+
+        # Merge resolved conflicts into the main action lists so the summary
+        # below reflects exactly what will run
+        for path, action in resolved_actions:
+            if action == SyncAction.UPLOAD:
+                uploads.append((path, "Resolved conflict"))
+            elif action == SyncAction.DOWNLOAD:
+                downloads.append((path, "Resolved conflict"))
+            elif action == SyncAction.DELETE_LOCAL:
+                deletes_local.append((path, "Resolved conflict"))
+            elif action == SyncAction.DELETE_REMOTE:
+                deletes_remote.append((path, "Resolved conflict"))
+
+        # The summary sits right next to the confirmation prompt: with a long
+        # file list above, this is what makes the decision readable
+        self._print_sync_summary(uploads, downloads, deletes_local, deletes_remote,
+                                 "Conflicts skipped", len(conflicts) - len(resolved_actions))
+
+        total_operations = (len(uploads) + len(downloads) +
+                            len(deletes_local) + len(deletes_remote))
 
         print(f"\n{total_operations} operations will be performed.")
-        response = input("Continue? [y/N]: ").strip().lower()
-
-        if response != 'y':
+        if not confirm("Continue? [y/N]: "):
             print("Sync cancelled.")
             return
 
@@ -863,23 +1159,26 @@ class S3SyncManager:
         print("\nSyncing...")
         success_count = 0
 
-        # Process uploads
-        for path, reason in uploads:
-            try:
-                self.perform_upload(path, local_files)
-                success_count += 1
-            except Exception as e:
-                print(f"  ❌ Failed to upload {path}: {e}")
+        # Process uploads and downloads
+        if self.use_rclone:
+            success_count += self.perform_uploads_batch([p for p, _ in uploads], include_backups)
+            success_count += self.perform_downloads_batch([p for p, _ in downloads], s3_files)
+        else:
+            for path, reason in uploads:
+                try:
+                    self.perform_upload(path, local_files)
+                    success_count += 1
+                except Exception as e:
+                    print(f"  ❌ Failed to upload {path}: {e}")
 
-        # Process downloads
-        for path, reason in downloads:
-            try:
-                self.perform_download(path, s3_files)
-                success_count += 1
-            except Exception as e:
-                print(f"  ❌ Failed to download {path}: {e}")
+            for path, reason in downloads:
+                try:
+                    self.perform_download(path, s3_files)
+                    success_count += 1
+                except Exception as e:
+                    print(f"  ❌ Failed to download {path}: {e}")
 
-        # Process deletions
+        # Process local deletions (no network involved, always per-file)
         for path, reason in deletes_local:
             try:
                 self.perform_delete_local(path)
@@ -887,27 +1186,16 @@ class S3SyncManager:
             except Exception as e:
                 print(f"  ❌ Failed to delete local {path}: {e}")
 
-        for path, reason in deletes_remote:
-            try:
-                self.perform_delete_remote(path)
-                success_count += 1
-            except Exception as e:
-                print(f"  ❌ Failed to delete remote {path}: {e}")
-
-        # Process resolved conflicts
-        for path, action in resolved_actions:
-            try:
-                if action == SyncAction.UPLOAD:
-                    self.perform_upload(path, local_files)
-                elif action == SyncAction.DOWNLOAD:
-                    self.perform_download(path, s3_files)
-                elif action == SyncAction.DELETE_LOCAL:
-                    self.perform_delete_local(path)
-                elif action == SyncAction.DELETE_REMOTE:
+        # Process remote deletions
+        if self.use_rclone:
+            success_count += self.perform_deletes_remote_batch([p for p, _ in deletes_remote], include_backups)
+        else:
+            for path, reason in deletes_remote:
+                try:
                     self.perform_delete_remote(path)
-                success_count += 1
-            except Exception as e:
-                print(f"  ❌ Failed to process {path}: {e}")
+                    success_count += 1
+                except Exception as e:
+                    print(f"  ❌ Failed to delete remote {path}: {e}")
 
         print(f"\n✓ Sync complete: {success_count}/{total_operations} operations successful")
 
@@ -919,6 +1207,12 @@ class S3SyncManager:
 
         if self.aws_profile:
             print(f"AWS Profile: {self.aws_profile}")
+
+        if self.use_rclone:
+            print("Transfer backend: rclone (parallel transfers)")
+        else:
+            print("Transfer backend: aws CLI (serial)")
+            print(f"⚠️  rclone unavailable, syncs will be slower: {self.rclone_unavailable_reason}")
 
         if not include_backups:
             print("Note: Ignoring backups/ directories (use --sync-backups to include them)")
@@ -959,6 +1253,145 @@ class S3SyncManager:
                         print(f"  {path}: {reason}")
 
 
+HFSYNC_CONFIG_NAME = '.hfsync.json'
+
+
+def load_hfsync_config(local_dir):
+    """Load the per-directory Hugging Face sync opt-in config, or None if absent"""
+    config_path = os.path.join(local_dir, HFSYNC_CONFIG_NAME)
+    if not os.path.exists(config_path):
+        return None
+
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    bucket_path = config.get('hf_bucket_path', '')
+    if not bucket_path.startswith('hf://buckets/'):
+        raise ValueError(f"{config_path}: 'hf_bucket_path' must start with hf://buckets/")
+    config['hf_bucket_path'] = bucket_path.rstrip('/')
+
+    hf_cli = shutil.which(config.get('hf_cli') or 'hf')
+    if not hf_cli:
+        raise ValueError(
+            f"{config_path}: hf CLI not found "
+            f"(install huggingface_hub>=1.0 or set 'hf_cli' to the binary's path)")
+    config['hf_cli'] = hf_cli
+
+    config.setdefault('tag', 'reviewed')
+    return config
+
+
+def classify_fibers(local_dir, tag):
+    """Split the directory's fiber JSONs into tagged / untagged / invalid"""
+    tagged, untagged, invalid = [], [], []
+
+    for name in sorted(os.listdir(local_dir)):
+        if name.startswith('.') or not name.endswith('.json'):
+            continue
+        path = os.path.join(local_dir, name)
+        if not os.path.isfile(path):
+            continue
+
+        try:
+            if os.path.getsize(path) == 0:
+                invalid.append((name, "zero-byte file"))
+                continue
+            with open(path, 'r') as f:
+                tags = json.load(f).get('tags', [])
+        except json.JSONDecodeError as e:
+            invalid.append((name, f"unparseable JSON ({e.msg} at line {e.lineno})"))
+            continue
+        except (OSError, UnicodeDecodeError) as e:
+            invalid.append((name, f"unreadable ({e})"))
+            continue
+
+        if tag in tags:
+            tagged.append(name)
+        else:
+            untagged.append(name)
+
+    return tagged, untagged, invalid
+
+
+def hf_sync(local_dir, dry_run=False):
+    """Sync tagged fibers to the Hugging Face bucket configured in .hfsync.json"""
+    local_dir = os.path.abspath(local_dir)
+
+    config = load_hfsync_config(local_dir)
+    if config is None:
+        print(f"Hugging Face sync is not configured for {local_dir}")
+        print(f"To enable it, create {os.path.join(local_dir, HFSYNC_CONFIG_NAME)}:")
+        print('  {')
+        print('    "hf_bucket_path": "hf://buckets/<org>/<bucket>/<path>",')
+        print('    "hf_cli": "/path/to/hf",          (optional, defaults to hf on PATH)')
+        print('    "tag": "reviewed"                 (optional)')
+        print('  }')
+        return
+
+    hf_cli = config['hf_cli']
+    bucket_path = config['hf_bucket_path']
+    tag = config['tag']
+
+    print(f"Hugging Face sync: {local_dir} → {bucket_path}")
+    if dry_run:
+        print("--dry-run mode: No changes will be made")
+
+    tagged, untagged, invalid = classify_fibers(local_dir, tag)
+    print(f"\nLocal fibers: {len(tagged)} tagged '{tag}', "
+          f"{len(untagged)} without the tag, {len(invalid)} invalid")
+    for name, problem in invalid:
+        print(f"  ⚠️  Skipping {name}: {problem}")
+
+    # Upload (additive): stage tagged files with mtimes preserved so
+    # `hf buckets sync` transfers only new or changed ones
+    if tagged:
+        staging = tempfile.mkdtemp(prefix='hfsync-')
+        try:
+            for name in tagged:
+                shutil.copy2(os.path.join(local_dir, name), staging)
+
+            cmd = [hf_cli, 'buckets', 'sync', staging, bucket_path]
+            if dry_run:
+                cmd.append('--dry-run')
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                print("❌ hf buckets sync failed; aborting before removals")
+                return
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    # Removals: only filenames that exist locally WITHOUT the tag and are
+    # present remotely. Files that exist only remotely are never touched.
+    result = subprocess.run([hf_cli, 'buckets', 'list', bucket_path, '-R', '-q'],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"❌ Could not list {bucket_path}: {(result.stderr or '').strip()}")
+        return
+    remote_names = {line.rsplit('/', 1)[-1]
+                    for line in result.stdout.splitlines() if line.strip()}
+
+    to_remove = [name for name in untagged if name in remote_names]
+    removed = 0
+    for name in to_remove:
+        if dry_run:
+            print(f"  Would remove from HF (no longer tagged '{tag}'): {name}")
+            continue
+        rm = subprocess.run([hf_cli, 'buckets', 'rm', f"{bucket_path}/{name}", '--yes'],
+                            capture_output=True, text=True)
+        if rm.returncode == 0:
+            print(f"  ✓ Removed from HF (no longer tagged '{tag}'): {name}")
+            removed += 1
+        else:
+            print(f"  ❌ Failed to remove {name}: {(rm.stderr or '').strip()}")
+
+    if dry_run:
+        print(f"\n--dry-run: {len(tagged)} upload candidates (unchanged files "
+              f"are skipped, see plan above), {len(to_remove)} would be removed")
+    else:
+        print(f"\n✓ Hugging Face sync complete: {len(tagged)} tagged fibers synced, "
+              f"{removed} removed, {len(invalid)} skipped as invalid")
+
+
 def main():
     parser = argparse.ArgumentParser(description='AWS S3 interactive sync with conflict resolution')
     subparsers = parser.add_subparsers(dest='command', help='Commands')
@@ -983,14 +1416,26 @@ def main():
     sync_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in sync')
 
     # Update command
-    update_parser = subparsers.add_parser('update', help='Update file tracking with current state')
+    update_parser = subparsers.add_parser(
+        'update',
+        help='Refresh file tracking without hiding pending changes '
+             '(records in-sync files, prunes stale entries)')
     update_parser.add_argument('directory', help='Local directory')
     update_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in tracking')
 
     # Reset command
-    reset_parser = subparsers.add_parser('reset', help='Reset sync tracking (mark all as synced)')
+    reset_parser = subparsers.add_parser(
+        'reset',
+        help='Reset sync tracking (marks ALL files as synced, discarding pending differences)')
     reset_parser.add_argument('directory', help='Local directory')
     reset_parser.add_argument('--sync-backups', action='store_true', help='Include backups/ directories in reset')
+
+    # Hugging Face sync command
+    hfsync_parser = subparsers.add_parser(
+        'hfsync', help='Sync tagged fibers to a Hugging Face bucket (requires .hfsync.json)')
+    hfsync_parser.add_argument('directory', help='Local directory')
+    hfsync_parser.add_argument('--dry-run', action='store_true',
+                               help='Show what would be synced without doing it')
 
     args = parser.parse_args()
 
@@ -999,63 +1444,32 @@ def main():
         sys.exit(1)
 
     if args.command == 'init':
-        # Initialize new sync configuration
+        # Initialize new sync configuration. No transfers happen here: files
+        # identical on both sides are recorded as in sync, and everything else
+        # (S3-only, local-only, size mismatches) is left for 'sync' to resolve.
         manager = S3SyncManager(args.directory, args.s3_bucket, args.s3_prefix, args.profile)
         print(f"Initialized sync configuration in {args.directory}")
         print(f"S3 location: s3://{args.s3_bucket}/{args.s3_prefix}/")
 
-        # Initial sync: download any S3 files that don't exist locally
-        print("\nChecking for files to download from S3...")
-        local_files = manager.scan_local_files(include_backups=False)  # Don't include backups by default
+        print("\nScanning initial state...")
+        local_files = manager.scan_local_files(include_backups=False)
         s3_files = manager.scan_s3_files(include_backups=False)
 
-        # Find files that exist in S3 but not locally
-        files_to_download = []
-        for path in s3_files:
-            if path not in local_files:
-                files_to_download.append(path)
+        manager._record_untracked_synced(local_files, s3_files)
 
-        if files_to_download:
-            print(f"\nFound {len(files_to_download)} files in S3 that don't exist locally.")
-            print("Note: Excluding backups/ directories. Use --sync-backups if needed.")
-            response = input("Download all files? [y/N]: ").strip().lower()
-
-            if response == 'y':
-                print(f"\nDownloading {len(files_to_download)} files using aws s3 sync (this is much faster)...")
-                print(f"S3 location: s3://{args.s3_bucket}/{args.s3_prefix}/")
-                print(f"Local directory: {args.directory}\n")
-
-                # Use aws s3 sync for bulk download - much faster!
-                cmd = [
-                    'aws', 's3', 'sync',
-                    f"s3://{args.s3_bucket}/{args.s3_prefix}/",
-                    args.directory,
-                    '--exclude', '.*',  # Exclude hidden files
-                    '--exclude', '*.obj',  # Exclude .obj files
-                ]
-
-                # Add excludes for layers and backups directories
-                cmd.extend(['--exclude', '*layers*/*'])
-                cmd.extend(['--exclude', '*/backups/*'])
-
-                if args.profile:
-                    cmd.extend(['--profile', args.profile])
-
-                # Run without capture_output so we see live progress
-                try:
-                    subprocess.run(cmd, check=True)
-                    print(f"\n✓ Download complete!")
-                except subprocess.CalledProcessError as e:
-                    print(f"\n❌ Download failed with exit code {e.returncode}")
-                    sys.exit(1)
-        else:
-            print("✓ All S3 files already exist locally")
-
-        # Do initial tracking update after downloads (exclude backups by default)
-        manager.update_files(include_backups=False)
+        s3_only = sum(1 for path in s3_files if path not in local_files)
+        local_only = sum(1 for path in local_files if path not in s3_files)
+        if s3_only:
+            print(f"{s3_only} file(s) exist only on S3 and can be downloaded with 'sync'")
+        if local_only:
+            print(f"{local_only} file(s) exist only locally and can be uploaded with 'sync'")
 
         print("\n✓ Initialization complete!")
-        print("Use 'status' command to see current sync state")
+        print("Use 'sync' to transfer differences and 'status' to see current sync state")
+
+    elif args.command == 'hfsync':
+        # Independent of the S3 sync configuration; gated only on .hfsync.json
+        hf_sync(args.directory, args.dry_run)
 
     else:
         # Check for existing configuration
@@ -1069,25 +1483,22 @@ def main():
         manager = S3SyncManager(args.directory)
 
         if args.command == 'status':
-            manager.show_status(args.verbose, getattr(args, 'sync_backups', False))
+            manager.show_status(args.verbose, args.sync_backups)
 
         elif args.command == 'sync':
-            manager.sync(args.dry_run, getattr(args, 'sync_backups', False))
-            if not args.dry_run:
-                manager.generate_segment_report()
+            manager.sync(args.dry_run, args.sync_backups)
 
         elif args.command == 'update':
-            manager.update_files(getattr(args, 'sync_backups', False))
+            manager.refresh_tracking(args.sync_backups)
 
         elif args.command == 'reset':
             print("Resetting sync tracking...")
-            print("This will mark all current files as synced.")
-            if not getattr(args, 'sync_backups', False):
+            print("This will mark ALL current files as synced, discarding any pending differences.")
+            if not args.sync_backups:
                 print("Note: Excluding backups/ directories (use --sync-backups to include them)")
-            response = input("Continue? [y/N]: ").strip().lower()
 
-            if response == 'y':
-                manager.update_files(getattr(args, 'sync_backups', False))
+            if confirm("Continue? [y/N]: "):
+                manager.reset_tracking(args.sync_backups)
                 print("✓ Sync tracking reset. All files marked as in sync.")
             else:
                 print("Reset cancelled.")

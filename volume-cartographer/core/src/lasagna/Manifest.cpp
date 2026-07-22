@@ -1,6 +1,7 @@
 #include "vc/lasagna/Manifest.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <stdexcept>
 
@@ -75,7 +76,8 @@ std::vector<LasagnaChannelGroup> parseGroups(
 
         LasagnaChannelGroup group;
         group.name = it.key();
-        group.zarrPath = resolvePath(baseDirectory, groupJson.at("zarr").get<std::string>());
+        group.relativeZarrKey = groupJson.at("zarr").get<std::string>();
+        group.zarrPath = resolvePath(baseDirectory, group.relativeZarrKey);
         group.scaledown = groupJson.value("scaledown", 0);
         if (group.scaledown < 0 || group.scaledown > 30) {
             throw std::runtime_error("Lasagna channel group '" + it.key() + "' has invalid scaledown");
@@ -155,8 +157,21 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseText(
     manifest.raw = root;
     manifest.version = root.value("version", 0);
     manifest.sourceToBase = root.value("source_to_base", 1.0);
-    if (!(manifest.sourceToBase > 0.0)) {
+    if (!(manifest.sourceToBase > 0.0) || !std::isfinite(manifest.sourceToBase)) {
         throw std::runtime_error("Lasagna manifest source_to_base must be positive");
+    }
+    if (root.contains("base_shape_zyx")) {
+        const auto& shape = root.at("base_shape_zyx");
+        if (!shape.is_array() || shape.size() != 3 ||
+            !shape.at(0).is_number_unsigned() ||
+            !shape.at(1).is_number_unsigned() ||
+            !shape.at(2).is_number_unsigned()) {
+            throw std::runtime_error("Lasagna manifest base_shape_zyx must contain three unsigned integers");
+        }
+        manifest.baseShapeZYX = std::array<std::size_t, 3>{
+            shape.at(0).get<std::size_t>(),
+            shape.at(1).get<std::size_t>(),
+            shape.at(2).get<std::size_t>()};
     }
     if (root.contains("init_shell_dir")) {
         if (!root.at("init_shell_dir").is_string()) {

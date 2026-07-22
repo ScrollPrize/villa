@@ -18,6 +18,7 @@ struct OpenDataSampleProjectResult {
     int attachedVolumeEntries = 0;
     int skippedVolumes = 0;
     int failedVolumes = 0;
+    int attachedLasagnaDatasets = 0;
     int supportedTifxyzSegments = 0;
     int cachedTifxyzSegments = 0;
     int attachedSegmentEntries = 0;

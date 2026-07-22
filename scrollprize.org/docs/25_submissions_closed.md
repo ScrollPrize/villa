@@ -1,6 +1,6 @@
 ---
 title: "Grand Prize submissions now closed"
-sidebar_label: "Announcement: Submissions now closed!"
+sidebar_label: "2023 GP Submissions Closed"
 hide_table_of_contents: true
 hide_title: true
 ---
@@ -23,20 +23,19 @@ hide_title: true
   <meta property="twitter:image" content="https://scrollprize.org/img/firstletters/purple_card-new.webp" />
 </head>
 
+:::warning[ARCHIVED]
+
+This page has been archived and is kept for historical reference: the prizes it describes have concluded. See [Winners](winners) for the results and [Prizes](prizes) for what is open today.
+
+:::
+
 <img src="/img/firstletters/composite_thumb.webp" />
 
-<h1 className="color-white text-4xl md:text-7xl font-black !mb-2 leading-none tracking-tighter">
-  Grand Prize submissions <span style={{
-    background:
-      "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
-    WebkitBackgroundClip: "text",
-    WebkitTextFillColor: "transparent",
-    backgroundClip: "text",
-    textFillColor: "transparent",
-  }}>now closed</span>
+<h1 className="color-white text-4xl md:text-7xl !mb-2 leading-none">
+  Grand Prize submissions <span className="text-accent">now closed</span>
 </h1>
 
-<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none tracking-tight">The 2023 Vesuvius Challenge Grand Prize submission window has closed. Review teams are evaluating entries — stay tuned as we announce results and next stages.</div>
+<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none">The 2023 Vesuvius Challenge Grand Prize submission window has closed. Review teams are evaluating entries — stay tuned as we announce results and next stages.</div>
 
 <div className="opacity-60 mb-8 italic">January 1, 2024</div>
 
@@ -50,7 +49,7 @@ We have accelerated progress on this amazing research problem, and we will read 
 
 Vesuvius Challenge is not over.
 Along with Grand Prize results, we will soon announce the next stages.
-For now, please stay engaged in our [community on Discord](https://discord.com/invite/uTfNwwecCQ), where discussion and exploration are ongoing.
+For now, please stay engaged in our [community on Discord](https://discord.gg/V4fJhvtaQn), where discussion and exploration are ongoing.
 The [datasets](data) will also remain available on our data server.
 
 Happy New Year to all, and let's make 2024 as incredible as 2023!

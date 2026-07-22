@@ -1,5 +1,9 @@
 import React from 'react';
 
+// Flat prize card on the ONE card recipe (.vc-card: surface + hairline + 8px
+// radius, hover = raised bg + stronger border — no shadows). One red maximum:
+// the $ amount carries the accent; title/description stay neutral.
+// Props are stable — all existing consumers (docs/15_winners.md etc.) keep working.
 const PrizeCard = ({
   href,
   prizeAmount,
@@ -16,28 +20,28 @@ const PrizeCard = ({
   const maxWidth = wide ? 'max-w-[632px]' : 'max-w-[200px]';
   const defaultImageClassName = wide ? 'max-w-[100%]' : '';
   const finalImageClassName = imageClassName || defaultImageClassName;
-  
-  const baseClasses = `${maxWidth} mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between ${className}`;
-  
+
+  const baseClasses = `vc-card ${maxWidth} mr-4 mb-4 flex flex-col justify-between hover:no-underline ${className}`;
+
   const renderMedia = () => {
     if (mediaType === 'video') {
       return (
-        <video 
-          autoPlay 
-          playsInline 
-          muted 
-          loop 
-          className={`w-[100%] ${finalImageClassName}`}
+        <video
+          autoPlay
+          playsInline
+          muted
+          loop
+          className={`vc-media w-full ${finalImageClassName}`}
         >
           <source src={mediaSrc} type={videoType} />
         </video>
       );
     } else {
       return (
-        <img 
-          src={mediaSrc} 
+        <img
+          src={mediaSrc}
           alt={mediaAlt}
-          className={finalImageClassName}
+          className={`vc-media ${finalImageClassName}`}
         />
       );
     }
@@ -46,8 +50,8 @@ const PrizeCard = ({
   return (
     <a className={baseClasses} href={href}>
       <div className="mb-4">
-        <div className="text-sm font-bold text-gray-300">{prizeAmount}</div>
-        <span className="font-bold">{title}:</span>
+        <div className="text-sm font-semibold text-accent vc-nums">{prizeAmount}</div>
+        <span className="font-semibold">{title}:</span>
         {description && (
           <> {description}</>
         )}
@@ -57,4 +61,4 @@ const PrizeCard = ({
   );
 };
 
-export default PrizeCard; 
+export default PrizeCard;

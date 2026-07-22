@@ -665,7 +665,8 @@ void addResolvedContext(
     const std::filesystem::path& manifestPath,
     const PairSetJob& job,
     const RankOptions& options,
-    size_t jobIndex)
+    size_t jobIndex,
+    double workingToBaseScale)
 {
     const double confidenceFloor = options.solverTolerance * options.confidenceFactor;
     const auto roles = selectLaplaceRankRoles(job.sideA.size(), job.sideB.size());
@@ -700,6 +701,7 @@ void addResolvedContext(
     buildOptions.sinkBase = job.sideB.front();
     buildOptions.marginBaseVoxels = options.marginBaseVoxels;
     buildOptions.threshold = options.threshold;
+    buildOptions.workingToBaseScale = workingToBaseScale;
 
     const auto report = buildMaxflowGraphFromManifest(manifestPath, buildOptions);
     const auto& solveTerminals = terminalsForSide(report, roles.solveSide);
@@ -889,6 +891,10 @@ nlohmann::json rankSnapPairsJson(
         throw std::invalid_argument("manifest must be a path string");
     }
     const std::filesystem::path manifestPath = request["manifest"].get<std::string>();
+    const double workingToBaseScale = request.value("working_to_base_scale", 1.0);
+    if (!(workingToBaseScale > 0.0) || !std::isfinite(workingToBaseScale)) {
+        throw std::invalid_argument("working_to_base_scale must be positive");
+    }
     const RankOptions options = parseOptions(request);
     const auto jobs = parseJobs(request);
 
@@ -922,7 +928,7 @@ nlohmann::json rankSnapPairsJson(
         const auto jobStart = std::chrono::steady_clock::now();
         nlohmann::json result;
         try {
-            result = rankJob(manifestPath, jobs[i], options, i);
+            result = rankJob(manifestPath, jobs[i], options, i, workingToBaseScale);
         } catch (const std::exception& e) {
             result = errorResult(jobs[i], "rank_failed", e.what());
         } catch (...) {

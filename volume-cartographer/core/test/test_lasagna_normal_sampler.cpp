@@ -8,6 +8,7 @@
 
 #include "utils/zarr.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -33,7 +34,8 @@ void createU8Zarr(
     const fs::path& path,
     std::vector<size_t> shape,
     std::vector<size_t> chunks,
-    const std::vector<uint8_t>* payload)
+    const std::vector<uint8_t>* payload,
+    double fillValue = 0.0)
 {
     utils::ZarrMetadata meta;
     meta.version = utils::ZarrVersion::v2;
@@ -41,7 +43,7 @@ void createU8Zarr(
     meta.chunks = std::move(chunks);
     meta.dtype = utils::ZarrDtype::uint8;
     meta.compressor_id.clear();
-    meta.fill_value = 0.0;
+    meta.fill_value = fillValue;
     auto array = utils::ZarrArray::create(path, meta);
     if (payload == nullptr) {
         return;
@@ -52,6 +54,32 @@ void createU8Zarr(
     }
     std::vector<size_t> zero(meta.shape.size(), 0);
     array.write_chunk(zero, bytes);
+}
+
+void createConstantChunkedU8Zarr(
+    const fs::path& path,
+    const std::array<size_t, 3>& shape,
+    const std::array<size_t, 3>& chunks,
+    uint8_t value)
+{
+    utils::ZarrMetadata meta;
+    meta.version = utils::ZarrVersion::v2;
+    meta.shape = {shape[0], shape[1], shape[2]};
+    meta.chunks = {chunks[0], chunks[1], chunks[2]};
+    meta.dtype = utils::ZarrDtype::uint8;
+    meta.compressor_id.clear();
+    meta.fill_value = 0.0;
+    auto array = utils::ZarrArray::create(path, meta);
+    std::vector<std::byte> bytes(chunks[0] * chunks[1] * chunks[2],
+                                 static_cast<std::byte>(value));
+    for (size_t z = 0; z < (shape[0] + chunks[0] - 1) / chunks[0]; ++z) {
+        for (size_t y = 0; y < (shape[1] + chunks[1] - 1) / chunks[1]; ++y) {
+            for (size_t x = 0; x < (shape[2] + chunks[2] - 1) / chunks[2]; ++x) {
+                const std::array<size_t, 3> indices{z, y, x};
+                array.write_chunk(indices, bytes);
+            }
+        }
+    }
 }
 
 void writeText(const fs::path& path, const std::string& text)
@@ -131,6 +159,13 @@ TEST_CASE("LasagnaNormalSampler supports 3D per-channel zarr groups and coordina
     CHECK(sample.normal[0] == doctest::Approx(1.0));
     CHECK(sample.normal[1] == doctest::Approx(0.0));
     CHECK(sample.normal[2] == doctest::Approx(0.0));
+
+    vc::lasagna::LasagnaDataset scaledDataset =
+        vc::lasagna::LasagnaDataset::open(manifestPath, {4.0});
+    vc::lasagna::LasagnaNormalSampler scaledSampler(scaledDataset);
+    const auto scaledSample = scaledSampler.sampleNormal({1.0, 1.0, 1.0});
+    REQUIRE(scaledSample.valid);
+    REQUIRE(scaledSampler.predDtSpacing() == std::nullopt);
     fs::remove_all(dir);
 }
 
@@ -245,6 +280,37 @@ TEST_CASE("LasagnaNormalSampler interpolates unoriented normal tensors")
     fs::remove_all(dir);
 }
 
+TEST_CASE("LasagnaNormalSampler fetches only interpolation source chunks across boundaries")
+{
+    const auto dir = tmpDir("chunk_boundary");
+    createConstantChunkedU8Zarr(dir / "grad_mag.zarr", {4, 4, 4}, {2, 2, 2}, 255);
+    createConstantChunkedU8Zarr(dir / "nx.zarr", {4, 4, 4}, {2, 2, 2}, 128);
+    createConstantChunkedU8Zarr(dir / "ny.zarr", {4, 4, 4}, {2, 2, 2}, 128);
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    writeText(manifestPath, R"({
+        "version": 2,
+        "grad_mag_encode_scale": 255.0,
+        "grad_mag_factor": 1.0,
+        "groups": {
+            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]}
+        }
+    })");
+
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+    std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
+    const auto report = sampler.sampleNormalBatch({{1.5, 1.5, 1.5}}, false, samples);
+
+    REQUIRE(samples.size() == 1);
+    REQUIRE(samples.front().sample.valid);
+    CHECK(samples.front().sample.normal[2] == doctest::Approx(1.0));
+    CHECK(report.prefetch.requestedChunks == 24);
+    CHECK(report.prefetch.chunksRead == 24);
+    fs::remove_all(dir);
+}
+
 TEST_CASE("LasagnaNormalSampler requires grad_mag channel")
 {
     const auto dir = tmpDir("missing_grad_mag_channel");
@@ -321,6 +387,37 @@ TEST_CASE("LasagnaNormalSampler reports invalid samples for missing chunks and z
     vc::lasagna::LasagnaNormalSampler missingSampler(missingDataset);
     CHECK_FALSE(missingSampler.sampleNormal({1.0, 1.0, 1.0}).valid);
 
+    fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaNormalSampler reads absent chunks from the Zarr fill value")
+{
+    const auto dir = tmpDir("fill_value");
+    std::vector<uint8_t> gradMag(2 * 2 * 2, 255);
+    createU8Zarr(dir / "grad_mag.zarr", {2, 2, 2}, {2, 2, 2}, &gradMag);
+    createU8Zarr(dir / "nx.zarr", {2, 2, 2}, {2, 2, 2}, nullptr, 128.0);
+    createU8Zarr(dir / "ny.zarr", {2, 2, 2}, {2, 2, 2}, nullptr, 128.0);
+
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    writeText(manifestPath, R"({
+        "version": 2,
+        "grad_mag_encode_scale": 255.0,
+        "grad_mag_factor": 1.0,
+        "groups": {
+            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]}
+        }
+    })");
+
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+    const auto sample = sampler.sampleNormal({1.0, 1.0, 1.0});
+
+    REQUIRE(sample.valid);
+    CHECK(sample.normal[0] == doctest::Approx(0.0));
+    CHECK(sample.normal[1] == doctest::Approx(0.0));
+    CHECK(sample.normal[2] == doctest::Approx(1.0));
     fs::remove_all(dir);
 }
 

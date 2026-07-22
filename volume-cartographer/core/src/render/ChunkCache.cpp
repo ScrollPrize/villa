@@ -4,6 +4,7 @@
 
 #include "vc/core/util/CacheCompression.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -172,7 +173,11 @@ ChunkCache::ChunkCache(std::vector<LevelInfo> levels,
         state_->options_.compressPersistentCache || persistentCompressionDefault();
     state_->options_.cacheQuantBinWidth = std::max(
         state_->options_.cacheQuantBinWidth, persistentQuantizationDefault());
-    if (state_->options_.persistentCachePath)
+    if (state_->options_.persistentCacheBudgetRoot &&
+        state_->options_.persistentCachePath)
+        state_->persistentBudget_ = PersistentZarrCacheBudget::findForPath(
+            *state_->options_.persistentCachePath);
+    if (state_->options_.persistentCachePath && !state_->persistentBudget_)
         startPersistentCacheSizeScan(state_);
 }
 
@@ -364,10 +369,24 @@ ChunkCache::Stats ChunkCache::stats() const
         result.persistentCacheEnabled = state->options_.persistentCachePath.has_value();
         result.viewProtectionStalls = state->viewProtectionStalls_;
     }
-    const auto persistentBytes = state->persistentCacheBytes_.load(std::memory_order_acquire);
-    result.persistentCacheBytes = persistentBytes > 0 ? static_cast<std::size_t>(persistentBytes) : 0;
-    result.persistentCacheScanInFlight =
-        state->persistentCacheScanInFlight_.load(std::memory_order_acquire);
+    if (state->persistentBudget_) {
+        const auto budget = state->persistentBudget_->stats();
+        result.persistentCacheBytes = static_cast<std::size_t>(budget.managedBytes);
+        result.persistentCacheScanInFlight = budget.scanInFlight;
+        result.persistentCacheTrimInFlight = budget.trimInFlight;
+        result.persistentCacheLowSpace = budget.lowSpace;
+        result.persistentCacheFreeBytes = static_cast<std::size_t>(budget.freeBytes);
+        result.persistentCacheMinimumFreeBytes =
+            static_cast<std::size_t>(budget.minimumFreeBytes);
+        if (budget.maximumBytes)
+            result.persistentCacheMaximumBytes =
+                static_cast<std::size_t>(*budget.maximumBytes);
+    } else {
+        const auto persistentBytes = state->persistentCacheBytes_.load(std::memory_order_acquire);
+        result.persistentCacheBytes = persistentBytes > 0 ? static_cast<std::size_t>(persistentBytes) : 0;
+        result.persistentCacheScanInFlight =
+            state->persistentCacheScanInFlight_.load(std::memory_order_acquire);
+    }
     return result;
 }
 
@@ -733,10 +752,18 @@ std::optional<std::vector<std::byte>> ChunkCache::readPersistent(const State& st
         return std::nullopt;
 
     const bool rawEntry = persistentEntryIsRaw(state, key);
+    auto readManaged = [&](const std::filesystem::path& path) {
+        auto pin = state.persistentBudget_
+            ? state.persistentBudget_->pinRead(path)
+            : PersistentZarrCacheBudget::ReadPin{};
+        auto bytes = readFileBytes(path);
+        pin.complete(bytes.has_value());
+        return bytes;
+    };
     if (rawEntry) {
         // Compressed variant wins when both formats exist: compaction and
         // compressed writes leave ".zst" as the authoritative copy.
-        if (auto compressed = readFileBytes(persistentCompressedPath(state, key))) {
+        if (auto compressed = readManaged(persistentCompressedPath(state, key))) {
             auto decompressed = vc::cacheDecompress(
                 std::span<const std::byte>(compressed->data(), compressed->size()),
                 expectedChunkBytes(state, key));
@@ -750,7 +777,7 @@ std::optional<std::vector<std::byte>> ChunkCache::readPersistent(const State& st
         }
     }
 
-    auto bytes = readFileBytes(persistentPath(state, key));
+    auto bytes = readManaged(persistentPath(state, key));
     if (!bytes)
         return std::nullopt;
     if (rawEntry && bytes->size() != expectedChunkBytes(state, key))
@@ -762,8 +789,14 @@ bool ChunkCache::readPersistentEmpty(const State& state, const ChunkKey& key)
 {
     if (!state.options_.persistentCachePath)
         return false;
+    const auto path = persistentEmptyPath(state, key);
+    auto pin = state.persistentBudget_
+        ? state.persistentBudget_->pinRead(path)
+        : PersistentZarrCacheBudget::ReadPin{};
     std::error_code ec;
-    return std::filesystem::exists(persistentEmptyPath(state, key), ec) && !ec;
+    const bool exists = std::filesystem::exists(path, ec) && !ec;
+    pin.complete(exists);
+    return exists;
 }
 
 bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
@@ -888,6 +921,17 @@ bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
 
     const auto path = compress ? persistentCompressedPath(state, key)
                                : persistentPath(state, key);
+    const auto counterpart = rawEntry
+        ? (compress ? persistentPath(state, key) : persistentCompressedPath(state, key))
+        : std::filesystem::path{};
+    auto reservation = state.persistentBudget_
+        ? state.persistentBudget_->reserveWrite(
+              path, payload->size(), counterpart.empty()
+                  ? std::vector<std::filesystem::path>{}
+                  : std::vector<std::filesystem::path>{counterpart})
+        : PersistentZarrCacheBudget::WriteReservation{};
+    if (state.persistentBudget_ && !reservation)
+        return false;
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     if (ec)
@@ -914,14 +958,19 @@ bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
     }
     if (ec) {
         std::filesystem::remove(tmp, ec);
+        const auto finalSize = regularFileSize(path).value_or(0);
+        addPersistentCacheBytesDelta(
+            state,
+            static_cast<std::int64_t>(finalSize) - static_cast<std::int64_t>(oldSize));
+        // The overwrite fallback may have removed the tracked destination even
+        // though publishing failed. Refresh all reserved paths from disk.
+        reservation.commit();
         return false;
     }
     std::int64_t removedCounterpart = 0;
     if (rawEntry) {
         // Drop the other-format copy so the freshly written file is
         // authoritative (reads prefer ".zst" over ".bin").
-        const auto counterpart = compress ? persistentPath(state, key)
-                                          : persistentCompressedPath(state, key);
         if (const auto size = regularFileSize(counterpart)) {
             std::error_code removeEc;
             if (std::filesystem::remove(counterpart, removeEc) && !removeEc)
@@ -933,6 +982,7 @@ bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
         state,
         static_cast<std::int64_t>(newSize) - static_cast<std::int64_t>(oldSize) -
             removedCounterpart);
+    reservation.commit();
     return true;
 }
 
@@ -942,6 +992,11 @@ bool ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
         return false;
 
     const auto path = persistentEmptyPath(state, key);
+    auto reservation = state.persistentBudget_
+        ? state.persistentBudget_->reserveWrite(path, 1)
+        : PersistentZarrCacheBudget::WriteReservation{};
+    if (state.persistentBudget_ && !reservation)
+        return false;
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     if (ec)
@@ -967,12 +1022,20 @@ bool ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
     }
     if (ec) {
         std::filesystem::remove(tmp, ec);
+        const auto finalSize = regularFileSize(path).value_or(0);
+        addPersistentCacheBytesDelta(
+            state,
+            static_cast<std::int64_t>(finalSize) - static_cast<std::int64_t>(oldSize));
+        // The overwrite fallback may have removed the tracked destination even
+        // though publishing failed. Refresh the reservation from disk.
+        reservation.commit();
         return false;
     }
     const auto newSize = regularFileSize(path).value_or(std::size_t{1});
     addPersistentCacheBytesDelta(
         state,
         static_cast<std::int64_t>(newSize) - static_cast<std::int64_t>(oldSize));
+    reservation.commit();
     return true;
 }
 
