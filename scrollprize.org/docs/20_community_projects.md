@@ -72,6 +72,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [preprocessed-data](https://github.com/usc-caisplusplus/scroll-data-preprocessing): Data preprocessing code and a fully processed version of the dataset in .zarr format to allow for faster training of ink detection models. 
 
+- [vesuvius-catalog](https://github.com/Schurkai/vesuvius-catalog): scriptable catalog CLI/library for the open-data bucket - answers which samples have segments, ink outputs or surface predictions at which resolutions, resolves S3/HTTPS data URLs (JSON/CSV output for scripting), and includes working openers for the bucket's OME-Zarr v2 stores under zarr-python 3.
+
 ## Segmentation
 
 ### 🌟 Highlighted
@@ -208,6 +210,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Probabilistic view on the offset for surface volume creation](https://discord.com/channels/1079907749569237093/1177617480366170162) by Giorgio Angelotti
 
 - [Creating segments from intersecting horizontal and vertical fibers](https://gist.github.com/jrudolph/3e0ebbd6e731f794733c236a86ff39fb) by Johannes Rudolph
+
+- [Phantom contamination audit of the published surface predictions](https://github.com/Schurkai/vesuvius-phantom-audit): chunk-listing-based measurement across all 36 samples with published m7 surface predictions (villa#1114) - every sample is affected, 16.9% of stored prediction chunks are certain phantoms; includes a voxel-exact-verified cleanup tool.
 
 ### 📊 Visualization
 
