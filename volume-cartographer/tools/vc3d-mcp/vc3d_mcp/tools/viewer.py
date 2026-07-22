@@ -6,7 +6,7 @@ the single shared ``mcp`` instance from ``vc3d_mcp.core``.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from ..core import mcp, _call, _strip_none
 
@@ -42,8 +42,8 @@ async def vc3d_get_cursor_point(
 async def vc3d_click(
     position: dict[str, float],
     viewer: Optional[str] = None,
-    space: str = "volume",
-    button: str = "left",
+    space: Literal["volume", "scene"] = "volume",
+    button: Literal["left", "right", "middle"] = "left",
     modifiers: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Synthesize a mouse click in a viewer at a volume-space (or scene-space)
@@ -79,8 +79,8 @@ async def vc3d_click(
 async def vc3d_shift_click(
     position: dict[str, float],
     viewer: Optional[str] = None,
-    space: str = "volume",
-    button: str = "left",
+    space: Literal["volume", "scene"] = "volume",
+    button: Literal["left", "right", "middle"] = "left",
     modifiers: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Shift+click convenience: the canonical place-point / set-focus gesture.
@@ -127,7 +127,9 @@ async def vc3d_zoom_viewer(factor: float, viewer: Optional[str] = None) -> dict[
 
 @mcp.tool()
 async def vc3d_rotate_viewer(
-    plane: str, degrees: float, relative: bool = True
+    plane: Literal["seg xz", "seg yz", "xz", "yz"],
+    degrees: float,
+    relative: bool = True,
 ) -> dict[str, Any]:
     """Rotate an axis-aligned slice plane -- the same rotation a human gets by
     middle-drag on the "seg xz" / "seg yz" panes. `plane` must be "seg xz" or
@@ -159,8 +161,8 @@ async def vc3d_drag(
     from_point: dict[str, float],
     to_point: dict[str, float],
     viewer: Optional[str] = None,
-    space: str = "volume",
-    button: str = "left",
+    space: Literal["volume", "scene"] = "volume",
+    button: Literal["left", "right", "middle", "none"] = "left",
     modifiers: Optional[list[str]] = None,
     steps: int = 8,
 ) -> dict[str, Any]:

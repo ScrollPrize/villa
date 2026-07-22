@@ -6,7 +6,9 @@ the single shared ``mcp`` instance from ``vc3d_mcp.core``.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+
+from mcp.server.fastmcp import Context
 
 from ..core import mcp, _call, _wait_for_job, _strip_none
 
@@ -81,11 +83,12 @@ async def vc3d_lasagna_list_datasets() -> dict[str, Any]:
 
 @mcp.tool()
 async def vc3d_lasagna_start_optimization(
-    mode: str,
+    mode: Literal["reoptimize", "new_model", "offset", "atlas"],
     config_path: Optional[str] = None,
     seed: Optional[dict[str, float]] = None,
     atlas_path: Optional[str] = None,
     wait: bool = False,
+    ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
     """Start a Lasagna optimization on the open volume package. Async (a
     source:"lasagna" job -- poll vc3d_job_status, or pass wait=true). Requires
@@ -122,7 +125,7 @@ async def vc3d_lasagna_start_optimization(
             }
         ),
     )
-    return await _wait_for_job(result["jobId"], wait, result)
+    return await _wait_for_job(result["jobId"], wait, result, ctx)
 
 
 @mcp.tool()
@@ -168,7 +171,9 @@ async def vc3d_lasagna_select_output(name: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def vc3d_lasagna_repeat_last(wait: bool = False) -> dict[str, Any]:
+async def vc3d_lasagna_repeat_last(
+    wait: bool = False, ctx: Optional[Context] = None
+) -> dict[str, Any]:
     """Repeat the last Lasagna optimization -- relaunch the last-used mode with
     its settings. Async (a source:"lasagna" job -- poll vc3d_job_status, or pass
     wait=true); same job semantics as vc3d_lasagna_start_optimization. Requires
@@ -184,4 +189,4 @@ async def vc3d_lasagna_repeat_last(wait: bool = False) -> dict[str, Any]:
     (Lasagna panel unavailable).
     """
     result = await _call("lasagna.repeat_last", {})
-    return await _wait_for_job(result["jobId"], wait, result)
+    return await _wait_for_job(result["jobId"], wait, result, ctx)

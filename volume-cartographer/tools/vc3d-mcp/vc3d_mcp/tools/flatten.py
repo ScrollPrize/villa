@@ -6,7 +6,9 @@ the single shared ``mcp`` instance from ``vc3d_mcp.core``.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+
+from mcp.server.fastmcp import Context
 
 from ..core import mcp, _call, _wait_for_job, _strip_none
 
@@ -21,7 +23,7 @@ __all__ = [
 @mcp.tool()
 async def vc3d_render_tifxyz(
     segment_id: str,
-    output_format: str,
+    output_format: Literal["zarr", "tif_stack"],
     volume_id: Optional[str] = None,
     output_dir: Optional[str] = None,
     scale: float = 1.0,
@@ -29,6 +31,7 @@ async def vc3d_render_tifxyz(
     num_slices: int = 1,
     voxel_size: Optional[float] = None,
     wait: bool = False,
+    ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
     """Render a segment's flattened surface with vc_render_tifxyz, the headless
     twin of the "Render" context-menu action. Asynchronous (a source:"tool" job
@@ -69,7 +72,7 @@ async def vc3d_render_tifxyz(
             }
         ),
     )
-    return await _wait_for_job(result["jobId"], wait, result)
+    return await _wait_for_job(result["jobId"], wait, result, ctx)
 
 
 @mcp.tool()
@@ -77,11 +80,12 @@ async def vc3d_flatten_slim(
     segment_id: str,
     iterations: Optional[int] = None,
     tolerance: Optional[float] = None,
-    energy_type: Optional[str] = None,
+    energy_type: Optional[Literal["symmetric_dirichlet", "conformal"]] = None,
     keep_percent: Optional[float] = None,
     inpaint_holes: Optional[bool] = None,
     output_dir: Optional[str] = None,
     wait: bool = False,
+    ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
     """Flatten a segment with SLIM/flatboi -- the production-recommended
     flattening method, the headless twin of the "SLIM flatten" context-menu
@@ -119,7 +123,7 @@ async def vc3d_flatten_slim(
             }
         ),
     )
-    return await _wait_for_job(result["jobId"], wait, result)
+    return await _wait_for_job(result["jobId"], wait, result, ctx)
 
 
 @mcp.tool()
@@ -128,6 +132,7 @@ async def vc3d_flatten_abf(
     iterations: Optional[int] = None,
     downsample_factor: Optional[int] = None,
     wait: bool = False,
+    ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
     """Flatten a segment with ABF++ -- the headless twin of the "ABF++ flatten"
     context-menu action. Runs in-process (no external tool), asynchronous (a
@@ -152,7 +157,7 @@ async def vc3d_flatten_abf(
             }
         ),
     )
-    return await _wait_for_job(result["jobId"], wait, result)
+    return await _wait_for_job(result["jobId"], wait, result, ctx)
 
 
 @mcp.tool()
@@ -166,6 +171,7 @@ async def vc3d_flatten_straighten(
     trim_max_edge: Optional[float] = None,
     output_dir: Optional[str] = None,
     wait: bool = False,
+    ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
     """Straighten a segment with vc_straighten -- the headless twin of the
     "Straighten" context-menu action. Asynchronous (a source:"flatten" job --
@@ -203,4 +209,4 @@ async def vc3d_flatten_straighten(
             }
         ),
     )
-    return await _wait_for_job(result["jobId"], wait, result)
+    return await _wait_for_job(result["jobId"], wait, result, ctx)

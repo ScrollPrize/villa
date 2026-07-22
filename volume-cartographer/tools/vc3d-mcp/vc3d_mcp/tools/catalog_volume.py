@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from mcp.server.fastmcp import Context
+
 from ..core import mcp, _call, _wait_for_job, _strip_none
 
 __all__ = [
@@ -31,6 +33,7 @@ async def vc3d_open_catalog_sample(
     sample_id: str,
     resources: Optional[dict[str, Any]] = None,
     wait: bool = False,
+    ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
     """Open an Open Data catalog sample by its manifest sample id. Async: a
     remote open is a multi-second-to-multi-minute network operation, so this
@@ -56,7 +59,7 @@ async def vc3d_open_catalog_sample(
     result = await _call(
         "catalog.open_sample", _strip_none({"sampleId": sample_id, "resources": resources})
     )
-    return await _wait_for_job(result["jobId"], wait, result)
+    return await _wait_for_job(result["jobId"], wait, result, ctx)
 
 
 @mcp.tool()

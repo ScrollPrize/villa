@@ -2,8 +2,8 @@
 """Self-test for vc3d-mcp, run without a real VC3D instance.
 
 Stands up a trivial fake JSON-RPC-over-AF_UNIX-socket server (standing in for
-apps/VC3D/agent_bridge/AgentBridgeServer, which doesn't exist yet at the time
-this was written) and confirms:
+apps/VC3D/agent_bridge/AgentBridgeServer, so the suite stays hermetic -- no Qt
+app needed) and confirms:
 
   * BridgeClient can connect, send a request, and parse a response
     (including JSON-RPC error replies, per SPEC.md section 2.5);
@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vc3d_mcp.bridge_client import (  # noqa: E402
     BridgeClient,
     BridgeClientConfig,
+    BridgeConnectionError,
     BridgeError,
     discover_registry_socket,
 )
@@ -69,6 +70,11 @@ class FakeAgentBridgeServer:
         # segmentation.save: when True, model the "nothing to flush" idle response
         # (jobId:null); when False, model a running "autosave" job that succeeds.
         self.save_idle: bool = False
+        # Count of accepted client connections (for the connect-race test).
+        self.connections: int = 0
+        # When False, simulated jobs emit started/output but never "finished",
+        # so a wait: true call blocks until the peer drops (disconnect test).
+        self.finish_jobs: bool = True
 
     async def start(self) -> None:
         if os.path.exists(self.socket_path):
@@ -85,6 +91,7 @@ class FakeAgentBridgeServer:
             os.unlink(self.socket_path)
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.connections += 1
         self._writers.append(writer)
         try:
             while True:
@@ -133,6 +140,25 @@ class FakeAgentBridgeServer:
                             "label": "Save segment"},
                 )
                 asyncio.create_task(self._simulate_job(job_id, "segmentation.save"))
+        elif method == "tracer.run_trace":
+            job_id = "job-5"
+            self._job_kinds[job_id] = "tracer.run_trace"
+            await self._reply(
+                writer, req_id,
+                result={"jobId": job_id, "kind": "tracer.run_trace",
+                        "source": "tool", "outputDir": "/tmp/traces"},
+            )
+            asyncio.create_task(self._simulate_job(job_id, "tracer.run_trace"))
+        elif method == "atlas.search_start":
+            job_id = "job-6"
+            self._job_kinds[job_id] = "atlas.fiber_search"
+            await self._reply(
+                writer, req_id,
+                result={"jobId": job_id, "kind": "atlas.fiber_search", "source": "atlas"},
+            )
+            asyncio.create_task(self._simulate_job(job_id, "atlas.fiber_search"))
+        elif method == "never_replies":
+            return  # deliberately no response (cancel / disconnect tests)
         elif method == "lasagna.start_optimization":
             job_id = "job-2"
             self._job_kinds[job_id] = "lasagna.optimize"
@@ -282,6 +308,8 @@ class FakeAgentBridgeServer:
         await self._broadcast(
             {"jobId": job_id, "kind": kind, "phase": "output", "message": "line A\nline B"}
         )
+        if not self.finish_jobs:
+            return  # never terminate: exercises wait-until-disconnect
         await asyncio.sleep(0.02)
         await self._broadcast(
             {
@@ -522,6 +550,265 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.fake_server._wrap_has_preview = True
         result = await server_module.vc3d_undo_wrap_annotation()
         self.assertTrue(result["undone"])
+
+
+class _FakeCtx:
+    """Stand-in for a FastMCP Context: records progress reports, or raises a
+    preset exception to model an unavailable/failing progress sink."""
+
+    def __init__(self, fail: BaseException | None = None) -> None:
+        self.reports: list[tuple[int, str | None]] = []
+        self._fail = fail
+
+    async def report_progress(self, progress, total=None, message=None) -> None:
+        if self._fail is not None:
+            raise self._fail
+        self.reports.append((progress, message))
+
+
+class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
+    """P1: connection/reader/waiter lifecycle (EOF reset, connect race, cancel
+    leak, write-failure invalidation, idempotent close)."""
+
+    async def asyncSetUp(self) -> None:
+        self.tmp_dir = tempfile.mkdtemp(prefix="vc3d-mcp-life-")
+        self.socket_path = os.path.join(self.tmp_dir, "fake-agent-bridge.sock")
+        self.fake_server = FakeAgentBridgeServer(self.socket_path)
+        await self.fake_server.start()
+        self.client = BridgeClient(BridgeClientConfig(socket=self.socket_path, request_timeout=5))
+
+    async def asyncTearDown(self) -> None:
+        await self.client.close()
+        await self.fake_server.stop()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    async def _wait_until(self, predicate, timeout=2.0) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if predicate():
+                return
+            await asyncio.sleep(0.01)
+        self.fail("condition not met within timeout")
+
+    async def test_reconnects_after_peer_eof(self) -> None:
+        self.assertEqual(await self.client.call("ping"), {"pong": True, "pid": 4242, "version": "test-0.0"})
+        # Drop the peer: stopping the server EOFs the client's reader.
+        await self.fake_server.stop()
+        await self._wait_until(lambda: self.client.connected is False)
+        self.assertFalse(self.client.connected)
+        # Bring the server back and confirm the next call transparently reconnects.
+        self.fake_server = FakeAgentBridgeServer(self.socket_path)
+        await self.fake_server.start()
+        result = await self.client.call("ping")
+        self.assertEqual(result["pong"], True)
+
+    async def test_two_concurrent_first_calls_open_one_connection(self) -> None:
+        results = await asyncio.gather(self.client.call("ping"), self.client.call("ping"))
+        self.assertEqual(len(results), 2)
+        self.assertEqual(self.fake_server.connections, 1)
+
+    async def test_cancelled_call_leaves_pending_empty(self) -> None:
+        task = asyncio.create_task(self.client.call("never_replies"))
+        await self._wait_until(lambda: len(self.client._pending) == 1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(self.client._pending, {})
+
+    async def test_write_failure_resets_connection(self) -> None:
+        await self.client.call("ping")  # establish a live connection
+
+        class BadWriter:
+            def is_closing(self):
+                return False
+
+            def write(self, data):
+                raise OSError("simulated write failure")
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        self.client._writer = BadWriter()
+        with self.assertRaises(BridgeConnectionError):
+            await self.client.call("ping")
+        self.assertFalse(self.client.connected)
+        self.assertIsNone(self.client._writer)
+
+    async def test_close_is_idempotent(self) -> None:
+        await self.client.call("ping")
+        await self.client.close()
+        await self.client.close()  # must not raise
+        self.assertFalse(self.client.connected)
+        with self.assertRaises(BridgeConnectionError):
+            await self.client.ensure_connected()
+
+
+class WaitAndProgressTest(unittest.IsolatedAsyncioTestCase):
+    """P3/P4: run_trace + atlas wait semantics, and best-effort progress
+    forwarding through _wait_for_job (buffered/new output, race-free terminal,
+    disconnect wake, tolerant of an unavailable/failing progress sink)."""
+
+    async def asyncSetUp(self) -> None:
+        self.tmp_dir = tempfile.mkdtemp(prefix="vc3d-mcp-wait-")
+        self.socket_path = os.path.join(self.tmp_dir, "fake-agent-bridge.sock")
+        self.fake_server = FakeAgentBridgeServer(self.socket_path)
+        await self.fake_server.start()
+        self.client = server_module.configure_client(self.socket_path, request_timeout=5)
+
+    async def asyncTearDown(self) -> None:
+        await self.client.close()
+        await self.fake_server.stop()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    # -- P3: the two newly wait-capable tools --
+
+    async def test_run_trace_no_wait_returns_job_id(self) -> None:
+        result = await server_module.vc3d_run_trace("seg-1", wait=False)
+        self.assertEqual(result["jobId"], "job-5")
+        self.assertNotIn("state", result)
+
+    async def test_run_trace_wait_returns_terminal_status(self) -> None:
+        result = await server_module.vc3d_run_trace("seg-1", wait=True)
+        self.assertEqual(result["jobId"], "job-5")
+        self.assertEqual(result["state"], "succeeded")
+        self.assertIn("consoleTail", result)
+
+    async def test_atlas_search_no_wait_returns_job_id(self) -> None:
+        result = await server_module.vc3d_atlas_search_start(wait=False)
+        self.assertEqual(result["jobId"], "job-6")
+        self.assertNotIn("state", result)
+
+    async def test_atlas_search_wait_returns_terminal_status(self) -> None:
+        result = await server_module.vc3d_atlas_search_start(wait=True)
+        self.assertEqual(result["jobId"], "job-6")
+        self.assertEqual(result["state"], "succeeded")
+
+    # -- P4: progress forwarding (driven at the tracker level for determinism) --
+
+    async def test_buffered_output_before_wait_is_forwarded(self) -> None:
+        jobs = self.client.jobs
+        jobs.on_progress({"jobId": "jb", "phase": "started"})
+        jobs.on_progress({"jobId": "jb", "phase": "output", "message": "buffered-1\nbuffered-2"})
+        jobs.on_progress({"jobId": "jb", "phase": "finished", "success": True})
+        ctx = _FakeCtx()
+        result = await server_module._wait_for_job("jb", True, {"jobId": "jb"}, ctx)
+        self.assertEqual(result["state"], "succeeded")
+        self.assertEqual([m for _, m in ctx.reports], ["buffered-1", "buffered-2"])
+        # local sequence is monotonic starting at 1
+        self.assertEqual([s for s, _ in ctx.reports], [1, 2])
+
+    async def test_new_output_during_wait_is_forwarded_in_order(self) -> None:
+        jobs = self.client.jobs
+        jobs.on_progress({"jobId": "jd", "phase": "output", "message": "first"})
+        ctx = _FakeCtx()
+        task = asyncio.create_task(
+            server_module._wait_for_job("jd", True, {"jobId": "jd"}, ctx)
+        )
+        await asyncio.sleep(0.02)  # let the waiter drain the buffered line and park
+        jobs.on_progress({"jobId": "jd", "phase": "output", "message": "second"})
+        jobs.on_progress({"jobId": "jd", "phase": "finished", "success": True})
+        result = await task
+        self.assertEqual(result["state"], "succeeded")
+        self.assertEqual([m for _, m in ctx.reports], ["first", "second"])
+
+    async def test_terminal_before_wait_is_race_free(self) -> None:
+        jobs = self.client.jobs
+        # Everything, including finished, arrives before the wait registers.
+        jobs.on_progress({"jobId": "jt", "phase": "output", "message": "done-line"})
+        jobs.on_progress({"jobId": "jt", "phase": "finished", "success": True})
+        ctx = _FakeCtx()
+        result = await asyncio.wait_for(
+            server_module._wait_for_job("jt", True, {"jobId": "jt"}, ctx), timeout=2.0
+        )
+        self.assertEqual(result["state"], "succeeded")
+        self.assertEqual([m for _, m in ctx.reports], ["done-line"])
+
+    async def test_disconnect_wakes_waiter_promptly(self) -> None:
+        jobs = self.client.jobs
+        jobs.on_progress({"jobId": "jx", "phase": "started"})
+        ctx = _FakeCtx()
+        task = asyncio.create_task(
+            server_module._wait_for_job("jx", True, {"jobId": "jx"}, ctx)
+        )
+        await asyncio.sleep(0.02)
+        jobs.fail_all(BridgeConnectionError("peer dropped"))
+        with self.assertRaises(RuntimeError):
+            await asyncio.wait_for(task, timeout=2.0)
+
+    async def test_wait_true_fails_promptly_on_bridge_disconnect(self) -> None:
+        self.fake_server.finish_jobs = False  # job never sends a finished notification
+        task = asyncio.create_task(server_module.vc3d_run_trace("seg-1", wait=True))
+        await asyncio.sleep(0.05)  # let the job start + the wait register
+        await self.fake_server.stop()  # peer EOF -> waiters must fail promptly
+        with self.assertRaises((RuntimeError, BridgeConnectionError)):
+            await asyncio.wait_for(task, timeout=2.0)
+
+    async def test_noop_ctx_does_not_fail_the_tool(self) -> None:
+        # ctx=None models an MCP client with no progress support.
+        result = await server_module.vc3d_run_trace("seg-1", wait=True, ctx=None)
+        self.assertEqual(result["state"], "succeeded")
+
+    async def test_progress_report_failure_does_not_fail_the_tool(self) -> None:
+        jobs = self.client.jobs
+        jobs.on_progress({"jobId": "jf", "phase": "output", "message": "line"})
+        jobs.on_progress({"jobId": "jf", "phase": "finished", "success": True})
+        ctx = _FakeCtx(fail=RuntimeError("progress sink is down"))
+        result = await server_module._wait_for_job("jf", True, {"jobId": "jf"}, ctx)
+        self.assertEqual(result["state"], "succeeded")
+
+    async def test_progress_report_cancellation_is_not_swallowed(self) -> None:
+        jobs = self.client.jobs
+        jobs.on_progress({"jobId": "jc", "phase": "output", "message": "line"})
+        jobs.on_progress({"jobId": "jc", "phase": "finished", "success": True})
+        ctx = _FakeCtx(fail=asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            await server_module._wait_for_job("jc", True, {"jobId": "jc"}, ctx)
+
+
+class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
+    """Official-SDK schema assertions over the whole registered tool surface."""
+
+    # The historical surface was 75 tools; this branch adds fetch, rotate, the
+    # axis-aligned-slice toggle, and the same-wrap annotation trio, so the real
+    # current count is 79. Assert the real number so schema drift is caught.
+    EXPECTED_TOOL_COUNT = 79
+
+    async def test_tool_surface_and_schemas(self) -> None:
+        tools = await server_module.mcp.list_tools()
+        by_name = {t.name: t.inputSchema for t in tools}
+        self.assertEqual(len(tools), self.EXPECTED_TOOL_COUNT)
+
+        # FastMCP-injected Context must never appear in any input schema.
+        for name, schema in by_name.items():
+            props = schema.get("properties") or {}
+            self.assertNotIn("ctx", props, f"{name} leaked ctx into its schema")
+
+        # Both formerly-missing wait params are present.
+        self.assertIn("wait", by_name["vc3d_run_trace"]["properties"])
+        self.assertIn("wait", by_name["vc3d_atlas_search_start"]["properties"])
+
+        # A sampling of required enum schemas are emitted as JSON-schema enums.
+        grow = by_name["vc3d_grow_segment"]["properties"]
+        self.assertEqual(grow["method"]["enum"], ["tracer", "corrections", "patch_tracer"])
+        self.assertEqual(
+            grow["direction"]["enum"], ["all", "up", "down", "left", "right", "fill"]
+        )
+        self.assertEqual(
+            by_name["vc3d_switch_workspace"]["properties"]["name"]["enum"],
+            ["main", "lasagna", "fiber_slice"],
+        )
+        self.assertEqual(
+            by_name["vc3d_atlas_search_start"]["properties"]["mode"]["enum"],
+            ["atlas_to_non_atlas", "non_atlas_only"],
+        )
+        self.assertEqual(
+            by_name["vc3d_render_tifxyz"]["properties"]["output_format"]["enum"],
+            ["zarr", "tif_stack"],
+        )
 
 
 class RegistryDiscoveryTest(unittest.TestCase):

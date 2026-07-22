@@ -6,9 +6,11 @@ the single shared ``mcp`` instance from ``vc3d_mcp.core``.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from ..core import mcp, _call, _strip_none
+from mcp.server.fastmcp import Context
+
+from ..core import mcp, _call, _strip_none, _wait_for_job
 
 __all__ = [
     "vc3d_atlas_open",
@@ -44,10 +46,12 @@ async def vc3d_atlas_status() -> dict[str, Any]:
 
 @mcp.tool()
 async def vc3d_atlas_search_start(
-    mode: str = "atlas_to_non_atlas",
+    mode: Literal["atlas_to_non_atlas", "non_atlas_only"] = "atlas_to_non_atlas",
     required_tags: Optional[list[str]] = None,
     excluded_tags: Optional[list[str]] = None,
     max_distance: Optional[float] = None,
+    wait: bool = False,
+    ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
     """Start an asynchronous atlas fiber-intersection search (a source:"atlas"
     job -- poll vc3d_job_status, then page results with vc3d_atlas_search_results).
@@ -57,8 +61,11 @@ async def vc3d_atlas_search_start(
     max_distance: broad-phase segment radius in voxels; omit to keep the
     current spin-box value. Returns {"jobId", "kind": "atlas.fiber_search",
     "source": "atlas"}.
+
+    wait: if true (MCP-server-side only), block until the job finishes
+    (30-minute cap) and return the terminal job.status inline.
     """
-    return await _call(
+    result = await _call(
         "atlas.search_start",
         _strip_none(
             {
@@ -69,6 +76,7 @@ async def vc3d_atlas_search_start(
             }
         ),
     )
+    return await _wait_for_job(result["jobId"], wait, result, ctx)
 
 
 @mcp.tool()

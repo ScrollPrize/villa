@@ -6,7 +6,9 @@ the single shared ``mcp`` instance from ``vc3d_mcp.core``.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
+
+from mcp.server.fastmcp import Context
 
 from ..core import mcp, _call, _wait_for_job
 
@@ -52,7 +54,9 @@ async def vc3d_seeding_reset_points() -> dict[str, Any]:
 
 
 @mcp.tool()
-async def vc3d_seeding_run(wait: bool = False) -> dict[str, Any]:
+async def vc3d_seeding_run(
+    wait: bool = False, ctx: Optional[Context] = None
+) -> dict[str, Any]:
     """Seeding: "seed the volume" -- grow one segment per point in the Seeding
     widget's currently selected source collection by spawning a
     vc_grow_seg_from_seed child process per point (bounded concurrency by the
@@ -80,11 +84,13 @@ async def vc3d_seeding_run(wait: bool = False) -> dict[str, Any]:
     cap) and return the terminal job.status inline.
     """
     result = await _call("seeding.run", {})
-    return await _wait_for_job(result["jobId"], wait, result)
+    return await _wait_for_job(result["jobId"], wait, result, ctx)
 
 
 @mcp.tool()
-async def vc3d_seeding_expand(wait: bool = False) -> dict[str, Any]:
+async def vc3d_seeding_expand(
+    wait: bool = False, ctx: Optional[Context] = None
+) -> dict[str, Any]:
     """Seeding: run the iterative seed-expansion pass -- spawn vc_grow_seg_from_seed
     with expand.json for N iterations (the widget's "Expansion iterations"
     setting), bounded concurrency by the "Processes" setting. Async: a
@@ -108,7 +114,7 @@ async def vc3d_seeding_expand(wait: bool = False) -> dict[str, Any]:
     cap) and return the terminal job.status inline.
     """
     result = await _call("seeding.expand", {})
-    return await _wait_for_job(result["jobId"], wait, result)
+    return await _wait_for_job(result["jobId"], wait, result, ctx)
 
 
 @mcp.tool()

@@ -6,7 +6,9 @@ the single shared ``mcp`` instance from ``vc3d_mcp.core``.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+
+from mcp.server.fastmcp import Context
 
 from ..core import mcp, _call, _wait_for_job, _strip_none, _is_placeholder_error
 from ..bridge_client import BridgeError
@@ -33,8 +35,24 @@ async def vc3d_list_segments(only_loaded: bool = False) -> dict[str, Any]:
     return await _call("segments.list", {"onlyLoaded": only_loaded})
 
 
+async def _fetch_segment_impl(
+    segment_id: str, wait: bool, ctx: Optional[Context] = None
+) -> dict[str, Any]:
+    """Fetch implementation shared by the vc3d_fetch_segment tool and the
+    auto-fetch path in vc3d_activate_segment. A plain (non-tool) coroutine so
+    the latter can forward progress through _wait_for_job without calling a
+    decorated tool."""
+    result = await _call("segments.fetch", {"segmentId": segment_id})
+    job_id = result.get("jobId") if isinstance(result, dict) else None
+    if not job_id:
+        return result  # synchronous: already materialized, nothing to wait on
+    return await _wait_for_job(job_id, wait, result, ctx)
+
+
 @mcp.tool()
-async def vc3d_fetch_segment(segment_id: str, wait: bool = True) -> dict[str, Any]:
+async def vc3d_fetch_segment(
+    segment_id: str, wait: bool = True, ctx: Optional[Context] = None
+) -> dict[str, Any]:
     """Download ("materialize") an open-data placeholder segment so it can be
     activated and edited.
 
@@ -51,15 +69,13 @@ async def vc3d_fetch_segment(segment_id: str, wait: bool = True) -> dict[str, An
 
     segment_id: a segment id as returned by vc3d_list_segments.
     """
-    result = await _call("segments.fetch", {"segmentId": segment_id})
-    job_id = result.get("jobId") if isinstance(result, dict) else None
-    if not job_id:
-        return result  # synchronous: already materialized, nothing to wait on
-    return await _wait_for_job(job_id, wait, result)
+    return await _fetch_segment_impl(segment_id, wait, ctx)
 
 
 @mcp.tool()
-async def vc3d_activate_segment(segment_id: str, auto_fetch: bool = True) -> dict[str, Any]:
+async def vc3d_activate_segment(
+    segment_id: str, auto_fetch: bool = True, ctx: Optional[Context] = None
+) -> dict[str, Any]:
     """Make a segment the active editing target (the programmatic equivalent of
     clicking it in the segment list). Required before vc3d_enable_editing /
     vc3d_grow_segment and after any segment switch.
@@ -79,7 +95,7 @@ async def vc3d_activate_segment(segment_id: str, auto_fetch: bool = True) -> dic
             raise
 
     # Placeholder + auto_fetch: fetch (blocking) then retry activation once.
-    fetch = await vc3d_fetch_segment(segment_id, wait=True)
+    fetch = await _fetch_segment_impl(segment_id, wait=True, ctx=ctx)
     if fetch.get("waitTimedOut"):
         return {"activated": False, "fetched": False, "fetch": fetch,
                 "detail": "segment fetch did not finish within the wait cap"}
@@ -122,10 +138,11 @@ async def vc3d_save_segment(wait: bool = True) -> dict[str, Any]:
 @mcp.tool()
 async def vc3d_grow_segment(
     steps: int,
-    method: str = "tracer",
-    direction: str = "all",
+    method: Literal["tracer", "corrections", "patch_tracer"] = "tracer",
+    direction: Literal["all", "up", "down", "left", "right", "fill"] = "all",
     inpaint_only: bool = False,
     wait: bool = False,
+    ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
     """Grow the active segmentation surface. Async: returns a jobId.
 
@@ -147,7 +164,7 @@ async def vc3d_grow_segment(
             "inpaintOnly": inpaint_only,
         },
     )
-    return await _wait_for_job(result["jobId"], wait, result)
+    return await _wait_for_job(result["jobId"], wait, result, ctx)
 
 
 @mcp.tool()
@@ -158,6 +175,7 @@ async def vc3d_grow_patch_from_seed(
     min_area_cm: float = 0.002,
     output_dir: Optional[str] = None,
     wait: bool = False,
+    ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
     """Create a brand-new segment by growing a patch from a 3D seed point
     (headless GrowPatch). Async: returns a jobId and outputDir.
@@ -182,11 +200,15 @@ async def vc3d_grow_patch_from_seed(
             }
         ),
     )
-    return await _wait_for_job(result["jobId"], wait, result)
+    return await _wait_for_job(result["jobId"], wait, result, ctx)
 
 
 @mcp.tool()
-async def vc3d_set_segment_tag(segment_id: str, tag: str, enabled: bool) -> dict[str, Any]:
+async def vc3d_set_segment_tag(
+    segment_id: str,
+    tag: Literal["approved", "defective", "reviewed", "inspect"],
+    enabled: bool,
+) -> dict[str, Any]:
     """Set (or clear) a review tag on a segment. tag is one of
     "approved" | "defective" | "reviewed" | "inspect" (there is no "revisit"
     tag). As a documented side effect this selects segment_id in the surface
@@ -232,7 +254,7 @@ async def vc3d_push_pull_set_config(
 
 @mcp.tool()
 async def vc3d_push_pull_start(
-    direction: str, alpha: Optional[bool] = None
+    direction: Literal["push", "pull"], alpha: Optional[bool] = None
 ) -> dict[str, Any]:
     """Start Gaussian push (direction="push") or pull (direction="pull") at the
     module's last recorded pointer position. Position the cursor first with a
@@ -258,14 +280,19 @@ async def vc3d_run_trace(
     param_overrides: Optional[dict[str, Any]] = None,
     omp_threads: Optional[int] = None,
     output_dir: Optional[str] = None,
+    wait: bool = False,
+    ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
     """Run the patch-stitching tracer (vc_grow_seg_from_segments) on a segment,
     the headless twin of the "Run Trace" context-menu action. Asynchronous
     (a source:"tool" job -- poll vc3d_job_status). param_overrides is merged
     over <volpkg>/trace_params.json. output_dir defaults to <volpkg>/traces.
     Rejects remote volumes. Returns {"jobId", "kind": "tracer.run_trace",
-    "source": "tool", "outputDir"}."""
-    return await _call(
+    "source": "tool", "outputDir"}.
+
+    wait: if true (MCP-server-side only), block until the job finishes
+    (30-minute cap) and return the terminal job.status inline."""
+    result = await _call(
         "tracer.run_trace",
         _strip_none(
             {
@@ -276,3 +303,4 @@ async def vc3d_run_trace(
             }
         ),
     )
+    return await _wait_for_job(result["jobId"], wait, result, ctx)

@@ -11,9 +11,10 @@ import back through ``server.py``).
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import Any, Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from .bridge_client import (
     BridgeClient,
@@ -87,21 +88,78 @@ def _is_placeholder_error(exc: Exception) -> bool:
     return "placeholder" in detail.lower() or "placeholder" in str(exc.message).lower()
 
 
-async def _wait_for_job(job_id: str, wait: bool, initial_result: dict[str, Any]) -> dict[str, Any]:
-    """Shared `wait: true` handling for the async grow.* tools.
+async def _report_progress(ctx: Optional[Context], seq: int, message: str) -> None:
+    """Best-effort MCP progress report. Never lets a reporting failure change
+    the job's execution or the tool's terminal result (progress is purely
+    observational), but never swallows task cancellation either."""
+    if ctx is None:
+        return
+    try:
+        await ctx.report_progress(progress=seq, total=None, message=message)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - progress is best-effort/observational
+        pass
 
-    SPEC.md section 5: "forwards phase:'output' messages as tool progress
-    ... when the caller opted into 'wait': true ... blocks the tool call
-    until the job's finished notification and returns the terminal status
-    inline. wait defaults to false; when true, the MCP server enforces a
-    30-minute cap and returns the still-running jobId on timeout."
+
+async def _wait_for_job(
+    job_id: str,
+    wait: bool,
+    initial_result: dict[str, Any],
+    ctx: Optional[Context] = None,
+) -> dict[str, Any]:
+    """Shared `wait: true` handling for the async long-running tools.
+
+    When ``wait`` is true, blocks the tool call until the job's finished
+    notification and returns the terminal ``job.status`` inline. ``wait``
+    defaults to false. When true, the MCP server enforces a 30-minute cap and
+    returns the still-running ``jobId`` (with ``waitTimedOut: true``) on
+    timeout, and fails promptly if the bridge disconnects.
+
+    All MCP progress reporting is centralized here (tool wrappers only pass
+    ``ctx`` through). Retained and newly-arriving ``phase:"output"`` lines are
+    forwarded via ``ctx.report_progress`` with a monotonically increasing local
+    sequence number; forwarding is best-effort and never affects the result.
     """
     if not wait:
         return initial_result
 
     client = _get_client()
-    record = await client.jobs.wait_finished(job_id, timeout=DEFAULT_WAIT_TIMEOUT_S)
-    if record is None:
+    tracker = client.jobs
+    record = tracker.register(job_id)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + DEFAULT_WAIT_TIMEOUT_S
+    local_seq = 0          # monotonic progress index reported to the MCP client
+    last_output_seq = 0    # highest job output sequence already forwarded
+    timed_out = False
+
+    while True:
+        wake = record.wake  # capture BEFORE reading state (no lost wakeup)
+        err = tracker.error
+        if err is not None:
+            # Bridge disconnected: fail promptly rather than block to the cap.
+            raise RuntimeError(str(err))
+
+        for output_seq, line in record.outputs_after(last_output_seq):
+            last_output_seq = output_seq
+            local_seq += 1
+            await _report_progress(ctx, local_seq, line)
+
+        if record.finished_event.is_set():
+            break
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            await asyncio.wait_for(wake.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            timed_out = True
+            break
+
+    if timed_out:
         return {**initial_result, "waitTimedOut": True}
 
     # job.status is the bridge's authoritative terminal record (SPEC.md 3.17);

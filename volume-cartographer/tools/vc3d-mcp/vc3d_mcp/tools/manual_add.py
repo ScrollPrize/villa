@@ -6,7 +6,7 @@ the single shared ``mcp`` instance from ``vc3d_mcp.core``.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from ..core import mcp, _call
 
@@ -42,7 +42,9 @@ async def vc3d_manual_add_finish(apply: bool = True) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def vc3d_manual_add_set_line_mode(mode: str) -> dict[str, Any]:
+async def vc3d_manual_add_set_line_mode(
+    mode: Literal["vertical", "horizontal", "cross", "cross_fill"]
+) -> dict[str, Any]:
     """Set the manual-add line-preview mode. mode: "vertical" | "horizontal" |
     "cross" | "cross_fill". Callable whether or not manual-add mode is active
     (the config persists). Returns the effective {"mode": str}."""
@@ -50,7 +52,9 @@ async def vc3d_manual_add_set_line_mode(mode: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def vc3d_manual_add_set_interpolation(mode: str) -> dict[str, Any]:
+async def vc3d_manual_add_set_interpolation(
+    mode: Literal["thin_plate_spline", "tracer_restricted_to_fill"]
+) -> dict[str, Any]:
     """Set the manual-add interpolation (fill) method. mode:
     "thin_plate_spline" | "tracer_restricted_to_fill". Callable whether or not
     manual-add mode is active. Returns the effective {"mode": str}."""

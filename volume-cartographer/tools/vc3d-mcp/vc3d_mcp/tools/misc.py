@@ -6,7 +6,7 @@ the single shared ``mcp`` instance from ``vc3d_mcp.core``.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from ..core import mcp, _call, _strip_none
 
@@ -70,7 +70,9 @@ async def vc3d_job_status(job_id: Optional[str] = None, source: Optional[str] = 
 
 
 @mcp.tool()
-async def vc3d_switch_workspace(name: str) -> dict[str, Any]:
+async def vc3d_switch_workspace(
+    name: Literal["main", "lasagna", "fiber_slice"]
+) -> dict[str, Any]:
     """Switch VC3D's active workspace tab. Requires a volume package to be open.
 
     name: "main" (the default segmentation/navigation workspace -- v1-v4's
