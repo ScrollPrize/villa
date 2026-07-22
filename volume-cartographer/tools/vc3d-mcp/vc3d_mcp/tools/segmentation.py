@@ -91,6 +91,46 @@ async def vc3d_activate_segment(
 
 
 @mcp.tool()
+async def vc3d_delete_segment(segment_id: str, confirm: bool = False) -> dict[str, Any]:
+    """Permanently delete a segment from the open volume package, removing it
+    from the surface panel AND deleting its files on disk.
+
+    IRREVERSIBLE: this deletes the segment's on-disk data. You MUST pass
+    confirm=True to actually delete; the default confirm=False is rejected
+    -32602 ({param:"confirm"}) as a safety guard. Deleting the active segment is
+    allowed (the active slot is cleared first), but deletion is refused while
+    segmentation editing mode is enabled -- turn it off with
+    vc3d_enable_editing(False) first.
+
+    segment_id: a segment id as returned by vc3d_list_segments.
+    confirm: must be True to proceed (guards against accidental data loss).
+
+    Returns {"deleted": [segmentId]}. Errors: -32602 (confirm not True),
+    -32007 (unknown segment), -32004/-32010 (cannot delete while editing)."""
+    return await _call("segments.delete", {"segmentId": segment_id, "confirm": confirm})
+
+
+@mcp.tool()
+async def vc3d_rename_segment(segment_id: str, new_name: str) -> dict[str, Any]:
+    """Rename a segment (its id and on-disk directory), the headless twin of the
+    surface panel's rename action.
+
+    new_name must match ^[a-zA-Z0-9_-]+$ (letters, digits, underscore, hyphen)
+    and must not collide with an existing segment. Renaming is refused while
+    segmentation editing mode is enabled -- turn it off with
+    vc3d_enable_editing(False) first. On any failure the on-disk state is rolled
+    back so the segment is left intact.
+
+    segment_id: a segment id as returned by vc3d_list_segments.
+    new_name: the desired new id/name.
+
+    Returns {"oldId", "newId"}. Errors: -32602 (invalid new_name), -32007
+    (unknown segment), -32010 (target name already exists / cannot rename while
+    editing)."""
+    return await _call("segments.rename", {"segmentId": segment_id, "newName": new_name})
+
+
+@mcp.tool()
 async def vc3d_enable_editing(enabled: bool) -> dict[str, Any]:
     """Turn segmentation editing mode on/off for the active segment."""
     return await _call("segmentation.enable_editing", {"enabled": enabled})

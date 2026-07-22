@@ -21,6 +21,7 @@ or via unittest discovery:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import shutil
@@ -33,6 +34,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from mcp.server.fastmcp import Image  # noqa: E402
+
 from vc3d_mcp.bridge_client import (  # noqa: E402
     BridgeClient,
     BridgeClientConfig,
@@ -43,23 +46,43 @@ from vc3d_mcp.bridge_client import (  # noqa: E402
 from vc3d_mcp import core, server as server_module  # noqa: E402
 from vc3d_mcp.tools.atlas import vc3d_atlas_search_start  # noqa: E402
 from vc3d_mcp.tools.lasagna import vc3d_lasagna_start_optimization  # noqa: E402
-from vc3d_mcp.tools.misc import vc3d_ping  # noqa: E402
+from vc3d_mcp.tools.catalog_volume import vc3d_list_volumes  # noqa: E402
+from vc3d_mcp.tools.misc import (  # noqa: E402
+    vc3d_cancel_job,
+    vc3d_ping,
+    vc3d_screenshot,
+    vc3d_wait_job,
+)
 from vc3d_mcp.tools.segmentation import (  # noqa: E402
     vc3d_activate_segment,
+    vc3d_delete_segment,
     vc3d_fetch_segment,
     vc3d_grow_segment,
+    vc3d_rename_segment,
     vc3d_run_trace,
     vc3d_save_segment,
 )
 from vc3d_mcp.tools.viewer import (  # noqa: E402
+    vc3d_get_render_settings,
     vc3d_rotate_viewer,
     vc3d_set_axis_aligned_slices,
+    vc3d_set_render_settings,
 )
 from vc3d_mcp.tools.wrap import (  # noqa: E402
     vc3d_commit_wrap_annotation,
     vc3d_set_wrap_annotation_mode,
     vc3d_undo_wrap_annotation,
 )
+
+
+# A minimal valid 1x1 opaque-red PNG (matches the on-the-wire "base64" the real
+# screenshot.capture bridge method returns for an inline, no-filePath capture).
+TINY_PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08"
+    b"\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00"
+    b"\x03\x01\x01\x00\xc9\xfe\x92\xef\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+TINY_PNG_B64 = base64.b64encode(TINY_PNG_BYTES).decode("ascii")
 
 
 class FakeAgentBridgeServer:
@@ -97,6 +120,24 @@ class FakeAgentBridgeServer:
         # When False, jobs stay "running" forever (never terminal), so a
         # wait: true call polls until the cap or the peer drops.
         self.finish_jobs: bool = True
+        # When True, screenshot.capture returns a null/absent base64 even for an
+        # inline (no filePath) capture -- models the "bridge unexpectedly gave
+        # us no image bytes" edge the tool must degrade gracefully on.
+        self.screenshot_drop_base64: bool = False
+        # Global viewer render settings (viewer.get_render_settings /
+        # viewer.set_render_settings). set merges its params over this and echoes
+        # the full merged object back, so a wrapper round-trip is meaningful.
+        self._render_settings: dict = {
+            "intersectionOpacity": 0.5,
+            "intersectionThickness": 1.0,
+            "overlayOpacity": 0.25,
+            "intersectionMaxSurfaces": 8,
+            "planeIntersectionLinesVisible": True,
+            "showSurfaceNormals": False,
+            "showDirectionHints": False,
+            "surfaceOverlayEnabled": True,
+            "highlightedSurfaceIds": [],
+        }
 
     async def start(self) -> None:
         if os.path.exists(self.socket_path):
@@ -301,6 +342,24 @@ class FakeAgentBridgeServer:
             undone = self._wrap_has_preview
             self._wrap_has_preview = False
             await self._reply(writer, req_id, result={"undone": undone})
+        elif method == "screenshot.capture":
+            # Mirror the real bridge contract: an inline capture (no filePath)
+            # returns the PNG as base64; a to-disk capture (filePath set) writes
+            # the file and returns a dict with base64 null plus the path.
+            file_path = params.get("filePath")
+            if file_path is not None:
+                await self._reply(
+                    writer, req_id,
+                    result={"target": params.get("target"), "filePath": file_path,
+                            "base64": None, "width": 1, "height": 1},
+                )
+            else:
+                b64 = None if self.screenshot_drop_base64 else TINY_PNG_B64
+                await self._reply(
+                    writer, req_id,
+                    result={"target": params.get("target"), "filePath": None,
+                            "base64": b64, "width": 1, "height": 1},
+                )
         elif method == "job.status":
             job_id = params.get("jobId", "job-1")
             rec = self._jobs.get(job_id)
@@ -325,6 +384,59 @@ class FakeAgentBridgeServer:
                     "consoleTail": list(rec["consoleTail"]),
                 },
             )
+        elif method == "job.cancel":
+            job_id = params.get("jobId")
+            source = params.get("source")
+            if not job_id and not source:
+                await self._reply(
+                    writer, req_id,
+                    error={"code": -32602, "message": "jobId or source is required",
+                           "data": {"param": "jobId"}},
+                )
+            else:
+                resolved = job_id or "job-for-" + str(source)
+                await self._reply(
+                    writer, req_id,
+                    result={"cancelRequested": True, "jobId": resolved,
+                            "source": source or "growth",
+                            "kind": self._job_kinds.get(resolved, "segmentation.grow")},
+                )
+        elif method == "volume.list":
+            await self._reply(
+                writer, req_id,
+                result={"volumeIds": ["vol-a", "vol-b"], "currentVolumeId": "vol-a"},
+            )
+        elif method == "segments.delete":
+            seg = params.get("segmentId")
+            if params.get("confirm") is not True:
+                await self._reply(
+                    writer, req_id,
+                    error={"code": -32602, "message": "destructive; pass confirm=true",
+                           "data": {"param": "confirm",
+                                    "reason": "destructive; pass confirm=true"}},
+                )
+            elif seg in ("seg-ready", "seg-ph") or seg in self._fetched:
+                self._fetched.discard(seg)
+                await self._reply(writer, req_id, result={"deleted": [seg]})
+            else:
+                await self._reply(
+                    writer, req_id,
+                    error={"code": -32007, "message": "Segment not found",
+                           "data": {"kind": "segment", "id": seg}},
+                )
+        elif method == "segments.rename":
+            seg = params.get("segmentId")
+            new_name = params.get("newName")
+            await self._reply(
+                writer, req_id, result={"oldId": seg, "newId": new_name},
+            )
+        elif method == "viewer.get_render_settings":
+            await self._reply(writer, req_id, result=dict(self._render_settings))
+        elif method == "viewer.set_render_settings":
+            # Merge the provided subset over current state and echo the full set,
+            # mirroring the real "reuse get logic" reply contract.
+            self._render_settings.update(params)
+            await self._reply(writer, req_id, result=dict(self._render_settings))
         elif method == "will_error":
             await self._reply(
                 writer,
@@ -454,6 +566,35 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         result = await vc3d_ping()
         self.assertTrue(result["pong"])
         self.assertEqual(result["pid"], 4242)
+
+    async def test_vc3d_screenshot_inline_returns_image(self) -> None:
+        # No file_path -> the tool decodes the bridge's base64 PNG into a
+        # FastMCP Image (so the model SEES the screenshot), not a base64 dict.
+        result = await vc3d_screenshot(target="window")
+        self.assertIsInstance(result, Image)
+        self.assertEqual(result.data, TINY_PNG_BYTES)
+        # It converts to a proper MCP image content object.
+        content = result.to_image_content()
+        self.assertEqual(content.type, "image")
+        self.assertEqual(content.mimeType, "image/png")
+        self.assertEqual(base64.b64decode(content.data), TINY_PNG_BYTES)
+
+    async def test_vc3d_screenshot_to_file_returns_dict(self) -> None:
+        # file_path given -> the PNG is written to disk; the tool returns the
+        # raw dict (base64 null), never an Image.
+        result = await vc3d_screenshot(target="window", file_path="/tmp/shot.png")
+        self.assertNotIsInstance(result, Image)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["filePath"], "/tmp/shot.png")
+        self.assertIsNone(result["base64"])
+
+    async def test_vc3d_screenshot_missing_base64_falls_back_to_dict(self) -> None:
+        # Bridge returns no image bytes for an inline capture -> fall back to
+        # the raw dict rather than crashing on decode.
+        self.fake_server.screenshot_drop_base64 = True
+        result = await vc3d_screenshot(target="window")
+        self.assertNotIsInstance(result, Image)
+        self.assertIsInstance(result, dict)
 
     async def test_vc3d_grow_segment_wait_returns_terminal_status(self) -> None:
         result = await vc3d_grow_segment(steps=1, wait=True)
@@ -589,6 +730,74 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.fake_server._wrap_has_preview = True
         result = await vc3d_undo_wrap_annotation()
         self.assertTrue(result["undone"])
+
+    async def test_vc3d_cancel_job_forwards_id_and_source(self) -> None:
+        result = await vc3d_cancel_job(job_id="job-1", source="growth")
+        self.assertTrue(result["cancelRequested"])
+        self.assertEqual(result["jobId"], "job-1")
+        # None args are stripped, but both were given here; the wrapper forwards
+        # them under the camelCase wire keys.
+        sent = self.fake_server.received_requests[-1]["params"]
+        self.assertEqual(sent, {"jobId": "job-1", "source": "growth"})
+
+    async def test_vc3d_cancel_job_strips_none_args(self) -> None:
+        result = await vc3d_cancel_job(source="lasagna")
+        self.assertTrue(result["cancelRequested"])
+        sent = self.fake_server.received_requests[-1]["params"]
+        self.assertEqual(sent, {"source": "lasagna"})  # jobId=None dropped
+
+    async def test_vc3d_list_volumes_roundtrip(self) -> None:
+        result = await vc3d_list_volumes()
+        self.assertEqual(result["volumeIds"], ["vol-a", "vol-b"])
+        self.assertEqual(result["currentVolumeId"], "vol-a")
+
+    async def test_vc3d_delete_segment_confirm_true_forwarded(self) -> None:
+        result = await vc3d_delete_segment("seg-ready", confirm=True)
+        self.assertEqual(result["deleted"], ["seg-ready"])
+        sent = self.fake_server.received_requests[-1]["params"]
+        self.assertEqual(sent, {"segmentId": "seg-ready", "confirm": True})
+
+    async def test_vc3d_delete_segment_default_confirm_false_is_forwarded_and_refused(self) -> None:
+        # confirm defaults to False and IS forwarded (the bridge enforces the
+        # guard); the fake refuses it with -32602.
+        with self.assertRaises(BridgeError) as ctx:
+            await vc3d_delete_segment("seg-ready")
+        self.assertEqual(ctx.exception.code, -32602)
+        sent = self.fake_server.received_requests[-1]["params"]
+        self.assertEqual(sent, {"segmentId": "seg-ready", "confirm": False})
+
+    async def test_vc3d_rename_segment_forwards_new_name(self) -> None:
+        result = await vc3d_rename_segment("seg-ready", "seg_renamed")
+        self.assertEqual(result["oldId"], "seg-ready")
+        self.assertEqual(result["newId"], "seg_renamed")
+        sent = self.fake_server.received_requests[-1]["params"]
+        self.assertEqual(sent, {"segmentId": "seg-ready", "newName": "seg_renamed"})
+
+    async def test_vc3d_get_render_settings_roundtrip(self) -> None:
+        result = await vc3d_get_render_settings()
+        self.assertEqual(result["intersectionOpacity"], 0.5)
+        self.assertIn("highlightedSurfaceIds", result)
+
+    async def test_vc3d_set_render_settings_maps_and_strips_none(self) -> None:
+        result = await vc3d_set_render_settings(
+            intersection_opacity=0.9,
+            show_surface_normals=True,
+            highlighted_surface_ids=["s1", "s2"],
+        )
+        # Only the three provided fields are sent, each under its camelCase key;
+        # all the omitted (None) args are dropped.
+        sent = self.fake_server.received_requests[-1]["params"]
+        self.assertEqual(
+            sent,
+            {"intersectionOpacity": 0.9, "showSurfaceNormals": True,
+             "highlightedSurfaceIds": ["s1", "s2"]},
+        )
+        # The fake echoes the merged full settings: changed fields updated,
+        # untouched fields preserved.
+        self.assertEqual(result["intersectionOpacity"], 0.9)
+        self.assertTrue(result["showSurfaceNormals"])
+        self.assertEqual(result["highlightedSurfaceIds"], ["s1", "s2"])
+        self.assertEqual(result["overlayOpacity"], 0.25)  # untouched
 
 
 class _FakeCtx:
@@ -818,6 +1027,38 @@ class WaitAndProgressTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.get("waitTimedOut"))
         self.assertEqual(result["jobId"], "job-5")
 
+    async def test_wait_job_returns_terminal_status(self) -> None:
+        # Launch a job with wait=false so the fake server holds a live,
+        # simulated record, then park on it: vc3d_wait_job must poll it to the
+        # terminal state and return the merged job.status.
+        started = await vc3d_grow_segment(steps=1, wait=False)
+        job_id = started["jobId"]
+        result = await vc3d_wait_job(job_id)
+        self.assertEqual(result["jobId"], job_id)
+        self.assertEqual(result["state"], "succeeded")
+        self.assertIn("consoleTail", result)
+
+    async def test_wait_job_forwards_console_progress(self) -> None:
+        started = await vc3d_grow_segment(steps=1, wait=False)
+        ctx = _FakeCtx()
+        result = await vc3d_wait_job(started["jobId"], ctx=ctx)
+        self.assertEqual(result["state"], "succeeded")
+        self.assertEqual([m for _, m in ctx.reports], ["line A", "line B"])
+
+    async def test_wait_job_cap_returns_timed_out(self) -> None:
+        self.fake_server.finish_jobs = False  # stays running past the cap
+        started = await vc3d_grow_segment(steps=1, wait=False)
+        orig_cap = core.DEFAULT_WAIT_TIMEOUT_S
+        core.DEFAULT_WAIT_TIMEOUT_S = 0.05
+        try:
+            result = await asyncio.wait_for(
+                vc3d_wait_job(started["jobId"]), timeout=3.0
+            )
+        finally:
+            core.DEFAULT_WAIT_TIMEOUT_S = orig_cap
+        self.assertTrue(result.get("waitTimedOut"))
+        self.assertEqual(result["jobId"], started["jobId"])
+
     async def test_noop_ctx_does_not_fail_the_tool(self) -> None:
         # ctx=None models an MCP client with no progress support.
         result = await vc3d_run_trace("seg-1", wait=True, ctx=None)
@@ -844,9 +1085,12 @@ class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
     """Official-SDK schema assertions over the whole registered tool surface."""
 
     # The historical surface was 75 tools; this branch adds fetch, rotate, the
-    # axis-aligned-slice toggle, and the same-wrap annotation trio, so the real
-    # current count is 79. Assert the real number so schema drift is caught.
-    EXPECTED_TOOL_COUNT = 79
+    # axis-aligned-slice toggle, the same-wrap annotation trio, and vc3d_wait_job
+    # (80), then items 3-6 add vc3d_cancel_job, vc3d_list_volumes,
+    # vc3d_delete_segment, vc3d_rename_segment, vc3d_get_render_settings, and
+    # vc3d_set_render_settings, so the real current count is 86. Assert the real
+    # number so schema drift is caught.
+    EXPECTED_TOOL_COUNT = 86
 
     async def test_tool_surface_and_schemas(self) -> None:
         tools = await core.mcp.list_tools()

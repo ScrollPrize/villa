@@ -215,8 +215,11 @@ connect. The server also bounds each request: a request line that grows past
 the server's maximum without a terminating newline causes that one client to be
 disconnected, and an oversized complete line is rejected — one misbehaving
 client cannot affect others. Keep individual RPC payloads (e.g. base64
-screenshots) within that bound; prefer writing screenshots to `filePath` for
-large captures rather than returning base64 inline.
+screenshots) within that bound. `vc3d_screenshot` returns the PNG as MCP **image
+content** (a FastMCP `Image`, decoded from the RPC's base64) when `file_path` is
+omitted, and a dict carrying the on-disk path when `file_path` is set. The base64
+still crosses the socket in the image-content case and counts against this bound,
+so prefer passing `file_path` for large captures.
 
 ## Self-test (no real VC3D required)
 
@@ -250,17 +253,17 @@ surface as MCP tool errors whose text is the JSON-encoded
 
 | Group | Tools |
 |---|---|
-| Core / navigation | `vc3d_ping`, `vc3d_get_state`, `vc3d_list_segments`, `vc3d_activate_segment`, `vc3d_screenshot`, `vc3d_get_cursor_point`, `vc3d_click`, `vc3d_shift_click`, `vc3d_drag`, `vc3d_center_viewer`, `vc3d_zoom_viewer`, `vc3d_rotate_viewer`, `vc3d_set_axis_aligned_slices` |
-| Segmentation growth/editing | `vc3d_fetch_segment`, `vc3d_enable_editing`, `vc3d_save_segment`, `vc3d_grow_segment`, `vc3d_grow_patch_from_seed`, `vc3d_manual_add_begin`, `vc3d_manual_add_finish`, `vc3d_manual_add_set_line_mode`, `vc3d_manual_add_set_interpolation`, `vc3d_manual_add_undo_constraint`, `vc3d_corrections_set_point_mode`, `vc3d_push_pull_set_config`, `vc3d_push_pull_start`, `vc3d_push_pull_stop` |
+| Core / navigation | `vc3d_ping`, `vc3d_get_state`, `vc3d_list_segments`, `vc3d_activate_segment`, `vc3d_screenshot`, `vc3d_get_cursor_point`, `vc3d_click`, `vc3d_shift_click`, `vc3d_drag`, `vc3d_center_viewer`, `vc3d_zoom_viewer`, `vc3d_rotate_viewer`, `vc3d_set_axis_aligned_slices`, `vc3d_get_render_settings`, `vc3d_set_render_settings` |
+| Segmentation growth/editing | `vc3d_fetch_segment`, `vc3d_enable_editing`, `vc3d_save_segment`, `vc3d_grow_segment`, `vc3d_grow_patch_from_seed`, `vc3d_delete_segment`, `vc3d_rename_segment`, `vc3d_manual_add_begin`, `vc3d_manual_add_finish`, `vc3d_manual_add_set_line_mode`, `vc3d_manual_add_set_interpolation`, `vc3d_manual_add_undo_constraint`, `vc3d_corrections_set_point_mode`, `vc3d_push_pull_set_config`, `vc3d_push_pull_start`, `vc3d_push_pull_stop` |
 | Points / tags | `vc3d_commit_points`, `vc3d_list_points`, `vc3d_set_segment_tag` |
 | Wrap annotation | `vc3d_set_wrap_annotation_mode`, `vc3d_commit_wrap_annotation`, `vc3d_undo_wrap_annotation` |
-| Volumes / catalog | `vc3d_open_volume`, `vc3d_open_catalog_sample`, `vc3d_list_catalog_samples`, `vc3d_describe_catalog_sample`, `vc3d_select_volume` |
+| Volumes / catalog | `vc3d_open_volume`, `vc3d_list_volumes`, `vc3d_open_catalog_sample`, `vc3d_list_catalog_samples`, `vc3d_describe_catalog_sample`, `vc3d_select_volume` |
 | Lasagna / workspace | `vc3d_lasagna_service_status`, `vc3d_lasagna_ensure_service`, `vc3d_lasagna_list_datasets`, `vc3d_lasagna_start_optimization`, `vc3d_lasagna_jobs`, `vc3d_lasagna_cancel`, `vc3d_lasagna_select_output`, `vc3d_lasagna_repeat_last`, `vc3d_switch_workspace` |
 | Atlas | `vc3d_atlas_open`, `vc3d_atlas_status`, `vc3d_atlas_search_start`, `vc3d_atlas_search_cancel`, `vc3d_atlas_search_results`, `vc3d_atlas_open_result`, `vc3d_atlas_remap`, `vc3d_atlas_optimize_snap_candidates` |
 | Line Annotation (fiber tracing) | `vc3d_fiber_launch`, `vc3d_fiber_list`, `vc3d_fiber_open`, `vc3d_fiber_set_follow`, `vc3d_fiber_save`, `vc3d_fiber_delete`, `vc3d_fiber_set_tag`, `vc3d_fiber_create_atlas`, `vc3d_fiber_export`, `vc3d_fiber_import` |
 | Seeding | `vc3d_seeding_set_winding_annotation_mode`, `vc3d_seeding_preview_rays`, `vc3d_seeding_cast_rays`, `vc3d_seeding_reset_points`, `vc3d_seeding_run`, `vc3d_seeding_expand`, `vc3d_seeding_cancel`, `vc3d_seeding_analyze_paths` |
 | Tracer / flatten / render | `vc3d_run_trace`, `vc3d_render_tifxyz`, `vc3d_flatten_slim`, `vc3d_flatten_abf`, `vc3d_flatten_straighten` |
-| Jobs | `vc3d_job_status` |
+| Jobs | `vc3d_job_status`, `vc3d_wait_job`, `vc3d_cancel_job` |
 
 ### The `wait` convenience
 
@@ -295,6 +298,17 @@ terminal result are unaffected. Because `consoleTail` is a rolling ≤50-line
 window, a burst of more than 50 lines between polls can be under-reported; the
 terminal `consoleTail` in the returned status is unaffected. The injected
 `Context` is not part of any tool's input schema.
+
+`vc3d_wait_job` (SPEC.md §21.3) is the standalone counterpart to `wait`: it has
+no underlying RPC and blocks on an **already-running** job by id, using the same
+`job.status` polling loop (once/sec, 30-minute cap, `consoleTail` forwarded as
+best-effort progress) and returning the terminal `job.status` inline — or the
+last status with `"waitTimedOut": true` on the cap. Use it to wait on a job that
+some earlier call started with `wait=false`, or on an externally-initiated job seen
+in `vc3d_get_state`. To stop a running job, `vc3d_cancel_job` (SPEC.md §21) maps to
+`job.cancel`: it is request-only (poll `vc3d_job_status` for the terminal state), and
+only `tool`/`atlas`/`seeding`/`lasagna` jobs are cancellable — `growth`/`flatten`/
+`catalog`/`autosave` jobs return an error.
 
 ## Known gaps
 

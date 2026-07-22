@@ -142,6 +142,75 @@ async def vc3d_set_axis_aligned_slices(enabled: bool) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def vc3d_get_render_settings() -> dict[str, Any]:
+    """Read the global viewer render settings (surface-intersection overlays,
+    opacities, normals/direction hints, highlighted surfaces).
+
+    Use this to inspect the current rendering state before tweaking it with
+    vc3d_set_render_settings, or to confirm a change took effect.
+
+    Returns the full settings object: {"intersectionOpacity" (0..1),
+    "intersectionThickness" (>=0), "overlayOpacity" (0..1),
+    "intersectionMaxSurfaces" (int >=0), "planeIntersectionLinesVisible" (bool),
+    "showSurfaceNormals" (bool), "showDirectionHints" (bool),
+    "surfaceOverlayEnabled" (bool), "highlightedSurfaceIds" ([str...])}."""
+    return await _call("viewer.get_render_settings")
+
+
+@mcp.tool()
+async def vc3d_set_render_settings(
+    intersection_opacity: Optional[float] = None,
+    intersection_thickness: Optional[float] = None,
+    overlay_opacity: Optional[float] = None,
+    intersection_max_surfaces: Optional[int] = None,
+    plane_intersection_lines_visible: Optional[bool] = None,
+    show_surface_normals: Optional[bool] = None,
+    show_direction_hints: Optional[bool] = None,
+    surface_overlay_enabled: Optional[bool] = None,
+    highlighted_surface_ids: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Update the global viewer render settings; changes apply across all
+    viewers. Every argument is optional -- omitted (None) fields are left
+    unchanged; pass only what you want to change.
+
+    intersection_opacity: surface-intersection overlay opacity, clamped 0..1.
+    intersection_thickness: intersection line thickness, >=0.
+    overlay_opacity: surface overlay opacity, clamped 0..1.
+    intersection_max_surfaces: cap on intersecting surfaces drawn, int >=0.
+    plane_intersection_lines_visible: show plane/surface intersection lines.
+    show_surface_normals: draw surface normal indicators.
+    show_direction_hints: draw growth direction hints.
+    surface_overlay_enabled: master toggle for the surface overlay.
+    highlighted_surface_ids: replace the set of highlighted surface ids.
+
+    The four numeric fields (opacities, thickness, max-surfaces) are backed by
+    ViewerManager and persist even with no viewer pane open. The five toggle/
+    highlight fields apply only to currently-open viewers: with zero viewers
+    instantiated they are no-ops, and the returned echo will report defaults
+    for them rather than the values you passed -- open a viewer first if you
+    need those to stick.
+
+    Returns the full resulting settings object (same shape as
+    vc3d_get_render_settings) so you can confirm what was applied."""
+    return await _call(
+        "viewer.set_render_settings",
+        _strip_none(
+            {
+                "intersectionOpacity": intersection_opacity,
+                "intersectionThickness": intersection_thickness,
+                "overlayOpacity": overlay_opacity,
+                "intersectionMaxSurfaces": intersection_max_surfaces,
+                "planeIntersectionLinesVisible": plane_intersection_lines_visible,
+                "showSurfaceNormals": show_surface_normals,
+                "showDirectionHints": show_direction_hints,
+                "surfaceOverlayEnabled": surface_overlay_enabled,
+                "highlightedSurfaceIds": highlighted_surface_ids,
+            }
+        ),
+    )
+
+
+@mcp.tool()
 async def vc3d_drag(
     from_point: dict[str, float],
     to_point: dict[str, float],

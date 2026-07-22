@@ -78,6 +78,21 @@ async def vc3d_describe_catalog_sample(
 
 
 @mcp.tool()
+async def vc3d_list_volumes() -> dict[str, Any]:
+    """List the volumes attached to the open volume package, with the currently
+    selected one.
+
+    Use this to discover the volume ids you can pass to vc3d_select_volume (or
+    other volume-scoped tools) without scraping vc3d_get_state. Requires a
+    volume package to be open.
+
+    Returns {"volumeIds": [str...], "currentVolumeId": str|null}, and may
+    include a "volumes" array of {id, path, voxelSize} objects when that detail
+    is cheap to gather. Errors: -32000 (no volume package loaded)."""
+    return await _call("volume.list")
+
+
+@mcp.tool()
 async def vc3d_select_volume(volume_id: str) -> dict[str, Any]:
     """Switch the current volume among the already-attached volumes of the open
     package (the programmatic equivalent of picking one in the volume combo).
