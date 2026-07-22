@@ -911,6 +911,56 @@ void SurfacePanelController::activateMaterializedSurface(
     }
 }
 
+bool SurfacePanelController::isOpenDataMaterializationRunning() const
+{
+    return _segmentMaterializationWatcher &&
+           _segmentMaterializationWatcher->isRunning();
+}
+
+SurfacePanelController::OpenDataFetchOutcome
+SurfacePanelController::fetchOpenDataSegmentAsync(
+    const std::string& id,
+    std::function<void(bool success, const QString& message)> onDone)
+{
+    auto surface = getSurfaceById(id);
+    if (!surface) {
+        return OpenDataFetchOutcome::NotFound;
+    }
+    if (!vc3d::opendata::isOpenDataSegmentPlaceholder(surface->path)) {
+        return OpenDataFetchOutcome::AlreadyMaterialized;
+    }
+    if (isOpenDataMaterializationRunning()) {
+        return OpenDataFetchOutcome::Busy;
+    }
+
+    const auto path = surface->path;
+    auto* watcher = new QFutureWatcher<
+        vc3d::opendata::OpenDataSegmentMaterializationResult>(this);
+    _segmentMaterializationWatcher = watcher;
+    connect(watcher, &QFutureWatcher<
+                         vc3d::opendata::OpenDataSegmentMaterializationResult>::finished,
+            this, [this, watcher, onDone = std::move(onDone)]() {
+                const auto result = watcher->result();
+                _segmentMaterializationWatcher = nullptr;
+                watcher->deleteLater();
+                if (result.success) {
+                    // Reload so the freshly-materialized surface stops being a
+                    // placeholder and becomes activatable. Unlike the GUI path
+                    // (activateMaterializedSurface) we do NOT force activation --
+                    // the bridge composes fetch + activate itself.
+                    loadSurfaces(true);
+                }
+                if (onDone) {
+                    onDone(result.success,
+                           QString::fromStdString(result.message));
+                }
+            });
+    watcher->setFuture(QtConcurrent::run([path]() {
+        return vc3d::opendata::materializeOpenDataSegment(path);
+    }));
+    return OpenDataFetchOutcome::Started;
+}
+
 void SurfacePanelController::materializeCurrentOpenDataFolder()
 {
     if (!_volumePkg) {

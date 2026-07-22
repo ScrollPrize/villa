@@ -37,6 +37,7 @@
 #include "MenuActionController.hpp"
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
+#include "OpenDataSegmentCache.hpp"
 #include "SeedingWidget.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfacePanelController.hpp"
@@ -681,6 +682,8 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleSegmentsList(p); });
     _handlers.insert("segments.activate",
         [this](const QJsonValue& p) { return handleSegmentsActivate(p); });
+    _handlers.insert("segments.fetch",
+        [this](const QJsonValue& p) { return handleSegmentsFetch(p); });
     _handlers.insert("screenshot.capture",
         [this](const QJsonValue& p) { return handleScreenshotCapture(p); });
     _handlers.insert("canvas.get_cursor_volume_point",
@@ -1105,6 +1108,108 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
     result["segment"] = segment;
     result["previousSegmentId"] = previousSegmentId;
     result["alreadyActive"] = alreadyActive;
+    return result;
+}
+
+QJsonObject AgentBridgeServer::handleSegmentsFetch(const QJsonValue& params)
+{
+    CState* state = _window ? _window->_state : nullptr;
+    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
+    if (!state || !state->hasVpkg() || !vpkg)
+        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+
+    const QJsonObject p = paramsObject(params);
+    const QString segmentIdQ = p.value("segmentId").toString();
+    if (segmentIdQ.isEmpty()) {
+        QJsonObject data;
+        data["param"] = "segmentId";
+        throw AgentBridgeError{-32602, "segmentId is required", data};
+    }
+    const std::string segmentId = segmentIdQ.toStdString();
+
+    SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr;
+    if (!panel) {
+        QJsonObject data;
+        data["detail"] = "surface panel is not available";
+        throw AgentBridgeError{-32010, "Surface panel unavailable", data};
+    }
+
+    // Resolve the segment path (prefer the loaded CState surface for multi-folder
+    // display ids, fall back to the vpkg) so the result carries a stable path.
+    auto resolveSegPath = [&]() -> QString {
+        if (auto surf = state->surface(segmentId))
+            return QString::fromStdString(surf->path.string());
+        try {
+            if (auto s = vpkg->segmentation(segmentId))
+                return QString::fromStdString(s->path().string());
+        } catch (...) {
+        }
+        return QString();
+    };
+    const QString segPath = resolveSegPath();
+
+    auto segmentEntry = [&](bool placeholder) {
+        QJsonObject seg;
+        seg["id"] = segmentIdQ;
+        seg["path"] = segPath;
+        seg["placeholder"] = placeholder;
+        return seg;
+    };
+
+    // A concurrent Open Data operation (catalog open or another segment fetch)
+    // shares the same download subsystem: reject up front (SPEC §1.3 / §18.4).
+    requireSourceIdle(QStringLiteral("catalog"));
+
+    // Kick off (or short-circuit) the materialize. fetchOpenDataSegmentAsync
+    // only calls onDone for the `Started` outcome; the others are terminal here.
+    // beginJob runs synchronously below before we return to the event loop, so
+    // the "catalog" job is registered before onDone (which finishes it) can fire.
+    const auto outcome = panel->fetchOpenDataSegmentAsync(
+        segmentId,
+        [this, segmentId](bool success, const QString& message) {
+            finishJob(QStringLiteral("catalog"), success,
+                      success
+                          ? QStringLiteral("segment %1 fetched")
+                                .arg(QString::fromStdString(segmentId))
+                          : message,
+                      QString());
+        });
+
+    switch (outcome) {
+    case SurfacePanelController::OpenDataFetchOutcome::NotFound: {
+        QJsonObject data;
+        data["kind"] = "segment";
+        data["id"] = segmentIdQ;
+        throw AgentBridgeError{-32007, "Segment not found", data};
+    }
+    case SurfacePanelController::OpenDataFetchOutcome::Busy: {
+        QJsonObject data;
+        data["source"] = "catalog";
+        data["detail"] = "another open-data segment fetch is already in progress";
+        throw AgentBridgeError{-32004, "A segment fetch is already in progress", data};
+    }
+    case SurfacePanelController::OpenDataFetchOutcome::AlreadyMaterialized: {
+        QJsonObject result;
+        result["fetched"] = true;
+        result["alreadyMaterialized"] = true;
+        result["segment"] = segmentEntry(false);
+        return result;
+    }
+    case SurfacePanelController::OpenDataFetchOutcome::Started:
+        break;
+    }
+
+    const QString jobId = beginJob(QStringLiteral("catalog"),
+                                   QStringLiteral("segments.fetch"),
+                                   QStringLiteral("Fetching segment %1").arg(segmentIdQ),
+                                   /*broadcastStart=*/true);
+
+    QJsonObject result;
+    result["jobId"] = jobId;
+    result["source"] = "catalog";
+    result["fetched"] = false;
+    result["alreadyMaterialized"] = false;
+    result["segment"] = segmentEntry(true);
     return result;
 }
 

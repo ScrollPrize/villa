@@ -53,6 +53,10 @@ class FakeAgentBridgeServer:
         # job_id -> kind, so job.status/job.progress can echo the right kind for
         # both the segmentation.grow and lasagna.optimize job flows.
         self._job_kinds: dict[str, str] = {}
+        # Segments that have been materialized (fetched). "seg-ph" starts as an
+        # unfetched open-data placeholder; fetching it adds it here so a
+        # subsequent segments.activate succeeds -- the fetch+retry compose.
+        self._fetched: set[str] = set()
 
     async def start(self) -> None:
         if os.path.exists(self.socket_path):
@@ -108,6 +112,53 @@ class FakeAgentBridgeServer:
                 result={"jobId": job_id, "kind": "lasagna.optimize", "source": "lasagna"},
             )
             asyncio.create_task(self._simulate_job(job_id, "lasagna.optimize"))
+        elif method == "segments.activate":
+            seg = params.get("segmentId")
+            if seg == "seg-ready" or seg in self._fetched:
+                await self._reply(
+                    writer, req_id,
+                    result={"activated": True,
+                            "segment": {"id": seg, "loaded": True, "active": True},
+                            "previousSegmentId": None, "alreadyActive": False},
+                )
+            elif seg == "seg-ph":
+                await self._reply(
+                    writer, req_id,
+                    error={"code": -32005, "message": "Segment could not be activated",
+                           "data": {"detail": f"segment {seg} is an open-data "
+                                              "placeholder; fetch it first"}},
+                )
+            else:
+                await self._reply(
+                    writer, req_id,
+                    error={"code": -32007, "message": "Segment not found",
+                           "data": {"kind": "segment", "id": seg}},
+                )
+        elif method == "segments.fetch":
+            seg = params.get("segmentId")
+            if seg == "seg-ready" or seg in self._fetched:
+                await self._reply(
+                    writer, req_id,
+                    result={"fetched": True, "alreadyMaterialized": True,
+                            "segment": {"id": seg, "placeholder": False}},
+                )
+            elif seg == "seg-ph":
+                job_id = "job-3"
+                self._job_kinds[job_id] = "segments.fetch"
+                self._fetched.add(seg)  # materialized once the fetch is requested
+                await self._reply(
+                    writer, req_id,
+                    result={"jobId": job_id, "source": "catalog", "fetched": False,
+                            "alreadyMaterialized": False,
+                            "segment": {"id": seg, "placeholder": True}},
+                )
+                asyncio.create_task(self._simulate_job(job_id, "segments.fetch"))
+            else:
+                await self._reply(
+                    writer, req_id,
+                    error={"code": -32007, "message": "Segment not found",
+                           "data": {"kind": "segment", "id": seg}},
+                )
         elif method == "job.status":
             job_id = params.get("jobId", "job-1")
             await self._reply(
@@ -275,6 +326,40 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["state"], "succeeded")
         self.assertEqual(result["kind"], "lasagna.optimize")
         self.assertIn("consoleTail", result)
+
+    async def test_vc3d_fetch_segment_already_materialized_is_synchronous(self) -> None:
+        result = await server_module.vc3d_fetch_segment("seg-ready")
+        self.assertTrue(result["fetched"])
+        self.assertTrue(result["alreadyMaterialized"])
+        self.assertNotIn("jobId", result)
+
+    async def test_vc3d_fetch_segment_placeholder_waits_for_job(self) -> None:
+        result = await server_module.vc3d_fetch_segment("seg-ph", wait=True)
+        self.assertEqual(result["jobId"], "job-3")
+        self.assertEqual(result["state"], "succeeded")
+
+    async def test_vc3d_fetch_segment_placeholder_no_wait_returns_job_id(self) -> None:
+        result = await server_module.vc3d_fetch_segment("seg-ph", wait=False)
+        self.assertEqual(result["jobId"], "job-3")
+        self.assertNotIn("state", result)
+
+    async def test_vc3d_activate_segment_plain_success(self) -> None:
+        result = await server_module.vc3d_activate_segment("seg-ready")
+        self.assertTrue(result["activated"])
+        self.assertNotIn("fetched", result)
+
+    async def test_vc3d_activate_segment_auto_fetches_placeholder(self) -> None:
+        # seg-ph refuses activation until fetched; auto_fetch (default) should
+        # fetch then retry, yielding activated + fetched.
+        result = await server_module.vc3d_activate_segment("seg-ph")
+        self.assertTrue(result["activated"])
+        self.assertTrue(result["fetched"])
+
+    async def test_vc3d_activate_segment_no_auto_fetch_raises_placeholder(self) -> None:
+        with self.assertRaises(BridgeError) as ctx:
+            await server_module.vc3d_activate_segment("seg-ph", auto_fetch=False)
+        self.assertEqual(ctx.exception.code, -32005)
+        self.assertIn("placeholder", str(ctx.exception).lower())
 
 
 class RegistryDiscoveryTest(unittest.TestCase):

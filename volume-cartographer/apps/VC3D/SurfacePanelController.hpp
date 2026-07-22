@@ -142,6 +142,33 @@ public:
     bool cycleToPreviousVisibleSegment();
     void materializeCurrentOpenDataFolder();
 
+    /// Outcome of a bridge-driven single-segment fetch request. Only `Started`
+    /// implies the completion callback will fire later (on the main thread);
+    /// the other outcomes are resolved synchronously by the caller with no
+    /// callback.
+    enum class OpenDataFetchOutcome {
+        Started,             ///< async materialize kicked off; onDone will fire
+        AlreadyMaterialized, ///< not a placeholder; nothing to fetch
+        NotFound,            ///< no such segment / surface could not be loaded
+        Busy,                ///< another single-segment materialize is running
+    };
+
+    /// Materialize (download) one open-data placeholder segment WITHOUT the
+    /// modal progress dialog and WITHOUT forcing activation -- the headless
+    /// counterpart to startOpenDataMaterialization used by the Agent Bridge's
+    /// segments.fetch RPC. Shares the same _segmentMaterializationWatcher
+    /// single-flight guard as the GUI path so the two never fetch the same
+    /// folder concurrently. On a `Started` outcome, reloads the surface list on
+    /// success (so the freshly-fetched segment becomes activatable) and then
+    /// invokes onDone(success, message) on the main thread.
+    OpenDataFetchOutcome fetchOpenDataSegmentAsync(
+        const std::string& id,
+        std::function<void(bool success, const QString& message)> onDone);
+
+    /// True while a single-segment materialize started by either the GUI or the
+    /// bridge is in flight (the shared single-flight guard is held).
+    bool isOpenDataMaterializationRunning() const;
+
 signals:
     void surfacesLoaded();
     void surfaceSelectionCleared();

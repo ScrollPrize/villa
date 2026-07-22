@@ -81,6 +81,18 @@ def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
+def _is_placeholder_error(exc: Exception) -> bool:
+    """True when a segments.activate failure is the 'unmaterialized open-data
+    placeholder; fetch it first' refusal (SurfacePanelController::activateSurfaceById),
+    so vc3d_activate_segment knows a fetch+retry can resolve it."""
+    if not isinstance(exc, BridgeError):
+        return False
+    detail = ""
+    if isinstance(exc.data, dict):
+        detail = str(exc.data.get("detail", ""))
+    return "placeholder" in detail.lower() or "placeholder" in str(exc.message).lower()
+
+
 async def _wait_for_job(job_id: str, wait: bool, initial_result: dict[str, Any]) -> dict[str, Any]:
     """Shared `wait: true` handling for the async grow.* tools.
 
@@ -133,15 +145,63 @@ async def vc3d_list_segments(only_loaded: bool = False) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def vc3d_activate_segment(segment_id: str) -> dict[str, Any]:
+async def vc3d_fetch_segment(segment_id: str, wait: bool = True) -> dict[str, Any]:
+    """Download ("materialize") an open-data placeholder segment so it can be
+    activated and edited.
+
+    Segments attached from the Open Data catalog are lazy placeholders that hold
+    only metadata until fetched -- vc3d_activate_segment on one fails with
+    "open-data placeholder; fetch it first". This runs the fetch, the
+    programmatic equivalent of the GUI's fetch-on-click.
+
+    If the segment is already materialized, returns immediately with
+    alreadyMaterialized=true. Otherwise the fetch runs as a "catalog"-source job:
+    wait defaults to true (block until the download finishes and the segment is
+    activatable); pass wait=false to get the jobId back immediately and poll
+    vc3d_job_status yourself.
+
+    segment_id: a segment id as returned by vc3d_list_segments.
+    """
+    result = await _call("segments.fetch", {"segmentId": segment_id})
+    job_id = result.get("jobId") if isinstance(result, dict) else None
+    if not job_id:
+        return result  # synchronous: already materialized, nothing to wait on
+    return await _wait_for_job(job_id, wait, result)
+
+
+@mcp.tool()
+async def vc3d_activate_segment(segment_id: str, auto_fetch: bool = True) -> dict[str, Any]:
     """Make a segment the active editing target (the programmatic equivalent of
     clicking it in the segment list). Required before vc3d_enable_editing /
     vc3d_grow_segment and after any segment switch.
 
     segment_id: a segment id as returned by vc3d_list_segments (including
     folder-qualified display ids like "paths/foo").
+    auto_fetch: if true (default), when segment_id is an unfetched open-data
+    placeholder, transparently fetch it first (blocking, via vc3d_fetch_segment)
+    and then activate -- mirroring a GUI double-click, which fetches on click.
+    The result then carries fetched=true. Set auto_fetch=false to instead get
+    the raw "open-data placeholder; fetch it first" error without downloading.
     """
-    return await _call("segments.activate", {"segmentId": segment_id})
+    try:
+        return await _call("segments.activate", {"segmentId": segment_id})
+    except BridgeError as exc:
+        if not (auto_fetch and _is_placeholder_error(exc)):
+            raise
+
+    # Placeholder + auto_fetch: fetch (blocking) then retry activation once.
+    fetch = await vc3d_fetch_segment(segment_id, wait=True)
+    if fetch.get("waitTimedOut"):
+        return {"activated": False, "fetched": False, "fetch": fetch,
+                "detail": "segment fetch did not finish within the wait cap"}
+    state = fetch.get("state")
+    if state is not None and state != "succeeded":
+        return {"activated": False, "fetched": False, "fetch": fetch,
+                "detail": f"segment fetch did not succeed (state={state})"}
+
+    result = await _call("segments.activate", {"segmentId": segment_id})
+    result["fetched"] = True
+    return result
 
 
 @mcp.tool()

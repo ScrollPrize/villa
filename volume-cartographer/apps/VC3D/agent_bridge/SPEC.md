@@ -489,6 +489,38 @@ Sources: `CommandLineToolRunner::toolStarted` → `started`;
 lines); `toolFinished` → `finished`. For in-process growth,
 `onSegmentationGrowthStatusChanged(true/false)` → `started` / `finished`.
 
+### 3.19 `segments.fetch` — materialize an open-data placeholder segment
+
+Segments attached from the Open Data catalog are **lazy placeholders** holding
+only metadata (`isOpenDataSegmentPlaceholder`); `segments.activate` (§17.3)
+refuses them with `-32005` / `data.detail` ending `"…placeholder; fetch it
+first"`. This RPC downloads the actual surface data — the headless counterpart
+to the GUI's fetch-on-click (`SurfacePanelController::fetchOpenDataSegmentAsync`,
+which reuses `materializeOpenDataSegment` and, on success, reloads the surface
+list so the segment becomes activatable). It does **not** activate the segment.
+
+- **params:** `{"segmentId": str}` — an id as returned by `segments.list`.
+- **result (already materialized — synchronous):**
+  ```json
+  {"fetched": true, "alreadyMaterialized": true,
+   "segment": {"id": str, "path": str, "placeholder": false}}
+  ```
+- **result (placeholder — async, SPEC §18.4 job):**
+  ```json
+  {"jobId": str, "source": "catalog", "fetched": false,
+   "alreadyMaterialized": false,
+   "segment": {"id": str, "path": str, "placeholder": true}}
+  ```
+  Progress and completion arrive as `job.progress` (§3.18) on the `"catalog"`
+  source; the terminal state is pollable via `job.status`.
+- **concurrency:** runs on the `"catalog"` job source and shares
+  `SurfacePanelController`'s single-flight materialize guard, so it is rejected
+  with `-32004` while a `catalog.open_sample`, another `segments.fetch`, or a
+  GUI-initiated fetch is in flight.
+- **errors:** `-32602` (missing `segmentId`); `-32007` (`data.kind:"segment"` —
+  unknown id); `-32004` (`data.source:"catalog"` — a fetch is already running);
+  `-32000` (no volume package loaded); `-32010` (surface panel unavailable).
+
 ---
 
 ## 4. Interactive/headless split: `onCreateSegmentGrowPatchFromSeed`
@@ -595,6 +627,7 @@ spawns VC3D itself with `--agent-bridge` and parses the stdout handshake line (�
 | `vc3d_ping` | `ping` | Check the VC3D bridge is alive; returns pid and app version. |
 | `vc3d_get_state` | `state.get` | Snapshot of VC3D: open volume package, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
 | `vc3d_list_segments` | `segments.list` | List segments in the open volume package with loaded/active flags. |
+| `vc3d_fetch_segment` | `segments.fetch` | Download ("materialize") an open-data placeholder segment so it can be activated/edited. Sync if already materialized; else a `"catalog"` job (`wait` defaults true). |
 | `vc3d_screenshot` | `screenshot.capture` | Capture a PNG of the whole VC3D window or one viewer pane. Returns base64 or writes to filePath. |
 | `vc3d_get_cursor_point` | `canvas.get_cursor_volume_point` | Resolve a viewer scene position (or the current cursor) to a 3D volume point + surface normal. |
 | `vc3d_click` | `canvas.click` | Synthesize a mouse click in a viewer at a volume-space (or scene-space) position, with button and modifiers (e.g. `{"modifiers": ["shift"]}` to place a point / set focus). |
@@ -2332,6 +2365,15 @@ A `source:"growth"` job in flight also implies the selection lock above — poll
 | `vc3d_activate_segment` | `segments.activate` | Make a segment the active editing target (the programmatic equivalent of clicking it in the segment list). Required before `vc3d_enable_editing` / `vc3d_grow_segment` and after any segment switch. |
 
 Same conventions as §5 (params/result passthrough, RPC errors preserved).
+
+`vc3d_activate_segment` additionally takes an MCP-server-side `auto_fetch` flag
+(default **true**, not part of the underlying RPC): when the target is an
+unfetched open-data placeholder, the tool catches the `-32005`
+`"…placeholder; fetch it first"` refusal, runs `vc3d_fetch_segment`
+(§3.19, blocking) and then retries `segments.activate` once — mirroring a GUI
+double-click, which fetches on click. The result then carries `fetched: true`.
+Pass `auto_fetch=false` to surface the raw placeholder error without
+downloading. Fetching a segment without activating it is `vc3d_fetch_segment`.
 
 ---
 

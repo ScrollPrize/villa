@@ -117,6 +117,7 @@ private:
     QJsonObject handleStateGet(const QJsonValue& params);
     QJsonObject handleSegmentsList(const QJsonValue& params);
     QJsonObject handleSegmentsActivate(const QJsonValue& params);
+    QJsonObject handleSegmentsFetch(const QJsonValue& params);
     QJsonObject handleScreenshotCapture(const QJsonValue& params);
     QJsonObject handleCursorVolumePoint(const QJsonValue& params);
     // Phase 2: canvas + mutating action handlers.
