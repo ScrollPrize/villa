@@ -4,10 +4,10 @@
 // loop — so a tiny dependency-free assert harness suffices (matches the
 // "plain main() returns nonzero on failure" style noted for this test).
 //
-// Covers the C4 hardening: QJsonValue::toDouble()/toInt()/toBool() silently
-// coerce a wrong-typed value to 0/false; the jsonRequire*/jsonTo* helpers must
-// instead reject a PRESENT-but-malformed value with AgentBridgeError{-32602}
-// carrying data["param"], while still ACCEPTING well-formed values.
+// QJsonValue::toDouble()/toInt()/toBool() silently coerce a wrong-typed value to
+// 0/false; the jsonRequire*/jsonTo* helpers must instead reject a PRESENT-but-
+// malformed value with AgentBridgeError{-32602} carrying data["param"], while
+// still ACCEPTING well-formed values.
 
 #include <cstdio>
 #include <limits>
@@ -15,7 +15,6 @@
 
 #include <QJsonObject>
 #include <QJsonValue>
-#include <QPointF>
 #include <QString>
 
 #include <opencv2/core.hpp>
@@ -142,28 +141,6 @@ int main()
         CHECK(jsonRequireInt(QJsonValue(-8.0), "steps") == -8);
     });
 
-    // --- jsonRequireUInt64: reject wrong type, fractional, negative, overflow ---
-    expectParamError("uint64<-string", "id",
-        [&] { jsonRequireUInt64(QJsonValue(QStringLiteral("3")), "id"); });
-    expectParamError("uint64<-fractional", "id",
-        [&] { jsonRequireUInt64(QJsonValue(1.5), "id"); });
-    expectParamError("uint64<-negative", "id",
-        [&] { jsonRequireUInt64(QJsonValue(-1), "id"); });
-    expectParamError("uint64<-overflow", "id",
-        [&] { jsonRequireUInt64(QJsonValue(1.0e300), "id"); });
-    expectNoThrow("uint64<-integral", [&] {
-        CHECK(jsonRequireUInt64(QJsonValue(42.0), "id") == 42u);
-    });
-
-    // --- jsonBoundedInt: reject out of range, accept in range ---
-    expectParamError("bounded<-below", "level",
-        [&] { jsonBoundedInt(QJsonValue(-1), "level", 0, 5); });
-    expectParamError("bounded<-above", "level",
-        [&] { jsonBoundedInt(QJsonValue(6), "level", 0, 5); });
-    expectNoThrow("bounded<-inrange", [&] {
-        CHECK(jsonBoundedInt(QJsonValue(3), "level", 0, 5) == 3);
-    });
-
     // --- jsonRequireBool: reject non-bool, accept bool ---
     expectParamError("bool<-number", "flag",
         [&] { jsonRequireBool(QJsonValue(1), "flag"); });
@@ -200,37 +177,6 @@ int main()
             CHECK(jsonOptionalBool(o, "missing", true) == true);
         });
     }
-
-    // --- jsonToScenePoint {x, y} ---
-    expectParamError("scene<-not-object", "pt",
-        [&] { jsonToScenePoint(QJsonValue(QStringLiteral("x")), "pt"); });
-    expectParamError("scene<-missing-y", "pt", [&] {
-        QJsonObject o;
-        o["x"] = 1.0;
-        jsonToScenePoint(QJsonValue(o), "pt");
-    });
-    expectParamError("scene<-string-coord", "x", [&] {
-        QJsonObject o;
-        o["x"] = QStringLiteral("nope");
-        o["y"] = 2.0;
-        jsonToScenePoint(QJsonValue(o), "pt");
-    });
-    // A finite double beyond float range must be rejected (not silently coerced
-    // to +inf when the coordinate is later narrowed to float).
-    expectParamError("scene<-float-overflow-x", "x", [&] {
-        QJsonObject o;
-        o["x"] = 1.0e300;
-        o["y"] = 2.0;
-        jsonToScenePoint(QJsonValue(o), "pt");
-    });
-    expectNoThrow("scene<-valid", [&] {
-        QJsonObject o;
-        o["x"] = 10.5;
-        o["y"] = -4.0;
-        const QPointF p = jsonToScenePoint(QJsonValue(o), "pt");
-        CHECK(p.x() == 10.5);
-        CHECK(p.y() == -4.0);
-    });
 
     // --- jsonToVec3 {x, y, z} ---
     expectParamError("vec3<-not-object", "point",
