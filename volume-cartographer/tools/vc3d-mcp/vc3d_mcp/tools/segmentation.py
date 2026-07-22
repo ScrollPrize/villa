@@ -1,8 +1,4 @@
-"""Segment listing/activation, editing, growth, tags, push/pull, and run-trace tools.
-
-Split out of the original monolithic ``server.py``; each tool registers on
-the single shared ``mcp`` instance from ``vc3d_mcp.core``.
-"""
+"""Segment listing/activation, editing, growth, tags, push/pull, and run-trace tools."""
 
 from __future__ import annotations
 
@@ -12,21 +8,6 @@ from mcp.server.fastmcp import Context
 
 from ..core import mcp, _call, _wait_for_job, _strip_none, _is_placeholder_error
 from ..bridge_client import BridgeError
-
-__all__ = [
-    "vc3d_list_segments",
-    "vc3d_fetch_segment",
-    "vc3d_activate_segment",
-    "vc3d_enable_editing",
-    "vc3d_save_segment",
-    "vc3d_grow_segment",
-    "vc3d_grow_patch_from_seed",
-    "vc3d_set_segment_tag",
-    "vc3d_push_pull_set_config",
-    "vc3d_push_pull_start",
-    "vc3d_push_pull_stop",
-    "vc3d_run_trace",
-]
 
 
 @mcp.tool()

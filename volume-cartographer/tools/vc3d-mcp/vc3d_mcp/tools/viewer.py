@@ -1,25 +1,10 @@
-"""Viewer + canvas interaction tools (cursor point, click, drag, center, zoom, rotate).
-
-Split out of the original monolithic ``server.py``; each tool registers on
-the single shared ``mcp`` instance from ``vc3d_mcp.core``.
-"""
+"""Viewer + canvas interaction tools (cursor point, click, drag, center, zoom, rotate)."""
 
 from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
 from ..core import mcp, _call, _strip_none
-
-__all__ = [
-    "vc3d_get_cursor_point",
-    "vc3d_click",
-    "vc3d_shift_click",
-    "vc3d_center_viewer",
-    "vc3d_zoom_viewer",
-    "vc3d_rotate_viewer",
-    "vc3d_set_axis_aligned_slices",
-    "vc3d_drag",
-]
 
 
 @mcp.tool()

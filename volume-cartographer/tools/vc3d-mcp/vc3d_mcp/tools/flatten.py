@@ -1,8 +1,4 @@
-"""Render + flatten/straighten output-producing tools.
-
-Split out of the original monolithic ``server.py``; each tool registers on
-the single shared ``mcp`` instance from ``vc3d_mcp.core``.
-"""
+"""Render + flatten/straighten output-producing tools."""
 
 from __future__ import annotations
 
@@ -11,13 +7,6 @@ from typing import Any, Literal, Optional
 from mcp.server.fastmcp import Context
 
 from ..core import mcp, _call, _wait_for_job, _strip_none
-
-__all__ = [
-    "vc3d_render_tifxyz",
-    "vc3d_flatten_slim",
-    "vc3d_flatten_abf",
-    "vc3d_flatten_straighten",
-]
 
 
 @mcp.tool()

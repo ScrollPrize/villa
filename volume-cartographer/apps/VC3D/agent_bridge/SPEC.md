@@ -789,20 +789,18 @@ corresponding RPC params block in §3, with the same names, types, defaults, and
 The MCP server performs no semantic validation beyond schema — the bridge is the
 authority.
 
-`job.progress` notifications: the MCP server listens for them purely as a client
-convenience — they do **not** back `vc3d_job_status`, which is answered by the bridge's
-authoritative `job.status` RPC (§3.17). The server folds them into a small local
-`JobTracker` used only to (a) implement the `wait` convenience, (b) forward progress to
-the MCP client, and (c) provide a terminal-record fallback if `job.status` races with
-process shutdown. `wait` is an MCP-server-side convenience param (not part of the RPC)
-available on the long-running job-returning tools; when `"wait": true` it blocks the tool
-call until the job's `finished` notification and returns the terminal `job.status`
-inline. While blocked, the server forwards each `phase:"output"` line to the MCP client as
-**best-effort** progress via the FastMCP `Context` (`ctx.report_progress`, monotonic
-sequence number) where the client supports it; forwarding is observational only and never
-affects job execution or the returned result. `wait` defaults to `false`; when `true`, the
-server enforces a 30-minute cap and returns the still-running `jobId` (with
-`"waitTimedOut": true`) on timeout, and fails promptly on bridge disconnect.
+`job.progress` notifications: the MCP server ignores them — it reads them off the socket
+and discards them. `wait: true` and progress forwarding are implemented instead by polling
+the authoritative `job.status` RPC (§3.17). `wait` is an MCP-server-side convenience param
+(not part of the RPC) available on the long-running job-returning tools; when `"wait": true`
+it polls `job.status` once a second until the job is terminal and returns the terminal
+`job.status` inline. Along the way the server forwards newly-appended `consoleTail` lines to
+the MCP client as **best-effort** progress via the FastMCP `Context` (`ctx.report_progress`,
+monotonic sequence number) where the client supports it; forwarding is observational only
+and never affects job execution or the returned result. `wait` defaults to `false`; when
+`true`, the server enforces a 30-minute cap and returns the still-running `jobId` (with
+`"waitTimedOut": true`) on timeout, and fails promptly on bridge disconnect (the next poll
+raises).
 
 ---
 

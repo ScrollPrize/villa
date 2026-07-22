@@ -7,11 +7,10 @@ app needed) and confirms:
 
   * BridgeClient can connect, send a request, and parse a response
     (including JSON-RPC error replies, per SPEC.md section 2.5);
-  * job.progress notifications (SPEC.md section 3.18) are picked up by the
-    background reader and folded into JobTracker, including the console
-    tail and the "wait until finished" convenience;
-  * the actual MCP tool functions in vc3d_mcp.server wire all of the above
-    together correctly (configure_client -> tool call -> bridge round trip).
+  * wait: true blocks until the job is terminal by polling job.status, and
+    forwards new consoleTail lines as MCP progress along the way;
+  * the actual MCP tool functions wire all of the above together correctly
+    (configure_client -> tool call -> bridge round trip).
 
 Run directly:
     cd tools/vc3d-mcp && python3 test_mcp_bridge.py -v
@@ -41,22 +40,42 @@ from vc3d_mcp.bridge_client import (  # noqa: E402
     BridgeError,
     discover_registry_socket,
 )
-from vc3d_mcp import server as server_module  # noqa: E402
+from vc3d_mcp import core, server as server_module  # noqa: E402
+from vc3d_mcp.tools.atlas import vc3d_atlas_search_start  # noqa: E402
+from vc3d_mcp.tools.lasagna import vc3d_lasagna_start_optimization  # noqa: E402
+from vc3d_mcp.tools.misc import vc3d_ping  # noqa: E402
+from vc3d_mcp.tools.segmentation import (  # noqa: E402
+    vc3d_activate_segment,
+    vc3d_fetch_segment,
+    vc3d_grow_segment,
+    vc3d_run_trace,
+    vc3d_save_segment,
+)
+from vc3d_mcp.tools.viewer import (  # noqa: E402
+    vc3d_rotate_viewer,
+    vc3d_set_axis_aligned_slices,
+)
+from vc3d_mcp.tools.wrap import (  # noqa: E402
+    vc3d_commit_wrap_annotation,
+    vc3d_set_wrap_annotation_mode,
+    vc3d_undo_wrap_annotation,
+)
 
 
 class FakeAgentBridgeServer:
     """Minimal stand-in for AgentBridgeServer: AF_UNIX, newline-delimited
-    JSON-RPC 2.0, a couple of canned methods, and the ability to simulate a
-    segmentation.grow job's job.progress notification sequence."""
+    JSON-RPC 2.0, a couple of canned methods, and stateful jobs whose
+    job.status consoleTail grows and then reaches a terminal state."""
 
     def __init__(self, socket_path: str):
         self.socket_path = socket_path
         self._server: asyncio.base_events.Server | None = None
         self._writers: list[asyncio.StreamWriter] = []
         self.received_requests: list[dict] = []
-        # job_id -> kind, so job.status/job.progress can echo the right kind for
-        # both the segmentation.grow and lasagna.optimize job flows.
+        # job_id -> kind, so job.status can echo the right kind for each flow.
         self._job_kinds: dict[str, str] = {}
+        # job_id -> live record answered by job.status (state grows to terminal).
+        self._jobs: dict[str, dict] = {}
         # Segments that have been materialized (fetched). "seg-ph" starts as an
         # unfetched open-data placeholder; fetching it adds it here so a
         # subsequent segments.activate succeeds -- the fetch+retry compose.
@@ -75,8 +94,8 @@ class FakeAgentBridgeServer:
         self.save_idle: bool = False
         # Count of accepted client connections (for the connect-race test).
         self.connections: int = 0
-        # When False, simulated jobs emit started/output but never "finished",
-        # so a wait: true call blocks until the peer drops (disconnect test).
+        # When False, jobs stay "running" forever (never terminal), so a
+        # wait: true call polls until the cap or the peer drops.
         self.finish_jobs: bool = True
 
     async def start(self) -> None:
@@ -132,7 +151,7 @@ class FakeAgentBridgeServer:
             job_id = "job-1"
             self._job_kinds[job_id] = "segmentation.grow"
             await self._reply(writer, req_id, result={"jobId": job_id, "kind": "segmentation.grow"})
-            asyncio.create_task(self._simulate_job(job_id, "segmentation.grow"))
+            self._start_job(job_id)
         elif method == "segmentation.save":
             if self.save_idle:
                 await self._reply(
@@ -150,7 +169,7 @@ class FakeAgentBridgeServer:
                             "kind": "segmentation.save", "state": "running",
                             "label": "Save segment"},
                 )
-                asyncio.create_task(self._simulate_job(job_id, "segmentation.save"))
+                self._start_job(job_id)
         elif method == "tracer.run_trace":
             job_id = "job-5"
             self._job_kinds[job_id] = "tracer.run_trace"
@@ -159,7 +178,7 @@ class FakeAgentBridgeServer:
                 result={"jobId": job_id, "kind": "tracer.run_trace",
                         "source": "tool", "outputDir": "/tmp/traces"},
             )
-            asyncio.create_task(self._simulate_job(job_id, "tracer.run_trace"))
+            self._start_job(job_id)
         elif method == "atlas.search_start":
             job_id = "job-6"
             self._job_kinds[job_id] = "atlas.fiber_search"
@@ -167,7 +186,7 @@ class FakeAgentBridgeServer:
                 writer, req_id,
                 result={"jobId": job_id, "kind": "atlas.fiber_search", "source": "atlas"},
             )
-            asyncio.create_task(self._simulate_job(job_id, "atlas.fiber_search"))
+            self._start_job(job_id)
         elif method == "never_replies":
             return  # deliberately no response (cancel / disconnect tests)
         elif method == "lasagna.start_optimization":
@@ -178,7 +197,7 @@ class FakeAgentBridgeServer:
                 req_id,
                 result={"jobId": job_id, "kind": "lasagna.optimize", "source": "lasagna"},
             )
-            asyncio.create_task(self._simulate_job(job_id, "lasagna.optimize"))
+            self._start_job(job_id)
         elif method == "segments.activate":
             seg = params.get("segmentId")
             if seg == "seg-ready" or seg in self._fetched:
@@ -219,7 +238,7 @@ class FakeAgentBridgeServer:
                             "alreadyMaterialized": False,
                             "segment": {"id": seg, "placeholder": True}},
                 )
-                asyncio.create_task(self._simulate_job(job_id, "segments.fetch"))
+                self._start_job(job_id)
             else:
                 await self._reply(
                     writer, req_id,
@@ -284,17 +303,26 @@ class FakeAgentBridgeServer:
             await self._reply(writer, req_id, result={"undone": undone})
         elif method == "job.status":
             job_id = params.get("jobId", "job-1")
+            rec = self._jobs.get(job_id)
+            if rec is None:
+                rec = {
+                    "jobId": job_id,
+                    "kind": self._job_kinds.get(job_id, "segmentation.grow"),
+                    "state": "succeeded", "message": "finished",
+                    "success": True, "consoleTail": [],
+                }
             await self._reply(
                 writer,
                 req_id,
                 result={
-                    "jobId": job_id,
-                    "kind": self._job_kinds.get(job_id, "segmentation.grow"),
+                    "jobId": rec["jobId"],
+                    "kind": rec["kind"],
                     "label": "Grow",
-                    "state": "succeeded",
-                    "message": "finished",
-                    "outputPath": None,
-                    "consoleTail": ["line A", "line B"],
+                    "state": rec["state"],
+                    "message": rec.get("message"),
+                    "success": rec.get("success"),
+                    "outputPath": rec.get("outputPath"),
+                    "consoleTail": list(rec["consoleTail"]),
                 },
             )
         elif method == "will_error":
@@ -310,27 +338,35 @@ class FakeAgentBridgeServer:
         else:
             await self._reply(writer, req_id, error={"code": -32601, "message": "Method not found"})
 
-    async def _simulate_job(self, job_id: str, kind: str = "segmentation.grow") -> None:
-        await asyncio.sleep(0.02)
-        await self._broadcast(
-            {"jobId": job_id, "kind": kind, "phase": "started", "message": "starting"}
-        )
-        await asyncio.sleep(0.02)
-        await self._broadcast(
-            {"jobId": job_id, "kind": kind, "phase": "output", "message": "line A\nline B"}
-        )
+    def _start_job(self, job_id: str) -> None:
+        """Create a running job record (synchronously, so job.status can be
+        polled immediately) and spawn its simulated progression."""
+        kind = self._job_kinds.get(job_id, "segmentation.grow")
+        self._jobs[job_id] = {
+            "jobId": job_id, "kind": kind, "state": "running",
+            "message": "starting", "success": None,
+            "outputPath": None, "consoleTail": [],
+        }
+        asyncio.create_task(self._simulate_job(job_id))
+
+    async def _simulate_job(self, job_id: str) -> None:
+        rec = self._jobs.get(job_id)
+        if rec is None:
+            return
+        kind = rec["kind"]
+        for text in ("line A", "line B"):
+            await asyncio.sleep(0.02)
+            rec["consoleTail"].append(text)
+        # One job.progress notification (segmentation.grow only): the client must
+        # read it off the socket and ignore it without disturbing the poll wait.
+        if kind == "segmentation.grow":
+            await self._broadcast(
+                {"jobId": job_id, "kind": kind, "phase": "output", "message": "ignored"}
+            )
         if not self.finish_jobs:
-            return  # never terminate: exercises wait-until-disconnect
+            return  # stays "running": exercises the wait cap / disconnect
         await asyncio.sleep(0.02)
-        await self._broadcast(
-            {
-                "jobId": job_id,
-                "kind": kind,
-                "phase": "finished",
-                "success": True,
-                "outputPath": None,
-            }
-        )
+        rec.update(state="succeeded", success=True, message="finished")
 
     async def _reply(self, writer: asyncio.StreamWriter, req_id, *, result=None, error=None) -> None:
         msg: dict = {"jsonrpc": "2.0", "id": req_id}
@@ -385,17 +421,6 @@ class BridgeClientTest(unittest.IsolatedAsyncioTestCase):
             await self.client.call("nope.not_a_real_method")
         self.assertEqual(ctx.exception.code, -32601)
 
-    async def test_job_progress_notifications_feed_tracker(self) -> None:
-        result = await self.client.call(
-            "segmentation.grow", {"method": "tracer", "direction": "all", "steps": 1}
-        )
-        job_id = result["jobId"]
-        record = await self.client.jobs.wait_finished(job_id, timeout=5)
-        self.assertIsNotNone(record)
-        self.assertEqual(record.state, "succeeded")
-        self.assertTrue(record.success)
-        self.assertTrue(any("line A" in line for line in record.console_tail))
-
     async def test_resolve_socket_path_absolute_existing_path(self) -> None:
         self.assertEqual(BridgeClient.resolve_socket_path(self.socket_path), self.socket_path)
 
@@ -415,151 +440,154 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.socket_path = os.path.join(self.tmp_dir, "fake-agent-bridge.sock")
         self.fake_server = FakeAgentBridgeServer(self.socket_path)
         await self.fake_server.start()
-        server_module.configure_client(self.socket_path, request_timeout=5)
+        core.configure_client(self.socket_path, request_timeout=5)
+        self._orig_poll = core.POLL_INTERVAL_S
+        core.POLL_INTERVAL_S = 0.01
 
     async def asyncTearDown(self) -> None:
-        await server_module._get_client().close()
+        core.POLL_INTERVAL_S = self._orig_poll
+        await core._get_client().close()
         await self.fake_server.stop()
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     async def test_vc3d_ping_tool_roundtrip(self) -> None:
-        result = await server_module.vc3d_ping()
+        result = await vc3d_ping()
         self.assertTrue(result["pong"])
         self.assertEqual(result["pid"], 4242)
 
     async def test_vc3d_grow_segment_wait_returns_terminal_status(self) -> None:
-        result = await server_module.vc3d_grow_segment(steps=1, wait=True)
+        result = await vc3d_grow_segment(steps=1, wait=True)
         self.assertEqual(result["state"], "succeeded")
         self.assertIn("consoleTail", result)
         self.assertEqual(result["jobId"], "job-1")
 
     async def test_vc3d_grow_segment_no_wait_returns_immediately(self) -> None:
-        result = await server_module.vc3d_grow_segment(steps=1, wait=False)
+        result = await vc3d_grow_segment(steps=1, wait=False)
         self.assertEqual(result["jobId"], "job-1")
         self.assertNotIn("state", result)
 
     async def test_vc3d_save_segment_idle_returns_immediately(self) -> None:
         self.fake_server.save_idle = True
-        result = await server_module.vc3d_save_segment()
+        result = await vc3d_save_segment()
         self.assertIsNone(result["jobId"])
         self.assertEqual(result["state"], "idle")
         self.assertFalse(result["saveInProgress"])
 
     async def test_vc3d_save_segment_wait_returns_terminal_status(self) -> None:
-        result = await server_module.vc3d_save_segment(wait=True)
+        result = await vc3d_save_segment(wait=True)
         self.assertEqual(result["jobId"], "job-4")
         self.assertEqual(result["state"], "succeeded")
         self.assertIn("consoleTail", result)
 
     async def test_vc3d_save_segment_no_wait_returns_job_id(self) -> None:
-        result = await server_module.vc3d_save_segment(wait=False)
+        result = await vc3d_save_segment(wait=False)
         self.assertEqual(result["jobId"], "job-4")
         self.assertEqual(result["state"], "running")
 
     async def test_vc3d_lasagna_start_optimization_no_wait_returns_immediately(self) -> None:
-        result = await server_module.vc3d_lasagna_start_optimization(mode="reoptimize", wait=False)
+        result = await vc3d_lasagna_start_optimization(mode="reoptimize", wait=False)
         self.assertEqual(result["jobId"], "job-2")
         self.assertEqual(result["source"], "lasagna")
         self.assertEqual(result["kind"], "lasagna.optimize")
         self.assertNotIn("state", result)
 
     async def test_vc3d_lasagna_start_optimization_wait_returns_terminal_status(self) -> None:
-        result = await server_module.vc3d_lasagna_start_optimization(mode="reoptimize", wait=True)
+        result = await vc3d_lasagna_start_optimization(mode="reoptimize", wait=True)
         self.assertEqual(result["jobId"], "job-2")
         self.assertEqual(result["state"], "succeeded")
         self.assertEqual(result["kind"], "lasagna.optimize")
         self.assertIn("consoleTail", result)
 
     async def test_vc3d_fetch_segment_already_materialized_is_synchronous(self) -> None:
-        result = await server_module.vc3d_fetch_segment("seg-ready")
+        result = await vc3d_fetch_segment("seg-ready")
         self.assertTrue(result["fetched"])
         self.assertTrue(result["alreadyMaterialized"])
         self.assertNotIn("jobId", result)
 
     async def test_vc3d_fetch_segment_placeholder_waits_for_job(self) -> None:
-        result = await server_module.vc3d_fetch_segment("seg-ph", wait=True)
+        result = await vc3d_fetch_segment("seg-ph", wait=True)
         self.assertEqual(result["jobId"], "job-3")
         self.assertEqual(result["state"], "succeeded")
 
     async def test_vc3d_fetch_segment_placeholder_no_wait_returns_job_id(self) -> None:
-        result = await server_module.vc3d_fetch_segment("seg-ph", wait=False)
+        result = await vc3d_fetch_segment("seg-ph", wait=False)
         self.assertEqual(result["jobId"], "job-3")
         self.assertNotIn("state", result)
 
     async def test_vc3d_activate_segment_plain_success(self) -> None:
-        result = await server_module.vc3d_activate_segment("seg-ready")
+        result = await vc3d_activate_segment("seg-ready")
         self.assertTrue(result["activated"])
         self.assertNotIn("fetched", result)
 
     async def test_vc3d_activate_segment_auto_fetches_placeholder(self) -> None:
         # seg-ph refuses activation until fetched; auto_fetch (default) should
         # fetch then retry, yielding activated + fetched.
-        result = await server_module.vc3d_activate_segment("seg-ph")
+        result = await vc3d_activate_segment("seg-ph")
         self.assertTrue(result["activated"])
         self.assertTrue(result["fetched"])
 
     async def test_vc3d_activate_segment_no_auto_fetch_raises_placeholder(self) -> None:
         with self.assertRaises(BridgeError) as ctx:
-            await server_module.vc3d_activate_segment("seg-ph", auto_fetch=False)
+            await vc3d_activate_segment("seg-ph", auto_fetch=False)
         self.assertEqual(ctx.exception.code, -32005)
         self.assertIn("placeholder", str(ctx.exception).lower())
 
     async def test_vc3d_rotate_viewer_relative_default_accumulates(self) -> None:
-        first = await server_module.vc3d_rotate_viewer("seg yz", 30.0)
+        first = await vc3d_rotate_viewer("seg yz", 30.0)
         self.assertEqual(first["plane"], "seg yz")
         self.assertEqual(first["previousDegrees"], 0.0)
         self.assertAlmostEqual(first["degrees"], 30.0)
         # relative is the default -- a second call adds to the first.
-        second = await server_module.vc3d_rotate_viewer("seg yz", 15.0)
+        second = await vc3d_rotate_viewer("seg yz", 15.0)
         self.assertAlmostEqual(second["previousDegrees"], 30.0)
         self.assertAlmostEqual(second["degrees"], 45.0)
 
     async def test_vc3d_rotate_viewer_absolute_sets_angle(self) -> None:
-        await server_module.vc3d_rotate_viewer("xz", 90.0)
-        result = await server_module.vc3d_rotate_viewer("xz", 10.0, relative=False)
+        await vc3d_rotate_viewer("xz", 90.0)
+        result = await vc3d_rotate_viewer("xz", 10.0, relative=False)
         # shorthand "xz" normalizes to "seg xz"; absolute overrides accumulation.
         self.assertEqual(result["plane"], "seg xz")
         self.assertAlmostEqual(result["degrees"], 10.0)
 
     async def test_vc3d_rotate_viewer_unknown_plane_raises(self) -> None:
         with self.assertRaises(BridgeError) as ctx:
-            await server_module.vc3d_rotate_viewer("seg xy", 10.0)
+            await vc3d_rotate_viewer("seg xy", 10.0)
         self.assertEqual(ctx.exception.code, -32602)
 
     async def test_vc3d_set_axis_aligned_slices_toggles(self) -> None:
-        on = await server_module.vc3d_set_axis_aligned_slices(True)
+        on = await vc3d_set_axis_aligned_slices(True)
         self.assertEqual(on["enabled"], True)
         # idempotent: setting the same value again stays on.
-        again = await server_module.vc3d_set_axis_aligned_slices(True)
+        again = await vc3d_set_axis_aligned_slices(True)
         self.assertEqual(again["enabled"], True)
-        off = await server_module.vc3d_set_axis_aligned_slices(False)
+        off = await vc3d_set_axis_aligned_slices(False)
         self.assertEqual(off["enabled"], False)
     async def test_vc3d_set_wrap_annotation_mode_toggles(self) -> None:
-        on = await server_module.vc3d_set_wrap_annotation_mode(True)
+        on = await vc3d_set_wrap_annotation_mode(True)
         self.assertTrue(on["enabled"])
-        off = await server_module.vc3d_set_wrap_annotation_mode(False)
+        off = await vc3d_set_wrap_annotation_mode(False)
         self.assertFalse(off["enabled"])
 
     async def test_vc3d_commit_wrap_annotation_with_preview(self) -> None:
-        await server_module.vc3d_set_wrap_annotation_mode(True)
+        await vc3d_set_wrap_annotation_mode(True)
         # Simulate a shift-click having seeded a preview on a chunked viewer.
         self.fake_server._wrap_has_preview = True
-        result = await server_module.vc3d_commit_wrap_annotation()
+        result = await vc3d_commit_wrap_annotation()
         self.assertTrue(result["committed"])
         self.assertTrue(result["hadPreview"])
         # The commit consumed the preview: a second commit is a no-op.
-        again = await server_module.vc3d_commit_wrap_annotation()
+        again = await vc3d_commit_wrap_annotation()
         self.assertFalse(again["committed"])
 
     async def test_vc3d_commit_wrap_annotation_mode_disabled_raises(self) -> None:
         with self.assertRaises(BridgeError) as ctx:
-            await server_module.vc3d_commit_wrap_annotation()
+            await vc3d_commit_wrap_annotation()
         self.assertEqual(ctx.exception.code, -32002)
 
     async def test_vc3d_undo_wrap_annotation(self) -> None:
-        await server_module.vc3d_set_wrap_annotation_mode(True)
+        await vc3d_set_wrap_annotation_mode(True)
         self.fake_server._wrap_has_preview = True
-        result = await server_module.vc3d_undo_wrap_annotation()
+        result = await vc3d_undo_wrap_annotation()
         self.assertTrue(result["undone"])
 
 
@@ -578,8 +606,8 @@ class _FakeCtx:
 
 
 class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
-    """P1: connection/reader/waiter lifecycle (EOF reset, connect race, cancel
-    leak, write-failure invalidation, idempotent close)."""
+    """Connection/reader lifecycle: EOF reset, connect race, cancel leak,
+    write-failure invalidation, idempotent close."""
 
     async def asyncSetUp(self) -> None:
         self.tmp_dir = tempfile.mkdtemp(prefix="vc3d-mcp-life-")
@@ -621,11 +649,13 @@ class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_call_leaves_pending_empty(self) -> None:
         task = asyncio.create_task(self.client.call("never_replies"))
-        await self._wait_until(lambda: len(self.client._pending) == 1)
+        await self._wait_until(
+            lambda: self.client._conn is not None and len(self.client._conn.pending) == 1
+        )
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
-        self.assertEqual(self.client._pending, {})
+        self.assertEqual(self.client._conn.pending, {})
 
     async def test_write_failure_resets_connection(self) -> None:
         await self.client.call("ping")  # establish a live connection
@@ -643,11 +673,11 @@ class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
             def close(self):
                 return None
 
-        self.client._writer = BadWriter()
+        self.client._conn.writer = BadWriter()
         with self.assertRaises(BridgeConnectionError):
             await self.client.call("ping")
         self.assertFalse(self.client.connected)
-        self.assertIsNone(self.client._writer)
+        self.assertIsNone(self.client._conn)
 
     async def test_close_is_idempotent(self) -> None:
         await self.client.call("ping")
@@ -655,67 +685,25 @@ class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
         await self.client.close()  # must not raise
         self.assertFalse(self.client.connected)
         with self.assertRaises(BridgeConnectionError):
-            await self.client.ensure_connected()
+            await self.client.connect()
 
     async def test_cancel_while_queued_for_write_lock_leaves_pending_empty(self) -> None:
-        # Finding 4: a call cancelled while queued for _write_lock (before the
-        # write) must not leak its _pending entry.
+        # A call cancelled while queued for _write_lock (before the write) must
+        # not leak its pending entry.
         await self.client.call("ping")  # establish a live connection
         await self.client._write_lock.acquire()
         try:
             task = asyncio.create_task(self.client.call("ping"))
-            # It registers in _pending, then blocks awaiting the held write lock.
-            await self._wait_until(lambda: len(self.client._pending) == 1)
+            # It registers in pending, then blocks awaiting the held write lock.
+            await self._wait_until(lambda: len(self.client._conn.pending) == 1)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
         finally:
             self.client._write_lock.release()
-        self.assertEqual(self.client._pending, {})
-
-    async def test_transport_reset_while_queued_for_write_lock_fails_cleanly(self) -> None:
-        # Finding 5: if the transport is reset (and a reconnect bumps the
-        # generation) while a call is queued for the write lock, the call must
-        # raise BridgeConnectionError -- not AttributeError on a None writer, and
-        # must NOT write the stale request onto the newer connection.
-        await self.client.call("ping")
-
-        class RecordingWriter:
-            def __init__(self) -> None:
-                self.writes: list[bytes] = []
-
-            def is_closing(self) -> bool:
-                return False
-
-            def write(self, data) -> None:
-                self.writes.append(data)
-
-            async def drain(self) -> None:
-                return None
-
-            def close(self) -> None:
-                return None
-
-        await self.client._write_lock.acquire()
-        new_writer = RecordingWriter()
-        try:
-            task = asyncio.create_task(self.client.call("ping"))
-            await self._wait_until(lambda: len(self.client._pending) == 1)
-            # Simulate an EOF drop that failed our pending future, followed by a
-            # reconnect that installed a NEW writer and bumped the generation.
-            self.client._on_disconnect(BridgeConnectionError("peer dropped"))
-            self.client._writer = new_writer
-            self.client._generation += 1
-        finally:
-            self.client._write_lock.release()
-        with self.assertRaises(BridgeConnectionError):
-            await task
-        # The stale request must never have reached the new connection.
-        self.assertEqual(new_writer.writes, [])
+        self.assertEqual(self.client._conn.pending, {})
 
     async def test_connect_after_close_does_not_resurrect(self) -> None:
-        # Finding 6: connect() must re-check _closed after acquiring the
-        # transport and bail rather than resurrecting a closed client.
         await self.client.close()
         with self.assertRaises(BridgeConnectionError):
             await self.client.connect()
@@ -723,9 +711,9 @@ class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.client.connected)
 
     async def test_close_racing_pending_connect_stays_closed(self) -> None:
-        # Finding 6: close() concurrent with an in-flight connect() must not
-        # leave the client connected. Delay open_unix_connection so close() runs
-        # while connect() is pending.
+        # close() concurrent with an in-flight connect() must not leave the
+        # client connected. Delay open_unix_connection so close() runs while
+        # connect() is pending; close() then tears down whatever connect built.
         fresh = BridgeClient(BridgeClientConfig(socket=self.socket_path, request_timeout=5))
         started = asyncio.Event()
         release = asyncio.Event()
@@ -739,227 +727,117 @@ class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "vc3d_mcp.bridge_client.asyncio.open_unix_connection", slow_open
         ):
-            conn_task = asyncio.create_task(fresh.ensure_connected())
+            conn_task = asyncio.create_task(fresh.connect())
             await asyncio.wait_for(started.wait(), timeout=2.0)
             close_task = asyncio.create_task(fresh.close())
             await asyncio.sleep(0.02)  # let close() set _closed + block on the lock
             release.set()
-            with self.assertRaises(BridgeConnectionError):
+            try:
                 await asyncio.wait_for(conn_task, timeout=2.0)
+            except BridgeConnectionError:
+                pass
             await asyncio.wait_for(close_task, timeout=2.0)
         self.assertTrue(fresh._closed)
         self.assertFalse(fresh.connected)
 
 
 class WaitAndProgressTest(unittest.IsolatedAsyncioTestCase):
-    """P3/P4: run_trace + atlas wait semantics, and best-effort progress
-    forwarding through _wait_for_job (buffered/new output, race-free terminal,
-    disconnect wake, tolerant of an unavailable/failing progress sink)."""
+    """Poll-based `wait: true`: terminal status, consoleTail progress
+    forwarding, disconnect handling, and the 30-minute cap."""
 
     async def asyncSetUp(self) -> None:
         self.tmp_dir = tempfile.mkdtemp(prefix="vc3d-mcp-wait-")
         self.socket_path = os.path.join(self.tmp_dir, "fake-agent-bridge.sock")
         self.fake_server = FakeAgentBridgeServer(self.socket_path)
         await self.fake_server.start()
-        self.client = server_module.configure_client(self.socket_path, request_timeout=5)
+        self.client = core.configure_client(self.socket_path, request_timeout=5)
+        # Poll fast so wait-loop tests run in milliseconds, not seconds.
+        self._orig_poll = core.POLL_INTERVAL_S
+        core.POLL_INTERVAL_S = 0.01
 
     async def asyncTearDown(self) -> None:
+        core.POLL_INTERVAL_S = self._orig_poll
         await self.client.close()
         await self.fake_server.stop()
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
-    # -- P3: the two newly wait-capable tools --
-
     async def test_run_trace_no_wait_returns_job_id(self) -> None:
-        result = await server_module.vc3d_run_trace("seg-1", wait=False)
+        result = await vc3d_run_trace("seg-1", wait=False)
         self.assertEqual(result["jobId"], "job-5")
         self.assertNotIn("state", result)
 
     async def test_run_trace_wait_returns_terminal_status(self) -> None:
-        result = await server_module.vc3d_run_trace("seg-1", wait=True)
+        result = await vc3d_run_trace("seg-1", wait=True)
         self.assertEqual(result["jobId"], "job-5")
         self.assertEqual(result["state"], "succeeded")
         self.assertIn("consoleTail", result)
 
     async def test_atlas_search_no_wait_returns_job_id(self) -> None:
-        result = await server_module.vc3d_atlas_search_start(wait=False)
+        result = await vc3d_atlas_search_start(wait=False)
         self.assertEqual(result["jobId"], "job-6")
         self.assertNotIn("state", result)
 
     async def test_atlas_search_wait_returns_terminal_status(self) -> None:
-        result = await server_module.vc3d_atlas_search_start(wait=True)
+        result = await vc3d_atlas_search_start(wait=True)
         self.assertEqual(result["jobId"], "job-6")
         self.assertEqual(result["state"], "succeeded")
 
-    # -- P4: progress forwarding (driven at the tracker level for determinism) --
-
-    async def test_buffered_output_before_wait_is_forwarded(self) -> None:
-        jobs = self.client.jobs
-        jobs.on_progress({"jobId": "jb", "phase": "started"})
-        jobs.on_progress({"jobId": "jb", "phase": "output", "message": "buffered-1\nbuffered-2"})
-        jobs.on_progress({"jobId": "jb", "phase": "finished", "success": True})
-        ctx = _FakeCtx()
-        result = await server_module._wait_for_job("jb", True, {"jobId": "jb"}, ctx)
+    async def test_wait_polls_job_status(self) -> None:
+        result = await vc3d_run_trace("seg-1", wait=True)
         self.assertEqual(result["state"], "succeeded")
-        self.assertEqual([m for _, m in ctx.reports], ["buffered-1", "buffered-2"])
-        # local sequence is monotonic starting at 1
+        polls = [r for r in self.fake_server.received_requests if r.get("method") == "job.status"]
+        self.assertGreaterEqual(len(polls), 1)
+
+    async def test_progress_forwarded_from_console_tail(self) -> None:
+        ctx = _FakeCtx()
+        result = await vc3d_grow_segment(steps=1, wait=True, ctx=ctx)
+        self.assertEqual(result["state"], "succeeded")
+        # The fake's consoleTail grows "line A" then "line B" across polls; they
+        # are forwarded once each, in order, with a monotonic sequence.
+        self.assertEqual([m for _, m in ctx.reports], ["line A", "line B"])
         self.assertEqual([s for s, _ in ctx.reports], [1, 2])
-
-    async def test_new_output_during_wait_is_forwarded_in_order(self) -> None:
-        jobs = self.client.jobs
-        jobs.on_progress({"jobId": "jd", "phase": "output", "message": "first"})
-        ctx = _FakeCtx()
-        task = asyncio.create_task(
-            server_module._wait_for_job("jd", True, {"jobId": "jd"}, ctx)
-        )
-        await asyncio.sleep(0.02)  # let the waiter drain the buffered line and park
-        jobs.on_progress({"jobId": "jd", "phase": "output", "message": "second"})
-        jobs.on_progress({"jobId": "jd", "phase": "finished", "success": True})
-        result = await task
-        self.assertEqual(result["state"], "succeeded")
-        self.assertEqual([m for _, m in ctx.reports], ["first", "second"])
-
-    async def test_terminal_before_wait_is_race_free(self) -> None:
-        jobs = self.client.jobs
-        # Everything, including finished, arrives before the wait registers.
-        jobs.on_progress({"jobId": "jt", "phase": "output", "message": "done-line"})
-        jobs.on_progress({"jobId": "jt", "phase": "finished", "success": True})
-        ctx = _FakeCtx()
-        result = await asyncio.wait_for(
-            server_module._wait_for_job("jt", True, {"jobId": "jt"}, ctx), timeout=2.0
-        )
-        self.assertEqual(result["state"], "succeeded")
-        self.assertEqual([m for _, m in ctx.reports], ["done-line"])
-
-    async def test_disconnect_wakes_waiter_promptly(self) -> None:
-        jobs = self.client.jobs
-        jobs.on_progress({"jobId": "jx", "phase": "started"})
-        ctx = _FakeCtx()
-        task = asyncio.create_task(
-            server_module._wait_for_job("jx", True, {"jobId": "jx"}, ctx)
-        )
-        await asyncio.sleep(0.02)
-        jobs.fail_all(BridgeConnectionError("peer dropped"))
-        with self.assertRaises(RuntimeError):
-            await asyncio.wait_for(task, timeout=2.0)
+        polls = [r for r in self.fake_server.received_requests if r.get("method") == "job.status"]
+        self.assertGreaterEqual(len(polls), 2)
 
     async def test_wait_true_fails_promptly_on_bridge_disconnect(self) -> None:
-        self.fake_server.finish_jobs = False  # job never sends a finished notification
-        task = asyncio.create_task(server_module.vc3d_run_trace("seg-1", wait=True))
-        await asyncio.sleep(0.05)  # let the job start + the wait register
-        await self.fake_server.stop()  # peer EOF -> waiters must fail promptly
-        with self.assertRaises((RuntimeError, BridgeConnectionError)):
-            await asyncio.wait_for(task, timeout=2.0)
-
-    async def test_noop_ctx_does_not_fail_the_tool(self) -> None:
-        # ctx=None models an MCP client with no progress support.
-        result = await server_module.vc3d_run_trace("seg-1", wait=True, ctx=None)
-        self.assertEqual(result["state"], "succeeded")
-
-    async def test_progress_report_failure_does_not_fail_the_tool(self) -> None:
-        jobs = self.client.jobs
-        jobs.on_progress({"jobId": "jf", "phase": "output", "message": "line"})
-        jobs.on_progress({"jobId": "jf", "phase": "finished", "success": True})
-        ctx = _FakeCtx(fail=RuntimeError("progress sink is down"))
-        result = await server_module._wait_for_job("jf", True, {"jobId": "jf"}, ctx)
-        self.assertEqual(result["state"], "succeeded")
-
-    async def test_progress_report_cancellation_is_not_swallowed(self) -> None:
-        jobs = self.client.jobs
-        jobs.on_progress({"jobId": "jc", "phase": "output", "message": "line"})
-        jobs.on_progress({"jobId": "jc", "phase": "finished", "success": True})
-        ctx = _FakeCtx(fail=asyncio.CancelledError())
-        with self.assertRaises(asyncio.CancelledError):
-            await server_module._wait_for_job("jc", True, {"jobId": "jc"}, ctx)
-
-    async def test_disconnect_survives_racing_reset_in_wait_for_job(self) -> None:
-        # Finding 7: a disconnect latched while a waiter is parked must be
-        # observed even if a racing reconnect clears the GLOBAL error first.
-        jobs = self.client.jobs
-        jobs.on_progress({"jobId": "jr", "phase": "started"})
-        ctx = _FakeCtx()
-        task = asyncio.create_task(
-            server_module._wait_for_job("jr", True, {"jobId": "jr"}, ctx)
-        )
-        await asyncio.sleep(0.02)  # let the waiter park
-        jobs.fail_all(BridgeConnectionError("peer dropped"))
-        jobs.reset_error()  # racing reconnect clears the global error immediately
+        self.fake_server.finish_jobs = False  # job never reaches a terminal state
+        task = asyncio.create_task(vc3d_run_trace("seg-1", wait=True))
+        await asyncio.sleep(0.05)  # let the job start + the first poll happen
+        await self.fake_server.stop()  # peer EOF -> the next poll must fail
         with self.assertRaises(RuntimeError):
             await asyncio.wait_for(task, timeout=2.0)
 
-    async def test_disconnect_survives_racing_reset_in_wait_finished(self) -> None:
-        # Finding 7: same latch guarantee for JobTracker.wait_finished.
-        jobs = self.client.jobs
-        jobs.on_progress({"jobId": "jw", "phase": "started"})
-        task = asyncio.create_task(jobs.wait_finished("jw", timeout=2.0))
-        await asyncio.sleep(0.02)
-        jobs.fail_all(BridgeConnectionError("peer dropped"))
-        jobs.reset_error()
-        with self.assertRaises(BridgeConnectionError):
-            await asyncio.wait_for(task, timeout=2.0)
-
-    async def test_blocked_progress_sink_does_not_defeat_wait_cap(self) -> None:
-        # Finding 8: a progress sink that blocks forever must not hold the tool
-        # past the wait cap. With the cap shortened, the call returns
-        # waitTimedOut instead of hanging on the report.
-        import vc3d_mcp.core as core
-
-        jobs = self.client.jobs
-        # Output present but NO finished notification: the job is still running.
-        jobs.on_progress({"jobId": "jp", "phase": "output", "message": "l1"})
-        blocker = asyncio.Event()  # never set -> report_progress hangs
-
-        class HangingCtx:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            async def report_progress(self, progress, total=None, message=None) -> None:
-                self.calls += 1
-                await blocker.wait()
-
-        ctx = HangingCtx()
+    async def test_wait_cap_returns_timed_out(self) -> None:
+        self.fake_server.finish_jobs = False  # stays running past the cap
         orig_cap = core.DEFAULT_WAIT_TIMEOUT_S
-        core.DEFAULT_WAIT_TIMEOUT_S = 0.2
+        core.DEFAULT_WAIT_TIMEOUT_S = 0.05
         try:
-            result = await asyncio.wait_for(
-                server_module._wait_for_job("jp", True, {"jobId": "jp"}, ctx), timeout=3.0
-            )
+            result = await asyncio.wait_for(vc3d_run_trace("seg-1", wait=True), timeout=3.0)
         finally:
             core.DEFAULT_WAIT_TIMEOUT_S = orig_cap
         self.assertTrue(result.get("waitTimedOut"))
-        self.assertGreaterEqual(ctx.calls, 1)  # it did attempt delivery
+        self.assertEqual(result["jobId"], "job-5")
 
-    async def test_trailing_output_with_finished_is_flushed(self) -> None:
-        # ALSO: output that lands together with `finished` while an earlier
-        # progress report is being awaited must still be forwarded, via the
-        # final rescan, rather than dropped when the loop breaks on `finished`.
-        jobs = self.client.jobs
-        jobs.on_progress({"jobId": "je", "phase": "output", "message": "first"})
-
-        injected = {"done": False}
-
-        class InjectingCtx:
-            def __init__(self) -> None:
-                self.reports: list[tuple[int, str | None]] = []
-
-            async def report_progress(self, progress, total=None, message=None) -> None:
-                self.reports.append((progress, message))
-                if not injected["done"]:
-                    injected["done"] = True
-                    # While the first line is "in flight", a trailing output line
-                    # and the finished notification arrive together -- exactly the
-                    # window the pre-fix loop would drop without a final rescan.
-                    jobs.on_progress(
-                        {"jobId": "je", "phase": "output", "message": "tail-line"}
-                    )
-                    jobs.on_progress({"jobId": "je", "phase": "finished", "success": True})
-
-        ctx = InjectingCtx()
-        result = await asyncio.wait_for(
-            server_module._wait_for_job("je", True, {"jobId": "je"}, ctx), timeout=2.0
-        )
+    async def test_noop_ctx_does_not_fail_the_tool(self) -> None:
+        # ctx=None models an MCP client with no progress support.
+        result = await vc3d_run_trace("seg-1", wait=True, ctx=None)
         self.assertEqual(result["state"], "succeeded")
-        self.assertIn("tail-line", [m for _, m in ctx.reports])
+
+    async def test_progress_report_failure_does_not_fail_the_tool(self) -> None:
+        ctx = _FakeCtx(fail=RuntimeError("progress sink is down"))
+        result = await vc3d_run_trace("seg-1", wait=True, ctx=ctx)
+        self.assertEqual(result["state"], "succeeded")
+
+    async def test_progress_report_cancellation_is_not_swallowed(self) -> None:
+        ctx = _FakeCtx(fail=asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            await vc3d_run_trace("seg-1", wait=True, ctx=ctx)
+
+    async def test_notification_is_ignored(self) -> None:
+        # segmentation.grow also emits a job.progress notification; the client
+        # must read it off the socket and ignore it, completing the wait cleanly.
+        result = await vc3d_grow_segment(steps=1, wait=True)
+        self.assertEqual(result["state"], "succeeded")
 
 
 class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
@@ -971,7 +849,7 @@ class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
     EXPECTED_TOOL_COUNT = 79
 
     async def test_tool_surface_and_schemas(self) -> None:
-        tools = await server_module.mcp.list_tools()
+        tools = await core.mcp.list_tools()
         by_name = {t.name: t.inputSchema for t in tools}
         self.assertEqual(len(tools), self.EXPECTED_TOOL_COUNT)
 
@@ -1081,14 +959,33 @@ class RegistryDiscoveryTest(unittest.TestCase):
         self.assertFalse(os.path.exists(bad_file), "malformed registry file should be removed")
 
 
+class NewTailLinesTest(unittest.TestCase):
+    """_new_tail_lines: which consoleTail lines are new versus already seen."""
+
+    def test_empty_prev_returns_all(self) -> None:
+        self.assertEqual(core._new_tail_lines([], ["a", "b", "c"]), ["a", "b", "c"])
+
+    def test_identical_lists_return_nothing(self) -> None:
+        self.assertEqual(core._new_tail_lines(["a", "b"], ["a", "b"]), [])
+
+    def test_rolling_window_slide(self) -> None:
+        prev = [str(n) for n in range(2, 52)]   # 2..51
+        cur = [str(n) for n in range(4, 54)]    # 4..53
+        self.assertEqual(core._new_tail_lines(prev, cur), ["52", "53"])
+
+    def test_disjoint_returns_all_of_cur(self) -> None:
+        self.assertEqual(core._new_tail_lines(["a", "b"], ["x", "y"]), ["x", "y"])
+
+    def test_cur_shorter_full_suffix_overlap(self) -> None:
+        self.assertEqual(core._new_tail_lines(["a", "b", "c"], ["b", "c"]), [])
+
+
 class TeardownReapTest(unittest.TestCase):
-    """Finding 13: _terminate_launched_process must always reap the child, even
-    when the post-kill() wait() times out."""
+    """_terminate_launched_process must always reap the child, even when the
+    post-kill() wait() times out."""
 
     def tearDown(self) -> None:
         server_module._launched_process = None
-        server_module._drain_thread = None
-        server_module._log_thread = None
 
     def test_reap_process_waits(self) -> None:
         proc = subprocess.Popen(["true"])  # exits immediately

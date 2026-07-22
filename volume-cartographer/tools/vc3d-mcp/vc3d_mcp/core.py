@@ -1,12 +1,9 @@
 """Shared infrastructure for the vc3d-mcp tool modules.
 
-This is the single source of the ``mcp`` :class:`FastMCP` instance that every
-``vc3d_mcp.tools.*`` module registers its ``@mcp.tool()`` functions on, plus the
-bridge-client plumbing (``configure_client`` / ``_get_client`` / ``_call``) and
-the shared ``wait: true`` job handling. Split out of the original monolithic
-``server.py`` so the domain tool modules can ``from vc3d_mcp.core import mcp,
-_call, _wait_for_job`` without importing the entrypoint (and without a circular
-import back through ``server.py``).
+Holds the single ``mcp`` :class:`FastMCP` instance every ``vc3d_mcp.tools.*``
+module registers its ``@mcp.tool()`` functions on, the bridge-client plumbing
+(``configure_client`` / ``_get_client`` / ``_call``), and the shared
+``wait: true`` job handling.
 """
 
 from __future__ import annotations
@@ -88,32 +85,36 @@ def _is_placeholder_error(exc: Exception) -> bool:
     return "placeholder" in detail.lower() or "placeholder" in str(exc.message).lower()
 
 
-async def _report_progress(
-    ctx: Optional[Context], seq: int, message: str, timeout: float | None = None
-) -> None:
-    """Best-effort MCP progress report. Never lets a reporting failure change
-    the job's execution or the tool's terminal result (progress is purely
-    observational), but never swallows task cancellation either.
+POLL_INTERVAL_S = 1.0
+PROGRESS_REPORT_TIMEOUT_S = 10.0
 
-    When ``timeout`` is given, delivery is bounded by it: a slow/blocked MCP
-    progress sink is abandoned (best-effort, logged as a skipped report) rather
-    than allowed to hold the tool past the wait deadline. A non-positive timeout
-    skips the report entirely."""
+
+def _new_tail_lines(prev: list[str], cur: list[str]) -> list[str]:
+    """Lines in `cur` not already seen at the end of `prev`.
+
+    consoleTail is a rolling window (last <=50 lines), so consecutive polls
+    overlap: the longest suffix of `prev` that is a prefix of `cur` is old
+    news; everything after it is new. Repeated identical lines can be
+    under-reported -- acceptable, progress forwarding is best-effort.
+    """
+    for k in range(min(len(prev), len(cur)), 0, -1):
+        if prev[len(prev) - k:] == cur[:k]:
+            return cur[k:]
+    return cur
+
+
+async def _report_progress(ctx: Optional[Context], seq: int, message: str) -> None:
+    """Best-effort MCP progress report: bounded, and never fails the tool."""
     if ctx is None:
         return
-    if timeout is not None and timeout <= 0:
-        return
     try:
-        coro = ctx.report_progress(progress=seq, total=None, message=message)
-        if timeout is not None:
-            await asyncio.wait_for(coro, timeout=timeout)
-        else:
-            await coro
+        await asyncio.wait_for(
+            ctx.report_progress(progress=seq, total=None, message=message),
+            timeout=PROGRESS_REPORT_TIMEOUT_S,
+        )
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001 - progress is best-effort/observational
-        # Includes asyncio.TimeoutError: a blocked sink must not fail the job or
-        # delay terminal completion; drop this report and carry on.
+    except Exception:  # noqa: BLE001 - progress is observational only
         pass
 
 
@@ -123,92 +124,30 @@ async def _wait_for_job(
     initial_result: dict[str, Any],
     ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
-    """Shared `wait: true` handling for the async long-running tools.
+    """Shared `wait: true` handling for the long-running tools.
 
-    When ``wait`` is true, blocks the tool call until the job's finished
-    notification and returns the terminal ``job.status`` inline. ``wait``
-    defaults to false. When true, the MCP server enforces a 30-minute cap and
-    returns the still-running ``jobId`` (with ``waitTimedOut: true``) on
-    timeout, and fails promptly if the bridge disconnects.
-
-    All MCP progress reporting is centralized here (tool wrappers only pass
-    ``ctx`` through). Retained and newly-arriving ``phase:"output"`` lines are
-    forwarded via ``ctx.report_progress`` with a monotonically increasing local
-    sequence number. Forwarding is best-effort: it never affects the result, and
-    an individual report that fails or exceeds the remaining wait deadline is
-    dropped (so a slow/blocked sink can't hold the tool past the cap). Delivery
-    of every line is therefore not guaranteed -- output beyond the tracker's
-    bounded retention window may also have been evicted before a late waiter
-    registers -- but ``job.status`` (returned on completion) remains authoritative.
+    Polls `job.status` (SPEC 3.17) once a second until the job is terminal,
+    forwarding new consoleTail lines as best-effort MCP progress along the
+    way, then returns the terminal status merged into `initial_result`. On
+    the 30-minute cap, returns `initial_result` plus `waitTimedOut: true`. A
+    bridge disconnect makes the next poll raise, failing the call promptly.
     """
     if not wait:
         return initial_result
 
-    client = _get_client()
-    tracker = client.jobs
-    record = tracker.register(job_id)
-
     loop = asyncio.get_running_loop()
     deadline = loop.time() + DEFAULT_WAIT_TIMEOUT_S
-    local_seq = 0          # monotonic progress index reported to the MCP client
-    last_output_seq = 0    # highest job output sequence already forwarded
-    seen_error = record.error  # baseline; a NEW latched error fails this wait
-    timed_out = False
-
-    async def _forward_new_outputs() -> None:
-        # Forward retained/newly-arrived output lines, each bounded by the
-        # REMAINING deadline so a slow/blocked MCP progress sink can never hold
-        # the tool past the 30-minute cap. Progress is observational only: a
-        # timed-out/failed report is dropped, never fails the job.
-        nonlocal local_seq, last_output_seq
-        for output_seq, line in record.outputs_after(last_output_seq):
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            last_output_seq = output_seq
-            local_seq += 1
-            await _report_progress(ctx, local_seq, line, timeout=remaining)
-
+    seen_tail: list[str] = []
+    seq = 0
     while True:
-        wake = record.wake  # capture BEFORE reading state (no lost wakeup)
-        if record.error is not None and record.error is not seen_error:
-            # Disconnect latched on our record while we waited; observe it even
-            # if a racing reconnect already cleared the global error.
-            raise RuntimeError(str(record.error))
-        if tracker.error is not None:
-            # Bridge disconnected: fail promptly rather than block to the cap.
-            raise RuntimeError(str(tracker.error))
-
-        await _forward_new_outputs()
-
-        if record.finished_event.is_set():
-            break
-
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            timed_out = True
-            break
-        try:
-            await asyncio.wait_for(wake.wait(), timeout=remaining)
-        except asyncio.TimeoutError:
-            timed_out = True
-            break
-
-    if timed_out:
-        return {**initial_result, "waitTimedOut": True}
-
-    # Terminal state observed. Output notifications that landed together with (or
-    # just before) `finished` -- possibly while a slow progress report was being
-    # awaited -- would otherwise be dropped when we break above. Flush once more
-    # so trailing lines are forwarded. Best-effort and deadline-bounded; this
-    # never blocks terminal completion.
-    await _forward_new_outputs()
-
-    # job.status is the bridge's authoritative terminal record (SPEC.md 3.17);
-    # prefer it over our locally-tracked notification data, falling back to
-    # the local record if the RPC itself races with process shutdown.
-    try:
         status = await _call("job.status", {"jobId": job_id})
-    except Exception:
-        status = record.as_dict()
-    return {**initial_result, **status}
+        tail = status.get("consoleTail") or []
+        for line in _new_tail_lines(seen_tail, tail):
+            seq += 1
+            await _report_progress(ctx, seq, line)
+        seen_tail = list(tail)
+        if status.get("state") in ("succeeded", "failed"):
+            return {**initial_result, **status}
+        if loop.time() >= deadline:
+            return {**initial_result, "waitTimedOut": True}
+        await asyncio.sleep(POLL_INTERVAL_S)

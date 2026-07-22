@@ -1,8 +1,5 @@
 """Same-winding wrap annotation tools (the tutorial's shift+E workflow).
 
-Split out of the original monolithic ``server.py``; each tool registers on
-the single shared ``mcp`` instance from ``vc3d_mcp.core``.
-
 Workflow (mirrors the human interaction):
 
 1. ``vc3d_set_wrap_annotation_mode(True)`` — enable "Same-wrap annotation mode".
@@ -22,12 +19,6 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from ..core import mcp, _call, _strip_none
-
-__all__ = [
-    "vc3d_set_wrap_annotation_mode",
-    "vc3d_commit_wrap_annotation",
-    "vc3d_undo_wrap_annotation",
-]
 
 
 @mcp.tool()

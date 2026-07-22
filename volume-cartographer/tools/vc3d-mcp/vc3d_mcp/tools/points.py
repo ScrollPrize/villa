@@ -1,19 +1,10 @@
-"""Annotation point collection tools.
-
-Split out of the original monolithic ``server.py``; each tool registers on
-the single shared ``mcp`` instance from ``vc3d_mcp.core``.
-"""
+"""Annotation point collection tools."""
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
 from ..core import mcp, _call, _strip_none
-
-__all__ = [
-    "vc3d_commit_points",
-    "vc3d_list_points",
-]
 
 
 @mcp.tool()

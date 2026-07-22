@@ -1,23 +1,10 @@
-"""Manual-add (hole-fill) mode and correction-point authoring tools.
-
-Split out of the original monolithic ``server.py``; each tool registers on
-the single shared ``mcp`` instance from ``vc3d_mcp.core``.
-"""
+"""Manual-add (hole-fill) mode and correction-point authoring tools."""
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
 from ..core import mcp, _call
-
-__all__ = [
-    "vc3d_manual_add_begin",
-    "vc3d_manual_add_finish",
-    "vc3d_manual_add_set_line_mode",
-    "vc3d_manual_add_set_interpolation",
-    "vc3d_manual_add_undo_constraint",
-    "vc3d_corrections_set_point_mode",
-]
 
 
 @mcp.tool()

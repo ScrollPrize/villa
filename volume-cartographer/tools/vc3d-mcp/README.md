@@ -28,12 +28,11 @@ flattening, and rendering.
 - **Async jobs**: the bridge is the authoritative source of job state —
   `vc3d_job_status` is answered by the bridge's own `job.status` RPC, not by
   anything in this process. `job.progress` notifications (SPEC.md §8.3/§3.18)
-  are consumed by a background reader task and folded into a small `JobTracker`
-  (`vc3d_mcp/jobs.py`) that exists only to (1) support the `wait: true`
-  convenience (block until a job finishes), (2) forward `phase:"output"` lines
-  to the MCP client as best-effort progress while a `wait: true` call is
-  blocked, and (3) provide a terminal-record fallback if the `job.status` RPC
-  races with process shutdown. It does not back or replace `job.status`.
+  are read off the socket and ignored. The `wait: true` convenience is
+  implemented by polling `job.status` once a second until the job is terminal;
+  along the way, newly-appended `consoleTail` lines are forwarded to the MCP
+  client as best-effort progress, and completion is observed with up to one
+  poll interval of latency.
 
 ## Layout
 
@@ -41,16 +40,14 @@ flattening, and rendering.
 tools/vc3d-mcp/
   vc3d_mcp/
     bridge_client.py   # asyncio client: socket resolution, JSON-RPC framing,
-                        # request/response correlation, notification dispatch
-    jobs.py            # JobTracker: turns job.progress notifications into
-                        # awaitable job records + bounded progress buffers
+                        # request/response correlation over one _Conn
     core.py            # shared FastMCP instance + _call / _wait_for_job /
                         # _strip_none used by every tool module
     tools/             # per-domain @mcp.tool() modules (segmentation, viewer,
                         # atlas, lasagna, seeding, flatten, ...) registered on
                         # the shared mcp instance
     server.py          # entry/CLI: connection resolution + auto-launch, imports
-                        # tools/ to register them, re-exports them for back-compat
+                        # tools/ to register them on the shared mcp instance
     __main__.py        # `python -m vc3d_mcp` entry point
   test_mcp_bridge.py   # self-test: fake AF_UNIX JSON-RPC server + assertions
   pyproject.toml
@@ -229,11 +226,12 @@ newline-delimited JSON-RPC 2.0 framing per SPEC.md §1.2) and checks that:
 
 - `BridgeClient` connects, sends a request, and parses both success and
   JSON-RPC error responses (error `code`/`message`/`data` preserved);
-- unsolicited `job.progress` notifications are picked up by the background
-  reader and folded into `JobTracker` (console tail, terminal state);
-- the actual `@mcp.tool()` functions in `vc3d_mcp/server.py` — not just the
-  transport layer — round-trip correctly, including the `wait: true`
-  behavior on the long-running tools.
+- `wait: true` blocks until the job is terminal by polling `job.status`,
+  forwarding new `consoleTail` lines as best-effort progress, and unsolicited
+  `job.progress` notifications are read off the socket and ignored;
+- the actual `@mcp.tool()` functions — not just the transport layer —
+  round-trip correctly, including the `wait: true` behavior on the
+  long-running tools.
 
 Run it:
 
@@ -280,21 +278,23 @@ underlying RPC, per SPEC.md §5). The full set is:
 (`vc3d_save_segment` also takes `wait`, defaulting to `true`.) All other
 wait-capable tools default to `wait=false`.
 
-When `true`, the tool call blocks until a `job.progress` notification with
-`phase:"finished"` arrives for that job (30-minute cap), then returns the
-authoritative terminal `job.status` result inline instead of just the `jobId`.
-On timeout it returns the original `{jobId, ...}` result with an extra
-`"waitTimedOut": true` field so the caller can fall back to polling
-`vc3d_job_status`; on a bridge disconnect it fails promptly rather than blocking
-to the cap.
+When `true`, the tool call polls `job.status` once a second until the job is
+terminal (30-minute cap), then returns the authoritative terminal `job.status`
+result inline instead of just the `jobId`. Completion is therefore observed with
+up to one poll interval of latency. On timeout it returns the original
+`{jobId, ...}` result with an extra `"waitTimedOut": true` field so the caller
+can fall back to polling `vc3d_job_status`; on a bridge disconnect the next poll
+raises and the call fails promptly rather than blocking to the cap.
 
-While a `wait=true` call is blocked, the server forwards the job's
-`phase:"output"` console lines to the MCP client as **best-effort** progress via
-the FastMCP `Context` (`ctx.report_progress`, with a monotonically increasing
+While a `wait=true` call is blocked, the server forwards newly-appended
+`consoleTail` lines to the MCP client as **best-effort** progress via the
+FastMCP `Context` (`ctx.report_progress`, with a monotonically increasing
 sequence number). This is observational only: if the MCP client does not support
-progress, or a progress notification fails, the job's execution and the tool's
-terminal result are unaffected. The injected `Context` is not part of any tool's
-input schema.
+progress, or a progress report fails, the job's execution and the tool's
+terminal result are unaffected. Because `consoleTail` is a rolling ≤50-line
+window, a burst of more than 50 lines between polls can be under-reported; the
+terminal `consoleTail` in the returned status is unaffected. The injected
+`Context` is not part of any tool's input schema.
 
 ## Known gaps
 

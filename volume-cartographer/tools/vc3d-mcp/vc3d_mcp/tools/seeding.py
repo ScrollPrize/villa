@@ -1,8 +1,4 @@
-"""Seeding widget tools (rays, run/expand batches, path analysis).
-
-Split out of the original monolithic ``server.py``; each tool registers on
-the single shared ``mcp`` instance from ``vc3d_mcp.core``.
-"""
+"""Seeding widget tools (rays, run/expand batches, path analysis)."""
 
 from __future__ import annotations
 
@@ -11,17 +7,6 @@ from typing import Any, Optional
 from mcp.server.fastmcp import Context
 
 from ..core import mcp, _call, _wait_for_job
-
-__all__ = [
-    "vc3d_seeding_set_winding_annotation_mode",
-    "vc3d_seeding_preview_rays",
-    "vc3d_seeding_cast_rays",
-    "vc3d_seeding_reset_points",
-    "vc3d_seeding_run",
-    "vc3d_seeding_expand",
-    "vc3d_seeding_cancel",
-    "vc3d_seeding_analyze_paths",
-]
 
 
 @mcp.tool()

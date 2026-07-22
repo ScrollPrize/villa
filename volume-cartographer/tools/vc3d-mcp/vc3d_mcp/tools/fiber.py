@@ -1,27 +1,10 @@
-"""Line-annotation (fiber tracing) workspace tools.
-
-Split out of the original monolithic ``server.py``; each tool registers on
-the single shared ``mcp`` instance from ``vc3d_mcp.core``.
-"""
+"""Line-annotation (fiber tracing) workspace tools."""
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
 from ..core import mcp, _call, _strip_none
-
-__all__ = [
-    "vc3d_fiber_launch",
-    "vc3d_fiber_list",
-    "vc3d_fiber_open",
-    "vc3d_fiber_set_follow",
-    "vc3d_fiber_save",
-    "vc3d_fiber_delete",
-    "vc3d_fiber_set_tag",
-    "vc3d_fiber_create_atlas",
-    "vc3d_fiber_export",
-    "vc3d_fiber_import",
-]
 
 
 @mcp.tool()

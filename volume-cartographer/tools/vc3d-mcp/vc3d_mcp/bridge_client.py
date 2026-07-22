@@ -1,21 +1,4 @@
-"""Thin asyncio client for the VC3D Agent Bridge JSON-RPC-over-local-socket channel.
-
-Speaks exactly the wire protocol described in
-``apps/VC3D/agent_bridge/SPEC.md`` section 1.2:
-
-- one JSON-RPC 2.0 message per line, UTF-8, LF-terminated;
-- requests get a numeric ``id`` and are answered 1:1, in the order the
-  bridge chooses to answer them (the bridge processes them serially, but we
-  do not assume that here -- responses are correlated by ``id``, not by
-  send order);
-- messages without an ``id`` are server -> client notifications (only
-  ``job.progress`` exists today) and are broadcast to every connected
-  client. This module tees them into a :class:`~vc3d_mcp.jobs.JobTracker`.
-
-The bridge's socket is a Qt ``QLocalServer``. On Unix (Linux/macOS -- the
-only platforms VC3D currently ships for) that is a plain ``AF_UNIX`` stream
-socket bound to a filesystem path, so a stdlib ``asyncio.open_unix_connection``
-is sufficient; no Qt/QLocalSocket dependency is needed on the Python side.
+"""Thin asyncio JSON-RPC 2.0 client for the VC3D Agent Bridge AF_UNIX socket.
 
 Socket resolution (see README.md "Socket discovery" for the full writeup):
 
@@ -26,16 +9,12 @@ Socket resolution (see README.md "Socket discovery" for the full writeup):
    known to place local-server sockets under on this platform
    (``$TMPDIR/<name>``, ``/tmp/<name>``). First one that exists wins.
 3. If VC3D was spawned by us (the auto-launch path in ``server.py``),
-   ``BridgeClient.socket_path_from_handshake``
-   extracts the authoritative path out of the
-   ``VC3D-AGENT-BRIDGE: listening name=... path=...`` stdout line instead
-   of guessing.
+   ``BridgeClient.socket_path_from_handshake`` extracts the authoritative
+   path out of the ``VC3D-AGENT-BRIDGE: listening name=... path=...`` stdout
+   line instead of guessing.
 
-SPEC.md does not pin down exact Qt local-socket filesystem conventions
-(they are platform- and Qt-version-dependent), so step 2 is a best-effort
-fallback documented here as an explicit assumption; step 1 (an explicit
-full path, e.g. forwarded via ``VC3D_AGENT_BRIDGE_SOCKET``) is the
-recommended, unambiguous way to point this client at a running bridge.
+Step 1 (an explicit full path, e.g. forwarded via ``VC3D_AGENT_BRIDGE_SOCKET``)
+is the unambiguous option; step 2 is a best-effort fallback.
 """
 
 from __future__ import annotations
@@ -44,10 +23,8 @@ import asyncio
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
-
-from .jobs import JobTracker
 
 HANDSHAKE_RE = re.compile(
     r"^VC3D-AGENT-BRIDGE:\s*listening\s+name=(?P<name>\S+)\s+path=(?P<path>.+)$"
@@ -187,30 +164,29 @@ class BridgeClientConfig:
 
 
 @dataclass
-class _Pending:
-    future: "asyncio.Future[Any]"
+class _Conn:
+    """One live connection: its transport, its pending calls, its reader task."""
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+    pending: dict[int, "asyncio.Future[Any]"] = field(default_factory=dict)
+    read_task: asyncio.Task | None = None
 
 
 class BridgeClient:
-    """Connects to one VC3D Agent Bridge socket and speaks its JSON-RPC 2.0."""
+    """Connects to one VC3D Agent Bridge socket and speaks its JSON-RPC 2.0.
+
+    Reconnects lazily: if the connection drops, in-flight calls fail and the
+    next call opens a fresh one. All per-connection state lives in a _Conn,
+    so a dying connection can only ever tear down itself.
+    """
 
     def __init__(self, config: BridgeClientConfig):
         self._config = config
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
-        self._read_task: asyncio.Task | None = None
-        self._pending: dict[int, _Pending] = {}
-        self._next_id = 1
-        self._write_lock = asyncio.Lock()
+        self._conn: _Conn | None = None
         self._connect_lock = asyncio.Lock()
-        self.jobs = JobTracker()
+        self._write_lock = asyncio.Lock()
+        self._next_id = 1
         self._closed = False
-        # Bumped on every successful connect(); passed into _read_loop so a
-        # stale reader only tears down state it still owns (prevents a dead
-        # reader from clearing a newer connection).
-        self._generation = 0
-
-    # -- connection lifecycle -------------------------------------------------
 
     @staticmethod
     def resolve_socket_path(configured: str) -> str:
@@ -247,241 +223,147 @@ class BridgeClient:
             return None
         return m.group("name"), m.group("path")
 
-    async def connect(self) -> None:
-        path = self.resolve_socket_path(self._config.socket)
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(path, limit=self._config.read_buffer_limit),
-                timeout=self._config.connect_timeout,
-            )
-        except (OSError, asyncio.TimeoutError) as exc:
-            raise BridgeConnectionError(
-                f"could not connect to VC3D agent bridge at {path!r} "
-                f"(configured as {self._config.socket!r}): {exc}"
-            ) from exc
-        # A close() may have raced with our open_unix_connection() above. If the
-        # client was closed while we were connecting, tear the fresh transport
-        # down and bail rather than resurrecting a closed client. (close() holds
-        # _connect_lock, so once it observes no writer/task it can't be here
-        # concurrently; the only race is close() setting _closed before we
-        # publish, which this re-check covers.)
-        if self._closed:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:  # noqa: BLE001 - closing a dead writer can raise
-                pass
-            raise BridgeConnectionError("bridge client has been closed")
-        self._reader, self._writer = reader, writer
-        self.jobs.reset_error()
-        self._generation += 1
-        self._read_task = asyncio.create_task(
-            self._read_loop(self._generation), name="vc3d-bridge-reader"
-        )
-
-    def _is_live(self) -> bool:
-        return (
-            self._writer is not None
-            and not self._writer.is_closing()
-            and self._read_task is not None
-            and not self._read_task.done()
-        )
-
-    async def ensure_connected(self) -> None:
-        if self._closed:
-            raise BridgeConnectionError("bridge client has been closed")
-        if self._is_live():
-            return
-        async with self._connect_lock:
-            # Double-check under the lock: a racing caller may have connected.
-            if self._closed:
-                raise BridgeConnectionError("bridge client has been closed")
-            if self._is_live():
-                return
-            await self.connect()
-
-    async def close(self) -> None:
-        # Idempotent: safe to call multiple times / after a drop.
-        # Set _closed FIRST, then synchronize with connect() via _connect_lock so
-        # a connect() in flight can't publish its transport after we've torn down
-        # (which would leave the client connected=True after close() returned).
-        self._closed = True
-        async with self._connect_lock:
-            task, self._read_task = self._read_task, None
-            if task is not None:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
-            writer, self._writer = self._writer, None
-            self._reader = None
-            if writer is not None and not writer.is_closing():
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:  # noqa: BLE001 - closing a dead writer can raise
-                    pass
-            self._on_disconnect(BridgeConnectionError("connection closed"))
-
-    def _on_disconnect(self, exc: Exception) -> None:
-        """Fail all pending RPC futures and wake/fail all job waiters."""
-        self._fail_all_pending(exc)
-        self.jobs.fail_all(exc)
-
-    def _reset_transport(self) -> None:
-        """Drop the dead reader/writer so the next call reconnects."""
-        self._read_task = None
-        self._reader = None
-        writer = self._writer
-        self._writer = None
-        if writer is not None and not writer.is_closing():
-            writer.close()
-
     @property
     def connected(self) -> bool:
-        return self._writer is not None and not self._writer.is_closing()
+        return self._conn is not None and not self._conn.writer.is_closing()
 
-    # -- request/response -----------------------------------------------------
+    async def _ensure_conn(self) -> _Conn:
+        if self._closed:
+            raise BridgeConnectionError("bridge client has been closed")
+        conn = self._conn
+        if conn is not None and not conn.writer.is_closing():
+            return conn
+        async with self._connect_lock:
+            if self._closed:
+                raise BridgeConnectionError("bridge client has been closed")
+            conn = self._conn
+            if conn is not None and not conn.writer.is_closing():
+                return conn
+            path = self.resolve_socket_path(self._config.socket)
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_unix_connection(path, limit=self._config.read_buffer_limit),
+                    timeout=self._config.connect_timeout,
+                )
+            except (OSError, asyncio.TimeoutError) as exc:
+                raise BridgeConnectionError(
+                    f"could not connect to VC3D agent bridge at {path!r} "
+                    f"(configured as {self._config.socket!r}): {exc}"
+                ) from exc
+            conn = _Conn(reader=reader, writer=writer)
+            conn.read_task = asyncio.create_task(
+                self._read_loop(conn), name="vc3d-bridge-reader"
+            )
+            self._conn = conn
+            return conn
+
+    async def connect(self) -> None:
+        await self._ensure_conn()
+
+    async def close(self) -> None:
+        self._closed = True
+        async with self._connect_lock:
+            conn, self._conn = self._conn, None
+            if conn is None:
+                return
+            if conn.read_task is not None:
+                conn.read_task.cancel()
+            self._drop(conn, BridgeConnectionError("bridge client has been closed"))
+            try:
+                await conn.writer.wait_closed()
+            except Exception:  # noqa: BLE001 - closing a dead writer can raise
+                pass
+
+    def _drop(self, conn: _Conn, exc: Exception) -> None:
+        """Fail `conn`'s pending calls, close its writer, forget it if current."""
+        if self._conn is conn:
+            self._conn = None
+        for fut in conn.pending.values():
+            if not fut.done():
+                fut.set_exception(exc)
+        conn.pending.clear()
+        if not conn.writer.is_closing():
+            conn.writer.close()
 
     async def call(
         self, method: str, params: dict[str, Any] | None = None, timeout: float | None = None
     ) -> Any:
         """Send a JSON-RPC request and await its response.
 
-        Raises :class:`BridgeError` for a JSON-RPC error reply, or
-        :class:`BridgeConnectionError` on transport failure/timeout.
+        Raises BridgeError for a JSON-RPC error reply, BridgeConnectionError
+        on transport failure or timeout.
         """
-        await self.ensure_connected()
-        # Capture the connection generation ensure_connected() just guaranteed
-        # live, so we can detect (under the write lock) an EOF-reset / reconnect
-        # that would otherwise let us write this stale request onto a NEWER
-        # connection after our future was already failed by the old disconnect.
-        gen = self._generation
-
+        conn = await self._ensure_conn()
         req_id = self._next_id
         self._next_id += 1
         message: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
         if params is not None:
             message["params"] = params
-
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[Any] = loop.create_future()
-        self._pending[req_id] = _Pending(future=fut)
-
-        # From here on, a single finally guarantees _pending[req_id] is removed --
-        # covering a cancel while queued for _write_lock or during drain(), not
-        # just the response wait (otherwise a cancelled-before-write call leaks
-        # its pending entry permanently).
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        conn.pending[req_id] = fut
+        line = json.dumps(message, separators=(",", ":")) + "\n"
         try:
-            line = json.dumps(message, separators=(",", ":")) + "\n"
             async with self._write_lock:
-                # Capture writer + generation under the lock and validate BEFORE
-                # writing. If EOF reset the transport (writer is None) or a
-                # reconnect bumped the generation while we waited for the lock,
-                # this request belongs to a dead connection: our future was
-                # already failed by _on_disconnect, so fail cleanly instead of
-                # dereferencing a None writer or writing onto the new connection.
-                writer = self._writer
-                if writer is None or self._generation != gen:
-                    if fut.done() and not fut.cancelled():
-                        fut.exception()  # mark the disconnect failure observed
+                if conn.writer.is_closing():
                     raise BridgeConnectionError(
-                        "bridge connection was reset before the request could be sent"
+                        "bridge connection closed before the request could be sent"
                     )
                 try:
-                    writer.write(line.encode("utf-8"))
-                    await writer.drain()
+                    conn.writer.write(line.encode("utf-8"))
+                    await conn.writer.drain()
                 except OSError as exc:
-                    # Write failed: the connection is dead. Invalidate it so the
-                    # next call reconnects, and wake anyone else waiting on it.
-                    err = BridgeConnectionError(f"write failed: {exc}")
-                    self._pending.pop(req_id, None)
-                    self._reset_transport()
-                    self._on_disconnect(err)
-                    raise err from exc
-
-            effective_timeout = timeout if timeout is not None else self._config.request_timeout
+                    self._drop(conn, BridgeConnectionError(f"write failed: {exc}"))
+                    raise BridgeConnectionError(f"write failed: {exc}") from exc
             try:
-                return await asyncio.wait_for(fut, timeout=effective_timeout)
+                return await asyncio.wait_for(
+                    fut, timeout=timeout if timeout is not None else self._config.request_timeout
+                )
             except asyncio.TimeoutError as exc:
                 raise BridgeConnectionError(
                     f"timed out waiting for response to {method!r} (id={req_id})"
                 ) from exc
-            except asyncio.CancelledError:
-                # Preserve caller cancellation; the finally below cleans up _pending.
-                raise
         finally:
-            # Any exit (success, timeout, cancel while queued for the lock or
-            # during the response wait, or a stale-connection raise): ensure the
-            # entry is gone. Idempotent on success (dispatch already removed it).
-            self._pending.pop(req_id, None)
+            # Any exit -- success, timeout, cancellation while queued for the
+            # write lock or while awaiting the reply -- removes the entry.
+            conn.pending.pop(req_id, None)
+            # A transport failure may have resolved fut via _drop while we raised
+            # our own error instead of awaiting it; retrieve the exception so
+            # asyncio does not warn that it went unobserved.
+            if fut.done() and not fut.cancelled():
+                fut.exception()
 
-    # -- background reader -----------------------------------------------------
-
-    async def _read_loop(self, generation: int) -> None:
-        # Read from our own captured reader so a stale loop keeps draining its
-        # own (dead) socket rather than a newer connection's.
-        reader = self._reader
-        assert reader is not None
+    async def _read_loop(self, conn: _Conn) -> None:
         try:
             while True:
-                line = await reader.readline()
+                line = await conn.reader.readline()
                 if not line:
                     break
                 line = line.strip()
-                if not line:
-                    continue
-                self._dispatch_line(line)
+                if line:
+                    self._dispatch_line(conn, line)
         except asyncio.CancelledError:
-            return  # close() cancelled us; it owns teardown + pending.
-        except Exception as exc:  # noqa: BLE001 - surface to all waiters below
-            if generation == self._generation:
-                self._reset_transport()
-                self._on_disconnect(BridgeConnectionError(f"reader loop crashed: {exc}"))
+            return  # close() owns teardown
+        except Exception as exc:  # noqa: BLE001 - fail this conn's waiters
+            self._drop(conn, BridgeConnectionError(f"reader loop crashed: {exc}"))
             return
-        # EOF: drop the now-dead socket so the next call reconnects -- but only
-        # if we still own the active connection (a stale reader must not clear
-        # a newer one).
-        if generation == self._generation:
-            self._reset_transport()
-            self._on_disconnect(BridgeConnectionError("connection closed by peer"))
+        self._drop(conn, BridgeConnectionError("connection closed by peer"))
 
-    def _fail_all_pending(self, exc: Exception) -> None:
-        for pending in self._pending.values():
-            if not pending.future.done():
-                pending.future.set_exception(exc)
-        self._pending.clear()
-
-    def _dispatch_line(self, raw: bytes) -> None:
+    def _dispatch_line(self, conn: _Conn, raw: bytes) -> None:
         try:
             msg = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return  # malformed line from the peer; nothing sane to do with it
-
-        if not isinstance(msg, dict):
+        if not isinstance(msg, dict) or msg.get("id") is None:
+            return  # notification (e.g. job.progress): unused, ignore
+        fut = conn.pending.pop(msg["id"], None)
+        if fut is None or fut.done():
             return
-
-        if "id" in msg and msg["id"] is not None:
-            req_id = msg["id"]
-            pending = self._pending.pop(req_id, None)
-            if pending is None:
-                return
-            if "error" in msg:
-                err = msg["error"] or {}
-                pending.future.set_exception(
-                    BridgeError(
-                        code=err.get("code", -32000),
-                        message=err.get("message", "unknown error"),
-                        data=err.get("data"),
-                    )
-                )
-            else:
-                pending.future.set_result(msg.get("result"))
-            return
-
-        # Notification (no id).
-        method = msg.get("method")
-        params = msg.get("params") or {}
-        if method == "job.progress":
-            self.jobs.on_progress(params)
+        if "error" in msg:
+            err = msg["error"] or {}
+            fut.set_exception(BridgeError(
+                code=err.get("code", -32000),
+                message=err.get("message", "unknown error"),
+                data=err.get("data"),
+            ))
+        else:
+            fut.set_result(msg.get("result"))

@@ -1,8 +1,4 @@
-"""Volume package + Open Data catalog tools.
-
-Split out of the original monolithic ``server.py``; each tool registers on
-the single shared ``mcp`` instance from ``vc3d_mcp.core``.
-"""
+"""Volume package + Open Data catalog tools."""
 
 from __future__ import annotations
 
@@ -11,14 +7,6 @@ from typing import Any, Optional
 from mcp.server.fastmcp import Context
 
 from ..core import mcp, _call, _wait_for_job, _strip_none
-
-__all__ = [
-    "vc3d_open_volume",
-    "vc3d_open_catalog_sample",
-    "vc3d_list_catalog_samples",
-    "vc3d_describe_catalog_sample",
-    "vc3d_select_volume",
-]
 
 
 @mcp.tool()

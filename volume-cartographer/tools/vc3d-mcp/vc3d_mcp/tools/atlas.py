@@ -1,8 +1,4 @@
-"""Fiber atlas open/search/remap tools.
-
-Split out of the original monolithic ``server.py``; each tool registers on
-the single shared ``mcp`` instance from ``vc3d_mcp.core``.
-"""
+"""Fiber atlas open/search/remap tools."""
 
 from __future__ import annotations
 
@@ -11,17 +7,6 @@ from typing import Any, Literal, Optional
 from mcp.server.fastmcp import Context
 
 from ..core import mcp, _call, _strip_none, _wait_for_job
-
-__all__ = [
-    "vc3d_atlas_open",
-    "vc3d_atlas_status",
-    "vc3d_atlas_search_start",
-    "vc3d_atlas_search_cancel",
-    "vc3d_atlas_search_results",
-    "vc3d_atlas_open_result",
-    "vc3d_atlas_remap",
-    "vc3d_atlas_optimize_snap_candidates",
-]
 
 
 @mcp.tool()

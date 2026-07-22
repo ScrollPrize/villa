@@ -1,22 +1,10 @@
-"""General app-state / navigation tools (ping, state, screenshot, job status, workspace switch).
-
-Split out of the original monolithic ``server.py``; each tool registers on
-the single shared ``mcp`` instance from ``vc3d_mcp.core``.
-"""
+"""General app-state / navigation tools (ping, state, screenshot, job status, workspace switch)."""
 
 from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
 from ..core import mcp, _call, _strip_none
-
-__all__ = [
-    "vc3d_ping",
-    "vc3d_get_state",
-    "vc3d_screenshot",
-    "vc3d_job_status",
-    "vc3d_switch_workspace",
-]
 
 
 @mcp.tool()

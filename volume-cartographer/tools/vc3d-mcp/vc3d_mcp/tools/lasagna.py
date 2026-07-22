@@ -1,8 +1,4 @@
-"""Lasagna fit-service and optimization tools.
-
-Split out of the original monolithic ``server.py``; each tool registers on
-the single shared ``mcp`` instance from ``vc3d_mcp.core``.
-"""
+"""Lasagna fit-service and optimization tools."""
 
 from __future__ import annotations
 
@@ -11,17 +7,6 @@ from typing import Any, Literal, Optional
 from mcp.server.fastmcp import Context
 
 from ..core import mcp, _call, _wait_for_job, _strip_none
-
-__all__ = [
-    "vc3d_lasagna_service_status",
-    "vc3d_lasagna_ensure_service",
-    "vc3d_lasagna_list_datasets",
-    "vc3d_lasagna_start_optimization",
-    "vc3d_lasagna_jobs",
-    "vc3d_lasagna_cancel",
-    "vc3d_lasagna_select_output",
-    "vc3d_lasagna_repeat_last",
-]
 
 
 @mcp.tool()
