@@ -1860,7 +1860,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "numcodecs", specifier = ">=0.16.5,<0.17" },
+    { name = "numcodecs", specifier = ">=0.15.1,<0.17" },
     { name = "numpy" },
 ]
 

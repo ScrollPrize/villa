@@ -14,6 +14,13 @@ from vesuvius.models.run.inference import Inferer
 from vesuvius.models.training.train import BaseTrainer
 
 
+def _create_array(group, name, **kwargs):
+    create_array = getattr(group, "create_array", None)
+    if create_array is not None:
+        return create_array(name, **kwargs)
+    return group.create_dataset(name, **kwargs)
+
+
 def _make_synthetic_dataset(root: Path) -> Path:
     data_root = root / "data"
     image_root = data_root / "images" / "volume1.zarr"
@@ -21,8 +28,8 @@ def _make_synthetic_dataset(root: Path) -> Path:
 
     image_group = zarr.open_group(str(image_root), mode="w")
     label_group = zarr.open_group(str(label_root), mode="w")
-    image_array = image_group.create_array("0", shape=(32, 32, 32), chunks=(32, 32, 32), dtype="float32")
-    label_array = label_group.create_array("0", shape=(32, 32, 32), chunks=(32, 32, 32), dtype="uint8")
+    image_array = _create_array(image_group, "0", shape=(32, 32, 32), chunks=(32, 32, 32), dtype="float32")
+    label_array = _create_array(label_group, "0", shape=(32, 32, 32), chunks=(32, 32, 32), dtype="uint8")
 
     coords = np.linspace(-1.0, 1.0, 32, dtype=np.float32)
     z = coords[:, None, None]

@@ -42,6 +42,14 @@ def _write_zarr_array(path: Path, arr: np.ndarray, chunks: Tuple[int, int, int])
     z[...] = arr
 
 
+def _create_group_array(group, name: str, data: np.ndarray, chunks: Tuple[int, int, int]) -> None:
+    create_array = getattr(group, "create_array", None)
+    if create_array is not None:
+        create_array(name, data=data, chunks=chunks)
+    else:
+        group.create_dataset(name, shape=data.shape, data=data, chunks=chunks)
+
+
 def _make_mgr(
     *,
     image_url: str,
@@ -267,9 +275,9 @@ def test_coarse_scan_level(tmp_path: Path):
     base = tmp_path / "labels.ome.zarr"
     base.mkdir(parents=True)
     group = zarr.open_group(str(base), mode="w")
-    group.create_array("0", data=labels, chunks=(16, 16, 16))
+    _create_group_array(group, "0", labels, chunks=(16, 16, 16))
     coarse = (labels[::4, ::4, ::4] > 0).astype(np.uint8)  # 16^3
-    group.create_array("1", data=coarse, chunks=(8, 8, 8))
+    _create_group_array(group, "1", coarse, chunks=(8, 8, 8))
 
     image_path = tmp_path / "image.zarr"
     tform_path = tmp_path / "transform.json"

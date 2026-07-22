@@ -4506,8 +4506,8 @@ requires-dist = [
     { name = "nnunetv2", marker = "extra == 'models'", directory = "../segmentation/models/arch/nnunet" },
     { name = "numba", marker = "extra == 'all'", specifier = ">=0.60.0" },
     { name = "numba", marker = "extra == 'models'", specifier = ">=0.60.0" },
-    { name = "numcodecs", specifier = ">=0.16.5,<0.17" },
-    { name = "numcodecs", marker = "extra == 'volume-only'", specifier = ">=0.16.5,<0.17" },
+    { name = "numcodecs", specifier = ">=0.15.1,<0.17" },
+    { name = "numcodecs", marker = "extra == 'volume-only'", specifier = ">=0.15.1,<0.17" },
     { name = "numpy", specifier = ">=2.0.2" },
     { name = "numpy", marker = "extra == 'volume-only'", specifier = ">=2.0.2" },
     { name = "opencv-contrib-python", marker = "extra == 'all'", specifier = ">=4.11.0.86" },
@@ -4564,8 +4564,8 @@ requires-dist = [
     { name = "wandb", extras = ["media"], marker = "extra == 'all'", specifier = ">=0.22.0" },
     { name = "wandb", extras = ["media"], marker = "extra == 'models'", specifier = ">=0.22.0" },
     { name = "wheel", marker = "extra == 'all'" },
-    { name = "zarr", specifier = ">=3.2,<4" },
-    { name = "zarr", marker = "extra == 'volume-only'", specifier = ">=3.2,<4" },
+    { name = "zarr", specifier = ">=2.18.7,<4" },
+    { name = "zarr", marker = "extra == 'volume-only'", specifier = ">=2.18.7,<4" },
 ]
 provides-extras = ["volume-only", "models", "render", "gui", "notebooks", "blending", "tests", "all"]
 
@@ -4605,7 +4605,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "numcodecs", specifier = ">=0.16.5,<0.17" },
+    { name = "numcodecs", specifier = ">=0.15.1,<0.17" },
     { name = "numpy" },
 ]
 

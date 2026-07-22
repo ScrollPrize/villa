@@ -1,14 +1,39 @@
 import asyncio
 
 import pytest
-from zarr.abc.store import RangeByteRequest
-from zarr.core.buffer.core import default_buffer_prototype
-from zarr.storage import MemoryStore
+import zarr
 
 from vesuvius.neural_tracing.datasets.common import _DiskCacheStore, OfflineCacheMiss
 
 
+ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
+
+
 def test_disk_cache_store_caches_hits_and_misses(tmp_path):
+    if not ZARR_V3:
+        remote = {"chunk": b"payload"}
+        cache = _DiskCacheStore(remote, str(tmp_path), url="memory://dataset")
+
+        assert cache["chunk"] == b"payload"
+        del remote["chunk"]
+        assert cache["chunk"] == b"payload"
+        assert "chunk" in cache
+
+        read_only_copy = cache.with_read_only(True)
+        assert read_only_copy["chunk"] == b"payload"
+
+        with pytest.raises(KeyError):
+            cache["missing"]
+        remote["missing"] = b"too late"
+        with pytest.raises(KeyError):
+            cache["missing"]
+        assert "missing" not in cache
+        return
+
+    from zarr.abc.store import RangeByteRequest
+    from zarr.core.buffer.core import default_buffer_prototype
+    from zarr.storage import MemoryStore
+
     async def exercise():
         prototype = default_buffer_prototype()
         remote = MemoryStore()
@@ -46,6 +71,25 @@ def test_disk_cache_store_caches_hits_and_misses(tmp_path):
 
 
 def test_disk_cache_store_offline_miss_and_range_read(tmp_path):
+    if not ZARR_V3:
+        remote = {"chunk": b"payload"}
+        online = _DiskCacheStore(remote, str(tmp_path), url="memory://online")
+        assert online["chunk"] == b"payload"
+
+        offline = _DiskCacheStore(
+            remote,
+            str(tmp_path),
+            url="memory://offline",
+            offline=True,
+        )
+        with pytest.raises(OfflineCacheMiss):
+            offline["chunk"]
+        return
+
+    from zarr.abc.store import RangeByteRequest
+    from zarr.core.buffer.core import default_buffer_prototype
+    from zarr.storage import MemoryStore
+
     async def exercise():
         prototype = default_buffer_prototype()
         remote = MemoryStore()

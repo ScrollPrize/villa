@@ -13,7 +13,6 @@ from vesuvius.tifxyz import Tifxyz
 from vesuvius.tifxyz.upsampling import interpolate_at_points
 import zarr
 import zarr.storage
-from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteRequest
 from typing import Any, Dict, List, Tuple
 import re
 from functools import lru_cache
@@ -22,9 +21,17 @@ from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
 import tifffile
 import warnings
+from collections.abc import MutableMapping
 
 
 _HTTP_PREFIXES = ('http://', 'https://')
+_ZARR_V3 = int(zarr.__version__.split('.', 1)[0]) >= 3
+
+if _ZARR_V3:
+    from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteRequest
+else:
+    # These names are only used by the Zarr 3 store implementation below.
+    OffsetByteRequest = RangeByteRequest = SuffixByteRequest = ()
 
 
 class OfflineCacheMiss(Exception):
@@ -72,12 +79,12 @@ except ImportError:
     pass
 
 
-class _DiskCacheStore(zarr.storage.WrapperStore):
+class _DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
     """Read-only Zarr v2 store wrapper that lazily caches remote bytes to disk."""
 
     def __init__(
         self,
-        remote: zarr.abc.store.Store,
+        remote: Any,
         cache_dir: str,
         url: str,
         offline: bool = False,
@@ -257,19 +264,173 @@ class _DiskCacheStore(zarr.storage.WrapperStore):
 
     def __eq__(self, other):
         return (
-            isinstance(other, _DiskCacheStore)
+            isinstance(other, _DiskCacheStoreV3)
             and self._remote == other._remote
             and self._cache_dir == other._cache_dir
         )
 
 
+class _DiskCacheStoreV2(MutableMapping):
+    """Read-only Zarr v2 mapping that lazily caches remote bytes to disk."""
+
+    _NEGATIVE_MARKER_SUFFIX = ".__notfound__"
+
+    def __init__(
+        self,
+        remote: MutableMapping,
+        cache_dir: str,
+        url: str,
+        offline: bool = False,
+        retry_budget_seconds: float = 0.0,
+    ) -> None:
+        self._remote = remote
+        self._cache_root = cache_dir
+        self._url = url
+        self._offline = offline
+        self._retry_budget_seconds = float(retry_budget_seconds)
+        normalized = url.rstrip('/')
+        scheme, sep, rest = normalized.partition('://')
+        subdir = os.path.join(scheme, rest) if sep else normalized
+        self._cache_dir = os.path.join(cache_dir, subdir)
+
+    def with_read_only(self, read_only: bool = False):
+        if not read_only:
+            raise NotImplementedError("_DiskCacheStore is always read-only")
+        return type(self)(
+            self._remote,
+            self._cache_root,
+            self._url,
+            offline=self._offline,
+            retry_budget_seconds=self._retry_budget_seconds,
+        )
+
+    def _atomic_write_bytes(self, target: str, data: bytes) -> None:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = f"{target}.tmp.{os.getpid()}.{threading.get_ident()}"
+        try:
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _remote_get_with_retry(self, key):
+        if self._retry_budget_seconds <= 0.0:
+            return self._remote[key]
+
+        deadline = time.monotonic() + self._retry_budget_seconds
+        delay = 1.0
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return self._remote[key]
+            except _NEVER_RETRY_EXCEPTIONS:
+                raise
+            except _RETRYABLE_EXCEPTIONS as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    print(
+                        f"[_DiskCacheStore] giving up on {key!r} after "
+                        f"{attempt} attempts, "
+                        f"{self._retry_budget_seconds:.0f}s budget exhausted: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    raise
+                wait = min(delay, remaining, 60.0)
+                print(
+                    f"[_DiskCacheStore] transient error fetching {key!r} "
+                    f"(attempt {attempt}): {type(exc).__name__}: {exc}; "
+                    f"retrying in {wait:.1f}s "
+                    f"(remaining budget {remaining:.0f}s)",
+                    flush=True,
+                )
+                time.sleep(wait)
+                delay = min(delay * 2.0, 60.0)
+
+    def __getitem__(self, key):
+        cached = os.path.join(self._cache_dir, key)
+        marker = cached + self._NEGATIVE_MARKER_SUFFIX
+
+        try:
+            with open(cached, 'rb') as f:
+                return f.read()
+        except FileNotFoundError:
+            pass
+
+        if os.path.isfile(marker):
+            raise KeyError(key)
+        if self._offline:
+            raise OfflineCacheMiss(
+                f"offline mode: chunk {key!r} not in local cache "
+                f"({self._cache_dir})"
+            )
+
+        try:
+            result = self._remote_get_with_retry(key)
+        except KeyError:
+            try:
+                self._atomic_write_bytes(marker, b"")
+            except OSError:
+                pass
+            raise
+
+        data = bytes(result)
+        self._atomic_write_bytes(cached, data)
+        return data
+
+    def __contains__(self, key):
+        cached = os.path.join(self._cache_dir, key)
+        if os.path.isfile(cached):
+            return True
+        if os.path.isfile(cached + self._NEGATIVE_MARKER_SUFFIX):
+            return False
+        if self._offline:
+            return False
+        return key in self._remote
+
+    def __iter__(self):
+        return iter(self._remote)
+
+    def __len__(self):
+        return len(self._remote)
+
+    def __setitem__(self, key, value):
+        raise PermissionError("read-only cache store")
+
+    def __delitem__(self, key):
+        raise PermissionError("read-only cache store")
+
+    def close(self) -> None:
+        close_fn = getattr(self._remote, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, _DiskCacheStoreV2)
+            and self._remote == other._remote
+            and self._cache_dir == other._cache_dir
+        )
+
+
+_DiskCacheStore = _DiskCacheStoreV3 if _ZARR_V3 else _DiskCacheStoreV2
+
+
 def _make_remote_store(path: str, storage_opts: dict, *, missing_exceptions: tuple[type[Exception], ...]):
-    return zarr.storage.FsspecStore.from_url(
-        path.rstrip('/'),
-        storage_options=storage_opts,
-        read_only=True,
-        allowed_exceptions=missing_exceptions,
-    )
+    if _ZARR_V3:
+        return zarr.storage.FsspecStore.from_url(
+            path.rstrip('/'),
+            storage_options=storage_opts,
+            read_only=True,
+            allowed_exceptions=missing_exceptions,
+        )
+    return zarr.storage.FSStore(path.rstrip('/'), mode='r', **storage_opts)
 
 
 def _resolve_config_relative_path(path_value, config):
