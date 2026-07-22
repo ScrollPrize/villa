@@ -24,11 +24,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Ensure curl available on Linux
+      - name: Install native build dependencies on Linux
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl \
+            libblosc-dev \
+            libceres-dev \
+            libcurl4-openssl-dev \
+            liblz4-dev \
+            libopencv-contrib-dev \
+            libopencv-dev \
+            libtiff-dev \
+            libzstd-dev \
+            nlohmann-json3-dev \
+            pkg-config \
+            zlib1g-dev
 
       - name: Install uv
         run: |
