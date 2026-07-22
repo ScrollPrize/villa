@@ -14,6 +14,7 @@ class QLabel;
 class QButtonGroup;
 class QAction;
 class QCheckBox;
+class QDoubleSpinBox;
 class QLineEdit;
 class QTreeView;
 class QVBoxLayout;
@@ -81,6 +82,11 @@ public:
     void selectFiber(uint64_t fiberId);
     void selectFibers(const std::vector<uint64_t>& fiberIds);
     void setDeleteConfirmationForTesting(std::function<bool(const std::vector<uint64_t>&)> confirmer);
+    void setShowFibersAvailable(bool available);
+    void setShowFibersChecked(bool checked);
+    [[nodiscard]] bool showFibersChecked() const;
+    void setFiberViewDistance(double distance);
+    [[nodiscard]] double fiberViewDistance() const;
 
 signals:
     void fiberOpenRequested(uint64_t fiberId);
@@ -91,11 +97,14 @@ signals:
     void fiberSpanOpenRequested(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
     void newAtlasFromFiberRequested(uint64_t fiberId);
     void addFibersToPointCollectionsRequested(std::vector<uint64_t> fiberIds);
+    void addFibersToSpiralFitRequested(std::vector<uint64_t> fiberIds);
     void fiberSliceRequested(uint64_t fiberId);
     void renameFiberFileRequested(uint64_t fiberId);
     void importFibersRequested();
     void exportFibersRequested();
     void metricsCalculationRequested(std::vector<uint64_t> orderedFiberIds);
+    void showFibersToggled(bool checked);
+    void fiberViewDistanceChanged(double distance);
 
 private slots:
     void onSelectionChanged();
@@ -108,7 +117,13 @@ private slots:
     void onHeaderSectionClicked(int section);
     void showContextMenu(const QPoint& pos);
 
+public:
+    // Enables the "Add to current spiral fit" context action while a Spiral
+    // session is active on the connected service.
+    void setSpiralFitAvailable(bool available) { _spiralFitAvailable = available; }
+
 private:
+    bool _spiralFitAvailable = false;
     void setupUi();
     void rebuildModel();
     void sortFibers();
@@ -137,6 +152,8 @@ private:
     Qt::SortOrder _sortOrder = Qt::AscendingOrder;
 
     QCheckBox* _calcMetricsCheckBox;
+    QCheckBox* _showFibersCheckBox;
+    QDoubleSpinBox* _fiberViewDistanceSpinBox;
     QTreeView* _treeView;
     QStandardItemModel* _model;
     QLabel* _nameLabel;

@@ -1,0 +1,293 @@
+#include "SpiralOverlayController.hpp"
+
+#include "FiberOverlayController.hpp"
+
+#include "../volume_viewers/VolumeViewerBase.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrent>
+
+#include <algorithm>
+
+namespace {
+QColor categoryColor(const QString& category)
+{
+    if (category == QStringLiteral("fibers")) return QColor(80, 220, 255);
+    if (category == QStringLiteral("tracks")) return QColor(255, 190, 60);
+    return QColor(220, 100, 255);
+}
+}
+
+SpiralOverlayController::SpiralOverlayController(QObject* parent)
+    : ViewerOverlayControllerBase("spiral_geometry", parent)
+{
+    _visible = {{QStringLiteral("fibers"), false}, {QStringLiteral("tracks"), false},
+                {QStringLiteral("pcls"), false}};
+}
+
+void SpiralOverlayController::publishIndex(std::shared_ptr<const PolylineIndex> index, quint64 generation)
+{
+    if (generation < _indexGeneration) return;
+    _index = std::move(index);
+    _indexGeneration = generation;
+    _cache.clear();
+    clearPointChainProjectionCache();
+    rebuildChains();
+    refreshAll();
+}
+
+void SpiralOverlayController::publishRunDiff(std::shared_ptr<QuadSurface> surface, QImage image)
+{
+    _runDiffSurface = std::move(surface);
+    _runDiffImage = std::move(image);
+    refreshAll();
+}
+
+void SpiralOverlayController::publishLossMap(std::shared_ptr<QuadSurface> surface,
+                                             QImage image, qreal opacity)
+{
+    _lossMapSurface = std::move(surface);
+    _lossMapImage = std::move(image);
+    _lossMapOpacity = std::clamp(opacity, 0.0, 1.0);
+    refreshAll();
+}
+
+void SpiralOverlayController::setRunDiffVisible(bool visible)
+{
+    if (_runDiffVisible == visible) return;
+    _runDiffVisible = visible;
+    refreshAll();
+}
+
+void SpiralOverlayController::setFiberViewDistance(double distance)
+{
+    const float clamped = static_cast<float>(std::clamp(distance, 0.0, 10000.0));
+    if (_fiberViewDistance == clamped) return;
+    _fiberViewDistance = clamped;
+    clearPointChainProjectionCache();
+    refreshAll();
+}
+
+void SpiralOverlayController::reset()
+{
+    _index.reset();
+    _indexGeneration = 0;
+    ++_requestGeneration;
+    _cache.clear();
+    _chains.clear();
+    clearPointChainProjectionCache();
+    _runDiffSurface.reset();
+    _runDiffImage = {};
+    _lossMapSurface.reset();
+    _lossMapImage = {};
+    refreshAll();
+}
+
+void SpiralOverlayController::rebuildChains()
+{
+    _chains.clear();
+    if (!_index) return;
+    // Fibers and pcls are decimated control-point strips, small enough to
+    // keep resident for the lifetime of the generation; only the dense track
+    // curves go through the viewport-limited spatial query.
+    for (const auto& polyline : _index->polylines()) {
+        const QString category = QString::fromStdString(polyline.category);
+        if (category == QStringLiteral("tracks") || polyline.points.empty()) continue;
+        ChainEntry entry;
+        entry.objectId = polyline.objectId;
+        entry.category = category;
+        entry.points = &polyline.points;
+        _chains.push_back(std::move(entry));
+    }
+}
+
+void SpiralOverlayController::setCategoryVisible(const QString& category, bool visible)
+{
+    if (_visible.value(category) == visible) return;
+    _visible[category] = visible;
+    _cache.clear();
+    refreshAll();
+}
+
+void SpiralOverlayController::detachViewer(VolumeViewerBase* viewer)
+{
+    _cache.erase(viewer);
+    ViewerOverlayControllerBase::detachViewer(viewer);
+}
+
+bool SpiralOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
+{
+    const bool geometryVisible = viewer && _index && !_index->empty()
+        && std::any_of(_visible.begin(), _visible.end(), [](bool value) { return value; });
+    const bool lossMapVisible = viewer && _lossMapSurface && !_lossMapImage.isNull()
+        && viewer->currentSurface() == _lossMapSurface.get();
+    return geometryVisible || hasRunDiffFor(viewer) || lossMapVisible;
+}
+
+bool SpiralOverlayController::hasRunDiffFor(VolumeViewerBase* viewer) const
+{
+    return _runDiffVisible && viewer && _runDiffSurface && !_runDiffImage.isNull()
+        && viewer->currentSurface() == _runDiffSurface.get();
+}
+
+void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder)
+{
+    if (!isOverlayEnabledFor(viewer)) return;
+
+    if (hasRunDiffFor(viewer)) {
+        const cv::Vec2f scale = _runDiffSurface->scale();
+        const cv::Vec3f center = _runDiffSurface->center();
+        if (std::abs(scale[0]) > 1e-6f && std::abs(scale[1]) > 1e-6f) {
+            auto gridToScene = [viewer, scale, center](int row, int col) {
+                const float surfaceX = static_cast<float>(col) / scale[0] - center[0];
+                const float surfaceY = static_cast<float>(row) / scale[1] - center[1];
+                return viewer->surfaceCoordsToScene(surfaceX, surfaceY);
+            };
+            const QPointF origin = gridToScene(0, 0);
+            const QPointF columnStep = gridToScene(0, 1) - origin;
+            const QPointF rowStep = gridToScene(1, 0) - origin;
+            const qreal scaleX = std::hypot(columnStep.x(), columnStep.y());
+            const qreal scaleY = std::hypot(rowStep.x(), rowStep.y());
+            if (scaleX > 1e-6 && scaleY > 1e-6)
+                builder.addImage(_runDiffImage, origin, scaleX, scaleY, 1.0, 65.0);
+        }
+    }
+
+    if (viewer && _lossMapSurface && !_lossMapImage.isNull()
+        && viewer->currentSurface() == _lossMapSurface.get()) {
+        const cv::Vec2f scale = _lossMapSurface->scale();
+        const cv::Vec3f center = _lossMapSurface->center();
+        if (std::abs(scale[0]) > 1e-6f && std::abs(scale[1]) > 1e-6f) {
+            auto gridToScene = [viewer, scale, center](int row, int col) {
+                const float surfaceX = static_cast<float>(col) / scale[0] - center[0];
+                const float surfaceY = static_cast<float>(row) / scale[1] - center[1];
+                return viewer->surfaceCoordsToScene(surfaceX, surfaceY);
+            };
+            const QPointF origin = gridToScene(0, 0);
+            const QPointF columnStep = gridToScene(0, 1) - origin;
+            const QPointF rowStep = gridToScene(1, 0) - origin;
+            const qreal scaleX = std::hypot(columnStep.x(), columnStep.y());
+            const qreal scaleY = std::hypot(rowStep.x(), rowStep.y());
+            if (scaleX > 1e-6 && scaleY > 1e-6)
+                builder.addImage(_lossMapImage, origin, scaleX, scaleY,
+                                 _lossMapOpacity, 66.0);
+        }
+    }
+
+    const bool geometryVisible = _index && !_index->empty()
+        && std::any_of(_visible.begin(), _visible.end(), [](bool value) { return value; });
+    if (!geometryVisible) return;
+    const bool surfacePane = dynamic_cast<QuadSurface*>(viewer->currentSurface()) != nullptr;
+    const float slab = surfacePane ? 10.0f : 4.0f;
+    // Fibers and pcls are ordered control-point chains: draw them like point
+    // collections (dots + polylines joining only consecutive points), fading
+    // out with distance to the pane's plane or surface. They render
+    // synchronously from the resident chain list so panning never waits on
+    // the async viewport query. The complete projected chains are handed to
+    // Qt for viewport clipping, keeping their topology camera-independent.
+    for (const auto& entry : _chains) {
+        if (!_visible.value(entry.category)) continue;
+        const bool fiber = entry.category == QStringLiteral("fibers");
+        const QColor color = fiber
+            ? FiberOverlayController::fiberColor(entry.objectId)
+            : categoryColor(entry.category);
+        const float distance = fiber ? _fiberViewDistance : slab;
+        PointChainStyle chainStyle = FiberOverlayController::fiberStyle(color, distance);
+        renderPointChain(viewer, builder, *entry.points, chainStyle);
+    }
+
+    if (!_visible.value(QStringLiteral("tracks"))) return;
+
+    const QRectF rect = visibleSceneRect(viewer);
+    const int samplesPerAxis = surfacePane ? 5 : 2;
+    cv::Vec3f lo, hi;
+    bool haveBounds = false;
+    for (int row = 0; row < samplesPerAxis; ++row) {
+        const qreal y = rect.top() + rect.height() * row / (samplesPerAxis - 1);
+        for (int col = 0; col < samplesPerAxis; ++col) {
+            const qreal x = rect.left() + rect.width() * col / (samplesPerAxis - 1);
+            const cv::Vec3f point = sceneToVolume(viewer, QPointF(x, y));
+            if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2]))
+                continue;
+            if (!haveBounds) {
+                lo = hi = point;
+                haveBounds = true;
+            } else {
+                for (int axis = 0; axis < 3; ++axis) {
+                    lo[axis] = std::min(lo[axis], point[axis]);
+                    hi[axis] = std::max(hi[axis], point[axis]);
+                }
+            }
+        }
+    }
+    if (!haveBounds) return;
+    lo -= cv::Vec3f(slab, slab, slab); hi += cv::Vec3f(slab, slab, slab);
+    const QString key = QStringLiteral("%1:%2:%3:%4:%5:%6:%7:%8")
+        .arg(_indexGeneration).arg(lo[0], 0, 'f', 1).arg(lo[1], 0, 'f', 1).arg(lo[2], 0, 'f', 1)
+        .arg(hi[0], 0, 'f', 1).arg(hi[1], 0, 'f', 1).arg(hi[2], 0, 'f', 1)
+        .arg(QString::fromStdString(viewer->surfName()));
+    auto& cache = _cache[viewer];
+    if (cache.requestKey != key) schedule(viewer, key, lo, hi);
+    for (const auto& path : cache.paths) {
+        if (!surfacePane) {
+            builder.addPath(path);
+            continue;
+        }
+        std::vector<QPointF> points;
+        points.reserve(path.points.size());
+        for (const cv::Vec3f& point : path.points) {
+            const QPointF scenePoint = viewer->volumeToScene(point);
+            if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
+                points.clear();
+                break;
+            }
+            points.push_back(scenePoint);
+        }
+        if (points.size() < 2) continue;
+        OverlayStyle style;
+        style.penColor = path.color;
+        style.penColor.setAlphaF(std::clamp(path.opacity, 0.0, 1.0));
+        style.penWidth = path.lineWidth;
+        style.z = path.z;
+        builder.addLineStrip(points, path.closed, style);
+    }
+}
+
+void SpiralOverlayController::schedule(VolumeViewerBase* viewer, const QString& key,
+                                       const cv::Vec3f& lo, const cv::Vec3f& hi)
+{
+    auto index = _index;
+    const quint64 request = ++_requestGeneration;
+    auto& cache = _cache[viewer];
+    cache.requestKey = key;
+    cache.requestGeneration = request;
+    auto* watcher = new QFutureWatcher<std::vector<PathPrimitive>>(this);
+    connect(watcher, &QFutureWatcher<std::vector<PathPrimitive>>::finished, this,
+            [this, watcher, viewer, request]() {
+        auto found = _cache.find(viewer);
+        if (found != _cache.end() && found->second.requestGeneration == request) {
+            found->second.paths = watcher->result();
+            refreshViewer(viewer);
+        }
+        watcher->deleteLater();
+    });
+    // Only the dense track curves need the spatial query; fibers/pcls render
+    // synchronously from the resident chain list.
+    watcher->setFuture(QtConcurrent::run([index, lo, hi]() {
+        std::vector<PathPrimitive> paths;
+        constexpr std::size_t maximum = 12000;
+        const auto segments = index->query(lo, hi, "tracks", maximum);
+        for (const auto& segment : segments) {
+            PathPrimitive path;
+            path.points = {segment.first, segment.second};
+            path.color = categoryColor(QStringLiteral("tracks"));
+            path.lineWidth = 1.0;
+            path.opacity = 0.9;
+            path.z = 70.0;
+            paths.push_back(std::move(path));
+        }
+        return paths;
+    }));
+}

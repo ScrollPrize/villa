@@ -4,6 +4,37 @@ import zarr
 import os
 from typing import Union, Dict, Any, Optional, Tuple
 
+
+def _normalize_zarr_creation_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate Zarr 3 creation keywords for a Zarr 2 runtime."""
+    normalized = dict(kwargs)
+    if int(zarr.__version__.split('.', 1)[0]) >= 3:
+        return normalized
+
+    zarr_format = normalized.pop('zarr_format', None)
+    if zarr_format not in (None, 2):
+        raise ValueError(
+            f"zarr-python 2 cannot create Zarr format {zarr_format}"
+        )
+    if zarr_format == 2:
+        normalized.setdefault('zarr_version', 2)
+
+    config = normalized.pop('config', None)
+    if config is not None:
+        if not isinstance(config, dict):
+            raise TypeError("Zarr 2 compatibility requires config to be a dict")
+        config = dict(config)
+        if 'write_empty_chunks' in config:
+            normalized['write_empty_chunks'] = config.pop('write_empty_chunks')
+        if config:
+            unsupported = ', '.join(sorted(config))
+            raise TypeError(
+                f"Zarr 2 does not support array config options: {unsupported}"
+            )
+
+    return normalized
+
+
 # Function to get the maximum value of a dtype
 def get_max_value(dtype: np.dtype) -> Union[float, int]:
     """
@@ -66,8 +97,8 @@ def open_zarr(path: str, mode: str = 'r',
     zarr.Array
         The opened zarr array
     """
-    if storage_options is None:
-        storage_options = {}
+    storage_options = dict(storage_options or {})
+    is_remote = path.startswith(('http://', 'https://', 's3://'))
     
     # Ensure parent directory exists for write modes and local paths
     if mode in ('w', 'w-', 'a') and not path.startswith(('http://', 'https://', 's3://')):
@@ -113,17 +144,14 @@ def open_zarr(path: str, mode: str = 'r',
         if verbose:
             print(f"Opening HTTP zarr store at {path} with storage_options: {storage_options}")
     
-    # Open zarr store directly with storage_options
+    # Zarr 3.2 rejects storage_options for local filesystem stores, even when
+    # the mapping is empty. Only URI-backed fsspec stores consume this option.
+    store_kwargs = {'storage_options': storage_options} if is_remote else {}
+
+    # Open the Zarr store with the protocol-appropriate keyword arguments.
     if verbose:
         print(f"Opening zarr store at {path} with mode={mode}")
     
-    # Zarr 3.2 rejects ``storage_options={}`` for local paths because those
-    # options are only meaningful for fsspec URLs. Pass the keyword only when
-    # there are actual backend options to apply.
-    storage_kwargs = (
-        {'storage_options': storage_options} if storage_options else {}
-    )
-
     # If we're creating a new array (mode='w') and shape is provided, pass creation parameters
     if mode == 'w' and shape is not None:
         create_kwargs = {}
@@ -140,17 +168,12 @@ def open_zarr(path: str, mode: str = 'r',
         
         # Add any other kwargs
         create_kwargs.update(kwargs)
+        create_kwargs = _normalize_zarr_creation_kwargs(create_kwargs)
         
         if verbose:
             print(f"Creating new zarr array with shape={shape}, chunks={chunks}, dtype={dtype}")
         
-        return zarr.open(
-            path,
-            mode=mode,
-            shape=shape,
-            **storage_kwargs,
-            **create_kwargs,
-        )
+        return zarr.open(path, mode=mode, shape=shape, **store_kwargs, **create_kwargs)
     else:
         # Just open the existing array
-        return zarr.open(path, mode=mode, **storage_kwargs, **kwargs)
+        return zarr.open(path, mode=mode, **store_kwargs, **kwargs)

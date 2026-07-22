@@ -29,6 +29,14 @@ from vesuvius.models.run.finalize_outputs import (
 )
 
 
+def _zarr_format_kwargs(zarr_format: int) -> dict[str, int]:
+    if int(zarr.__version__.split('.', 1)[0]) >= 3:
+        return {'zarr_format': zarr_format}
+    if zarr_format != 2:
+        pytest.skip('Zarr format 3 requires zarr-python 3')
+    return {'zarr_version': 2}
+
+
 def test_apply_support_mask_counts_multichannel_spatial_voxels_once() -> None:
     output = np.arange(1, 17, dtype=np.uint8).reshape(2, 2, 2, 2)
     support = np.array(
@@ -332,7 +340,7 @@ def test_mask_predictions_invalid_workers_preserve_existing_output(tmp_path) -> 
         shape=shape,
         chunks=shape,
         dtype='u1',
-        zarr_format=2,
+        **_zarr_format_kwargs(2),
     )
     prediction[:] = 1
     support = zarr.open(
@@ -341,7 +349,7 @@ def test_mask_predictions_invalid_workers_preserve_existing_output(tmp_path) -> 
         shape=shape,
         chunks=shape,
         dtype='u1',
-        zarr_format=2,
+        **_zarr_format_kwargs(2),
     )
     support[:] = 1
     existing_output = zarr.open(
@@ -350,7 +358,7 @@ def test_mask_predictions_invalid_workers_preserve_existing_output(tmp_path) -> 
         shape=shape,
         chunks=shape,
         dtype='u1',
-        zarr_format=2,
+        **_zarr_format_kwargs(2),
     )
     existing_output[:] = 37
     existing_output.attrs['sentinel'] = 'preserve'
@@ -549,7 +557,7 @@ def test_finalize_logits_applies_local_support_zarr_and_records_metadata(
         shape=logits.shape,
         chunks=logits.shape,
         dtype=logits.dtype,
-        zarr_format=2,
+        **_zarr_format_kwargs(2),
     )
     logits_store[:] = logits
     support_store = zarr.open_array(
@@ -558,7 +566,7 @@ def test_finalize_logits_applies_local_support_zarr_and_records_metadata(
         shape=support.shape,
         chunks=support.shape,
         dtype=support.dtype,
-        zarr_format=2,
+        **_zarr_format_kwargs(2),
     )
     support_store[:] = support
 
@@ -622,7 +630,7 @@ def test_fused_blend_and_finalize_applies_support_mask(tmp_path) -> None:
         shape=logits.shape,
         chunks=logits.shape,
         dtype=logits.dtype,
-        zarr_format=2,
+        **_zarr_format_kwargs(2),
     )
     logits_store[:] = logits
     logits_store.attrs['patch_size'] = list(patch_size)
@@ -634,7 +642,7 @@ def test_fused_blend_and_finalize_applies_support_mask(tmp_path) -> None:
         shape=(1, 3),
         chunks=(1, 3),
         dtype=np.int32,
-        zarr_format=2,
+        **_zarr_format_kwargs(2),
     )
     coords_store[:] = np.array([[0, 0, 0]], dtype=np.int32)
 
@@ -644,7 +652,7 @@ def test_fused_blend_and_finalize_applies_support_mask(tmp_path) -> None:
         shape=support.shape,
         chunks=support.shape,
         dtype=support.dtype,
-        zarr_format=2,
+        **_zarr_format_kwargs(2),
     )
     support_store[:] = support
 
@@ -699,7 +707,7 @@ def test_mask_existing_prediction_accepts_zarr_v3_support(tmp_path) -> None:
         shape=prediction.shape,
         chunks=(1, 2, 2),
         dtype=prediction.dtype,
-        zarr_format=2,
+        **_zarr_format_kwargs(2),
     )
     prediction_store[:] = prediction
     prediction_store.attrs['artifact_id'] = 'fixture'
@@ -709,7 +717,7 @@ def test_mask_existing_prediction_accepts_zarr_v3_support(tmp_path) -> None:
         shape=support.shape,
         chunks=(1, 2, 2),
         dtype=support.dtype,
-        zarr_format=3,
+        **_zarr_format_kwargs(3),
     )
     support_store[:] = support
 

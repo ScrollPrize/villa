@@ -866,6 +866,7 @@ void CChunkedVolumeViewer::rebuildChunkArray()
     }
     _chunkArray.reset();
     _lastRenderResult.reset();
+    _cachePressureLevelBias = 0;
     if (!_volume)
         return;
 
@@ -1218,9 +1219,15 @@ void CChunkedVolumeViewer::recalcPyramidLevel()
         ? kSegmentationResolutionLodZoomBias
         : kResolutionLodZoomBias;
     const float lodScale = std::max(_scale * lodZoomBias, 1e-6f);
-    _dsScaleIdx = std::clamp(
+    const int newIdx = std::clamp(
         static_cast<int>(std::floor(std::max(0.0f, std::log2(1.0f / lodScale)))),
         0, std::max(0, n - 1));
+    if (newIdx != _dsScaleIdx) {
+        // Zoom crossed a pyramid-level boundary: the working set changes, so
+        // retry full resolution before any cache-pressure degrade re-applies.
+        _cachePressureLevelBias = 0;
+    }
+    _dsScaleIdx = newIdx;
     _dsScale = static_cast<float>(std::uint64_t{1} << _dsScaleIdx);
     updateScalebarScale();
 }
@@ -1342,7 +1349,7 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
     // `_dsScaleIdx` intentionally waits for about 2x more zoom before moving
     // to a finer level. Surface-resolution views keep their target level to
     // avoid panning blur.
-    int level = _dsScaleIdx;
+    int level = _dsScaleIdx + _cachePressureLevelBias;
     if (preferSurfaceResolution && _chunkArray && level < _chunkArray->numLevels() - 1)
         level -= kSurfaceResolutionLevelBias;
     level = std::max(level, _maxDisplayedResolution);
@@ -1355,7 +1362,7 @@ int CChunkedVolumeViewer::overlayRenderStartLevel(bool preferSurfaceResolution) 
         return 0;
     }
 
-    int level = _dsScaleIdx;
+    int level = _dsScaleIdx + _cachePressureLevelBias;
     if (preferSurfaceResolution && level < _overlayChunkArray->numLevels() - 1) {
         level -= kSurfaceResolutionLevelBias;
     }
@@ -1377,9 +1384,39 @@ bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
            _compositeSettings.useVolumeGradients;
 }
 
+namespace {
+
+// Holds a ChunkCache view request open while a render job samples, so
+// capacity eviction cannot drop chunks an in-flight render still needs
+// (which would force a refetch + re-render loop).
+struct ViewRequestGuard {
+    explicit ViewRequestGuard(std::shared_ptr<vc::render::ChunkCache> c)
+        : cache(std::move(c))
+    {
+        if (cache)
+            token = cache->beginViewRequest();
+    }
+    ~ViewRequestGuard()
+    {
+        if (cache)
+            cache->endViewRequest(token);
+    }
+    ViewRequestGuard(const ViewRequestGuard&) = delete;
+    ViewRequestGuard& operator=(const ViewRequestGuard&) = delete;
+
+    std::shared_ptr<vc::render::ChunkCache> cache;
+    std::int64_t token = 0;
+};
+
+} // namespace
+
 struct CChunkedVolumeViewer::RenderContext {
     PendingRenderJob renderJob;
     std::uint64_t serial = 0;
+    std::unique_ptr<ViewRequestGuard> viewRequest;
+    std::unique_ptr<ViewRequestGuard> overlayViewRequest;
+    std::size_t viewStallsAtStart = 0;
+    std::size_t overlayViewStallsAtStart = 0;
     int fbW = 0;
     int fbH = 0;
     float surfacePtrX = 0.0f;
@@ -1390,6 +1427,7 @@ struct CChunkedVolumeViewer::RenderContext {
     int startLevel = 0;
     int overlayStartLevel = 0;
     vc::Sampling samplingMethod = vc::Sampling::Trilinear;
+    vc::Sampling overlaySamplingMethod = vc::Sampling::Nearest;
     CompositeRenderSettings compositeSettings;
     float windowLow = 0.0f;
     float windowHigh = 255.0f;
@@ -1427,6 +1465,11 @@ struct CChunkedVolumeViewer::RenderResult {
     std::chrono::steady_clock::time_point submittedAt;
     std::chrono::steady_clock::time_point workerStartedAt;
     std::chrono::steady_clock::time_point workerFinishedAt;
+    // Cache viewProtectionStalls counters when the job started; if they
+    // advanced while rendering, the shared cache could not hold the live
+    // working set and the viewer should degrade a level.
+    std::size_t viewStallsAtStart = 0;
+    std::size_t overlayViewStallsAtStart = 0;
 };
 
 CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
@@ -1453,6 +1496,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     result.surfacePtrX = ctx.surfacePtrX;
     result.surfacePtrY = ctx.surfacePtrY;
     result.scale = ctx.scale;
+    result.viewStallsAtStart = ctx.viewStallsAtStart;
+    result.overlayViewStallsAtStart = ctx.overlayViewStallsAtStart;
     result.submittedAt = ctx.renderJob.submittedAt;
     result.workerStartedAt = std::chrono::steady_clock::now();
     result.framebuffer = QImage(std::max(1, ctx.fbW), std::max(1, ctx.fbH), QImage::Format_RGB32);
@@ -1479,6 +1524,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
     const vc::render::ChunkedPlaneSampler::Options options(ctx.samplingMethod, 32);
+    const vc::render::ChunkedPlaneSampler::Options overlayOptions(
+        ctx.overlaySamplingMethod, options.tileSize);
 
     auto streamingCompositeUnsupported = [&]() {
         return !isSupportedStreamingCompositeMethod(ctx.compositeSettings.params.method) ||
@@ -1552,12 +1599,12 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                                      int layersFront,
                                      int layersBehind,
                                      float zStep,
-                                     const CompositeParams& params) {
+                                     const CompositeParams& params,
+                                     const vc::render::ChunkedPlaneSampler::Options& samplingOptions) {
         const int front = std::max(0, layersFront);
         const int behind = std::max(0, layersBehind);
         const int numLayers = front + behind + 1;
         const int zStart = -behind;
-        const auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(vc::Sampling::Nearest, options.tileSize);
         std::vector<cv::Mat_<uint8_t>> layerValues;
         std::vector<cv::Mat_<uint8_t>> layerCoverage;
         cv::Mat_<cv::Vec3f> layerCoords(coords.rows, coords.cols);
@@ -1580,7 +1627,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             layerCoverage.emplace_back(dst.rows, dst.cols, uint8_t(0));
             vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
                 array, startLevel, layerCoords,
-                layerValues.back(), layerCoverage.back(), compositeOptions);
+                layerValues.back(), layerCoverage.back(), samplingOptions);
         }
         LayerStack stack;
         stack.values.resize(numLayers);
@@ -1621,10 +1668,12 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         }
 
         const float zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
+        const auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(
+            vc::Sampling::Nearest, options.tileSize);
         sampleCoordsComposite(coords, normals, dst, cov, array, ctx.startLevel,
                               ctx.compositeSettings.layersFront,
                               ctx.compositeSettings.layersBehind,
-                              zStep, ctx.compositeSettings.params);
+                              zStep, ctx.compositeSettings.params, compositeOptions);
     };
 
     const bool planeView = dynamic_cast<PlaneSurface*>(ctx.surf.get()) != nullptr;
@@ -1651,7 +1700,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             const int level = std::clamp(ctx.overlayStartLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
             vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
                 *ctx.overlayChunkArray, level, origin, vxStep, vyStep,
-                overlayValues, overlayCoverage, options);
+                overlayValues, overlayCoverage, overlayOptions);
         }
     } else {
         cv::Mat_<cv::Vec3f> coords;
@@ -1739,10 +1788,11 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                                           *ctx.overlayChunkArray, level,
                                           ctx.overlayComposite.layersFront,
                                           ctx.overlayComposite.layersBehind,
-                                          zStep, overlayParams);
+                                          zStep, overlayParams, overlayOptions);
                 } else {
                     vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                        *ctx.overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
+                        *ctx.overlayChunkArray, level, coords, overlayValues, overlayCoverage,
+                        overlayOptions);
                 }
             }
         }
@@ -1843,6 +1893,7 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.startLevel = renderStartLevel(preferSurfaceResolution);
     job.overlayStartLevel = overlayRenderStartLevel(preferSurfaceResolution);
     job.samplingMethod = _samplingMethod;
+    job.overlaySamplingMethod = _overlaySamplingMethod;
     job.compositeSettings = _compositeSettings;
     job.windowLow = _windowLow;
     job.windowHigh = _windowHigh;
@@ -1893,6 +1944,7 @@ bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
            a.startLevel == b.startLevel &&
            a.overlayStartLevel == b.overlayStartLevel &&
            a.samplingMethod == b.samplingMethod &&
+           a.overlaySamplingMethod == b.overlaySamplingMethod &&
            a.compositeSettings == b.compositeSettings &&
            a.windowLow == b.windowLow &&
            a.windowHigh == b.windowHigh &&
@@ -1947,12 +1999,13 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     _activeRenderJob = job;
     _pendingRenderDirty = false;
 
-    job.chunkArray->beginViewRequest();
-    if (job.overlayChunkArray) {
-        job.overlayChunkArray->beginViewRequest();
-    }
-
     RenderContext ctx;
+    ctx.viewRequest = std::make_unique<ViewRequestGuard>(job.chunkArray);
+    ctx.viewStallsAtStart = job.chunkArray->stats().viewProtectionStalls;
+    if (job.overlayChunkArray) {
+        ctx.overlayViewRequest = std::make_unique<ViewRequestGuard>(job.overlayChunkArray);
+        ctx.overlayViewStallsAtStart = job.overlayChunkArray->stats().viewProtectionStalls;
+    }
     ctx.renderJob = job;
     ctx.serial = ++_renderSerial;
     emit renderFrameSubmitted(ctx.serial);
@@ -1966,6 +2019,7 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.startLevel = job.startLevel;
     ctx.overlayStartLevel = job.overlayStartLevel;
     ctx.samplingMethod = job.samplingMethod;
+    ctx.overlaySamplingMethod = job.overlaySamplingMethod;
     ctx.compositeSettings = job.compositeSettings;
     ctx.windowLow = job.windowLow;
     ctx.windowHigh = job.windowHigh;
@@ -2161,6 +2215,7 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
         }
     }
     submitPendingRenderJobIfNeeded();
+    maybeDegradeForCachePressure(*result);
 
     if (profile.enabled()) {
         profile.setDetails(std::format(
@@ -2168,6 +2223,29 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
             result->serial, result->renderJob.requestId, result->renderFrameElapsedMs,
             _framebuffer.width(), _framebuffer.height(), _pendingRenderJob.has_value()));
     }
+}
+
+void CChunkedVolumeViewer::maybeDegradeForCachePressure(const RenderResult& result)
+{
+    const auto& job = result.renderJob;
+    const bool stalled =
+        (job.chunkArray &&
+         job.chunkArray->stats().viewProtectionStalls > result.viewStallsAtStart) ||
+        (job.overlayChunkArray &&
+         job.overlayChunkArray->stats().viewProtectionStalls > result.overlayViewStallsAtStart);
+    if (!stalled || !_chunkArray)
+        return;
+
+    // The shared cache could not hold every live view's working set while
+    // this frame rendered; re-requesting evicted chunks at the same level
+    // sustains the coarse/fine refetch loop indefinitely. Render coarser
+    // instead; recalcPyramidLevel resets the bias when the zoom moves to a
+    // different level.
+    const int coarsest = _chunkArray->numLevels() - 1;
+    if (_dsScaleIdx + _cachePressureLevelBias >= coarsest)
+        return;
+    ++_cachePressureLevelBias;
+    submitRender("cache pressure degrade");
 }
 
 void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::source_location caller)
@@ -2255,6 +2333,23 @@ void CChunkedVolumeViewer::setOverlayColormap(const std::string& colormapId)
     }
     _overlayColormapId = colormapId;
     submitRender("overlay colormap changed");
+}
+
+void CChunkedVolumeViewer::setOverlaySamplingMethod(vc::Sampling method)
+{
+    if (_closing) {
+        return;
+    }
+
+    const vc::Sampling sanitized = method == vc::Sampling::Trilinear
+        ? vc::Sampling::Trilinear
+        : vc::Sampling::Nearest;
+    if (_overlaySamplingMethod == sanitized) {
+        return;
+    }
+
+    _overlaySamplingMethod = sanitized;
+    submitRender("overlay sampling changed");
 }
 
 void CChunkedVolumeViewer::setOverlayThreshold(float threshold)

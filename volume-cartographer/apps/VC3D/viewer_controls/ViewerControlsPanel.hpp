@@ -13,6 +13,9 @@ class QSpinBox;
 class ViewerManager;
 class WindowRangeWidget;
 class ViewerTransformsPanel;
+class ViewerNavigationPanel;
+class ViewerNormalVisualizationPanel;
+class ViewerViewExtrasPanel;
 
 class ViewerControlsPanel : public QWidget
 {
@@ -50,6 +53,7 @@ public:
 
     ViewerTransformsPanel* transformsPanel() const { return _transformsPanel; }
     void setTransformsPanel(ViewerTransformsPanel* panel) { _transformsPanel = panel; }
+    void setViewerManager(ViewerManager* viewerManager);
     void setViewControlsEnabled(bool enabled);
     void setOverlayWindowAvailable(bool available);
 
@@ -64,6 +68,7 @@ private:
     void setupViewerControlWiring();
     void setupWindowRangeControls();
     void setupIntersectionControls();
+    void connectViewerManagerSignals();
     void updateOverlayWindowControlsEnabled();
     void rememberGroupState(class CollapsibleSettingsGroup* group, const char* key);
     class CollapsibleSettingsGroup* addViewerGroup(const QString& title,
@@ -74,6 +79,9 @@ private:
     UiRefs _uiRefs;
     ViewerManager* _viewerManager{nullptr};
     ViewerTransformsPanel* _transformsPanel{nullptr};
+    ViewerNavigationPanel* _navigationPanel{nullptr};
+    ViewerNormalVisualizationPanel* _normalPanel{nullptr};
+    ViewerViewExtrasPanel* _viewExtrasPanel{nullptr};
     WindowRangeWidget* _volumeWindowWidget{nullptr};
     WindowRangeWidget* _overlayWindowWidget{nullptr};
     bool _viewControlsEnabled{true};

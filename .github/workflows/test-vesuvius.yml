@@ -15,6 +15,7 @@ jobs:
             # support all dependencies yet.  Extend this list once the build scripts
             # for macOS and Windows are confirmed.
             os: [ubuntu-latest]
+            zarr: ['2.18.7', '3.2.1']
     defaults:
       run:
         shell: bash
@@ -24,11 +25,31 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Ensure curl available on Linux
+      - name: Install native build dependencies on Linux
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl
+          # Native dependency closure for volume-cartographer's Python-only
+          # scikit-build configuration (apps, UI tracer, flatboi, tests: OFF).
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl \
+            git \
+            libblosc-dev \
+            libboost-dev \
+            libceres-dev \
+            libcurl4-openssl-dev \
+            libeigen3-dev \
+            liblz4-dev \
+            libopencv-contrib-dev \
+            libopencv-dev \
+            libsuitesparse-dev \
+            libtiff-dev \
+            libzstd-dev \
+            ninja-build \
+            nlohmann-json3-dev \
+            pkg-config \
+            zlib1g-dev
 
       - name: Install uv
         run: |
@@ -38,5 +59,8 @@ jobs:
       - name: Sync dependencies
         run: uv sync --extra all
 
+      - name: Select Zarr version
+        run: uv pip install "zarr==${{ matrix.zarr }}"
+
       - name: Run tests
-        run: uv run pytest tests
+        run: uv run --no-sync pytest tests -m "not slow and not network"

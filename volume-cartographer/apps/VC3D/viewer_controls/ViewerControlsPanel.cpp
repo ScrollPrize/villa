@@ -61,11 +61,13 @@ void ViewerControlsPanel::addViewerGroups()
                                      viewer::GROUP_VIEW_EXPANDED,
                                      viewer::GROUP_VIEW_EXPANDED_DEFAULT);
     if (viewGroup) {
-        viewGroup->contentLayout()->addWidget(new ViewerViewExtrasPanel(_viewerManager, viewGroup));
+        _viewExtrasPanel = new ViewerViewExtrasPanel(_viewerManager, viewGroup);
+        viewGroup->contentLayout()->addWidget(_viewExtrasPanel);
     }
 
+    _navigationPanel = new ViewerNavigationPanel(_viewerManager, _uiRefs.contents);
     addViewerGroup(tr("Navigation"),
-                   new ViewerNavigationPanel(_viewerManager, _uiRefs.contents),
+                   _navigationPanel,
                    "viewer_controls/group_navigation_expanded",
                    true);
 
@@ -79,17 +81,54 @@ void ViewerControlsPanel::addViewerGroups()
         .normalMaxArrowsSlider = _uiRefs.normalMaxArrowsSlider,
         .normalMaxArrowsValueLabel = _uiRefs.normalMaxArrowsValueLabel,
     };
-    auto* normalPanel = new ViewerNormalVisualizationPanel(normalUi, _viewerManager, _uiRefs.contents);
-    connect(normalPanel, &ViewerNormalVisualizationPanel::statusMessageRequested,
+    _normalPanel = new ViewerNormalVisualizationPanel(normalUi, _viewerManager, _uiRefs.contents);
+    connect(_normalPanel, &ViewerNormalVisualizationPanel::statusMessageRequested,
             this, &ViewerControlsPanel::statusMessageRequested);
     addViewerGroup(tr("Normal Visualization"),
-                   normalPanel,
+                   _normalPanel,
                    viewer::GROUP_NORMAL_VIS_EXPANDED,
                    viewer::GROUP_NORMAL_VIS_EXPANDED_DEFAULT);
 
     if (auto* layout = qobject_cast<QVBoxLayout*>(_uiRefs.contents->layout())) {
         layout->addStretch(1);
     }
+}
+
+void ViewerControlsPanel::setViewerManager(ViewerManager* viewerManager)
+{
+    if (_viewerManager == viewerManager) {
+        return;
+    }
+    if (_viewerManager) {
+        disconnect(_viewerManager, nullptr, this, nullptr);
+    }
+    _viewerManager = viewerManager;
+    if (_viewExtrasPanel) _viewExtrasPanel->setViewerManager(_viewerManager);
+    if (_navigationPanel) _navigationPanel->setViewerManager(_viewerManager);
+    if (_normalPanel) _normalPanel->setViewerManager(_viewerManager);
+    connectViewerManagerSignals();
+
+    if (!_viewerManager) {
+        setOverlayWindowAvailable(false);
+        return;
+    }
+    if (_volumeWindowWidget) {
+        const QSignalBlocker blocker(_volumeWindowWidget);
+        _volumeWindowWidget->setWindowValues(
+            static_cast<int>(std::lround(_viewerManager->volumeWindowLow())),
+            static_cast<int>(std::lround(_viewerManager->volumeWindowHigh())));
+    }
+    if (_overlayWindowWidget) {
+        const QSignalBlocker blocker(_overlayWindowWidget);
+        _overlayWindowWidget->setWindowValues(
+            static_cast<int>(std::lround(_viewerManager->overlayWindowLow())),
+            static_cast<int>(std::lround(_viewerManager->overlayWindowHigh())));
+    }
+    if (_uiRefs.intersectionThicknessSpin) {
+        const QSignalBlocker blocker(_uiRefs.intersectionThicknessSpin);
+        _uiRefs.intersectionThicknessSpin->setValue(_viewerManager->intersectionThickness());
+    }
+    setOverlayWindowAvailable(static_cast<bool>(_viewerManager->overlayVolume()));
 }
 
 void ViewerControlsPanel::setViewControlsEnabled(bool enabled)
@@ -121,6 +160,29 @@ void ViewerControlsPanel::setupViewerControlWiring()
 
 }
 
+void ViewerControlsPanel::connectViewerManagerSignals()
+{
+    if (!_viewerManager) {
+        return;
+    }
+    connect(_viewerManager, &ViewerManager::volumeWindowChanged,
+            this, [this](float low, float high) {
+                if (_volumeWindowWidget) {
+                    _volumeWindowWidget->setWindowValues(static_cast<int>(std::lround(low)),
+                                                         static_cast<int>(std::lround(high)));
+                }
+            });
+    connect(_viewerManager, &ViewerManager::overlayWindowChanged,
+            this, [this](float low, float high) {
+                if (_overlayWindowWidget) {
+                    _overlayWindowWidget->setWindowValues(static_cast<int>(std::lround(low)),
+                                                          static_cast<int>(std::lround(high)));
+                }
+            });
+    connect(_viewerManager, &ViewerManager::overlayVolumeAvailabilityChanged,
+            this, &ViewerControlsPanel::setOverlayWindowAvailable);
+}
+
 void ViewerControlsPanel::setupWindowRangeControls()
 {
     if (auto* volumeContainer = _uiRefs.volumeWindowContainer) {
@@ -143,15 +205,6 @@ void ViewerControlsPanel::setupWindowRangeControls()
                 });
 
         if (_viewerManager) {
-            connect(_viewerManager, &ViewerManager::volumeWindowChanged,
-                    this, [this](float low, float high) {
-                        if (!_volumeWindowWidget) {
-                            return;
-                        }
-                        _volumeWindowWidget->setWindowValues(static_cast<int>(std::lround(low)),
-                                                             static_cast<int>(std::lround(high)));
-                    });
-
             _volumeWindowWidget->setWindowValues(
                 static_cast<int>(std::lround(_viewerManager->volumeWindowLow())),
                 static_cast<int>(std::lround(_viewerManager->volumeWindowHigh())));
@@ -178,22 +231,13 @@ void ViewerControlsPanel::setupWindowRangeControls()
                 });
 
         if (_viewerManager) {
-            connect(_viewerManager, &ViewerManager::overlayWindowChanged,
-                    this, [this](float low, float high) {
-                        if (!_overlayWindowWidget) {
-                            return;
-                        }
-                        _overlayWindowWidget->setWindowValues(static_cast<int>(std::lround(low)),
-                                                              static_cast<int>(std::lround(high)));
-                    });
-            connect(_viewerManager, &ViewerManager::overlayVolumeAvailabilityChanged,
-                    this, &ViewerControlsPanel::setOverlayWindowAvailable);
-
             _overlayWindowWidget->setWindowValues(
                 static_cast<int>(std::lround(_viewerManager->overlayWindowLow())),
                 static_cast<int>(std::lround(_viewerManager->overlayWindowHigh())));
         }
     }
+
+    connectViewerManagerSignals();
 }
 
 void ViewerControlsPanel::setupIntersectionControls()

@@ -13,6 +13,10 @@ node_modules/.yarn-integrity
 
 *.DS_Store
 
+# Defense in depth for google-github-actions/auth. Progress Prize workflows set
+# create_credentials_file: false and must never produce these files.
+gha-creds-*.json
+
 **/checkpoints/
 
 # WandB (allow general wandb but ignore this one)
@@ -56,3 +60,4 @@ volume-cartographer/AGENTS.md
 /lasagna/snap_surf_objs
 /volume-cartographer/scripts/spiral/bench
 /volume-cartographer/scripts/cache
+/volume-cartographer/docs/plans

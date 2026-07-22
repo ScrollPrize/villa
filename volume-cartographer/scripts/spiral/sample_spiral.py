@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 
+import geom_utils
+
 
 def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_winding=False, device='cuda'):
 
@@ -65,6 +67,7 @@ def get_theta(relative_yx):
     return theta, relative_yx
 
 
+@geom_utils.maybe_compile
 def get_theta_and_radii(relative_yx, dr_per_winding):
     theta, relative_yx = get_theta(relative_yx)
     radius = torch.linalg.norm(relative_yx, dim=-1)
@@ -75,6 +78,7 @@ def get_theta_and_radii(relative_yx, dr_per_winding):
     return theta, radius, shifted_radius
 
 
+@geom_utils.maybe_compile
 def get_theta_crossing_step_adjustments(theta, dr_per_winding, dim=-1):
     """Return shifted-radius corrections for consecutive theta=0 crossings."""
     if theta.shape[dim] <= 1:
@@ -89,22 +93,32 @@ def get_theta_crossing_step_adjustments(theta, dr_per_winding, dim=-1):
     ) * dr_per_winding.detach()
 
 
+@geom_utils.maybe_compile
 def unwrap_shifted_radii(theta, shifted_radii, dr_per_winding, dim=-1):
-    """Unwrap shifted radii along ``dim`` and return them with their crossing adjustments."""
+    """Unwrap shifted radii along ``dim`` and return their crossing adjustments."""
     if theta.shape[dim] == 0:
         return shifted_radii, torch.zeros_like(shifted_radii)
 
-    step_adjustments = get_theta_crossing_step_adjustments(theta, dr_per_winding, dim=dim)
+    step_adjustments = get_theta_crossing_step_adjustments(
+        theta, dr_per_winding, dim=dim,
+    )
     zero_shape = list(theta.shape)
     zero_shape[dim] = 1
     adjustments = torch.cat([
-        torch.zeros(zero_shape, device=shifted_radii.device, dtype=shifted_radii.dtype),
+        torch.zeros(
+            zero_shape,
+            device=shifted_radii.device,
+            dtype=shifted_radii.dtype,
+        ),
         torch.cumsum(step_adjustments.to(shifted_radii.dtype), dim=dim),
     ], dim=dim)
     return shifted_radii + adjustments, adjustments
 
 
-def radius_from_unwrapped_shifted(theta, unwrapped_shifted_radii, crossing_adjustments, dr_per_winding):
+@geom_utils.maybe_compile
+def radius_from_unwrapped_shifted(
+    theta, unwrapped_shifted_radii, crossing_adjustments, dr_per_winding,
+):
     """Convert unwrapped shifted radii back to each point's wrapped-theta radius."""
     raw_shifted_radii = unwrapped_shifted_radii - crossing_adjustments
     return raw_shifted_radii + theta / (2 * np.pi) * dr_per_winding
