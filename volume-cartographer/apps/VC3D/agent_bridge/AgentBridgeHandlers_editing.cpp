@@ -166,7 +166,8 @@ QJsonObject AgentBridgeServer::handleCanvasClick(const QJsonValue& params, bool 
             throw AgentBridgeError{-32602, "scene-space position must be an object {x, y}", data};
         }
         const QJsonObject po = posv.toObject();
-        scenePos = QPointF(po.value("x").toDouble(), po.value("y").toDouble());
+        scenePos = QPointF(jsonRequireFinite(po.value("x"), "x"),
+                           jsonRequireFinite(po.value("y"), "y"));
     } else if (space == QLatin1String("volume")) {
         const cv::Vec3f vol = jsonToVec3(p.value("position"), "position");
         scenePos = chunked->volumeToScene(vol);
@@ -241,7 +242,7 @@ QJsonObject AgentBridgeServer::handleViewerZoom(const QJsonValue& params)
         data["param"] = "factor";
         throw AgentBridgeError{-32602, "factor is required", data};
     }
-    const double factor = p.value("factor").toDouble();
+    const double factor = jsonRequireNumber(p.value("factor"), "factor");
     if (!std::isfinite(factor) || factor <= 0.0) {
         QJsonObject data;
         data["param"] = "factor";
@@ -288,7 +289,7 @@ QJsonObject AgentBridgeServer::handleViewerRotate(const QJsonValue& params)
         data["param"] = "degrees";
         throw AgentBridgeError{-32602, "degrees is required", data};
     }
-    const double degrees = p.value("degrees").toDouble();
+    const double degrees = jsonRequireNumber(p.value("degrees"), "degrees");
     if (!std::isfinite(degrees)) {
         QJsonObject data;
         data["param"] = "degrees";
@@ -377,7 +378,7 @@ QJsonObject AgentBridgeServer::handleSegmentationEnableEditing(const QJsonValue&
         data["param"] = "enabled";
         throw AgentBridgeError{-32602, "enabled is required", data};
     }
-    const bool enabled = p.value("enabled").toBool();
+    const bool enabled = jsonRequireBool(p.value("enabled"), "enabled");
 
     SegmentationWidget* widget = _window->_segmentationWidget;
     if (!widget) {
@@ -488,7 +489,7 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
         data["param"] = "steps";
         throw AgentBridgeError{-32602, "steps is required", data};
     }
-    const int steps = p.value("steps").toInt(0);
+    const int steps = jsonRequireInt(p.value("steps"), "steps");
     if (steps < 1) {
         QJsonObject data;
         data["param"] = "steps";
@@ -645,7 +646,7 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
         }
     }
 
-    gp.iterations = p.contains("iterations") ? p.value("iterations").toInt(200) : 200;
+    gp.iterations = jsonOptionalInt(p, "iterations", 200);
     if (gp.iterations < 1 || gp.iterations > 100000) {
         QJsonObject data;
         data["param"] = "iterations";
@@ -874,7 +875,7 @@ QJsonObject AgentBridgeServer::handleCorrectionsSetPointMode(const QJsonValue& p
         data["param"] = "active";
         throw AgentBridgeError{-32602, "active is required", data};
     }
-    const bool active = p.value("active").toBool();
+    const bool active = jsonRequireBool(p.value("active"), "active");
 
     SegmentationModule* mod = _window ? _window->_segmentationModule.get() : nullptr;
     SegmentationWidget* widget = _window ? _window->_segmentationWidget : nullptr;
@@ -937,12 +938,7 @@ QJsonObject AgentBridgeServer::handlePointsCommit(const QJsonValue& params)
 
     std::optional<double> winding;
     if (p.contains("winding")) {
-        const double w = p.value("winding").toDouble();
-        if (!std::isfinite(w)) {
-            QJsonObject data;
-            data["param"] = "winding";
-            throw AgentBridgeError{-32602, "winding must be finite", data};
-        }
+        const double w = jsonRequireFinite(p.value("winding"), "winding");
         winding = w;
     }
 
@@ -1097,7 +1093,8 @@ QJsonObject AgentBridgeServer::handleCanvasDrag(const QJsonValue& params)
                     data};
             }
             const QJsonObject o = v.toObject();
-            return QPointF(o.value("x").toDouble(), o.value("y").toDouble());
+            return QPointF(jsonRequireFinite(o.value("x"), "x"),
+                           jsonRequireFinite(o.value("y"), "y"));
         }
         if (space == QLatin1String("volume")) {
             const cv::Vec3f vol = jsonToVec3(v, name);

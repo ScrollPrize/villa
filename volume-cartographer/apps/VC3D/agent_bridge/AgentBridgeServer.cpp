@@ -12,6 +12,7 @@
 #include <QJsonDocument>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QSaveFile>
 #include <QMdiSubWindow>
 #include <QPixmap>
 #include <QPointF>
@@ -62,6 +63,14 @@
 #include "agent_bridge/AgentBridgeInternal.hpp"
 
 
+namespace {
+// Upper bound on a single framed request (and on the un-framed read buffer that
+// precedes a newline). One oversized client is reported + dropped without
+// affecting the others (SPEC §6).
+constexpr int kMaxLineBytes = 1 * 1024 * 1024;  // 1 MiB
+}  // namespace
+
+
 AgentBridgeServer::AgentBridgeServer(CWindow* window, QObject* parent)
     : QObject(parent), _window(window)
 {
@@ -86,8 +95,11 @@ AgentBridgeServer::AgentBridgeServer(CWindow* window, QObject* parent)
     // dataset-picker QFileDialog. A per-call guard cannot cover the async
     // completions, so suppression is set once for the bridge's lifetime:
     // messages are logged and recorded (takeLastSuppressedError) instead of
-    // shown. The bridge is opt-in (--agent-bridge), so this never affects a
-    // normal interactive session.
+    // shown. The bridge is opt-in (--agent-bridge), but when it is attached to a
+    // live/windowed session these line-annotation dialogs are suppressed for the
+    // human sharing that window too — by design, since an async completion cannot
+    // be guarded per-call. Suppressed errors stay visible: they are logged and
+    // returned as structured JSON-RPC errors, so nothing is silently swallowed.
     if (_window && _window->_lineAnnotationController) {
         _window->_lineAnnotationController->setErrorDialogsSuppressed(true);
     }
@@ -97,8 +109,11 @@ AgentBridgeServer::AgentBridgeServer(CWindow* window, QObject* parent)
     // run/expand entry points) opens a precondition QMessageBox::warning on a
     // failed precondition; a static QMessageBox spins a nested event loop,
     // forbidden in a bridge handler. As with the line-annotation valve above, set
-    // once for the bridge's lifetime (the bridge is opt-in via --agent-bridge, so
-    // interactive sessions are unaffected). The batch actions (seeding.run /
+    // once for the bridge's lifetime: when the bridge is attached to a
+    // live/windowed session these seeding precondition dialogs are suppressed for
+    // the human too (the no-nested-modal invariant wins), and the failures surface
+    // as structured JSON-RPC errors + logs rather than modal popups. The batch
+    // actions (seeding.run /
     // seeding.expand) are now exposed: their former nested-processEvents wait was
     // refactored away (SeedingWidget::runSegmentationHeadless / runExpandSeedsHeadless
     // launch the QProcess batch and return; it drains through the process finished
@@ -125,8 +140,28 @@ bool AgentBridgeServer::listen(const QString& serverName)
                 this, &AgentBridgeServer::onNewConnection);
     }
 
+    // Restrict the endpoint to the current user (SPEC §6): the bridge grants full
+    // control of the running app, so no other account should be able to connect.
+    _server->setSocketOptions(QLocalServer::UserAccessOption);
+
+    // Probe the name BEFORE listening: a successful connect means a LIVE bridge
+    // already owns the endpoint, so we must refuse without touching it. We cannot
+    // rely on a listen() failure to detect this -- on Linux/Qt, QLocalServer::listen()
+    // will reclaim (unlink + rebind) a name whose socket is still served by another
+    // process, returning success and stranding that server. Probing first is the
+    // only reliable guard (SPEC §6: a live socket name is never unlinked as stale).
+    {
+        QLocalSocket probe;
+        probe.connectToServer(serverName);
+        const bool live = probe.waitForConnected(200);
+        probe.abort();
+        if (live)
+            return false;  // name collision with a running bridge; leave it alone
+    }
+
     if (!_server->listen(serverName)) {
-        // Stale socket file from a crashed run: remove once and retry (SPEC §1.1).
+        // No live server answered, but the endpoint still refused: a stale socket
+        // file from a crashed run. Remove once and retry (SPEC §6).
         QLocalServer::removeServer(serverName);
         if (!_server->listen(serverName))
             return false;
@@ -168,11 +203,15 @@ void AgentBridgeServer::writeRegistryFile()
     obj[QStringLiteral("startedAt")] =
         static_cast<double>(QDateTime::currentMSecsSinceEpoch());
 
-    QFile f(filePath);
+    // Publish atomically (SPEC §6): a QSaveFile writes to a temp sibling and
+    // rename()s into place on commit, so a concurrent reader can never observe
+    // (and reap) a half-written JSON file.
+    QSaveFile f(filePath);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
         return;
     f.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
-    f.close();
+    if (!f.commit())
+        return;
 
     _registryFilePath = filePath;
 }
@@ -227,12 +266,33 @@ void AgentBridgeServer::onSocketReadyRead()
     QByteArray& buffer = _buffers[socket];
     buffer.append(socket->readAll());
 
+    // Bound the un-framed buffer: an oversized request that never sends a newline
+    // must not grow memory without limit. Report (best-effort) and drop ONLY this
+    // client; other connections are untouched (SPEC §6).
+    if (buffer.indexOf('\n') == -1 && buffer.size() > kMaxLineBytes) {
+        sendError(socket, QJsonValue(QJsonValue::Null), -32600,
+                  QStringLiteral("Invalid Request: request exceeds %1-byte limit")
+                      .arg(kMaxLineBytes));
+        _buffers.remove(socket);  // `buffer` dangles after this; do not touch it
+        socket->disconnectFromServer();
+        return;
+    }
+
     int newlineIdx;
     while ((newlineIdx = buffer.indexOf('\n')) != -1) {
         QByteArray line = buffer.left(newlineIdx);
         buffer.remove(0, newlineIdx + 1);
         if (line.endsWith('\r'))
             line.chop(1);
+        // Reject a complete line whose own length exceeds the limit (SPEC §6).
+        if (line.size() > kMaxLineBytes) {
+            sendError(socket, QJsonValue(QJsonValue::Null), -32600,
+                      QStringLiteral("Invalid Request: request exceeds %1-byte limit")
+                          .arg(kMaxLineBytes));
+            _buffers.remove(socket);  // `buffer` dangles after this; do not touch it
+            socket->disconnectFromServer();
+            return;
+        }
         if (line.trimmed().isEmpty())
             continue;
         processLine(socket, line);

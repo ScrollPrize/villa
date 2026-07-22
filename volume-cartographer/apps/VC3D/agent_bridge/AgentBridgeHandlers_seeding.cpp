@@ -551,12 +551,8 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
         throw AgentBridgeError{-32602, "paramOverrides must be an object", data};
     }
     if (p.contains("ompThreads")) {
-        if (!p.value("ompThreads").isDouble()) {
-            QJsonObject data;
-            data["param"] = "ompThreads";
-            throw AgentBridgeError{-32602, "ompThreads must be an integer", data};
-        }
-        rt.ompThreads = p.value("ompThreads").toInt();
+        // Strict: reject wrong-typed and fractional values (SPEC §5).
+        rt.ompThreads = jsonRequireInt(p.value("ompThreads"), "ompThreads");
     }
     rt.tgtDir = p.value("outputDir").toString();
 

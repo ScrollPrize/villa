@@ -619,7 +619,8 @@ QJsonObject AgentBridgeServer::handleCursorVolumePoint(const QJsonValue& params)
     QPointF scenePos;
     if (p.contains("scene") && p.value("scene").isObject()) {
         const QJsonObject s = p.value("scene").toObject();
-        scenePos = QPointF(s.value("x").toDouble(), s.value("y").toDouble());
+        scenePos = QPointF(jsonRequireFinite(s.value("x"), "x"),
+                           jsonRequireFinite(s.value("y"), "y"));
     } else {
         scenePos = chunked->lastScenePosition();
     }

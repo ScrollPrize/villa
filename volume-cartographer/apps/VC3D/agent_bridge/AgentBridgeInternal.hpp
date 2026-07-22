@@ -7,16 +7,18 @@
 // from AgentBridgeServer.cpp.
 
 #include <cmath>
+#include <limits>
 #include <optional>
 
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QPointF>
 #include <QString>
 
 #include <opencv2/core.hpp>
 
-#include "agent_bridge/AgentBridgeServer.hpp"     // AgentBridgeError
+#include "agent_bridge/AgentBridgeError.hpp"       // AgentBridgeError
 #include "segmentation/tools/ManualAddTool.hpp"   // ManualAddTool enums
 
 inline QJsonObject vec3ToJson(const cv::Vec3f& v)
@@ -35,6 +37,118 @@ inline QJsonObject paramsObject(const QJsonValue& params)
     return QJsonObject();
 }
 
+// ---------------------------------------------------------------------------
+// Strict wire-parameter parsing (SPEC §5). QJsonValue::toDouble()/toInt()/
+// toBool() silently coerce a wrong-typed value to 0/false, which turns a
+// malformed request into a plausible-but-wrong operation. These helpers reject a
+// PRESENT-but-malformed value with -32602 + data.param instead. Callers still
+// decide required vs optional: an omitted optional may keep its documented
+// default, but a value that IS present must have the right type.
+// ---------------------------------------------------------------------------
+
+[[noreturn]] inline void throwParamError(const char* paramName, const QString& detail)
+{
+    QJsonObject data;
+    data["param"] = QString::fromLatin1(paramName);
+    throw AgentBridgeError{-32602,
+        QStringLiteral("%1 %2").arg(QLatin1String(paramName), detail), data};
+}
+
+// Require a JSON number. Rejects strings, booleans, null, objects, arrays.
+inline double jsonRequireNumber(const QJsonValue& v, const char* paramName)
+{
+    if (!v.isDouble())
+        throwParamError(paramName, QStringLiteral("must be a number"));
+    return v.toDouble();
+}
+
+// Require a finite JSON number (rejects NaN/Inf in addition to wrong types).
+inline double jsonRequireFinite(const QJsonValue& v, const char* paramName)
+{
+    const double d = jsonRequireNumber(v, paramName);
+    if (!std::isfinite(d))
+        throwParamError(paramName, QStringLiteral("must be a finite number"));
+    return d;
+}
+
+// Require an integer carried by an integral JSON number. Rejects wrong types,
+// non-finite, fractional values, and values overflowing int.
+inline int jsonRequireInt(const QJsonValue& v, const char* paramName)
+{
+    const double d = jsonRequireNumber(v, paramName);
+    if (!std::isfinite(d) || std::floor(d) != d)
+        throwParamError(paramName, QStringLiteral("must be an integer"));
+    if (d < static_cast<double>(std::numeric_limits<int>::min()) ||
+        d > static_cast<double>(std::numeric_limits<int>::max()))
+        throwParamError(paramName, QStringLiteral("is out of range"));
+    return static_cast<int>(d);
+}
+
+// Require an integer within [lo, hi].
+inline int jsonBoundedInt(const QJsonValue& v, const char* paramName, int lo, int hi)
+{
+    const int i = jsonRequireInt(v, paramName);
+    if (i < lo || i > hi)
+        throwParamError(paramName,
+            QStringLiteral("must be in [%1, %2]").arg(lo).arg(hi));
+    return i;
+}
+
+// Require a JSON boolean. Rejects numbers/strings (which toBool() would coerce).
+inline bool jsonRequireBool(const QJsonValue& v, const char* paramName)
+{
+    if (!v.isBool())
+        throwParamError(paramName, QStringLiteral("must be a boolean"));
+    return v.toBool();
+}
+
+// Require a JSON string on an object key (rejects absent + wrong type).
+inline QString jsonRequireString(const QJsonObject& o, const char* key)
+{
+    const QJsonValue v = o.value(QLatin1String(key));
+    if (!v.isString())
+        throwParamError(key, QStringLiteral("must be a string"));
+    return v.toString();
+}
+
+// Optional string: absent -> default; present-but-wrong-type -> reject.
+inline QString jsonOptionalString(const QJsonObject& o, const char* key,
+                                  const QString& def = QString())
+{
+    if (!o.contains(QLatin1String(key)))
+        return def;
+    return jsonRequireString(o, key);
+}
+
+// Optional bool: absent -> default; present-but-wrong-type -> reject.
+inline bool jsonOptionalBool(const QJsonObject& o, const char* key, bool def)
+{
+    if (!o.contains(QLatin1String(key)))
+        return def;
+    return jsonRequireBool(o.value(QLatin1String(key)), key);
+}
+
+// Optional int: absent -> default; present-but-malformed -> reject.
+inline int jsonOptionalInt(const QJsonObject& o, const char* key, int def)
+{
+    if (!o.contains(QLatin1String(key)))
+        return def;
+    return jsonRequireInt(o.value(QLatin1String(key)), key);
+}
+
+// Parse a {x, y} scene point strictly (rejects a missing/malformed coordinate).
+inline QPointF jsonToScenePoint(const QJsonValue& value, const char* paramName)
+{
+    if (!value.isObject())
+        throwParamError(paramName, QStringLiteral("must be an object {x, y}"));
+    const QJsonObject o = value.toObject();
+    if (!o.contains("x") || !o.contains("y"))
+        throwParamError(paramName, QStringLiteral("requires x and y"));
+    const double x = jsonRequireFinite(o.value("x"), "x");
+    const double y = jsonRequireFinite(o.value("y"), "y");
+    return QPointF(x, y);
+}
+
 inline cv::Vec3f jsonToVec3(const QJsonValue& value, const char* paramName)
 {
     if (!value.isObject()) {
@@ -50,15 +164,11 @@ inline cv::Vec3f jsonToVec3(const QJsonValue& value, const char* paramName)
         throw AgentBridgeError{-32602,
             QStringLiteral("%1 requires x, y and z").arg(QLatin1String(paramName)), data};
     }
-    const double x = o.value("x").toDouble();
-    const double y = o.value("y").toDouble();
-    const double z = o.value("z").toDouble();
-    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
-        QJsonObject data;
-        data["param"] = QString::fromLatin1(paramName);
-        throw AgentBridgeError{-32602,
-            QStringLiteral("%1 has non-finite coordinates").arg(QLatin1String(paramName)), data};
-    }
+    // Reject wrong-typed (string/bool) or non-finite coordinates rather than
+    // silently coercing them to 0 (SPEC §5).
+    const double x = jsonRequireFinite(o.value("x"), "x");
+    const double y = jsonRequireFinite(o.value("y"), "y");
+    const double z = jsonRequireFinite(o.value("z"), "z");
     return cv::Vec3f(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
 }
 

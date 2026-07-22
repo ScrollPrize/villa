@@ -161,7 +161,8 @@ QJsonObject AgentBridgeServer::handleFiberLaunch(const QJsonValue& params)
             throw AgentBridgeError{-32602, "scene-space position must be an object {x, y}", data};
         }
         const QJsonObject po = posv.toObject();
-        scenePos = QPointF(po.value("x").toDouble(), po.value("y").toDouble());
+        scenePos = QPointF(jsonRequireFinite(po.value("x"), "x"),
+                           jsonRequireFinite(po.value("y"), "y"));
     } else if (space == QLatin1String("volume")) {
         const cv::Vec3f vol = jsonToVec3(p.value("position"), "position");
         scenePos = chunked->volumeToScene(vol);

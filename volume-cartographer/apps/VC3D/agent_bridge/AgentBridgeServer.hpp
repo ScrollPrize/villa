@@ -26,6 +26,8 @@
 
 #include "MenuActionController.hpp"
 
+#include "agent_bridge/AgentBridgeError.hpp"  // AgentBridgeError
+
 class QLocalServer;
 class QLocalSocket;
 class QTimer;
@@ -35,13 +37,6 @@ class VolumeViewerBase;
 namespace vc3d::opendata {
 struct OpenDataManifest;
 }
-
-// Thrown by handlers to produce a JSON-RPC error response. Codes follow SPEC §2.5.
-struct AgentBridgeError {
-    int code;
-    QString message;
-    QJsonObject data;
-};
 
 // Thrown by a handler that has deferred its response (SPEC §8.4): the handler
 // has stashed (socket, id) via beginDeferred() and will write the response
