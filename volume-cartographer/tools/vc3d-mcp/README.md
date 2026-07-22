@@ -25,10 +25,15 @@ flattening, and rendering.
   (`asyncio.open_unix_connection`) — no Qt dependency needed on the Python
   side, since `QLocalServer`/`QLocalSocket` are plain AF_UNIX sockets on the
   Unix platforms VC3D ships for.
-- **Async jobs**: `job.progress` notifications (SPEC.md §8.3/§3.18) are
-  consumed by a background reader task and folded into a small `JobTracker`
-  (`vc3d_mcp/jobs.py`), which backs `vc3d_job_status` and the `wait: true`
-  convenience on the long-running grow/flatten/render/atlas-search tools.
+- **Async jobs**: the bridge is the authoritative source of job state —
+  `vc3d_job_status` is answered by the bridge's own `job.status` RPC, not by
+  anything in this process. `job.progress` notifications (SPEC.md §8.3/§3.18)
+  are consumed by a background reader task and folded into a small `JobTracker`
+  (`vc3d_mcp/jobs.py`) that exists only to (1) support the `wait: true`
+  convenience (block until a job finishes), (2) forward `phase:"output"` lines
+  to the MCP client as best-effort progress while a `wait: true` call is
+  blocked, and (3) provide a terminal-record fallback if the `job.status` RPC
+  races with process shutdown. It does not back or replace `job.status`.
 
 ## Layout
 
@@ -38,10 +43,16 @@ tools/vc3d-mcp/
     bridge_client.py   # asyncio client: socket resolution, JSON-RPC framing,
                         # request/response correlation, notification dispatch
     jobs.py            # JobTracker: turns job.progress notifications into
-                        # pollable/awaitable job records
-    server.py           # FastMCP app: one @mcp.tool() per RPC, CLI entry point
-    __main__.py         # `python -m vc3d_mcp` entry point
-  test_mcp_bridge.py    # self-test: fake AF_UNIX JSON-RPC server + assertions
+                        # awaitable job records + bounded progress buffers
+    core.py            # shared FastMCP instance + _call / _wait_for_job /
+                        # _strip_none used by every tool module
+    tools/             # per-domain @mcp.tool() modules (segmentation, viewer,
+                        # atlas, lasagna, seeding, flatten, ...) registered on
+                        # the shared mcp instance
+    server.py          # entry/CLI: connection resolution + auto-launch, imports
+                        # tools/ to register them, re-exports them for back-compat
+    __main__.py        # `python -m vc3d_mcp` entry point
+  test_mcp_bridge.py   # self-test: fake AF_UNIX JSON-RPC server + assertions
   pyproject.toml
   requirements.txt
   README.md
@@ -64,12 +75,21 @@ priority order:
    discovery convention used elsewhere in VC3D
    (`LasagnaServiceManager::discoverServices`).
 3. **Auto-launch VC3D** — if nothing is running, the server launches VC3D
-   itself (with `--agent-bridge`), reads the handshake line off its stdout, and
-   connects. The binary is `--launch <path>`, else the `VC3D_BINARY` env var,
-   else the repo-root build `build-macos/bin/VC3D`; the fallback is used only if
-   it names a real, executable file. Pass `--volpkg <path>` to have the launched
-   VC3D preload a volume package (forwarded as `--load-first`) so the agent's
-   first action need not be opening one.
+   itself (with `--agent-bridge`) and connects. A daemon thread drains the
+   child's stdout (with stderr merged in) for the whole process lifetime: it
+   detects the handshake line, signals the launcher with the socket path, and
+   keeps reading so the OS pipe never fills and stalls VC3D. Child log lines are
+   forwarded to *this* process's stderr only — never stdout, which is reserved
+   for the MCP stdio transport. The launcher waits up to a real wall-clock
+   timeout (default 30 s): a silent-but-live child times out at the deadline; a
+   child that exits before the handshake fails immediately with its captured log
+   tail. On shutdown the child is torn down with escalation (`terminate()`, wait
+   ~5 s, then `kill()` and reap), safe to invoke repeatedly. The binary is
+   `--launch <path>`, else the `VC3D_BINARY` env var, else the repo-root build
+   `build-macos/bin/VC3D`; the fallback is used only if it names a real,
+   executable file. Pass `--volpkg <path>` to have the launched VC3D preload a
+   volume package (forwarded as `--load-first`) so the agent's first action need
+   not be opening one.
 4. Otherwise the server exits with status 2 and a stderr message explaining all
    three options above.
 
@@ -182,6 +202,17 @@ auto-launch parses the launched VC3D's handshake line with
 `BridgeClient.socket_path_from_handshake(line)`. Neither path relies on the
 best-effort name→path guessing of step 2.
 
+### Socket and request-size restrictions
+
+The bridge is a local-only automation channel. On the C++ side the
+`QLocalServer` is created with user-only access, so only the same OS user can
+connect. The server also bounds each request: a request line that grows past
+the server's maximum without a terminating newline causes that one client to be
+disconnected, and an oversized complete line is rejected — one misbehaving
+client cannot affect others. Keep individual RPC payloads (e.g. base64
+screenshots) within that bound; prefer writing screenshots to `filePath` for
+large captures rather than returning base64 inline.
+
 ## Self-test (no real VC3D required)
 
 `test_mcp_bridge.py` starts a trivial fake JSON-RPC server on a local
@@ -213,9 +244,10 @@ surface as MCP tool errors whose text is the JSON-encoded
 
 | Group | Tools |
 |---|---|
-| Core / navigation | `vc3d_ping`, `vc3d_get_state`, `vc3d_list_segments`, `vc3d_activate_segment`, `vc3d_screenshot`, `vc3d_get_cursor_point`, `vc3d_click`, `vc3d_shift_click`, `vc3d_drag`, `vc3d_center_viewer`, `vc3d_zoom_viewer` |
-| Segmentation growth/editing | `vc3d_enable_editing`, `vc3d_grow_segment`, `vc3d_grow_patch_from_seed`, `vc3d_manual_add_begin`, `vc3d_manual_add_finish`, `vc3d_manual_add_set_line_mode`, `vc3d_manual_add_set_interpolation`, `vc3d_manual_add_undo_constraint`, `vc3d_corrections_set_point_mode`, `vc3d_push_pull_set_config`, `vc3d_push_pull_start`, `vc3d_push_pull_stop` |
+| Core / navigation | `vc3d_ping`, `vc3d_get_state`, `vc3d_list_segments`, `vc3d_activate_segment`, `vc3d_screenshot`, `vc3d_get_cursor_point`, `vc3d_click`, `vc3d_shift_click`, `vc3d_drag`, `vc3d_center_viewer`, `vc3d_zoom_viewer`, `vc3d_rotate_viewer`, `vc3d_set_axis_aligned_slices` |
+| Segmentation growth/editing | `vc3d_fetch_segment`, `vc3d_enable_editing`, `vc3d_save_segment`, `vc3d_grow_segment`, `vc3d_grow_patch_from_seed`, `vc3d_manual_add_begin`, `vc3d_manual_add_finish`, `vc3d_manual_add_set_line_mode`, `vc3d_manual_add_set_interpolation`, `vc3d_manual_add_undo_constraint`, `vc3d_corrections_set_point_mode`, `vc3d_push_pull_set_config`, `vc3d_push_pull_start`, `vc3d_push_pull_stop` |
 | Points / tags | `vc3d_commit_points`, `vc3d_list_points`, `vc3d_set_segment_tag` |
+| Wrap annotation | `vc3d_set_wrap_annotation_mode`, `vc3d_commit_wrap_annotation`, `vc3d_undo_wrap_annotation` |
 | Volumes / catalog | `vc3d_open_volume`, `vc3d_open_catalog_sample`, `vc3d_list_catalog_samples`, `vc3d_describe_catalog_sample`, `vc3d_select_volume` |
 | Lasagna / workspace | `vc3d_lasagna_service_status`, `vc3d_lasagna_ensure_service`, `vc3d_lasagna_list_datasets`, `vc3d_lasagna_start_optimization`, `vc3d_lasagna_jobs`, `vc3d_lasagna_cancel`, `vc3d_lasagna_select_output`, `vc3d_lasagna_repeat_last`, `vc3d_switch_workspace` |
 | Atlas | `vc3d_atlas_open`, `vc3d_atlas_status`, `vc3d_atlas_search_start`, `vc3d_atlas_search_cancel`, `vc3d_atlas_search_results`, `vc3d_atlas_open_result`, `vc3d_atlas_remap`, `vc3d_atlas_optimize_snap_candidates` |
@@ -226,18 +258,35 @@ surface as MCP tool errors whose text is the JSON-encoded
 
 ### The `wait` convenience
 
-Long-running tools (`vc3d_grow_segment`, `vc3d_grow_patch_from_seed`,
-`vc3d_run_trace`, `vc3d_render_tifxyz`, `vc3d_flatten_slim`/`_abf`/`_straighten`,
-`vc3d_atlas_search_start`, `vc3d_lasagna_start_optimization`,
-`vc3d_lasagna_repeat_last`, `vc3d_seeding_run`, `vc3d_seeding_expand`) accept an
-MCP-only `wait: bool = false` param (not
-part of the underlying RPC, per SPEC.md §5). When `true`, the tool call
-blocks until a `job.progress` notification with `phase:"finished"` arrives
-for that job's source (30-minute cap), then returns the terminal
-`job.status` result inline instead of just the `jobId`. On timeout it
-returns the original `{jobId, ...}` result with an extra
+The wait-capable tools accept an MCP-only `wait: bool` param (not part of the
+underlying RPC, per SPEC.md §5). The full set is:
+
+- `vc3d_fetch_segment` (defaults to `wait=true`) and `vc3d_open_catalog_sample`,
+- `vc3d_grow_segment`, `vc3d_grow_patch_from_seed`, `vc3d_run_trace`,
+- `vc3d_atlas_search_start`,
+- `vc3d_lasagna_start_optimization`, `vc3d_lasagna_repeat_last`,
+- `vc3d_seeding_run`, `vc3d_seeding_expand`,
+- `vc3d_render_tifxyz`, `vc3d_flatten_slim`, `vc3d_flatten_abf`,
+  `vc3d_flatten_straighten`.
+
+(`vc3d_save_segment` also takes `wait`, defaulting to `true`.) All other
+wait-capable tools default to `wait=false`.
+
+When `true`, the tool call blocks until a `job.progress` notification with
+`phase:"finished"` arrives for that job (30-minute cap), then returns the
+authoritative terminal `job.status` result inline instead of just the `jobId`.
+On timeout it returns the original `{jobId, ...}` result with an extra
 `"waitTimedOut": true` field so the caller can fall back to polling
-`vc3d_job_status`.
+`vc3d_job_status`; on a bridge disconnect it fails promptly rather than blocking
+to the cap.
+
+While a `wait=true` call is blocked, the server forwards the job's
+`phase:"output"` console lines to the MCP client as **best-effort** progress via
+the FastMCP `Context` (`ctx.report_progress`, with a monotonically increasing
+sequence number). This is observational only: if the MCP client does not support
+progress, or a progress notification fails, the job's execution and the tool's
+terminal result are unaffected. The injected `Context` is not part of any tool's
+input schema.
 
 ## Known gaps
 

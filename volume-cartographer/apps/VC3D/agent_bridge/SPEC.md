@@ -32,7 +32,13 @@ constructed at all** — zero runtime cost and zero listening sockets in normal 
   `vc3d-agent-<pid>` where `<pid>` is `QCoreApplication::applicationPid()`.
   The PID suffix makes concurrent test runs safe by construction.
 - `--agent-bridge-name foo` uses `foo` verbatim (for tests that want a predictable name).
-  If `QLocalServer::listen(name)` fails (stale socket), call
+  Before listening the server sets `QLocalServer::UserAccessOption` so only the current
+  user can connect (the bridge grants full control of the running app). If
+  `QLocalServer::listen(name)` fails, the server does **not** blindly unlink the endpoint:
+  it first probes `name` with a `QLocalSocket`. A successful connect means a **live**
+  bridge already owns the name — the server reports the collision and returns false
+  **without** removing it (unlinking would strand the other server's clients). Only when
+  the probe fails (a demonstrably stale socket file from a crashed run) does it call
   `QLocalServer::removeServer(name)` once and retry; if it still fails, print an error to
   stderr and exit with code 2 (a test that asked for a bridge must not silently run without
   one).
@@ -55,6 +61,11 @@ existing `friend class RenderBenchReplay;` precedent at `CWindow.hpp:123` — ad
 
 - One JSON-RPC 2.0 message per line, UTF-8, LF-terminated (newline-delimited JSON).
   No embedded newlines inside a message (standard compact `QJsonDocument::Compact`).
+- A single framed request is bounded to **1 MiB**. If a client's un-framed read buffer
+  grows past the bound without a newline, or a newline-terminated line itself exceeds it,
+  the server sends a best-effort `-32600 Invalid Request` and disconnects **only that
+  client**; other connections are unaffected (the per-socket buffer cannot grow without
+  limit).
 - Multiple concurrent client connections are allowed. Requests are executed strictly
   serially on the Qt main thread (queued via the socket's `readyRead` on the GUI thread);
   there is no request pipelining guarantee beyond FIFO per connection.
@@ -769,14 +780,20 @@ corresponding RPC params block in §3, with the same names, types, defaults, and
 The MCP server performs no semantic validation beyond schema — the bridge is the
 authority.
 
-`job.progress` notifications: the MCP server listens for them and (a) folds them into
-`vc3d_job_status` responses (console tail, state) and (b) where the MCP client supports
-progress notifications, forwards `phase:"output"` messages as tool progress for the
-long-running `vc3d_grow_*` calls when the caller opted into `"wait": true` — an
-MCP-server-side convenience param (not part of the RPC) that blocks the tool call until
-the job's `finished` notification and returns the terminal status inline.
-`wait` defaults to `false`; when `true`, the MCP server enforces a 30-minute cap and
-returns the still-running `jobId` on timeout.
+`job.progress` notifications: the MCP server listens for them purely as a client
+convenience — they do **not** back `vc3d_job_status`, which is answered by the bridge's
+authoritative `job.status` RPC (§3.17). The server folds them into a small local
+`JobTracker` used only to (a) implement the `wait` convenience, (b) forward progress to
+the MCP client, and (c) provide a terminal-record fallback if `job.status` races with
+process shutdown. `wait` is an MCP-server-side convenience param (not part of the RPC)
+available on the long-running job-returning tools; when `"wait": true` it blocks the tool
+call until the job's `finished` notification and returns the terminal `job.status`
+inline. While blocked, the server forwards each `phase:"output"` line to the MCP client as
+**best-effort** progress via the FastMCP `Context` (`ctx.report_progress`, monotonic
+sequence number) where the client supports it; forwarding is observational only and never
+affects job execution or the returned result. `wait` defaults to `false`; when `true`, the
+server enforces a 30-minute cap and returns the still-running `jobId` (with
+`"waitTimedOut": true`) on timeout, and fails promptly on bridge disconnect.
 
 ---
 
@@ -2155,12 +2172,34 @@ instead of blocking. Result shapes: `preview_rays`/`cast_rays` return
 - **New `SeedingWidget` signals (binding).**
   `void seedingBatchProgressChanged(const QString& kind, int completed, int total)`
   (emitted on each child completion; `kind` is `"run"` | `"expand"`) and
-  `void seedingBatchFinished(const QString& kind, bool success, int completed, int total)`
-  (emitted at completion or cancel; `success=false` for cancel). The bridge connects
+  `void seedingBatchFinished(const QString& kind, bool success, bool canceled, int completed, int total, const QString& message)`
+  (emitted exactly once at completion, execution failure, or cancel). The bridge connects
   these in `subscribeJobSignals()` and mirrors them onto a `source:"seeding"` job,
   exactly as the atlas search wires `atlasSearchProgressChanged`/`atlasSearchFinished`.
   Introspection getters: `seedingBatchActive()` (run/expand only — excludes a neural
   trace, which shares `jobsRunning`), `seedingBatchKind()`, `seedingBatchTotal()`.
+
+- **Seeding batch outcome (SPEC §1 correctness).** A batch **succeeds only if every
+  child process starts, exits normally, and returns exit code 0**. The widget aggregates
+  per-child outcomes: `finished(exitCode, exitStatus)` and
+  `errorOccurred(FailedToStart)` are both wired, de-duplicated through a
+  `QSet<QProcess*>` so each child contributes to completion exactly once, and abnormal
+  exit / nonzero exit / failure-to-start all count as failures. An individual failure
+  does **not** abort the batch — the remaining children still run — but it is counted.
+  Merged child output is drained continuously (`readyReadStandardOutput`) so a QProcess
+  buffer never grows unbounded; a bounded diagnostic tail is retained for failure
+  reporting. The priority wrappers `nice`/`ionice` are resolved with
+  `QStandardPaths::findExecutable` (macOS has no `ionice`, and neither is guaranteed);
+  when a wrapper is absent the child launches `vc_grow_seg_from_seed` directly, and
+  `FailedToStart` is handled on every launch path so a missing tool fails the batch
+  instead of stranding it. The terminal `success` is
+  `!cancelRequested && failureCount == 0`; `finalizeSeedingBatch()` is idempotent.
+  `message` carries meaningful terminal text: success `"Seeding <kind> finished: N/N"`,
+  failure `"Seeding <kind> failed: X of N child processes failed; <diagnostic>"`,
+  cancel `"Seeding <kind> canceled after X/N"`. The bridge's
+  `handleSeedingBatchFinished` maps **success → job `succeeded`**, **execution failure →
+  job `failed`** (with the failure detail), and **cancellation → job `failed`** (with the
+  explicit cancel message); `canceled` distinguishes the two failure paths.
 
 - **Job model.** `seeding.run` and `seeding.expand` are both `source:"seeding"`
   (§8.3). They are already mutually exclusive via `jobsRunning`; mapping both to one
@@ -2178,9 +2217,13 @@ instead of blocking. Result shapes: `preview_rays`/`cast_rays` return
   | `seeding.cancel` | `{}` | `{"cancelRequested": true}` | `-32007` (`data.kind:"job"` — no batch running), `-32010` |
   | `seeding.analyze_paths` | `{}` | `{"analyzed": true, "paths", "peaks"}` (synchronous, **not** a job) | `-32000`, `-32001`, `-32007` (`data.kind:"path"` — no drawn paths), `-32010` |
 
-  `seeding.cancel` is synchronous: the bounded teardown emits `seedingBatchFinished`
-  before the RPC returns, so the job's terminal `job.progress` notification has already
-  gone out. Populating the source collection for `seeding.run` reuses `points.commit`
+  `seeding.cancel` is synchronous: the bounded teardown sets the cancel flag and emits
+  `seedingBatchFinished(..., canceled=true, ...)` before the RPC returns, so the job's
+  terminal `job.progress` notification (state `failed`, with the explicit cancel
+  message) has already gone out. A batch that runs to completion with one or more failed
+  children likewise terminates as `failed` (message names the failure count and a
+  bounded diagnostic tail); only an all-clean batch terminates as `succeeded`.
+  Populating the source collection for `seeding.run` reuses `points.commit`
   (a committed collection becomes the combo's current selection) or the widget's own
   Cast Rays flow; `analyze_paths` requires paths drawn via Draw-mode `canvas.drag`.
 
