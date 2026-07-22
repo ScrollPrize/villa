@@ -454,6 +454,21 @@ class TestBundleComposition:
         assert names == ['dense_spacing_count', 'dense_spacing_phase',
                          'min_spacing', 'dense_attachment']
 
+    def test_min_spacing_executes_without_phase_assets(self):
+        class Model:
+            device = torch.device('cpu')
+
+            def get_native_log_gaps(self, winding, theta, z):
+                return torch.zeros_like(theta, requires_grad=True)
+
+        cfg = phase_cfg(loss_weight_min_spacing=2.0)
+        names = [
+            name for name, _loss, _metrics in iter_phase_bundle_losses(
+                Model(), PerfectSpiralToX(), torch.tensor(DR_PER_WINDING),
+                None, None, 8, cfg, 1, 2)
+        ]
+        assert names == ['min_spacing']
+
     def test_zero_sub_weights_disable_components_without_new_modes(self):
         torch.manual_seed(5)
         volume = sheet_volume(100, [10, 20, 30, 40, 50, 60, 70, 80])
@@ -621,16 +636,18 @@ class TestOptionalInputSelection:
             'unverified_num_points_per_patch', 'loss_weight_dense_normals',
             'dense_normals_num_points', 'loss_weight_dense_spacing',
             'loss_weight_dense_spacing_count',
-            'loss_weight_dense_spacing_density', 'loss_weight_min_spacing',
+            'loss_weight_dense_spacing_density',
             'loss_weight_dense_attachment', 'dense_spacing_num_pairs',
             'dense_spacing_density_extra_pairs', 'dense_attachment_num_points',
-            'min_spacing_independent_samples', 'loss_weight_track_radius',
+            'loss_weight_track_radius',
             'loss_weight_track_dt', 'track_num_per_step',
             'track_num_points_per_step', 'loss_weight_unattached_pcl_radius',
             'loss_weight_unattached_pcl_dt', 'unattached_pcl_num_per_step',
             'unattached_pcl_num_points_per_step',
         }
         assert all(config[key] == 0 for key in expected_zero)
+        assert config['loss_weight_min_spacing'] == 4.0
+        assert config['min_spacing_independent_samples'] == 2_000
 
     def test_disabled_grad_mag_zeroes_legacy_spacing(self):
         config = {

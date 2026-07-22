@@ -31,6 +31,7 @@ class SpiralPanel : public QWidget
 public:
     explicit SpiralPanel(SpiralServiceManager* service, QWidget* parent = nullptr);
     void setVolumes(const QVector<VolumeSelector::VolumeOption>& volumes, const QString& selectedId);
+    void setAnnotationVolumeSpec(const QJsonObject& spec);
     void setLossMapOptions(const QStringList& names);
     void setLossMapLegend(const QString& text);
 
@@ -80,6 +81,7 @@ private:
     QHash<QString, QLineEdit*> _paths;
     QHash<QString, QToolButton*> _pathBrowseButtons;
     QHash<QString, QCheckBox*> _visibilityChecks;
+    QJsonObject _annotationVolumeSpec;
     QHash<QString, QCheckBox*> _optionalInputs;
     QHash<QString, bool> _pathDirectories;
     QDialog* _displayDialog = nullptr;

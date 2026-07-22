@@ -143,6 +143,7 @@ lasagna_scale = 4
 # session API already resolved 'auto' to mmap before this changed.
 lasagna_storage_backend = 'auto'
 render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
+annotation_volume_spec = None
 _active_lasagna_store = None
 _active_scalar_stores = []
 
@@ -327,8 +328,8 @@ default_config = {
     'dense_spacing_phase_top2_margin': 0.1,
     'dense_spacing_phase_min_matched_windings': 2,
     'dense_spacing_phase_min_matched_mass': 1.0,
-    # Native pre-expansion anti-collapse barrier. min_spacing runs only as
-    # part of the 'phase' bundle.
+    # Native pre-expansion anti-collapse barrier. This is asset-independent
+    # and can run in either dense-spacing mode.
     'loss_weight_min_spacing': 0.0,
     # Crossing count: per-step it is gradient-starved on coarse fits and its
     # support gate self-confirms, but its integer-topology pressure compounds
@@ -931,6 +932,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # Fibers form two sampling groups, horizontal and vertical, rather than one
     # group per source file like the regular pcls.
     for pcl in fiber_point_collections.values():
+        pcl.setdefault('metadata', {})['input_role'] = 'fiber'
         hv_tag = pcl.get('metadata', {}).get('hv_classification', {}).get('automatic_tag')
         if hv_tag not in ('H', 'V'):
             print(
@@ -1273,14 +1275,14 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     sdt_inactive_warned = set()
 
     def warn_if_sdt_loss_inactive():
-        # Run-mutable weights are read afresh every step, but phase-bundle
+        # Run-mutable weights are read afresh every step, but the SDT-backed
         # components only exist in phase mode; make a grad_mag session's
-        # nonzero bundle weights a visible no-op.
+        # nonzero SDT-backed weights a visible no-op. The native min-spacing
+        # barrier is asset-independent and remains active in either mode.
         if phase_mode:
             return
         for weight_key in ('loss_weight_dense_spacing_count',
                            'loss_weight_dense_spacing_density',
-                           'loss_weight_min_spacing',
                            'loss_weight_dense_attachment'):
             if cfg[weight_key] > 0 and weight_key not in sdt_inactive_warned:
                 sdt_inactive_warned.add(weight_key)
@@ -2190,6 +2192,38 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             torch.random.set_rng_state(torch_state)
             torch.cuda.set_rng_state_all(cuda_states)
 
+    fiber_display_geometry = {}
+    write_fiber_annotation_volume = None
+    load_fiber_display_geometry = None
+    if (interactive_driver is not None
+            and getattr(interactive_driver, 'publishes_outputs', True)
+            and annotation_volume_spec):
+        from fiber_annotation_volume import (
+            load_fiber_display_geometry, write_fiber_annotation_volume)
+        display_scale = float(annotation_volume_spec.get(
+            'fiber_coordinate_scale', 0.25))
+        if fibers_path:
+            for fiber_path in sorted(glob.glob(os.path.join(fibers_path, '*.json'))):
+                try:
+                    display = load_fiber_display_geometry(
+                        fiber_path, identity=os.path.basename(fiber_path),
+                        coordinate_scale=display_scale)
+                    if display is not None:
+                        fiber_display_geometry[display['identity']] = display
+                except Exception as exc:
+                    print(f'WARNING: could not prepare fiber display geometry '
+                          f'{fiber_path}: {exc}')
+
+    def publish_fiber_annotation_volume():
+        if write_fiber_annotation_volume is None or not fiber_display_geometry:
+            return None
+        destination = os.path.join(
+            out_path, '.spiral-fiber-volumes', f'generation-{time.time_ns()}')
+        manifest = write_fiber_annotation_volume(
+            destination, annotation_volume_spec, fiber_display_geometry)
+        interactive_driver.publish_annotation_volume(manifest)
+        return manifest
+
     def incorporate_interactive_inputs(records, influence_config=None):
         """Append uploaded ephemeral inputs to the resident fit structures.
 
@@ -2218,6 +2252,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             run_cfg.update(dict(influence_config or {}))
             new_patches = {}
             new_collections = {}
+            new_display_fibers = {}
             for record in records:
                 kind = record.get('kind')
                 path = record.get('path')
@@ -2248,6 +2283,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     hv_tag = pcl['metadata'].get('hv_classification', {}).get('automatic_tag')
                     pcl['sampling_group'] = f'fibers:{hv_tag if hv_tag in ("H", "V") else "H"}'
                     new_collections[next_id] = pcl
+                    if load_fiber_display_geometry is not None:
+                        display = load_fiber_display_geometry(
+                            path, identity=str(input_id),
+                            coordinate_scale=float(annotation_volume_spec.get(
+                                'fiber_coordinate_scale', 0.25)))
+                        if display is not None:
+                            new_display_fibers[display['identity']] = display
                     next_id += 1
                 elif kind == 'pcl':
                     role = record.get('role')
@@ -2377,6 +2419,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                         'source_file': pcl.get('source_file'),
                         'zyxs': zyxs,
                         'windings': windings,
+                        'display_category': pcl.get('metadata', {}).get('input_role'),
                     })
                     unattached_strip_sampling_groups.append(pcl.get('sampling_group'))
                 # The flat GPU bundle is derived from the strip list; drop it so
@@ -2405,6 +2448,14 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 interactive_influence_loss_weight = float(run_cfg['loss_weight_anchor'])
                 interactive_influence_anchor_samples = int(
                     run_cfg['interactive_influence_anchor_samples_per_step'])
+
+            if new_display_fibers:
+                fiber_display_geometry.update(new_display_fibers)
+                try:
+                    publish_fiber_annotation_volume()
+                except Exception as exc:
+                    print(f'WARNING: failed to publish updated fiber annotation '
+                          f'volume: {type(exc).__name__}: {exc}')
 
             # run() sets the target before this callback is drained at the
             # pause boundary, so this is exactly the iteration window requested
@@ -2440,11 +2491,17 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         geometry_manifest = None
         if getattr(interactive_driver, 'publishes_outputs', True):
             fiber_root = os.path.abspath(fibers_path) if fibers_path else None
-            snapshot_categories = {'fibers': [], 'pcls': [], 'tracks': []}
+            snapshot_categories = {'pcls': [], 'tracks': []}
             for strip in unattached_pcl_strips:
                 source = os.path.abspath(strip.get('source_file') or '')
-                category = 'fibers' if fiber_root and os.path.commonpath([fiber_root, source]) == fiber_root else 'pcls'
-                snapshot_categories[category].append(strip['zyxs'])
+                is_fiber = strip.get('display_category') == 'fiber'
+                if not is_fiber and fiber_root:
+                    try:
+                        is_fiber = os.path.commonpath([fiber_root, source]) == fiber_root
+                    except ValueError:
+                        is_fiber = False
+                if not is_fiber:
+                    snapshot_categories['pcls'].append(strip['zyxs'])
             if tracks:
                 snapshot_categories['tracks'] = (
                     tracks if isinstance(tracks, PackedTrackCollection)
@@ -2454,6 +2511,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             write_geometry_snapshot(geometry_path, snapshot_categories, input_order='ZYX')
             geometry_manifest = os.path.join(geometry_path, 'manifest.json')
             del snapshot_categories
+        annotation_volume_manifest = None
+        if getattr(interactive_driver, 'publishes_outputs', True):
+            try:
+                annotation_volume_manifest = publish_fiber_annotation_volume()
+            except Exception as exc:
+                print(f'WARNING: failed to publish initial fiber annotation '
+                      f'volume: {type(exc).__name__}: {exc}')
         # In the usual zero-exclusion case preview bounds reuse the prepared
         # flat tensor, so the original list of per-track arrays is no longer
         # needed after the one-time VC3D geometry handoff.
@@ -2465,6 +2529,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             save_checkpoint=save_model_to,
             export_preview=export_interactive_preview,
             geometry_snapshot_manifest=geometry_manifest,
+            annotation_volume_manifest=annotation_volume_manifest,
             incorporate_inputs=incorporate_interactive_inputs,
             finish_run=clear_interactive_influence,
             configure_run=configure_interactive_run,
@@ -2677,12 +2742,17 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 })
 
         warn_if_sdt_loss_inactive()
-        if phase_mode_active():
-            # The four phase-bundle components, one backward each so at most
-            # one large graph is resident at a time. Weights are re-read every
-            # step (run-mutable); a zero weight skips the component entirely.
-            attachment_ramp = get_dense_attachment_ramp(iteration)
-            log_metrics['dense_attachment_ramp'] = attachment_ramp
+        phase_components_active = phase_mode_active()
+        min_spacing_active = cfg['loss_weight_min_spacing'] > 0
+        if phase_components_active or min_spacing_active:
+            # SDT-backed phase components require phase mode; the native
+            # min-spacing barrier does not. Weights are re-read every step so
+            # the barrier can be enabled at a Run boundary in either mode.
+            attachment_ramp = (
+                get_dense_attachment_ramp(iteration)
+                if phase_components_active else 0.0)
+            if phase_components_active:
+                log_metrics['dense_attachment_ramp'] = attachment_ramp
             component_weights = phase_bundle_component_weights(
                 cfg, attachment_ramp)
             # Components tagged '_shared_graph' (count, phase, shared-batch
@@ -2721,12 +2791,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             if pending_shared:
                 backward_family(pending_shared)
             del pending_shared
-            if lasagna_volume['backend'] == 'mmap':
+            if (phase_components_active
+                    and lasagna_volume['backend'] == 'mmap'):
                 log_metrics.update({
                     f'dense_spacing_phase_normal_{name}': value
                     for name, value in lasagna_volume['store'].last_timings.items()
                 })
-            if sdt_volume['backend'] == 'mmap':
+            if phase_components_active and sdt_volume['backend'] == 'mmap':
                 log_metrics.update({
                     f'dense_spacing_phase_sdt_store_{name}': value
                     for name, value in sdt_volume['store'].last_timings.items()

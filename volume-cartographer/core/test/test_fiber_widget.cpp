@@ -97,6 +97,30 @@ int main(int argc, char** argv)
     auto* treeView = widget.findChild<QTreeView*>(QStringLiteral("fiberTreeView"));
     require(treeView != nullptr, "Fiber tree view was not found");
     require(treeView->model() != nullptr, "Fiber tree view model was not found");
+    auto* showFiberVolume =
+        widget.findChild<QCheckBox*>(QStringLiteral("showFiberVolumeCheckBox"));
+    require(showFiberVolume != nullptr, "Show fiber volume checkbox was not found");
+    require(!showFiberVolume->isEnabled(),
+            "Show fiber volume should be disabled before a generation is ready");
+    int fiberVolumeToggleCount = 0;
+    bool fiberVolumeToggleValue = false;
+    QObject::connect(&widget, &CFiberWidget::showFiberVolumeToggled, &widget,
+                     [&](bool checked) {
+                         ++fiberVolumeToggleCount;
+                         fiberVolumeToggleValue = checked;
+                     });
+    widget.setFiberVolumeAvailable(true);
+    require(showFiberVolume->isEnabled(),
+            "Show fiber volume should enable when a generation is ready");
+    showFiberVolume->setChecked(true);
+    require(fiberVolumeToggleCount == 1 && fiberVolumeToggleValue,
+            "Show fiber volume did not emit its checked state");
+    widget.setShowFiberVolumeChecked(false);
+    require(!widget.showFiberVolumeChecked() && fiberVolumeToggleCount == 1,
+            "Programmatic fiber-volume synchronization should not re-emit");
+    widget.setFiberVolumeAvailable(false);
+    require(!showFiberVolume->isEnabled() && !widget.showFiberVolumeChecked(),
+            "Unavailable fiber volume should disable and clear the control");
     const QFontMetrics metrics(treeView->font());
     const QString adaptedName = vc3d::adaptFiberNameToWidth(
         QStringLiteral("kb_20260605T184821587_000002"),

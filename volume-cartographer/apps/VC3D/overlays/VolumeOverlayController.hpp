@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vc/core/types/Sampling.hpp"
@@ -48,10 +49,18 @@ public:
     void refreshForCurrentVolume();
     void toggleVisibility();
     bool hasOverlaySelection() const;
+    [[nodiscard]] const std::string& selectedOverlayId() const noexcept { return _overlayVolumeId; }
+    bool selectOverlay(const std::string& volumeId);
+    void setSelectedColormap(const std::string& colormapId) { setColormap(colormapId); }
+    void setSupplementalVolume(const std::string& volumeId,
+                               const QString& label,
+                               std::shared_ptr<Volume> volume);
+    void removeSupplementalVolume(const std::string& volumeId);
     void syncWindowFromManager(float low, float high);
 
 signals:
     void requestStatusMessage(const QString& message, int timeoutMs);
+    void overlaySelectionChanged(std::string volumeId);
 
 private:
     void connectUiSignals();
@@ -69,6 +78,7 @@ private:
     OverlayCompositeSettings currentCompositeSettings() const;
     void syncCompositeUi();
     void pushCompositeToManager();
+    [[nodiscard]] bool isCategoricalOverlay() const;
 
     void handleVolumeComboChanged(int index);
     void handleColormapChanged(int index);
@@ -101,6 +111,12 @@ private:
     int _compositeLayersFront{8};
     int _compositeLayersBehind{0};
     bool _overlayVisible{false};
+
+    struct SupplementalVolume {
+        QString label;
+        std::shared_ptr<Volume> volume;
+    };
+    std::unordered_map<std::string, SupplementalVolume> _supplementalVolumes;
 
     std::vector<QMetaObject::Connection> _connections;
     bool _suspendPersistence{false};

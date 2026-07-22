@@ -81,6 +81,7 @@ signals:
     // Local (cache) filesystem paths: artifact transfers already happened.
     void previewAvailable(const QString& manifestPath, qint64 generation);
     void geometryAvailable(const QString& manifestPath, quint64 generation);
+    void annotationVolumeAvailable(const QString& volumePath, quint64 generation);
     void checkpointDownloadFinished(const QString& localPath, const QString& error);
     void checkpointUploadProgress(qint64 sentBytes, qint64 totalBytes);
     void inputUploadFinished(const QString& inputId, const QString& error);
@@ -160,7 +161,10 @@ private:
     QString _fetchingPreviewArtifact;
     QString _installedGeometryArtifact;
     QString _fetchingGeometryArtifact;
+    QString _installedAnnotationVolumeArtifact;
+    QString _fetchingAnnotationVolumeArtifact;
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;
     QString _lastGeometryLocalPath;
+    QString _lastAnnotationVolumeLocalPath;
 };

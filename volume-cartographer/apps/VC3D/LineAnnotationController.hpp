@@ -180,6 +180,7 @@ public:
     // not yet saved). Used by cross-panel actions such as adding a fiber to a
     // running Spiral fit.
     [[nodiscard]] std::filesystem::path fiberFilePath(uint64_t fiberId) const;
+    [[nodiscard]] std::filesystem::path fiberDirectory() const { return fibersDir(); }
 
 signals:
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);

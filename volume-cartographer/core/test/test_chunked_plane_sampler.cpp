@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -127,6 +128,54 @@ cv::Mat_<cv::Vec3f> axisAlignedCoords(int rows, int cols, float z = 0.f)
 }
 
 } // namespace
+
+class UInt16LabelsArray : public vc::render::IChunkedArray {
+public:
+    int numLevels() const override { return 1; }
+    std::array<int, 3> shape(int) const override { return {1, 1, 4}; }
+    std::array<int, 3> chunkShape(int) const override { return {1, 1, 4}; }
+    vc::render::ChunkDtype dtype() const override { return vc::render::ChunkDtype::UInt16; }
+    double fillValue() const override { return 0.0; }
+    LevelTransform levelTransform(int) const override { return {}; }
+    ChunkResult tryGetChunk(int, int iz, int iy, int ix) override
+    {
+        ChunkResult result;
+        result.dtype = vc::render::ChunkDtype::UInt16;
+        result.shape = shape(0);
+        if (iz != 0 || iy != 0 || ix != 0) {
+            result.status = ChunkStatus::Missing;
+            return result;
+        }
+        const std::array<std::uint16_t, 4> labels{0, 255, 256, 65535};
+        auto bytes = std::make_shared<std::vector<std::byte>>(labels.size() * 2);
+        std::memcpy(bytes->data(), labels.data(), bytes->size());
+        result.status = ChunkStatus::Data;
+        result.bytes = std::move(bytes);
+        return result;
+    }
+    ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override
+    {
+        return tryGetChunk(level, iz, iy, ix);
+    }
+    void prefetchChunks(const std::vector<ChunkKey>&, bool, int) override {}
+    ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback) override { return 0; }
+    void removeChunkReadyListener(ChunkReadyCallbackId) override {}
+};
+
+TEST_CASE("categorical uint16 samples map complete labels to repeating palette indices")
+{
+    UInt16LabelsArray array;
+    cv::Mat_<uint8_t> out(1, 4, uint8_t{0});
+    cv::Mat_<uint8_t> coverage(1, 4, uint8_t{0});
+    ChunkedPlaneSampler::samplePlaneLevel(
+        array, 0,
+        cv::Vec3f(0, 0, 0), cv::Vec3f(1, 0, 0), cv::Vec3f(0, 1, 0),
+        out, coverage, {vc::Sampling::Trilinear, 4, true});
+    CHECK(out(0, 0) == 0);
+    CHECK(out(0, 1) == 255);
+    CHECK(out(0, 2) == 1);
+    CHECK(out(0, 3) == 255);
+}
 
 TEST_CASE("collectPlaneDependencies / collectCoordsDependencies enumerate keys")
 {

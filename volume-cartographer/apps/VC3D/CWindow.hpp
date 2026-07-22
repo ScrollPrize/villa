@@ -107,6 +107,7 @@ class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class ViewerTransformsPanel;
 class LineAnnotationController;
+class FiberVolumeController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
 class StatusDockPanelHost;
@@ -414,6 +415,9 @@ private:
     bool _maskRenderInProgress{false};
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
     std::unique_ptr<LineAnnotationController> _lineAnnotationController;
+    std::unique_ptr<FiberVolumeController> _fiberVolumeController;
+    std::string _fiberVolumeOverlayId;
+    std::string _overlayBeforeFiberVolume;
     // Keyboard shortcuts
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;

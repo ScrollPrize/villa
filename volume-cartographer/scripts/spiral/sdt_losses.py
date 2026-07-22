@@ -1,10 +1,9 @@
-"""Surf-SDT-driven dense losses: the ``phase`` dense-spacing bundle.
+"""Dense spacing losses, including the Surf-SDT-driven ``phase`` bundle.
 
-All components are driven by one capped signed-distance store of the
+The SDT-backed components use one capped signed-distance store of the
 binarized surface prediction (positive outside, negative inside, encoded
-0 = no-data). The ``phase`` bundle executes four independently weighted
-components (a zero sub-weight disables one component, it does not create
-another mode):
+0 = no-data). Each component is independently weighted; a zero sub-weight
+disables that component:
 
 - soft-sequence phase registration: complete SDT bands detected on an
   extended ray are aligned to the ordered modeled-winding sequence with a
@@ -24,8 +23,9 @@ differentiable. The count loss keeps a detached endpoint support gate with a
 nominal-mass denominator floor, so it scales down (to a defined zero) when
 support is scarce instead of collapsing back to an ordinary mean.
 
-The legacy ``grad_mag`` density-integral objective lives unchanged in
-``losses.iter_lasagna_losses``.
+The native minimum-spacing barrier is asset-independent and can also execute
+when the legacy ``grad_mag`` density-integral objective in
+``losses.iter_lasagna_losses`` is selected.
 """
 
 import itertools
@@ -1856,10 +1856,12 @@ def iter_phase_bundle_losses(
 ):
     """Yield the active phase-bundle components as (name, loss, metrics).
 
-    The bundle is the single ``phase`` dense-spacing mode: soft-sequence
-    phase registration, crossing count (sharing the phase rays), native
-    minimum spacing, and SDT attachment. Yielding lazily lets the training
-    loop run one backward per graph so at most one large graph is resident;
+    The SDT-backed components belong to the single ``phase`` dense-spacing
+    mode: soft-sequence phase registration, crossing count (sharing the phase
+    rays), and SDT attachment. Native minimum spacing is asset-independent,
+    so this iterator may also be called without the SDT/normal volumes to run
+    that component alone. Yielding lazily lets the training loop run one
+    backward per graph so at most one large graph is resident;
     components whose metrics carry ``'_shared_graph': True`` (count, phase,
     shared-batch density) share the central-ray graph and should be summed
     into one backward. The public mode stays ``phase`` regardless of this

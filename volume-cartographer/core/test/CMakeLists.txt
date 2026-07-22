@@ -65,6 +65,8 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
+vc_add_test(NAME test_sparse_annotation_volume)
+
 vc_add_test(NAME test_appendmask_render)
 
 vc_add_test(NAME test_chunked_plane_sampler_fallback)

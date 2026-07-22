@@ -4,6 +4,7 @@
 #include "CState.hpp"
 #include "ConsoleOutputWidget.hpp"
 #include "Keybinds.hpp"
+#include "OpenDataCoordinateIdentity.hpp"
 #include "SpiralPanel.hpp"
 #include "SpiralServiceManager.hpp"
 #include "SurfaceOverlayColors.hpp"
@@ -42,6 +43,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <string_view>
 #include <unordered_map>
 
 namespace {
@@ -232,7 +234,9 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             _outputVisible = shown;
             _state->setSurface("segmentation", shown ? _currentPreview : nullptr);
             updateSurfaceIntersections();
-        } else if (category == QStringLiteral("fibers") || category == QStringLiteral("tracks") || category == QStringLiteral("pcls")) {
+        } else if (category == QStringLiteral("fibers")) {
+            setFiberVolumeVisible(shown);
+        } else if (category == QStringLiteral("tracks") || category == QStringLiteral("pcls")) {
             _overlay->setCategoryVisible(category, shown);
         } else if (category == QStringLiteral("pending_only")) {
             _pendingPatchesOnly = shown;
@@ -267,6 +271,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     _requestedPreviewGeneration = -1;
                     _inputSurfaceGeneration = 0;
                     _geometryManifestPath.clear();
+                    _fiberAnnotationVolume.reset();
+                    _fiberAnnotationVolumePath.clear();
+                    _fiberVolumeVisible = false;
+                    _viewerManager->setOverlayVolume(nullptr, {});
                     _pendingPatchIds.clear();
                     _haveRunDiffBaseline = false;
                     _previewRunDiffImage = {};
@@ -312,6 +320,23 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 if (manifestPath.isEmpty() || manifestPath == _geometryManifestPath) return;
                 _geometryManifestPath = manifestPath;
                 loadGeometrySnapshot(manifestPath, generation);
+            });
+    connect(_service, &SpiralServiceManager::annotationVolumeAvailable, this,
+            [this](const QString& volumePath, quint64) {
+                if (volumePath.isEmpty() || volumePath == _fiberAnnotationVolumePath)
+                    return;
+                try {
+                    auto volume = Volume::New(volumePath.toStdString());
+                    _fiberAnnotationVolume = std::move(volume);
+                    _fiberAnnotationVolumePath = volumePath;
+                    if (_fiberVolumeVisible)
+                        setFiberVolumeVisible(true);
+                } catch (const std::exception& error) {
+                    statusBar()->showMessage(
+                        tr("Could not open the Spiral fiber volume: %1")
+                            .arg(QString::fromUtf8(error.what())),
+                        15000);
+                }
             });
     if (_mainState) {
         connect(_mainState, &CState::vpkgChanged, this, [this](const std::shared_ptr<VolumePkg>&) { refreshVolumes(); });
@@ -667,6 +692,7 @@ void SpiralWorkspace::refreshVolumes()
     if (!_state->currentVolume() && _mainState) {
         _state->setCurrentVolume(_mainState->currentVolume());
     }
+    updateAnnotationVolumeSpec();
     ensureInitialFocus();
 }
 
@@ -677,11 +703,13 @@ void SpiralWorkspace::selectVolume(const QString& id)
     auto volume = package->volume(id.toStdString());
     if (!volume) return;
     if (volume == _state->currentVolume()) {
+        updateAnnotationVolumeSpec();
         ensureInitialFocus();
         return;
     }
     const bool hadFocus = _state->poi("focus") != nullptr;
     _viewerManager->switchVolume(volume);
+    updateAnnotationVolumeSpec();
     if (!hadFocus) {
         // switchVolume created a volume-center default; prefer the preview
         // focus when one is already loaded.
@@ -689,6 +717,109 @@ void SpiralWorkspace::selectVolume(const QString& id)
         initializePreviewFocus();
     }
     for (auto* viewer : _viewerManager->baseViewers()) if (viewer) viewer->requestRender("Spiral display volume changed");
+}
+
+void SpiralWorkspace::updateAnnotationVolumeSpec()
+{
+    const auto volume = _state ? _state->currentVolume() : nullptr;
+    if (!volume) {
+        _panel->setAnnotationVolumeSpec({});
+        return;
+    }
+
+    const auto toJsonArray = [](const auto& values) {
+        QJsonArray array;
+        for (const auto value : values)
+            array.append(static_cast<double>(value));
+        return array;
+    };
+
+    const auto shape = volume->shape();
+    QJsonObject spec{
+        {QStringLiteral("shape_zyx"), toJsonArray(shape)},
+        {QStringLiteral("pyramid_levels"), QJsonArray{}},
+        {QStringLiteral("fiber_coordinate_scale"), 0.25},
+    };
+    try {
+        spec[QStringLiteral("voxel_size_um")] = volume->voxelSize();
+    } catch (const std::exception&) {
+    }
+
+    QJsonArray pyramid;
+    for (const int level : volume->presentScaleLevels()) {
+        if (level <= 0)
+            continue;
+        const auto levelShape = volume->shape(level);
+        std::array<double, 3> scale{};
+        for (std::size_t axis = 0; axis < scale.size(); ++axis)
+            scale[axis] = static_cast<double>(shape[axis]) /
+                          static_cast<double>(levelShape[axis]);
+        pyramid.append(QJsonObject{
+            {QStringLiteral("shape_zyx"), toJsonArray(levelShape)},
+            {QStringLiteral("scale_zyx"), toJsonArray(scale)},
+            {QStringLiteral("translation_zyx"), QJsonArray{0.0, 0.0, 0.0}},
+        });
+    }
+    spec[QStringLiteral("pyramid_levels")] = pyramid;
+
+    if (_state->vpkg()) {
+        const auto identity = vc3d::opendata::coordinateIdentityForVolume(
+            *_state->vpkg(), _state->currentVolumeId());
+        QJsonObject coordinateIdentity;
+        if (identity) {
+            coordinateIdentity = QJsonObject{
+                {QStringLiteral("vc_open_data_coordinate_space"),
+                 QString::fromStdString(identity->coordinateSpace)},
+                {QStringLiteral("vc_open_data_source_path"),
+                 QString::fromStdString(identity->sourcePath)},
+                {QStringLiteral("vc_open_data_source_coordinate_level"),
+                 identity->sourceCoordinateLevel},
+                {QStringLiteral("vc_open_data_source_coordinate_scale_factor"),
+                 static_cast<double>(identity->sourceCoordinateScaleFactor)},
+                {QStringLiteral("vc_open_data_source_original_resolution"),
+                 identity->sourceOriginalResolution},
+            };
+        } else {
+            constexpr std::string_view prefix = "vc-open-data-coordinate-space:";
+            for (const auto& tag :
+                 _state->vpkg()->volumeTags(_state->currentVolumeId())) {
+                if (tag.rfind(prefix, 0) == 0) {
+                    coordinateIdentity[QStringLiteral("vc_open_data_coordinate_space")] =
+                        QString::fromStdString(tag.substr(prefix.size()));
+                    break;
+                }
+            }
+        }
+        if (!coordinateIdentity.isEmpty())
+            spec[QStringLiteral("coordinate_identity")] = coordinateIdentity;
+    }
+    _panel->setAnnotationVolumeSpec(spec);
+}
+
+void SpiralWorkspace::setFiberVolumeVisible(bool visible)
+{
+    _fiberVolumeVisible = visible;
+    if (!visible) {
+        if (_viewerManager->overlayVolumeId().rfind("spiral-fibers:", 0) == 0)
+            _viewerManager->setOverlayVolume(nullptr, {});
+        return;
+    }
+    if (!_fiberAnnotationVolume) {
+        statusBar()->showMessage(tr("The Spiral fiber volume is not available yet"), 5000);
+        return;
+    }
+    _viewerManager->setOverlayVolume(
+        _fiberAnnotationVolume,
+        "spiral-fibers:" + _fiberAnnotationVolumePath.toStdString());
+    if (_viewerManager->overlayVolume() != _fiberAnnotationVolume) {
+        statusBar()->showMessage(
+            tr("The Spiral fiber volume does not match the selected display volume"),
+            10000);
+        return;
+    }
+    _viewerManager->setOverlayColormap("glasbey_black0");
+    _viewerManager->setOverlaySamplingMethod(vc::Sampling::Nearest);
+    _viewerManager->setOverlayWindow(1.0f, 255.0f);
 }
 
 void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation)

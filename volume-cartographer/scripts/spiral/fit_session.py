@@ -114,10 +114,9 @@ def apply_optional_input_selection(config: dict[str, Any]) -> dict[str, Any]:
     spacing_mode = str(config.get("dense_spacing_mode", "phase"))
     if not sdt or not normals:
         zero("loss_weight_dense_spacing_count",
-             "loss_weight_dense_spacing_density", "loss_weight_min_spacing",
+             "loss_weight_dense_spacing_density",
              "loss_weight_dense_attachment", "dense_spacing_count_extra_pairs",
-             "dense_spacing_density_extra_pairs", "dense_attachment_num_points",
-             "min_spacing_independent_samples")
+             "dense_spacing_density_extra_pairs", "dense_attachment_num_points")
         if spacing_mode == "phase":
             zero("loss_weight_dense_spacing", "dense_spacing_num_pairs")
     if (not bool(config.get("use_gradient_magnitude", True))
@@ -203,6 +202,7 @@ class SpiralRunConfig:
     legacy_checkpoint_step: int = 0
     run_tag: str = ""
     render_volume_scale: int = 16
+    annotation_volume: Mapping[str, Any] = field(default_factory=dict)
     config: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -219,6 +219,7 @@ class SpiralRunConfig:
             legacy_checkpoint_step=int(value.get("legacy_checkpoint_step", 0)),
             run_tag=str(value.get("run_tag", "")),
             render_volume_scale=int(value.get("render_volume_scale", 16)),
+            annotation_volume=dict(value.get("annotation_volume", {})),
             config=dict(value.get("config", {})),
         )
 

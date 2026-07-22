@@ -1100,7 +1100,14 @@ QJsonObject SpiralPanel::sessionRequest() const
                     {"run_tag", _runTag->text()},
                     {"render_volume_scale", _renderVolumeScale->value()},
                     {"config", config}};
+    if (!_annotationVolumeSpec.isEmpty())
+        run[QStringLiteral("annotation_volume")] = _annotationVolumeSpec;
     return {{"paths", paths}, {"run", run}, {"preview", QJsonObject{{"first_winding", 10}}}};
+}
+
+void SpiralPanel::setAnnotationVolumeSpec(const QJsonObject& spec)
+{
+    _annotationVolumeSpec = spec;
 }
 
 QJsonObject SpiralPanel::influenceConfig() const
@@ -1312,9 +1319,9 @@ void SpiralPanel::applyOptionalInputConfig(QJsonObject& config,
         config.value(QStringLiteral("dense_spacing_mode")).toString(QStringLiteral("grad_mag"));
     if (!sdt || !normals) {
         zero({"loss_weight_dense_spacing_count", "loss_weight_dense_spacing_density",
-              "loss_weight_min_spacing", "loss_weight_dense_attachment",
+              "loss_weight_dense_attachment",
               "dense_spacing_count_extra_pairs", "dense_spacing_density_extra_pairs",
-              "dense_attachment_num_points", "min_spacing_independent_samples"});
+              "dense_attachment_num_points"});
         if (spacingMode == QStringLiteral("phase"))
             zero({"loss_weight_dense_spacing", "dense_spacing_num_pairs"});
     }
