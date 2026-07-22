@@ -319,8 +319,14 @@ Convenience alias: identical to `canvas.click` with `"shift"` unioned into `modi
 
 ### 3.9 `viewer.zoom`
 
-- **params:** `{"viewer"?: str, "factor": float}` — `factor` > 0; >1 zooms in.
-- Maps to `VolumeViewerBase::adjustZoomByFactor(float)` (VolumeViewerBase.hpp:85).
+- **params:** `{"viewer"?: str, "factor": float}` — `factor` > 0; >1 zooms in,
+  <1 zooms out. A **true scale multiplier** applied in one call (new scale =
+  `clamp(scale × factor, kMinScale, kMaxScale)`), centered on the viewport — not
+  a fixed wheel notch. A very large factor saturates at the viewer's max zoom, so
+  the returned `scale` may reflect less than the full multiply; compare it to
+  gauge remaining headroom.
+- Maps to `VolumeViewerBase::adjustZoomByFactor(float)` (VolumeViewerBase.hpp:85),
+  which shares `CChunkedVolumeViewer::zoomByFactorAt` with the wheel zoom.
 - **result:** `{"scale": float}` — post-zoom `getCurrentScale()`.
 - **errors:** `-32002`, `-32602` (factor ≤ 0 or non-finite).
 

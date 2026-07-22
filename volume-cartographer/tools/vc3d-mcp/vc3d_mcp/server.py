@@ -325,8 +325,12 @@ async def vc3d_center_viewer(
 
 @mcp.tool()
 async def vc3d_zoom_viewer(factor: float, viewer: Optional[str] = None) -> dict[str, Any]:
-    """Multiply a viewer's zoom by a factor (>1 zooms in). Returns the new
-    scale."""
+    """Multiply a viewer's zoom scale by `factor` (>1 zooms in, <1 zooms out;
+    e.g. 10 = 10x closer, 0.5 = half). It is a true multiplier applied in one
+    call -- no need to repeat small steps. Returns the new scale, which is
+    clamped to the viewer's zoom limits, so a very large factor saturates at
+    max zoom and the returned scale may reflect less than the full multiply.
+    Compare the returned scale to gauge how much room is left."""
     return await _call("viewer.zoom", _strip_none({"viewer": viewer, "factor": factor}))
 
 

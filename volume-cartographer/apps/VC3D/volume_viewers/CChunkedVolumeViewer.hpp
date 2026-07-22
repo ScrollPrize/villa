@@ -289,6 +289,10 @@ private:
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
     void panByF(float dx, float dy);
     void zoomStepsAt(int steps, const QPointF& scenePos);
+    // Multiply the current scale by `factor` (clamped to [kMinScale, kMaxScale]),
+    // keeping the scene point under `scenePos` fixed. The shared core of both the
+    // discrete wheel zoom (zoomStepsAt) and the continuous adjustZoomByFactor.
+    void zoomByFactorAt(float factor, const QPointF& scenePos);
     bool isAxisAlignedView() const;
     void ensureDefaultSurface();
     void updateContentBounds();
