@@ -33,9 +33,11 @@ def get_max_value(dtype: np.dtype) -> Union[float, int]:
         raise ValueError("Unsupported dtype")
     return max_value
 
-def open_zarr(path: str, mode: str = 'r', 
+def open_zarr(path: str, mode: str = 'r',
               storage_options: Optional[Dict[str, Any]] = None,
               verbose: bool = False,
+              cache: bool = False,
+              cache_size_mb: int = 256,
               # Additional zarr creation parameters
               shape: Optional[Tuple] = None,
               chunks: Optional[Tuple] = None,
@@ -57,6 +59,14 @@ def open_zarr(path: str, mode: str = 'r',
         Additional options for storage backend. For S3, {'anon': False} will be added by default.
     verbose : bool, default False
         Whether to print verbose information about opening the zarr array.
+    cache : bool, default False
+        If True (read mode only), wrap the store in an in-memory LRU chunk
+        cache so repeated reads of the same region are served locally instead
+        of re-fetched from the remote store. Byte-exact: caches the compressed
+        chunks as stored, so decoded values are identical with or without it.
+    cache_size_mb : int, default 256
+        Maximum size of the LRU chunk cache, in megabytes. Ignored unless
+        ``cache=True``.
     shape, chunks, dtype, compressor, fill_value, order : zarr creation parameters
         Only used when mode is 'w' to create a new zarr array.
     **kwargs : Additional parameters passed to zarr.open
@@ -137,7 +147,84 @@ def open_zarr(path: str, mode: str = 'r',
         if verbose:
             print(f"Creating new zarr array with shape={shape}, chunks={chunks}, dtype={dtype}")
         
-        return zarr.open(path, mode=mode, shape=shape, storage_options=storage_options, **create_kwargs)
+        return zarr.open(path, mode=mode, shape=shape, storage_options=storage_options or None, **create_kwargs)
     else:
         # Just open the existing array
-        return zarr.open(path, mode=mode, storage_options=storage_options, **kwargs)
+        if cache and mode == 'r':
+            # Wrap the store in an in-memory LRU chunk cache (see
+            # LRUCacheStore below). Repeated reads of the same region
+            # (overlapping training patches, viewer panning, tracer
+            # neighborhood revisits) are then served from memory instead of
+            # re-fetched over the network. The cache holds the compressed
+            # chunk bytes exactly as stored, so decoded values are
+            # byte-identical to the uncached path. This restores what
+            # use_volume_store_cache provided before zarr 3 removed
+            # LRUStoreCache.
+            from zarr.storage import FsspecStore, LocalStore
+            if path.startswith(('http://', 'https://', 's3://')):
+                inner = FsspecStore.from_url(path, storage_options=storage_options, read_only=True)
+            else:
+                inner = LocalStore(path, read_only=True)
+            cached_store = LRUCacheStore(inner, max_size_bytes=cache_size_mb * 2**20)
+            if verbose:
+                print(f"Wrapping store in LRU chunk cache ({cache_size_mb} MB)")
+            return zarr.open(cached_store, mode=mode, **kwargs)
+        # zarr 3 rejects storage_options for non-URL (local) paths, even empty
+        return zarr.open(path, mode=mode, storage_options=storage_options or None, **kwargs)
+
+
+class LRUCacheStore(zarr.storage.WrapperStore):
+    """A read-through, in-memory, size-bounded LRU cache for zarr 3 stores.
+
+    zarr 2's ``LRUStoreCache`` was removed in zarr 3 (which is why
+    ``use_volume_store_cache`` in neural_tracing was deprecated); this is the
+    zarr 3 equivalent, composed via ``zarr.storage.WrapperStore``. Cached
+    values are the raw stored bytes (compressed chunks), keyed by
+    ``(key, byte_range)``, so reads decode identically with or without the
+    cache. Writes and deletes pass through and invalidate the affected key.
+    """
+
+    def __init__(self, store, max_size_bytes: int = 256 * 2**20):
+        super().__init__(store)
+        from collections import OrderedDict
+        self._lru: "OrderedDict[tuple, bytes]" = OrderedDict()
+        self._max_size = max_size_bytes
+        self._current_size = 0
+
+    def _evict(self, incoming: int) -> None:
+        while self._lru and self._current_size + incoming > self._max_size:
+            _, evicted = self._lru.popitem(last=False)
+            self._current_size -= len(evicted)
+
+    def _invalidate(self, key: str) -> None:
+        for ck in [ck for ck in self._lru if ck[0] == key]:
+            self._current_size -= len(self._lru.pop(ck))
+
+    async def get(self, key, prototype, byte_range=None):
+        cache_key = (key, repr(byte_range))
+        if cache_key in self._lru:
+            self._lru.move_to_end(cache_key)
+            return prototype.buffer.from_bytes(self._lru[cache_key])
+        value = await super().get(key, prototype, byte_range)
+        if value is not None:
+            raw = value.to_bytes()
+            if len(raw) <= self._max_size:
+                # Idempotent insert: if a concurrent miss for the same key
+                # already populated it (zarr fetches chunks concurrently),
+                # drop the prior entry first so _current_size can't
+                # double-count. The mutation block has no await, so it runs
+                # atomically under asyncio's single thread.
+                if cache_key in self._lru:
+                    self._current_size -= len(self._lru.pop(cache_key))
+                self._evict(len(raw))
+                self._lru[cache_key] = raw
+                self._current_size += len(raw)
+        return value
+
+    async def set(self, key, value):
+        self._invalidate(key)
+        await super().set(key, value)
+
+    async def delete(self, key):
+        self._invalidate(key)
+        await super().delete(key)
