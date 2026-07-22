@@ -339,8 +339,12 @@ Convenience alias: identical to `canvas.click` with `"shift"` unioned into `modi
   an absolute angle. Only the two axis-aligned seg planes rotate — the main xy/segment
   view is not rotatable.
 - Maps to `AxisAlignedSliceController::setRotationDegrees(std::string, float)` +
-  `flushOrientationUpdate()` (AxisAlignedSliceController.cpp:483,509), the same path the
-  middle-drag handler drives; angle read back via `currentRotationDegrees`.
+  `scheduleOrientationUpdate()` + `flushOrientationUpdate()` (AxisAlignedSliceController.cpp:483,493,509),
+  the same path the middle-drag handler drives; angle read back via `currentRotationDegrees`.
+  The `scheduleOrientationUpdate()` call is required: it sets the `_orientationDirty`
+  flag, and `flushOrientationUpdate()` early-returns unless that flag is set — without it
+  the angle field updates but `applyOrientation()`/the viewer repaint never run, so the
+  plane state changes with no visible rotation.
 - **result:** `{"plane": str, "degrees": float, "previousDegrees": float, "relative": bool}`
   — `degrees` is the normalized post-rotation angle (`remainder(·, 360)`).
 - **errors:** `-32000` (slice controller unavailable), `-32002` (axis-aligned slice mode
