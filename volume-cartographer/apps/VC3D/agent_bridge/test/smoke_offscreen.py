@@ -199,6 +199,59 @@ def check_c2_oversized(sock_path: str, results: Results) -> None:
                        f"{type(e).__name__}: {e}")
 
 
+def check_c2_suffix_bypass(sock_path: str, results: Results) -> None:
+    """A VALID line followed by a >1 MiB UNTERMINATED suffix must still get the
+    client dropped: the pre-loop bound check is skipped when any newline is
+    present, so the residual has to be bounded after the framed lines are
+    consumed (codex #9). Send '{}\\n' + >1 MiB with no further newline."""
+    raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw.settimeout(10.0)
+    closed_by_server = False
+    detail = ""
+    try:
+        raw.connect(sock_path)
+        # A well-formed (if unknown-method) line first, then an oversized tail.
+        raw.sendall(b'{"jsonrpc":"2.0","id":1,"method":"state.get","params":{}}\n')
+        over = 2 * 1024 * 1024
+        chunk = b" " * 65536
+        sent = 0
+        try:
+            while sent < over:
+                sent += raw.send(chunk)
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                try:
+                    data = raw.recv(65536)
+                except socket.timeout:
+                    break
+                if data == b"":
+                    closed_by_server = True
+                    break
+            detail = ("server dropped the client after the oversized suffix (EOF)"
+                      if closed_by_server else "server did not drop within 10s")
+        except (BrokenPipeError, ConnectionResetError) as e:
+            closed_by_server = True
+            detail = f"server dropped mid-send ({type(e).__name__}) after {sent} bytes"
+        results.record("c9_suffix_bypass_dropped", closed_by_server, detail)
+    except Exception as e:  # noqa: BLE001
+        results.record("c9_suffix_bypass_dropped", False, f"{type(e).__name__}: {e}")
+    finally:
+        raw.close()
+
+    # Bridge still serves other clients after bounding the suffix.
+    try:
+        fresh = BridgeClient(sock_path, connect_timeout=10.0)
+        try:
+            state, _ = fresh.call("state.get", {}, timeout=10.0)
+            results.record("c9_other_client_unaffected", isinstance(state, dict),
+                           "fresh connection still answers after suffix drop")
+        finally:
+            fresh.close()
+    except Exception as e:  # noqa: BLE001
+        results.record("c9_other_client_unaffected", False,
+                       f"{type(e).__name__}: {e}")
+
+
 def _inode(path: str):
     try:
         return os.stat(path).st_ino
@@ -286,6 +339,7 @@ def main() -> int:
 
         check_c4(client, results)
         check_c2_oversized(sock_path, results)
+        check_c2_suffix_bypass(sock_path, results)
         check_c3_live_probe(binary, name, sock_path, client, results)
 
         # Final: the original process is still alive after everything.

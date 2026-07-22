@@ -280,7 +280,7 @@ QJsonObject AgentBridgeServer::handleSegmentsList(const QJsonValue& params)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
     const QJsonObject p = paramsObject(params);
-    const bool onlyLoaded = p.value("onlyLoaded").toBool(false);
+    const bool onlyLoaded = jsonOptionalBool(p, "onlyLoaded", false);
 
     // Loaded surface names live in CState; the on-disk segment ids come from the
     // package. A segment is "loaded" when its id appears among CState surfaces.
@@ -517,7 +517,7 @@ QJsonObject AgentBridgeServer::handleSegmentsFetch(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
 {
     const QJsonObject p = paramsObject(params);
-    const QString target = p.value("target").toString(QStringLiteral("window"));
+    const QString target = jsonOptionalString(p, "target", QStringLiteral("window"));
 
     QWidget* widget = nullptr;
     if (target.isEmpty() || target == QLatin1String("window")) {
@@ -559,7 +559,7 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     }
 
     if (p.contains("maxDim")) {
-        const int maxDim = p.value("maxDim").toInt(0);
+        const int maxDim = jsonOptionalInt(p, "maxDim", 0);
         if (maxDim > 0) {
             const int longest = std::max(pixmap.width(), pixmap.height());
             if (longest > maxDim)
@@ -575,7 +575,7 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     result["height"] = image.height();
     result["format"] = "png";
 
-    const QString filePath = p.value("filePath").toString();
+    const QString filePath = jsonOptionalString(p, "filePath");
     if (!filePath.isEmpty()) {
         if (!image.save(filePath, "PNG")) {
             QJsonObject data;
@@ -619,8 +619,8 @@ QJsonObject AgentBridgeServer::handleCursorVolumePoint(const QJsonValue& params)
     QPointF scenePos;
     if (p.contains("scene") && p.value("scene").isObject()) {
         const QJsonObject s = p.value("scene").toObject();
-        scenePos = QPointF(jsonRequireFinite(s.value("x"), "x"),
-                           jsonRequireFinite(s.value("y"), "y"));
+        scenePos = QPointF(jsonRequireFiniteFloat(s.value("x"), "x"),
+                           jsonRequireFiniteFloat(s.value("y"), "y"));
     } else {
         scenePos = chunked->lastScenePosition();
     }
@@ -682,7 +682,7 @@ QJsonObject AgentBridgeServer::handleVolumeOpen(const QJsonValue& params)
     auto vpkg = state->vpkg();
     const auto ids = vpkg->volumeIDs();
 
-    const QString volumeId = p.value("volumeId").toString();
+    const QString volumeId = jsonOptionalString(p, "volumeId");
     if (!volumeId.isEmpty()) {
         if (std::find(ids.begin(), ids.end(), volumeId.toStdString()) == ids.end()) {
             QJsonObject data;
@@ -1028,7 +1028,7 @@ void AgentBridgeServer::startManifestFetch(
 QJsonObject AgentBridgeServer::handleCatalogListSamples(const QJsonValue& params)
 {
     const QJsonObject p = paramsObject(params);
-    const bool refresh = p.value("refresh").toBool(false);
+    const bool refresh = jsonOptionalBool(p, "refresh", false);
 
     auto build = [](const vc3d::opendata::OpenDataManifest& manifest) -> QJsonObject {
         QJsonObject result;
@@ -1061,7 +1061,7 @@ QJsonObject AgentBridgeServer::handleCatalogDescribeSample(const QJsonValue& par
         data["param"] = "sampleId";
         throw AgentBridgeError{-32602, "sampleId is required", data};
     }
-    const bool refresh = p.value("refresh").toBool(false);
+    const bool refresh = jsonOptionalBool(p, "refresh", false);
     const std::string sid = sampleId.toStdString();
 
     auto build = [sampleId, sid](const vc3d::opendata::OpenDataManifest& manifest) -> QJsonObject {

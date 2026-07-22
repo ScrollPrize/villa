@@ -41,7 +41,13 @@ constructed at all** — zero runtime cost and zero listening sockets in normal 
   the probe fails (a demonstrably stale socket file from a crashed run) does it call
   `QLocalServer::removeServer(name)` once and retry; if it still fails, print an error to
   stderr and exit with code 2 (a test that asked for a bridge must not silently run without
-  one).
+  one). On Unix the whole probe→remove→listen sequence is serialized by an advisory
+  `flock` on a name-derived lock file (`<tmp>/<name>.listen.lock`): without it two VC3D
+  processes starting the **same** name *concurrently* could both probe before either
+  listens (each sees "not live"), and the loser's `removeServer` would then unlink the
+  winner's live endpoint. The lock is held across probe+listen and released once the
+  process is the live owner (or has refused), so the second acquirer's probe sees the first
+  as live and refuses — the live socket is still never unlinked.
 
 On successful listen, VC3D prints exactly one machine-parseable line to stdout:
 
@@ -65,7 +71,10 @@ existing `friend class RenderBenchReplay;` precedent at `CWindow.hpp:123` — ad
   grows past the bound without a newline, or a newline-terminated line itself exceeds it,
   the server sends a best-effort `-32600 Invalid Request` and disconnects **only that
   client**; other connections are unaffected (the per-socket buffer cannot grow without
-  limit).
+  limit). The residual after consuming complete lines is bounded too: a valid line followed
+  by a >1 MiB unterminated tail (e.g. `"{}\n"` + junk) is caught by a post-framing check, so
+  the pre-loop guard being skipped whenever a newline is present cannot leave an oversized
+  tail buffered indefinitely.
 - Multiple concurrent client connections are allowed. Requests are executed strictly
   serially on the Qt main thread (queued via the socket's `readyRead` on the GUI thread);
   there is no request pipelining guarantee beyond FIFO per connection.

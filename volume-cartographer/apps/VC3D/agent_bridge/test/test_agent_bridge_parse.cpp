@@ -114,6 +114,18 @@ int main()
         CHECK(jsonRequireFinite(QJsonValue(-3.25), "gain") == -3.25);
     });
 
+    // --- jsonRequireFiniteFloat: reject a finite double beyond float range ---
+    // (1e300 is finite as double but overflows to +inf when narrowed to float).
+    expectParamError("finiteFloat<-overflow", "coord",
+        [&] { jsonRequireFiniteFloat(QJsonValue(1.0e300), "coord"); });
+    expectParamError("finiteFloat<-neg-overflow", "coord",
+        [&] { jsonRequireFiniteFloat(QJsonValue(-1.0e300), "coord"); });
+    expectParamError("finiteFloat<-inf", "coord",
+        [&] { jsonRequireFiniteFloat(QJsonValue(kInf), "coord"); });
+    expectNoThrow("finiteFloat<-inrange", [&] {
+        CHECK(jsonRequireFiniteFloat(QJsonValue(123.5), "coord") == 123.5);
+    });
+
     // --- jsonRequireInt: reject wrong type, fractional, non-finite, overflow ---
     expectParamError("int<-string", "steps",
         [&] { jsonRequireInt(QJsonValue(QStringLiteral("3")), "steps"); });
@@ -128,6 +140,19 @@ int main()
     });
     expectNoThrow("int<-integral-double", [&] {
         CHECK(jsonRequireInt(QJsonValue(-8.0), "steps") == -8);
+    });
+
+    // --- jsonRequireUInt64: reject wrong type, fractional, negative, overflow ---
+    expectParamError("uint64<-string", "id",
+        [&] { jsonRequireUInt64(QJsonValue(QStringLiteral("3")), "id"); });
+    expectParamError("uint64<-fractional", "id",
+        [&] { jsonRequireUInt64(QJsonValue(1.5), "id"); });
+    expectParamError("uint64<-negative", "id",
+        [&] { jsonRequireUInt64(QJsonValue(-1), "id"); });
+    expectParamError("uint64<-overflow", "id",
+        [&] { jsonRequireUInt64(QJsonValue(1.0e300), "id"); });
+    expectNoThrow("uint64<-integral", [&] {
+        CHECK(jsonRequireUInt64(QJsonValue(42.0), "id") == 42u);
     });
 
     // --- jsonBoundedInt: reject out of range, accept in range ---
@@ -190,6 +215,14 @@ int main()
         o["y"] = 2.0;
         jsonToScenePoint(QJsonValue(o), "pt");
     });
+    // A finite double beyond float range must be rejected (not silently coerced
+    // to +inf when the coordinate is later narrowed to float).
+    expectParamError("scene<-float-overflow-x", "x", [&] {
+        QJsonObject o;
+        o["x"] = 1.0e300;
+        o["y"] = 2.0;
+        jsonToScenePoint(QJsonValue(o), "pt");
+    });
     expectNoThrow("scene<-valid", [&] {
         QJsonObject o;
         o["x"] = 10.5;
@@ -213,6 +246,13 @@ int main()
         o["x"] = 1.0;
         o["y"] = 2.0;
         o["z"] = true;
+        jsonToVec3(QJsonValue(o), "point");
+    });
+    expectParamError("vec3<-float-overflow-z", "z", [&] {
+        QJsonObject o;
+        o["x"] = 1.0;
+        o["y"] = 2.0;
+        o["z"] = 1.0e300;  // finite double, +inf as float
         jsonToVec3(QJsonValue(o), "point");
     });
     expectNoThrow("vec3<-valid", [&] {

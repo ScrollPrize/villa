@@ -92,8 +92,8 @@ QJsonObject AgentBridgeServer::handleLasagnaEnsureService(const QJsonValue& para
     if (hasHost && hasPort) {
         // External mode: connectToExternal pings GET /health asynchronously;
         // completion is deferred (SPEC §8.4) on serviceStarted/serviceError.
-        const QString host = p.value("host").toString();
-        const int port = p.value("port").toInt();
+        const QString host = jsonRequireString(p, "host");
+        const int port = jsonRequireInt(p.value("port"), "port");
         const int token = beginDeferred(15000, "Lasagna external service connect");
         connect(&mgr, &LasagnaServiceManager::serviceStarted, this,
                 [this, token]() {
@@ -118,7 +118,7 @@ QJsonObject AgentBridgeServer::handleLasagnaEnsureService(const QJsonValue& para
 
     // Internal mode: ensureServiceRunning() blocks until the process is up (or
     // fails) and returns synchronously -- no deferral needed.
-    const QString pythonPath = p.value("pythonPath").toString();
+    const QString pythonPath = jsonOptionalString(p, "pythonPath");
     if (!mgr.ensureServiceRunning(pythonPath)) {
         QJsonObject data;
         data["detail"] = mgr.lastError();
@@ -187,8 +187,8 @@ QJsonObject AgentBridgeServer::handleLasagnaStartOptimization(const QJsonValue& 
         throw AgentBridgeError{-32009, "Lasagna panel unavailable", data};
     }
 
-    const QString configPath = p.value("configPath").toString();
-    const QString atlasPath = p.value("atlasPath").toString();
+    const QString configPath = jsonOptionalString(p, "configPath");
+    const QString atlasPath = jsonOptionalString(p, "atlasPath");
     std::optional<cv::Vec3i> seed;
     if (p.contains("seed")) {
         const cv::Vec3f v = jsonToVec3(p.value("seed"), "seed");
@@ -274,7 +274,7 @@ QJsonObject AgentBridgeServer::handleLasagnaCancel(const QJsonValue& params)
         }
         mgr.stopOptimization();
     } else {
-        const QString jobId = p.value("jobId").toString();
+        const QString jobId = jsonRequireString(p, "jobId");
         if (jobId.startsWith(QLatin1String("job-"))) {
             const JobRecord* job = jobById(jobId);
             if (!job) {

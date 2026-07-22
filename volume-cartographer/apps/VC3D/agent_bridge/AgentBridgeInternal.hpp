@@ -7,6 +7,7 @@
 // from AgentBridgeServer.cpp.
 
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <optional>
 
@@ -69,6 +70,33 @@ inline double jsonRequireFinite(const QJsonValue& v, const char* paramName)
     if (!std::isfinite(d))
         throwParamError(paramName, QStringLiteral("must be a finite number"));
     return d;
+}
+
+// Require a finite JSON number that also stays finite when narrowed to float.
+// A finite double beyond float's range (e.g. 1e300) becomes +/-inf on cast, which
+// would silently violate the finite-coordinate promise of the {x,y,z} helpers.
+// (SPEC §5 / FINDING 11b.)
+inline double jsonRequireFiniteFloat(const QJsonValue& v, const char* paramName)
+{
+    const double d = jsonRequireFinite(v, paramName);
+    if (std::abs(d) > static_cast<double>(std::numeric_limits<float>::max()))
+        throwParamError(paramName, QStringLiteral("is out of range for a float coordinate"));
+    return d;
+}
+
+// Require an integral JSON number carried as uint64. Rejects wrong types,
+// non-finite, fractional values, negatives, and values overflowing uint64 —
+// e.g. a finite double like 1e300 that would be undefined when cast (FINDING 11a).
+inline uint64_t jsonRequireUInt64(const QJsonValue& v, const char* paramName)
+{
+    const double d = jsonRequireNumber(v, paramName);
+    if (!std::isfinite(d) || std::floor(d) != d)
+        throwParamError(paramName, QStringLiteral("must be an integer"));
+    // 2^64 is exactly representable as double; reject at/above it so the cast is
+    // always in range (a value == 2^64 is out of uint64's [0, 2^64) domain).
+    if (d < 0.0 || d >= std::ldexp(1.0, 64))
+        throwParamError(paramName, QStringLiteral("is out of range"));
+    return static_cast<uint64_t>(d);
 }
 
 // Require an integer carried by an integral JSON number. Rejects wrong types,
@@ -144,8 +172,8 @@ inline QPointF jsonToScenePoint(const QJsonValue& value, const char* paramName)
     const QJsonObject o = value.toObject();
     if (!o.contains("x") || !o.contains("y"))
         throwParamError(paramName, QStringLiteral("requires x and y"));
-    const double x = jsonRequireFinite(o.value("x"), "x");
-    const double y = jsonRequireFinite(o.value("y"), "y");
+    const double x = jsonRequireFiniteFloat(o.value("x"), "x");
+    const double y = jsonRequireFiniteFloat(o.value("y"), "y");
     return QPointF(x, y);
 }
 
@@ -165,10 +193,12 @@ inline cv::Vec3f jsonToVec3(const QJsonValue& value, const char* paramName)
             QStringLiteral("%1 requires x, y and z").arg(QLatin1String(paramName)), data};
     }
     // Reject wrong-typed (string/bool) or non-finite coordinates rather than
-    // silently coercing them to 0 (SPEC §5).
-    const double x = jsonRequireFinite(o.value("x"), "x");
-    const double y = jsonRequireFinite(o.value("y"), "y");
-    const double z = jsonRequireFinite(o.value("z"), "z");
+    // silently coercing them to 0 (SPEC §5). jsonRequireFiniteFloat additionally
+    // rejects a finite double that would overflow to +/-inf on the float cast
+    // below (FINDING 11b).
+    const double x = jsonRequireFiniteFloat(o.value("x"), "x");
+    const double y = jsonRequireFiniteFloat(o.value("y"), "y");
+    const double z = jsonRequireFiniteFloat(o.value("z"), "z");
     return cv::Vec3f(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
 }
 

@@ -92,7 +92,10 @@ uint64_t jsonToFiberId(const QJsonValue& value, const char* paramName)
     }
     if (value.isDouble()) {
         const double d = value.toDouble();
-        if (std::isfinite(d) && d > 0 && std::floor(d) == d)
+        // Reject a finite double that would overflow uint64 on cast (e.g. 1e300):
+        // 2^64 is exactly representable as double, so require strictly below it
+        // (FINDING 11a).
+        if (std::isfinite(d) && d > 0 && std::floor(d) == d && d < std::ldexp(1.0, 64))
             return static_cast<uint64_t>(d);
         data["value"] = value;
         throw AgentBridgeError{-32602,
@@ -151,7 +154,7 @@ QJsonObject AgentBridgeServer::handleFiberLaunch(const QJsonValue& params)
 
     // Position conversion per §3.6 conventions (same round-trip rule as
     // canvas.click).
-    const QString space = p.value("space").toString(QStringLiteral("volume"));
+    const QString space = jsonOptionalString(p, "space", QStringLiteral("volume"));
     QPointF scenePos;
     if (space == QLatin1String("scene")) {
         const QJsonValue posv = p.value("position");
@@ -161,8 +164,8 @@ QJsonObject AgentBridgeServer::handleFiberLaunch(const QJsonValue& params)
             throw AgentBridgeError{-32602, "scene-space position must be an object {x, y}", data};
         }
         const QJsonObject po = posv.toObject();
-        scenePos = QPointF(jsonRequireFinite(po.value("x"), "x"),
-                           jsonRequireFinite(po.value("y"), "y"));
+        scenePos = QPointF(jsonRequireFiniteFloat(po.value("x"), "x"),
+                           jsonRequireFiniteFloat(po.value("y"), "y"));
     } else if (space == QLatin1String("volume")) {
         const cv::Vec3f vol = jsonToVec3(p.value("position"), "position");
         scenePos = chunked->volumeToScene(vol);
@@ -195,7 +198,7 @@ QJsonObject AgentBridgeServer::handleFiberLaunch(const QJsonValue& params)
         throw AgentBridgeError{-32003, "Invalid coordinates", data};
     }
 
-    const bool replaceOwning = p.value("replaceOwning").toBool(true);
+    const bool replaceOwning = jsonOptionalBool(p, "replaceOwning", true);
     (void)ctrl->takeLastSuppressedError();
     ctrl->launchFromViewerAtPoint(chunked, scenePos, replaceOwning);
     const QString err = ctrl->takeLastSuppressedError();
@@ -278,7 +281,10 @@ QJsonObject AgentBridgeServer::handleFiberOpen(const QJsonValue& params)
     auto readIndex = [&](const char* key) -> int {
         const QJsonValue v = p.value(QLatin1String(key));
         const double d = v.toDouble(std::numeric_limits<double>::quiet_NaN());
-        if (!v.isDouble() || !std::isfinite(d) || std::floor(d) != d || d < 0) {
+        // The int upper-bound guard rejects a finite double (e.g. 1e300) that would
+        // overflow the int cast below (FINDING 11a).
+        if (!v.isDouble() || !std::isfinite(d) || std::floor(d) != d || d < 0 ||
+            d > static_cast<double>(std::numeric_limits<int>::max())) {
             QJsonObject data;
             data["param"] = QString::fromLatin1(key);
             throw AgentBridgeError{-32602,
@@ -303,7 +309,8 @@ QJsonObject AgentBridgeServer::handleFiberOpen(const QJsonValue& params)
         const QJsonArray sa = sv.toArray();
         auto readSpanIndex = [&](const QJsonValue& v, const char* which) -> int {
             const double d = v.toDouble(std::numeric_limits<double>::quiet_NaN());
-            if (!v.isDouble() || !std::isfinite(d) || std::floor(d) != d || d < 0) {
+            if (!v.isDouble() || !std::isfinite(d) || std::floor(d) != d || d < 0 ||
+                d > static_cast<double>(std::numeric_limits<int>::max())) {
                 QJsonObject data;
                 data["param"] = "span";
                 data["detail"] = QStringLiteral("%1 span index must be a non-negative integer")

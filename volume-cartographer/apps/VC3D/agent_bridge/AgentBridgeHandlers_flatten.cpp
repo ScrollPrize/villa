@@ -149,11 +149,9 @@ QJsonObject AgentBridgeServer::handleFlattenSlim(const QJsonValue& params)
     SegmentationCommandHandler::SlimFlattenParams sp;  // headless defaults (§20)
 
     if (p.contains("iterations")) {
-        if (!p.value("iterations").isDouble()) {
-            QJsonObject data; data["param"] = "iterations";
-            throw AgentBridgeError{-32602, "iterations must be an integer", data};
-        }
-        sp.iterations = p.value("iterations").toInt();
+        // jsonRequireInt rejects a fractional value (e.g. 1.5) that toInt() would
+        // silently truncate, plus wrong types and int overflow.
+        sp.iterations = jsonRequireInt(p.value("iterations"), "iterations");
         if (sp.iterations < 1) {
             QJsonObject data; data["param"] = "iterations";
             throw AgentBridgeError{-32602, "iterations must be >= 1", data};
@@ -197,7 +195,7 @@ QJsonObject AgentBridgeServer::handleFlattenSlim(const QJsonValue& params)
         }
         sp.inpaintHoles = p.value("inpaintHoles").toBool();
     }
-    sp.outputDir = p.value("outputDir").toString();
+    sp.outputDir = jsonOptionalString(p, "outputDir");
 
     SegmentationCommandHandler* handler =
         _window ? _window->_segmentationCommandHandler.get() : nullptr;
@@ -226,22 +224,14 @@ QJsonObject AgentBridgeServer::handleFlattenAbf(const QJsonValue& params)
     int iterations = 10;        // ABFFlattenDialog session default
     int downsampleFactor = 1;
     if (p.contains("iterations")) {
-        if (!p.value("iterations").isDouble()) {
-            QJsonObject data; data["param"] = "iterations";
-            throw AgentBridgeError{-32602, "iterations must be an integer", data};
-        }
-        iterations = p.value("iterations").toInt();
+        iterations = jsonRequireInt(p.value("iterations"), "iterations");
         if (iterations < 1) {
             QJsonObject data; data["param"] = "iterations";
             throw AgentBridgeError{-32602, "iterations must be >= 1", data};
         }
     }
     if (p.contains("downsampleFactor")) {
-        if (!p.value("downsampleFactor").isDouble()) {
-            QJsonObject data; data["param"] = "downsampleFactor";
-            throw AgentBridgeError{-32602, "downsampleFactor must be an integer", data};
-        }
-        downsampleFactor = p.value("downsampleFactor").toInt();
+        downsampleFactor = jsonRequireInt(p.value("downsampleFactor"), "downsampleFactor");
         if (downsampleFactor < 1) {
             QJsonObject data; data["param"] = "downsampleFactor";
             throw AgentBridgeError{-32602, "downsampleFactor must be >= 1", data};
@@ -296,11 +286,9 @@ QJsonObject AgentBridgeServer::handleFlattenStraighten(const QJsonValue& params)
         }
     }
     if (p.contains("overlapPasses")) {
-        if (!p.value("overlapPasses").isDouble()) {
-            QJsonObject data; data["param"] = "overlapPasses";
-            throw AgentBridgeError{-32602, "overlapPasses must be an integer", data};
-        }
-        stp.overlapPasses = p.value("overlapPasses").toInt();
+        // jsonRequireInt rejects fractional (e.g. 1.5) / wrong-typed / overflowing
+        // values that toInt() would otherwise silently accept.
+        stp.overlapPasses = jsonRequireInt(p.value("overlapPasses"), "overlapPasses");
         if (stp.overlapPasses < 0) {
             QJsonObject data; data["param"] = "overlapPasses";
             throw AgentBridgeError{-32602, "overlapPasses must be >= 0", data};
@@ -331,7 +319,7 @@ QJsonObject AgentBridgeServer::handleFlattenStraighten(const QJsonValue& params)
             throw AgentBridgeError{-32602, "trimMaxEdge must be a finite value >= 0", data};
         }
     }
-    stp.outputDir = p.value("outputDir").toString();
+    stp.outputDir = jsonOptionalString(p, "outputDir");
 
     SegmentationCommandHandler* handler =
         _window ? _window->_segmentationCommandHandler.get() : nullptr;

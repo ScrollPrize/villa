@@ -30,6 +30,12 @@
 #include <string>
 #include <unordered_set>
 
+#if defined(Q_OS_UNIX)
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
 #include "CWindow.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
@@ -143,6 +149,33 @@ bool AgentBridgeServer::listen(const QString& serverName)
     // Restrict the endpoint to the current user (SPEC §6): the bridge grants full
     // control of the running app, so no other account should be able to connect.
     _server->setSocketOptions(QLocalServer::UserAccessOption);
+
+#if defined(Q_OS_UNIX)
+    // Serialize the whole probe->remove->listen sequence against another VC3D
+    // starting the SAME name CONCURRENTLY (codex #3). Without this, both can
+    // probe before either listens (each sees "not live"); the first listens, the
+    // second's listen() fails, and its removeServer() below would then unlink the
+    // first's LIVE socket -- stranding it and violating SPEC §6's "a live socket
+    // name is never unlinked as stale." An advisory lock on a name-derived file,
+    // held across probe+listen and released only once we are the live owner (or
+    // have refused), makes acquisition atomic. Best-effort: if the lock cannot be
+    // taken we still fall through to the probe, which covers the common
+    // (already-running, not simultaneous) case.
+    struct ListenLock {
+        int fd{-1};
+        ~ListenLock() { if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); } }
+    } listenLock;
+    {
+        QString safeName = serverName;
+        safeName.replace(QLatin1Char('/'), QLatin1Char('_'));
+        const QByteArray lockPath =
+            (QDir::tempPath() + QLatin1Char('/') + safeName + QStringLiteral(".listen.lock"))
+                .toLocal8Bit();
+        listenLock.fd = ::open(lockPath.constData(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (listenLock.fd >= 0)
+            ::flock(listenLock.fd, LOCK_EX);  // blocks until the concurrent starter releases
+    }
+#endif
 
     // Probe the name BEFORE listening: a successful connect means a LIVE bridge
     // already owns the endpoint, so we must refuse without touching it. We cannot
@@ -296,6 +329,22 @@ void AgentBridgeServer::onSocketReadyRead()
         if (line.trimmed().isEmpty())
             continue;
         processLine(socket, line);
+    }
+
+    // Bound the UNTERMINATED remainder left after consuming complete lines. The
+    // pre-loop check is skipped whenever the read contained any newline, so a
+    // valid line followed by a >1 MiB tail with no further newline (e.g.
+    // "{}\n" + 2 MiB of junk) would otherwise let that tail sit unbounded until
+    // more data or disconnect (codex #9). The loop only exits with no newline in
+    // `buffer`, so any residual over the bound is a partial oversized line: drop
+    // ONLY this client, others untouched (SPEC §6).
+    if (buffer.size() > kMaxLineBytes) {
+        sendError(socket, QJsonValue(QJsonValue::Null), -32600,
+                  QStringLiteral("Invalid Request: request exceeds %1-byte limit")
+                      .arg(kMaxLineBytes));
+        _buffers.remove(socket);  // `buffer` dangles after this; do not touch it
+        socket->disconnectFromServer();
+        return;
     }
 }
 

@@ -179,6 +179,14 @@ QJsonObject AgentBridgeServer::handleAtlasSearchStart(const QJsonValue& params)
                 QStringLiteral("%1 must be an array of strings").arg(QLatin1String(key)), data};
         }
         for (const QJsonValue& tv : v.toArray()) {
+            // Reject a wrong-typed element rather than silently coercing it to ""
+            // and dropping it (SPEC §5).
+            if (!tv.isString()) {
+                QJsonObject data;
+                data["param"] = QString::fromLatin1(key);
+                throw AgentBridgeError{-32602,
+                    QStringLiteral("%1 must be an array of strings").arg(QLatin1String(key)), data};
+            }
             const QString s = tv.toString();
             if (!s.isEmpty())
                 tags.append(s);
@@ -262,14 +270,14 @@ QJsonObject AgentBridgeServer::handleAtlasSearchResults(const QJsonValue& params
     const QJsonObject p = paramsObject(params);
     int offset = 0;
     if (p.contains("offset")) {
-        const QJsonValue ov = p.value("offset");
-        const double od = ov.toDouble(std::numeric_limits<double>::quiet_NaN());
-        if (!ov.isDouble() || !std::isfinite(od) || std::floor(od) != od || od < 0) {
+        // jsonRequireInt rejects wrong-typed / fractional / int-overflowing values
+        // (the last guarding the cast against a finite double like 1e300, §11a).
+        offset = jsonRequireInt(p.value("offset"), "offset");
+        if (offset < 0) {
             QJsonObject data;
             data["param"] = "offset";
             throw AgentBridgeError{-32602, "offset must be a non-negative integer", data};
         }
-        offset = static_cast<int>(od);
     }
     int limit = 100;
     if (p.contains("limit")) {
@@ -335,14 +343,10 @@ QJsonObject AgentBridgeServer::handleAtlasOpenResult(const QJsonValue& params)
         throw AgentBridgeError{-32010, "Window unavailable", {}};
 
     const QJsonObject p = paramsObject(params);
-    const QJsonValue iv = p.value("index");
-    const double id = iv.toDouble(std::numeric_limits<double>::quiet_NaN());
-    if (!iv.isDouble() || !std::isfinite(id) || std::floor(id) != id) {
-        QJsonObject data;
-        data["param"] = "index";
-        throw AgentBridgeError{-32602, "index must be an integer", data};
-    }
-    const int index = static_cast<int>(id);
+    // jsonRequireInt rejects wrong-typed / fractional / int-overflowing values
+    // (the last guarding the cast against a finite double like 1e300, §11a). The
+    // in-range check against the result count follows below.
+    const int index = jsonRequireInt(p.value("index"), "index");
     const auto& results = _window->_atlasSearchResults;
     if (index < 0 || index >= static_cast<int>(results.size())) {
         QJsonObject data;

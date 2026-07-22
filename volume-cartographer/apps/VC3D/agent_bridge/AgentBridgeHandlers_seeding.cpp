@@ -409,13 +409,9 @@ QJsonObject AgentBridgeServer::handlePushPullSetConfig(const QJsonValue& params)
     };
     auto readInt = [&](const char* key, int& dst) {
         if (!p.contains(key)) return;
-        const QJsonValue v = p.value(key);
-        if (!v.isDouble()) {
-            QJsonObject data;
-            data["param"] = key;
-            throw AgentBridgeError{-32602, QStringLiteral("%1 must be an integer").arg(key), data};
-        }
-        dst = v.toInt();
+        // jsonRequireInt rejects wrong-typed, fractional (e.g. 1.5), and
+        // int-overflowing values rather than silently truncating via toInt().
+        dst = jsonRequireInt(p.value(key), key);
     };
     auto readBool = [&](const char* key, bool& dst) {
         if (!p.contains(key)) return;
@@ -554,7 +550,7 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
         // Strict: reject wrong-typed and fractional values (SPEC §5).
         rt.ompThreads = jsonRequireInt(p.value("ompThreads"), "ompThreads");
     }
-    rt.tgtDir = p.value("outputDir").toString();
+    rt.tgtDir = jsonOptionalString(p, "outputDir");
 
     const QString jobId = beginJob(QStringLiteral("tool"),
                                    QStringLiteral("tracer.run_trace"),
@@ -661,7 +657,7 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
 
     // volumeId: optional; validated here so a bad id is a clean -32007 before the
     // job is registered (mirrors segmentation.grow_patch_from_seed).
-    rp.volumeId = p.value("volumeId").toString();
+    rp.volumeId = jsonOptionalString(p, "volumeId");
     if (!rp.volumeId.isEmpty()) {
         const auto ids = state->vpkg()->volumeIDs();
         if (std::find(ids.begin(), ids.end(), rp.volumeId.toStdString()) == ids.end()) {
@@ -687,14 +683,10 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
         throw AgentBridgeError{-32602, "scale must be a finite value > 0", data};
     }
 
-    // groupIdx: optional, default 0; OME-Zarr group index (>= 0).
+    // groupIdx: optional, default 0; OME-Zarr group index (>= 0). jsonRequireInt
+    // rejects wrong-typed / fractional (e.g. 1.5) / overflowing values.
     if (p.contains("groupIdx")) {
-        if (!p.value("groupIdx").isDouble()) {
-            QJsonObject data;
-            data["param"] = "groupIdx";
-            throw AgentBridgeError{-32602, "groupIdx must be an integer", data};
-        }
-        rp.groupIdx = p.value("groupIdx").toInt(0);
+        rp.groupIdx = jsonRequireInt(p.value("groupIdx"), "groupIdx");
     }
     if (rp.groupIdx < 0) {
         QJsonObject data;
@@ -702,14 +694,10 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
         throw AgentBridgeError{-32602, "groupIdx must be >= 0", data};
     }
 
-    // numSlices: optional, default 1; must be >= 1.
+    // numSlices: optional, default 1; must be >= 1. jsonRequireInt rejects
+    // wrong-typed / fractional / overflowing values.
     if (p.contains("numSlices")) {
-        if (!p.value("numSlices").isDouble()) {
-            QJsonObject data;
-            data["param"] = "numSlices";
-            throw AgentBridgeError{-32602, "numSlices must be an integer", data};
-        }
-        rp.numSlices = p.value("numSlices").toInt(1);
+        rp.numSlices = jsonRequireInt(p.value("numSlices"), "numSlices");
     }
     if (rp.numSlices < 1) {
         QJsonObject data;
@@ -735,7 +723,7 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
         rp.voxelSizeUm = vs;
     }
 
-    rp.outputDir = p.value("outputDir").toString();
+    rp.outputDir = jsonOptionalString(p, "outputDir");
 
     // Render runs the external vc_render_tifxyz process: the "tool" source (§8.3).
     requireSourceIdle(QStringLiteral("tool"));
