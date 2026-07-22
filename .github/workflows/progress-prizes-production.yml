@@ -1,0 +1,867 @@
+name: Progress Prize production rollover
+run-name: >-
+  Progress Prize production ${{ inputs.operation }}
+  ${{ inputs['source-cycle'] }} to ${{ inputs['target-cycle'] }}
+  request ${{ inputs['request-id'] || 'manual' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Safe production operation
+        required: true
+        type: choice
+        default: validate
+        options:
+          - validate
+          - dry-run
+          - prepare
+          - activate
+          - verify
+      source-cycle:
+        description: Source cycle (YYYY-MM)
+        required: true
+        type: string
+        default: "2026-07"
+      target-cycle:
+        description: Consecutive target cycle (YYYY-MM)
+        required: true
+        type: string
+        default: "2026-08"
+      verify-mode:
+        description: Verification state
+        required: true
+        type: choice
+        default: prepared
+        options:
+          - prepared
+          - active
+      request-id:
+        description: Trusted schedule run ID; leave empty for manual dispatch
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: progress-prizes-production
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  preflight:
+    name: Validate public production controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Reject invalid trigger context and controls
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          OPERATION: ${{ inputs.operation }}
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+          VERIFY_MODE: ${{ inputs['verify-mode'] }}
+          REQUEST_ID: ${{ inputs['request-id'] }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+
+          assert.equal(process.env.REPOSITORY, 'ScrollPrize/villa');
+          assert.equal(process.env.REPOSITORY_ID, '890972577');
+          assert.equal(process.env.REPOSITORY_OWNER_ID, '121906140');
+          assert.equal(process.env.REF, 'refs/heads/main');
+          assert.match(process.env.HEAD_SHA ?? '', /^[a-f0-9]{40}$/);
+          assert.equal(process.env.EVENT_NAME, 'workflow_dispatch');
+          assert.equal(
+            new Set(['validate', 'dry-run', 'prepare', 'activate', 'verify'])
+              .has(process.env.OPERATION ?? ''),
+            true,
+          );
+          assert.equal(new Set(['prepared', 'active']).has(process.env.VERIFY_MODE ?? ''), true);
+          assert.match(process.env.SOURCE_CYCLE ?? '', /^\d{4}-(?:0[1-9]|1[0-2])$/);
+          assert.match(process.env.TARGET_CYCLE ?? '', /^\d{4}-(?:0[1-9]|1[0-2])$/);
+
+          const [sourceYear, sourceMonth] = process.env.SOURCE_CYCLE.split('-').map(Number);
+          const target = sourceMonth === 12
+            ? `${sourceYear + 1}-01`
+            : `${sourceYear}-${String(sourceMonth + 1).padStart(2, '0')}`;
+          assert.equal(process.env.TARGET_CYCLE, target);
+          if (process.env.REQUEST_ID !== '') assert.match(process.env.REQUEST_ID, /^[1-9]\d*$/);
+          NODE
+
+  validate:
+    if: inputs.operation == 'validate'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-production
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out the exact trusted trigger commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Validate production Google Form
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: validate
+          environment: production
+          source-cycle: ${{ inputs['source-cycle'] }}
+          branch: main
+          target-branch: main
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ inputs['source-cycle'] == '2026-07' && secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL || '' }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  dry-run:
+    if: inputs.operation == 'dry-run'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the exact trusted trigger commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Dry-run production preparation
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: prepare
+          environment: production
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          dry-run: "true"
+          branch: main
+          target-branch: main
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+      - name: Summarize the public no-mutation proposal
+        env:
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFile } from 'node:fs/promises';
+          import { getCycleDeadline } from './scrollprize.org/scripts/progress-prizes/dates.mjs';
+
+          const deadline = getCycleDeadline(process.env.TARGET_CYCLE);
+          const title = `${deadline.monthName} ${deadline.year} Progress Prizes`;
+          await appendFile(
+            process.env.GITHUB_STEP_SUMMARY,
+            [
+              '### Production dry-run proposal',
+              '',
+              `- Form title: \`${title}\``,
+              `- Public deadline: \`${deadline.label}\``,
+              '- Google mutation: `disabled`',
+              '- Website mutation: `disabled`',
+              '',
+            ].join('\n'),
+          );
+          NODE
+
+  prepare-google:
+    if: inputs.operation == 'prepare'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-production
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out the exact trusted trigger commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Prepare the next production Google Form
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: prepare
+          environment: production
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          branch: main
+          target-branch: main
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  prepare-page:
+    if: >-
+      inputs.operation == 'prepare' &&
+      needs.prepare-google.outputs['responder-uri'] != ''
+    needs: prepare-google
+    uses: ./.github/workflows/progress-prizes-page-pr.yml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      environment: production
+      source-cycle: ${{ inputs['source-cycle'] }}
+      target-cycle: ${{ inputs['target-cycle'] }}
+      responder-uri: ${{ needs.prepare-google.outputs['responder-uri'] }}
+      head-branch: codex/progress-prize-${{ inputs['target-cycle'] }}
+      base-branch: main
+
+  activation-state:
+    name: Resolve pending or completed activation
+    if: inputs.operation == 'activate'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      state: ${{ steps.state.outputs.state }}
+      head-sha: ${{ steps.state.outputs['head-sha'] }}
+      base-sha: ${{ steps.state.outputs['base-sha'] }}
+      pr-number: ${{ steps.state.outputs['pr-number'] }}
+      refresh-required: ${{ steps.state.outputs['refresh-required'] }}
+    steps:
+      - name: Check out exact trusted state code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Resolve trusted GitHub activation state
+        id: state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: codex/progress-prize-${{ inputs['target-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+          TRIGGER_SHA: ${{ github.sha }}
+        run: >-
+          node .github/progress-prizes-github.mjs activation-state
+          --head "$HEAD_BRANCH"
+          --base main
+          --cycle "$TARGET_CYCLE"
+          --expected-base-sha "$TRIGGER_SHA"
+
+  activation-page-state:
+    name: Recover the intentionally public prepared page state
+    if: >-
+      inputs.operation == 'activate' &&
+      needs.activation-state.outputs.state == 'pending' &&
+      needs.activation-state.outputs['refresh-required'] == 'true'
+    needs: activation-state
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      responder-uri: ${{ steps.page.outputs['responder-uri'] }}
+    steps:
+      - name: Check out exact trusted parser code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Read only managed public fields from the pending commit
+        id: page
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.activation-state.outputs['head-sha'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFile } from 'node:fs/promises';
+          import { parseProgressPrizeMarkdown } from './scrollprize.org/scripts/progress-prizes/markdown.mjs';
+
+          const sha = process.env.HEAD_SHA ?? '';
+          if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error('Recovery requires an exact commit SHA.');
+          const url = new URL('https://api.github.com/repos/ScrollPrize/villa/contents/scrollprize.org/docs/34_prizes.md');
+          url.searchParams.set('ref', sha);
+          const response = await fetch(url, {
+            redirect: 'error',
+            headers: {
+              accept: 'application/vnd.github.raw+json',
+              authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+              'user-agent': 'progress-prize-page-recovery',
+              'x-github-api-version': '2022-11-28',
+            },
+          });
+          if (response.status !== 200) throw new Error('Could not read the pending managed page.');
+          const body = await response.text();
+          if (Buffer.byteLength(body, 'utf8') > 1024 * 1024) throw new Error('Managed page response is too large.');
+          const page = parseProgressPrizeMarkdown(body);
+          if (page.cycle !== process.env.TARGET_CYCLE) {
+            throw new Error('Pending page cycle does not match the requested recovery cycle.');
+          }
+          await appendFile(process.env.GITHUB_OUTPUT, `responder-uri=${page.responderUri}\n`);
+          NODE
+
+  refresh-page:
+    name: Rebuild a stale prepared page on the exact current main
+    if: >-
+      inputs.operation == 'activate' &&
+      needs.activation-state.outputs.state == 'pending' &&
+      needs.activation-state.outputs['refresh-required'] == 'true'
+    needs:
+      - activation-state
+      - activation-page-state
+    uses: ./.github/workflows/progress-prizes-page-pr.yml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      environment: production
+      source-cycle: ${{ inputs['source-cycle'] }}
+      target-cycle: ${{ inputs['target-cycle'] }}
+      responder-uri: ${{ needs.activation-page-state.outputs['responder-uri'] }}
+      head-branch: codex/progress-prize-${{ inputs['target-cycle'] }}
+      base-branch: main
+
+  activation-binding:
+    name: Freeze the prepared activation commit
+    if: >-
+      always() &&
+      needs.activation-state.result == 'success' &&
+      needs.activation-state.outputs.state == 'pending' &&
+      (needs.refresh-page.result == 'success' || needs.refresh-page.result == 'skipped')
+    needs:
+      - activation-state
+      - refresh-page
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      head-sha: ${{ steps.binding.outputs['head-sha'] }}
+      base-sha: ${{ steps.binding.outputs['base-sha'] }}
+      pr-number: ${{ steps.binding.outputs['pr-number'] }}
+    steps:
+      - name: Select and validate the exact pending tuple
+        id: binding
+        env:
+          REFRESH_REQUIRED: ${{ needs.activation-state.outputs['refresh-required'] }}
+          STATE_HEAD_SHA: ${{ needs.activation-state.outputs['head-sha'] }}
+          STATE_BASE_SHA: ${{ needs.activation-state.outputs['base-sha'] }}
+          STATE_PR_NUMBER: ${{ needs.activation-state.outputs['pr-number'] }}
+          REFRESH_HEAD_SHA: ${{ needs.refresh-page.outputs['head-sha'] }}
+          REFRESH_BASE_SHA: ${{ needs.refresh-page.outputs['base-sha'] }}
+          REFRESH_PR_NUMBER: ${{ needs.refresh-page.outputs['pr-number'] }}
+          TRIGGER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if test "$REFRESH_REQUIRED" = true; then
+            head_sha="$REFRESH_HEAD_SHA"
+            base_sha="$REFRESH_BASE_SHA"
+            pr_number="$REFRESH_PR_NUMBER"
+          else
+            test "$REFRESH_REQUIRED" = false
+            head_sha="$STATE_HEAD_SHA"
+            base_sha="$STATE_BASE_SHA"
+            pr_number="$STATE_PR_NUMBER"
+          fi
+          [[ "$head_sha" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$base_sha" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$pr_number" =~ ^[1-9][0-9]*$ ]]
+          test "$base_sha" = "$TRIGGER_SHA"
+          printf 'head-sha=%s\nbase-sha=%s\npr-number=%s\n' \
+            "$head_sha" "$base_sha" "$pr_number" >>"$GITHUB_OUTPUT"
+
+  activation-gate:
+    name: Gate the exact production PR and preview
+    if: inputs.operation == 'activate' && needs.activation-state.outputs.state == 'pending'
+    needs:
+      - activation-state
+      - activation-binding
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      pull-requests: read
+      statuses: read
+    outputs:
+      head-sha: ${{ steps.gate.outputs['head-sha'] }}
+      base-sha: ${{ steps.gate.outputs['base-sha'] }}
+      pr-number: ${{ steps.gate.outputs['pr-number'] }}
+    steps:
+      - name: Check out exact trusted gate code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Wait for the immutable code checks and Vercel preview
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: codex/progress-prize-${{ inputs['target-cycle'] }}
+          HEAD_SHA: ${{ needs.activation-binding.outputs['head-sha'] }}
+          BASE_SHA: ${{ needs.activation-binding.outputs['base-sha'] }}
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+        run: >-
+          node .github/progress-prizes-github.mjs gate
+          --head "$HEAD_BRANCH"
+          --base main
+          --base-sha "$BASE_SHA"
+          --source-cycle "$SOURCE_CYCLE"
+          --cycle "$TARGET_CYCLE"
+          --sha "$HEAD_SHA"
+          --timeout-seconds 1800
+      - name: Open approval only inside the bounded cutoff window
+        env:
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { getCycleDeadline } from './scrollprize.org/scripts/progress-prizes/dates.mjs';
+
+          const waitMilliseconds = getCycleDeadline(process.env.SOURCE_CYCLE).cutoffAt.getTime()
+            - Date.now();
+          if (waitMilliseconds > 60 * 60 * 1000) {
+            throw new Error('Production approval was requested outside its bounded cutoff window.');
+          }
+          NODE
+
+  activation-approval:
+    name: Approve the real production cutoff
+    if: inputs.operation == 'activate' && needs.activation-state.outputs.state == 'pending'
+    needs:
+      - activation-state
+      - activation-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: progress-prizes-production-activation
+    permissions: {}
+    steps:
+      - name: Bind approval to the exact gated run
+        env:
+          HEAD_SHA: ${{ needs.activation-gate.outputs['head-sha'] }}
+          BASE_SHA: ${{ needs.activation-gate.outputs['base-sha'] }}
+          TRIGGER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$HEAD_SHA" =~ ^[a-f0-9]{40}$ ]]
+          test "$BASE_SHA" = "$TRIGGER_SHA"
+
+  activate-production:
+    name: Lease and activate production
+    if: inputs.operation == 'activate' && needs.activation-state.outputs.state == 'pending'
+    needs:
+      - activation-state
+      - activation-gate
+      - activation-approval
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    environment: progress-prizes-production
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      id-token: write
+      pull-requests: read
+      statuses: read
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+      head-sha: ${{ needs.activation-gate.outputs['head-sha'] }}
+      base-sha: ${{ needs.activation-gate.outputs['base-sha'] }}
+      pr-number: ${{ needs.activation-gate.outputs['pr-number'] }}
+    steps:
+      - name: Check out the exact trusted trigger commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Activate only the exact gated production transition
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: activate
+          environment: production
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          branch: codex/progress-prize-${{ inputs['target-cycle'] }}
+          target-branch: main
+          head-sha: ${{ needs.activation-gate.outputs['head-sha'] }}
+          base-sha: ${{ needs.activation-gate.outputs['base-sha'] }}
+          github-token: ${{ github.token }}
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  merge:
+    name: Ready and merge the activated page
+    if: inputs.operation == 'activate' && needs.activation-state.outputs.state == 'pending'
+    needs:
+      - activation-state
+      - activate-production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out exact trusted merge code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Merge only the activated immutable tuple
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: codex/progress-prize-${{ inputs['target-cycle'] }}
+          HEAD_SHA: ${{ needs.activate-production.outputs['head-sha'] }}
+          BASE_SHA: ${{ needs.activate-production.outputs['base-sha'] }}
+          PR_NUMBER: ${{ needs.activate-production.outputs['pr-number'] }}
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+        run: >-
+          node .github/progress-prizes-github.mjs merge
+          --head "$HEAD_BRANCH"
+          --base main
+          --sha "$HEAD_SHA"
+          --base-sha "$BASE_SHA"
+          --pr-number "$PR_NUMBER"
+          --source-cycle "$SOURCE_CYCLE"
+          --cycle "$TARGET_CYCLE"
+
+  verify-completed-activation:
+    if: inputs.operation == 'activate' && needs.activation-state.outputs.state == 'completed'
+    needs:
+      - preflight
+      - activation-state
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the exact trusted trigger commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Verify the already completed production activation
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: verify
+          environment: production
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          verify-mode: active
+          branch: main
+          target-branch: main
+          head-sha: ${{ needs.activation-state.outputs['head-sha'] }}
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  verify-prepared-state:
+    name: Resolve the pending page for prepared verification
+    if: inputs.operation == 'verify' && inputs['verify-mode'] == 'prepared'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      head-branch: ${{ steps.binding.outputs['head-branch'] }}
+      head-sha: ${{ steps.state.outputs['head-sha'] }}
+    steps:
+      - name: Check out exact trusted state code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Resolve exactly one pending rollover pull request
+        id: state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: codex/progress-prize-${{ inputs['target-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+          TRIGGER_SHA: ${{ github.sha }}
+        run: >-
+          node .github/progress-prizes-github.mjs activation-state
+          --head "$HEAD_BRANCH"
+          --base main
+          --cycle "$TARGET_CYCLE"
+          --expected-base-sha "$TRIGGER_SHA"
+      - name: Require pending prepared state
+        if: steps.state.outputs.state != 'pending'
+        run: |
+          echo "Prepared verification requires exactly one pending rollover pull request." >&2
+          exit 1
+      - name: Reject a prepared page that requires reconstruction
+        if: steps.state.outputs['refresh-required'] != 'false'
+        run: |
+          echo "Prepared verification requires an exact page-only commit on current main." >&2
+          exit 1
+      - name: Export the fixed automation branch
+        id: binding
+        env:
+          HEAD_BRANCH: codex/progress-prize-${{ inputs['target-cycle'] }}
+        run: printf 'head-branch=%s\n' "$HEAD_BRANCH" >>"$GITHUB_OUTPUT"
+
+  verify-prepared:
+    if: inputs.operation == 'verify' && inputs['verify-mode'] == 'prepared'
+    needs:
+      - preflight
+      - verify-prepared-state
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the exact trusted trigger commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Verify the exact prepared production form and page
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: verify
+          environment: production
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          verify-mode: prepared
+          branch: ${{ needs.verify-prepared-state.outputs['head-branch'] }}
+          target-branch: main
+          head-sha: ${{ needs.verify-prepared-state.outputs['head-sha'] }}
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  verify-active:
+    if: inputs.operation == 'verify' && inputs['verify-mode'] == 'active'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the exact trusted trigger commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Verify active production Google and page state
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: verify
+          environment: production
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          verify-mode: active
+          branch: main
+          target-branch: main
+          head-sha: ${{ github.sha }}
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  report-scheduled-failure:
+    name: Report a redacted scheduled production failure
+    if: >-
+      always() &&
+      github.repository == 'ScrollPrize/villa' &&
+      github.repository_id == '890972577' &&
+      github.repository_owner_id == '121906140' &&
+      github.ref == 'refs/heads/main' &&
+      github.workflow_ref == 'ScrollPrize/villa/.github/workflows/progress-prizes-production.yml@refs/heads/main' &&
+      github.workflow_sha == github.sha &&
+      inputs['request-id'] != '' &&
+      (needs.preflight.result == 'failure' ||
+       needs.validate.result == 'failure' ||
+       needs.dry-run.result == 'failure' ||
+       needs.prepare-google.result == 'failure' ||
+       needs.prepare-page.result == 'failure' ||
+       needs.activation-state.result == 'failure' ||
+       needs.activation-page-state.result == 'failure' ||
+       needs.refresh-page.result == 'failure' ||
+       needs.activation-binding.result == 'failure' ||
+       needs.activation-gate.result == 'failure' ||
+       needs.activation-approval.result == 'failure' ||
+       needs.activate-production.result == 'failure' ||
+       needs.merge.result == 'failure' ||
+       needs.verify-completed-activation.result == 'failure' ||
+       needs.verify-prepared-state.result == 'failure' ||
+       needs.verify-prepared.result == 'failure' ||
+       needs.verify-active.result == 'failure')
+    needs:
+      - preflight
+      - validate
+      - dry-run
+      - prepare-google
+      - prepare-page
+      - activation-state
+      - activation-page-state
+      - refresh-page
+      - activation-binding
+      - activation-gate
+      - activation-approval
+      - activate-production
+      - merge
+      - verify-completed-activation
+      - verify-prepared-state
+      - verify-prepared
+      - verify-active
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Create or reuse the fixed automation issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          const title = '[automation] Progress Prize rollover needs attention';
+          const notice = [
+            'A scheduled Progress Prize rollover did not complete.',
+            '',
+            `Review the redacted [Actions run](${process.env.RUN_URL}).`,
+            '',
+            'Google identifiers, ACL identities, and operation output are intentionally omitted.',
+          ].join('\n');
+
+          async function github(path, method = 'GET', body) {
+            const response = await fetch(`https://api.github.com${path}`, {
+              method,
+              redirect: 'error',
+              headers: {
+                accept: 'application/vnd.github+json',
+                authorization: `Bearer ${process.env.GH_TOKEN}`,
+                'content-type': 'application/json',
+                'user-agent': 'progress-prize-production-reporter',
+                'x-github-api-version': '2022-11-28',
+              },
+              body: body === undefined ? undefined : JSON.stringify(body),
+            });
+            if (!response.ok) throw new Error('Redacted issue reporting failed.');
+            return response.status === 204 ? undefined : response.json();
+          }
+
+          const query = new URLSearchParams({
+            q: `repo:ScrollPrize/villa is:issue is:open in:title "${title}"`,
+            per_page: '100',
+          });
+          const search = await github(`/search/issues?${query}`);
+          if (!Number.isInteger(search?.total_count) || search.total_count > 100) {
+            throw new Error('Redacted issue reporting search is ambiguous.');
+          }
+          const existing = search.items.filter(
+            (issue) => !issue.pull_request && issue.title === title,
+          );
+          if (existing.length > 1) throw new Error('Redacted issue reporting is ambiguous.');
+          if (existing.length === 1) {
+            await github(
+              `/repos/ScrollPrize/villa/issues/${existing[0].number}/comments`,
+              'POST',
+              { body: notice },
+            );
+          } else {
+            await github('/repos/ScrollPrize/villa/issues', 'POST', { title, body: notice });
+          }
+          NODE
