@@ -20,7 +20,9 @@ import atexit
 import os
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 
 from .bridge_client import (
     BridgeClient,
@@ -70,6 +72,8 @@ LAUNCH_HANDSHAKE_TIMEOUT_S = 30.0
 # Kept alive for the process lifetime so a bridge we launched isn't reaped as a
 # child zombie, and can be terminated on our own exit.
 _launched_process: subprocess.Popen | None = None
+# Daemon thread that drains the launched child's stdout for its whole lifetime.
+_drain_thread: threading.Thread | None = None
 
 
 def default_vc3d_binary() -> str:
@@ -102,14 +106,21 @@ def launch_vc3d(
 ) -> str:
     """Spawn VC3D with the agent bridge enabled and return its socket path.
 
-    Reads the child's stdout until the ``VC3D-AGENT-BRIDGE: listening ...``
-    handshake line appears (parsed by ``BridgeClient.socket_path_from_handshake``),
-    then returns the authoritative ``path=`` value. Raises
-    ``BridgeConnectionError`` if VC3D exits or the handshake never arrives
-    within ``timeout`` seconds. The process is retained (module global) so it
-    keeps running for the MCP session and is terminated on our exit.
+    A daemon thread drains the child's stdout for the whole process lifetime
+    (with stderr merged in): it detects the ``VC3D-AGENT-BRIDGE: listening ...``
+    handshake line (parsed by ``BridgeClient.socket_path_from_handshake``),
+    signals a ``threading.Event`` with the authoritative ``path=`` value, and
+    keeps reading so the OS pipe never fills and blocks VC3D. Non-handshake
+    lines are forwarded to this process's STDERR only (stdout is reserved for
+    MCP stdio) and a bounded tail is retained for error reporting.
+
+    Waits up to ``timeout`` seconds for the handshake. A silent-but-live child
+    times out at the deadline; a child that exits before the handshake fails
+    immediately with its captured log tail. Raises ``BridgeConnectionError`` in
+    both failure cases. The process is retained (module global) so it keeps
+    running for the MCP session and is terminated (escalating) on our exit.
     """
-    global _launched_process
+    global _launched_process, _drain_thread
 
     args = [binary, "--agent-bridge"]
     if volpkg:
@@ -120,48 +131,78 @@ def launch_vc3d(
     proc = subprocess.Popen(
         args,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,  # keep diagnostics; drained below
         text=True,
         bufsize=1,  # line-buffered
     )
     _launched_process = proc
     atexit.register(_terminate_launched_process)
 
+    handshake: dict[str, str] = {}
+    found = threading.Event()
+    tail: deque[str] = deque(maxlen=200)
+
+    def _drain() -> None:
+        # Read the child's stdout for its whole lifetime: find the handshake,
+        # then keep draining so the OS pipe never fills and blocks VC3D. Child
+        # output goes to OUR stderr only -- never stdout (MCP stdio transport).
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            stripped = line.rstrip("\n")
+            tail.append(stripped)
+            if not found.is_set():
+                parsed = BridgeClient.socket_path_from_handshake(line)
+                if parsed is not None:
+                    handshake["path"] = parsed[1]
+                    found.set()
+                    continue
+            print(stripped, file=sys.stderr)
+        found.set()  # EOF: unblock the waiter even if no handshake arrived
+
+    _drain_thread = threading.Thread(target=_drain, name="vc3d-stdout-drain", daemon=True)
+    _drain_thread.start()
+
     deadline = time.monotonic() + timeout
-    assert proc.stdout is not None
     while time.monotonic() < deadline:
+        if found.wait(timeout=0.1):
+            if "path" in handshake:
+                return handshake["path"]
+            break  # EOF set the event with no handshake
         if proc.poll() is not None:
-            raise BridgeConnectionError(
-                f"VC3D ({binary!r}) exited with code {proc.returncode} "
-                "before printing the agent-bridge handshake line"
-            )
-        line = proc.stdout.readline()
-        if not line:
-            # EOF without exit yet: brief pause, then re-check poll/deadline.
-            time.sleep(0.05)
-            continue
-        parsed = BridgeClient.socket_path_from_handshake(line)
-        if parsed is not None:
-            _name, path = parsed
-            return path
+            break
 
     _terminate_launched_process()
+    detail = "\n".join(tail)
+    if proc.returncode is not None:
+        raise BridgeConnectionError(
+            f"VC3D ({binary!r}) exited with code {proc.returncode} before printing the "
+            f"agent-bridge handshake line. Last output:\n{detail}"
+        )
     raise BridgeConnectionError(
-        f"timed out after {timeout:g}s waiting for VC3D ({binary!r}) to print "
-        "its agent-bridge handshake line"
+        f"timed out after {timeout:g}s waiting for VC3D ({binary!r}) to print its "
+        f"agent-bridge handshake line. Last output:\n{detail}"
     )
 
 
 def _terminate_launched_process() -> None:
-    global _launched_process
+    global _launched_process, _drain_thread
     proc = _launched_process
     if proc is None:
         return
     _launched_process = None
+    _drain_thread = None
     if proc.poll() is not None:
         return
     try:
         proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
     except OSError:
         pass
 
