@@ -166,7 +166,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Scroll-specific augmentations](https://github.com/ScrollPrize/villa/pull/997) by pscamillo. GPU-native training augmentations modeling real scroll/CT distortions: Squeeze, Decohesion, Warp, Ring, Streak (#201), each validated with ablation + benchmark.
 
-- [winding-ruler](https://github.com/pscamillo/winding-ruler) by pscamillo. Measures winding evidence for the spiral fit: where human annotations matter, why generation fails at the published resolution, and a collection-wide winding-pitch atlas (35 scrolls).
+- [winding-ruler](https://github.com/pscamillo/winding-ruler) by pscamillo. Measures winding evidence for the spiral fit: where human annotations matter, why generation fails at the published resolution, and a collection-wide winding-pitch atlas (36 scrolls). Includes [qa_holescan](https://github.com/pscamillo/winding-ruler/blob/main/concordance/qa_holescan.py), a content-level detector for silent z-slice loss in predict3d output ([#1183](https://github.com/ScrollPrize/villa/issues/1183)).
        
 ### 📦 Materials
 
