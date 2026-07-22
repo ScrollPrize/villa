@@ -1,9 +1,9 @@
 #include "SeedingBatchTracker.hpp"
 
-void SeedingBatchTracker::begin(const QString& kind, int total)
+void SeedingBatchTracker::reset()
 {
-    _kind = kind;
-    _total = total;
+    _kind.clear();
+    _total = 0;
     _completed = 0;
     _failures = 0;
     _failureMessages.clear();
@@ -13,7 +13,14 @@ void SeedingBatchTracker::begin(const QString& kind, int total)
     _result = Result{};
 }
 
-bool SeedingBatchTracker::recordTerminal(const void* key, bool failedToStart,
+void SeedingBatchTracker::begin(const QString& kind, int total)
+{
+    reset();
+    _kind = kind;
+    _total = total;
+}
+
+bool SeedingBatchTracker::recordTerminal(int key, bool failedToStart,
                                          bool crashed, int exitCode,
                                          const QString& tail, const QString& label)
 {

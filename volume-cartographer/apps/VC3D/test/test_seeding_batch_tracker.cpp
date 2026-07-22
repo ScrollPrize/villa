@@ -1,11 +1,12 @@
 // Unit tests for SeedingBatchTracker — the honest run/expand batch outcome
 // aggregation extracted from SeedingWidget (SPEC §1).
 //
-// Deterministic and process-free: the tracker takes an opaque per-child key
-// (a const void*, the QProcess identity in production) plus pre-extracted
-// outcome fields, so we exercise every terminal shape (clean exit, nonzero
-// exit, crash, failed-to-start, cancel, duplicate terminal) without spawning
-// any child. No .volpkg data required.
+// Deterministic and process-free: the tracker takes a stable per-child index
+// key (the child's batch index in production, NOT a raw QProcess* — see
+// pointerReuseKeyedByIndexDoesNotStrand) plus pre-extracted outcome fields, so
+// we exercise every terminal shape (clean exit, nonzero exit, crash,
+// failed-to-start, cancel, duplicate terminal) without spawning any child.
+// No .volpkg data required.
 //
 // SCOPE NOTE: the "a child that fails to start does not HANG the batch"
 // guarantee has two halves. This test covers the tracker LOGIC half — a
@@ -19,12 +20,9 @@
 
 #include "SeedingBatchTracker.hpp"
 
-// Distinct opaque keys standing in for QProcess* identities.
-static const void* keyFor(int i)
-{
-    static char keySlots[64];
-    return &keySlots[i];
-}
+// The stable per-child batch index the tracker dedups on (production passes the
+// point/iteration index, never a QProcess address).
+static int keyFor(int i) { return i; }
 
 class TestSeedingBatchTracker : public QObject {
     Q_OBJECT
@@ -158,6 +156,28 @@ private slots:
         QCOMPARE(r.completed, 2);
     }
 
+    // Regression (codex #1): keying dedup on the stable index rather than a raw
+    // QProcess* means a later child reusing an earlier (freed) process address
+    // can never be misread as already-terminal. Simulate the production hazard:
+    // child 0 finishes, then a distinct later child would collide on address but
+    // carries its own index -> it still counts and the batch finalizes (no
+    // stranding / no forever-"running" bridge job).
+    void pointerReuseKeyedByIndexDoesNotStrand()
+    {
+        SeedingBatchTracker t;
+        t.begin(QStringLiteral("run"), 3);
+        QVERIFY(t.recordTerminal(keyFor(0), false, false, 0, QString()));
+        QVERIFY(t.recordTerminal(keyFor(1), false, false, 0, QString()));
+        // Index 2 is a genuinely different child even though, in production, its
+        // QProcess could sit at index-0's recycled address. Keyed by index it is
+        // NOT a duplicate: it advances completion and finalizes the batch.
+        QVERIFY(t.recordTerminal(keyFor(2), false, false, 0, QString()));
+        QVERIFY(t.isComplete());
+        const auto r = t.finalize();
+        QVERIFY(r.success);
+        QCOMPARE(r.completed, 3);
+    }
+
     // Mixed batch: some zero, some nonzero, one failed-to-start ->
     // completed == total and the failure count is exact.
     void mixedBatchCounts()
@@ -178,6 +198,27 @@ private slots:
         QCOMPARE(r.completed, 5);
         QCOMPARE(r.total, 5);
         QVERIFY(r.message.startsWith(QStringLiteral("Seeding run failed: 3 of 5 child processes failed")));
+    }
+
+    // Regression (codex #2b): reset() clears a finalized batch back to the
+    // fresh, not-finalized shape so a shared teardown (neural trace) is not
+    // short-circuited by a prior batch's lingering finalized() == true.
+    void resetClearsFinalizedState()
+    {
+        SeedingBatchTracker t;
+        t.begin(QStringLiteral("run"), 1);
+        QVERIFY(t.recordTerminal(keyFor(0), false, false, 0, QString()));
+        (void)t.finalize();
+        QVERIFY(t.finalized());
+
+        t.reset();
+        QVERIFY(!t.finalized());
+        QVERIFY(t.kind().isEmpty());
+        QCOMPARE(t.completed(), 0);
+        QCOMPARE(t.total(), 0);
+        QVERIFY(!t.cancelRequested());
+        // A previously-seen key is no longer terminal after reset.
+        QVERIFY(t.recordTerminal(keyFor(0), false, false, 0, QString()));
     }
 
     // The optional diagnostic label + output tail flow into the failure message.

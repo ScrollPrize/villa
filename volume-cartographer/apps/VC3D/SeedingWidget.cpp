@@ -1224,6 +1224,18 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
         return false;
     }
 
+    // Resolve + validate the volume path BEFORE latching a batch (codex #2a):
+    // _batch.begin() sets _batch.kind() non-empty, so bailing out after it would
+    // leave a phantom "run" batch. A later neural trace sets jobsRunning=true,
+    // making seedingBatchActive() (jobsRunning && !kind.isEmpty()) wrongly true —
+    // then jobIsRunning("seeding") accepts a seeding.cancel that kills the trace.
+    _batchVolumePath = commandPathForVolume(currentVolume);
+    if (_batchVolumePath.isEmpty()) {
+        setError(tr("Could not resolve a volume path for segmentation "
+                    "(no local mirror and no remote locator)."));
+        return false;
+    }
+
     // Latch per-batch config into member state so the QProcess finished callbacks
     // (which outlive this call now that the blocking loop is gone) read stable
     // fields rather than dangling stack captures.
@@ -1233,12 +1245,6 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     _batchNextIndex = 0;
     _batchOmpThreads = ompThreads;
     _batchProcessTail.clear();
-    _batchVolumePath = commandPathForVolume(currentVolume);
-    if (_batchVolumePath.isEmpty()) {
-        setError(tr("Could not resolve a volume path for segmentation "
-                    "(no local mirror and no remote locator)."));
-        return false;
-    }
     _batchPathsDir = pathsDir;
     _batchConfigJson = seedJsonPath;
     _batchWorkingDir = QString::fromStdString(pathsDir.parent_path().string());
@@ -1309,12 +1315,15 @@ void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int
     const bool isExpand = (_batch.kind() == QLatin1String("expand"));
     const bool crashed = (exitStatus != QProcess::NormalExit);
 
-    // Aggregate the outcome (dedup by the QProcess identity: finished() and
-    // errorOccurred() can both fire for the same child). recordTerminal returns
-    // false if this child already reached its terminal state — count once.
+    // Aggregate the outcome (dedup by the stable child index: finished() and
+    // errorOccurred() can both fire for the same child). We must NOT key on the
+    // QProcess* here — process->deleteLater() below frees each finished child
+    // mid-batch, and a later new QProcess can be allocated at that same address,
+    // which would then be misread as already-terminal and strand the batch. The
+    // index is unique per child and identical across both signals.
     const QString label = isExpand ? tr("Expansion iteration %1").arg(index)
                                    : tr("Segmentation for point %1").arg(index);
-    if (!_batch.recordTerminal(process, failedToStart, crashed, exitCode,
+    if (!_batch.recordTerminal(index, failedToStart, crashed, exitCode,
                                _batchProcessTail.value(process), label)) {
         return;
     }
@@ -2318,6 +2327,17 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
         return false;
     }
 
+    // Resolve + validate the volume path BEFORE latching a batch (codex #2a):
+    // begin() after this would leave a phantom "expand" batch that a later
+    // neural trace could expose via seedingBatchActive() (see
+    // runSegmentationHeadless).
+    _batchVolumePath = commandPathForVolume(currentVolume);
+    if (_batchVolumePath.isEmpty()) {
+        setError(tr("Could not resolve a volume path for expansion "
+                    "(no local mirror and no remote locator)."));
+        return false;
+    }
+
     // Latch per-batch config into member state (see runSegmentationHeadless).
     // Reset outcome aggregation before launching the first child (SPEC §1).
     _batch.begin(QStringLiteral("expand"), expansionIterations);
@@ -2325,12 +2345,6 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     _batchNextIndex = 0;
     _batchOmpThreads = ompThreads;
     _batchProcessTail.clear();
-    _batchVolumePath = commandPathForVolume(currentVolume);
-    if (_batchVolumePath.isEmpty()) {
-        setError(tr("Could not resolve a volume path for expansion "
-                    "(no local mirror and no remote locator)."));
-        return false;
-    }
     _batchPathsDir = pathsDir;
     _batchConfigJson = expandJsonPath;
     _batchWorkingDir = QString::fromStdString(pathsDir.parent_path().string());
@@ -2654,6 +2668,11 @@ void SeedingWidget::onNeuralTraceClicked()
     // Update UI
     infoLabel->setText("Running neural trace...");
     _btnNeuralTrace->setEnabled(false);
+    // Clear any finalized state left by a PRIOR seeding batch so this neural
+    // activation's shared finalizeSeedingBatch() teardown (via cancel) is not
+    // short-circuited by a stale _batch.finalized() (codex #2b). A neural trace
+    // has no real batch (kind stays empty), so seedingBatchActive() is false.
+    _batch.reset();
     jobsRunning = true;
     cancelButton->setVisible(true);
 
