@@ -46,6 +46,7 @@ from sample_spiral import (
     get_winding_xy,
 )
 from losses import (
+    build_pcl_sampling_strata,
     configure_losses,
     get_lasagna_losses,
     get_patch_abs_winding_loss,
@@ -120,6 +121,10 @@ default_config = {
     'num_flow_integration_steps': 3,
     'flow_integration_solver': 'rk4',
     'num_flow_timesteps': 1,
+    # Number of independent stationary flow fields composed sequentially,
+    # phi = exp(v_N) o ... o exp(v_1) (each stage keeps the fast inline-rk4 + sparse-grad
+    # path when num_flow_timesteps == 1 and the solver is rk4). 1 == original behaviour.
+    'num_flow_stages': 1,
     'flow_bounds_z_margin': 160,
     'flow_bounds_radius': 3200,
     'flow_voxel_resolution': 16,
@@ -143,6 +148,18 @@ default_config = {
     'num_patches_per_step': 360,
     'num_patches_per_step_for_dt': 240,
     'num_points_per_patch': 800,
+    # How patch-loss strips are sampled in patch ij space (patch radius/DT losses and the
+    # rel/abs-winding L-shapes):
+    #   'straight' -> contiguous subranges of single rows/columns (+ 4 cardinal L-shapes for
+    #                 the winding losses).
+    #   'dijkstra' -> wiggly geodesic strips: from a start cell, walk the 8-connected valid-quad
+    #                 graph to a distant reachable endpoint via shortest path, skirting holes /
+    #                 ragged edges. Paths land in small per-patch (and per-anchor, for the
+    #                 winding losses) pools, built and continuously refreshed dataloader-style
+    #                 by FIT_SPIRAL_STRIP_PATH_WORKERS background processes (default 4; 0 =
+    #                 inline builds with fixed pools); per-step sampling just subsamples points
+    #                 along a pooled path, so steady-state cost matches 'straight'.
+    'patch_strip_sampling': 'straight',
     'erode_patches': 1,  # if >0, erode every patch's valid region (verified + unverified) by this many grid cells
     'disable_patches': False,  # fit on PCLs + tracks only; load no verified/unverified patches
     'unverified_patch_radius_loss_margin': 0.025,
@@ -158,6 +175,18 @@ default_config = {
     'rel_winding_num_pcls': 48,
     'rel_winding_num_patch_pairs_per_pcl': 4,
     'rel_winding_adjacent_patches_only': True,
+    # Per-group weighting of the per-step pcl draws (rel-winding and unattached-strip
+    # losses). None = legacy behaviour: uniform over all pcls regardless of source.
+    # A dict switches on stratified sampling: each sampling group (pcl source json,
+    # keyed by basename with the .json suffix stripped e.g. 'relative_windings';
+    # fibers split into 'fibers:H' / 'fibers:V') gets a per-step share of the samples
+    # proportional to its weight, regardless of how many pcls it holds. When set, the
+    # dict must list every group explicitly (a missing group is an error); weight 0
+    # switches a group off entirely. Equal weights reproduce plain stratification; e.g.
+    # {'abs_winding': 1, 'patch-overlap-pcls': 1, 'relative_windings': 1,
+    #  'same_windings': 0, 'fibers:H': 2, 'fibers:V': 1} drops same-windings and
+    # doubles the horizontal-fiber share.
+    'pcl_sampling_weights': None,
     'abs_winding_num_pcls': 48,
     'abs_winding_num_points_per_pcl': 4,
     'fiber_min_point_spacing': 40.,
@@ -166,7 +195,7 @@ default_config = {
     'unattached_pcl_min_point_spacing': 16.,
     'track_num_per_step': 48000,
     'track_num_points_per_step': 24,
-    'track_exclusion_radius': 0.0,
+    'track_exclusion_radius': 16.0,
     'track_radius_target': 'mean',
     'track_radius_loss_margin': 0.025,
     'track_radius_within_norm_p': 6.0,  # >1 emphasises worst within-track point in the radius loss (1.0 = mean)
@@ -577,6 +606,7 @@ def main(load_only_patches_and_point_collections=False):
             loaded = load_point_collection(path) or {}
             for pcl in loaded.values():
                 pcl['source_file'] = path
+                pcl['sampling_group'] = path
                 # Absolute-winding status is determined solely by the source file:
                 # only pcls loaded from abs_winding.json carry absolute winding
                 # numbers. Any metadata key in another file is ignored.
@@ -591,6 +621,17 @@ def main(load_only_patches_and_point_collections=False):
         next_id,
         min_point_spacing=cfg['fiber_min_point_spacing'],
     )
+    # Fibers form two sampling groups, horizontal and vertical, rather than one
+    # group per source file like the regular pcls.
+    for pcl in fiber_point_collections.values():
+        hv_tag = pcl.get('metadata', {}).get('hv_classification', {}).get('automatic_tag')
+        if hv_tag not in ('H', 'V'):
+            print(
+                f'WARNING: fiber {pcl.get("name")!r} has hv_classification.automatic_tag '
+                f'{hv_tag!r} (expected "H" or "V"); grouping as horizontal'
+            )
+            hv_tag = 'H'
+        pcl['sampling_group'] = f'fibers:{hv_tag}'
     point_collections.update(fiber_point_collections)
 
     for pcl in point_collections.values():
@@ -724,6 +765,7 @@ def main(load_only_patches_and_point_collections=False):
             points_by_patch.setdefault(pid, []).append(point)
         pcl['points_by_patch'] = points_by_patch
     unattached_pcl_strips = _UnattachedPclStripList()
+    unattached_strip_sampling_groups = []  # parallel to unattached_pcl_strips
     min_point_spacing = cfg['unattached_pcl_min_point_spacing']
     # For each unattached pcl, materialise an id-sorted strip of point zyxs and the
     # corresponding winding annotations. Strips with <2 points are dropped.
@@ -756,14 +798,36 @@ def main(load_only_patches_and_point_collections=False):
             'zyxs': zyxs,
             'windings': windings,
         })
+        unattached_strip_sampling_groups.append(pcl['sampling_group'])
 
     cross_patch_pcls = list(cross_patch_point_collections.values())
     print(
         f'pcls: {len(cross_patch_pcls)} cross-patch, '
         f'{len(unattached_pcl_strips)} unattached'
     )
+    if cfg['pcl_sampling_weights'] is not None:
+        def _group_counts(groups):
+            counts = {}
+            for group in groups:
+                counts[group] = counts.get(group, 0) + 1
+            return ', '.join(
+                f'{os.path.splitext(os.path.basename(str(g)))[0]} (w={cfg["pcl_sampling_weights"][os.path.splitext(os.path.basename(str(g)))[0]]}): {n}'
+                for g, n in sorted(counts.items(), key=lambda kv: str(kv[0]))
+            )
+        print(f'  cross-patch sampling groups: {_group_counts(pcl["sampling_group"] for pcl in cross_patch_pcls)}')
+        print(f'  unattached sampling groups: {_group_counts(unattached_strip_sampling_groups)}')
     if load_only_patches_and_point_collections:
         return verified_patches, unverified_patches, shell_patch, cross_patch_pcls, unattached_pcl_strips
+
+    # Precompute the per-step sampling pools for the rel-winding and unattached-strip
+    # losses: pool indices grouped into strata by sampling group. Single-point pcls
+    # (possible only for winding_is_absolute pcls) can't form a cross-patch pair, so
+    # they are excluded from the rel-winding pool here.
+    cross_patch_sampling_strata = build_pcl_sampling_strata(
+        pcl['sampling_group'] if len(pcl['points']) > 1 else None
+        for pcl in cross_patch_pcls
+    )
+    unattached_sampling_strata = build_pcl_sampling_strata(unattached_strip_sampling_groups)
 
     # ==========================================================================
     # lasagna and tracks loading
@@ -1203,7 +1267,9 @@ def main(load_only_patches_and_point_collections=False):
     # Optimizer and checkpoint helpers
     # ==========================================================================
 
-    flow_field_params = list(spiral_and_transform.flow_field.parameters())
+    # All flow stages' parameters go into the flow param group (stage 0 == .flow_field,
+    # plus any extra_flow_fields when num_flow_stages > 1).
+    flow_field_params = [p for flow_field in spiral_and_transform.flow_fields for p in flow_field.parameters()]
     gap_expander_params = list(spiral_and_transform.gap_expander_params.parameters())
     linear_params = [spiral_and_transform.linear_logits]
     grouped_ids = {id(p) for p in flow_field_params + gap_expander_params + linear_params}
@@ -1298,7 +1364,9 @@ def main(load_only_patches_and_point_collections=False):
 
     for iteration in tqdm(range(start_iteration, num_training_steps), disable=not is_main_process()):
         step_timer.start('fwd')
-        spiral_and_transform.flow_field.flow_scales[1] = get_flow_field_high_res_lr_scale(iteration)
+        flow_field_high_res_lr_scale = get_flow_field_high_res_lr_scale(iteration)
+        for flow_field in spiral_and_transform.flow_fields:
+            flow_field.flow_scales[1] = flow_field_high_res_lr_scale
 
         slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
         dr_per_winding = spiral_and_transform.get_dr_per_winding()
@@ -1379,6 +1447,7 @@ def main(load_only_patches_and_point_collections=False):
                 verified_patches,
                 patch_atlas,
                 cross_patch_pcls,
+                cross_patch_sampling_strata,
             ) * cfg['loss_weight_rel_winding']
 
         if cfg['loss_weight_abs_winding'] > 0 and cross_patch_pcls:
@@ -1412,6 +1481,7 @@ def main(load_only_patches_and_point_collections=False):
                 slice_to_spiral_transform,
                 dr_per_winding,
                 unattached_pcl_strips,
+                unattached_sampling_strata,
                 get_or_build_unattached_pcl_flat,
                 cfg['unattached_pcl_num_per_step'],
                 cfg['unattached_pcl_num_points_per_step'],
@@ -1449,9 +1519,11 @@ def main(load_only_patches_and_point_collections=False):
         step_timer.stop('fwd')
         step_timer.start('bwd')
         loss.backward()
-        apply_accumulated_field_grad = getattr(spiral_and_transform.flow_field, 'apply_accumulated_field_grad', None)
-        if apply_accumulated_field_grad is not None:
-            apply_accumulated_field_grad()
+        # Flush every stage's sparse-accumulated field gradient into its parameters.
+        for flow_field in spiral_and_transform.flow_fields:
+            apply_accumulated_field_grad = getattr(flow_field, 'apply_accumulated_field_grad', None)
+            if apply_accumulated_field_grad is not None:
+                apply_accumulated_field_grad()
         step_timer.stop('bwd')
         step_timer.start('comm')
         allreduce_grads_(dist_grad_params)

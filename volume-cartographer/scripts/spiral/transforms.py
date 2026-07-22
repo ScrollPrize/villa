@@ -236,18 +236,24 @@ class SpiralAndTransform(nn.Module):
         self.dr_per_winding_logit = nn.Parameter(torch.tensor(config['initial_dr_per_winding'] / self.dr_per_winding_scale, dtype=torch.float32))
 
         flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // config['flow_voxel_resolution']
-        if config['flow_field_type'] == 'cylindrical':
-            self.flow_field = CylindricalFlowField(
+        flow_field_cls = CylindricalFlowField if config['flow_field_type'] == 'cylindrical' else CartesianFlowField
+
+        def make_flow_field():
+            return flow_field_cls(
                 flow_resolution,
                 lr_scale_factor=config['flow_field_high_res_lr_scale_initial'],
                 num_flow_timesteps=config['num_flow_timesteps'],
             )
-        else:
-            self.flow_field = CartesianFlowField(
-                flow_resolution,
-                lr_scale_factor=config['flow_field_high_res_lr_scale_initial'],
-                num_flow_timesteps=config['num_flow_timesteps'],
-            )
+
+        # num_flow_stages: number of independent stationary flow fields whose integrated
+        # diffeomorphisms are composed sequentially (phi = exp(v_N) o ... o exp(v_1) in the
+        # spiral->slice direction; the inverse applies the stage inverses in reverse order via
+        # ComposeTransform.inv). num_flow_stages == 1 is exactly the original single-field
+        # behaviour: `flow_field` keeps its name/state_dict keys and `extra_flow_fields` is empty.
+        self.num_flow_stages = int(config.get('num_flow_stages', 1) or 1)
+        assert self.num_flow_stages >= 1
+        self.flow_field = make_flow_field()
+        self.extra_flow_fields = nn.ModuleList([make_flow_field() for _ in range(self.num_flow_stages - 1)])
 
         self.linear_logits = nn.Parameter(torch.zeros([int(flow_max_corner_zyx[0] - flow_min_corner_zyx[0]) // config['linear_z_resolution'], 2, 2], dtype=torch.float32))
 
@@ -263,9 +269,17 @@ class SpiralAndTransform(nn.Module):
     def device(self):
         return self.linear_logits.device
 
+    @property
+    def flow_fields(self):
+        # All flow stages, in application order (stage 0 first in the spiral->slice direction).
+        return [self.flow_field, *self.extra_flow_fields]
+
     def get_slice_to_spiral_transform(self, truncate_at_step=None):
         truncate_frac = None if truncate_at_step is None else truncate_at_step / (self.flow_integration_steps - 1)
-        diffeomorphism = IntegratedFlowDiffeomorphism(self.flow_field, self.flow_min_corner_zyx, self.flow_max_corner_zyx, num_steps=self.flow_integration_steps, solver=self.flow_integration_solver, truncate_at_step=truncate_at_step)
+        diffeomorphisms = [
+            IntegratedFlowDiffeomorphism(flow_field, self.flow_min_corner_zyx, self.flow_max_corner_zyx, num_steps=self.flow_integration_steps, solver=self.flow_integration_solver, truncate_at_step=truncate_at_step)
+            for flow_field in self.flow_fields
+        ]
         gap_expander = GapExpandingTransform(
             self.gap_expander_params,
             self.get_dr_per_winding(),
@@ -283,7 +297,9 @@ class SpiralAndTransform(nn.Module):
         return pyro.distributions.transforms.ComposeTransform([
             gap_expander,
             *maybe_flip,
-            diffeomorphism,
+            # Sequential composition of the integrated stationary flows; ComposeTransform.inv
+            # applies the stage inverses in reverse order in the slice->spiral direction.
+            *diffeomorphisms,
             VaryingLinearTransform(self.linear_logits * self.linear_logits_scale, self.flow_min_corner_zyx[0], self.flow_max_corner_zyx[0], truncate_frac),
             self.umbilicus_transform,
         ]).inv
