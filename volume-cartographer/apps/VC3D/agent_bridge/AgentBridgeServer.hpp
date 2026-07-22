@@ -125,6 +125,7 @@ private:
     QJsonObject handleCanvasDrag(const QJsonValue& params);
     QJsonObject handleViewerCenterOnPoint(const QJsonValue& params);
     QJsonObject handleViewerZoom(const QJsonValue& params);
+    QJsonObject handleViewerRotate(const QJsonValue& params);
     QJsonObject handleSegmentationEnableEditing(const QJsonValue& params);
     QJsonObject handleSegmentationGrow(const QJsonValue& params);
     QJsonObject handleSegmentationGrowPatchFromSeed(const QJsonValue& params);

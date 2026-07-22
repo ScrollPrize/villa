@@ -330,6 +330,22 @@ Convenience alias: identical to `canvas.click` with `"shift"` unioned into `modi
 - **result:** `{"scale": float}` — post-zoom `getCurrentScale()`.
 - **errors:** `-32002`, `-32602` (factor ≤ 0 or non-finite).
 
+### 3.9b `viewer.rotate`
+
+- **params:** `{"plane": "seg xz" | "seg yz", "degrees": float, "relative"?: bool = true}`
+  — the programmatic equivalent of the human middle-drag rotation on the axis-aligned
+  slice panes. `plane` accepts the `"xz"`/`"yz"` shorthands. When `relative` is true
+  (default) `degrees` is a delta added to the plane's current angle; when false it is
+  an absolute angle. Only the two axis-aligned seg planes rotate — the main xy/segment
+  view is not rotatable.
+- Maps to `AxisAlignedSliceController::setRotationDegrees(std::string, float)` +
+  `flushOrientationUpdate()` (AxisAlignedSliceController.cpp:483,509), the same path the
+  middle-drag handler drives; angle read back via `currentRotationDegrees`.
+- **result:** `{"plane": str, "degrees": float, "previousDegrees": float, "relative": bool}`
+  — `degrees` is the normalized post-rotation angle (`remainder(·, 360)`).
+- **errors:** `-32000` (slice controller unavailable), `-32002` (axis-aligned slice mode
+  not active), `-32602` (unknown plane, or non-finite/missing `degrees`).
+
 ### 3.10 `segmentation.enable_editing`
 
 - **params:** `{"enabled": bool}`
@@ -640,6 +656,7 @@ spawns VC3D itself with `--agent-bridge` and parses the stdout handshake line (�
 | `vc3d_shift_click` | `canvas.shift_click` | Shift+click convenience: the canonical place-point / set-focus gesture. |
 | `vc3d_center_viewer` | `viewer.center_on_point` | Center a viewer pane on a 3D volume point. |
 | `vc3d_zoom_viewer` | `viewer.zoom` | Multiply a viewer's zoom by a factor (>1 zooms in). Returns the new scale. |
+| `vc3d_rotate_viewer` | `viewer.rotate` | Rotate the "seg xz"/"seg yz" axis-aligned slice plane (middle-drag equivalent). Relative delta by default. |
 | `vc3d_enable_editing` | `segmentation.enable_editing` | Turn segmentation editing mode on/off for the active segment. |
 | `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections/patch_tracer; direction; steps). Async: returns a jobId. |
 | `vc3d_grow_patch_from_seed` | `segmentation.grow_patch_from_seed` | Create a brand-new segment by growing a patch from a 3D seed point (headless GrowPatch). Async: returns a jobId and outputDir. |

@@ -57,6 +57,9 @@ class FakeAgentBridgeServer:
         # unfetched open-data placeholder; fetching it adds it here so a
         # subsequent segments.activate succeeds -- the fetch+retry compose.
         self._fetched: set[str] = set()
+        # Per-plane rotation state for viewer.rotate (mirrors the C++ controller's
+        # _segXZRotationDeg / _segYZRotationDeg members).
+        self._rotation: dict[str, float] = {}
 
     async def start(self) -> None:
         if os.path.exists(self.socket_path):
@@ -158,6 +161,29 @@ class FakeAgentBridgeServer:
                     writer, req_id,
                     error={"code": -32007, "message": "Segment not found",
                            "data": {"kind": "segment", "id": seg}},
+                )
+        elif method == "viewer.rotate":
+            plane = params.get("plane")
+            norm = {"xz": "seg xz", "yz": "seg yz",
+                    "seg xz": "seg xz", "seg yz": "seg yz"}.get(plane)
+            if norm is None:
+                await self._reply(
+                    writer, req_id,
+                    error={"code": -32602, "message": "unknown plane",
+                           "data": {"param": "plane", "value": plane}},
+                )
+            else:
+                prev = self._rotation.get(norm, 0.0)
+                deg = params.get("degrees", 0.0)
+                target = prev + deg if params.get("relative", True) else deg
+                # match the C++ remainder(., 360) normalization
+                target = target - 360.0 * round(target / 360.0)
+                self._rotation[norm] = target
+                await self._reply(
+                    writer, req_id,
+                    result={"plane": norm, "degrees": target,
+                            "previousDegrees": prev,
+                            "relative": params.get("relative", True)},
                 )
         elif method == "job.status":
             job_id = params.get("jobId", "job-1")
@@ -360,6 +386,28 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
             await server_module.vc3d_activate_segment("seg-ph", auto_fetch=False)
         self.assertEqual(ctx.exception.code, -32005)
         self.assertIn("placeholder", str(ctx.exception).lower())
+
+    async def test_vc3d_rotate_viewer_relative_default_accumulates(self) -> None:
+        first = await server_module.vc3d_rotate_viewer("seg yz", 30.0)
+        self.assertEqual(first["plane"], "seg yz")
+        self.assertEqual(first["previousDegrees"], 0.0)
+        self.assertAlmostEqual(first["degrees"], 30.0)
+        # relative is the default -- a second call adds to the first.
+        second = await server_module.vc3d_rotate_viewer("seg yz", 15.0)
+        self.assertAlmostEqual(second["previousDegrees"], 30.0)
+        self.assertAlmostEqual(second["degrees"], 45.0)
+
+    async def test_vc3d_rotate_viewer_absolute_sets_angle(self) -> None:
+        await server_module.vc3d_rotate_viewer("xz", 90.0)
+        result = await server_module.vc3d_rotate_viewer("xz", 10.0, relative=False)
+        # shorthand "xz" normalizes to "seg xz"; absolute overrides accumulation.
+        self.assertEqual(result["plane"], "seg xz")
+        self.assertAlmostEqual(result["degrees"], 10.0)
+
+    async def test_vc3d_rotate_viewer_unknown_plane_raises(self) -> None:
+        with self.assertRaises(BridgeError) as ctx:
+            await server_module.vc3d_rotate_viewer("seg xy", 10.0)
+        self.assertEqual(ctx.exception.code, -32602)
 
 
 class RegistryDiscoveryTest(unittest.TestCase):

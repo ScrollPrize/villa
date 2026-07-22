@@ -30,6 +30,7 @@
 #include <unordered_set>
 
 #include "CWindow.hpp"
+#include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
 #include "LasagnaServiceManager.hpp"
 #include "LineAnnotationController.hpp"
@@ -700,6 +701,8 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleViewerCenterOnPoint(p); });
     _handlers.insert("viewer.zoom",
         [this](const QJsonValue& p) { return handleViewerZoom(p); });
+    _handlers.insert("viewer.rotate",
+        [this](const QJsonValue& p) { return handleViewerRotate(p); });
     _handlers.insert("segmentation.enable_editing",
         [this](const QJsonValue& p) { return handleSegmentationEnableEditing(p); });
     _handlers.insert("segmentation.grow",
@@ -1463,6 +1466,72 @@ QJsonObject AgentBridgeServer::handleViewerZoom(const QJsonValue& params)
 
     QJsonObject result;
     result["scale"] = viewer->getCurrentScale();
+    return result;
+}
+
+QJsonObject AgentBridgeServer::handleViewerRotate(const QJsonValue& params)
+{
+    const QJsonObject p = paramsObject(params);
+
+    AxisAlignedSliceController* slices =
+        _window ? _window->_axisAlignedSliceController.get() : nullptr;
+    if (!slices)
+        throw AgentBridgeError{-32000, "Axis-aligned slice controller unavailable", {}};
+
+    // Accept "seg xz"/"seg yz" and the "xz"/"yz" shorthands.
+    QString planeRaw = p.value("plane").toString().trimmed().toLower();
+    std::string plane;
+    if (planeRaw == "seg xz" || planeRaw == "xz")
+        plane = "seg xz";
+    else if (planeRaw == "seg yz" || planeRaw == "yz")
+        plane = "seg yz";
+    else {
+        QJsonObject data;
+        data["param"] = "plane";
+        data["value"] = p.value("plane").toString();
+        data["allowed"] = QJsonArray{"seg xz", "seg yz"};
+        throw AgentBridgeError{-32602,
+            "plane must be one of the rotatable axis-aligned planes: \"seg xz\", \"seg yz\"",
+            data};
+    }
+
+    if (!p.contains("degrees")) {
+        QJsonObject data;
+        data["param"] = "degrees";
+        throw AgentBridgeError{-32602, "degrees is required", data};
+    }
+    const double degrees = p.value("degrees").toDouble();
+    if (!std::isfinite(degrees)) {
+        QJsonObject data;
+        data["param"] = "degrees";
+        data["value"] = degrees;
+        throw AgentBridgeError{-32602, "degrees must be a finite number", data};
+    }
+
+    // Default to relative (delta) rotation — matches the middle-drag interaction.
+    const bool relative = p.value("relative").toBool(true);
+
+    if (!slices->isEnabled())
+        throw AgentBridgeError{-32002,
+            "Axis-aligned slice mode is not active; enable it before rotating the seg xz/yz planes",
+            {}};
+
+    const float previous = slices->currentRotationDegrees(plane);
+    const float target = relative ? static_cast<float>(previous + degrees)
+                                  : static_cast<float>(degrees);
+    slices->setRotationDegrees(plane, target);
+    // scheduleOrientationUpdate() marks the orientation dirty (exactly as the
+    // human middle-drag does); flushOrientationUpdate() early-returns unless the
+    // dirty flag is set, so without this the plane would never be reconfigured or
+    // repainted even though _segXZ/YZRotationDeg was updated.
+    slices->scheduleOrientationUpdate();
+    slices->flushOrientationUpdate();
+
+    QJsonObject result;
+    result["plane"] = QString::fromStdString(plane);
+    result["degrees"] = slices->currentRotationDegrees(plane);
+    result["previousDegrees"] = previous;
+    result["relative"] = relative;
     return result;
 }
 

@@ -335,6 +335,23 @@ async def vc3d_zoom_viewer(factor: float, viewer: Optional[str] = None) -> dict[
 
 
 @mcp.tool()
+async def vc3d_rotate_viewer(
+    plane: str, degrees: float, relative: bool = True
+) -> dict[str, Any]:
+    """Rotate an axis-aligned slice plane -- the same rotation a human gets by
+    middle-drag on the "seg xz" / "seg yz" panes. `plane` must be "seg xz" or
+    "seg yz" (the "xz"/"yz" shorthands are accepted); only these two planes
+    rotate -- the main xy/segment view is not rotatable. By default `degrees` is
+    a relative delta added to the current angle (positive = same sense as
+    dragging up); pass relative=False to set an absolute angle. Requires
+    axis-aligned slice mode to be active. Returns the new and previous angles in
+    degrees."""
+    return await _call(
+        "viewer.rotate", {"plane": plane, "degrees": degrees, "relative": relative}
+    )
+
+
+@mcp.tool()
 async def vc3d_enable_editing(enabled: bool) -> dict[str, Any]:
     """Turn segmentation editing mode on/off for the active segment."""
     return await _call("segmentation.enable_editing", {"enabled": enabled})
