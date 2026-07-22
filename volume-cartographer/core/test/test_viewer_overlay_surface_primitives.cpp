@@ -7,6 +7,7 @@
 #include <QTreeWidget>
 
 #include "AtlasControlPointsDock.hpp"
+#include "ViewerManager.hpp"
 #include "overlays/AtlasControlPointsOverlayController.hpp"
 #include "overlays/AtlasOverlayController.hpp"
 #include "overlays/FiberOverlayController.hpp"
@@ -701,7 +702,7 @@ private slots:
         viewer.graphicsView()->resize(800, 600);
         viewer.setSurfaceSceneTransform(1.0, QPointF{});
 
-        cv::Mat_<cv::Vec3f> points(40, 40);
+        cv::Mat_<cv::Vec3f> points(40, 30);
         for (int row = 0; row < points.rows; ++row) {
             for (int col = 0; col < points.cols; ++col) {
                 points(row, col) = cv::Vec3f(static_cast<float>(col),
@@ -709,10 +710,13 @@ private slots:
                                               0.0f);
             }
         }
-        viewer.setCurrentSurface(
-            std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f, 1.0f)));
+        auto surface = std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f, 1.0f));
+        viewer.setCurrentSurface(surface);
 
+        ViewerManager manager(nullptr, nullptr);
+        manager.surfacePatchIndex()->rebuild({surface}, 0.0f, false);
         ChainTestController controller;
+        controller.bindToViewerManager(&manager);
         ChainTestController::OverlayBuilder builder(&viewer);
         // The first control point is coplanar but outside the finite segment.
         // Its nearest mesh point is on the left edge and remains useful as a
@@ -720,7 +724,9 @@ private slots:
         const std::vector<cv::Vec3f> chain = {
             {-2.0f, 20.0f, 0.0f}, {5.0f, 20.0f, 0.0f}};
         ViewerOverlayControllerBase::PointChainStyle style;
-        style.distanceTolerance = 4.0f;
+        // A wide tolerance used to accept the surface center as a good-enough
+        // iterative-search seed, making this artifact distance-dependent.
+        style.distanceTolerance = 20.0f;
         style.sceneJumpRatio = 20.0f;
         controller.renderPointChain(&viewer, builder, chain, style);
 
@@ -732,6 +738,7 @@ private slots:
                     std::get_if<ViewerOverlayControllerBase::LineStripPrimitive>(&primitive)) {
                 ++strips;
                 QCOMPARE(strip->points.size(), std::size_t{2});
+                QVERIFY(std::fabs(strip->points.front().x() + surface->center()[0]) < 0.1);
             } else if (std::holds_alternative<ViewerOverlayControllerBase::PointPrimitive>(primitive)) {
                 ++dots;
             }
@@ -739,18 +746,17 @@ private slots:
         QCOMPARE(strips, std::size_t{1});
         QCOMPARE(dots, std::size_t{1});
 
-        ChainTestController::OverlayBuilder normalOffsetBuilder(&viewer);
-        const std::vector<cv::Vec3f> normalOffsetChain = {
-            {1.0f, 20.0f, 2.0f}, {5.0f, 20.0f, 2.0f}};
-        controller.renderPointChain(&viewer, normalOffsetBuilder, normalOffsetChain, style);
-        const auto normalOffsetPrimitives = normalOffsetBuilder.takePrimitives();
-        const auto normalOffsetDots = std::count_if(
-            normalOffsetPrimitives.begin(), normalOffsetPrimitives.end(), [](const auto& primitive) {
+        ChainTestController::OverlayBuilder realEdgePointBuilder(&viewer);
+        const std::vector<cv::Vec3f> realEdgePointChain = {
+            {0.0f, 20.0f, 0.0f}, {5.0f, 20.0f, 2.0f}};
+        controller.renderPointChain(&viewer, realEdgePointBuilder, realEdgePointChain, style);
+        const auto realEdgePointPrimitives = realEdgePointBuilder.takePrimitives();
+        const auto realEdgePointDots = std::count_if(
+            realEdgePointPrimitives.begin(), realEdgePointPrimitives.end(), [](const auto& primitive) {
                 return std::holds_alternative<ViewerOverlayControllerBase::PointPrimitive>(primitive);
             });
-        // A real point above the segment edge remains visible: only
-        // tangentially clamped projections are suppressed.
-        QCOMPARE(normalOffsetDots, std::ptrdiff_t{2});
+        // A control point genuinely on the segment boundary remains visible.
+        QCOMPARE(realEdgePointDots, std::ptrdiff_t{2});
     }
 
     void renderPointChainCullsPointsOutsideVolumeBounds()

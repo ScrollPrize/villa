@@ -24,6 +24,63 @@ class DensePhaseObservation:
     valid: torch.Tensor
 
 
+def sample_straight_ray_cache(
+    cache_center_zyx: torch.Tensor,
+    cache_long_direction_zyx: torch.Tensor,
+    cached_field: torch.Tensor,
+    live_points_zyx: torch.Tensor,
+    *,
+    spacing_wv: float = 1.0,
+    cached_valid: torch.Tensor | None = None,
+    maximum_transverse_distance_wv: float = 24.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiably sample a detached straight-ray field at live 3-D points.
+
+    Integer cell selection is detached, while the linear interpolation weight
+    retains the gradient through the live point.  A detached transverse gate
+    prevents a stale cache from exerting force after the fit moves too far.
+    """
+    if cache_center_zyx.ndim != 2 or cache_center_zyx.shape[-1] != 3:
+        raise ValueError("cache centers must have shape [rays,3]")
+    if cache_long_direction_zyx.shape != cache_center_zyx.shape:
+        raise ValueError("cache directions must match cache centers")
+    if cached_field.ndim != 2 or cached_field.shape[0] != cache_center_zyx.shape[0]:
+        raise ValueError("cached field must have shape [rays,samples]")
+    if live_points_zyx.ndim != 3 or live_points_zyx.shape[::2] != (
+        cache_center_zyx.shape[0], 3
+    ):
+        raise ValueError("live points must have shape [rays,points,3]")
+    if float(spacing_wv) <= 0 or float(maximum_transverse_distance_wv) <= 0:
+        raise ValueError("cache spacing and transverse distance must be positive")
+    center = cache_center_zyx.detach().float()
+    direction = F.normalize(cache_long_direction_zyx.detach().float(), dim=-1)
+    field = cached_field.detach().float()
+    delta = live_points_zyx - center[:, None, :]
+    longitudinal_wv = (delta * direction[:, None, :]).sum(dim=-1)
+    index = longitudinal_wv / float(spacing_wv) + 0.5 * (field.shape[1] - 1)
+    lower = index.detach().floor().long()
+    upper = lower + 1
+    in_bounds = (lower >= 0) & (upper < field.shape[1])
+    lower_clamped = lower.clamp(0, field.shape[1] - 1)
+    upper_clamped = upper.clamp(0, field.shape[1] - 1)
+    left = torch.gather(field, 1, lower_clamped)
+    right = torch.gather(field, 1, upper_clamped)
+    fraction = index - lower.to(index.dtype)
+    sampled = left + fraction * (right - left)
+    nearest = center[:, None, :] + longitudinal_wv[:, :, None] * direction[:, None, :]
+    transverse = torch.linalg.vector_norm(live_points_zyx - nearest, dim=-1)
+    valid = in_bounds & (
+        transverse.detach() <= float(maximum_transverse_distance_wv)
+    )
+    if cached_valid is not None:
+        cache_valid = cached_valid.detach().bool()
+        if cache_valid.shape != field.shape:
+            raise ValueError("cached validity must match the cached field")
+        valid &= torch.gather(cache_valid, 1, lower_clamped)
+        valid &= torch.gather(cache_valid, 1, upper_clamped)
+    return sampled, valid, index
+
+
 def _cached_arclength(points_zyx: torch.Tensor) -> torch.Tensor:
     step = torch.linalg.vector_norm(points_zyx[:, 1:] - points_zyx[:, :-1], dim=-1)
     return F.pad(step.cumsum(dim=1), (1, 0))

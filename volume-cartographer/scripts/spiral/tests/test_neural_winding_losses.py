@@ -4,6 +4,7 @@ from neural_winding_losses import (
     dense_metric_density_loss,
     dense_phase_observations,
     dense_phase_registration_loss,
+    sample_straight_ray_cache,
 )
 
 
@@ -85,3 +86,30 @@ def test_density_rejects_insufficiently_covered_ray():
     )
     assert loss == 0.0
     assert metrics["valid_fraction"] == 0.0
+
+
+def test_straight_cache_sampling_keeps_live_longitudinal_gradient():
+    point = torch.tensor([[[0.0, 0.0, 0.25]]], requires_grad=True)
+    sampled, valid, index = sample_straight_ray_cache(
+        torch.tensor([[0.0, 0.0, 0.0]]),
+        torch.tensor([[0.0, 0.0, 1.0]]),
+        torch.arange(5, dtype=torch.float32)[None],
+        point,
+    )
+    sampled.sum().backward()
+    torch.testing.assert_close(sampled, torch.tensor([[2.25]]))
+    torch.testing.assert_close(index, torch.tensor([[2.25]]))
+    assert valid.item()
+    torch.testing.assert_close(point.grad[0, 0, 2], torch.tensor(1.0))
+
+
+def test_straight_cache_rejects_large_transverse_drift():
+    sampled, valid, _ = sample_straight_ray_cache(
+        torch.tensor([[0.0, 0.0, 0.0]]),
+        torch.tensor([[0.0, 0.0, 1.0]]),
+        torch.arange(5, dtype=torch.float32)[None],
+        torch.tensor([[[0.0, 3.0, 0.0]]]),
+        maximum_transverse_distance_wv=2.0,
+    )
+    assert torch.isfinite(sampled).all()
+    assert not valid.item()

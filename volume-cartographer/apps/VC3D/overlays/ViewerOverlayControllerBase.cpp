@@ -29,20 +29,19 @@
 namespace
 {
 
-bool isTangentialBoundaryProjection(QuadSurface* surface,
-                                    const cv::Vec3f& pointer,
-                                    const cv::Vec3f& sourcePoint,
-                                    float distance)
+bool isDisplacedBoundaryProjection(QuadSurface* surface,
+                                   const cv::Vec3f& pointer,
+                                   float distance)
 {
     if (!surface || !std::isfinite(distance) || distance <= 1.0e-3f) {
         return false;
     }
 
-    // pointTo() returns the closest point on the finite mesh. For a source
-    // point just beyond the segment footprint that closest point lies on the
-    // mesh boundary, even though the source point has no projection onto the
-    // segment. Keep such a point as a polyline endpoint (so the line can meet
-    // the segment edge), but do not present it as a control point.
+    // Nearest-surface projection returns a point on the finite mesh boundary
+    // for a source point just beyond the segment footprint, even though the
+    // source point has no projection onto the segment. Keep such a point as a
+    // polyline endpoint (so the line can meet the segment edge), but do not
+    // present it as a control point.
     const cv::Vec2f scale = surface->scale();
     if (!std::isfinite(scale[0]) || !std::isfinite(scale[1]) ||
         std::fabs(scale[0]) <= 1.0e-6f || std::fabs(scale[1]) <= 1.0e-6f) {
@@ -56,39 +55,7 @@ bool isTangentialBoundaryProjection(QuadSurface* surface,
         !surface->valid(pointer, { probeX, 0.0f, 0.0f}) ||
         !surface->valid(pointer, {0.0f, -probeY, 0.0f}) ||
         !surface->valid(pointer, {0.0f,  probeY, 0.0f});
-    if (!nearBoundary) {
-        return false;
-    }
-
-    const cv::Vec3f projectedPoint = surface->coord(pointer);
-    cv::Vec3f normal = surface->normal(pointer);
-    auto finiteVector = [](const cv::Vec3f& value) {
-        return std::isfinite(value[0]) && std::isfinite(value[1]) &&
-               std::isfinite(value[2]);
-    };
-    const bool invalidProjectedPoint = projectedPoint[0] == -1.0f &&
-                                       projectedPoint[1] == -1.0f &&
-                                       projectedPoint[2] == -1.0f;
-    if (!finiteVector(projectedPoint) || invalidProjectedPoint ||
-        !finiteVector(normal)) {
-        return true;
-    }
-
-    const float normalLength = cv::norm(normal);
-    if (!std::isfinite(normalLength) || normalLength <= 1.0e-6f) {
-        return true;
-    }
-    normal /= normalLength;
-    const cv::Vec3f delta = sourcePoint - projectedPoint;
-    const float axialDistance = std::fabs(delta.dot(normal));
-    const float deltaLengthSquared = delta.dot(delta);
-    const float tangentialDistance = std::sqrt(
-        std::max(0.0f, deltaLengthSquared - axialDistance * axialDistance));
-
-    // Allow normal-offset points at a real segment edge. A projection is
-    // considered clamped only when its tangential residual dominates; the
-    // small absolute allowance absorbs interpolation and normal noise.
-    return tangentialDistance > std::max(0.5f, axialDistance);
+    return nearBoundary;
 }
 
 } // namespace
@@ -690,6 +657,12 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
     }
 
     auto* patchIndex = _manager ? _manager->surfacePatchIndex() : nullptr;
+    SurfacePatchIndex::SurfacePtr indexedQuad;
+    bool usePatchIndex = false;
+    if (quad && patchIndex && !patchIndex->empty() && std::isfinite(tolerance)) {
+        indexedQuad = SurfacePatchIndex::SurfacePtr(quad, [](QuadSurface*) {});
+        usePatchIndex = patchIndex->containsSurface(indexedQuad);
+    }
     const std::uint64_t surfaceGeneration = quad && patchIndex
         ? patchIndex->globalGeneration()
         : 0;
@@ -751,17 +724,31 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
                 surfacePoint = {projected[0], projected[1]};
             } else {
                 cv::Vec3f pointer = quad->pointer();
-                distance = quad->pointTo(pointer,
-                                         point,
-                                         std::max(tolerance, 0.0f),
-                                         100,
-                                         patchIndex);
-                if (distance < 0.0f || distance > tolerance) {
+                if (!usePatchIndex) {
+                    // Quad-surface overlays are UI-only and always have the
+                    // maintained patch index. If its current generation does
+                    // not contain this surface, skip the point rather than
+                    // falling back to pointTo()'s tolerance-dependent random
+                    // search; the next index generation invalidates the cache.
+                    valid = false;
+                } else {
+                    SurfacePatchIndex::PointQuery query;
+                    query.worldPoint = point;
+                    query.tolerance = std::max(tolerance, 1.0e-3f);
+                    query.surfaces.only = indexedQuad;
+                    if (const auto hit = patchIndex->locate(query)) {
+                        pointer = hit->ptr;
+                        distance = hit->distance;
+                    } else {
+                        valid = false;
+                    }
+                }
+                if (!valid || distance < 0.0f || distance > tolerance) {
                     valid = false;
                 } else {
                     const cv::Vec3f location = quad->loc(pointer);
                     surfacePoint = {location[0], location[1]};
-                    if (isTangentialBoundaryProjection(quad, pointer, point, distance)) {
+                    if (isDisplacedBoundaryProjection(quad, pointer, distance)) {
                         // Retain the projected endpoint for the line strip,
                         // but do not draw a synthetic control-point marker at
                         // the finite surface boundary.
