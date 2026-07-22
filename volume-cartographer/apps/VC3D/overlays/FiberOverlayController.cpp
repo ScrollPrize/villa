@@ -121,6 +121,7 @@ public:
         if (!painter) {
             return;
         }
+        painter->save();
         const QRectF exposed = option ? option->exposedRect : _bounds;
         for (const DrawCommand& command : _commands) {
             if (!exposed.isEmpty() && !command.bounds.intersects(exposed)) {
@@ -130,6 +131,7 @@ public:
             painter->setBrush(command.brush);
             painter->drawPath(command.path);
         }
+        painter->restore();
     }
 
 private:
@@ -252,6 +254,12 @@ void FiberOverlayController::applyOverlayPrimitives(
             ViewerOverlayControllerBase::clearOverlay(viewer);
         }
 
+        QGraphicsScene* scene = viewerScene(viewer);
+        if (!scene) {
+            clearOverlay(viewer);
+            return;
+        }
+
         auto* lines = new FiberBatchItem(FiberBatchItem::Content::Lines);
         auto* points = new FiberBatchItem(FiberBatchItem::Content::Points);
         lines->setZValue(94.0);
@@ -259,10 +267,8 @@ void FiberOverlayController::applyOverlayPrimitives(
         lines->setPrimitives(primitives);
         points->setPrimitives(primitives);
 
-        if (QGraphicsScene* scene = viewerScene(viewer)) {
-            scene->addItem(lines);
-            scene->addItem(points);
-        }
+        scene->addItem(lines);
+        scene->addItem(points);
         viewer->setOverlayGroup(overlayGroupKey(), {lines, points});
         items.lines = lines;
         items.points = points;
