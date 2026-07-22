@@ -28,17 +28,24 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # Native dependency closure for volume-cartographer's Python-only
+          # scikit-build configuration (apps, UI tracer, flatboi, tests: OFF).
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             curl \
+            git \
             libblosc-dev \
+            libboost-dev \
             libceres-dev \
             libcurl4-openssl-dev \
+            libeigen3-dev \
             liblz4-dev \
             libopencv-contrib-dev \
             libopencv-dev \
+            libsuitesparse-dev \
             libtiff-dev \
             libzstd-dev \
+            ninja-build \
             nlohmann-json3-dev \
             pkg-config \
             zlib1g-dev
