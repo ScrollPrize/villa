@@ -189,12 +189,20 @@ class InteractiveInfluenceState:
 
     @torch.no_grad()
     def _allocate_masks(self, spiral_and_transform):
-        flow_field = spiral_and_transform.flow_field
-        if not hasattr(flow_field, 'flows') or len(flow_field.flows) != 2:
+        flow_fields = spiral_and_transform.flow_fields
+        for flow_field in flow_fields:
+            if not hasattr(flow_field, 'flows') or len(flow_field.flows) != 2:
+                raise RuntimeError(
+                    'interactive influence regions require cartesian flow fields '
+                    '(low-res + high-res lattices)')
+        lr_flow, hr_flow = flow_fields[0].flows
+        if any(
+            tuple(field.flows[level].shape[2:]) != tuple((lr_flow, hr_flow)[level].shape[2:])
+            for field in flow_fields
+            for level in range(2)
+        ):
             raise RuntimeError(
-                'interactive influence regions require the cartesian flow field '
-                '(low-res + high-res lattices)')
-        lr_flow, hr_flow = flow_field.flows
+                'interactive influence regions require all flow stages to share lattice shapes')
         gap_logits = spiral_and_transform.gap_expander_params.logits
         self.masks = {
             'flow_lr': torch.zeros(lr_flow.shape[2:], dtype=torch.float16, device=self.device),
@@ -233,10 +241,13 @@ class InteractiveInfluenceState:
 
     @torch.no_grad()
     def _flow_z_displacement_bound(self, spiral_and_transform):
-        flow_field = spiral_and_transform.flow_field
-        lr_flow, hr_flow = flow_field.flows
-        v_max = (lr_flow[:, 0].abs().max() * float(flow_field.flow_scales[0])
-                 + hr_flow[:, 0].abs().max() * float(flow_field.flow_scales[1]))
+        v_max = 0.
+        for flow_field in spiral_and_transform.flow_fields:
+            lr_flow, hr_flow = flow_field.flows
+            v_max = v_max + (
+                lr_flow[:, 0].abs().max() * float(flow_field.flow_scales[0])
+                + hr_flow[:, 0].abs().max() * float(flow_field.flow_scales[1])
+            )
         z_range = float(spiral_and_transform.flow_max_corner_zyx[0]
                         - spiral_and_transform.flow_min_corner_zyx[0])
         return float(v_max) * z_range
@@ -360,11 +371,15 @@ class InteractiveInfluenceState:
     def _apply_optimizer_surgery(self, spiral_and_transform, optimiser):
         # Adam momentum would keep moving masked-out elements after their
         # gradients are zeroed; scale it by the mask (zero where fully masked).
-        lr_flow, hr_flow = spiral_and_transform.flow_field.flows
         gap_logits = spiral_and_transform.gap_expander_params.logits
-        for param, mask in ((lr_flow, self.masks['flow_lr']),
-                            (hr_flow, self.masks['flow_hr']),
-                            (gap_logits, self.masks['gap'])):
+        masked_params = [(gap_logits, self.masks['gap'])]
+        for flow_field in spiral_and_transform.flow_fields:
+            lr_flow, hr_flow = flow_field.flows
+            masked_params.extend((
+                (lr_flow, self.masks['flow_lr']),
+                (hr_flow, self.masks['flow_hr']),
+            ))
+        for param, mask in masked_params:
             state = optimiser.state.get(param)
             if state and 'exp_avg' in state:
                 state['exp_avg'].mul_(mask)
@@ -401,11 +416,15 @@ class InteractiveInfluenceState:
 
     @torch.no_grad()
     def apply_grad_masks_(self, spiral_and_transform):
-        lr_flow, hr_flow = spiral_and_transform.flow_field.flows
         gap_logits = spiral_and_transform.gap_expander_params.logits
-        for param, mask in ((lr_flow, self.masks['flow_lr']),
-                            (hr_flow, self.masks['flow_hr']),
-                            (gap_logits, self.masks['gap'])):
+        masked_params = [(gap_logits, self.masks['gap'])]
+        for flow_field in spiral_and_transform.flow_fields:
+            lr_flow, hr_flow = flow_field.flows
+            masked_params.extend((
+                (lr_flow, self.masks['flow_lr']),
+                (hr_flow, self.masks['flow_hr']),
+            ))
+        for param, mask in masked_params:
             if param.grad is not None:
                 param.grad.mul_(mask)
         for param in (spiral_and_transform.linear_logits,

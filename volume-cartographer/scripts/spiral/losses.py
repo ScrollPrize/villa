@@ -1,4 +1,5 @@
 import itertools
+import os
 
 import numpy as np
 import torch
@@ -8,6 +9,7 @@ import geom_utils
 import prefetch
 from dt_targets import patch_dt_target_in_sample_frame, strip_dt_target_in_sample_frame
 from loss_maps import diagnostics_enabled, record_loss_samples
+import strip_path_pools
 from sample_spiral import (
     canonical_winding_samples,
     get_theta_and_radii,
@@ -27,6 +29,8 @@ def configure_losses(config, z_begin_value, z_end_value):
     cfg = config
     z_begin = z_begin_value
     z_end = z_end_value
+    if cfg['patch_strip_sampling'] == 'dijkstra':
+        strip_path_pools.warm_workers()
 
 
 def _masked_mean(values, mask):
@@ -34,42 +38,79 @@ def _masked_mean(values, mask):
     return (values * mask_f).sum() / mask_f.sum().clamp(min=1.)
 
 
+def _pcl_sampling_group_weight(group):
+    # Look up the per-step sampling weight of a sampling group in
+    # cfg['pcl_sampling_weights']. Keys are matched on the group's basename with the
+    # .json suffix stripped, so the source json stem (e.g. 'relative_windings') or the
+    # fiber tag ('fibers:H' / 'fibers:V'). When the dict is in use every group must
+    # have an explicit key, so a missing one is an error rather than a silent default.
+    key = os.path.splitext(os.path.basename(str(group)))[0]
+    try:
+        return float(cfg['pcl_sampling_weights'][key])
+    except KeyError:
+        raise KeyError(
+            f'pcl_sampling_weights has no entry for sampling group {key!r}; '
+            f'when set, it must list a weight for every group'
+        )
+
+
 def build_pcl_sampling_strata(sampling_groups):
     # Precompute the per-step sampling pool for _choose_pcl_indices from each pool
     # member's sampling group (source json file; fibers split into fibers:H /
-    # fibers:V). Members whose group is None are ineligible and excluded. Returns
-    # {'strata': [int64 pool-index array per group], 'all': all eligible indices}.
-    # (Ported from origin/spiral-fibers-and-dt 015de2ee9.)
+    # fibers:V). Members whose group is None are ineligible and excluded. When
+    # cfg['pcl_sampling_weights'] is a dict, every group must have an explicit weight
+    # and groups with weight <= 0 are switched off (dropped from the pool entirely).
+    # Otherwise all groups stay eligible; the legacy stratified_pcl_sampling flag
+    # controls whether selection uses equal strata or the combined pool.
+    # Returns {'strata': [int64 pool-index array per group], 'groups': [group name
+    # per stratum], 'weights': float weight per stratum, 'all': all eligible indices}.
     group_to_indices = {}
     for idx, group in enumerate(sampling_groups):
         if group is None:
             continue
         group_to_indices.setdefault(group, []).append(idx)
-    strata = [np.asarray(indices, dtype=np.int64) for indices in group_to_indices.values()]
+    weighted = cfg['pcl_sampling_weights'] is not None
+    strata, groups, weights = [], [], []
+    for group, indices in group_to_indices.items():
+        weight = _pcl_sampling_group_weight(group) if weighted else 1.0
+        if weighted and weight <= 0:
+            continue  # switched off
+        strata.append(np.asarray(indices, dtype=np.int64))
+        groups.append(group)
+        weights.append(weight)
     all_indices = np.concatenate(strata) if strata else np.empty(0, dtype=np.int64)
-    return {'strata': strata, 'all': all_indices}
+    return {
+        'strata': strata,
+        'groups': groups,
+        'weights': np.asarray(weights, dtype=np.float64),
+        'all': all_indices,
+    }
 
 
 def _choose_pcl_indices(sampling_strata, num_to_sample):
     # Choose num_to_sample pool indices from a build_pcl_sampling_strata() bundle.
-    # Stratified mode (cfg['stratified_pcl_sampling']) splits the draw as evenly as
-    # possible across the strata regardless of stratum size (remainder going to a
-    # random subset of strata), then samples uniformly within each stratum, with
-    # replacement only when a stratum's share exceeds its size. Non-stratified mode
-    # is the legacy behaviour: uniform over the whole pool without replacement.
-    if not cfg['stratified_pcl_sampling']:
+    # Explicit weights allocate draws proportionally. Without them, the legacy
+    # stratified_pcl_sampling switch selects equal group shares or uniform sampling
+    # over the combined pool.
+    weighted = cfg['pcl_sampling_weights'] is not None
+    if not weighted and not cfg['stratified_pcl_sampling']:
         return np.random.choice(sampling_strata['all'], num_to_sample, replace=False)
     strata = sampling_strata['strata']
-    quotas = np.full(len(strata), num_to_sample // len(strata), dtype=np.int64)
+    weights = sampling_strata['weights'] if weighted else np.ones(
+        len(strata), dtype=np.float64)
+    shares = num_to_sample * weights / weights.sum()
+    quotas = np.floor(shares).astype(np.int64)
     remainder = num_to_sample - int(quotas.sum())
     if remainder > 0:
-        quotas[np.random.choice(len(strata), remainder, replace=False)] += 1
+        frac = shares - quotas
+        probs = frac / frac.sum() if frac.sum() > 0 else weights / weights.sum()
+        quotas[np.random.choice(len(strata), remainder, replace=False, p=probs)] += 1
     chosen = [
         np.random.choice(stratum, quota, replace=quota > len(stratum))
         for stratum, quota in zip(strata, quotas)
         if quota > 0
     ]
-    return np.concatenate(chosen)
+    return np.concatenate(chosen) if chosen else np.empty(0, dtype=np.int64)
 
 
 
@@ -119,6 +160,39 @@ def _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding):
     return unwrap_shifted_radii(theta, shifted_radii, dr_per_winding)[0]
 
 
+# ============================================================================================
+# 'dijkstra' strip sampling (cfg['patch_strip_sampling'] == 'dijkstra'): instead of straight
+# rows/columns (and cardinal L-shapes), strips are geodesic shortest paths on the 8-connected
+# valid-quad graph, from a start cell to a 'distant' reachable endpoint, skirting holes and
+# ragged edges. Consecutive path cells are grid-adjacent, so a path is a contiguous walk and
+# unwrap_shifted_radii can stitch theta=0 crossings along it exactly as for straight
+# strips. The paths come from per-patch / per-anchor pools built and continuously refreshed by
+# background worker processes (see strip_path_pools.py; strip_paths.py has the actual path
+# computation); here we only subsample positions along a pooled path + subpixel jitter.
+# ============================================================================================
+
+def _sample_points_along_path(path_ij, num_points, rng=None):
+    # Subsample `num_points` positions along a path (sorted in traversal order, so the unwrap
+    # sees a contiguous walk) with per-point subpixel jitter in both axes; path cells are valid
+    # quads, so jittered points stay on valid quads.
+    rng = np.random if rng is None else rng
+    path_len = path_ij.shape[0]
+    positions = np.sort(rng.choice(path_len, num_points, replace=num_points > path_len))
+    return path_ij[positions].astype(np.float32) + rng.uniform(
+        0., 1., size=[num_points, 2]).astype(np.float32)
+
+
+def _sample_dijkstra_strips_at_ij(patch, i_q, j_q, num_points):
+    # 'dijkstra'-mode replacement for _sample_l_shapes_at_ij: 4 geodesic strips from the
+    # annotated cell, one per cardinal cone; None while the anchor's pools are still being
+    # built in the background. Caller guarantees valid_quad[i_q, j_q].
+    pools = strip_path_pools.get_anchor_path_pools(patch, i_q, j_q)
+    if pools is None:
+        return None
+    return [
+        _sample_points_along_path(pool[np.random.randint(len(pool))], num_points)
+        for pool in pools
+    ]
 
 def _sample_strip_ijs(line_valid, seed, fixed_coord, axis, num_points):
     # Sample num_points fractional ijs along the contiguous True run of `line_valid`
@@ -210,6 +284,15 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng):
     # one column strip of fractional ijs. Pure numpy + `rng` so it can run on
     # the prefetch worker for the next step while the GPU works on this one.
     N = len(patch_indices)
+
+    use_dijkstra_strips = cfg['patch_strip_sampling'] == 'dijkstra'
+    if use_dijkstra_strips:
+        touched_patches = [patches[patch_idx] for patch_idx in dict.fromkeys(patch_indices)]
+        strip_path_pools.ensure_patch_path_pools(touched_patches)
+        # Submitted before the sampling below so the workers refresh while this step proceeds.
+        for patch in touched_patches:
+            strip_path_pools.submit_patch_pool_refresh(patch)
+
     P = num_points_per_direction
     horizontal_ijs_by_patch = np.empty([N, P, 2], dtype=np.float32)
     vertical_ijs_by_patch = np.empty([N, P, 2], dtype=np.float32)
@@ -221,6 +304,18 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng):
     var_jitters_v = rand((N, P)).astype(np.float32)
     for n, patch_idx in enumerate(patch_indices):
         patch = patches[patch_idx]
+
+        if use_dijkstra_strips:
+            # Two independent geodesic strips per patch (no horizontal/vertical distinction;
+            # the 'horizontal'/'vertical' arrays are just the two strip slots). Snapshot the
+            # pool once: a background refresh may swap the list, but never mutates it.
+            pool = patch._strip_path_pool
+            path_a, path_b = (
+                pool[k] for k in rng.choice(len(pool), 2, replace=len(pool) < 2)
+            )
+            horizontal_ijs_by_patch[n] = _sample_points_along_path(path_a, P, rng)
+            vertical_ijs_by_patch[n] = _sample_points_along_path(path_b, P, rng)
+            continue
 
         # Horizontal: pick a row uniformly from rows-with-valid-quads, then pick a run
         # within that row weighted by length (matches original `np.random.choice(flatnonzero)`).
@@ -272,7 +367,7 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
         patch_indices = rng.choice(len(patches), num_to_sample,
                                    p=sampling_probabilities, replace=True)
         native_atlas = getattr(patch_atlas, 'sampling_atlas', None)
-        if native_atlas is not None:
+        if native_atlas is not None and cfg['patch_strip_sampling'] != 'dijkstra':
             seed = int(rng.randint(0, np.iinfo(np.int64).max))
             ijs_np = np.asarray(native_atlas.sample_patch_strips(
                 np.ascontiguousarray(patch_indices, dtype=np.int64),
@@ -296,12 +391,9 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
 
 
 def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, batch, extra_zyxs=None, num_points_per_patch=None):
-    # For each patch, we take one row and one column. _sample_strip_ijs picks a contiguous
-    # subrange of each so _unwrap_track_shifted_radii can reliably handle theta=0 crossings
-    # between consecutive sorted samples.
-
-    # TODO: instead of 'strict' horizontal & vertical strips, could/should take wiggly strips that take a mostly-horizontal
-    #  or mostly-vertical patch between distant points, skirting around gaps/holes; important for long, ragged traces
+    # For each patch, take one row and one column in straight mode, or two
+    # geodesic paths in dijkstra mode. Either representation is a contiguous
+    # walk, so unwrapping can stitch theta=0 crossings between samples.
 
     if num_points_per_patch is None:
         num_points_per_patch = cfg['num_points_per_patch']
@@ -672,11 +764,14 @@ def _sample_single_l_shape(valid_quad, i_q, j_q, leg1_axis, leg1_dir, leg2_dir, 
 
 
 def _sample_l_shapes_at_ij(patch, i, j, num_points):
-    # Sample 4 L-shapes anchored on the annotated point (i, j) of `patch`, one per cardinal
-    # primary direction: right (+j), left (-j), down (+i), up (-i). For each, leg 2's
+    # Sample 4 strips anchored on the annotated point (i, j) of `patch`, one per cardinal
+    # primary direction. In 'dijkstra' mode these are geodesic strips to distant endpoints
+    # (one per cardinal cone; see _sample_dijkstra_strips_at_ij); otherwise L-shapes, one per
+    # primary direction: right (+j), left (-j), down (+i), up (-i). For each L, leg 2's
     # perpendicular direction is chosen uniformly at random. Returns a list of 4 float32
     # [num_points, 2] arrays sampled in traversal order, or None if (i, j) doesn't lie on
-    # a valid quad. Each L is a single contiguous walk in patch space, so the unwrap can
+    # a valid quad (or, in dijkstra mode, while this anchor's path pools are still being
+    # built in the background). Each L is a single contiguous walk in patch space, so the unwrap can
     # handle theta=0 seam crossings along the bent strip just as it does along a straight
     # row/column.
     valid_quad = patch._sampling_valid_quad_mask_np
@@ -685,6 +780,9 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
     j_q = min(max(int(j), 0), W_q - 1)
     if not valid_quad[i_q, j_q]:
         return None
+
+    if cfg['patch_strip_sampling'] == 'dijkstra':
+        return _sample_dijkstra_strips_at_ij(patch, i_q, j_q, num_points)
 
     primary_specs = [(0, +1), (0, -1), (1, +1), (1, -1)]  # (leg1_axis, leg1_dir)
     return [
@@ -702,6 +800,8 @@ def _sample_l_shapes_batch(patches_dict, patch_atlas, requests, num_points):
     if not requests:
         return []
     native_atlas = getattr(patch_atlas, 'sampling_atlas', None)
+    if cfg['patch_strip_sampling'] == 'dijkstra':
+        native_atlas = None
     if native_atlas is None:
         return [
             _sample_l_shapes_at_ij(patches_dict[pid], i, j, num_points)
@@ -722,8 +822,6 @@ def _sample_l_shapes_batch(patches_dict, patch_atlas, requests, num_points):
     ijs = np.asarray(result['ijs'])
     valid = np.asarray(result['valid'], dtype=bool)
     return [ijs[k] if valid[k] else None for k in range(len(requests))]
-
-
 
 def _batched_pcl_chain_seam_adjustments(slice_to_spiral_transform, dr_per_winding, chain_zyxs_list):
     # Cumulative theta=0 seam adjustment (last unwrap entry) for each pcl chain.
@@ -747,7 +845,6 @@ def _batched_pcl_chain_seam_adjustments(slice_to_spiral_transform, dr_per_windin
         chain_theta, _, _ = get_theta_and_radii(chain_spiral[..., 1:], dr_per_winding)
         chain_adjustments = _unwrap_track_shifted_radii(chain_theta, torch.zeros_like(chain_theta), dr_per_winding)
         return chain_adjustments[:, -1]
-
 
 
 def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections, sampling_strata):

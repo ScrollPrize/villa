@@ -212,11 +212,13 @@ def build_transform(checkpoint, model_z_begin, model_z_end):
     model.to(device)
     model.load_state_dict(checkpoint['spiral_and_transform'])
     model.eval()
-    # The high-res flow field is stored "pre-scale": at forward time the hr params
-    # are multiplied by flow_scales[1], which training ramps and which is NOT part
-    # of the state_dict. A fully-fitted checkpoint ends the ramp at its 'final'
-    # value, so pin the scale to that to reproduce the saved transform.
-    model.flow_field.flow_scales[1] = cfg['flow_field_high_res_lr_scale_final']
+    # The high-res flow fields are stored "pre-scale": at forward time the hr params
+    # are multiplied by flow_scales[1], which training ramps (identically for every
+    # stage when num_flow_stages > 1) and which is NOT part of the state_dict. A
+    # fully-fitted checkpoint ends the ramp at its 'final' value, so pin every
+    # stage's scale to that to reproduce the saved transform.
+    for flow_field in model.flow_fields:
+        flow_field.flow_scales[1] = cfg['flow_field_high_res_lr_scale_final']
 
     transform = model.get_slice_to_spiral_transform()
     dr_per_winding = model.get_dr_per_winding()

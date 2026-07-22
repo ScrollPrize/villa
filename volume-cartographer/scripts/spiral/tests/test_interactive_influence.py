@@ -45,24 +45,28 @@ INFLUENCE_CONFIG = {
 }
 
 
-def make_tiny_model():
+def make_tiny_model(**config_overrides):
     torch.manual_seed(0)
     min_corner = torch.tensor([0, -96, -96], dtype=torch.int64)
     max_corner = torch.tensor([192, 96, 96], dtype=torch.int64)
     umbilicus = torch.zeros([5, 3])
     umbilicus[:, 0] = torch.linspace(0., 192., 5)
+    config = dict(TINY_CONFIG)
+    config.update(config_overrides)
     return SpiralAndTransform(
         flow_integration_steps=3,
         flow_integration_solver='rk4',
         flow_min_corner_zyx=min_corner,
         flow_max_corner_zyx=max_corner,
         umbilicus_zyx=umbilicus,
-        config=TINY_CONFIG,
+        config=config,
     )
 
 
 def make_optimiser(model, gap_weight_decay=1.e-2):
-    flow_field_params = list(model.flow_field.parameters())
+    flow_field_params = [
+        param for flow_field in model.flow_fields for param in flow_field.parameters()
+    ]
     gap_expander_params = list(model.gap_expander_params.parameters())
     linear_params = [model.linear_logits]
     grouped = {id(p) for p in flow_field_params + gap_expander_params + linear_params}
@@ -227,6 +231,23 @@ class FlowLatticeMappingTests(unittest.TestCase):
             round_trip = transform.inv(transform(points))
         torch.testing.assert_close(round_trip, points, atol=0.5, rtol=0.)
 
+    def test_two_stage_flow_round_trip(self):
+        model = make_tiny_model(num_flow_stages=2)
+        self.assertEqual(len(model.flow_fields), 2)
+        with torch.no_grad():
+            for flow_field in model.flow_fields:
+                for flow in flow_field.flows:
+                    flow.normal_(std=1e-3)
+        transform = model.get_slice_to_spiral_transform()
+        points = torch.stack([
+            torch.empty([256]).uniform_(10., 180.),
+            torch.empty([256]).uniform_(-80., 80.),
+            torch.empty([256]).uniform_(-80., 80.),
+        ], dim=-1)
+        with torch.no_grad():
+            round_trip = transform.inv(transform(points))
+        torch.testing.assert_close(round_trip, points, atol=0.5, rtol=0.)
+
 
 class FreezeInvariantTests(unittest.TestCase):
     def _prepopulated(self):
@@ -303,6 +324,20 @@ class FreezeInvariantTests(unittest.TestCase):
         optimiser2.step()
         moved_free = (gap2.detach() - before).abs().mean()
         self.assertLess(float(moved_masked), float(moved_free))
+
+    def test_flow_masks_apply_to_every_stage(self):
+        model = make_tiny_model(num_flow_stages=2)
+        state = make_influence_state(INFLUENCE_CONFIG, torch.device('cpu'))
+        state._allocate_masks(model)
+        state.masks['flow_lr'].zero_()
+        state.masks['flow_hr'].zero_()
+        for flow_field in model.flow_fields:
+            for flow in flow_field.flows:
+                flow.grad = torch.ones_like(flow)
+        state.apply_grad_masks_(model)
+        for flow_field in model.flow_fields:
+            for flow in flow_field.flows:
+                self.assertEqual(float(flow.grad.abs().sum()), 0.)
 
     def test_gap_weight_decay_disabled_and_reemulated_in_region(self):
         model, optimiser = self._prepopulated()
