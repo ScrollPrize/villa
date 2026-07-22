@@ -351,6 +351,19 @@ public:
                          QString* errorMessage = nullptr,
                          QString* resolvedOutputDir = nullptr);
 
+    /// Dialog-free core of onRenameSurface: renames the segment folder + meta.json
+    /// UUID from `oldId` to `newName`, keeping the editing guard, the
+    /// ^[a-zA-Z0-9_-]+$ name validation, the collision check, the CState/vpkg
+    /// cleanup, and the rollback paths. Never opens QInputDialog / QMessageBox.
+    /// Returns true on success. On failure returns false and, when `err` is
+    /// non-null, sets it to a classifiable sentence: "editing in progress",
+    /// "invalid name", "name unchanged", "segment not found", "name exists",
+    /// "no volume package", or a metadata/rename error string. The interactive
+    /// onRenameSurface calls this after its dialog; the agent bridge calls it
+    /// directly (ADDITIONS_SPEC item 5).
+    bool renameSurfaceHeadless(const QString& oldId, const QString& newName,
+                               QString* err = nullptr);
+
     QString findNewNeighborSurface(const NeighborCopyJob& job) const;
     bool startNeighborCopyPass(const QString& paramsPath,
                                const QString& resumeSurface,

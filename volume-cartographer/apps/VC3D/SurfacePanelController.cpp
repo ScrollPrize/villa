@@ -1520,6 +1520,30 @@ void SurfacePanelController::handleDeleteSegments(const QStringList& segmentIds)
         return;
     }
 
+    const int total = segmentIds.size();
+    QString err;
+    if (deleteSegmentsHeadless(segmentIds, &err)) {
+        emit statusMessageRequested(tr("Successfully deleted %1 segment(s)").arg(total), 5000);
+    } else if (!err.isEmpty()) {
+        QMessageBox::warning(parentWidget,
+                             tr("Deletion Failed"),
+                             tr("Some segments could not be deleted: %1\n\n"
+                                "Permission errors may require manual deletion or running with "
+                                "elevated privileges.")
+                                 .arg(err));
+    }
+}
+
+bool SurfacePanelController::deleteSegmentsHeadless(const QStringList& segmentIds, QString* err)
+{
+    if (segmentIds.isEmpty() || !_volumePkg) {
+        if (err) {
+            *err = _volumePkg ? tr("no segments specified")
+                              : tr("no volume package loaded");
+        }
+        return false;
+    }
+
     int successCount = 0;
     QStringList failedSegments;
     bool anyChanges = false;
@@ -1566,24 +1590,12 @@ void SurfacePanelController::handleDeleteSegments(const QStringList& segmentIds)
         emit surfacesLoaded();
     }
 
-    if (successCount == segmentIds.size()) {
-        emit statusMessageRequested(tr("Successfully deleted %1 segment(s)").arg(successCount), 5000);
-    } else if (successCount > 0) {
-        QMessageBox::warning(parentWidget,
-                             tr("Partial Success"),
-                             tr("Deleted %1 segment(s), but failed to delete: %2\n\n"
-                                "Note: Permission errors may require manual deletion or running with elevated privileges.")
-                                 .arg(successCount)
-                                 .arg(failedSegments.join(", ")));
-    } else {
-        QMessageBox::critical(parentWidget,
-                              tr("Deletion Failed"),
-                              tr("Failed to delete any segments.\n\n"
-                                 "Failed segments: %1\n\n"
-                                 "This may be due to insufficient permissions. "
-                                 "Try running the application with elevated privileges or manually delete the folders.")
-                                  .arg(failedSegments.join(", ")));
-    }
+    if (successCount == segmentIds.size())
+        return true;
+
+    if (err)
+        *err = failedSegments.join(", ");
+    return false;
 }
 
 void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCollection* pointCollection)

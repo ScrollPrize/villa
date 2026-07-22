@@ -138,6 +138,14 @@ public:
     void setVisibleSegmentFolders(std::vector<SegmentFolderSelection> folders);
     void addSingleSegmentation(const std::string& segId);
     void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
+    // Dialog-free core of handleDeleteSegments: irreversibly deletes each id from
+    // the package on disk (removeSingleSegmentation + VolumePkg::removeSegmentation)
+    // and refreshes the panel. Never shows a dialog. Returns true when every id
+    // was deleted; on partial/total failure returns false and, when `err` is
+    // non-null, sets it to a human-readable summary of the failed ids. The
+    // interactive handleDeleteSegments calls this after its confirmation dialog;
+    // the agent bridge calls it directly (ADDITIONS_SPEC item 5).
+    bool deleteSegmentsHeadless(const QStringList& segmentIds, QString* err = nullptr);
     bool cycleToNextVisibleSegment();
     bool cycleToPreviousVisibleSegment();
     void materializeCurrentOpenDataFolder();

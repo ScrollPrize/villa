@@ -5279,126 +5279,161 @@ void SegmentationCommandHandler::onRenameSurface(const QString& segmentId)
         return;
     }
 
-    std::string newId = newName.toStdString();
-
-    // Validate new name: alphanumeric + underscore + hyphen only
-    static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
-    if (!validNameRegex.match(newName).hasMatch()) {
+    // Dialog-free core carries the validation, rename, and rollback. Map its
+    // distinct failure sentences back to the interactive message boxes.
+    QString err;
+    if (renameSurfaceHeadless(segmentId, newName, &err)) {
+        emit statusMessage(tr("Renamed '%1' to '%2'").arg(segmentId, newName), 5000);
+        return;
+    }
+    if (err == QLatin1String("name unchanged"))
+        return;
+    if (err == QLatin1String("invalid name")) {
         QMessageBox::warning(_parentWidget, tr("Invalid Name"),
             tr("Surface name can only contain letters, numbers, underscores, and hyphens."));
-        return;
+    } else if (err == QLatin1String("name exists")) {
+        QMessageBox::warning(_parentWidget, tr("Name Exists"),
+            tr("A surface with the name '%1' already exists.").arg(newName));
+    } else if (err == QLatin1String("segment not found")) {
+        emit statusMessage(tr("Segment not found: %1").arg(segmentId), 3000);
+    } else if (!err.isEmpty()) {
+        QMessageBox::critical(_parentWidget, tr("Error"), err);
     }
+}
 
-    // Check if name is unchanged
-    if (newId == oldId) {
-        return;
-    }
+bool SegmentationCommandHandler::renameSurfaceHeadless(const QString& segmentIdQ,
+                                                       const QString& newName,
+                                                       QString* err)
+{
+    // The short sentinels below are stable machine-read tokens: both
+    // onRenameSurface and the agent-bridge handleSegmentsRename compare *err
+    // against these exact literals to pick their user-facing message / JSON
+    // error code, so they must stay untranslated. Only the descriptive
+    // failures further down (which are shown verbatim) are wrapped in tr().
+    auto fail = [&](const QString& msg) {
+        if (err) *err = msg;
+        return false;
+    };
 
-    // Check for name collision
-    std::filesystem::path volpkgPath(_state->vpkg()->getVolpkgDirectory());
+    if (!_state || !_state->vpkg())
+        return fail(QStringLiteral("no volume package"));
+
+    // Block if surface is currently being edited.
+    if (_isEditingCheck && _isEditingCheck())
+        return fail(QStringLiteral("editing in progress"));
+
+    const std::string oldId = segmentIdQ.toStdString();
+    auto seg = _state->vpkg()->segmentation(oldId);
+    if (!seg)
+        return fail(QStringLiteral("segment not found"));
+
+    const std::string newId = newName.toStdString();
+
+    // Validate new name: alphanumeric + underscore + hyphen only.
+    static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
+    if (!validNameRegex.match(newName).hasMatch())
+        return fail(QStringLiteral("invalid name"));
+
+    // Check if name is unchanged.
+    if (newId == oldId)
+        return fail(QStringLiteral("name unchanged"));
+
+    // Check for name collision.
     std::filesystem::path currentPath = seg->path();
     std::filesystem::path parentDir = currentPath.parent_path();
     std::filesystem::path newPath = parentDir / newId;
 
-    if (std::filesystem::exists(newPath)) {
-        QMessageBox::warning(_parentWidget, tr("Name Exists"),
-            tr("A surface with the name '%1' already exists.").arg(newName));
-        return;
-    }
+    if (std::filesystem::exists(newPath))
+        return fail(QStringLiteral("name exists"));
 
-    // Check if this is the currently selected segment
+    // Check if this is the currently selected segment.
     bool wasSelected = (_state->activeSurfaceId() == oldId);
 
-    // Store the old UUID for rollback if needed
+    // Store the old UUID for rollback if needed.
     std::string oldUuid = seg->id();
 
     // === Clean up the segment before renaming ===
 
-    // Clear from surface collection (including "segmentation" if it matches)
+    // Clear from surface collection (including "segmentation" if it matches).
     if (_state) {
         auto currentSurface = _state->surface(oldId);
         auto segmentationSurface = _state->surface("segmentation");
 
-        // If this surface is currently shown as "segmentation", clear it
+        // If this surface is currently shown as "segmentation", clear it.
         if (currentSurface && segmentationSurface && currentSurface == segmentationSurface) {
             _state->setSurface("segmentation", nullptr, false, false);
         }
 
-        // Clear the surface from the collection
+        // Clear the surface from the collection.
         _state->setSurface(oldId, nullptr, false, false);
     }
 
-    // Unload the surface from VolumePkg
+    // Unload the surface from VolumePkg.
     _state->vpkg()->unloadSurface(oldId);
 
-    // Clear selection if this was selected
+    // Clear selection if this was selected.
     if (wasSelected) {
         if (_clearSelectionCallback) {
             _clearSelectionCallback();
         }
     }
 
-    // Update meta.json UUID
+    // Update meta.json UUID.
     try {
         seg->setId(newId);
         seg->saveMetadata();
     } catch (const std::exception& e) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-            tr("Failed to update metadata: %1").arg(e.what()));
-        // Reload the old segment
+        // Reload the old segment.
         _state->vpkg()->refreshSegmentations();
         if (_surfacePanel) {
             _surfacePanel->reloadSurfacesFromDisk();
         }
-        return;
+        return fail(tr("Failed to update metadata: %1").arg(e.what()));
     }
 
-    // Perform the folder rename
+    // Perform the folder rename.
     try {
         std::filesystem::rename(currentPath, newPath);
 
-        // Remove old ID from VolumePkg's internal tracking
+        // Remove old ID from VolumePkg's internal tracking.
         _state->vpkg()->removeSingleSegmentation(oldId);
 
-        // Remove from surface panel
+        // Remove from surface panel.
         if (_surfacePanel) {
             _surfacePanel->removeSingleSegmentation(oldId);
         }
 
-        // Refresh segmentations to pick up the new ID
+        // Refresh segmentations to pick up the new ID.
         _state->vpkg()->refreshSegmentations();
 
-        // Add the new segment
+        // Add the new segment.
         if (_surfacePanel) {
             _surfacePanel->addSingleSegmentation(newId);
         }
 
-        // Restore selection if it was the selected surface
+        // Restore selection if it was the selected surface.
         if (wasSelected && _restoreSelectionCallback) {
             _restoreSelectionCallback(newId);
         }
 
-        emit statusMessage(
-            tr("Renamed '%1' to '%2'").arg(segmentId, newName), 5000);
+        return true;
 
     } catch (const std::exception& e) {
-        // Attempt to rollback metadata change
+        // Attempt to rollback metadata change.
         try {
             seg->setId(oldUuid);
             seg->saveMetadata();
         } catch (...) {
-            // Rollback failed - metadata is now inconsistent
+            // Rollback failed - metadata is now inconsistent.
         }
 
-        QMessageBox::critical(_parentWidget, tr("Error"),
-            tr("Failed to rename folder: %1\n\n"
-               "The segment has been unloaded. Please reload surfaces.").arg(e.what()));
-
-        // Refresh to get back to a consistent state
+        // Refresh to get back to a consistent state.
         _state->vpkg()->refreshSegmentations();
         if (_surfacePanel) {
             _surfacePanel->reloadSurfacesFromDisk();
         }
+        return fail(tr("Failed to rename folder: %1\n\n"
+                       "The segment has been unloaded. Please reload surfaces.").arg(e.what()));
     }
 }
 
