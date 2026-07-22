@@ -17,6 +17,7 @@ __all__ = [
     "vc3d_center_viewer",
     "vc3d_zoom_viewer",
     "vc3d_rotate_viewer",
+    "vc3d_set_axis_aligned_slices",
     "vc3d_drag",
 ]
 
@@ -139,6 +140,18 @@ async def vc3d_rotate_viewer(
     return await _call(
         "viewer.rotate", {"plane": plane, "degrees": degrees, "relative": relative}
     )
+
+
+@mcp.tool()
+async def vc3d_set_axis_aligned_slices(enabled: bool) -> dict[str, Any]:
+    """Enable or disable axis-aligned slice mode -- the same checkbox (and its
+    keyboard shortcut) a human toggles to make "seg xz"/"seg yz" the rotatable
+    canonical slice planes. This is the prerequisite for vc3d_rotate_viewer,
+    which errors when the mode is off. Toggling is idempotent and persists the
+    setting exactly like the human path. Returns {"enabled": bool} with the
+    resulting mode state. Read the current state via vc3d_get_state's
+    "axisAlignedSlices" field."""
+    return await _call("viewer.set_axis_aligned_slices", {"enabled": enabled})
 
 
 @mcp.tool()

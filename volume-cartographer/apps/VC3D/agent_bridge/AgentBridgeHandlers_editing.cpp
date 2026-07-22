@@ -2,6 +2,7 @@
 #include "agent_bridge/AgentBridgeInternal.hpp"
 
 #include <QBuffer>
+#include <QCheckBox>
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDateTime>
@@ -323,6 +324,43 @@ QJsonObject AgentBridgeServer::handleViewerRotate(const QJsonValue& params)
 }
 
 
+QJsonObject AgentBridgeServer::handleViewerSetAxisAlignedSlices(const QJsonValue& params)
+{
+    const QJsonObject p = paramsObject(params);
+
+    AxisAlignedSliceController* slices =
+        _window ? _window->_axisAlignedSliceController.get() : nullptr;
+    if (!slices)
+        throw AgentBridgeError{-32000, "Axis-aligned slice controller unavailable", {}};
+
+    if (!p.contains(QStringLiteral("enabled")) || !p.value(QStringLiteral("enabled")).isBool()) {
+        QJsonObject data;
+        data["param"] = "enabled";
+        throw AgentBridgeError{-32602, "enabled (bool) is required", data};
+    }
+    const bool enabled = p.value(QStringLiteral("enabled")).toBool();
+
+    // Drive the checkbox so the toggle takes the exact human/shortcut path
+    // (CWindow::onAxisAlignedSlicesToggled): setEnabled + persist the QSetting +
+    // sync the overlay checkbox. setChecked emits toggled synchronously (same
+    // thread, direct connection), so slices->isEnabled() is up to date on return.
+    // Setting an already-matching value is a no-op (idempotent).
+    QCheckBox* chk = _window ? _window->chkAxisAlignedSlices : nullptr;
+    if (chk) {
+        if (chk->isChecked() != enabled)
+            chk->setChecked(enabled);
+    } else {
+        // No UI checkbox available (not expected in a normal bridge session):
+        // drive the controller directly as a fallback.
+        slices->setEnabled(enabled);
+    }
+
+    QJsonObject result;
+    result["enabled"] = slices->isEnabled();
+    return result;
+}
+
+
 // ---------------------------------------------------------------------------
 // Segmentation editing + growth (SPEC §3.10-3.12)
 // ---------------------------------------------------------------------------
@@ -504,6 +542,72 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
     result["jobId"] = jobId;
     result["kind"] = "segmentation.grow";
     return result;
+}
+
+
+QJsonObject AgentBridgeServer::handleSegmentationSave(const QJsonValue&)
+{
+    // Force the pending autosave to disk and report the flush as an async
+    // "autosave"-source job (SPEC §3.11c). Params are ignored ({} accepted).
+    SegmentationModule* mod = _window ? _window->_segmentationModule.get() : nullptr;
+    if (!mod) {
+        QJsonObject data;
+        data["detail"] = "segmentation module is not available";
+        throw AgentBridgeError{-32000, "Segmentation module unavailable", data};
+    }
+
+    const SegmentationModule::AutosaveStatus before = mod->autosaveStatus();
+
+    // Nothing dirty and no save in flight -> nothing to flush. Return an idle
+    // body (jobId:null) so callers can no-op without polling a job.
+    if (!before.pending && !before.saveInProgress) {
+        QJsonObject result;
+        result["jobId"] = QJsonValue::Null;
+        result["kind"] = "segmentation.save";
+        result["state"] = "idle";
+        result["pending"] = false;
+        result["saveInProgress"] = false;
+        result["dirtyAfterSave"] = false;
+        return result;
+    }
+
+    // A save is pending or already running: model it as a job. A second explicit
+    // save while one is running is rejected (-32004).
+    requireSourceIdle(QStringLiteral("autosave"));
+
+    const QString jobId = beginJob(QStringLiteral("autosave"),
+                                   QStringLiteral("segmentation.save"),
+                                   QStringLiteral("Save segment"),
+                                   /*broadcastStart=*/false);
+
+    // flushAutosave() -> markAutosaveNeeded(true) -> performAutosave(): startSave()
+    // flips saveInProgress synchronously when a save actually launches (or when a
+    // save was already in flight it stays true and its completion signal will
+    // close this job). If saveInProgress is still false afterwards, performAutosave
+    // early-returned (no resolvable surface / missing file metadata) and no
+    // autosaveCompleted signal will fire — so resolve the job here.
+    mod->flushAutosave();
+    const SegmentationModule::AutosaveStatus after = mod->autosaveStatus();
+
+    if (!after.saveInProgress) {
+        // The flush did not start (nor continue) a disk write: drop the job we
+        // optimistically opened and report the resulting idle state.
+        _activeJobs.remove(QStringLiteral("autosave"));
+        QJsonObject result;
+        result["jobId"] = QJsonValue::Null;
+        result["kind"] = "segmentation.save";
+        result["state"] = "idle";
+        result["pending"] = after.pending;
+        result["saveInProgress"] = false;
+        result["dirtyAfterSave"] = after.dirtyAfterSave;
+        return result;
+    }
+
+    if (auto it = _activeJobs.find(QStringLiteral("autosave")); it != _activeJobs.end())
+        broadcastJobProgress(it.value(), QStringLiteral("started"));
+
+    const JobRecord* rec = jobById(jobId);
+    return rec ? jobStatusJson(*rec) : QJsonObject{};
 }
 
 

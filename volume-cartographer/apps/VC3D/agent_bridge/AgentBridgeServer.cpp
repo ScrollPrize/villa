@@ -562,12 +562,16 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleViewerZoom(p); });
     _handlers.insert("viewer.rotate",
         [this](const QJsonValue& p) { return handleViewerRotate(p); });
+    _handlers.insert("viewer.set_axis_aligned_slices",
+        [this](const QJsonValue& p) { return handleViewerSetAxisAlignedSlices(p); });
     _handlers.insert("segmentation.enable_editing",
         [this](const QJsonValue& p) { return handleSegmentationEnableEditing(p); });
     _handlers.insert("segmentation.grow",
         [this](const QJsonValue& p) { return handleSegmentationGrow(p); });
     _handlers.insert("segmentation.grow_patch_from_seed",
         [this](const QJsonValue& p) { return handleSegmentationGrowPatchFromSeed(p); });
+    _handlers.insert("segmentation.save",
+        [this](const QJsonValue& p) { return handleSegmentationSave(p); });
     _handlers.insert("segmentation.manual_add.begin",
         [this](const QJsonValue& p) { return handleManualAddBegin(p); });
     _handlers.insert("segmentation.manual_add.finish",
@@ -580,6 +584,12 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleManualAddUndoConstraint(p); });
     _handlers.insert("segmentation.corrections.set_point_mode",
         [this](const QJsonValue& p) { return handleCorrectionsSetPointMode(p); });
+    _handlers.insert("wrap_annotation.set_mode",
+        [this](const QJsonValue& p) { return handleWrapAnnotationSetMode(p); });
+    _handlers.insert("wrap_annotation.commit",
+        [this](const QJsonValue& p) { return handleWrapAnnotationCommit(p); });
+    _handlers.insert("wrap_annotation.undo",
+        [this](const QJsonValue& p) { return handleWrapAnnotationUndo(p); });
     _handlers.insert("points.commit",
         [this](const QJsonValue& p) { return handlePointsCommit(p); });
     _handlers.insert("points.list",

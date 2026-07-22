@@ -275,6 +275,15 @@ bool WrapAnnotationWidget::sameWrapAnnotationEnabled() const
     return _chkSameWrapAnnotation && _chkSameWrapAnnotation->isChecked();
 }
 
+void WrapAnnotationWidget::setSameWrapAnnotationEnabled(bool enabled)
+{
+    if (!_chkSameWrapAnnotation)
+        return;
+    // setChecked() only emits toggled() when the state actually changes, which
+    // is exactly what we want: setting the current state is an inert no-op.
+    _chkSameWrapAnnotation->setChecked(enabled);
+}
+
 double WrapAnnotationWidget::sameWrapAnnotationSpacing() const
 {
     return _sameWrapSpacingSpinbox ? _sameWrapSpacingSpinbox->value() : 20.0;

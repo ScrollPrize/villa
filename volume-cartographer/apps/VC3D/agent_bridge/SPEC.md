@@ -350,6 +350,64 @@ Convenience alias: identical to `canvas.click` with `"shift"` unioned into `modi
 - **errors:** `-32000` (slice controller unavailable), `-32002` (axis-aligned slice mode
   not active), `-32602` (unknown plane, or non-finite/missing `degrees`).
 
+### 3.9c `viewer.set_axis_aligned_slices`
+
+- **params:** `{"enabled": bool}` — turns axis-aligned slice mode on/off, the same
+  checkbox (`chkAxisAlignedSlices`) and keyboard shortcut a human uses to make
+  `"seg xz"`/`"seg yz"` the rotatable canonical slice planes. This is the prerequisite
+  for `viewer.rotate` (§3.9b), which returns `-32002` when the mode is off; there was no
+  prior RPC to enable it.
+- Drives `CWindow::chkAxisAlignedSlices->setChecked(enabled)` (CWindow is a friend), which
+  emits `toggled` synchronously into `CWindow::onAxisAlignedSlicesToggled` (CWindow.cpp:10601)
+  → `AxisAlignedSliceController::setEnabled(...)` + persists the `USE_AXIS_ALIGNED_SLICES`
+  QSetting + syncs the overlay checkbox. Idempotent: setting the current value is a no-op.
+  Falls back to `setEnabled(enabled)` directly if no checkbox exists.
+- **result:** `{"enabled": bool}` — the mode state after toggling (`isEnabled()`).
+- **errors:** `-32000` (slice controller unavailable), `-32602` (missing/non-bool `enabled`).
+- The current mode + per-plane rotation angles are also reported in `state.get` under
+  `"axisAlignedSlices": {"enabled": bool, "segXZRotationDeg": float, "segYZRotationDeg": float}`.
+### 3.9d `wrap_annotation.set_mode` / `wrap_annotation.commit` / `wrap_annotation.undo`
+
+The **same-winding wrap annotation** workflow — the tutorial's **shift+E**. Human flow:
+enable "Same-wrap annotation mode" (a checkbox in the Wrap Annotation panel) → shift-click
+on a chunked volume viewer pane to seed preview points → **shift+E** to commit them into
+the point collection (Ctrl+Z clears the preview / undoes the last committed collection).
+The preview is seeded **only** by `canvas.shift_click` on a chunked viewer, exactly as for
+a human — there is no seeding RPC here.
+
+**`wrap_annotation.set_mode`**
+- **params:** `{"enabled": bool}` — required boolean.
+- Maps to `WrapAnnotationWidget::setSameWrapAnnotationEnabled(bool)`, which drives the
+  `_chkSameWrapAnnotation` checkbox's `toggled()` signal → `CWindow` →
+  `CChunkedVolumeViewer::setSameWrapAnnotationMode(bool)` (the same wiring a human click
+  fires). Setting the current state is an inert no-op.
+- **result:** `{"enabled": bool}` — the effective `sameWrapAnnotationEnabled()` after the call.
+- **errors:** `-32000` (wrap annotation widget unavailable), `-32602`
+  (`data.param:"enabled"` — missing / non-boolean).
+
+**`wrap_annotation.commit`**
+- **params:** `{"viewer"?: str}` — optional viewer id / surface-slot. When given, commit on
+  that viewer (must be a chunked volume viewer); when omitted, iterate the base viewers like
+  the shift+E handler and commit on the first chunked viewer that reports success.
+- Maps to `CChunkedVolumeViewer::commitSameWrapAnnotationPreview()` (the same call the
+  shift+E key handler makes). Requires **same-wrap annotation mode enabled**. A commit with
+  no seeded preview is a no-op that returns `committed:false`.
+- **result:** `{"committed": bool, "hadPreview": bool}`.
+- **errors:** `-32000` (widget/viewer-manager unavailable), `-32002` (same-wrap annotation
+  mode is not enabled), `-32009` (resolved `viewer` is not a chunked volume viewer).
+
+**`wrap_annotation.undo`**
+- **params:** `{"viewer"?: str}` — same viewer resolution as `commit`.
+- Maps to `CChunkedVolumeViewer::undoSameWrapAnnotation()` (the Ctrl+Z equivalent: clears an
+  uncommitted preview, or undoes the last committed same-wrap collection).
+- **result:** `{"undone": bool}`.
+- **errors:** `-32000` (viewer manager unavailable), `-32009` (resolved `viewer` is not a
+  chunked volume viewer).
+
+`state.get` additionally reports `"sameWrapAnnotation": {"enabled": bool, "hasPreview": bool}`
+(or `null` when the widget / viewer manager is unavailable), where `hasPreview` is true when
+any chunked viewer currently holds an uncommitted preview.
+
 ### 3.10 `segmentation.enable_editing`
 
 - **params:** `{"enabled": bool}`
@@ -385,6 +443,34 @@ by `SegmentationGrower::start(...)` (segmentation/growth/SegmentationGrower.hpp:
 - **errors:** `-32000`, `-32001`, `-32004`, `-32007` (no active segmentation surface),
   `-32008` (editing not enabled), `-32009` (`method:"manual_add"`, §8.1),
   `-32602` (bad enum string / steps < 1).
+
+### 3.11c `segmentation.save`
+
+Asynchronous. Forces the active segment's pending autosave to disk immediately and
+reports the flush as a job. Maps to `SegmentationModule::flushAutosave()`
+(`markAutosaveNeeded(true)` -> `performAutosave()`); the underlying save runs in a
+`QtConcurrent` worker and completion is signaled by `SegmentationModule::autosaveCompleted(bool)`.
+
+- **params:** `{}` (none; any params are ignored).
+- **result (nothing to flush):** when no save is pending and none is in flight — or when
+  the flush cannot start a disk write (no resolvable surface / surface missing file
+  metadata) — an idle body:
+  ```json
+  {"jobId": null, "kind": "segmentation.save", "state": "idle",
+   "pending": bool, "saveInProgress": false, "dirtyAfterSave": bool}
+  ```
+- **result (save running):** when a save is pending or already in flight, the flush is
+  registered as a `source:"autosave"` job and the running `job.status` body is returned
+  (the `jobStatusJson` shape of §3.17: `{"jobId", "source":"autosave",
+  "kind":"segmentation.save", "state":"running", ...}`). The job is closed by a
+  `job.progress` notification with `phase:"finished"` (`success:true` on a successful disk
+  write, `false` on save failure) when `autosaveCompleted(bool)` fires. A second explicit
+  save while one is running is rejected with `-32004` (`data.source:"autosave"`).
+- **errors:** `-32000` (segmentation module unavailable), `-32004` (an `"autosave"` job is
+  already running).
+
+Only bridge-initiated explicit saves are tracked as `"autosave"` jobs; the periodic /
+edit-driven autosaves do not create jobs.
 
 ### 3.12 `segmentation.grow_patch_from_seed`
 
@@ -661,7 +747,12 @@ spawns VC3D itself with `--agent-bridge` and parses the stdout handshake line (�
 | `vc3d_center_viewer` | `viewer.center_on_point` | Center a viewer pane on a 3D volume point. |
 | `vc3d_zoom_viewer` | `viewer.zoom` | Multiply a viewer's zoom by a factor (>1 zooms in). Returns the new scale. |
 | `vc3d_rotate_viewer` | `viewer.rotate` | Rotate the "seg xz"/"seg yz" axis-aligned slice plane (middle-drag equivalent). Relative delta by default. |
+| `vc3d_set_axis_aligned_slices` | `viewer.set_axis_aligned_slices` | Enable/disable axis-aligned slice mode (checkbox equivalent) — prerequisite for `viewer.rotate`. |
+| `vc3d_set_wrap_annotation_mode` | `wrap_annotation.set_mode` | Enable/disable "Same-wrap annotation mode" (prerequisite for the shift+E commit workflow; seed the preview via `vc3d_shift_click`). |
+| `vc3d_commit_wrap_annotation` | `wrap_annotation.commit` | Commit the seeded same-wrap annotation preview into the point collection (the tutorial's shift+E). Requires the mode enabled. |
+| `vc3d_undo_wrap_annotation` | `wrap_annotation.undo` | Undo the same-wrap annotation (Ctrl+Z equivalent): clear the preview or undo the last committed collection. |
 | `vc3d_enable_editing` | `segmentation.enable_editing` | Turn segmentation editing mode on/off for the active segment. |
+| `vc3d_save_segment` | `segmentation.save` | Force the active segment's pending autosave to disk. Idle no-op (`jobId:null`) when nothing is dirty; else an `"autosave"` job (`wait` defaults true). |
 | `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections/patch_tracer; direction; steps). Async: returns a jobId. |
 | `vc3d_grow_patch_from_seed` | `segmentation.grow_patch_from_seed` | Create a brand-new segment by growing a patch from a 3D seed point (headless GrowPatch). Async: returns a jobId and outputDir. |
 | `vc3d_commit_points` | `points.commit` | Add annotation points (volume space) to a named collection, optionally with a winding annotation. |
@@ -1036,6 +1127,19 @@ correction-point-authoring state (as-built during Stage 2):
 manualAddConfig()` (the persisted panel config, valid whether or not manual-add mode is
 active); they are `null` only when the segmentation widget does not exist. `manualAddMode`
 and `correctionsPointMode` are `false` when the segmentation module is absent.
+
+The result also gains an `autosave` object reporting the explicit-save bookkeeping
+(SPEC §3.11c), mirrored from `SegmentationModule::autosaveStatus()`:
+
+```json
+{
+  "autosave": {                 // null when the segmentation module is absent
+    "pending": bool,            // a deferred save is queued (edits not yet on disk)
+    "saveInProgress": bool,     // a QtConcurrent save is currently running
+    "dirtyAfterSave": bool      // more edits arrived while a save was in flight
+  }
+}
+```
 
 **As-built clarification to §9.2:** the documented precondition errors (`-32008`,
 `-32007 data.kind:"session"`, `-32004 data.source:"growth"`) are checked in the handler

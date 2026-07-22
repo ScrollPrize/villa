@@ -138,6 +138,10 @@ void AgentBridgeServer::subscribeJobSignals()
     if (_window->_segmentationModule) {
         connect(_window->_segmentationModule.get(), &SegmentationModule::growthInProgressChanged,
                 this, [this](bool running) { handleGrowthStatusChanged(running); });
+        // Explicit segment save/flush lifecycle -> source:"autosave" jobs
+        // (SPEC §3.11c). Closes the job opened by handleSegmentationSave.
+        connect(_window->_segmentationModule.get(), &SegmentationModule::autosaveCompleted,
+                this, [this](bool success) { handleAutosaveCompleted(success); });
     }
 
     // Flattening lifecycle -> source:"flatten" jobs (SPEC §8.3, §20). Emitted by
@@ -455,6 +459,20 @@ void AgentBridgeServer::handleGrowthStatusChanged(bool running)
         finishJob(QStringLiteral("growth"), true,
                   QStringLiteral("Segmentation growth finished"), QString());
     }
+}
+
+
+void AgentBridgeServer::handleAutosaveCompleted(bool success)
+{
+    // Only close a bridge-initiated explicit save (SPEC §3.11c). Autosaves that
+    // fire from the periodic timer / edit hooks are not tracked as jobs, so
+    // finishJob is a no-op unless handleSegmentationSave opened one.
+    if (!_activeJobs.contains(QStringLiteral("autosave")))
+        return;
+    finishJob(QStringLiteral("autosave"), success,
+              success ? QStringLiteral("Segment saved")
+                      : QStringLiteral("Segment save failed"),
+              QString());
 }
 
 

@@ -55,6 +55,7 @@ from .tools.points import *  # noqa: F401,F403
 from .tools.seeding import *  # noqa: F401,F403
 from .tools.segmentation import *  # noqa: F401,F403
 from .tools.viewer import *  # noqa: F401,F403
+from .tools.wrap import *  # noqa: F401,F403
 
 
 # ---------------------------------------------------------------------------

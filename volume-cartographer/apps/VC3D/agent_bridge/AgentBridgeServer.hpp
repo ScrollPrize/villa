@@ -126,9 +126,14 @@ private:
     QJsonObject handleViewerCenterOnPoint(const QJsonValue& params);
     QJsonObject handleViewerZoom(const QJsonValue& params);
     QJsonObject handleViewerRotate(const QJsonValue& params);
+    QJsonObject handleViewerSetAxisAlignedSlices(const QJsonValue& params);
     QJsonObject handleSegmentationEnableEditing(const QJsonValue& params);
     QJsonObject handleSegmentationGrow(const QJsonValue& params);
     QJsonObject handleSegmentationGrowPatchFromSeed(const QJsonValue& params);
+    // Force an explicit segment save/flush, reported as a "autosave"-source job
+    // (SPEC §3.11c). Idle response when nothing is pending; else a running job
+    // closed by handleAutosaveCompleted().
+    QJsonObject handleSegmentationSave(const QJsonValue& params);
     // Manual-add (hole-fill) + corrections point authoring (SPEC §9.2–9.7).
     QJsonObject handleManualAddBegin(const QJsonValue& params);
     QJsonObject handleManualAddFinish(const QJsonValue& params);
@@ -136,6 +141,12 @@ private:
     QJsonObject handleManualAddSetInterpolation(const QJsonValue& params);
     QJsonObject handleManualAddUndoConstraint(const QJsonValue& params);
     QJsonObject handleCorrectionsSetPointMode(const QJsonValue& params);
+    // Same-winding wrap annotation (tutorial's shift+E). set_mode drives the
+    // WrapAnnotationWidget checkbox; commit/undo mirror the shift+E / Ctrl+Z
+    // key handlers over the chunked viewers (SPEC §3.9d).
+    QJsonObject handleWrapAnnotationSetMode(const QJsonValue& params);
+    QJsonObject handleWrapAnnotationCommit(const QJsonValue& params);
+    QJsonObject handleWrapAnnotationUndo(const QJsonValue& params);
     QJsonObject handlePointsCommit(const QJsonValue& params);
     QJsonObject handlePointsList(const QJsonValue& params);
     QJsonObject handleVolumeOpen(const QJsonValue& params);
@@ -278,6 +289,10 @@ private:
     void handleToolFinished(bool success, const QString& message, const QString& outputPath);
     void handleConsoleOutput(const QString& output);
     void handleGrowthStatusChanged(bool running);
+    // Closes the "autosave"-source job when an explicit segment save (§3.11c)
+    // finishes. Wired from SegmentationModule::autosaveCompleted; a no-op unless a
+    // bridge-initiated autosave job is active.
+    void handleAutosaveCompleted(bool success);
     // Flattening lifecycle -> source:"flatten" JobRecord (SPEC §8.3, §20). Wired
     // from SegmentationCommandHandler::flattenJobStarted / flattenJobFinished.
     // Registers human-initiated flattens as external jobs too.

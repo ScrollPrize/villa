@@ -16,6 +16,7 @@ __all__ = [
     "vc3d_fetch_segment",
     "vc3d_activate_segment",
     "vc3d_enable_editing",
+    "vc3d_save_segment",
     "vc3d_grow_segment",
     "vc3d_grow_patch_from_seed",
     "vc3d_set_segment_tag",
@@ -96,6 +97,26 @@ async def vc3d_activate_segment(segment_id: str, auto_fetch: bool = True) -> dic
 async def vc3d_enable_editing(enabled: bool) -> dict[str, Any]:
     """Turn segmentation editing mode on/off for the active segment."""
     return await _call("segmentation.enable_editing", {"enabled": enabled})
+
+
+@mcp.tool()
+async def vc3d_save_segment(wait: bool = True) -> dict[str, Any]:
+    """Force the active segment's pending autosave to disk now.
+
+    Segment edits are normally flushed by a periodic autosave; this forces that
+    flush immediately (the programmatic equivalent of not waiting for the timer).
+
+    If nothing is dirty and no save is already in flight, this is a no-op and
+    returns immediately with jobId=null and state="idle". Otherwise the flush runs
+    as an "autosave"-source job: wait defaults to true (block until the save job
+    finishes and return the terminal job.status inline); pass wait=false to get the
+    jobId back immediately and poll vc3d_job_status yourself.
+    """
+    result = await _call("segmentation.save", {})
+    job_id = result.get("jobId") if isinstance(result, dict) else None
+    if not job_id:
+        return result  # idle: nothing to flush, nothing to wait on
+    return await _wait_for_job(job_id, wait, result)
 
 
 @mcp.tool()

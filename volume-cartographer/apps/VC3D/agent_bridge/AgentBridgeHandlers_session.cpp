@@ -45,6 +45,7 @@
 #include "SurfacePanelController.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "ViewerManager.hpp"
+#include "WrapAnnotationWidget.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "segmentation/SegmentationPushPullConfig.hpp"
 #include "segmentation/SegmentationWidget.hpp"
@@ -112,6 +113,9 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["manualAddLineMode"] = QJsonValue::Null;
         result["manualAddInterpolation"] = QJsonValue::Null;
         result["correctionsPointMode"] = false;
+        result["axisAlignedSlices"] = QJsonValue::Null;
+        result["sameWrapAnnotation"] = QJsonValue::Null;
+        result["autosave"] = QJsonValue::Null;
         result["viewers"] = QJsonArray();
         result["job"] = QJsonValue::Null;
         result["focusPoi"] = QJsonValue::Null;
@@ -162,9 +166,30 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     if (SegmentationModule* mod = _window->_segmentationModule.get()) {
         result["manualAddMode"] = mod->manualAddMode();
         result["correctionsPointMode"] = mod->correctionPointMode();
+        // Explicit save/flush bookkeeping (SPEC §3.11c, §9.8).
+        const SegmentationModule::AutosaveStatus save = mod->autosaveStatus();
+        QJsonObject autosave;
+        autosave["pending"] = save.pending;
+        autosave["saveInProgress"] = save.saveInProgress;
+        autosave["dirtyAfterSave"] = save.dirtyAfterSave;
+        result["autosave"] = autosave;
     } else {
         result["manualAddMode"] = false;
         result["correctionsPointMode"] = false;
+        result["autosave"] = QJsonValue::Null;
+    }
+
+    // Axis-aligned slice mode (SPEC §3.9c): when enabled, "seg xz"/"seg yz" are the
+    // rotatable canonical planes. viewer.rotate requires this on (else -32002), and
+    // viewer.set_axis_aligned_slices toggles it.
+    if (AxisAlignedSliceController* slices = _window->_axisAlignedSliceController.get()) {
+        QJsonObject axis;
+        axis["enabled"] = slices->isEnabled();
+        axis["segXZRotationDeg"] = slices->currentRotationDegrees("seg xz");
+        axis["segYZRotationDeg"] = slices->currentRotationDegrees("seg yz");
+        result["axisAlignedSlices"] = axis;
+    } else {
+        result["axisAlignedSlices"] = QJsonValue::Null;
     }
     if (SegmentationWidget* widget = _window->_segmentationWidget) {
         const ManualAddTool::Config cfg = widget->manualAddConfig();
@@ -173,6 +198,27 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     } else {
         result["manualAddLineMode"] = QJsonValue::Null;
         result["manualAddInterpolation"] = QJsonValue::Null;
+    }
+
+    // Same-winding wrap annotation (SPEC §3.9d). `enabled` is the widget's
+    // checkbox state; `hasPreview` is true when any chunked viewer currently
+    // holds an uncommitted preview (seeded by shift-click, committed by shift+E).
+    WrapAnnotationWidget* wrapWidget = _window->_wrapAnnotationWidget;
+    ViewerManager* viewerMgr = _window->_viewerManager.get();
+    if (wrapWidget && viewerMgr) {
+        bool hasPreview = false;
+        viewerMgr->forEachBaseViewer([&hasPreview](VolumeViewerBase* baseViewer) {
+            if (hasPreview || !baseViewer)
+                return;
+            if (auto* viewer = qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject()))
+                hasPreview = viewer->hasSameWrapAnnotationPreview();
+        });
+        QJsonObject wrap;
+        wrap["enabled"] = wrapWidget->sameWrapAnnotationEnabled();
+        wrap["hasPreview"] = hasPreview;
+        result["sameWrapAnnotation"] = wrap;
+    } else {
+        result["sameWrapAnnotation"] = QJsonValue::Null;
     }
 
     // viewers

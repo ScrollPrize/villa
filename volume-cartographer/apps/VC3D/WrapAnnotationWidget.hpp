@@ -37,6 +37,12 @@ public:
     double relWindingPatchTolerance() const;
 
 public slots:
+    // Programmatic equivalent of the human toggling the "Same-wrap annotation
+    // mode" checkbox. Drives _chkSameWrapAnnotation's checked state so its
+    // toggled() signal fires the same CWindow -> CChunkedVolumeViewer
+    // ::setSameWrapAnnotationMode wiring as a click, keeping
+    // sameWrapAnnotationEnabled() truthful. No-op if the checkbox is absent.
+    void setSameWrapAnnotationEnabled(bool enabled);
     void setRelWindingAnnotationChecked(bool checked);
     void selectCollection(uint64_t collectionId);
     void selectPoint(uint64_t pointId);

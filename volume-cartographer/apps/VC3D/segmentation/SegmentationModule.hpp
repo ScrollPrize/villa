@@ -215,6 +215,21 @@ public:
     bool startPushPullMode(int direction, std::optional<bool> alphaOverride = std::nullopt);
     void stopPushPullAll();
 
+    // Public save/flush accessors for the agent bridge (SPEC §3.11c / segmentation.save).
+    // Snapshot of the autosave bookkeeping, mirrored from segmentation::AutosaveState.
+    struct AutosaveStatus
+    {
+        bool pending{false};        // a deferred save is queued (edits not yet on disk)
+        bool saveInProgress{false}; // a QtConcurrent save is currently running
+        bool dirtyAfterSave{false}; // more edits arrived while a save was in flight
+    };
+    // Force the pending autosave to run immediately (markAutosaveNeeded(true) ->
+    // performAutosave). A no-op when nothing is pending; when a save is already in
+    // flight it marks the state dirty so a follow-up save runs on completion.
+    void flushAutosave();
+    // Current autosave bookkeeping snapshot (SPEC §3.11c, §9.8).
+    [[nodiscard]] AutosaveStatus autosaveStatus() const;
+
 public slots:
     void setSelectedAnnotationCollection(uint64_t collectionId);
 
@@ -231,6 +246,10 @@ signals:
                               int steps,
                               bool inpaintOnly);
     void growthInProgressChanged(bool running);
+    // Emitted when an in-flight autosave (performAutosave) reaches its terminal,
+    // non-stale completion — success==true on a successful disk write, false on a
+    // save failure. Used by the agent bridge to close the "autosave" job.
+    void autosaveCompleted(bool success);
     void approvalMaskSaved(const std::string& segmentId);
     void annotationPointSelected(uint64_t pointId);
     void annotationCollectionSelected(uint64_t collectionId);

@@ -2854,6 +2854,24 @@ void SegmentationModule::stopPushPullAll()
     stopAllPushPull();
 }
 
+// Agent-bridge public save/flush accessors (SPEC §3.11c / segmentation.save).
+void SegmentationModule::flushAutosave()
+{
+    // markAutosaveNeeded(true) runs performAutosave() synchronously if a save is
+    // pending; when a save is already in flight it is marked dirty so a follow-up
+    // save runs on completion. A no-op when nothing is pending.
+    markAutosaveNeeded(true);
+}
+
+SegmentationModule::AutosaveStatus SegmentationModule::autosaveStatus() const
+{
+    AutosaveStatus status;
+    status.pending = _autosaveState.pending();
+    status.saveInProgress = _autosaveState.saveInProgress();
+    status.dirtyAfterSave = _autosaveState.dirtyAfterSave();
+    return status;
+}
+
 bool SegmentationModule::applyPushPullStep()
 {
     return _pushPullTool ? _pushPullTool->applyStep() : false;
@@ -3034,13 +3052,21 @@ void SegmentationModule::performAutosave()
             ? _autosaveState.completeSuccess(autosaveTicket)
             : _autosaveState.completeFailure(autosaveTicket, canRetry);
         if (completion == segmentation::AutosaveState::Completion::Stale) {
+            // The write itself finished (its success/failure is already known);
+            // the completion is only "stale" because the editing session ended or
+            // restarted while this async save was in flight. Still emit so any
+            // in-flight bridge autosave job (SPEC §3.11c) closes instead of
+            // hanging -- the GUI ignores this signal, and the bridge handler is a
+            // no-op unless an explicit save job is open.
             updateAutosaveState();
+            emit autosaveCompleted(failureMessage.isEmpty());
             return;
         }
 
         if (failureMessage.isEmpty()) {
             _saveSnapshot = savedSnapshot;
             emit statusMessageRequested(tr("Saved"), kStatusShort);
+            emit autosaveCompleted(true);
         } else {
             qCWarning(lcSegModule) << "Autosave failed:" << failureMessage;
             if (!_autosaveState.failureNotified()) {
@@ -3049,6 +3075,7 @@ void SegmentationModule::performAutosave()
                                             kStatusLong);
                 _autosaveState.setFailureNotified(true);
             }
+            emit autosaveCompleted(false);
         }
 
         // If another save was requested while we were saving, start it now

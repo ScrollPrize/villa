@@ -20,6 +20,7 @@ from . import (  # noqa: F401  (imported for their registration side effects)
     seeding,
     segmentation,
     viewer,
+    wrap,
 )
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     "seeding",
     "segmentation",
     "viewer",
+    "wrap",
 ]

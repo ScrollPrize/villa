@@ -227,6 +227,7 @@ set(srcs
     agent_bridge/AgentBridgeJobs.cpp
     agent_bridge/AgentBridgeHandlers_session.cpp
     agent_bridge/AgentBridgeHandlers_editing.cpp
+    agent_bridge/AgentBridgeHandlers_wrap.cpp
     agent_bridge/AgentBridgeHandlers_atlas.cpp
     agent_bridge/AgentBridgeHandlers_fiber.cpp
     agent_bridge/AgentBridgeHandlers_seeding.cpp

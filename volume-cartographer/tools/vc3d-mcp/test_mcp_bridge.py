@@ -60,6 +60,15 @@ class FakeAgentBridgeServer:
         # Per-plane rotation state for viewer.rotate (mirrors the C++ controller's
         # _segXZRotationDeg / _segYZRotationDeg members).
         self._rotation: dict[str, float] = {}
+        # Axis-aligned slice mode (viewer.set_axis_aligned_slices / state.get).
+        self._axis_enabled: bool = False
+        # Same-wrap annotation state (SPEC §3.9d): the mode checkbox and whether a
+        # chunked viewer holds an uncommitted preview (seeded by shift-click).
+        self._wrap_enabled: bool = False
+        self._wrap_has_preview: bool = False
+        # segmentation.save: when True, model the "nothing to flush" idle response
+        # (jobId:null); when False, model a running "autosave" job that succeeds.
+        self.save_idle: bool = False
 
     async def start(self) -> None:
         if os.path.exists(self.socket_path):
@@ -106,6 +115,24 @@ class FakeAgentBridgeServer:
             self._job_kinds[job_id] = "segmentation.grow"
             await self._reply(writer, req_id, result={"jobId": job_id, "kind": "segmentation.grow"})
             asyncio.create_task(self._simulate_job(job_id, "segmentation.grow"))
+        elif method == "segmentation.save":
+            if self.save_idle:
+                await self._reply(
+                    writer, req_id,
+                    result={"jobId": None, "kind": "segmentation.save",
+                            "state": "idle", "pending": False,
+                            "saveInProgress": False, "dirtyAfterSave": False},
+                )
+            else:
+                job_id = "job-4"
+                self._job_kinds[job_id] = "segmentation.save"
+                await self._reply(
+                    writer, req_id,
+                    result={"jobId": job_id, "source": "autosave",
+                            "kind": "segmentation.save", "state": "running",
+                            "label": "Save segment"},
+                )
+                asyncio.create_task(self._simulate_job(job_id, "segmentation.save"))
         elif method == "lasagna.start_optimization":
             job_id = "job-2"
             self._job_kinds[job_id] = "lasagna.optimize"
@@ -185,6 +212,39 @@ class FakeAgentBridgeServer:
                             "previousDegrees": prev,
                             "relative": params.get("relative", True)},
                 )
+        elif method == "viewer.set_axis_aligned_slices":
+            enabled = params.get("enabled")
+            if not isinstance(enabled, bool):
+                await self._reply(
+                    writer, req_id,
+                    error={"code": -32602, "message": "enabled (bool) is required",
+                           "data": {"param": "enabled"}},
+                )
+            else:
+                self._axis_enabled = enabled  # idempotent set, like setChecked
+                await self._reply(writer, req_id, result={"enabled": self._axis_enabled})
+        elif method == "wrap_annotation.set_mode":
+            self._wrap_enabled = bool(params.get("enabled"))
+            await self._reply(writer, req_id, result={"enabled": self._wrap_enabled})
+        elif method == "wrap_annotation.commit":
+            if not self._wrap_enabled:
+                await self._reply(
+                    writer, req_id,
+                    error={"code": -32002,
+                           "message": "same-wrap annotation mode is not enabled"},
+                )
+            else:
+                had_preview = self._wrap_has_preview
+                committed = self._wrap_enabled and self._wrap_has_preview
+                self._wrap_has_preview = False  # commit consumes the preview
+                await self._reply(
+                    writer, req_id,
+                    result={"committed": committed, "hadPreview": had_preview},
+                )
+        elif method == "wrap_annotation.undo":
+            undone = self._wrap_has_preview
+            self._wrap_has_preview = False
+            await self._reply(writer, req_id, result={"undone": undone})
         elif method == "job.status":
             job_id = params.get("jobId", "job-1")
             await self._reply(
@@ -339,6 +399,24 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["jobId"], "job-1")
         self.assertNotIn("state", result)
 
+    async def test_vc3d_save_segment_idle_returns_immediately(self) -> None:
+        self.fake_server.save_idle = True
+        result = await server_module.vc3d_save_segment()
+        self.assertIsNone(result["jobId"])
+        self.assertEqual(result["state"], "idle")
+        self.assertFalse(result["saveInProgress"])
+
+    async def test_vc3d_save_segment_wait_returns_terminal_status(self) -> None:
+        result = await server_module.vc3d_save_segment(wait=True)
+        self.assertEqual(result["jobId"], "job-4")
+        self.assertEqual(result["state"], "succeeded")
+        self.assertIn("consoleTail", result)
+
+    async def test_vc3d_save_segment_no_wait_returns_job_id(self) -> None:
+        result = await server_module.vc3d_save_segment(wait=False)
+        self.assertEqual(result["jobId"], "job-4")
+        self.assertEqual(result["state"], "running")
+
     async def test_vc3d_lasagna_start_optimization_no_wait_returns_immediately(self) -> None:
         result = await server_module.vc3d_lasagna_start_optimization(mode="reoptimize", wait=False)
         self.assertEqual(result["jobId"], "job-2")
@@ -408,6 +486,42 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BridgeError) as ctx:
             await server_module.vc3d_rotate_viewer("seg xy", 10.0)
         self.assertEqual(ctx.exception.code, -32602)
+
+    async def test_vc3d_set_axis_aligned_slices_toggles(self) -> None:
+        on = await server_module.vc3d_set_axis_aligned_slices(True)
+        self.assertEqual(on["enabled"], True)
+        # idempotent: setting the same value again stays on.
+        again = await server_module.vc3d_set_axis_aligned_slices(True)
+        self.assertEqual(again["enabled"], True)
+        off = await server_module.vc3d_set_axis_aligned_slices(False)
+        self.assertEqual(off["enabled"], False)
+    async def test_vc3d_set_wrap_annotation_mode_toggles(self) -> None:
+        on = await server_module.vc3d_set_wrap_annotation_mode(True)
+        self.assertTrue(on["enabled"])
+        off = await server_module.vc3d_set_wrap_annotation_mode(False)
+        self.assertFalse(off["enabled"])
+
+    async def test_vc3d_commit_wrap_annotation_with_preview(self) -> None:
+        await server_module.vc3d_set_wrap_annotation_mode(True)
+        # Simulate a shift-click having seeded a preview on a chunked viewer.
+        self.fake_server._wrap_has_preview = True
+        result = await server_module.vc3d_commit_wrap_annotation()
+        self.assertTrue(result["committed"])
+        self.assertTrue(result["hadPreview"])
+        # The commit consumed the preview: a second commit is a no-op.
+        again = await server_module.vc3d_commit_wrap_annotation()
+        self.assertFalse(again["committed"])
+
+    async def test_vc3d_commit_wrap_annotation_mode_disabled_raises(self) -> None:
+        with self.assertRaises(BridgeError) as ctx:
+            await server_module.vc3d_commit_wrap_annotation()
+        self.assertEqual(ctx.exception.code, -32002)
+
+    async def test_vc3d_undo_wrap_annotation(self) -> None:
+        await server_module.vc3d_set_wrap_annotation_mode(True)
+        self.fake_server._wrap_has_preview = True
+        result = await server_module.vc3d_undo_wrap_annotation()
+        self.assertTrue(result["undone"])
 
 
 class RegistryDiscoveryTest(unittest.TestCase):
