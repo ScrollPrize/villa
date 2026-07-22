@@ -25,9 +25,12 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -86,7 +89,15 @@ class FakeAgentBridgeServer:
             w.close()
         if self._server is not None:
             self._server.close()
-            await self._server.wait_closed()
+            # Bound wait_closed(): on some CPython versions Server.wait_closed()
+            # can block indefinitely if a client opened and immediately dropped a
+            # connection (e.g. connect()'s abort-when-closed path) so it was
+            # never fully accepted. That's a harness/stdlib quirk, not product
+            # behavior; don't let it hang teardown.
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
         if os.path.exists(self.socket_path):
             os.unlink(self.socket_path)
 
@@ -646,6 +657,99 @@ class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BridgeConnectionError):
             await self.client.ensure_connected()
 
+    async def test_cancel_while_queued_for_write_lock_leaves_pending_empty(self) -> None:
+        # Finding 4: a call cancelled while queued for _write_lock (before the
+        # write) must not leak its _pending entry.
+        await self.client.call("ping")  # establish a live connection
+        await self.client._write_lock.acquire()
+        try:
+            task = asyncio.create_task(self.client.call("ping"))
+            # It registers in _pending, then blocks awaiting the held write lock.
+            await self._wait_until(lambda: len(self.client._pending) == 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        finally:
+            self.client._write_lock.release()
+        self.assertEqual(self.client._pending, {})
+
+    async def test_transport_reset_while_queued_for_write_lock_fails_cleanly(self) -> None:
+        # Finding 5: if the transport is reset (and a reconnect bumps the
+        # generation) while a call is queued for the write lock, the call must
+        # raise BridgeConnectionError -- not AttributeError on a None writer, and
+        # must NOT write the stale request onto the newer connection.
+        await self.client.call("ping")
+
+        class RecordingWriter:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def is_closing(self) -> bool:
+                return False
+
+            def write(self, data) -> None:
+                self.writes.append(data)
+
+            async def drain(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        await self.client._write_lock.acquire()
+        new_writer = RecordingWriter()
+        try:
+            task = asyncio.create_task(self.client.call("ping"))
+            await self._wait_until(lambda: len(self.client._pending) == 1)
+            # Simulate an EOF drop that failed our pending future, followed by a
+            # reconnect that installed a NEW writer and bumped the generation.
+            self.client._on_disconnect(BridgeConnectionError("peer dropped"))
+            self.client._writer = new_writer
+            self.client._generation += 1
+        finally:
+            self.client._write_lock.release()
+        with self.assertRaises(BridgeConnectionError):
+            await task
+        # The stale request must never have reached the new connection.
+        self.assertEqual(new_writer.writes, [])
+
+    async def test_connect_after_close_does_not_resurrect(self) -> None:
+        # Finding 6: connect() must re-check _closed after acquiring the
+        # transport and bail rather than resurrecting a closed client.
+        await self.client.close()
+        with self.assertRaises(BridgeConnectionError):
+            await self.client.connect()
+        self.assertTrue(self.client._closed)
+        self.assertFalse(self.client.connected)
+
+    async def test_close_racing_pending_connect_stays_closed(self) -> None:
+        # Finding 6: close() concurrent with an in-flight connect() must not
+        # leave the client connected. Delay open_unix_connection so close() runs
+        # while connect() is pending.
+        fresh = BridgeClient(BridgeClientConfig(socket=self.socket_path, request_timeout=5))
+        started = asyncio.Event()
+        release = asyncio.Event()
+        real_open = asyncio.open_unix_connection
+
+        async def slow_open(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return await real_open(*args, **kwargs)
+
+        with mock.patch(
+            "vc3d_mcp.bridge_client.asyncio.open_unix_connection", slow_open
+        ):
+            conn_task = asyncio.create_task(fresh.ensure_connected())
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+            close_task = asyncio.create_task(fresh.close())
+            await asyncio.sleep(0.02)  # let close() set _closed + block on the lock
+            release.set()
+            with self.assertRaises(BridgeConnectionError):
+                await asyncio.wait_for(conn_task, timeout=2.0)
+            await asyncio.wait_for(close_task, timeout=2.0)
+        self.assertTrue(fresh._closed)
+        self.assertFalse(fresh.connected)
+
 
 class WaitAndProgressTest(unittest.IsolatedAsyncioTestCase):
     """P3/P4: run_trace + atlas wait semantics, and best-effort progress
@@ -768,6 +872,95 @@ class WaitAndProgressTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await server_module._wait_for_job("jc", True, {"jobId": "jc"}, ctx)
 
+    async def test_disconnect_survives_racing_reset_in_wait_for_job(self) -> None:
+        # Finding 7: a disconnect latched while a waiter is parked must be
+        # observed even if a racing reconnect clears the GLOBAL error first.
+        jobs = self.client.jobs
+        jobs.on_progress({"jobId": "jr", "phase": "started"})
+        ctx = _FakeCtx()
+        task = asyncio.create_task(
+            server_module._wait_for_job("jr", True, {"jobId": "jr"}, ctx)
+        )
+        await asyncio.sleep(0.02)  # let the waiter park
+        jobs.fail_all(BridgeConnectionError("peer dropped"))
+        jobs.reset_error()  # racing reconnect clears the global error immediately
+        with self.assertRaises(RuntimeError):
+            await asyncio.wait_for(task, timeout=2.0)
+
+    async def test_disconnect_survives_racing_reset_in_wait_finished(self) -> None:
+        # Finding 7: same latch guarantee for JobTracker.wait_finished.
+        jobs = self.client.jobs
+        jobs.on_progress({"jobId": "jw", "phase": "started"})
+        task = asyncio.create_task(jobs.wait_finished("jw", timeout=2.0))
+        await asyncio.sleep(0.02)
+        jobs.fail_all(BridgeConnectionError("peer dropped"))
+        jobs.reset_error()
+        with self.assertRaises(BridgeConnectionError):
+            await asyncio.wait_for(task, timeout=2.0)
+
+    async def test_blocked_progress_sink_does_not_defeat_wait_cap(self) -> None:
+        # Finding 8: a progress sink that blocks forever must not hold the tool
+        # past the wait cap. With the cap shortened, the call returns
+        # waitTimedOut instead of hanging on the report.
+        import vc3d_mcp.core as core
+
+        jobs = self.client.jobs
+        # Output present but NO finished notification: the job is still running.
+        jobs.on_progress({"jobId": "jp", "phase": "output", "message": "l1"})
+        blocker = asyncio.Event()  # never set -> report_progress hangs
+
+        class HangingCtx:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def report_progress(self, progress, total=None, message=None) -> None:
+                self.calls += 1
+                await blocker.wait()
+
+        ctx = HangingCtx()
+        orig_cap = core.DEFAULT_WAIT_TIMEOUT_S
+        core.DEFAULT_WAIT_TIMEOUT_S = 0.2
+        try:
+            result = await asyncio.wait_for(
+                server_module._wait_for_job("jp", True, {"jobId": "jp"}, ctx), timeout=3.0
+            )
+        finally:
+            core.DEFAULT_WAIT_TIMEOUT_S = orig_cap
+        self.assertTrue(result.get("waitTimedOut"))
+        self.assertGreaterEqual(ctx.calls, 1)  # it did attempt delivery
+
+    async def test_trailing_output_with_finished_is_flushed(self) -> None:
+        # ALSO: output that lands together with `finished` while an earlier
+        # progress report is being awaited must still be forwarded, via the
+        # final rescan, rather than dropped when the loop breaks on `finished`.
+        jobs = self.client.jobs
+        jobs.on_progress({"jobId": "je", "phase": "output", "message": "first"})
+
+        injected = {"done": False}
+
+        class InjectingCtx:
+            def __init__(self) -> None:
+                self.reports: list[tuple[int, str | None]] = []
+
+            async def report_progress(self, progress, total=None, message=None) -> None:
+                self.reports.append((progress, message))
+                if not injected["done"]:
+                    injected["done"] = True
+                    # While the first line is "in flight", a trailing output line
+                    # and the finished notification arrive together -- exactly the
+                    # window the pre-fix loop would drop without a final rescan.
+                    jobs.on_progress(
+                        {"jobId": "je", "phase": "output", "message": "tail-line"}
+                    )
+                    jobs.on_progress({"jobId": "je", "phase": "finished", "success": True})
+
+        ctx = InjectingCtx()
+        result = await asyncio.wait_for(
+            server_module._wait_for_job("je", True, {"jobId": "je"}, ctx), timeout=2.0
+        )
+        self.assertEqual(result["state"], "succeeded")
+        self.assertIn("tail-line", [m for _, m in ctx.reports])
+
 
 class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
     """Official-SDK schema assertions over the whole registered tool surface."""
@@ -886,6 +1079,56 @@ class RegistryDiscoveryTest(unittest.TestCase):
 
         self.assertIsNone(discover_registry_socket(self.registry_dir))
         self.assertFalse(os.path.exists(bad_file), "malformed registry file should be removed")
+
+
+class TeardownReapTest(unittest.TestCase):
+    """Finding 13: _terminate_launched_process must always reap the child, even
+    when the post-kill() wait() times out."""
+
+    def tearDown(self) -> None:
+        server_module._launched_process = None
+        server_module._drain_thread = None
+        server_module._log_thread = None
+
+    def test_reap_process_waits(self) -> None:
+        proc = subprocess.Popen(["true"])  # exits immediately
+        server_module._reap_process(proc)
+        self.assertIsNotNone(proc.returncode)
+
+    def test_kill_timeout_schedules_background_reaper(self) -> None:
+        # A child that survives terminate() and the timed wait()s after kill():
+        # _terminate must spawn a background waiter that performs a final
+        # unconditional (blocking) wait() so it can't linger as a zombie.
+        class StubbornProc:
+            def __init__(self) -> None:
+                self.terminated = False
+                self.killed = False
+                self._reaped = threading.Event()
+
+            def poll(self):
+                return 0 if self._reaped.is_set() else None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def kill(self) -> None:
+                self.killed = True
+
+            def wait(self, timeout=None):
+                if timeout is not None:
+                    # terminate()'s and kill()'s timed waits both "time out".
+                    raise subprocess.TimeoutExpired(cmd="stubborn", timeout=timeout)
+                # The background reaper's unconditional blocking wait reaps it.
+                self._reaped.set()
+                return 0
+
+        proc = StubbornProc()
+        server_module._launched_process = proc
+        server_module._terminate_launched_process()
+        self.assertTrue(proc.terminated)
+        self.assertTrue(proc.killed)
+        # Background reaper must eventually perform the blocking wait().
+        self.assertTrue(proc._reaped.wait(timeout=3.0), "child was never reaped")
 
 
 if __name__ == "__main__":

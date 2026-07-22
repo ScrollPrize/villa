@@ -78,13 +78,21 @@ priority order:
    itself (with `--agent-bridge`) and connects. A daemon thread drains the
    child's stdout (with stderr merged in) for the whole process lifetime: it
    detects the handshake line, signals the launcher with the socket path, and
-   keeps reading so the OS pipe never fills and stalls VC3D. Child log lines are
-   forwarded to *this* process's stderr only — never stdout, which is reserved
-   for the MCP stdio transport. The launcher waits up to a real wall-clock
-   timeout (default 30 s): a silent-but-live child times out at the deadline; a
-   child that exits before the handshake fails immediately with its captured log
-   tail. On shutdown the child is torn down with escalation (`terminate()`, wait
-   ~5 s, then `kill()` and reap), safe to invoke repeatedly. The binary is
+   keeps reading so VC3D's stdout pipe keeps draining and never blocks VC3D.
+   Child log lines are handed to a bounded in-memory queue that a *separate*
+   thread forwards to *this* process's stderr only — never stdout, which is
+   reserved for the MCP stdio transport. That decoupling is deliberate: if the
+   stderr sink stalls (e.g. an MCP host that stops reading the piped stderr),
+   the forwarder blocks but the stdout drain does not, so VC3D never blocks on
+   its stdout pipe; if the queue fills, the oldest overflow lines are dropped
+   best-effort (a bounded tail is still retained for error reporting). The
+   launcher waits up to a real wall-clock timeout (default 30 s): a
+   silent-but-live child times out at the deadline; a child that exits before
+   the handshake fails immediately with its captured log tail. On shutdown the
+   child is torn down with escalation (`terminate()`, wait ~5 s, then `kill()`;
+   if it still hasn't exited a background thread performs a final blocking
+   `wait()` so it is always reaped and never lingers as a zombie), safe to
+   invoke repeatedly. The binary is
    `--launch <path>`, else the `VC3D_BINARY` env var, else the repo-root build
    `build-macos/bin/VC3D`; the fallback is used only if it names a real,
    executable file. Pass `--volpkg <path>` to have the launched VC3D preload a

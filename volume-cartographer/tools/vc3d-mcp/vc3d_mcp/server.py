@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -74,6 +75,15 @@ LAUNCH_HANDSHAKE_TIMEOUT_S = 30.0
 _launched_process: subprocess.Popen | None = None
 # Daemon thread that drains the launched child's stdout for its whole lifetime.
 _drain_thread: threading.Thread | None = None
+# Daemon thread that forwards buffered child log lines to our stderr, decoupled
+# from the stdout drain so stderr backpressure can never stall stdout draining.
+_log_thread: threading.Thread | None = None
+
+# Bound on the in-memory hand-off queue between the stdout drain and the stderr
+# forwarder. If a stuck stderr sink lets it fill, further lines are dropped
+# (best-effort) rather than blocking the drain -- the bounded `tail` deque still
+# retains the most recent lines for error reporting.
+_LOG_QUEUE_MAX = 1000
 
 
 def default_vc3d_binary() -> str:
@@ -110,9 +120,12 @@ def launch_vc3d(
     (with stderr merged in): it detects the ``VC3D-AGENT-BRIDGE: listening ...``
     handshake line (parsed by ``BridgeClient.socket_path_from_handshake``),
     signals a ``threading.Event`` with the authoritative ``path=`` value, and
-    keeps reading so the OS pipe never fills and blocks VC3D. Non-handshake
-    lines are forwarded to this process's STDERR only (stdout is reserved for
-    MCP stdio) and a bounded tail is retained for error reporting.
+    keeps reading so VC3D's stdout pipe keeps draining and never blocks VC3D.
+    Non-handshake lines are handed to a bounded in-memory queue that a *separate*
+    daemon thread forwards to this process's STDERR only (stdout is reserved for
+    MCP stdio); this decoupling means a stalled/piped stderr sink can never stop
+    the stdout drain (if the queue fills, lines are dropped best-effort). A
+    bounded tail of recent lines is also retained for error reporting.
 
     Waits up to ``timeout`` seconds for the handshake. A silent-but-live child
     times out at the deadline; a child that exits before the handshake fails
@@ -120,7 +133,7 @@ def launch_vc3d(
     both failure cases. The process is retained (module global) so it keeps
     running for the MCP session and is terminated (escalating) on our exit.
     """
-    global _launched_process, _drain_thread
+    global _launched_process, _drain_thread, _log_thread
 
     args = [binary, "--agent-bridge"]
     if volpkg:
@@ -141,11 +154,29 @@ def launch_vc3d(
     handshake: dict[str, str] = {}
     found = threading.Event()
     tail: deque[str] = deque(maxlen=200)
+    # Bounded hand-off from the stdout drain to the stderr forwarder. Decoupling
+    # the two threads means a stuck stderr sink can never stall the stdout drain
+    # (which would eventually block VC3D on its own stdout pipe). ``None`` is the
+    # EOF sentinel that stops the forwarder.
+    log_queue: "queue.Queue[str | None]" = queue.Queue(maxsize=_LOG_QUEUE_MAX)
+
+    def _forward_logs() -> None:
+        # Blocking writes to stderr happen HERE, off the stdout-drain path. If
+        # this blocks on stderr backpressure, the drain thread keeps running.
+        while True:
+            item = log_queue.get()
+            if item is None:
+                return  # EOF sentinel
+            try:
+                print(item, file=sys.stderr)
+            except Exception:  # noqa: BLE001 - stderr sink gone/broken; drop it
+                pass
 
     def _drain() -> None:
         # Read the child's stdout for its whole lifetime: find the handshake,
-        # then keep draining so the OS pipe never fills and blocks VC3D. Child
-        # output goes to OUR stderr only -- never stdout (MCP stdio transport).
+        # then keep draining so the pipe keeps emptying and never blocks VC3D.
+        # Child output goes to OUR stderr only -- never stdout (MCP stdio) -- via
+        # the decoupled forwarder above, and never blocks this loop.
         assert proc.stdout is not None
         for line in proc.stdout:
             stripped = line.rstrip("\n")
@@ -156,9 +187,21 @@ def launch_vc3d(
                     handshake["path"] = parsed[1]
                     found.set()
                     continue
-            print(stripped, file=sys.stderr)
+            # Non-blocking hand-off: never let stderr backpressure stall the
+            # stdout drain. If the forwarder is backed up, drop this line (the
+            # `tail` deque still retains the most recent output for diagnostics).
+            try:
+                log_queue.put_nowait(stripped)
+            except queue.Full:
+                pass
         found.set()  # EOF: unblock the waiter even if no handshake arrived
+        try:
+            log_queue.put_nowait(None)  # best-effort: stop the forwarder
+        except queue.Full:
+            pass
 
+    _log_thread = threading.Thread(target=_forward_logs, name="vc3d-stderr-forward", daemon=True)
+    _log_thread.start()
     _drain_thread = threading.Thread(target=_drain, name="vc3d-stdout-drain", daemon=True)
     _drain_thread.start()
 
@@ -184,13 +227,23 @@ def launch_vc3d(
     )
 
 
+def _reap_process(proc: subprocess.Popen) -> None:
+    """Block until `proc` is reaped, so a slow-exiting child can't linger as a
+    zombie after teardown gave up waiting. Runs on a daemon thread."""
+    try:
+        proc.wait()
+    except Exception:  # noqa: BLE001 - already-reaped / OS error: nothing to do
+        pass
+
+
 def _terminate_launched_process() -> None:
-    global _launched_process, _drain_thread
+    global _launched_process, _drain_thread, _log_thread
     proc = _launched_process
     if proc is None:
         return
     _launched_process = None
     _drain_thread = None
+    _log_thread = None
     if proc.poll() is not None:
         return
     try:
@@ -202,7 +255,12 @@ def _terminate_launched_process() -> None:
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                pass
+                # kill() was delivered but the child hasn't been reaped within
+                # the grace period. Reap it in the background so it can't linger
+                # as a zombie (an unconditional final waitpid).
+                threading.Thread(
+                    target=_reap_process, args=(proc,), name="vc3d-reaper", daemon=True
+                ).start()
     except OSError:
         pass
 

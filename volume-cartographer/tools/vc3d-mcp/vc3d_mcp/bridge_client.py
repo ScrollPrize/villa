@@ -250,7 +250,7 @@ class BridgeClient:
     async def connect(self) -> None:
         path = self.resolve_socket_path(self._config.socket)
         try:
-            self._reader, self._writer = await asyncio.wait_for(
+            reader, writer = await asyncio.wait_for(
                 asyncio.open_unix_connection(path, limit=self._config.read_buffer_limit),
                 timeout=self._config.connect_timeout,
             )
@@ -259,7 +259,20 @@ class BridgeClient:
                 f"could not connect to VC3D agent bridge at {path!r} "
                 f"(configured as {self._config.socket!r}): {exc}"
             ) from exc
-        self._closed = False
+        # A close() may have raced with our open_unix_connection() above. If the
+        # client was closed while we were connecting, tear the fresh transport
+        # down and bail rather than resurrecting a closed client. (close() holds
+        # _connect_lock, so once it observes no writer/task it can't be here
+        # concurrently; the only race is close() setting _closed before we
+        # publish, which this re-check covers.)
+        if self._closed:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001 - closing a dead writer can raise
+                pass
+            raise BridgeConnectionError("bridge client has been closed")
+        self._reader, self._writer = reader, writer
         self.jobs.reset_error()
         self._generation += 1
         self._read_task = asyncio.create_task(
@@ -289,23 +302,27 @@ class BridgeClient:
 
     async def close(self) -> None:
         # Idempotent: safe to call multiple times / after a drop.
+        # Set _closed FIRST, then synchronize with connect() via _connect_lock so
+        # a connect() in flight can't publish its transport after we've torn down
+        # (which would leave the client connected=True after close() returned).
         self._closed = True
-        task, self._read_task = self._read_task, None
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        writer, self._writer = self._writer, None
-        self._reader = None
-        if writer is not None and not writer.is_closing():
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:  # noqa: BLE001 - closing a dead writer can raise
-                pass
-        self._on_disconnect(BridgeConnectionError("connection closed"))
+        async with self._connect_lock:
+            task, self._read_task = self._read_task, None
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            writer, self._writer = self._writer, None
+            self._reader = None
+            if writer is not None and not writer.is_closing():
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:  # noqa: BLE001 - closing a dead writer can raise
+                    pass
+            self._on_disconnect(BridgeConnectionError("connection closed"))
 
     def _on_disconnect(self, exc: Exception) -> None:
         """Fail all pending RPC futures and wake/fail all job waiters."""
@@ -336,7 +353,11 @@ class BridgeClient:
         :class:`BridgeConnectionError` on transport failure/timeout.
         """
         await self.ensure_connected()
-        assert self._writer is not None
+        # Capture the connection generation ensure_connected() just guaranteed
+        # live, so we can detect (under the write lock) an EOF-reset / reconnect
+        # that would otherwise let us write this stale request onto a NEWER
+        # connection after our future was already failed by the old disconnect.
+        gen = self._generation
 
         req_id = self._next_id
         self._next_id += 1
@@ -348,33 +369,52 @@ class BridgeClient:
         fut: asyncio.Future[Any] = loop.create_future()
         self._pending[req_id] = _Pending(future=fut)
 
-        line = json.dumps(message, separators=(",", ":")) + "\n"
-        async with self._write_lock:
-            try:
-                self._writer.write(line.encode("utf-8"))
-                await self._writer.drain()
-            except OSError as exc:
-                # Write failed: the connection is dead. Invalidate it so the
-                # next call reconnects, and wake anyone else waiting on it.
-                err = BridgeConnectionError(f"write failed: {exc}")
-                self._pending.pop(req_id, None)
-                self._reset_transport()
-                self._on_disconnect(err)
-                raise err from exc
-
-        effective_timeout = timeout if timeout is not None else self._config.request_timeout
+        # From here on, a single finally guarantees _pending[req_id] is removed --
+        # covering a cancel while queued for _write_lock or during drain(), not
+        # just the response wait (otherwise a cancelled-before-write call leaks
+        # its pending entry permanently).
         try:
-            return await asyncio.wait_for(fut, timeout=effective_timeout)
-        except asyncio.TimeoutError as exc:
-            raise BridgeConnectionError(
-                f"timed out waiting for response to {method!r} (id={req_id})"
-            ) from exc
-        except asyncio.CancelledError:
-            # Preserve caller cancellation; the finally below cleans up _pending.
-            raise
+            line = json.dumps(message, separators=(",", ":")) + "\n"
+            async with self._write_lock:
+                # Capture writer + generation under the lock and validate BEFORE
+                # writing. If EOF reset the transport (writer is None) or a
+                # reconnect bumped the generation while we waited for the lock,
+                # this request belongs to a dead connection: our future was
+                # already failed by _on_disconnect, so fail cleanly instead of
+                # dereferencing a None writer or writing onto the new connection.
+                writer = self._writer
+                if writer is None or self._generation != gen:
+                    if fut.done() and not fut.cancelled():
+                        fut.exception()  # mark the disconnect failure observed
+                    raise BridgeConnectionError(
+                        "bridge connection was reset before the request could be sent"
+                    )
+                try:
+                    writer.write(line.encode("utf-8"))
+                    await writer.drain()
+                except OSError as exc:
+                    # Write failed: the connection is dead. Invalidate it so the
+                    # next call reconnects, and wake anyone else waiting on it.
+                    err = BridgeConnectionError(f"write failed: {exc}")
+                    self._pending.pop(req_id, None)
+                    self._reset_transport()
+                    self._on_disconnect(err)
+                    raise err from exc
+
+            effective_timeout = timeout if timeout is not None else self._config.request_timeout
+            try:
+                return await asyncio.wait_for(fut, timeout=effective_timeout)
+            except asyncio.TimeoutError as exc:
+                raise BridgeConnectionError(
+                    f"timed out waiting for response to {method!r} (id={req_id})"
+                ) from exc
+            except asyncio.CancelledError:
+                # Preserve caller cancellation; the finally below cleans up _pending.
+                raise
         finally:
-            # Timeout OR caller cancellation: the reader never popped us.
-            # Idempotent on success (dispatch already removed the entry).
+            # Any exit (success, timeout, cancel while queued for the lock or
+            # during the response wait, or a stale-connection raise): ensure the
+            # entry is gone. Idempotent on success (dispatch already removed it).
             self._pending.pop(req_id, None)
 
     # -- background reader -----------------------------------------------------

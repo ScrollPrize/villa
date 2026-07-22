@@ -54,6 +54,11 @@ class JobRecord:
     # Wake event, replaced+set on every update so a parked waiter re-checks state
     # without losing a wakeup (see JobTracker._notify).
     wake: asyncio.Event = field(default_factory=asyncio.Event)
+    # Disconnect error latched onto THIS record by fail_all(). A waiter captures
+    # the record's error when it starts and fails if a *different* error object
+    # appears during its wait -- so a reconnect's reset_error() (which clears only
+    # the global error) can't erase a disconnect a parked waiter must observe.
+    error: Exception | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -154,10 +159,14 @@ class JobTracker:
     def fail_all(self, exc: Exception) -> None:
         """Bridge disconnect: record the error and wake every parked waiter.
 
-        New waiters registered while `_error` is set observe it immediately.
+        The error is set globally (so a *new* waiter registered while the bridge
+        is down observes it immediately) AND latched onto every existing record
+        (so a waiter already parked on one observes this specific failure even if
+        a racing reconnect calls reset_error() before the woken waiter resumes).
         """
         self._error = exc
         for record in self._jobs.values():
+            record.error = exc
             self._notify(record)
 
     def reset_error(self) -> None:
@@ -178,8 +187,13 @@ class JobTracker:
         record = self._get_or_create(job_id)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        seen_error = record.error  # baseline; a NEW latched error fails this wait
         while True:
             wake = record.wake  # capture BEFORE reading state (no lost wakeup)
+            if record.error is not None and record.error is not seen_error:
+                # Disconnect latched on our record while we waited; observe it
+                # even if a reconnect already cleared the global _error.
+                raise record.error
             if self._error is not None:
                 raise self._error
             if record.finished_event.is_set():
