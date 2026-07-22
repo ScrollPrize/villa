@@ -16,6 +16,8 @@
 #include <QMdiSubWindow>
 #include <QPixmap>
 #include <QPointF>
+#include <QRegularExpression>
+#include <QSettings>
 #include <QTabWidget>
 #include <QTimer>
 #include <QVector3D>
@@ -45,6 +47,7 @@
 #include "SurfacePanelController.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "ViewerManager.hpp"
+#include "VCSettings.hpp"
 #include "WrapAnnotationWidget.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "segmentation/SegmentationPushPullConfig.hpp"
@@ -137,6 +140,13 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         volume["id"] = QString::fromStdString(state->currentVolumeId());
         volume["path"] = QString::fromStdString(vol->path().string());
         volume["voxelSize"] = vol->voxelSize();
+        // Additive: every volume id in the open package (ADDITIONS_SPEC item 4).
+        QJsonArray volIds;
+        if (state->hasVpkg() && state->vpkg()) {
+            for (const auto& id : state->vpkg()->volumeIDs())
+                volIds.append(QString::fromStdString(id));
+        }
+        volume["volumeIds"] = volIds;
         result["volume"] = volume;
     } else {
         result["volume"] = QJsonValue::Null;
@@ -711,6 +721,305 @@ QJsonObject AgentBridgeServer::handleVolumeOpen(const QJsonValue& params)
         idArr.append(QString::fromStdString(id));
     result["volumeIds"] = idArr;
     return result;
+}
+
+
+QJsonObject AgentBridgeServer::handleVolumeList(const QJsonValue&)
+{
+    CState* state = _window ? _window->_state : nullptr;
+    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
+    if (!state || !state->hasVpkg() || !vpkg)
+        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+
+    QJsonArray volumeIds;
+    for (const auto& id : vpkg->volumeIDs())
+        volumeIds.append(QString::fromStdString(id));
+
+    const std::string current = state->currentVolumeId();
+
+    QJsonObject result;
+    result["volumeIds"] = volumeIds;
+    result["currentVolumeId"] = current.empty() ? QJsonValue(QJsonValue::Null)
+                                                : QJsonValue(QString::fromStdString(current));
+    // Per-volume {id, path, voxelSize} objects are intentionally omitted: reading
+    // voxelSize would force-load every (possibly remote) volume, which is not
+    // "cheap" per ADDITIONS_SPEC item 4. The id list plus state.get's per-volume
+    // block cover the affordable data.
+    return result;
+}
+
+
+QJsonObject AgentBridgeServer::handleSegmentsDelete(const QJsonValue& params)
+{
+    CState* state = _window ? _window->_state : nullptr;
+    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
+    if (!state || !state->hasVpkg() || !vpkg)
+        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+
+    const QJsonObject p = paramsObject(params);
+    const QString segmentIdQ = jsonRequireString(p, "segmentId");
+    const bool confirm = jsonOptionalBool(p, "confirm", false);
+    if (!confirm) {
+        QJsonObject data;
+        data["param"] = "confirm";
+        data["reason"] = "destructive; pass confirm=true";
+        throw AgentBridgeError{-32602,
+            "confirm must be true (on-disk deletion is irreversible)", data};
+    }
+
+    // Refuse while a segmentation edit is in progress (would race the delete
+    // against unsaved edits / active-surface teardown).
+    if (_window->_segmentationWidget && _window->_segmentationWidget->isEditingEnabled()) {
+        QJsonObject data;
+        data["detail"] = "cannot delete while editing";
+        throw AgentBridgeError{-32004, "cannot delete while editing", data};
+    }
+
+    // Unknown id -> -32007. Match against the package's known segment ids.
+    const std::string segmentId = segmentIdQ.toStdString();
+    const std::vector<std::string> ids = vpkg->segmentationIDs();
+    if (std::find(ids.begin(), ids.end(), segmentId) == ids.end()) {
+        QJsonObject data;
+        data["kind"] = "segment";
+        data["id"] = segmentIdQ;
+        throw AgentBridgeError{-32007, QStringLiteral("Unknown segment id: %1").arg(segmentIdQ), data};
+    }
+
+    SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr;
+    if (!panel) {
+        QJsonObject data;
+        data["detail"] = "surface panel is not available";
+        throw AgentBridgeError{-32010, "Surface panel unavailable", data};
+    }
+
+    // Dialog-free core clears the active slot first, deletes on disk, and refreshes.
+    QString err;
+    if (!panel->deleteSegmentsHeadless(QStringList{segmentIdQ}, &err)) {
+        QJsonObject data;
+        data["detail"] = err.isEmpty() ? QStringLiteral("delete failed") : err;
+        throw AgentBridgeError{-32010, QStringLiteral("Failed to delete segment: %1").arg(err), data};
+    }
+
+    QJsonArray deleted;
+    deleted.append(segmentIdQ);
+    QJsonObject result;
+    result["deleted"] = deleted;
+    return result;
+}
+
+
+QJsonObject AgentBridgeServer::handleSegmentsRename(const QJsonValue& params)
+{
+    CState* state = _window ? _window->_state : nullptr;
+    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
+    if (!state || !state->hasVpkg() || !vpkg)
+        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+
+    const QJsonObject p = paramsObject(params);
+    const QString segmentIdQ = jsonRequireString(p, "segmentId");
+    const QString newName = jsonRequireString(p, "newName");
+
+    // Validate the new name up front so a bad name is -32602 (not -32010).
+    static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
+    if (!validNameRegex.match(newName).hasMatch()) {
+        QJsonObject data;
+        data["param"] = "newName";
+        throw AgentBridgeError{-32602,
+            "newName must match ^[a-zA-Z0-9_-]+$", data};
+    }
+
+    // Refuse while editing (mirrors segments.delete and the interactive guard).
+    if (_window->_segmentationWidget && _window->_segmentationWidget->isEditingEnabled()) {
+        QJsonObject data;
+        data["detail"] = "cannot rename while editing";
+        throw AgentBridgeError{-32004, "cannot rename while editing", data};
+    }
+
+    // Unknown id -> -32007.
+    const std::string segmentId = segmentIdQ.toStdString();
+    const std::vector<std::string> ids = vpkg->segmentationIDs();
+    if (std::find(ids.begin(), ids.end(), segmentId) == ids.end()) {
+        QJsonObject data;
+        data["kind"] = "segment";
+        data["id"] = segmentIdQ;
+        throw AgentBridgeError{-32007, QStringLiteral("Unknown segment id: %1").arg(segmentIdQ), data};
+    }
+
+    SegmentationCommandHandler* sch = _window ? _window->_segmentationCommandHandler.get() : nullptr;
+    if (!sch) {
+        QJsonObject data;
+        data["detail"] = "segmentation command handler is not available";
+        throw AgentBridgeError{-32010, "Segmentation command handler unavailable", data};
+    }
+
+    QString err;
+    if (!sch->renameSurfaceHeadless(segmentIdQ, newName, &err)) {
+        // Map the core's classifiable sentences to JSON-RPC codes.
+        if (err == QLatin1String("name exists")) {
+            QJsonObject data;
+            data["kind"] = "segment";
+            data["id"] = newName;
+            data["reason"] = "target name already exists";
+            throw AgentBridgeError{-32010, QStringLiteral("A segment named %1 already exists").arg(newName), data};
+        }
+        if (err == QLatin1String("invalid name")) {
+            QJsonObject data;
+            data["param"] = "newName";
+            throw AgentBridgeError{-32602, "newName must match ^[a-zA-Z0-9_-]+$", data};
+        }
+        if (err == QLatin1String("name unchanged")) {
+            QJsonObject data;
+            data["param"] = "newName";
+            throw AgentBridgeError{-32602, "newName is unchanged", data};
+        }
+        if (err == QLatin1String("editing in progress")) {
+            QJsonObject data;
+            data["detail"] = "cannot rename while editing";
+            throw AgentBridgeError{-32004, "cannot rename while editing", data};
+        }
+        if (err == QLatin1String("segment not found")) {
+            QJsonObject data;
+            data["kind"] = "segment";
+            data["id"] = segmentIdQ;
+            throw AgentBridgeError{-32007, QStringLiteral("Unknown segment id: %1").arg(segmentIdQ), data};
+        }
+        QJsonObject data;
+        data["detail"] = err.isEmpty() ? QStringLiteral("rename failed") : err;
+        throw AgentBridgeError{-32010, QStringLiteral("Failed to rename segment: %1").arg(err), data};
+    }
+
+    QJsonObject result;
+    result["oldId"] = segmentIdQ;
+    result["newId"] = newName;
+    return result;
+}
+
+
+QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
+{
+    ViewerManager* mgr = _window ? _window->_viewerManager.get() : nullptr;
+    if (!mgr) {
+        QJsonObject data;
+        data["detail"] = "viewer manager is not available";
+        throw AgentBridgeError{-32010, "Viewer manager unavailable", data};
+    }
+
+    // First live chunked viewer carries the per-viewer (uniformly-driven) toggles;
+    // fall back to QSettings-backed defaults when no viewer exists yet.
+    CChunkedVolumeViewer* firstChunked = nullptr;
+    mgr->forEachBaseViewer([&firstChunked](VolumeViewerBase* v) {
+        if (firstChunked || !v)
+            return;
+        if (auto* c = qobject_cast<CChunkedVolumeViewer*>(v->asQObject()))
+            firstChunked = c;
+    });
+
+    QJsonObject o;
+    o["intersectionOpacity"] = mgr->intersectionOpacity();
+    o["intersectionThickness"] = mgr->intersectionThickness();
+    o["overlayOpacity"] = mgr->overlayOpacity();
+    o["intersectionMaxSurfaces"] = mgr->intersectionMaxSurfaces();
+
+    if (firstChunked) {
+        o["planeIntersectionLinesVisible"] = firstChunked->isPlaneIntersectionLinesVisible();
+        o["showSurfaceNormals"] = firstChunked->isShowSurfaceNormals();
+        o["showDirectionHints"] = firstChunked->isShowDirectionHints();
+        o["surfaceOverlayEnabled"] = firstChunked->surfaceOverlayEnabled();
+        QJsonArray ids;
+        for (const std::string& id : firstChunked->highlightedSurfaceIds())
+            ids.append(QString::fromStdString(id));
+        o["highlightedSurfaceIds"] = ids;
+    } else {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        o["planeIntersectionLinesVisible"] = settings.value(
+            vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES,
+            vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toBool();
+        o["showSurfaceNormals"] = settings.value(
+            vc3d::settings::viewer::SHOW_SURFACE_NORMALS,
+            vc3d::settings::viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
+        o["showDirectionHints"] = settings.value(
+            vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
+            vc3d::settings::viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
+        o["surfaceOverlayEnabled"] = false;
+        o["highlightedSurfaceIds"] = QJsonArray();
+    }
+    return o;
+}
+
+
+QJsonObject AgentBridgeServer::handleViewerGetRenderSettings(const QJsonValue&)
+{
+    return viewerRenderSettingsJson();
+}
+
+
+QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& params)
+{
+    ViewerManager* mgr = _window ? _window->_viewerManager.get() : nullptr;
+    if (!mgr) {
+        QJsonObject data;
+        data["detail"] = "viewer manager is not available";
+        throw AgentBridgeError{-32010, "Viewer manager unavailable", data};
+    }
+
+    const QJsonObject p = paramsObject(params);
+
+    // Global controls via ViewerManager (broadcast + QSettings-persisted). Present-
+    // but-wrong-typed values are rejected by the strict helpers; opacities are
+    // clamped to 0..1 (the setters clamp again defensively).
+    if (p.contains("intersectionOpacity")) {
+        const double v = jsonRequireFinite(p.value("intersectionOpacity"), "intersectionOpacity");
+        mgr->setIntersectionOpacity(static_cast<float>(std::clamp(v, 0.0, 1.0)));
+    }
+    if (p.contains("intersectionThickness")) {
+        const double v = jsonRequireFinite(p.value("intersectionThickness"), "intersectionThickness");
+        mgr->setIntersectionThickness(static_cast<float>(std::max(0.0, v)));
+    }
+    if (p.contains("overlayOpacity")) {
+        const double v = jsonRequireFinite(p.value("overlayOpacity"), "overlayOpacity");
+        mgr->setOverlayOpacity(static_cast<float>(std::clamp(v, 0.0, 1.0)));
+    }
+    if (p.contains("intersectionMaxSurfaces")) {
+        const int v = jsonRequireInt(p.value("intersectionMaxSurfaces"), "intersectionMaxSurfaces");
+        mgr->setIntersectionMaxSurfaces(std::max(0, v));
+    }
+    if (p.contains("highlightedSurfaceIds")) {
+        const QJsonValue hv = p.value("highlightedSurfaceIds");
+        if (!hv.isArray())
+            throwParamError("highlightedSurfaceIds", QStringLiteral("must be an array of strings"));
+        std::vector<std::string> ids;
+        for (const QJsonValue& e : hv.toArray()) {
+            if (!e.isString())
+                throwParamError("highlightedSurfaceIds", QStringLiteral("must be an array of strings"));
+            ids.push_back(e.toString().toStdString());
+        }
+        mgr->setHighlightedSurfaceIds(ids);
+    }
+
+    // Per-viewer toggles are driven uniformly across every base viewer.
+    auto broadcast = [mgr](const std::function<void(VolumeViewerBase*)>& fn) {
+        mgr->forEachBaseViewer([&fn](VolumeViewerBase* v) { if (v) fn(v); });
+    };
+    if (p.contains("planeIntersectionLinesVisible")) {
+        const bool b = jsonRequireBool(p.value("planeIntersectionLinesVisible"),
+                                       "planeIntersectionLinesVisible");
+        broadcast([b](VolumeViewerBase* v) { v->setPlaneIntersectionLinesVisible(b); });
+    }
+    if (p.contains("showSurfaceNormals")) {
+        const bool b = jsonRequireBool(p.value("showSurfaceNormals"), "showSurfaceNormals");
+        broadcast([b](VolumeViewerBase* v) { v->setShowSurfaceNormals(b); });
+    }
+    if (p.contains("showDirectionHints")) {
+        const bool b = jsonRequireBool(p.value("showDirectionHints"), "showDirectionHints");
+        broadcast([b](VolumeViewerBase* v) { v->setShowDirectionHints(b); });
+    }
+    if (p.contains("surfaceOverlayEnabled")) {
+        const bool b = jsonRequireBool(p.value("surfaceOverlayEnabled"), "surfaceOverlayEnabled");
+        broadcast([b](VolumeViewerBase* v) { v->setSurfaceOverlayEnabled(b); });
+    }
+
+    // Echo the resulting full settings (unknown keys are ignored).
+    return viewerRenderSettingsJson();
 }
 
 

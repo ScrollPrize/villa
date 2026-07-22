@@ -607,6 +607,10 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleSegmentsActivate(p); });
     _handlers.insert("segments.fetch",
         [this](const QJsonValue& p) { return handleSegmentsFetch(p); });
+    _handlers.insert("segments.delete",
+        [this](const QJsonValue& p) { return handleSegmentsDelete(p); });
+    _handlers.insert("segments.rename",
+        [this](const QJsonValue& p) { return handleSegmentsRename(p); });
     _handlers.insert("screenshot.capture",
         [this](const QJsonValue& p) { return handleScreenshotCapture(p); });
     _handlers.insert("canvas.get_cursor_volume_point",
@@ -627,6 +631,10 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleViewerRotate(p); });
     _handlers.insert("viewer.set_axis_aligned_slices",
         [this](const QJsonValue& p) { return handleViewerSetAxisAlignedSlices(p); });
+    _handlers.insert("viewer.get_render_settings",
+        [this](const QJsonValue& p) { return handleViewerGetRenderSettings(p); });
+    _handlers.insert("viewer.set_render_settings",
+        [this](const QJsonValue& p) { return handleViewerSetRenderSettings(p); });
     _handlers.insert("segmentation.enable_editing",
         [this](const QJsonValue& p) { return handleSegmentationEnableEditing(p); });
     _handlers.insert("segmentation.grow",
@@ -661,6 +669,8 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleVolumeOpen(p); });
     _handlers.insert("volume.select",
         [this](const QJsonValue& p) { return handleVolumeSelect(p); });
+    _handlers.insert("volume.list",
+        [this](const QJsonValue& p) { return handleVolumeList(p); });
     _handlers.insert("catalog.open_sample",
         [this](const QJsonValue& p) { return handleCatalogOpenSample(p); });
     _handlers.insert("catalog.list_samples",
@@ -669,6 +679,8 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleCatalogDescribeSample(p); });
     _handlers.insert("job.status",
         [this](const QJsonValue& p) { return handleJobStatus(p); });
+    _handlers.insert("job.cancel",
+        [this](const QJsonValue& p) { return handleJobCancel(p); });
 
     // --- Lasagna RPCs (SPEC §11) ---
     _handlers.insert("lasagna.service_status",

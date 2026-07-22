@@ -723,3 +723,91 @@ QJsonObject AgentBridgeServer::handleJobStatus(const QJsonValue& params)
 
     return jobStatusJson(*rec);
 }
+
+
+QJsonObject AgentBridgeServer::handleJobCancel(const QJsonValue& params)
+{
+    const QJsonObject p = paramsObject(params);
+    const QString jobId = jsonOptionalString(p, "jobId");
+    const QString source = jsonOptionalString(p, "source");
+    if (jobId.isEmpty() && source.isEmpty()) {
+        QJsonObject data;
+        data["param"] = "jobId";
+        throw AgentBridgeError{-32602,
+            "at least one of jobId or source is required", data};
+    }
+
+    // Prefer jobId; if only source given, resolve the source's active job.
+    const QString resolvedId = jobId.isEmpty() ? activeJobId(source) : jobId;
+    const JobRecord* rec = resolvedId.isEmpty() ? nullptr : jobById(resolvedId);
+    if (!rec || rec->state != QLatin1String("running")) {
+        QJsonObject data;
+        data["kind"] = "job";
+        if (!resolvedId.isEmpty())
+            data["id"] = resolvedId;
+        else if (!source.isEmpty())
+            data["source"] = source;
+        throw AgentBridgeError{-32007, "No such running job", data};
+    }
+
+    // Snapshot the identifying fields BEFORE dispatching: a synchronous cancel
+    // authority (e.g. tool/seeding) may call finishJob, which erases the active
+    // JobRecord and invalidates `rec`.
+    const QString outId = rec->id;
+    const QString outSource = rec->source;
+    const QString outKind = rec->kind;
+    const QString externalId = rec->externalId;
+
+    // Dispatch on the job's source to its per-source cancel authority.
+    if (outSource == QLatin1String("atlas")) {
+        if (!_window)
+            throw AgentBridgeError{-32010, "Window unavailable", {}};
+        // Dialog-free: sets cancel flags; the job terminates via atlasSearchFinished.
+        _window->cancelAtlasFiberIntersectionSearch();
+    } else if (outSource == QLatin1String("seeding")) {
+        SeedingWidget* widget = _window ? _window->_seedingWidget : nullptr;
+        if (!widget) {
+            QJsonObject data;
+            data["detail"] = "seeding widget is not available";
+            throw AgentBridgeError{-32010, "Seeding widget unavailable", data};
+        }
+        // Bounded synchronous teardown; emits seedingBatchFinished -> finishJob.
+        widget->cancelSeedingBatchHeadless();
+    } else if (outSource == QLatin1String("lasagna")) {
+        LasagnaServiceManager& mgr = LasagnaServiceManager::instance();
+        if (!mgr.isRunning()) {
+            QJsonObject data;
+            data["detail"] = "lasagna service is not running";
+            throw AgentBridgeError{-32005, "Lasagna service not running", data};
+        }
+        if (externalId.isEmpty())
+            mgr.stopOptimization();
+        else
+            mgr.cancelJob(externalId);
+    } else if (outSource == QLatin1String("tool")) {
+        // grow/trace/render tools run as CommandLineToolRunner child QProcesses:
+        // terminate cleanly; toolFinished then resolves the job via finishJob.
+        if (!_window || !_window->_cmdRunner || !_window->_cmdRunner->isRunning()) {
+            QJsonObject data;
+            data["detail"] = "no running tool process to cancel";
+            throw AgentBridgeError{-32005, "Tool process not running", data};
+        }
+        _window->_cmdRunner->cancel();
+    } else {
+        // growth (QtConcurrent future, no cancel), flatten (self-owned job with no
+        // reachable cancel handle), catalog, autosave: no safe cancel authority.
+        QJsonObject data;
+        data["kind"] = "job";
+        data["reason"] = "not cancellable";
+        data["source"] = outSource;
+        throw AgentBridgeError{-32010,
+            QStringLiteral("A %1 job cannot be cancelled").arg(outSource), data};
+    }
+
+    QJsonObject result;
+    result["cancelRequested"] = true;
+    result["jobId"] = outId;
+    result["source"] = outSource;
+    result["kind"] = outKind;
+    return result;
+}

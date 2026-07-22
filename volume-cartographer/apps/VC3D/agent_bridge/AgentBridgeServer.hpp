@@ -113,6 +113,11 @@ private:
     QJsonObject handleSegmentsList(const QJsonValue& params);
     QJsonObject handleSegmentsActivate(const QJsonValue& params);
     QJsonObject handleSegmentsFetch(const QJsonValue& params);
+    // Destructive on-disk segment ops (ADDITIONS_SPEC item 5). Both resolve the
+    // id like handleSegmentsActivate and drive dialog-free cores extracted from
+    // the interactive SurfacePanelController / SegmentationCommandHandler slots.
+    QJsonObject handleSegmentsDelete(const QJsonValue& params);
+    QJsonObject handleSegmentsRename(const QJsonValue& params);
     QJsonObject handleScreenshotCapture(const QJsonValue& params);
     QJsonObject handleCursorVolumePoint(const QJsonValue& params);
     // Phase 2: canvas + mutating action handlers.
@@ -122,6 +127,14 @@ private:
     QJsonObject handleViewerZoom(const QJsonValue& params);
     QJsonObject handleViewerRotate(const QJsonValue& params);
     QJsonObject handleViewerSetAxisAlignedSlices(const QJsonValue& params);
+    // Global render-settings get/set (ADDITIONS_SPEC item 6). Reads current
+    // values from ViewerManager getters and the first chunked viewer; the set
+    // handler applies each present field via ViewerManager setters / broadcast
+    // and echoes the resulting full settings. viewerRenderSettingsJson() builds
+    // the shared reply body.
+    QJsonObject handleViewerGetRenderSettings(const QJsonValue& params);
+    QJsonObject handleViewerSetRenderSettings(const QJsonValue& params);
+    QJsonObject viewerRenderSettingsJson() const;
     QJsonObject handleSegmentationEnableEditing(const QJsonValue& params);
     QJsonObject handleSegmentationGrow(const QJsonValue& params);
     QJsonObject handleSegmentationGrowPatchFromSeed(const QJsonValue& params);
@@ -146,11 +159,16 @@ private:
     QJsonObject handlePointsList(const QJsonValue& params);
     QJsonObject handleVolumeOpen(const QJsonValue& params);
     QJsonObject handleVolumeSelect(const QJsonValue& params);
+    // Lists every volume id in the open package (ADDITIONS_SPEC item 4).
+    QJsonObject handleVolumeList(const QJsonValue& params);
     QJsonObject handleCatalogOpenSample(const QJsonValue& params);
     // Remote catalog resource selection (SPEC §10.1-10.2).
     QJsonObject handleCatalogListSamples(const QJsonValue& params);
     QJsonObject handleCatalogDescribeSample(const QJsonValue& params);
     QJsonObject handleJobStatus(const QJsonValue& params);
+    // Generic cancel that resolves a running job (by id or source) and dispatches
+    // to its per-source cancel authority (ADDITIONS_SPEC item 3).
+    QJsonObject handleJobCancel(const QJsonValue& params);
     // Lasagna RPCs (SPEC §11) + workspace switching (SPEC §11.9).
     QJsonObject handleLasagnaServiceStatus(const QJsonValue& params);
     QJsonObject handleLasagnaEnsureService(const QJsonValue& params);

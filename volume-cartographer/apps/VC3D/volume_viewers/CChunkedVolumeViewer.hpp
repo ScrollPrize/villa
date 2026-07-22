@@ -123,6 +123,7 @@ public:
     void setStretchValues(bool) { if (_closing) return; submitRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
     void setPlaneIntersectionLinesVisible(bool visible) override;
+    bool isPlaneIntersectionLinesVisible() const { return _planeIntersectionLinesVisible; }
 
     void setShowDirectionHints(bool on) override { if (_closing) return; _showDirectionHints = on; emit overlaysUpdated(); }
     bool isShowDirectionHints() const override { return _showDirectionHints; }
@@ -178,6 +179,9 @@ public:
     void setIntersectionOpacity(float v) override;
     void setIntersectionThickness(float v) override;
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids) override;
+    std::vector<std::string> highlightedSurfaceIds() const {
+        return {_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end()};
+    }
     void setSurfacePatchSamplingStride(int s) override;
 
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
