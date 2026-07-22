@@ -11,7 +11,7 @@ def test_load_density_mask_with_and_without_channel(tmp_path):
     vol = np.zeros((Z, Y, X), dtype=np.uint8)
     vol[1:3, 1:2, 2:4] = 7
     path_nochan = os.path.join(tmp_path, "raw_nochan.zarr")
-    zarr.save_array(path_nochan, vol, chunks=(Z, Y, X))
+    zarr.create_array(store=path_nochan, data=vol, chunks=(Z, Y, X))
 
     mask = load_density_mask(path_nochan, volume_id=7, bounds=(0, Z, 0, Y, 0, X))
     assert mask.shape == (Z, Y, X)
@@ -21,7 +21,7 @@ def test_load_density_mask_with_and_without_channel(tmp_path):
     # with a leading channel axis
     volc = vol[None]  # shape (1,Z,Y,X)
     path_chan = os.path.join(tmp_path, "raw_chan.zarr")
-    zarr.save_array(path_chan, volc, chunks=(1, Z, Y, X))
+    zarr.create_array(store=path_chan, data=volc, chunks=(1, Z, Y, X))
     mask2 = load_density_mask(path_chan, volume_id=7, bounds=(0, Z, 0, Y, 0, X))
     assert torch.allclose(mask2, mask)
 
@@ -34,7 +34,7 @@ def test_load_eigenvector_field(tmp_path):
     ev[0] = 1.0  # v0.x
     ev[4] = 1.0  # v1.y  (since layout is [v0x,v0y,v0z, v1x,v1y,v1z, v2x,v2y,v2z])
     root = zarr.open_group(os.path.join(tmp_path, "ev.zarr"), mode="w")
-    root.create_dataset("eigenvectors", data=ev, chunks=(1, Z, Y, X), dtype="f4")
+    root.create_array("eigenvectors", data=ev, chunks=(1, Z, Y, X))
 
     # principal (index 0)
     block0 = load_eigenvector_field(str(root.store.path), eig_index=0, bounds=(0, Z, 0, Y, 0, X))

@@ -267,9 +267,9 @@ def test_coarse_scan_level(tmp_path: Path):
     base = tmp_path / "labels.ome.zarr"
     base.mkdir(parents=True)
     group = zarr.open_group(str(base), mode="w")
-    group.create_dataset("0", data=labels, chunks=(16, 16, 16))
+    group.create_array("0", data=labels, chunks=(16, 16, 16))
     coarse = (labels[::4, ::4, ::4] > 0).astype(np.uint8)  # 16^3
-    group.create_dataset("1", data=coarse, chunks=(8, 8, 8))
+    group.create_array("1", data=coarse, chunks=(8, 8, 8))
 
     image_path = tmp_path / "image.zarr"
     tform_path = tmp_path / "transform.json"

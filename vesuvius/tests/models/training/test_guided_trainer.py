@@ -57,9 +57,9 @@ def _make_synthetic_dataset(root: Path) -> Path:
     image_group = zarr.open_group(str(image_root), mode="w")
     label_group_ink = zarr.open_group(str(label_root_ink), mode="w")
     label_group_surface = zarr.open_group(str(label_root_surface), mode="w")
-    image_array = image_group.create_dataset("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="float32")
-    label_array_ink = label_group_ink.create_dataset("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="uint8")
-    label_array_surface = label_group_surface.create_dataset("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="uint8")
+    image_array = image_group.create_array("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="float32")
+    label_array_ink = label_group_ink.create_array("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="uint8")
+    label_array_surface = label_group_surface.create_array("0", shape=(16, 16, 16), chunks=(16, 16, 16), dtype="uint8")
 
     coords = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
     z = coords[:, None, None]
