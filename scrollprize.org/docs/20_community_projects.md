@@ -236,6 +236,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Scroll Slab Viewer](https://github.com/Paul-G2/ScrollSlabViewer) by Paul Geiger. A 3D viewer tailored for the [Kaggle Surface Detection challenge](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection).
 
+- [Readability gate](https://github.com/robertlangdonn/vesuvius-readability-gate) by Prasad Khake. A CPU-only readability-risk diagnostic for rendered surfaces: it scores per-column "depth occupancy" over the ink model's 62-layer render window — a surface that isolates one papyrus sheet lights a small localized slice (readable), while one that can't (oblique geometry, or packed/gap-less laminae) saturates through depth (speckle). Predicts whether a candidate surface is worth running ink inference on before spending GPU. Validated on public data (a readable PHerc1667 sheet at median occupancy 0.35 vs unreadable PHerc1203 auto-grown surfaces at 0.97) with a same-scroll geometry-sensitivity control.
+
 ## Ink Detection
 
 ### 🏆 3D Ink Detection
