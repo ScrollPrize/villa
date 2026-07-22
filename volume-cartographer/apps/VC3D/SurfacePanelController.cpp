@@ -1521,21 +1521,38 @@ void SurfacePanelController::handleDeleteSegments(const QStringList& segmentIds)
     }
 
     const int total = segmentIds.size();
+    int deleted = 0;
     QString err;
-    if (deleteSegmentsHeadless(segmentIds, &err)) {
+    if (deleteSegmentsHeadless(segmentIds, &err, &deleted)) {
         emit statusMessageRequested(tr("Successfully deleted %1 segment(s)").arg(total), 5000);
-    } else if (!err.isEmpty()) {
+    } else if (deleted > 0) {
+        // Partial success: some segments were deleted, others failed.
         QMessageBox::warning(parentWidget,
-                             tr("Deletion Failed"),
-                             tr("Some segments could not be deleted: %1\n\n"
+                             tr("Partial Deletion"),
+                             tr("Deleted %1 of %2 segment(s). The following could not be deleted: %3\n\n"
                                 "Permission errors may require manual deletion or running with "
                                 "elevated privileges.")
+                                 .arg(deleted)
+                                 .arg(total)
                                  .arg(err));
+    } else {
+        // Total failure: nothing was deleted.
+        QMessageBox::critical(parentWidget,
+                              tr("Deletion Failed"),
+                              tr("None of the %1 selected segment(s) could be deleted: %2\n\n"
+                                 "Permission errors may require manual deletion or running with "
+                                 "elevated privileges.")
+                                  .arg(total)
+                                  .arg(err.isEmpty() ? tr("unknown error") : err));
     }
 }
 
-bool SurfacePanelController::deleteSegmentsHeadless(const QStringList& segmentIds, QString* err)
+bool SurfacePanelController::deleteSegmentsHeadless(const QStringList& segmentIds, QString* err,
+                                                    int* deletedCount)
 {
+    if (deletedCount) {
+        *deletedCount = 0;
+    }
     if (segmentIds.isEmpty() || !_volumePkg) {
         if (err) {
             *err = _volumePkg ? tr("no segments specified")
@@ -1588,6 +1605,10 @@ bool SurfacePanelController::deleteSegmentsHeadless(const QStringList& segmentId
             _filtersUpdated();
         }
         emit surfacesLoaded();
+    }
+
+    if (deletedCount) {
+        *deletedCount = successCount;
     }
 
     if (successCount == segmentIds.size())
@@ -2933,6 +2954,26 @@ void SurfacePanelController::applyHighlightSelection(const std::string& id, bool
         std::vector<std::string> ids(_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end());
         _viewerManager->setHighlightedSurfaceIds(ids);
     }
+}
+
+void SurfacePanelController::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
+{
+    _highlightedSurfaceIds.clear();
+    for (const auto& id : ids) {
+        if (!id.empty()) {
+            _highlightedSurfaceIds.insert(id);
+        }
+    }
+
+    if (_viewerManager) {
+        std::vector<std::string> live(_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end());
+        _viewerManager->setHighlightedSurfaceIds(live);
+    }
+}
+
+std::vector<std::string> SurfacePanelController::highlightedSurfaceIds() const
+{
+    return std::vector<std::string>(_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end());
 }
 
 std::shared_ptr<QuadSurface> SurfacePanelController::getSurfaceById(const std::string& id) const

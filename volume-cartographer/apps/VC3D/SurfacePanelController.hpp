@@ -142,10 +142,20 @@ public:
     // the package on disk (removeSingleSegmentation + VolumePkg::removeSegmentation)
     // and refreshes the panel. Never shows a dialog. Returns true when every id
     // was deleted; on partial/total failure returns false and, when `err` is
-    // non-null, sets it to a human-readable summary of the failed ids. The
+    // non-null, sets it to a human-readable summary of the failed ids. When
+    // `deletedCount` is non-null it receives the number of ids actually deleted
+    // (so callers can distinguish partial success from total failure). The
     // interactive handleDeleteSegments calls this after its confirmation dialog;
-    // the agent bridge calls it directly (ADDITIONS_SPEC item 5).
-    bool deleteSegmentsHeadless(const QStringList& segmentIds, QString* err = nullptr);
+    // the agent bridge calls it directly (SPEC.md §23).
+    bool deleteSegmentsHeadless(const QStringList& segmentIds, QString* err = nullptr,
+                                int* deletedCount = nullptr);
+    // Replace the whole highlighted-surface set at once and push it to the viewers,
+    // keeping _highlightedSurfaceIds (the source of truth behind the context-menu
+    // "Highlight in slice views" checkmarks) in sync. The agent bridge routes
+    // viewer.set_render_settings through this instead of ViewerManager directly, so
+    // a bridge-driven highlight change and the GUI toggle stay consistent.
+    void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
+    std::vector<std::string> highlightedSurfaceIds() const;
     bool cycleToNextVisibleSegment();
     bool cycleToPreviousVisibleSegment();
     void materializeCurrentOpenDataFolder();

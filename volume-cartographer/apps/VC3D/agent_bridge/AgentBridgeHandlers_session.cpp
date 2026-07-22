@@ -925,10 +925,6 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
         o["showSurfaceNormals"] = firstChunked->isShowSurfaceNormals();
         o["showDirectionHints"] = firstChunked->isShowDirectionHints();
         o["surfaceOverlayEnabled"] = firstChunked->surfaceOverlayEnabled();
-        QJsonArray ids;
-        for (const std::string& id : firstChunked->highlightedSurfaceIds())
-            ids.append(QString::fromStdString(id));
-        o["highlightedSurfaceIds"] = ids;
     } else {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         o["planeIntersectionLinesVisible"] = settings.value(
@@ -941,8 +937,21 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
             vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
             vc3d::settings::viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
         o["surfaceOverlayEnabled"] = false;
-        o["highlightedSurfaceIds"] = QJsonArray();
     }
+
+    // Highlighted surface ids are sourced from the surface panel (the source of
+    // truth behind the context-menu checkmarks), so get/set stay consistent and
+    // the value is reported even when no viewer is instantiated. Fall back to the
+    // first live viewer only if the panel is unavailable.
+    QJsonArray highlightIds;
+    if (SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr) {
+        for (const std::string& id : panel->highlightedSurfaceIds())
+            highlightIds.append(QString::fromStdString(id));
+    } else if (firstChunked) {
+        for (const std::string& id : firstChunked->highlightedSurfaceIds())
+            highlightIds.append(QString::fromStdString(id));
+    }
+    o["highlightedSurfaceIds"] = highlightIds;
     return o;
 }
 
@@ -993,7 +1002,14 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
                 throwParamError("highlightedSurfaceIds", QStringLiteral("must be an array of strings"));
             ids.push_back(e.toString().toStdString());
         }
-        mgr->setHighlightedSurfaceIds(ids);
+        // Route through the surface panel so its _highlightedSurfaceIds (the source
+        // of truth behind the context-menu checkmarks) stays in sync; otherwise the
+        // next GUI highlight toggle would rebuild from the stale panel set and
+        // clobber these. Fall back to ViewerManager if the panel is unavailable.
+        if (SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr)
+            panel->setHighlightedSurfaceIds(ids);
+        else
+            mgr->setHighlightedSurfaceIds(ids);
     }
 
     // Per-viewer toggles are driven uniformly across every base viewer.
