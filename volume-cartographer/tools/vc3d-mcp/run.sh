@@ -18,15 +18,25 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$DIR/.venv"
 
+# A venv is healthy only if its python exists AND can import the runtime deps.
+# A partial venv (python but no pip, or pip but no mcp) is rebuilt from scratch.
+needs_setup=0
 if [ ! -x "$VENV/bin/python" ]; then
-    echo "[vc3d-mcp] First run: setting up Python environment in $VENV ..." >&2
+    needs_setup=1
+elif ! "$VENV/bin/python" -c "import mcp, vc3d_mcp" >/dev/null 2>&1; then
+    echo "[vc3d-mcp] Existing $VENV is incomplete; rebuilding ..." >&2
+    rm -rf "$VENV"
+    needs_setup=1
+fi
+
+if [ "$needs_setup" -eq 1 ]; then
+    echo "[vc3d-mcp] Setting up Python environment in $VENV ..." >&2
     PYTHON_BIN="${PYTHON:-python3}"
     if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
         echo "[vc3d-mcp] No '$PYTHON_BIN' found on PATH. Install Python 3.10+ or set PYTHON=/path/to/python3." >&2
         exit 1
     fi
     "$PYTHON_BIN" -m venv "$VENV"
-    "$VENV/bin/pip" install -q --upgrade pip
     "$VENV/bin/pip" install -q -e "$DIR"
     echo "[vc3d-mcp] Setup complete." >&2
 fi

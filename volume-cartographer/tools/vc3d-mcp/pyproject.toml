@@ -9,7 +9,7 @@ description = "MCP server that drives a running VC3D instance through its Agent 
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.6.0",
+    "mcp>=1.6.0,<2",
 ]
 
 [project.scripts]
