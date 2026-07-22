@@ -3134,7 +3134,7 @@ class Model3D(nn.Module):
 		# Vectorized GPU Newton solve.  Only the KDTree candidate search stays on
 		# CPU.  Math is float64 to match the original (float32 breaks near-ties between
 		# overlapping cells differently).
-		use_cuda = bool(getattr(device, "type", "cpu") == "cuda")
+		use_cuda = bool(torch.device(device).type == "cuda")
 		es_cell = torch.as_tensor(q10 - q00, dtype=torch.float64, device=device)
 		et_cell = torch.as_tensor(q01 - q00, dtype=torch.float64, device=device)
 		bl_cell = torch.as_tensor(q11 - q10 - q01 + q00, dtype=torch.float64, device=device)
@@ -3155,6 +3155,9 @@ class Model3D(nn.Module):
 		total = int(out_h) * int(out_w)
 		chunk = max(1, int(chunk_points))
 		if use_cuda and chunk < (1 << 20):
+			# Peak GPU memory scales with chunk * k: the Newton loop holds ~a dozen
+			# (chunk, k[, 2]) float64 temporaries, roughly 1-2 GB at chunk=1M, k=8.
+			# If k_candidates grows large or OOMs appear, lower this cap.
 			chunk = 1 << 20
 		for start in range(0, total, chunk):
 			stop = min(total, start + chunk)
