@@ -1,0 +1,71 @@
+{
+	"args": {
+		"model-init": "flatten",
+	    "flatten_solver": "forward"
+	},
+	"base": {
+		"flatten_sdir": 1.0,
+		"flatten_map_step": 0.1,
+		"flatten_avg_offset": 1.0,
+		"flatten_orient": 10.0
+	},
+	"stages": [
+		{
+			"name": "flatten",
+			"steps": 4500,
+			"lr" : 0.01,
+			"params": ["map_flatten_ms"],
+			"min_scaledown": 0,
+			"args": {
+				"flatten_support": true,
+				"flatten_support_radius": 1,
+				"flatten_orient_min_det": 0.0,
+				"flatten_filter_source_angles": false,
+				"flatten_max_update": 0.1,
+				"flatten_sdir_eps": 1e-8,
+				"status_interval": 100,
+				"auto_steps_window": 2000,
+				"auto_steps_max": 100000,
+				"auto_steps_rel_threshold": 1e-5
+			}
+		},
+		{
+			"name": "flatten",
+			"steps": 1000,
+			"lr" : 0.001,
+			"params": ["map_flatten_ms"],
+			"min_scaledown": 0,
+			"args": {
+				"flatten_support": true,
+				"flatten_support_radius": 1,
+				"flatten_orient_min_det": 0.0,
+				"flatten_filter_source_angles": false,
+				"flatten_max_update": 0.1,
+				"flatten_sdir_eps": 1e-8,
+				"status_interval": 100,
+				"auto_steps_window": 2000,
+				"auto_steps_max": 100000,
+				"auto_steps_rel_threshold": 1e-5
+			}
+		},
+		{
+			"name": "flatten",
+			"steps": 1000,
+			"lr" : 0.0001,
+			"params": ["map_flatten_ms"],
+			"min_scaledown": 0,
+			"args": {
+				"flatten_support": true,
+				"flatten_support_radius": 1,
+				"flatten_orient_min_det": 0.0,
+				"flatten_filter_source_angles": false,
+				"flatten_max_update": 0.1,
+				"flatten_sdir_eps": 1e-8,
+				"status_interval": 100,
+				"auto_steps_window": 2000,
+				"auto_steps_max": 100000,
+				"auto_steps_rel_threshold": 1e-5
+			}
+		}
+	]
+}
