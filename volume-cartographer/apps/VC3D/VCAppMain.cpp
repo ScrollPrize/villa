@@ -417,8 +417,12 @@ auto main(int argc, char* argv[]) -> int
             if (!agentBridge->listen(bridgeName)) {
                 std::cerr << "Error: agent bridge failed to listen on '"
                           << bridgeName.toStdString() << "'." << std::endl;
+                std::cout.flush();
                 std::cerr.flush();
-                return 2;
+                // Exit like the std::_Exit path below rather than returning: a plain
+                // return runs DSO finalizers (gnutls/libtasn1 free through mimalloc
+                // post-teardown) and segfaults in _dl_fini. Nothing has loaded yet.
+                std::_Exit(2);
             }
             std::cout << "VC3D-AGENT-BRIDGE: listening name="
                       << agentBridge->serverName().toStdString()
