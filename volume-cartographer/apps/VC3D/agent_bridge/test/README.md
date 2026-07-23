@@ -16,9 +16,10 @@ docker exec vc3d-bridge bash -lc 'cd /work && QT_QPA_PLATFORM=offscreen python3 
 After changing a method descriptor, regenerate the checked-in description with
 the same command plus `--update-description-snapshot`.
 
-`manual_bridge_test.py` is a developer-only live fixture suite and benchmark.
-It requires the local volume-package JSON files described at the top of the
-script:
+`manual_bridge_test.py` is the entry point for the developer-only fixture suite
+and benchmark. Its `manual_bridge_*.py` modules group checks by domain and are
+not separate commands. The suite requires the local volume-package JSON files
+described in `manual_bridge_support.py`:
 
 ```sh
 python3 apps/VC3D/agent_bridge/test/manual_bridge_test.py offscreen
