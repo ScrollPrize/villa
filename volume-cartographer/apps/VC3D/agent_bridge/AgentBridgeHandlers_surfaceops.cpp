@@ -37,7 +37,7 @@
 
 QJsonObject AgentBridgeServer::handleSegmentCropBounds(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
@@ -46,7 +46,7 @@ QJsonObject AgentBridgeServer::handleSegmentCropBounds(const QJsonValue& params)
     if (!state->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    const QString segmentId = jsonRequireString(p, "segmentId");
+    const QString segmentId = p.value("segmentId").toString();
     if (!state->vpkg()->getSurface(segmentId.toStdString())) {
         QJsonObject data;
         data["kind"] = "segment";
@@ -94,20 +94,14 @@ QJsonObject AgentBridgeServer::handleSegmentCropBounds(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleSegmentRecalcArea(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
     if (!state->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    const QJsonValue idsVal = p.value("segmentIds");
-    if (!idsVal.isArray()) {
-        QJsonObject data;
-        data["param"] = "segmentIds";
-        throw AgentBridgeError{-32602, "segmentIds must be an array of strings", data};
-    }
-    const QJsonArray idsArr = idsVal.toArray();
+    const QJsonArray idsArr = p.value("segmentIds").toArray();
     if (idsArr.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentIds";
@@ -116,14 +110,8 @@ QJsonObject AgentBridgeServer::handleSegmentRecalcArea(const QJsonValue& params)
 
     std::vector<std::string> ids;
     ids.reserve(static_cast<size_t>(idsArr.size()));
-    for (const QJsonValue& v : idsArr) {
-        if (!v.isString()) {
-            QJsonObject data;
-            data["param"] = "segmentIds";
-            throw AgentBridgeError{-32602, "segmentIds must be an array of strings", data};
-        }
+    for (const QJsonValue& v : idsArr)
         ids.push_back(v.toString().toStdString());
-    }
 
     // Pure computation, no UI: per-segment results carry their own success flag,
     // so an unknown/invalid id is reported in-band (success:false) rather than
@@ -156,14 +144,14 @@ QJsonObject AgentBridgeServer::handleSegmentRecalcArea(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleSegmentReoptimize(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
     if (!state->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    const QString segmentId = jsonRequireString(p, "segmentId");
+    const QString segmentId = p.value("segmentId").toString();
     if (!state->vpkg()->getSurface(segmentId.toStdString())) {
         QJsonObject data;
         data["kind"] = "segment";
@@ -172,7 +160,7 @@ QJsonObject AgentBridgeServer::handleSegmentReoptimize(const QJsonValue& params)
     }
 
     SegmentationCommandHandler::ResumeLocalGrowParams rp;
-    rp.volumeId = jsonOptionalString(p, "volumeId");
+    rp.volumeId = p.value("volumeId").toString();
     // Validate volumeId up front (clean -32007 before the job is registered).
     if (!rp.volumeId.isEmpty()) {
         const auto vids = state->vpkg()->volumeIDs();
@@ -183,21 +171,8 @@ QJsonObject AgentBridgeServer::handleSegmentReoptimize(const QJsonValue& params)
             throw AgentBridgeError{-32007, QStringLiteral("Unknown volume id: %1").arg(rp.volumeId), data};
         }
     }
-    rp.ompThreads = jsonOptionalInt(p, "ompThreads", rp.ompThreads);
-    if (rp.ompThreads < 0) {
-        QJsonObject data;
-        data["param"] = "ompThreads";
-        throw AgentBridgeError{-32602, "ompThreads must be >= 0", data};
-    }
-    if (p.contains("paramOverrides")) {
-        const QJsonValue ov = p.value("paramOverrides");
-        if (!ov.isObject()) {
-            QJsonObject data;
-            data["param"] = "paramOverrides";
-            throw AgentBridgeError{-32602, "paramOverrides must be an object", data};
-        }
-        rp.paramOverrides = ov.toObject();
-    }
+    rp.ompThreads = p.value("ompThreads").toInt(rp.ompThreads);
+    rp.paramOverrides = p.value("paramOverrides").toObject();
 
     // Reoptimize runs vc_grow_seg_from_segments via the runner: the "tool" source.
     requireSourceIdle(QStringLiteral("tool"));
@@ -256,14 +231,14 @@ QJsonObject AgentBridgeServer::handleSegmentReoptimize(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleSegmentRefineAlphaComp(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
     if (!state->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    const QString segmentId = jsonRequireString(p, "segmentId");
+    const QString segmentId = p.value("segmentId").toString();
     if (!state->vpkg()->getSurface(segmentId.toStdString())) {
         QJsonObject data;
         data["kind"] = "segment";
@@ -272,25 +247,22 @@ QJsonObject AgentBridgeServer::handleSegmentRefineAlphaComp(const QJsonValue& pa
     }
 
     SegmentationCommandHandler::AlphaCompRefineParams rp;
-    // Optional overrides; each present value is strictly typed (SPEC §5). Absent
-    // values keep the dialog-default already in the struct.
-    auto optFinite = [&](const char* key, double& target) {
-        if (p.contains(key)) target = jsonRequireFinite(p.value(key), key);
-    };
-    rp.refine = jsonOptionalBool(p, "refine", rp.refine);
-    optFinite("start", rp.start);
-    optFinite("stop", rp.stop);
-    optFinite("step", rp.step);
-    rp.low = jsonOptionalInt(p, "low", rp.low);
-    rp.high = jsonOptionalInt(p, "high", rp.high);
-    optFinite("borderOff", rp.borderOff);
-    rp.radius = jsonOptionalInt(p, "radius", rp.radius);
-    rp.genVertexColor = jsonOptionalBool(p, "genVertexColor", rp.genVertexColor);
-    rp.overwrite = jsonOptionalBool(p, "overwrite", rp.overwrite);
-    optFinite("readerScale", rp.readerScale);
-    rp.scaleGroup = jsonOptionalString(p, "scaleGroup", rp.scaleGroup);
-    rp.ompThreads = jsonOptionalInt(p, "ompThreads", rp.ompThreads);
-    rp.outputDir = jsonOptionalString(p, "outputDir");
+    rp.refine = p.value("refine").toBool(rp.refine);
+    rp.start = p.value("start").toDouble(rp.start);
+    rp.stop = p.value("stop").toDouble(rp.stop);
+    rp.step = p.value("step").toDouble(rp.step);
+    rp.low = p.value("low").toInt(rp.low);
+    rp.high = p.value("high").toInt(rp.high);
+    rp.borderOff = p.value("borderOff").toDouble(rp.borderOff);
+    rp.radius = p.value("radius").toInt(rp.radius);
+    rp.genVertexColor =
+        p.value("genVertexColor").toBool(rp.genVertexColor);
+    rp.overwrite = p.value("overwrite").toBool(rp.overwrite);
+    rp.readerScale = p.value("readerScale").toDouble(rp.readerScale);
+    rp.scaleGroup = p.value("scaleGroup").toString(rp.scaleGroup);
+    if (p.contains("ompThreads"))
+        rp.ompThreads = p.value("ompThreads").toInt();
+    rp.outputDir = p.value("outputDir").toString();
 
     // Refinement runs vc_objrefine via the runner: the "tool" source.
     requireSourceIdle(QStringLiteral("tool"));
@@ -354,12 +326,12 @@ QJsonObject AgentBridgeServer::handleSegmentAppendMask(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleSegmentMask(const QJsonValue& params, bool append)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QString segmentId = jsonRequireString(p, "segmentId");
+    const QString segmentId = p.value("segmentId").toString();
     auto surf = state->vpkg()->getSurface(segmentId.toStdString());
     if (!surf) {
         QJsonObject data;
