@@ -3,7 +3,9 @@
 // Shared inline free helpers for the Agent Bridge server, used across several
 // per-domain translation units (ODR-safe as inline free functions).
 
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -167,6 +169,19 @@ inline cv::Vec3f jsonToVec3(const QJsonValue& value, const char* paramName)
     const double y = jsonRequireFiniteFloat(o.value("y"), "y");
     const double z = jsonRequireFiniteFloat(o.value("z"), "z");
     return cv::Vec3f(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+}
+
+inline bool volumePointInBounds(const cv::Vec3f& point,
+                                const std::array<int, 3>& shapeXyz)
+{
+    for (std::size_t axis = 0; axis < shapeXyz.size(); ++axis) {
+        if (!std::isfinite(point[axis]) ||
+            point[axis] < 0.0f ||
+            point[axis] >= static_cast<float>(shapeXyz[axis])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 inline QString linePreviewModeToString(ManualAddTool::LinePreviewMode mode)

@@ -228,10 +228,16 @@ QJsonObject AgentBridgeServer::handleViewerCenterOnPoint(const QJsonValue& param
 {
     const QJsonObject p = paramsObject(params);
     VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
-    if (!viewer->currentVolume())
+    const auto volume = viewer->currentVolume();
+    if (!volume)
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
     const cv::Vec3f point = jsonToVec3(p.value("point"), "point");
+    if (!volumePointInBounds(point, volume->shapeXyz())) {
+        QJsonObject data;
+        data["point"] = vec3ToJson(point);
+        throw AgentBridgeError{-32003, "Point is outside volume bounds", data};
+    }
     const bool forceRender = jsonOptionalBool(p, "forceRender", true);
     viewer->centerOnVolumePoint(point, forceRender);
 

@@ -228,6 +228,11 @@ int main()
         CHECK(v[2] == 3.0f);
     });
 
+    CHECK(volumePointInBounds(cv::Vec3f{0.0f, 1.0f, 2.0f}, {3, 4, 5}));
+    CHECK(volumePointInBounds(cv::Vec3f{2.9f, 3.9f, 4.9f}, {3, 4, 5}));
+    CHECK(!volumePointInBounds(cv::Vec3f{-0.1f, 1.0f, 2.0f}, {3, 4, 5}));
+    CHECK(!volumePointInBounds(cv::Vec3f{3.0f, 1.0f, 2.0f}, {3, 4, 5}));
+
     const auto mapLaunchError = [](CommandLaunchError::Kind kind) {
         return commandLaunchErrorToBridgeError(
             {kind, QStringLiteral("detail")},
