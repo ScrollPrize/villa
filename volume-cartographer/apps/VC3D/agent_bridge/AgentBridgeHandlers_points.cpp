@@ -58,33 +58,20 @@ VCCollection* requirePointStore(CState* state)
         QStringLiteral("Unknown point: %1").arg(id), data};
 }
 
-// Require an integral, positive JSON number carrying a uint64 id (points.*-only
-// wire shape; the shared helpers stop at int). The bound is 2^53-1 (JSON's
-// safe-integer limit), not uint64_t's range: static_cast<double>(uint64_t::max())
-// rounds up to 2^64, and casting that back to uint64_t is UB. Ids this large are
-// not real ids anyway.
-uint64_t jsonRequireId(const QJsonValue& v, const char* paramName)
-{
-    constexpr double kMaxSafeInteger = 9007199254740991.0;  // 2^53 - 1
-    const double d = jsonRequireFinite(v, paramName);
-    if (std::floor(d) != d || d < 1.0 || d > kMaxSafeInteger)
-        throwParamError(paramName, QStringLiteral("must be a positive integer id"));
-    return static_cast<uint64_t>(d);
-}
-
 // Collection-identifying params accept EITHER `collection` (name) OR
 // `collectionId` (number). The numeric id wins when both are present. Throws
 // -32007 (kind:"collection") when the referenced collection does not exist.
 uint64_t resolveCollectionId(VCCollection* pc, const QJsonObject& p)
 {
     if (p.contains("collectionId")) {
-        const uint64_t id = jsonRequireId(p.value("collectionId"), "collectionId");
+        const uint64_t id =
+            static_cast<uint64_t>(p.value("collectionId").toDouble());
         if (pc->getAllCollections().count(id) == 0)
             throwUnknownCollection(QString::number(id));
         return id;
     }
 
-    const QString name = jsonRequireString(p, "collection");
+    const QString name = p.value("collection").toString();
     const uint64_t id = pc->getCollectionId(name.toStdString());  // 0 when absent
     if (id == 0)
         throwUnknownCollection(name);
@@ -95,8 +82,6 @@ uint64_t resolveCollectionId(VCCollection* pc, const QJsonObject& p)
 // jsonToVec3 does not apply here).
 cv::Vec3f jsonRequireColor(const QJsonValue& v, const char* paramName)
 {
-    if (!v.isArray())
-        throwParamError(paramName, QStringLiteral("must be an array [r, g, b]"));
     const QJsonArray a = v.toArray();
     if (a.size() != 3)
         throwParamError(paramName, QStringLiteral("must have exactly 3 components"));
@@ -117,11 +102,10 @@ QJsonArray colorToJson(const cv::Vec3f& c)
 
 std::vector<uint64_t> jsonRequireIdArray(const QJsonValue& v, const char* paramName)
 {
-    if (!v.isArray())
-        throwParamError(paramName, QStringLiteral("must be an array of ids"));
+    Q_UNUSED(paramName);
     std::vector<uint64_t> ids;
     for (const QJsonValue& e : v.toArray())
-        ids.push_back(jsonRequireId(e, paramName));
+        ids.push_back(static_cast<uint64_t>(e.toDouble()));
     return ids;
 }
 
@@ -153,12 +137,12 @@ QJsonValue windingToJson(float winding)
 
 QJsonObject AgentBridgeServer::handlePointsCommit(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QString collection = jsonRequireString(p, "collection");
+    const QString collection = p.value("collection").toString();
     if (collection.isEmpty()) {
         QJsonObject data;
         data["param"] = "collection";
@@ -211,11 +195,11 @@ QJsonObject AgentBridgeServer::handlePointsCommit(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handlePointsList(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = state ? state->pointCollection() : nullptr;
 
-    const QString filter = jsonOptionalString(p, "collection");
+    const QString filter = p.value("collection").toString();
 
     QJsonArray collections;
     if (pc) {
@@ -269,13 +253,13 @@ QJsonObject AgentBridgeServer::handlePointsList(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handlePointsAddCollection(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
     // Omitted name -> a generated unique name (mirrors the "New collection"
     // button); a present name must be a string.
-    QString name = jsonOptionalString(p, "name");
+    QString name = p.value("name").toString();
     if (name.isEmpty())
         name = QString::fromStdString(pc->generateNewCollectionName());
 
@@ -290,12 +274,12 @@ QJsonObject AgentBridgeServer::handlePointsAddCollection(const QJsonValue& param
 
 QJsonObject AgentBridgeServer::handlePointsRenameCollection(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
     const uint64_t id = resolveCollectionId(pc, p);
-    const QString newName = jsonRequireString(p, "newName");
+    const QString newName = p.value("newName").toString();
     // Reject empty: it would make the collection unreachable by name
     // (resolveCollectionId's name lookup treats "" the same as absent).
     if (newName.isEmpty())
@@ -311,7 +295,7 @@ QJsonObject AgentBridgeServer::handlePointsRenameCollection(const QJsonValue& pa
 
 QJsonObject AgentBridgeServer::handlePointsClearCollection(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
@@ -343,11 +327,12 @@ QJsonObject AgentBridgeServer::handlePointsClearAll(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handlePointsUpdatePoint(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
-    const uint64_t pointId = jsonRequireId(p.value("pointId"), "pointId");
+    const uint64_t pointId =
+        static_cast<uint64_t>(p.value("pointId").toDouble());
     std::optional<ColPoint> cp = pc->getPoint(pointId);
     if (!cp)
         throwUnknownPoint(pointId);
@@ -375,11 +360,12 @@ QJsonObject AgentBridgeServer::handlePointsUpdatePoint(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handlePointsRemovePoint(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
-    const uint64_t pointId = jsonRequireId(p.value("pointId"), "pointId");
+    const uint64_t pointId =
+        static_cast<uint64_t>(p.value("pointId").toDouble());
     if (!pc->getPoint(pointId))
         throwUnknownPoint(pointId);
     pc->removePoint(pointId);
@@ -396,7 +382,7 @@ QJsonObject AgentBridgeServer::handlePointsRemovePoint(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handlePointsSetCollectionColor(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
@@ -413,13 +399,14 @@ QJsonObject AgentBridgeServer::handlePointsSetCollectionColor(const QJsonValue& 
 
 QJsonObject AgentBridgeServer::handlePointsSetCollectionMetadata(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
     const uint64_t id = resolveCollectionId(pc, p);
     CollectionMetadata meta;
-    meta.absolute_winding_number = jsonRequireBool(p.value("absoluteWindingNumber"), "absoluteWindingNumber");
+    meta.absolute_winding_number =
+        p.value("absoluteWindingNumber").toBool();
     pc->setCollectionMetadata(id, meta);
 
     QJsonObject result;
@@ -431,13 +418,13 @@ QJsonObject AgentBridgeServer::handlePointsSetCollectionMetadata(const QJsonValu
 
 QJsonObject AgentBridgeServer::handlePointsSetCollectionTag(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
     const uint64_t id = resolveCollectionId(pc, p);
-    const QString key = jsonRequireString(p, "key");
-    const QString value = jsonRequireString(p, "value");
+    const QString key = p.value("key").toString();
+    const QString value = p.value("value").toString();
     pc->setCollectionTag(id, key.toStdString(), value.toStdString());
 
     QJsonObject result;
@@ -448,12 +435,12 @@ QJsonObject AgentBridgeServer::handlePointsSetCollectionTag(const QJsonValue& pa
 
 QJsonObject AgentBridgeServer::handlePointsRemoveCollectionTag(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
     const uint64_t id = resolveCollectionId(pc, p);
-    const QString key = jsonRequireString(p, "key");
+    const QString key = p.value("key").toString();
     pc->removeCollectionTag(id, key.toStdString());
 
     QJsonObject result;
@@ -464,7 +451,7 @@ QJsonObject AgentBridgeServer::handlePointsRemoveCollectionTag(const QJsonValue&
 
 QJsonObject AgentBridgeServer::handlePointsSetWindingsLinked(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
@@ -489,13 +476,13 @@ QJsonObject AgentBridgeServer::handlePointsSetWindingsLinked(const QJsonValue& p
 
 QJsonObject AgentBridgeServer::handlePointsAutoFillWindings(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
     const uint64_t id = resolveCollectionId(pc, p);
     const PointCollections::WindingFillMode mode =
-        windingFillModeFromString(jsonRequireString(p, "mode"));
+        windingFillModeFromString(p.value("mode").toString());
     // constant only matters for Constant mode; default 0 when omitted.
     // jsonRequireFiniteFloat rejects an out-of-float-range value before the cast
     // narrows it to +/-inf.
@@ -512,13 +499,13 @@ QJsonObject AgentBridgeServer::handlePointsAutoFillWindings(const QJsonValue& pa
 
 QJsonObject AgentBridgeServer::handlePointsSetAutoFillMode(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
     const uint64_t id = resolveCollectionId(pc, p);
     const PointCollections::WindingFillMode mode =
-        windingFillModeFromString(jsonRequireString(p, "mode"));
+        windingFillModeFromString(p.value("mode").toString());
     // Same float-narrowing concern as autoFillWindingNumbers above.
     const float constant = p.contains("constant")
         ? static_cast<float>(jsonRequireFiniteFloat(p.value("constant"), "constant"))
@@ -547,7 +534,7 @@ QJsonObject AgentBridgeServer::handlePointsResetWindings(const QJsonValue& param
 
 QJsonObject AgentBridgeServer::handlePointsApplyAnchorOffset(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
@@ -569,11 +556,11 @@ QJsonObject AgentBridgeServer::handlePointsApplyAnchorOffset(const QJsonValue& p
 
 QJsonObject AgentBridgeServer::handlePointsSaveJson(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
-    const QString path = jsonRequireString(p, "path");
+    const QString path = p.value("path").toString();
 
     QJsonObject result;
     result["saved"] = pc->saveToJSON(path.toStdString());
@@ -583,11 +570,11 @@ QJsonObject AgentBridgeServer::handlePointsSaveJson(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handlePointsLoadJson(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
-    const QString path = jsonRequireString(p, "path");
+    const QString path = p.value("path").toString();
 
     QJsonObject result;
     result["loaded"] = pc->loadFromJSON(path.toStdString());
@@ -597,11 +584,11 @@ QJsonObject AgentBridgeServer::handlePointsLoadJson(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handlePointsSaveSegmentPath(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
-    const QString segmentPath = jsonRequireString(p, "segmentPath");
+    const QString segmentPath = p.value("segmentPath").toString();
 
     QJsonObject result;
     result["saved"] = pc->saveToSegmentPath(std::filesystem::path(segmentPath.toStdString()));
@@ -611,11 +598,11 @@ QJsonObject AgentBridgeServer::handlePointsSaveSegmentPath(const QJsonValue& par
 
 QJsonObject AgentBridgeServer::handlePointsLoadSegmentPath(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
-    const QString segmentPath = jsonRequireString(p, "segmentPath");
+    const QString segmentPath = p.value("segmentPath").toString();
 
     QJsonObject result;
     result["loaded"] = pc->loadFromSegmentPath(std::filesystem::path(segmentPath.toStdString()));
