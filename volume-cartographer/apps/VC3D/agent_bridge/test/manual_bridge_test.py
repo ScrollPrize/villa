@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""VC3D Agent Bridge validation / benchmark driver.
+"""Developer-run VC3D Agent Bridge validation and benchmark driver.
 
 Drives the REAL, already-built VC3D binary over its agent-bridge JSON-RPC
 socket (see apps/VC3D/agent_bridge/SPEC.md), against real (non-synthetic)
 .volpkg fixtures already checked out under test-data/. No mocking of VC3D
 internals: this talks to the live application process exactly as an external
-MCP-server client would.
+MCP-server client would. This fixture-dependent suite is intentionally separate
+from the hermetic offscreen smoke test used by CI.
 
 Usage:
-    python3 bridge_client_test.py offscreen   # deterministic headless test + benchmark
-    python3 bridge_client_test.py live        # windowed on-screen smoke test
+    python3 manual_bridge_test.py offscreen   # headless fixture tests + benchmark
+    python3 manual_bridge_test.py live        # windowed fixture smoke test
 
 Results are printed as a single JSON object on stdout (last line), plus
 human-readable progress on stderr, so a driver can `tail -1 | python3 -m json.tool`.
@@ -65,26 +66,11 @@ S3_VOLPKG_JSON = Path(
     )
 )
 
-# Real curated seed derived from test-data/s1_ds2.volpkg/trace_params.json
-# control_points (highest-scored real detected-sheet sample point,
-# score=0.8563), verified against the volume "s1_2.4um_ds2_raw" (matches the
-# "volume" field recorded in the meta.json of segments already grown from
-# this same volpkg, e.g. traces/auto_grown_20260416135719054_inp_hr).
+# Curated points from test-data/s1_ds2.volpkg/trace_params.json.
 LOCAL_REAL_SEED = {"x": 4914.0, "y": 3539.0, "z": 9150.0}
 LOCAL_RAW_VOLUME_ID = "s1_2.4um_ds2_raw"
 
-# Additional real curated control points from the same trace_params.json
-# control_points list, deliberately DIFFERENT from LOCAL_REAL_SEED (and from
-# each other) so that job-completion re-verification runs are genuine new
-# growths in fresh regions of the volume -- not re-runs over ground already
-# covered by earlier repro/test runs (whose auto_grown_* output dirs are
-# timestamp-named and would not literally collide, but a same-seed rerun
-# would still be regrowing an already-grown neighborhood).
-#   {"x": 4829, "y": 3467, "z": 9400, "score": 0.7826}
-#   {"x": 4392, "y": 4435, "z": 13600, "score": 0.8306}   <- used for live check
-#   {"x": 4384, "y": 4437, "z": 14050, "score": 0.7689}
-#   {"x": 4457, "y": 4467, "z": 14350, "score": 0.7690}
-#   {"x": 4326, "y": 4921, "z": 16350, "score": 0.8757}   <- used for offscreen re-verify
+# Re-verification uses distinct points so runs cover fresh neighborhoods.
 LOCAL_REAL_SEED_OFFSCREEN_REVERIFY = {"x": 4326.0, "y": 4921.0, "z": 16350.0}
 LOCAL_REAL_SEED_LIVE_REVERIFY = {"x": 4392.0, "y": 4435.0, "z": 13600.0}
 
@@ -497,7 +483,7 @@ def run_offscreen(args) -> dict:
         # always failed -32007 (see run_manual_add_corrections_smoke docstring).
         # This activates a real pre-existing segment and proves editing can then
         # actually be enabled and that the active-surface state is observable via
-        # both segments.list and state.get. Deliberately run BEFORE the Stage 2
+        # both segments.list and state.get. Run before editing
         # smoke test below (not after, as an earlier revision of this driver had
         # it) -- otherwise segmentation.enable_editing / manual_add.begin /
         # corrections.set_point_mode only ever exercise their no-active-surface
@@ -529,7 +515,7 @@ def run_offscreen(args) -> dict:
                 rec.step("re-fetch canvas_point after segments.activate re-centered the viewer",
                          False, f"code={e.code} message={e.message} data={e.data}")
 
-        # 10d. Stage 2 (SPEC §9.2-9.7): manual-add / hole-fill + corrections
+        # 10d. Manual-add / hole-fill and corrections
         # point authoring. Now that a segment is active (previous step) and
         # editing is enabled, this exercises the REAL success paths (manual-add
         # begin/constraints/finish, corrections point mode + solver-triggering
@@ -546,7 +532,7 @@ def run_offscreen(args) -> dict:
                                               canvas_point, n=args.bench_iterations)
         result["benchmark"] = benchmark
 
-        # 11b. Stage 4 (SPEC §11): Lasagna RPCs. Runs before the catalog suite
+        # 11b. Lasagna RPCs. Runs before the catalog suite
         # (needs the original local segments still attached; catalog.open_sample
         # replaces the whole project). All calls are liveness-checked on timeout
         # (SPEC §18.6) since the historical failure mode here was a HANG, not a
@@ -555,7 +541,7 @@ def run_offscreen(args) -> dict:
         # connection and could block forever offscreen.
         run_lasagna_smoke(client, rec, proc)
 
-        # 11c. Stage 5 (SPEC §12): Atlas RPCs. No real atlas data exists in
+        # 11c. Atlas RPCs. No real atlas data exists in
         # this fixture, so this exercises every atlas.* method's error paths:
         # the point is proving well-formed errors with NO hang and NO crash
         # (the historical atlas failure modes were QMessageBox paths several
@@ -564,7 +550,7 @@ def run_offscreen(args) -> dict:
         # offscreen). Every timeout is liveness-checked (SPEC §18.6).
         run_atlas_smoke(client, rec, proc)
 
-        # 11d. Stage 5b (SPEC §13): Line annotation / fiber RPCs. Runs before
+        # 11d. Line annotation / fiber RPCs. Runs before
         # the catalog suite (needs the local fixture project). Includes a REAL
         # headless fiber.import / fiber.export round trip through a temp file
         # (the newest headless-split code), with cleanup via fiber.delete so
@@ -574,7 +560,7 @@ def run_offscreen(args) -> dict:
         # broken-branch-links prompt) plus saveOpenFibers' nested QEventLoop.
         run_fiber_smoke(client, rec, proc)
 
-        # 11e. Stage 6 (SPEC §15): tags.set / seeding.* / push_pull.* /
+        # 11e. tags.set / seeding.* / push_pull.* /
         # tracer.run_trace. Runs before the catalog suite (needs the local
         # fixture project + its segments still attached). Error paths for every
         # RPC plus the safe fire-and-forget success paths; no external tool job
@@ -585,14 +571,14 @@ def run_offscreen(args) -> dict:
         # actions.
         run_stage6_smoke(client, rec, proc, seg_ids)
 
-        # 11b. Stage 7a (SPEC §19): render.tifxyz. Runs against the still-attached
+        # 11b. render.tifxyz. Runs against the still-attached
         # local fixture + its real segments, BEFORE the catalog stage replaces the
         # project. Error paths plus one real bounded render (tif_stack, tiny scale,
         # single slice) to a temp dir, polled to terminal with the on-disk artifact
         # verified. Threaded `proc` so every timeout is liveness-checked.
         run_render_smoke(client, rec, proc, seg_ids)
 
-        # 11f. Stage 7b (SPEC §20): flatten.slim / flatten.abf / flatten.straighten.
+        # 11f. flatten.slim / flatten.abf / flatten.straighten.
         # Runs against the still-attached local fixture + its real segments, BEFORE
         # the catalog stage replaces the project. Error paths for all three RPCs
         # (missing/bad params, unknown segment, concurrency guard) plus one REAL
@@ -603,7 +589,7 @@ def run_offscreen(args) -> dict:
         # QMessageBox::critical calls, all now gated behind suppressDialogs.
         run_flatten_smoke(client, rec, proc, seg_ids)
 
-        # 12. Stage 3 (SPEC §10): remote catalog resource selection. Runs LAST
+        # 12. Remote catalog resource selection. Runs last
         # because a real catalog.open_sample replaces the local fixture project.
         # Network-gated: probes the manifest URL first and skips cleanly (not a
         # failure) when unreachable from this environment. `proc` is threaded in
@@ -627,7 +613,7 @@ def run_offscreen(args) -> dict:
 
 
 def run_lasagna_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) -> None:
-    """Stage 4 smoke (SPEC §11): lasagna.* RPCs + workspace.switch.
+    """Exercise lasagna.* RPCs and workspace.switch.
 
     No real Lasagna Python service is assumed to be installed -- every call is
     liveness-checked on timeout (SPEC §18.6), since the historical failure mode
@@ -725,7 +711,7 @@ def run_lasagna_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) ->
 
 
 def run_atlas_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) -> None:
-    """Stage 5 smoke (SPEC §12): atlas.* RPCs.
+    """Exercise atlas.* RPCs.
 
     The local fixture has no atlas directory, no saved fibers and no Lasagna
     dataset, so success paths are unreachable here -- every step below proves a
@@ -844,7 +830,7 @@ def run_atlas_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) -> N
 
 
 def run_fiber_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) -> None:
-    """Stage 5b smoke (SPEC §13): fiber.* line-annotation RPCs.
+    """Exercise fiber.* line-annotation RPCs.
 
     The local fixture has no saved fibers and (normally) no resolvable Lasagna
     dataset, so workspace-opening success paths are exercised as clean,
@@ -1214,7 +1200,7 @@ def _open_sample_via_job(client: BridgeClient, proc: VC3DProcess, rec: Recorder,
 
 def run_catalog_resource_selection_smoke(client: BridgeClient, rec: Recorder,
                                          proc: VC3DProcess) -> None:
-    """Stage 3 smoke (SPEC §10): catalog.list_samples / describe_sample /
+    """Exercise catalog.list_samples / describe_sample /
     open_sample(resources) / volume.select against the REAL Open Data manifest.
 
     Network-gated: if the manifest URL is unreachable from this environment the
@@ -1303,7 +1289,7 @@ def _run_catalog_resource_selection_smoke_impl(client: BridgeClient, rec: Record
     # representations) -- the lightest possible real open. Confirms only the
     # selected resources attach.
     #
-    # Cache caveat (verified as-built): createOpenDataSampleProject loads any
+    # Cache caveat: createOpenDataSampleProject loads any
     # previously-cached sample project first, so a filter gates *new* additions
     # but does not remove volume entries a prior (unfiltered) open already
     # persisted to the remote cache. On a CLEAN first open the filtered result
@@ -1591,7 +1577,7 @@ def run_catalog_strict_subset_and_volume_select(client: BridgeClient, rec: Recor
 
 def run_manual_add_corrections_smoke(client: BridgeClient, rec: Recorder,
                                      target_viewer, canvas_point) -> None:
-    """Stage 2 smoke (SPEC §9.2-9.7): manual-add (hole-fill) mode, its
+    """Exercise manual-add (hole-fill) mode, its
     line/interpolation config, plane-constraint placement via canvas.*, and
     corrections point-authoring mode.
 
@@ -1781,7 +1767,7 @@ def run_manual_add_corrections_smoke(client: BridgeClient, rec: Recorder,
         st_b, _ = client.call("state.get", timeout=10.0)
         if st_b.get("manualAddMode") is True and not r.get("applied"):
             rec.step("manual_add.finish(apply=true) with nothing to commit leaves manualAddMode "
-                     "stuck active (confirmed as-built behavior, not a fresh regression)",
+                     "stuck active (known application behavior)",
                      True, f"applied={r.get('applied')}; recovering via finish(apply=false)")
             r2, _ = client.call("segmentation.manual_add.finish", {"apply": False}, timeout=10.0)
             log(f"recovery manual_add.finish(apply=false) -> {json.dumps(r2)}")
@@ -1963,14 +1949,14 @@ def run_manual_add_corrections_smoke(client: BridgeClient, rec: Recorder,
 
 def run_stage6_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
                      seg_ids: set) -> None:
-    """Stage 6 backlog smoke (SPEC §15): tags.set, seeding.*, push_pull.*,
+    """Exercise tags.set, seeding.*, push_pull.*,
     tracer.run_trace.
 
     Every step is liveness-checked (a SIGSEGV presents as a client timeout,
     SPEC §18.6). The safe fire-and-forget seeding actions (preview/cast/reset,
     winding mode) are exercised for real; seeding.run / seeding.expand /
     seeding.analyze_paths are deliberately absent (they spin a nested event
-    loop, §15.2 amendment). tracer.run_trace is exercised only through its
+    loop, §15.2). tracer.run_trace is exercised only through its
     error paths so no external tool job is launched. tags.set applies and then
     reverts a single tag so the fixture is left unchanged.
     """
@@ -2106,7 +2092,7 @@ def run_stage6_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
 
 def run_render_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
                      seg_ids: set, render_timeout: float = 300.0) -> None:
-    """Stage 7a smoke (SPEC §19): render.tifxyz.
+    """Exercise render.tifxyz.
 
     Exercises every error path (missing/bad params, unknown segment, unknown
     volume) plus a real, bounded render of a pre-existing segment to a temp
@@ -2272,7 +2258,7 @@ def run_render_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
 
 def run_flatten_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
                       seg_ids: set, flatten_timeout: float = 300.0) -> None:
-    """Stage 7b smoke (SPEC §20): flatten.slim / flatten.abf / flatten.straighten.
+    """Exercise flatten.slim / flatten.abf / flatten.straighten.
 
     Exercises every error path for all three RPCs (missing/bad params, unknown
     segment, and the source:"flatten" concurrency guard) plus one REAL, bounded,

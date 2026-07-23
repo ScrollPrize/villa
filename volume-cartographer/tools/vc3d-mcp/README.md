@@ -27,12 +27,10 @@ flattening, and rendering.
   Unix platforms VC3D ships for.
 - **Async jobs**: the bridge is the authoritative source of job state —
   `vc3d_job_status` is answered by the bridge's own `job.status` RPC, not by
-  anything in this process. `job.progress` notifications (SPEC.md §8.3/§3.18)
-  are read off the socket and ignored. The `wait: true` convenience is
-  implemented by polling `job.status` once a second until the job is terminal;
-  along the way, newly-appended `consoleTail` lines are forwarded to the MCP
-  client as best-effort progress, and completion is observed with up to one
-  poll interval of latency.
+  anything in this process. A `wait: true` call subscribes to sequenced
+  `job.progress` notifications, replays the server's bounded history, and
+  periodically reads `job.status` as a lost-notification and terminal-state
+  fallback.
 
 ## Layout
 
@@ -228,9 +226,8 @@ newline-delimited JSON-RPC 2.0 framing per SPEC.md §1.2) and checks that:
 
 - `BridgeClient` connects, sends a request, and parses both success and
   JSON-RPC error responses (error `code`/`message`/`data` preserved);
-- `wait: true` blocks until the job is terminal by polling `job.status`,
-  forwarding new `consoleTail` lines as best-effort progress, and unsolicited
-  `job.progress` notifications are read off the socket and ignored;
+- `wait: true` merges buffered and live `job.progress` updates in sequence,
+  with `job.status` as the authoritative terminal fallback;
 - the actual `@mcp.tool()` functions — not just the transport layer —
   round-trip correctly, including the `wait: true` behavior on the
   long-running tools.
@@ -254,7 +251,7 @@ surface as MCP tool errors whose text is the JSON-encoded
 |---|---|
 | Core / navigation | `vc3d_ping`, `vc3d_get_state`, `vc3d_list_segments`, `vc3d_activate_segment`, `vc3d_screenshot`, `vc3d_get_cursor_point`, `vc3d_click`, `vc3d_shift_click`, `vc3d_drag`, `vc3d_center_viewer`, `vc3d_zoom_viewer`, `vc3d_rotate_viewer`, `vc3d_set_axis_aligned_slices`, `vc3d_get_render_settings`, `vc3d_set_render_settings` |
 | Segmentation growth/editing | `vc3d_fetch_segment`, `vc3d_enable_editing`, `vc3d_save_segment`, `vc3d_grow_segment`, `vc3d_grow_patch_from_seed`, `vc3d_delete_segment`, `vc3d_rename_segment`, `vc3d_manual_add_begin`, `vc3d_manual_add_finish`, `vc3d_manual_add_set_line_mode`, `vc3d_manual_add_set_interpolation`, `vc3d_manual_add_undo_constraint`, `vc3d_corrections_set_point_mode`, `vc3d_push_pull_set_config`, `vc3d_push_pull_start`, `vc3d_push_pull_stop` |
-| Points / tags | `vc3d_commit_points`, `vc3d_list_points`, `vc3d_set_segment_tag` |
+| Points / tags / review | `vc3d_commit_points`, `vc3d_list_points`, `vc3d_add_point_collection`, `vc3d_update_point`, `vc3d_remove_point`, `vc3d_clear_point_collection`, `vc3d_clear_all_points`, `vc3d_rename_point_collection`, `vc3d_set_point_collection_color`, `vc3d_set_point_collection_metadata`, `vc3d_set_point_collection_tag`, `vc3d_remove_point_collection_tag`, `vc3d_set_point_windings_linked`, `vc3d_auto_fill_windings`, `vc3d_set_auto_fill_mode`, `vc3d_reset_windings`, `vc3d_apply_anchor_offset`, `vc3d_save_points_json`, `vc3d_load_points_json`, `vc3d_save_points_segment_path`, `vc3d_load_points_segment_path`, `vc3d_set_segment_tag`, `vc3d_review_segments` |
 | Wrap annotation | `vc3d_set_wrap_annotation_mode`, `vc3d_commit_wrap_annotation`, `vc3d_undo_wrap_annotation` |
 | Volumes / catalog | `vc3d_open_volume`, `vc3d_list_volumes`, `vc3d_open_catalog_sample`, `vc3d_list_catalog_samples`, `vc3d_describe_catalog_sample`, `vc3d_select_volume` |
 | Lasagna / workspace | `vc3d_lasagna_service_status`, `vc3d_lasagna_ensure_service`, `vc3d_lasagna_list_datasets`, `vc3d_lasagna_start_optimization`, `vc3d_lasagna_jobs`, `vc3d_lasagna_cancel`, `vc3d_lasagna_select_output`, `vc3d_lasagna_repeat_last`, `vc3d_switch_workspace` |
@@ -280,28 +277,26 @@ underlying RPC, per SPEC.md §5). The full set is:
 (`vc3d_save_segment` also takes `wait`, defaulting to `true`.) All other
 wait-capable tools default to `wait=false`.
 
-When `true`, the tool call polls `job.status` once a second until the job is
-terminal (30-minute cap), then returns the authoritative terminal `job.status`
-result inline instead of just the `jobId`. Completion is therefore observed with
-up to one poll interval of latency. On timeout it returns the original
+When `true`, the tool subscribes before its first status read, replays the
+server's bounded progress history, and streams new notifications by sequence.
+It periodically reads `job.status` to recover from notification loss and returns
+that authoritative terminal result (30-minute cap). On timeout it returns the original
 `{jobId, ...}` result with an extra `"waitTimedOut": true` field so the caller
 can fall back to polling `vc3d_job_status`; on a bridge disconnect the next poll
 raises and the call fails promptly rather than blocking to the cap.
 
-While a `wait=true` call is blocked, the server forwards newly-appended
-`consoleTail` lines to the MCP client as **best-effort** progress via the
-FastMCP `Context` (`ctx.report_progress`, with a monotonically increasing
-sequence number). This is observational only: if the MCP client does not support
-progress, or a progress report fails, the job's execution and the tool's
-terminal result are unaffected. Because `consoleTail` is a rolling ≤50-line
-window, a burst of more than 50 lines between polls can be under-reported; the
-terminal `consoleTail` in the returned status is unaffected. The injected
-`Context` is not part of any tool's input schema.
+Progress is **ordered and best-effort** for the lifetime of the wait call. The
+bridge retains the latest 64 updates and the Python queue is bounded to the same
+size. Output updates are forwarded as text; completion is forwarded as compact
+structured data. Reporting is observational: an unsupported context is a no-op,
+and a failing or stalled sink is abandoned after one bounded attempt without
+changing execution or the terminal result. Task cancellation still propagates.
+The injected `Context` is not part of any tool's input schema.
 
 `vc3d_wait_job` (SPEC.md §21.3) is the standalone counterpart to `wait`: it has
 no underlying RPC and blocks on an **already-running** job by id, using the same
-`job.status` polling loop (once/sec, 30-minute cap, `consoleTail` forwarded as
-best-effort progress) and returning the terminal `job.status` inline — or the
+notification/replay/status-fallback loop and returning the terminal `job.status`
+inline — or the
 last status with `"waitTimedOut": true` on the cap. Use it to wait on a job that
 some earlier call started with `wait=false`, or on an externally-initiated job seen
 in `vc3d_get_state`. To stop a running job, `vc3d_cancel_job` (SPEC.md §21) maps to
