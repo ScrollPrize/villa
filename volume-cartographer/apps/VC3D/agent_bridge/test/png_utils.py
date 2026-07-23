@@ -12,8 +12,6 @@ import struct
 import zlib
 from dataclasses import dataclass
 
-import numpy as np
-
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
@@ -26,7 +24,7 @@ class DecodedPng:
     width: int
     height: int
     channels: int
-    pixels: np.ndarray  # shape (height, width, channels), dtype uint8
+    pixels: bytes
 
 
 def _paeth(a: int, b: int, c: int) -> int:
@@ -65,6 +63,8 @@ def decode_png(data: bytes) -> DecodedPng:
 
     if width is None:
         raise PngUnsupported("no IHDR chunk found")
+    if width <= 0 or height <= 0:
+        raise PngUnsupported("invalid image dimensions")
     if bit_depth != 8:
         raise PngUnsupported(f"unsupported bit depth {bit_depth}")
     if interlace != 0:
@@ -81,13 +81,13 @@ def decode_png(data: bytes) -> DecodedPng:
     if len(raw) < expected_len:
         raise PngUnsupported("decompressed data shorter than expected")
 
-    out = np.zeros((height, width, channels), dtype=np.uint8)
-    prev_row = np.zeros(stride, dtype=np.int16)
+    out = bytearray()
+    prev_row = bytearray(stride)
     offset = 0
-    for y in range(height):
+    for _ in range(height):
         filter_type = raw[offset]
         offset += 1
-        row = np.frombuffer(raw, dtype=np.uint8, count=stride, offset=offset).astype(np.int16)
+        row = bytearray(raw[offset:offset + stride])
         offset += stride
 
         if filter_type == 0:
@@ -96,7 +96,8 @@ def decode_png(data: bytes) -> DecodedPng:
             for x in range(channels, stride):
                 row[x] = (row[x] + row[x - channels]) & 0xFF
         elif filter_type == 2:  # Up
-            row = (row + prev_row) & 0xFF
+            for x in range(stride):
+                row[x] = (row[x] + prev_row[x]) & 0xFF
         elif filter_type == 3:  # Average
             for x in range(stride):
                 a = row[x - channels] if x >= channels else 0
@@ -111,10 +112,10 @@ def decode_png(data: bytes) -> DecodedPng:
         else:
             raise PngUnsupported(f"unsupported filter type {filter_type}")
 
-        out[y] = row.astype(np.uint8).reshape(width, channels)
+        out.extend(row)
         prev_row = row
 
-    return DecodedPng(width=width, height=height, channels=channels, pixels=out)
+    return DecodedPng(width=width, height=height, channels=channels, pixels=bytes(out))
 
 
 def is_nontrivial_image(data: bytes, min_stddev: float = 1.0) -> tuple[bool, str]:
@@ -130,8 +131,12 @@ def is_nontrivial_image(data: bytes, min_stddev: float = 1.0) -> tuple[bool, str
         ok = len(data) > 4096
         return ok, f"png decode unsupported ({e}); size-heuristic only: {len(data)} bytes"
 
-    stddev = float(decoded.pixels.astype(np.float64).std())
-    nonzero_fraction = float(np.count_nonzero(decoded.pixels)) / decoded.pixels.size
+    count = len(decoded.pixels)
+    total = sum(decoded.pixels)
+    mean = total / count
+    variance = sum((value - mean) ** 2 for value in decoded.pixels) / count
+    stddev = variance ** 0.5
+    nonzero_fraction = sum(value != 0 for value in decoded.pixels) / count
     ok = stddev >= min_stddev and nonzero_fraction > 0.0
     detail = (f"{decoded.width}x{decoded.height}x{decoded.channels}, "
               f"stddev={stddev:.3f}, nonzero_fraction={nonzero_fraction:.4f}")
