@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Fixture-free offscreen smoke test for the VC3D Agent Bridge.
 
-Exercises the C2/C3/C4 stabilization work against the REAL VC3D binary with no
-volume package and no display (QT_QPA_PLATFORM=offscreen), so it is safe to run
-anywhere the build tree exists:
+Exercises the C2/C3/C4 stabilization work against the REAL VC3D binary with a
+temporary empty volume package and no display (QT_QPA_PLATFORM=offscreen), so
+it is safe to run anywhere the build tree exists:
 
   C4  strict wire-parameter parsing rejects a present-but-malformed value with
       -32602 + data.param, BEFORE touching viewer/controller state, and the
@@ -36,6 +36,7 @@ import json
 import os
 import socket
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -72,10 +73,13 @@ def unique_name(tag: str) -> str:
     return f"vc3d-smoke-{tag}-{os.getpid()}-{int(time.time() * 1000) % 100000}"
 
 
-def launch(binary: str, name: str) -> VC3DProcess:
+def launch(binary: str, name: str, volpkg: str | None = None) -> VC3DProcess:
+    args = ["--agent-bridge", "--agent-bridge-name", name]
+    if volpkg is not None:
+        args.extend(["--volpkg", volpkg])
     return VC3DProcess(
         binary,
-        ["--agent-bridge", "--agent-bridge-name", name],
+        args,
         env_overrides=OFFSCREEN_ENV,
     )
 
@@ -97,7 +101,7 @@ def expect_param_error(client: BridgeClient, method: str, params: dict,
         return False, f"unexpected {type(e).__name__}: {e}"
 
 
-def check_c4(client: BridgeClient, results: Results) -> None:
+def check_c4(client: BridgeClient, results: Results, volpkg: str) -> None:
     # Liveness / dispatch sanity.
     try:
         state, _ = client.call("state.get", {}, timeout=10.0)
@@ -141,9 +145,9 @@ def check_c4(client: BridgeClient, results: Results) -> None:
     except Exception as e:  # noqa: BLE001
         results.record("c4_no_corruption_state_get", False, f"{type(e).__name__}: {e}")
 
-    # Project-open failures must return over the bridge instead of opening a
-    # modal warning that blocks the offscreen process indefinitely.
+    before = None
     try:
+        before, _ = client.call("state.get", {}, timeout=10.0)
         client.call(
             "volume.open",
             {"path": "/vc3d-smoke/does-not-exist.volpkg.json"},
@@ -156,6 +160,33 @@ def check_c4(client: BridgeClient, results: Results) -> None:
                        f"returned code={e.code} without blocking")
     except Exception as e:  # noqa: BLE001
         results.record("volume_open_failure_is_headless", False,
+                       f"unexpected {type(e).__name__}: {e}")
+
+    try:
+        after, _ = client.call("state.get", {}, timeout=10.0)
+        preserved = before is not None and after.get("vpkg") == before.get("vpkg")
+        results.record("volume_open_failure_preserves_project", preserved,
+                       f"vpkg unchanged={preserved}")
+    except Exception as e:  # noqa: BLE001
+        results.record("volume_open_failure_preserves_project", False,
+                       f"unexpected {type(e).__name__}: {e}")
+
+    try:
+        client.call(
+            "volume.open",
+            {"path": volpkg, "volumeId": "missing-volume"},
+            timeout=10.0,
+        )
+        results.record("volume_open_unknown_id_preserves_project", False,
+                       "expected a bridge error, got a result")
+    except BridgeError as e:
+        after, _ = client.call("state.get", {}, timeout=10.0)
+        preserved = before is not None and after.get("vpkg") == before.get("vpkg")
+        results.record("volume_open_unknown_id_preserves_project",
+                       e.code == -32007 and preserved,
+                       f"code={e.code} vpkg unchanged={preserved}")
+    except Exception as e:  # noqa: BLE001
+        results.record("volume_open_unknown_id_preserves_project", False,
                        f"unexpected {type(e).__name__}: {e}")
 
 
@@ -342,28 +373,30 @@ def main() -> int:
         return 2
 
     results = Results()
-    name = unique_name("main")
-    proc = launch(binary, name)
-    client = None
-    try:
-        sock_path = proc.wait_for_handshake(timeout=60.0)
-        log(f"handshake: name={name} path={sock_path}")
-        client = BridgeClient(sock_path, connect_timeout=10.0)
+    with tempfile.TemporaryDirectory(prefix="vc3d-smoke-") as tmp_dir:
+        volpkg = Path(tmp_dir) / "smoke.volpkg.json"
+        volpkg.write_text(json.dumps({"name": "smoke", "version": 1}))
+        name = unique_name("main")
+        proc = launch(binary, name, str(volpkg))
+        client = None
+        try:
+            sock_path = proc.wait_for_handshake(timeout=60.0)
+            log(f"handshake: name={name} path={sock_path}")
+            client = BridgeClient(sock_path, connect_timeout=10.0)
 
-        check_c4(client, results)
-        check_c2_oversized(sock_path, results)
-        check_c2_suffix_bypass(sock_path, results)
-        check_c3_live_probe(binary, name, sock_path, client, results)
+            check_c4(client, results, str(volpkg))
+            check_c2_oversized(sock_path, results)
+            check_c2_suffix_bypass(sock_path, results)
+            check_c3_live_probe(binary, name, sock_path, client, results)
 
-        # Final: the original process is still alive after everything.
-        results.record("process_alive", proc.is_running(),
-                       f"running={proc.is_running()}")
-    except Exception as e:  # noqa: BLE001
-        results.record("harness", False, f"{type(e).__name__}: {e}")
-    finally:
-        if client is not None:
-            client.close()
-        proc.terminate()
+            results.record("process_alive", proc.is_running(),
+                           f"running={proc.is_running()}")
+        except Exception as e:  # noqa: BLE001
+            results.record("harness", False, f"{type(e).__name__}: {e}")
+        finally:
+            if client is not None:
+                client.close()
+            proc.terminate()
 
     summary = {
         "ok": results.ok,

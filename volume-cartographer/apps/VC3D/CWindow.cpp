@@ -8899,52 +8899,6 @@ void CWindow::setWidgetsEnabled(bool state)
     }
 }
 
-auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath,
-                                  bool interactive,
-                                  QString* errorMessage) -> bool
-{
-    _state->setVpkg(nullptr);
-    updateNormalGridAvailability();
-    if (_segmentationModule && _segmentationModule->editingEnabled()) {
-        _segmentationModule->setEditingEnabled(false);
-    }
-    if (_segmentationModule) {
-        _segmentationModule->setAnnotateMode(false);
-    }
-    if (_segmentationWidget) {
-        if (!_segmentationModule || _segmentationWidget->isEditingEnabled()) {
-            _segmentationWidget->setEditingEnabled(false);
-        }
-        _segmentationWidget->setAvailableVolumes({}, QString());
-        _segmentationWidget->setVolumePackagePath(QString());
-    }
-
-    QString loadError;
-    try {
-        _state->setVpkg(VolumePkg::load(nVpkgPath));
-    } catch (const std::exception& e) {
-        Logger()->error("Failed to initialize volpkg: {}", e.what());
-        loadError = QString::fromUtf8(e.what());
-    }
-
-    if (_state->vpkg() == nullptr) {
-        Logger()->error("Cannot open project: {}", nVpkgPath);
-        if (errorMessage) {
-            *errorMessage = loadError.isEmpty()
-                ? tr("Project failed to load.")
-                : tr("Project failed to load: %1").arg(loadError);
-        }
-        if (interactive) {
-            QMessageBox::warning(
-                this, "Error",
-                "Project failed to load. Falling back to a new blank project.");
-            _state->setVpkg(VolumePkg::newEmpty());
-        }
-        return false;
-    }
-    return true;
-}
-
 // Update the widgets
 void CWindow::UpdateView(void)
 {
@@ -9078,10 +9032,17 @@ void CWindow::onSharedCacheStatsChanged(const QStringList& items)
 }
 
 // Open volume package
-bool CWindow::OpenVolume(const QString& path, bool interactive, QString* errorMessage)
+bool CWindow::OpenVolume(const QString& path,
+                         bool interactive,
+                         QString* errorMessage,
+                         const QString& preferredVolumeId,
+                         VolumeOpenError* openError)
 {
     if (errorMessage) {
         errorMessage->clear();
+    }
+    if (openError) {
+        *openError = VolumeOpenError::None;
     }
     QString aVpkgPath = path;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -9090,6 +9051,9 @@ bool CWindow::OpenVolume(const QString& path, bool interactive, QString* errorMe
         if (!interactive) {
             if (errorMessage) {
                 *errorMessage = tr("Project path is empty.");
+            }
+            if (openError) {
+                *openError = VolumeOpenError::PackageLoadFailed;
             }
             return false;
         }
@@ -9103,14 +9067,36 @@ bool CWindow::OpenVolume(const QString& path, bool interactive, QString* errorMe
         }
     }
 
-    if (!InitializeVolumePkg(aVpkgPath.toStdString(), interactive, errorMessage)) {
+    std::shared_ptr<VolumePkg> package;
+    QString loadError;
+    try {
+        package = VolumePkg::load(aVpkgPath.toStdString());
+    } catch (const std::exception& e) {
+        Logger()->error("Failed to initialize volpkg: {}", e.what());
+        loadError = QString::fromUtf8(e.what());
+    }
+
+    if (!package) {
+        Logger()->error("Cannot open project: {}", aVpkgPath.toStdString());
+        const QString message = loadError.isEmpty()
+            ? tr("Project failed to load.")
+            : tr("Project failed to load: %1").arg(loadError);
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        if (openError) {
+            *openError = VolumeOpenError::PackageLoadFailed;
+        }
+        if (interactive) {
+            QMessageBox::warning(this, tr("Error"), message);
+        }
         return false;
     }
 
     // Check version number
-    if (_state->vpkg()->version() < VOLPKG_MIN_VERSION) {
+    if (package->version() < VOLPKG_MIN_VERSION) {
         const auto msg = "Volume package is version " +
-                         std::to_string(_state->vpkg()->version()) +
+                         std::to_string(package->version()) +
                          " but this program requires version " +
                          std::to_string(VOLPKG_MIN_VERSION) + "+.";
         Logger()->error(msg);
@@ -9120,12 +9106,41 @@ bool CWindow::OpenVolume(const QString& path, bool interactive, QString* errorMe
         if (interactive) {
             QMessageBox::warning(this, tr("ERROR"), QString::fromStdString(msg));
         }
-        _state->setVpkg(nullptr);
-        updateNormalGridAvailability();
+        if (openError) {
+            *openError = VolumeOpenError::PackageLoadFailed;
+        }
         return false;
     }
 
-    refreshCurrentVolumePackageUi(QString(), true);
+    if (!preferredVolumeId.isEmpty()) {
+        const auto ids = package->volumeIDs();
+        const auto id = preferredVolumeId.toStdString();
+        if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
+            if (errorMessage) {
+                *errorMessage = tr("Unknown volume id: %1").arg(preferredVolumeId);
+            }
+            if (openError) {
+                *openError = VolumeOpenError::VolumeNotFound;
+            }
+            return false;
+        }
+        try {
+            (void)package->volume(id);
+        } catch (const std::exception& e) {
+            if (errorMessage) {
+                *errorMessage = tr("Failed to load volume %1: %2")
+                                    .arg(preferredVolumeId, QString::fromUtf8(e.what()));
+            }
+            if (openError) {
+                *openError = VolumeOpenError::PackageLoadFailed;
+            }
+            return false;
+        }
+    }
+
+    CloseVolume();
+    _state->setVpkg(std::move(package));
+    refreshCurrentVolumePackageUi(preferredVolumeId, true);
     if (_menuController) {
         _menuController->updateRecentVolpkgList(aVpkgPath);
     }
@@ -9138,10 +9153,12 @@ bool CWindow::OpenVolume(const QString& path, bool interactive, QString* errorMe
 
 bool CWindow::openVolumePackage(const QString& path,
                                 bool interactive,
-                                QString* errorMessage)
+                                QString* errorMessage,
+                                const QString& preferredVolumeId,
+                                VolumeOpenError* openError)
 {
-    CloseVolume();
-    const bool opened = OpenVolume(path, interactive, errorMessage);
+    const bool opened = OpenVolume(
+        path, interactive, errorMessage, preferredVolumeId, openError);
     UpdateView();
     return opened;
 }

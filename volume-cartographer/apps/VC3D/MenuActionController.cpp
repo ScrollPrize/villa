@@ -368,7 +368,6 @@ void MenuActionController::openVolpkg()
         if (!runLegacyVolpkgConvert(file, &converted)) return;
         file = converted;
     }
-    _window->CloseVolume();
     _window->OpenVolume(file);
     _window->UpdateView();
 }
@@ -382,7 +381,6 @@ void MenuActionController::openRecentVolpkg()
     if (auto* action = qobject_cast<QAction*>(sender())) {
         const QString path = action->data().toString();
         if (!path.isEmpty()) {
-            _window->CloseVolume();
             _window->OpenVolume(path);
             _window->UpdateView();
         }

@@ -674,46 +674,31 @@ QJsonObject AgentBridgeServer::handleVolumeOpen(const QJsonValue& params)
         throw AgentBridgeError{-32005, "No volume package path", data};
     }
 
-    MenuActionController* mc = _window ? _window->_menuController.get() : nullptr;
-    if (!mc) {
+    if (!_window) {
         QJsonObject data;
-        data["detail"] = "menu controller is not available";
+        data["detail"] = "main window is not available";
         throw AgentBridgeError{-32010, "Internal error", data};
     }
 
+    const QString volumeId = jsonOptionalString(p, "volumeId");
     QString errorMessage;
-    if (!mc->openVolpkgAt(path, false, &errorMessage)) {
+    CWindow::VolumeOpenError openError = CWindow::VolumeOpenError::None;
+    if (!_window->openVolumePackage(path, false, &errorMessage, volumeId, &openError)) {
         QJsonObject data;
         data["detail"] = errorMessage.isEmpty()
             ? QStringLiteral("failed to open volume package at %1").arg(path)
             : errorMessage;
+        if (openError == CWindow::VolumeOpenError::VolumeNotFound) {
+            data["kind"] = "volume";
+            data["id"] = volumeId;
+            throw AgentBridgeError{
+                -32007, QStringLiteral("Unknown volume id: %1").arg(volumeId), data};
+        }
         throw AgentBridgeError{-32005, "Volume package load failed", data};
     }
 
     CState* state = _window->_state;
-    auto vpkg = state->vpkg();
-    const auto ids = vpkg->volumeIDs();
-
-    const QString volumeId = jsonOptionalString(p, "volumeId");
-    if (!volumeId.isEmpty()) {
-        if (std::find(ids.begin(), ids.end(), volumeId.toStdString()) == ids.end()) {
-            QJsonObject data;
-            data["kind"] = "volume";
-            data["id"] = volumeId;
-            throw AgentBridgeError{-32007, QStringLiteral("Unknown volume id: %1").arg(volumeId), data};
-        }
-        try {
-            _window->setVolume(vpkg->volume(volumeId.toStdString()));
-            _window->syncVolumeSelectionControls(volumeId);
-        } catch (const AgentBridgeError&) {
-            throw;
-        } catch (const std::exception& e) {
-            QJsonObject data;
-            data["detail"] = QString::fromUtf8(e.what());
-            throw AgentBridgeError{-32005, "Failed to switch volume", data};
-        }
-    }
-
+    const auto ids = state->vpkg()->volumeIDs();
     QJsonObject result;
     result["opened"] = true;
     result["vpkgPath"] = state->vpkgPath();

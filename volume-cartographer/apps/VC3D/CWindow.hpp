@@ -176,13 +176,21 @@ public slots:
     void onFocusViewsRequested(uint64_t collectionId, uint64_t pointId);
 
 public:
+    enum class VolumeOpenError {
+        None,
+        PackageLoadFailed,
+        VolumeNotFound,
+    };
+
     explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB,
                      RenderBenchOptions benchOptions = {});
     ~CWindow(void);
 
     bool openVolumePackage(const QString& path,
                            bool interactive = true,
-                           QString* errorMessage = nullptr);
+                           QString* errorMessage = nullptr,
+                           const QString& preferredVolumeId = {},
+                           VolumeOpenError* openError = nullptr);
 
     // Helper method to get the current volume path
     QString getCurrentVolumePath() const;
@@ -263,13 +271,11 @@ private:
 
     void setWidgetsEnabled(bool state);
 
-    bool InitializeVolumePkg(const std::string& nVpkgPath,
-                             bool interactive = true,
-                             QString* errorMessage = nullptr);
-
     bool OpenVolume(const QString& path,
                     bool interactive = true,
-                    QString* errorMessage = nullptr);
+                    QString* errorMessage = nullptr,
+                    const QString& preferredVolumeId = {},
+                    VolumeOpenError* openError = nullptr);
     void CloseVolume(void);
 
 
