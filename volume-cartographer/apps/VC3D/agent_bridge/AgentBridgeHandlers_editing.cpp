@@ -226,7 +226,7 @@ QJsonObject AgentBridgeServer::handleCanvasClick(const QJsonValue& params, bool 
 
 QJsonObject AgentBridgeServer::handleViewerCenterOnPoint(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
     const auto volume = viewer->currentVolume();
     if (!volume)
@@ -238,7 +238,7 @@ QJsonObject AgentBridgeServer::handleViewerCenterOnPoint(const QJsonValue& param
         data["point"] = vec3ToJson(point);
         throw AgentBridgeError{-32003, "Point is outside volume bounds", data};
     }
-    const bool forceRender = jsonOptionalBool(p, "forceRender", true);
+    const bool forceRender = p.value("forceRender").toBool(true);
     viewer->centerOnVolumePoint(point, forceRender);
 
     QJsonObject result;
@@ -250,21 +250,9 @@ QJsonObject AgentBridgeServer::handleViewerCenterOnPoint(const QJsonValue& param
 
 QJsonObject AgentBridgeServer::handleViewerZoom(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
-
-    if (!p.contains("factor")) {
-        QJsonObject data;
-        data["param"] = "factor";
-        throw AgentBridgeError{-32602, "factor is required", data};
-    }
-    const double factor = jsonRequireNumber(p.value("factor"), "factor");
-    if (!std::isfinite(factor) || factor <= 0.0) {
-        QJsonObject data;
-        data["param"] = "factor";
-        data["value"] = factor;
-        throw AgentBridgeError{-32602, "factor must be a positive finite number", data};
-    }
+    const double factor = p.value("factor").toDouble();
 
     viewer->adjustZoomByFactor(static_cast<float>(factor));
 
@@ -276,7 +264,7 @@ QJsonObject AgentBridgeServer::handleViewerZoom(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleViewerRotate(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     AxisAlignedSliceController* slices =
         _window ? _window->_axisAlignedSliceController.get() : nullptr;
@@ -284,7 +272,7 @@ QJsonObject AgentBridgeServer::handleViewerRotate(const QJsonValue& params)
         throw AgentBridgeError{-32000, "Axis-aligned slice controller unavailable", {}};
 
     // Accept "seg xz"/"seg yz" and the "xz"/"yz" shorthands.
-    QString planeRaw = jsonRequireString(p, "plane").trimmed().toLower();
+    QString planeRaw = p.value("plane").toString().trimmed().toLower();
     std::string plane;
     if (planeRaw == "seg xz" || planeRaw == "xz")
         plane = "seg xz";
@@ -300,21 +288,10 @@ QJsonObject AgentBridgeServer::handleViewerRotate(const QJsonValue& params)
             data};
     }
 
-    if (!p.contains("degrees")) {
-        QJsonObject data;
-        data["param"] = "degrees";
-        throw AgentBridgeError{-32602, "degrees is required", data};
-    }
-    const double degrees = jsonRequireNumber(p.value("degrees"), "degrees");
-    if (!std::isfinite(degrees)) {
-        QJsonObject data;
-        data["param"] = "degrees";
-        data["value"] = degrees;
-        throw AgentBridgeError{-32602, "degrees must be a finite number", data};
-    }
+    const double degrees = p.value("degrees").toDouble();
 
     // Default to relative (delta) rotation — matches the middle-drag interaction.
-    const bool relative = jsonOptionalBool(p, "relative", true);
+    const bool relative = p.value("relative").toBool(true);
 
     if (!slices->isEnabled())
         throw AgentBridgeError{-32002,
@@ -343,18 +320,13 @@ QJsonObject AgentBridgeServer::handleViewerRotate(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleViewerSetAxisAlignedSlices(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     AxisAlignedSliceController* slices =
         _window ? _window->_axisAlignedSliceController.get() : nullptr;
     if (!slices)
         throw AgentBridgeError{-32000, "Axis-aligned slice controller unavailable", {}};
 
-    if (!p.contains(QStringLiteral("enabled")) || !p.value(QStringLiteral("enabled")).isBool()) {
-        QJsonObject data;
-        data["param"] = "enabled";
-        throw AgentBridgeError{-32602, "enabled (bool) is required", data};
-    }
     const bool enabled = p.value(QStringLiteral("enabled")).toBool();
 
     // Drive the checkbox so the toggle takes the human/shortcut path

@@ -224,9 +224,13 @@
                 "type": "boolean"
               },
               "layersBehind": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
                 "type": "integer"
               },
               "layersFront": {
+                "maximum": 2147483647,
+                "minimum": -2147483648,
                 "type": "integer"
               },
               "method": {
@@ -241,6 +245,8 @@
             "type": "object"
           },
           "maxDisplayedResolution": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
             "type": "integer"
           },
           "opacity": {
@@ -305,6 +311,8 @@
             "type": "array"
           },
           "intersectionMaxSurfaces": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
             "type": "integer"
           },
           "intersectionOpacity": {
@@ -317,6 +325,8 @@
             "type": "number"
           },
           "normalMaxArrows": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
             "type": "integer"
           },
           "overlayOpacity": {
@@ -326,6 +336,8 @@
             "type": "boolean"
           },
           "samplingStride": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
             "type": "integer"
           },
           "segmentationCursorMirroring": {

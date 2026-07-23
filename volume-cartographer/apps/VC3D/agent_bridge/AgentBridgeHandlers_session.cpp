@@ -978,98 +978,87 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         throw AgentBridgeError{-32010, "Viewer manager unavailable", data};
     }
 
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
-    // --- Phase 1: parse/validate/clamp into locals (opacities to 0..1). Doing
-    // this before any setter or QSettings write means a malformed field rejects
-    // the whole request rather than leaving render settings half-applied. ---
+    // Mechanical input validation has already run from the method descriptor.
+    // Normalize into locals before any setter or QSettings write so the update
+    // remains atomic.
     const bool hasIntersectionOpacity = p.contains("intersectionOpacity");
     float intersectionOpacity = 0.0f;
     if (hasIntersectionOpacity) {
-        const double v = jsonRequireFinite(p.value("intersectionOpacity"), "intersectionOpacity");
+        const double v = p.value("intersectionOpacity").toDouble();
         intersectionOpacity = static_cast<float>(std::clamp(v, 0.0, 1.0));
     }
 
     const bool hasIntersectionThickness = p.contains("intersectionThickness");
     float intersectionThickness = 0.0f;
     if (hasIntersectionThickness) {
-        const double v = jsonRequireFinite(p.value("intersectionThickness"), "intersectionThickness");
+        const double v = p.value("intersectionThickness").toDouble();
         intersectionThickness = static_cast<float>(std::max(0.0, v));
     }
 
     const bool hasOverlayOpacity = p.contains("overlayOpacity");
     float overlayOpacity = 0.0f;
     if (hasOverlayOpacity) {
-        const double v = jsonRequireFinite(p.value("overlayOpacity"), "overlayOpacity");
+        const double v = p.value("overlayOpacity").toDouble();
         overlayOpacity = static_cast<float>(std::clamp(v, 0.0, 1.0));
     }
 
     const bool hasIntersectionMaxSurfaces = p.contains("intersectionMaxSurfaces");
     int intersectionMaxSurfaces = 0;
     if (hasIntersectionMaxSurfaces) {
-        const int v = jsonRequireInt(p.value("intersectionMaxSurfaces"), "intersectionMaxSurfaces");
+        const int v = p.value("intersectionMaxSurfaces").toInt();
         intersectionMaxSurfaces = std::max(0, v);
     }
 
     const bool hasHighlightedSurfaceIds = p.contains("highlightedSurfaceIds");
     std::vector<std::string> highlightedSurfaceIds;
     if (hasHighlightedSurfaceIds) {
-        const QJsonValue hv = p.value("highlightedSurfaceIds");
-        if (!hv.isArray())
-            throwParamError("highlightedSurfaceIds", QStringLiteral("must be an array of strings"));
-        for (const QJsonValue& e : hv.toArray()) {
-            if (!e.isString())
-                throwParamError("highlightedSurfaceIds", QStringLiteral("must be an array of strings"));
+        for (const QJsonValue& e : p.value("highlightedSurfaceIds").toArray())
             highlightedSurfaceIds.push_back(e.toString().toStdString());
-        }
     }
 
     const bool hasVolumeWindow = p.contains("volumeWindow");
     float volumeWindowLow = 0.0f;
     float volumeWindowHigh = 0.0f;
     if (hasVolumeWindow) {
-        const QJsonValue wv = p.value("volumeWindow");
-        if (!wv.isObject())
-            throwParamError("volumeWindow", QStringLiteral("must be an object {low, high}"));
-        const QJsonObject wo = wv.toObject();
-        if (!wo.contains("low") || !wo.contains("high"))
-            throwParamError("volumeWindow", QStringLiteral("requires low and high"));
-        volumeWindowLow = static_cast<float>(jsonRequireFinite(wo.value("low"), "volumeWindow.low"));
-        volumeWindowHigh = static_cast<float>(jsonRequireFinite(wo.value("high"), "volumeWindow.high"));
+        const QJsonObject window = p.value("volumeWindow").toObject();
+        volumeWindowLow = static_cast<float>(window.value("low").toDouble());
+        volumeWindowHigh = static_cast<float>(window.value("high").toDouble());
     }
 
     const bool hasSamplingStride = p.contains("samplingStride");
     const int samplingStride = hasSamplingStride
-        ? jsonRequireInt(p.value("samplingStride"), "samplingStride") : 0;
+        ? p.value("samplingStride").toInt() : 0;
 
     const bool hasZScrollSensitivity = p.contains("zScrollSensitivity");
     const double zScrollSensitivity = hasZScrollSensitivity
-        ? jsonRequireFinite(p.value("zScrollSensitivity"), "zScrollSensitivity") : 0.0;
+        ? p.value("zScrollSensitivity").toDouble() : 0.0;
 
     const bool hasSegmentationCursorMirroring = p.contains("segmentationCursorMirroring");
     const bool segmentationCursorMirroring = hasSegmentationCursorMirroring
-        ? jsonRequireBool(p.value("segmentationCursorMirroring"), "segmentationCursorMirroring") : false;
+        ? p.value("segmentationCursorMirroring").toBool() : false;
 
     const bool hasPlaneIntersectionLinesVisible = p.contains("planeIntersectionLinesVisible");
     const bool planeIntersectionLinesVisible = hasPlaneIntersectionLinesVisible
-        ? jsonRequireBool(p.value("planeIntersectionLinesVisible"), "planeIntersectionLinesVisible") : false;
+        ? p.value("planeIntersectionLinesVisible").toBool() : false;
 
     const bool hasShowSurfaceNormals = p.contains("showSurfaceNormals");
     const bool showSurfaceNormals = hasShowSurfaceNormals
-        ? jsonRequireBool(p.value("showSurfaceNormals"), "showSurfaceNormals") : false;
+        ? p.value("showSurfaceNormals").toBool() : false;
 
     const bool hasShowDirectionHints = p.contains("showDirectionHints");
     const bool showDirectionHints = hasShowDirectionHints
-        ? jsonRequireBool(p.value("showDirectionHints"), "showDirectionHints") : false;
+        ? p.value("showDirectionHints").toBool() : false;
 
     const bool hasSurfaceOverlayEnabled = p.contains("surfaceOverlayEnabled");
     const bool surfaceOverlayEnabled = hasSurfaceOverlayEnabled
-        ? jsonRequireBool(p.value("surfaceOverlayEnabled"), "surfaceOverlayEnabled") : false;
+        ? p.value("surfaceOverlayEnabled").toBool() : false;
 
     const bool hasNormalArrowLengthScale = p.contains("normalArrowLengthScale");
     float normalArrowLengthScale = 0.0f;
     if (hasNormalArrowLengthScale) {
-        const double v = jsonRequireFinite(p.value("normalArrowLengthScale"), "normalArrowLengthScale");
+        const double v = p.value("normalArrowLengthScale").toDouble();
         // Clamp to the GUI slider's range (sliderNormalArrowLength: 10-200%) rather
         // than passing a negative/huge scale straight to the renderer.
         normalArrowLengthScale = static_cast<float>(std::clamp(v, 0.1, 2.0));
@@ -1078,14 +1067,13 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
     const bool hasNormalMaxArrows = p.contains("normalMaxArrows");
     int normalMaxArrows = 0;
     if (hasNormalMaxArrows) {
-        const int v = jsonRequireInt(p.value("normalMaxArrows"), "normalMaxArrows");
+        const int v = p.value("normalMaxArrows").toInt();
         // Clamp to the GUI slider's range (sliderNormalMaxArrows: 4-100).
         normalMaxArrows = std::clamp(v, 4, 100);
     }
 
-    // --- Phase 2: apply. Fully validated above, so the setters, QSettings
-    // writes, and broadcasts run as a group. Global controls go via ViewerManager
-    // (broadcast + QSettings-persisted). ---
+    // Apply as a group. Global controls go via ViewerManager (broadcast +
+    // QSettings-persisted).
     if (hasIntersectionOpacity)
         mgr->setIntersectionOpacity(intersectionOpacity);
     if (hasIntersectionThickness)

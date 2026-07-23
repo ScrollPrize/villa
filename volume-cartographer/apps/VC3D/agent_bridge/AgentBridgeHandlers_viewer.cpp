@@ -6,7 +6,6 @@
 #include <QJsonValue>
 #include <QString>
 
-#include <algorithm>
 #include <memory>
 #include <set>
 #include <string>
@@ -16,7 +15,6 @@
 #include "ViewerManager.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
-#include "vc/core/render/Colormaps.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Compositing.hpp"
@@ -38,20 +36,6 @@ ViewerManager* requireViewerManager(ViewerManager* mgr)
         throw AgentBridgeError{-32010, "Viewer manager unavailable", data};
     }
     return mgr;
-}
-
-// vc::resolve() silently falls back to the first spec ("fire") for an unknown
-// id, so validate against vc::specs() (the same table the overlay combo uses).
-// Empty string is VolumeOverlayController's "no explicit choice" sentinel, so
-// it stays valid.
-bool isKnownOverlayColormap(const QString& id)
-{
-    if (id.isEmpty())
-        return true;
-    const auto& specs = vc::specs();
-    return std::any_of(specs.begin(), specs.end(), [&id](const vc::OverlayColormapSpec& s) {
-        return QString::fromStdString(s.id) == id;
-    });
 }
 
 QJsonObject overlaySettingsJson(ViewerManager* mgr)
@@ -88,18 +72,18 @@ QJsonObject AgentBridgeServer::handleViewerGetOverlay(const QJsonValue&)
 QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
 {
     ViewerManager* mgr = requireViewerManager(_window ? _window->_viewerManager.get() : nullptr);
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
-    // --- Phase 1: parse/validate/resolve into locals. No mutation here, so a
-    // malformed field rejects the whole request (-32602 / -32007 / -32000)
-    // instead of leaving the overlay half-updated. ---
+    // Mechanical input validation has already run from the method descriptor.
+    // Resolve the remaining semantic preconditions into locals before mutating
+    // anything, so a rejected request cannot leave the overlay half-updated.
 
     // Overlay volume selection: "clear" or an explicit empty "volumeId" both
     // mean "no overlay volume"; a non-empty "volumeId" resolves and sets it.
     // Absent entirely -> leave the current overlay volume untouched.
-    const bool clear = jsonOptionalBool(p, "clear", false);
+    const bool clear = p.value("clear").toBool(false);
     const bool hasVolumeId = p.contains("volumeId");
-    const QString volumeId = hasVolumeId ? jsonRequireString(p, "volumeId") : QString();
+    const QString volumeId = hasVolumeId ? p.value("volumeId").toString() : QString();
     const bool clearVolume = clear || (hasVolumeId && volumeId.isEmpty());
     const bool setVolume = !clearVolume && hasVolumeId;
     // Resolve the overlay Volume shared_ptr up front so the -32007 unknown-volume
@@ -120,66 +104,49 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
     }
 
     const bool hasColormap = p.contains("colormap");
-    QString colormap;
-    if (hasColormap) {
-        colormap = jsonRequireString(p, "colormap");
-        if (!isKnownOverlayColormap(colormap))
-            throwParamError("colormap", QStringLiteral("must be one of the known overlay colormap ids"));
-    }
+    const QString colormap =
+        hasColormap ? p.value("colormap").toString() : QString();
 
     const bool hasOpacity = p.contains("opacity");
     const float opacity = hasOpacity
-        ? static_cast<float>(jsonRequireFinite(p.value("opacity"), "opacity")) : 0.0f;
+        ? static_cast<float>(p.value("opacity").toDouble()) : 0.0f;
 
     const bool hasThreshold = p.contains("threshold");
     const float threshold = hasThreshold
-        ? static_cast<float>(jsonRequireFinite(p.value("threshold"), "threshold")) : 0.0f;
+        ? static_cast<float>(p.value("threshold").toDouble()) : 0.0f;
 
     const bool hasWindow = p.contains("window");
     float windowLow = 0.0f;
     float windowHigh = 0.0f;
     if (hasWindow) {
-        const QJsonValue wv = p.value("window");
-        if (!wv.isObject())
-            throwParamError("window", QStringLiteral("must be an object {low, high}"));
-        const QJsonObject wo = wv.toObject();
-        if (!wo.contains("low") || !wo.contains("high"))
-            throwParamError("window", QStringLiteral("requires low and high"));
-        windowLow = static_cast<float>(jsonRequireFinite(wo.value("low"), "window.low"));
-        windowHigh = static_cast<float>(jsonRequireFinite(wo.value("high"), "window.high"));
+        const QJsonObject window = p.value("window").toObject();
+        windowLow = static_cast<float>(window.value("low").toDouble());
+        windowHigh = static_cast<float>(window.value("high").toDouble());
     }
 
     const bool hasMaxRes = p.contains("maxDisplayedResolution");
     const int maxRes = hasMaxRes
-        ? jsonRequireInt(p.value("maxDisplayedResolution"), "maxDisplayedResolution") : 0;
+        ? p.value("maxDisplayedResolution").toInt() : 0;
 
     const bool hasComposite = p.contains("composite");
     OverlayCompositeSettings composite;
     if (hasComposite) {
-        const QJsonValue cv = p.value("composite");
-        if (!cv.isObject())
-            throwParamError("composite", QStringLiteral("must be an object"));
-        const QJsonObject co = cv.toObject();
+        const QJsonObject object = p.value("composite").toObject();
 
         // Merge over current settings so a caller can tweak one sub-key without
         // restating the rest (a read, so it stays in the validation phase).
         composite = mgr->overlayComposite();
-        if (co.contains("enabled"))
-            composite.enabled = jsonRequireBool(co.value("enabled"), "composite.enabled");
-        if (co.contains("method")) {
-            const QString method = jsonRequireString(co, "method");
-            if (method != "max" && method != "mean" && method != "min")
-                throwParamError("composite.method", QStringLiteral("must be one of max, mean, min"));
-            composite.method = method.toStdString();
-        }
-        if (co.contains("layersFront"))
-            composite.layersFront = jsonRequireInt(co.value("layersFront"), "composite.layersFront");
-        if (co.contains("layersBehind"))
-            composite.layersBehind = jsonRequireInt(co.value("layersBehind"), "composite.layersBehind");
+        if (object.contains("enabled"))
+            composite.enabled = object.value("enabled").toBool();
+        if (object.contains("method"))
+            composite.method = object.value("method").toString().toStdString();
+        if (object.contains("layersFront"))
+            composite.layersFront = object.value("layersFront").toInt();
+        if (object.contains("layersBehind"))
+            composite.layersBehind = object.value("layersBehind").toInt();
     }
 
-    // --- Phase 2: apply. The request is fully validated, so these setters run
-    // as a group -- a rejected request above mutated nothing. ---
+    // Apply only after every semantic precondition has passed.
     if (clearVolume) {
         mgr->setOverlayVolume(nullptr, "");
     } else if (setVolume) {
@@ -236,20 +203,14 @@ QJsonObject AgentBridgeServer::handleViewerListOverlayVolumes(const QJsonValue&)
 QJsonObject AgentBridgeServer::handleViewerSetIntersects(const QJsonValue& params)
 {
     ViewerManager* mgr = requireViewerManager(_window ? _window->_viewerManager.get() : nullptr);
-    const QJsonObject p = paramsObject(params);
-
-    if (!p.value("surfaceIds").isArray())
-        throwParamError("surfaceIds", QStringLiteral("must be an array of strings"));
+    const QJsonObject p = params.toObject();
 
     // The GUI's own filter application (SurfacePanelController::applyFilters)
     // always seeds the drawn set with "segmentation"; mirror that invariant
     // here rather than trusting the caller to include it.
     std::set<std::string> ids{"segmentation"};
-    for (const QJsonValue& e : p.value("surfaceIds").toArray()) {
-        if (!e.isString())
-            throwParamError("surfaceIds", QStringLiteral("must be an array of strings"));
+    for (const QJsonValue& e : p.value("surfaceIds").toArray())
         ids.insert(e.toString().toStdString());
-    }
 
     QJsonArray appliedToViewers;
     if (p.contains("viewer") && !p.value("viewer").isNull()) {

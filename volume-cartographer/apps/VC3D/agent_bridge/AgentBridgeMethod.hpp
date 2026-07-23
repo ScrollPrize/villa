@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -288,6 +289,8 @@ inline AgentBridgeParam optionalInteger(const QString& name)
         .name = name,
         .type = AgentBridgeParamType::Integer,
         .finite = true,
+        .minimum = std::numeric_limits<int>::lowest(),
+        .maximum = std::numeric_limits<int>::max(),
     };
 }
 
