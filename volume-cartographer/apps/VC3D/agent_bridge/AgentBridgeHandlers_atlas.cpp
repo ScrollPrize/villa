@@ -72,8 +72,8 @@ QJsonObject AgentBridgeServer::handleAtlasOpen(const QJsonValue& params)
     if (!state || !state->hasVpkg() || !vpkg)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QJsonObject p = paramsObject(params);
-    const QString atlasDirStr = jsonRequireString(p, "atlasDir");
+    const QJsonObject p = params.toObject();
+    const QString atlasDirStr = p.value("atlasDir").toString();
     if (atlasDirStr.isEmpty()) {
         QJsonObject data;
         data["param"] = "atlasDir";
@@ -150,20 +150,15 @@ QJsonObject AgentBridgeServer::handleAtlasSearchStart(const QJsonValue& params)
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     AtlasFiberSearchParams sp;
-    const QString modeStr = jsonOptionalString(
-        p, "mode", QStringLiteral("atlas_to_non_atlas"));
+    const QString modeStr =
+        p.value("mode").toString(QStringLiteral("atlas_to_non_atlas"));
     if (modeStr == QLatin1String("atlas_to_non_atlas")) {
         sp.searchMode = 0;  // ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS (CWindow.cpp)
-    } else if (modeStr == QLatin1String("non_atlas_only")) {
-        sp.searchMode = 1;  // ATLAS_SEARCH_MODE_NON_ATLAS_ONLY (CWindow.cpp)
     } else {
-        QJsonObject data;
-        data["param"] = "mode";
-        data["value"] = modeStr;
-        throw AgentBridgeError{-32602, QStringLiteral("Invalid mode: %1").arg(modeStr), data};
+        sp.searchMode = 1;  // ATLAS_SEARCH_MODE_NON_ATLAS_ONLY (CWindow.cpp)
     }
 
     auto readTags = [](const QJsonObject& obj, const char* key) -> QStringList {
@@ -171,21 +166,7 @@ QJsonObject AgentBridgeServer::handleAtlasSearchStart(const QJsonValue& params)
         const QJsonValue v = obj.value(QLatin1String(key));
         if (v.isUndefined() || v.isNull())
             return tags;
-        if (!v.isArray()) {
-            QJsonObject data;
-            data["param"] = QString::fromLatin1(key);
-            throw AgentBridgeError{-32602,
-                QStringLiteral("%1 must be an array of strings").arg(QLatin1String(key)), data};
-        }
         for (const QJsonValue& tv : v.toArray()) {
-            // Reject a wrong-typed element rather than silently coercing it to ""
-            // and dropping it (SPEC §5).
-            if (!tv.isString()) {
-                QJsonObject data;
-                data["param"] = QString::fromLatin1(key);
-                throw AgentBridgeError{-32602,
-                    QStringLiteral("%1 must be an array of strings").arg(QLatin1String(key)), data};
-            }
             const QString s = tv.toString();
             if (!s.isEmpty())
                 tags.append(s);
@@ -196,14 +177,7 @@ QJsonObject AgentBridgeServer::handleAtlasSearchStart(const QJsonValue& params)
     sp.excludedTags = readTags(p, "excludedTags");
 
     if (p.contains("maxDistance")) {
-        const QJsonValue mv = p.value("maxDistance");
-        const double md = mv.toDouble(std::numeric_limits<double>::quiet_NaN());
-        if (!mv.isDouble() || !std::isfinite(md) || md < 0.0) {
-            QJsonObject data;
-            data["param"] = "maxDistance";
-            throw AgentBridgeError{-32602, "maxDistance must be a non-negative number", data};
-        }
-        sp.maxDistance = md;
+        sp.maxDistance = p.value("maxDistance").toDouble();
     }
     // else: keep the current spin-box value (SPEC §12.3) — the headless
     // launcher reads the persisted QSettings key.
@@ -266,29 +240,9 @@ QJsonObject AgentBridgeServer::handleAtlasSearchResults(const QJsonValue& params
     if (!_window)
         throw AgentBridgeError{-32010, "Window unavailable", {}};
 
-    const QJsonObject p = paramsObject(params);
-    int offset = 0;
-    if (p.contains("offset")) {
-        // jsonRequireInt rejects wrong-typed / fractional / int-overflowing values
-        // (the last guarding the cast against a finite double like 1e300, §11a).
-        offset = jsonRequireInt(p.value("offset"), "offset");
-        if (offset < 0) {
-            QJsonObject data;
-            data["param"] = "offset";
-            throw AgentBridgeError{-32602, "offset must be a non-negative integer", data};
-        }
-    }
-    int limit = 100;
-    if (p.contains("limit")) {
-        const QJsonValue lv = p.value("limit");
-        const double ld = lv.toDouble(std::numeric_limits<double>::quiet_NaN());
-        if (!lv.isDouble() || !std::isfinite(ld) || std::floor(ld) != ld || ld < 1) {
-            QJsonObject data;
-            data["param"] = "limit";
-            throw AgentBridgeError{-32602, "limit must be a positive integer", data};
-        }
-        limit = static_cast<int>(std::min(ld, 1000.0));  // clamp to [1, 1000] (§12.5)
-    }
+    const QJsonObject p = params.toObject();
+    const int offset = p.value("offset").toInt(0);
+    const int limit = std::min(p.value("limit").toInt(100), 1000);
 
     const auto& results = _window->_atlasSearchResults;
     const auto& signedWindings = _window->_atlasSearchSignedWindings;
@@ -341,10 +295,8 @@ QJsonObject AgentBridgeServer::handleAtlasOpenResult(const QJsonValue& params)
     if (!_window)
         throw AgentBridgeError{-32010, "Window unavailable", {}};
 
-    const QJsonObject p = paramsObject(params);
-    // jsonRequireInt rejects wrong-typed / fractional / int-overflowing values
-    // (the last guarding the cast against a finite double like 1e300, §11a).
-    const int index = jsonRequireInt(p.value("index"), "index");
+    const QJsonObject p = params.toObject();
+    const int index = p.value("index").toInt();
     const auto& results = _window->_atlasSearchResults;
     if (index < 0 || index >= static_cast<int>(results.size())) {
         QJsonObject data;
