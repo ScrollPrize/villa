@@ -881,8 +881,10 @@ void AgentBridgeServer::completeDeferredResult(int token, const QJsonObject& res
         pd.timer->stop();
         pd.timer->deleteLater();
     }
-    if (pd.socket && pd.socket->state() == QLocalSocket::ConnectedState)
+    if (!pd.id.isUndefined() &&
+        pd.socket && pd.socket->state() == QLocalSocket::ConnectedState) {
         sendResponse(pd.socket.data(), pd.id, result);
+    }
 }
 
 
@@ -898,6 +900,8 @@ void AgentBridgeServer::completeDeferredError(int token, int code, const QString
         pd.timer->stop();
         pd.timer->deleteLater();
     }
-    if (pd.socket && pd.socket->state() == QLocalSocket::ConnectedState)
+    if (!pd.id.isUndefined() &&
+        pd.socket && pd.socket->state() == QLocalSocket::ConnectedState) {
         sendError(pd.socket.data(), pd.id, code, message, data);
+    }
 }
