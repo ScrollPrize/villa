@@ -70,6 +70,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [llfio-chunkloader](https://github.com/climbmax123/LLFIOCunkloadingTestingAndBenching): A method to access data in chunks of (x,y,z) that is much faster and more compute-efficient than Zarr. (Written in C++ but it is possible to integrate in Python).
 
+- [Volume read cache + chunk-size study](https://github.com/ScrollPrize/villa/pull/1177) by Prasad Khake. Fixes zarr-3 breakage in the Python `vesuvius` `Volume` (multiscale reads raised `TypeError` under the pinned zarr) and adds an opt-in LRU chunk cache — repeated reads of a region are served from memory (~300× faster, byte-identical, off by default) instead of re-fetched, restoring the caching lost when zarr 3 removed `LRUStoreCache`. Includes a measured chunk-size × access-pattern study: read amplification (bytes fetched vs. requested) swings from 1.3× to 176× depending on chunk geometry and access pattern (random patches / z-slices / sequential tracing), giving a basis for choosing chunk shape per workload rather than by opinion.
+
 - [preprocessed-data](https://github.com/usc-caisplusplus/scroll-data-preprocessing): Data preprocessing code and a fully processed version of the dataset in .zarr format to allow for faster training of ink detection models. 
 
 ## Segmentation
@@ -233,6 +235,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Scroll Sleuth](https://github.com/Paul-G2/ScrollSleuth) by Paul Geiger. A web app that supports visual ink-searching in segment volumes via multiple display modes and segmentation tools.
 
 - [Scroll Slab Viewer](https://github.com/Paul-G2/ScrollSlabViewer) by Paul Geiger. A 3D viewer tailored for the [Kaggle Surface Detection challenge](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection).
+
+- [Readability gate](https://github.com/robertlangdonn/vesuvius-readability-gate) by Prasad Khake. A CPU-only readability-risk diagnostic for rendered surfaces: it scores per-column "depth occupancy" over the ink model's 62-layer render window — a surface that isolates one papyrus sheet lights a small localized slice (readable), while one that can't (oblique geometry, or packed/gap-less laminae) saturates through depth (speckle). Predicts whether a candidate surface is worth running ink inference on before spending GPU. Validated on public data (a readable PHerc1667 sheet at median occupancy 0.35 vs unreadable PHerc1203 auto-grown surfaces at 0.97) with a same-scroll geometry-sensitivity control.
 
 ## Ink Detection
 
