@@ -1266,6 +1266,16 @@ def _export_flatten_result(
 	fit2tifxyz._print_area(area)
 
 
+def _initial_flatten_state(
+	mdl: model.Model3D,
+	*,
+	invert_forward: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	if mdl.flatten_direction == "forward" and not invert_forward:
+		return mdl._flatten_forward_current()
+	return mdl._flatten_sample_current()
+
+
 def _run_flatten_mode(
 	*,
 	cfg: dict,
@@ -1314,6 +1324,7 @@ def _run_flatten_mode(
 	filter_source_angles = _truthy_config_bool(flatten_args.get("flatten_filter_source_angles", True))
 	filter_angle_deg = float(flatten_args.get("flatten_filter_angle_deg", 90.0))
 	filter_radius = int(flatten_args.get("flatten_filter_radius", 2))
+	initial_inversion = _truthy_config_bool(flatten_args.get("flatten_initial_inversion", True))
 	mdl = model.Model3D.from_flatten_tifxyz_crop(
 		xyz,
 		valid,
@@ -1366,9 +1377,16 @@ def _run_flatten_mode(
 			print(f"PROGRESS {step} {total} {loss:.6f}", flush=True)
 
 	with torch.no_grad():
-		map_yx, xyz0, point_mask, quad_mask = mdl._flatten_sample_current()
+		map_yx, xyz0, point_mask, quad_mask = _initial_flatten_state(
+			mdl,
+			invert_forward=initial_inversion,
+		)
+		if flatten_direction == "forward" and not initial_inversion:
+			initial_label = "initial forward flatten (inversion skipped)"
+		else:
+			initial_label = "initial flatten"
 		print(
-			f"initial flatten: map_shape={tuple(map_yx.shape)} "
+			f"{initial_label}: map_shape={tuple(map_yx.shape)} "
 			f"point_valid={int(point_mask.sum())}/{point_mask.numel()} "
 			f"quad_valid={int(quad_mask.sum())}/{quad_mask.numel()}",
 			flush=True,
