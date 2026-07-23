@@ -1,0 +1,67 @@
+{
+  "aggregate": {
+    "intersecting_chunk_bytes_uncompressed_upper_bound": 8662786880,
+    "logical_plane_bytes": 54142418,
+    "nonzero_voxels_removed": 1820368,
+    "phantom_fraction_after": 0.0,
+    "phantom_fraction_before": 0.5994186814203615,
+    "phantom_positives_after": 0,
+    "phantom_positives_before": 1820368,
+    "positive_voxels_after": 1216521,
+    "positive_voxels_before": 3036889,
+    "spatial_voxels": 27071209,
+    "support_fraction": 0.21302761173318857,
+    "supported_values_preserved": true,
+    "supported_voxels": 5766915
+  },
+  "anonymous_access": true,
+  "created_utc": "2026-07-19T00:08:59.591571+00:00",
+  "elapsed_seconds": 39.57161210000049,
+  "environment": {
+    "numpy": "2.5.1",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.6",
+    "zarr": "3.2.1"
+  },
+  "planes": [
+    {
+      "elapsed_seconds": 39.5711217999924,
+      "intersecting_chunk_bytes_uncompressed_upper_bound": 8662786880,
+      "logical_plane_bytes": 54142418,
+      "nonzero_voxels_removed": 1820368,
+      "phantom_fraction_after": 0.0,
+      "phantom_fraction_before": 0.5994186814203615,
+      "phantom_positives_after": 0,
+      "phantom_positives_before": 1820368,
+      "positive_voxels_after": 1216521,
+      "positive_voxels_before": 3036889,
+      "spatial_voxels": 27071209,
+      "support_fraction": 0.21302761173318857,
+      "supported_values_preserved": true,
+      "supported_voxels": 5766915,
+      "z_index": 7493
+    }
+  ],
+  "prediction_chunks": [
+    192,
+    192,
+    192
+  ],
+  "prediction_dtype": "uint8",
+  "prediction_path": "s3://vesuvius-challenge-open-data/PHerc1451/representations/predictions/surfaces/20260319101107-surface-20260413222639-surface-m7-L2-th0.2.zarr/0",
+  "prediction_shape": [
+    14986,
+    5203,
+    5203
+  ],
+  "prediction_threshold": 0.0,
+  "schema_version": 2,
+  "support_chunks": [
+    128,
+    128,
+    128
+  ],
+  "support_dtype": "uint8",
+  "support_path": "s3://vesuvius-challenge-open-data/PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr/2",
+  "support_threshold": 5.0
+}
