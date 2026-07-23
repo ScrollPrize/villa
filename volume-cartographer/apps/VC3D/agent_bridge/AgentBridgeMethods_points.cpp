@@ -1,5 +1,7 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
 
+#include <iterator>
+
 namespace Params = AgentBridgeParams;
 namespace Mcp = AgentBridgeMcpTools;
 
