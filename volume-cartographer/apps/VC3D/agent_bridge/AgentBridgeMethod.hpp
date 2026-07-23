@@ -375,6 +375,23 @@ inline AgentBridgeParam requiredInteger(const QString& name)
     return required(optionalInteger(name));
 }
 
+inline AgentBridgeParam optionalSafeId(const QString& name)
+{
+    AgentBridgeParam param{
+        .name = name,
+        .type = AgentBridgeParamType::Integer,
+        .finite = true,
+        .minimum = 1.0,
+        .maximum = 9007199254740991.0,
+    };
+    return param;
+}
+
+inline AgentBridgeParam requiredSafeId(const QString& name)
+{
+    return required(optionalSafeId(name));
+}
+
 inline AgentBridgeParam optionalBoolean(
     const QString& name,
     const QJsonValue& defaultValue = QJsonValue(QJsonValue::Undefined))

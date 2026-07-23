@@ -1136,6 +1136,593 @@
         "type": "object"
       }
     },
+    "points.add_collection": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_add_point_collection"
+      },
+      "params": {
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "points.apply_anchor_offset": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_apply_anchor_offset"
+      },
+      "params": {
+        "properties": {
+          "offsetX": {
+            "type": "number"
+          },
+          "offsetY": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "offsetX",
+          "offsetY"
+        ],
+        "type": "object"
+      }
+    },
+    "points.auto_fill_windings": {
+      "errors": [
+        -32000,
+        -32010,
+        -32007,
+        -32602
+      ],
+      "mcp": {
+        "tool": "vc3d_auto_fill_windings"
+      },
+      "params": {
+        "properties": {
+          "collection": {
+            "type": "string"
+          },
+          "collectionId": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "constant": {
+            "type": "number"
+          },
+          "mode": {
+            "enum": [
+              "none",
+              "incremental",
+              "decremental",
+              "constant"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      }
+    },
+    "points.clear_all": {
+      "errors": [
+        -32000,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_clear_all_points"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "points.clear_collection": {
+      "errors": [
+        -32000,
+        -32010,
+        -32007,
+        -32602
+      ],
+      "mcp": {
+        "tool": "vc3d_clear_point_collection"
+      },
+      "params": {
+        "properties": {
+          "collection": {
+            "type": "string"
+          },
+          "collectionId": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "points.commit": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_commit_points"
+      },
+      "params": {
+        "properties": {
+          "collection": {
+            "type": "string"
+          },
+          "points": {
+            "items": {
+              "properties": {
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                },
+                "z": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "x",
+                "y",
+                "z"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "winding": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "collection",
+          "points"
+        ],
+        "type": "object"
+      }
+    },
+    "points.list": {
+      "errors": [
+        -32602,
+        -32007
+      ],
+      "mcp": {
+        "tool": "vc3d_list_points"
+      },
+      "params": {
+        "properties": {
+          "collection": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "points.load_json": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_load_points_json"
+      },
+      "params": {
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "points.load_segment_path": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_load_points_segment_path"
+      },
+      "params": {
+        "properties": {
+          "segmentPath": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentPath"
+        ],
+        "type": "object"
+      }
+    },
+    "points.remove_collection_tag": {
+      "errors": [
+        -32000,
+        -32010,
+        -32007,
+        -32602
+      ],
+      "mcp": {
+        "tool": "vc3d_remove_point_collection_tag"
+      },
+      "params": {
+        "properties": {
+          "collection": {
+            "type": "string"
+          },
+          "collectionId": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "type": "object"
+      }
+    },
+    "points.remove_point": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32007
+      ],
+      "mcp": {
+        "tool": "vc3d_remove_point"
+      },
+      "params": {
+        "properties": {
+          "pointId": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pointId"
+        ],
+        "type": "object"
+      }
+    },
+    "points.rename_collection": {
+      "errors": [
+        -32000,
+        -32010,
+        -32007,
+        -32602
+      ],
+      "mcp": {
+        "tool": "vc3d_rename_point_collection"
+      },
+      "params": {
+        "properties": {
+          "collection": {
+            "type": "string"
+          },
+          "collectionId": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "newName": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "newName"
+        ],
+        "type": "object"
+      }
+    },
+    "points.reset_windings": {
+      "errors": [
+        -32000,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_reset_windings"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "points.save_json": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_save_points_json"
+      },
+      "params": {
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "points.save_segment_path": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_save_points_segment_path"
+      },
+      "params": {
+        "properties": {
+          "segmentPath": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentPath"
+        ],
+        "type": "object"
+      }
+    },
+    "points.set_auto_fill_mode": {
+      "errors": [
+        -32000,
+        -32010,
+        -32007,
+        -32602
+      ],
+      "mcp": {
+        "tool": "vc3d_set_auto_fill_mode"
+      },
+      "params": {
+        "properties": {
+          "collection": {
+            "type": "string"
+          },
+          "collectionId": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "constant": {
+            "type": "number"
+          },
+          "mode": {
+            "enum": [
+              "none",
+              "incremental",
+              "decremental",
+              "constant"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      }
+    },
+    "points.set_collection_color": {
+      "errors": [
+        -32000,
+        -32010,
+        -32007,
+        -32602
+      ],
+      "mcp": {
+        "tool": "vc3d_set_point_collection_color"
+      },
+      "params": {
+        "properties": {
+          "collection": {
+            "type": "string"
+          },
+          "collectionId": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "color": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "color"
+        ],
+        "type": "object"
+      }
+    },
+    "points.set_collection_metadata": {
+      "errors": [
+        -32000,
+        -32010,
+        -32007,
+        -32602
+      ],
+      "mcp": {
+        "tool": "vc3d_set_point_collection_metadata"
+      },
+      "params": {
+        "properties": {
+          "absoluteWindingNumber": {
+            "type": "boolean"
+          },
+          "collection": {
+            "type": "string"
+          },
+          "collectionId": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "absoluteWindingNumber"
+        ],
+        "type": "object"
+      }
+    },
+    "points.set_collection_tag": {
+      "errors": [
+        -32000,
+        -32010,
+        -32007,
+        -32602
+      ],
+      "mcp": {
+        "tool": "vc3d_set_point_collection_tag"
+      },
+      "params": {
+        "properties": {
+          "collection": {
+            "type": "string"
+          },
+          "collectionId": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
+      }
+    },
+    "points.set_windings_linked": {
+      "errors": [
+        -32000,
+        -32010,
+        -32007,
+        -32602
+      ],
+      "mcp": {
+        "tool": "vc3d_set_point_windings_linked"
+      },
+      "params": {
+        "properties": {
+          "collection": {
+            "type": "string"
+          },
+          "collectionId": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "linkedCollectionIds": {
+            "items": {
+              "maximum": 9007199254740991,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "linkedCollectionIds"
+        ],
+        "type": "object"
+      }
+    },
+    "points.update_point": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32007
+      ],
+      "mcp": {
+        "extraParams": [
+          "clear_winding"
+        ],
+        "tool": "vc3d_update_point"
+      },
+      "params": {
+        "properties": {
+          "pointId": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "position": {
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "z"
+            ],
+            "type": "object"
+          },
+          "winding": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "pointId"
+        ],
+        "type": "object"
+      }
+    },
     "rpc.describe": {
       "errors": [
         -32602

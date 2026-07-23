@@ -711,48 +711,7 @@ void AgentBridgeServer::registerHandlers()
     _handlers.insert("segmentation.corrections.set_point_mode",
         [this](const QJsonValue& p) { return handleCorrectionsSetPointMode(p); });
     registerWrapHandlers();
-    _handlers.insert("points.commit",
-        [this](const QJsonValue& p) { return handlePointsCommit(p); });
-    _handlers.insert("points.list",
-        [this](const QJsonValue& p) { return handlePointsList(p); });
-    _handlers.insert("points.add_collection",
-        [this](const QJsonValue& p) { return handlePointsAddCollection(p); });
-    _handlers.insert("points.update_point",
-        [this](const QJsonValue& p) { return handlePointsUpdatePoint(p); });
-    _handlers.insert("points.remove_point",
-        [this](const QJsonValue& p) { return handlePointsRemovePoint(p); });
-    _handlers.insert("points.clear_collection",
-        [this](const QJsonValue& p) { return handlePointsClearCollection(p); });
-    _handlers.insert("points.clear_all",
-        [this](const QJsonValue& p) { return handlePointsClearAll(p); });
-    _handlers.insert("points.rename_collection",
-        [this](const QJsonValue& p) { return handlePointsRenameCollection(p); });
-    _handlers.insert("points.set_collection_color",
-        [this](const QJsonValue& p) { return handlePointsSetCollectionColor(p); });
-    _handlers.insert("points.set_collection_metadata",
-        [this](const QJsonValue& p) { return handlePointsSetCollectionMetadata(p); });
-    _handlers.insert("points.set_collection_tag",
-        [this](const QJsonValue& p) { return handlePointsSetCollectionTag(p); });
-    _handlers.insert("points.remove_collection_tag",
-        [this](const QJsonValue& p) { return handlePointsRemoveCollectionTag(p); });
-    _handlers.insert("points.set_windings_linked",
-        [this](const QJsonValue& p) { return handlePointsSetWindingsLinked(p); });
-    _handlers.insert("points.auto_fill_windings",
-        [this](const QJsonValue& p) { return handlePointsAutoFillWindings(p); });
-    _handlers.insert("points.set_auto_fill_mode",
-        [this](const QJsonValue& p) { return handlePointsSetAutoFillMode(p); });
-    _handlers.insert("points.reset_windings",
-        [this](const QJsonValue& p) { return handlePointsResetWindings(p); });
-    _handlers.insert("points.apply_anchor_offset",
-        [this](const QJsonValue& p) { return handlePointsApplyAnchorOffset(p); });
-    _handlers.insert("points.save_json",
-        [this](const QJsonValue& p) { return handlePointsSaveJson(p); });
-    _handlers.insert("points.load_json",
-        [this](const QJsonValue& p) { return handlePointsLoadJson(p); });
-    _handlers.insert("points.save_segment_path",
-        [this](const QJsonValue& p) { return handlePointsSaveSegmentPath(p); });
-    _handlers.insert("points.load_segment_path",
-        [this](const QJsonValue& p) { return handlePointsLoadSegmentPath(p); });
+    registerPointsHandlers();
     registerJobHandlers();
 
     registerLasagnaHandlers();

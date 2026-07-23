@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional, TypedDict
 
 from ..core import mcp, _call, _strip_none
 
 
+class Point3D(TypedDict):
+    x: float
+    y: float
+    z: float
+
+
 @mcp.tool()
 async def vc3d_commit_points(
-    collection: str, points: list[dict[str, float]], winding: Optional[float] = None
+    collection: str, points: list[Point3D], winding: Optional[float] = None
 ) -> dict[str, Any]:
     """Add annotation points (volume space) to a named collection, optionally
     with a winding annotation. The collection is created if absent."""
@@ -35,7 +41,7 @@ async def vc3d_add_point_collection(name: Optional[str] = None) -> dict[str, Any
 @mcp.tool()
 async def vc3d_update_point(
     pointId: int,
-    position: Optional[dict[str, float]] = None,
+    position: Optional[Point3D] = None,
     winding: Optional[float] = None,
     clear_winding: bool = False,
 ) -> dict[str, Any]:
@@ -171,7 +177,7 @@ async def vc3d_set_point_windings_linked(
 
 @mcp.tool()
 async def vc3d_auto_fill_windings(
-    mode: str,
+    mode: Literal["none", "incremental", "decremental", "constant"],
     collection: Optional[str] = None,
     collectionId: Optional[int] = None,
     constant: Optional[float] = None,
@@ -194,7 +200,7 @@ async def vc3d_auto_fill_windings(
 
 @mcp.tool()
 async def vc3d_set_auto_fill_mode(
-    mode: str,
+    mode: Literal["none", "incremental", "decremental", "constant"],
     collection: Optional[str] = None,
     collectionId: Optional[int] = None,
     constant: Optional[float] = None,

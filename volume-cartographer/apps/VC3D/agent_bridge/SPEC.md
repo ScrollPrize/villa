@@ -3834,8 +3834,10 @@ be indistinguishable from "unset") is rejected with `-32602` rather than accepte
 | `vc3d_set_auto_fill_mode` | `points.set_auto_fill_mode` |
 | `vc3d_reset_windings` | `points.reset_windings` |
 | `vc3d_apply_anchor_offset` | `points.apply_anchor_offset` |
-| `vc3d_save_points_json` / `vc3d_load_points_json` | `points.save_json` / `points.load_json` |
-| `vc3d_save_points_segment_path` / `vc3d_load_points_segment_path` | `points.save_segment_path` / `points.load_segment_path` |
+| `vc3d_save_points_json` | `points.save_json` |
+| `vc3d_load_points_json` | `points.load_json` |
+| `vc3d_save_points_segment_path` | `points.save_segment_path` |
+| `vc3d_load_points_segment_path` | `points.load_segment_path` |
 
 Same conventions as §5 (params/result passthrough, RPC errors preserved). Param names are
 1:1 with the RPC (this family does not snake_case-rename `collectionId`/`pointId`/etc.).
