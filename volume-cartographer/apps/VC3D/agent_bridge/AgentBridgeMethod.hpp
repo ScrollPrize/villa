@@ -237,11 +237,34 @@ private:
 
 namespace AgentBridgeParams {
 
-inline AgentBridgeParam optionalString(const QString& name)
+inline AgentBridgeParam withDefault(
+    AgentBridgeParam param,
+    const QJsonValue& defaultValue)
+{
+    param.defaultValue = defaultValue;
+    return param;
+}
+
+inline AgentBridgeParam nullable(AgentBridgeParam param)
+{
+    param.nullable = true;
+    return param;
+}
+
+inline AgentBridgeParam required(AgentBridgeParam param)
+{
+    param.required = true;
+    return param;
+}
+
+inline AgentBridgeParam optionalString(
+    const QString& name,
+    const QJsonValue& defaultValue = QJsonValue(QJsonValue::Undefined))
 {
     return {
         .name = name,
         .type = AgentBridgeParamType::String,
+        .defaultValue = defaultValue,
     };
 }
 
@@ -252,19 +275,30 @@ inline AgentBridgeParam requiredString(const QString& name)
     return param;
 }
 
-inline AgentBridgeParam optionalStringEnum(const QString& name, QStringList values)
+inline AgentBridgeParam optionalStringEnum(
+    const QString& name,
+    QStringList values,
+    const QJsonValue& defaultValue = QJsonValue(QJsonValue::Undefined))
 {
-    AgentBridgeParam param = optionalString(name);
+    AgentBridgeParam param = optionalString(name, defaultValue);
     param.values = std::move(values);
     return param;
 }
 
-inline AgentBridgeParam optionalNumber(const QString& name)
+inline AgentBridgeParam requiredStringEnum(const QString& name, QStringList values)
+{
+    return required(optionalStringEnum(name, std::move(values)));
+}
+
+inline AgentBridgeParam optionalNumber(
+    const QString& name,
+    const QJsonValue& defaultValue = QJsonValue(QJsonValue::Undefined))
 {
     return {
         .name = name,
         .type = AgentBridgeParamType::Number,
         .finite = true,
+        .defaultValue = defaultValue,
     };
 }
 
@@ -283,7 +317,9 @@ inline AgentBridgeParam requiredPositiveNumber(const QString& name)
     return param;
 }
 
-inline AgentBridgeParam optionalInteger(const QString& name)
+inline AgentBridgeParam optionalInteger(
+    const QString& name,
+    const QJsonValue& defaultValue = QJsonValue(QJsonValue::Undefined))
 {
     return {
         .name = name,
@@ -291,7 +327,13 @@ inline AgentBridgeParam optionalInteger(const QString& name)
         .finite = true,
         .minimum = std::numeric_limits<int>::lowest(),
         .maximum = std::numeric_limits<int>::max(),
+        .defaultValue = defaultValue,
     };
+}
+
+inline AgentBridgeParam requiredInteger(const QString& name)
+{
+    return required(optionalInteger(name));
 }
 
 inline AgentBridgeParam optionalBoolean(
@@ -321,6 +363,13 @@ inline AgentBridgeParam optionalObject(
         .type = AgentBridgeParamType::Object,
         .properties = std::move(properties),
     };
+}
+
+inline AgentBridgeParam requiredObject(
+    const QString& name,
+    std::vector<AgentBridgeParam> properties)
+{
+    return required(optionalObject(name, std::move(properties)));
 }
 
 inline AgentBridgeParam optionalArray(

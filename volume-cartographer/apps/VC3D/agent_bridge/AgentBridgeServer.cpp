@@ -687,34 +687,8 @@ void AgentBridgeServer::registerHandlers()
             .errors = {-32602},
         },
         [this](const QJsonValue& p) { return handleRpcDescribe(p); });
-    _handlers.insert("ping",
-        [this](const QJsonValue& p) { return handlePing(p); });
-    _handlers.insert("state.get",
-        [this](const QJsonValue& p) { return handleStateGet(p); });
-    _handlers.insert("segments.list",
-        [this](const QJsonValue& p) { return handleSegmentsList(p); });
-    _handlers.insert("segments.activate",
-        [this](const QJsonValue& p) { return handleSegmentsActivate(p); });
-    _handlers.insert("segments.fetch",
-        [this](const QJsonValue& p) { return handleSegmentsFetch(p); });
-    _handlers.insert("segments.delete",
-        [this](const QJsonValue& p) { return handleSegmentsDelete(p); });
-    _handlers.insert("segments.rename",
-        [this](const QJsonValue& p) { return handleSegmentsRename(p); });
-    _handlers.insert("segments.review",
-        [this](const QJsonValue& p) { return handleSegmentsReview(p); });
-    _handlers.insert("screenshot.capture",
-        [this](const QJsonValue& p) { return handleScreenshotCapture(p); });
-    _handlers.insert("canvas.get_cursor_volume_point",
-        [this](const QJsonValue& p) { return handleCursorVolumePoint(p); });
-
-    // --- Phase 2: canvas + mutating actions ---
-    _handlers.insert("canvas.click",
-        [this](const QJsonValue& p) { return handleCanvasClick(p, /*addShift=*/false); });
-    _handlers.insert("canvas.shift_click",
-        [this](const QJsonValue& p) { return handleCanvasClick(p, /*addShift=*/true); });
-    _handlers.insert("canvas.drag",
-        [this](const QJsonValue& p) { return handleCanvasDrag(p); });
+    registerSessionHandlers();
+    registerCanvasHandlers();
     registerViewerHandlers();
     _handlers.insert("segmentation.enable_editing",
         [this](const QJsonValue& p) { return handleSegmentationEnableEditing(p); });
@@ -736,12 +710,7 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleManualAddUndoConstraint(p); });
     _handlers.insert("segmentation.corrections.set_point_mode",
         [this](const QJsonValue& p) { return handleCorrectionsSetPointMode(p); });
-    _handlers.insert("wrap_annotation.set_mode",
-        [this](const QJsonValue& p) { return handleWrapAnnotationSetMode(p); });
-    _handlers.insert("wrap_annotation.commit",
-        [this](const QJsonValue& p) { return handleWrapAnnotationCommit(p); });
-    _handlers.insert("wrap_annotation.undo",
-        [this](const QJsonValue& p) { return handleWrapAnnotationUndo(p); });
+    registerWrapHandlers();
     _handlers.insert("points.commit",
         [this](const QJsonValue& p) { return handlePointsCommit(p); });
     _handlers.insert("points.list",
@@ -784,22 +753,7 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handlePointsSaveSegmentPath(p); });
     _handlers.insert("points.load_segment_path",
         [this](const QJsonValue& p) { return handlePointsLoadSegmentPath(p); });
-    _handlers.insert("volume.open",
-        [this](const QJsonValue& p) { return handleVolumeOpen(p); });
-    _handlers.insert("volume.select",
-        [this](const QJsonValue& p) { return handleVolumeSelect(p); });
-    _handlers.insert("volume.list",
-        [this](const QJsonValue& p) { return handleVolumeList(p); });
-    _handlers.insert("catalog.open_sample",
-        [this](const QJsonValue& p) { return handleCatalogOpenSample(p); });
-    _handlers.insert("catalog.list_samples",
-        [this](const QJsonValue& p) { return handleCatalogListSamples(p); });
-    _handlers.insert("catalog.describe_sample",
-        [this](const QJsonValue& p) { return handleCatalogDescribeSample(p); });
-    _handlers.insert("job.status",
-        [this](const QJsonValue& p) { return handleJobStatus(p); });
-    _handlers.insert("job.cancel",
-        [this](const QJsonValue& p) { return handleJobCancel(p); });
+    registerJobHandlers();
 
     // --- Lasagna RPCs (SPEC §11) ---
     _handlers.insert("lasagna.service_status",

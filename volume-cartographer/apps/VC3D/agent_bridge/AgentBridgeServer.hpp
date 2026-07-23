@@ -73,7 +73,11 @@ private:
     using Handler = std::function<QJsonObject(const QJsonValue& params)>;
 
     void registerHandlers();
+    void registerSessionHandlers();
+    void registerCanvasHandlers();
     void registerViewerHandlers();
+    void registerWrapHandlers();
+    void registerJobHandlers();
     void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's

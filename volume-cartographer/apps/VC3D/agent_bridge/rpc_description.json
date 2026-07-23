@@ -1,5 +1,470 @@
 {
   "methods": {
+    "canvas.click": {
+      "errors": [
+        -32602,
+        -32002,
+        -32009,
+        -32001,
+        -32003
+      ],
+      "mcp": {
+        "tool": "vc3d_click"
+      },
+      "params": {
+        "properties": {
+          "button": {
+            "default": "left",
+            "enum": [
+              "left",
+              "right",
+              "middle"
+            ],
+            "type": "string"
+          },
+          "modifiers": {
+            "items": {
+              "enum": [
+                "shift",
+                "ctrl",
+                "alt",
+                "meta",
+                "keypad"
+              ],
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "position": {
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "space": {
+            "default": "volume",
+            "enum": [
+              "volume",
+              "scene"
+            ],
+            "type": "string"
+          },
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "position"
+        ],
+        "type": "object"
+      }
+    },
+    "canvas.drag": {
+      "errors": [
+        -32602,
+        -32002,
+        -32009,
+        -32001,
+        -32003
+      ],
+      "mcp": {
+        "paramRenames": {
+          "from": "from_point",
+          "to": "to_point"
+        },
+        "tool": "vc3d_drag"
+      },
+      "params": {
+        "properties": {
+          "button": {
+            "default": "left",
+            "enum": [
+              "left",
+              "right",
+              "middle",
+              "none"
+            ],
+            "type": "string"
+          },
+          "from": {
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "modifiers": {
+            "items": {
+              "enum": [
+                "shift",
+                "ctrl",
+                "alt",
+                "meta",
+                "keypad"
+              ],
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "space": {
+            "default": "volume",
+            "enum": [
+              "volume",
+              "scene"
+            ],
+            "type": "string"
+          },
+          "steps": {
+            "default": 8,
+            "maximum": 2147483647,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "to": {
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ],
+        "type": "object"
+      }
+    },
+    "canvas.get_cursor_volume_point": {
+      "errors": [
+        -32602,
+        -32002,
+        -32009,
+        -32001,
+        -32003
+      ],
+      "mcp": {
+        "tool": "vc3d_get_cursor_point"
+      },
+      "params": {
+        "properties": {
+          "scene": {
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      }
+    },
+    "canvas.shift_click": {
+      "errors": [
+        -32602,
+        -32002,
+        -32009,
+        -32001,
+        -32003
+      ],
+      "mcp": {
+        "tool": "vc3d_shift_click"
+      },
+      "params": {
+        "properties": {
+          "button": {
+            "default": "left",
+            "enum": [
+              "left",
+              "right",
+              "middle"
+            ],
+            "type": "string"
+          },
+          "modifiers": {
+            "items": {
+              "enum": [
+                "shift",
+                "ctrl",
+                "alt",
+                "meta",
+                "keypad"
+              ],
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "position": {
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "space": {
+            "default": "volume",
+            "enum": [
+              "volume",
+              "scene"
+            ],
+            "type": "string"
+          },
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "position"
+        ],
+        "type": "object"
+      }
+    },
+    "catalog.describe_sample": {
+      "errors": [
+        -32602,
+        -32007,
+        -32005,
+        -32010
+      ],
+      "mcp": {
+        "paramRenames": {
+          "sampleId": "sample_id"
+        },
+        "tool": "vc3d_describe_catalog_sample"
+      },
+      "params": {
+        "properties": {
+          "refresh": {
+            "default": false,
+            "type": "boolean"
+          },
+          "sampleId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sampleId"
+        ],
+        "type": "object"
+      }
+    },
+    "catalog.list_samples": {
+      "errors": [
+        -32602,
+        -32005,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_list_catalog_samples"
+      },
+      "params": {
+        "properties": {
+          "refresh": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "catalog.open_sample": {
+      "errors": [
+        -32602,
+        -32007,
+        -32005,
+        -32010,
+        -32004
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "sampleId": "sample_id"
+        },
+        "tool": "vc3d_open_catalog_sample"
+      },
+      "params": {
+        "properties": {
+          "resources": {
+            "properties": {
+              "kinds": {
+                "items": {
+                  "enum": [
+                    "normal_grids",
+                    "lasagna",
+                    "prediction"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "representationRefs": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "volumeIds": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "sampleId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sampleId"
+        ],
+        "type": "object"
+      }
+    },
+    "job.cancel": {
+      "errors": [
+        -32602,
+        -32007,
+        -32010,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "jobId": "job_id"
+        },
+        "tool": "vc3d_cancel_job"
+      },
+      "params": {
+        "properties": {
+          "jobId": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "job.status": {
+      "errors": [
+        -32602,
+        -32007
+      ],
+      "mcp": {
+        "paramRenames": {
+          "jobId": "job_id"
+        },
+        "tool": "vc3d_job_status"
+      },
+      "params": {
+        "properties": {
+          "jobId": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "ping": {
+      "errors": [],
+      "mcp": {
+        "tool": "vc3d_ping"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
     "rpc.describe": {
       "errors": [
         -32602
@@ -10,6 +475,236 @@
             "type": "string"
           }
         },
+        "type": "object"
+      }
+    },
+    "screenshot.capture": {
+      "errors": [
+        -32602,
+        -32002,
+        -32009,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "filePath": "file_path",
+          "maxDim": "max_dim"
+        },
+        "tool": "vc3d_screenshot"
+      },
+      "params": {
+        "properties": {
+          "filePath": {
+            "type": "string"
+          },
+          "maxDim": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "target": {
+            "default": "window",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "segments.activate": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32004,
+        -32007,
+        -32005
+      ],
+      "mcp": {
+        "extraParams": [
+          "auto_fetch"
+        ],
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_activate_segment"
+      },
+      "params": {
+        "properties": {
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
+    "segments.delete": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32007,
+        -32010
+      ],
+      "mcp": {
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_delete_segment"
+      },
+      "params": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "type": "boolean"
+          },
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
+    "segments.fetch": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32004,
+        -32007
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_fetch_segment"
+      },
+      "params": {
+        "properties": {
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
+    "segments.list": {
+      "errors": [
+        -32602,
+        -32000
+      ],
+      "mcp": {
+        "paramRenames": {
+          "onlyLoaded": "only_loaded"
+        },
+        "tool": "vc3d_list_segments"
+      },
+      "params": {
+        "properties": {
+          "onlyLoaded": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "segments.rename": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32007,
+        -32010
+      ],
+      "mcp": {
+        "paramRenames": {
+          "newName": "new_name",
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_rename_segment"
+      },
+      "params": {
+        "properties": {
+          "newName": {
+            "type": "string"
+          },
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId",
+          "newName"
+        ],
+        "type": "object"
+      }
+    },
+    "segments.review": {
+      "errors": [
+        -32602,
+        -32000
+      ],
+      "mcp": {
+        "paramRenames": {
+          "onlyLoaded": "only_loaded"
+        },
+        "tool": "vc3d_review_segments"
+      },
+      "params": {
+        "properties": {
+          "filter": {
+            "properties": {
+              "approved": {
+                "type": "boolean"
+              },
+              "defective": {
+                "type": "boolean"
+              },
+              "hideDefective": {
+                "type": "boolean"
+              },
+              "inspect": {
+                "type": "boolean"
+              },
+              "partialReview": {
+                "type": "boolean"
+              },
+              "reviewed": {
+                "type": "boolean"
+              },
+              "unreviewed": {
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "onlyLoaded": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "state.get": {
+      "errors": [],
+      "mcp": {
+        "tool": "vc3d_get_state"
+      },
+      "params": {
+        "properties": {},
         "type": "object"
       }
     },
@@ -398,6 +1093,135 @@
         "required": [
           "factor"
         ],
+        "type": "object"
+      }
+    },
+    "volume.list": {
+      "errors": [
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_list_volumes"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "volume.open": {
+      "errors": [
+        -32602,
+        -32005,
+        -32007,
+        -32010
+      ],
+      "mcp": {
+        "paramRenames": {
+          "volumeId": "volume_id"
+        },
+        "tool": "vc3d_open_volume"
+      },
+      "params": {
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "volumeId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "volume.select": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "volumeId": "volume_id"
+        },
+        "tool": "vc3d_select_volume"
+      },
+      "params": {
+        "properties": {
+          "volumeId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "volumeId"
+        ],
+        "type": "object"
+      }
+    },
+    "wrap_annotation.commit": {
+      "errors": [
+        -32602,
+        -32000,
+        -32002,
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_commit_wrap_annotation"
+      },
+      "params": {
+        "properties": {
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      }
+    },
+    "wrap_annotation.set_mode": {
+      "errors": [
+        -32602,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_set_wrap_annotation_mode"
+      },
+      "params": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      }
+    },
+    "wrap_annotation.undo": {
+      "errors": [
+        -32602,
+        -32000,
+        -32002,
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_undo_wrap_annotation"
+      },
+      "params": {
+        "properties": {
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       }
     }

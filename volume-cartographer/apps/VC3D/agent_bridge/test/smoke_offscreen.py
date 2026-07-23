@@ -199,12 +199,6 @@ def check_rpc_describe(
             ok,
             f"methods={len(methods)} coverage={coverage}",
         )
-        report = probe_invalid_inputs(client, {"methods": methods})
-        results.record(
-            "viewer_described_invalid_inputs",
-            report.ok,
-            report.detail,
-        )
     except Exception as error:  # noqa: BLE001
         results.record(
             "rpc_describe_viewer",
@@ -224,6 +218,12 @@ def check_rpc_describe(
             rendered == expected,
             f"methods={len(snapshot['methods'])}"
             + (" snapshot updated" if update_snapshot else ""),
+        )
+        report = probe_invalid_inputs(client, snapshot)
+        results.record(
+            "described_invalid_inputs",
+            report.ok,
+            report.detail,
         )
     except Exception as error:  # noqa: BLE001
         results.record(
@@ -319,6 +319,30 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
         "representative clamp/range cases passed"
         if not failures else "; ".join(failures[:4]),
     )
+
+
+def check_canvas_normalization(client: BridgeClient, results: Results) -> None:
+    try:
+        result, _ = client.call(
+            "canvas.drag",
+            {
+                "from": {"x": 1, "y": 1, "z": 1},
+                "to": {"x": 1, "y": 1, "z": 1},
+                "steps": 300,
+            },
+            timeout=10.0,
+        )
+        results.record(
+            "canvas_drag_step_clamp",
+            result.get("steps") == 256,
+            f"steps={result.get('steps')}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "canvas_drag_step_clamp",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
 
 
 def check_c4(client: BridgeClient, results: Results, volpkg: str,
@@ -692,6 +716,7 @@ def main() -> int:
                 update_snapshot=args.update_description_snapshot,
             )
             check_viewer_normalization(client, results)
+            check_canvas_normalization(client, results)
             contracts = [
                 load_contract(path)
                 for path in sorted(CONTRACT_DIR.glob("*.json"))

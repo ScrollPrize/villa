@@ -13,7 +13,6 @@ from vc3d_mcp import tools as _tools  # noqa: F401 - registers the MCP tools
 VC_ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_DIR = VC_ROOT / "apps/VC3D/agent_bridge/schema"
 SPEC_PATH = VC_ROOT / "apps/VC3D/agent_bridge/SPEC.md"
-SERVER_PATH = VC_ROOT / "apps/VC3D/agent_bridge/AgentBridgeServer.cpp"
 DESCRIPTION_PATH = VC_ROOT / "apps/VC3D/agent_bridge/rpc_description.json"
 
 
@@ -120,12 +119,18 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
                     for schema in extra_params.values():
                         self._assert_extensions(schema)
 
-    def test_contracted_methods_are_registered(self) -> None:
-        source = SERVER_PATH.read_text(encoding="utf-8")
-        registered = set(
-            re.findall(r'_handlers\.insert\("([^"]+)"', source)
+    def test_contracts_are_present_in_live_description(self) -> None:
+        remaining = set(self.methods) - set(self.described_methods)
+        sources = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                VC_ROOT / "apps/VC3D/agent_bridge"
+            ).glob("AgentBridge*.cpp")
         )
-        self.assertLessEqual(set(self.methods), registered)
+        registered = set(
+            re.findall(r'_handlers\.insert\("([^"]+)"', sources)
+        )
+        self.assertLessEqual(remaining, registered)
 
     def test_live_description_shape(self) -> None:
         self.assertTrue(self.described_methods)
