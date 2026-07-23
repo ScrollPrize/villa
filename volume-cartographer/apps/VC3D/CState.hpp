@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
@@ -67,6 +68,11 @@ public:
 
     // --- Surfaces (inlined from CSurfaceCollection) ---
     void setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend = false, bool isEditUpdate = false);
+    // Apply catalog-style surface additions/replacements/removals atomically
+    // from observers' perspective. Individual surface signals are suppressed
+    // and one empty-name surfaceChanged signal is emitted after the map is final.
+    void setSurfacesBatch(
+        const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& updates);
     std::shared_ptr<Surface> surface(const std::string& name);
     Surface* surfaceRaw(const std::string& name);
     std::string findSurfaceId(Surface* surf);
@@ -115,4 +121,6 @@ private:
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;
     std::unordered_map<std::string, std::unique_ptr<POI>> _pois;
     uint64_t _surfacesVersion = 0;
+    int _surfaceBatchDepth = 0;
+    bool _surfaceBatchChanged = false;
 };

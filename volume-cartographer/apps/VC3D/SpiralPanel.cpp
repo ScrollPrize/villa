@@ -436,6 +436,24 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             this, &SpiralPanel::surfaceIntersectionsChanged);
     displayDialogLayout->addWidget(_showSurfaceIntersections);
 
+    auto* intersectionStrideRow = new QWidget(_displayDialog);
+    auto* intersectionStrideLayout = new QHBoxLayout(intersectionStrideRow);
+    intersectionStrideLayout->setContentsMargins(0, 0, 0, 0);
+    auto* intersectionStride = new QSpinBox(intersectionStrideRow);
+    intersectionStride->setObjectName(QStringLiteral("spiralSurfaceIntersectionStride"));
+    intersectionStride->setRange(1, 16);
+    intersectionStride->setValue(4);
+    intersectionStride->setToolTip(
+        tr("Sample every Nth input-surface grid cell when building Spiral intersections; "
+           "larger values are faster but less detailed"));
+    intersectionStrideLayout->addWidget(
+        new QLabel(tr("Surface intersection stride"), intersectionStrideRow));
+    intersectionStrideLayout->addWidget(intersectionStride);
+    intersectionStrideLayout->addStretch(1);
+    connect(intersectionStride, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, &SpiralPanel::surfaceIntersectionStrideChanged);
+    displayDialogLayout->addWidget(intersectionStrideRow);
+
     auto* surfaceOverlap = new QCheckBox(tr("Show patch overlap on flattened output"),
                                          _displayDialog);
     surfaceOverlap->setObjectName(QStringLiteral("spiralShowSurfaceOverlap"));

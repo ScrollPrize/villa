@@ -46,6 +46,7 @@ signals:
     void lossMapChanged(const QString& name, qreal opacity);
     void windingRangeChanged(int minimum, int maximum);
     void surfaceIntersectionsChanged(bool shown);
+    void surfaceIntersectionStrideChanged(int stride);
     void surfaceOverlapChanged(bool shown);
     void pythonOutputRequested();
     void flattenWithLasagnaRequested();

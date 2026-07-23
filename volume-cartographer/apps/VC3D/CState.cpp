@@ -332,7 +332,8 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     if (sameSurface && !isEditUpdate && surf != nullptr) {
         return;
     }
-    if (it != _surfs.end() && it->second && it->second != surf) {
+    if (_surfaceBatchDepth == 0 && it != _surfs.end() && it->second &&
+        it->second != surf) {
         emit surfaceWillBeDeleted(name, it->second);
     }
 
@@ -360,9 +361,12 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
         // Edit updates re-set the same pointer every frame; only a mapping
         // change should invalidate cached views of the surface map.
         ++_surfacesVersion;
+        if (_surfaceBatchDepth > 0) {
+            _surfaceBatchChanged = true;
+        }
     }
 
-    if (!noSignalSend || surf == nullptr) {
+    if (_surfaceBatchDepth == 0 && (!noSignalSend || surf == nullptr)) {
         emit surfaceChanged(name, surf, isEditUpdate);
     }
 
@@ -374,6 +378,37 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
             delayedFocusPoi->suppressTransientPlaneIntersections = false;
         }
     }
+}
+
+void CState::setSurfacesBatch(
+    const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& updates)
+{
+    const bool outermost = _surfaceBatchDepth == 0;
+    if (outermost) {
+        _surfaceBatchChanged = false;
+    }
+    ++_surfaceBatchDepth;
+
+    auto finishBatch = [this, outermost]() {
+        --_surfaceBatchDepth;
+        if (outermost) {
+            const bool changed = _surfaceBatchChanged;
+            _surfaceBatchChanged = false;
+            if (changed) {
+                emit surfaceChanged("", nullptr, false);
+            }
+        }
+    };
+
+    try {
+        for (const auto& [name, surface] : updates) {
+            setSurface(name, surface, true, false);
+        }
+    } catch (...) {
+        finishBatch();
+        throw;
+    }
+    finishBatch();
 }
 
 void CState::emitSurfacesChanged()

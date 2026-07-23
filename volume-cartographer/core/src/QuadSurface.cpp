@@ -295,6 +295,68 @@ cv::Vec3f surfaceCenterFor(const cv::Mat_<cv::Vec3f>& points, const cv::Vec2f& s
     };
 }
 
+struct LazySurfaceGeometry {
+    cv::Vec2f scale;
+    cv::Vec3f center;
+    cv::Rect bounds;
+};
+
+LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
+                                            const utils::Json& metadata)
+{
+    auto readScale = [](const utils::Json& json) -> std::optional<cv::Vec2f> {
+        if (!json.contains("scale") || !json["scale"].is_array() ||
+            json["scale"].size() < 2) {
+            return std::nullopt;
+        }
+        const cv::Vec2f scale{json["scale"][0].get_float(),
+                              json["scale"][1].get_float()};
+        if (!std::isfinite(scale[0]) || !std::isfinite(scale[1]) ||
+            scale[0] <= 0.0f || scale[1] <= 0.0f) {
+            return std::nullopt;
+        }
+        return scale;
+    };
+
+    std::optional<cv::Vec2f> scale = readScale(metadata);
+    if (!scale) {
+        const auto diskMetadata =
+            vc::json::load_json_file(path / "meta.json");
+        scale = readScale(diskMetadata);
+    }
+    if (!scale) {
+        throw std::runtime_error("Missing or invalid surface scale in: " +
+                                 (path / "meta.json").string());
+    }
+
+    const auto xPath = path / "x.tif";
+    TIFF* tif = TIFFOpen(xPath.string().c_str(), "r");
+    if (!tif) {
+        throw std::runtime_error("Failed to open TIFF: " + xPath.string());
+    }
+    uint32_t width = 0;
+    uint32_t height = 0;
+    const bool haveGeometry =
+        TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width) &&
+        TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
+    TIFFClose(tif);
+    if (!haveGeometry || width == 0 || height == 0) {
+        throw std::runtime_error("TIFF missing width/height: " + xPath.string());
+    }
+
+    LazySurfaceGeometry result;
+    result.scale = *scale;
+    result.center = {
+        scaledCenterComponent(static_cast<int>(width), result.scale[0]),
+        scaledCenterComponent(static_cast<int>(height), result.scale[1]),
+        0.0f,
+    };
+    result.bounds = {
+        0, 0, static_cast<int>(width) - 1, static_cast<int>(height) - 1,
+    };
+    return result;
+}
+
 cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
     const cv::Mat_<cv::Vec3f>& points,
     const cv::Size& newSize)
@@ -614,6 +676,10 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
         }
     }
 
+    const LazySurfaceGeometry geometry = readLazySurfaceGeometry(path, meta);
+    _scale = geometry.scale;
+    _center = geometry.center;
+    _bounds = geometry.bounds;
     _maskTimestamp = readMaskTimestamp(path);
     _needsLoad = true;  // Points will be loaded lazily
 }
@@ -635,6 +701,10 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &
         }
     }
 
+    const LazySurfaceGeometry geometry = readLazySurfaceGeometry(path, meta);
+    _scale = geometry.scale;
+    _center = geometry.center;
+    _bounds = geometry.bounds;
     _maskTimestamp = readMaskTimestamp(path);
     _needsLoad = true;  // Points will be loaded lazily
 }

@@ -61,6 +61,53 @@ std::shared_ptr<QuadSurface> makeSurface(std::string id)
 
 } // namespace
 
+TEST_CASE("CState batches surface catalog mutations into one notification")
+{
+    int changedCount = 0;
+    int willDeleteCount = 0;
+    std::string changedName;
+    CState state(0);
+    auto first = makeSurface("first");
+    auto second = makeSurface("second");
+
+    const auto changedConnection = QObject::connect(
+        &state, &CState::surfaceChanged,
+        [&changedCount, &changedName](std::string name, std::shared_ptr<Surface>, bool) {
+            ++changedCount;
+            changedName = std::move(name);
+        });
+    const auto deleteConnection = QObject::connect(
+        &state, &CState::surfaceWillBeDeleted,
+        [&willDeleteCount](std::string, std::shared_ptr<Surface>) {
+            ++willDeleteCount;
+        });
+
+    state.setSurfacesBatch({
+        {"first", first},
+        {"second", second},
+    });
+
+    CHECK(changedCount == 1);
+    CHECK(changedName.empty());
+    CHECK(willDeleteCount == 0);
+    CHECK(state.surface("first") == first);
+    CHECK(state.surface("second") == second);
+
+    state.setSurfacesBatch({
+        {"first", nullptr},
+        {"second", first},
+    });
+
+    CHECK(changedCount == 2);
+    CHECK(changedName.empty());
+    CHECK(willDeleteCount == 0);
+    CHECK(state.surface("first") == nullptr);
+    CHECK(state.surface("second") == first);
+
+    QObject::disconnect(changedConnection);
+    QObject::disconnect(deleteConnection);
+}
+
 TEST_CASE("ink detection options survive transformed segmentation previews with source id")
 {
     const std::string segmentId = "20260623144957-w053-058";

@@ -1609,6 +1609,15 @@ void ViewerManager::handleSurfacePatchIndexTaskFinished()
     }
 
     const auto result = _surfacePatchIndexTaskWatcher->future().result();
+    if (_surfacePatchIndexNeedsRebuild) {
+        // A bulk surface replacement superseded this serialized delta while it
+        // was running. The task mutated only the outgoing live index; rebuild
+        // once from the final state and do not render the transient result.
+        _indexedSurfaceIds.clear();
+        primeSurfacePatchIndicesAsync();
+        return;
+    }
+
     if (result.success) {
         if (result.type == SurfacePatchIndexTaskType::Update) {
             _indexedSurfaceIds.insert(result.id);
@@ -1700,6 +1709,31 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
 
 void ViewerManager::handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate)
 {
+    if (name.empty()) {
+        // Empty-name notifications represent a completed bulk mutation of the
+        // surface catalog. Drop serialized deltas and rebuild once from the
+        // final CState snapshot instead of replaying thousands of updates.
+        _pendingSurfacePatchIndexTasks.clear();
+        _surfacesQueuedDuringRebuild.clear();
+        _pendingSurfacePatchIndexSurfaceIds.clear();
+        _deferredIndexSwap.reset();
+        _deferredIndexSwapIds.clear();
+        _indexedSurfaceIds.clear();
+        _surfacePatchIndexNeedsRebuild = true;
+        forEachBaseViewer([](VolumeViewerBase* v) {
+            v->invalidateIntersect();
+        });
+
+        // A single-surface task mutates the live index. Let it drain before
+        // launching the replacement build; its completion handler will prime.
+        const bool taskRunning =
+            _surfacePatchIndexTaskWatcher && _surfacePatchIndexTaskWatcher->isRunning();
+        if (!taskRunning) {
+            primeSurfacePatchIndicesAsync();
+        }
+        return;
+    }
+
     bool affectsSurfaceIndex = false;
     bool regionUpdated = false;
 

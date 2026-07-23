@@ -132,6 +132,9 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     // re-applying it here never resets the warm cache.
     _state = new CState(_mainState ? _mainState->cacheSizeBytes() : 0, this);
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
+    // Spiral can trade some intersection detail for substantially cheaper
+    // input-patch indexing without changing the main workspace preference.
+    _viewerManager->setSurfacePatchSamplingStride(4, false);
     _slices = std::make_unique<AxisAlignedSliceController>(_state, this);
     _slices->setViewerManager(_viewerManager.get());
     // Spiral always uses axis-aligned slices; don't write the user's global
@@ -347,6 +350,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         _showSurfaceIntersections = shown;
         updateSurfaceIntersections();
     });
+    connect(_panel, &SpiralPanel::surfaceIntersectionStrideChanged,
+            this, [this](int stride) {
+                _viewerManager->setSurfacePatchSamplingStride(stride, false);
+            });
     connect(_panel, &SpiralPanel::surfaceOverlapChanged, this, [this](bool shown) {
         _showSurfaceOverlap = shown;
         updateSurfaceIntersections();
@@ -551,8 +558,8 @@ void SpiralWorkspace::loadInputSurfaces(const QJsonObject& servicePaths, quint64
             }
             for (int index = 0; index < candidates.size(); ++index) {
                 try {
-                    auto loaded = load_quad_from_tifxyz(candidates[index].toStdString());
-                    auto surface = std::shared_ptr<QuadSurface>(std::move(loaded));
+                    auto surface = std::make_shared<QuadSurface>(
+                        std::filesystem::path(candidates[index].toStdString()));
                     const QString id = QStringLiteral("spiral/%1/g%2/%3-%4")
                         .arg(category).arg(generation)
                         .arg(QFileInfo(candidates[index]).fileName()).arg(index);
@@ -579,8 +586,12 @@ void SpiralWorkspace::installInputSurfaces(const InputSurfaceLoadResult& result,
         replacement[category] = {};
     QHash<QString, QString> replacementSourceIds;
     std::map<std::string, cv::Vec3b> replacementColors;
+    std::vector<std::pair<std::string, std::shared_ptr<Surface>>> surfaceUpdates;
+    surfaceUpdates.reserve(result.surfaces.size());
+    QSet<QString> replacementIds;
     for (const auto& entry : result.surfaces) {
-        _state->setSurface(entry.id.toStdString(), entry.surface);
+        surfaceUpdates.emplace_back(entry.id.toStdString(), entry.surface);
+        replacementIds.insert(entry.id);
         replacement[entry.category].push_back(entry.id);
         replacementSourceIds[entry.id] = entry.sourceId;
         const std::string colorKey = QStringLiteral("%1/%2")
@@ -599,16 +610,18 @@ void SpiralWorkspace::installInputSurfaces(const InputSurfaceLoadResult& result,
                                    vc3d::surfaceOverlayColorBgr(assignment->second));
     }
     const auto retired = _surfaceCategoryIds;
+    for (auto it = retired.begin(); it != retired.end(); ++it) {
+        for (const QString& id : it.value()) {
+            if (!replacementIds.contains(id)) {
+                surfaceUpdates.emplace_back(id.toStdString(), nullptr);
+            }
+        }
+    }
     _surfaceCategoryIds = replacement;
     _surfaceSourceIds = std::move(replacementSourceIds);
     _surfaceOverlayColors = std::move(replacementColors);
+    _state->setSurfacesBatch(surfaceUpdates);
     updateSurfaceIntersections();
-    QTimer::singleShot(0, this, [this, retired]() {
-        if (_shuttingDown) return;
-        for (auto it = retired.begin(); it != retired.end(); ++it)
-            for (const QString& id : it.value())
-                _state->setSurface(id.toStdString(), nullptr);
-    });
     if (!result.warnings.isEmpty())
         statusBar()->showMessage(result.warnings.join(QStringLiteral("; ")), 15000);
 }

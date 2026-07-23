@@ -84,6 +84,10 @@ TEST_CASE("QuadSurface(path, json) ctor with bbox + components fields")
     j["components"] = comps;
 
     QuadSurface qs(d, j);
+    CHECK_FALSE(qs.isLoaded());
+    CHECK(qs.scale() == cv::Vec2f(1.f, 1.f));
+    CHECK(qs.center() == cv::Vec3f(8.f, 8.f, 0.f));
+    CHECK_FALSE(qs.isLoaded());
     qs.ensureLoaded();
     CHECK(qs.rawPointsPtr() != nullptr);
     CHECK(qs.meta["uuid"].get_string() == "test-uuid");
@@ -249,9 +253,38 @@ TEST_CASE("countValid* on path-only (unloaded) construction lazily loads")
         seed.save(d);
     }
     QuadSurface reloaded(d);
+    CHECK_FALSE(reloaded.isLoaded());
+    CHECK(reloaded.scale() == cv::Vec2f(1.f, 1.f));
+    CHECK(reloaded.center() == cv::Vec3f(4.f, 4.f, 0.f));
+    CHECK_FALSE(reloaded.isLoaded());
     // Just touch countValidPoints; it triggers ensureLoaded internally.
     int validPts = reloaded.countValidPoints();
     CHECK(validPts >= 0); // small grids may or may not have valid points
+    fs::remove_all(root);
+}
+
+TEST_CASE("mapped SurfacePatchIndex rebuild keeps disk-backed surfaces lazy")
+{
+    auto root = tmpDir("mapped_lazy_index");
+    auto d = root / "seg";
+    {
+        QuadSurface seed(makePlanarGrid(16, 16, 5.f), cv::Vec2f(2.f, 4.f));
+        seed.id = d.filename().string();
+        seed.save(d);
+    }
+
+    auto lazy = std::make_shared<QuadSurface>(d);
+    CHECK_FALSE(lazy->isLoaded());
+    CHECK(lazy->scale() == cv::Vec2f(2.f, 4.f));
+    CHECK(lazy->center() == cv::Vec3f(4.f, 2.f, 0.f));
+
+    SurfacePatchIndex index;
+    index.setSamplingStride(4);
+    index.rebuild({lazy});
+
+    CHECK_FALSE(index.empty());
+    CHECK(index.containsSurface(lazy));
+    CHECK_FALSE(lazy->isLoaded());
     fs::remove_all(root);
 }
 
