@@ -27,6 +27,7 @@
 #include "MenuActionController.hpp"
 
 #include "agent_bridge/AgentBridgeError.hpp"  // AgentBridgeError
+#include "agent_bridge/AgentBridgeMethod.hpp"
 
 class QLocalServer;
 class QLocalSocket;
@@ -72,6 +73,8 @@ private:
     using Handler = std::function<QJsonObject(const QJsonValue& params)>;
 
     void registerHandlers();
+    void registerViewerHandlers();
+    void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's
     // ~/.fit_services convention) ---
@@ -113,6 +116,7 @@ private:
 
     // --- Handlers ---
     QJsonObject handlePing(const QJsonValue& params);
+    QJsonObject handleRpcDescribe(const QJsonValue& params);
     QJsonObject handleStateGet(const QJsonValue& params);
     QJsonObject handleSegmentsList(const QJsonValue& params);
     QJsonObject handleSegmentsActivate(const QJsonValue& params);
@@ -409,6 +413,7 @@ private:
     // until a successful listen()); removed in the destructor.
     QString _registryFilePath;
     QHash<QString, Handler> _handlers;
+    QHash<QString, AgentBridgeMethod> _methodDescriptions;
     QHash<QLocalSocket*, QByteArray> _buffers;
 
     std::vector<ViewerEntry> _viewers;

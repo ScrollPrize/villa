@@ -29,6 +29,7 @@
 #include <set>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 #include "CWindow.hpp"
 #include "AxisAlignedSliceController.hpp"
@@ -92,6 +93,7 @@ private:
     LineAnnotationController* _controller;
     bool _wasSuppressed;
 };
+
 }  // namespace
 
 
@@ -390,6 +392,9 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
 
     QJsonObject result;
     try {
+        auto description = _methodDescriptions.constFind(method);
+        if (description != _methodDescriptions.cend())
+            description.value().validate(params);
         result = it.value()(params);
     } catch (const AgentBridgeDeferred&) {
         // The handler took ownership of the reply; it will be written later by
@@ -610,8 +615,78 @@ VolumeViewerBase* AgentBridgeServer::resolveViewer(const QJsonValue& ref,
 // Handlers
 // ---------------------------------------------------------------------------
 
+QJsonObject AgentBridgeServer::handleRpcDescribe(const QJsonValue& params)
+{
+    const QJsonObject object = paramsObject(params);
+    const QString prefix = jsonOptionalString(object, "prefix");
+
+    QStringList describedNames = _methodDescriptions.keys();
+    std::sort(describedNames.begin(), describedNames.end());
+
+    QJsonObject methods;
+    int describedCount = 0;
+    for (const QString& name : describedNames) {
+        if (prefix.isEmpty() || name.startsWith(prefix)) {
+            methods[name] = _methodDescriptions.value(name).describe();
+            ++describedCount;
+        }
+    }
+
+    QStringList registeredNames = _handlers.keys();
+    std::sort(registeredNames.begin(), registeredNames.end());
+
+    QJsonArray undocumented;
+    int registeredCount = 0;
+    for (const QString& name : registeredNames) {
+        if (!prefix.isEmpty() && !name.startsWith(prefix))
+            continue;
+        ++registeredCount;
+        if (!_methodDescriptions.contains(name))
+            undocumented.append(name);
+    }
+
+    QJsonObject coverage;
+    coverage["described"] = describedCount;
+    coverage["registered"] = registeredCount;
+    coverage["complete"] = describedCount == registeredCount;
+
+    QJsonObject result;
+    result["methods"] = methods;
+    result["undocumented"] = undocumented;
+    result["coverage"] = coverage;
+    return result;
+}
+
+
+void AgentBridgeServer::registerMethod(AgentBridgeMethod method, Handler handler)
+{
+    const QString name = method.name;
+    const QString definitionError = method.definitionError();
+    if (!definitionError.isEmpty()) {
+        qFatal(
+            "Invalid agent bridge method description: %s",
+            qPrintable(definitionError));
+    }
+    if (_handlers.contains(name))
+        qFatal("Duplicate agent bridge method: %s", qPrintable(name));
+
+    _methodDescriptions.insert(name, std::move(method));
+    _handlers.insert(name, std::move(handler));
+}
+
+
 void AgentBridgeServer::registerHandlers()
 {
+    registerMethod(
+        {
+            .name = QStringLiteral("rpc.describe"),
+            .params = {{
+                .name = QStringLiteral("prefix"),
+                .type = AgentBridgeParamType::String,
+            }},
+            .errors = {-32602},
+        },
+        [this](const QJsonValue& p) { return handleRpcDescribe(p); });
     _handlers.insert("ping",
         [this](const QJsonValue& p) { return handlePing(p); });
     _handlers.insert("state.get",
@@ -640,26 +715,7 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleCanvasClick(p, /*addShift=*/true); });
     _handlers.insert("canvas.drag",
         [this](const QJsonValue& p) { return handleCanvasDrag(p); });
-    _handlers.insert("viewer.center_on_point",
-        [this](const QJsonValue& p) { return handleViewerCenterOnPoint(p); });
-    _handlers.insert("viewer.zoom",
-        [this](const QJsonValue& p) { return handleViewerZoom(p); });
-    _handlers.insert("viewer.rotate",
-        [this](const QJsonValue& p) { return handleViewerRotate(p); });
-    _handlers.insert("viewer.set_axis_aligned_slices",
-        [this](const QJsonValue& p) { return handleViewerSetAxisAlignedSlices(p); });
-    _handlers.insert("viewer.get_render_settings",
-        [this](const QJsonValue& p) { return handleViewerGetRenderSettings(p); });
-    _handlers.insert("viewer.set_render_settings",
-        [this](const QJsonValue& p) { return handleViewerSetRenderSettings(p); });
-    _handlers.insert("viewer.get_overlay",
-        [this](const QJsonValue& p) { return handleViewerGetOverlay(p); });
-    _handlers.insert("viewer.set_overlay",
-        [this](const QJsonValue& p) { return handleViewerSetOverlay(p); });
-    _handlers.insert("viewer.list_overlay_volumes",
-        [this](const QJsonValue& p) { return handleViewerListOverlayVolumes(p); });
-    _handlers.insert("viewer.set_intersects",
-        [this](const QJsonValue& p) { return handleViewerSetIntersects(p); });
+    registerViewerHandlers();
     _handlers.insert("segmentation.enable_editing",
         [this](const QJsonValue& p) { return handleSegmentationEnableEditing(p); });
     _handlers.insert("segmentation.grow",

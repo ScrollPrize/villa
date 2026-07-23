@@ -93,18 +93,21 @@ are **jobs**: the RPC returns immediately with a `jobId` and progress is deliver
 
 ## 2. Common conventions
 
-`schema/viewer.json` is the machine-readable pilot for viewer method membership and
-input shapes. `tools/vc3d-mcp/test_contract.py` checks it against the MCP mappings in
-this document and FastMCP's generated input schemas. The offscreen smoke test calls every
-declared method against the real bridge, then derives invalid-input, error, and
-normalization probes from the same contract. The hand-written result shapes and
-behavioral notes below remain authoritative; the pilot does not generate or replace them.
+The viewer RPCs pilot server-owned method descriptions in
+`AgentBridgeServer::registerViewerHandlers`. Each description declares mechanical input
+types, required fields, enums, simple rejecting bounds, and documented error codes beside
+the handler registration. Dispatch validates those declarations before invoking the
+handler. `rpc.describe {"prefix":"viewer."}` returns the live descriptions plus migration
+coverage. Cross-field rules, normalization, result shapes, and behavioral notes remain in
+their readable handlers and the reference below.
 
-The contract uses `x-clamp: [minimum, maximum]` for accepted numeric values that are
-normalized rather than rejected (`null` means no bound). Coupled low/high windows also
-carry `x-ordered-range`, because clamping `high` cannot be specified independently from the
-minimum-gap rule. The offscreen smoke test derives live normalization probes from these
-annotations.
+`rpc.describe` accepts an optional string `prefix`. Its `methods` object contains matching
+method descriptions, `undocumented` lists matching handlers not yet migrated, and `coverage`
+reports matching `described` and `registered` counts plus whether that slice is complete.
+
+The remaining files under `schema/` are temporary migration oracles for methods that have
+not moved to C++ registration yet. Their generic conformance and offscreen probes stay in
+place until each domain is migrated, then that domain file is deleted.
 
 ### 2.1 Coordinate spaces
 
@@ -3426,7 +3429,7 @@ Both return the **full** settings object with these exact keys:
 **`viewer.get_render_settings`**
 - **params:** none.
 - **result:** the settings object above.
-- **errors:** none.
+- **errors:** `-32010` (viewer manager unavailable).
 
 **`viewer.set_render_settings`**
 - **params:** any **subset** of the keys above (all optional; unknown keys are ignored).
@@ -3441,7 +3444,8 @@ Both return the **full** settings object with these exact keys:
   slider's range); `highlightedSurfaceIds` **replaces** the list wholesale. A key present
   with a wrong-typed value → `-32602` (`data.param` names the offender).
 - **result:** the full settings object **after** applying the change (same shape as get).
-- **errors:** `-32602` (`data.param` — a provided key had the wrong type).
+- **errors:** `-32602` (`data.param` — a provided key had the wrong type),
+  `-32010` (viewer manager unavailable).
 
 Grounding: `intersectionOpacity`/`intersectionThickness`/`overlayOpacity`/
 `intersectionMaxSurfaces`/`volumeWindow`/`samplingStride`/`zScrollSensitivity` are

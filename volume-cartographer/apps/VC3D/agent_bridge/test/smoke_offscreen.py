@@ -146,6 +146,156 @@ def expect_param_error(client: BridgeClient, method: str, params: object,
         return False, f"unexpected {type(e).__name__}: {e}"
 
 
+def check_rpc_describe(client: BridgeClient, results: Results) -> None:
+    expected = {
+        "viewer.center_on_point",
+        "viewer.zoom",
+        "viewer.rotate",
+        "viewer.set_axis_aligned_slices",
+        "viewer.get_render_settings",
+        "viewer.set_render_settings",
+        "viewer.get_overlay",
+        "viewer.set_overlay",
+        "viewer.list_overlay_volumes",
+        "viewer.set_intersects",
+    }
+    try:
+        description, _ = client.call(
+            "rpc.describe",
+            {"prefix": "viewer."},
+            timeout=10.0,
+        )
+        methods = description.get("methods", {})
+        coverage = description.get("coverage", {})
+        factor = (
+            methods.get("viewer.zoom", {})
+            .get("params", {})
+            .get("properties", {})
+            .get("factor", {})
+        )
+        surface_ids = (
+            methods.get("viewer.set_intersects", {})
+            .get("params", {})
+            .get("properties", {})
+            .get("surfaceIds", {})
+        )
+        ok = (
+            set(methods) == expected
+            and description.get("undocumented") == []
+            and coverage.get("described") == len(expected)
+            and coverage.get("registered") == len(expected)
+            and coverage.get("complete") is True
+            and factor.get("type") == "number"
+            and factor.get("exclusiveMinimum") == 0
+            and surface_ids.get("items", {}).get("type") == "string"
+        )
+        results.record(
+            "rpc_describe_viewer",
+            ok,
+            f"methods={len(methods)} coverage={coverage}",
+        )
+        report = probe_invalid_inputs(client, {"methods": methods})
+        results.record(
+            "viewer_described_invalid_inputs",
+            report.ok,
+            report.detail,
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "rpc_describe_viewer",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
+    ok, detail = expect_param_error(
+        client,
+        "rpc.describe",
+        {"prefix": 7},
+        "prefix",
+    )
+    results.record("rpc_describe_prefix_type", ok, detail)
+
+
+def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
+    failures: list[str] = []
+
+    def expect(result: dict, path: str, expected: int | float) -> None:
+        actual: object = result
+        for part in path.split("."):
+            if not isinstance(actual, dict) or part not in actual:
+                failures.append(f"{path}: missing from result")
+                return
+            actual = actual[part]
+        if actual != expected:
+            failures.append(f"{path}: expected {expected}, got {actual!r}")
+
+    try:
+        render, _ = client.call(
+            "viewer.set_render_settings",
+            {
+                "intersectionOpacity": 7.5,
+                "intersectionThickness": -7.5,
+                "overlayOpacity": -7.5,
+                "intersectionMaxSurfaces": -7,
+                "volumeWindow": {"low": 10, "high": 5},
+                "normalArrowLengthScale": 7.5,
+                "normalMaxArrows": 107,
+                "samplingStride": -7,
+                "zScrollSensitivity": 107,
+            },
+            timeout=10.0,
+        )
+        for path, expected in {
+            "intersectionOpacity": 1,
+            "intersectionThickness": 0,
+            "overlayOpacity": 0,
+            "intersectionMaxSurfaces": 0,
+            "volumeWindow.low": 10,
+            "volumeWindow.high": 11,
+            "normalArrowLengthScale": 2,
+            "normalMaxArrows": 100,
+            "samplingStride": 1,
+            "zScrollSensitivity": 100,
+        }.items():
+            expect(render, path, expected)
+
+        overlay, _ = client.call(
+            "viewer.set_overlay",
+            {
+                "opacity": 7.5,
+                "threshold": 300,
+                "maxDisplayedResolution": 12,
+                "composite": {"layersFront": -7, "layersBehind": 100},
+            },
+            timeout=10.0,
+        )
+        for path, expected in {
+            "opacity": 1,
+            "threshold": 255,
+            "maxDisplayedResolution": 5,
+            "composite.layersFront": 0,
+            "composite.layersBehind": 64,
+        }.items():
+            expect(overlay, path, expected)
+
+        overlay, _ = client.call(
+            "viewer.set_overlay",
+            {"window": {"low": 10, "high": 5}},
+            timeout=10.0,
+        )
+        expect(overlay, "windowLow", 10)
+        expect(overlay, "windowHigh", 11)
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"{type(error).__name__}: {error}")
+
+    results.record(
+        "viewer_normalization",
+        not failures,
+        "representative clamp/range cases passed"
+        if not failures else "; ".join(failures[:4]),
+    )
+
+
 def check_c4(client: BridgeClient, results: Results, volpkg: str,
              broken_fiber_volpkg: str) -> None:
     # Liveness / dispatch sanity.
@@ -167,6 +317,17 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
     ok, detail = expect_param_error(
         client, "viewer.zoom", {"factor": "abc"}, "factor")
     results.record("c4_zoom_factor_string", ok, detail)
+
+    ok, detail = expect_param_error(
+        client,
+        "viewer.center_on_point",
+        {
+            "viewer": "__missing__",
+            "point": {"x": "bad", "y": 1, "z": 1},
+        },
+        "point.x",
+    )
+    results.record("viewer_prevalidation_precedence", ok, detail)
 
     ok, detail = expect_param_error(
         client, "volume.open", {"path": 123}, "path")
@@ -495,6 +656,8 @@ def main() -> int:
             log(f"handshake: name={name} path={sock_path}")
             client = BridgeClient(sock_path, connect_timeout=10.0)
 
+            check_rpc_describe(client, results)
+            check_viewer_normalization(client, results)
             contracts = [
                 load_contract(path)
                 for path in sorted(CONTRACT_DIR.glob("*.json"))

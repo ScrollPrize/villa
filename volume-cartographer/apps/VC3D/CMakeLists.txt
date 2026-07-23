@@ -227,6 +227,8 @@ set(srcs
     volume_viewers/CChunkedVolumeViewer.hpp
     agent_bridge/AgentBridgeServer.cpp
     agent_bridge/AgentBridgeServer.hpp
+    agent_bridge/AgentBridgeMethod.hpp
+    agent_bridge/AgentBridgeMethods_viewer.cpp
     agent_bridge/AgentBridgeCommandError.hpp
     agent_bridge/AgentBridgeInternal.hpp
     agent_bridge/AgentBridgeJobs.cpp

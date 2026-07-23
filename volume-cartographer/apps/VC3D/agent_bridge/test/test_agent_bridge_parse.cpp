@@ -18,6 +18,7 @@
 
 #include "agent_bridge/AgentBridgeCommandError.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
+#include "agent_bridge/AgentBridgeMethod.hpp"
 
 namespace {
 
@@ -227,6 +228,78 @@ int main()
         CHECK(v[1] == 2.0f);
         CHECK(v[2] == 3.0f);
     });
+
+    AgentBridgeParam factor{
+        .name = QStringLiteral("factor"),
+        .type = AgentBridgeParamType::Number,
+        .required = true,
+        .finite = true,
+        .minimum = 0.0,
+        .exclusiveMinimum = true,
+    };
+    AgentBridgeParam mode{
+        .name = QStringLiteral("mode"),
+        .type = AgentBridgeParamType::String,
+        .values = {QStringLiteral("max"), QStringLiteral("mean")},
+    };
+    AgentBridgeMethod method{
+        .name = QStringLiteral("test.method"),
+        .params = {factor, mode},
+        .errors = {-32602, -32000},
+    };
+    expectNoThrow("method<-valid", [&] {
+        method.validate(QJsonObject{{"factor", 2.5}, {"mode", "max"}});
+    });
+    expectParamError("method<-missing", "factor", [&] {
+        method.validate(QJsonObject{});
+    });
+    expectParamError("method<-wrong-type", "factor", [&] {
+        method.validate(QJsonObject{{"factor", "2.5"}});
+    });
+    expectParamError("method<-exclusive-minimum", "factor", [&] {
+        method.validate(QJsonObject{{"factor", 0.0}});
+    });
+    expectParamError("method<-enum", "mode", [&] {
+        method.validate(QJsonObject{{"factor", 1.0}, {"mode", "minimum"}});
+    });
+    expectParamError("method<-array-params", "params", [&] {
+        method.validate(QJsonArray{});
+    });
+    AgentBridgeParam nestedArray = AgentBridgeParams::optionalArray(
+        QStringLiteral("points"),
+        AgentBridgeParams::optionalArray(
+            QString(),
+            AgentBridgeParams::optionalNumber(QString())));
+    expectNoThrow("nested-array<-valid", [&] {
+        nestedArray.validate(QJsonArray{QJsonArray{1.0, 2.0}});
+    });
+    expectParamError("nested-array<-invalid-item", "points", [&] {
+        nestedArray.validate(QJsonArray{QJsonArray{1.0, "two"}});
+    });
+    CHECK(method.definitionError().isEmpty());
+    CHECK(nestedArray.definitionError(QStringLiteral("points")).isEmpty());
+    const AgentBridgeMethod duplicateParams{
+        .name = QStringLiteral("duplicate.params"),
+        .params = {factor, factor},
+    };
+    CHECK(duplicateParams.definitionError().contains("duplicate parameter"));
+    const AgentBridgeParam missingItems{
+        .name = QStringLiteral("values"),
+        .type = AgentBridgeParamType::Array,
+    };
+    CHECK(missingItems.definitionError().contains("no item schema"));
+    {
+        const QJsonObject description = method.describe();
+        const QJsonObject params = description.value("params").toObject();
+        const QJsonObject properties = params.value("properties").toObject();
+        CHECK(params.value("required").toArray() == QJsonArray{"factor"});
+        CHECK(properties.value("factor").toObject().value("exclusiveMinimum") == 0.0);
+        CHECK(properties.value("mode").toObject().value("enum").toArray() ==
+              QJsonArray({"max", "mean"}));
+        CHECK(description.value("errors").toArray() == QJsonArray({-32602, -32000}));
+        CHECK(nestedArray.describe().value("items").toObject()
+                  .value("items").toObject().value("type") == "number");
+    }
 
     CHECK(volumePointInBounds(cv::Vec3f{0.0f, 1.0f, 2.0f}, {3, 4, 5}));
     CHECK(volumePointInBounds(cv::Vec3f{2.9f, 3.9f, 4.9f}, {3, 4, 5}));
