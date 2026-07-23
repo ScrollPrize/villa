@@ -47,13 +47,10 @@ void AgentBridgeServer::registerEditingHandlers()
         {
             .name = QStringLiteral("segmentation.grow"),
             .params = {
-                Params::optionalStringEnum(
+                // manual_add is parsed by the handler to preserve its specific
+                // -32009 guidance instead of collapsing it into -32602.
+                Params::optionalString(
                     QStringLiteral("method"),
-                    {
-                        QStringLiteral("tracer"),
-                        QStringLiteral("corrections"),
-                        QStringLiteral("patch_tracer"),
-                    },
                     QStringLiteral("tracer")),
                 Params::optionalStringEnum(
                     QStringLiteral("direction"),

@@ -65,27 +65,12 @@ namespace {
 
 Qt::MouseButton jsonToMouseButton(const QJsonValue& value)
 {
-    // Absent/null -> default "left"; a value that IS present must be a valid button
-    // string. A wrong-typed value (e.g. button:123) is rejected, not silently
-    // coerced to "left" (SPEC §5).
-    if (value.isUndefined() || value.isNull())
-        return Qt::LeftButton;
-    if (!value.isString()) {
-        QJsonObject data;
-        data["param"] = QStringLiteral("button");
-        throw AgentBridgeError{-32602, QStringLiteral("button must be a string"), data};
-    }
-    const QString s = value.toString();
-    if (s == QLatin1String("left"))
-        return Qt::LeftButton;
+    const QString s = value.toString(QStringLiteral("left"));
     if (s == QLatin1String("right"))
         return Qt::RightButton;
     if (s == QLatin1String("middle"))
         return Qt::MiddleButton;
-    QJsonObject data;
-    data["param"] = QStringLiteral("button");
-    data["value"] = s;
-    throw AgentBridgeError{-32602, QStringLiteral("Invalid button: %1").arg(s), data};
+    return Qt::LeftButton;
 }
 QString mouseButtonToJson(Qt::MouseButton button)
 {
@@ -102,11 +87,6 @@ Qt::KeyboardModifiers jsonToModifiers(const QJsonValue& value)
     Qt::KeyboardModifiers mods = Qt::NoModifier;
     if (value.isUndefined() || value.isNull())
         return mods;
-    if (!value.isArray()) {
-        QJsonObject data;
-        data["param"] = QStringLiteral("modifiers");
-        throw AgentBridgeError{-32602, "modifiers must be an array of strings", data};
-    }
     for (const QJsonValue& mv : value.toArray()) {
         const QString s = mv.toString();
         if (s == QLatin1String("shift"))
@@ -119,12 +99,6 @@ Qt::KeyboardModifiers jsonToModifiers(const QJsonValue& value)
             mods |= Qt::MetaModifier;
         else if (s == QLatin1String("keypad"))
             mods |= Qt::KeypadModifier;
-        else {
-            QJsonObject data;
-            data["param"] = QStringLiteral("modifiers");
-            data["value"] = s;
-            throw AgentBridgeError{-32602, QStringLiteral("Invalid modifier: %1").arg(s), data};
-        }
     }
     return mods;
 }
@@ -149,7 +123,7 @@ QJsonArray modifiersToJson(Qt::KeyboardModifiers mods)
 
 QJsonObject AgentBridgeServer::handleCanvasClick(const QJsonValue& params, bool addShift)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
     auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(viewer);
@@ -166,15 +140,11 @@ QJsonObject AgentBridgeServer::handleCanvasClick(const QJsonValue& params, bool 
     if (addShift)
         modifiers |= Qt::ShiftModifier;
 
-    const QString space = jsonOptionalString(p, "space", QStringLiteral("volume"));
+    const QString space =
+        p.value("space").toString(QStringLiteral("volume"));
     QPointF scenePos;
     if (space == QLatin1String("scene")) {
         const QJsonValue posv = p.value("position");
-        if (!posv.isObject()) {
-            QJsonObject data;
-            data["param"] = "position";
-            throw AgentBridgeError{-32602, "scene-space position must be an object {x, y}", data};
-        }
         const QJsonObject po = posv.toObject();
         scenePos = QPointF(jsonRequireFiniteFloat(po.value("x"), "x"),
                            jsonRequireFiniteFloat(po.value("y"), "y"));
@@ -192,11 +162,6 @@ QJsonObject AgentBridgeServer::handleCanvasClick(const QJsonValue& params, bool 
                                  .arg(dist, 0, 'f', 3);
             throw AgentBridgeError{-32003, "Invalid coordinates", data};
         }
-    } else {
-        QJsonObject data;
-        data["param"] = "space";
-        data["value"] = space;
-        throw AgentBridgeError{-32602, "space must be \"volume\" or \"scene\"", data};
     }
 
     // Synthesize the full click through the real mouse slots so all signal
@@ -354,17 +319,12 @@ QJsonObject AgentBridgeServer::handleViewerSetAxisAlignedSlices(const QJsonValue
 
 QJsonObject AgentBridgeServer::handleSegmentationEnableEditing(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    if (!p.contains("enabled")) {
-        QJsonObject data;
-        data["param"] = "enabled";
-        throw AgentBridgeError{-32602, "enabled is required", data};
-    }
-    const bool enabled = jsonRequireBool(p.value("enabled"), "enabled");
+    const bool enabled = p.value("enabled").toBool();
 
     SegmentationWidget* widget = _window->_segmentationWidget;
     if (!widget) {
@@ -401,7 +361,7 @@ QJsonObject AgentBridgeServer::handleSegmentationEnableEditing(const QJsonValue&
 
 QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
@@ -409,7 +369,8 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
     // Method enum (SPEC §3.11 as amended by §8.1).
-    const QString methodStr = jsonOptionalString(p, "method", QStringLiteral("tracer"));
+    const QString methodStr =
+        p.value("method").toString(QStringLiteral("tracer"));
     // Footgun fix (§8.1): manual-add is an interactive editing mode, not a grow
     // invocation. Feeding SegmentationGrowthMethod::ManualAdd through
     // onGrowSegmentationSurface from the bridge would bypass the mode's session
@@ -439,7 +400,8 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
     }
 
     // Direction enum.
-    const QString dirStr = jsonOptionalString(p, "direction", QStringLiteral("all"));
+    const QString dirStr =
+        p.value("direction").toString(QStringLiteral("all"));
     SegmentationGrowthDirection direction;
     if (dirStr == QLatin1String("all"))
         direction = SegmentationGrowthDirection::All;
@@ -451,29 +413,11 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
         direction = SegmentationGrowthDirection::Left;
     else if (dirStr == QLatin1String("right"))
         direction = SegmentationGrowthDirection::Right;
-    else if (dirStr == QLatin1String("fill"))
+    else
         direction = SegmentationGrowthDirection::Fill;
-    else {
-        QJsonObject data;
-        data["param"] = "direction";
-        data["value"] = dirStr;
-        throw AgentBridgeError{-32602, QStringLiteral("Invalid direction: %1").arg(dirStr), data};
-    }
 
-    if (!p.contains("steps")) {
-        QJsonObject data;
-        data["param"] = "steps";
-        throw AgentBridgeError{-32602, "steps is required", data};
-    }
-    const int steps = jsonRequireInt(p.value("steps"), "steps");
-    if (steps < 1) {
-        QJsonObject data;
-        data["param"] = "steps";
-        data["value"] = steps;
-        throw AgentBridgeError{-32602, "steps must be >= 1", data};
-    }
-
-    const bool inpaintOnly = jsonOptionalBool(p, "inpaintOnly", false);
+    const int steps = p.value("steps").toInt();
+    const bool inpaintOnly = p.value("inpaintOnly").toBool(false);
 
     // Growth is the "growth" source; a concurrent tool/lasagna/atlas job is fine
     // (§8.3), but a second growth job is not.
@@ -589,7 +533,7 @@ QJsonObject AgentBridgeServer::handleSegmentationSave(const QJsonValue&)
 
 QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
@@ -610,7 +554,7 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
     }
 
     SegmentationCommandHandler::GrowPatchSeedParams gp;
-    gp.volumeId = jsonOptionalString(p, "volumeId");
+    gp.volumeId = p.value("volumeId").toString();
     if (!gp.volumeId.isEmpty()) {
         const auto ids = state->vpkg()->volumeIDs();
         if (std::find(ids.begin(), ids.end(), gp.volumeId.toStdString()) == ids.end()) {
@@ -621,23 +565,9 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
         }
     }
 
-    gp.iterations = jsonOptionalInt(p, "iterations", 200);
-    if (gp.iterations < 1 || gp.iterations > 100000) {
-        QJsonObject data;
-        data["param"] = "iterations";
-        data["value"] = gp.iterations;
-        throw AgentBridgeError{-32602, "iterations must be in [1, 100000]", data};
-    }
-    // Present-but-malformed minAreaCm must reject, not silently fall back to the
-    // 0.002 default (which .toDouble(0.002) would do for a wrong-typed value).
-    gp.minAreaCm = p.contains("minAreaCm")
-        ? jsonRequireFinite(p.value("minAreaCm"), "minAreaCm") : 0.002;
-    if (gp.minAreaCm < 0.0) {
-        QJsonObject data;
-        data["param"] = "minAreaCm";
-        throw AgentBridgeError{-32602, "minAreaCm must be a finite value >= 0", data};
-    }
-    gp.outputDir = jsonOptionalString(p, "outputDir");
+    gp.iterations = p.value("iterations").toInt(200);
+    gp.minAreaCm = p.value("minAreaCm").toDouble(0.002);
+    gp.outputDir = p.value("outputDir").toString();
 
     const QString effectiveVolumeId = gp.volumeId.isEmpty()
         ? QString::fromStdString(state->currentVolumeId())
@@ -727,7 +657,7 @@ QJsonObject AgentBridgeServer::handleManualAddBegin(const QJsonValue&)
 
 QJsonObject AgentBridgeServer::handleManualAddFinish(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     SegmentationModule* mod = _window ? _window->_segmentationModule.get() : nullptr;
     if (!mod) {
         QJsonObject data;
@@ -740,7 +670,7 @@ QJsonObject AgentBridgeServer::handleManualAddFinish(const QJsonValue& params)
         data["detail"] = "manual-add mode is not active";
         throw AgentBridgeError{-32007, "Manual add mode not active", data};
     }
-    const bool apply = jsonOptionalBool(p, "apply", true);
+    const bool apply = p.value("apply").toBool(true);
     const bool applied = mod->setManualAddModeActive(false, apply);
     QJsonObject result;
     result["applied"] = applied;
@@ -750,14 +680,14 @@ QJsonObject AgentBridgeServer::handleManualAddFinish(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleManualAddSetLineMode(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     SegmentationWidget* widget = _window ? _window->_segmentationWidget : nullptr;
     if (!widget) {
         QJsonObject data;
         data["detail"] = "segmentation widget is not available";
         throw AgentBridgeError{-32000, "Segmentation widget unavailable", data};
     }
-    const QString modeStr = jsonRequireString(p, "mode");
+    const QString modeStr = p.value("mode").toString();
     ManualAddTool::LinePreviewMode mode;
     if (modeStr == QLatin1String("vertical"))
         mode = ManualAddTool::LinePreviewMode::VerticalOnly;
@@ -767,12 +697,8 @@ QJsonObject AgentBridgeServer::handleManualAddSetLineMode(const QJsonValue& para
         mode = ManualAddTool::LinePreviewMode::Cross;
     else if (modeStr == QLatin1String("cross_fill"))
         mode = ManualAddTool::LinePreviewMode::CrossFill;
-    else {
-        QJsonObject data;
-        data["param"] = "mode";
-        data["value"] = modeStr;
-        throw AgentBridgeError{-32602, QStringLiteral("Invalid mode: %1").arg(modeStr), data};
-    }
+    else
+        mode = ManualAddTool::LinePreviewMode::CrossFill;
     const ManualAddTool::LinePreviewMode effective = widget->setManualAddLinePreviewMode(mode);
     QJsonObject result;
     result["mode"] = linePreviewModeToString(effective);
@@ -782,25 +708,21 @@ QJsonObject AgentBridgeServer::handleManualAddSetLineMode(const QJsonValue& para
 
 QJsonObject AgentBridgeServer::handleManualAddSetInterpolation(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     SegmentationWidget* widget = _window ? _window->_segmentationWidget : nullptr;
     if (!widget) {
         QJsonObject data;
         data["detail"] = "segmentation widget is not available";
         throw AgentBridgeError{-32000, "Segmentation widget unavailable", data};
     }
-    const QString modeStr = jsonRequireString(p, "mode");
+    const QString modeStr = p.value("mode").toString();
     ManualAddTool::InterpolationMode mode;
     if (modeStr == QLatin1String("thin_plate_spline"))
         mode = ManualAddTool::InterpolationMode::ThinPlateSpline;
     else if (modeStr == QLatin1String("tracer_restricted_to_fill"))
         mode = ManualAddTool::InterpolationMode::TracerRestrictedToFill;
-    else {
-        QJsonObject data;
-        data["param"] = "mode";
-        data["value"] = modeStr;
-        throw AgentBridgeError{-32602, QStringLiteral("Invalid mode: %1").arg(modeStr), data};
-    }
+    else
+        mode = ManualAddTool::InterpolationMode::TracerRestrictedToFill;
     const ManualAddTool::InterpolationMode effective = widget->setManualAddInterpolationMode(mode);
     QJsonObject result;
     result["mode"] = interpolationModeToString(effective);
@@ -831,13 +753,8 @@ QJsonObject AgentBridgeServer::handleManualAddUndoConstraint(const QJsonValue&)
 
 QJsonObject AgentBridgeServer::handleCorrectionsSetPointMode(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
-    if (!p.contains("active")) {
-        QJsonObject data;
-        data["param"] = "active";
-        throw AgentBridgeError{-32602, "active is required", data};
-    }
-    const bool active = jsonRequireBool(p.value("active"), "active");
+    const QJsonObject p = params.toObject();
+    const bool active = p.value("active").toBool();
 
     SegmentationModule* mod = _window ? _window->_segmentationModule.get() : nullptr;
     SegmentationWidget* widget = _window ? _window->_segmentationWidget : nullptr;
@@ -880,7 +797,7 @@ QJsonObject AgentBridgeServer::handleCorrectionsSetPointMode(const QJsonValue& p
 
 QJsonObject AgentBridgeServer::handleCanvasDrag(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
     auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(viewer);
@@ -894,65 +811,39 @@ QJsonObject AgentBridgeServer::handleCanvasDrag(const QJsonValue& params)
 
     // button, incl. the "none" hover-only variant (§9.1).
     const QJsonValue btnv = p.value("button");
-    const QString btnStr = btnv.isString() ? btnv.toString() : QStringLiteral("left");
+    const QString btnStr = btnv.toString(QStringLiteral("left"));
     const bool buttonNone = (btnStr == QLatin1String("none"));
     Qt::MouseButton button = Qt::NoButton;
     if (!buttonNone)
-        button = jsonToMouseButton(btnv);  // validates / throws -32602
+        button = jsonToMouseButton(btnv);
     const Qt::KeyboardModifiers modifiers = jsonToModifiers(p.value("modifiers"));
 
-    // steps: default 8; non-integer / < 1 -> -32602; > 256 clamped silently.
-    // jsonRequireInt rejects wrong-typed/fractional/overflowing values (the last
-    // guarding against a finite double like 1e300 overflowing the int cast, §11a).
-    int steps = 8;
-    if (p.contains("steps")) {
-        steps = jsonRequireInt(p.value("steps"), "steps");
-        if (steps < 1) {
-            QJsonObject data;
-            data["param"] = "steps";
-            data["value"] = steps;
-            throw AgentBridgeError{-32602, "steps must be >= 1", data};
-        }
-        if (steps > 256)
-            steps = 256;
-    }
+    const int steps = std::min(p.value("steps").toInt(8), 256);
 
-    const QString space = jsonOptionalString(p, "space", QStringLiteral("volume"));
+    const QString space =
+        p.value("space").toString(QStringLiteral("volume"));
 
     // Convert one endpoint (Vec3 volume, or {x,y} scene) to a scene point,
     // reusing the §3.6 round-trip validation. `name` is "from" / "to".
     auto convertEndpoint = [&](const QJsonValue& v, const char* name) -> QPointF {
         if (space == QLatin1String("scene")) {
-            if (!v.isObject()) {
-                QJsonObject data;
-                data["param"] = QString::fromLatin1(name);
-                throw AgentBridgeError{-32602,
-                    QStringLiteral("%1 must be a scene object {x, y}").arg(QLatin1String(name)),
-                    data};
-            }
             const QJsonObject o = v.toObject();
             return QPointF(jsonRequireFiniteFloat(o.value("x"), "x"),
                            jsonRequireFiniteFloat(o.value("y"), "y"));
         }
-        if (space == QLatin1String("volume")) {
-            const cv::Vec3f vol = jsonToVec3(v, name);
-            const QPointF sc = chunked->volumeToScene(vol);
-            const cv::Vec3f back = chunked->sceneToVolume(sc);
-            const double dist = cv::norm(back - vol);
-            if (!std::isfinite(dist) || dist > 2.0) {
-                QJsonObject data;
-                data["point"] = QString::fromLatin1(name);
-                data["detail"] =
-                    QStringLiteral("%1 is not on this viewer's view (round-trip %2 voxels)")
-                        .arg(QLatin1String(name)).arg(dist, 0, 'f', 3);
-                throw AgentBridgeError{-32003, "Invalid coordinates", data};
-            }
-            return sc;
+        const cv::Vec3f vol = jsonToVec3(v, name);
+        const QPointF sc = chunked->volumeToScene(vol);
+        const cv::Vec3f back = chunked->sceneToVolume(sc);
+        const double dist = cv::norm(back - vol);
+        if (!std::isfinite(dist) || dist > 2.0) {
+            QJsonObject data;
+            data["point"] = QString::fromLatin1(name);
+            data["detail"] =
+                QStringLiteral("%1 is not on this viewer's view (round-trip %2 voxels)")
+                    .arg(QLatin1String(name)).arg(dist, 0, 'f', 3);
+            throw AgentBridgeError{-32003, "Invalid coordinates", data};
         }
-        QJsonObject data;
-        data["param"] = "space";
-        data["value"] = space;
-        throw AgentBridgeError{-32602, "space must be \"volume\" or \"scene\"", data};
+        return sc;
     };
 
     const QPointF sceneFrom = convertEndpoint(p.value("from"), "from");

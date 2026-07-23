@@ -2499,11 +2499,6 @@
           },
           "method": {
             "default": "tracer",
-            "enum": [
-              "tracer",
-              "corrections",
-              "patch_tracer"
-            ],
             "type": "string"
           },
           "steps": {
