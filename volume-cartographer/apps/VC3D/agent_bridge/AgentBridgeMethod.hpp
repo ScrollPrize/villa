@@ -276,14 +276,6 @@ private:
 
 namespace AgentBridgeParams {
 
-inline AgentBridgeParam withDefault(
-    AgentBridgeParam param,
-    const QJsonValue& defaultValue)
-{
-    param.defaultValue = defaultValue;
-    return param;
-}
-
 inline AgentBridgeParam nullable(AgentBridgeParam param)
 {
     param.nullable = true;

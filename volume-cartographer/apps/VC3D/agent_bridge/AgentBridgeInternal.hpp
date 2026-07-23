@@ -88,27 +88,6 @@ inline double jsonRequireFiniteFloat(const QJsonValue& v, const char* paramName)
     return d;
 }
 
-// Require an integer carried by an integral JSON number. Rejects wrong types,
-// non-finite, fractional values, and values overflowing int.
-inline int jsonRequireInt(const QJsonValue& v, const char* paramName)
-{
-    const double d = jsonRequireNumber(v, paramName);
-    if (!std::isfinite(d) || std::floor(d) != d)
-        throwParamError(paramName, QStringLiteral("must be an integer"));
-    if (d < static_cast<double>(std::numeric_limits<int>::min()) ||
-        d > static_cast<double>(std::numeric_limits<int>::max()))
-        throwParamError(paramName, QStringLiteral("is out of range"));
-    return static_cast<int>(d);
-}
-
-// Require a JSON boolean. Rejects numbers/strings (which toBool() would coerce).
-inline bool jsonRequireBool(const QJsonValue& v, const char* paramName)
-{
-    if (!v.isBool())
-        throwParamError(paramName, QStringLiteral("must be a boolean"));
-    return v.toBool();
-}
-
 inline QString jsonRequireString(const QJsonValue& value, const char* paramName)
 {
     if (!value.isString())
@@ -129,22 +108,6 @@ inline QString jsonOptionalString(const QJsonObject& o, const char* key,
     if (!o.contains(QLatin1String(key)))
         return def;
     return jsonRequireString(o, key);
-}
-
-// Optional bool: absent -> default; present-but-wrong-type -> reject.
-inline bool jsonOptionalBool(const QJsonObject& o, const char* key, bool def)
-{
-    if (!o.contains(QLatin1String(key)))
-        return def;
-    return jsonRequireBool(o.value(QLatin1String(key)), key);
-}
-
-// Optional int: absent -> default; present-but-malformed -> reject.
-inline int jsonOptionalInt(const QJsonObject& o, const char* key, int def)
-{
-    if (!o.contains(QLatin1String(key)))
-        return def;
-    return jsonRequireInt(o.value(QLatin1String(key)), key);
 }
 
 inline cv::Vec3f jsonToVec3(const QJsonValue& value, const char* paramName)

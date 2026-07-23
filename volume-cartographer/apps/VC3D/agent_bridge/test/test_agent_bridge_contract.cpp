@@ -1,5 +1,4 @@
-// Unit tests for the Agent Bridge strict wire-parameter helpers (SPEC §5).
-// Pure functions over QJsonValue/QJsonObject, so a tiny assert harness suffices.
+// Unit tests for the Agent Bridge wire contract and remaining parsing helpers.
 //
 // QJsonValue::toDouble()/toInt()/toBool() silently coerce a wrong-typed value to
 // 0/false; the jsonRequire*/jsonTo* helpers must instead reject a PRESENT-but-
@@ -142,32 +141,7 @@ int main()
         CHECK(jsonRequireFiniteFloat(QJsonValue(123.5), "coord") == 123.5);
     });
 
-    // --- jsonRequireInt: reject wrong type, fractional, non-finite, overflow ---
-    expectParamError("int<-string", "steps",
-        [&] { jsonRequireInt(QJsonValue(QStringLiteral("3")), "steps"); });
-    expectParamError("int<-fractional", "steps",
-        [&] { jsonRequireInt(QJsonValue(1.5), "steps"); });
-    expectParamError("int<-inf", "steps",
-        [&] { jsonRequireInt(QJsonValue(kInf), "steps"); });
-    expectParamError("int<-overflow", "steps",
-        [&] { jsonRequireInt(QJsonValue(1.0e300), "steps"); });
-    expectNoThrow("int<-integer", [&] {
-        CHECK(jsonRequireInt(QJsonValue(42), "steps") == 42);
-    });
-    expectNoThrow("int<-integral-double", [&] {
-        CHECK(jsonRequireInt(QJsonValue(-8.0), "steps") == -8);
-    });
-
-    // --- jsonRequireBool: reject non-bool, accept bool ---
-    expectParamError("bool<-number", "flag",
-        [&] { jsonRequireBool(QJsonValue(1), "flag"); });
-    expectParamError("bool<-string", "flag",
-        [&] { jsonRequireBool(QJsonValue(QStringLiteral("true")), "flag"); });
-    expectNoThrow("bool<-bool", [&] {
-        CHECK(jsonRequireBool(QJsonValue(true), "flag") == true);
-    });
-
-    // --- jsonRequireString / optionals: absent vs present-but-wrong-type ---
+    // --- jsonRequireString / optional string ---
     {
         QJsonObject o;
         o["name"] = QStringLiteral("hi");
@@ -184,14 +158,6 @@ int main()
         expectNoThrow("optString<-absent", [&] {
             CHECK(jsonOptionalString(o, "missing", QStringLiteral("def")) ==
                   QLatin1String("def"));
-        });
-        expectParamError("optInt<-fractional", "num2", [&] {
-            QJsonObject bad;
-            bad["num2"] = 2.5;
-            jsonOptionalInt(bad, "num2", 0);
-        });
-        expectNoThrow("optBool<-absent", [&] {
-            CHECK(jsonOptionalBool(o, "missing", true) == true);
         });
     }
 
@@ -382,7 +348,7 @@ int main()
     CHECK(busyError.data.value("source").toString() == QLatin1String("tool"));
 
     if (g_failures == 0) {
-        std::printf("PASS: all %d checks in test_agent_bridge_parse\n", g_checks);
+        std::printf("PASS: all %d checks in test_agent_bridge_contract\n", g_checks);
         return 0;
     }
     std::fprintf(stderr, "FAILED: %d of %d checks failed\n", g_failures, g_checks);
