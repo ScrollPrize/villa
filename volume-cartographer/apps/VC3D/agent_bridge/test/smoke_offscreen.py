@@ -46,7 +46,7 @@ from contract_probe import (  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_VC3D_BIN = REPO_ROOT / "build" / "ci-release-gcc" / "bin" / "VC3D"
-VIEWER_CONTRACT = Path(__file__).resolve().parents[1] / "schema" / "viewer.json"
+CONTRACT_DIR = Path(__file__).resolve().parents[1] / "schema"
 
 OFFSCREEN_ENV = {"QT_QPA_PLATFORM": "offscreen"}
 
@@ -131,9 +131,9 @@ def create_test_project(root: Path) -> Path:
     return volpkg
 
 
-def check_viewer_contract_states(
+def check_contract_states(
     binary: str,
-    contract: dict,
+    contracts: list[dict],
     empty_volpkg: Path,
     config_home: Path,
     results: Results,
@@ -145,24 +145,30 @@ def check_viewer_contract_states(
         sock_path = proc.wait_for_handshake(timeout=60.0)
         client = BridgeClient(sock_path, connect_timeout=10.0)
 
-        no_project = probe_declared_errors(client, contract, "no-project")
-        results.record(
-            "viewer_contract_errors_no_project",
-            no_project.ok,
-            no_project.detail,
-        )
+        for contract in contracts:
+            domain = contract["domain"].replace(".", "_")
+            no_project = probe_declared_errors(client, contract, "no-project")
+            if no_project.attempted:
+                results.record(
+                    f"{domain}_contract_errors_no_project",
+                    no_project.ok,
+                    no_project.detail,
+                )
 
         client.call(
             "volume.open",
             {"path": str(empty_volpkg)},
             timeout=10.0,
         )
-        empty = probe_declared_errors(client, contract, "empty")
-        results.record(
-            "viewer_contract_errors_empty",
-            empty.ok,
-            empty.detail,
-        )
+        for contract in contracts:
+            domain = contract["domain"].replace(".", "_")
+            empty = probe_declared_errors(client, contract, "empty")
+            if empty.attempted:
+                results.record(
+                    f"{domain}_contract_errors_empty",
+                    empty.ok,
+                    empty.detail,
+                )
     except Exception as error:  # noqa: BLE001
         results.record(
             "viewer_contract_error_states",
@@ -519,34 +525,38 @@ def main() -> int:
             log(f"handshake: name={name} path={sock_path}")
             client = BridgeClient(sock_path, connect_timeout=10.0)
 
-            contract = load_contract(VIEWER_CONTRACT)
-            success_report = probe_successful_calls(client, contract)
-            results.record(
-                "viewer_contract_success",
-                success_report.ok,
-                success_report.detail,
-            )
-            invalid_report = probe_invalid_inputs(client, contract)
-            results.record(
-                "viewer_contract_invalid_inputs",
-                invalid_report.ok,
-                invalid_report.detail,
-            )
-            clamp_report = probe_clamps(client, contract)
-            results.record(
-                "viewer_contract_clamps",
-                clamp_report.ok,
-                clamp_report.detail,
-            )
-            loaded_errors = probe_declared_errors(client, contract, "loaded")
-            results.record(
-                "viewer_contract_errors_loaded",
-                loaded_errors.ok,
-                loaded_errors.detail,
-            )
-            check_viewer_contract_states(
+            contracts = [
+                load_contract(path)
+                for path in sorted(CONTRACT_DIR.glob("*.json"))
+            ]
+            for contract in contracts:
+                domain = contract["domain"].replace(".", "_")
+                for suffix, probe in (
+                    ("success", probe_successful_calls),
+                    ("invalid_inputs", probe_invalid_inputs),
+                    ("clamps", probe_clamps),
+                ):
+                    report = probe(client, contract)
+                    if report.attempted:
+                        results.record(
+                            f"{domain}_contract_{suffix}",
+                            report.ok,
+                            report.detail,
+                        )
+                loaded_errors = probe_declared_errors(
+                    client,
+                    contract,
+                    "loaded",
+                )
+                if loaded_errors.attempted:
+                    results.record(
+                        f"{domain}_contract_errors_loaded",
+                        loaded_errors.ok,
+                        loaded_errors.detail,
+                    )
+            check_contract_states(
                 binary,
-                contract,
+                contracts,
                 empty_volpkg,
                 tmp_path / "config-contract-states",
                 results,
