@@ -79,8 +79,8 @@ async def vc3d_screenshot(
 async def vc3d_job_status(job_id: Optional[str] = None, source: Optional[str] = None) -> dict[str, Any]:
     """Poll a job by id (or the latest job): state, message, console tail.
 
-    source: optionally filter "the latest job" to one source ("tool" | "growth"
-    | "lasagna" | "atlas") when job_id is omitted (SPEC §8.3).
+    source: optionally filter the latest job to tool, growth, lasagna, atlas,
+    catalog, flatten, seeding, or autosave when job_id is omitted.
     """
     return await _call("job.status", _strip_none({"jobId": job_id, "source": source}))
 
@@ -93,10 +93,10 @@ async def vc3d_wait_job(job_id: str, ctx: Optional[Context] = None) -> dict[str,
     Use this to park on a job you launched with wait=false, or one whose
     wait=true launch came back with waitTimedOut, instead of polling
     vc3d_job_status every turn. It blocks up to the same 30-minute cap as an
-    inline wait, forwarding new console output as MCP progress along the way.
+    inline wait, forwarding job progress where the MCP client supports it.
 
     Returns the terminal job.status fields (state "succeeded"/"failed",
-    message, success, outputPath, consoleTail, ...) merged over {"jobId": ...}.
+    message, outputPath, consoleTail, ...) merged over {"jobId": ...}.
     On the 30-minute cap it returns {"jobId": ..., "waitTimedOut": true}; call
     again to keep waiting. A bridge disconnect fails the call promptly.
     """
