@@ -70,6 +70,7 @@ _PCL_ROLE_FILES = {
     PclRole.PATCH_OVERLAP.value: "patch-overlap-pcls.json",
     PclRole.RELATIVE.value: "relative_windings.json",
     PclRole.SAME_WINDING.value: "same_windings.json",
+    PclRole.DRAWN_CONTROL_POINTS.value: "drawn_control_points.json",
 }
 
 # Base input paths are owned by the service when it was launched with

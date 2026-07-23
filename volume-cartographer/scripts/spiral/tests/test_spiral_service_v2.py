@@ -375,6 +375,19 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(response["root"], str(self.root))
         self.assertIn("umbilicus", response["resolved"])
 
+    def test_dataset_resolution_discovers_drawn_control_points(self):
+        drawn = self.root / "drawn_control_points.json"
+        drawn.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"0": {"name": "drawn", "points": {}}},
+        }))
+        resolution = resolve_dataset_root(self.root)
+        entries = [entry for entry in resolution.pcl_inputs
+                   if entry["role"] == "drawn_control_points"]
+        self.assertEqual(entries, [{
+            "path": str(drawn), "role": "drawn_control_points", "required": False,
+        }])
+
     def test_arbitrary_root_resolution_is_refused(self):
         with self.assertRaises(ApiError) as caught:
             self.state.resolve("/somewhere/else")
@@ -518,6 +531,16 @@ class UploadTests(unittest.TestCase):
         with self.assertRaisesRegex(ApiError, "role"):
             self.state.begin_upload({"kind": "pcl", "id": "roleless", "files": [
                 {"name": "pcl.json", "size": 1, "sha256": "0" * 64}]})
+
+    def test_drawn_control_points_are_forwarded_to_the_next_run(self):
+        session = self._session()
+        upload_id = _upload_input(self.state, "pcl", "drawn-1", PCL_FILES,
+                                  role="drawn_control_points")
+        self.state.finalize_upload(upload_id)
+        self.state.run({"iterations": 2})
+        _, pending, _, _, _ = session.run_calls[-1]
+        self.assertEqual([(record["id"], record["role"]) for record in pending],
+                         [("drawn-1", "drawn_control_points")])
 
     def test_quota_is_enforced(self):
         self._session()
@@ -791,6 +814,31 @@ class CommitTests(unittest.TestCase):
                          {"patch-9", "fiber-9", "pcl-9"})
         self.assertTrue(all(record["committed"] and record["state"] == "pending"
                             for record in inputs))
+
+    def test_drawn_control_points_commit_preserves_line_and_point_order(self):
+        existing = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"4": {"name": "existing", "points": {}}},
+        }
+        target = self.dataset / "drawn_control_points.json"
+        target.write_text(json.dumps(existing))
+        incoming = {"drawn.json": json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "0": {"name": "first", "points": {
+                    "0": {"p": [0, 0, 0]}, "1": {"p": [30, 0, 0]}}},
+                "1": {"name": "second", "points": {
+                    "0": {"p": [0, 1, 0]}, "1": {"p": [30, 1, 0]}}},
+            },
+        }).encode()}
+        self._finalize("pcl", "drawn-1", incoming, role="drawn_control_points")
+        self.state.commit_inputs()
+        merged = json.loads(target.read_text())
+        self.assertEqual([collection["name"] for collection in merged["collections"].values()],
+                         ["existing", "first", "second"])
+        self.assertEqual(list(merged["collections"]["5"]["points"]), ["0", "1"])
+        self.assertEqual(len(list(self.dataset.glob(
+            "drawn_control_points.json.*.bak"))), 1)
 
     def test_commit_keeps_pending_inputs_queued_and_incorporation_retires_them(self):
         record = self._finalize("patch", "patch-9", PATCH_FILES)

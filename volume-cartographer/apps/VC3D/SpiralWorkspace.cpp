@@ -31,6 +31,7 @@
 #include <QLabel>
 #include <QMessageBox>
 #include <QSettings>
+#include <QSaveFile>
 #include <QShortcut>
 #include <QStatusBar>
 #include <QTimer>
@@ -219,21 +220,43 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                         : tr("Adding %1 to the spiral fit failed: %2").arg(inputId, error),
                     15000);
                 auto pending = _pendingBrushPatches.find(inputId);
-                if (pending == _pendingBrushPatches.end()) return;
-                const PendingBrushPatch patch = pending.value();
-                _pendingBrushPatches.erase(pending);
+                if (pending != _pendingBrushPatches.end()) {
+                    const PendingBrushPatch patch = pending.value();
+                    _pendingBrushPatches.erase(pending);
+                    if (error.isEmpty()) {
+                        _brushProvisionalPaths[inputId] = patch.path;
+                        _unverifiedBrushIds.insert(inputId);
+                        registerPendingPatchSurface(inputId, patch.surface, patch.color);
+                        _brush->finalizationSucceeded(inputId);
+                    } else {
+                        QDir(patch.path).removeRecursively();
+                        _brush->finalizationFailed(inputId);
+                        if (_pendingExitAction) {
+                            _commitAfterBrushUploads = false;
+                            _pendingExitAction = {};
+                            QMessageBox::warning(this, tr("Brush upload failed"), error);
+                        }
+                    }
+                    maybeCommitForPendingExit();
+                    return;
+                }
+                auto pointCollections = _pendingPointCollectionPaths.find(inputId);
+                if (pointCollections == _pendingPointCollectionPaths.end()) return;
+                const QString path = pointCollections.value();
+                _pendingPointCollectionPaths.erase(pointCollections);
                 if (error.isEmpty()) {
-                    _brushProvisionalPaths[inputId] = patch.path;
-                    _unverifiedBrushIds.insert(inputId);
-                    registerPendingPatchSurface(inputId, patch.surface, patch.color);
+                    _pointCollectionProvisionalPaths[inputId] = path;
+                    _uncommittedPointCollectionIds.insert(inputId);
+                    _pendingDrawnPointCollectionIds.insert(inputId);
+                    _brush->setPendingPointCollectionIds(_pendingDrawnPointCollectionIds);
                     _brush->finalizationSucceeded(inputId);
                 } else {
-                    QDir(patch.path).removeRecursively();
+                    QFile::remove(path);
                     _brush->finalizationFailed(inputId);
                     if (_pendingExitAction) {
                         _commitAfterBrushUploads = false;
                         _pendingExitAction = {};
-                        QMessageBox::warning(this, tr("Brush upload failed"), error);
+                        QMessageBox::warning(this, tr("Control-point upload failed"), error);
                     }
                 }
                 maybeCommitForPendingExit();
@@ -250,6 +273,9 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     const QString path = _brushProvisionalPaths.take(id);
                     if (!path.isEmpty()) QDir(path).removeRecursively();
                     _unverifiedBrushIds.remove(id);
+                    const QString pclPath = _pointCollectionProvisionalPaths.take(id);
+                    if (!pclPath.isEmpty()) QFile::remove(pclPath);
+                    _uncommittedPointCollectionIds.remove(id);
                 }
                 if (_pendingExitAction && !hasPendingBrushWork()) {
                     auto continuation = std::move(_pendingExitAction);
@@ -352,6 +378,15 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _pendingBrushPatches.clear();
                 _brushProvisionalPaths.clear();
                 _unverifiedBrushIds.clear();
+                for (const QString& path : std::as_const(_pendingPointCollectionPaths))
+                    QFile::remove(path);
+                for (const QString& path : std::as_const(_pointCollectionProvisionalPaths))
+                    QFile::remove(path);
+                _pendingPointCollectionPaths.clear();
+                _pointCollectionProvisionalPaths.clear();
+                _uncommittedPointCollectionIds.clear();
+                _pendingDrawnPointCollectionIds.clear();
+                _brush->setPendingPointCollectionIds({});
                 // A newly loaded fit starts a new comparison sequence even when
                 // it reuses the existing service connection.
                 _haveRunDiffBaseline = false;
@@ -563,17 +598,29 @@ void SpiralWorkspace::setSurfaceCategoryVisible(const QString& category, bool vi
 
 void SpiralWorkspace::updatePendingPatchIds(const QJsonObject& status)
 {
-    QSet<QString> pending;
+    QSet<QString> pendingPatches;
+    QSet<QString> pendingDrawnPointCollections;
     for (const QJsonValue& value : status.value(QStringLiteral("ephemeral_inputs")).toArray()) {
         const QJsonObject input = value.toObject();
         if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("patch")
             && !input.value(QStringLiteral("committed")).toBool()) {
-            pending.insert(input.value(QStringLiteral("id")).toString());
+            pendingPatches.insert(input.value(QStringLiteral("id")).toString());
+        }
+        if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("pcl")
+            && input.value(QStringLiteral("role")).toString()
+                   == QStringLiteral("drawn_control_points")
+            && input.value(QStringLiteral("state")).toString() == QStringLiteral("pending")) {
+            pendingDrawnPointCollections.insert(input.value(QStringLiteral("id")).toString());
         }
     }
-    if (pending == _pendingPatchIds) return;
-    _pendingPatchIds = std::move(pending);
-    if (_pendingPatchesOnly) updateSurfaceIntersections();
+    if (pendingDrawnPointCollections != _pendingDrawnPointCollectionIds) {
+        _pendingDrawnPointCollectionIds = std::move(pendingDrawnPointCollections);
+        _brush->setPendingPointCollectionIds(_pendingDrawnPointCollectionIds);
+    }
+    if (pendingPatches != _pendingPatchIds) {
+        _pendingPatchIds = std::move(pendingPatches);
+        if (_pendingPatchesOnly) updateSurfaceIntersections();
+    }
 }
 
 void SpiralWorkspace::updateSurfaceIntersections()
@@ -658,20 +705,23 @@ QString SpiralWorkspace::provisionalBrushRoot() const
 void SpiralWorkspace::finalizeBrushPaint()
 {
     if (!_service || !_service->hasActiveSession()) {
-        statusBar()->showMessage(tr("Load a Spiral fit before finalizing brush paint"), 10000);
+        statusBar()->showMessage(tr("Load a Spiral fit before finalizing drawn inputs"), 10000);
         return;
     }
     QStringList warnings;
     auto patches = _brush->preparePatches(warnings);
+    auto pointCollections = _brush->preparePointCollections(warnings);
     if (!warnings.isEmpty()) statusBar()->showMessage(warnings.join(QStringLiteral("; ")), 10000);
-    if (patches.empty()) {
+    if (patches.empty() && pointCollections.id.isEmpty()) {
         maybeCommitForPendingExit();
         return;
     }
     const QString root = provisionalBrushRoot();
     if (!QDir().mkpath(root)) {
         for (const auto& patch : patches) _brush->finalizationFailed(patch.id);
-        QMessageBox::warning(this, tr("Cannot save brush patches"),
+        if (!pointCollections.id.isEmpty())
+            _brush->finalizationFailed(pointCollections.id);
+        QMessageBox::warning(this, tr("Cannot save drawn inputs"),
                              tr("Could not create %1").arg(root));
         _pendingExitAction = {};
         _commitAfterBrushUploads = false;
@@ -711,12 +761,31 @@ void SpiralWorkspace::finalizeBrushPaint()
             }
         }));
     }
+    if (!pointCollections.id.isEmpty()) {
+        const QString path = QDir(root).filePath(pointCollections.id + QStringLiteral(".json"));
+        QSaveFile file(path);
+        if (!file.open(QIODevice::WriteOnly)
+            || file.write(pointCollections.document.toJson(QJsonDocument::Indented)) < 0
+            || !file.commit()) {
+            _brush->finalizationFailed(pointCollections.id);
+            _commitAfterBrushUploads = false;
+            _pendingExitAction = {};
+            QMessageBox::warning(this, tr("Cannot save control-point lines"),
+                                 tr("Could not write %1").arg(path));
+        } else {
+            _pendingPointCollectionPaths[pointCollections.id] = path;
+            _service->uploadJsonInput(QStringLiteral("pcl"), path, pointCollections.id,
+                                      QStringLiteral("drawn_control_points"));
+        }
+    }
 }
 
 bool SpiralWorkspace::hasPendingBrushWork() const
 {
-    return (_brush && _brush->hasUnfinalizedPaint())
-        || !_pendingBrushPatches.isEmpty() || !_unverifiedBrushIds.isEmpty();
+    return (_brush && (_brush->hasUnfinalizedPaint() || _brush->hasUnfinalizedPolylines()))
+        || !_pendingBrushPatches.isEmpty() || !_unverifiedBrushIds.isEmpty()
+        || !_pendingPointCollectionPaths.isEmpty()
+        || !_uncommittedPointCollectionIds.isEmpty();
 }
 
 void SpiralWorkspace::discardBrushWork()
@@ -726,9 +795,18 @@ void SpiralWorkspace::discardBrushWork()
         if (!pending.path.isEmpty()) QDir(pending.path).removeRecursively();
     for (const QString& path : std::as_const(_brushProvisionalPaths))
         if (!path.isEmpty()) QDir(path).removeRecursively();
+    for (const QString& path : std::as_const(_pendingPointCollectionPaths))
+        if (!path.isEmpty()) QFile::remove(path);
+    for (const QString& path : std::as_const(_pointCollectionProvisionalPaths))
+        if (!path.isEmpty()) QFile::remove(path);
     _pendingBrushPatches.clear();
     _brushProvisionalPaths.clear();
     _unverifiedBrushIds.clear();
+    _pendingPointCollectionPaths.clear();
+    _pointCollectionProvisionalPaths.clear();
+    _uncommittedPointCollectionIds.clear();
+    _pendingDrawnPointCollectionIds.clear();
+    _brush->setPendingPointCollectionIds({});
     const QStringList brushSurfaceIds = _surfaceCategoryIds.take(QStringLiteral("brush"));
     for (const QString& id : brushSurfaceIds) {
         _surfaceSourceIds.remove(id);
@@ -744,9 +822,9 @@ void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
         continuation();
         return;
     }
-    QMessageBox box(QMessageBox::Warning, tr("Uncommitted Spiral brush patches"),
-                    tr("This Spiral session contains brush paint that has not been committed "
-                       "to verified_patches."), QMessageBox::NoButton, this);
+    QMessageBox box(QMessageBox::Warning, tr("Uncommitted Spiral drawn inputs"),
+                    tr("This Spiral session contains brush paint or control-point lines that "
+                       "have not been committed to the dataset."), QMessageBox::NoButton, this);
     auto* commit = box.addButton(tr("Commit"), QMessageBox::AcceptRole);
     auto* exit = box.addButton(tr("Exit Without Commit"), QMessageBox::DestructiveRole);
     box.addButton(QMessageBox::Cancel);
@@ -754,7 +832,8 @@ void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
     if (box.clickedButton() == commit) {
         _pendingExitAction = std::move(continuation);
         _commitAfterBrushUploads = true;
-        if (_brush->hasUnfinalizedPaint()) finalizeBrushPaint();
+        if (_brush->hasUnfinalizedPaint() || _brush->hasUnfinalizedPolylines())
+            finalizeBrushPaint();
         else maybeCommitForPendingExit();
     } else if (box.clickedButton() == exit) {
         discardBrushWork();
@@ -764,18 +843,19 @@ void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
 
 void SpiralWorkspace::maybeCommitForPendingExit()
 {
-    if (!_commitAfterBrushUploads || !_pendingExitAction || !_pendingBrushPatches.isEmpty()) return;
-    if (_brush->hasUnfinalizedPaint()) {
+    if (!_commitAfterBrushUploads || !_pendingExitAction || !_pendingBrushPatches.isEmpty()
+        || !_pendingPointCollectionPaths.isEmpty()) return;
+    if (_brush->hasUnfinalizedPaint() || _brush->hasUnfinalizedPolylines()) {
         // A too-small gesture was intentionally left editable. Do not silently
         // discard it during an exit commit.
         _commitAfterBrushUploads = false;
         _pendingExitAction = {};
-        QMessageBox::warning(this, tr("Brush patch not committed"),
-                             tr("At least one painted area does not contain a complete quad."));
+        QMessageBox::warning(this, tr("Drawn input not committed"),
+                             tr("At least one drawn input could not be finalized."));
         return;
     }
     _commitAfterBrushUploads = false;
-    if (_unverifiedBrushIds.isEmpty()) {
+    if (_unverifiedBrushIds.isEmpty() && _uncommittedPointCollectionIds.isEmpty()) {
         auto continuation = std::move(_pendingExitAction);
         _pendingExitAction = {};
         continuation();

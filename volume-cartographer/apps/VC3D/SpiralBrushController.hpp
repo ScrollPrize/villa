@@ -3,22 +3,26 @@
 #include "overlays/ViewerOverlayControllerBase.hpp"
 
 #include <QColor>
+#include <QJsonDocument>
 #include <QPainterPath>
 #include <QPointF>
 #include <QSet>
 #include <QString>
 
+#include <opencv2/core/types.hpp>
+
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 class QuadSurface;
 class VolumeViewerBase;
 class SpiralBrushCursorWidget;
 
-// Spiral-only surface paint. This deliberately does not use VC3D's annotation
-// or segmentation drawing paths: every mark is an antialiased filled vector
-// shape whose primitive is a true swept circle.
+// Spiral-only drawn inputs. This deliberately does not use VC3D's annotation
+// or segmentation drawing paths: brush marks are true swept-circle vector
+// shapes, while control-point lines retain their ordered surface/volume samples.
 class SpiralBrushController final : public ViewerOverlayControllerBase
 {
     Q_OBJECT
@@ -28,16 +32,23 @@ public:
         QColor color;
         std::shared_ptr<QuadSurface> surface;
     };
+    struct PreparedPointCollections {
+        QString id;
+        QJsonDocument document;
+    };
 
     explicit SpiralBrushController(QObject* parent = nullptr);
 
     void bindFlattenedViewer(VolumeViewerBase* viewer);
-    void setPaintSurface(const std::shared_ptr<QuadSurface>& surface) { _paintSurface = surface; }
+    void setPaintSurface(const std::shared_ptr<QuadSurface>& surface);
+    void setPendingPointCollectionIds(const QSet<QString>& ids);
     void resetSession();
     bool hasUnfinalizedPaint() const;
+    bool hasUnfinalizedPolylines() const;
     int brushDiameter() const { return _diameterPx; }
 
     std::vector<PreparedPatch> preparePatches(QStringList& warnings);
+    PreparedPointCollections preparePointCollections(QStringList& warnings);
     void finalizationSucceeded(const QString& id);
     void finalizationFailed(const QString& id);
     void discardUnfinalized();
@@ -52,7 +63,7 @@ protected:
     void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private:
-    enum class GestureState { Painted, Finalizing };
+    enum class GestureState { Painted, Finalizing, Finalized };
     struct Gesture {
         QString id;
         QColor color;
@@ -63,7 +74,17 @@ private:
         QPointF rowStep;
         GestureState state = GestureState::Painted;
     };
-    enum class DragMode { None, Paint, Erase };
+    struct PolylineGesture {
+        QString id;
+        QColor color;
+        std::shared_ptr<QuadSurface> source;
+        std::vector<QPointF> surfacePoints;
+        std::vector<cv::Vec3f> volumePoints;
+        qint64 creationTime = 0;
+        int sequence = 0;
+        GestureState state = GestureState::Painted;
+    };
+    enum class DragMode { None, Paint, Polyline, Erase };
 
     QColor nextColor();
     QPainterPath deviceDisk(const QPointF& center) const;
@@ -71,6 +92,7 @@ private:
     QPainterPath deviceToSurface(const QPainterPath& path) const;
     QPainterPath surfaceToScene(const QPainterPath& path) const;
     void beginPaint(const QPointF& devicePos);
+    void beginPolyline(const QPointF& devicePos);
     void beginErase(const QPointF& devicePos);
     void extendDrag(const QPointF& devicePos);
     void finishDrag(const QPointF& devicePos);
@@ -78,6 +100,10 @@ private:
     void updateCursor(const QPointF& devicePos);
     void updateCursorWidget();
     void sampleColor(const QPointF& scenePos);
+    bool appendPolylinePoint(const QPointF& devicePos);
+    std::optional<std::pair<QPointF, cv::Vec3f>> pointOnSurface(
+        const QPointF& devicePos, const std::shared_ptr<QuadSurface>& source) const;
+    void resamplePolyline(PolylineGesture& gesture);
     PreparedPatch makePatch(Gesture& gesture) const;
 
     VolumeViewerBase* _viewer = nullptr;
@@ -86,6 +112,8 @@ private:
     QObject* _viewObject = nullptr;
     SpiralBrushCursorWidget* _cursorWidget = nullptr;
     std::vector<Gesture> _gestures;
+    std::vector<PolylineGesture> _polylines;
+    QSet<QString> _pendingPointCollectionIds;
     QSet<QRgb> _usedColors;
     std::optional<QColor> _sampledColor;
     QPointF _cursorDevicePos;
@@ -93,6 +121,9 @@ private:
     QPointF _lastDevicePos;
     DragMode _dragMode = DragMode::None;
     int _activeGesture = -1;
+    int _activePolyline = -1;
+    int _nextPolylineSequence = 1;
+    bool _polylineBlocked = false;
     int _diameterPx = 32;
     bool _gHeld = false;
     bool _shiftHeld = false;

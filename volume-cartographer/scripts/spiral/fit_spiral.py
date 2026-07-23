@@ -122,6 +122,7 @@ pcl_json_paths = [
     f'{dataset_path}/patch-overlap-pcls.json',
     f'{dataset_path}/relative_windings.json',
     f'{dataset_path}/same_windings.json',
+    f'{dataset_path}/drawn_control_points.json',
 ]
 # The interactive session API supplies explicit roles.  The legacy CLI leaves
 # this as None and retains the historical abs_winding.json basename behavior.

@@ -8,6 +8,9 @@
 
 #include <QDateTime>
 #include <QEvent>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
@@ -27,6 +30,10 @@ namespace {
 constexpr int kMinimumDiameter = 4;
 constexpr int kMaximumDiameter = 256;
 constexpr qreal kPaintOpacity = 0.45;
+constexpr float kPolylineSpacingVoxels = 30.0f;
+constexpr qreal kPolylineWidth = 3.0;
+constexpr qreal kControlPointRadius = 3.5;
+constexpr float kPolylineProjectionToleranceVoxels = 100.0f;
 
 bool validPoint(const cv::Vec3f& point)
 {
@@ -92,6 +99,14 @@ SpiralBrushController::SpiralBrushController(QObject* parent)
         kMinimumDiameter, kMaximumDiameter);
 }
 
+void SpiralBrushController::setPaintSurface(const std::shared_ptr<QuadSurface>& surface)
+{
+    if (_paintSurface == surface) return;
+    _paintSurface = surface;
+    clearPointChainProjectionCache();
+    refreshAll();
+}
+
 void SpiralBrushController::bindFlattenedViewer(VolumeViewerBase* viewer)
 {
     if (_viewport) _viewport->removeEventFilter(this);
@@ -119,12 +134,18 @@ void SpiralBrushController::bindFlattenedViewer(VolumeViewerBase* viewer)
 void SpiralBrushController::resetSession()
 {
     _gestures.clear();
+    _polylines.clear();
+    _pendingPointCollectionIds.clear();
+    clearPointChainProjectionCache();
     _usedColors.clear();
     _sampledColor.reset();
     _cursorInside = false;
     updateCursorWidget();
     _dragMode = DragMode::None;
     _activeGesture = -1;
+    _activePolyline = -1;
+    _nextPolylineSequence = 1;
+    _polylineBlocked = false;
     refreshAll();
     emit paintStateChanged();
 }
@@ -134,6 +155,20 @@ bool SpiralBrushController::hasUnfinalizedPaint() const
     return std::any_of(_gestures.begin(), _gestures.end(), [](const Gesture& gesture) {
         return gesture.state == GestureState::Painted && !gesture.shape.isEmpty();
     });
+}
+
+bool SpiralBrushController::hasUnfinalizedPolylines() const
+{
+    return std::any_of(_polylines.begin(), _polylines.end(), [](const PolylineGesture& line) {
+        return line.state == GestureState::Painted && line.volumePoints.size() >= 2;
+    });
+}
+
+void SpiralBrushController::setPendingPointCollectionIds(const QSet<QString>& ids)
+{
+    if (_pendingPointCollectionIds == ids) return;
+    _pendingPointCollectionIds = ids;
+    refreshAll();
 }
 
 QColor SpiralBrushController::nextColor()
@@ -228,6 +263,131 @@ void SpiralBrushController::beginPaint(const QPointF& devicePos)
     emit paintStateChanged();
 }
 
+std::optional<std::pair<QPointF, cv::Vec3f>>
+SpiralBrushController::pointOnSurface(
+    const QPointF& devicePos, const std::shared_ptr<QuadSurface>& source) const
+{
+    auto* view = _viewer ? _viewer->graphicsView() : nullptr;
+    if (!view || !source || source.get() != _viewer->currentSurface()) return std::nullopt;
+    bool transformValid = false;
+    const QTransform viewportToScene = view->viewportTransform().inverted(&transformValid);
+    if (!transformValid) return std::nullopt;
+    const QPointF scenePos = viewportToScene.map(devicePos);
+    const cv::Vec2f surface = _viewer->sceneToSurfaceCoords(scenePos);
+    if (!std::isfinite(surface[0]) || !std::isfinite(surface[1])) return std::nullopt;
+
+    const auto* points = source->rawPointsPtr();
+    const cv::Vec2f scale = source->scale();
+    const cv::Vec3f center = source->center();
+    if (!points || points->empty() || !std::isfinite(scale[0]) || !std::isfinite(scale[1])
+        || std::abs(scale[0]) < 1e-6f || std::abs(scale[1]) < 1e-6f) return std::nullopt;
+    const float col = (surface[0] + center[0]) * scale[0];
+    const float row = (surface[1] + center[1]) * scale[1];
+    const int col0 = static_cast<int>(std::floor(col));
+    const int row0 = static_cast<int>(std::floor(row));
+    if (col0 < 0 || row0 < 0 || col0 + 1 >= points->cols || row0 + 1 >= points->rows)
+        return std::nullopt;
+    const cv::Vec3f& p00 = (*points)(row0, col0);
+    const cv::Vec3f& p01 = (*points)(row0, col0 + 1);
+    const cv::Vec3f& p10 = (*points)(row0 + 1, col0);
+    const cv::Vec3f& p11 = (*points)(row0 + 1, col0 + 1);
+    if (!validPoint(p00) || !validPoint(p01) || !validPoint(p10) || !validPoint(p11))
+        return std::nullopt;
+    const float colFraction = col - static_cast<float>(col0);
+    const float rowFraction = row - static_cast<float>(row0);
+    const cv::Vec3f top = p00 * (1.0f - colFraction) + p01 * colFraction;
+    const cv::Vec3f bottom = p10 * (1.0f - colFraction) + p11 * colFraction;
+    const cv::Vec3f point = top * (1.0f - rowFraction) + bottom * rowFraction;
+    if (!validPoint(point)) return std::nullopt;
+    return std::make_pair(QPointF(surface[0], surface[1]), point);
+}
+
+bool SpiralBrushController::appendPolylinePoint(const QPointF& devicePos)
+{
+    if (_activePolyline < 0 || _activePolyline >= static_cast<int>(_polylines.size()))
+        return false;
+    auto& line = _polylines[static_cast<std::size_t>(_activePolyline)];
+    const auto sample = pointOnSurface(devicePos, line.source);
+    if (!sample) return false;
+    if (!line.volumePoints.empty()) {
+        const cv::Vec3f delta = sample->second - line.volumePoints.back();
+        if (delta.dot(delta) < 1e-4f) return true;
+    }
+    line.surfacePoints.push_back(sample->first);
+    line.volumePoints.push_back(sample->second);
+    clearPointChainProjectionCache();
+    return true;
+}
+
+void SpiralBrushController::beginPolyline(const QPointF& devicePos)
+{
+    if (!_viewer || _viewer->surfName() != "segmentation") return;
+    auto* sourceRaw = dynamic_cast<QuadSurface*>(_viewer->currentSurface());
+    if (!sourceRaw || !_paintSurface || _paintSurface.get() != sourceRaw) return;
+    PolylineGesture line;
+    line.color = nextColor();
+    line.source = _paintSurface;
+    line.creationTime = QDateTime::currentMSecsSinceEpoch();
+    line.sequence = _nextPolylineSequence++;
+    _polylines.push_back(std::move(line));
+    _activePolyline = static_cast<int>(_polylines.size()) - 1;
+    _polylineBlocked = false;
+    if (!appendPolylinePoint(devicePos)) {
+        _polylines.pop_back();
+        _activePolyline = -1;
+        return;
+    }
+    _lastDevicePos = devicePos;
+    _dragMode = DragMode::Polyline;
+    refreshViewer(_viewer);
+    emit paintStateChanged();
+}
+
+void SpiralBrushController::resamplePolyline(PolylineGesture& line)
+{
+    if (line.volumePoints.size() < 2 || line.surfacePoints.size() != line.volumePoints.size()) {
+        line.volumePoints.clear();
+        line.surfacePoints.clear();
+        return;
+    }
+    std::vector<float> cumulative(line.volumePoints.size(), 0.0f);
+    for (std::size_t index = 1; index < line.volumePoints.size(); ++index) {
+        const cv::Vec3f delta = line.volumePoints[index] - line.volumePoints[index - 1];
+        cumulative[index] = cumulative[index - 1] + std::sqrt(delta.dot(delta));
+    }
+    const float total = cumulative.back();
+    if (total < 1e-3f) {
+        line.volumePoints.clear();
+        line.surfacePoints.clear();
+        return;
+    }
+
+    std::vector<float> targets{0.0f};
+    for (float distance = kPolylineSpacingVoxels; distance < total; distance += kPolylineSpacingVoxels)
+        targets.push_back(distance);
+    if (total - targets.back() > 1e-3f) targets.push_back(total);
+
+    std::vector<cv::Vec3f> volumePoints;
+    std::vector<QPointF> surfacePoints;
+    volumePoints.reserve(targets.size());
+    surfacePoints.reserve(targets.size());
+    std::size_t segment = 1;
+    for (float target : targets) {
+        while (segment + 1 < cumulative.size() && cumulative[segment] < target) ++segment;
+        const float startDistance = cumulative[segment - 1];
+        const float segmentLength = cumulative[segment] - startDistance;
+        const float fraction = segmentLength > 1e-6f
+            ? std::clamp((target - startDistance) / segmentLength, 0.0f, 1.0f) : 0.0f;
+        volumePoints.push_back(line.volumePoints[segment - 1] * (1.0f - fraction)
+                               + line.volumePoints[segment] * fraction);
+        surfacePoints.push_back(line.surfacePoints[segment - 1] * (1.0 - fraction)
+                                + line.surfacePoints[segment] * fraction);
+    }
+    line.volumePoints = std::move(volumePoints);
+    line.surfacePoints = std::move(surfacePoints);
+    clearPointChainProjectionCache();
+}
+
 void SpiralBrushController::beginErase(const QPointF& devicePos)
 {
     if (!_viewer || _viewer->surfName() != "segmentation"
@@ -239,13 +399,16 @@ void SpiralBrushController::beginErase(const QPointF& devicePos)
 
 void SpiralBrushController::extendDrag(const QPointF& devicePos)
 {
-    const QPainterPath addition = deviceToSurface(deviceSweep(_lastDevicePos, devicePos));
     if (_dragMode == DragMode::Paint && _activeGesture >= 0
         && _activeGesture < static_cast<int>(_gestures.size())) {
+        const QPainterPath addition = deviceToSurface(deviceSweep(_lastDevicePos, devicePos));
         auto& gesture = _gestures[static_cast<std::size_t>(_activeGesture)];
         gesture.shape = gesture.shape.united(addition);
     } else if (_dragMode == DragMode::Erase) {
+        const QPainterPath addition = deviceToSurface(deviceSweep(_lastDevicePos, devicePos));
         eraseWith(addition);
+    } else if (_dragMode == DragMode::Polyline && !_polylineBlocked) {
+        if (!appendPolylinePoint(devicePos)) _polylineBlocked = true;
     }
     _lastDevicePos = devicePos;
     refreshViewer(_viewer);
@@ -254,8 +417,17 @@ void SpiralBrushController::extendDrag(const QPointF& devicePos)
 void SpiralBrushController::finishDrag(const QPointF& devicePos)
 {
     if (_dragMode != DragMode::None) extendDrag(devicePos);
+    if (_dragMode == DragMode::Polyline && _activePolyline >= 0
+        && _activePolyline < static_cast<int>(_polylines.size())) {
+        auto& line = _polylines[static_cast<std::size_t>(_activePolyline)];
+        resamplePolyline(line);
+        if (line.volumePoints.size() < 2)
+            _polylines.erase(_polylines.begin() + _activePolyline);
+    }
     _dragMode = DragMode::None;
     _activeGesture = -1;
+    _activePolyline = -1;
+    _polylineBlocked = false;
     _gestures.erase(std::remove_if(_gestures.begin(), _gestures.end(), [](const Gesture& gesture) {
         return gesture.state == GestureState::Painted && gesture.shape.isEmpty();
     }), _gestures.end());
@@ -363,7 +535,11 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
                   mouse->globalPosition().toPoint()));
         _shiftHeld = mouse->modifiers().testFlag(Qt::ShiftModifier);
         updateCursor(devicePos);
-        if (_dragMode != DragMode::None && (mouse->buttons() & Qt::RightButton)) {
+        const bool paintDragging = _dragMode == DragMode::Paint
+            && mouse->buttons().testFlag(Qt::LeftButton);
+        const bool rightDragging = (_dragMode == DragMode::Polyline || _dragMode == DragMode::Erase)
+            && mouse->buttons().testFlag(Qt::RightButton);
+        if (paintDragging || rightDragging) {
             extendDrag(devicePos);
             return true;
         }
@@ -379,11 +555,17 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
             sampleColor(_viewer->graphicsView()->mapToScene(devicePos.toPoint()));
             return true;
         }
-        if (mouse->button() == Qt::RightButton && mouse->modifiers() == Qt::ShiftModifier) {
+        if (mouse->button() == Qt::LeftButton && mouse->modifiers() == Qt::ShiftModifier) {
             _shiftHeld = true;
             updateCursor(devicePos);
             beginPaint(devicePos);
             return _dragMode == DragMode::Paint;
+        }
+        if (mouse->button() == Qt::RightButton && mouse->modifiers() == Qt::ShiftModifier) {
+            _shiftHeld = true;
+            updateCursor(devicePos);
+            beginPolyline(devicePos);
+            return _dragMode == DragMode::Polyline;
         }
         if (mouse->button() == Qt::RightButton && mouse->modifiers() == Qt::ControlModifier) {
             beginErase(devicePos);
@@ -396,7 +578,11 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
             ? mouse->position()
             : QPointF(qobject_cast<QWidget*>(_viewport)->mapFromGlobal(
                   mouse->globalPosition().toPoint()));
-        if (mouse->button() == Qt::RightButton && _dragMode != DragMode::None) {
+        const bool matchingRelease =
+            (mouse->button() == Qt::LeftButton && _dragMode == DragMode::Paint)
+            || (mouse->button() == Qt::RightButton
+                && (_dragMode == DragMode::Polyline || _dragMode == DragMode::Erase));
+        if (matchingRelease) {
             finishDrag(devicePos);
             updateCursor(devicePos);
             return true;
@@ -409,9 +595,15 @@ bool SpiralBrushController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
     if (!viewer || viewer != _viewer || viewer->surfName() != "segmentation") return false;
     Surface* current = viewer->currentSurface();
-    return std::any_of(
+    const bool hasPaint = std::any_of(
         _gestures.begin(), _gestures.end(), [current](const Gesture& gesture) {
             return gesture.source.get() == current && !gesture.shape.isEmpty();
+        });
+    return hasPaint || std::any_of(
+        _polylines.begin(), _polylines.end(), [this](const PolylineGesture& line) {
+            const bool visible = line.state != GestureState::Finalized
+                || _pendingPointCollectionIds.contains(line.id);
+            return visible && line.volumePoints.size() >= 2;
         });
 }
 
@@ -427,6 +619,26 @@ void SpiralBrushController::collectPrimitives(VolumeViewerBase* viewer, OverlayB
         style.brushColor.setAlphaF(kPaintOpacity);
         style.z = 118.0;
         builder.addPainterPath(surfaceToScene(gesture.shape), style);
+    }
+    for (const auto& line : _polylines) {
+        const bool visible = line.state != GestureState::Finalized
+            || _pendingPointCollectionIds.contains(line.id);
+        if (!visible || line.volumePoints.size() < 2) continue;
+        // Volume points remain the canonical line. renderPointChain projects
+        // them through the current preview's indexed surface generation, so a
+        // fitted replacement surface cannot strand the overlay on stale grid
+        // coordinates.
+        PointChainStyle style;
+        style.color = line.color;
+        style.pointBorderColor = line.color;
+        style.pointRadius = kControlPointRadius;
+        style.pointPenWidth = 1.0;
+        style.lineWidth = kPolylineWidth;
+        style.lineOpacity = 1.0f;
+        style.pointZ = 120.0;
+        style.lineZ = 119.0;
+        style.distanceTolerance = kPolylineProjectionToleranceVoxels;
+        renderPointChain(viewer, builder, line.volumePoints, style);
     }
 }
 
@@ -535,11 +747,67 @@ SpiralBrushController::preparePatches(QStringList& warnings)
     return patches;
 }
 
+SpiralBrushController::PreparedPointCollections
+SpiralBrushController::preparePointCollections(QStringList& warnings)
+{
+    PreparedPointCollections result;
+    if (_dragMode != DragMode::None) {
+        warnings.push_back(tr("Release the mouse button before finalizing control-point lines"));
+        return result;
+    }
+    QJsonObject collections;
+    int collectionId = 0;
+    for (auto& line : _polylines) {
+        if (line.state != GestureState::Painted || line.volumePoints.size() < 2) continue;
+        QJsonObject points;
+        for (int index = 0; index < static_cast<int>(line.volumePoints.size()); ++index) {
+            const cv::Vec3f& point = line.volumePoints[static_cast<std::size_t>(index)];
+            points[QString::number(index)] = QJsonObject{
+                {QStringLiteral("p"), QJsonArray{point[0], point[1], point[2]}},
+                {QStringLiteral("wind_a"), QJsonValue::Null},
+                {QStringLiteral("creation_time"), line.creationTime},
+            };
+        }
+        collections[QString::number(collectionId++)] = QJsonObject{
+            {QStringLiteral("name"),
+             QStringLiteral("drawn_line_%1").arg(line.sequence, 4, 10, QLatin1Char('0'))},
+            {QStringLiteral("points"), points},
+            {QStringLiteral("metadata"),
+             QJsonObject{{QStringLiteral("winding_is_absolute"), false}}},
+            {QStringLiteral("color"),
+             QJsonArray{line.color.redF(), line.color.greenF(), line.color.blueF()}},
+        };
+    }
+    if (collections.isEmpty()) return result;
+    const QString stamp = QDateTime::currentDateTimeUtc().toString(
+        QStringLiteral("yyyyMMdd_HHmmss_zzz"));
+    const QString suffix = QString::number(QRandomGenerator::global()->generate(), 16)
+                               .rightJustified(8, '0');
+    result.id = QStringLiteral("drawn_control_points_%1_%2").arg(stamp, suffix);
+    result.document = QJsonDocument(QJsonObject{
+        {QStringLiteral("vc_pointcollections_json_version"), QStringLiteral("1")},
+        {QStringLiteral("collections"), collections},
+    });
+    for (auto& line : _polylines) {
+        if (line.state == GestureState::Painted && line.volumePoints.size() >= 2) {
+            line.id = result.id;
+            line.state = GestureState::Finalizing;
+        }
+    }
+    refreshAll();
+    emit paintStateChanged();
+    return result;
+}
+
 void SpiralBrushController::finalizationSucceeded(const QString& id)
 {
     _gestures.erase(std::remove_if(_gestures.begin(), _gestures.end(), [&](const Gesture& gesture) {
         return gesture.id == id;
     }), _gestures.end());
+    for (auto& line : _polylines) {
+        if (line.id == id && line.state == GestureState::Finalizing)
+            line.state = GestureState::Finalized;
+    }
     refreshAll();
     emit paintStateChanged();
 }
@@ -552,6 +820,12 @@ void SpiralBrushController::finalizationFailed(const QString& id)
             gesture.state = GestureState::Painted;
         }
     }
+    for (auto& line : _polylines) {
+        if (line.id == id && line.state == GestureState::Finalizing) {
+            line.id.clear();
+            line.state = GestureState::Painted;
+        }
+    }
     refreshAll();
     emit paintStateChanged();
 }
@@ -559,6 +833,9 @@ void SpiralBrushController::finalizationFailed(const QString& id)
 void SpiralBrushController::discardUnfinalized()
 {
     _gestures.clear();
+    _polylines.clear();
+    _pendingPointCollectionIds.clear();
+    clearPointChainProjectionCache();
     _sampledColor.reset();
     refreshAll();
     emit paintStateChanged();

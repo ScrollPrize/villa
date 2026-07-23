@@ -159,6 +159,7 @@ private:
     QHash<QString, QString> _surfaceSourceIds;
     QHash<QString, bool> _surfaceCategoryVisible;
     QSet<QString> _pendingPatchIds;
+    QSet<QString> _pendingDrawnPointCollectionIds;
     std::map<std::string, std::size_t> _surfaceOverlayColorAssignments;
     std::map<std::string, cv::Vec3b> _surfaceOverlayColors;
     std::size_t _nextSurfaceOverlayColorIndex = 0;
@@ -193,6 +194,9 @@ private:
     QHash<QString, PendingBrushPatch> _pendingBrushPatches;
     QHash<QString, QString> _brushProvisionalPaths;
     QSet<QString> _unverifiedBrushIds;
+    QHash<QString, QString> _pendingPointCollectionPaths;
+    QHash<QString, QString> _pointCollectionProvisionalPaths;
+    QSet<QString> _uncommittedPointCollectionIds;
     std::function<void()> _pendingExitAction;
     bool _commitAfterBrushUploads = false;
 };

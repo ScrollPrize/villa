@@ -213,6 +213,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _pclRole->addItem(tr("Patch overlap"), QStringLiteral("patch_overlap"));
     _pclRole->addItem(tr("Relative"), QStringLiteral("relative"));
     _pclRole->addItem(tr("Same winding"), QStringLiteral("same_winding"));
+    _pclRole->addItem(tr("Drawn control points"), QStringLiteral("drawn_control_points"));
     _pclPath = new QLineEdit(pclContainer);
     _pclPath->setObjectName(QStringLiteral("spiralPclPath"));
     _pclPath->setPlaceholderText(tr("PCL path"));
@@ -724,7 +725,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         if (QMessageBox::question(this, tr("Commit inputs"),
                                   tr("Move the added inputs into the dataset? Patches go to "
                                      "verified_patches/, fibers to fibers/, and PCL documents "
-                                     "merge into their conventional role file."))
+                                     "merge into their conventional role file (drawn control "
+                                     "points go to drawn_control_points.json)."))
             != QMessageBox::Yes) return;
         _service->commitInputs();
     });
@@ -1611,7 +1613,8 @@ void SpiralPanel::restore()
         // Import settings written by the original four-row PCL UI once.
         for (const auto& pair : std::initializer_list<std::pair<const char*, const char*>>{
                  {"pcl_absolute", "absolute"}, {"pcl_patch_overlap", "patch_overlap"},
-                 {"pcl_relative", "relative"}, {"pcl_same_winding", "same_winding"}}) {
+                 {"pcl_relative", "relative"}, {"pcl_same_winding", "same_winding"},
+                 {"pcl_drawn_control_points", "drawn_control_points"}}) {
             const QString path = settings.value(
                 QStringLiteral("spiral/paths/") + QString::fromLatin1(pair.first)).toString();
             addPclItem(path, QString::fromLatin1(pair.second));

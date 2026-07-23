@@ -130,6 +130,7 @@ class PclRole(str, Enum):
     PATCH_OVERLAP = "patch_overlap"
     RELATIVE = "relative"
     SAME_WINDING = "same_winding"
+    DRAWN_CONTROL_POINTS = "drawn_control_points"
 
 
 @dataclass(frozen=True)
@@ -263,6 +264,7 @@ _CONVENTIONAL_ENTRIES: tuple[tuple[str, str, str, bool], ...] = (
 _PCL_ENTRIES: tuple[tuple[PclRole, str, bool], ...] = (
     (PclRole.ABSOLUTE, "abs_winding.json", False),
     (PclRole.RELATIVE, "relative_windings.json", False),
+    (PclRole.DRAWN_CONTROL_POINTS, "drawn_control_points.json", False),
 )
 
 
