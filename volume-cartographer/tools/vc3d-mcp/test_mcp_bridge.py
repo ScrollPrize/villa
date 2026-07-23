@@ -578,6 +578,9 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content.type, "image")
         self.assertEqual(content.mimeType, "image/png")
         self.assertEqual(base64.b64decode(content.data), TINY_PNG_BYTES)
+        self.assertEqual(
+            self.fake_server.received_requests[-1]["params"]["maxDim"], 2048
+        )
 
     async def test_vc3d_screenshot_to_file_returns_dict(self) -> None:
         # file_path given -> the PNG is written to disk; the tool returns the
@@ -587,6 +590,13 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result, dict)
         self.assertEqual(result["filePath"], "/tmp/shot.png")
         self.assertIsNone(result["base64"])
+        self.assertNotIn("maxDim", self.fake_server.received_requests[-1]["params"])
+
+    async def test_vc3d_screenshot_honors_explicit_max_dim(self) -> None:
+        await vc3d_screenshot(target="window", max_dim=1024)
+        self.assertEqual(
+            self.fake_server.received_requests[-1]["params"]["maxDim"], 1024
+        )
 
     async def test_vc3d_screenshot_missing_base64_falls_back_to_dict(self) -> None:
         # Bridge returns no image bytes for an inline capture -> fall back to

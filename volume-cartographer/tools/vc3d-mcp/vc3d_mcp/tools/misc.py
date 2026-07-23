@@ -9,6 +9,8 @@ from mcp.server.fastmcp import Context, Image
 
 from ..core import mcp, _call, _strip_none, _wait_for_job
 
+INLINE_SCREENSHOT_MAX_DIM = 2048
+
 
 @mcp.tool()
 async def vc3d_ping() -> dict[str, Any]:
@@ -44,6 +46,8 @@ async def vc3d_screenshot(
     file_path: absolute path; when set, the PNG is written to disk and the
     result dict is returned. Omit to get the PNG back as an inline image.
     max_dim: optional downscale, longest side in pixels, aspect preserved.
+    Inline captures default to 2048 pixels so their base64 response stays
+    within the bridge transport budget. File captures default to full size.
 
     Fails -32009 if the target widget isn't currently visible (e.g. it's on a
     non-frontmost tab, such as a fiber/lasagna workspace pane while a
@@ -51,9 +55,15 @@ async def vc3d_screenshot(
     side) -- rather than silently returning a meaningless near-zero-size
     image. Switch to the right tab/workspace first if you hit this.
     """
+    effective_max_dim = max_dim
+    if effective_max_dim is None and file_path is None:
+        effective_max_dim = INLINE_SCREENSHOT_MAX_DIM
+
     result = await _call(
         "screenshot.capture",
-        _strip_none({"target": target, "filePath": file_path, "maxDim": max_dim}),
+        _strip_none(
+            {"target": target, "filePath": file_path, "maxDim": effective_max_dim}
+        ),
     )
     if file_path is not None:
         return result

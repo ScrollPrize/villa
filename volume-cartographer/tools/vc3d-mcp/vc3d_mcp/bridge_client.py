@@ -157,10 +157,9 @@ class BridgeClientConfig:
     socket: str
     connect_timeout: float = 5.0
     request_timeout: float = 30.0
-    # asyncio.StreamReader's default line-length limit (64 KiB) is comfortably
-    # above a single bridge message (screenshots go through filePath/base64
-    # but base64 payloads can still be large); raise it generously.
-    read_buffer_limit: int = 8 * 1024 * 1024
+    # A 2048x2048 RGBA PNG can approach 16 MiB before base64 encoding. Leave
+    # enough room for that inline response and its JSON envelope.
+    read_buffer_limit: int = 32 * 1024 * 1024
 
 
 @dataclass
