@@ -35,6 +35,7 @@ def _make_flatten_model(
 	xyz: torch.Tensor,
 	valid: torch.Tensor | None = None,
 	*,
+	device: torch.device | None = None,
 	mesh_step: int = 1,
 	flatten_filter_source_angles: bool = False,
 	flatten_filter_angle_deg: float = 90.0,
@@ -46,7 +47,7 @@ def _make_flatten_model(
 	return fit_model.Model3D.from_flatten_tifxyz_crop(
 		xyz,
 		valid,
-		device=torch.device("cpu"),
+		device=torch.device("cpu") if device is None else device,
 		mesh_step=mesh_step,
 		winding_step=1,
 		subsample_mesh=1,
@@ -278,6 +279,7 @@ class FlattenLossTest(unittest.TestCase):
 		for stage in cfg["stages"]:
 			self.assertFalse(stage["args"]["flatten_diagnostics"])
 			self.assertTrue(stage["args"]["compile_flatten"])
+			self.assertTrue(stage["args"]["compile_flatten_combined"])
 			self.assertTrue(stage["args"]["fused_flatten_adam_clamp"])
 
 	def test_bilinear_validity_rejects_cells_with_any_invalid_corner(self) -> None:
@@ -382,6 +384,126 @@ class FlattenLossTest(unittest.TestCase):
 			self.assertEqual(len(compiled_grads), len(eager_grads))
 			for compiled_grad, eager_grad in zip(compiled_grads, eager_grads, strict=True):
 				self.assertTrue(torch.allclose(compiled_grad, eager_grad, rtol=1.0e-5, atol=1.0e-6))
+		finally:
+			opt_loss_flatten.configure(diagnostics=True, orient_min_det=0.0, reset_history=True)
+			opt_loss_flatten.configure_compile(enabled=False)
+
+	def test_forward_flatten_static_caches_match_source_and_identity(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(7, 9, sx=2.0, sy=3.0),
+			mesh_step=5,
+			flatten_direction="forward",
+		)
+
+		expected_metric = fit_model.Model3D._flatten_source_metric(mdl.flatten_source_xyz)
+		self.assertTrue(torch.equal(mdl.flatten_source_metric, expected_metric))
+		self.assertTrue(torch.equal(mdl.flatten_identity_y, torch.arange(7, dtype=torch.float32)))
+		self.assertTrue(torch.equal(mdl.flatten_identity_x, torch.arange(9, dtype=torch.float32)))
+		self.assertNotIn("flatten_source_metric", mdl.state_dict())
+		self.assertNotIn("flatten_identity_y", mdl.state_dict())
+		self.assertNotIn("flatten_identity_x", mdl.state_dict())
+
+	def _assert_combined_forward_flatten_loss_matches_individual_losses_and_gradients(
+		self,
+		*,
+		device: torch.device,
+		backend: str | None,
+	) -> None:
+		weights = torch.tensor([1.0, 0.1, 1.0, 10.0], device=device, dtype=torch.float32)
+
+		def _evaluate(*, combined: bool) -> tuple[torch.Tensor, list[torch.Tensor]]:
+			opt_loss_flatten.configure(orient_min_det=1.1, diagnostics=False, reset_history=True)
+			opt_loss_flatten.configure_compile(enabled=combined, backend=backend)
+			mdl = _make_flatten_model(
+				_flat_grid(8, 9),
+				device=device,
+				mesh_step=1,
+				flatten_direction="forward",
+			)
+			map_yx = mdl.flatten_map().detach().clone()
+			map_yx[..., 0] += 0.03 * torch.sin(map_yx[..., 1])
+			map_yx[..., 1] *= 1.07
+			_set_flatten_map(mdl, map_yx)
+			res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+			if combined:
+				total = opt_loss_flatten.flatten_combined_loss(res=res, weights=weights)
+			else:
+				losses = (
+					opt_loss_flatten.flatten_sdir_loss(res=res)[0],
+					opt_loss_flatten.flatten_map_step_loss(res=res)[0],
+					opt_loss_flatten.flatten_avg_offset_loss(res=res)[0],
+					opt_loss_flatten.flatten_orient_loss(res=res)[0],
+				)
+				total = sum(weight * loss for weight, loss in zip(weights, losses, strict=True))
+			total.backward()
+			return total.detach(), [p.grad.detach().clone() for p in mdl.flatten_map_ms]
+
+		try:
+			eager_loss, eager_grads = _evaluate(combined=False)
+			combined_loss, combined_grads = _evaluate(combined=True)
+			self.assertIsNotNone(opt_loss_flatten._compiled_combined_core)
+			self.assertTrue(torch.allclose(combined_loss, eager_loss, rtol=1.0e-6, atol=1.0e-6))
+			self.assertEqual(len(combined_grads), len(eager_grads))
+			for combined_grad, eager_grad in zip(combined_grads, eager_grads, strict=True):
+				self.assertTrue(torch.allclose(combined_grad, eager_grad, rtol=1.0e-5, atol=1.0e-6))
+		finally:
+			opt_loss_flatten.configure(diagnostics=True, orient_min_det=0.0, reset_history=True)
+			opt_loss_flatten.configure_compile(enabled=False)
+
+	def test_combined_forward_flatten_loss_matches_individual_losses_and_gradients(self) -> None:
+		self._assert_combined_forward_flatten_loss_matches_individual_losses_and_gradients(
+			device=torch.device("cpu"),
+			backend="eager",
+		)
+
+	@unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+	def test_combined_forward_flatten_loss_matches_individual_losses_and_gradients_on_cuda(self) -> None:
+		self._assert_combined_forward_flatten_loss_matches_individual_losses_and_gradients(
+			device=torch.device("cuda"),
+			backend=None,
+		)
+
+	def test_optimizer_dispatches_complete_forward_objective_to_combined_loss(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(6, 7), mesh_step=1, flatten_direction="forward")
+		stages = optimizer.load_stages_cfg({
+			"args": {"model-init": "flatten"},
+			"base": {
+				"flatten_sdir": 1.0,
+				"flatten_map_step": 0.1,
+				"flatten_avg_offset": 1.0,
+				"flatten_orient": 10.0,
+			},
+			"stages": [{
+				"name": "flatten",
+				"steps": 1,
+				"lr": 0.0,
+				"params": ["map_flatten_ms"],
+				"args": {
+					"compile_flatten": True,
+					"compile_flatten_backend": "eager",
+					"compile_flatten_combined": True,
+					"flatten_diagnostics": False,
+					"flatten_max_update": 0.0,
+					"status_interval": 0,
+				},
+			}],
+		})
+
+		try:
+			with mock.patch.object(
+				opt_loss_flatten,
+				"flatten_combined_loss",
+				wraps=opt_loss_flatten.flatten_combined_loss,
+			) as combined:
+				optimizer.optimize(
+					model=mdl,
+					data=fit._dummy_flatten_data(),
+					stages=stages,
+					snapshot_interval=0,
+					snapshot_fn=lambda **_kw: None,
+					progress_fn=lambda **_kw: None,
+				)
+			self.assertGreaterEqual(combined.call_count, 2)
 		finally:
 			opt_loss_flatten.configure(diagnostics=True, orient_min_det=0.0, reset_history=True)
 			opt_loss_flatten.configure_compile(enabled=False)

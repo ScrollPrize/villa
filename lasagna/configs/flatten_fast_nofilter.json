@@ -19,6 +19,7 @@
 			"min_scaledown": 0,
 			"args": {
 				"compile_flatten": true,
+				"compile_flatten_combined": true,
 				"flatten_diagnostics": false,
 				"fused_flatten_adam_clamp": true,
 				"flatten_support": true,
@@ -41,6 +42,7 @@
 			"min_scaledown": 0,
 			"args": {
 				"compile_flatten": true,
+				"compile_flatten_combined": true,
 				"flatten_diagnostics": false,
 				"fused_flatten_adam_clamp": true,
 				"flatten_support": true,
@@ -63,6 +65,7 @@
 			"min_scaledown": 0,
 			"args": {
 				"compile_flatten": true,
+				"compile_flatten_combined": true,
 				"flatten_diagnostics": false,
 				"fused_flatten_adam_clamp": true,
 				"flatten_support": true,

@@ -18,6 +18,7 @@ _compile_fullgraph = False
 _compile_key: tuple[bool, str | None, str | None, bool, bool] | None = None
 _compiled_forward_sdir_core = None
 _compiled_orient_core = None
+_compiled_combined_core = None
 _compile_disabled_reason: str | None = None
 
 
@@ -49,13 +50,15 @@ def configure_compile(
 ) -> None:
 	"""Configure opt-in torch.compile use for the expensive flatten loss kernels."""
 	global _compile_flatten, _compile_backend, _compile_mode, _compile_dynamic, _compile_fullgraph
-	global _compile_key, _compiled_forward_sdir_core, _compiled_orient_core, _compile_disabled_reason
+	global _compile_key, _compiled_forward_sdir_core, _compiled_orient_core, _compiled_combined_core
+	global _compile_disabled_reason
 	backend = str(backend).strip() if backend is not None and str(backend).strip() else None
 	mode = str(mode).strip() if mode is not None and str(mode).strip() else None
 	key = (bool(enabled), backend, mode, bool(dynamic), bool(fullgraph))
 	if key != _compile_key:
 		_compiled_forward_sdir_core = None
 		_compiled_orient_core = None
+		_compiled_combined_core = None
 		_compile_disabled_reason = None
 		_compile_key = key
 	_compile_flatten = bool(enabled)
@@ -78,14 +81,22 @@ def _compile_kwargs() -> dict[str, object]:
 
 
 def _compiled_flatten_core(which: str, eager_fn):
-	global _compiled_forward_sdir_core, _compiled_orient_core, _compile_disabled_reason
+	global _compiled_forward_sdir_core, _compiled_orient_core, _compiled_combined_core
+	global _compile_disabled_reason
 	if not _compile_flatten or _compile_disabled_reason is not None:
 		return eager_fn
 	if not hasattr(torch, "compile"):
 		_compile_disabled_reason = "torch.compile is unavailable"
 		print(f"[opt_loss_flatten] compile_flatten disabled: {_compile_disabled_reason}", flush=True)
 		return eager_fn
-	compiled = _compiled_forward_sdir_core if which == "forward_sdir" else _compiled_orient_core
+	if which == "forward_sdir":
+		compiled = _compiled_forward_sdir_core
+	elif which == "orient":
+		compiled = _compiled_orient_core
+	elif which == "combined":
+		compiled = _compiled_combined_core
+	else:
+		raise ValueError(f"unknown flatten compile core {which!r}")
 	if compiled is None:
 		try:
 			compiled = torch.compile(eager_fn, **_compile_kwargs())
@@ -95,8 +106,10 @@ def _compiled_flatten_core(which: str, eager_fn):
 			return eager_fn
 		if which == "forward_sdir":
 			_compiled_forward_sdir_core = compiled
-		else:
+		elif which == "orient":
 			_compiled_orient_core = compiled
+		else:
+			_compiled_combined_core = compiled
 	return compiled
 
 
@@ -157,29 +170,40 @@ def _forward_source_fields(
 	return uv, xyz, vertex_valid.to(dtype=torch.bool), cell_valid.to(dtype=torch.bool)
 
 
+def _identity_vectors(
+	res: fit_model.FitResult3D,
+	map_yx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	identity_y = res.flatten_identity_y
+	identity_x = res.flatten_identity_x
+	if identity_y is None or int(identity_y.numel()) != int(map_yx.shape[0]):
+		identity_y = torch.arange(int(map_yx.shape[0]), device=map_yx.device, dtype=map_yx.dtype)
+	else:
+		identity_y = identity_y.to(device=map_yx.device, dtype=map_yx.dtype)
+	if identity_x is None or int(identity_x.numel()) != int(map_yx.shape[1]):
+		identity_x = torch.arange(int(map_yx.shape[1]), device=map_yx.device, dtype=map_yx.dtype)
+	else:
+		identity_x = identity_x.to(device=map_yx.device, dtype=map_yx.dtype)
+	return identity_y, identity_x
+
+
 def _flatten_forward_sdir_core(
 	uv: torch.Tensor,
-	xyz: torch.Tensor,
+	source_metric: torch.Tensor,
 	cell_valid: torch.Tensor,
 	domain_step: torch.Tensor,
 	eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-	p00 = xyz[:-1, :-1]
-	p10 = xyz[1:, :-1]
-	p01 = xyz[:-1, 1:]
-	p11 = xyz[1:, 1:]
 	u00 = uv[:-1, :-1]
 	u10 = uv[1:, :-1]
 	u01 = uv[:-1, 1:]
 	u11 = uv[1:, 1:]
-	Xy = 0.5 * ((p10 - p00) + (p11 - p01))
-	Xx = 0.5 * ((p01 - p00) + (p11 - p10))
 	Uy = 0.5 * ((u10 - u00) + (u11 - u01))
 	Ux = 0.5 * ((u01 - u00) + (u11 - u10))
 
-	g00 = (Xy * Xy).sum(dim=-1)
-	g01 = (Xy * Xx).sum(dim=-1)
-	g11 = (Xx * Xx).sum(dim=-1)
+	g00 = source_metric[..., 0]
+	g01 = source_metric[..., 1]
+	g11 = source_metric[..., 2]
 	c00 = (Uy * Uy).sum(dim=-1)
 	c01 = (Uy * Ux).sum(dim=-1)
 	c11 = (Ux * Ux).sum(dim=-1)
@@ -212,6 +236,167 @@ def _flatten_forward_sdir_core(
 	return loss, lm, mask, valid
 
 
+def _flatten_forward_combined_core(
+	uv: torch.Tensor,
+	source_metric: torch.Tensor,
+	vertex_valid: torch.Tensor,
+	cell_valid: torch.Tensor,
+	domain_step: torch.Tensor,
+	avg_mask: torch.Tensor,
+	avg_target: torch.Tensor,
+	identity_y: torch.Tensor,
+	identity_x: torch.Tensor,
+	weights: torch.Tensor,
+	eps: float,
+	orient_min_det: float,
+) -> torch.Tensor:
+	"""Combined diagnostics-free forward flatten objective.
+
+	The source metric and identity vectors are immutable model buffers. UV cell
+	derivatives and determinants are shared by symmetric Dirichlet and orientation.
+	"""
+	m00 = uv[:-1, :-1]
+	m10 = uv[1:, :-1]
+	m01 = uv[:-1, 1:]
+	m11 = uv[1:, 1:]
+	uy = 0.5 * ((m10 - m00) + (m11 - m01))
+	ux = 0.5 * ((m01 - m00) + (m11 - m10))
+	c00 = (uy * uy).sum(dim=-1)
+	c01 = (uy * ux).sum(dim=-1)
+	c11 = (ux * ux).sum(dim=-1)
+	det_c = c00 * c11 - c01 * c01
+	det_uv = uy[..., 0] * ux[..., 1] - uy[..., 1] * ux[..., 0]
+
+	g00 = source_metric[..., 0]
+	g01 = source_metric[..., 1]
+	g11 = source_metric[..., 2]
+	det_g = g00 * g11 - g01 * g01
+	inv_g00 = g11 / det_g.clamp_min(eps)
+	inv_g01 = -g01 / det_g.clamp_min(eps)
+	inv_g11 = g00 / det_g.clamp_min(eps)
+	inv_c00 = c11 / det_c.clamp_min(eps)
+	inv_c01 = -c01 / det_c.clamp_min(eps)
+	inv_c11 = c00 / det_c.clamp_min(eps)
+	domain_step2 = domain_step * domain_step
+	tr_j = domain_step2 * (c00 * inv_g00 + 2.0 * c01 * inv_g01 + c11 * inv_g11)
+	tr_inv = (g00 * inv_c00 + 2.0 * g01 * inv_c01 + g11 * inv_c11) / domain_step2
+	sdir_lm = torch.nan_to_num(tr_j + tr_inv - 4.0, nan=0.0, posinf=1.0e12, neginf=0.0)
+	sdir_valid = (
+		cell_valid
+		& torch.isfinite(sdir_lm)
+		& torch.isfinite(det_g)
+		& torch.isfinite(det_c)
+		& (det_g > eps)
+		& (det_c > eps)
+		& torch.isfinite(det_uv)
+		& (det_uv > eps)
+	)
+	sdir_mask = sdir_valid.to(dtype=uv.dtype)
+	sdir_weight = sdir_mask.sum()
+	sdir_sum = (sdir_lm * sdir_mask).sum()
+	sdir_loss = torch.where(
+		sdir_weight > 0,
+		sdir_sum / sdir_weight.clamp_min(1.0),
+		sdir_sum * 0.0,
+	)
+
+	dy0 = uv[1:, :, 0] - uv[:-1, :, 0] - 1.0
+	dy1 = uv[1:, :, 1] - uv[:-1, :, 1]
+	dy_lm = dy0 * dy0 + dy1 * dy1
+	dy_valid = torch.isfinite(dy_lm) & vertex_valid[1:, :] & vertex_valid[:-1, :]
+	dy_mask = dy_valid.to(dtype=uv.dtype)
+	dy_safe = torch.nan_to_num(dy_lm, nan=0.0, posinf=1.0e12, neginf=0.0)
+	dx0 = uv[:, 1:, 0] - uv[:, :-1, 0]
+	dx1 = uv[:, 1:, 1] - uv[:, :-1, 1] - 1.0
+	dx_lm = dx0 * dx0 + dx1 * dx1
+	dx_valid = torch.isfinite(dx_lm) & vertex_valid[:, 1:] & vertex_valid[:, :-1]
+	dx_mask = dx_valid.to(dtype=uv.dtype)
+	dx_safe = torch.nan_to_num(dx_lm, nan=0.0, posinf=1.0e12, neginf=0.0)
+	map_step_sum = (dy_safe * dy_mask).sum() + (dx_safe * dx_mask).sum()
+	map_step_weight = dy_mask.sum() + dx_mask.sum()
+	map_step_loss = torch.where(
+		map_step_weight > 0,
+		map_step_sum / map_step_weight.clamp_min(1.0),
+		map_step_sum * 0.0,
+	)
+
+	avg_mask_f = avg_mask.to(dtype=uv.dtype)
+	avg_weight = avg_mask_f.sum()
+	offset_y = uv[..., 0] - identity_y.reshape(-1, 1)
+	offset_x = uv[..., 1] - identity_x.reshape(1, -1)
+	avg_candidate = torch.stack(
+		((offset_y * avg_mask_f).sum(), (offset_x * avg_mask_f).sum()),
+	) / avg_weight.clamp_min(1.0)
+	avg_diff_candidate = avg_candidate - avg_target
+	avg_diff = torch.where(avg_weight > 0, avg_diff_candidate, torch.zeros_like(avg_diff_candidate))
+	avg_loss = (avg_diff * avg_diff).sum()
+
+	orient_lm = torch.nan_to_num(
+		torch.relu(orient_min_det - det_uv) ** 2,
+		nan=0.0,
+		posinf=1.0e12,
+		neginf=0.0,
+	)
+	orient_active = cell_valid & torch.isfinite(det_uv) & (det_uv < orient_min_det)
+	orient_loss = (orient_lm * orient_active.to(dtype=uv.dtype)).sum()
+
+	return (
+		weights[0] * sdir_loss
+		+ weights[1] * map_step_loss
+		+ weights[2] * avg_loss
+		+ weights[3] * orient_loss
+	)
+
+
+def flatten_combined_loss(
+	*,
+	res: fit_model.FitResult3D,
+	weights: torch.Tensor,
+) -> torch.Tensor:
+	"""Evaluate all four forward flatten terms in one compiled autograd graph."""
+	if not _is_forward(res):
+		raise RuntimeError("combined flatten loss currently requires the forward solver")
+	uv, xyz, vertex_valid, cell_valid = _forward_source_fields(res)
+	if int(uv.shape[0]) < 2 or int(uv.shape[1]) < 2:
+		raise RuntimeError("combined flatten loss requires a map of at least 2x2")
+	metric = res.flatten_source_metric
+	if metric is None or int(metric.numel()) == 0:
+		metric = fit_model.Model3D._flatten_source_metric(xyz)
+	metric = metric.to(device=uv.device, dtype=uv.dtype)
+	if tuple(metric.shape) != (int(uv.shape[0]) - 1, int(uv.shape[1]) - 1, 3):
+		raise RuntimeError(f"flatten source metric shape {tuple(metric.shape)} does not match map {tuple(uv.shape)}")
+	avg_mask = res.flatten_avg_offset_mask
+	avg_target = res.flatten_initial_avg_offset
+	if avg_mask is None or avg_target is None:
+		raise RuntimeError("combined flatten loss requires average-offset mask and target")
+	if tuple(avg_mask.shape) != tuple(uv.shape[:2]):
+		raise RuntimeError("combined flatten average-offset mask shape does not match map")
+	identity_y, identity_x = _identity_vectors(res, uv)
+	if int(weights.numel()) != 4:
+		raise ValueError(f"combined flatten weights must have four values, got {tuple(weights.shape)}")
+	domain_step = (
+		uv.new_tensor(float(res.params.mesh_step))
+		if res.flatten_target_step is None
+		else res.flatten_target_step.to(device=uv.device, dtype=uv.dtype)
+	).clamp_min(1.0e-12)
+	return _run_compiled_flatten_core(
+		"combined",
+		_flatten_forward_combined_core,
+		uv,
+		metric,
+		vertex_valid.to(device=uv.device, dtype=torch.bool),
+		cell_valid.to(device=uv.device, dtype=torch.bool),
+		domain_step,
+		avg_mask.to(device=uv.device, dtype=torch.bool),
+		avg_target.to(device=uv.device, dtype=uv.dtype).reshape(2),
+		identity_y,
+		identity_x,
+		weights.to(device=uv.device, dtype=uv.dtype).reshape(4),
+		float(_sdir_eps),
+		float(_orient_min_det),
+	)
+
+
 def _flatten_forward_sdir_loss(
 	*,
 	res: fit_model.FitResult3D,
@@ -228,12 +413,18 @@ def _flatten_forward_sdir_loss(
 	else:
 		domain_step = res.flatten_target_step.to(device=uv.device, dtype=uv.dtype)
 	domain_step = domain_step.clamp_min(1.0e-12)
+	metric = res.flatten_source_metric
+	if metric is None or int(metric.numel()) == 0:
+		metric = fit_model.Model3D._flatten_source_metric(xyz)
+	metric = metric.to(device=uv.device, dtype=uv.dtype)
+	if tuple(metric.shape) != (int(uv.shape[0]) - 1, int(uv.shape[1]) - 1, 3):
+		raise RuntimeError(f"flatten source metric shape {tuple(metric.shape)} does not match map {tuple(uv.shape)}")
 	eps = float(_sdir_eps)
 	loss, lm, mask, valid = _run_compiled_flatten_core(
 		"forward_sdir",
 		_flatten_forward_sdir_core,
 		uv,
-		xyz,
+		metric,
 		cell_valid,
 		domain_step,
 		eps,
@@ -421,23 +612,22 @@ def flatten_avg_offset_loss(
 	if target.numel() != 2:
 		raise RuntimeError(f"flatten_initial_avg_offset must have 2 values, got {tuple(target.shape)}")
 
-	identity = fit_model.Model3D._identity_flatten_map(
-		h=int(map_yx.shape[0]),
-		w=int(map_yx.shape[1]),
-		device=map_yx.device,
-		dtype=map_yx.dtype,
-	)
+	identity_y, identity_x = _identity_vectors(res, map_yx)
 	mask_f = mask.to(device=map_yx.device, dtype=map_yx.dtype)
 	weight = mask_f.sum()
 	target_t = target.to(device=map_yx.device, dtype=map_yx.dtype).reshape(2)
-	weighted_offset = ((map_yx - identity) * mask_f.unsqueeze(-1)).sum(dim=(0, 1))
+	offset_y = map_yx[..., 0] - identity_y.reshape(-1, 1)
+	offset_x = map_yx[..., 1] - identity_x.reshape(1, -1)
+	weighted_offset = torch.stack(
+		((offset_y * mask_f).sum(), (offset_x * mask_f).sum()),
+	)
 	avg_candidate = weighted_offset / weight.clamp_min(1.0)
 	diff_candidate = avg_candidate - target_t
 	diff = torch.where(weight > 0, diff_candidate, torch.zeros_like(diff_candidate))
 	loss = (diff * diff).sum()
 	if _diagnostics_enabled:
 		lm = torch.nan_to_num(
-			((map_yx - identity) - target_t.reshape(1, 1, 2)).square().sum(dim=-1),
+			(offset_y - target_t[0]).square() + (offset_x - target_t[1]).square(),
 			nan=0.0,
 			posinf=1.0e12,
 			neginf=0.0,

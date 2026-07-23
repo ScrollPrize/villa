@@ -2286,6 +2286,10 @@ def optimize(
 			"LASAGNA_COMPILE_FLATTEN_FULLGRAPH",
 			stage_args.get("compile_flatten_fullgraph", False),
 		))
+		_compile_flatten_combined = _truthy(os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_COMBINED",
+			stage_args.get("compile_flatten_combined", True),
+		))
 		opt_loss_flatten.configure_compile(
 			enabled=_compile_flatten,
 			backend=_compile_flatten_backend,
@@ -2305,8 +2309,35 @@ def optimize(
 				_details.append("dynamic=1")
 			if _compile_flatten_fullgraph:
 				_details.append("fullgraph=1")
+			if (
+				_compile_flatten_combined
+				and not _flatten_diagnostics
+				and str(getattr(model, "flatten_direction", "inverse")) == "forward"
+			):
+				_details.append("combined=1")
 			_detail_str = " " + " ".join(_details) if _details else ""
 			print(f"[optimizer] {label}: compile_flatten=1{_detail_str}", flush=True)
+		_flatten_combined_names = (
+			"flatten_sdir",
+			"flatten_map_step",
+			"flatten_avg_offset",
+			"flatten_orient",
+		)
+		_flatten_combined_weights = None
+		if (
+			_compile_flatten
+			and _compile_flatten_combined
+			and not _flatten_diagnostics
+			and "map_flatten_ms" in opt_cfg.params
+			and str(getattr(model, "flatten_direction", "inverse")) == "forward"
+		):
+			_flatten_weight_values = tuple(_need_term(name, stage_eff) for name in _flatten_combined_names)
+			if all(weight != 0.0 for weight in _flatten_weight_values):
+				_flatten_combined_weights = torch.tensor(
+					_flatten_weight_values,
+					device=next(model.parameters()).device,
+					dtype=torch.float32,
+				)
 		_compile_cyl_normal_raw = os.environ.get(
 			"LASAGNA_COMPILE_CYL_NORMAL",
 			stage_args.get("compile_cyl_normal", False),
@@ -3231,7 +3262,38 @@ def optimize(
 			if stage_uses_cyl_loss:
 				opt_loss_cyl.reset_candidate_terms()
 			D = res_.xyz_lr.shape[0]
+			if _flatten_combined_weights is not None:
+				for name in _flatten_combined_names:
+					t = terms[name]
+					missing = _missing_loss_fields(
+						name=name,
+						required=t.get("needs", Needs()),
+						res_=res_,
+					)
+					if missing:
+						raise RuntimeError(
+							f"{profile_label or label}: active combined flatten loss missing "
+							f"artifact(s) for '{name}': {', '.join(missing)}"
+						)
+				loss_label = f"{profile_label or label}.flatten_combined"
+				_log_cuda_memory(f"{loss_label}.before")
+				_t_loss = _stage_start(loss_label) if profile_label is not None else None
+				_t_loss_wall = time.perf_counter() if timing is not None else None
+				combined_loss = opt_loss_flatten.flatten_combined_loss(
+					res=res_,
+					weights=_flatten_combined_weights,
+				)
+				_debug_cuda_sync(loss_label)
+				_log_cuda_memory(f"{loss_label}.after_raw")
+				if timing is not None and _t_loss_wall is not None:
+					timing.sync()
+					timing.add("loss:flatten_combined", time.perf_counter() - _t_loss_wall)
+				if _t_loss is not None:
+					_stage_done(loss_label, _t_loss)
+				total = total + combined_loss
 			for name, t in terms.items():
+				if _flatten_combined_weights is not None and name in _flatten_combined_names:
+					continue
 				min_d = t.get("min_depth", 1)
 				if D < min_d:
 					continue
