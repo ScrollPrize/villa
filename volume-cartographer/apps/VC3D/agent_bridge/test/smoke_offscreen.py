@@ -2,7 +2,7 @@
 """Fixture-free offscreen smoke test for the VC3D Agent Bridge.
 
 Exercises the C2/C3/C4 stabilization work against the REAL VC3D binary with a
-temporary empty volume package and no display (QT_QPA_PLATFORM=offscreen), so
+temporary local volume package and no display (QT_QPA_PLATFORM=offscreen), so
 it is safe to run anywhere the build tree exists:
 
   C4  strict wire-parameter parsing rejects a present-but-malformed value with
@@ -14,14 +14,6 @@ it is safe to run anywhere the build tree exists:
   C3  a second server launched on the same --agent-bridge-name REFUSES (probes
       the live endpoint first and does not unlink it); the first server stays
       reachable.
-
-Note on the fractional-integer C4 case (growth `steps` / tracer `ompThreads`):
-offscreen those handlers hit their "No volume package loaded" (-32000) gate
-BEFORE the strict int parse runs, so the -32602 fractional-int rejection is not
-reachable here — it is covered deterministically by the C++ unit test
-(apps/VC3D/agent_bridge/test/test_agent_bridge_parse.cpp, ctest agent_bridge_parse).
-This smoke still fires such a request to confirm it is cleanly rejected (not a
-crash) and that the bridge survives.
 
 Prints a single JSON result object on the last stdout line; exits nonzero if any
 check fails. Every socket wait carries a timeout so an offscreen hang cannot
@@ -44,9 +36,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from bridge_client import BridgeClient, BridgeError, parse_handshake_line  # noqa: E402
 from vc3d_process import VC3DProcess  # noqa: E402
+from viewer_contract_probe import (  # noqa: E402
+    load_contract,
+    probe_clamps,
+    probe_declared_errors,
+    probe_invalid_inputs,
+    probe_successful_calls,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_VC3D_BIN = REPO_ROOT / "build" / "ci-release-gcc" / "bin" / "VC3D"
+VIEWER_CONTRACT = Path(__file__).resolve().parents[1] / "schema" / "viewer.json"
 
 OFFSCREEN_ENV = {"QT_QPA_PLATFORM": "offscreen"}
 
@@ -73,15 +73,106 @@ def unique_name(tag: str) -> str:
     return f"vc3d-smoke-{tag}-{os.getpid()}-{int(time.time() * 1000) % 100000}"
 
 
-def launch(binary: str, name: str, volpkg: str | None = None) -> VC3DProcess:
+def launch(
+    binary: str,
+    name: str,
+    volpkg: str | None = None,
+    config_home: str | None = None,
+) -> VC3DProcess:
     args = ["--agent-bridge", "--agent-bridge-name", name]
     if volpkg is not None:
         args.extend(["--volpkg", volpkg])
+    env = dict(OFFSCREEN_ENV)
+    if config_home is not None:
+        env["XDG_CONFIG_HOME"] = config_home
     return VC3DProcess(
         binary,
         args,
-        env_overrides=OFFSCREEN_ENV,
+        env_overrides=env,
     )
+
+
+def create_test_project(root: Path) -> Path:
+    volume = root / "volumes" / "vol1"
+    level = volume / "0"
+    level.mkdir(parents=True)
+    (volume / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    (volume / ".zattrs").write_text(json.dumps({}))
+    (volume / "meta.json").write_text(json.dumps({
+        "type": "vol",
+        "uuid": "vol1",
+        "name": "vol1",
+        "format": "zarr",
+        "width": 16,
+        "height": 16,
+        "slices": 16,
+        "voxelsize": 1.0,
+        "min": 0.0,
+        "max": 255.0,
+    }))
+    (level / ".zarray").write_text(json.dumps({
+        "zarr_format": 2,
+        "shape": [16, 16, 16],
+        "chunks": [16, 16, 16],
+        "dtype": "|u1",
+        "compressor": None,
+        "fill_value": 0,
+        "order": "C",
+        "filters": None,
+        "dimension_separator": ".",
+    }))
+
+    volpkg = root / "smoke.volpkg.json"
+    volpkg.write_text(json.dumps({
+        "name": "smoke",
+        "version": 1,
+        "volumes": ["volumes"],
+    }))
+    return volpkg
+
+
+def check_viewer_contract_states(
+    binary: str,
+    contract: dict,
+    empty_volpkg: Path,
+    config_home: Path,
+    results: Results,
+) -> None:
+    name = unique_name("contract-states")
+    proc = launch(binary, name, config_home=str(config_home))
+    client = None
+    try:
+        sock_path = proc.wait_for_handshake(timeout=60.0)
+        client = BridgeClient(sock_path, connect_timeout=10.0)
+
+        no_project = probe_declared_errors(client, contract, "no-project")
+        results.record(
+            "viewer_contract_errors_no_project",
+            no_project.ok,
+            no_project.detail,
+        )
+
+        client.call(
+            "volume.open",
+            {"path": str(empty_volpkg)},
+            timeout=10.0,
+        )
+        empty = probe_declared_errors(client, contract, "empty")
+        results.record(
+            "viewer_contract_errors_empty",
+            empty.ok,
+            empty.detail,
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "viewer_contract_error_states",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+    finally:
+        if client is not None:
+            client.close()
+        proc.terminate()
 
 
 def expect_param_error(client: BridgeClient, method: str, params: object,
@@ -135,21 +226,13 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
         client, "job.status", {"jobId": 123}, "jobId")
     results.record("c4_job_id_number", ok, detail)
 
-    # C4: fractional value for an integer param. Offscreen this is gated by the
-    # -32000 "no volume package" check before the int parse (see module docstring);
-    # assert it is cleanly rejected (any BridgeError) rather than crashing. The
-    # -32602 fractional-int rejection itself is covered by the C++ unit test.
-    try:
-        client.call("segmentation.grow",
-                    {"direction": "all", "steps": 1.5}, timeout=10.0)
-        results.record("c4_int_fractional_rejected", False,
-                       "expected a BridgeError, got a result")
-    except BridgeError as e:
-        results.record("c4_int_fractional_rejected", True,
-                       f"cleanly rejected code={e.code} (int -32602 covered by unit test)")
-    except Exception as e:  # noqa: BLE001
-        results.record("c4_int_fractional_rejected", False,
-                       f"unexpected {type(e).__name__}: {e}")
+    ok, detail = expect_param_error(
+        client,
+        "segmentation.grow",
+        {"direction": "all", "steps": 1.5},
+        "steps",
+    )
+    results.record("c4_int_fractional_rejected", ok, detail)
 
     try:
         state2, _ = client.call("state.get", {}, timeout=10.0)
@@ -337,7 +420,8 @@ def _inode(path: str):
 
 
 def check_c3_live_probe(binary: str, name: str, sock_path: str,
-                        first_client: BridgeClient, results: Results) -> None:
+                        first_client: BridgeClient, config_home: str,
+                        results: Results) -> None:
     """Launch a second server on the same name; it MUST refuse (probe the live
     endpoint and leave it alone). A refusal means: the second exits nonzero /
     logs a collision, never prints its own handshake, and the live socket file is
@@ -345,7 +429,7 @@ def check_c3_live_probe(binary: str, name: str, sock_path: str,
     already-established client connection and a bare path-exists check both
     survive an unlink+re-listen and would mask the strand."""
     ino_before = _inode(sock_path)
-    second = launch(binary, name)
+    second = launch(binary, name, config_home=config_home)
     exit_code = None
     took_over = False
     try:
@@ -407,9 +491,11 @@ def main() -> int:
 
     results = Results()
     with tempfile.TemporaryDirectory(prefix="vc3d-smoke-") as tmp_dir:
-        volpkg = Path(tmp_dir) / "smoke.volpkg.json"
-        volpkg.write_text(json.dumps({"name": "smoke", "version": 1}))
-        broken_volpkg = Path(tmp_dir) / "broken.volpkg.json"
+        tmp_path = Path(tmp_dir)
+        volpkg = create_test_project(tmp_path)
+        empty_volpkg = tmp_path / "empty.volpkg.json"
+        empty_volpkg.write_text(json.dumps({"name": "empty", "version": 1}))
+        broken_volpkg = tmp_path / "broken.volpkg.json"
         broken_volpkg.write_text(json.dumps({"name": "broken", "version": 1}))
         fiber_dir = Path(tmp_dir) / "fibers" / broken_volpkg.name
         fiber_dir.mkdir(parents=True)
@@ -425,17 +511,58 @@ def main() -> int:
             "branches": [{}],
         }))
         name = unique_name("main")
-        proc = launch(binary, name, str(volpkg))
+        config_home = tmp_path / "config-main"
+        proc = launch(binary, name, str(volpkg), str(config_home))
         client = None
         try:
             sock_path = proc.wait_for_handshake(timeout=60.0)
             log(f"handshake: name={name} path={sock_path}")
             client = BridgeClient(sock_path, connect_timeout=10.0)
 
+            contract = load_contract(VIEWER_CONTRACT)
+            success_report = probe_successful_calls(client, contract)
+            results.record(
+                "viewer_contract_success",
+                success_report.ok,
+                success_report.detail,
+            )
+            invalid_report = probe_invalid_inputs(client, contract)
+            results.record(
+                "viewer_contract_invalid_inputs",
+                invalid_report.ok,
+                invalid_report.detail,
+            )
+            clamp_report = probe_clamps(client, contract)
+            results.record(
+                "viewer_contract_clamps",
+                clamp_report.ok,
+                clamp_report.detail,
+            )
+            loaded_errors = probe_declared_errors(client, contract, "loaded")
+            results.record(
+                "viewer_contract_errors_loaded",
+                loaded_errors.ok,
+                loaded_errors.detail,
+            )
+            check_viewer_contract_states(
+                binary,
+                contract,
+                empty_volpkg,
+                tmp_path / "config-contract-states",
+                results,
+            )
+
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_c2_oversized(sock_path, results)
             check_c2_suffix_bypass(sock_path, results)
-            check_c3_live_probe(binary, name, sock_path, client, results)
+            check_c3_live_probe(
+                binary,
+                name,
+                sock_path,
+                client,
+                str(config_home),
+                results,
+            )
 
             results.record("process_alive", proc.is_running(),
                            f"running={proc.is_running()}")

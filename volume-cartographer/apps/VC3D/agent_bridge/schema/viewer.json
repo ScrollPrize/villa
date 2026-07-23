@@ -1,13 +1,24 @@
 {
   "contractVersion": 1,
   "domain": "viewer",
+  "probeSetup": [
+    {
+      "method": "viewer.set_axis_aligned_slices",
+      "params": {
+        "enabled": true
+      }
+    }
+  ],
   "methods": {
     "viewer.center_on_point": {
       "params": {
         "type": "object",
         "properties": {
           "viewer": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "point": {
             "type": "object",
@@ -43,6 +54,45 @@
         -32002,
         -32001
       ],
+      "errorProbes": [
+        {
+          "name": "unknown viewer",
+          "state": "loaded",
+          "params": {
+            "viewer": "__missing__",
+            "point": {
+              "x": 1,
+              "y": 1,
+              "z": 1
+            }
+          },
+          "code": -32002
+        },
+        {
+          "name": "outside volume",
+          "state": "loaded",
+          "params": {
+            "point": {
+              "x": 1000000,
+              "y": 1,
+              "z": 1
+            }
+          },
+          "code": -32003
+        },
+        {
+          "name": "no current volume",
+          "state": "empty",
+          "params": {
+            "point": {
+              "x": 1,
+              "y": 1,
+              "z": 1
+            }
+          },
+          "code": -32001
+        }
+      ],
       "mcp": {
         "tool": "vc3d_center_viewer",
         "paramRenames": {
@@ -55,7 +105,10 @@
         "type": "object",
         "properties": {
           "viewer": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "factor": {
             "type": "number",
@@ -69,6 +122,17 @@
       "errors": [
         -32602,
         -32002
+      ],
+      "errorProbes": [
+        {
+          "name": "unknown viewer",
+          "state": "loaded",
+          "params": {
+            "viewer": "__missing__",
+            "factor": 1
+          },
+          "code": -32002
+        }
       ],
       "mcp": {
         "tool": "vc3d_zoom_viewer"
@@ -105,6 +169,36 @@
         -32002,
         -32000
       ],
+      "errorProbes": [
+        {
+          "name": "slice mode disabled",
+          "state": "loaded",
+          "before": [
+            {
+              "method": "viewer.set_axis_aligned_slices",
+              "params": {
+                "enabled": false
+              }
+            }
+          ],
+          "params": {
+            "plane": "seg xz",
+            "degrees": 1
+          },
+          "code": -32002,
+          "after": [
+            {
+              "method": "viewer.set_axis_aligned_slices",
+              "params": {
+                "enabled": true
+              }
+            }
+          ]
+        }
+      ],
+      "unprobedErrors": [
+        -32000
+      ],
       "mcp": {
         "tool": "vc3d_rotate_viewer"
       }
@@ -123,6 +217,9 @@
       },
       "errors": [
         -32602,
+        -32000
+      ],
+      "unprobedErrors": [
         -32000
       ],
       "mcp": {
@@ -144,16 +241,32 @@
         "type": "object",
         "properties": {
           "intersectionOpacity": {
-            "type": "number"
+            "type": "number",
+            "x-clamp": [
+              0,
+              1
+            ]
           },
           "intersectionThickness": {
-            "type": "number"
+            "type": "number",
+            "x-clamp": [
+              0,
+              100
+            ]
           },
           "overlayOpacity": {
-            "type": "number"
+            "type": "number",
+            "x-clamp": [
+              0,
+              1
+            ]
           },
           "intersectionMaxSurfaces": {
-            "type": "integer"
+            "type": "integer",
+            "x-clamp": [
+              0,
+              null
+            ]
           },
           "planeIntersectionLinesVisible": {
             "type": "boolean"
@@ -175,12 +288,26 @@
           },
           "volumeWindow": {
             "type": "object",
+            "x-ordered-range": {
+              "lower": "low",
+              "upper": "high",
+              "minimumGap": 1,
+              "ceiling": 255
+            },
             "properties": {
               "low": {
-                "type": "number"
+                "type": "number",
+                "x-clamp": [
+                  0,
+                  255
+                ]
               },
               "high": {
-                "type": "number"
+                "type": "number",
+                "x-clamp": [
+                  null,
+                  255
+                ]
               }
             },
             "required": [
@@ -189,24 +316,43 @@
             ]
           },
           "normalArrowLengthScale": {
-            "type": "number"
+            "type": "number",
+            "x-clamp": [
+              0.1,
+              2
+            ]
           },
           "normalMaxArrows": {
-            "type": "integer"
+            "type": "integer",
+            "x-clamp": [
+              4,
+              100
+            ]
           },
           "segmentationCursorMirroring": {
             "type": "boolean"
           },
           "samplingStride": {
-            "type": "integer"
+            "type": "integer",
+            "x-clamp": [
+              1,
+              null
+            ]
           },
           "zScrollSensitivity": {
-            "type": "number"
+            "type": "number",
+            "x-clamp": [
+              0.1,
+              100
+            ]
           }
         }
       },
       "errors": [
         -32602,
+        -32010
+      ],
+      "unprobedErrors": [
         -32010
       ],
       "mcp": {
@@ -236,6 +382,9 @@
         "properties": {}
       },
       "errors": [
+        -32010
+      ],
+      "unprobedErrors": [
         -32010
       ],
       "mcp": {
@@ -268,19 +417,47 @@
             ]
           },
           "opacity": {
-            "type": "number"
+            "type": "number",
+            "x-clamp": [
+              0,
+              1
+            ]
           },
           "threshold": {
-            "type": "number"
+            "type": "number",
+            "x-clamp": [
+              0,
+              255
+            ]
           },
           "window": {
             "type": "object",
+            "x-ordered-range": {
+              "lower": "low",
+              "upper": "high",
+              "minimumGap": 1,
+              "ceiling": 255,
+              "result": {
+                "low": "windowLow",
+                "high": "windowHigh"
+              }
+            },
             "properties": {
               "low": {
-                "type": "number"
+                "type": "number",
+                "x-clamp": [
+                  0,
+                  255
+                ],
+                "x-result": "windowLow"
               },
               "high": {
-                "type": "number"
+                "type": "number",
+                "x-clamp": [
+                  null,
+                  255
+                ],
+                "x-result": "windowHigh"
               }
             },
             "required": [
@@ -289,7 +466,11 @@
             ]
           },
           "maxDisplayedResolution": {
-            "type": "integer"
+            "type": "integer",
+            "x-clamp": [
+              0,
+              5
+            ]
           },
           "composite": {
             "type": "object",
@@ -306,10 +487,18 @@
                 ]
               },
               "layersFront": {
-                "type": "integer"
+                "type": "integer",
+                "x-clamp": [
+                  0,
+                  64
+                ]
               },
               "layersBehind": {
-                "type": "integer"
+                "type": "integer",
+                "x-clamp": [
+                  0,
+                  64
+                ]
               }
             }
           }
@@ -320,6 +509,27 @@
         -32010,
         -32007,
         -32000
+      ],
+      "errorProbes": [
+        {
+          "name": "unknown volume",
+          "state": "loaded",
+          "params": {
+            "volumeId": "__missing__"
+          },
+          "code": -32007
+        },
+        {
+          "name": "no volume package",
+          "state": "no-project",
+          "params": {
+            "volumeId": "__missing__"
+          },
+          "code": -32000
+        }
+      ],
+      "unprobedErrors": [
+        -32010
       ],
       "mcp": {
         "tool": "vc3d_set_overlay",
@@ -338,6 +548,17 @@
         -32010,
         -32000
       ],
+      "errorProbes": [
+        {
+          "name": "no volume package",
+          "state": "no-project",
+          "params": {},
+          "code": -32000
+        }
+      ],
+      "unprobedErrors": [
+        -32010
+      ],
       "mcp": {
         "tool": "vc3d_list_overlay_volumes"
       }
@@ -353,7 +574,10 @@
             }
           },
           "viewer": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -365,6 +589,29 @@
         -32010,
         -32009,
         -32002
+      ],
+      "errorProbes": [
+        {
+          "name": "unknown viewer",
+          "state": "loaded",
+          "params": {
+            "surfaceIds": [],
+            "viewer": "__missing__"
+          },
+          "code": -32002
+        },
+        {
+          "name": "segmentation viewer",
+          "state": "loaded",
+          "params": {
+            "surfaceIds": [],
+            "viewer": "segmentation"
+          },
+          "code": -32009
+        }
+      ],
+      "unprobedErrors": [
+        -32010
       ],
       "mcp": {
         "tool": "vc3d_set_intersects",

@@ -184,7 +184,7 @@ async def vc3d_get_render_settings() -> dict[str, Any]:
     vc3d_set_render_settings, or to confirm a change took effect.
 
     Returns the full settings object: {"intersectionOpacity" (0..1),
-    "intersectionThickness" (>=0), "overlayOpacity" (0..1),
+    "intersectionThickness" (0..100), "overlayOpacity" (0..1),
     "intersectionMaxSurfaces" (int >=0), "volumeWindow" ({"low","high"}),
     "samplingStride" (int >=1), "zScrollSensitivity" (0.1..100),
     "segmentationCursorMirroring" (bool),
@@ -218,7 +218,7 @@ async def vc3d_set_render_settings(
     unchanged; pass only what you want to change.
 
     intersection_opacity: surface-intersection overlay opacity, clamped 0..1.
-    intersection_thickness: intersection line thickness, >=0.
+    intersection_thickness: intersection line thickness, clamped 0..100.
     overlay_opacity: surface overlay opacity, clamped 0..1.
     intersection_max_surfaces: cap on intersecting surfaces drawn, int >=0.
     plane_intersection_lines_visible: show plane/surface intersection lines.
@@ -309,7 +309,7 @@ async def vc3d_set_overlay(
     "blue", "cyan", "magenta", "glasbey_black0"; empty string clears it.
     An unrecognized id raises -32602 rather than being silently ignored.
     opacity: overlay opacity, clamped 0..1.
-    threshold: overlay display threshold, clamped >=0.
+    threshold: overlay display threshold, clamped 0..255.
     window: {"low", "high"} overlay display window, clamped 0..255.
     max_displayed_resolution: overlay resolution cap, clamped 0..5.
     composite: {"enabled", "method" ("max"|"mean"|"min"), "layersFront",

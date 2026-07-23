@@ -94,10 +94,17 @@ are **jobs**: the RPC returns immediately with a `jobId` and progress is deliver
 ## 2. Common conventions
 
 `schema/viewer.json` is the machine-readable pilot for viewer method membership and
-input shapes. `tools/vc3d-mcp/test_contract.py` checks it against the C++ registration
-table, the MCP mappings in this document, and FastMCP's generated input schemas. The
-hand-written result shapes and behavioral notes below remain authoritative; the pilot
-does not generate or replace them.
+input shapes. `tools/vc3d-mcp/test_contract.py` checks it against the MCP mappings in
+this document and FastMCP's generated input schemas. The offscreen smoke test calls every
+declared method against the real bridge, then derives invalid-input, error, and
+normalization probes from the same contract. The hand-written result shapes and
+behavioral notes below remain authoritative; the pilot does not generate or replace them.
+
+The contract uses `x-clamp: [minimum, maximum]` for accepted numeric values that are
+normalized rather than rejected (`null` means no bound). Coupled low/high windows also
+carry `x-ordered-range`, because clamping `high` cannot be specified independently from the
+minimum-gap rule. The offscreen smoke test derives live normalization probes from these
+annotations.
 
 ### 2.1 Coordinate spaces
 
@@ -3400,10 +3407,10 @@ Both return the **full** settings object with these exact keys:
 
 ```json
 {"intersectionOpacity": float,          // 0..1
- "intersectionThickness": float,         // >= 0
+ "intersectionThickness": float,         // 0..100
  "overlayOpacity": float,                // 0..1
  "intersectionMaxSurfaces": int,         // >= 0
- "volumeWindow": {"low": float, "high": float},  // each 0..255; high forced > low
+ "volumeWindow": {"low": float, "high": float},  // each 0..255; high raised above low when possible
  "samplingStride": int,                  // >= 1 (floored)
  "zScrollSensitivity": float,            // 0.1..100
  "segmentationCursorMirroring": bool,
@@ -3423,9 +3430,11 @@ Both return the **full** settings object with these exact keys:
 
 **`viewer.set_render_settings`**
 - **params:** any **subset** of the keys above (all optional; unknown keys are ignored).
-  Opacities clamp to `0..1`; `intersectionThickness` / `intersectionMaxSurfaces` clamp to
-  `>= 0`; `volumeWindow.low`/`volumeWindow.high` clamp to `0..255` each (`high` is forced to
-  stay `> low`, minimum gap `1.0`, same rule as `viewer.set_overlay`'s `window`);
+  Opacities clamp to `0..1`; `intersectionThickness` clamps to `0..100`;
+  `intersectionMaxSurfaces` clamps to `>= 0`; `volumeWindow.low`/`volumeWindow.high`
+  clamp to `0..255` each (`high` is raised to at least `min(255, low + 1)` when
+  needed, so both remain `255` when `low` reaches the ceiling; same rule as
+  `viewer.set_overlay`'s `window`);
   `samplingStride` floors to `>= 1`; `zScrollSensitivity` clamps to `0.1..100`;
   `segmentationCursorMirroring` accepts any bool; `normalArrowLengthScale` clamps to
   `0.1..2.0` (the GUI slider's range); `normalMaxArrows` clamps to `4..100` (the GUI
@@ -3519,8 +3528,8 @@ surface set (`viewer.set_intersects`, mirroring `SurfacePanelController`'s per-v
    "clear"?: bool,            // true clears the overlay volume; equivalent to volumeId:""
    "colormap"?: str,          // one of the ids in the table below, or "" to clear
    "opacity"?: float,         // clamps 0..1
-   "threshold"?: float,       // clamps >= 0 (see note below)
-   "window"?: {"low": float, "high": float},  // each clamps 0..255; high forced > low
+   "threshold"?: float,       // clamps 0..255 (see note below)
+   "window"?: {"low": float, "high": float},  // each 0..255; high raised above low when possible
    "maxDisplayedResolution"?: int,   // clamps 0..5
    "composite"?: {"enabled"?: bool, "method"?: "max"|"mean"|"min",
                   "layersFront"?: int, "layersBehind"?: int}}  // layers clamp 0..64
@@ -3562,8 +3571,8 @@ both null the overlay volume (`ViewerManager::setOverlayVolume(nullptr, "")`). O
 
 **`threshold` is an alias, not an independent field.** `ViewerManager::setOverlayThreshold`
 is implemented as `setOverlayWindow(max(threshold, 0), currentWindowHigh)` — i.e. setting
-`threshold` actually moves `windowLow` (clamped `>= 0`) while leaving `windowHigh`
-untouched, going through the same `high > low` gap enforcement as `window`. The echoed
+`threshold` actually moves `windowLow` (clamped to `0..255`) while leaving `windowHigh`
+untouched, going through the same bounded minimum-gap normalization as `window`. The echoed
 `threshold` in the result always equals the resulting `windowLow`. Setting `threshold` and
 `window` in the same request is not additive — whichever is applied last in handler order
 (`window` after `threshold`) wins for `windowLow`.
