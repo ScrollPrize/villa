@@ -67,11 +67,11 @@ async def vc3d_render_tifxyz(
 @mcp.tool()
 async def vc3d_flatten_slim(
     segment_id: str,
-    iterations: Optional[int] = None,
-    tolerance: Optional[float] = None,
-    energy_type: Optional[Literal["symmetric_dirichlet", "conformal"]] = None,
-    keep_percent: Optional[float] = None,
-    inpaint_holes: Optional[bool] = None,
+    iterations: int = 50,
+    tolerance: float = 0.0,
+    energy_type: Literal["symmetric_dirichlet", "conformal"] = "symmetric_dirichlet",
+    keep_percent: float = 100.0,
+    inpaint_holes: bool = False,
     output_dir: Optional[str] = None,
     wait: bool = False,
     ctx: Optional[Context] = None,
@@ -118,8 +118,8 @@ async def vc3d_flatten_slim(
 @mcp.tool()
 async def vc3d_flatten_abf(
     segment_id: str,
-    iterations: Optional[int] = None,
-    downsample_factor: Optional[int] = None,
+    iterations: int = 10,
+    downsample_factor: int = 1,
     wait: bool = False,
     ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
@@ -152,12 +152,12 @@ async def vc3d_flatten_abf(
 @mcp.tool()
 async def vc3d_flatten_straighten(
     segment_id: str,
-    unbend: Optional[bool] = None,
-    unbend_smooth_cols: Optional[float] = None,
-    overlap_passes: Optional[int] = None,
-    orthogonalize: Optional[bool] = None,
-    trim: Optional[bool] = None,
-    trim_max_edge: Optional[float] = None,
+    unbend: bool = True,
+    unbend_smooth_cols: float = 300.0,
+    overlap_passes: int = 2,
+    orthogonalize: bool = True,
+    trim: bool = True,
+    trim_max_edge: float = 100.0,
     output_dir: Optional[str] = None,
     wait: bool = False,
     ctx: Optional[Context] = None,

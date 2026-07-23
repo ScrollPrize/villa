@@ -894,6 +894,184 @@
         "type": "object"
       }
     },
+    "flatten.abf": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "downsampleFactor": "downsample_factor",
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_flatten_abf"
+      },
+      "params": {
+        "properties": {
+          "downsampleFactor": {
+            "default": 1,
+            "maximum": 2147483647,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "iterations": {
+            "default": 10,
+            "maximum": 2147483647,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
+    "flatten.slim": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32006,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "energyType": "energy_type",
+          "inpaintHoles": "inpaint_holes",
+          "keepPercent": "keep_percent",
+          "outputDir": "output_dir",
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_flatten_slim"
+      },
+      "params": {
+        "properties": {
+          "energyType": {
+            "default": "symmetric_dirichlet",
+            "enum": [
+              "symmetric_dirichlet",
+              "conformal"
+            ],
+            "type": "string"
+          },
+          "inpaintHoles": {
+            "default": false,
+            "type": "boolean"
+          },
+          "iterations": {
+            "default": 50,
+            "maximum": 2147483647,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "keepPercent": {
+            "default": 100,
+            "exclusiveMinimum": 0,
+            "maximum": 100,
+            "type": "number"
+          },
+          "outputDir": {
+            "type": "string"
+          },
+          "segmentId": {
+            "type": "string"
+          },
+          "tolerance": {
+            "default": 0,
+            "minimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
+    "flatten.straighten": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32006,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "outputDir": "output_dir",
+          "overlapPasses": "overlap_passes",
+          "segmentId": "segment_id",
+          "trimMaxEdge": "trim_max_edge",
+          "unbendSmoothCols": "unbend_smooth_cols"
+        },
+        "tool": "vc3d_flatten_straighten"
+      },
+      "params": {
+        "properties": {
+          "orthogonalize": {
+            "default": true,
+            "type": "boolean"
+          },
+          "outputDir": {
+            "type": "string"
+          },
+          "overlapPasses": {
+            "default": 2,
+            "maximum": 2147483647,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "segmentId": {
+            "type": "string"
+          },
+          "trim": {
+            "default": true,
+            "type": "boolean"
+          },
+          "trimMaxEdge": {
+            "default": 100,
+            "minimum": 0,
+            "type": "number"
+          },
+          "unbend": {
+            "default": true,
+            "type": "boolean"
+          },
+          "unbendSmoothCols": {
+            "default": 300,
+            "minimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
     "job.cancel": {
       "errors": [
         -32602,

@@ -700,13 +700,7 @@ void AgentBridgeServer::registerHandlers()
     registerFiberHandlers();
     registerSeedingHandlers();
 
-    // --- Flattening RPCs (SPEC §20) ---
-    _handlers.insert("flatten.slim",
-        [this](const QJsonValue& p) { return handleFlattenSlim(p); });
-    _handlers.insert("flatten.abf",
-        [this](const QJsonValue& p) { return handleFlattenAbf(p); });
-    _handlers.insert("flatten.straighten",
-        [this](const QJsonValue& p) { return handleFlattenStraighten(p); });
+    registerFlattenHandlers();
 
     // --- Per-segment mesh operations (SPEC §25) ---
     _handlers.insert("segment.crop_bounds",

@@ -232,6 +232,7 @@ set(srcs
     agent_bridge/AgentBridgeMethods_canvas.cpp
     agent_bridge/AgentBridgeMethods_editing.cpp
     agent_bridge/AgentBridgeMethods_fiber.cpp
+    agent_bridge/AgentBridgeMethods_flatten.cpp
     agent_bridge/AgentBridgeMethods_jobs.cpp
     agent_bridge/AgentBridgeMethods_lasagna.cpp
     agent_bridge/AgentBridgeMethods_points.cpp
