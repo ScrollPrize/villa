@@ -103,6 +103,21 @@ public:
     [[nodiscard]] std::filesystem::path remotePersistentCachePath() const;
     [[nodiscard]] std::filesystem::path path() const noexcept { return path_; }
 
+    /**
+     * @brief Locator to pass to external command-line tools (e.g.
+     * @c vc_grow_seg_from_seed ) as the volume argument.
+     *
+     * Remote/streaming-only volumes have no local filesystem path, so path()
+     * is empty for them; a caller that forwards path() straight to a child
+     * process hands it an empty argument and the tool fails immediately. This
+     * returns the remote locator for remote volumes and the local path
+     * otherwise, so the spawned tool always receives a usable reference.
+     */
+    [[nodiscard]] std::string commandLocator() const
+    {
+        return isRemote_ ? remoteLocator_ : path_.string();
+    }
+
     [[nodiscard]] int sliceWidth() const noexcept;
     [[nodiscard]] int sliceHeight() const noexcept;
     [[nodiscard]] int numSlices() const noexcept;

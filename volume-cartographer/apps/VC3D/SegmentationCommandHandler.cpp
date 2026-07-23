@@ -113,10 +113,9 @@ static QString commandPathForVolume(const std::shared_ptr<Volume>& volume)
     if (!volume) {
         return QString();
     }
-    if (volume->isRemote()) {
-        return QString::fromStdString(volume->remoteLocator());
-    }
-    return QString::fromStdString(volume->path().string());
+    // Remote-aware volume reference; Volume::commandLocator() keeps the
+    // remote-locator vs. local-path choice in a single place.
+    return QString::fromStdString(volume->commandLocator());
 }
 
 static QString findExecutable(
