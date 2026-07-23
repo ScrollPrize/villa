@@ -2135,7 +2135,7 @@ dialogs. Result shapes: `preview_rays`/`cast_rays` return `{"requested": true}`;
   these in `subscribeJobSignals()` and mirrors them onto a `source:"seeding"` job,
   exactly as the atlas search wires `atlasSearchProgressChanged`/`atlasSearchFinished`.
   Introspection getters: `seedingBatchActive()` (run/expand only — excludes a neural
-  trace, which shares `jobsRunning`), `seedingBatchKind()`, `seedingBatchTotal()`.
+  trace, which shares `jobsRunning`) and `seedingBatchTotal()`.
 
 - **Seeding batch outcome.** A batch **succeeds only if every
   child process starts, exits normally, and returns exit code 0**. The widget aggregates
@@ -3403,7 +3403,7 @@ errors preserved).
 
 ## 25. Viewer overlay + intersects
 
-Round-2 viewer controls: the overlay-volume settings the GUI's overlay combo box +
+Viewer controls: the overlay-volume settings the GUI's overlay combo box +
 sliders drive (`viewer.get_overlay` / `viewer.set_overlay` / `viewer.list_overlay_volumes`,
 all backed by `ViewerManager`'s `_overlay*` state), and the per-viewer intersection-line
 surface set (`viewer.set_intersects`, mirroring `SurfacePanelController`'s per-viewer

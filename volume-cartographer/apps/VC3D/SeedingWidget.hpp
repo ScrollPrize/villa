@@ -73,11 +73,8 @@ public:
     // bridge RPC handler. Fires seedingBatchFinished(kind,false,...) when a run/expand
     // batch was active.
     void cancelSeedingBatchHeadless();
-    // Live batch introspection for the bridge job model (SPEC §8.3); "active" means a
-    // run/expand batch, not a neural trace (which shares the jobsRunning flag). kind is
-    // "run" | "expand" | "" (idle).
+    // A neural trace shares jobsRunning but is not a seeding batch.
     [[nodiscard]] bool seedingBatchActive() const { return jobsRunning && !_batch.kind().isEmpty(); }
-    [[nodiscard]] QString seedingBatchKind() const { return _batch.kind(); }
     [[nodiscard]] int seedingBatchTotal() const { return _batch.total(); }
 
 signals:

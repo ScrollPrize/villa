@@ -261,7 +261,7 @@ class SurfaceOpsTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_crop_bounds_failure_propagates(self) -> None:
         """A crop core failure surfaces as a BridgeError (-32005), not a false
-        cropped:true (finding #4)."""
+        cropped:true."""
         from vc3d_mcp.bridge_client import BridgeError
 
         with self.assertRaises(BridgeError) as cm:

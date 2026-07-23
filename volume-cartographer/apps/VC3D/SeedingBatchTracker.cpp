@@ -91,9 +91,7 @@ SeedingBatchTracker::Result SeedingBatchTracker::finalize()
     }
 
     _result = r;
-    // Mirror SeedingWidget's post-finalize clearing of the batch kind so
-    // seedingBatchKind() reads empty once idle; the cached Result keeps the
-    // kind-bearing message intact for idempotent repeat calls.
+    // Clear the live kind; the cached result keeps repeat finalization idempotent.
     _kind.clear();
     return r;
 }

@@ -1205,7 +1205,7 @@ def run_catalog_resource_selection_smoke(client: BridgeClient, rec: Recorder,
 
     Network-gated: if the manifest URL is unreachable from this environment the
     whole suite is SKIPPED (clearly, not faked as a pass) -- a deeper
-    independent test runs in a later phase regardless. When reachable, this
+    independent fixture tests regardless. When reachable, this
     proves the read-only surface end-to-end and that a resources filter attaches
     a strict subset while an unfiltered open still attaches everything.
 
@@ -1353,7 +1353,7 @@ def _run_catalog_resource_selection_smoke_impl(client: BridgeClient, rec: Record
     # 4. Regression: an unfiltered open still opens the full set. This can be a
     # heavy real open (multiple remote volumes + streaming normal grids), so it
     # is best-effort: a timeout here is recorded as a non-fatal "deferred" note
-    # (the deeper online test in a later phase covers the full attach), while a
+    # (the deeper online test covers the full attach), while a
     # documented BridgeError is a real regression failure.
     try:
         ur, timed_out = _open_sample_via_job(
