@@ -38,12 +38,14 @@ void AgentBridgeServer::registerAtlasHandlers()
                         QStringLiteral("non_atlas_only"),
                     },
                     QStringLiteral("atlas_to_non_atlas")),
-                Params::optionalArray(
-                    QStringLiteral("requiredTags"),
-                    AgentBridgeParamType::String),
-                Params::optionalArray(
-                    QStringLiteral("excludedTags"),
-                    AgentBridgeParamType::String),
+                Params::nullable(
+                    Params::optionalArray(
+                        QStringLiteral("requiredTags"),
+                        AgentBridgeParamType::String)),
+                Params::nullable(
+                    Params::optionalArray(
+                        QStringLiteral("excludedTags"),
+                        AgentBridgeParamType::String)),
                 maxDistance,
             },
             .errors = {-32602, -32004, -32007, -32005, -32000},
