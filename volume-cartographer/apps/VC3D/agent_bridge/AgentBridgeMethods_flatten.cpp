@@ -46,13 +46,14 @@ void AgentBridgeServer::registerFlattenHandlers()
                 Params::requiredString(QStringLiteral("segmentId")),
                 integerAtLeast(QStringLiteral("iterations"), 50, 1),
                 numberAtLeast(QStringLiteral("tolerance"), 0.0, 0.0),
-                Params::optionalStringEnum(
-                    QStringLiteral("energyType"),
-                    {
-                        QStringLiteral("symmetric_dirichlet"),
-                        QStringLiteral("conformal"),
-                    },
-                    QStringLiteral("symmetric_dirichlet")),
+                Params::nullable(
+                    Params::optionalStringEnum(
+                        QStringLiteral("energyType"),
+                        {
+                            QStringLiteral("symmetric_dirichlet"),
+                            QStringLiteral("conformal"),
+                        },
+                        QStringLiteral("symmetric_dirichlet"))),
                 keepPercent(),
                 Params::optionalBoolean(
                     QStringLiteral("inpaintHoles"),

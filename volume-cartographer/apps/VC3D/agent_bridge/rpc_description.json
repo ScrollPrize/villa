@@ -969,7 +969,10 @@
               "symmetric_dirichlet",
               "conformal"
             ],
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "inpaintHoles": {
             "default": false,
