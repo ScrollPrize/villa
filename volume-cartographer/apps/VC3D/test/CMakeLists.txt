@@ -30,7 +30,8 @@ add_test(NAME seeding_batch_tracker COMMAND test_seeding_batch_tracker)
 set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_seeding_batch_tracker)
 
 add_executable(test_fiber_save_batch_tracker
-    test_fiber_save_batch_tracker.cpp)
+    test_fiber_save_batch_tracker.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp)
 
 set_target_properties(test_fiber_save_batch_tracker PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
