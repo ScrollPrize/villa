@@ -34,6 +34,15 @@ AgentBridgeParam positiveNumber(
     return param;
 }
 
+AgentBridgeParam positiveFloat(
+    const QString& name,
+    const QJsonValue& defaultValue = QJsonValue(QJsonValue::Undefined))
+{
+    AgentBridgeParam param = positiveNumber(name, defaultValue);
+    param.maximum = static_cast<double>(std::numeric_limits<float>::max());
+    return param;
+}
+
 }  // namespace
 
 void AgentBridgeServer::registerSeedingHandlers()
@@ -222,7 +231,7 @@ void AgentBridgeServer::registerSeedingHandlers()
                     }),
                 Params::optionalString(QStringLiteral("volumeId")),
                 Params::optionalString(QStringLiteral("outputDir")),
-                positiveNumber(QStringLiteral("scale"), 1.0),
+                positiveFloat(QStringLiteral("scale"), 1.0),
                 nonNegativeInteger(QStringLiteral("groupIdx"), 0),
                 std::move(numSlices),
                 Params::nullable(

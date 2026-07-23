@@ -82,7 +82,7 @@ void AgentBridgeServer::registerFiberHandlers()
                 nonNegativeIndex(QStringLiteral("linePointIndex")),
                 Params::optionalArray(
                     QStringLiteral("span"),
-                    Params::requiredInteger(QString())),
+                    nonNegativeIndex(QString())),
             },
             .errors = {-32602, -32000, -32010, -32007, -32005},
             .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_open")),

@@ -243,6 +243,26 @@ def check_rpc_describe(
     )
     results.record("rpc_describe_prefix_type", ok, detail)
 
+    ok, detail = expect_param_error(
+        client,
+        "fiber.open",
+        {"fiberId": "1", "span": [-1, 0]},
+        "span",
+    )
+    results.record("fiber_span_non_negative", ok, detail)
+
+    ok, detail = expect_param_error(
+        client,
+        "render.tifxyz",
+        {
+            "segmentId": "probe",
+            "outputFormat": "zarr",
+            "scale": 1.0e300,
+        },
+        "scale",
+    )
+    results.record("render_scale_float_range", ok, detail)
+
 
 def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
     failures: list[str] = []

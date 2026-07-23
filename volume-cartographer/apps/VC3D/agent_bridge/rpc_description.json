@@ -194,7 +194,10 @@
               "right",
               "middle"
             ],
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "modifiers": {
             "items": {
@@ -276,7 +279,10 @@
               "middle",
               "none"
             ],
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "from": {
             "properties": {
@@ -419,7 +425,10 @@
               "right",
               "middle"
             ],
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "modifiers": {
             "items": {
@@ -809,7 +818,7 @@
           "span": {
             "items": {
               "maximum": 2147483647,
-              "minimum": -2147483648,
+              "minimum": 0,
               "type": "integer"
             },
             "type": "array"
@@ -1957,6 +1966,7 @@
           "scale": {
             "default": 1,
             "exclusiveMinimum": 0,
+            "maximum": 3.4028234663852886e+38,
             "type": "number"
           },
           "segmentId": {

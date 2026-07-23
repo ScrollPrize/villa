@@ -57,10 +57,11 @@ AgentBridgeParam button(bool allowNone = false)
     };
     if (allowNone)
         values.append(QStringLiteral("none"));
-    return Params::optionalStringEnum(
-        QStringLiteral("button"),
-        std::move(values),
-        QStringLiteral("left"));
+    return Params::nullable(
+        Params::optionalStringEnum(
+            QStringLiteral("button"),
+            std::move(values),
+            QStringLiteral("left")));
 }
 
 AgentBridgeParam space()

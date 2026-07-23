@@ -71,6 +71,9 @@ uint64_t resolveCollectionId(VCCollection* pc, const QJsonObject& p)
         return id;
     }
 
+    if (!p.contains("collection"))
+        throwParamError("collection", QStringLiteral("is required"));
+
     const QString name = p.value("collection").toString();
     const uint64_t id = pc->getCollectionId(name.toStdString());  // 0 when absent
     if (id == 0)
