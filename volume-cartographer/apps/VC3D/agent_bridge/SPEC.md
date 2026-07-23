@@ -93,6 +93,12 @@ are **jobs**: the RPC returns immediately with a `jobId` and progress is deliver
 
 ## 2. Common conventions
 
+`schema/viewer.json` is the machine-readable pilot for viewer method membership and
+input shapes. `tools/vc3d-mcp/test_contract.py` checks it against the C++ registration
+table, the MCP mappings in this document, and FastMCP's generated input schemas. The
+hand-written result shapes and behavioral notes below remain authoritative; the pilot
+does not generate or replace them.
+
 ### 2.1 Coordinate spaces
 
 - `"volume"` — full-resolution voxel coordinates `{x, y, z}` (floats), the space of

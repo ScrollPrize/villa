@@ -1,0 +1,377 @@
+{
+  "contractVersion": 1,
+  "domain": "viewer",
+  "methods": {
+    "viewer.center_on_point": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "viewer": {
+            "type": "string"
+          },
+          "point": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "z"
+            ]
+          },
+          "forceRender": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "required": [
+          "point"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32003,
+        -32002,
+        -32001
+      ],
+      "mcp": {
+        "tool": "vc3d_center_viewer",
+        "paramRenames": {
+          "forceRender": "force_render"
+        }
+      }
+    },
+    "viewer.zoom": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "viewer": {
+            "type": "string"
+          },
+          "factor": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        },
+        "required": [
+          "factor"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32002
+      ],
+      "mcp": {
+        "tool": "vc3d_zoom_viewer"
+      }
+    },
+    "viewer.rotate": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "plane": {
+            "type": "string",
+            "enum": [
+              "seg xz",
+              "seg yz",
+              "xz",
+              "yz"
+            ]
+          },
+          "degrees": {
+            "type": "number"
+          },
+          "relative": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "required": [
+          "plane",
+          "degrees"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32002,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_rotate_viewer"
+      }
+    },
+    "viewer.set_axis_aligned_slices": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_set_axis_aligned_slices"
+      }
+    },
+    "viewer.get_render_settings": {
+      "params": {
+        "type": "object",
+        "properties": {}
+      },
+      "errors": [],
+      "mcp": {
+        "tool": "vc3d_get_render_settings"
+      }
+    },
+    "viewer.set_render_settings": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "intersectionOpacity": {
+            "type": "number"
+          },
+          "intersectionThickness": {
+            "type": "number"
+          },
+          "overlayOpacity": {
+            "type": "number"
+          },
+          "intersectionMaxSurfaces": {
+            "type": "integer"
+          },
+          "planeIntersectionLinesVisible": {
+            "type": "boolean"
+          },
+          "showSurfaceNormals": {
+            "type": "boolean"
+          },
+          "showDirectionHints": {
+            "type": "boolean"
+          },
+          "surfaceOverlayEnabled": {
+            "type": "boolean"
+          },
+          "highlightedSurfaceIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "volumeWindow": {
+            "type": "object",
+            "properties": {
+              "low": {
+                "type": "number"
+              },
+              "high": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "low",
+              "high"
+            ]
+          },
+          "normalArrowLengthScale": {
+            "type": "number"
+          },
+          "normalMaxArrows": {
+            "type": "integer"
+          },
+          "segmentationCursorMirroring": {
+            "type": "boolean"
+          },
+          "samplingStride": {
+            "type": "integer"
+          },
+          "zScrollSensitivity": {
+            "type": "number"
+          }
+        }
+      },
+      "errors": [
+        -32602,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_set_render_settings",
+        "paramRenames": {
+          "intersectionOpacity": "intersection_opacity",
+          "intersectionThickness": "intersection_thickness",
+          "overlayOpacity": "overlay_opacity",
+          "intersectionMaxSurfaces": "intersection_max_surfaces",
+          "planeIntersectionLinesVisible": "plane_intersection_lines_visible",
+          "showSurfaceNormals": "show_surface_normals",
+          "showDirectionHints": "show_direction_hints",
+          "surfaceOverlayEnabled": "surface_overlay_enabled",
+          "highlightedSurfaceIds": "highlighted_surface_ids",
+          "volumeWindow": "volume_window",
+          "normalArrowLengthScale": "normal_arrow_length_scale",
+          "normalMaxArrows": "normal_max_arrows",
+          "segmentationCursorMirroring": "segmentation_cursor_mirroring",
+          "samplingStride": "sampling_stride",
+          "zScrollSensitivity": "z_scroll_sensitivity"
+        }
+      }
+    },
+    "viewer.get_overlay": {
+      "params": {
+        "type": "object",
+        "properties": {}
+      },
+      "errors": [
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_get_overlay"
+      }
+    },
+    "viewer.set_overlay": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "volumeId": {
+            "type": "string"
+          },
+          "clear": {
+            "type": "boolean"
+          },
+          "colormap": {
+            "type": "string",
+            "enum": [
+              "",
+              "fire",
+              "viridis",
+              "magma",
+              "red",
+              "green",
+              "blue",
+              "cyan",
+              "magenta",
+              "glasbey_black0"
+            ]
+          },
+          "opacity": {
+            "type": "number"
+          },
+          "threshold": {
+            "type": "number"
+          },
+          "window": {
+            "type": "object",
+            "properties": {
+              "low": {
+                "type": "number"
+              },
+              "high": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "low",
+              "high"
+            ]
+          },
+          "maxDisplayedResolution": {
+            "type": "integer"
+          },
+          "composite": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "method": {
+                "type": "string",
+                "enum": [
+                  "max",
+                  "mean",
+                  "min"
+                ]
+              },
+              "layersFront": {
+                "type": "integer"
+              },
+              "layersBehind": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "errors": [
+        -32602,
+        -32010,
+        -32007,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_set_overlay",
+        "paramRenames": {
+          "volumeId": "volume_id",
+          "maxDisplayedResolution": "max_displayed_resolution"
+        }
+      }
+    },
+    "viewer.list_overlay_volumes": {
+      "params": {
+        "type": "object",
+        "properties": {}
+      },
+      "errors": [
+        -32010,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_list_overlay_volumes"
+      }
+    },
+    "viewer.set_intersects": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "surfaceIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "viewer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "surfaceIds"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32010,
+        -32009,
+        -32002
+      ],
+      "mcp": {
+        "tool": "vc3d_set_intersects",
+        "paramRenames": {
+          "surfaceIds": "surface_ids"
+        }
+      }
+    }
+  }
+}

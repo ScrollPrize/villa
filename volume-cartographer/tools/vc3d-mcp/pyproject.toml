@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.6.0,<2",
+    "typing-extensions>=4.8",
 ]
 
 [project.scripts]

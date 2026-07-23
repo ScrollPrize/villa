@@ -4,7 +4,41 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
+from typing_extensions import TypedDict
+
 from ..core import mcp, _call, _strip_none
+
+
+class _Vec3(TypedDict):
+    x: float
+    y: float
+    z: float
+
+
+class _Window(TypedDict):
+    low: float
+    high: float
+
+
+class _OverlayComposite(TypedDict, total=False):
+    enabled: bool
+    method: Literal["max", "mean", "min"]
+    layersFront: int
+    layersBehind: int
+
+
+_OverlayColormap = Literal[
+    "",
+    "fire",
+    "viridis",
+    "magma",
+    "red",
+    "green",
+    "blue",
+    "cyan",
+    "magenta",
+    "glasbey_black0",
+]
 
 
 @mcp.tool()
@@ -90,7 +124,7 @@ async def vc3d_shift_click(
 
 @mcp.tool()
 async def vc3d_center_viewer(
-    point: dict[str, float], viewer: Optional[str] = None, force_render: bool = True
+    point: _Vec3, viewer: Optional[str] = None, force_render: bool = True
 ) -> dict[str, Any]:
     """Center a viewer pane on a 3D volume point."""
     return await _call(
@@ -172,7 +206,7 @@ async def vc3d_set_render_settings(
     show_direction_hints: Optional[bool] = None,
     surface_overlay_enabled: Optional[bool] = None,
     highlighted_surface_ids: Optional[list[str]] = None,
-    volume_window: Optional[dict[str, float]] = None,
+    volume_window: Optional[_Window] = None,
     normal_arrow_length_scale: Optional[float] = None,
     normal_max_arrows: Optional[int] = None,
     segmentation_cursor_mirroring: Optional[bool] = None,
@@ -256,12 +290,12 @@ async def vc3d_get_overlay() -> dict[str, Any]:
 async def vc3d_set_overlay(
     volume_id: Optional[str] = None,
     clear: Optional[bool] = None,
-    colormap: Optional[str] = None,
+    colormap: Optional[_OverlayColormap] = None,
     opacity: Optional[float] = None,
     threshold: Optional[float] = None,
-    window: Optional[dict[str, float]] = None,
+    window: Optional[_Window] = None,
     max_displayed_resolution: Optional[int] = None,
-    composite: Optional[dict[str, Any]] = None,
+    composite: Optional[_OverlayComposite] = None,
 ) -> dict[str, Any]:
     """Update the overlay-volume settings. Every argument is optional --
     omitted (None) fields are left unchanged; pass only what you want to
