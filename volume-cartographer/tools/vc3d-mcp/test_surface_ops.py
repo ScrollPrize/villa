@@ -16,8 +16,6 @@ Run:
 
 from __future__ import annotations
 
-import asyncio
-import json
 import os
 import shutil
 import sys
@@ -27,6 +25,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from vc3d_mcp import core  # noqa: E402
+from test_support import FakeBridgeServer  # noqa: E402
 from vc3d_mcp.tools.surface_ops import (  # noqa: E402
     vc3d_append_segment_mask,
     vc3d_crop_segment_bounds,
@@ -37,74 +36,29 @@ from vc3d_mcp.tools.surface_ops import (  # noqa: E402
 )
 
 
-class FakeBridge:
+class SurfaceOpsBridge(FakeBridgeServer):
     """Minimal AgentBridgeServer stand-in for the surface_ops RPCs."""
 
     def __init__(self, socket_path: str):
-        self.socket_path = socket_path
-        self._server: asyncio.base_events.Server | None = None
-        self._writers: list[asyncio.StreamWriter] = []
-        self.received: list[dict] = []
+        super().__init__(socket_path)
         # Job records answered by job.status; they start "running" and flip to
         # "succeeded" after the first poll so wait=True exercises the poll loop.
         self._jobs: dict[str, dict] = {}
         self._polls: dict[str, int] = {}
 
-    async def start(self) -> None:
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
-        self._server = await asyncio.start_unix_server(self._handle_client, path=self.socket_path)
-
-    async def stop(self) -> None:
-        for w in list(self._writers):
-            w.close()
-        if self._server is not None:
-            self._server.close()
-            try:
-                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
-
-    def params_for(self, method: str) -> dict:
-        """Params of the last request for `method` (for wire assertions)."""
-        for msg in reversed(self.received):
-            if msg.get("method") == method:
-                return msg.get("params") or {}
-        raise AssertionError(f"no request seen for {method}")
-
-    async def _handle_client(self, reader, writer) -> None:
-        self._writers.append(writer)
-        try:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                await self._handle_line(line, writer)
-        finally:
-            if writer in self._writers:
-                self._writers.remove(writer)
-
-    async def _handle_line(self, raw: bytes, writer) -> None:
-        msg = json.loads(raw.decode("utf-8"))
-        self.received.append(msg)
+    async def handle_message(self, msg: dict, writer) -> None:
         method = msg.get("method")
         req_id = msg.get("id")
         params = msg.get("params") or {}
 
         if method == "segment.crop_bounds":
-            # "seg-bad" models the crop core reporting an internal failure through
-            # its err out-param (finding #4): a real -32005 instead of cropped:true.
+            # The crop core reports failures through its error out-param.
             if params.get("segmentId") == "seg-bad":
-                await self._reply(writer, req_id, error={
+                await self.reply(writer, req_id, error={
                     "code": -32005, "message": "Crop failed",
                     "data": {"detail": "Cannot crop surface: Missing coordinate grid"}})
             else:
-                await self._reply(writer, req_id,
+                await self.reply(writer, req_id,
                                   result={"cropped": True, "segmentId": params.get("segmentId")})
         elif method == "segment.recalc_area":
             results = [
@@ -112,27 +66,27 @@ class FakeBridge:
                  "success": True, "errorReason": None}
                 for sid in params.get("segmentIds", [])
             ]
-            await self._reply(writer, req_id, result={"results": results})
+            await self.reply(writer, req_id, result={"results": results})
         elif method == "segment.reoptimize":
             job_id = "job-ro"
             self._jobs[job_id] = {"jobId": job_id, "kind": "segment.reoptimize"}
-            await self._reply(writer, req_id, result={
+            await self.reply(writer, req_id, result={
                 "jobId": job_id, "kind": "segment.reoptimize", "source": "tool",
                 "outputDir": "/vpkg/paths/seg", "volumeId": "vol-a"})
         elif method == "segment.refine_alpha_comp":
             job_id = "job-ac"
             self._jobs[job_id] = {"jobId": job_id, "kind": "segment.refine_alpha_comp"}
-            await self._reply(writer, req_id, result={
+            await self.reply(writer, req_id, result={
                 "jobId": job_id, "kind": "segment.refine_alpha_comp", "source": "tool",
                 "outputDir": "/vpkg/paths/seg_refined", "segmentId": params.get("segmentId")})
         elif method == "segment.generate_mask":
             # Deferred on the real bridge; the client just sees a normal reply.
-            await self._reply(writer, req_id, result={
+            await self.reply(writer, req_id, result={
                 "generated": True, "appended": False,
                 "maskPath": "/vpkg/paths/seg/mask.tif",
                 "segmentId": params.get("segmentId"), "message": "Mask saved"})
         elif method == "segment.append_mask":
-            await self._reply(writer, req_id, result={
+            await self.reply(writer, req_id, result={
                 "generated": True, "appended": True,
                 "maskPath": "/vpkg/paths/seg/mask.tif",
                 "segmentId": params.get("segmentId"),
@@ -142,29 +96,24 @@ class FakeBridge:
             rec = self._jobs.get(job_id, {"jobId": job_id, "kind": "segment.reoptimize"})
             self._polls[job_id] = self._polls.get(job_id, 0) + 1
             state = "running" if self._polls[job_id] < 2 else "succeeded"
-            await self._reply(writer, req_id, result={
+            await self.reply(writer, req_id, result={
                 "jobId": job_id, "kind": rec["kind"], "label": "op",
                 "state": state, "message": "finished" if state == "succeeded" else "working",
                 "success": state == "succeeded", "outputPath": None,
                 "consoleTail": ["line A"] if state == "running" else ["line A", "line B"]})
         else:
-            await self._reply(writer, req_id, error={"code": -32601, "message": "Method not found"})
-
-    async def _reply(self, writer, req_id, *, result=None, error=None) -> None:
-        msg: dict = {"jsonrpc": "2.0", "id": req_id}
-        if error is not None:
-            msg["error"] = error
-        else:
-            msg["result"] = result
-        writer.write((json.dumps(msg) + "\n").encode("utf-8"))
-        await writer.drain()
+            await self.reply(
+                writer,
+                req_id,
+                error={"code": -32601, "message": "Method not found"},
+            )
 
 
 class SurfaceOpsTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.tmp_dir = tempfile.mkdtemp(prefix="vc3d-surfaceops-test-")
         self.socket_path = os.path.join(self.tmp_dir, "fake-bridge.sock")
-        self.bridge = FakeBridge(self.socket_path)
+        self.bridge = SurfaceOpsBridge(self.socket_path)
         await self.bridge.start()
         core.configure_client(self.socket_path, request_timeout=5)
         self._orig_poll = core.POLL_INTERVAL_S

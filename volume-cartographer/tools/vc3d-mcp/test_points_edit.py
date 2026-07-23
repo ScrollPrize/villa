@@ -18,8 +18,6 @@ or via unittest discovery:
 
 from __future__ import annotations
 
-import asyncio
-import json
 import os
 import shutil
 import tempfile
@@ -30,6 +28,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from vc3d_mcp import core  # noqa: E402
+from test_support import EchoBridgeServer  # noqa: E402
 from vc3d_mcp.tools.points import (  # noqa: E402
     vc3d_add_point_collection,
     vc3d_apply_anchor_offset,
@@ -53,66 +52,11 @@ from vc3d_mcp.tools.points import (  # noqa: E402
 )
 
 
-class FakePointsBridge:
-    """AF_UNIX JSON-RPC 2.0 stand-in: records requests, echoes a canned result
-    ({"echoedMethod", "echoedParams"}) for every method so passthrough is
-    observable."""
-
-    def __init__(self, socket_path: str):
-        self.socket_path = socket_path
-        self._server: asyncio.base_events.Server | None = None
-        self._writers: list[asyncio.StreamWriter] = []
-        self.received_requests: list[dict] = []
-
-    async def start(self) -> None:
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
-        self._server = await asyncio.start_unix_server(self._handle_client, path=self.socket_path)
-
-    async def stop(self) -> None:
-        for w in list(self._writers):
-            w.close()
-        if self._server is not None:
-            self._server.close()
-            try:
-                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
-
-    async def _handle_client(self, reader, writer) -> None:
-        self._writers.append(writer)
-        try:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                msg = json.loads(line.decode("utf-8"))
-                self.received_requests.append(msg)
-                reply = {
-                    "jsonrpc": "2.0",
-                    "id": msg.get("id"),
-                    "result": {
-                        "echoedMethod": msg.get("method"),
-                        "echoedParams": msg.get("params") or {},
-                    },
-                }
-                writer.write((json.dumps(reply) + "\n").encode("utf-8"))
-                await writer.drain()
-        finally:
-            if writer in self._writers:
-                self._writers.remove(writer)
-
-
 class PointsToolTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.tmp_dir = tempfile.mkdtemp(prefix="vc3d-points-test-")
         self.socket_path = os.path.join(self.tmp_dir, "fake-bridge.sock")
-        self.fake = FakePointsBridge(self.socket_path)
+        self.fake = EchoBridgeServer(self.socket_path)
         await self.fake.start()
         core.configure_client(self.socket_path, request_timeout=5)
 

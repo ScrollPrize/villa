@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
-"""Self-test for the viewer round-2 tools (overlay + intersects), run without
-a real VC3D instance.
+"""Self-test for the viewer overlay and intersection tools.
 
-Purpose-built fake bridge (model: FakeAgentBridgeServer in test_mcp_bridge.py)
-stands in for AgentBridgeServer just long enough to confirm each new/extended
-vc3d_mcp.tools.viewer function sends the right method + camelCase params,
-strips None args, and passes the fake's response straight through.
+A purpose-built fake bridge confirms that each wrapper sends the right method
+and camelCase params, strips None values, and returns the bridge response.
 
 Run directly:
-    cd tools/vc3d-mcp && python3 test_viewer2.py -v
+    cd tools/vc3d-mcp && python3 test_viewer.py -v
 or via unittest discovery:
-    python3 -m unittest test_viewer2 -v
+    python3 -m unittest test_viewer -v
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import os
 import shutil
 import sys
@@ -27,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from vc3d_mcp import core  # noqa: E402
 from vc3d_mcp.bridge_client import BridgeError  # noqa: E402
+from test_support import FakeBridgeServer  # noqa: E402
 from vc3d_mcp.tools.viewer import (  # noqa: E402
     vc3d_get_overlay,
     vc3d_get_render_settings,
@@ -46,17 +42,14 @@ _KNOWN_COLORMAPS = {
 }
 
 
-class FakeAgentBridgeServer:
+class ViewerBridge(FakeBridgeServer):
     """Minimal AF_UNIX, newline-delimited JSON-RPC 2.0 stand-in that echoes
     back whatever params it received (merged over a small canned state), so
     each test can assert on the request it produced and the response passed
     through."""
 
     def __init__(self, socket_path: str):
-        self.socket_path = socket_path
-        self._server: asyncio.base_events.Server | None = None
-        self._writers: list[asyncio.StreamWriter] = []
-        self.received_requests: list[dict] = []
+        super().__init__(socket_path)
         self._render_settings: dict = {
             "intersectionOpacity": 0.5,
             "volumeWindow": {"low": 0.0, "high": 255.0},
@@ -78,40 +71,7 @@ class FakeAgentBridgeServer:
             "composite": {"enabled": False, "method": "max", "layersFront": 8, "layersBehind": 0},
         }
 
-    async def start(self) -> None:
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
-        self._server = await asyncio.start_unix_server(self._handle_client, path=self.socket_path)
-
-    async def stop(self) -> None:
-        for w in list(self._writers):
-            w.close()
-        if self._server is not None:
-            self._server.close()
-            try:
-                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
-
-    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        self._writers.append(writer)
-        try:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if line:
-                    await self._handle_line(line, writer)
-        finally:
-            if writer in self._writers:
-                self._writers.remove(writer)
-
-    async def _handle_line(self, raw: bytes, writer: asyncio.StreamWriter) -> None:
-        msg = json.loads(raw.decode("utf-8"))
-        self.received_requests.append(msg)
+    async def handle_message(self, msg: dict, writer) -> None:
         method = msg.get("method")
         req_id = msg.get("id")
         params = msg.get("params") or {}
@@ -133,7 +93,7 @@ class FakeAgentBridgeServer:
             result = dict(self._overlay)
         elif method == "viewer.set_overlay":
             if "colormap" in params and params["colormap"] not in _KNOWN_COLORMAPS:
-                await self._send(writer, {"jsonrpc": "2.0", "id": req_id,
+                await self.send(writer, {"jsonrpc": "2.0", "id": req_id,
                                            "error": {"code": -32602,
                                                      "message": "colormap must be one of the known overlay colormap ids"}})
                 return
@@ -160,21 +120,19 @@ class FakeAgentBridgeServer:
             applied = [params["viewer"]] if params.get("viewer") else ["v1", "v2"]
             result = {"surfaceIds": ids, "appliedToViewers": applied}
         else:
-            await self._send(writer, {"jsonrpc": "2.0", "id": req_id,
+            await self.send(writer, {"jsonrpc": "2.0", "id": req_id,
                                        "error": {"code": -32601, "message": "Method not found"}})
             return
-        await self._send(writer, {"jsonrpc": "2.0", "id": req_id, "result": result})
-
-    async def _send(self, writer: asyncio.StreamWriter, obj: dict) -> None:
-        writer.write((json.dumps(obj) + "\n").encode("utf-8"))
-        await writer.drain()
+        await self.send(
+            writer, {"jsonrpc": "2.0", "id": req_id, "result": result}
+        )
 
 
-class ViewerRound2ToolTest(unittest.IsolatedAsyncioTestCase):
+class ViewerToolTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.tmp_dir = tempfile.mkdtemp(prefix="vc3d-mcp-test-")
         self.socket_path = os.path.join(self.tmp_dir, "fake-agent-bridge.sock")
-        self.fake_server = FakeAgentBridgeServer(self.socket_path)
+        self.fake_server = ViewerBridge(self.socket_path)
         await self.fake_server.start()
         core.configure_client(self.socket_path, request_timeout=5)
 
