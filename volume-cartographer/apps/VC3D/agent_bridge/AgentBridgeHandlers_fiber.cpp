@@ -150,7 +150,7 @@ void AgentBridgeServer::requireKnownFiber(LineAnnotationController* ctrl, quint6
 QJsonObject AgentBridgeServer::handleFiberLaunch(const QJsonValue& params)
 {
     LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
     auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(viewer);
@@ -164,19 +164,14 @@ QJsonObject AgentBridgeServer::handleFiberLaunch(const QJsonValue& params)
 
     // Position conversion per §3.6 conventions (same round-trip rule as
     // canvas.click).
-    const QString space = jsonOptionalString(p, "space", QStringLiteral("volume"));
+    const QString space =
+        p.value("space").toString(QStringLiteral("volume"));
     QPointF scenePos;
     if (space == QLatin1String("scene")) {
-        const QJsonValue posv = p.value("position");
-        if (!posv.isObject()) {
-            QJsonObject data;
-            data["param"] = "position";
-            throw AgentBridgeError{-32602, "scene-space position must be an object {x, y}", data};
-        }
-        const QJsonObject po = posv.toObject();
+        const QJsonObject po = p.value("position").toObject();
         scenePos = QPointF(jsonRequireFiniteFloat(po.value("x"), "x"),
                            jsonRequireFiniteFloat(po.value("y"), "y"));
-    } else if (space == QLatin1String("volume")) {
+    } else {
         const cv::Vec3f vol = jsonToVec3(p.value("position"), "position");
         scenePos = chunked->volumeToScene(vol);
         const cv::Vec3f back = chunked->sceneToVolume(scenePos);
@@ -189,11 +184,6 @@ QJsonObject AgentBridgeServer::handleFiberLaunch(const QJsonValue& params)
                     .arg(dist, 0, 'f', 3);
             throw AgentBridgeError{-32003, "Invalid coordinates", data};
         }
-    } else {
-        QJsonObject data;
-        data["param"] = "space";
-        data["value"] = space;
-        throw AgentBridgeError{-32602, "space must be \"volume\" or \"scene\"", data};
     }
 
     if (!ctrl->canLaunchFromViewer(chunked)) {
@@ -208,7 +198,7 @@ QJsonObject AgentBridgeServer::handleFiberLaunch(const QJsonValue& params)
         throw AgentBridgeError{-32003, "Invalid coordinates", data};
     }
 
-    const bool replaceOwning = jsonOptionalBool(p, "replaceOwning", true);
+    const bool replaceOwning = p.value("replaceOwning").toBool(true);
     const QString err = captureFiberError(ctrl, [&] {
         ctrl->launchFromViewerAtPoint(chunked, scenePos, replaceOwning);
     });
@@ -272,7 +262,7 @@ QJsonObject AgentBridgeServer::handleFiberList(const QJsonValue&)
 QJsonObject AgentBridgeServer::handleFiberOpen(const QJsonValue& params)
 {
     LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
     requireKnownFiber(ctrl, fiberId);
@@ -288,52 +278,25 @@ QJsonObject AgentBridgeServer::handleFiberOpen(const QJsonValue& params)
         throw AgentBridgeError{-32602, "Conflicting fiber.open selectors", data};
     }
 
-    auto readIndex = [&](const char* key) -> int {
-        const QJsonValue v = p.value(QLatin1String(key));
-        const double d = v.toDouble(std::numeric_limits<double>::quiet_NaN());
-        // The int upper-bound guard rejects a finite double (e.g. 1e300) that would
-        // overflow the int cast below (FINDING 11a).
-        if (!v.isDouble() || !std::isfinite(d) || std::floor(d) != d || d < 0 ||
-            d > static_cast<double>(std::numeric_limits<int>::max())) {
-            QJsonObject data;
-            data["param"] = QString::fromLatin1(key);
-            throw AgentBridgeError{-32602,
-                QStringLiteral("%1 must be a non-negative integer").arg(QLatin1String(key)),
-                data};
-        }
-        return static_cast<int>(d);
-    };
-
     const QString err = captureFiberError(ctrl, [&] {
         if (p.contains("controlPointIndex")) {
-            ctrl->openFiberAtControlPoint(fiberId, readIndex("controlPointIndex"));
+            ctrl->openFiberAtControlPoint(
+                fiberId, p.value("controlPointIndex").toInt());
         } else if (p.contains("linePointIndex")) {
-            ctrl->openFiberAtLinePointIndex(fiberId, readIndex("linePointIndex"));
+            ctrl->openFiberAtLinePointIndex(
+                fiberId, p.value("linePointIndex").toInt());
         } else if (p.contains("span")) {
             const QJsonValue sv = p.value("span");
-            if (!sv.isArray() || sv.toArray().size() != 2) {
+            if (sv.toArray().size() != 2) {
                 QJsonObject data;
                 data["param"] = "span";
                 throw AgentBridgeError{
                     -32602, "span must be [firstControlIndex, secondControlIndex]", data};
             }
             const QJsonArray sa = sv.toArray();
-            auto readSpanIndex = [&](const QJsonValue& v, const char* which) -> int {
-                const double d = v.toDouble(std::numeric_limits<double>::quiet_NaN());
-                if (!v.isDouble() || !std::isfinite(d) || std::floor(d) != d || d < 0 ||
-                    d > static_cast<double>(std::numeric_limits<int>::max())) {
-                    QJsonObject data;
-                    data["param"] = "span";
-                    data["detail"] =
-                        QStringLiteral("%1 span index must be a non-negative integer")
-                            .arg(QLatin1String(which));
-                    throw AgentBridgeError{-32602, "Invalid span", data};
-                }
-                return static_cast<int>(d);
-            };
             ctrl->openFiberSpan(fiberId,
-                                readSpanIndex(sa.at(0), "first"),
-                                readSpanIndex(sa.at(1), "second"));
+                                sa.at(0).toInt(),
+                                sa.at(1).toInt());
         } else {
             ctrl->openFiber(fiberId);
         }
@@ -354,14 +317,8 @@ QJsonObject AgentBridgeServer::handleFiberOpen(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleFiberSetFollow(const QJsonValue& params)
 {
     LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = paramsObject(params);
-
-    const QJsonValue ev = p.value("enabled");
-    if (!ev.isBool()) {
-        QJsonObject data;
-        data["param"] = "enabled";
-        throw AgentBridgeError{-32602, "enabled must be a boolean", data};
-    }
+    const QJsonObject p = params.toObject();
+    const bool enabled = p.value("enabled").toBool();
 
     LineAnnotationDialog* dialog = ctrl->mostRecentLineAnnotationDialog();
     if (!dialog) {
@@ -371,7 +328,7 @@ QJsonObject AgentBridgeServer::handleFiberSetFollow(const QJsonValue& params)
         throw AgentBridgeError{-32007, "No line-annotation workspace open", data};
     }
 
-    dialog->setCutFollowEnabled(ev.toBool());
+    dialog->setCutFollowEnabled(enabled);
 
     QJsonObject result;
     result["enabled"] = dialog->cutFollowEnabled();
@@ -406,10 +363,10 @@ QJsonObject AgentBridgeServer::handleFiberSave(const QJsonValue&)
 QJsonObject AgentBridgeServer::handleFiberDelete(const QJsonValue& params)
 {
     LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     const QJsonValue idsv = p.value("fiberIds");
-    if (!idsv.isArray() || idsv.toArray().isEmpty()) {
+    if (idsv.toArray().isEmpty()) {
         QJsonObject data;
         data["param"] = "fiberIds";
         throw AgentBridgeError{-32602, "fiberIds must be a non-empty array of fiber ids", data};
@@ -456,26 +413,21 @@ QJsonObject AgentBridgeServer::handleFiberDelete(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleFiberSetTag(const QJsonValue& params)
 {
     LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
-    const QString tag = jsonRequireString(p, "tag").trimmed();
+    const QString tag = p.value("tag").toString().trimmed();
     if (tag.isEmpty()) {
         QJsonObject data;
         data["param"] = "tag";
         throw AgentBridgeError{-32602, "tag must be a non-empty string", data};
     }
-    const QJsonValue ev = p.value("enabled");
-    if (!ev.isBool()) {
-        QJsonObject data;
-        data["param"] = "enabled";
-        throw AgentBridgeError{-32602, "enabled must be a boolean", data};
-    }
+    const bool enabled = p.value("enabled").toBool();
 
     requireKnownFiber(ctrl, fiberId);
 
     const QString err = captureFiberError(
-        ctrl, [&] { ctrl->setFiberTag(fiberId, tag, ev.toBool()); });
+        ctrl, [&] { ctrl->setFiberTag(fiberId, tag, enabled); });
     if (!err.isEmpty()) {
         QJsonObject data;
         data["detail"] = err;
@@ -485,7 +437,7 @@ QJsonObject AgentBridgeServer::handleFiberSetTag(const QJsonValue& params)
     QJsonObject result;
     result["fiberId"] = QString::number(fiberId);
     result["tag"] = tag;
-    result["enabled"] = ev.toBool();
+    result["enabled"] = enabled;
     return result;
 }
 
@@ -493,7 +445,7 @@ QJsonObject AgentBridgeServer::handleFiberSetTag(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleFiberCreateAtlas(const QJsonValue& params)
 {
     LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
     requireKnownFiber(ctrl, fiberId);
@@ -525,24 +477,15 @@ QJsonObject AgentBridgeServer::handleFiberCreateAtlas(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleFiberExport(const QJsonValue& params)
 {
     LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
-    const QString pathStr = jsonRequireString(p, "path");
+    const QString pathStr = p.value("path").toString();
     if (pathStr.isEmpty()) {
         QJsonObject data;
         data["param"] = "path";
         throw AgentBridgeError{-32602, "path is required", data};
     }
-    double scale = 1.0;
-    if (p.contains("scale")) {
-        const QJsonValue sv = p.value("scale");
-        scale = sv.toDouble(std::numeric_limits<double>::quiet_NaN());
-        if (!sv.isDouble() || !std::isfinite(scale) || scale <= 0.0) {
-            QJsonObject data;
-            data["param"] = "scale";
-            throw AgentBridgeError{-32602, "scale must be a positive finite number", data};
-        }
-    }
+    const double scale = p.value("scale").toDouble(1.0);
 
     QString err;
     int exported = 0;
@@ -563,24 +506,15 @@ QJsonObject AgentBridgeServer::handleFiberExport(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleFiberImport(const QJsonValue& params)
 {
     LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
-    const QString pathStr = jsonRequireString(p, "path");
+    const QString pathStr = p.value("path").toString();
     if (pathStr.isEmpty()) {
         QJsonObject data;
         data["param"] = "path";
         throw AgentBridgeError{-32602, "path is required", data};
     }
-    double scale = 1.0;
-    if (p.contains("scale")) {
-        const QJsonValue sv = p.value("scale");
-        scale = sv.toDouble(std::numeric_limits<double>::quiet_NaN());
-        if (!sv.isDouble() || !std::isfinite(scale) || scale <= 0.0) {
-            QJsonObject data;
-            data["param"] = "scale";
-            throw AgentBridgeError{-32602, "scale must be a positive finite number", data};
-        }
-    }
+    const double scale = p.value("scale").toDouble(1.0);
 
     const std::filesystem::path importPath(pathStr.toStdString());
     std::error_code ec;
