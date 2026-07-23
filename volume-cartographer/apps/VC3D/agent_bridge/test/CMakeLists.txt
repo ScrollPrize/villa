@@ -2,7 +2,9 @@
 # helpers used behind it. It needs no process launch or volume data.
 find_package(Qt6 REQUIRED COMPONENTS Core)
 
-add_executable(test_agent_bridge_contract test_agent_bridge_contract.cpp)
+add_executable(test_agent_bridge_contract
+    test_agent_bridge_contract.cpp
+    ../AgentBridgeMethod.cpp)
 
 # The included app headers declare Q_OBJECT classes, but the test never
 # instantiates them (it only uses the free inline helpers), so no MOC is needed.

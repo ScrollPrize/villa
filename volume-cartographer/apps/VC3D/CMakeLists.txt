@@ -246,6 +246,7 @@ set(srcs
     volume_viewers/CChunkedVolumeViewer.hpp
     agent_bridge/AgentBridgeServer.cpp
     agent_bridge/AgentBridgeServer.hpp
+    agent_bridge/AgentBridgeMethod.cpp
     agent_bridge/AgentBridgeMethod.hpp
     agent_bridge/AgentBridgeMethods_atlas.cpp
     agent_bridge/AgentBridgeMethods_canvas.cpp
