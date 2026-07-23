@@ -264,6 +264,7 @@ set(srcs
     agent_bridge/AgentBridgeCommandError.hpp
     agent_bridge/AgentBridgeInternal.hpp
     agent_bridge/AgentBridgeJobs.cpp
+    agent_bridge/AgentBridgeHandlers_catalog.cpp
     agent_bridge/AgentBridgeHandlers_session.cpp
     agent_bridge/AgentBridgeHandlers_editing.cpp
     agent_bridge/AgentBridgeHandlers_wrap.cpp
