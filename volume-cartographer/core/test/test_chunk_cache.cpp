@@ -416,6 +416,112 @@ TEST_CASE("ChunkCache: zero protection window restores strict-capacity LRU")
     CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
 }
 
+TEST_CASE("ChunkCache: active view request protects entries past the hard ceiling")
+{
+    auto f = std::make_shared<CountingFetcher>();
+    cannedDataChunks(*f, 5);
+    // Zero protection window: only the view request keeps entries alive.
+    auto c = makeTinyCapacityCache(f, std::chrono::milliseconds{0});
+
+    const auto token = c->beginViewRequest();
+    CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 1, 0, 0).status == ChunkStatus::Data);
+
+    // 5 x 64 = 320 bytes: past the 256-byte hard ceiling, but all entries
+    // belong to the active view request, so none may be evicted and the
+    // cache reports the stall instead.
+    CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(c->tryGetChunk(0, 1, 0, 0).status == ChunkStatus::Data);
+    CHECK(c->stats().decodedBytes == 320);
+    CHECK(c->stats().viewProtectionStalls >= 1);
+    CHECK(f->fetchCalls.load() == 5);
+    c->endViewRequest(token);
+}
+
+TEST_CASE("ChunkCache: ending the view request releases eviction protection")
+{
+    auto f = std::make_shared<CountingFetcher>();
+    cannedDataChunks(*f, 6);
+    auto c = makeTinyCapacityCache(f, std::chrono::milliseconds{0});
+
+    const auto token = c->beginViewRequest();
+    CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 1, 0, 0).status == ChunkStatus::Data);
+    c->endViewRequest(token);
+
+    // With no active view request and a zero protection window, the next
+    // store prunes straight back down to the 128-byte budget.
+    CHECK(waitForResolved(*c, 0, 1, 0, 1).status == ChunkStatus::Data);
+    CHECK(c->stats().decodedBytes <= 128);
+    CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+}
+
+TEST_CASE("ChunkCache: entries from before the view request stay evictable")
+{
+    auto f = std::make_shared<CountingFetcher>();
+    cannedDataChunks(*f, 4);
+    auto c = makeTinyCapacityCache(f, std::chrono::milliseconds{0});
+
+    CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
+
+    // Entries touched only before the request began are not part of its
+    // working set; over-budget stores may still evict them.
+    const auto token = c->beginViewRequest();
+    CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
+
+    CHECK(c->stats().decodedBytes <= 128);
+    CHECK(c->tryGetChunk(0, 0, 1, 0).status == ChunkStatus::Data);
+    CHECK(c->tryGetChunk(0, 0, 1, 1).status == ChunkStatus::Data);
+    c->endViewRequest(token);
+}
+
+TEST_CASE("ChunkCache: view-request OOM ceiling still evicts as a last resort")
+{
+    // 16x8x8 volume of 4x4x4 chunks: 16 chunks; the view-request ceiling
+    // (4x the 128-byte capacity) holds eight.
+    auto f = std::make_shared<CountingFetcher>();
+    for (int iz = 0; iz < 4; ++iz)
+        for (int iy : {0, 1})
+            for (int ix : {0, 1}) {
+                ChunkFetchResult fr;
+                fr.status = ChunkFetchStatus::Found;
+                fr.bytes = makeBytes(64, std::byte{99});
+                f->setCanned({0, iz, iy, ix}, fr);
+            }
+    std::vector<ChunkCache::LevelInfo> levels = {{{16, 8, 8}, {4, 4, 4}, {}}};
+    ChunkCache::Options opts;
+    opts.maxConcurrentReads = 1;
+    opts.detectAllFillChunks = true;
+    opts.decodedByteCapacity = 128;
+    opts.evictionProtectionWindow = std::chrono::minutes{10};
+    auto c = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
+        0.0, ChunkDtype::UInt8, opts);
+
+    const auto token = c->beginViewRequest();
+    for (int i = 0; i < 9; ++i) {
+        const int iz = i / 4;
+        const int iy = (i / 2) % 2;
+        const int ix = i % 2;
+        CHECK(waitForResolved(*c, 0, iz, iy, ix).status == ChunkStatus::Data);
+    }
+
+    // The ninth store pushes past the 512-byte view-request ceiling; the
+    // LRU tail is reclaimed despite the active request.
+    CHECK(c->stats().decodedBytes <= 512);
+    CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    c->endViewRequest(token);
+}
+
 namespace {
 
 // Records fetch order; the first fetch blocks until release() so later

@@ -5,6 +5,7 @@
 #include <QHBoxLayout>
 #include <QFontDatabase>
 #include <QClipboard>
+#include <QTextDocument>
 
 
 ConsoleOutputWidget::ConsoleOutputWidget(QWidget* parent)
@@ -71,4 +72,8 @@ void ConsoleOutputWidget::setTitle(const QString& title)
     _titleLabel->setText(title);
 }
 
+void ConsoleOutputWidget::setMaximumBlockCount(int maximum)
+{
+    _textEdit->document()->setMaximumBlockCount(maximum);
+}
 

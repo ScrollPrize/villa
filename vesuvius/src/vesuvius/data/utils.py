@@ -66,8 +66,8 @@ def open_zarr(path: str, mode: str = 'r',
     zarr.Array
         The opened zarr array
     """
-    if storage_options is None:
-        storage_options = {}
+    storage_options = dict(storage_options or {})
+    is_remote = path.startswith(('http://', 'https://', 's3://'))
     
     # Ensure parent directory exists for write modes and local paths
     if mode in ('w', 'w-', 'a') and not path.startswith(('http://', 'https://', 's3://')):
@@ -113,7 +113,11 @@ def open_zarr(path: str, mode: str = 'r',
         if verbose:
             print(f"Opening HTTP zarr store at {path} with storage_options: {storage_options}")
     
-    # Open zarr store directly with storage_options
+    # Zarr 3.2 rejects storage_options for local filesystem stores, even when
+    # the mapping is empty. Only URI-backed fsspec stores consume this option.
+    store_kwargs = {'storage_options': storage_options} if is_remote else {}
+
+    # Open the Zarr store with the protocol-appropriate keyword arguments.
     if verbose:
         print(f"Opening zarr store at {path} with mode={mode}")
     
@@ -137,7 +141,7 @@ def open_zarr(path: str, mode: str = 'r',
         if verbose:
             print(f"Creating new zarr array with shape={shape}, chunks={chunks}, dtype={dtype}")
         
-        return zarr.open(path, mode=mode, shape=shape, storage_options=storage_options, **create_kwargs)
+        return zarr.open(path, mode=mode, shape=shape, **store_kwargs, **create_kwargs)
     else:
         # Just open the existing array
-        return zarr.open(path, mode=mode, storage_options=storage_options, **kwargs)
+        return zarr.open(path, mode=mode, **store_kwargs, **kwargs)

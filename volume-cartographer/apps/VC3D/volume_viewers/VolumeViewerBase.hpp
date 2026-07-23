@@ -17,6 +17,7 @@
 
 #include <opencv2/core/mat.hpp>
 #include "overlays/ViewerOverlayControllerBase.hpp"
+#include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/Compositing.hpp"
 
 class CVolumeViewerView;
@@ -126,6 +127,7 @@ public:
     virtual void setOverlayVolume(std::shared_ptr<Volume> volume) = 0;
     virtual void setOverlayOpacity(float opacity) = 0;
     virtual void setOverlayColormap(const std::string& colormapId) = 0;
+    virtual void setOverlaySamplingMethod(vc::Sampling method) = 0;
     virtual void setOverlayThreshold(float threshold) = 0;
     virtual void setOverlayWindow(float low, float high) = 0;
     virtual void setOverlayMaxDisplayedResolution(int level) = 0;

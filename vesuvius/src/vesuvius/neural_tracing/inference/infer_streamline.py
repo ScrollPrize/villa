@@ -744,7 +744,7 @@ def _open_volume_array(volume_path, volume_scale):
             "volume_cache_retry_seconds": VOLUME_CACHE_RETRY_SECONDS,
         },
     )
-    if isinstance(root, zarr.hierarchy.Group):
+    if isinstance(root, zarr.Group):
         scale_key = str(int(volume_scale))
         if scale_key not in root:
             raise KeyError(f"volume scale {scale_key!r} not found in {volume_path}")

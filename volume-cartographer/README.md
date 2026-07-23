@@ -212,6 +212,7 @@ _Main UI widget for adjusting the ROI and display of the volume viewers_
 - `Axis overlay opacity` : Modifies the opacity of the plane slice axis overlays
 - `Overlay threshold` : The value of the overlay array below which will not be rendered on the base volume (useful for removing background)
 - `Overlay colormap` : The colormap to use for the overlay volume
+- `Overlay interpolation` : Selects nearest-neighbor (default) or trilinear sampling independently of the base volume
 - `Use axis aligned slices` : by default, vc3d attempts to align your XZ and YZ planes orthogonal to the normal of the current selected surface, this checkbox will instead use the plane normal as the axis to slice along
 - `Show axis overlays in XY view` : if you do not wish to view the axis overlays in the XY view, this checkbox will disable them
 

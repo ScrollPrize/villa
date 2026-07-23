@@ -79,6 +79,7 @@ public:
     uint64_t surfacesVersion() const { return _surfacesVersion; }
 
     // --- POIs (inlined from CSurfaceCollection) ---
+    std::unique_ptr<POI> createSurfaceFocusPoi(QuadSurface& surface);
     void setPOI(const std::string& name, POI* poi);
     POI* poi(const std::string& name);
     std::vector<POI*> pois();
