@@ -140,6 +140,40 @@ public:
                                           // => <segment>_straightened (dialog default)
     };
 
+    // Parameters the interactive Resume-opt Local dialog (selectResumeLocalTracerParams)
+    // collects, packaged so the non-interactive (agent bridge) path can supply
+    // them directly. See startResumeLocalGrowPatch. Base tracer params are fixed
+    // (matching the interactive path); paramOverrides merge over them last, exactly
+    // like the dialog's JsonProfileEditor "extra params".
+    struct ResumeLocalGrowParams {
+        QString     volumeId;         // vpkg volume id; empty => current volume
+        int         ompThreads{1};    // OMP_NUM_THREADS for the run; matches the dialog
+                                      // default (VCSettings RESUME_LOCAL_OMP_THREADS_DEFAULT).
+        QJsonObject paramOverrides;   // merged over the fixed resume-local tracer params
+    };
+
+    // Parameters the interactive AlphaCompRefineDialog collects, packaged so the
+    // non-interactive (agent bridge) path can supply them directly. See
+    // startAlphaCompRefine. Defaults mirror the dialog's session defaults
+    // (ToolDialogs.cpp AlphaCompRefineDialog::s_*).
+    struct AlphaCompRefineParams {
+        bool    refine{true};
+        double  start{-6.0};
+        double  stop{30.0};
+        double  step{2.0};
+        int     low{26};
+        int     high{255};
+        double  borderOff{1.0};
+        int     radius{3};
+        bool    genVertexColor{false};
+        bool    overwrite{true};
+        double  readerScale{0.5};
+        QString scaleGroup{QStringLiteral("1")};
+        int     ompThreads{-1};       // -1 => runner default (no OMP override)
+        QString outputDir;            // absolute or relative to volpkg root; empty =>
+                                      // <segment>_refined (matching the dialog default)
+    };
+
     // --- Construction ---
 
     explicit SegmentationCommandHandler(QWidget* parentWidget,
@@ -350,6 +384,55 @@ public:
                          const StraightenParams& params,
                          QString* errorMessage = nullptr,
                          QString* resolvedOutputDir = nullptr);
+
+    /// Headless Resume-opt Local (GrowPatch) launch. Performs the same
+    /// preconditions, params-JSON assembly, and vc_grow_seg_from_segments launch
+    /// (Tool::NeighborCopy, resumeOpt "local") that onResumeLocalGrowPatchRequested
+    /// performs today, but reports failures through `errorMessage` (never via
+    /// QMessageBox) and never opens selectResumeLocalTracerParams. Returns true
+    /// when the tool process was launched (job accepted). Completion is observable
+    /// via CommandLineToolRunner::toolFinished exactly as in the interactive path
+    /// (the CWindow toolFinished slot reloads surfaces and clears resumeLocalJob()).
+    /// Distinct failure sentences let the bridge map to JSON-RPC codes: "No volume
+    /// package loaded" / "No volume loaded", "Command line tools are not available"
+    /// (-32006), "already running" / "already active" (-32004), "Invalid segment"
+    /// (-32007 segment), "Unknown volume id" (-32007 volume), and generic
+    /// write/launch failures (-32005). On success `resolvedOutputDir` (when
+    /// non-null) receives the target segment directory.
+    bool startResumeLocalGrowPatch(const std::string& segmentId,
+                                   const ResumeLocalGrowParams& params,
+                                   QString* errorMessage = nullptr,
+                                   QString* resolvedOutputDir = nullptr);
+
+    /// Headless alpha-comp refinement launch (vc_objrefine via
+    /// Tool::AlphaCompRefine). Performs the same preconditions, output-path
+    /// derivation, params-JSON write, and launch that onAlphaCompRefine performs
+    /// today, but reports failures through `errorMessage` (never via QMessageBox)
+    /// and never opens the AlphaCompRefineDialog. Returns true when the tool
+    /// process was launched (job accepted). Completion is observable via
+    /// CommandLineToolRunner::toolFinished exactly as in the interactive path.
+    /// Distinct failure sentences let the bridge map to JSON-RPC codes: "No volume
+    /// package or volume loaded", "Invalid segment" (-32007 segment), "Command
+    /// line tools are not available" (-32006), "already running" (-32004), "only
+    /// local volumes" (remote guard -> -32009), and generic failures (-32005). On
+    /// success `resolvedOutputDir` (when non-null) receives the refined output
+    /// directory.
+    bool startAlphaCompRefine(const std::string& segmentId,
+                              const AlphaCompRefineParams& params,
+                              QString* errorMessage = nullptr,
+                              QString* resolvedOutputDir = nullptr);
+
+    /// Dialog-free core of onCropSurfaceToValidRegion (the interactive slot is a
+    /// thin wrapper over this). Crops the surface grid to its tightest valid
+    /// bounds, writes it in place, and refreshes metrics, reporting every failure
+    /// through `errorMessage` (never via QMessageBox) so the agent bridge can
+    /// return a real error rather than a false success. Returns true on success,
+    /// including the already-tightest no-op. Failure sentences: "No volume package
+    /// or volume loaded", "Invalid segment or segment not loaded", "Missing
+    /// coordinate grid", "does not contain any valid vertices", channel-size
+    /// mismatch, and save failures.
+    bool cropSurfaceToValidRegion(const std::string& segmentId,
+                                  QString* errorMessage = nullptr);
 
     /// Dialog-free core of onRenameSurface: renames the segment folder + meta.json
     /// UUID from `oldId` to `newName`, keeping the editing guard, the

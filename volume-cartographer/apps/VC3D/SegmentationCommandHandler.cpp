@@ -3024,6 +3024,164 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
     emit statusMessage(tr("Resume-opt local GrowPatch started for %1").arg(segmentId), 5000);
 }
 
+bool SegmentationCommandHandler::startResumeLocalGrowPatch(const std::string& segmentId,
+                                                          const ResumeLocalGrowParams& params,
+                                                          QString* errorMessage,
+                                                          QString* resolvedOutputDir)
+{
+    // Dialog-free mirror of onResumeLocalGrowPatchRequested: same preconditions,
+    // fixed base tracer params, and Tool::NeighborCopy launch, but failures report
+    // through errorMessage (never a QMessageBox) so the bridge can classify them
+    // (see startRenderSegment for the sentence->code convention). The interactive
+    // "Missing Normal3D" confirmation prompt is intentionally dropped -- an
+    // unattended run cannot answer it, and the constraint merely has no effect.
+    auto fail = [&](const QString& message) -> bool {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+
+    if (!_state || !_state->vpkg()) {
+        return fail(tr("No volume package loaded."));
+    }
+    if (_state->currentVolume() == nullptr) {
+        return fail(tr("No volume loaded."));
+    }
+    if (!_cmdRunner) {
+        return fail(tr("Command line tools are not available."));
+    }
+    if (_cmdRunner->isRunning()) {
+        return fail(tr("A command line tool is already running."));
+    }
+    // Preflight the tool binary the same way startRenderSegment does: execute()
+    // would otherwise pop a blocking QMessageBox on a missing binary, hanging an
+    // unattended bridge run. Tool::NeighborCopy launches vc_grow_seg_from_seed.
+    const QString toolPath =
+        QCoreApplication::applicationDirPath() + QStringLiteral("/vc_grow_seg_from_seed");
+    if (const QFileInfo toolInfo(toolPath); !toolInfo.exists() || !toolInfo.isExecutable()) {
+        return fail(tr("vc_grow_seg_from_seed not found or not executable: %1").arg(toolPath));
+    }
+    if (_neighborCopyJob && _neighborCopyJob->stage != NeighborCopyJob::Stage::None) {
+        return fail(tr("A neighbor copy request is already active."));
+    }
+    if (_resumeLocalJob) {
+        return fail(tr("A resume-opt local GrowPatch run is already active."));
+    }
+
+    auto surf = _state->vpkg()->getSurface(segmentId);
+    if (!surf) {
+        return fail(tr("Invalid segment or segment not loaded: %1")
+                        .arg(QString::fromStdString(segmentId)));
+    }
+
+    QString defaultVolumeId;
+    const auto volumeOptions = buildVolumeOptionList(&defaultVolumeId);
+    if (volumeOptions.isEmpty()) {
+        return fail(tr("No volumes available in the volume package."));
+    }
+
+    QString selectedVolumeId = params.volumeId.isEmpty() ? defaultVolumeId : params.volumeId;
+    QString selectedVolumePath;
+    for (const auto& option : volumeOptions) {
+        if (option.id == selectedVolumeId) {
+            selectedVolumePath = option.path;
+            break;
+        }
+    }
+    if (selectedVolumePath.isEmpty()) {
+        return fail(tr("Unknown volume id: %1").arg(selectedVolumeId));
+    }
+
+    QString volpkgRoot = _state->vpkgPath();
+    if (volpkgRoot.isEmpty()) {
+        volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
+    }
+
+    std::filesystem::path outputDirFs = surf->path.parent_path();
+    QString outputDirPath = QString::fromStdString(outputDirFs.string());
+    if (outputDirPath.isEmpty()) {
+        outputDirPath = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
+    }
+    QDir outDir(outputDirPath);
+    if (!outDir.exists() && !outDir.mkpath(QStringLiteral("."))) {
+        return fail(tr("Failed to create output directory: %1").arg(outputDirPath));
+    }
+    outputDirPath = outDir.absolutePath();
+
+    QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
+    if (normalGridPath.isEmpty() && _state->vpkg()) {
+        const auto paths = _state->vpkg()->normalGridPaths();
+        if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
+    }
+
+    QJsonObject paramsJson;
+    paramsJson["normal_grid_path"] = normalGridPath;
+    if (_normal3dZarrPathGetter) {
+        const QString n3dPath = _normal3dZarrPathGetter();
+        if (!n3dPath.isEmpty()) {
+            paramsJson["normal3d_zarr_path"] = n3dPath;
+        }
+    }
+    paramsJson["max_gen"] = 1;
+    paramsJson["generations"] = 1;
+    paramsJson["resume_local_opt_step"] = 20;
+    paramsJson["resume_local_opt_radius"] = 40;
+    paramsJson["resume_local_max_iters"] = 1000;
+    paramsJson["resume_local_dense_qr"] = false;
+
+    // Caller overrides win, exactly like the dialog's extra-params editor.
+    for (auto it = params.paramOverrides.begin(); it != params.paramOverrides.end(); ++it) {
+        paramsJson.insert(it.key(), it.value());
+    }
+
+    auto paramsFile = std::make_unique<QTemporaryFile>(
+        QDir::temp().filePath("growpatch_resume_local_XXXXXX.json"));
+    if (!paramsFile->open()) {
+        return fail(tr("Failed to create temporary params file."));
+    }
+    paramsFile->write(QJsonDocument(paramsJson).toJson(QJsonDocument::Indented));
+    paramsFile->flush();
+
+    _resumeLocalJob = ResumeLocalJob{};
+    auto& job = *_resumeLocalJob;
+    job.segmentId = QString::fromStdString(segmentId);
+    job.outputDir = outputDirPath;
+    job.paramsPath = paramsFile->fileName();
+    job.paramsFile = std::move(paramsFile);
+
+    _cmdRunner->setNeighborCopyParams(selectedVolumePath,
+                                      job.paramsPath,
+                                      QString::fromStdString(surf->path.string()),
+                                      outputDirPath,
+                                      QStringLiteral("local"));
+    configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
+    _cmdRunner->setOmpThreads(params.ompThreads);
+    // Headless launcher (bridge-only): execute() synchronously pops the
+    // interactive console dock when _autoShowConsole is set (its default), so
+    // turn auto-show off just for this launch and restore the prior value -- a
+    // later GUI-driven run must still auto-show. (The async error-path console
+    // pop is gated separately on the run's suppress-dialogs flag; see
+    // CommandLineToolRunner::onProcessError.) The interactive
+    // onResumeLocalGrowPatchRequested slot shows the console for GUI runs.
+    const bool prevAutoShow = _cmdRunner->autoShowConsoleOutput();
+    _cmdRunner->setAutoShowConsoleOutput(false);
+    const bool started = _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
+    _cmdRunner->setAutoShowConsoleOutput(prevAutoShow);
+    if (!started) {
+        // Nothing was launched, so toolFinished (which clears resumeLocalJob()
+        // in the CWindow slot) will never fire: undo our own bookkeeping here.
+        _resumeLocalJob.reset();
+        _cmdRunner->setOmpThreads(-1);
+        return fail(tr("Failed to start resume-opt local GrowPatch."));
+    }
+
+    if (resolvedOutputDir) {
+        *resolvedOutputDir = outputDirPath;
+    }
+    return true;
+}
+
 bool SegmentationCommandHandler::startGrowPatchFromSeed(const QVector3D& seedPoint,
                                                        const GrowPatchSeedParams& params,
                                                        QString* errorMessage)
@@ -3426,15 +3584,46 @@ void SegmentationCommandHandler::onConvertToObj(const std::string& segmentId)
 
 void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& segmentId)
 {
-    auto* surface = requireSurfaceAndRunner(segmentId, false);
-    if (!surface) return;
+    // Interactive wrapper: run the dialog-free core and surface any failure the
+    // way the slot always did -- through a QMessageBox. Success (including the
+    // already-tightest no-op) is reported by the core's own statusMessage.
+    QString err;
+    if (!cropSurfaceToValidRegion(segmentId, &err) && !err.isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Crop failed"), err);
+    }
+}
 
+bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& segmentId,
+                                                          QString* errorMessage)
+{
+    // Dialog-free core shared by the interactive slot above and the agent bridge:
+    // crops the surface grid to its tightest valid bounds and persists it,
+    // reporting every failure through errorMessage (never a QMessageBox) so the
+    // bridge can surface a real error instead of a false success. Returns true on
+    // success, including the already-tightest no-op (see startRenderSegment for
+    // the sentence-based error convention).
+    auto fail = [&](const QString& message) -> bool {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+
+    // Inlined from requireSurfaceAndRunner (which pops dialogs) so this path stays
+    // dialog-free; runner state is irrelevant to a synchronous crop.
+    if (!_state || _state->currentVolume() == nullptr || !_state->vpkg()) {
+        return fail(tr("No volume package or volume loaded."));
+    }
     auto surf = _state->vpkg()->getSurface(segmentId);
+    if (!surf) {
+        return fail(tr("Invalid segment or segment not loaded: %1")
+                        .arg(QString::fromStdString(segmentId)));
+    }
+    QuadSurface* surface = surf.get();
 
     cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (!points || points->empty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Cannot crop surface: Missing coordinate grid"));
-        return;
+        return fail(tr("Cannot crop surface: Missing coordinate grid"));
     }
 
     const int origCols = points->cols;
@@ -3442,11 +3631,8 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
 
     const auto boundsOpt = computeValidSurfaceBounds(*points);
     if (!boundsOpt) {
-        QMessageBox::warning(_parentWidget,
-                             tr("Crop failed"),
-                             tr("Surface %1 does not contain any valid vertices to crop.")
-                                 .arg(QString::fromStdString(segmentId)));
-        return;
+        return fail(tr("Surface %1 does not contain any valid vertices to crop.")
+                        .arg(QString::fromStdString(segmentId)));
     }
 
     const cv::Rect roi = *boundsOpt;
@@ -3455,7 +3641,7 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
             tr("Surface %1 already occupies the tightest bounds.")
                 .arg(QString::fromStdString(segmentId)),
             4000);
-        return;
+        return true;
     }
 
     struct CroppedChannel {
@@ -3477,15 +3663,12 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
                 droppedGenerationsChannel = true;
                 continue;
             }
-            QMessageBox::warning(_parentWidget,
-                                 tr("Crop failed"),
-                                 tr("Channel '%1' has size %2x%3, which is not divisible by the surface grid %4x%5.")
-                                     .arg(QString::fromStdString(name))
-                                     .arg(channelData.cols)
-                                     .arg(channelData.rows)
-                                     .arg(origCols)
-                                     .arg(origRows));
-            return;
+            return fail(tr("Channel '%1' has size %2x%3, which is not divisible by the surface grid %4x%5.")
+                            .arg(QString::fromStdString(name))
+                            .arg(channelData.cols)
+                            .arg(channelData.rows)
+                            .arg(origCols)
+                            .arg(origRows));
         }
 
         const int scaleX = channelData.cols / origCols;
@@ -3497,11 +3680,8 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
         if (chanRect.x < 0 || chanRect.y < 0 ||
             chanRect.x + chanRect.width > channelData.cols ||
             chanRect.y + chanRect.height > channelData.rows) {
-            QMessageBox::warning(_parentWidget,
-                                 tr("Crop failed"),
-                                 tr("Computed crop exceeds the bounds of channel '%1'.")
-                                     .arg(QString::fromStdString(name)));
-            return;
+            return fail(tr("Computed crop exceeds the bounds of channel '%1'.")
+                            .arg(QString::fromStdString(name)));
         }
 
         croppedChannels.push_back({name, channelData(chanRect).clone()});
@@ -3522,12 +3702,9 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
         }
         tempSurface->save(surface->path.string(), surface->id, true);
     } catch (const std::exception& ex) {
-        QMessageBox::critical(_parentWidget,
-                              tr("Crop failed"),
-                              tr("Failed to crop %1: %2")
-                                  .arg(QString::fromStdString(segmentId))
-                                  .arg(QString::fromUtf8(ex.what())));
-        return;
+        return fail(tr("Failed to crop %1: %2")
+                        .arg(QString::fromStdString(segmentId))
+                        .arg(QString::fromUtf8(ex.what())));
     }
 
     croppedPoints.copyTo(*points);
@@ -3569,6 +3746,7 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
             .arg(roi.x)
             .arg(roi.y),
         5000);
+    return true;
 }
 
 void SegmentationCommandHandler::onFlipSurface(const std::string& segmentId, bool flipU)
@@ -3704,6 +3882,130 @@ void SegmentationCommandHandler::onAlphaCompRefine(const std::string& segmentId)
     _cmdRunner->setOmpThreads(dlg.ompThreads());
     _cmdRunner->execute(CommandLineToolRunner::Tool::AlphaCompRefine);
     emit statusMessage(tr("Refining segment: %1").arg(QString::fromStdString(segmentId)), 5000);
+}
+
+bool SegmentationCommandHandler::startAlphaCompRefine(const std::string& segmentId,
+                                                     const AlphaCompRefineParams& params,
+                                                     QString* errorMessage,
+                                                     QString* resolvedOutputDir)
+{
+    // Dialog-free mirror of onAlphaCompRefine: same preconditions, output-path
+    // derivation, params-JSON, and Tool::AlphaCompRefine launch, but failures
+    // report through errorMessage (never a QMessageBox) so the bridge can
+    // classify them. The remote-volume guard is preserved -- vc_objrefine cannot
+    // consume a remote locator -- and surfaces as a distinct sentence.
+    auto fail = [&](const QString& message) -> bool {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+
+    if (!_state || _state->currentVolume() == nullptr || !_state->vpkg()) {
+        return fail(tr("No volume package or volume loaded."));
+    }
+    auto surf = _state->vpkg()->getSurface(segmentId);
+    if (!surf) {
+        return fail(tr("Invalid segment or segment not loaded: %1")
+                        .arg(QString::fromStdString(segmentId)));
+    }
+    if (!_cmdRunner) {
+        return fail(tr("Command line tools are not available."));
+    }
+    if (_cmdRunner->isRunning()) {
+        return fail(tr("A command line tool is already running."));
+    }
+    if (_state->currentVolume()->isRemote()) {
+        return fail(tr("Alpha-comp refinement accepts only local volumes."));
+    }
+    // Preflight the tool binary (as startRenderSegment does): a missing binary
+    // would otherwise trip execute()'s blocking QMessageBox, hanging a headless
+    // bridge run. Tool::AlphaCompRefine launches vc_objrefine.
+    const QString toolPath =
+        QCoreApplication::applicationDirPath() + QStringLiteral("/vc_objrefine");
+    if (const QFileInfo toolInfo(toolPath); !toolInfo.exists() || !toolInfo.isExecutable()) {
+        return fail(tr("vc_objrefine not found or not executable: %1").arg(toolPath));
+    }
+
+    const QString volumePath = getCurrentVolumePath();
+    if (volumePath.isEmpty()) {
+        return fail(tr("Unable to determine volume path."));
+    }
+
+    const QString srcPath = QString::fromStdString(surf->path.string());
+    const QFileInfo srcInfo(srcPath);
+
+    // Empty request -> the dialog's default output (<src>_refined); a relative
+    // path is resolved against the volpkg root so callers can pass short names.
+    QString dstPath = params.outputDir.trimmed();
+    if (dstPath.isEmpty()) {
+        if (srcInfo.isDir()) {
+            dstPath = srcInfo.absoluteFilePath() + "_refined";
+        } else {
+            const QString base = srcInfo.completeBaseName();
+            const QString suffix = srcInfo.completeSuffix();
+            QString candidate = srcInfo.absolutePath() + "/" + base + "_refined";
+            if (!suffix.isEmpty()) {
+                candidate += "." + suffix;
+            }
+            dstPath = candidate;
+        }
+    } else if (QDir::isRelativePath(dstPath)) {
+        QString volpkgRoot = _state->vpkgPath();
+        if (volpkgRoot.isEmpty()) {
+            volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
+        }
+        dstPath = QDir(volpkgRoot).filePath(dstPath);
+    }
+
+    QJsonObject paramsJson;
+    paramsJson["refine"] = params.refine;
+    paramsJson["start"] = params.start;
+    paramsJson["stop"] = params.stop;
+    paramsJson["step"] = params.step;
+    paramsJson["low"] = params.low;
+    paramsJson["high"] = params.high;
+    paramsJson["border_off"] = params.borderOff;
+    paramsJson["r"] = params.radius;
+    paramsJson["gen_vertexcolor"] = params.genVertexColor;
+    paramsJson["overwrite"] = params.overwrite;
+    paramsJson["reader_scale"] = params.readerScale;
+    paramsJson["scale_group"] = params.scaleGroup.isEmpty() ? QStringLiteral("1")
+                                                            : params.scaleGroup;
+
+    auto paramsFile = std::make_unique<QTemporaryFile>(
+        QDir::temp().filePath("vc_objrefine_XXXXXX.json"));
+    if (!paramsFile->open()) {
+        return fail(tr("Failed to create temporary params JSON file."));
+    }
+    paramsFile->write(QJsonDocument(paramsJson).toJson(QJsonDocument::Indented));
+    paramsFile->flush();
+    const QString paramsPath = paramsFile->fileName();
+    // The runner reads the file after this scope, so keep it on disk (identical
+    // to onAlphaCompRefine's local QTemporaryFile with auto-remove disabled).
+    paramsFile->setAutoRemove(false);
+    paramsFile->close();
+
+    _cmdRunner->setObjRefineParams(volumePath, srcPath, dstPath, paramsPath);
+    _cmdRunner->setOmpThreads(params.ompThreads);
+    // Headless launcher (bridge-only): suppress execute()'s synchronous console-
+    // dock pop (it fires when _autoShowConsole is set, the default) for this
+    // launch only, then restore so a later GUI run still auto-shows. The async
+    // error-path pop is gated on the run's suppress-dialogs flag; see
+    // CommandLineToolRunner::onProcessError.
+    const bool prevAutoShow = _cmdRunner->autoShowConsoleOutput();
+    _cmdRunner->setAutoShowConsoleOutput(false);
+    const bool started = _cmdRunner->execute(CommandLineToolRunner::Tool::AlphaCompRefine);
+    _cmdRunner->setAutoShowConsoleOutput(prevAutoShow);
+    if (!started) {
+        _cmdRunner->setOmpThreads(-1);
+        return fail(tr("Failed to start alpha-comp refinement."));
+    }
+
+    if (resolvedOutputDir) {
+        *resolvedOutputDir = dstPath;
+    }
+    return true;
 }
 
 void SegmentationCommandHandler::handleNeighborCopyToolFinished(bool success)

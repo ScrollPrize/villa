@@ -235,6 +235,10 @@ set(srcs
     agent_bridge/AgentBridgeHandlers_seeding.cpp
     agent_bridge/AgentBridgeHandlers_lasagna.cpp
     agent_bridge/AgentBridgeHandlers_flatten.cpp
+    agent_bridge/AgentBridgeHandlers_points.cpp
+    agent_bridge/AgentBridgeHandlers_review.cpp
+    agent_bridge/AgentBridgeHandlers_viewer.cpp
+    agent_bridge/AgentBridgeHandlers_surfaceops.cpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)

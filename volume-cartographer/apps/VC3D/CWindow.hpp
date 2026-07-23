@@ -150,6 +150,21 @@ public:
     bool startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchParams& params,
                                                    QString* errorMessage = nullptr);
 
+    // Headless mask render for the agent bridge. Renders <segment>/mask.tif on a
+    // QtConcurrent worker exactly as onEditMaskPressed (append=false) or
+    // onAppendMaskPressed (append=true) do, but never opens a QMessageBox or the
+    // OS file viewer (QDesktopServices), so it is safe to drive unattended. The
+    // `_maskRenderInProgress` guard is honored and cleared when the worker
+    // finishes. `onFinished` runs on the GUI thread at completion with
+    // (success, message): message is a human status string on success, or the
+    // captured error text on failure. Returns true when the worker was launched;
+    // on a precondition failure returns false and sets `errorMessage` to a
+    // classifiable sentence: "No volume package loaded", "Invalid segment",
+    // "No volume loaded", or "A mask render is already in progress".
+    bool startMaskRenderHeadless(const QString& segmentId, bool append,
+                                 std::function<void(bool, QString)> onFinished,
+                                 QString* errorMessage = nullptr);
+
 signals:
     // Atlas search progress (SPEC §12.9). `phase` in [1, ATLAS_SEARCH_PHASE_COUNT];
     // `fraction` in [0,1] within that phase.

@@ -3408,10 +3408,16 @@ Both return the **full** settings object with these exact keys:
  "intersectionThickness": float,         // >= 0
  "overlayOpacity": float,                // 0..1
  "intersectionMaxSurfaces": int,         // >= 0
+ "volumeWindow": {"low": float, "high": float},  // each 0..255; high forced > low
+ "samplingStride": int,                  // >= 1 (floored)
+ "zScrollSensitivity": float,            // 0.1..100
+ "segmentationCursorMirroring": bool,
  "planeIntersectionLinesVisible": bool,
  "showSurfaceNormals": bool,
  "showDirectionHints": bool,
  "surfaceOverlayEnabled": bool,
+ "normalArrowLengthScale": float,        // 0.1..2.0
+ "normalMaxArrows": int,                 // 4..100
  "highlightedSurfaceIds": [str]}
 ```
 
@@ -3423,35 +3429,55 @@ Both return the **full** settings object with these exact keys:
 **`viewer.set_render_settings`**
 - **params:** any **subset** of the keys above (all optional; unknown keys are ignored).
   Opacities clamp to `0..1`; `intersectionThickness` / `intersectionMaxSurfaces` clamp to
-  `>= 0`; `highlightedSurfaceIds` **replaces** the list wholesale. A key present with a
-  wrong-typed value → `-32602` (`data.param` names the offender).
+  `>= 0`; `volumeWindow.low`/`volumeWindow.high` clamp to `0..255` each (`high` is forced to
+  stay `> low`, minimum gap `1.0`, same rule as `viewer.set_overlay`'s `window`);
+  `samplingStride` floors to `>= 1`; `zScrollSensitivity` clamps to `0.1..100`;
+  `segmentationCursorMirroring` accepts any bool; `normalArrowLengthScale` clamps to
+  `0.1..2.0` (the GUI slider's range); `normalMaxArrows` clamps to `4..100` (the GUI
+  slider's range); `highlightedSurfaceIds` **replaces** the list wholesale. A key present
+  with a wrong-typed value → `-32602` (`data.param` names the offender).
 - **result:** the full settings object **after** applying the change (same shape as get).
 - **errors:** `-32602` (`data.param` — a provided key had the wrong type).
 
-Grounding: the four numeric fields are `ViewerManager` setters/getters; the five
-toggle/highlight fields are per-viewer `CChunkedVolumeViewer` toggles broadcast to every
-live viewer via `forEachBaseViewer`.
+Grounding: `intersectionOpacity`/`intersectionThickness`/`overlayOpacity`/
+`intersectionMaxSurfaces`/`volumeWindow`/`samplingStride`/`zScrollSensitivity` are
+`ViewerManager` setters/getters; `segmentationCursorMirroring` is a `CWindow` member
+(`_mirrorCursorToSegmentation`) with its own QSettings key; the remaining toggle/highlight
+fields (including `normalArrowLengthScale`/`normalMaxArrows`) are per-viewer
+`CChunkedVolumeViewer` toggles broadcast to every live viewer via `forEachBaseViewer`.
 
 ### 24.2 Known limitation: ViewerManager-backed vs live-viewer-only fields
 
-The two field groups have **different persistence**, and the echoed result can disagree
+The field groups have **different persistence**, and the echoed result can disagree
 with the request when no viewer is open — a real limitation surfaced in review:
 
-- **ViewerManager-backed (persist without a viewer):** `intersectionOpacity`,
-  `intersectionThickness`, `overlayOpacity`, `intersectionMaxSurfaces`. Setting these
-  updates `ViewerManager` state and takes effect immediately; the echoed result reflects
-  the set value even with **zero** viewers instantiated.
+- **ViewerManager/window-backed (persist without a viewer):** `intersectionOpacity`,
+  `intersectionThickness`, `overlayOpacity`, `intersectionMaxSurfaces`, `volumeWindow`,
+  `samplingStride`, `zScrollSensitivity`, `segmentationCursorMirroring`. Setting these
+  updates `ViewerManager` (or, for `segmentationCursorMirroring`, `CWindow`) state and
+  QSettings immediately; the echoed result reflects the set value even with **zero**
+  viewers instantiated.
 - **Live-viewer-only (no-op without a viewer):** `planeIntersectionLinesVisible`,
   `showSurfaceNormals`, `showDirectionHints`, `surfaceOverlayEnabled`,
   `highlightedSurfaceIds`. These apply by broadcasting to live `CChunkedVolumeViewer`s via
   `forEachBaseViewer`. With **zero** viewers instantiated the broadcast reaches nothing, so
-  the set is a **no-op** and the echoed result reports the **defaults** for these five
-  fields rather than the values just requested. Once at least one viewer exists they behave
+  the set is a **no-op** and the echoed result reports the **defaults** for these fields
+  rather than the values just requested. Once at least one viewer exists they behave
   normally.
+- **Exception — `normalArrowLengthScale` / `normalMaxArrows`:** these two are per-viewer
+  `CChunkedVolumeViewer` toggles like the group above, but the setter **unconditionally**
+  persists them to the same QSettings keys the "ViewerNormalVisualizationPanel" sliders
+  use (`normalArrowLengthScale` stored as an int percent, `normalArrowLengthScale * 100`)
+  *before* broadcasting, and the getter falls back to those same QSettings keys whenever no
+  chunked viewer is live. So — unlike the four toggle/highlight fields above — their echoed
+  value matches the request even with **zero** viewers instantiated; only the live-viewer
+  broadcast itself is a no-op in that case.
 
-Agents that need the five toggle/highlight fields to stick should ensure a viewer is open
-(the default workspace has them, §2.2) before setting them, and should treat those fields
-as viewer-scoped rather than global.
+Agents that need the five live-viewer-only fields (`planeIntersectionLinesVisible`,
+`showSurfaceNormals`, `showDirectionHints`, `surfaceOverlayEnabled`,
+`highlightedSurfaceIds`) to stick should ensure a viewer is open (the default workspace has
+them, §2.2) before setting them, and should treat those fields as viewer-scoped rather than
+global.
 
 ### 24.3 MCP tool surface
 
@@ -3462,3 +3488,551 @@ as viewer-scoped rather than global.
 
 Same conventions as §5 (snake_case params 1:1 with §24.1, params/result passthrough, RPC
 errors preserved).
+
+---
+
+## 25. Viewer overlay + intersects
+
+Round-2 viewer controls: the overlay-volume settings the GUI's overlay combo box +
+sliders drive (`viewer.get_overlay` / `viewer.set_overlay` / `viewer.list_overlay_volumes`,
+all backed by `ViewerManager`'s `_overlay*` state), and the per-viewer intersection-line
+surface set (`viewer.set_intersects`, mirroring `SurfacePanelController`'s per-viewer
+`setIntersects()` calls).
+
+### 25.1 `viewer.get_overlay`
+
+- **params:** none.
+- **result:**
+  ```json
+  {"volumeId": str,           // "" when no overlay volume is set
+   "colormap": str,           // "" is the "no explicit choice" sentinel
+   "opacity": float,          // 0..1
+   "threshold": float,        // alias of windowLow (see 25.2)
+   "windowLow": float,        // 0..255
+   "windowHigh": float,       // 0..255, forced > windowLow
+   "maxDisplayedResolution": int,   // 0..5
+   "composite": {"enabled": bool, "method": "max"|"mean"|"min",
+                 "layersFront": int, "layersBehind": int}}  // layers 0..64
+  ```
+- **errors:** `-32010` (`data.detail` — viewer manager unavailable).
+
+### 25.2 `viewer.set_overlay`
+
+- **params:** any **subset** of:
+  ```json
+  {"volumeId"?: str,          // "" or omitting-with-clear:true means "no overlay"
+   "clear"?: bool,            // true clears the overlay volume; equivalent to volumeId:""
+   "colormap"?: str,          // one of the ids in the table below, or "" to clear
+   "opacity"?: float,         // clamps 0..1
+   "threshold"?: float,       // clamps >= 0 (see note below)
+   "window"?: {"low": float, "high": float},  // each clamps 0..255; high forced > low
+   "maxDisplayedResolution"?: int,   // clamps 0..5
+   "composite"?: {"enabled"?: bool, "method"?: "max"|"mean"|"min",
+                  "layersFront"?: int, "layersBehind"?: int}}  // layers clamp 0..64
+  ```
+  Absent fields leave the current setting untouched. `composite` is **merged** over the
+  current composite settings (an agent may send just `{"enabled": false}`), not replaced
+  wholesale.
+- **result:** the full overlay settings object (same shape as `viewer.get_overlay`),
+  reflecting what actually stuck (see the coordinate-space note below).
+- **errors:**
+  - `-32010` (`data.detail`) — viewer manager unavailable.
+  - `-32000` — no volume package loaded (only reachable when a non-empty `volumeId` is
+    supplied, since resolving it requires the vpkg).
+  - `-32007` (`data.kind:"volume"`, `data.id`) — `volumeId` does not name a known volume.
+  - `-32602` (`data.param:"colormap"`) — `colormap` is not one of the known ids (below).
+  - `-32602` (`data.param:"composite.method"`) — `composite.method` is not
+    `"max"`/`"mean"`/`"min"`.
+  - `-32602` (`data.param`) — a wrong-typed/malformed field (`window` missing `low`/`high`,
+    a non-object `composite`, etc).
+
+**Request atomicity.** `viewer.set_overlay` parses and validates **every** supplied field
+first — including resolving `volumeId` to a `Volume` and checking `colormap` /
+`composite.method` against their enums — before applying **any** of them. A malformed or
+unknown field anywhere in the request rejects the whole call and mutates nothing; the
+overlay is never left half-updated by a request that fails partway through.
+
+**Colormap validation.** Unlike the renderer (`vc::resolve()`, which silently falls back to
+`"fire"` on an unrecognized id), `viewer.set_overlay` validates `colormap` against the same
+table the overlay panel's combo box is populated from (`vc::specs()`,
+core/src/render/Colormaps.cpp) and rejects an unknown id with `-32602` rather than silently
+accepting a typo. The empty string `""` is always valid (the "no explicit choice yet"
+sentinel `VolumeOverlayController::resetToDefaults()` uses). Valid non-empty ids:
+`"fire"`, `"viridis"`, `"magma"`, `"red"`, `"green"`, `"blue"`, `"cyan"`, `"magenta"`,
+`"glasbey_black0"`.
+
+**Clear semantics.** `clear: true` and an explicit empty `"volumeId": ""` are equivalent —
+both null the overlay volume (`ViewerManager::setOverlayVolume(nullptr, "")`). Omitting
+`volumeId` entirely (and not passing `clear`) leaves the current overlay volume untouched.
+
+**`threshold` is an alias, not an independent field.** `ViewerManager::setOverlayThreshold`
+is implemented as `setOverlayWindow(max(threshold, 0), currentWindowHigh)` — i.e. setting
+`threshold` actually moves `windowLow` (clamped `>= 0`) while leaving `windowHigh`
+untouched, going through the same `high > low` gap enforcement as `window`. The echoed
+`threshold` in the result always equals the resulting `windowLow`. Setting `threshold` and
+`window` in the same request is not additive — whichever is applied last in handler order
+(`window` after `threshold`) wins for `windowLow`.
+
+**Coordinate-space re-validation.** `ViewerManager::setOverlayVolume` independently
+re-validates the requested volume's coordinate-space tag against the base (current) volume
+and **silently nulls** the selection on a mismatch (logged, not surfaced as an RPC error).
+`viewer.set_overlay`'s `-32007` only catches an unresolvable `volumeId`; a resolvable but
+coordinate-space-incompatible one is accepted by the RPC and then quietly dropped by
+`ViewerManager`. Always check the echoed `volumeId` in the result to confirm a set actually
+stuck — `viewer.list_overlay_volumes` (25.3) intentionally does not pre-filter by
+compatibility, so an agent can pick a volume, attempt the set, and diagnose the rejection
+from the echo.
+
+### 25.3 `viewer.list_overlay_volumes`
+
+- **params:** none.
+- **result:** `{"volumes": [{"id": str, "current": bool}], "overlayVolumeId": str}` —
+  every `VolumePkg` volume id, `current` marking the base (current) volume; `overlayVolumeId`
+  is `""` when no overlay is set. Not filtered by coordinate-space compatibility (25.2).
+- **errors:** `-32010` (viewer manager unavailable), `-32000` (no volume package loaded).
+
+### 25.4 `viewer.set_intersects`
+
+Set which surfaces' intersection lines a viewer draws — the RPC twin of
+`SurfacePanelController`'s per-viewer `setIntersects()` calls.
+
+- **params:**
+  ```json
+  {"surfaceIds": [str],       // required; surface/slot ids to draw intersections for
+   "viewer"?: str}            // viewer id or surface-slot name (§2.2); omit/null => broadcast
+  ```
+- **result:** `{"surfaceIds": [str], "appliedToViewers": [str]}` — `surfaceIds` is the
+  resulting set (see the union note below); `appliedToViewers` lists the registry viewer
+  id(s) (§2.2) the set was applied to.
+- **errors:**
+  - `-32010` (viewer manager unavailable).
+  - `-32602` (`data.param:"surfaceIds"`) — `surfaceIds` is missing, not an array, or
+    contains a non-string.
+  - `-32002` — `viewer` does not resolve to exactly one live viewer (§2.2 targeting rules).
+  - `-32009` (`data.detail:"the segmentation viewer does not draw intersections against
+    itself"`) — `viewer` resolves to the `"segmentation"` surface slot.
+
+**Always unions `"segmentation"`.** The applied set always includes `"segmentation"` even
+if the caller's `surfaceIds` omits it — mirroring `SurfacePanelController::applyFilters`,
+which always seeds the drawn set with `"segmentation"`. The echoed `surfaceIds` reflects
+this union, not the raw request array.
+
+**Broadcast when `viewer` is omitted.** With no `viewer` (or an explicit JSON `null`), the
+call applies to **every** base viewer except the one bound to the `"segmentation"` surface
+slot (the GUI's own no-filter default). `appliedToViewers` then lists every viewer it
+touched.
+
+**`-32009` when the target resolves to the segmentation viewer.** Explicitly targeting a
+viewer whose `surfName()` is `"segmentation"` is rejected outright (that viewer never draws
+intersections against itself) rather than silently no-op'd.
+
+### 25.5 MCP tool surface
+
+| MCP tool | → RPC | Description shown to the agent |
+|---|---|---|
+| `vc3d_get_overlay` | `viewer.get_overlay` | Read the current overlay-volume settings. |
+| `vc3d_set_overlay` | `viewer.set_overlay` | Update the overlay-volume settings (volume, colormap, opacity, threshold, window, resolution cap, composite); any subset. |
+| `vc3d_list_overlay_volumes` | `viewer.list_overlay_volumes` | List every volume id in the open package, for picking an overlay volume. |
+| `vc3d_set_intersects` | `viewer.set_intersects` | Set which surfaces' intersection lines a viewer draws. |
+
+Same conventions as §5 (snake_case params 1:1 with 25.1–25.4, params/result passthrough, RPC
+errors preserved).
+
+---
+
+## 26. Point-collection editing (`points.*`)
+
+Full CRUD + attribute editing over the live `VCCollection` point-annotation store
+(`CState::pointCollection()`), extending the read/create-only `points.commit` /
+`points.list` pair (§3.13–3.14). Every handler in this family first resolves the live
+store (`-32000` if no volume package is loaded; `-32010` if the store itself is
+unexpectedly null) and, where a collection is named, resolves its id (see below).
+
+**Identifier convention.** Every collection-scoped RPC accepts **either** `"collection"`
+(name, string) **or** `"collectionId"` (numeric id) to identify the target collection.
+When both are present, `collectionId` wins. An unresolvable name or id →
+`-32007` with `data.kind:"collection"`, `data.id` (the offending name or, for an unknown
+id, its string form). A point-scoped RPC identifies its target with a single required
+`"pointId"` (numeric); an unknown point id → `-32007` with `data.kind:"point"`,
+`data.id` (the numeric id, as a JSON number).
+
+**Safe-integer id limit.** Point and collection ids travel as JSON numbers (IEEE-754
+doubles), which round-trip integers exactly only up to `2^53 - 1`
+(`9007199254740991`, JSON's safe-integer bound). Any `pointId` / `collectionId` param is
+validated as a positive integer `<= 2^53 - 1`; a non-integer, non-positive, or
+too-large value → `-32602` rather than silently corrupting via a double-to-`uint64_t`
+round-trip.
+
+**Winding null↔NaN convention.** `winding_annotation` is a C++ `float`; on the wire,
+"unset" is JSON `null` and any other value is a finite number. Reading a point
+(`points.list`, and the results below) reports `null` when the annotation is NaN.
+Writing a point (`points.update_point`) accepts an explicit JSON `null` to **clear** the
+annotation (sets it back to NaN); omitting `"winding"` entirely leaves it untouched.
+A non-finite-as-float number (e.g. `1e300`, which would silently narrow to `+/-inf` and
+be indistinguishable from "unset") is rejected with `-32602` rather than accepted.
+
+**Winding-fill `mode` enum.** `"none" | "incremental" | "decremental" | "constant"`
+(`PointCollections::WindingFillMode`); an unrecognized string → `-32602`
+(`data.param:"mode"`, `data.value`). `"constant"` is the only mode that reads the optional
+`"constant"?: float` parameter (default `0.0` when omitted).
+
+### 26.1 Collection lifecycle
+
+**`points.add_collection`**
+- **params:** `{"name"?: str}` — omit for an auto-generated unique name (mirrors the GUI's
+  "New collection" button, `VCCollection::generateNewCollectionName()`).
+- **result:** `{"collectionId": int, "name": str}`.
+- **errors:** `-32000`, `-32010`.
+
+**`points.rename_collection`**
+- **params:** `{"collection"?: str, "collectionId"?: int, "newName": str}`.
+- **result:** `{"collectionId": int, "name": str}`.
+- **errors:** `-32000`, `-32010`, `-32007` (unknown source collection),
+  `-32602` (`data.param:"newName"`) — `newName` is empty (an empty name would make the
+  collection unreachable by name via the `collection` identifier).
+
+**`points.clear_collection`**
+- **params:** `{"collection"?: str, "collectionId"?: int}`.
+- **result:** `{"cleared": true}`.
+- **errors:** `-32000`, `-32010`, `-32007` (unknown collection).
+
+**`points.clear_all`**
+- **params:** none.
+- **result:** `{"cleared": true}`.
+- **errors:** `-32000`, `-32010`.
+
+### 26.2 Point mutation
+
+**`points.update_point`**
+- **params:**
+  ```json
+  {"pointId": int,             // required
+   "position"?: Vec3,          // volume space; omit to leave unchanged
+   "winding"?: float | null}   // null clears; omit leaves unchanged
+  ```
+- **result:** `{"id": int, "position": Vec3, "winding": float | null}` — the point's
+  state after applying the change.
+- **errors:** `-32000`, `-32010`, `-32007` (`data.kind:"point"` — unknown `pointId`),
+  `-32602` (missing/non-finite `pointId`; non-finite `position`; out-of-float-range
+  `winding`).
+
+**`points.remove_point`**
+- **params:** `{"pointId": int}`.
+- **result:** `{"removed": true}`.
+- **errors:** `-32000`, `-32010`, `-32007` (`data.kind:"point"` — unknown `pointId`).
+
+### 26.3 Collection attributes
+
+**`points.set_collection_color`**
+- **params:** `{"collection"?: str, "collectionId"?: int, "color": [float, float, float]}`
+  — an `[r, g, b]` array (not an `{x,y,z}` object).
+- **result:** `{"collectionId": int, "color": [float, float, float]}`.
+- **errors:** `-32000`, `-32010`, `-32007`, `-32602` (`color` not a 3-element finite
+  array).
+
+**`points.set_collection_metadata`**
+- **params:** `{"collection"?: str, "collectionId"?: int, "absoluteWindingNumber": bool}`.
+- **result:** `{"collectionId": int, "absoluteWindingNumber": bool}`.
+- **errors:** `-32000`, `-32010`, `-32007`, `-32602` (missing/non-bool
+  `absoluteWindingNumber`).
+
+**`points.set_collection_tag`**
+- **params:** `{"collection"?: str, "collectionId"?: int, "key": str, "value": str}`.
+- **result:** `{"ok": true}`.
+- **errors:** `-32000`, `-32010`, `-32007`, `-32602` (missing `key`/`value`).
+
+**`points.remove_collection_tag`**
+- **params:** `{"collection"?: str, "collectionId"?: int, "key": str}`.
+- **result:** `{"ok": true}`.
+- **errors:** `-32000`, `-32010`, `-32007`, `-32602` (missing `key`).
+
+**`points.set_windings_linked`**
+- **params:** `{"collection"?: str, "collectionId"?: int, "linkedCollectionIds": [int]}`
+  — ids of other collections whose winding numbers stay linked to this one.
+- **result:** `{"collectionId": int, "linkedCollectionIds": [int]}` — echoes the array as
+  applied (ids are **not** individually existence-checked against `getAllCollections()`).
+- **errors:** `-32000`, `-32010`, `-32007` (unknown target collection),
+  `-32602` (`linkedCollectionIds` not an array of safe-integer ids).
+
+### 26.4 Winding fills
+
+**`points.auto_fill_windings`**
+- **params:** `{"collection"?: str, "collectionId"?: int, "mode": str, "constant"?: float}`
+  — applies the fill immediately across the collection's existing points.
+- **result:** `{"ok": true}`.
+- **errors:** `-32000`, `-32010`, `-32007`, `-32602` (bad `mode`; out-of-float-range
+  `constant`).
+
+**`points.set_auto_fill_mode`**
+- **params:** same shape as `auto_fill_windings`, but only records the mode/constant for
+  **future** points added to the collection — it does not touch existing points.
+- **result:** `{"ok": true}`.
+- **errors:** same as `auto_fill_windings`.
+
+**`points.reset_windings`**
+- **params:** none. Resets winding numbers **across all collections**.
+- **result:** `{"ok": true}`.
+- **errors:** `-32000`, `-32010`.
+
+**`points.apply_anchor_offset`**
+- **params:** `{"offsetX": float, "offsetY": float}` — applies a 2D grid offset to every
+  collection's anchor (used when remapping annotations after a surface-growth shift).
+- **result:** `{"ok": true}`.
+- **errors:** `-32000`, `-32010`, `-32602` (non-finite offset).
+
+### 26.5 Persistence (whole-collection JSON + per-segment correction paths)
+
+**`points.save_json` / `points.load_json`**
+- **params:** `{"path": str}` — absolute or relative file path.
+- **result:** `{"saved": bool}` / `{"loaded": bool}` — the underlying
+  `VCCollection::saveToJSON` / `loadFromJSON` success flag; a write/parse failure is
+  reported **in-band** (`false`), not as an RPC error.
+- **errors:** `-32000`, `-32010`, `-32602` (missing/empty `path`).
+
+**`points.save_segment_path` / `points.load_segment_path`**
+- **params:** `{"segmentPath": str}` — a segment directory (2D-anchored correction points
+  live alongside the segment's own data, not in a standalone JSON file).
+- **result:** `{"saved": bool}` / `{"loaded": bool}` — same in-band-failure convention as
+  `save_json`/`load_json`.
+- **errors:** `-32000`, `-32010`, `-32602` (missing/empty `segmentPath`).
+
+### 26.6 MCP tool surface
+
+| MCP tool | → RPC |
+|---|---|
+| `vc3d_add_point_collection` | `points.add_collection` |
+| `vc3d_rename_point_collection` | `points.rename_collection` |
+| `vc3d_clear_point_collection` | `points.clear_collection` |
+| `vc3d_clear_all_points` | `points.clear_all` |
+| `vc3d_update_point` | `points.update_point` |
+| `vc3d_remove_point` | `points.remove_point` |
+| `vc3d_set_point_collection_color` | `points.set_collection_color` |
+| `vc3d_set_point_collection_metadata` | `points.set_collection_metadata` |
+| `vc3d_set_point_collection_tag` | `points.set_collection_tag` |
+| `vc3d_remove_point_collection_tag` | `points.remove_collection_tag` |
+| `vc3d_set_point_windings_linked` | `points.set_windings_linked` |
+| `vc3d_auto_fill_windings` | `points.auto_fill_windings` |
+| `vc3d_set_auto_fill_mode` | `points.set_auto_fill_mode` |
+| `vc3d_reset_windings` | `points.reset_windings` |
+| `vc3d_apply_anchor_offset` | `points.apply_anchor_offset` |
+| `vc3d_save_points_json` / `vc3d_load_points_json` | `points.save_json` / `points.load_json` |
+| `vc3d_save_points_segment_path` / `vc3d_load_points_segment_path` | `points.save_segment_path` / `points.load_segment_path` |
+
+Same conventions as §5 (params/result passthrough, RPC errors preserved). Param names are
+1:1 with the RPC (this family does not snake_case-rename `collectionId`/`pointId`/etc.).
+
+---
+
+## 27. Review-state segment listing (`segments.review`)
+
+Programmatic twin of the surface panel's review-tag filter checkboxes
+(`SurfacePanelController.cpp` ~2727–2782): lists segments together with their
+`approved`/`defective`/`reviewed`/`inspect`/`partial_review` tag state and a summarized
+`reviewState`, with the same optional filtering the panel's checkboxes apply.
+
+- **params:**
+  ```json
+  {"onlyLoaded"?: bool = false,   // restrict to currently-loaded surfaces
+   "filter"?: {                  // all optional bools; ANDed together
+     "unreviewed"?: bool,        // keep only segments WITHOUT "reviewed"
+     "approved"?: bool,          // keep only segments WITH "approved"
+     "defective"?: bool,         // keep only segments WITH "defective"
+     "hideDefective"?: bool,     // keep only segments WITHOUT "defective"
+     "reviewed"?: bool,          // keep only segments WITH "reviewed"
+     "inspect"?: bool,           // keep only segments WITH "inspect"
+     "partialReview"?: bool}}    // keep only segments WITH "partial_review"
+  ```
+  A `filter` key that is absent or `false` contributes nothing — same as an unchecked
+  checkbox — rather than inverting the predicate.
+- **result:**
+  ```json
+  {"segments": [
+    {"id": str, "path": str, "loaded": bool, "active": bool,
+     "tags": {"approved": bool, "defective": bool, "reviewed": bool,
+              "inspect": bool, "partial_review": bool},
+     "reviewState": str}],       // one-line precedence summary, see below
+   "total": int,                 // count of the onlyLoaded-scoped candidate set
+   "returned": int}              // count after `filter` is additionally applied
+  ```
+- **errors:** `-32000` (no volume package loaded).
+
+**`reviewState` precedence.** `"defective"` (wins even over `"approved"` — a segment
+flagged defective needs attention regardless of a stale approval) > `"approved"` >
+`"reviewed"` > `"partial_review"` > `"inspect"` > `"unreviewed"` (none of the tags set).
+This mirrors the filter's `hasPartialReview = partial_review || reviewed` grouping while
+still distinguishing the two states individually.
+
+**Meta source (freshness).** For each segment, tags are read from, in order: (1) a live
+`QuadSurface` — `CState::surface(id)` (attached to a viewer) or, failing that,
+`VolumePkg::getSurface(id)` (loaded earlier this session) — because tag-checkbox edits in
+the GUI mutate that object's `meta` in place and flush to disk immediately; this is the
+freshest possible source for a segment touched this session. (2) Failing that, a **fresh
+read of `meta.json` straight off disk** — deliberately **not**
+`Segmentation::metadata()`, which is parsed once at project-open time and never updated
+afterwards, so it would go stale the moment a segment is loaded, tag-edited, and unloaded
+again within the same session. The `meta.json` re-read is a small-file parse (not a
+TIFF/point-data load), so this stays cheap enough that `onlyLoaded:false` remains a safe
+default. If the file is transiently unreadable, the handler falls back to the stale
+cached `Segmentation::metadata()` rather than dropping the segment from the listing.
+
+**`loaded` matches `segments.list`'s convention.** Both endpoints compute `"loaded"` the
+same way — set membership against `CState::surfaceNames()` — so they agree on what
+"loaded" means for a given segment id.
+
+### 27.1 MCP tool surface
+
+| MCP tool | → RPC | Description shown to the agent |
+|---|---|---|
+| `vc3d_review_segments` | `segments.review` | List segments with review-tag state and optional server-side filtering (the programmatic equivalent of the surface panel's review filter checkboxes). |
+
+Snake_case params 1:1 with the RPC above (`only_loaded`; `filter`'s nested keys are passed
+through unrenamed).
+
+---
+
+## 28. Per-segment mesh operations (`segment.*`)
+
+Six operations extending the per-segment mesh-editing surface (§23's segment lifecycle,
+Workstream 4): two synchronous dialog-free ops (`crop_bounds`, `recalc_area`), two
+asynchronous external-tool ops sharing the `source:"tool"` job slot (§8.3) like
+`render.tifxyz` (`reoptimize`, `refine_alpha_comp`), and two asynchronous in-process ops
+resolved via the §8.4 deferred-response mechanism (`generate_mask`, `append_mask`).
+
+### 28.1 `segment.crop_bounds` (synchronous)
+
+Headless twin of the "Crop to valid region" context-menu action
+(`SegmentationCommandHandler::cropSurfaceToValidRegion`): crops the surface grid to its
+tightest valid bounds, writes it in place, and refreshes metrics — synchronously, before
+the RPC returns.
+
+- **params:** `{"segmentId": str}`.
+- **result:** `{"cropped": true, "segmentId": str}` — the op does not distinguish
+  "cropped" from "already at tightest bounds"; both report `cropped: true`.
+- **errors:** `-32000` (no vpkg), `-32001` (no current volume),
+  `-32007` (`data.kind:"segment"` — unknown segment),
+  `-32004` (`data.detail:"a mask render is in progress"`) — **rejected** while a
+  `generate_mask`/`append_mask` render is running, because crop rewrites the same
+  in-memory `QuadSurface` (points/channels/meta) a background mask render is mutating,
+  `-32009` (`data.detail`) — segmentation command handler unavailable,
+  `-32005` (`data.detail`) — internal crop failure (missing coordinate grid,
+  channel-size mismatch, save error).
+
+### 28.2 `segment.recalc_area` (synchronous)
+
+Pure computation, no UI — the headless twin of the surface panel's area recalculation.
+
+- **params:** `{"segmentIds": [str]}` — non-empty array.
+- **result:**
+  ```json
+  {"results": [
+    {"segmentId": str, "areaVx2": float, "areaCm2": float,
+     "success": bool, "errorReason": str | null}]}
+  ```
+  A bad/unknown id is reported **in-band** (`success:false`, `errorReason` set) rather
+  than failing the whole call.
+- **errors:** `-32000` (no vpkg), `-32001` (no current volume),
+  `-32602` (`segmentIds` missing/not-an-array/empty/non-string-element).
+
+### 28.3 `segment.reoptimize` (asynchronous, `source:"tool"`)
+
+Resume-opt local reoptimization (`vc_grow_seg_from_segments` via
+`SegmentationCommandHandler::startResumeLocalGrowPatch`) — the headless twin of the
+"Resume-opt Local (GrowPatch)" context-menu action. No dialog is ever shown.
+
+- **params:**
+  ```json
+  {"segmentId": str,               // required
+   "volumeId"?: str,                // default: current volume
+   "ompThreads"?: int = 1,          // >= 0 (0 => runner default)
+   "paramOverrides"?: {...}}        // merged over the fixed resume-local tracer params
+  ```
+- **result:** `{"jobId": str, "kind": "segment.reoptimize", "source": "tool",
+  "outputDir": str, "volumeId": str}`. Completion is a `job.progress`
+  (`phase:"finished"`, `source:"tool"`) notification, observable via `job.status`.
+- **errors:** `-32000`, `-32001`, `-32007` (unknown `segmentId` or `volumeId`),
+  `-32602` (`ompThreads < 0`; `paramOverrides` not an object),
+  `-32004` (`data.source:"tool"`) — a `"tool"`-source job is already running/active,
+  `-32006` — `vc_grow_seg_from_segments` not found or not executable,
+  `-32009` — segmentation command handler unavailable,
+  `-32005` (`data.detail`) — generic launch failure.
+
+### 28.4 `segment.refine_alpha_comp` (asynchronous, `source:"tool"`)
+
+Alpha-composite refinement (`vc_objrefine` via
+`SegmentationCommandHandler::startAlphaCompRefine`) — the headless twin of the
+"Alpha-comp refine" context-menu action. No dialog is ever shown. **Rejects remote
+volumes** (alpha-comp refine only supports local volumes).
+
+- **params:** (all optional; defaults mirror `AlphaCompRefineDialog`'s session defaults)
+  ```json
+  {"segmentId": str,                // required
+   "refine"?: bool = true,
+   "start"?: float = -6.0, "stop"?: float = 30.0, "step"?: float = 2.0,
+   "low"?: int = 26, "high"?: int = 255,
+   "borderOff"?: float = 1.0, "radius"?: int = 3,
+   "genVertexColor"?: bool = false, "overwrite"?: bool = true,
+   "readerScale"?: float = 0.5, "scaleGroup"?: str = "1",
+   "ompThreads"?: int,               // omit for the runner default
+   "outputDir"?: str}                // default: <segment>_refined
+  ```
+- **result:** `{"jobId": str, "kind": "segment.refine_alpha_comp", "source": "tool",
+  "outputDir": str, "segmentId": str}`. Completion is a `job.progress`
+  (`phase:"finished"`, `source:"tool"`) notification, observable via `job.status`.
+- **errors:** `-32000`, `-32001`, `-32007` (unknown `segmentId`),
+  `-32009` (`data.detail`) — **remote volume rejected**, or segmentation command handler
+  unavailable,
+  `-32004` (`data.source:"tool"`) — a `"tool"`-source job is already running,
+  `-32006` — `vc_objrefine` not found or not executable,
+  `-32005` (`data.detail`) — generic launch failure.
+
+### 28.5 `segment.generate_mask` / `segment.append_mask` (asynchronous, deferred, §8.4)
+
+Render a segment's binary mask (`generate_mask`) or append a volume-image layer to an
+existing/new mask (`append_mask`) — headless twins of the "Edit mask" / "Append mask"
+context-menu actions. The underlying render runs on a `QtConcurrent` worker with no
+bridge-visible completion signal, so both RPCs resolve via the **deferred-response**
+mechanism (§8.4) rather than a job: the bridge holds the reply open and writes it from the
+worker's finished callback. **Timeout: 120 s** (`beginDeferred(120000, ...)`); the MCP
+tools set a **130 s client-side timeout** to stay safely past the server cap.
+
+- **params:** `{"segmentId": str}` (both).
+- **result:**
+  - `generate_mask`, mask already exists (`mask.tif` present — **not** regenerated,
+    matching the GUI's "Edit mask" behavior): synchronously
+    `{"generated": false, "alreadyExists": true, "maskPath": str, "segmentId": str}`.
+  - `generate_mask`, fresh render / `append_mask` (always renders): on completion
+    `{"generated": true, "appended": bool, "maskPath": str, "segmentId": str,
+    "message": str}`.
+- **errors:**
+  - `-32000` — no volume package loaded.
+  - `-32007` (`data.kind:"segment"`) — unknown segment.
+  - `-32001` — no current volume (`append_mask` **only**: appending renders a
+    volume-image layer, so a current volume is required; `generate_mask`'s binary-mask
+    path does not need one).
+  - `-32004` (`data.detail:"a mask render is already in progress"`) — another
+    `generate_mask`/`append_mask` render is already running (at most one at a time,
+    guarded by `_maskRenderInProgress`; this is the same flag `segment.crop_bounds`
+    checks in the other direction).
+  - `-32005` (`data.detail`) — the render failed (reported through the worker's
+    completion callback, or a synchronous launch/setup failure caught and converted to
+    the same deferred error).
+
+### 28.6 Deliberately not implemented
+
+`SegmentationCommandHandler::onExportWidthChunks` (the "Export width-chunks (40k px)"
+context-menu action) has **no** bridge RPC. It was intentionally left off this surface;
+there is no `segment.export_width_chunks` (or similar) method.
+
+### 28.7 MCP tool surface
+
+| MCP tool | → RPC | Description shown to the agent |
+|---|---|---|
+| `vc3d_crop_segment_bounds` | `segment.crop_bounds` | Crop a segment's surface grid to its tightest valid bounds. Synchronous. |
+| `vc3d_recalc_segment_area` | `segment.recalc_area` | Recompute surface area for one or more segments. Synchronous. |
+| `vc3d_reoptimize_segment` | `segment.reoptimize` | Resume-opt local reoptimization of a segment. Asynchronous (`source:"tool"`); supports `wait: bool = false` (30-minute cap). |
+| `vc3d_refine_segment_alpha_comp` | `segment.refine_alpha_comp` | Alpha-composite refinement of a segment. Asynchronous (`source:"tool"`); rejects remote volumes; supports `wait: bool = false` (30-minute cap). |
+| `vc3d_generate_segment_mask` | `segment.generate_mask` | Render a segment's binary mask. Blocks until the render completes (130 s client timeout); no job to poll. |
+| `vc3d_append_segment_mask` | `segment.append_mask` | Append a volume-image layer to a segment's mask. Blocks until the render completes (130 s client timeout); requires a current volume. |
+
+Same conventions as §5 (snake_case params 1:1, `wait` is an MCP-server-side convenience
+folding the terminal `job.status` inline per §5/§19.3, RPC errors preserved).

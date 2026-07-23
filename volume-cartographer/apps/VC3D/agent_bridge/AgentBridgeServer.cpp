@@ -611,6 +611,8 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleSegmentsDelete(p); });
     _handlers.insert("segments.rename",
         [this](const QJsonValue& p) { return handleSegmentsRename(p); });
+    _handlers.insert("segments.review",
+        [this](const QJsonValue& p) { return handleSegmentsReview(p); });
     _handlers.insert("screenshot.capture",
         [this](const QJsonValue& p) { return handleScreenshotCapture(p); });
     _handlers.insert("canvas.get_cursor_volume_point",
@@ -635,6 +637,14 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleViewerGetRenderSettings(p); });
     _handlers.insert("viewer.set_render_settings",
         [this](const QJsonValue& p) { return handleViewerSetRenderSettings(p); });
+    _handlers.insert("viewer.get_overlay",
+        [this](const QJsonValue& p) { return handleViewerGetOverlay(p); });
+    _handlers.insert("viewer.set_overlay",
+        [this](const QJsonValue& p) { return handleViewerSetOverlay(p); });
+    _handlers.insert("viewer.list_overlay_volumes",
+        [this](const QJsonValue& p) { return handleViewerListOverlayVolumes(p); });
+    _handlers.insert("viewer.set_intersects",
+        [this](const QJsonValue& p) { return handleViewerSetIntersects(p); });
     _handlers.insert("segmentation.enable_editing",
         [this](const QJsonValue& p) { return handleSegmentationEnableEditing(p); });
     _handlers.insert("segmentation.grow",
@@ -665,6 +675,44 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handlePointsCommit(p); });
     _handlers.insert("points.list",
         [this](const QJsonValue& p) { return handlePointsList(p); });
+    _handlers.insert("points.add_collection",
+        [this](const QJsonValue& p) { return handlePointsAddCollection(p); });
+    _handlers.insert("points.update_point",
+        [this](const QJsonValue& p) { return handlePointsUpdatePoint(p); });
+    _handlers.insert("points.remove_point",
+        [this](const QJsonValue& p) { return handlePointsRemovePoint(p); });
+    _handlers.insert("points.clear_collection",
+        [this](const QJsonValue& p) { return handlePointsClearCollection(p); });
+    _handlers.insert("points.clear_all",
+        [this](const QJsonValue& p) { return handlePointsClearAll(p); });
+    _handlers.insert("points.rename_collection",
+        [this](const QJsonValue& p) { return handlePointsRenameCollection(p); });
+    _handlers.insert("points.set_collection_color",
+        [this](const QJsonValue& p) { return handlePointsSetCollectionColor(p); });
+    _handlers.insert("points.set_collection_metadata",
+        [this](const QJsonValue& p) { return handlePointsSetCollectionMetadata(p); });
+    _handlers.insert("points.set_collection_tag",
+        [this](const QJsonValue& p) { return handlePointsSetCollectionTag(p); });
+    _handlers.insert("points.remove_collection_tag",
+        [this](const QJsonValue& p) { return handlePointsRemoveCollectionTag(p); });
+    _handlers.insert("points.set_windings_linked",
+        [this](const QJsonValue& p) { return handlePointsSetWindingsLinked(p); });
+    _handlers.insert("points.auto_fill_windings",
+        [this](const QJsonValue& p) { return handlePointsAutoFillWindings(p); });
+    _handlers.insert("points.set_auto_fill_mode",
+        [this](const QJsonValue& p) { return handlePointsSetAutoFillMode(p); });
+    _handlers.insert("points.reset_windings",
+        [this](const QJsonValue& p) { return handlePointsResetWindings(p); });
+    _handlers.insert("points.apply_anchor_offset",
+        [this](const QJsonValue& p) { return handlePointsApplyAnchorOffset(p); });
+    _handlers.insert("points.save_json",
+        [this](const QJsonValue& p) { return handlePointsSaveJson(p); });
+    _handlers.insert("points.load_json",
+        [this](const QJsonValue& p) { return handlePointsLoadJson(p); });
+    _handlers.insert("points.save_segment_path",
+        [this](const QJsonValue& p) { return handlePointsSaveSegmentPath(p); });
+    _handlers.insert("points.load_segment_path",
+        [this](const QJsonValue& p) { return handlePointsLoadSegmentPath(p); });
     _handlers.insert("volume.open",
         [this](const QJsonValue& p) { return handleVolumeOpen(p); });
     _handlers.insert("volume.select",
@@ -781,6 +829,20 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handleFlattenAbf(p); });
     _handlers.insert("flatten.straighten",
         [this](const QJsonValue& p) { return handleFlattenStraighten(p); });
+
+    // --- Per-segment mesh operations (SPEC §25) ---
+    _handlers.insert("segment.crop_bounds",
+        [this](const QJsonValue& p) { return handleSegmentCropBounds(p); });
+    _handlers.insert("segment.recalc_area",
+        [this](const QJsonValue& p) { return handleSegmentRecalcArea(p); });
+    _handlers.insert("segment.reoptimize",
+        [this](const QJsonValue& p) { return handleSegmentReoptimize(p); });
+    _handlers.insert("segment.refine_alpha_comp",
+        [this](const QJsonValue& p) { return handleSegmentRefineAlphaComp(p); });
+    _handlers.insert("segment.generate_mask",
+        [this](const QJsonValue& p) { return handleSegmentGenerateMask(p); });
+    _handlers.insert("segment.append_mask",
+        [this](const QJsonValue& p) { return handleSegmentAppendMask(p); });
 }
 
 

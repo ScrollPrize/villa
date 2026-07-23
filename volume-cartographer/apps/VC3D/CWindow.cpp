@@ -10146,6 +10146,130 @@ void CWindow::onAppendMaskPressed(const QString& segmentId)
     }));
 }
 
+bool CWindow::startMaskRenderHeadless(const QString& segmentId, bool append,
+                                      std::function<void(bool, QString)> onFinished,
+                                      QString* errorMessage)
+{
+    // Dialog-free twin of onEditMaskPressed / onAppendMaskPressed. The worker
+    // bodies are copied verbatim minus the QMessageBox / QDesktopServices GUI
+    // side effects, so an unattended bridge run cannot block on a modal or spawn
+    // an external viewer. Completion is reported through `onFinished` (invoked on
+    // the GUI thread via the watcher's finished signal), which the bridge wires
+    // to a deferred JSON-RPC response.
+    auto fail = [&](const QString& message) -> bool {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+
+    auto surf = (_state && _state->vpkg())
+        ? _state->vpkg()->getSurface(segmentId.toStdString())
+        : nullptr;
+    if (!surf) {
+        return fail(tr("No volume package loaded or invalid segment."));
+    }
+    auto volume = _state ? _state->currentVolume() : nullptr;
+    if (append && !volume) {
+        return fail(tr("No volume loaded."));
+    }
+    if (_maskRenderInProgress) {
+        return fail(tr("A mask render is already in progress."));
+    }
+    _maskRenderInProgress = true;
+    showStatusBarMessage(tr("Rendering mask..."));
+
+    // The worker's finished slot clears _maskRenderInProgress on completion, but
+    // the setup below (coordinate-identity copy, watcher allocation, future
+    // launch) can throw before the worker is ever queued. Arm a guard that
+    // restores the flag on any such early failure, so a subsequent mask op is not
+    // permanently blocked; it is dismissed once the worker owns the flag.
+    bool workerLaunched = false;
+    struct InProgressGuard {
+        bool& flag;
+        const bool& launched;
+        ~InProgressGuard() { if (!launched) flag = false; }
+    } inProgressGuard{_maskRenderInProgress, workerLaunched};
+
+    const std::filesystem::path path = surf->path / "mask.tif";
+    vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+        *surf, *_state->vpkg(), _state->currentVolumeId());
+
+    auto* watcher = new QFutureWatcher<QString>(this);
+    connect(watcher, &QFutureWatcher<QString>::finished, this,
+            [this, watcher, onFinished = std::move(onFinished)]() {
+                watcher->deleteLater();
+                _maskRenderInProgress = false;
+                clearStatusBarMessage();
+                try {
+                    const QString msg = watcher->result();
+                    if (onFinished) onFinished(true, msg);
+                } catch (const std::exception& e) {
+                    if (onFinished) onFinished(false, QString::fromUtf8(e.what()));
+                }
+            });
+
+    watcher->setFuture(QtConcurrent::run([surf, volume, path, append]() -> QString {
+        cv::Mat_<uint8_t> mask;
+        if (!append) {
+            cv::Mat_<cv::Vec3f> coords;
+            render_binary_mask(surf.get(), mask, coords, 1.0f);
+            // cv::imwrite returns false (rather than throwing) on most write
+            // failures; treat that as an error so the bridge reports a deferred
+            // failure instead of a false generated:true.
+            if (!cv::imwrite(path.string(), mask)) {
+                throw std::runtime_error("Failed to write mask to " + path.string());
+            }
+            surf->meta["date_last_modified"] = get_surface_time_str();
+            surf->save_meta();
+            return QString("Mask saved");
+        }
+
+        cv::Mat_<uint8_t> img;
+        std::vector<cv::Mat> existing_layers;
+        if (std::filesystem::exists(path)) {
+            cv::imreadmulti(path.string(), existing_layers, cv::IMREAD_UNCHANGED);
+            if (existing_layers.empty())
+                throw std::runtime_error("Could not read existing mask file.");
+
+            mask = existing_layers[0];
+            const cv::Size maskSize = mask.size();
+            {
+                const cv::Size rawSize = surf->rawPointsPtr()->size();
+                const cv::Vec3f ptr(0, 0, 0);
+                const cv::Vec3f offset(-rawSize.width / 2.0f, -rawSize.height / 2.0f, 0);
+                const float surfScale = surf->scale()[0];
+                cv::Mat_<cv::Vec3f> coords;
+                surf->gen(&coords, nullptr, maskSize, ptr, surfScale, offset);
+                img.create(coords.size());
+                render_image_from_coords(coords, img, volume.get());
+            }
+            cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
+            existing_layers.push_back(img);
+            atomicImwriteMulti(path, existing_layers);
+
+            surf->meta["date_last_modified"] = get_surface_time_str();
+            surf->save_meta();
+            return QString("Appended surface image to existing mask (now %1 layers)")
+                .arg(existing_layers.size());
+        }
+
+        cv::Mat_<cv::Vec3f> coords;
+        render_binary_mask(surf.get(), mask, coords, 1.0f);
+        render_surface_image(surf.get(), mask, img, volume.get(), 0, 1.0f);
+        cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
+        std::vector<cv::Mat> layers = {mask, img};
+        atomicImwriteMulti(path, layers);
+
+        surf->meta["date_last_modified"] = get_surface_time_str();
+        surf->save_meta();
+        return QString("Created new surface mask with image data");
+    }));
+
+    workerLaunched = true;  // worker now owns _maskRenderInProgress; disarm the guard
+    return true;
+}
+
 QString CWindow::getCurrentVolumePath() const
 {
     auto volume = _state->currentVolume();

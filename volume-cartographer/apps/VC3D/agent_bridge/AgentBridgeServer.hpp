@@ -118,6 +118,10 @@ private:
     // the interactive SurfacePanelController / SegmentationCommandHandler slots.
     QJsonObject handleSegmentsDelete(const QJsonValue& params);
     QJsonObject handleSegmentsRename(const QJsonValue& params);
+    // Review-state-aware segment listing with optional server-side tag filters
+    // (AgentBridgeHandlers_review.cpp); reads meta["tags"] without forcing a
+    // heavy surface load.
+    QJsonObject handleSegmentsReview(const QJsonValue& params);
     QJsonObject handleScreenshotCapture(const QJsonValue& params);
     QJsonObject handleCursorVolumePoint(const QJsonValue& params);
     // Phase 2: canvas + mutating action handlers.
@@ -135,6 +139,13 @@ private:
     QJsonObject handleViewerGetRenderSettings(const QJsonValue& params);
     QJsonObject handleViewerSetRenderSettings(const QJsonValue& params);
     QJsonObject viewerRenderSettingsJson() const;
+    // Viewer round-2: overlay-volume controls + per-viewer intersection sets
+    // (AgentBridgeHandlers_viewer.cpp). overlaySettingsJson() builds the shared
+    // reply body for get/set_overlay.
+    QJsonObject handleViewerGetOverlay(const QJsonValue& params);
+    QJsonObject handleViewerSetOverlay(const QJsonValue& params);
+    QJsonObject handleViewerListOverlayVolumes(const QJsonValue& params);
+    QJsonObject handleViewerSetIntersects(const QJsonValue& params);
     QJsonObject handleSegmentationEnableEditing(const QJsonValue& params);
     QJsonObject handleSegmentationGrow(const QJsonValue& params);
     QJsonObject handleSegmentationGrowPatchFromSeed(const QJsonValue& params);
@@ -157,6 +168,27 @@ private:
     QJsonObject handleWrapAnnotationUndo(const QJsonValue& params);
     QJsonObject handlePointsCommit(const QJsonValue& params);
     QJsonObject handlePointsList(const QJsonValue& params);
+    // Full point-collection editing surface (points.*, AgentBridgeHandlers_points.cpp):
+    // collection lifecycle, point mutation, attributes, winding fills, and IO.
+    QJsonObject handlePointsAddCollection(const QJsonValue& params);
+    QJsonObject handlePointsUpdatePoint(const QJsonValue& params);
+    QJsonObject handlePointsRemovePoint(const QJsonValue& params);
+    QJsonObject handlePointsClearCollection(const QJsonValue& params);
+    QJsonObject handlePointsClearAll(const QJsonValue& params);
+    QJsonObject handlePointsRenameCollection(const QJsonValue& params);
+    QJsonObject handlePointsSetCollectionColor(const QJsonValue& params);
+    QJsonObject handlePointsSetCollectionMetadata(const QJsonValue& params);
+    QJsonObject handlePointsSetCollectionTag(const QJsonValue& params);
+    QJsonObject handlePointsRemoveCollectionTag(const QJsonValue& params);
+    QJsonObject handlePointsSetWindingsLinked(const QJsonValue& params);
+    QJsonObject handlePointsAutoFillWindings(const QJsonValue& params);
+    QJsonObject handlePointsSetAutoFillMode(const QJsonValue& params);
+    QJsonObject handlePointsResetWindings(const QJsonValue& params);
+    QJsonObject handlePointsApplyAnchorOffset(const QJsonValue& params);
+    QJsonObject handlePointsSaveJson(const QJsonValue& params);
+    QJsonObject handlePointsLoadJson(const QJsonValue& params);
+    QJsonObject handlePointsSaveSegmentPath(const QJsonValue& params);
+    QJsonObject handlePointsLoadSegmentPath(const QJsonValue& params);
     QJsonObject handleVolumeOpen(const QJsonValue& params);
     QJsonObject handleVolumeSelect(const QJsonValue& params);
     // Lists every volume id in the open package (ADDITIONS_SPEC item 4).
@@ -241,6 +273,18 @@ private:
     QJsonObject launchFlattenJob(
         const QString& kind, const QString& label, const QString& segmentId,
         const std::function<bool(QString* err, QString* outDir)>& launch);
+
+    // Per-segment mesh operations (SPEC §25, AgentBridgeHandlers_surfaceops.cpp).
+    // Sync: crop_bounds / recalc_area. Async source:"tool": reoptimize /
+    // refine_alpha_comp (mirror render.tifxyz). In-process deferred (§8.4):
+    // generate_mask / append_mask (shared handleSegmentMask helper).
+    QJsonObject handleSegmentCropBounds(const QJsonValue& params);
+    QJsonObject handleSegmentRecalcArea(const QJsonValue& params);
+    QJsonObject handleSegmentReoptimize(const QJsonValue& params);
+    QJsonObject handleSegmentRefineAlphaComp(const QJsonValue& params);
+    QJsonObject handleSegmentGenerateMask(const QJsonValue& params);
+    QJsonObject handleSegmentAppendMask(const QJsonValue& params);
+    QJsonObject handleSegmentMask(const QJsonValue& params, bool append);
 
     // --- Open Data manifest acquisition (SPEC §10.1) ---
     // Serves the cached manifest synchronously when available and `refresh` is

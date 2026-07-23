@@ -919,12 +919,22 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
     o["intersectionThickness"] = mgr->intersectionThickness();
     o["overlayOpacity"] = mgr->overlayOpacity();
     o["intersectionMaxSurfaces"] = mgr->intersectionMaxSurfaces();
+    // ViewerManager-backed, so meaningful with zero viewers instantiated too.
+    QJsonObject volumeWindow;
+    volumeWindow["low"] = mgr->volumeWindowLow();
+    volumeWindow["high"] = mgr->volumeWindowHigh();
+    o["volumeWindow"] = volumeWindow;
+    o["samplingStride"] = mgr->surfacePatchSamplingStride();
+    o["zScrollSensitivity"] = mgr->zScrollSensitivity();
+    o["segmentationCursorMirroring"] = _window->segmentationCursorMirroringEnabled();
 
     if (firstChunked) {
         o["planeIntersectionLinesVisible"] = firstChunked->isPlaneIntersectionLinesVisible();
         o["showSurfaceNormals"] = firstChunked->isShowSurfaceNormals();
         o["showDirectionHints"] = firstChunked->isShowDirectionHints();
         o["surfaceOverlayEnabled"] = firstChunked->surfaceOverlayEnabled();
+        o["normalArrowLengthScale"] = firstChunked->normalArrowLengthScale();
+        o["normalMaxArrows"] = firstChunked->normalMaxArrows();
     } else {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         o["planeIntersectionLinesVisible"] = settings.value(
@@ -937,6 +947,14 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
             vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
             vc3d::settings::viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
         o["surfaceOverlayEnabled"] = false;
+        // Stored as a percentage int (100 = 1.0x) by ViewerNormalVisualizationPanel;
+        // convert to the same float scale setNormalArrowLengthScale() takes.
+        o["normalArrowLengthScale"] = settings.value(
+            vc3d::settings::viewer::NORMAL_ARROW_LENGTH_SCALE,
+            vc3d::settings::viewer::NORMAL_ARROW_LENGTH_SCALE_DEFAULT).toInt() / 100.0;
+        o["normalMaxArrows"] = settings.value(
+            vc3d::settings::viewer::NORMAL_MAX_ARROWS,
+            vc3d::settings::viewer::NORMAL_MAX_ARROWS_DEFAULT).toInt();
     }
 
     // Highlighted surface ids are sourced from the surface panel (the source of
@@ -973,65 +991,172 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
 
     const QJsonObject p = paramsObject(params);
 
-    // Global controls via ViewerManager (broadcast + QSettings-persisted). Present-
-    // but-wrong-typed values are rejected by the strict helpers; opacities are
-    // clamped to 0..1 (the setters clamp again defensively).
-    if (p.contains("intersectionOpacity")) {
+    // --- Phase 1: parse, validate, and clamp every supplied field into locals.
+    // Present-but-wrong-typed values are rejected by the strict helpers; opacities
+    // are clamped to 0..1 (the setters clamp again defensively). Doing all of this
+    // before any setter or QSettings write means a malformed field rejects the
+    // whole request rather than persisting the earlier fields and then throwing,
+    // which would leave render settings half-applied. ---
+    const bool hasIntersectionOpacity = p.contains("intersectionOpacity");
+    float intersectionOpacity = 0.0f;
+    if (hasIntersectionOpacity) {
         const double v = jsonRequireFinite(p.value("intersectionOpacity"), "intersectionOpacity");
-        mgr->setIntersectionOpacity(static_cast<float>(std::clamp(v, 0.0, 1.0)));
+        intersectionOpacity = static_cast<float>(std::clamp(v, 0.0, 1.0));
     }
-    if (p.contains("intersectionThickness")) {
+
+    const bool hasIntersectionThickness = p.contains("intersectionThickness");
+    float intersectionThickness = 0.0f;
+    if (hasIntersectionThickness) {
         const double v = jsonRequireFinite(p.value("intersectionThickness"), "intersectionThickness");
-        mgr->setIntersectionThickness(static_cast<float>(std::max(0.0, v)));
+        intersectionThickness = static_cast<float>(std::max(0.0, v));
     }
-    if (p.contains("overlayOpacity")) {
+
+    const bool hasOverlayOpacity = p.contains("overlayOpacity");
+    float overlayOpacity = 0.0f;
+    if (hasOverlayOpacity) {
         const double v = jsonRequireFinite(p.value("overlayOpacity"), "overlayOpacity");
-        mgr->setOverlayOpacity(static_cast<float>(std::clamp(v, 0.0, 1.0)));
+        overlayOpacity = static_cast<float>(std::clamp(v, 0.0, 1.0));
     }
-    if (p.contains("intersectionMaxSurfaces")) {
+
+    const bool hasIntersectionMaxSurfaces = p.contains("intersectionMaxSurfaces");
+    int intersectionMaxSurfaces = 0;
+    if (hasIntersectionMaxSurfaces) {
         const int v = jsonRequireInt(p.value("intersectionMaxSurfaces"), "intersectionMaxSurfaces");
-        mgr->setIntersectionMaxSurfaces(std::max(0, v));
+        intersectionMaxSurfaces = std::max(0, v);
     }
-    if (p.contains("highlightedSurfaceIds")) {
+
+    const bool hasHighlightedSurfaceIds = p.contains("highlightedSurfaceIds");
+    std::vector<std::string> highlightedSurfaceIds;
+    if (hasHighlightedSurfaceIds) {
         const QJsonValue hv = p.value("highlightedSurfaceIds");
         if (!hv.isArray())
             throwParamError("highlightedSurfaceIds", QStringLiteral("must be an array of strings"));
-        std::vector<std::string> ids;
         for (const QJsonValue& e : hv.toArray()) {
             if (!e.isString())
                 throwParamError("highlightedSurfaceIds", QStringLiteral("must be an array of strings"));
-            ids.push_back(e.toString().toStdString());
+            highlightedSurfaceIds.push_back(e.toString().toStdString());
         }
+    }
+
+    const bool hasVolumeWindow = p.contains("volumeWindow");
+    float volumeWindowLow = 0.0f;
+    float volumeWindowHigh = 0.0f;
+    if (hasVolumeWindow) {
+        const QJsonValue wv = p.value("volumeWindow");
+        if (!wv.isObject())
+            throwParamError("volumeWindow", QStringLiteral("must be an object {low, high}"));
+        const QJsonObject wo = wv.toObject();
+        if (!wo.contains("low") || !wo.contains("high"))
+            throwParamError("volumeWindow", QStringLiteral("requires low and high"));
+        volumeWindowLow = static_cast<float>(jsonRequireFinite(wo.value("low"), "volumeWindow.low"));
+        volumeWindowHigh = static_cast<float>(jsonRequireFinite(wo.value("high"), "volumeWindow.high"));
+    }
+
+    const bool hasSamplingStride = p.contains("samplingStride");
+    const int samplingStride = hasSamplingStride
+        ? jsonRequireInt(p.value("samplingStride"), "samplingStride") : 0;
+
+    const bool hasZScrollSensitivity = p.contains("zScrollSensitivity");
+    const double zScrollSensitivity = hasZScrollSensitivity
+        ? jsonRequireFinite(p.value("zScrollSensitivity"), "zScrollSensitivity") : 0.0;
+
+    const bool hasSegmentationCursorMirroring = p.contains("segmentationCursorMirroring");
+    const bool segmentationCursorMirroring = hasSegmentationCursorMirroring
+        ? jsonRequireBool(p.value("segmentationCursorMirroring"), "segmentationCursorMirroring") : false;
+
+    const bool hasPlaneIntersectionLinesVisible = p.contains("planeIntersectionLinesVisible");
+    const bool planeIntersectionLinesVisible = hasPlaneIntersectionLinesVisible
+        ? jsonRequireBool(p.value("planeIntersectionLinesVisible"), "planeIntersectionLinesVisible") : false;
+
+    const bool hasShowSurfaceNormals = p.contains("showSurfaceNormals");
+    const bool showSurfaceNormals = hasShowSurfaceNormals
+        ? jsonRequireBool(p.value("showSurfaceNormals"), "showSurfaceNormals") : false;
+
+    const bool hasShowDirectionHints = p.contains("showDirectionHints");
+    const bool showDirectionHints = hasShowDirectionHints
+        ? jsonRequireBool(p.value("showDirectionHints"), "showDirectionHints") : false;
+
+    const bool hasSurfaceOverlayEnabled = p.contains("surfaceOverlayEnabled");
+    const bool surfaceOverlayEnabled = hasSurfaceOverlayEnabled
+        ? jsonRequireBool(p.value("surfaceOverlayEnabled"), "surfaceOverlayEnabled") : false;
+
+    const bool hasNormalArrowLengthScale = p.contains("normalArrowLengthScale");
+    float normalArrowLengthScale = 0.0f;
+    if (hasNormalArrowLengthScale) {
+        const double v = jsonRequireFinite(p.value("normalArrowLengthScale"), "normalArrowLengthScale");
+        // Clamp to the GUI slider's range (sliderNormalArrowLength: 10-200%) rather
+        // than passing a negative/huge scale straight to the renderer.
+        normalArrowLengthScale = static_cast<float>(std::clamp(v, 0.1, 2.0));
+    }
+
+    const bool hasNormalMaxArrows = p.contains("normalMaxArrows");
+    int normalMaxArrows = 0;
+    if (hasNormalMaxArrows) {
+        const int v = jsonRequireInt(p.value("normalMaxArrows"), "normalMaxArrows");
+        // Clamp to the GUI slider's range (sliderNormalMaxArrows: 4-100).
+        normalMaxArrows = std::clamp(v, 4, 100);
+    }
+
+    // --- Phase 2: apply. The request is fully validated, so every setter,
+    // QSettings write, and broadcast below runs as a group -- a rejected request
+    // above mutated nothing. Global controls go via ViewerManager (broadcast +
+    // QSettings-persisted). ---
+    if (hasIntersectionOpacity)
+        mgr->setIntersectionOpacity(intersectionOpacity);
+    if (hasIntersectionThickness)
+        mgr->setIntersectionThickness(intersectionThickness);
+    if (hasOverlayOpacity)
+        mgr->setOverlayOpacity(overlayOpacity);
+    if (hasIntersectionMaxSurfaces)
+        mgr->setIntersectionMaxSurfaces(intersectionMaxSurfaces);
+    if (hasHighlightedSurfaceIds) {
         // Route through the surface panel so its _highlightedSurfaceIds (the source
         // of truth behind the context-menu checkmarks) stays in sync; otherwise the
         // next GUI highlight toggle would rebuild from the stale panel set and
         // clobber these. Fall back to ViewerManager if the panel is unavailable.
         if (SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr)
-            panel->setHighlightedSurfaceIds(ids);
+            panel->setHighlightedSurfaceIds(highlightedSurfaceIds);
         else
-            mgr->setHighlightedSurfaceIds(ids);
+            mgr->setHighlightedSurfaceIds(highlightedSurfaceIds);
     }
+    if (hasVolumeWindow)
+        mgr->setVolumeWindow(volumeWindowLow, volumeWindowHigh);
+    if (hasSamplingStride)
+        mgr->setSurfacePatchSamplingStride(samplingStride);
+    if (hasZScrollSensitivity)
+        mgr->setZScrollSensitivity(zScrollSensitivity);
+    if (hasSegmentationCursorMirroring)
+        _window->setSegmentationCursorMirroring(segmentationCursorMirroring);
 
     // Per-viewer toggles are driven uniformly across every base viewer.
     auto broadcast = [mgr](const std::function<void(VolumeViewerBase*)>& fn) {
         mgr->forEachBaseViewer([&fn](VolumeViewerBase* v) { if (v) fn(v); });
     };
-    if (p.contains("planeIntersectionLinesVisible")) {
-        const bool b = jsonRequireBool(p.value("planeIntersectionLinesVisible"),
-                                       "planeIntersectionLinesVisible");
-        broadcast([b](VolumeViewerBase* v) { v->setPlaneIntersectionLinesVisible(b); });
+    if (hasPlaneIntersectionLinesVisible)
+        broadcast([planeIntersectionLinesVisible](VolumeViewerBase* v) {
+            v->setPlaneIntersectionLinesVisible(planeIntersectionLinesVisible);
+        });
+    if (hasShowSurfaceNormals)
+        broadcast([showSurfaceNormals](VolumeViewerBase* v) { v->setShowSurfaceNormals(showSurfaceNormals); });
+    if (hasShowDirectionHints)
+        broadcast([showDirectionHints](VolumeViewerBase* v) { v->setShowDirectionHints(showDirectionHints); });
+    if (hasSurfaceOverlayEnabled)
+        broadcast([surfaceOverlayEnabled](VolumeViewerBase* v) { v->setSurfaceOverlayEnabled(surfaceOverlayEnabled); });
+    if (hasNormalArrowLengthScale) {
+        // Persist under the same key + storage format (int percent) that
+        // ViewerNormalVisualizationPanel writes, so a later GUI open/RPC
+        // read-back agree instead of the RPC being a no-op with zero viewers.
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::viewer::NORMAL_ARROW_LENGTH_SCALE,
+                           static_cast<int>(std::lround(normalArrowLengthScale * 100.0f)));
+        broadcast([normalArrowLengthScale](VolumeViewerBase* base) {
+            base->setNormalArrowLengthScale(normalArrowLengthScale);
+        });
     }
-    if (p.contains("showSurfaceNormals")) {
-        const bool b = jsonRequireBool(p.value("showSurfaceNormals"), "showSurfaceNormals");
-        broadcast([b](VolumeViewerBase* v) { v->setShowSurfaceNormals(b); });
-    }
-    if (p.contains("showDirectionHints")) {
-        const bool b = jsonRequireBool(p.value("showDirectionHints"), "showDirectionHints");
-        broadcast([b](VolumeViewerBase* v) { v->setShowDirectionHints(b); });
-    }
-    if (p.contains("surfaceOverlayEnabled")) {
-        const bool b = jsonRequireBool(p.value("surfaceOverlayEnabled"), "surfaceOverlayEnabled");
-        broadcast([b](VolumeViewerBase* v) { v->setSurfaceOverlayEnabled(b); });
+    if (hasNormalMaxArrows) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::viewer::NORMAL_MAX_ARROWS, normalMaxArrows);
+        broadcast([normalMaxArrows](VolumeViewerBase* base) { base->setNormalMaxArrows(normalMaxArrows); });
     }
 
     // Echo the resulting full settings (unknown keys are ignored).

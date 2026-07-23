@@ -126,6 +126,10 @@ public:
     void showConsoleOutput();
     void hideConsoleOutput();
     void setAutoShowConsoleOutput(bool autoShow);
+    // Read back the auto-show flag so a headless (bridge) launcher can save it,
+    // turn auto-show off for a single execute(), then restore the prior value
+    // (see SegmentationCommandHandler's start* methods).
+    bool autoShowConsoleOutput() const { return _autoShowConsole; }
     void setIncludeTifs(bool include);
     void setOmpThreads(int threads);
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
@@ -137,8 +141,9 @@ public:
     // bridge sets this before launching a job it tracks so that a headless /
     // offscreen (or otherwise unattended) process is not starved by a modal
     // dialog that no one can dismiss (mirrors the NeighborCopy first-pass
-    // suppression). The flag is scoped to a single run: it is cleared
-    // automatically once toolFinished has been emitted.
+    // suppression). It also gates the error-path console-dock pop in
+    // onProcessError for the same reason. The flag is scoped to a single run: it
+    // is cleared automatically once toolFinished has been emitted.
     void setSuppressCompletionDialogs(bool suppress) { _suppressCompletionDialogs = suppress; }
     bool suppressCompletionDialogs() const { return _suppressCompletionDialogs; }
 
