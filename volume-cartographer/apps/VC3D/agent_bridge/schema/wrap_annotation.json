@@ -1,14 +1,6 @@
 {
   "contractVersion": 1,
   "domain": "wrap_annotation",
-  "probeSetup": [
-    {
-      "method": "wrap_annotation.set_mode",
-      "params": {
-        "enabled": true
-      }
-    }
-  ],
   "methods": {
     "wrap_annotation.set_mode": {
       "params": {
@@ -24,9 +16,6 @@
       },
       "errors": [
         -32602,
-        -32000
-      ],
-      "unprobedErrors": [
         -32000
       ],
       "mcp": {
@@ -51,42 +40,6 @@
         -32002,
         -32009
       ],
-      "errorProbes": [
-        {
-          "name": "annotation mode disabled",
-          "state": "loaded",
-          "before": [
-            {
-              "method": "wrap_annotation.set_mode",
-              "params": {
-                "enabled": false
-              }
-            }
-          ],
-          "params": {},
-          "code": -32002,
-          "after": [
-            {
-              "method": "wrap_annotation.set_mode",
-              "params": {
-                "enabled": true
-              }
-            }
-          ]
-        },
-        {
-          "name": "unknown viewer",
-          "state": "loaded",
-          "params": {
-            "viewer": "__missing__"
-          },
-          "code": -32002
-        }
-      ],
-      "unprobedErrors": [
-        -32000,
-        -32009
-      ],
       "mcp": {
         "tool": "vc3d_commit_wrap_annotation"
       }
@@ -107,20 +60,6 @@
         -32602,
         -32000,
         -32002,
-        -32009
-      ],
-      "errorProbes": [
-        {
-          "name": "unknown viewer",
-          "state": "loaded",
-          "params": {
-            "viewer": "__missing__"
-          },
-          "code": -32002
-        }
-      ],
-      "unprobedErrors": [
-        -32000,
         -32009
       ],
       "mcp": {

@@ -628,10 +628,12 @@ QJsonObject AgentBridgeServer::handleCursorVolumePoint(const QJsonValue& params)
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
     QPointF scenePos;
-    if (p.contains("scene") && p.value("scene").isObject()) {
-        const QJsonObject s = p.value("scene").toObject();
-        scenePos = QPointF(jsonRequireFiniteFloat(s.value("x"), "x"),
-                           jsonRequireFiniteFloat(s.value("y"), "y"));
+    if (p.contains("scene") && !p.value("scene").isNull()) {
+        if (!p.value("scene").isObject())
+            throwParamError("scene", QStringLiteral("must be an object or null"));
+        const QJsonObject scene = p.value("scene").toObject();
+        scenePos = QPointF(jsonRequireFiniteFloat(scene.value("x"), "x"),
+                           jsonRequireFiniteFloat(scene.value("y"), "y"));
     } else {
         scenePos = chunked->lastScenePosition();
     }
@@ -1156,6 +1158,11 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
         data["param"] = "sampleId";
         throw AgentBridgeError{-32602, "sampleId is required", data};
     }
+    if (p.contains("resources") && !p.value("resources").isObject()) {
+        QJsonObject data;
+        data["param"] = "resources";
+        throw AgentBridgeError{-32602, "resources must be an object", data};
+    }
 
     if (!_window) {
         QJsonObject data;
@@ -1193,13 +1200,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
     options.interactive = false;  // SPEC §8.2: explicit call = consent to replace.
 
     if (p.contains("resources")) {
-        const QJsonValue resv = p.value("resources");
-        if (!resv.isObject()) {
-            QJsonObject data;
-            data["param"] = "resources";
-            throw AgentBridgeError{-32602, "resources must be an object", data};
-        }
-        const QJsonObject res = resv.toObject();
+        const QJsonObject res = p.value("resources").toObject();
         auto& selection = options.selection;
 
         // Set of the sample's real volume ids (validation + zero-volume check).

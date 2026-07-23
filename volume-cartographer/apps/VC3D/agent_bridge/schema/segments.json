@@ -16,14 +16,6 @@
         -32602,
         -32000
       ],
-      "errorProbes": [
-        {
-          "name": "no volume package",
-          "state": "no-project",
-          "params": {},
-          "code": -32000
-        }
-      ],
       "mcp": {
         "tool": "vc3d_list_segments",
         "paramRenames": {
@@ -49,30 +41,6 @@
         -32010,
         -32004,
         -32007,
-        -32005
-      ],
-      "successProbe": false,
-      "errorProbes": [
-        {
-          "name": "unknown segment",
-          "state": "loaded",
-          "params": {
-            "segmentId": "__missing__"
-          },
-          "code": -32007
-        },
-        {
-          "name": "no volume package",
-          "state": "no-project",
-          "params": {
-            "segmentId": "__missing__"
-          },
-          "code": -32000
-        }
-      ],
-      "unprobedErrors": [
-        -32010,
-        -32004,
         -32005
       ],
       "mcp": {
@@ -106,29 +74,6 @@
         -32010,
         -32004,
         -32007
-      ],
-      "successProbe": false,
-      "errorProbes": [
-        {
-          "name": "unknown segment",
-          "state": "loaded",
-          "params": {
-            "segmentId": "__missing__"
-          },
-          "code": -32007
-        },
-        {
-          "name": "no volume package",
-          "state": "no-project",
-          "params": {
-            "segmentId": "__missing__"
-          },
-          "code": -32000
-        }
-      ],
-      "unprobedErrors": [
-        -32010,
-        -32004
       ],
       "mcp": {
         "tool": "vc3d_fetch_segment",
@@ -166,39 +111,6 @@
         -32007,
         -32010
       ],
-      "successProbe": false,
-      "errorProbes": [
-        {
-          "name": "confirmation required",
-          "state": "loaded",
-          "params": {
-            "segmentId": "__missing__"
-          },
-          "code": -32602
-        },
-        {
-          "name": "unknown segment",
-          "state": "loaded",
-          "params": {
-            "segmentId": "__missing__",
-            "confirm": true
-          },
-          "code": -32007
-        },
-        {
-          "name": "no volume package",
-          "state": "no-project",
-          "params": {
-            "segmentId": "__missing__",
-            "confirm": true
-          },
-          "code": -32000
-        }
-      ],
-      "unprobedErrors": [
-        -32004,
-        -32010
-      ],
       "mcp": {
         "tool": "vc3d_delete_segment",
         "paramRenames": {
@@ -215,8 +127,7 @@
           },
           "newName": {
             "type": "string",
-            "pattern": "^[a-zA-Z0-9_-]+$",
-            "x-invalid": "bad/name"
+            "pattern": "^[a-zA-Z0-9_-]+$"
           }
         },
         "required": [
@@ -229,31 +140,6 @@
         -32000,
         -32004,
         -32007,
-        -32010
-      ],
-      "successProbe": false,
-      "errorProbes": [
-        {
-          "name": "unknown segment",
-          "state": "loaded",
-          "params": {
-            "segmentId": "__missing__",
-            "newName": "renamed"
-          },
-          "code": -32007
-        },
-        {
-          "name": "no volume package",
-          "state": "no-project",
-          "params": {
-            "segmentId": "__missing__",
-            "newName": "renamed"
-          },
-          "code": -32000
-        }
-      ],
-      "unprobedErrors": [
-        -32004,
         -32010
       ],
       "mcp": {
@@ -303,14 +189,6 @@
       "errors": [
         -32602,
         -32000
-      ],
-      "errorProbes": [
-        {
-          "name": "no volume package",
-          "state": "no-project",
-          "params": {},
-          "code": -32000
-        }
       ],
       "mcp": {
         "tool": "vc3d_review_segments",

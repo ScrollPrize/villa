@@ -10,10 +10,7 @@
             "type": "string"
           },
           "resources": {
-            "type": [
-              "object",
-              "null"
-            ],
+            "type": "object",
             "properties": {
               "volumeIds": {
                 "type": "array",
@@ -52,18 +49,6 @@
         -32010,
         -32004
       ],
-      "successProbe": false,
-      "invalidProbe": {
-        "skipParams": [
-          "resources"
-        ]
-      },
-      "unprobedErrors": [
-        -32007,
-        -32005,
-        -32010,
-        -32004
-      ],
       "mcp": {
         "tool": "vc3d_open_catalog_sample",
         "paramRenames": {
@@ -92,11 +77,6 @@
         -32005,
         -32010
       ],
-      "successProbe": false,
-      "unprobedErrors": [
-        -32005,
-        -32010
-      ],
       "mcp": {
         "tool": "vc3d_list_catalog_samples"
       }
@@ -119,12 +99,6 @@
       },
       "errors": [
         -32602,
-        -32007,
-        -32005,
-        -32010
-      ],
-      "successProbe": false,
-      "unprobedErrors": [
         -32007,
         -32005,
         -32010

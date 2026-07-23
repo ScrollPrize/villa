@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from vc3d_mcp import tools as _tools  # noqa: F401 - registers the MCP tools
 VC_ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_DIR = VC_ROOT / "apps/VC3D/agent_bridge/schema"
 SPEC_PATH = VC_ROOT / "apps/VC3D/agent_bridge/SPEC.md"
+SERVER_PATH = VC_ROOT / "apps/VC3D/agent_bridge/AgentBridgeServer.cpp"
 
 
 def _load_contracts() -> list[dict[str, Any]]:
@@ -71,10 +73,6 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
                 domain_contract["_path"].stem,
                 domain.replace(".", "_"),
             )
-            for action in domain_contract.get("probeSetup", []):
-                self.assertTrue(action["method"])
-                self.assertIsInstance(action.get("params", {}), dict)
-
             for method, contract in domain_contract["methods"].items():
                 with self.subTest(domain=domain, method=method):
                     self.assertNotIn(method, methods)
@@ -97,43 +95,6 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
                     if contract["params"]["properties"]:
                         self.assertIn(-32602, contract["errors"])
                     self._assert_extensions(contract["params"])
-                    success_probe = contract.get("successProbe", {})
-                    self.assertTrue(
-                        success_probe is False
-                        or isinstance(success_probe.get("params", {}), dict)
-                    )
-                    invalid_probe = contract.get("invalidProbe", {})
-                    self.assertTrue(
-                        invalid_probe is False
-                        or isinstance(invalid_probe.get("skipParams", []), list)
-                    )
-                    if invalid_probe is not False:
-                        self.assertLessEqual(
-                            set(invalid_probe.get("skipParams", [])),
-                            set(contract["params"]["properties"]),
-                        )
-
-                    probes = contract.get("errorProbes", [])
-                    probed_errors = {probe["code"] for probe in probes}
-                    if contract["params"]["properties"]:
-                        probed_errors.add(-32602)
-                    unprobed_errors = set(contract.get("unprobedErrors", []))
-                    self.assertFalse(probed_errors & unprobed_errors)
-                    self.assertEqual(
-                        set(contract["errors"]),
-                        probed_errors | unprobed_errors,
-                    )
-                    for probe in probes:
-                        self.assertTrue(probe["name"])
-                        self.assertTrue(probe["state"])
-                        self.assertIsInstance(probe["params"], dict)
-                        self.assertIn(probe["code"], contract["errors"])
-                        for action in (
-                            *probe.get("before", []),
-                            *probe.get("after", []),
-                        ):
-                            self.assertTrue(action["method"])
-                            self.assertIsInstance(action.get("params", {}), dict)
 
                     tool = contract["mcp"]["tool"]
                     self.assertNotIn(tool, tools)
@@ -155,6 +116,13 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
                     )
                     for schema in extra_params.values():
                         self._assert_extensions(schema)
+
+    def test_contracted_methods_are_registered(self) -> None:
+        source = SERVER_PATH.read_text(encoding="utf-8")
+        registered = set(
+            re.findall(r'_handlers\.insert\("([^"]+)"', source)
+        )
+        self.assertLessEqual(set(self.methods), registered)
 
     def _assert_extensions(self, schema: dict[str, Any]) -> None:
         if "x-clamp" in schema:

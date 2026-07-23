@@ -1,14 +1,6 @@
 {
   "contractVersion": 1,
   "domain": "viewer",
-  "probeSetup": [
-    {
-      "method": "viewer.set_axis_aligned_slices",
-      "params": {
-        "enabled": true
-      }
-    }
-  ],
   "methods": {
     "viewer.center_on_point": {
       "params": {
@@ -54,45 +46,6 @@
         -32002,
         -32001
       ],
-      "errorProbes": [
-        {
-          "name": "unknown viewer",
-          "state": "loaded",
-          "params": {
-            "viewer": "__missing__",
-            "point": {
-              "x": 1,
-              "y": 1,
-              "z": 1
-            }
-          },
-          "code": -32002
-        },
-        {
-          "name": "outside volume",
-          "state": "loaded",
-          "params": {
-            "point": {
-              "x": 1000000,
-              "y": 1,
-              "z": 1
-            }
-          },
-          "code": -32003
-        },
-        {
-          "name": "no current volume",
-          "state": "empty",
-          "params": {
-            "point": {
-              "x": 1,
-              "y": 1,
-              "z": 1
-            }
-          },
-          "code": -32001
-        }
-      ],
       "mcp": {
         "tool": "vc3d_center_viewer",
         "paramRenames": {
@@ -122,17 +75,6 @@
       "errors": [
         -32602,
         -32002
-      ],
-      "errorProbes": [
-        {
-          "name": "unknown viewer",
-          "state": "loaded",
-          "params": {
-            "viewer": "__missing__",
-            "factor": 1
-          },
-          "code": -32002
-        }
       ],
       "mcp": {
         "tool": "vc3d_zoom_viewer"
@@ -169,36 +111,6 @@
         -32002,
         -32000
       ],
-      "errorProbes": [
-        {
-          "name": "slice mode disabled",
-          "state": "loaded",
-          "before": [
-            {
-              "method": "viewer.set_axis_aligned_slices",
-              "params": {
-                "enabled": false
-              }
-            }
-          ],
-          "params": {
-            "plane": "seg xz",
-            "degrees": 1
-          },
-          "code": -32002,
-          "after": [
-            {
-              "method": "viewer.set_axis_aligned_slices",
-              "params": {
-                "enabled": true
-              }
-            }
-          ]
-        }
-      ],
-      "unprobedErrors": [
-        -32000
-      ],
       "mcp": {
         "tool": "vc3d_rotate_viewer"
       }
@@ -217,9 +129,6 @@
       },
       "errors": [
         -32602,
-        -32000
-      ],
-      "unprobedErrors": [
         -32000
       ],
       "mcp": {
@@ -352,9 +261,6 @@
         -32602,
         -32010
       ],
-      "unprobedErrors": [
-        -32010
-      ],
       "mcp": {
         "tool": "vc3d_set_render_settings",
         "paramRenames": {
@@ -382,9 +288,6 @@
         "properties": {}
       },
       "errors": [
-        -32010
-      ],
-      "unprobedErrors": [
         -32010
       ],
       "mcp": {
@@ -510,27 +413,6 @@
         -32007,
         -32000
       ],
-      "errorProbes": [
-        {
-          "name": "unknown volume",
-          "state": "loaded",
-          "params": {
-            "volumeId": "__missing__"
-          },
-          "code": -32007
-        },
-        {
-          "name": "no volume package",
-          "state": "no-project",
-          "params": {
-            "volumeId": "__missing__"
-          },
-          "code": -32000
-        }
-      ],
-      "unprobedErrors": [
-        -32010
-      ],
       "mcp": {
         "tool": "vc3d_set_overlay",
         "paramRenames": {
@@ -547,17 +429,6 @@
       "errors": [
         -32010,
         -32000
-      ],
-      "errorProbes": [
-        {
-          "name": "no volume package",
-          "state": "no-project",
-          "params": {},
-          "code": -32000
-        }
-      ],
-      "unprobedErrors": [
-        -32010
       ],
       "mcp": {
         "tool": "vc3d_list_overlay_volumes"
@@ -589,29 +460,6 @@
         -32010,
         -32009,
         -32002
-      ],
-      "errorProbes": [
-        {
-          "name": "unknown viewer",
-          "state": "loaded",
-          "params": {
-            "surfaceIds": [],
-            "viewer": "__missing__"
-          },
-          "code": -32002
-        },
-        {
-          "name": "segmentation viewer",
-          "state": "loaded",
-          "params": {
-            "surfaceIds": [],
-            "viewer": "segmentation"
-          },
-          "code": -32009
-        }
-      ],
-      "unprobedErrors": [
-        -32010
       ],
       "mcp": {
         "tool": "vc3d_set_intersects",

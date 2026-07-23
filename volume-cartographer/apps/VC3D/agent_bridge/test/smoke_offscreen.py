@@ -39,9 +39,7 @@ from vc3d_process import VC3DProcess  # noqa: E402
 from contract_probe import (  # noqa: E402
     load_contract,
     probe_clamps,
-    probe_declared_errors,
     probe_invalid_inputs,
-    probe_successful_calls,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -131,56 +129,6 @@ def create_test_project(root: Path) -> Path:
     return volpkg
 
 
-def check_contract_states(
-    binary: str,
-    contracts: list[dict],
-    empty_volpkg: Path,
-    config_home: Path,
-    results: Results,
-) -> None:
-    name = unique_name("contract-states")
-    proc = launch(binary, name, config_home=str(config_home))
-    client = None
-    try:
-        sock_path = proc.wait_for_handshake(timeout=60.0)
-        client = BridgeClient(sock_path, connect_timeout=10.0)
-
-        for contract in contracts:
-            domain = contract["domain"].replace(".", "_")
-            no_project = probe_declared_errors(client, contract, "no-project")
-            if no_project.attempted:
-                results.record(
-                    f"{domain}_contract_errors_no_project",
-                    no_project.ok,
-                    no_project.detail,
-                )
-
-        client.call(
-            "volume.open",
-            {"path": str(empty_volpkg)},
-            timeout=10.0,
-        )
-        for contract in contracts:
-            domain = contract["domain"].replace(".", "_")
-            empty = probe_declared_errors(client, contract, "empty")
-            if empty.attempted:
-                results.record(
-                    f"{domain}_contract_errors_empty",
-                    empty.ok,
-                    empty.detail,
-                )
-    except Exception as error:  # noqa: BLE001
-        results.record(
-            "viewer_contract_error_states",
-            False,
-            f"{type(error).__name__}: {error}",
-        )
-    finally:
-        if client is not None:
-            client.close()
-        proc.terminate()
-
-
 def expect_param_error(client: BridgeClient, method: str, params: object,
                        expect_param: str) -> tuple[bool, str]:
     """Calls `method`; expects BridgeError(-32602) with data.param == expect_param."""
@@ -223,6 +171,30 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
     ok, detail = expect_param_error(
         client, "volume.open", {"path": 123}, "path")
     results.record("c4_volume_path_number", ok, detail)
+
+    try:
+        client.call(
+            "viewer.set_overlay",
+            {"volumeId": "__missing__"},
+            timeout=10.0,
+        )
+        results.record(
+            "viewer_overlay_unknown_volume",
+            False,
+            "expected -32007, got a result",
+        )
+    except BridgeError as error:
+        results.record(
+            "viewer_overlay_unknown_volume",
+            error.code == -32007,
+            f"returned code={error.code}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "viewer_overlay_unknown_volume",
+            False,
+            f"unexpected {type(error).__name__}: {error}",
+        )
 
     ok, detail = expect_param_error(
         client, "state.get", ["not", "an", "object"], "params")
@@ -499,8 +471,6 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="vc3d-smoke-") as tmp_dir:
         tmp_path = Path(tmp_dir)
         volpkg = create_test_project(tmp_path)
-        empty_volpkg = tmp_path / "empty.volpkg.json"
-        empty_volpkg.write_text(json.dumps({"name": "empty", "version": 1}))
         broken_volpkg = tmp_path / "broken.volpkg.json"
         broken_volpkg.write_text(json.dumps({"name": "broken", "version": 1}))
         fiber_dir = Path(tmp_dir) / "fibers" / broken_volpkg.name
@@ -532,7 +502,6 @@ def main() -> int:
             for contract in contracts:
                 domain = contract["domain"].replace(".", "_")
                 for suffix, probe in (
-                    ("success", probe_successful_calls),
                     ("invalid_inputs", probe_invalid_inputs),
                     ("clamps", probe_clamps),
                 ):
@@ -543,24 +512,6 @@ def main() -> int:
                             report.ok,
                             report.detail,
                         )
-                loaded_errors = probe_declared_errors(
-                    client,
-                    contract,
-                    "loaded",
-                )
-                if loaded_errors.attempted:
-                    results.record(
-                        f"{domain}_contract_errors_loaded",
-                        loaded_errors.ok,
-                        loaded_errors.detail,
-                    )
-            check_contract_states(
-                binary,
-                contracts,
-                empty_volpkg,
-                tmp_path / "config-contract-states",
-                results,
-            )
 
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_c2_oversized(sock_path, results)

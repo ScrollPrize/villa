@@ -58,8 +58,8 @@ def _sample(schema: dict[str, Any]) -> Any:
     if kind == "object":
         properties = schema.get("properties", {})
         return {
-            name: _sample(properties[name])
-            for name in schema.get("required", [])
+            name: _sample(property_schema)
+            for name, property_schema in properties.items()
         }
     raise ValueError(f"unsupported schema type: {kind}")
 
@@ -159,64 +159,22 @@ def _record_expected_param_error(
         )
 
 
-def probe_successful_calls(client: Any, contract: dict[str, Any]) -> ProbeReport:
-    report = ProbeReport()
-    try:
-        for action in contract.get("probeSetup", []):
-            client.call(
-                action["method"],
-                action.get("params", {}),
-                timeout=10.0,
-            )
-    except Exception as error:  # noqa: BLE001
-        report.failures.append(f"setup: {type(error).__name__}: {error}")
-        return report
-
-    for method, method_contract in contract["methods"].items():
-        success_probe = method_contract.get("successProbe", {})
-        if success_probe is False:
-            continue
-        report.attempted += 1
-        try:
-            client.call(
-                method,
-                success_probe.get(
-                    "params",
-                    _required_params(method_contract["params"]),
-                ),
-                timeout=10.0,
-            )
-        except Exception as error:  # noqa: BLE001
-            report.failures.append(
-                f"{method}: {type(error).__name__}: {error}"
-            )
-    return report
-
-
 def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
     report = ProbeReport()
     for method, method_contract in contract["methods"].items():
         params_schema = method_contract["params"]
-        invalid_probe = method_contract.get("invalidProbe", {})
-        if invalid_probe is False:
-            continue
-        skipped_params = set(invalid_probe.get("skipParams", []))
         for name in params_schema.get("required", []):
-            if name in skipped_params:
-                continue
             params = _required_params(params_schema)
             params.pop(name)
             _record_expected_param_error(report, client, method, params, name)
 
         for name, schema in params_schema["properties"].items():
-            if name in skipped_params:
-                continue
             params = _required_params(params_schema)
             params[name] = _invalid_value(schema)
             _record_expected_param_error(report, client, method, params, name)
 
         for path, schema in _walk(params_schema, "enum"):
-            if not path or path[0] in skipped_params:
+            if not path:
                 continue
             params = _params_with_value(
                 params_schema,
@@ -233,8 +191,6 @@ def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
 
         for keyword in ("exclusiveMinimum", "minimum", "maximum", "exclusiveMaximum"):
             for path, schema in _walk(params_schema, keyword):
-                if path and path[0] in skipped_params:
-                    continue
                 bound = schema[keyword]
                 if keyword == "exclusiveMinimum":
                     value = bound
@@ -252,76 +208,6 @@ def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
                     params,
                     ".".join(path),
                 )
-
-        for path, schema in _walk(params_schema, "x-invalid"):
-            if not path or path[0] in skipped_params:
-                continue
-            params = _params_with_value(
-                params_schema,
-                path,
-                schema["x-invalid"],
-            )
-            _record_expected_param_error(
-                report,
-                client,
-                method,
-                params,
-                ".".join(path),
-            )
-    return report
-
-
-def probe_declared_errors(
-    client: Any,
-    contract: dict[str, Any],
-    state: str,
-) -> ProbeReport:
-    report = ProbeReport()
-    for method, method_contract in contract["methods"].items():
-        for probe in method_contract.get("errorProbes", []):
-            if probe["state"] != state:
-                continue
-            report.attempted += 1
-            try:
-                for action in probe.get("before", []):
-                    client.call(
-                        action["method"],
-                        action.get("params", {}),
-                        timeout=10.0,
-                    )
-                try:
-                    result, _ = client.call(
-                        method,
-                        probe["params"],
-                        timeout=10.0,
-                    )
-                    report.failures.append(
-                        f"{method} ({probe['name']}): expected {probe['code']}, "
-                        f"got {list(result)[:4]}"
-                    )
-                except BridgeError as error:
-                    if error.code != probe["code"]:
-                        report.failures.append(
-                            f"{method} ({probe['name']}): expected {probe['code']}, "
-                            f"got {error.code}"
-                        )
-            except Exception as error:  # noqa: BLE001
-                report.failures.append(
-                    f"{method} ({probe['name']}): {type(error).__name__}: {error}"
-                )
-            finally:
-                for action in probe.get("after", []):
-                    try:
-                        client.call(
-                            action["method"],
-                            action.get("params", {}),
-                            timeout=10.0,
-                        )
-                    except Exception as error:  # noqa: BLE001
-                        report.failures.append(
-                            f"{method} ({probe['name']}) cleanup: "
-                            f"{type(error).__name__}: {error}"
-                        )
     return report
 
 

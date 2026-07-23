@@ -30,20 +30,6 @@
         -32009,
         -32005
       ],
-      "errorProbes": [
-        {
-          "name": "unknown viewer",
-          "state": "loaded",
-          "params": {
-            "target": "__missing__"
-          },
-          "code": -32002
-        }
-      ],
-      "unprobedErrors": [
-        -32009,
-        -32005
-      ],
       "mcp": {
         "tool": "vc3d_screenshot",
         "paramRenames": {

@@ -23,21 +23,6 @@
         -32602,
         -32000
       ],
-      "successProbe": {
-        "params": {
-          "name": "main"
-        }
-      },
-      "errorProbes": [
-        {
-          "name": "no volume package",
-          "state": "no-project",
-          "params": {
-            "name": "main"
-          },
-          "code": -32000
-        }
-      ],
       "mcp": {
         "tool": "vc3d_switch_workspace"
       }

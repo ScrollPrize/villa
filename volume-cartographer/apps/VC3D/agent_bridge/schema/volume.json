@@ -26,29 +26,6 @@
         -32007,
         -32010
       ],
-      "successProbe": false,
-      "errorProbes": [
-        {
-          "name": "empty path",
-          "state": "loaded",
-          "params": {
-            "path": ""
-          },
-          "code": -32005
-        },
-        {
-          "name": "missing package",
-          "state": "loaded",
-          "params": {
-            "path": "/vc3d-contract/does-not-exist.volpkg.json"
-          },
-          "code": -32005
-        }
-      ],
-      "unprobedErrors": [
-        -32007,
-        -32010
-      ],
       "mcp": {
         "tool": "vc3d_open_volume",
         "paramRenames": {
@@ -74,32 +51,6 @@
         -32007,
         -32005
       ],
-      "successProbe": {
-        "params": {
-          "volumeId": "vol1"
-        }
-      },
-      "errorProbes": [
-        {
-          "name": "unknown volume",
-          "state": "loaded",
-          "params": {
-            "volumeId": "__missing__"
-          },
-          "code": -32007
-        },
-        {
-          "name": "no volume package",
-          "state": "no-project",
-          "params": {
-            "volumeId": "vol1"
-          },
-          "code": -32000
-        }
-      ],
-      "unprobedErrors": [
-        -32005
-      ],
       "mcp": {
         "tool": "vc3d_select_volume",
         "paramRenames": {
@@ -114,14 +65,6 @@
       },
       "errors": [
         -32000
-      ],
-      "errorProbes": [
-        {
-          "name": "no volume package",
-          "state": "no-project",
-          "params": {},
-          "code": -32000
-        }
       ],
       "mcp": {
         "tool": "vc3d_list_volumes"

@@ -97,6 +97,10 @@ QJsonObject AgentBridgeServer::handleWrapAnnotationSetMode(const QJsonValue& par
 QJsonObject AgentBridgeServer::handleWrapAnnotationCommit(const QJsonValue& params)
 {
     const QJsonObject p = paramsObject(params);
+    if (p.contains("viewer") && !p.value("viewer").isNull() &&
+        !p.value("viewer").isString()) {
+        throwParamError("viewer", QStringLiteral("must be a string or null"));
+    }
 
     // Precondition: same-wrap mode must be enabled, mirroring the shift+E key
     // handler's guard (CWindow::keyPressEvent). commit is otherwise a no-op.
