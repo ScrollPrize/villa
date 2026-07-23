@@ -23,9 +23,7 @@
 #include <QtConcurrent>
 
 #include <algorithm>
-#include <cmath>
 #include <filesystem>
-#include <limits>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -117,14 +115,14 @@ QJsonObject AgentBridgeServer::launchFlattenJob(
 
 QJsonObject AgentBridgeServer::handleFlattenSlim(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
     if (!state->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    const QString segmentId = jsonRequireString(p, "segmentId");
+    const QString segmentId = p.value("segmentId").toString();
     if (segmentId.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
@@ -133,54 +131,12 @@ QJsonObject AgentBridgeServer::handleFlattenSlim(const QJsonValue& params)
 
     SegmentationCommandHandler::SlimFlattenParams sp;  // headless defaults (§20)
 
-    if (p.contains("iterations")) {
-        // jsonRequireInt rejects a fractional value (e.g. 1.5) that toInt() would
-        // silently truncate, plus wrong types and int overflow.
-        sp.iterations = jsonRequireInt(p.value("iterations"), "iterations");
-        if (sp.iterations < 1) {
-            QJsonObject data; data["param"] = "iterations";
-            throw AgentBridgeError{-32602, "iterations must be >= 1", data};
-        }
-    }
-    if (p.contains("tolerance")) {
-        if (!p.value("tolerance").isDouble()) {
-            QJsonObject data; data["param"] = "tolerance";
-            throw AgentBridgeError{-32602, "tolerance must be a number", data};
-        }
-        sp.tolerance = p.value("tolerance").toDouble();
-        if (!std::isfinite(sp.tolerance) || sp.tolerance < 0.0) {
-            QJsonObject data; data["param"] = "tolerance";
-            throw AgentBridgeError{-32602, "tolerance must be a finite value >= 0", data};
-        }
-    }
-    if (p.contains("energyType") && !p.value("energyType").isNull()) {
-        const QString e = jsonRequireString(p, "energyType");
-        if (e != QLatin1String("symmetric_dirichlet") && e != QLatin1String("conformal")) {
-            QJsonObject data; data["param"] = "energyType";
-            data["detail"] = "energyType must be \"symmetric_dirichlet\" or \"conformal\"";
-            throw AgentBridgeError{-32602, "Invalid energyType", data};
-        }
-        sp.energyType = e;
-    }
-    if (p.contains("keepPercent")) {
-        if (!p.value("keepPercent").isDouble()) {
-            QJsonObject data; data["param"] = "keepPercent";
-            throw AgentBridgeError{-32602, "keepPercent must be a number", data};
-        }
-        sp.keepPercent = p.value("keepPercent").toDouble();
-        if (!std::isfinite(sp.keepPercent) || sp.keepPercent <= 0.0 || sp.keepPercent > 100.0) {
-            QJsonObject data; data["param"] = "keepPercent";
-            throw AgentBridgeError{-32602, "keepPercent must be in (0, 100]", data};
-        }
-    }
-    if (p.contains("inpaintHoles")) {
-        if (!p.value("inpaintHoles").isBool()) {
-            QJsonObject data; data["param"] = "inpaintHoles";
-            throw AgentBridgeError{-32602, "inpaintHoles must be a boolean", data};
-        }
-        sp.inpaintHoles = p.value("inpaintHoles").toBool();
-    }
-    sp.outputDir = jsonOptionalString(p, "outputDir");
+    sp.iterations = p.value("iterations").toInt(sp.iterations);
+    sp.tolerance = p.value("tolerance").toDouble(sp.tolerance);
+    sp.energyType = p.value("energyType").toString(sp.energyType);
+    sp.keepPercent = p.value("keepPercent").toDouble(sp.keepPercent);
+    sp.inpaintHoles = p.value("inpaintHoles").toBool(sp.inpaintHoles);
+    sp.outputDir = p.value("outputDir").toString();
 
     SegmentationCommandHandler* handler =
         _window ? _window->_segmentationCommandHandler.get() : nullptr;
@@ -195,34 +151,20 @@ QJsonObject AgentBridgeServer::handleFlattenSlim(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleFlattenAbf(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QString segmentId = jsonRequireString(p, "segmentId");
+    const QString segmentId = p.value("segmentId").toString();
     if (segmentId.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
         throw AgentBridgeError{-32602, "segmentId is required", data};
     }
 
-    int iterations = 10;        // ABFFlattenDialog session default
-    int downsampleFactor = 1;
-    if (p.contains("iterations")) {
-        iterations = jsonRequireInt(p.value("iterations"), "iterations");
-        if (iterations < 1) {
-            QJsonObject data; data["param"] = "iterations";
-            throw AgentBridgeError{-32602, "iterations must be >= 1", data};
-        }
-    }
-    if (p.contains("downsampleFactor")) {
-        downsampleFactor = jsonRequireInt(p.value("downsampleFactor"), "downsampleFactor");
-        if (downsampleFactor < 1) {
-            QJsonObject data; data["param"] = "downsampleFactor";
-            throw AgentBridgeError{-32602, "downsampleFactor must be >= 1", data};
-        }
-    }
+    const int iterations = p.value("iterations").toInt(10);
+    const int downsampleFactor = p.value("downsampleFactor").toInt(1);
 
     SegmentationCommandHandler* handler =
         _window ? _window->_segmentationCommandHandler.get() : nullptr;
@@ -239,14 +181,14 @@ QJsonObject AgentBridgeServer::handleFlattenAbf(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleFlattenStraighten(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
     if (!state->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    const QString segmentId = jsonRequireString(p, "segmentId");
+    const QString segmentId = p.value("segmentId").toString();
     if (segmentId.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
@@ -255,59 +197,15 @@ QJsonObject AgentBridgeServer::handleFlattenStraighten(const QJsonValue& params)
 
     SegmentationCommandHandler::StraightenParams stp;  // defaults mirror the dialog
 
-    if (p.contains("unbend")) {
-        if (!p.value("unbend").isBool()) {
-            QJsonObject data; data["param"] = "unbend";
-            throw AgentBridgeError{-32602, "unbend must be a boolean", data};
-        }
-        stp.unbend = p.value("unbend").toBool();
-    }
-    if (p.contains("unbendSmoothCols")) {
-        if (!p.value("unbendSmoothCols").isDouble()) {
-            QJsonObject data; data["param"] = "unbendSmoothCols";
-            throw AgentBridgeError{-32602, "unbendSmoothCols must be a number", data};
-        }
-        stp.unbendSmoothCols = p.value("unbendSmoothCols").toDouble();
-        if (!std::isfinite(stp.unbendSmoothCols) || stp.unbendSmoothCols < 0.0) {
-            QJsonObject data; data["param"] = "unbendSmoothCols";
-            throw AgentBridgeError{-32602, "unbendSmoothCols must be a finite value >= 0", data};
-        }
-    }
-    if (p.contains("overlapPasses")) {
-        // jsonRequireInt rejects fractional (e.g. 1.5) / wrong-typed / overflowing
-        // values that toInt() would otherwise silently accept.
-        stp.overlapPasses = jsonRequireInt(p.value("overlapPasses"), "overlapPasses");
-        if (stp.overlapPasses < 0) {
-            QJsonObject data; data["param"] = "overlapPasses";
-            throw AgentBridgeError{-32602, "overlapPasses must be >= 0", data};
-        }
-    }
-    if (p.contains("orthogonalize")) {
-        if (!p.value("orthogonalize").isBool()) {
-            QJsonObject data; data["param"] = "orthogonalize";
-            throw AgentBridgeError{-32602, "orthogonalize must be a boolean", data};
-        }
-        stp.orthogonalize = p.value("orthogonalize").toBool();
-    }
-    if (p.contains("trim")) {
-        if (!p.value("trim").isBool()) {
-            QJsonObject data; data["param"] = "trim";
-            throw AgentBridgeError{-32602, "trim must be a boolean", data};
-        }
-        stp.trim = p.value("trim").toBool();
-    }
-    if (p.contains("trimMaxEdge")) {
-        if (!p.value("trimMaxEdge").isDouble()) {
-            QJsonObject data; data["param"] = "trimMaxEdge";
-            throw AgentBridgeError{-32602, "trimMaxEdge must be a number", data};
-        }
-        stp.trimMaxEdge = p.value("trimMaxEdge").toDouble();
-        if (!std::isfinite(stp.trimMaxEdge) || stp.trimMaxEdge < 0.0) {
-            QJsonObject data; data["param"] = "trimMaxEdge";
-            throw AgentBridgeError{-32602, "trimMaxEdge must be a finite value >= 0", data};
-        }
-    }
-    stp.outputDir = jsonOptionalString(p, "outputDir");
+    stp.unbend = p.value("unbend").toBool(stp.unbend);
+    stp.unbendSmoothCols =
+        p.value("unbendSmoothCols").toDouble(stp.unbendSmoothCols);
+    stp.overlapPasses = p.value("overlapPasses").toInt(stp.overlapPasses);
+    stp.orthogonalize =
+        p.value("orthogonalize").toBool(stp.orthogonalize);
+    stp.trim = p.value("trim").toBool(stp.trim);
+    stp.trimMaxEdge = p.value("trimMaxEdge").toDouble(stp.trimMaxEdge);
+    stp.outputDir = p.value("outputDir").toString();
 
     SegmentationCommandHandler* handler =
         _window ? _window->_segmentationCommandHandler.get() : nullptr;
