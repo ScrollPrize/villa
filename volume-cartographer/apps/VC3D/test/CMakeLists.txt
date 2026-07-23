@@ -28,3 +28,19 @@ target_link_libraries(test_seeding_batch_tracker PRIVATE
 
 add_test(NAME seeding_batch_tracker COMMAND test_seeding_batch_tracker)
 set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_seeding_batch_tracker)
+
+add_executable(test_fiber_save_batch_tracker
+    test_fiber_save_batch_tracker.cpp)
+
+set_target_properties(test_fiber_save_batch_tracker PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_save_batch_tracker PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_save_batch_tracker PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_save_batch_tracker COMMAND test_fiber_save_batch_tracker)
+set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_fiber_save_batch_tracker)

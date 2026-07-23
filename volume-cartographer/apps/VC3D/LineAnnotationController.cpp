@@ -2,6 +2,7 @@
 
 #include "CState.hpp"
 #include "FiberNameDisplay.hpp"
+#include "FiberSaveBatchTracker.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 #include "FiberSliceGeometry.hpp"
@@ -4661,19 +4662,15 @@ void LineAnnotationController::saveOpenFibers()
 
 void LineAnnotationController::saveOpenFibersHeadless(FiberSaveCompletion onFinished)
 {
-    auto batch = std::make_shared<FiberSaveBatch>();
-    batch->completion = std::move(onFinished);
+    auto batch = std::make_shared<FiberSaveBatchTracker>(std::move(onFinished));
     _activeFiberSaveBatch = batch;
     try {
         saveOpenFibersCore();
     } catch (const std::exception& ex) {
-        batch->errors.push_back(QString::fromUtf8(ex.what()));
+        batch->addError(QString::fromUtf8(ex.what()));
     }
     _activeFiberSaveBatch.reset();
-    batch->scheduling = false;
-    if (batch->pendingJobs == 0 && batch->completion) {
-        batch->completion(batch->errors.isEmpty(), batch->errors.join('\n'));
-    }
+    batch->finishScheduling();
 }
 
 LineAnnotationDialog* LineAnnotationController::mostRecentLineAnnotationDialog() const
@@ -9406,7 +9403,7 @@ void LineAnnotationController::scheduleFiberSaveSnapshots(
     job.snapshots = std::move(snapshots);
     job.showErrors = showErrors && !_activeFiberSaveBatch && !_errorDialogsSuppressed;
     if (_activeFiberSaveBatch) {
-        ++_activeFiberSaveBatch->pendingJobs;
+        _activeFiberSaveBatch->addJob();
         job.batches.push_back(_activeFiberSaveBatch);
     }
     FiberSaveJob probe = job;
@@ -9483,7 +9480,7 @@ void LineAnnotationController::startNextFiberSaveJob()
 void LineAnnotationController::finishFiberSaveJob(
     QFutureWatcher<FiberSaveTaskResult>* watcher,
     bool showErrors,
-    std::vector<std::shared_ptr<FiberSaveBatch>> batches)
+    std::vector<std::shared_ptr<FiberSaveBatchTracker>> batches)
 {
     FiberSaveTaskResult result;
     try {
@@ -9527,14 +9524,7 @@ void LineAnnotationController::finishFiberSaveJob(
         if (!batch) {
             continue;
         }
-        if (!result.ok) {
-            batch->errors.push_back(errorMessage);
-        }
-        --batch->pendingJobs;
-        if (!batch->scheduling && batch->pendingJobs == 0 && batch->completion) {
-            auto completion = std::move(batch->completion);
-            completion(batch->errors.isEmpty(), batch->errors.join('\n'));
-        }
+        batch->finishJob(errorMessage);
     }
 
     startNextFiberSaveJob();
@@ -10072,7 +10062,7 @@ std::string LineAnnotationController::uniqueImportedFiberFileName(
 void LineAnnotationController::showError(const QString& message, bool suppressDialog) const
 {
     if (_activeFiberSaveBatch) {
-        _activeFiberSaveBatch->errors.push_back(message);
+        _activeFiberSaveBatch->addError(message);
         Logger()->warn("Line Annotation (headless save): {}", message.toStdString());
         return;
     }

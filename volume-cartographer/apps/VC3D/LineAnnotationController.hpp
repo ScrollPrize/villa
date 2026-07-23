@@ -28,6 +28,7 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 class CState;
+class FiberSaveBatchTracker;
 class FiberSliceOverlayController;
 class LineAnnotationDialog;
 class QMdiArea;
@@ -316,18 +317,11 @@ private:
         nlohmann::json coordinateIdentity = nlohmann::json::object();
     };
 
-    struct FiberSaveBatch {
-        int pendingJobs = 0;
-        bool scheduling = true;
-        QStringList errors;
-        FiberSaveCompletion completion;
-    };
-
     struct FiberSaveJob {
         uint64_t sequence = 0;
         std::vector<FiberSaveSnapshot> snapshots;
         bool showErrors = true;
-        std::vector<std::shared_ptr<FiberSaveBatch>> batches;
+        std::vector<std::shared_ptr<FiberSaveBatchTracker>> batches;
     };
 
     struct BranchLinkValidationIssue {
@@ -551,7 +545,7 @@ private:
     void startNextFiberSaveJob();
     void finishFiberSaveJob(QFutureWatcher<FiberSaveTaskResult>* watcher,
                             bool showErrors,
-                            std::vector<std::shared_ptr<FiberSaveBatch>> batches);
+                            std::vector<std::shared_ptr<FiberSaveBatchTracker>> batches);
     void waitForFiberSaves();
     [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber) const;
     [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
@@ -648,7 +642,7 @@ private:
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;
     bool _fiberSaveRunning = false;
-    mutable std::shared_ptr<FiberSaveBatch> _activeFiberSaveBatch;
+    mutable std::shared_ptr<FiberSaveBatchTracker> _activeFiberSaveBatch;
     uint64_t _nextSideStripIntersectionToken = 0;
     uint64_t _latestSideStripIntersectionToken = 0;
     std::shared_ptr<std::atomic<uint64_t>> _latestSideStripIntersectionTokenAtomic =

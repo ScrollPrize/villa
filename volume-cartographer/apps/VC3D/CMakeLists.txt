@@ -63,6 +63,7 @@ set(srcs
     AtlasControlPointsDock.hpp
     AtlasControlPointsTypes.hpp
     CommandLaunchError.hpp
+    FiberSaveBatchTracker.hpp
     SegmentationCommandHandler.cpp
     SegmentationCommandHandler.hpp
     volume_viewers/annotation_tools/SameWrapAnnotationTool.cpp
