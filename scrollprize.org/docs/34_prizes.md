@@ -187,6 +187,21 @@ All submissions will be assessed by the Review Team, which consists of a Technic
 
 </details>
 
+<details>
+<summary>How to get started</summary>
+
+This is a big prize, and it breaks into two stages: first **segmentation** (unrolling the whole scroll into a flat surface), then **ink detection** on that surface. The two stages need quite different skills, so this is a great prize to tackle as a team — one person who enjoys unwrapping, one who enjoys ink detection.
+
+**Stage 1 — segment the whole scroll.** We'd tackle large-scale whole-scroll segmentation first. Our current state of the art for this is the **spiral fitter**, but you don't have to use it — we'd love for someone to build something better.
+
+* If you do use the spiral fitter, follow the [spiral fitting tutorial](/tutorial_spiral) to get started.
+* The spiral needs evidence and constraints to fit to: annotations of points that lie on the same winding versus different windings, fibers, the umbilicus, and so on. See [winding constraints](/open_problems/winding_annotations) for how these annotations work and how to create them.
+* Run the fit, then **inspect the result in VC3D** ([VC3D tutorial](/tutorial_VC3D)) to see how good the unrolling is, and iterate on the constraints. In particular, check if you can visually follow horizontal papyrus fibers across the page -- this is an indication the segmentation is good (and not jumping between sheets).
+
+**Stage 2 — detect ink.** Once you can unroll large areas, render them and try detecting ink on them. This is the same problem as the [First Letters prize](#first-letters-prizes) below — start there — except now you need it to work well across most of the scroll rather than a single 4 cm² patch.
+
+</details>
+
 [Submission Form](https://forms.gle/wvNK7DkNKuRKjHJdA)
 
 ***
@@ -223,6 +238,24 @@ These prizes bridge ink detection on fragments to the much harder problem of rea
 
 * Your submission will be reviewed by the review teams to verify technical validity and papyrological plausibility and legibility.
 * As with the Grand Prize, you **must not** make your discovery public until the prize is officially announced. We will work with you to announce your findings.
+</details>
+
+<details>
+<summary>How to get started</summary>
+
+Here's one way in. This is a suggested path, not a requirement — anything that produces a qualifying image counts.
+
+1. **Pick a scroll** from the [eligible list](#2027-grand-prize).
+2. **Open it in VC3D** from the built-in open data catalog, and **grow a segment** on the scroll's recto surface prediction with `Create Segment (GrowPatch)`, refining it by hand where the automatic growth goes wrong. See the [VC3D unwrapping tutorial](/tutorial_VC3D) for opening the catalog and growing patches, and the [segmentation tutorial](/segmentation) for more on growing and manually refining meshes.
+3. **Render** the flattened segment and **run ink detection** on it, following the [ink detection tutorial](/tutorial5).
+4. **Repeat** on other regions (and other scrolls) until you find 10 legible letters within a single 4 cm² area.
+
+A few things worth knowing:
+
+* **We don't yet know whether our existing ink models will work on these scrolls.** They might, or they might not — it may be necessary to train a scroll-specific model.
+* **Sometimes ink is visible directly in the flattened render**, with no model at all (usually it shows up as bright areas). If that's already enough legible letters, that by itself qualifies for the prize.
+* **If you can see a little ink but not enough**, that's a foothold: train a model on it — or fine-tune one of our [latest ink detection models](https://huggingface.co/scrollprize) — and then use [iterative labeling](/tutorial5#improving-the-model-iterative-labeling) to grow from a few visible strokes to complete words.
+
 </details>
 
 [Submission Form](https://forms.gle/TM5ao8GwC2mDrdLk9)
@@ -271,8 +304,8 @@ Discovering a scroll’s title tells scholars what — and whom — they have be
 
 ***
 
-:::warning
-The previous prizes are too ambitious? You can still contribute!
+:::tip
+The prizes above feel too ambitious? There are plenty of other ways to contribute!
 :::
 
 ## Progress Prizes
@@ -293,6 +326,7 @@ Beyond that, progress prizes will be awarded at a range of levels based on the c
 We favor submissions that:
 * Are **released or open-sourced early**. Tools released earlier have a higher chance of being used for reading the scrolls than those released the last day of the month.
 * Actually **get used**. We’ll look for signals from the community: questions, comments, bug reports, feature requests. Our Annotation Team will publicly provide comments on tools they use.
+* Solve a **real problem**. For example, they improve metrics on real data (e.g. our [ink detection](/data_datasets#ink-labels-2026-07) or [surface prediction](/data_datasets#surface-labels-2026-07) datasets), or resolve a genuine outstanding bug in tools that people are using. 
 * Are **well documented**. It helps a lot if relevant documentation, walkthroughs, images, tutorials or similar are included with the work so that others can use it!
 
 Any contribution that makes any of the [Open Problems](/2026_open_problems) easier to address will be eligible for a Progress Prize.

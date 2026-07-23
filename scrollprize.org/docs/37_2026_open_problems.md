@@ -539,7 +539,7 @@ What happens if the models don’t generalize? The right conclusion here is neit
 * the ink morphology or chemistry may differ across scrolls;    
 * the signal may be present but below the current pipeline's ability to use it.
 
-**This is why better diagnostics are more important than better models.**
+**This is why better diagnostics matter just as much as better models — without them, it's hard to know which of these failure modes you're even fighting.**
 
 ## 4\. Data scale: the infrastructure bottleneck
 A full-resolution scroll volume is huge — too huge to just download to a laptop and work with as a local folder. So the project increasingly depends on chunked, cloud-friendly formats instead.
