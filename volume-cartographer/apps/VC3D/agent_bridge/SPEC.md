@@ -613,13 +613,20 @@ sample in the catalog window.
 - **params:** `{"jobId"?: str}` — omit for "the current/most recent job".
 - **result:**
   ```json
-  {"jobId": str, "kind": str, "label": str,
+  {"jobId": str, "source": str, "kind": str, "label": str,
    "state": "running" | "succeeded" | "failed",
    "message": str,                 // last status/finish message
    "outputPath": str | null,      // from toolFinished when applicable
-   "consoleTail": [str]}          // last <=50 console lines (consoleOutputReceived)
+   "externalId": str | null,      // backing service id when applicable
+   "consoleTail": [str],          // last <=50 console lines
+   "progressHistory": [object],   // last <=64 job.progress params objects
+   "startedAtMs": number,
+   "finishedAtMs": number | null,
+   "result": object | null}       // terminal method-specific result when applicable
   ```
-  The bridge retains the last **8** completed job records for late polling.
+  The bridge retains the last **8** completed records per source for late
+  polling. `progressHistory` is the bounded replay tail; its entries have the
+  same shape as the notification `params` below.
 - **errors:** `-32007` (`data.kind:"job"` — unknown id and no job has ever run).
 
 ### 3.18 `job.progress` — server-push notification (no `id`)
@@ -630,18 +637,24 @@ Broadcast to all connected clients. Never sent as a response.
 {"jsonrpc": "2.0", "method": "job.progress",
  "params": {
    "jobId": str,
+   "seq": number,                       // monotonically increases within the job
+   "source": str,                       // lifecycle authority: tool, growth, ...
    "kind": str,                       // "segmentation.grow", "segmentation.grow_patch_from_seed", ...
    "phase": "started" | "output" | "finished",
    "message"?: str,                   // toolStarted message / console line chunk
    "success"?: bool,                  // present iff phase == "finished"
-   "outputPath"?: str                 // present iff phase == "finished" and applicable
+   "outputPath"?: str,                // present iff phase == "finished" and applicable
+   "result"?: object | null           // present iff phase == "finished"
  }}
 ```
 
-Sources: `CommandLineToolRunner::toolStarted` → `started`;
-`consoleOutputReceived` → `output` (rate-limited to ≤10 notifications/sec, coalescing
-lines); `toolFinished` → `finished`. For in-process growth,
-`onSegmentationGrowthStatusChanged(true/false)` → `started` / `finished`.
+Notifications are ordered and best-effort for the lifetime of a connection.
+The bounded `job.status.progressHistory` tail lets clients subscribe before
+reading status, replay retained updates, and merge live notifications by
+`seq` without a lost-wakeup window. Sources include external tools, in-process
+growth, flattening, Lasagna, atlas searches, catalog downloads, autosave, and
+seeding. High-volume output is rate-limited to at most 10 notifications per
+second and coalesced.
 
 ### 3.19 `segments.fetch` — materialize an open-data placeholder segment
 
@@ -811,18 +824,17 @@ corresponding RPC params block in §3, with the same names, types, defaults, and
 The MCP server performs no semantic validation beyond schema — the bridge is the
 authority.
 
-`job.progress` notifications: the MCP server ignores them — it reads them off the socket
-and discards them. `wait: true` and progress forwarding are implemented instead by polling
-the authoritative `job.status` RPC (§3.17). `wait` is an MCP-server-side convenience param
-(not part of the RPC) available on the long-running job-returning tools; when `"wait": true`
-it polls `job.status` once a second until the job is terminal and returns the terminal
-`job.status` inline. Along the way the server forwards newly-appended `consoleTail` lines to
-the MCP client as **best-effort** progress via the FastMCP `Context` (`ctx.report_progress`,
-monotonic sequence number) where the client supports it; forwarding is observational only
-and never affects job execution or the returned result. `wait` defaults to `false`; when
-`true`, the server enforces a 30-minute cap and returns the still-running `jobId` (with
-`"waitTimedOut": true`) on timeout, and fails promptly on bridge disconnect (the next poll
-raises).
+`wait` is an MCP-server-side convenience parameter, not part of the RPC. A wait
+subscribes to `job.progress` before its first `job.status` read, replays the
+bounded `progressHistory` tail, and merges live updates by `seq`. It periodically
+reads authoritative status as a delivery fallback and to obtain the terminal
+result. Output updates become messages; terminal updates are forwarded as
+compact structured progress. Reporting is best-effort and observational: an
+unsupported, failing, or stalled FastMCP progress sink is disabled for that wait
+without changing job execution or the returned result. Cancellation still
+propagates. `wait` defaults to false except where a tool explicitly documents a
+different default. A wait has a 30-minute cap and returns `"waitTimedOut": true`
+with the still-running job id on timeout.
 
 `vc3d_screenshot` return shape (MCP-layer only; the §3.4 RPC contract is untouched): the
 `screenshot.capture` RPC still returns `base64` when `filePath` was omitted, else writes the
@@ -831,13 +843,11 @@ omitted it decodes the RPC's `base64` and returns the PNG as FastMCP **image con
 `Image`) so MCP hosts render it inline; when `file_path` is set it returns the dict carrying
 the on-disk `filePath` (no inline base64). This conversion lives entirely in the MCP server.
 
-`vc3d_wait_job` (MCP-only; no underlying RPC): the counterpart to the `wait` param above for
-a job the current tool call did **not** itself start. It blocks on an **already-running** job
-by id using the identical `job.status` polling loop (once/sec, 30-minute cap, `consoleTail`
-forwarded as best-effort progress via the FastMCP `Context`) and returns the terminal
-`job.status` record inline, or the last-seen status with `"waitTimedOut": true` on the cap.
-Use it to wait on a job started earlier with `wait=false`, or on an externally-initiated job
-seen in `state.get`. See §21.3.
+`vc3d_wait_job` is the MCP-only counterpart for a job the current call did not
+start. It uses the same subscription, replay, status fallback, and 30-minute cap,
+returning the terminal `job.status` record or `"waitTimedOut": true`. Use it for
+a job started with `wait=false` or an externally initiated job visible through
+`state.get`. See §21.3.
 
 ---
 

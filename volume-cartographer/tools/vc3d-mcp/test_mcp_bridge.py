@@ -900,6 +900,18 @@ class _HangingCtx:
         await asyncio.Event().wait()
 
 
+class _SlowCtx(_FakeCtx):
+    def __init__(self, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+        self.calls = 0
+
+    async def report_progress(self, progress, total=None, message=None) -> None:
+        self.calls += 1
+        await asyncio.sleep(self.delay)
+        await super().report_progress(progress, total, message)
+
+
 class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
     """Connection/reader lifecycle: EOF reset, connect race, cancel leak,
     write-failure invalidation, idempotent close."""
@@ -1201,6 +1213,33 @@ class WaitAndProgressTest(unittest.IsolatedAsyncioTestCase):
             core.PROGRESS_REPORT_TIMEOUT_S = original_timeout
         self.assertEqual(result["state"], "succeeded")
         self.assertEqual(ctx.calls, 1)
+
+    async def test_buffered_replay_has_one_timeout_budget(self) -> None:
+        started = await vc3d_grow_segment(steps=1, wait=False)
+        await asyncio.sleep(0.1)
+        record = self.fake_server._jobs[started["jobId"]]
+        record["progressHistory"] = [
+            {
+                "jobId": started["jobId"],
+                "kind": record["kind"],
+                "seq": seq,
+                "phase": "output",
+                "message": f"line {seq}",
+            }
+            for seq in range(1, 65)
+        ]
+        ctx = _SlowCtx(delay=0.02)
+        original_timeout = core.PROGRESS_REPORT_TIMEOUT_S
+        core.PROGRESS_REPORT_TIMEOUT_S = 0.03
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        try:
+            result = await vc3d_wait_job(started["jobId"], ctx=ctx)
+        finally:
+            core.PROGRESS_REPORT_TIMEOUT_S = original_timeout
+        self.assertEqual(result["state"], "succeeded")
+        self.assertLess(loop.time() - started_at, 0.15)
+        self.assertLessEqual(ctx.calls, 2)
 
     async def test_progress_report_cancellation_is_not_swallowed(self) -> None:
         ctx = _FakeCtx(fail=asyncio.CancelledError())

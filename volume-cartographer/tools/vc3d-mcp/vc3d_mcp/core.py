@@ -113,14 +113,16 @@ def _new_tail_lines(prev: list[str], cur: list[str]) -> list[str]:
     return cur
 
 
-async def _report_progress(ctx: Optional[Context], seq: int, message: str) -> bool:
+async def _report_progress(
+    ctx: Optional[Context], seq: int, message: str, timeout: float
+) -> bool:
     """Report progress once, returning false when the sink is unavailable."""
-    if ctx is None:
+    if ctx is None or timeout <= 0:
         return False
     try:
         await asyncio.wait_for(
             ctx.report_progress(progress=seq, total=None, message=message),
-            timeout=PROGRESS_REPORT_TIMEOUT_S,
+            timeout=timeout,
         )
         return True
     except asyncio.CancelledError:
@@ -162,7 +164,10 @@ async def _wait_for_job(
     local_seq = 0
     reporting = ctx is not None
 
-    async def forward(update: dict[str, Any]) -> None:
+    async def forward(
+        update: dict[str, Any],
+        report_timeout: Optional[float] = None,
+    ) -> None:
         nonlocal last_seq, local_seq, reporting
         raw_seq = update.get("seq")
         update_seq = int(raw_seq) if isinstance(raw_seq, (int, float)) else 0
@@ -174,8 +179,13 @@ async def _wait_for_job(
         else:
             local_seq += 1
         if reporting:
+            timeout = (
+                PROGRESS_REPORT_TIMEOUT_S
+                if report_timeout is None
+                else report_timeout
+            )
             reporting = await _report_progress(
-                ctx, local_seq, _progress_message(update)
+                ctx, local_seq, _progress_message(update), timeout
             )
 
     client = _get_client()
@@ -184,9 +194,12 @@ async def _wait_for_job(
             status = await _call("job.status", {"jobId": job_id})
             history = status.get("progressHistory")
             if isinstance(history, list):
+                # A slow but responsive sink must not turn a 64-item replay
+                # into 64 independent timeout windows.
+                replay_deadline = loop.time() + PROGRESS_REPORT_TIMEOUT_S
                 for update in history:
                     if isinstance(update, dict):
-                        await forward(update)
+                        await forward(update, replay_deadline - loop.time())
             else:
                 # Compatibility with bridge versions that predate sequenced
                 # progress history.
