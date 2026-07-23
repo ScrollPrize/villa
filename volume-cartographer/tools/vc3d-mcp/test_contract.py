@@ -10,13 +10,18 @@ from vc3d_mcp import tools as _tools  # noqa: F401 - registers the MCP tools
 
 
 VC_ROOT = Path(__file__).resolve().parents[2]
-CONTRACT_PATH = VC_ROOT / "apps/VC3D/agent_bridge/schema/viewer.json"
+CONTRACT_DIR = VC_ROOT / "apps/VC3D/agent_bridge/schema"
 SPEC_PATH = VC_ROOT / "apps/VC3D/agent_bridge/SPEC.md"
 
 
-def _load_contract() -> dict[str, Any]:
-    with CONTRACT_PATH.open(encoding="utf-8") as stream:
-        return json.load(stream)
+def _load_contracts() -> list[dict[str, Any]]:
+    contracts = []
+    for path in sorted(CONTRACT_DIR.glob("*.json")):
+        with path.open(encoding="utf-8") as stream:
+            contract = json.load(stream)
+        contract["_path"] = path
+        contracts.append(contract)
+    return contracts
 
 
 def _resolve_ref(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
@@ -42,57 +47,90 @@ def _without_null(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any
     return _resolve_ref(choices[0], root)
 
 
-class ViewerContractTest(unittest.IsolatedAsyncioTestCase):
+class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.contract = _load_contract()
-        cls.methods = cls.contract["methods"]
+        cls.contracts = _load_contracts()
+        cls.methods = {
+            method: method_contract
+            for contract in cls.contracts
+            for method, method_contract in contract["methods"].items()
+        }
 
     def test_contract_shape(self) -> None:
-        self.assertEqual(self.contract["contractVersion"], 1)
-        self.assertEqual(self.contract["domain"], "viewer")
-        for action in self.contract.get("probeSetup", []):
-            self.assertTrue(action["method"])
-            self.assertIsInstance(action.get("params", {}), dict)
-
+        self.assertTrue(self.contracts)
+        domains: set[str] = set()
+        methods: set[str] = set()
         tools: set[str] = set()
-        for method, contract in self.methods.items():
-            self.assertTrue(method.startswith("viewer."))
-            self.assertEqual(contract["params"]["type"], "object")
-            self.assertIsInstance(contract["params"]["properties"], dict)
-            self.assertEqual(len(contract["errors"]), len(set(contract["errors"])))
-            self.assertTrue(all(isinstance(code, int) and code < 0 for code in contract["errors"]))
-            if contract["params"]["properties"]:
-                self.assertIn(-32602, contract["errors"])
-            self._assert_extensions(contract["params"])
-
-            probes = contract.get("errorProbes", [])
-            probed_errors = {probe["code"] for probe in probes}
-            if contract["params"]["properties"]:
-                probed_errors.add(-32602)
-            unprobed_errors = set(contract.get("unprobedErrors", []))
-            self.assertFalse(probed_errors & unprobed_errors)
+        for domain_contract in self.contracts:
+            domain = domain_contract["domain"]
+            self.assertEqual(domain_contract["contractVersion"], 1)
+            self.assertNotIn(domain, domains)
+            domains.add(domain)
             self.assertEqual(
-                set(contract["errors"]),
-                probed_errors | unprobed_errors,
+                domain_contract["_path"].stem,
+                domain.replace(".", "_"),
             )
-            for probe in probes:
-                self.assertTrue(probe["name"])
-                self.assertTrue(probe["state"])
-                self.assertIsInstance(probe["params"], dict)
-                self.assertIn(probe["code"], contract["errors"])
-                for action in (*probe.get("before", []), *probe.get("after", [])):
-                    self.assertTrue(action["method"])
-                    self.assertIsInstance(action.get("params", {}), dict)
+            for action in domain_contract.get("probeSetup", []):
+                self.assertTrue(action["method"])
+                self.assertIsInstance(action.get("params", {}), dict)
 
-            tool = contract["mcp"]["tool"]
-            self.assertNotIn(tool, tools)
-            tools.add(tool)
+            for method, contract in domain_contract["methods"].items():
+                with self.subTest(domain=domain, method=method):
+                    self.assertNotIn(method, methods)
+                    methods.add(method)
+                    self.assertTrue(
+                        method == domain or method.startswith(f"{domain}.")
+                    )
+                    self.assertEqual(contract["params"]["type"], "object")
+                    self.assertIsInstance(contract["params"]["properties"], dict)
+                    self.assertEqual(
+                        len(contract["errors"]),
+                        len(set(contract["errors"])),
+                    )
+                    self.assertTrue(
+                        all(
+                            isinstance(code, int) and code < 0
+                            for code in contract["errors"]
+                        )
+                    )
+                    if contract["params"]["properties"]:
+                        self.assertIn(-32602, contract["errors"])
+                    self._assert_extensions(contract["params"])
 
-            properties = contract["params"]["properties"]
-            renames = contract["mcp"].get("paramRenames", {})
-            self.assertLessEqual(renames.keys(), properties.keys())
-            self.assertEqual(len(renames.values()), len(set(renames.values())))
+                    probes = contract.get("errorProbes", [])
+                    probed_errors = {probe["code"] for probe in probes}
+                    if contract["params"]["properties"]:
+                        probed_errors.add(-32602)
+                    unprobed_errors = set(contract.get("unprobedErrors", []))
+                    self.assertFalse(probed_errors & unprobed_errors)
+                    self.assertEqual(
+                        set(contract["errors"]),
+                        probed_errors | unprobed_errors,
+                    )
+                    for probe in probes:
+                        self.assertTrue(probe["name"])
+                        self.assertTrue(probe["state"])
+                        self.assertIsInstance(probe["params"], dict)
+                        self.assertIn(probe["code"], contract["errors"])
+                        for action in (
+                            *probe.get("before", []),
+                            *probe.get("after", []),
+                        ):
+                            self.assertTrue(action["method"])
+                            self.assertIsInstance(action.get("params", {}), dict)
+
+                    tool = contract["mcp"]["tool"]
+                    self.assertNotIn(tool, tools)
+                    tools.add(tool)
+
+                    properties = contract["params"]["properties"]
+                    renames = contract["mcp"].get("paramRenames", {})
+                    self.assertLessEqual(renames.keys(), properties.keys())
+                    self.assertEqual(
+                        len(renames.values()),
+                        len(set(renames.values())),
+                    )
 
     def _assert_extensions(self, schema: dict[str, Any]) -> None:
         if "x-clamp" in schema:

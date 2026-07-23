@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from bridge_client import BridgeClient, BridgeError, parse_handshake_line  # noqa: E402
 from vc3d_process import VC3DProcess  # noqa: E402
-from viewer_contract_probe import (  # noqa: E402
+from contract_probe import (  # noqa: E402
     load_contract,
     probe_clamps,
     probe_declared_errors,
