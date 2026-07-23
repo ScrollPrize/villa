@@ -12,6 +12,7 @@ from bridge_client import BridgeError
 @dataclass
 class ProbeReport:
     attempted: int = 0
+    skipped: int = 0
     failures: list[str] = field(default_factory=list)
 
     @property
@@ -21,7 +22,10 @@ class ProbeReport:
     @property
     def detail(self) -> str:
         if self.ok:
-            return f"{self.attempted} probes passed"
+            detail = f"{self.attempted - self.skipped} probes passed"
+            if self.skipped:
+                detail += f", {self.skipped} blocked by declared preconditions"
+            return detail
         return f"{len(self.failures)}/{self.attempted} failed: {'; '.join(self.failures[:3])}"
 
 
@@ -140,6 +144,7 @@ def _record_expected_param_error(
     method: str,
     params: dict[str, Any],
     expected_param: str,
+    declared_errors: set[int],
 ) -> None:
     report.attempted += 1
     try:
@@ -148,6 +153,9 @@ def _record_expected_param_error(
             f"{method}.{expected_param}: expected -32602, got {list(result)[:4]}"
         )
     except BridgeError as error:
+        if error.code != -32602 and error.code in declared_errors:
+            report.skipped += 1
+            return
         actual_param = error.data.get("param")
         if error.code != -32602 or actual_param != expected_param:
             report.failures.append(
@@ -163,15 +171,30 @@ def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
     report = ProbeReport()
     for method, method_contract in contract["methods"].items():
         params_schema = method_contract["params"]
+        declared_errors = set(method_contract["errors"])
         for name in params_schema.get("required", []):
             params = _required_params(params_schema)
             params.pop(name)
-            _record_expected_param_error(report, client, method, params, name)
+            _record_expected_param_error(
+                report,
+                client,
+                method,
+                params,
+                name,
+                declared_errors,
+            )
 
         for name, schema in params_schema["properties"].items():
             params = _required_params(params_schema)
             params[name] = _invalid_value(schema)
-            _record_expected_param_error(report, client, method, params, name)
+            _record_expected_param_error(
+                report,
+                client,
+                method,
+                params,
+                name,
+                declared_errors,
+            )
 
         for path, schema in _walk(params_schema, "enum"):
             if not path:
@@ -187,6 +210,7 @@ def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
                 method,
                 params,
                 ".".join(path),
+                declared_errors,
             )
 
         for keyword in ("exclusiveMinimum", "minimum", "maximum", "exclusiveMaximum"):
@@ -207,6 +231,7 @@ def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
                     method,
                     params,
                     ".".join(path),
+                    declared_errors,
                 )
     return report
 
