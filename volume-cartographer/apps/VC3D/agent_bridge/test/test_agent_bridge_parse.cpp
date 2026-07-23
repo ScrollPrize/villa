@@ -16,6 +16,7 @@
 
 #include <opencv2/core.hpp>
 
+#include "agent_bridge/AgentBridgeCommandError.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 
 namespace {
@@ -85,6 +86,22 @@ int main()
 {
     const double kInf = std::numeric_limits<double>::infinity();
     const double kNaN = std::numeric_limits<double>::quiet_NaN();
+
+    expectNoThrow("params<-absent", [&] {
+        CHECK(paramsObject(QJsonValue(QJsonValue::Undefined)).isEmpty());
+    });
+    expectNoThrow("params<-null", [&] {
+        CHECK(paramsObject(QJsonValue(QJsonValue::Null)).isEmpty());
+    });
+    expectNoThrow("params<-object", [&] {
+        CHECK(paramsObject(QJsonObject{{"value", 1}}).value("value").toInt() == 1);
+    });
+    expectParamError("params<-array", "params", [&] {
+        paramsObject(QJsonArray{});
+    });
+    expectParamError("params<-number", "params", [&] {
+        paramsObject(QJsonValue(1));
+    });
 
     // --- jsonRequireNumber: reject non-numbers, accept numbers ---
     expectParamError("number<-string", "amount",
@@ -207,6 +224,31 @@ int main()
         CHECK(v[1] == 2.0f);
         CHECK(v[2] == 3.0f);
     });
+
+    const auto mapLaunchError = [](CommandLaunchError::Kind kind) {
+        return commandLaunchErrorToBridgeError(
+            {kind, QStringLiteral("detail")},
+            QStringLiteral("fallback"),
+            QStringLiteral("segment-1"),
+            QStringLiteral("tool"));
+    };
+    CHECK(mapLaunchError(CommandLaunchError::Other).code == -32005);
+    CHECK(mapLaunchError(CommandLaunchError::InvalidState).code == -32005);
+    const auto segmentError = mapLaunchError(CommandLaunchError::SegmentNotFound);
+    CHECK(segmentError.code == -32007);
+    CHECK(segmentError.data.value("kind").toString() == QLatin1String("segment"));
+    CHECK(segmentError.data.value("id").toString() == QLatin1String("segment-1"));
+    const auto volumeError = mapLaunchError(CommandLaunchError::VolumeNotFound);
+    CHECK(volumeError.code == -32007);
+    CHECK(volumeError.data.value("kind").toString() == QLatin1String("volume"));
+    const auto inputError = mapLaunchError(CommandLaunchError::InputNotFound);
+    CHECK(inputError.code == -32007);
+    CHECK(inputError.data.value("kind").toString() == QLatin1String("file"));
+    CHECK(mapLaunchError(CommandLaunchError::RemoteVolume).code == -32009);
+    CHECK(mapLaunchError(CommandLaunchError::ToolUnavailable).code == -32006);
+    const auto busyError = mapLaunchError(CommandLaunchError::Busy);
+    CHECK(busyError.code == -32004);
+    CHECK(busyError.data.value("source").toString() == QLatin1String("tool"));
 
     if (g_failures == 0) {
         std::printf("PASS: all %d checks in test_agent_bridge_parse\n", g_checks);

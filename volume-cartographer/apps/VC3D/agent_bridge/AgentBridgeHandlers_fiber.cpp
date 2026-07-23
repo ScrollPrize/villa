@@ -458,7 +458,7 @@ QJsonObject AgentBridgeServer::handleFiberSetTag(const QJsonValue& params)
     const QJsonObject p = paramsObject(params);
 
     const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
-    const QString tag = p.value("tag").toString().trimmed();
+    const QString tag = jsonRequireString(p, "tag").trimmed();
     if (tag.isEmpty()) {
         QJsonObject data;
         data["param"] = "tag";
@@ -526,7 +526,7 @@ QJsonObject AgentBridgeServer::handleFiberExport(const QJsonValue& params)
     LineAnnotationController* ctrl = fiberController();
     const QJsonObject p = paramsObject(params);
 
-    const QString pathStr = p.value("path").toString();
+    const QString pathStr = jsonRequireString(p, "path");
     if (pathStr.isEmpty()) {
         QJsonObject data;
         data["param"] = "path";
@@ -564,7 +564,7 @@ QJsonObject AgentBridgeServer::handleFiberImport(const QJsonValue& params)
     LineAnnotationController* ctrl = fiberController();
     const QJsonObject p = paramsObject(params);
 
-    const QString pathStr = p.value("path").toString();
+    const QString pathStr = jsonRequireString(p, "path");
     if (pathStr.isEmpty()) {
         QJsonObject data;
         data["param"] = "path";

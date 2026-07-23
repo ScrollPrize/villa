@@ -195,6 +195,9 @@ Standard JSON-RPC error member: `{"code": <int>, "message": <string>, "data": {.
 | -32009  | UNSUPPORTED          | viewer/target does not support the operation |
 | -32010  | INTERNAL             | unexpected C++ exception; `data.detail` |
 
+`params` may be omitted, null, or an object. Arrays and scalar values are
+rejected with `-32602` and `data.param:"params"` before method dispatch.
+
 ---
 
 ## 3. JSON-RPC method reference

@@ -30,9 +30,15 @@ inline QJsonObject vec3ToJson(const cv::Vec3f& v)
 
 inline QJsonObject paramsObject(const QJsonValue& params)
 {
-    if (params.isObject())
+    if (params.isObject()) {
         return params.toObject();
-    return QJsonObject();
+    }
+    if (params.isUndefined() || params.isNull()) {
+        return {};
+    }
+    QJsonObject data;
+    data["param"] = "params";
+    throw AgentBridgeError{-32602, "params must be an object", data};
 }
 
 // ---------------------------------------------------------------------------

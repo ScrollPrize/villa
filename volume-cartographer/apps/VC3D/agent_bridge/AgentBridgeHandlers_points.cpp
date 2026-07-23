@@ -158,7 +158,7 @@ QJsonObject AgentBridgeServer::handlePointsCommit(const QJsonValue& params)
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QString collection = p.value("collection").toString();
+    const QString collection = jsonRequireString(p, "collection");
     if (collection.isEmpty()) {
         QJsonObject data;
         data["param"] = "collection";

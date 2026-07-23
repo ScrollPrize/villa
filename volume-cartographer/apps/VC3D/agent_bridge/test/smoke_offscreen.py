@@ -84,7 +84,7 @@ def launch(binary: str, name: str, volpkg: str | None = None) -> VC3DProcess:
     )
 
 
-def expect_param_error(client: BridgeClient, method: str, params: dict,
+def expect_param_error(client: BridgeClient, method: str, params: object,
                        expect_param: str) -> tuple[bool, str]:
     """Calls `method`; expects BridgeError(-32602) with data.param == expect_param."""
     try:
@@ -121,6 +121,14 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str) -> None:
     ok, detail = expect_param_error(
         client, "viewer.zoom", {"factor": "abc"}, "factor")
     results.record("c4_zoom_factor_string", ok, detail)
+
+    ok, detail = expect_param_error(
+        client, "volume.open", {"path": 123}, "path")
+    results.record("c4_volume_path_number", ok, detail)
+
+    ok, detail = expect_param_error(
+        client, "state.get", ["not", "an", "object"], "params")
+    results.record("c4_array_params", ok, detail)
 
     # C4: fractional value for an integer param. Offscreen this is gated by the
     # -32000 "no volume package" check before the int parse (see module docstring);

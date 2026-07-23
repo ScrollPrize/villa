@@ -278,7 +278,7 @@ QJsonObject AgentBridgeServer::handleViewerRotate(const QJsonValue& params)
         throw AgentBridgeError{-32000, "Axis-aligned slice controller unavailable", {}};
 
     // Accept "seg xz"/"seg yz" and the "xz"/"yz" shorthands.
-    QString planeRaw = p.value("plane").toString().trimmed().toLower();
+    QString planeRaw = jsonRequireString(p, "plane").trimmed().toLower();
     std::string plane;
     if (planeRaw == "seg xz" || planeRaw == "xz")
         plane = "seg xz";
@@ -287,7 +287,7 @@ QJsonObject AgentBridgeServer::handleViewerRotate(const QJsonValue& params)
     else {
         QJsonObject data;
         data["param"] = "plane";
-        data["value"] = p.value("plane").toString();
+        data["value"] = planeRaw;
         data["allowed"] = QJsonArray{"seg xz", "seg yz"};
         throw AgentBridgeError{-32602,
             "plane must be one of the rotatable axis-aligned planes: \"seg xz\", \"seg yz\"",
@@ -779,7 +779,7 @@ QJsonObject AgentBridgeServer::handleManualAddSetLineMode(const QJsonValue& para
         data["detail"] = "segmentation widget is not available";
         throw AgentBridgeError{-32000, "Segmentation widget unavailable", data};
     }
-    const QString modeStr = p.value("mode").toString();
+    const QString modeStr = jsonRequireString(p, "mode");
     ManualAddTool::LinePreviewMode mode;
     if (modeStr == QLatin1String("vertical"))
         mode = ManualAddTool::LinePreviewMode::VerticalOnly;
@@ -811,7 +811,7 @@ QJsonObject AgentBridgeServer::handleManualAddSetInterpolation(const QJsonValue&
         data["detail"] = "segmentation widget is not available";
         throw AgentBridgeError{-32000, "Segmentation widget unavailable", data};
     }
-    const QString modeStr = p.value("mode").toString();
+    const QString modeStr = jsonRequireString(p, "mode");
     ManualAddTool::InterpolationMode mode;
     if (modeStr == QLatin1String("thin_plate_spline"))
         mode = ManualAddTool::InterpolationMode::ThinPlateSpline;

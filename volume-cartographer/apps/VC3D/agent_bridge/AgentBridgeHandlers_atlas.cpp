@@ -73,7 +73,7 @@ QJsonObject AgentBridgeServer::handleAtlasOpen(const QJsonValue& params)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
     const QJsonObject p = paramsObject(params);
-    const QString atlasDirStr = p.value("atlasDir").toString();
+    const QString atlasDirStr = jsonRequireString(p, "atlasDir");
     if (atlasDirStr.isEmpty()) {
         QJsonObject data;
         data["param"] = "atlasDir";
@@ -153,9 +153,8 @@ QJsonObject AgentBridgeServer::handleAtlasSearchStart(const QJsonValue& params)
     const QJsonObject p = paramsObject(params);
 
     AtlasFiberSearchParams sp;
-    const QString modeStr = p.contains("mode")
-        ? p.value("mode").toString()
-        : QStringLiteral("atlas_to_non_atlas");
+    const QString modeStr = jsonOptionalString(
+        p, "mode", QStringLiteral("atlas_to_non_atlas"));
     if (modeStr == QLatin1String("atlas_to_non_atlas")) {
         sp.searchMode = 0;  // ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS (CWindow.cpp)
     } else if (modeStr == QLatin1String("non_atlas_only")) {

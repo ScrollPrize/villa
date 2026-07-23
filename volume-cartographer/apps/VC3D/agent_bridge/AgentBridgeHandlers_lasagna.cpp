@@ -160,7 +160,7 @@ QJsonObject AgentBridgeServer::handleLasagnaStartOptimization(const QJsonValue& 
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QString modeStr = p.value("mode").toString();
+    const QString modeStr = jsonRequireString(p, "mode");
     SegmentationLasagnaPanel::LasagnaMode mode;
     if (modeStr == QLatin1String("reoptimize"))
         mode = SegmentationLasagnaPanel::ReOptimize;
@@ -306,7 +306,7 @@ QJsonObject AgentBridgeServer::handleLasagnaCancel(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleLasagnaSelectOutputSegment(const QJsonValue& params)
 {
     const QJsonObject p = paramsObject(params);
-    const QString name = p.value("name").toString();
+    const QString name = jsonRequireString(p, "name");
     if (name.isEmpty()) {
         QJsonObject data;
         data["param"] = "name";
@@ -384,7 +384,7 @@ QJsonObject AgentBridgeServer::handleLasagnaRepeatLast(const QJsonValue&)
 QJsonObject AgentBridgeServer::handleWorkspaceSwitch(const QJsonValue& params)
 {
     const QJsonObject p = paramsObject(params);
-    const QString name = p.value("name").toString();
+    const QString name = jsonRequireString(p, "name");
 
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())

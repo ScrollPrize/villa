@@ -60,6 +60,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
 
+#include "agent_bridge/AgentBridgeCommandError.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 
 
@@ -336,6 +337,16 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
         return;
     }
 
+    const QJsonValue params = request.value("params");
+    if (!params.isUndefined() && !params.isNull() && !params.isObject()) {
+        if (!isNotification) {
+            QJsonObject data;
+            data["param"] = "params";
+            sendError(socket, id, -32602, "params must be an object", data);
+        }
+        return;
+    }
+
     auto it = _handlers.find(method);
     if (it == _handlers.end()) {
         if (!isNotification)
@@ -351,7 +362,7 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
 
     QJsonObject result;
     try {
-        result = it.value()(request.value("params"));
+        result = it.value()(params);
     } catch (const AgentBridgeDeferred&) {
         // The handler took ownership of the reply; it will be written later by
         // a signal completion or the timeout (SPEC §8.4). Send nothing now.
@@ -450,32 +461,7 @@ void AgentBridgeServer::broadcastNotification(const QString& method, const QJson
     const QString& segmentId,
     const QString& source)
 {
-    QJsonObject data;
-    data["detail"] = error.message;
-
-    switch (error.kind) {
-    case CommandLaunchError::SegmentNotFound:
-        data["kind"] = "segment";
-        data["id"] = segmentId;
-        throw AgentBridgeError{-32007, "Segment not found", data};
-    case CommandLaunchError::VolumeNotFound:
-        data["kind"] = "volume";
-        throw AgentBridgeError{-32007, "Volume not found", data};
-    case CommandLaunchError::InputNotFound:
-        data["kind"] = "file";
-        throw AgentBridgeError{-32007, "Required input not found", data};
-    case CommandLaunchError::RemoteVolume:
-        throw AgentBridgeError{-32009, "Remote volume not supported", data};
-    case CommandLaunchError::ToolUnavailable:
-        throw AgentBridgeError{-32006, "Command line tool unavailable", data};
-    case CommandLaunchError::Busy:
-        data["source"] = source;
-        throw AgentBridgeError{-32004, "A job is already running", data};
-    case CommandLaunchError::InvalidState:
-    case CommandLaunchError::Other:
-        throw AgentBridgeError{-32005, fallbackMessage, data};
-    }
-    throw AgentBridgeError{-32005, fallbackMessage, data};
+    throw commandLaunchErrorToBridgeError(error, fallbackMessage, segmentId, source);
 }
 
 

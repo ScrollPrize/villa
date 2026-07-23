@@ -336,7 +336,7 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
     const QJsonObject p = paramsObject(params);
-    const QString segmentIdQ = p.value("segmentId").toString();
+    const QString segmentIdQ = jsonRequireString(p, "segmentId");
     if (segmentIdQ.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
@@ -430,7 +430,7 @@ QJsonObject AgentBridgeServer::handleSegmentsFetch(const QJsonValue& params)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
     const QJsonObject p = paramsObject(params);
-    const QString segmentIdQ = p.value("segmentId").toString();
+    const QString segmentIdQ = jsonRequireString(p, "segmentId");
     if (segmentIdQ.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
@@ -667,7 +667,7 @@ QJsonObject AgentBridgeServer::handleCursorVolumePoint(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleVolumeOpen(const QJsonValue& params)
 {
     const QJsonObject p = paramsObject(params);
-    const QString path = p.value("path").toString();
+    const QString path = jsonRequireString(p, "path");
     if (path.isEmpty()) {
         QJsonObject data;
         data["detail"] = "path is required";
@@ -1150,7 +1150,7 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
 QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
 {
     const QJsonObject p = paramsObject(params);
-    const QString sampleId = p.value("sampleId").toString();
+    const QString sampleId = jsonRequireString(p, "sampleId");
     if (sampleId.isEmpty()) {
         QJsonObject data;
         data["param"] = "sampleId";
@@ -1488,7 +1488,7 @@ QJsonObject AgentBridgeServer::handleCatalogListSamples(const QJsonValue& params
 QJsonObject AgentBridgeServer::handleCatalogDescribeSample(const QJsonValue& params)
 {
     const QJsonObject p = paramsObject(params);
-    const QString sampleId = p.value("sampleId").toString();
+    const QString sampleId = jsonRequireString(p, "sampleId");
     if (sampleId.isEmpty()) {
         QJsonObject data;
         data["param"] = "sampleId";
@@ -1573,7 +1573,7 @@ QJsonObject AgentBridgeServer::handleVolumeSelect(const QJsonValue& params)
     if (!state || !state->hasVpkg() || !vpkg)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QString volumeIdQ = p.value("volumeId").toString();
+    const QString volumeIdQ = jsonRequireString(p, "volumeId");
     if (volumeIdQ.isEmpty()) {
         QJsonObject data;
         data["param"] = "volumeId";

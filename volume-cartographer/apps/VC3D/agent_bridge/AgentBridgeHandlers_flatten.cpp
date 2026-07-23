@@ -124,7 +124,7 @@ QJsonObject AgentBridgeServer::handleFlattenSlim(const QJsonValue& params)
     if (!state->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    const QString segmentId = p.value("segmentId").toString();
+    const QString segmentId = jsonRequireString(p, "segmentId");
     if (segmentId.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
@@ -154,7 +154,7 @@ QJsonObject AgentBridgeServer::handleFlattenSlim(const QJsonValue& params)
         }
     }
     if (p.contains("energyType") && !p.value("energyType").isNull()) {
-        const QString e = p.value("energyType").toString();
+        const QString e = jsonRequireString(p, "energyType");
         if (e != QLatin1String("symmetric_dirichlet") && e != QLatin1String("conformal")) {
             QJsonObject data; data["param"] = "energyType";
             data["detail"] = "energyType must be \"symmetric_dirichlet\" or \"conformal\"";
@@ -200,7 +200,7 @@ QJsonObject AgentBridgeServer::handleFlattenAbf(const QJsonValue& params)
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QString segmentId = p.value("segmentId").toString();
+    const QString segmentId = jsonRequireString(p, "segmentId");
     if (segmentId.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
@@ -246,7 +246,7 @@ QJsonObject AgentBridgeServer::handleFlattenStraighten(const QJsonValue& params)
     if (!state->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    const QString segmentId = p.value("segmentId").toString();
+    const QString segmentId = jsonRequireString(p, "segmentId");
     if (segmentId.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";

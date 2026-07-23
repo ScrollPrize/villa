@@ -3269,7 +3269,7 @@ bool SegmentationCommandHandler::startGrowPatchFromSeed(const QVector3D& seedPoi
     }
     if (normalGridPath.isEmpty()) {
         return fail(tr("No normal grid is available for GrowPatch."),
-                    CommandLaunchError::InputNotFound);
+                    CommandLaunchError::InvalidState);
     }
 
     QString volpkgRoot = _state->vpkgPath();

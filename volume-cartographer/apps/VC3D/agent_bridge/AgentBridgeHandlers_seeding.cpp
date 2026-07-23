@@ -91,13 +91,13 @@ QJsonObject AgentBridgeServer::handleTagsSet(const QJsonValue& params)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
     const QJsonObject p = paramsObject(params);
-    const QString segmentIdQ = p.value("segmentId").toString();
+    const QString segmentIdQ = jsonRequireString(p, "segmentId");
     if (segmentIdQ.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
         throw AgentBridgeError{-32602, "segmentId is required", data};
     }
-    const QString tagStr = p.value("tag").toString();
+    const QString tagStr = jsonRequireString(p, "tag");
     if (!p.contains("enabled") || !p.value("enabled").isBool()) {
         QJsonObject data;
         data["param"] = "enabled";
@@ -466,7 +466,7 @@ QJsonObject AgentBridgeServer::handlePushPullStart(const QJsonValue& params)
     }
 
     const QJsonObject p = paramsObject(params);
-    const QString dirStr = p.value("direction").toString();
+    const QString dirStr = jsonRequireString(p, "direction");
     int direction = 0;
     if (dirStr == QLatin1String("push"))
         direction = 1;
@@ -530,7 +530,7 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QString segmentIdQ = p.value("segmentId").toString();
+    const QString segmentIdQ = jsonRequireString(p, "segmentId");
     if (segmentIdQ.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
@@ -612,7 +612,7 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
     if (!state->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    const QString segmentIdQ = p.value("segmentId").toString();
+    const QString segmentIdQ = jsonRequireString(p, "segmentId");
     if (segmentIdQ.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
@@ -623,7 +623,7 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
 
     // outputFormat: required; the headline new capability over the GUI (which is
     // hardcoded to a per-slice TIFF stack).
-    const QString outputFormat = p.value("outputFormat").toString();
+    const QString outputFormat = jsonRequireString(p, "outputFormat");
     if (outputFormat == QLatin1String("zarr")) {
         rp.outputFormat = CommandLineToolRunner::RenderOutputFormat::Zarr;
     } else if (outputFormat == QLatin1String("tif_stack")) {

@@ -62,6 +62,7 @@ set(srcs
     AtlasControlPointsDock.cpp
     AtlasControlPointsDock.hpp
     AtlasControlPointsTypes.hpp
+    CommandLaunchError.hpp
     SegmentationCommandHandler.cpp
     SegmentationCommandHandler.hpp
     volume_viewers/annotation_tools/SameWrapAnnotationTool.cpp
@@ -225,6 +226,7 @@ set(srcs
     volume_viewers/CChunkedVolumeViewer.hpp
     agent_bridge/AgentBridgeServer.cpp
     agent_bridge/AgentBridgeServer.hpp
+    agent_bridge/AgentBridgeCommandError.hpp
     agent_bridge/AgentBridgeInternal.hpp
     agent_bridge/AgentBridgeJobs.cpp
     agent_bridge/AgentBridgeHandlers_session.cpp

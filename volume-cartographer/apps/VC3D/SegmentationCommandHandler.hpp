@@ -15,6 +15,7 @@
 #include <QVector3D>
 
 #include "elements/VolumeSelector.hpp"
+#include "CommandLaunchError.hpp"
 // Full definition needed: RenderSegmentParams stores a
 // CommandLineToolRunner::RenderOutputFormat (nested enum) by value.
 #include "CommandLineToolRunner.hpp"
@@ -26,22 +27,6 @@ class SegmentationGrower;
 class QuadSurface;
 class QWidget;
 class QFileInfo;
-
-struct CommandLaunchError {
-    enum Kind {
-        Other,
-        InvalidState,
-        SegmentNotFound,
-        VolumeNotFound,
-        InputNotFound,
-        RemoteVolume,
-        ToolUnavailable,
-        Busy,
-    };
-
-    Kind kind{Other};
-    QString message;
-};
 
 /**
  * SegmentationCommandHandler
