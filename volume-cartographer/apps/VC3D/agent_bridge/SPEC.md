@@ -107,12 +107,14 @@ complete. The full unfiltered response is required to report complete coverage.
 
 `rpc_description.json` is a generated snapshot of the live descriptions, not a
 hand-authored contract. The offscreen smoke test checks it against the compiled binary and
-the host-side MCP suite consumes it for input-schema parity. Regenerate it after changing a
-description with:
+the host-side MCP suite consumes it for input-schema parity. The build tree and Qt runtime
+live in the `vc3d-bridge` container, so regenerate the snapshot there after changing a
+description:
 
 ```
-QT_QPA_PLATFORM=offscreen python3 apps/VC3D/agent_bridge/test/smoke_offscreen.py \
-  --vc3d build/ci-release-gcc/bin/VC3D --update-description-snapshot
+docker exec vc3d-bridge bash -lc 'cd /work && QT_QPA_PLATFORM=offscreen python3 \
+  apps/VC3D/agent_bridge/test/smoke_offscreen.py \
+  --vc3d build/ci-release-gcc/bin/VC3D --update-description-snapshot'
 ```
 
 ### 2.1 Coordinate spaces
