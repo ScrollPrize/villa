@@ -52,7 +52,9 @@ public:
     void updateRecentVolpkgList(const QString& path);
     void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
-    void openVolpkgAt(const QString& path);
+    bool openVolpkgAt(const QString& path,
+                      bool interactive = true,
+                      QString* errorMessage = nullptr);
     void showOpenDataCatalog();
     bool isOpenDataCatalogVisible() const;
     // Headless twin of double-clicking a catalog sample; resolves `sampleId` against the

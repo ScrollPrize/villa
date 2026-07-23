@@ -180,6 +180,10 @@ public:
                      RenderBenchOptions benchOptions = {});
     ~CWindow(void);
 
+    bool openVolumePackage(const QString& path,
+                           bool interactive = true,
+                           QString* errorMessage = nullptr);
+
     // Helper method to get the current volume path
     QString getCurrentVolumePath() const;
     VCCollection* pointCollection() { return _state->pointCollection(); }
@@ -259,9 +263,13 @@ private:
 
     void setWidgetsEnabled(bool state);
 
-    bool InitializeVolumePkg(const std::string& nVpkgPath);
+    bool InitializeVolumePkg(const std::string& nVpkgPath,
+                             bool interactive = true,
+                             QString* errorMessage = nullptr);
 
-    void OpenVolume(const QString& path);
+    bool OpenVolume(const QString& path,
+                    bool interactive = true,
+                    QString* errorMessage = nullptr);
     void CloseVolume(void);
 
 

@@ -93,8 +93,7 @@ priority order:
    `--launch <path>`, else the `VC3D_BINARY` env var, else the repo-root build
    `build-macos/bin/VC3D`; the fallback is used only if it names a real,
    executable file. Pass `--volpkg <path>` to have the launched VC3D preload a
-   volume package (forwarded as `--load-first`) so the agent's first action need
-   not be opening one.
+   volume package so the agent's first action need not be opening one.
 4. Otherwise the server exits with status 2 and a stderr message explaining all
    three options above.
 

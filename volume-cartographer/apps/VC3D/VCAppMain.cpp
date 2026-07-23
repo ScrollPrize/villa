@@ -239,6 +239,12 @@ auto main(int argc, char* argv[]) -> int
         "folder");
     parser.addOption(loadFirstOption);
 
+    QCommandLineOption volumePackageOption(
+        "volpkg",
+        "Open a volume package at startup.",
+        "path");
+    parser.addOption(volumePackageOption);
+
     QCommandLineOption debugOption(
         "debug",
         "Enable verbose diagnostic logging while loading surfaces.");
@@ -401,6 +407,18 @@ auto main(int argc, char* argv[]) -> int
     int rc = 0;
     {
         CWindow aWin(cacheSizeGB, benchOptions);
+
+        if (parser.isSet(volumePackageOption)) {
+            QString errorMessage;
+            if (!aWin.openVolumePackage(parser.value(volumePackageOption).trimmed(),
+                                        false,
+                                        &errorMessage)) {
+                std::cerr << "Error: " << errorMessage.toStdString() << std::endl;
+                std::cout.flush();
+                std::cerr.flush();
+                std::_Exit(2);
+            }
+        }
 
         // Agent bridge (opt-in, off by default). Constructed only when a bridge
         // flag is present, so normal runs pay zero cost and open no socket.

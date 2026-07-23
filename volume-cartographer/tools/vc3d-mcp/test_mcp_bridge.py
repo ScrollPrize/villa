@@ -1198,6 +1198,14 @@ class RegistryDiscoveryTest(unittest.TestCase):
         self.assertFalse(os.path.exists(bad_file), "malformed registry file should be removed")
 
 
+class AutoLaunchTest(unittest.TestCase):
+    def test_volume_package_uses_its_own_cli_option(self) -> None:
+        self.assertEqual(
+            server_module._launch_command("/tmp/VC3D", "/tmp/demo.volpkg.json"),
+            ["/tmp/VC3D", "--agent-bridge", "--volpkg", "/tmp/demo.volpkg.json"],
+        )
+
+
 class NewTailLinesTest(unittest.TestCase):
     """_new_tail_lines: which consoleTail lines are new versus already seen."""
 

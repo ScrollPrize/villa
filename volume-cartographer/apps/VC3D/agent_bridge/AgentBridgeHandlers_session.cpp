@@ -680,15 +680,16 @@ QJsonObject AgentBridgeServer::handleVolumeOpen(const QJsonValue& params)
         throw AgentBridgeError{-32010, "Internal error", data};
     }
 
-    mc->openVolpkgAt(path);
-
-    CState* state = _window->_state;
-    if (!state || !state->hasVpkg()) {
+    QString errorMessage;
+    if (!mc->openVolpkgAt(path, false, &errorMessage)) {
         QJsonObject data;
-        data["detail"] = QStringLiteral("failed to open volume package at %1").arg(path);
+        data["detail"] = errorMessage.isEmpty()
+            ? QStringLiteral("failed to open volume package at %1").arg(path)
+            : errorMessage;
         throw AgentBridgeError{-32005, "Volume package load failed", data};
     }
 
+    CState* state = _window->_state;
     auto vpkg = state->vpkg();
     const auto ids = vpkg->volumeIDs();
 

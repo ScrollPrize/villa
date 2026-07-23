@@ -141,6 +141,23 @@ def check_c4(client: BridgeClient, results: Results) -> None:
     except Exception as e:  # noqa: BLE001
         results.record("c4_no_corruption_state_get", False, f"{type(e).__name__}: {e}")
 
+    # Project-open failures must return over the bridge instead of opening a
+    # modal warning that blocks the offscreen process indefinitely.
+    try:
+        client.call(
+            "volume.open",
+            {"path": "/vc3d-smoke/does-not-exist.volpkg.json"},
+            timeout=10.0,
+        )
+        results.record("volume_open_failure_is_headless", False,
+                       "expected a bridge error, got a result")
+    except BridgeError as e:
+        results.record("volume_open_failure_is_headless", e.code == -32005,
+                       f"returned code={e.code} without blocking")
+    except Exception as e:  # noqa: BLE001
+        results.record("volume_open_failure_is_headless", False,
+                       f"unexpected {type(e).__name__}: {e}")
+
 
 def check_c2_oversized(sock_path: str, results: Results) -> None:
     """Send a single unterminated line > 1 MiB; the server must drop that socket

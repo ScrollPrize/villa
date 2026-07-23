@@ -389,15 +389,18 @@ void MenuActionController::openRecentVolpkg()
     }
 }
 
-void MenuActionController::openVolpkgAt(const QString& path)
+bool MenuActionController::openVolpkgAt(const QString& path,
+                                        bool interactive,
+                                        QString* errorMessage)
 {
     if (!_window) {
-        return;
+        if (errorMessage) {
+            *errorMessage = QObject::tr("Main window is not available.");
+        }
+        return false;
     }
 
-    _window->CloseVolume();
-    _window->OpenVolume(path);
-    _window->UpdateView();
+    return _window->openVolumePackage(path, interactive, errorMessage);
 }
 
 // --- Remote recents management ---

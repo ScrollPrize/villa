@@ -59,6 +59,13 @@ def resolve_launch_binary(explicit: str | None) -> str | None:
     return None
 
 
+def _launch_command(binary: str, volpkg: str | None) -> list[str]:
+    command = [binary, "--agent-bridge"]
+    if volpkg:
+        command += ["--volpkg", volpkg]
+    return command
+
+
 def launch_vc3d(
     binary: str,
     volpkg: str | None = None,
@@ -83,14 +90,8 @@ def launch_vc3d(
     """
     global _launched_process
 
-    args = [binary, "--agent-bridge"]
-    if volpkg:
-        # SPEC: forwarded to VC3D as --load-first so the agent doesn't have to
-        # open a volume as its first action.
-        args += ["--load-first", volpkg]
-
     proc = subprocess.Popen(
-        args,
+        _launch_command(binary, volpkg),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,  # keep diagnostics; drained below
         text=True,
@@ -250,7 +251,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional volume-package path forwarded to an auto-launched VC3D as "
-            "--load-first, so the agent's first action need not be opening a "
+            "--volpkg, so the agent's first action need not be opening a "
             "volume. Only used on the auto-launch path."
         ),
     )

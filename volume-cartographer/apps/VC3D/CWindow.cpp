@@ -8899,7 +8899,9 @@ void CWindow::setWidgetsEnabled(bool state)
     }
 }
 
-auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
+auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath,
+                                  bool interactive,
+                                  QString* errorMessage) -> bool
 {
     _state->setVpkg(nullptr);
     updateNormalGridAvailability();
@@ -8917,18 +8919,27 @@ auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
         _segmentationWidget->setVolumePackagePath(QString());
     }
 
+    QString loadError;
     try {
         _state->setVpkg(VolumePkg::load(nVpkgPath));
     } catch (const std::exception& e) {
         Logger()->error("Failed to initialize volpkg: {}", e.what());
+        loadError = QString::fromUtf8(e.what());
     }
 
     if (_state->vpkg() == nullptr) {
         Logger()->error("Cannot open project: {}", nVpkgPath);
-        QMessageBox::warning(
-            this, "Error",
-            "Project failed to load. Falling back to a new blank project.");
-        _state->setVpkg(VolumePkg::newEmpty());
+        if (errorMessage) {
+            *errorMessage = loadError.isEmpty()
+                ? tr("Project failed to load.")
+                : tr("Project failed to load: %1").arg(loadError);
+        }
+        if (interactive) {
+            QMessageBox::warning(
+                this, "Error",
+                "Project failed to load. Falling back to a new blank project.");
+            _state->setVpkg(VolumePkg::newEmpty());
+        }
         return false;
     }
     return true;
@@ -9067,24 +9078,33 @@ void CWindow::onSharedCacheStatsChanged(const QStringList& items)
 }
 
 // Open volume package
-void CWindow::OpenVolume(const QString& path)
+bool CWindow::OpenVolume(const QString& path, bool interactive, QString* errorMessage)
 {
+    if (errorMessage) {
+        errorMessage->clear();
+    }
     QString aVpkgPath = path;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     if (aVpkgPath.isEmpty()) {
+        if (!interactive) {
+            if (errorMessage) {
+                *errorMessage = tr("Project path is empty.");
+            }
+            return false;
+        }
         aVpkgPath = QFileDialog::getOpenFileName(
             this, tr("Open Project"), settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
             tr("Project (*.volpkg.json);;All files (*.*)"),
             nullptr, QFileDialog::DontResolveSymlinks | QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
         if (aVpkgPath.isEmpty()) {
             Logger()->info("Open project canceled");
-            return;
+            return false;
         }
     }
 
-    if (!InitializeVolumePkg(aVpkgPath.toStdString())) {
-        return;
+    if (!InitializeVolumePkg(aVpkgPath.toStdString(), interactive, errorMessage)) {
+        return false;
     }
 
     // Check version number
@@ -9094,10 +9114,15 @@ void CWindow::OpenVolume(const QString& path)
                          " but this program requires version " +
                          std::to_string(VOLPKG_MIN_VERSION) + "+.";
         Logger()->error(msg);
-        QMessageBox::warning(this, tr("ERROR"), QString(msg.c_str()));
+        if (errorMessage) {
+            *errorMessage = QString::fromStdString(msg);
+        }
+        if (interactive) {
+            QMessageBox::warning(this, tr("ERROR"), QString::fromStdString(msg));
+        }
         _state->setVpkg(nullptr);
         updateNormalGridAvailability();
-        return;
+        return false;
     }
 
     refreshCurrentVolumePackageUi(QString(), true);
@@ -9108,6 +9133,17 @@ void CWindow::OpenVolume(const QString& path)
     if (_fileWatcher) {
         _fileWatcher->startWatching();
     }
+    return true;
+}
+
+bool CWindow::openVolumePackage(const QString& path,
+                                bool interactive,
+                                QString* errorMessage)
+{
+    CloseVolume();
+    const bool opened = OpenVolume(path, interactive, errorMessage);
+    UpdateView();
+    return opened;
 }
 
 std::vector<QComboBox*> CWindow::volumeSelectionControls() const
