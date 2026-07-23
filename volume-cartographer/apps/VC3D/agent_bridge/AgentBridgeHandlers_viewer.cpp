@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <memory>
 #include <set>
-#include <stdexcept>
 #include <string>
 
 #include "CState.hpp"
@@ -111,9 +110,8 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
         std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
         if (!state || !state->hasVpkg() || !vpkg)
             throw AgentBridgeError{-32000, "No volume package loaded", {}};
-        try {
-            overlayVolume = vpkg->volume(volumeId.toStdString());
-        } catch (const std::out_of_range&) {
+        overlayVolume = vpkg->volume(volumeId.toStdString());
+        if (!overlayVolume) {
             QJsonObject data;
             data["kind"] = "volume";
             data["id"] = volumeId;

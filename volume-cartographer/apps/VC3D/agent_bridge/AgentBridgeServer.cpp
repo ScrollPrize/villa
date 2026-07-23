@@ -559,6 +559,9 @@ QString AgentBridgeServer::viewerTitle(VolumeViewerBase* viewer) const
 VolumeViewerBase* AgentBridgeServer::resolveViewer(const QJsonValue& ref,
                                                    const QString& defaultSlot) const
 {
+    if (!ref.isUndefined() && !ref.isNull() && !ref.isString())
+        throwParamError("viewer", QStringLiteral("must be a string"));
+
     QString key = ref.isString() ? ref.toString() : QString();
     if (key.isEmpty())
         key = defaultSlot;
