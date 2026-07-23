@@ -63,16 +63,25 @@
 
 // ---------------------------------------------------------------------------
 // Line-annotation / fiber RPCs (SPEC §13)
-//
-// All handlers rely on LineAnnotationController running with error dialogs
-// suppressed (set in the constructor): the controller's public API reports
-// most failures through showError(), which in headless mode records the
-// message instead of raising a QMessageBox. Handlers clear the recorded
-// message before a call (takeLastSuppressedError) and turn any message
-// recorded during the call into a structured -32005 error.
 // ---------------------------------------------------------------------------
 
 namespace {
+
+template <typename Operation>
+QString captureFiberError(LineAnnotationController* controller, Operation&& operation)
+{
+    controller->setErrorDialogsSuppressed(true);
+    (void)controller->takeLastSuppressedError();
+    try {
+        operation();
+    } catch (...) {
+        controller->setErrorDialogsSuppressed(false);
+        throw;
+    }
+    const QString error = controller->takeLastSuppressedError();
+    controller->setErrorDialogsSuppressed(false);
+    return error;
+}
 
 // Parses a fiber id param: a decimal string (the canonical wire form — uint64
 // ids serialize as strings, SPEC §13.2) or a non-negative integer number.
@@ -199,9 +208,9 @@ QJsonObject AgentBridgeServer::handleFiberLaunch(const QJsonValue& params)
     }
 
     const bool replaceOwning = jsonOptionalBool(p, "replaceOwning", true);
-    (void)ctrl->takeLastSuppressedError();
-    ctrl->launchFromViewerAtPoint(chunked, scenePos, replaceOwning);
-    const QString err = ctrl->takeLastSuppressedError();
+    const QString err = captureFiberError(ctrl, [&] {
+        ctrl->launchFromViewerAtPoint(chunked, scenePos, replaceOwning);
+    });
     if (!err.isEmpty()) {
         QJsonObject data;
         data["detail"] = err;
@@ -294,39 +303,40 @@ QJsonObject AgentBridgeServer::handleFiberOpen(const QJsonValue& params)
         return static_cast<int>(d);
     };
 
-    (void)ctrl->takeLastSuppressedError();
-    if (p.contains("controlPointIndex")) {
-        ctrl->openFiberAtControlPoint(fiberId, readIndex("controlPointIndex"));
-    } else if (p.contains("linePointIndex")) {
-        ctrl->openFiberAtLinePointIndex(fiberId, readIndex("linePointIndex"));
-    } else if (p.contains("span")) {
-        const QJsonValue sv = p.value("span");
-        if (!sv.isArray() || sv.toArray().size() != 2) {
-            QJsonObject data;
-            data["param"] = "span";
-            throw AgentBridgeError{-32602, "span must be [firstControlIndex, secondControlIndex]", data};
-        }
-        const QJsonArray sa = sv.toArray();
-        auto readSpanIndex = [&](const QJsonValue& v, const char* which) -> int {
-            const double d = v.toDouble(std::numeric_limits<double>::quiet_NaN());
-            if (!v.isDouble() || !std::isfinite(d) || std::floor(d) != d || d < 0 ||
-                d > static_cast<double>(std::numeric_limits<int>::max())) {
+    const QString err = captureFiberError(ctrl, [&] {
+        if (p.contains("controlPointIndex")) {
+            ctrl->openFiberAtControlPoint(fiberId, readIndex("controlPointIndex"));
+        } else if (p.contains("linePointIndex")) {
+            ctrl->openFiberAtLinePointIndex(fiberId, readIndex("linePointIndex"));
+        } else if (p.contains("span")) {
+            const QJsonValue sv = p.value("span");
+            if (!sv.isArray() || sv.toArray().size() != 2) {
                 QJsonObject data;
                 data["param"] = "span";
-                data["detail"] = QStringLiteral("%1 span index must be a non-negative integer")
-                                     .arg(QLatin1String(which));
-                throw AgentBridgeError{-32602, "Invalid span", data};
+                throw AgentBridgeError{
+                    -32602, "span must be [firstControlIndex, secondControlIndex]", data};
             }
-            return static_cast<int>(d);
-        };
-        ctrl->openFiberSpan(fiberId,
-                            readSpanIndex(sa.at(0), "first"),
-                            readSpanIndex(sa.at(1), "second"));
-    } else {
-        ctrl->openFiber(fiberId);
-    }
-
-    const QString err = ctrl->takeLastSuppressedError();
+            const QJsonArray sa = sv.toArray();
+            auto readSpanIndex = [&](const QJsonValue& v, const char* which) -> int {
+                const double d = v.toDouble(std::numeric_limits<double>::quiet_NaN());
+                if (!v.isDouble() || !std::isfinite(d) || std::floor(d) != d || d < 0 ||
+                    d > static_cast<double>(std::numeric_limits<int>::max())) {
+                    QJsonObject data;
+                    data["param"] = "span";
+                    data["detail"] =
+                        QStringLiteral("%1 span index must be a non-negative integer")
+                            .arg(QLatin1String(which));
+                    throw AgentBridgeError{-32602, "Invalid span", data};
+                }
+                return static_cast<int>(d);
+            };
+            ctrl->openFiberSpan(fiberId,
+                                readSpanIndex(sa.at(0), "first"),
+                                readSpanIndex(sa.at(1), "second"));
+        } else {
+            ctrl->openFiber(fiberId);
+        }
+    });
     if (!err.isEmpty()) {
         QJsonObject data;
         data["detail"] = err;
@@ -371,23 +381,24 @@ QJsonObject AgentBridgeServer::handleFiberSetFollow(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleFiberSave(const QJsonValue&)
 {
     LineAnnotationController* ctrl = fiberController();
-
-    (void)ctrl->takeLastSuppressedError();
-    // Headless split (SPEC §13.5 as-built): the interactive saveOpenFibers()
-    // ends in waitForFiberSaves(), which spins a nested QEventLoop — forbidden
-    // here (§1.3). The headless variant schedules the same saves; they
-    // complete asynchronously on the fiber-save watcher.
-    ctrl->saveOpenFibersHeadless();
-    const QString err = ctrl->takeLastSuppressedError();
-    if (!err.isEmpty()) {
-        QJsonObject data;
-        data["detail"] = err;
-        throw AgentBridgeError{-32005, "fiber.save failed", data};
-    }
-
-    QJsonObject result;
-    result["saved"] = true;
-    return result;
+    const int token = beginDeferred(120000, "fiber saves");
+    QPointer<AgentBridgeServer> self(this);
+    ctrl->saveOpenFibersHeadless(
+        [self, token](bool success, const QString& error) {
+            if (!self) {
+                return;
+            }
+            if (success) {
+                QJsonObject result;
+                result["saved"] = true;
+                self->completeDeferredResult(token, result);
+                return;
+            }
+            QJsonObject data;
+            data["detail"] = error;
+            self->completeDeferredError(token, -32005, "fiber.save failed", data);
+        });
+    throw AgentBridgeDeferred{};
 }
 
 
@@ -411,9 +422,7 @@ QJsonObject AgentBridgeServer::handleFiberDelete(const QJsonValue& params)
     for (uint64_t id : ids)
         requireKnownFiber(ctrl, id);
 
-    (void)ctrl->takeLastSuppressedError();
-    ctrl->deleteFibers(ids);
-    const QString err = ctrl->takeLastSuppressedError();
+    const QString err = captureFiberError(ctrl, [&] { ctrl->deleteFibers(ids); });
 
     // Determine what actually got removed (deleteFibers continues past
     // per-file failures).
@@ -464,9 +473,8 @@ QJsonObject AgentBridgeServer::handleFiberSetTag(const QJsonValue& params)
 
     requireKnownFiber(ctrl, fiberId);
 
-    (void)ctrl->takeLastSuppressedError();
-    ctrl->setFiberTag(fiberId, tag, ev.toBool());
-    const QString err = ctrl->takeLastSuppressedError();
+    const QString err = captureFiberError(
+        ctrl, [&] { ctrl->setFiberTag(fiberId, tag, ev.toBool()); });
     if (!err.isEmpty()) {
         QJsonObject data;
         data["detail"] = err;

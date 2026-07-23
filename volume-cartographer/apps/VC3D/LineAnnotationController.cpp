@@ -143,6 +143,7 @@ struct LineAnnotationController::LineAnnotationSession {
     vc::atlas::AtlasPredSnapSet predSnapSet;
     bool suppressFiberSave = false;
     bool suppressGeneratedViews = false;
+    bool suppressErrorDialogs = false;
     LineAnnotationController::SessionOptimizationState optimizationState =
         LineAnnotationController::SessionOptimizationState::Unoptimized;
     LineAnnotationController::SessionOptimizationState pendingOptimizationState =
@@ -1954,6 +1955,7 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     if (!_state || !session) {
         return false;
     }
+    session->suppressErrorDialogs = _errorDialogsSuppressed;
     if (!prepareForUserFacingLineAnnotationOpen()) {
         return false;
     }
@@ -2151,6 +2153,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     }
 
     auto session = std::make_shared<LineAnnotationSession>();
+    session->suppressErrorDialogs = _errorDialogsSuppressed;
     session->fiberId = it->id;
     session->fiberUsername = it->username;
     session->fiberStartedAt = it->startedAt;
@@ -4645,13 +4648,21 @@ void LineAnnotationController::saveOpenFibers()
     waitForFiberSaves();
 }
 
-void LineAnnotationController::saveOpenFibersHeadless()
+void LineAnnotationController::saveOpenFibersHeadless(FiberSaveCompletion onFinished)
 {
-    // Agent bridge (SPEC §13.5): same scheduling as saveOpenFibers but without
-    // waitForFiberSaves(), which spins a nested QEventLoop (forbidden in
-    // bridge handlers, SPEC §1.3). The scheduled saves complete asynchronously
-    // through the fiber-save watcher on the main event loop.
-    saveOpenFibersCore();
+    auto batch = std::make_shared<FiberSaveBatch>();
+    batch->completion = std::move(onFinished);
+    _activeFiberSaveBatch = batch;
+    try {
+        saveOpenFibersCore();
+    } catch (const std::exception& ex) {
+        batch->errors.push_back(QString::fromUtf8(ex.what()));
+    }
+    _activeFiberSaveBatch.reset();
+    batch->scheduling = false;
+    if (batch->pendingJobs == 0 && batch->completion) {
+        batch->completion(batch->errors.isEmpty(), batch->errors.join('\n'));
+    }
 }
 
 LineAnnotationDialog* LineAnnotationController::mostRecentLineAnnotationDialog() const
@@ -5859,8 +5870,9 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
 
 bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& session)
 {
+    const bool headless = session.suppressErrorDialogs || _errorDialogsSuppressed;
     if (!_state || !_state->vpkg()) {
-        showError(tr("No volume package loaded."));
+        showError(tr("No volume package loaded."), headless);
         return false;
     }
 
@@ -5879,7 +5891,8 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         }
     } catch (const std::exception& ex) {
         showError(tr("Cannot resolve Lasagna for the active volume: %1")
-                      .arg(QString::fromStdString(ex.what())));
+                      .arg(QString::fromStdString(ex.what())),
+                  headless);
         return false;
     }
 
@@ -5889,12 +5902,12 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
             : vpkg->path().parent_path();
         // Suppressed (agent bridge, SPEC §1.3): never open the dataset-picker
         // QFileDialog; fail as if the user cancelled, recording the reason.
-        auto picked = (_datasetPicker && !_errorDialogsSuppressed)
+        auto picked = (_datasetPicker && !headless)
             ? _datasetPicker(_parentWidget, startDir)
             : std::optional<std::string>{};
         if (!picked || picked->empty()) {
-            if (_errorDialogsSuppressed) {
-                showError(tr("No Lasagna dataset is selected for the active volume."));
+            if (headless) {
+                showError(tr("No Lasagna dataset is selected for the active volume."), true);
             }
             return false;
         }
@@ -5908,7 +5921,8 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
             session.dataset = std::move(dataset);
             session.normalSampler = std::move(sampler);
         } catch (const std::exception& ex) {
-            showError(tr("Invalid Lasagna dataset: %1").arg(QString::fromStdString(ex.what())));
+            showError(tr("Invalid Lasagna dataset: %1").arg(QString::fromStdString(ex.what())),
+                      headless);
             return false;
         }
         vpkg->setSelectedLasagnaDataset(selected);
@@ -5924,7 +5938,8 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
                 session.normalSampler = std::move(sampler);
             } catch (const std::exception& ex) {
                 showError(tr("Invalid selected Lasagna dataset: %1")
-                              .arg(QString::fromStdString(ex.what())));
+                              .arg(QString::fromStdString(ex.what())),
+                          headless);
                 return false;
             }
         }
@@ -5972,7 +5987,8 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
         session.taskState = LineAnnotationSession::TaskState::Failed;
         session.error = task.error;
         showError(tr("Lasagna line optimization failed: %1")
-                      .arg(QString::fromStdString(task.error)));
+                      .arg(QString::fromStdString(task.error)),
+                  session.suppressErrorDialogs);
         return false;
     }
 
@@ -6074,7 +6090,8 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
         return false;
     }
     if (!session.normalSampler) {
-        showError(tr("Could not run final line optimization: no Lasagna dataset is loaded."));
+        showError(tr("Could not run final line optimization: no Lasagna dataset is loaded."),
+                  session.suppressErrorDialogs);
         return false;
     }
 
@@ -6388,7 +6405,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
 {
     if (!_state) {
         session.error = "No active application state.";
-        showError(tr("Could not create line annotation views: no active application state."));
+        showError(tr("Could not create line annotation views: no active application state."),
+                  session.suppressErrorDialogs);
         return false;
     }
 
@@ -6398,7 +6416,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     } catch (const std::exception& ex) {
         session.error = ex.what();
         showError(tr("Could not create line annotation views: %1")
-                      .arg(QString::fromStdString(session.error)));
+                      .arg(QString::fromStdString(session.error)),
+                  session.suppressErrorDialogs);
         return false;
     }
 
@@ -6512,7 +6531,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         }
         session.generatedSurfaceNames.clear();
         session.error = "Failed to create generated annotation viewers.";
-        showError(tr("Could not create generated line annotation viewers."));
+        showError(tr("Could not create generated line annotation viewers."),
+                  session.suppressErrorDialogs);
         return false;
     }
     if (session.fiberId != 0 &&
@@ -8957,7 +8977,8 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
                     snapshots.push_back(makeFiberSaveSnapshot(*linkedIt));
                 }
             }
-            scheduleFiberSaveSnapshots(std::move(snapshots));
+            scheduleFiberSaveSnapshots(std::move(snapshots),
+                                       !session.suppressErrorDialogs);
         }
         invalidateFiberAlignmentMetrics(savedFiberId, true);
         addKnownFiberTags(session.fiberTags);
@@ -9312,7 +9333,9 @@ void LineAnnotationController::scheduleFiberPairSave(const StoredFiber& first,
     scheduleFiberSaveSnapshots(std::move(snapshots));
 }
 
-void LineAnnotationController::scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots)
+void LineAnnotationController::scheduleFiberSaveSnapshots(
+    std::vector<FiberSaveSnapshot> snapshots,
+    bool showErrors)
 {
     if (snapshots.empty()) {
         return;
@@ -9333,11 +9356,21 @@ void LineAnnotationController::scheduleFiberSaveSnapshots(std::vector<FiberSaveS
     FiberSaveJob job;
     job.sequence = ++_nextFiberSaveSequence;
     job.snapshots = std::move(snapshots);
+    job.showErrors = showErrors && !_activeFiberSaveBatch && !_errorDialogsSuppressed;
+    if (_activeFiberSaveBatch) {
+        ++_activeFiberSaveBatch->pendingJobs;
+        job.batches.push_back(_activeFiberSaveBatch);
+    }
     FiberSaveJob probe = job;
     const auto key = jobKey(probe);
     for (auto& pending : _pendingFiberSaveJobs) {
         if (jobKey(pending) == key) {
-            pending = std::move(job);
+            pending.sequence = job.sequence;
+            pending.snapshots = std::move(job.snapshots);
+            pending.showErrors = pending.showErrors || job.showErrors;
+            pending.batches.insert(pending.batches.end(),
+                                   std::make_move_iterator(job.batches.begin()),
+                                   std::make_move_iterator(job.batches.end()));
             startNextFiberSaveJob();
             return;
         }
@@ -9355,14 +9388,16 @@ void LineAnnotationController::startNextFiberSaveJob()
     FiberSaveJob job = std::move(_pendingFiberSaveJobs.front());
     _pendingFiberSaveJobs.pop_front();
     _fiberSaveRunning = true;
+    const bool showErrors = job.showErrors;
+    auto batches = std::move(job.batches);
 
     auto* watcher = new QFutureWatcher<FiberSaveTaskResult>(this);
     _fiberSaveWatcher = watcher;
     connect(watcher,
             &QFutureWatcher<FiberSaveTaskResult>::finished,
             this,
-            [this, watcher]() {
-                finishFiberSaveJob(watcher);
+            [this, watcher, showErrors, batches = std::move(batches)]() mutable {
+                finishFiberSaveJob(watcher, showErrors, std::move(batches));
             });
 
     watcher->setFuture(QtConcurrent::run([job = std::move(job)]() mutable {
@@ -9397,7 +9432,10 @@ void LineAnnotationController::startNextFiberSaveJob()
     }));
 }
 
-void LineAnnotationController::finishFiberSaveJob(QFutureWatcher<FiberSaveTaskResult>* watcher)
+void LineAnnotationController::finishFiberSaveJob(
+    QFutureWatcher<FiberSaveTaskResult>* watcher,
+    bool showErrors,
+    std::vector<std::shared_ptr<FiberSaveBatch>> batches)
 {
     FiberSaveTaskResult result;
     try {
@@ -9413,6 +9451,7 @@ void LineAnnotationController::finishFiberSaveJob(QFutureWatcher<FiberSaveTaskRe
     }
     watcher->deleteLater();
 
+    QString errorMessage;
     if (result.ok) {
         for (size_t i = 0; i < result.fiberIds.size(); ++i) {
             const uint64_t generation =
@@ -9420,15 +9459,34 @@ void LineAnnotationController::finishFiberSaveJob(QFutureWatcher<FiberSaveTaskRe
             emit fiberSaved(result.fiberIds[i], generation);
         }
     } else {
-        QString message = tr("Could not save fiber data: %1")
-                              .arg(QString::fromStdString(result.error));
+        errorMessage = tr("Could not save fiber data: %1")
+                           .arg(QString::fromStdString(result.error));
         if (!result.recoveryFiles.empty()) {
-            message += tr("\nRecovery backups were kept:");
+            errorMessage += tr("\nRecovery backups were kept:");
             for (const auto& path : result.recoveryFiles) {
-                message += QStringLiteral("\n") + QString::fromStdString(path.string());
+                errorMessage += QStringLiteral("\n") + QString::fromStdString(path.string());
             }
         }
-        showError(message);
+        if (showErrors) {
+            showError(errorMessage);
+        } else if (batches.empty()) {
+            Logger()->warn("Line Annotation (headless save): {}",
+                           errorMessage.toStdString());
+        }
+    }
+
+    for (const auto& batch : batches) {
+        if (!batch) {
+            continue;
+        }
+        if (!result.ok) {
+            batch->errors.push_back(errorMessage);
+        }
+        --batch->pendingJobs;
+        if (!batch->scheduling && batch->pendingJobs == 0 && batch->completion) {
+            auto completion = std::move(batch->completion);
+            completion(batch->errors.isEmpty(), batch->errors.join('\n'));
+        }
     }
 
     startNextFiberSaveJob();
@@ -9963,13 +10021,17 @@ std::string LineAnnotationController::uniqueImportedFiberFileName(
     throw std::runtime_error("Could not find an available imported fiber file name");
 }
 
-void LineAnnotationController::showError(const QString& message) const
+void LineAnnotationController::showError(const QString& message, bool suppressDialog) const
 {
-    if (_errorDialogsSuppressed) {
-        // Agent-bridge headless mode (SPEC §1.3): record + log, never a
-        // blocking QMessageBox. The bridge retrieves the message through
-        // takeLastSuppressedError() to build a structured RPC error.
-        _lastSuppressedError = message;
+    if (_activeFiberSaveBatch) {
+        _activeFiberSaveBatch->errors.push_back(message);
+        Logger()->warn("Line Annotation (headless save): {}", message.toStdString());
+        return;
+    }
+    if (_errorDialogsSuppressed || suppressDialog) {
+        if (_errorDialogsSuppressed) {
+            _lastSuppressedError = message;
+        }
         Logger()->warn("Line Annotation (suppressed dialog): {}", message.toStdString());
         return;
     }

@@ -1064,10 +1064,9 @@ def run_fiber_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) -> N
                 rec.step("fiber.create_atlas fails CLEANLY (no Lasagna dataset), no dialog hang",
                          False, f"HANG: {e}")
 
-        # 10. fiber.save: must return promptly. The interactive saveOpenFibers
-        # ends in waitForFiberSaves() -- a nested QEventLoop -- so this proves
-        # the headless split (saveOpenFibersHeadless) is what actually runs.
-        sv = call_checked("fiber.save returns promptly (nested-event-loop split)",
+        # 10. fiber.save: the deferred reply confirms persistence without the
+        # interactive path's nested event loop.
+        sv = call_checked("fiber.save confirms persistence",
                           "fiber.save", {}, timeout=20.0)
         if sv is not None:
             rec.step("fiber.save result shape", sv.get("saved") is True, json.dumps(sv))

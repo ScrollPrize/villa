@@ -189,6 +189,14 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str) -> None:
         results.record("volume_open_unknown_id_preserves_project", False,
                        f"unexpected {type(e).__name__}: {e}")
 
+    try:
+        saved, _ = client.call("fiber.save", {}, timeout=10.0)
+        results.record("fiber_save_completion_response", saved.get("saved") is True,
+                       f"saved={saved.get('saved')}")
+    except Exception as e:  # noqa: BLE001
+        results.record("fiber_save_completion_response", False,
+                       f"unexpected {type(e).__name__}: {e}")
+
 
 def check_c2_oversized(sock_path: str, results: Results) -> None:
     """Send a single unterminated line > 1 MiB; the server must drop that socket

@@ -86,17 +86,6 @@ AgentBridgeServer::AgentBridgeServer(CWindow* window, QObject* parent)
     }
 
     subscribeJobSignals();
-
-    // Line-annotation headless error reporting (SPEC §13, §1.3): the fiber
-    // subsystem funnels nearly every failure -- including ASYNCHRONOUS completions
-    // that land after an RPC returned -- through a blocking QMessageBox. A per-call
-    // guard cannot cover the async ones, so suppression is set once for the
-    // bridge's lifetime (this also suppresses these dialogs for a human sharing the
-    // window). Suppressed errors are still logged and returned as JSON-RPC errors.
-    if (_window && _window->_lineAnnotationController) {
-        _window->_lineAnnotationController->setErrorDialogsSuppressed(true);
-    }
-
 }
 
 

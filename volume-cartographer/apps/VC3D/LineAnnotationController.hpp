@@ -180,11 +180,8 @@ public:
                                             std::optional<std::filesystem::path> atlasDir,
                                             QString* errorMessage = nullptr);
     void saveOpenFibers();
-    // Headless twin of saveOpenFibers (agent bridge, SPEC §13.5): schedules the
-    // same per-pane finalize+save work but does NOT call waitForFiberSaves()
-    // (which spins a nested QEventLoop, forbidden in bridge handlers per SPEC
-    // §1.3). Saves complete asynchronously on the normal fiber-save watcher.
-    void saveOpenFibersHeadless();
+    using FiberSaveCompletion = std::function<void(bool, const QString&)>;
+    void saveOpenFibersHeadless(FiberSaveCompletion onFinished);
     void closeFiberWindowForSurface(const std::string& surfaceName);
     bool showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,
                                               const QPointF& scenePoint,
@@ -228,19 +225,9 @@ public:
     // Most recently opened live line-annotation workspace window, or nullptr
     // (agent bridge, SPEC §13.4 fiber.set_follow).
     [[nodiscard]] LineAnnotationDialog* mostRecentLineAnnotationDialog() const;
-    // Agent-bridge safety valve (SPEC §1.3/§13): while suppressed, every
-    // blocking prompt reachable from bridge-driven fiber paths is skipped —
-    // showError() logs and records instead of QMessageBox::warning, the
-    // Lasagna dataset picker is never opened (the operation fails as if
-    // cancelled), the broken-branch-links repair prompt defaults to "keep
-    // files unchanged", and linked-control-point edit confirmation defaults
-    // to "no". Set once for the bridge's lifetime by AgentBridgeServer; it
-    // must stay set because failures can also surface from asynchronous
-    // completions (e.g. line-optimization results) long after an RPC returned.
+    // Synchronous bridge calls use this as a short-lived dialog guard. Sessions
+    // created while it is set retain their own headless error policy.
     void setErrorDialogsSuppressed(bool suppressed);
-    // Returns and clears the most recent suppressed showError message (empty
-    // when none was recorded since the last take). Lets a bridge handler turn
-    // an otherwise-silent interactive failure into a structured RPC error.
     [[nodiscard]] QString takeLastSuppressedError();
 
     void setDatasetPickerForTesting(DatasetPicker picker);
@@ -328,9 +315,18 @@ private:
         nlohmann::json coordinateIdentity = nlohmann::json::object();
     };
 
+    struct FiberSaveBatch {
+        int pendingJobs = 0;
+        bool scheduling = true;
+        QStringList errors;
+        FiberSaveCompletion completion;
+    };
+
     struct FiberSaveJob {
         uint64_t sequence = 0;
         std::vector<FiberSaveSnapshot> snapshots;
+        bool showErrors = true;
+        std::vector<std::shared_ptr<FiberSaveBatch>> batches;
     };
 
     struct BranchLinkValidationIssue {
@@ -545,11 +541,14 @@ private:
     void saveFiberNow(const StoredFiber& fiber) const;
     void scheduleFiberSave(const StoredFiber& fiber);
     void scheduleFiberPairSave(const StoredFiber& first, const StoredFiber& second);
-    void scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots);
+    void scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots,
+                                    bool showErrors = true);
     void canonicalizeFiberSaveSnapshots(std::vector<FiberSaveSnapshot>& snapshots) const;
     void validateFiberSaveSnapshots(const std::vector<FiberSaveSnapshot>& snapshots) const;
     void startNextFiberSaveJob();
-    void finishFiberSaveJob(QFutureWatcher<FiberSaveTaskResult>* watcher);
+    void finishFiberSaveJob(QFutureWatcher<FiberSaveTaskResult>* watcher,
+                            bool showErrors,
+                            std::vector<std::shared_ptr<FiberSaveBatch>> batches);
     void waitForFiberSaves();
     [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber) const;
     [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
@@ -596,7 +595,7 @@ private:
         const std::vector<ControlSpanRecord>& spans,
         const vc::lasagna::NormalSampler& sampler);
     void finishFiberAlignmentMetrics(QFutureWatcher<FiberMetricsTaskResult>* watcher);
-    void showError(const QString& message) const;
+    void showError(const QString& message, bool suppressDialog = false) const;
     // Shared core of createAtlasFromFiber / createAtlasFromFiberHeadless.
     // Returns the created atlas directory; throws std::exception on failure.
     // Does not emit atlasCreated (callers decide).
@@ -646,6 +645,7 @@ private:
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;
     bool _fiberSaveRunning = false;
+    mutable std::shared_ptr<FiberSaveBatch> _activeFiberSaveBatch;
     uint64_t _nextSideStripIntersectionToken = 0;
     uint64_t _latestSideStripIntersectionToken = 0;
     std::shared_ptr<std::atomic<uint64_t>> _latestSideStripIntersectionTokenAtomic =
@@ -661,8 +661,6 @@ private:
     std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
-    // Agent-bridge headless error reporting (setErrorDialogsSuppressed).
-    // _lastSuppressedError is mutable because showError() is const.
     bool _errorDialogsSuppressed = false;
     mutable QString _lastSuppressedError;
 };

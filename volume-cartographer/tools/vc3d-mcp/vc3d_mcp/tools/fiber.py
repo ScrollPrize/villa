@@ -6,6 +6,8 @@ from typing import Any, Optional
 
 from ..core import mcp, _call, _strip_none
 
+FIBER_SAVE_TIMEOUT_S = 130.0
+
 
 @mcp.tool()
 async def vc3d_fiber_launch(
@@ -92,10 +94,9 @@ async def vc3d_fiber_set_follow(enabled: bool) -> dict[str, Any]:
 
 @mcp.tool()
 async def vc3d_fiber_save() -> dict[str, Any]:
-    """Save every open line-annotation workspace's fiber to disk. Saves are
-    scheduled and complete asynchronously (headless twin of Save Open Fibers).
-    Returns {"saved": true}."""
-    return await _call("fiber.save", {})
+    """Save every open line-annotation workspace's fiber to disk. Returns only
+    after persistence completes, with {"saved": true}."""
+    return await _call("fiber.save", {}, timeout=FIBER_SAVE_TIMEOUT_S)
 
 
 @mcp.tool()

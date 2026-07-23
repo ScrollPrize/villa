@@ -1935,34 +1935,20 @@ does: a single fiber JSON, a bundle, or a directory of fiber JSONs
 Implementation-time amendments; where these contradict §13.1–13.10, the
 as-built notes win.
 
-- **Bridge-lifetime headless error reporting (binding).** Nearly every
-  `LineAnnotationController` public method — including all §13 targets —
-  reports failures through `showError()` (a blocking `QMessageBox::warning`,
-  LineAnnotationController.cpp) or can reach the Lasagna **dataset-picker
-  QFileDialog** (`ensureDatasetForSession` /
-  `resolveAlignmentMetricsManifestPath` when no dataset is selected), and
-  failures also surface from **asynchronous completions** (line-optimization
-  results, fiber-save jobs) minutes after an RPC returned, so a per-call
-  guard cannot cover them. As built, `AgentBridgeServer`'s constructor calls
-  the new `LineAnnotationController::setErrorDialogsSuppressed(true)` once for
-  the bridge's lifetime: `showError` logs + records instead of showing a
-  dialog, the dataset picker is never opened (the operation fails as if
-  cancelled, with the reason recorded), the broken-branch-links repair prompt
-  in `loadFibersForCurrentPackage` defaults to the non-destructive "keep
-  files unchanged" path, and `confirmLinkedControlPointEdit` refuses (returns
-  false) instead of prompting. Handlers convert a recorded message
-  (`takeLastSuppressedError()`) into `-32005` with `data.detail`. The bridge
-  is opt-in, so plain interactive sessions are unaffected.
-- **`fiber.launch` / `fiber.open`** therefore fail `-32005` (not a hang) with
+- **Per-operation headless errors.** Fiber handlers suppress dialogs only
+  while invoking their controller operation and convert synchronous failures
+  to `-32005`. A line-annotation session created in that scope retains the
+  headless policy for its own asynchronous optimization failures. Enabling the
+  bridge does not alter dialogs for human-initiated work in the same window.
+- **`fiber.launch` / `fiber.open`** fail `-32005` (not a hang) with
   `data.detail: "No Lasagna dataset is selected for the active volume."` when
   the package has no resolvable Lasagna dataset — the interactive twin would
   block on the picker dialog.
-- **`fiber.save`** maps to a new headless split
-  `LineAnnotationController::saveOpenFibersHeadless()` (shared core
-  `saveOpenFibersCore`), NOT to `saveOpenFibers()` as §13.5 stated: the
-  interactive method ends in `waitForFiberSaves()`, which spins a nested
-  `QEventLoop` (forbidden, §1.3). The headless variant schedules the same
-  saves; they complete asynchronously on the fiber-save watcher.
+- **`fiber.save` is deferred.** `saveOpenFibersHeadless()` reports completion
+  after every scheduled write finishes. The bridge holds the response open for
+  up to 120 seconds and returns `{"saved":true}` only after persistence
+  succeeds; write failures return `-32005` with `data.detail`. Interactive
+  saves continue to display their own failures.
 - **`fiber.create_atlas` is synchronous, not deferred.** §13.8's deferred
   design is dropped: `createAtlasFromFiber` runs entirely on the GUI thread
   and emits `atlasCreated` before returning, so deferral added nothing — and
@@ -2040,9 +2026,9 @@ As built (Stage 5b), `LineAnnotationController` gained three further headless
 splits beyond the two above, all distinct names per the same doctrine:
 `createAtlasFromFiberHeadless` (+ shared core `createAtlasFromFiberCore`),
 `saveOpenFibersHeadless` (+ shared core `saveOpenFibersCore`; the interactive
-`saveOpenFibers` keeps its `waitForFiberSaves()` nested event loop), and the
-bridge-lifetime `setErrorDialogsSuppressed(bool)` /
-`takeLastSuppressedError()` headless error-reporting valve plus
+`saveOpenFibers` keeps its `waitForFiberSaves()` nested event loop), plus the
+operation-scoped `setErrorDialogsSuppressed(bool)` /
+`takeLastSuppressedError()` error capture and
 `mostRecentLineAnnotationDialog()`; `LineAnnotationDialog` gained the public
 `setCutFollowEnabled(bool)` / `cutFollowEnabled()` wrappers. See §13.11.
 
