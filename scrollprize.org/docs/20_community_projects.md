@@ -80,8 +80,6 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🛠️ Tools
 
-- [Scroll-specific augmentations](https://github.com/ScrollPrize/villa/pull/999) by pscamillo. GPU-native augmentations for the segmentation training pipeline, addressing #201: Squeeze (compression, [#997](https://github.com/ScrollPrize/villa/pull/997)), Decohesion (beam-scatter blur) and Warp (coherent warping), plus CT-reconstruction artifacts — Ring ([#1020](https://github.com/ScrollPrize/villa/pull/1020)) and Streak ([#1021](https://github.com/ScrollPrize/villa/pull/1021)). Each models a real scroll/CT distortion rather than generic noise, and is validated with a controlled ablation and a speed benchmark to improve segmentation robustness in degraded regions.
-
 - [Volume Cartographer](https://github.com/educelab/volume-cartographer): the OG virtual unwrapping toolkit. Includes a graphical interface to annotate scroll segments. First built by [EduceLab](https://educelab.engr.uky.edu/); an [active fork](https://github.com/spacegaier/volume-cartographer) by Philip Allgaier contains many community contributions and is currently used by the segmentation team.
   
 - [Thaumato Anakalyptor](https://github.com/schillij95/ThaumatoAnakalyptor/tree/main) is an automatic tool that combines classical methods such as threshold gradient operator based edge detectors and Deep Learning based instance segmentation of point clouds to detect, merge and render segments. It was built by Julian Schilliger (part of Grand Prize winning submission).
@@ -165,7 +163,11 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
   
 - [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
     - [GPU-accelerated MLS projection for ScrollFiesta](https://github.com/pscamillo/scrollfiesta_public/blob/cuda-mls/BENCHMARKS.md) by pscamillo — OpenMP + CUDA FP32 acceleration, byte-identical, ~6x throughput.
-      
+
+- [Scroll-specific augmentations](https://github.com/ScrollPrize/villa/pull/997) by pscamillo. GPU-native training augmentations modeling real scroll/CT distortions: Squeeze, Decohesion, Warp, Ring, Streak (#201), each validated with ablation + benchmark.
+
+- [winding-ruler](https://github.com/pscamillo/winding-ruler) by pscamillo. Measures winding evidence for the spiral fit: where human annotations matter, why generation fails at the published resolution, and a collection-wide winding-pitch atlas (36 scrolls). Includes [qa_holescan](https://github.com/pscamillo/winding-ruler/blob/main/concordance/qa_holescan.py), a content-level detector for silent z-slice loss in predict3d output ([#1183](https://github.com/ScrollPrize/villa/issues/1183)).
+       
 ### 📦 Materials
 
 #### 🌟 Highlighted
