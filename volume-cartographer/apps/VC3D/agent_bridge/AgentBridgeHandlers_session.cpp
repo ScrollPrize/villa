@@ -290,8 +290,8 @@ QJsonObject AgentBridgeServer::handleSegmentsList(const QJsonValue& params)
     if (!state || !state->hasVpkg() || !vpkg)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QJsonObject p = paramsObject(params);
-    const bool onlyLoaded = jsonOptionalBool(p, "onlyLoaded", false);
+    const QJsonObject p = params.toObject();
+    const bool onlyLoaded = p.value("onlyLoaded").toBool(false);
 
     // Loaded surface names live in CState; the on-disk segment ids come from the
     // package. A segment is "loaded" when its id appears among CState surfaces.
@@ -335,8 +335,8 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
     if (!state || !state->hasVpkg() || !vpkg)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QJsonObject p = paramsObject(params);
-    const QString segmentIdQ = jsonRequireString(p, "segmentId");
+    const QJsonObject p = params.toObject();
+    const QString segmentIdQ = p.value("segmentId").toString();
     if (segmentIdQ.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
@@ -429,8 +429,8 @@ QJsonObject AgentBridgeServer::handleSegmentsFetch(const QJsonValue& params)
     if (!state || !state->hasVpkg() || !vpkg)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QJsonObject p = paramsObject(params);
-    const QString segmentIdQ = jsonRequireString(p, "segmentId");
+    const QJsonObject p = params.toObject();
+    const QString segmentIdQ = p.value("segmentId").toString();
     if (segmentIdQ.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
@@ -527,8 +527,9 @@ QJsonObject AgentBridgeServer::handleSegmentsFetch(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
-    const QString target = jsonOptionalString(p, "target", QStringLiteral("window"));
+    const QJsonObject p = params.toObject();
+    const QString target =
+        p.value("target").toString(QStringLiteral("window"));
 
     QWidget* widget = nullptr;
     if (target.isEmpty() || target == QLatin1String("window")) {
@@ -570,7 +571,7 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     }
 
     if (p.contains("maxDim")) {
-        const int maxDim = jsonOptionalInt(p, "maxDim", 0);
+        const int maxDim = p.value("maxDim").toInt();
         if (maxDim > 0) {
             const int longest = std::max(pixmap.width(), pixmap.height());
             if (longest > maxDim)
@@ -586,7 +587,7 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     result["height"] = image.height();
     result["format"] = "png";
 
-    const QString filePath = jsonOptionalString(p, "filePath");
+    const QString filePath = p.value("filePath").toString();
     if (!filePath.isEmpty()) {
         if (!image.save(filePath, "PNG")) {
             QJsonObject data;
@@ -614,7 +615,7 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleCursorVolumePoint(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
     auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(viewer);
@@ -629,8 +630,6 @@ QJsonObject AgentBridgeServer::handleCursorVolumePoint(const QJsonValue& params)
 
     QPointF scenePos;
     if (p.contains("scene") && !p.value("scene").isNull()) {
-        if (!p.value("scene").isObject())
-            throwParamError("scene", QStringLiteral("must be an object or null"));
         const QJsonObject scene = p.value("scene").toObject();
         scenePos = QPointF(jsonRequireFiniteFloat(scene.value("x"), "x"),
                            jsonRequireFiniteFloat(scene.value("y"), "y"));
@@ -668,8 +667,8 @@ QJsonObject AgentBridgeServer::handleCursorVolumePoint(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleVolumeOpen(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
-    const QString path = jsonRequireString(p, "path");
+    const QJsonObject p = params.toObject();
+    const QString path = p.value("path").toString();
     if (path.isEmpty()) {
         QJsonObject data;
         data["detail"] = "path is required";
@@ -682,7 +681,7 @@ QJsonObject AgentBridgeServer::handleVolumeOpen(const QJsonValue& params)
         throw AgentBridgeError{-32010, "Internal error", data};
     }
 
-    const QString volumeId = jsonOptionalString(p, "volumeId");
+    const QString volumeId = p.value("volumeId").toString();
     QString errorMessage;
     CWindow::VolumeOpenError openError = CWindow::VolumeOpenError::None;
     if (!_window->openVolumePackage(path, false, &errorMessage, volumeId, &openError)) {
@@ -745,9 +744,9 @@ QJsonObject AgentBridgeServer::handleSegmentsDelete(const QJsonValue& params)
     if (!state || !state->hasVpkg() || !vpkg)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QJsonObject p = paramsObject(params);
-    const QString segmentIdQ = jsonRequireString(p, "segmentId");
-    const bool confirm = jsonOptionalBool(p, "confirm", false);
+    const QJsonObject p = params.toObject();
+    const QString segmentIdQ = p.value("segmentId").toString();
+    const bool confirm = p.value("confirm").toBool(false);
     if (!confirm) {
         QJsonObject data;
         data["param"] = "confirm";
@@ -804,9 +803,9 @@ QJsonObject AgentBridgeServer::handleSegmentsRename(const QJsonValue& params)
     if (!state || !state->hasVpkg() || !vpkg)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QJsonObject p = paramsObject(params);
-    const QString segmentIdQ = jsonRequireString(p, "segmentId");
-    const QString newName = jsonRequireString(p, "newName");
+    const QJsonObject p = params.toObject();
+    const QString segmentIdQ = p.value("segmentId").toString();
+    const QString newName = p.value("newName").toString();
 
     // Validate the new name up front so a bad name is -32602 (not -32010).
     static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
@@ -1139,19 +1138,13 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
 
 QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
-    const QString sampleId = jsonRequireString(p, "sampleId");
+    const QJsonObject p = params.toObject();
+    const QString sampleId = p.value("sampleId").toString();
     if (sampleId.isEmpty()) {
         QJsonObject data;
         data["param"] = "sampleId";
         throw AgentBridgeError{-32602, "sampleId is required", data};
     }
-    if (p.contains("resources") && !p.value("resources").isObject()) {
-        QJsonObject data;
-        data["param"] = "resources";
-        throw AgentBridgeError{-32602, "resources must be an object", data};
-    }
-
     if (!_window) {
         QJsonObject data;
         data["detail"] = "window is not available";
@@ -1199,15 +1192,9 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
         // volumeIds axis.
         if (res.contains("volumeIds")) {
             const QJsonValue vidsv = res.value("volumeIds");
-            if (!vidsv.isArray()) {
-                QJsonObject data;
-                data["param"] = "resources.volumeIds";
-                throw AgentBridgeError{-32602, "resources.volumeIds must be an array", data};
-            }
             std::vector<std::string> vids;
             for (const QJsonValue& vv : vidsv.toArray()) {
-                const std::string vid =
-                    jsonRequireString(vv, "resources.volumeIds").toStdString();
+                const std::string vid = vv.toString().toStdString();
                 if (std::find(sampleVolumeIds.begin(), sampleVolumeIds.end(), vid) ==
                     sampleVolumeIds.end()) {
                     QJsonObject data;
@@ -1233,17 +1220,10 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
         // representation of the sample (from derivedRepresentations()).
         if (res.contains("representationRefs")) {
             const QJsonValue refsv = res.value("representationRefs");
-            if (!refsv.isArray()) {
-                QJsonObject data;
-                data["param"] = "resources.representationRefs";
-                throw AgentBridgeError{-32602,
-                    "resources.representationRefs must be an array", data};
-            }
             const auto derived = vc3d::opendata::derivedRepresentations(*sample);
             std::vector<vc3d::opendata::OpenDataRepresentationRef> refs;
             for (const QJsonValue& rv : refsv.toArray()) {
-                const QString refStr =
-                    jsonRequireString(rv, "resources.representationRefs");
+                const QString refStr = rv.toString();
                 const auto reject = [&]() {
                     QJsonObject data;
                     data["kind"] = "resource";
@@ -1273,14 +1253,9 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
         // kinds axis.
         if (res.contains("kinds")) {
             const QJsonValue kindsv = res.value("kinds");
-            if (!kindsv.isArray()) {
-                QJsonObject data;
-                data["param"] = "resources.kinds";
-                throw AgentBridgeError{-32602, "resources.kinds must be an array", data};
-            }
             std::vector<vc3d::opendata::OpenDataRepresentationKind> kinds;
             for (const QJsonValue& kv : kindsv.toArray()) {
-                const QString ks = jsonRequireString(kv, "resources.kinds");
+                const QString ks = kv.toString();
                 const auto kind = representationKindFromJson(ks);
                 if (!kind) {
                     QJsonObject data;
@@ -1451,8 +1426,8 @@ void AgentBridgeServer::startManifestFetch(
 
 QJsonObject AgentBridgeServer::handleCatalogListSamples(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
-    const bool refresh = jsonOptionalBool(p, "refresh", false);
+    const QJsonObject p = params.toObject();
+    const bool refresh = p.value("refresh").toBool(false);
 
     auto build = [](const vc3d::opendata::OpenDataManifest& manifest) -> QJsonObject {
         QJsonObject result;
@@ -1478,14 +1453,14 @@ QJsonObject AgentBridgeServer::handleCatalogListSamples(const QJsonValue& params
 
 QJsonObject AgentBridgeServer::handleCatalogDescribeSample(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
-    const QString sampleId = jsonRequireString(p, "sampleId");
+    const QJsonObject p = params.toObject();
+    const QString sampleId = p.value("sampleId").toString();
     if (sampleId.isEmpty()) {
         QJsonObject data;
         data["param"] = "sampleId";
         throw AgentBridgeError{-32602, "sampleId is required", data};
     }
-    const bool refresh = jsonOptionalBool(p, "refresh", false);
+    const bool refresh = p.value("refresh").toBool(false);
     const std::string sid = sampleId.toStdString();
 
     auto build = [sampleId, sid](const vc3d::opendata::OpenDataManifest& manifest) -> QJsonObject {
@@ -1558,13 +1533,13 @@ QJsonObject AgentBridgeServer::handleCatalogDescribeSample(const QJsonValue& par
 
 QJsonObject AgentBridgeServer::handleVolumeSelect(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
     if (!state || !state->hasVpkg() || !vpkg)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QString volumeIdQ = jsonRequireString(p, "volumeId");
+    const QString volumeIdQ = p.value("volumeId").toString();
     if (volumeIdQ.isEmpty()) {
         QJsonObject data;
         data["param"] = "volumeId";
