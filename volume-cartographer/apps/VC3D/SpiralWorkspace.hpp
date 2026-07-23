@@ -5,14 +5,17 @@
 #include <QHash>
 #include <QImage>
 #include <QJsonObject>
+#include <QColor>
 #include <QSet>
 #include <QStringList>
 #include <opencv2/core/types.hpp>
 #include <cstddef>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
+#include <functional>
 
 class AxisAlignedSliceController;
 class CState;
@@ -27,6 +30,7 @@ class ViewerSplitGrid;
 class VolumePkg;
 class PolylineIndex;
 class SpiralOverlayController;
+class SpiralBrushController;
 class SegmentationOverlayController;
 
 class SpiralWorkspace : public QMainWindow
@@ -44,6 +48,8 @@ public:
     void addPatchToCurrentFit(const QString& tifxyzDirectory,
                               const std::shared_ptr<QuadSurface>& surface = {});
     void addFiberToCurrentFit(const QString& fiberJsonPath);
+    void requestSessionExit(std::function<void()> continuation);
+    bool hasPendingBrushWork() const;
 
 signals:
     void spiralSessionActiveChanged(bool active);
@@ -121,7 +127,12 @@ private:
     void loadInputSurfaces(const QJsonObject& paths, quint64 generation);
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
     void registerPendingPatchSurface(const QString& inputId,
-                                     const std::shared_ptr<QuadSurface>& surface);
+                                     const std::shared_ptr<QuadSurface>& surface,
+                                     const std::optional<QColor>& color = std::nullopt);
+    void finalizeBrushPaint();
+    void maybeCommitForPendingExit();
+    QString provisionalBrushRoot() const;
+    void discardBrushWork();
     void setSurfaceCategoryVisible(const QString& category, bool visible);
     void updatePendingPatchIds(const QJsonObject& status);
     void updateSurfaceIntersections();
@@ -134,6 +145,7 @@ private:
     std::unique_ptr<ViewerManager> _viewerManager;
     std::unique_ptr<AxisAlignedSliceController> _slices;
     std::unique_ptr<SpiralOverlayController> _overlay;
+    std::unique_ptr<SpiralBrushController> _brush;
     std::unique_ptr<SegmentationOverlayController> _surfaceOverlapOverlay;
     SpiralServiceManager* _service = nullptr;
     SpiralPanel* _panel = nullptr;
@@ -142,6 +154,7 @@ private:
     ViewerSplitGrid* _grid = nullptr;
     qint64 _requestedPreviewGeneration = -1;
     QString _geometryManifestPath;
+    QJsonObject _sessionPaths;
     QHash<QString, QStringList> _surfaceCategoryIds;
     QHash<QString, QString> _surfaceSourceIds;
     QHash<QString, bool> _surfaceCategoryVisible;
@@ -172,4 +185,14 @@ private:
     // interaction and no preview yet); the first preview may then retarget it.
     bool _focusIsAutoDefault = false;
     bool _shuttingDown = false;
+    struct PendingBrushPatch {
+        QString path;
+        QColor color;
+        std::shared_ptr<QuadSurface> surface;
+    };
+    QHash<QString, PendingBrushPatch> _pendingBrushPatches;
+    QHash<QString, QString> _brushProvisionalPaths;
+    QSet<QString> _unverifiedBrushIds;
+    std::function<void()> _pendingExitAction;
+    bool _commitAfterBrushUploads = false;
 };

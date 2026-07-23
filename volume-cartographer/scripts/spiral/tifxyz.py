@@ -17,6 +17,7 @@ class Patch:
     overlapping_ids: Optional[list[str]]  # None implies no overlapping.json (hence unknown overlaps)
     winding: Optional[Union[Literal['single'], torch.Tensor]]  # None means no winding.tif found
     uuid: Optional[str] = None
+    erosion_cells_override: Optional[int] = None
     _valid_vertex_indices: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
     _valid_quad_indices: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
     _valid_zyxs: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
@@ -64,6 +65,11 @@ class Patch:
         self._valid_vertex_indices = None
         self._valid_quad_indices = None
         self._valid_zyxs = None
+
+    def erosion_cells(self, default: int) -> int:
+        """Return this patch's requested erosion, falling back to fit config."""
+        return int(default if self.erosion_cells_override is None
+                   else self.erosion_cells_override)
 
     def ij_to_zyx(self, ij: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Bilinearly interpolate zyx coordinates at fractional (i, j) pixel locations.
@@ -300,6 +306,7 @@ def load_tifxyz(path):
         metadata = json.load(meta_json)
         scale = torch.tensor(metadata['scale'])
         uuid = metadata.get('uuid')
+        erosion_cells_override = metadata.get('spiral_patch_erode_cells')
     zyxs_np = np.stack([np.array(Image.open(f'{path}/{coord}.tif')) for coord in 'zyx'], axis=-1)
 
     # Some patches mark invalid vertices via mask.tif (mask == 0) rather than the -1 sentinel in
@@ -332,7 +339,8 @@ def load_tifxyz(path):
     else:
         winding_value = None
 
-    return Patch(zyxs, scale, overlapping_ids, winding_value, uuid)
+    return Patch(zyxs, scale, overlapping_ids, winding_value, uuid,
+                 erosion_cells_override)
 
 
 def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):

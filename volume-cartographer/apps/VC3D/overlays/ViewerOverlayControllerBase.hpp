@@ -8,6 +8,7 @@
 #include <QColor>
 #include <QFont>
 #include <QImage>
+#include <QPainterPath>
 #include <QPointF>
 #include <QRectF>
 #include <QString>
@@ -30,7 +31,6 @@ class ViewerManager;
 class QGraphicsItem;
 class QGraphicsScene;
 class Surface;
-class QPainterPath;
 
 class ViewerOverlayControllerBase : public QObject
 {
@@ -100,6 +100,11 @@ public:
         OverlayStyle style{};
     };
 
+    struct PainterPathPrimitive {
+        QPainterPath path;
+        OverlayStyle style{};
+    };
+
     struct TextPrimitive {
         QPointF position;
         QString text;
@@ -161,6 +166,7 @@ public:
                                           LineStripPrimitive,
                                           SurfaceLineStripPrimitive,
                                           RectPrimitive,
+                                          PainterPathPrimitive,
                                           TextPrimitive,
                                           PathPrimitive,
                                           ArrowPrimitive,
@@ -272,6 +278,9 @@ protected:
         void addRect(const QRectF& rect,
                      bool filled,
                      OverlayStyle style);
+
+        void addPainterPath(const QPainterPath& path,
+                            OverlayStyle style);
 
         void addText(const QPointF& position,
                      const QString& text,

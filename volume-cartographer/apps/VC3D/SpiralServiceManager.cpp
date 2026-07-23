@@ -687,8 +687,17 @@ void SpiralServiceManager::commitInputs()
     postWithRetry(QStringLiteral("/session/commit-inputs"),
                   {{QStringLiteral("command_id"), commandId()}},
                   Timeout::LongCommand, kMutationRetries,
-                  [this](const QJsonObject&) {
+                  [this](const QJsonObject& response) {
                       if (_serviceOwnsDataset) fetchAdvertisedDataset();
+                      handleStatus(response);
+                      QStringList committed;
+                      for (const QJsonValue& value : response.value(QStringLiteral("committed")).toArray())
+                          committed.push_back(value.toString());
+                      emit commitInputsFinished(committed, {});
+                  },
+                  [this](const QString& error) {
+                      emit commitInputsFinished({}, error);
+                      emit errorOccurred(error);
                   });
 }
 

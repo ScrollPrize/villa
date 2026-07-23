@@ -3122,10 +3122,17 @@ void CChunkedVolumeViewer::onKeyRelease(int key, Qt::KeyboardModifiers)
 
 QPointF CChunkedVolumeViewer::surfaceToScene(float surfX, float surfY) const
 {
-    const float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
-    const float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
-    const qreal vx = (surfX - _surfacePtrX) * _scale + vpCx;
-    const qreal vy = (surfY - _surfacePtrY) * _scale + vpCy;
+    // Keep the camera arithmetic in qreal. Overlay code derives an affine
+    // surface-to-scene transform from this function; doing these operations in
+    // float makes its one-unit basis lose precision far from surface origin,
+    // and that error is then multiplied by the absolute surface coordinate.
+    const qreal vpCx = static_cast<qreal>(_framebuffer.width()) * 0.5;
+    const qreal vpCy = static_cast<qreal>(_framebuffer.height()) * 0.5;
+    const qreal scale = static_cast<qreal>(_scale);
+    const qreal vx = (static_cast<qreal>(surfX) - static_cast<qreal>(_surfacePtrX))
+                   * scale + vpCx;
+    const qreal vy = (static_cast<qreal>(surfY) - static_cast<qreal>(_surfacePtrY))
+                   * scale + vpCy;
     return QPointF(vx, vy);
 }
 

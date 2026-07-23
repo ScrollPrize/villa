@@ -192,6 +192,8 @@ set(srcs
     LasagnaServiceManager.hpp
     SpiralArtifactCache.cpp
     SpiralArtifactCache.hpp
+    SpiralBrushController.cpp
+    SpiralBrushController.hpp
     SpiralServiceManager.cpp
     SpiralServiceManager.hpp
     SpiralServiceProfile.hpp

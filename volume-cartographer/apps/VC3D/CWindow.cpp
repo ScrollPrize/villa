@@ -8143,6 +8143,15 @@ void CWindow::saveWindowState()
 
 void CWindow::closeEvent(QCloseEvent* event)
 {
+    if (_spiralWorkspace && !_spiralCloseGuardBypass
+        && _spiralWorkspace->hasPendingBrushWork()) {
+        event->ignore();
+        _spiralWorkspace->requestSessionExit([this]() {
+            _spiralCloseGuardBypass = true;
+            close();
+        });
+        return;
+    }
     _destroyingWindow = true;
     // Flush a render-bench recording (if any) before teardown.
     if (_benchRecorder && _benchRecorder->attached()) {

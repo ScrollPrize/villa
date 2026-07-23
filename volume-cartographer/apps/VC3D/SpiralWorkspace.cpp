@@ -5,8 +5,10 @@
 #include "ConsoleOutputWidget.hpp"
 #include "Keybinds.hpp"
 #include "SpiralPanel.hpp"
+#include "SpiralBrushController.hpp"
 #include "SpiralServiceManager.hpp"
 #include "SurfaceOverlayColors.hpp"
+#include "VCSettings.hpp"
 #include "ViewerManager.hpp"
 #include "elements/ViewerSplitGrid.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
@@ -27,7 +29,9 @@
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QMessageBox>
 #include <QSettings>
+#include <QShortcut>
 #include <QStatusBar>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -133,6 +137,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
     _overlay = std::make_unique<SpiralOverlayController>(this);
     _overlay->bindToViewerManager(_viewerManager.get());
+    _brush = std::make_unique<SpiralBrushController>(this);
+    _brush->bindToViewerManager(_viewerManager.get());
     _surfaceOverlapOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
     _surfaceOverlapOverlay->setViewerManager(_viewerManager.get());
     _viewerManager->setSegmentationOverlay(_surfaceOverlapOverlay.get());
@@ -151,6 +157,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     // Ctrl+click-to-focus is wired by ViewerManager for every viewer.
     for (int pane = 0; pane < 4; ++pane) {
         auto* viewer = _viewerManager->createViewerInWidget(specs[pane].surface, _grid);
+        if (pane == 0) _brush->bindFlattenedViewer(viewer);
         viewer->setIntersects(specs[pane].intersects);
         _grid->setViewer(pane, qobject_cast<QWidget*>(viewer->asQObject()));
     }
@@ -211,9 +218,58 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                         ? tr("Added %1 to the current spiral fit; it is used on the next run").arg(inputId)
                         : tr("Adding %1 to the spiral fit failed: %2").arg(inputId, error),
                     15000);
+                auto pending = _pendingBrushPatches.find(inputId);
+                if (pending == _pendingBrushPatches.end()) return;
+                const PendingBrushPatch patch = pending.value();
+                _pendingBrushPatches.erase(pending);
+                if (error.isEmpty()) {
+                    _brushProvisionalPaths[inputId] = patch.path;
+                    _unverifiedBrushIds.insert(inputId);
+                    registerPendingPatchSurface(inputId, patch.surface, patch.color);
+                    _brush->finalizationSucceeded(inputId);
+                } else {
+                    QDir(patch.path).removeRecursively();
+                    _brush->finalizationFailed(inputId);
+                    if (_pendingExitAction) {
+                        _commitAfterBrushUploads = false;
+                        _pendingExitAction = {};
+                        QMessageBox::warning(this, tr("Brush upload failed"), error);
+                    }
+                }
+                maybeCommitForPendingExit();
+            });
+    connect(_service, &SpiralServiceManager::commitInputsFinished, this,
+            [this](const QStringList& committed, const QString& error) {
+                if (!error.isEmpty()) {
+                    _commitAfterBrushUploads = false;
+                    _pendingExitAction = {};
+                    QMessageBox::warning(this, tr("Commit failed"), error);
+                    return;
+                }
+                for (const QString& id : committed) {
+                    const QString path = _brushProvisionalPaths.take(id);
+                    if (!path.isEmpty()) QDir(path).removeRecursively();
+                    _unverifiedBrushIds.remove(id);
+                }
+                if (_pendingExitAction && !hasPendingBrushWork()) {
+                    auto continuation = std::move(_pendingExitAction);
+                    _pendingExitAction = {};
+                    continuation();
+                }
+            });
+    auto* finalizeBrushShortcut = new QShortcut(QKeySequence(Qt::SHIFT | Qt::Key_E), this);
+    finalizeBrushShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(finalizeBrushShortcut, &QShortcut::activated,
+            this, &SpiralWorkspace::finalizeBrushPaint);
+    connect(_brush.get(), &SpiralBrushController::brushDiameterChanged,
+            this, [this](int diameter) {
+                statusBar()->showMessage(tr("Spiral brush diameter: %1 px").arg(diameter), 2500);
             });
 
     _panel = new SpiralPanel(_service, this);
+    _panel->setSessionExitGuard([this](std::function<void()> continuation) {
+        requestSessionExit(std::move(continuation));
+    });
     auto* dock = new QDockWidget(tr("Spiral"), this);
     dock->setObjectName(QStringLiteral("spiralControlDock"));
     dock->setFeatures(QDockWidget::NoDockWidgetFeatures);
@@ -291,6 +347,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             &SpiralWorkspace::updatePendingPatchIds);
     connect(_service, &SpiralServiceManager::sessionAccepted, this,
             [this](const QJsonObject& paths, qint64 generation) {
+                _sessionPaths = paths;
+                _brush->resetSession();
+                _pendingBrushPatches.clear();
+                _brushProvisionalPaths.clear();
+                _unverifiedBrushIds.clear();
                 // A newly loaded fit starts a new comparison sequence even when
                 // it reuses the existing service connection.
                 _haveRunDiffBaseline = false;
@@ -461,17 +522,18 @@ void SpiralWorkspace::installInputSurfaces(const InputSurfaceLoadResult& result,
 }
 
 void SpiralWorkspace::registerPendingPatchSurface(
-    const QString& inputId, const std::shared_ptr<QuadSurface>& surface)
+    const QString& inputId, const std::shared_ptr<QuadSurface>& surface,
+    const std::optional<QColor>& explicitColor)
 {
     if (!surface || inputId.isEmpty()) return;
-    for (const QString& id : _surfaceCategoryIds.value(QStringLiteral("ephemeral"))) {
+    const QString category = explicitColor ? QStringLiteral("brush") : QStringLiteral("ephemeral");
+    for (const QString& id : _surfaceCategoryIds.value(category)) {
         if (_surfaceSourceIds.value(id) == inputId) return;
     }
-    const QString id = QStringLiteral("spiral/ephemeral/g%1/%2")
-                           .arg(_inputSurfaceGeneration)
-                           .arg(inputId);
+    const QString id = QStringLiteral("spiral/%1/g%2/%3")
+                           .arg(category).arg(_inputSurfaceGeneration).arg(inputId);
     _state->setSurface(id.toStdString(), surface);
-    _surfaceCategoryIds[QStringLiteral("ephemeral")].push_back(id);
+    _surfaceCategoryIds[category].push_back(id);
     _surfaceSourceIds[id] = inputId;
     const std::string colorKey = QStringLiteral("patch/%1").arg(inputId).toStdString();
     auto assignment = _surfaceOverlayColorAssignments.find(colorKey);
@@ -480,9 +542,16 @@ void SpiralWorkspace::registerPendingPatchSurface(
                          .emplace(colorKey, _nextSurfaceOverlayColorIndex++)
                          .first;
     }
-    _surfaceOverlayColors[id.toStdString()] =
-        vc3d::surfaceOverlayColorBgr(assignment->second);
-    if (_pendingPatchesOnly) updateSurfaceIntersections();
+    if (explicitColor) {
+        _surfaceOverlayColors[id.toStdString()] = {
+            static_cast<uchar>(explicitColor->blue()),
+            static_cast<uchar>(explicitColor->green()),
+            static_cast<uchar>(explicitColor->red())};
+    } else {
+        _surfaceOverlayColors[id.toStdString()] =
+            vc3d::surfaceOverlayColorBgr(assignment->second);
+    }
+    if (_pendingPatchesOnly || explicitColor) updateSurfaceIntersections();
 }
 
 void SpiralWorkspace::setSurfaceCategoryVisible(const QString& category, bool visible)
@@ -537,6 +606,9 @@ void SpiralWorkspace::updateSurfaceIntersections()
             if (visible.value()) addCategory(visible.key(), false);
         }
     }
+    // Brush-created patches are session annotations and remain visible even
+    // when the dataset input categories are hidden.
+    addCategory(QStringLiteral("brush"), false);
     for (auto* viewer : _viewerManager->baseViewers()) {
         if (!viewer) continue;
         if (viewer->surfName() == "segmentation") {
@@ -572,6 +644,144 @@ void SpiralWorkspace::addFiberToCurrentFit(const QString& fiberJsonPath)
     const QString inputId = QFileInfo(fiberJsonPath).completeBaseName();
     statusBar()->showMessage(tr("Uploading fiber %1 to the Spiral session…").arg(inputId));
     _service->uploadJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
+}
+
+QString SpiralWorkspace::provisionalBrushRoot() const
+{
+    const QString serviceRoot = _sessionPaths.value(QStringLiteral("dataset_root")).toString();
+    const QString localRoot = serviceRoot.isEmpty() ? QString() : mapServicePath(serviceRoot);
+    if (!localRoot.isEmpty())
+        return QDir(localRoot).filePath(QStringLiteral("provisional_meshes"));
+    return QFileInfo(vc3d::settingsFilePath()).dir().filePath(QStringLiteral("provisional_meshes"));
+}
+
+void SpiralWorkspace::finalizeBrushPaint()
+{
+    if (!_service || !_service->hasActiveSession()) {
+        statusBar()->showMessage(tr("Load a Spiral fit before finalizing brush paint"), 10000);
+        return;
+    }
+    QStringList warnings;
+    auto patches = _brush->preparePatches(warnings);
+    if (!warnings.isEmpty()) statusBar()->showMessage(warnings.join(QStringLiteral("; ")), 10000);
+    if (patches.empty()) {
+        maybeCommitForPendingExit();
+        return;
+    }
+    const QString root = provisionalBrushRoot();
+    if (!QDir().mkpath(root)) {
+        for (const auto& patch : patches) _brush->finalizationFailed(patch.id);
+        QMessageBox::warning(this, tr("Cannot save brush patches"),
+                             tr("Could not create %1").arg(root));
+        _pendingExitAction = {};
+        _commitAfterBrushUploads = false;
+        return;
+    }
+    for (const auto& patch : patches) {
+        const QString path = QDir(root).filePath(patch.id);
+        _pendingBrushPatches.insert(patch.id, {path, patch.color, patch.surface});
+        auto* watcher = new QFutureWatcher<QString>(this);
+        connect(watcher, &QFutureWatcher<QString>::finished, this,
+                [this, watcher, id = patch.id, path]() {
+                    const QString error = watcher->result();
+                    watcher->deleteLater();
+                    auto pending = _pendingBrushPatches.find(id);
+                    if (pending == _pendingBrushPatches.end()) {
+                        QDir(path).removeRecursively();
+                        return;
+                    }
+                    if (!error.isEmpty()) {
+                        _pendingBrushPatches.erase(pending);
+                        QDir(path).removeRecursively();
+                        _brush->finalizationFailed(id);
+                        _commitAfterBrushUploads = false;
+                        _pendingExitAction = {};
+                        QMessageBox::warning(this, tr("Cannot save brush patch"), error);
+                        return;
+                    }
+                    _service->uploadPatch(path, id);
+                });
+        const auto surface = patch.surface;
+        watcher->setFuture(QtConcurrent::run([surface, path]() -> QString {
+            try {
+                surface->save(path.toStdString(), false);
+                return {};
+            } catch (const std::exception& error) {
+                return QString::fromUtf8(error.what());
+            }
+        }));
+    }
+}
+
+bool SpiralWorkspace::hasPendingBrushWork() const
+{
+    return (_brush && _brush->hasUnfinalizedPaint())
+        || !_pendingBrushPatches.isEmpty() || !_unverifiedBrushIds.isEmpty();
+}
+
+void SpiralWorkspace::discardBrushWork()
+{
+    if (_brush) _brush->discardUnfinalized();
+    for (const auto& pending : std::as_const(_pendingBrushPatches))
+        if (!pending.path.isEmpty()) QDir(pending.path).removeRecursively();
+    for (const QString& path : std::as_const(_brushProvisionalPaths))
+        if (!path.isEmpty()) QDir(path).removeRecursively();
+    _pendingBrushPatches.clear();
+    _brushProvisionalPaths.clear();
+    _unverifiedBrushIds.clear();
+    const QStringList brushSurfaceIds = _surfaceCategoryIds.take(QStringLiteral("brush"));
+    for (const QString& id : brushSurfaceIds) {
+        _surfaceSourceIds.remove(id);
+        _surfaceOverlayColors.erase(id.toStdString());
+        _state->setSurface(id.toStdString(), nullptr);
+    }
+    updateSurfaceIntersections();
+}
+
+void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
+{
+    if (!hasPendingBrushWork()) {
+        continuation();
+        return;
+    }
+    QMessageBox box(QMessageBox::Warning, tr("Uncommitted Spiral brush patches"),
+                    tr("This Spiral session contains brush paint that has not been committed "
+                       "to verified_patches."), QMessageBox::NoButton, this);
+    auto* commit = box.addButton(tr("Commit"), QMessageBox::AcceptRole);
+    auto* exit = box.addButton(tr("Exit Without Commit"), QMessageBox::DestructiveRole);
+    box.addButton(QMessageBox::Cancel);
+    box.exec();
+    if (box.clickedButton() == commit) {
+        _pendingExitAction = std::move(continuation);
+        _commitAfterBrushUploads = true;
+        if (_brush->hasUnfinalizedPaint()) finalizeBrushPaint();
+        else maybeCommitForPendingExit();
+    } else if (box.clickedButton() == exit) {
+        discardBrushWork();
+        continuation();
+    }
+}
+
+void SpiralWorkspace::maybeCommitForPendingExit()
+{
+    if (!_commitAfterBrushUploads || !_pendingExitAction || !_pendingBrushPatches.isEmpty()) return;
+    if (_brush->hasUnfinalizedPaint()) {
+        // A too-small gesture was intentionally left editable. Do not silently
+        // discard it during an exit commit.
+        _commitAfterBrushUploads = false;
+        _pendingExitAction = {};
+        QMessageBox::warning(this, tr("Brush patch not committed"),
+                             tr("At least one painted area does not contain a complete quad."));
+        return;
+    }
+    _commitAfterBrushUploads = false;
+    if (_unverifiedBrushIds.isEmpty()) {
+        auto continuation = std::move(_pendingExitAction);
+        _pendingExitAction = {};
+        continuation();
+        return;
+    }
+    _service->commitInputs();
 }
 
 SpiralWorkspace::~SpiralWorkspace()
@@ -1116,6 +1326,7 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
         if (_outputVisible) _state->setSurface("segmentation", nullptr);
         const QString previousRegistration = _currentPreviewRegistrationId;
         _currentPreview.reset();
+        _brush->setPaintSurface({});
         _currentPreviewRegistrationId.clear();
         _overlay->publishRunDiff({}, {});
         _overlay->publishLossMap({}, {}, _lossMapOpacity);
@@ -1158,6 +1369,7 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
     }
     const QString previousRegistration = _currentPreviewRegistrationId;
     _currentPreview = preview;
+    _brush->setPaintSurface(preview);
     _currentPreviewRegistrationId = registrationId;
     if (_outputVisible) _state->setSurface("segmentation", preview, false, preserveFocus);
     updateRunDiffOverlay();

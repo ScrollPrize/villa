@@ -905,7 +905,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         for patch_id, patch in list(patches.items()):
             # we erode cells this distance from any invalid cell to catch annotation errors
             # which are hard to detect at the edges of patches
-            cells_to_erode = int(cfg['erode_patches'])
+            cells_to_erode = patch.erosion_cells(cfg['erode_patches'])
             if cells_to_erode > 0:
                 if not erode_patch_valid_region(patch, cells_to_erode):
                     del patches[patch_id]
@@ -2268,7 +2268,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     if input_id in verified_patches or input_id in new_patches:
                         raise RuntimeError(f'Patch {input_id!r} is already part of this session')
                     patch = load_tifxyz(path)
-                    cells_to_erode = int(cfg['erode_patches'])
+                    cells_to_erode = patch.erosion_cells(cfg['erode_patches'])
                     if cells_to_erode > 0 and not erode_patch_valid_region(patch, cells_to_erode):
                         raise RuntimeError(f'Patch {input_id!r} has no valid quads after erosion')
                     if not patch_intersects_z_roi(patch, z_begin, z_end):

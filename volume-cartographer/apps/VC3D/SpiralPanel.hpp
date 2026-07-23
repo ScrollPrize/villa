@@ -5,6 +5,7 @@
 #include <QJsonObject>
 #include <QSet>
 #include <QWidget>
+#include <functional>
 
 #include "SpiralServiceProfile.hpp"
 #include "elements/VolumeSelector.hpp"
@@ -33,6 +34,8 @@ public:
     void setVolumes(const QVector<VolumeSelector::VolumeOption>& volumes, const QString& selectedId);
     void setLossMapOptions(const QStringList& names);
     void setLossMapLegend(const QString& text);
+    void setSessionExitGuard(
+        std::function<void(std::function<void()>)> guard) { _sessionExitGuard = std::move(guard); }
 
 signals:
     void volumeSelected(const QString& id);
@@ -75,6 +78,7 @@ private:
     void setRemoteMode(bool remote);
     void connectToSelectedProfile();
     QString formSettingsPrefix() const;
+    void guardSessionExit(std::function<void()> action);
 
     SpiralServiceManager* _service = nullptr;
     QHash<QString, QLineEdit*> _paths;
@@ -172,4 +176,6 @@ private:
     bool _connected = false;
     int _ephemeralCount = 0;
     int _uncommittedCount = 0;
+    std::function<void(std::function<void()>)> _sessionExitGuard;
+    bool _runningGuardedExit = false;
 };

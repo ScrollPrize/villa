@@ -6,6 +6,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
+#include <QStringList>
 #include <QTimer>
 
 #include <functional>
@@ -84,6 +85,7 @@ signals:
     void checkpointDownloadFinished(const QString& localPath, const QString& error);
     void checkpointUploadProgress(qint64 sentBytes, qint64 totalBytes);
     void inputUploadFinished(const QString& inputId, const QString& error);
+    void commitInputsFinished(const QStringList& committedIds, const QString& error);
     void logMessage(const QString& message);
     void errorOccurred(const QString& message);
 

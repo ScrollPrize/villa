@@ -321,6 +321,31 @@ private slots:
         QVERIFY(sawPoint);
     }
 
+    void painterPathPrimitivePreservesFilledShapeAndHoles()
+    {
+        FakeViewer viewer;
+        QPainterPath shape;
+        shape.addEllipse(QPointF(20.0, 20.0), 10.0, 10.0);
+        QPainterPath erased;
+        erased.addEllipse(QPointF(20.0, 20.0), 3.0, 3.0);
+        shape = shape.subtracted(erased);
+
+        ViewerOverlayControllerBase::OverlayStyle style;
+        style.penColor = Qt::transparent;
+        style.brushColor = QColor(255, 0, 0, 115);
+        ViewerOverlayControllerBase::applyPrimitives(&viewer, "paint_shape", {
+            ViewerOverlayControllerBase::PainterPathPrimitive{shape, style},
+        });
+
+        const auto items = viewer.scene().items();
+        QCOMPARE(items.size(), 1);
+        auto* pathItem = qgraphicsitem_cast<QGraphicsPathItem*>(items.front());
+        QVERIFY(pathItem != nullptr);
+        QVERIFY(pathItem->path().contains(QPointF(20.0, 11.0)));
+        QVERIFY(!pathItem->path().contains(QPointF(20.0, 20.0)));
+        QCOMPARE(pathItem->brush().color().alpha(), 115);
+    }
+
     void atlasOverlayControllerEmitsLineAndAnchorPoints()
     {
         FakeViewer viewer;

@@ -670,17 +670,19 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                                  tr("Advanced config must be a JSON object: %1").arg(error.errorString()));
             return;
         }
-        if (_uncommittedCount > 0
-            && QMessageBox::question(
-                   this, tr("Uncommitted inputs"),
-                   tr("The current session has %1 added input(s) that were not committed "
-                      "to the dataset. Reloading discards them. Continue?").arg(_uncommittedCount))
-                   != QMessageBox::Yes)
-            return;
-        persist();
-        emit pythonOutputRequested();
-        _pendingSessionRequest = sessionRequest();
-        _service->loadSession(_pendingSessionRequest);
+        guardSessionExit([this]() {
+            if (_uncommittedCount > 0
+                && QMessageBox::question(
+                       this, tr("Uncommitted inputs"),
+                       tr("The current session has %1 added input(s) that were not committed "
+                          "to the dataset. Reloading discards them. Continue?").arg(_uncommittedCount))
+                       != QMessageBox::Yes)
+                return;
+            persist();
+            emit pythonOutputRequested();
+            _pendingSessionRequest = sessionRequest();
+            _service->loadSession(_pendingSessionRequest);
+        });
     });
     connect(_run, &QPushButton::clicked, this, [this]() {
         QJsonParseError error;
@@ -823,9 +825,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         rebuildProfileCombo();
         selectProfile(kLocalhostProfileId);
     });
-    connect(_connectButton, &QPushButton::clicked, this, [this]() { connectToSelectedProfile(); });
+    connect(_connectButton, &QPushButton::clicked, this, [this]() {
+        guardSessionExit([this]() { connectToSelectedProfile(); });
+    });
     connect(_disconnectButton, &QPushButton::clicked, this, [this]() {
-        _service->disconnectFromService();
+        guardSessionExit([this]() { _service->disconnectFromService(); });
     });
 
     // Load saved profiles and select the previous one.
@@ -871,6 +875,15 @@ QString SpiralPanel::formSettingsPrefix() const
 void SpiralPanel::selectProfile(const QString& profileId)
 {
     if (profileId == _currentProfileId) return;
+    if (!_runningGuardedExit && _sessionExitGuard) {
+        const int oldIndex = _profileCombo->findData(_currentProfileId);
+        if (oldIndex >= 0) {
+            const QSignalBlocker blocker(_profileCombo);
+            _profileCombo->setCurrentIndex(oldIndex);
+        }
+        guardSessionExit([this, profileId]() { selectProfile(profileId); });
+        return;
+    }
     if (!_currentProfileId.isEmpty()) persist();
     _service->disconnectFromService();
     _currentProfileId = profileId;
@@ -931,6 +944,19 @@ void SpiralPanel::connectToSelectedProfile()
         profile.save(settings); // never persists the API key
     }
     _service->connectToService(profile);
+}
+
+void SpiralPanel::guardSessionExit(std::function<void()> action)
+{
+    if (!_sessionExitGuard || _runningGuardedExit) {
+        action();
+        return;
+    }
+    _sessionExitGuard([this, action = std::move(action)]() mutable {
+        _runningGuardedExit = true;
+        action();
+        _runningGuardedExit = false;
+    });
 }
 
 void SpiralPanel::setRemoteMode(bool remote)

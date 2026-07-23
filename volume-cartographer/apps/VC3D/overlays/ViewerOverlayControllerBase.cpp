@@ -232,6 +232,16 @@ void ViewerOverlayControllerBase::OverlayBuilder::addRect(const QRectF& rect,
     _primitives.emplace_back(std::move(prim));
 }
 
+void ViewerOverlayControllerBase::OverlayBuilder::addPainterPath(
+    const QPainterPath& path, OverlayStyle style)
+{
+    if (path.isEmpty()) return;
+    PainterPathPrimitive prim;
+    prim.path = path;
+    prim.style = style;
+    _primitives.emplace_back(std::move(prim));
+}
+
 void ViewerOverlayControllerBase::OverlayBuilder::addText(const QPointF& position,
                                                           const QString& text,
                                                           const QFont& font,
@@ -1192,6 +1202,10 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                         style.brushColor = Qt::transparent;
                     }
                     addItem(item, style);
+                } else if constexpr (std::is_same_v<T, PainterPathPrimitive>) {
+                    flushPointGroups();
+                    auto* item = new QGraphicsPathItem(prim.path);
+                    addItem(item, prim.style);
                 } else if constexpr (std::is_same_v<T, TextPrimitive>) {
                     flushPointGroups();
                     if (prim.outlined) {
