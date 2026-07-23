@@ -59,6 +59,7 @@ public:
         std::string automaticHvTag;
         std::string manualHvTag;
         std::vector<std::string> tags;
+        int linkedFiberCount = 0;
     };
 
     explicit CFiberWidget(QWidget* parent = nullptr);

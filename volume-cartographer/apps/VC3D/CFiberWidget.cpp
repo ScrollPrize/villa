@@ -37,6 +37,7 @@ namespace {
 enum FiberColumn {
     kNameColumn = 0,
     kDirectionColumn,
+    kLinkColumn,
     kLengthColumn,
     kControlPointsColumn,
     kLinePointsColumn,
@@ -328,6 +329,7 @@ void CFiberWidget::setupUi()
     _model->setHorizontalHeaderLabels({
         tr("name"),
         tr("dir"),
+        tr("link"),
         tr("len"),
         tr("cps"),
         tr("pts"),
@@ -353,6 +355,7 @@ void CFiberWidget::setupUi()
     _treeView->header()->setSortIndicator(_sortColumn, _sortOrder);
     _treeView->setColumnWidth(kNameColumn, 220);
     _treeView->setColumnWidth(kDirectionColumn, 42);
+    _treeView->setColumnWidth(kLinkColumn, 42);
     _treeView->setColumnWidth(kLengthColumn, 72);
     _treeView->setColumnWidth(kControlPointsColumn, 48);
     _treeView->setColumnWidth(kLinePointsColumn, 48);
@@ -654,6 +657,7 @@ void CFiberWidget::rebuildModel()
     _model->setHorizontalHeaderLabels({
         tr("name"),
         tr("dir"),
+        tr("link"),
         tr("len"),
         tr("cps"),
         tr("pts"),
@@ -669,6 +673,9 @@ void CFiberWidget::rebuildModel()
         QList<QStandardItem*> row{
             readOnlyItem(displayNameForFiber(fiber)),
             readOnlyItem(directionForFiber(fiber)),
+            readOnlyItem(fiber.linkedFiberCount > 0
+                             ? QString::number(fiber.linkedFiberCount)
+                             : QString()),
             readOnlyItem(formatDouble(fiber.lengthVx, 1)),
             readOnlyItem(QString::number(fiber.controlPointCount)),
             readOnlyItem(QString::number(fiber.linePointCount)),
@@ -687,6 +694,7 @@ void CFiberWidget::rebuildModel()
             QList<QStandardItem*> childRow{
                 readOnlyItem(spanName),
                 readOnlyItem(directionForFiber(fiber)),
+                readOnlyItem(QString()),
                 readOnlyItem(formatDouble(span.lengthVx, 1)),
                 readOnlyItem(QString::number(span.controlPointCount)),
                 readOnlyItem(QString::number(span.linePointCount)),
@@ -815,6 +823,10 @@ void CFiberWidget::sortFibers()
             less = compareText(a, b);
             break;
         }
+        case kLinkColumn:
+            different = lhs.linkedFiberCount != rhs.linkedFiberCount;
+            less = compareNumber(lhs.linkedFiberCount, rhs.linkedFiberCount);
+            break;
         case kLengthColumn:
             different = lhs.lengthVx != rhs.lengthVx;
             less = compareNumber(lhs.lengthVx, rhs.lengthVx);
