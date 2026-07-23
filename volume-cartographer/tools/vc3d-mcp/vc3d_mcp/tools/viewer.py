@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from ..core import mcp, _call, _strip_none
 
@@ -13,6 +13,20 @@ class _Vec3(TypedDict):
     x: float
     y: float
     z: float
+
+
+class _Point(TypedDict):
+    x: float
+    y: float
+    z: NotRequired[float]
+
+
+class _ScenePoint(TypedDict):
+    x: float
+    y: float
+
+
+_Modifiers = list[Literal["shift", "ctrl", "alt", "meta", "keypad"]]
 
 
 class _Window(TypedDict):
@@ -43,7 +57,8 @@ _OverlayColormap = Literal[
 
 @mcp.tool()
 async def vc3d_get_cursor_point(
-    viewer: Optional[str] = None, scene: Optional[dict[str, float]] = None
+    viewer: Optional[str] = None,
+    scene: Optional[_ScenePoint] = None,
 ) -> dict[str, Any]:
     """Resolve a viewer scene position (or the current cursor) to a 3D volume
     point + surface normal.
@@ -59,11 +74,11 @@ async def vc3d_get_cursor_point(
 
 @mcp.tool()
 async def vc3d_click(
-    position: dict[str, float],
+    position: _Point,
     viewer: Optional[str] = None,
     space: Literal["volume", "scene"] = "volume",
     button: Literal["left", "right", "middle"] = "left",
-    modifiers: Optional[list[str]] = None,
+    modifiers: Optional[_Modifiers] = None,
 ) -> dict[str, Any]:
     """Synthesize a mouse click in a viewer at a volume-space (or scene-space)
     position, with button and modifiers (e.g. modifiers=["shift"] to place a
@@ -96,11 +111,11 @@ async def vc3d_click(
 
 @mcp.tool()
 async def vc3d_shift_click(
-    position: dict[str, float],
+    position: _Point,
     viewer: Optional[str] = None,
     space: Literal["volume", "scene"] = "volume",
     button: Literal["left", "right", "middle"] = "left",
-    modifiers: Optional[list[str]] = None,
+    modifiers: Optional[_Modifiers] = None,
 ) -> dict[str, Any]:
     """Shift+click convenience: the canonical place-point / set-focus gesture.
     Identical to vc3d_click with "shift" unioned into modifiers.
@@ -374,12 +389,12 @@ async def vc3d_set_intersects(
 
 @mcp.tool()
 async def vc3d_drag(
-    from_point: dict[str, float],
-    to_point: dict[str, float],
+    from_point: _Point,
+    to_point: _Point,
     viewer: Optional[str] = None,
     space: Literal["volume", "scene"] = "volume",
     button: Literal["left", "right", "middle", "none"] = "left",
-    modifiers: Optional[list[str]] = None,
+    modifiers: Optional[_Modifiers] = None,
     steps: int = 8,
 ) -> dict[str, Any]:
     """Synthesize a full press-move-release drag in a viewer, from one point to
