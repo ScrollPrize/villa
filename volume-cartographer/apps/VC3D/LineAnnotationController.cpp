@@ -7135,6 +7135,9 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
 
 void LineAnnotationController::loadFibersForCurrentPackage()
 {
+    // Runtime fiber ids are reassigned per package load; a surviving candidate
+    // could silently point at an unrelated fiber with the same id.
+    _linkCandidate.reset();
     _fibers.clear();
     _fiberAlignmentMetrics.clear();
     _pendingFiberAlignmentMetrics.clear();

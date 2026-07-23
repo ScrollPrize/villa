@@ -1351,7 +1351,30 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.scenePoint = scenePoint;
     options.globalPos = globalPos;
     options.controlPoints = _generatedViews.controlPoints;
-    options.fiberIntersections = _generatedViews.fiberIntersections;
+    // On the cut viewers only plane-filtered X markers are drawn; restrict the
+    // hit-test candidates the same way so the menu never targets an invisible
+    // off-plane marker that happens to project near the click.
+    PlaneSurface* cutPlane = nullptr;
+    if (viewer == _currentCutViewer) {
+        cutPlane = _generatedViews.currentCutSurface.get();
+    } else if (viewer == _sideCutViewer) {
+        cutPlane = _generatedViews.sideCutSurface.get();
+    }
+    if (!cutPlane) {
+        options.fiberIntersections = _generatedViews.fiberIntersections;
+    } else if (const std::optional<float> intersectionThreshold =
+                   vc3d::line_annotation::generatedCrossSliceControlPointDistanceThreshold(
+                       viewer)) {
+        for (const auto& intersection : _generatedViews.fiberIntersections) {
+            if (!finitePoint(intersection.point)) {
+                continue;
+            }
+            const float distance = cutPlane->pointDist(intersection.point);
+            if (std::isfinite(distance) && std::abs(distance) <= *intersectionThreshold) {
+                options.fiberIntersections.push_back(intersection);
+            }
+        }
+    }
     options.linePointCount = _generatedViews.linePoints.size();
     options.linePosition = linePosition;
     options.stripViewer = stripViewer;
